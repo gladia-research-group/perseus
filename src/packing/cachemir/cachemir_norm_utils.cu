@@ -1,5 +1,6 @@
 #include "packing/cachemir/cachemir_norm_utils.h"
 #include "inference.h"
+#include "nonlinear.h"   // fused_ln_var_enabled()
 
 #include <utility>
 
@@ -16,6 +17,10 @@ PackedCtx compute_per_token_sum(Inference& inf, const PackedCtx& x_in) {
         PackedCtx tmp = inf.fhe->rotate(mean, i);
         inf.fhe->inplace_add(mean, tmp);
     }
+    // The ladder starts at gap=t, so this is a mod-t class sum (NOT an all-reduce):
+    // t-periodic. Named stamp so a bootstrap placed here can route sparse.
+    mean.tag = packtag::t_reduce_stride(packtag::PackTag::top(S), t);
+    inf.fhe->tag_ct(mean.ct, mean.tag);
     return mean;
 }
 
@@ -35,12 +40,30 @@ PackedCtx compute_variance_interleaved(Inference& inf, const PackedCtx& centered
     const int S  = inf.slots;
     const int rD = inf.size.getRealHidDim();
 
-    PackedCtx var = inf.fhe->square(centered_x_in);
-    for (int gap = 1; gap < S; gap *= 2) {
-        PackedCtx tmp = inf.fhe->rotate(var, gap);
-        inf.fhe->inplace_add(var, tmp);
+    PackedCtx var;
+    if (fused_ln_var_enabled()) {
+
+        CKKSContext::AutoBtsSuppressScope no_auto(*inf.fhe);
+        var = inf.fhe->square(centered_x_in);
+
+        const uint32_t s_eff = inf.fhe->fold_slots_for(1);
+        for (int gap = 1; gap < (int)s_eff; gap *= 2) {
+            PackedCtx tmp = inf.fhe->rotate(var, gap);
+            inf.fhe->inplace_add(var, tmp);
+        }
+        inf.fhe->fold_bootstrap(var.ct, s_eff, /*n_live=*/rD);
+    } else {
+        var = inf.fhe->square(centered_x_in);
+        for (int gap = 1; gap < S; gap *= 2) {
+            PackedCtx tmp = inf.fhe->rotate(var, gap);
+            inf.fhe->inplace_add(var, tmp);
+        }
+        inf.fhe->inplace_mult(var, 1.0 / (double)rD);  // biased variance, matches nn.LayerNorm
     }
-    inf.fhe->inplace_mult(var, 1.0 / (double)rD);  // biased variance, matches nn.LayerNorm
+
+    var.tag = packtag::t_reduce_all(packtag::PackTag::top(S));
+
+    inf.fhe->tag_ct(var.ct, var.tag);
     return var;
 }
 
@@ -61,15 +84,6 @@ std::vector<double> pack_per_feature_vec(int slots, const std::vector<double>& v
     for (int k = 0; k < C_real; ++k) out[k * t] = v[k];
     return out;
 }
-
-std::vector<double> decode_single_token(const std::vector<double>& slots_vec,
-                                        int slots, int d_pad, int C_real) {
-    const int t = slots / d_pad;
-    std::vector<double> out(C_real);
-    for (int k = 0; k < C_real; ++k) out[k] = slots_vec[k * t];
-    return out;
-}
-
 PackedCtx encrypt_single_token(Inference& inf, const std::vector<double>& x_pad,
                                int d_pad, int C_real) {
     auto slots = pack_per_feature_vec(inf.slots, x_pad, d_pad, C_real);

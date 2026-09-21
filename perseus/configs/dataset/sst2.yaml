@@ -1,6 +1,0 @@
-name: sst2
-kind: text
-path: stanfordnlp/sst2
-split: train
-text_field: sentence
-pool_tokens: 800000

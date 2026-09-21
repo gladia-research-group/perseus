@@ -14,8 +14,7 @@
 // conj-split + per-half centering masks + repack below are token-pair-specific.
 static PackedCtx ln_tail(Inference& inf, PackedCtx xs, const NormConfig& cfg,
                          int rD, int t, double c_eff_sq) {
-    return ln_inv_sqrt_tail(inf, std::move(xs), cfg, rD, t, c_eff_sq,
-                            sparse_ln_enabled(), /*tp_probes=*/true);
+    return ln_inv_sqrt_tail(inf, std::move(xs), cfg, rD, t, c_eff_sq, sparse_ln_enabled());
 }
 
 static Ptx ln_center_mask_imag(Inference& inf, const PackedCtx& ref, int d, int t,
@@ -52,7 +51,6 @@ PackedCtx norm_token_pair(Inference& inf, const PackedCtx& x, const std::string&
     const double c_eff_sq = cfg.center_scale * cfg.center_scale;   // filling: scalar (center_pos = -1)
     const int off = inf.output.capture_t;
     const int nA = inf.n_tok, nB = inf.n_tok_imag;
-    inf.fhe->tp_probe("lnin:" + cfg_name, x.ct);
 
     auto [A, B] = inf.fhe->conj_split(x);   // A = 2*Re(x), B = 2i*Im(x)
 
@@ -75,7 +73,6 @@ PackedCtx norm_token_pair(Inference& inf, const PackedCtx& x, const std::string&
         out = std::move(outA);
     }
     inf.output.capture_t = off; inf.n_tok = nA;
-    inf.fhe->tp_probe("ln:" + cfg_name, out.ct);
     return out;
 }
 

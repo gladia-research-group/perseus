@@ -14,10 +14,16 @@ namespace cachemir {
 // per-block (center_scale / center_scale_sq[pos]) ⇒ block-scoped tag; pos < 0 means
 // position-invariant (no center_scale_sq array). Shared by norm.cu and
 // generate_decode_masks so the cached value never drifts.
+// Prefix-taking form is the primitive; the Inference& form forwards to it —
+// see the note on score_mask_tag: both MUST produce byte-identical tags.
+inline std::string ln_center_mask_tag(const std::string& prefix, const std::string& cfg_name,
+                                      int pos) {
+    return Inference::scoped_in(prefix, "ln.center." + cfg_name +
+                                (pos < 0 ? std::string(".base") : ".p" + std::to_string(pos)));
+}
 inline std::string ln_center_mask_tag(const Inference& inf, const std::string& cfg_name,
                                       int pos) {
-    return inf.scoped("ln.center." + cfg_name +
-                      (pos < 0 ? std::string(".base") : ".p" + std::to_string(pos)));
+    return ln_center_mask_tag(inf.block_prefix, cfg_name, pos);
 }
 
 PackedCtx compute_per_token_sum(Inference& inf, const PackedCtx& x);
@@ -41,12 +47,6 @@ PackedCtx floor_inactive_token_lanes(Inference& inf, const PackedCtx& var_scaled
 // (slot k*t = v[k] for k in [0, C_real)), zero elsewhere.
 std::vector<double> pack_per_feature_vec(int slots, const std::vector<double>& v,
                                          int d_pad, int C_real);
-
-// Inverse of pack_per_feature_vec on the slot side: reads out[k] = slots_vec[k * t]
-// for k in [0, C_real). Used by callers that decrypt a single-token cachemir ct
-// and want the dense per-feature vector back.
-std::vector<double> decode_single_token(const std::vector<double>& slots_vec,
-                                        int slots, int d_pad, int C_real);
 
 // Pack a length-d_pad padded vector into single-token cachemir layout and encrypt.
 // C_real defaults to d_pad (all features carry data); pass a smaller value to

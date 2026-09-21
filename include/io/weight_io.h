@@ -1,11 +1,5 @@
 #pragma once
 
-// Reading exported weights from disk: binary file/zip byte access, the
-// safetensors manifest schema (TensorMeta + parse_manifest_json), matrix-txt
-// loading, and dtype decoding. JSON scanning (and text-file reading) is
-// delegated to json_utils; this header owns the binary/format side. No
-// CKKS/CUDA dependency.
-
 #include "json_utils.h"
 
 #ifdef WEIGHT_LOADER_WITH_LIBARCHIVE

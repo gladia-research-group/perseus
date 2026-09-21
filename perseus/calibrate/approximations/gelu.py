@@ -7,6 +7,7 @@ gelu_thor_composite op. (The iterative softsign_inv_sqrt method was removed
 from the calibrator; the runtime still parses legacy softsign configs.)
 """
 
+import logging
 import math
 
 import numpy as np
@@ -15,6 +16,8 @@ import torch.nn as nn
 
 from perseus.calibrate.numerics import safe_quantile
 from perseus.calibrate.registry import Approximation, register
+
+log = logging.getLogger(__name__)
 
 
 def _thor_g(x):
@@ -66,7 +69,7 @@ def fit_thor_gelu(samples, cfg):
                   float(abs_s.max()) * cfg.raw_max_safety))
     p1, p2, e_max, e_med = _fit_thor_composite(
         S, int(cfg.d1), int(cfg.d2))
-    print(f"[thor-gelu] S={S:8.3f}  d1={cfg.d1} d2={cfg.d2}"
+    log.info(f"[thor-gelu] S={S:8.3f}  d1={cfg.d1} d2={cfg.d2}"
           f"  max|err|={e_max:.3e}  med={e_med:.3e}")
     return {
         "method": "thor_composite",

@@ -1,0 +1,45 @@
+{
+  "family": "gpt2",
+  "ckks": {
+    "logN": 16,
+    "depth": 10,
+    "scale_bits": 54,
+    "enable_bootstrap": true,
+    "btp_depth_overhead": 16,
+    "level_budget": [
+      4,
+      3
+    ],
+    "bootstrap_slots": 0,
+    "sparse_bts_slots_list": [
+      512,
+      1
+    ],
+    "sparse_level_budget": [],
+    "btp_scale_bits": 54,
+    "correction_factor": 6,
+    "first_mod_bits": 56,
+    "num_large_digits": 6,
+    "auto_bts_level_override": 46,
+    "batch_size": 0,
+    "ckks_complex_payload": true,
+    "h_weight": 192,
+    "extra_rot_steps": [],
+    "deferred_rot_steps": [],
+    "bts_iterations": 1,
+    "bts_precision": 12,
+    "composite_degree": 2,
+    "defer_heavy_setup": false
+  },
+  "inference": {
+    "dim": 768,
+    "expanded": 3072,
+    "hidDim": 1024,
+    "expDim": 4096,
+    "numHeads": 16,
+    "numHeadsReal": 12,
+    "seqLen": 1024,
+    "packing_kind": "Cachemir",
+    "aux_packing_kinds": []
+  }
+}

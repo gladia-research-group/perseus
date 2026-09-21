@@ -1,0 +1,396 @@
+{
+ "version": 1,
+ "nodes": [
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_p01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_p01",
+   "step": "synth.C4_fanout.p01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p01",
+    "pt_p02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_p02",
+   "step": "synth.C4_fanout.p02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p02",
+    "pt_p03"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_p03",
+   "step": "synth.C4_fanout.p03",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p03",
+    "pt_f0_01"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_f0_01",
+   "step": "synth.C4_fanout.f0_01",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f0_01",
+    "pt_f0_02"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_f0_02",
+   "step": "synth.C4_fanout.f0_02",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f0_02",
+    "pt_f0_03"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_f0_03",
+   "step": "synth.C4_fanout.f0_03",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f0_03",
+    "pt_f0_04"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_f0_04",
+   "step": "synth.C4_fanout.f0_04",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f0_04",
+    "pt_f0_05"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_f0_05",
+   "step": "synth.C4_fanout.f0_05",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p03",
+    "pt_f1_01"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_f1_01",
+   "step": "synth.C4_fanout.f1_01",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f1_01",
+    "pt_f1_02"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_f1_02",
+   "step": "synth.C4_fanout.f1_02",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f1_02",
+    "pt_f1_03"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_f1_03",
+   "step": "synth.C4_fanout.f1_03",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f1_03",
+    "pt_f1_04"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_f1_04",
+   "step": "synth.C4_fanout.f1_04",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f1_04",
+    "pt_f1_05"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_f1_05",
+   "step": "synth.C4_fanout.f1_05",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p03",
+    "pt_f2_01"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_f2_01",
+   "step": "synth.C4_fanout.f2_01",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f2_01",
+    "pt_f2_02"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_f2_02",
+   "step": "synth.C4_fanout.f2_02",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f2_02",
+    "pt_f2_03"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_f2_03",
+   "step": "synth.C4_fanout.f2_03",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f2_03",
+    "pt_f2_04"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_f2_04",
+   "step": "synth.C4_fanout.f2_04",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f2_04",
+    "pt_f2_05"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_f2_05",
+   "step": "synth.C4_fanout.f2_05",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p03",
+    "pt_f3_01"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_f3_01",
+   "step": "synth.C4_fanout.f3_01",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f3_01",
+    "pt_f3_02"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_f3_02",
+   "step": "synth.C4_fanout.f3_02",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f3_02",
+    "pt_f3_03"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_f3_03",
+   "step": "synth.C4_fanout.f3_03",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f3_03",
+    "pt_f3_04"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_f3_04",
+   "step": "synth.C4_fanout.f3_04",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_f3_04",
+    "pt_f3_05"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_f3_05",
+   "step": "synth.C4_fanout.f3_05",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  }
+ ]
+}

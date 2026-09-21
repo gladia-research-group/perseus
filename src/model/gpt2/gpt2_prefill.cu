@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <cstdlib>
 #include <exception>
 #include <map>
@@ -77,7 +78,6 @@ void reset_graph_runtime(Inference& inf) {
     inf.fhe->pt_vars.clear();
     inf.fhe->graph_ct_counter = 0;
     inf.fhe->graph_pt_counter = 0;
-    inf.fhe->current_runtime_node_id = 0;
 }
 
 }  // namespace
@@ -91,11 +91,6 @@ struct TailLmPrep {
     std::atomic<bool>          attempted{false};
 };
 TailLmPrep g_tail_lm;
-
-bool tail_prefetch_enabled() {
-    const char* e = std::getenv("FHE_TAIL_PREFETCH");
-    return !(e && *e && std::atoi(e) == 0);
-}
 }  // namespace
 
 bool gpt2_tail_lm_take(std::vector<EncodedBlock>& out, std::vector<std::string>& complex_keys) {
@@ -104,6 +99,85 @@ bool gpt2_tail_lm_take(std::vector<EncodedBlock>& out, std::vector<std::string>&
     complex_keys = std::move(g_tail_lm.complex_keys);
     g_tail_lm.ready.store(false);
     return true;
+}
+
+namespace {
+
+struct EarlyBlock0 {
+    std::atomic<bool>          attempted{false};
+    std::future<EncodedBlock>  fut;
+    double                     enc_s = 0.0;   // worker wall, reported separately
+};
+EarlyBlock0 g_early_b0;
+
+int prefill_encode_threads() {
+    const char* et = std::getenv("FHE_PREFILL_ENCODE_THREADS");
+    return et ? std::atoi(et) : 12;
+}
+}  // namespace
+
+void gpt2_prefill_early_block0(Inference& inf,
+                               const weight_loader::WeightStore& store,
+                               const config_loader::ParsedConfigs& parsed_configs,
+                               const BlockPlans& plans) {
+    if (g_early_b0.attempted.exchange(true)) return;
+    { std::vector<double> w(16, 0.0); (void)inf.cc()->MakeCKKSPackedPlaintext(w, 1, 0u); }
+    g_early_b0.fut = std::async(std::launch::async,
+                                [&inf, &store, &parsed_configs, plans]() {
+        omp_set_num_threads(prefill_encode_threads());
+        const auto t0 = std::chrono::steady_clock::now();
+        BlockLoader raw_loader = make_block_loader(store, parsed_configs, plans);
+
+        const int st = pt_stage_block_threads();
+        if (st > 0)
+            inf.pt_stage_hook = [](const std::string&, std::vector<Ptx>&) {};
+        EncodedBlock r = raw_loader(inf, 0, nullptr);
+        if (st > 0) inf.pt_stage_hook = nullptr;
+        g_early_b0.enc_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "[prefill-early] block_0 encoded on the worker in %.1fs "
+                             "(overlapped with key/bts setup)\n", g_early_b0.enc_s);
+        return r;
+    });
+}
+
+void gpt2_prefill_early_block0_join(Inference& inf) {
+    if (!g_early_b0.fut.valid()) return;
+    EncodedBlock r = g_early_b0.fut.get();
+    const int st = pt_stage_block_threads();
+    if (st > 0) {
+        inf.begin_stage_block();
+        stage_block_weights(inf, r, st);
+    }
+    std::promise<EncodedBlock> p;
+    p.set_value(std::move(r));
+    g_early_b0.fut = p.get_future();
+}
+
+namespace {
+
+struct ChunkWCache {
+    int  mode = 0;                       // 0=off, 1=fill (chunk 0), 2=reuse (chunk 1+)
+    std::vector<EncodedBlock> blocks;
+};
+ChunkWCache g_wcache;
+}  // namespace
+
+void gpt2_prefill_wcache_configure(Inference& inf, int n_blocks, int mode) {
+    if (mode != 0 && graph_dir_env()) mode = 0;   // capture: keep the recorded flow simple
+    g_wcache.mode = mode;
+    if (mode == 1) {
+        g_wcache.blocks.assign(static_cast<size_t>(n_blocks), EncodedBlock{});
+        inf.cc()->SuppressStageReleaseCpu(true);   // keep host payloads for the re-stage
+    } else if (mode == 0) {
+        inf.cc()->SuppressStageReleaseCpu(false);
+    }
+}
+
+void gpt2_prefill_wcache_end(Inference& inf) {
+    inf.cc()->SuppressStageReleaseCpu(false);
+    g_wcache.blocks.clear();   // drops the payload-holding pt refs -> host RAM returns
+    g_wcache.mode = 0;
 }
 
 PackedCtx gpt2_prefill(Inference& inf, PackedCtx x,
@@ -116,9 +190,32 @@ PackedCtx gpt2_prefill(Inference& inf, PackedCtx x,
     BlockLoader raw_loader = make_block_loader(store, parsed_configs, plans);
     auto enc_s = std::make_shared<double>(0.0);   // [prefill-timing] weight-encode wall (load_block_state)
 
-    constexpr int kEncodeThreads = 12;
+    const int kEncodeThreads = prefill_encode_threads();
     auto mask_obs = std::make_shared<MaskObs>();
-    BlockLoader loader = [raw_loader, enc_s, mask_obs, n_blocks, &store](Inference& i, int b, cudaStream_t s) {
+    BlockLoader loader = [raw_loader, enc_s, mask_obs, n_blocks, &store, kEncodeThreads,
+                          &plans](Inference& i, int b, cudaStream_t s) {
+
+        if (g_wcache.mode == 2 && b < static_cast<int>(g_wcache.blocks.size())
+            && !g_wcache.blocks[b].w.empty()) {
+            EncodedBlock r = g_wcache.blocks[b];   // shallow: shared pts
+            r.plan = plans.at(b);                  // THIS chunk's placements
+            const int st2 = pt_stage_block_threads();
+            if (st2 > 0) {
+                i.begin_stage_block();
+                stage_block_weights(i, r, st2);
+            }
+            r.staged_masks.clear();
+            prefetch_block_masks(i, r, b, *mask_obs);
+            return r;
+        }
+
+        if (b == 0 && g_early_b0.fut.valid()) {
+            EncodedBlock r = g_early_b0.fut.get();
+            if (g_wcache.mode == 1 && b < static_cast<int>(g_wcache.blocks.size()))
+                g_wcache.blocks[b] = r;   // shallow copy into the chunk cache
+            prefetch_block_masks(i, r, b, *mask_obs);
+            return r;
+        }
         omp_set_num_threads(kEncodeThreads);
         const auto t0 = std::chrono::steady_clock::now();
         const int st = pt_stage_block_threads();
@@ -133,8 +230,10 @@ PackedCtx gpt2_prefill(Inference& inf, PackedCtx x,
             i.pt_stage_hook = nullptr;
             stage_block_weights(i, r, st);
         }
+        if (g_wcache.mode == 1 && b < static_cast<int>(g_wcache.blocks.size()))
+            g_wcache.blocks[b] = r;   // shallow copy into the chunk cache (pts shared)
         prefetch_block_masks(i, r, b, *mask_obs);
-        if (b >= n_blocks - 3 && tail_prefetch_enabled()
+        if (b >= n_blocks - 3
             && !i.fhe->complex_payload
             && !g_tail_lm.attempted.exchange(true)) {
             const auto tp0 = std::chrono::steady_clock::now();
@@ -163,20 +262,29 @@ PackedCtx gpt2_prefill(Inference& inf, PackedCtx x,
     auto cmp_s = std::make_shared<double>(0.0);   // [prefill-timing] block-compute wall (main thread)
     auto body = [planned, cmp_s](Inference& i, PackedCtx& h, int b) {
         size_t mem_free = 0, mem_total = 0;
-        cudaMemGetInfo(&mem_free, &mem_total);
+        {
+
+            WithStep _w(i, "body_prologue");
+            cudaMemGetInfo(&mem_free, &mem_total);
+        }
         std::fprintf(stderr, "[prefill-mem] block %d enter: free=%.2fGB / %.2fGB\n",
                      b, mem_free / 1e9, mem_total / 1e9);
         std::fflush(stderr);
         const auto t0 = std::chrono::steady_clock::now();
         i.output.capture_b = b;
         if (planned || graph_dir_env()) reset_graph_runtime(i);
+
+        i.fhe->profile.ensure_initialized();
+        if (i.fhe->profile.mode == StepProfiler::Mode::Wall) {
+            WithStep _w(i, "block_entry_flush");
+            cudaDeviceSynchronize();
+        }
         gpt2_block_step(i, h, b, [](Inference& j) {
             WithStep _w(j, "kv_reload"); reload_block_kv(j);   // same prologue as decode
         });
         *cmp_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
 
-    // TODO: check this part out
     auto release = [mask_obs](Inference& i, int b) {
         record_block_mask_obs(i, b, *mask_obs);
         gpt2_block_release(i, b);

@@ -1,0 +1,8 @@
+{
+  "_comment": "Flat per-op latency weights (ms) for the DaCapo segment DP on the n32 chain. bootstrap = measured dense 4:3 wall (blackwell campaign); others are order-of-magnitude op costs. Bootstrap dominates by ~60-500x, so per-level refinement is second-order; swap this file via PLAN_LATENCY_TABLE to test sensitivity.",
+  "bootstrap": 28.5,
+  "mult": 0.5,
+  "rotate": 0.3,
+  "add": 0.05,
+  "other": 0.05
+}

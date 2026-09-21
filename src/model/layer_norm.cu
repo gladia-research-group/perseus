@@ -1,4 +1,5 @@
 #include "model/layer_norm.h"
+#include "slot_layout.h"
 
 #include "nonlinear.h"
 #include "packing/cachemir/cachemir_norm_utils.h"
@@ -46,10 +47,15 @@ PackedCtx ln_affine(Inference& inf, const PackedCtx& normed, const std::string& 
 PackedCtx layer_norm(Inference& inf, const PackedCtx& x, const std::string& cfg_name) {
     WithStep _w(inf, "layer_norm:" + cfg_name);
     PackedCtx normed = norm(inf, x, cfg_name);
+    slotlayout::propagate(x.ct, normed.ct);   // per-feature op: the basis survives
     if (fold_ln_affine(cfg_name)) {   // gamma folded into consumer; beta rides input as (beta/gamma) shift
         WithStep _ws(inf, "ln_shift");
         inf.add_affine_term(normed, cfg_name + ".shift");
         return normed;
     }
-    return ln_affine(inf, normed, cfg_name);
+
+    inf.fhe->maybe_bootstrap(normed.ct);
+    PackedCtx out = ln_affine(inf, normed, cfg_name);
+    slotlayout::propagate(x.ct, out.ct);
+    return out;
 }

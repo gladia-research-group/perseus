@@ -1,7 +1,10 @@
 #pragma once
+#include <filesystem>
+#include <fstream>
 
 #include "graph.h"
 #include "fideslib_wrapper.h"
+#include "fhe_errors.h"
 #include "nonlinear.h"
 #include "packing/packed_ctx.h"
 #include "packing/cachemir/cachemir_masks.h"
@@ -14,13 +17,9 @@
 #include <unordered_set>
 #include <vector>
 #include <string>
-#include <chrono>
 #include <iostream>
 #include <functional>
 #include <cstdlib>
-
-// Packing-aware slot index dispatchers. Inference members below build masks
-// from these; cachemir-specific layouts live in packing/cachemir/cachemir_masks.h.
 
 inline std::vector<int> stride_slots(const Packing& packing,
                                      int slots, int d, int stride,
@@ -63,7 +62,6 @@ enum class InferenceMode { Sync, Threaded, Prefetch };
 enum class WeightGranularity { Block, Sublayer, Linear, Plaintext };
 
 struct InferenceOutput {
-    // Current decode position — set in the block loop, read by norm.cu (per-position LN center).
     int capture_t = 0;
     int capture_b = 0;
     int capture_chunk = -1;
@@ -79,17 +77,15 @@ struct Inference {
     int   slots       = 0;
 
     bool parallel        = true;
-    bool bench_mode      = false;  // true → all rotations use index 5 (minimal keys)
+    bool bench_mode      = false;
 
-    InferenceMode mode   = InferenceMode::Threaded;  // overlap policy (Sync/Threaded/Prefetch)
-    bool cache_weights   = false;  // true → encode weights once, never re-encode (reuse across passes)
-    bool complex         = false;  // single global complex switch: fused-KV complex attention + complex MLP
-                                   // (up & down) + complex lm_head. Two paths only — complex or not.
-    bool token_pair      = false;  // prefill-only: tok j→Re, tok j+t→Im (64 tok/chunk); set in configure_phase
-    bool bidirectional   = false;  // filling attention over ALL cached keys (ViT); requires every
-                                   // K/V group pushed before attention (two-phase driver)
+    InferenceMode mode   = InferenceMode::Threaded;
+    bool cache_weights   = false;
+    bool complex         = false;
+    bool token_pair      = false;
+    bool bidirectional   = false;
 
-    Packing packing{};   // overwritten by make_inference based on opts.packing_kind
+    Packing packing{};
 
     std::string weight_dir;
 
@@ -106,18 +102,15 @@ struct Inference {
     InferenceOutput output;   // per-token / per-block capture (test-only; see above)
 
     std::string scoped(const std::string& name) const { return block_prefix + name; }
+    // Thread-safe form of scoped(): the caller supplies the prefix instead of reading the
+    // mutable block_prefix member, so a worker thread can build scoped tags.
+    static std::string scoped_in(const std::string& prefix, const std::string& name) {
+        return prefix + name;
+    }
 
     std::unordered_map<std::string, NormConfig>        norm_cfg;
     std::unordered_map<std::string, SoftmaxConfig> sm_cfg;
     std::unordered_map<std::string, GeLUConfig>     gelu_cfg;
-
-    Ptx encode_stride_mask(int d, int stride, double scale = 1.0, double fill_value = 0.0) const {
-        std::vector<double> v(slots, fill_value);
-        for (int i = 0; i < d; ++i)
-            v[i * stride] = scale;
-        return cc()->MakeCKKSPackedPlaintext(v, 1);
-    }
-
     Packing make_packing(PackingKind kind) const {
         Packing p;
         p.kind     = kind;
@@ -146,8 +139,9 @@ struct Inference {
     }
 
     void begin_stage_block() { cc()->BeginStageBlock(); }
+    void begin_stage_block(int owner) { cc()->BeginStageBlockOwned(owner); }
+    void release_stage_block(int owner) { cc()->ReleaseStageBlock(owner); }
     void set_persistent_staging(bool on) { cc()->SetPersistentStaging(on); }
-    void set_stage_multi_consume(bool on) { cc()->SetStageMultiConsume(on); }
     void evict_plaintext(Ptx& pt) {
         if (!pt || !pt->loaded || pt->gpu == 0) return;
         cc()->EvictDevicePlaintext(pt->gpu);
@@ -162,10 +156,22 @@ struct Inference {
         w.erase(it);
     }
 
+    uint32_t pending_rescale_primes(const Ctx& ct) const {
+        if (fhe) return fhe->pending_rescale_primes(ct);
+        return (ct && ct->GetNoiseScaleDeg() == 2) ? 1u : 0u;
+    }
+
+    template <class Vec>
+    Ptx encode_tagged(const Vec& v, uint32_t lv) const {
+        Ptx pt = cc()->MakeCKKSPackedPlaintext(v, /*noiseScaleDeg=*/1, lv);
+        if (fhe) fhe->tag_plaintext(pt, v);   // real and complex overloads
+        return pt;
+    }
+
     Ptx encode_at(const std::vector<double>& v, const Ctx& ct) const {
         const uint32_t lv = static_cast<uint32_t>(level_of(ct))
-                          + (ct->GetNoiseScaleDeg() == 2 ? 1u : 0u);
-        return cc()->MakeCKKSPackedPlaintext(v, /*noiseScaleDeg=*/1, lv);
+                          + pending_rescale_primes(ct);
+        return encode_tagged(v, lv);
     }
 
     Ptx encode_at(const std::vector<double>& v, const PackedCtx& pc) const {
@@ -174,8 +180,7 @@ struct Inference {
 
     Ptx encode_complex_const_at(double re, double im, const Ctx& ct) const {
         const uint32_t lv = static_cast<uint32_t>(level_of(ct))
-                          + (ct->GetNoiseScaleDeg() == 2 ? 1u : 0u);
-        // memoised by (re,im,level) — encode once, reuse across all blocks/tokens (== const_pt)
+                          + pending_rescale_primes(ct);
         return fhe->complex_const_pt(re, im, static_cast<int>(lv));
     }
     Ptx encode_complex_const_at(double re, double im, const PackedCtx& pc) const {
@@ -196,6 +201,25 @@ struct Inference {
         for (int slot : active)
             if (is_cachemir(packing) || (slot % t) < n_tok) v[slot] = scale;
         return v;
+    }
+
+    std::shared_ptr<const std::vector<uint8_t>> live_lane_mask_token() const {
+        const int t = slots / size.hidDim;
+        auto m = std::make_shared<std::vector<uint8_t>>(slots, uint8_t(0));
+        for (int slot = 0; slot < slots; ++slot) {
+            const int k = slot / t, i = slot % t;
+            if (k % size.numHeads < size.getRealNumHeads() && i < n_tok) (*m)[slot] = 1;
+        }
+        return m;
+    }
+
+    std::shared_ptr<const std::vector<uint8_t>> live_lane_mask_expanded() const {
+        const int t_out = slots / size.expDim;
+        auto m = std::make_shared<std::vector<uint8_t>>(slots, uint8_t(0));
+        for (int j = 0; j < size.getRealFfDim(); ++j)
+            for (int tok = 0; tok < std::min(t_out, n_tok); ++tok)
+                (*m)[j * t_out + tok] = 1;
+        return m;
     }
     std::vector<double> active_expanded_mask_vec(double scale, double fill_value) const {
         std::vector<double> v(slots, fill_value);
@@ -291,8 +315,6 @@ struct Inference {
     }
 
     Ptx gelu_half_mask(const PackedCtx& pc, double scale = 0.5) const {
-        // token-pair only: the mask depends on n_tok and the A/B halves differ on partial chunks
-        // (nA != nB) -> key it. Real/decode tags stay byte-identical (frozen plans reference them).
         const std::string nt = token_pair ? ".nt" + std::to_string(n_tok) : "";
         if (mlp_tile_dim > 0) {
             const int t = slots / mlp_tile_dim;
@@ -346,12 +368,18 @@ struct Inference {
         return encode_active_residual_mask_at_cached(tag, d, t, pc.ct);
     }
 
+    std::pair<uint32_t, uint32_t> encode_like_params(const Ctx& ref) const {
+        const uint32_t nsd_ref = static_cast<uint32_t>(ref->GetNoiseScaleDeg());
+        const uint32_t lv_ref  = static_cast<uint32_t>(level_of(ref));
+        if (!fhe || fhe->composite_degree <= 1) return {lv_ref, nsd_ref};
+        return {lv_ref + pending_rescale_primes(ref), 1u};
+    }
+
     // Re-encode a slot vector to exactly match a ct's level + noiseScaleDeg.
 
     Ptx encode_like(const std::vector<double>& v, const Ctx& ref) const {
-        return cc()->MakeCKKSPackedPlaintext(v,
-            /*noiseScaleDeg=*/ref->GetNoiseScaleDeg(),
-            /*level=*/static_cast<uint32_t>(level_of(ref)));
+        const auto [lv, nsd] = encode_like_params(ref);
+        return cc()->MakeCKKSPackedPlaintext(v, nsd, lv);
     }
     Ptx encode_like(const std::vector<double>& v, const PackedCtx& ref) const {
         return encode_like(v, ref.ct);
@@ -367,9 +395,9 @@ struct Inference {
     mutable std::unordered_map<std::string, Ptx> enc_cache;
     mutable uint64_t enc_cache_hit = 0, enc_cache_miss = 0;
 
-    bool strict_masks = false;        // live gate (toggled around the per-block loop)
-    bool strict_masks_armed = false;  // set by generate_decode_masks: masks pre-generated
-    mutable uint64_t mask_strict_miss = 0;   // strict-mode misses seen (>0 ⇒ plan gap)
+    bool strict_masks = false;        
+    bool strict_masks_armed = false;  
+    mutable uint64_t mask_strict_miss = 0;
 
     static std::string enc_cache_key(const std::string& tag, uint32_t lv, uint32_t nsd) {
         return tag + "#L" + std::to_string(lv) + ":d" + std::to_string(nsd);
@@ -389,8 +417,6 @@ struct Inference {
         return n;
     }
 
-    // Device-evict only entries under a tag prefix (host entries stay). Lets the prefill
-    // block loop drop the finished block's scoped masks while shared masks stay resident.
     size_t evict_enc_cache_device_scoped(const std::string& prefix) {
         size_t n = 0;
         for (auto& kv : enc_cache)
@@ -425,25 +451,32 @@ struct Inference {
         return n;
     }
 
-    void prime_enc_cache(const std::string& tag, const std::vector<double>& v,
-                         uint32_t lv) const {
+    template <class Gen>
+    void prime_enc_cache_gen(const std::string& tag, uint32_t lv, Gen&& gen) const {
         const std::string key = enc_cache_key(tag, lv, 1);
         if (enc_cache.find(key) != enc_cache.end()) return;
-        enc_cache.emplace(key, cc()->MakeCKKSPackedPlaintext(v, /*noiseScaleDeg=*/1, lv));
+        Ptx pt = encode_tagged(gen(), lv);
+        enc_cache.emplace(key, std::move(pt));
     }
 
-    // Adopt an already-encoded plaintext (worker-side mask prefetch); no-op when the
-    // key is present — the loser is simply dropped.
+    void prime_enc_cache(const std::string& tag, const std::vector<double>& v,
+                         uint32_t lv) const {
+        prime_enc_cache_gen(tag, lv, [&]() -> const std::vector<double>& { return v; });
+    }
+
+    template <class Gen>
+    void prime_enc_cache_lazy(const std::string& tag, uint32_t lv, Gen&& gen) const {
+        prime_enc_cache_gen(tag, lv, std::forward<Gen>(gen));
+    }
+
     void adopt_enc_cache(const std::string& tag, uint32_t lv, Ptx pt) const {
         enc_cache.emplace(enc_cache_key(tag, lv, 1), std::move(pt));
     }
 
-    // Complex variant (K/V-pack v.lane mask): same enc_cache, complex per-slot plaintext.
     void prime_enc_cache(const std::string& tag, const std::vector<std::complex<double>>& v,
                          uint32_t lv) const {
-        const std::string key = enc_cache_key(tag, lv, 1);
-        if (enc_cache.find(key) != enc_cache.end()) return;
-        enc_cache.emplace(key, cc()->MakeCKKSPackedPlaintext(v, /*noiseScaleDeg=*/1, lv));
+        prime_enc_cache_gen(tag, lv,
+                            [&]() -> const std::vector<std::complex<double>>& { return v; });
     }
 
     template <class Build>
@@ -454,12 +487,13 @@ struct Inference {
         ++enc_cache_miss;
         if (strict_masks) {
             ++mask_strict_miss;
-            throw std::runtime_error(
+            throw fhe::MaskError(
                 "[mask_miss] strict planned-mask cache miss: '" + key +
                 "' not pre-generated by generate_decode_masks (plan mask_levels gap or "
                 "stale capture/plan). Re-capture/re-plan to refresh mask_levels.");
         }
-        Ptx pt = cc()->MakeCKKSPackedPlaintext(build(), /*noiseScaleDeg=*/1, lv);
+        const auto vals = build();
+        Ptx pt = encode_tagged(vals, lv);
         enc_cache.emplace(key, pt);
         return pt;
     }
@@ -468,7 +502,7 @@ struct Inference {
     Ptx encode_at_cached(const std::string& tag, const std::vector<double>& v,
                          const Ctx& ct) const {
         const uint32_t lv = static_cast<uint32_t>(level_of(ct))
-                          + (ct->GetNoiseScaleDeg() == 2 ? 1u : 0u);
+                          + pending_rescale_primes(ct);
         return encode_at_cached_impl(tag, lv, [&]() -> const std::vector<double>& { return v; });
     }
     Ptx encode_at_cached(const std::string& tag, const std::vector<double>& v,
@@ -479,7 +513,7 @@ struct Inference {
     template <class Gen>
     Ptx encode_at_cached(const std::string& tag, const Ctx& ct, Gen&& gen) const {
         const uint32_t lv = static_cast<uint32_t>(level_of(ct))
-                          + (ct->GetNoiseScaleDeg() == 2 ? 1u : 0u);
+                          + pending_rescale_primes(ct);
         return encode_at_cached_impl(tag, lv, std::forward<Gen>(gen));
     }
     template <class Gen>
@@ -490,16 +524,18 @@ struct Inference {
     template <class Gen>
     Ptx encode_at_cached_complex(const std::string& tag, const Ctx& ct, Gen&& gen) const {
         const uint32_t lv = static_cast<uint32_t>(level_of(ct))
-                          + (ct->GetNoiseScaleDeg() == 2 ? 1u : 0u);
+                          + pending_rescale_primes(ct);
         const std::string key = enc_cache_key(tag, lv, 1);
         auto it = enc_cache.find(key);
         if (it != enc_cache.end()) { ++enc_cache_hit; return it->second; }
         ++enc_cache_miss;
         if (strict_masks) {
             ++mask_strict_miss;
-            throw std::runtime_error("[mask_miss] strict planned-mask cache miss (complex): '" + key + "'");
+            throw fhe::MaskError("[mask_miss] strict planned-mask cache miss (complex): '" + key + "'");
         }
-        Ptx pt = cc()->MakeCKKSPackedPlaintext(gen(), /*noiseScaleDeg=*/1, lv);
+        const auto vals = gen();
+        Ptx pt = cc()->MakeCKKSPackedPlaintext(vals, /*noiseScaleDeg=*/1, lv);
+        if (fhe) fhe->tag_plaintext(pt, vals);
         enc_cache.emplace(key, pt);
         return pt;
     }
@@ -510,13 +546,14 @@ struct Inference {
 
     template <class Build>
     Ptx encode_like_cached_impl(const std::string& tag, const Ctx& ref, Build&& build) const {
-        const uint32_t lv  = static_cast<uint32_t>(level_of(ref));
-        const uint32_t nsd = static_cast<uint32_t>(ref->GetNoiseScaleDeg());
+        const auto [lv, nsd] = encode_like_params(ref);
         const std::string key = enc_cache_key(tag, lv, nsd);
         auto it = enc_cache.find(key);
         if (it != enc_cache.end()) { ++enc_cache_hit; return it->second; }
         ++enc_cache_miss;
-        Ptx pt = cc()->MakeCKKSPackedPlaintext(build(), nsd, lv);
+        const auto vals = build();
+        Ptx pt = cc()->MakeCKKSPackedPlaintext(vals, nsd, lv);
+        if (fhe) fhe->tag_plaintext(pt, vals);
         enc_cache.emplace(key, pt);
         return pt;
     }
@@ -540,13 +577,14 @@ struct Inference {
 
     template <class Gen>
     Ptx encode_like_cached_complex_impl(const std::string& tag, const Ctx& ref, Gen&& gen) const {
-        const uint32_t lv  = static_cast<uint32_t>(level_of(ref));
-        const uint32_t nsd = static_cast<uint32_t>(ref->GetNoiseScaleDeg());
+        const auto [lv, nsd] = encode_like_params(ref);
         const std::string key = enc_cache_key(tag, lv, nsd);
         auto it = enc_cache.find(key);
         if (it != enc_cache.end()) { ++enc_cache_hit; return it->second; }
         ++enc_cache_miss;
-        Ptx pt = cc()->MakeCKKSPackedPlaintext(gen(), nsd, lv);
+        const auto vals = gen();
+        Ptx pt = cc()->MakeCKKSPackedPlaintext(vals, nsd, lv);
+        if (fhe) fhe->tag_plaintext(pt, vals);
         enc_cache.emplace(key, pt);
         return pt;
     }
@@ -555,9 +593,6 @@ struct Inference {
         return encode_like_cached_complex_impl(tag, ref.ct, std::forward<Gen>(gen));
     }
 
-    // Additive per-feature plaintext, mirrored into the Im lane under token-pair packing (v -> v+iv)
-    // so add() lands on BOTH A (Re) and B (Im) token lanes. token_pair=false (decode/real) is
-    // byte-identical to encode_like_cached. `rv` returns the real per-slot values (from a stored weight).
     template <class RealGen>
     Ptx encode_additive_like(const std::string& tag, const PackedCtx& ref, RealGen&& rv) const {
         if (!token_pair) return encode_like_cached(tag, ref, std::forward<RealGen>(rv));
@@ -569,10 +604,6 @@ struct Inference {
         });
     }
 
-    // Add a stored per-feature affine term (weights_at `name`) to `ct`; under token-pair packing
-    // mirror it into the Im lane (v -> v+iv) so both A and B tokens receive it. Decode/real
-    // (token_pair=false) stays on weights_at -> byte-identical. Values read from the stored tile
-    // (level-independent) so no spurious weight_relevel.
     void add_affine_term(PackedCtx& ct, const std::string& name) {
         if (!token_pair) { fhe->inplace_add(ct, weights_at(name, ct)[0]); return; }
         Ptx s = encode_like_cached_complex(scoped(name) + ".ri", ct, [&] {
@@ -588,7 +619,7 @@ struct Inference {
         std::vector<Ptx>& tiles = w.at(name);
 
         const uint32_t lv = static_cast<uint32_t>(level_of(ref))
-                          + (ref->GetNoiseScaleDeg() == 2 ? 1u : 0u);
+                          + pending_rescale_primes(ref);
 
         std::vector<Ptx>* canon = nullptr;
         if (weight_store) {
@@ -599,8 +630,12 @@ struct Inference {
         for (size_t i = 0; i < tiles.size(); ++i) {
             const uint32_t enc_lv = static_cast<uint32_t>(tiles[i]->GetLevel());
             if (enc_lv == lv) continue;  // aligned
-            if (enc_lv != lv + 1u)
+            if (enc_lv != lv + 1u) {
+                std::fprintf(stderr, "[weight_dg] name=%s enc=%u eff=%u raw=%d deg=%d\n",
+                             name.c_str(), enc_lv, lv, (int)level_of(ref),
+                             (int)ref->GetNoiseScaleDeg());
                 fhe->warn_planned_weight_relevel(name, enc_lv, lv);   // no-op unless planned
+            }
             ++fhe->weight_relevel_count;   // total re-encodes (diagnostic; 0 = weight_levels perfect)
 
             fhe->record_weight_relevel(name, enc_lv, lv,
@@ -610,9 +645,9 @@ struct Inference {
             Ptx adapted = complex_weight_names.count(name)
                 ? cc()->MakeCKKSPackedPlaintext(tiles[i]->GetCKKSPackedValue(), /*noiseScaleDeg=*/1, lv)
                 : cc()->MakeCKKSPackedPlaintext(tiles[i]->GetRealPackedValue(), /*noiseScaleDeg=*/1, lv);
-            evict_plaintext(tiles[i]);   // free the stale-level tile's device buffer
-            tiles[i] = adapted;          // use it this pass
-            if (canon) (*canon)[i] = adapted;  // and persist for the next token
+            evict_plaintext(tiles[i]);
+            tiles[i] = adapted;
+            if (canon) (*canon)[i] = adapted;
         }
         return tiles;
     }
@@ -621,12 +656,13 @@ struct Inference {
     }
 
     std::unordered_set<std::string> complex_weight_names;
+    std::unordered_set<std::string> token_basis_weights;
 
     std::unordered_map<std::string, int> cache_count;
-    int& k_count() { return cache_count[scoped("k")]; }   // keys pushed into this block's K cache
-    int& v_count() { return cache_count[scoped("v")]; }   // values pushed into this block's V cache
+    int& k_count() { return cache_count[scoped("k")]; }
+    int& v_count() { return cache_count[scoped("v")]; }
 
-    bool use_cache = true;  // false → mha_block resets K/V cache per call (ViT-style)
+    bool use_cache = true;
     bool suppress_kv_periodic_bts = false;
 
     WeightGranularity weight_granularity = WeightGranularity::Block;
@@ -634,16 +670,13 @@ struct Inference {
     std::function<void(const std::string&, std::vector<Ptx>&)> pt_stage_hook;
 
     int n_tok = 1;
-    int n_tok_imag = 0;   // token-pair: active count of the IMAG half (B = tokens [t,2t)); 0 otherwise
+    int n_tok_imag = 0;
     int mlp_tile_dim = 0;
 
+    // Prefill MLP is tiled (per-hidDim up/down tiles) when the chunk holds more tokens
+    // than the expanded layout can pack.
     bool tiled_mlp() const {
         if (!(is_cachemir_filling(packing) && size.expDim > 0)) return false;
-        static const int force = [] {
-            const char* e = std::getenv("FHE_TILED_MLP");
-            return (e && *e) ? std::atoi(e) : -1;
-        }();
-        if (force >= 0) return force != 0;
         return n_tok > slots / size.expDim;
     }
 
@@ -694,39 +727,34 @@ struct Inference {
     void name_graph_ct_if_absent(const PackedCtx& pc, const std::string& name) {
         name_graph_ct_if_absent(pc.ct, name);
     }
-
-    void name_graph_pt(const Ptx& pt, const std::string& name, bool overwrite = true) {
-        if (fhe) {
-            fhe->name_pt(pt, name, overwrite);
-        }
-    }
-
-    void name_graph_pt_if_absent(const Ptx& pt, const std::string& name) {
-        if (fhe) {
-            fhe->name_pt_if_absent(pt, name);
-        }
-    }
-
-    void record_graph_op(const std::string& op_type,
-                         std::initializer_list<std::string> inputs,
-                         const std::string& output) {
-        if (graph) {
-            graph->add_node(op_type, inputs, output, fhe ? fhe->step_path() : "");
-        }
-    }
-
-    void record_graph_op(const std::string& op_type,
-                         const std::vector<std::string>& inputs,
-                         const std::string& output) {
-        if (graph) {
-            graph->add_node(op_type, inputs, output, fhe ? fhe->step_path() : "");
-        }
-    }
-
     void export_graph_json(const std::string& path) const {
         if (graph) {
+            if (fhe) fhe->drain_magnitudes();   // async magnitude capture: patch before write
             graph->export_json(path);
+            write_capture_env_json(path);
         }
+    }
+
+    void write_capture_env_json(const std::string& graph_path) const {
+        static const char* kLoadBearing[] = {
+            "CHAIN", "LOGN", "AUTO_BTS_LEVEL", "BTS_ITERATIONS",
+            "CKKS_COMPLEX", "GPT2_PACKING", "GPT2_CACHE",
+            "GPT2_FOLD_LN1", "GPT2_FOLD_LN2", "GPT2_FOLD_LNF",
+            "CACHE_READ_LEVEL_K", "CACHE_READ_LEVEL_V", "FHE_LMHEAD_CAP",
+        };
+        const std::filesystem::path dir = std::filesystem::path(graph_path).parent_path();
+        std::ofstream f(dir / "capture_env.json");
+        if (!f) return;
+        f << "{\n  \"env\": {";
+        bool first = true;
+        for (const char* k : kLoadBearing) {
+            const char* v = std::getenv(k);
+            f << (first ? "\n" : ",\n") << "    \"" << k << "\": ";
+            if (v) f << "\"" << v << "\""; else f << "null";
+            first = false;
+        }
+        f << "\n  },\n  \"session\": {\"level_limit\": " << (fhe ? fhe->level_limit() : 0)
+          << ", \"slots\": " << slots << ", \"logN\": " << logN << "}\n}\n";
     }
 
     bool load_bootstrap_plan_json(const std::string& path) {
@@ -745,11 +773,6 @@ struct Inference {
     bool planned_bootstraps_enabled() const {
         return fhe && fhe->planned_bootstraps_enabled();
     }
-
-    std::string graph_json() const {
-        return graph ? graph->to_json() : std::string("{\n  \"version\": 1,\n  \"nodes\": []\n}\n");
-    }
-
 };
 
 struct InferenceOptions {

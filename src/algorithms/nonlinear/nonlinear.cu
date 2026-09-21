@@ -1,4 +1,5 @@
 #include "ckks_primitives.h"
+#include "slot_layout.h"
 #include "inference.h"
 #include "nonlinear.h"
 #include "model/layer_norm.h"   // fold_ln_affine
@@ -49,22 +50,6 @@ PackedCtx sign(Inference& inf, const PackedCtx& x) {
 
     return h;
 }
-
-PackedCtx lt_function(Inference& inf, const PackedCtx& x, double value,
-                      double rescale_factor) {
-    PackedCtx y = inf.fhe->add(x, -value);
-    if (rescale_factor != 1.0)
-        inf.fhe->inplace_mult(y, rescale_factor);
-
-    PackedCtx s = sign(inf, y);
-
-    PackedCtx res = inf.fhe->negate(s);
-    inf.fhe->inplace_add(res, 1.0);
-    inf.fhe->inplace_mult(res, 0.5);
-
-    return res;
-}
-
 /// @brief exp(x) ≈ (1 + x / 2^r)^{2^r}.
 PackedCtx exp_approx(Inference& inf, const PackedCtx& x, int r) {
     double inv_2r = 1.0 / (double)(1 << r);
@@ -93,7 +78,7 @@ PackedCtx gelu_softsign_core(Inference& inf, PackedCtx x2, const GeLUConfig& cfg
                           1.0 / (cfg.inv_out_scale * cfg.inv_out_scale));
 
     _w2.next("inv_sqrt_mult");
-    inf.fhe->bootstrap_hint(inv, inf.fhe->level_limit() - 4);
+    inf.fhe->bootstrap_hint(inv, inf.fhe->level_headroom(4));
 
     PackedCtx g_over_s = inf.fhe->mult(x2, h * cfg.xmax * cfg.a / cfg.inv_out_scale);   // = g / s
     z = inf.fhe->mult(g_over_s, inv);
@@ -131,7 +116,7 @@ static PackedCtx gelu_softsign_inv_sqrt(Inference& inf, PackedCtx& x,
 static PackedCtx gelu_chebyshev(Inference& inf, PackedCtx& x,
                                 const GeLUConfig& cfg) {
     WithStep _w(inf, "gelu_chebyshev");
-    inf.fhe->bootstrap_hint(x, inf.fhe->level_limit() - 4);
+    inf.fhe->bootstrap_hint(x, inf.fhe->level_headroom(4));
     return eval_chebyshev_series(inf.cc_ctx(), x, cfg.cheb_coeffs,
                                  cfg.cheb_a, cfg.cheb_b);
 }
@@ -139,13 +124,24 @@ static PackedCtx gelu_chebyshev(Inference& inf, PackedCtx& x,
 PackedCtx gelu_thor_core(Inference& inf, PackedCtx t, const GeLUConfig& cfg) {
     inf.fhe->bootstrap_hint(t, 16);
 
+    const bool cheb = !cfg.thor_p1_cheb.empty();
+
     WithStep _w2(inf, "thor_p1");
-    PackedCtx p1 = eval_polynomial_ps(inf.cc_ctx(), t, cfg.thor_p1, (size_t)inf.slots);
-    inf.fhe->bootstrap_hint(p1, inf.fhe->level_limit() - 4);  // bounded composite output
+    PackedCtx p1 = cheb
+        ? eval_chebyshev_series(inf.cc_ctx(), t, cfg.thor_p1_cheb,
+                                cfg.thor_p1_a, cfg.thor_p1_b)
+        : eval_polynomial_ps(inf.cc_ctx(), t, cfg.thor_p1, (size_t)inf.slots);
+    inf.fhe->bootstrap_hint(p1, inf.fhe->level_headroom(4));  // bounded composite output
 
     _w2.next("thor_p2");
-    PackedCtx g = eval_polynomial_ps(inf.cc_ctx(), p1, cfg.thor_p2, (size_t)inf.slots);
+    PackedCtx g = cheb
+        ? eval_chebyshev_series(inf.cc_ctx(), p1, cfg.thor_p2_cheb,
+                                cfg.thor_p2_a, cfg.thor_p2_b)
+        : eval_polynomial_ps(inf.cc_ctx(), p1, cfg.thor_p2, (size_t)inf.slots);
     inf.fhe->inplace_add(g, 0.5);                            // g = P2(P1(x/S)) + 1/2 ≈ Φ(x)
+
+    if (inf.fhe->composite_degree > 1)
+        inf.fhe->bootstrap_hint(g, static_cast<int>(inf.fhe->level_limit()) - 4);
     return g;
 }
 
@@ -160,7 +156,8 @@ static PackedCtx gelu_thor_composite(Inference& inf, PackedCtx& x,
         PackedCtx xs = inf.fhe->im_cleanse(x);               // 2·Re(x)
         g = inf.fhe->mult(g, xs);
         Ptx half = inf.gelu_half_mask(g, 0.5);               // 0.5 cancels conj-doubling ⇒ GELU = x·g
-        return inf.fhe->mult(g, half);
+        PackedCtx out = inf.fhe->mult(g, half);
+        return out;
     }
 }
 
@@ -169,13 +166,15 @@ PackedCtx gelu_approx(Inference& inf, PackedCtx& x, const std::string& cfg_name)
         return gelu_token_pair(inf, x, cfg_name);
     WithStep _w(inf, "gelu:" + cfg_name);
     const GeLUConfig& cfg = inf.gelu_cfg.at(cfg_name);
+    // Elementwise: the slot BASIS survives (slot_layout.h).
+    auto keep = [&](PackedCtx y) { slotlayout::propagate(x.ct, y.ct); return y; };
     switch (cfg.method) {
         case GeLUMethod::SOFTSIGN_INV_SQRT:
-            return gelu_softsign_inv_sqrt(inf, x, cfg);
+            return keep(gelu_softsign_inv_sqrt(inf, x, cfg));
         case GeLUMethod::CHEBYSHEV:
-            return gelu_chebyshev(inf, x, cfg);
+            return keep(gelu_chebyshev(inf, x, cfg));
         case GeLUMethod::THOR_COMPOSITE:
-            return gelu_thor_composite(inf, x, cfg);
+            return keep(gelu_thor_composite(inf, x, cfg));
     }
     throw std::runtime_error("gelu_approx: unhandled GeLUMethod");
 }

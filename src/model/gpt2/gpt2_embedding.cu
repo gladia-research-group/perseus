@@ -138,10 +138,11 @@ PackedCtx gpt2_cutmax_feedback(Inference& inf,
     std::vector<Op> ops;
     Op cm;
     cm.label = "cutmax";
-    if (p13)
-        cm.install = [plan13](Inference& i) {
-            i.fhe->install_plan_live(*plan13);
-        };
+
+    cm.install = [plan13, p13](Inference& i) {
+        if (p13) i.fhe->install_plan_live(*plan13);
+        else     i.fhe->clear_bootstrap_plan();
+    };
     cm.fwd = [z, vocab, cm_s, p13, &cmc](Inference& i, PackedCtx& x) {
         const auto t0 = std::chrono::steady_clock::now();
         // block-13 subgraph: capture (FHE_GRAPH_DIR, token 0) / strict plan
@@ -155,7 +156,7 @@ PackedCtx gpt2_cutmax_feedback(Inference& inf,
         x = z->front();
         end_subgraph_capture(i, 13);
 
-        cudaDeviceSynchronize(); // TODO: remove this sync once the graph capture is fixed to not leak across tokens
+        cudaDeviceSynchronize();   // required: captured graphs must not span two tokens
         *cm_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
     };

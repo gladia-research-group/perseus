@@ -1,24 +1,28 @@
-"""Pre-capture config lint — run BEFORE any STAGE=capture (costed us a full
-recapture round on 2026-07-28 when gpt2_base/gpt2_squeeze went to capture with
-FIXED counts, violating the baselines-always-adaptive ruling).
+#!/usr/bin/env python3
+"""Check an approximation config before a capture.
 
-  python scripts/utils/lint_approx_config.py <configs.json> [--tier base|squeeze|heat]
+    python scripts/utils/lint_approx_config.py configs/model/approximation/gpt2_base_n32/configs.json [--tier base|heat|squeeze]
 
-Checks: (1) base/squeeze tiers must carry ADAPTIVE per-site counts (spread, not
-uniform — heat is exempt: learned counts may be uniform); (2) gpt2 configs must
-carry the frozen CutMax section byte-equal to the donor.
+Base and squeeze tiers must carry adaptive per-site iteration counts (a uniform count means
+the calibration did not run per site); GPT-2 configs must carry the CutMax section byte-equal
+to the frozen one in configs/model/approximation/gpt2_base/configs.json (or CUTMAX_DONOR_CONFIG),
+because the encrypted argmax plan is bound to it. Exit 0 on OK, 1 with the reasons otherwise.
 """
-import json, os, sys, collections, hashlib
+import collections
+import hashlib
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DONOR = os.environ.get("CUTMAX_DONOR_CONFIG") or os.path.join(
+    _HERE, "..", "..", "configs", "model", "approximation", "gpt2_base", "configs.json")
 
 path = sys.argv[1]
 tier = sys.argv[sys.argv.index("--tier") + 1] if "--tier" in sys.argv else \
     ("heat" if "heat" in path else "squeeze" if "squeeze" in path else "base")
 d = json.load(open(path))
 fail = []
-# A config emitted by scripts/recount_1e4.py carries a machine-readable record of the criterion
-# it was fitted under. Where that record exists it REPLACES the spread heuristic below, which
-# only ever inferred "somebody forgot to fit this" from uniformity — a uniform count is the
-# correct answer when the level-minimising fit lands there (e.g. vit_squeeze gs=8 at 25/25).
 prov = d.get("_provenance") or {}
 certified = bool(prov.get("tool", "").startswith("recount") and prov.get("target"))
 if tier in ("base", "squeeze") and not certified:
@@ -30,20 +34,12 @@ if certified:
     for key in ("criterion", "cost_function", "count_convention", "source_config_md5"):
         if not prov.get(key): fail.append(f"_provenance missing '{key}'")
 if "gpt2" in path:
-    # Repo-relative by default; LINT_CUTMAX_DONOR overrides. The old absolute /leonardo_work
-    # path made every GPT-2 capture die at the gate on any other machine.
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _default = os.path.normpath(os.path.join(
-        _here, "..", "..", "..", "..", "configs", "model", "approximation",
-        "gpt2_baseline", "configs.json"))
-    donor_path = os.environ.get("LINT_CUTMAX_DONOR", _default)
-    if not os.path.exists(donor_path):
-        print(f"[lint] {path} tier={tier} FAIL:\n  - cutmax donor not found at {donor_path} "
-              f"(set LINT_CUTMAX_DONOR)"); sys.exit(1)
-    donor = json.load(open(donor_path))["cutmax"]
-    h = lambda x: hashlib.md5(json.dumps(x, sort_keys=True).encode()).hexdigest()
-    if "cutmax" not in d: fail.append("cutmax section MISSING (silent 21s fallback)")
-    elif h(d["cutmax"]) != h(donor): fail.append("cutmax differs from frozen donor")
+    if not os.path.exists(_DONOR):
+        print(f"[lint] {path}: CutMax donor {_DONOR} not found (set CUTMAX_DONOR_CONFIG)"); sys.exit(1)
+    donor = json.load(open(_DONOR))["cutmax"]
+    h = lambda x: hashlib.md5(json.dumps(x, sort_keys=True).encode()).hexdigest()   # noqa: E731
+    if "cutmax" not in d: fail.append("cutmax section MISSING")
+    elif h(d["cutmax"]) != h(donor): fail.append("cutmax differs from the frozen donor")
 if fail:
     print(f"[lint] {path} tier={tier} FAIL:"); [print(f"  - {f}") for f in fail]; sys.exit(1)
 print(f"[lint] {path} tier={tier} OK")

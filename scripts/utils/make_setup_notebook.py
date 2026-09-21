@@ -1,293 +1,256 @@
-"""Generate notebooks/setup_artifacts.ipynb — the artifacts every model notebook loads.
+"""Generate notebooks/setup_artifacts.ipynb — the artifacts every GPT-2 notebook loads.
 
-Artifacts only: export, pool, calibrate, plan. It never runs the encrypted model; the
-model notebooks do that. Model-agnostic via the FAMILIES registry (bert|vit|gpt2), which
-holds nothing but names — export dispatches on config.model_type and calibration is
-hydra configs, so steps 1-3 are uniform.
+Artifacts only: export, token pool, calibration, decode oracle, graph capture and plan.
+It never runs the encrypted model; the model notebooks do that. Every step is guarded by
+an existence check, so re-running the notebook on a prepared checkout is free.
 
-Also injects an idempotent "Prerequisites" cell into the model notebooks.
+    python scripts/utils/make_setup_notebook.py      # from the repo root
+
+`tests/test_notebooks.py` checks that this generator reproduces the tracked file byte for
+byte, which is why every cell id is pinned (nbformat mints random ids otherwise).
 """
-
 import nbformat as nbf
 
-nb = nbf.v4.new_notebook()
-C = []
-md = lambda s: C.append(nbf.v4.new_markdown_cell(s.strip()))
-code = lambda s: C.append(nbf.v4.new_code_cell(s.strip()))
+OUT = "notebooks/setup_artifacts.ipynb"
 
-md("""
-# Setting up encrypted inference
 
-Encrypted models inference requires producing several artifacts to complete the porting to the encrypted world. Apart from exporting weights from the HuggingFace format to the CUDA one we need to:
-- calibrate approximation
-- create a plan for a fixed bts schedule.
+def build() -> nbf.NotebookNode:
+    """The notebook as a NotebookNode (no file I/O)."""
+    cells = []
 
-| # | artifact | made by | ETA |
+    def md(slug, s):
+        cells.append((slug, nbf.v4.new_markdown_cell(s.strip())))
+
+    def code(slug, s):
+        cells.append((slug, nbf.v4.new_code_cell(s.strip())))
+
+    md("intro", """
+# Setting up encrypted GPT-2 inference
+
+Running GPT-2 under CKKS needs a few artifacts besides the HuggingFace checkpoint: the
+weights in the runtime's packed format, the calibrated polynomial approximations of every
+nonlinearity, a plaintext oracle the decode gate compares against, and — for the planned
+row — a captured operation graph and the bootstrap plan computed from it.
+
+| # | artifact | made by | cost |
 |---|---|---|---|
-| 1 | `weights.bin.zip`, `client.npz` | `perseus.export` | seconds, CPU |
-| 2 | calibration pool (tokens or images) | `perseus.calibrate.data` | needs network |
-| 3 | `configs.json` — the fitted approximations | `perseus.calibrate` | ~5 min, GPU |
-| 4 | the **plan** — where bootstraps go | `perseus.plan.plan_graph_dir` | ~2 min, CPU |
+| 1 | `weights.bin.zip`, `client.npz` | `perseus-export` | seconds, CPU |
+| 2 | calibration token pool (`.npy`) | `perseus.calibrate.data` | needs network once |
+| 3 | `configs.json` — the fitted approximations | `perseus-calibrate` (shipped) | minutes, GPU |
+| 4 | the decode oracle (`all_blocks_io/`) | `scripts/utils/gen_gpt2_oracle.py` | seconds, CPU |
+| 5 | the captured graph (`graphs/gpt2_decode_n32`) | `scripts/run_task.sh` (shipped) | minutes, GPU |
+| 6 | the bootstrap plan (`bootstrap_placements/gpt2_decode_n32`) | `scripts/make_plans.sh` (shipped) | seconds, CPU |
+
+Steps 1-4 land under `PERSEUS_DATA` (default `.cache/` in the checkout), which is where
+`scripts/local_env.sh` and the runner look for them; the graph and the plan land in the
+repository, under `graphs/` and `bootstrap_placements/`. Each cell skips its step when the
+artifact already exists.
 """)
 
-code('''
-import os, json, time, subprocess, sys
+    code("setup", '''
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-import numpy as np
-import torch                                   # torch before _core (NCCL load order)
-from omegaconf import OmegaConf
+REPO = Path.cwd()
+DATA = Path(os.environ.get("PERSEUS_DATA", REPO / ".cache"))
+MODEL = "openai-community/gpt2"
 
-FAMILY  = os.environ.get("FAMILY", "bert")
-REPO    = Path.cwd()
-SCRATCH = os.environ["SCRATCH"]
-PYTHON  = sys.executable
-os.environ.setdefault("HF_HOME", f"{SCRATCH}/.cache")
-os.environ.setdefault("HF_HUB_CACHE", f"{SCRATCH}/.cache")
+MODEL_DIR = DATA / "models" / MODEL / "classic"           # weights.bin.zip + client.npz
+WEIGHTS = MODEL_DIR / "weights.bin.zip"
+POOL = DATA / "pools" / "openwebtext_gpt2.npy"            # calibration token pool
+CONFIGS = Path(os.environ.get("CONFIGS_PATH",
+                              REPO / "configs/model/approximation/gpt2_base_n32/configs.json"))
+ORACLE = DATA / "oracle" / "gpt2" / "all_blocks_io"       # the teacher-forced decode oracle
+GRAPHS = REPO / "graphs" / "gpt2_decode_n32"              # captured graph of one forward
+PLAN = REPO / "bootstrap_placements" / "gpt2_decode_n32"  # the paper's main plan
 
-FAMILIES = {
-    "bert": dict(
-        hf_name="textattack/bert-base-uncased-SST-2",
-        hydra=dict(model="bert_base", dataset="sst2", approximation="bert_base"),
-        calib_extra=["model.block_size=32"],   # == the deployed T (real arm caps at 32)
-        configs_name="bert_base",
-        graph_dir=".cache/graph_bert_base",
-        plan_dir="bootstrap_placements/planned_bert_base",
-        keep=("goldschmidt", "inv_sqrt_newton", ".var", "ln_affine", "remez"),  # BERT needs keep
-        probe=["scripts/utils/bert_operating_point.py", "--block-size", "32"],
-        notebook="bert_torch_forward.ipynb",
-    ),
-    "vit": dict(
-        hf_name="google/vit-base-patch16-224",
-        hydra=dict(model="vit_base_224", dataset="tiny_imagenet", approximation="vit_base"),
-        calib_extra=["model.resolution=80"],
-        configs_name="vit_base",
-        graph_dir=".cache/graph_vit_base",
-        plan_dir="bootstrap_placements/planned_vit_base",
-        keep=(".var",),                        # relax — the shipped ViT recipe (2026-07-27)
-        probe=None,
-        notebook="vit_torch_forward.ipynb",
-    ),
-    "gpt2": dict(
-        hf_name="openai-community/gpt2",
-        hydra=dict(model="gpt2", dataset="openwebtext", approximation="gpt2_cutmax"),
-        calib_extra=[],                        # block_size null = inferred from the config
-        configs_name="gpt2_base",
-        graph_dir=".cache/graph_gpt2_base",
-        plan_dir="bootstrap_placements/planned_gpt2_base",
-        keep=(),                               # decode = bare smart cut, no keeps
-        probe=None,
-        notebook="gpt2_torch_forward.ipynb",
-    ),
-}
+PYTHON = sys.executable
 
-F = FAMILIES[FAMILY]
-MODEL_DIR = f"{SCRATCH}/.cache/perseus/models/{F['hf_name']}/classic"
-CONFIGS   = f"{REPO}/configs/model/approximation/{F['configs_name']}/configs.json"
-DATASET   = OmegaConf.load(REPO / f"perseus/configs/dataset/{F['hydra']['dataset']}.yaml")
-run = lambda *a: subprocess.run([str(x) for x in a], check=True, cwd=REPO)
 
-print(f"FAMILY = {FAMILY}   ({F['hf_name']})")
-print(f"  weights -> {MODEL_DIR}")
-print(f"  configs -> {CONFIGS}")
-print(f"  dataset -> {DATASET.name} ({DATASET.kind})")
+def run(*args, **env):
+    subprocess.run([str(a) for a in args], check=True, cwd=REPO, env={**os.environ, **env})
+
+
+print(f"model   {MODEL}")
+print(f"data    {DATA}")
+print(f"configs {CONFIGS}")
 ''')
 
-md("""
+    md("export-md", """
 ## 1. Export the weights
 
 Splits the checkpoint in two:
 - `weights.bin.zip` — the tensors the server evaluates under encryption
-- `client.npz` — what stays client-side in the clear (embeddings, and any head with no
-  registered FHE approximation)
+- `client.npz` — what stays client-side in the clear (the token and position embeddings)
 
-`export.adapter_for` dispatches on `config.model_type`, so this is the same call for
-every architecture.
+This is `perseus-export`; `--out` is the model directory, the export adds the `classic/`
+tag below it.
 """)
 
-code("""
-if not Path(f"{MODEL_DIR}/weights.bin.zip").exists():
-    run(PYTHON, "-m", "perseus.export", "--model", F["hf_name"],
-        "--out", str(Path(MODEL_DIR).parent))
-else:
+    code("export", '''
+if WEIGHTS.exists():
     print("already exported")
+else:
+    run(PYTHON, "-m", "perseus.export", "--model", MODEL, "--out", MODEL_DIR.parent)
 
 for f in ("weights.bin.zip", "client.npz"):
-    p = Path(f"{MODEL_DIR}/{f}")
-    print(f"  {f:<18} {p.stat().st_size/1e6:8.1f} MB")
+    print(f"  {f:<16} {(MODEL_DIR / f).stat().st_size / 1e6:8.1f} MB")
+''')
+
+    md("pool-md", """
+## 2. Calibration token pool
+
+Tokens of what the model will actually see, streamed once from the calibration dataset
+(`perseus/configs/dataset/openwebtext.yaml`: OpenWebText, 2M tokens) and cached as an
+`.npy`. It feeds both the calibration and the decode oracle below. Building it needs
+network; everything after this cell is offline.
 """)
 
-md("""
-## 2. Calibration pool
+    code("pool", '''
+import numpy as np
+from omegaconf import OmegaConf
 
-Samples of what the model will actually see, cached as an `.npy` next to the HF cache.
-Text families stream tokens, image families stream preprocessed tensors.
-
-Calibrate on the **deployment distribution**, not generic corpora. BERT calibrated on
-openwebtext instead of SST-2 lands its LayerNorm inverse-sqrt 3.9x outside the
-Goldschmidt basin, and the encrypted run dies at block 2.
-
-Building needs network. Compute nodes here have none, so run this cell once on a login
-node; everything after it is offline-safe.
-""")
-
-code('''
 from perseus.calibrate import data
 
-if DATASET.kind == "image":
-    pool = data.load_image_pool(F["hf_name"], DATASET)
-    print(f"image pool: {pool.shape}")
+DATASET = OmegaConf.load(REPO / "perseus/configs/dataset/openwebtext.yaml")
+if POOL.exists():
+    pool = np.load(POOL, mmap_mode="r")
 else:
-    pool = data.load_token_pool(F["hf_name"], DATASET)
-    print(f"token pool: {len(pool):,} tokens")
+    pool = data.load_token_pool(MODEL, DATASET)      # streams + caches under the HF home
+    POOL.parent.mkdir(parents=True, exist_ok=True)
+    np.save(POOL, np.asarray(pool))
+print(f"token pool: {len(pool):,} tokens -> {POOL}")
 ''')
 
-md("""
-## 3. Calibrate
+    md("calibrate-md", """
+## 3. Calibrate the approximations
 
-Fits every nonlinearity (LayerNorm inverse-sqrt, softmax, GELU) over the ranges the
-model actually visits and writes `configs.json`.
+`perseus-calibrate` fits every nonlinearity (LayerNorm inverse-sqrt, softmax, GELU, the
+CutMax argmax) over the ranges the model visits on the pool and writes `configs.json`.
 
-`block_size` must equal the deployed sequence length: it sets the softmax denominator
-range and the per-position LayerNorm rescale. The registry pins it per family.
+The checkout ships the calibration the paper ran with
+(`configs/model/approximation/gpt2_base_n32/configs.json`), and the shipped graph and plan
+are bound to it: a re-calibration changes the polynomials, so it needs a new capture and a
+new plan (steps 5–6). The cell therefore reuses the shipped file and only calibrates when
+`CONFIGS_PATH` points somewhere new. Calibration runs on the GPU by default
+(`device=cpu` works, slowly).
 """)
 
-code('''
-if not Path(CONFIGS).exists():
-    t0 = time.perf_counter()
-    run(PYTHON, "-m", "perseus.calibrate",
-        f"model={F['hydra']['model']}", f"dataset={F['hydra']['dataset']}",
-        f"approximation={F['hydra']['approximation']}",
-        *F["calib_extra"], f"calib_out_path={CONFIGS}")
-    print(f"calibrated in {time.perf_counter()-t0:.0f} s")
+    code("calibrate", '''
+if CONFIGS.exists():
+    print(f"using {CONFIGS}")
 else:
-    print(f"already calibrated (delete {Path(CONFIGS).name} to refit)")
+    run(PYTHON, "-m", "perseus.calibrate", "model=gpt2", "dataset=openwebtext",
+        f"calib_out_path={CONFIGS}")
 
 cfg = json.load(open(CONFIGS))
-print(f"  {len(cfg['norm'])} norm, {len(cfg['softgelu'])} gelu, {len(cfg['softmax'])} softmax sites")
+print(f"  {len(cfg['norm'])} norm, {len(cfg['softgelu'])} gelu, {len(cfg['softmax'])} softmax"
+      " sites + cutmax")
 ''')
 
-md("""
-### Check the operating point first
+    md("oracle-md", """
+## 4. The decode oracle
 
-Runs the plaintext model on what the calibrator saw and on what you will encrypt, then
-prints where each approximation lands inside its fitted band. Two minutes on CPU.
-
-The first out-of-band site by depth is the block the encrypted run will die at. Cheaper
-to find here than as a `Decode(): approximation error is too high` ten blocks in.
+The decode gate (`TASK=decode`) feeds the encrypted model a fixed token sequence and compares
+its per-position argmax and next-token distribution against the plaintext model. The
+reference is the raw model's own forward on a slice of the token pool: block-0 inputs
+(`all_blocks_L00_T<T>.json`) and final logits (`all_blocks_lm_head_steps_T<T>.json`) for
+each horizon `T`. The runner reads the `T = 128` pair (`STEPS_T`).
 """)
 
-code('''
-if F["probe"]:
-    run(PYTHON, *F["probe"])
+    code("oracle", '''
+if all((ORACLE / f).exists() for f in ("all_blocks_L00_T128.json",
+                                        "all_blocks_lm_head_steps_T128.json")):
+    print("oracle already generated")
 else:
-    print(f"no probe wired for {FAMILY} — scripts/utils/bert_operating_point.py is the template")
+    run(PYTHON, "scripts/utils/gen_gpt2_oracle.py", "--model", MODEL, "--pool", POOL,
+        "--out", ORACLE, "--T", "16", "32", "64", "128")
+print(f"oracle: {sorted(p.name for p in ORACLE.glob('*.json'))}")
 ''')
 
-md("""
+    md("capture-md", """
+## 5. Capture the graph
+
+The planner works on a record of one forward: every ciphertext edge with its packing period
+and largest coefficient. `STAGE=capture` runs one synchronous forward on the GPU and writes
+`graphs/gpt2_decode_n32/block_<b>/graph.json`; the checkout ships the capture the paper's
+plans were computed on, so this cell normally does nothing. A capture is bound to the
+runtime build and to `configs.json`: change either and re-capture.
+""")
+
+    code("capture", '''
+graphs = sorted(GRAPHS.glob("block_*/graph.json"))
+if graphs:
+    print(f"captured graph present: {len(graphs)} blocks in {GRAPHS.relative_to(REPO)}")
+else:
+    run("bash", "scripts/run_task.sh", TASK="decode", STAGE="capture", CHAIN="n32")
+    graphs = sorted(GRAPHS.glob("block_*/graph.json"))
+
+eager = sum(sum(n["op_type"] == "auto_bootstrap" for n in json.load(open(g))["nodes"])
+            for g in graphs)
+# one forward of the 12 blocks and the LM head; the paper's eager row is a decode session,
+# which also pays the encrypted-argmax tail every token (1310 per token, README Table 1)
+print(f"  the capture fired {eager} reactive bootstraps")
+''')
+
+    md("plan-md", """
+## 6. Plan the bootstraps
+
+`scripts/make_plans.sh main` runs the min-cut placer over the captured graph with the paper's
+recipe and writes one `block_<b>_placement.json` per block plus `PLAN_CMD.txt` with the exact
+command. Pure Python, seconds on the CPU. `bash scripts/make_plans.sh` (no argument)
+regenerates every plan the paper reports except `baselines/orion`, which is the released
+Orion tool's output and ships as an artifact; `bootstrap_placements/README.md` maps each
+directory to its table row.
+""")
+
+    code("plan", '''
+plans = sorted(PLAN.glob("block_*_placement.json"))
+if plans:
+    print(f"plan present: {len(plans)} blocks in {PLAN.relative_to(REPO)}")
+else:
+    run("bash", "scripts/make_plans.sh", "main")
+    plans = sorted(PLAN.glob("block_*_placement.json"))
+
+# what the paper counts: cut placements + hint-triggered + deliberate refreshes
+s = [json.load(open(p))["summary"] for p in plans]
+placed = sum(x["num_placements"] for x in s)
+total = sum(x["total_bootstraps"] for x in s)
+print(f"  {total} planned bootstraps ({placed} from the cut, the rest hint-fired or deliberate)")
+''')
+
+    md("run", """
 ## Run it
 
-Artifacts done — the model runs now, in eager mode. Running it belongs to the model
-notebooks:
-
-| FAMILY | notebook | |
-|---|---|---|
-| `bert` | `bert_torch_forward.ipynb` | sentence in, sentiment out |
-| `vit` | `vit_torch_forward.ipynb` | image in, class out |
-| `gpt2` | `gpt2_torch_forward.ipynb` | prefill, hand-off, generate |
-
-Current limits: embeddings and unapproximated heads run client-side; BERT is capped at
-32 tokens (~76% of SST-2 validation) until the multi-chunk arm is validated; encrypted
-logits come out compressed toward zero, so argmax is reliable but magnitudes are not
-calibrated.
-""")
-
-md("""
-## 4. Capture and plan — optional, slow
-
-Only buys speed: eager places bootstraps reactively, a plan places them deliberately.
-BERT 96.5s -> 83.4s, ViT-80 118s -> 110s.
-
-Needs a capture — one forward in `Sync` with full rotation keys, so it gets its own job
-(~35 min for BERT-base):
+The artifacts are in place. The measured row is one command:
 
 ```bash
-TASK=bert STAGE=capture GATE_BLOCKS=12 sbatch scripts/run_task.sh
+TASK=decode CHAIN=n32 bash scripts/run_task.sh        # planned decode, prints [decode] PASS
+TASK=decode STAGE=eager bash scripts/run_task.sh      # the same without a plan
 ```
 
-Planning is then ~2 min on CPU. The default cut is **relax** (`.var`); BERT is the
-exception and keeps the LayerNorm bootstraps, since relax leaves its last blocks with no
-feasible placement. Output goes to `_staged` — diff the placements before promoting.
+The notebooks run the model interactively (`NB=<name> bash scripts/run_notebooks.sh`
+executes one headless):
+
+| notebook | |
+|---|---|
+| `gpt2_torch_forward.ipynb` | a prompt of your choosing, generated under encryption through the C++ driver |
+| `gpt2_perseus_nn.ipynb` | the same through the Python modules, split into client and server |
+| `custom_encrypted_model.ipynb` | your own model from `Enc*` modules: capture, plan, planned rerun |
+| `client_server_minimal.ipynb` | the key bundle protocol in three cells |
 """)
 
-code('''
-from perseus.plan import PlanOptions, plan_graph_dir
+    nb = nbf.v4.new_notebook()
+    nb.cells = [c for _, c in cells]
+    for i, (slug, c) in enumerate(cells):
+        c.id = f"setup-{i:02d}-{slug}"       # pinned: regeneration is byte-identical
+    nb.metadata = {"language_info": {"name": "python"}}
+    return nb
 
-graphs = sorted(Path(F["graph_dir"]).glob("block_*/graph.json"))
-staged = f"{F['plan_dir']}_staged"
 
-if not graphs:
-    print(f"no capture at {F['graph_dir']}")
-    print(f"  make one:  TASK=<task> STAGE=capture sbatch scripts/run_task.sh")
-else:
-    summaries = plan_graph_dir(F["graph_dir"], staged,
-                               PlanOptions(erase_keep_steps=F["keep"]))
-
-    # Count from the WRITTEN files, not summary["num_placements"] — the summary counts
-    # only the min-cut deliberate placements (a fraction), while the plan the runtime
-    # loads is the full `placements` array. Mixing the two makes an identical plan look
-    # like a 90% regression.
-    def n_placements(d):
-        return sum(len(json.load(open(p)).get("placements", []))
-                   for p in sorted(Path(d).glob("block_*_placement.json")))
-
-    eager = sum(sum(n["op_type"] == "auto_bootstrap" for n in json.load(open(g))["nodes"])
-                for g in graphs)
-    print(f"\\n{len(summaries)} blocks -> {staged}")
-    print(f"  placements {n_placements(staged)}   (capture fired {eager} eager auto-bootstraps)")
-
-    live = Path(F["plan_dir"])
-    if live.is_dir():
-        print(f"  live plan {live.name}: {n_placements(live)} placements — compare before promoting")
-''')
-
-md("""
-Three things that decide whether a plan binds:
-
-1. **Config- and binary-bound.** Recalibrate or rebuild and you re-capture and re-plan.
-   A stale plan throws `[plan_level_error]`, it does not degrade quietly.
-2. **Chain-bound.** One recipe per plan directory. A block's plan pins the level its
-   predecessors produce, so plans from two recipes cannot be spliced.
-3. **`unplanned_bts=0` is the gate.** A plan that fails to bind still returns correct
-   output, reactively — the counter is the only signal. The exit code is not evidence;
-   read the `PASS` marker.
-
-Point `FHE_BOOTSTRAP_PLACEMENTS_DIR` at the staged plan and run `Threaded` to use it.
-""")
-
-nb.cells = C
-nb.metadata = {"language_info": {"name": "python"}}
-nbf.write(nb, "notebooks/setup_artifacts.ipynb")
-print("wrote notebooks/setup_artifacts.ipynb")
-
-MARK = "<!-- prereq-cell -->"
-NOTE = MARK + """
-> **Prerequisites.** This notebook loads artifacts it does not create: the exported
-> weights (`weights.bin.zip`, `client.npz`), the calibrated `configs.json`, and — for the
-> planned path — a bootstrap plan. Run **`setup_artifacts.ipynb`** first if you do not
-> have them.
-"""
-
-for path in ("notebooks/bert_torch_forward.ipynb",
-             "notebooks/vit_torch_forward.ipynb",
-             "notebooks/gpt2_torch_forward.ipynb",
-             "notebooks/custom_encrypted_model.ipynb"):
-    try:
-        n = nbf.read(path, as_version=4)
-    except FileNotFoundError:
-        print(f"  (skip {path}: not found)")
-        continue
-    n.cells = [c for c in n.cells if MARK not in c.source]      # idempotent
-    n.cells.insert(1, nbf.v4.new_markdown_cell(NOTE.strip()))
-    nbf.write(n, path)
-    print(f"  prereq note -> {path}")
+if __name__ == "__main__":
+    nbf.write(build(), OUT)
+    print(f"wrote {OUT}")

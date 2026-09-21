@@ -64,13 +64,28 @@ void v_lane_scatter(Inference& inf, const PackedCtx& v_rot, int right_rot, MaskF
     const int d_head      = d / inf.size.numHeads;
     const int t           = tok_stride(inf);
     const int d_head_real = inf.size.getRealDHead();
-    for (int i = 0; i < d_head_real; ++i) {
+
+    std::vector<Ptx> pts;
+    pts.reserve(d_head_real);
+    for (int i = 0; i < d_head_real; ++i)
+        pts.push_back(inf.encode_at_cached(vlane_mask_tag(i, right_rot), v_rot,
+                                           [&] { return mask_fn(i); }));
+
+    if (inf.fhe->lane_batch_usable(v_rot.ct, pts)) {
         WithStep _w(inf, "lane_mask_mult");
-        Ptx mask_pt = inf.encode_at_cached(vlane_mask_tag(i, right_rot), v_rot,
-                                           [&] { return mask_fn(i); });
-        PackedCtx tmp = inf.fhe->mult(v_rot, mask_pt);
-        const int lane = ((inf.v_count() / t) - i + d_head) % d_head;
-        v_lane_accumulate(inf, lane, tmp);
+        auto raw = inf.fhe->mult_batch_exec(v_rot.ct, pts);
+        for (int i = 0; i < d_head_real; ++i) {
+            PackedCtx tmp = inf.fhe->mult_finish(v_rot, pts[i], std::move(raw[i]));
+            const int lane = ((inf.v_count() / t) - i + d_head) % d_head;
+            v_lane_accumulate(inf, lane, tmp);
+        }
+    } else {
+        for (int i = 0; i < d_head_real; ++i) {
+            WithStep _w(inf, "lane_mask_mult");
+            PackedCtx tmp = inf.fhe->mult(v_rot, pts[i]);
+            const int lane = ((inf.v_count() / t) - i + d_head) % d_head;
+            v_lane_accumulate(inf, lane, tmp);
+        }
     }
     inf.v_count()++;
 }
@@ -119,38 +134,6 @@ void cache_v_push(Inference& inf, const PackedCtx& value) {
     const double lane_scale = 0.5;
     v_lane_scatter(inf, v_rot, right_rot,
                    [&](int i) { return vlane_mask_vec(inf, i, right_rot, lane_scale); });
-}
-
-void cache_v_push_pair(Inference& inf, const PackedCtx& va, const PackedCtx& vb) {
-    if (!inf.fhe->complex_payload) {
-        cache_v_push(inf, va);
-        cache_v_push(inf, vb);
-        return;
-    }
-    WithStep _w(inf, "cache_v_push");
-    const int t     = tok_stride(inf);
-    const int rot_a = inf.v_count() % t;
-    const int rot_b = (inf.v_count() + 1) % t;
-    PackedCtx a_rot = v_rotate(inf, va, rot_a);
-    PackedCtx b_rot = v_rotate(inf, vb, rot_b);
-
-    {
-        WithStep _wp(inf, "v_pack_bts");
-        Ptx i_pt = inf.encode_complex_const_at(0.0, 1.0, b_rot);
-        PackedCtx P = inf.fhe->pack_ri(a_rot, b_rot, i_pt);
-        inf.fhe->bootstrap(P.ct);
-        PackedCtx conj = inf.fhe->conjugate(P);
-        a_rot = inf.fhe->add(P, conj);   // 2*Re(P) = 2*va_rot
-        b_rot = inf.fhe->sub(P, conj);   // 2i*Im(P) = 2i*vb_rot
-    }
-
-    inf.fhe->drop_to_level(a_rot, cache_read_level_v());
-    inf.fhe->drop_to_level(b_rot, cache_read_level_v());
-
-    v_lane_scatter(inf, a_rot, rot_a,
-                   [&](int i) { return vlane_mask_vec(inf, i, rot_a, 0.5); });
-    v_lane_scatter(inf, b_rot, rot_b,
-                   [&](int i) { return complex_vlane_mask_vec(inf, i, rot_b, /*imag_scale=*/-1.0); });
 }
 
 void cache_kv_push(Inference& inf, const PackedCtx& key, const PackedCtx& value) {

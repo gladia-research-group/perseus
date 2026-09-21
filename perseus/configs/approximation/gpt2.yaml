@@ -8,6 +8,11 @@ norm:
   inv_y_max: 3.0
   range_q_lo: 0.0
   range_q_hi: 1.0
+
+  pos_q_lo: 0.0
+  pos_q_hi: 1.0
+
+  pos_floor_band: false
   range_margin: 0.15
   z_max_safety: 2.0
   z_min_safety: 1.0
@@ -15,6 +20,8 @@ norm:
   remez_d_den: 1
   gs_init_method: linear
   gs_target_err: 1.0e-3
+
+  chain_noise: 0.0
   gs_max_iters: 18
   gs_iters: 12
   gs_drift_margin: 1.0
@@ -59,6 +66,8 @@ softmax:
   init_q_hi: 1.0
   d_safety: 3.0
   gs_target_err: 1.0e-3
+
+  chain_noise: 0.0
   gs_max_iters: 16
   gs_iters: 8
   refine_drift_margin: 1.0

@@ -5,10 +5,6 @@
 #include <utility>
 #include <vector>
 
-// Per-half GELU bodies = THE shared cores (nonlinear.cu); only the entry prescale
-// (done by the caller: the conj 2x rides the /2) and the output mult against the
-// RAW half (replaces the real arm's im_cleanse — same 2x, same mask pairing) are
-// token-pair-specific.
 static PackedCtx gelu_half(Inference& inf, PackedCtx x2, const PackedCtx& half,
                            const GeLUConfig& cfg) {
     PackedCtx z = gelu_softsign_core(inf, std::move(x2), cfg);
@@ -53,7 +49,6 @@ PackedCtx gelu_token_pair(Inference& inf, const PackedCtx& x, const std::string&
         out = std::move(outA);
     }
     inf.n_tok = nA;
-    inf.fhe->tp_probe("gelu", out.ct);
     return out;
 }
 

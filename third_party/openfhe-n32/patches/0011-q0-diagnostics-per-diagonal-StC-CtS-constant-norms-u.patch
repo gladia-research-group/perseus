@@ -1,0 +1,60 @@
+From eeab66114ab29830d8bde6e951d96663984ae825 Mon Sep 17 00:00:00 2001
+From: Davide-F5-Marincione <marincione@di.uniroma1.it>
+Date: Thu, 27 Aug 2026 11:24:21 +0200
+Subject: [PATCH 11/12] q0 diagnostics: per-diagonal StC/CtS constant norms
+ under OPENFHE_Q0_DIAG
+
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp | 12 ++++++++++++
+ third-party/google-benchmark               |  1 -
+ third-party/google-test                    |  1 -
+ third-party/gperftools                     |  1 -
+ 4 files changed, 12 insertions(+), 3 deletions(-)
+ delete mode 160000 third-party/google-benchmark
+ delete mode 160000 third-party/google-test
+ delete mode 160000 third-party/gperftools
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index c747a95b..efb63429 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -2456,6 +2456,18 @@ std::vector<std::vector<ReadOnlyPlaintext>> FHECKKSRNS::EvalCoeffsToSlotsPrecomp
+ 
+                         auto rotateTemp = Rotate(coeff[s][g * i + j], rot);
+ 
++                        // OPENFHE_Q0_DIAG: per-diagonal constant norms (add.165 comb hunt).
++                        if (std::getenv("OPENFHE_Q0_DIAG")) {
++                            double mx = 0;
++                            for (const auto& z : rotateTemp)
++                                mx = std::max({mx, std::abs(z.real()), std::abs(z.imag())});
++#if !defined(__MINGW32__) && !defined(__MINGW64__)
++    #pragma omp critical
++#endif
++                            std::cerr << "[q0_diag] diag s=" << s << " idx=" << (g * i + j)
++                                      << " max=" << mx << " lvl=" << (level0 - compositeDegree * s)
++                                      << std::endl;
++                        }
+                         result[s][g * i + j] = MakeAuxPlaintext(cc, paramsVector[s - stop], rotateTemp, 1,
+                                                                 level0 - compositeDegree * s, rotateTemp.size());
+                     }
+diff --git a/third-party/google-benchmark b/third-party/google-benchmark
+deleted file mode 160000
+index eddb0241..00000000
+--- a/third-party/google-benchmark
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit eddb0241389718a23a42db6af5f0164b6e0139af
+diff --git a/third-party/google-test b/third-party/google-test
+deleted file mode 160000
+index 52eb8108..00000000
+--- a/third-party/google-test
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 52eb8108c5bdec04579160ae17225d66034bd723
+diff --git a/third-party/gperftools b/third-party/gperftools
+deleted file mode 160000
+index 83edb608..00000000
+--- a/third-party/gperftools
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 83edb60836d87cf1b406e8846b9059c03031e8f5

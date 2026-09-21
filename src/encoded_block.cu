@@ -10,7 +10,8 @@ void load_block_to_device(Inference& inf, EncodedBlock& blk, cudaStream_t stream
 }
 
 void cpu_extract_block(Inference& inf, EncodedBlock& blk) {
-    inf.begin_stage_block();
+    if (blk.stage_owner >= 0) inf.begin_stage_block(blk.stage_owner);
+    else                      inf.begin_stage_block();
     for (auto& kv : blk.w)
         for (auto& pt : kv.second) inf.extract_plaintext(pt);
 }

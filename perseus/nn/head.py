@@ -12,6 +12,9 @@ class EncLMHead(EncModule):
         self.vocab = _core.lm_head_vocab(store)
         self._cache = _core.LMHeadCache()
 
+    def extra_repr(self):
+        return f"vocab={self.vocab}"
+
     def forward(self, x):
         return _core.lm_head(self.inf, x, self.store, self.vocab, self.plan, self._cache)
 
@@ -32,6 +35,9 @@ class EncCutMax(EncModule):
         cfg = (_core.cutmax_config_from_calib(parsed.cutmax) if parsed.has_cutmax
                else _core.default_cutmax_config())
         return cls(vocab, cfg)
+
+    def extra_repr(self):
+        return f"vocab={self.vocab}"
 
     def forward(self, tiles):
         return _core.cutmax_argmax(self.inf, tiles, self.vocab, self.config)

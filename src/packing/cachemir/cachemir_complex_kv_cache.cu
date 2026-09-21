@@ -24,19 +24,37 @@ void bucket_v_complex(Inference& inf, const PackedCtx& v_rot, int right_rot) {
     auto& vc = inf.cache[inf.scoped("v")];
     const int d_head_real = inf.size.getRealDHead();
     const int c = inf.v_count() / t;
+
+    std::vector<Ptx> pts;
+    pts.reserve(d_head_real / 2);
     for (int p = 0; p < d_head_real / 2; ++p) {
-        WithStep _wm(inf, "lane_mask_mult");
         const int i_re = ((c - 2 * p)     % d_head + d_head) % d_head;   // source lane → dest 2p   (Re)
         const int i_im = ((c - 2 * p - 1) % d_head + d_head) % d_head;   // source lane → dest 2p+1 (Im)
-        Ptx mask_pt = inf.encode_at_cached_complex(
+        pts.push_back(inf.encode_at_cached_complex(
             vpair_mask_complex_tag(i_re, i_im, right_rot), v_rot,
-            [&] { return vpair_mask_complex_vec(inf, i_re, i_im, right_rot); });
-        PackedCtx tmp = inf.fhe->mult(v_rot, mask_pt);
+            [&] { return vpair_mask_complex_vec(inf, i_re, i_im, right_rot); }));
+    }
+
+    auto accumulate = [&](int p, PackedCtx tmp) {
         if (vc[p].ct == nullptr) {
             vc[p] = inf.fhe->clone(tmp);
         } else {
             inf.name_graph_ct_if_absent(vc[p], inf.scoped("v.acc." + std::to_string(p)));
             inf.fhe->inplace_add(vc[p], tmp);
+        }
+    };
+
+    if (inf.fhe->lane_batch_usable(v_rot.ct, pts)) {
+        // Batched lanes: one fused kernel for all pair products, serial-order replay of
+        // the recording+accumulate (node stream identical to the loop below).
+        WithStep _wm(inf, "lane_mask_mult");
+        auto raw = inf.fhe->mult_batch_exec(v_rot.ct, pts);
+        for (int p = 0; p < d_head_real / 2; ++p)
+            accumulate(p, inf.fhe->mult_finish(v_rot, pts[p], std::move(raw[p])));
+    } else {
+        for (int p = 0; p < d_head_real / 2; ++p) {
+            WithStep _wm(inf, "lane_mask_mult");
+            accumulate(p, inf.fhe->mult(v_rot, pts[p]));
         }
     }
     inf.v_count()++;

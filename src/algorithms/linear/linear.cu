@@ -1,19 +1,26 @@
 #include "model/gpt2.h"
 #include "inference.h"
+#include "slot_layout.h"
 #include "packing/cachemir/cachemir_linear.h"
 #include "packing/cachemir/cachemir_linear_utils.h"
 #include "packing/diagonal/diagonal_linear.h"
 #include "packing/diagonal/diagonal_linear_utils.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 // CachemirFilling reuses the diagonal
 
 PackedCtx linear(Inference& inf, const PackedCtx& x,
                  const std::string& wname, int d_in, int d_out, bool stream_pt) {
-    if (is_cachemir(x.packing)) return cachemir::linear(inf, x, wname, d_in, d_out);
+    const PackedCtx xin = slotlayout::check_linear_input(inf, x, wname, d_in, d_out);
+    if (is_cachemir(xin.packing)) {
+        PackedCtx y = cachemir::linear(inf, xin, wname, d_in, d_out);
+        slotlayout::note_linear_output(inf, y, wname, d_in, d_out);
+        return y;
+    }
     if (is_diagonal(x.packing) || is_cachemir_filling(x.packing)) {
-        CKKSContext::MagnitudeSuppressScope _ms(*inf.fhe);
+        CKKSContext::MagnitudeSuppressScope _ms(*inf.fhe, true);   // linears carry no capture magnitudes
         return diagonal::linear(inf, x, wname, d_in, d_out, stream_pt);
     }
     throw std::runtime_error("linear: unsupported packing");
@@ -30,10 +37,14 @@ PreparedLinearInput prepare_linear_input(Inference& inf, const PackedCtx& x,
 
 PackedCtx apply_linear(Inference& inf, const PreparedLinearInput& prep,
                        const std::string& wname, bool stream_pt) {
-    if (is_cachemir(prep.x.packing))
-        return cachemir::apply_linear(inf, prep.rotated, wname, prep.d_in, prep.d_out);
+    slotlayout::check_linear_input(inf, prep.x, wname, prep.d_in, prep.d_out);
+    if (is_cachemir(prep.x.packing)) {
+        PackedCtx y = cachemir::apply_linear(inf, prep.rotated, wname, prep.d_in, prep.d_out);
+        slotlayout::note_linear_output(inf, y, wname, prep.d_in, prep.d_out);
+        return y;
+    }
     if (is_diagonal(prep.x.packing) || is_cachemir_filling(prep.x.packing)) {
-        CKKSContext::MagnitudeSuppressScope _ms(*inf.fhe);
+        CKKSContext::MagnitudeSuppressScope _ms(*inf.fhe, true);
         return diagonal::linear(inf, prep.x, wname, prep.d_in, prep.d_out, stream_pt);
     }
     throw std::runtime_error("apply_linear: unsupported packing");

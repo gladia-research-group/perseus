@@ -11,9 +11,6 @@
 /// @param ans_init, the initial guess for 1/sqrt(x)
 /// @param iters, the number of iterations to perform
 /// @return the i-th newton-raphson approximation of 1/sqrt(x)
-/// @todo: this function is instead canonical... if we find out
-///        that the goldschmidt method performs the same, we should replace
-///        this function with the goldschmidt method, which should be better.
 Ctx inv_sqrt_newton(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iters, double x_scale,
                     int real_d, int real_stride) {
     Ctx c = cc.mult(x, -0.5 * x_scale);
@@ -33,22 +30,14 @@ Ctx inv_sqrt_newton(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iter
     return ct;
 }
 
-/// TODO: seems to consume four levels while it should use 3?
 /// @brief Computes the inverse square root of a value using the Goldschmidt iteration method.
 /// @param cc, the crypto context
 /// @param x, the input ciphertext for which we want to compute 1/sqrt(x)
 /// @param ans_init, the initial guess for 1/sqrt(x)
 /// @param iters, the number of iterations to perform
 /// @return the i-th goldschmidt approximation of 1/sqrt(x)
-/// @todo: this function seems iffy because the naming seems wrong, since it
-///        is actually computing almost the same algorithm as newton-raphson.
-///        The second iffy part is that, after the scalar mult with -0.5, there
-///        is no rescale, which is a bit strange. I assume the reasoning for the 
-///        lack of a rescale is that the value is then multiplied with sqrt_ct and
-///        ans, which will both be rescaled, so the rescale will be implicitly
-///        applied there? We should thoroughly check this, because it promises
-///        to cost just 2 levels, and to also parallelize those multiplications.
-///        Which I am wary to believe.
+/// @note The scalar mult by -0.5 is not rescaled here: the result feeds products with
+///       sqrt_ct and ans, which rescale, so the rescale is applied there.
 Ctx goldschmidt_inv_sqrt(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iters) {
     Ctx x_copy = x;
     Ctx ans = cc.clone(ans_init);   // mutated in the loop below, so clone the caller's init
@@ -68,44 +57,14 @@ Ctx goldschmidt_inv_sqrt(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int
     return ans;
 }
 
-/// @brief Computes the inverse of a value using the Newton iteration method.
-/// @param cc, the crypto context
-/// @param res, the initial guess for the inverse
-/// @param dnm, the ciphertext for which we want to compute 1/dnm
-/// @param iters, the number of iterations to perform
-/// @return the i-th Newton approximation of 1/dnm
-///
-/// Depth budget: 2 levels per iteration.
-///   y_{i+1} = y_i · (2 − d·y_i)
-///
-/// Two ct×ct mults per iteration with a scalar add in between. The "2·y −
-/// d·y²" rewrite was tried for symmetry but leaves the two operands of the
-/// final EvalAdd at different levels in FLEXIBLEAUTOEXT, forcing an extra
-/// rescale on the shallower one.
-Ctx newton_inverse(CKKSContext& cc, const Ctx& res, Ctx dnm, int iters) {
-    Ctx y = res;
-    for (int i = 0; i < iters; ++i) {
-        Ctx t = cc.mult(dnm, y);   // d·y
-        cc.inplace_negate(t);
-        cc.inplace_add(t, 2.0);    // 2 − d·y (scalar add: no level)
-        y = cc.mult(y, t);         // y · (2 − d·y)
-    }
-    return y;
-}
-
 /// @brief Computes the inverse of a value using the Goldschmidt iteration method.
 /// @param cc, the crypto context
 /// @param a, the ciphertext a, for which we want to compute 1/a
 /// @param x0_init, the initial guess for 1/a
 /// @param iters, the number of iterations to perform
 /// @return the i-th goldschmidt approximation of 1/a
-/// @todo: this function assumes the inputs could be reused after the call,
-///        as it makes copies and avoids touching the inputs. If we want
-///        to ensure maximum performance, we could allow in-place updates
-///        of the inputs!
-///        The reason why it would make sense, is because during runtime
-///        we will likely never reuse something that was used as input to this
-///        function.
+/// @note Copies its inputs rather than mutating them, so the caller may reuse `a` and
+///       `x0_init` after the call.
 Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& a, const Ctx& x0_init, int iters) {
     WithStep _w(cc, "goldschmidt");
 
@@ -136,7 +95,7 @@ Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& N_init, const Ctx& D_init, const
     Ctx F, D_neg;
     {
         CKKSContext::SparseBtsScope ss(cc, sparse_df);
-        F     = cc.negate(F_init);
+        F = cc.negate(F_init);
         D_neg = cc.mult(D_init, F);   // pay negate once, upfront, outside the loop
         F     = cc.add(D_neg, 2.0);   // F = 2 - D = 2 + D_neg, free
     }
@@ -154,18 +113,26 @@ Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& N_init, const Ctx& D_init, const
     return N;
 }
 
-Ctx goldschmidt_recip(CKKSContext& cc, const Ctx& D_init, const Ctx& F_init, int iters) {
+Ctx goldschmidt_recip(CKKSContext& cc, const Ctx& D_init, const Ctx& F_init, int iters,
+                      bool sparse_df) {
     WithStep _w(cc, "goldschmidt_recip");
 
+    // sparse_df: the D/F correction track is a broadcast quantity, so its reactive/planned
+    // refreshes may route sparse. The R track stays dense: it carries the payload.
     Ctx R = F_init;                   // R_0 = 1·F_init
-    Ctx F = cc.negate(F_init);
-    Ctx D_neg = cc.mult(D_init, F);   // = -D_init·F_init
-    F  = cc.add(D_neg, 2.0);          // F_1 = 2 - D_init·F_init
+    Ctx F, D_neg;
+    {
+        CKKSContext::SparseBtsScope ss(cc, sparse_df);
+        F = cc.negate(F_init);
+        D_neg = cc.mult(D_init, F);   // = -D_init·F_init
+        F  = cc.add(D_neg, 2.0);      // F_1 = 2 - D_init·F_init
+    }
 
     for (int i = 1; i < iters; ++i) {
         WithStep _wi(cc, "iter_" + std::to_string(i));
         R = cc.mult(R, F);
         if (i + 1 < iters) {
+            CKKSContext::SparseBtsScope ss(cc, sparse_df);
             D_neg = cc.mult(D_neg, F);
             F = cc.add(D_neg, 2.0);
         }
@@ -180,8 +147,7 @@ Ctx goldschmidt_recip(CKKSContext& cc, const Ctx& D_init, const Ctx& F_init, int
 /// @param cts, the vector of ciphertexts to be summed 
 /// @param weights, the vector of plaintext weights corresponding to each ciphertext
 /// @return the resulting ciphertext of the weighted sum
-/// @todo: this function assumes input cyphertexts are all of the same shape.
-///       We should add checks to ensure this is the case, and throw an error if not.
+/// @note Assumes every input ciphertext has the same shape; this is not checked.
 Ctx eval_linear_wsum(CKKSContext& cc,
                      std::vector<Ctx>& cts,
                      const std::vector<double>& weights) {
@@ -192,19 +158,6 @@ Ctx eval_linear_wsum(CKKSContext& cc,
     }
     return result;
 }
-
-/// @brief Helper function to repeatedly square a ciphertext
-/// @param cc, the crypto context
-/// @param x, the input ciphertext to be squared
-/// @param iters, the number of times to square the ciphertext
-/// @return the resulting ciphertext after repeated squaring
-Ctx exp_squaring(CKKSContext& cc, Ctx x, int iters) {
-    for (int i = 0; i < iters; ++i) {
-        cc.inplace_square(x);
-    }
-    return x;
-}
-
 
 /// @brief Masks the first active_dim * (slots / active_dim) slots, zeroing the rest.
 Ctx mask_slots(CKKSContext& cc, const Ctx& x, int slots, int active_dim) {

@@ -1,0 +1,41 @@
+From d15bfd82c960b8879090929dcbb30a375092193e Mon Sep 17 00:00:00 2001
+From: Davide-F5-Marincione <marincione@di.uniroma1.it>
+Date: Wed, 26 Aug 2026 15:14:30 +0200
+Subject: [PATCH 09/12] n32: size the DoubleInteger cap to the real width
+ (leveledshe hunk only)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cherry-picked hunk: at NATIVEINT=32 basicint.h typedefs int128_t -> int64_t, so
+HAVE_INT128 wrongly selected the 125-bit cap for a 64-bit word in
+GetElementForEvalMult; scalars with operand*scFactor >= 2^63 wrapped silently.
+The diagnostics the original hunk carried in ckksrns-fhe.cpp are dropped here: this
+tree has no use for them.
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-leveledshe.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-leveledshe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-leveledshe.cpp
+index 23736862..6fd5cb84 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-leveledshe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-leveledshe.cpp
+@@ -454,9 +454,17 @@ std::vector<DCRTPoly::Integer> LeveledSHECKKSRNS::GetElementForEvalMult(ConstCip
+ 
+     double scFactor = cryptoParams->GetScalingFactorReal(ciphertext->GetLevel());
+ 
++    // HAVE_INT128 says the COMPILER has __int128; it does NOT say `int128_t` is 128 bits.
++    // At NATIVEINT=32 basicint.h typedefs int128_t -> int64_t (and uint128_t -> uint64_t),
++    // so HAVE_INT128 selects the 125-bit cap for what is really a 64-bit word: any scalar
++    // with operand*scFactor >= 2^63 then skips the scale-down path and wraps SILENTLY.
++    // Size the cap to the type that is actually present. The bootstrap's own adjust sits
++    // at 2^54 and does not reach it, but the same defect exists on the GPU side in
++    // FIDESlib ContextData::ElemForEvalMult.
+     #if defined(HAVE_INT128)
+     typedef int128_t DoubleInteger;
+-    int32_t MAX_BITS_IN_WORD_LOCAL = 125;
++    int32_t MAX_BITS_IN_WORD_LOCAL =
++        (sizeof(DoubleInteger) >= 16) ? 125 : LargeScalingFactorConstants::MAX_BITS_IN_WORD;
+     #else
+     typedef int64_t DoubleInteger;
+     int32_t MAX_BITS_IN_WORD_LOCAL = LargeScalingFactorConstants::MAX_BITS_IN_WORD;

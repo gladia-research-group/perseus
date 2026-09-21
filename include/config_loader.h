@@ -13,23 +13,8 @@
 
 namespace config_loader {
 
-// Bring the JSON-scanning primitives (find_*_field, walk_section, load_or_warn,
-// find_object_field, read_file_to_string) into scope; the schema layer below
-// reads them unqualified.
 using namespace json_utils;
 
-// ── Declarative field binding ──────────────────────────────────────────────
-// A config's JSON schema lives in ONE place: a `describe(Binder<T>&)` overload
-// listing each field as (json_name, &T::member). `req` throws if the field is
-// absent — calibration-derived values must be present, never silently defaulted
-// — while `opt` keeps the struct default and warns. The member type selects the
-// right JSON extractor automatically, so a field is one self-describing line.
-//
-// To add a new layer type:
-//   1. define its `XConfig` struct (nonlinear.h);
-//   2. write one `describe(Binder<XConfig>&)` overload below;
-//   3. add `std::unordered_map<std::string, XConfig> x;` to ParsedConfigs and a
-//      single `parse_section(text, "x", out.x);` line in parse_configs_json.
 template <typename T>
 struct Binder {
     const std::string& obj;
@@ -61,8 +46,6 @@ inline void describe(Binder<NormConfig>& b) {
     b.req("eps",     &NormConfig::epsilon);
     b.req("center_scale", &NormConfig::center_scale);
 
-    // Optional method dispatch — absent ⇒ TAYLOR (original path). Old
-    // configs.json files keep working without edits.
     const bool has_method = b.obj.find("\"method\"") != std::string::npos;
     if (has_method) {
         b.req_enum("method", &NormConfig::nr_init_method, {
@@ -106,7 +89,6 @@ inline void describe(Binder<SoftmaxConfig>& b) {
     b.req("gs_iters_scaled",        &SoftmaxConfig::gs_iters_scaled);
     b.req("gs_iters_refine_scaled", &SoftmaxConfig::gs_iters_refine_scaled);
     b.req("per_step_refine_iters",  &SoftmaxConfig::per_step_refine_iters);
-    // Optional: bounded Chebyshev exp eval (absent ⇒ monomial deg8/PS path, back-compat).
     b.opt("cheb_coeffs",            &SoftmaxConfig::cheb_coeffs);
     b.opt("cheb_a",                 &SoftmaxConfig::cheb_a);
     b.opt("cheb_b",                 &SoftmaxConfig::cheb_b);
@@ -122,7 +104,7 @@ inline void describe(Binder<GeLUConfig>& b) {
 
     switch (b.out.method) {
         case GeLUMethod::SOFTSIGN_INV_SQRT:
-            b.opt("gate",      &GeLUConfig::gate);   // P3: absent ⇒ gated (back-compat)
+            b.opt("gate",      &GeLUConfig::gate);
             b.req("a",         &GeLUConfig::a);
             b.req("b",         &GeLUConfig::b);
             b.req("c",         &GeLUConfig::c);
@@ -133,13 +115,13 @@ inline void describe(Binder<GeLUConfig>& b) {
             b.req("gs_hi",     &GeLUConfig::gs_hi);
             b.req("lin_alpha", &GeLUConfig::lin_alpha);
             b.req("lin_beta",  &GeLUConfig::lin_beta);
-            b.req("inv_out_scale", &GeLUConfig::inv_out_scale);   // softsign inv_sqrt value-scale; absent ⇒ 1.0 (legacy)
+            b.req("inv_out_scale", &GeLUConfig::inv_out_scale);
             b.req("Ncoeffs",   &GeLUConfig::Ncoeffs);
             b.req("Dcoeffs",   &GeLUConfig::Dcoeffs);
             b.opt("exp_iters",    &GeLUConfig::exp_iters);
             b.opt("newton_iters", &GeLUConfig::newton_iters);
             b.opt("gs_iters",     &GeLUConfig::gs_iters);
-            b.opt("gate_cheb_coeffs", &GeLUConfig::gate_cheb_coeffs);  // poly gate exp; absent => limit-form
+            b.opt("gate_cheb_coeffs", &GeLUConfig::gate_cheb_coeffs);
             b.opt("gate_cheb_a",      &GeLUConfig::gate_cheb_a);
             b.opt("gate_cheb_b",      &GeLUConfig::gate_cheb_b);
             break;
@@ -149,20 +131,24 @@ inline void describe(Binder<GeLUConfig>& b) {
             b.req("cheb_b",      &GeLUConfig::cheb_b);
             break;
         case GeLUMethod::THOR_COMPOSITE:
-            b.req("xmax",    &GeLUConfig::xmax);    // S: composite normalization x/S
+            b.req("xmax",    &GeLUConfig::xmax);
             b.req("thor_p1", &GeLUConfig::thor_p1);
             b.req("thor_p2", &GeLUConfig::thor_p2);
+            b.opt("thor_p1_cheb", &GeLUConfig::thor_p1_cheb);
+            b.opt("thor_p2_cheb", &GeLUConfig::thor_p2_cheb);
+            b.opt("thor_p1_a",    &GeLUConfig::thor_p1_a);
+            b.opt("thor_p1_b",    &GeLUConfig::thor_p1_b);
+            b.opt("thor_p2_a",    &GeLUConfig::thor_p2_a);
+            b.opt("thor_p2_b",    &GeLUConfig::thor_p2_b);
             break;
     }
 }
 
-// Model architecture, exported from the Python model config so one build runs
-// GPT-2 small/medium/large without code edits.
 struct ModelConfig {
-    int n_layers = 0;   // number of transformer blocks
-    int n_embd   = 0;   // hidden size (real, unpadded)
-    int n_head   = 0;   // attention heads (real)
-    int n_inner  = 0;   // MLP inner size (real, unpadded)
+    int n_layers = 0;
+    int n_embd   = 0;
+    int n_head   = 0;
+    int n_inner  = 0;
 };
 
 inline void describe(Binder<ModelConfig>& b) {

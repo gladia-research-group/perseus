@@ -26,8 +26,8 @@ std::vector<int32_t> gpt2_decode_only_rot_steps(int slots, int hidDim, int ffDim
 
 void offload_block_kv(Inference& inf);
 void reload_block_kv(Inference& inf);
-// Overlapped (FHE_KV_OVERLAP=1, default) staged-swap pipeline: seed reload(0) before the block loop,
-// prefetch reload(b+1) / defer offload(b) at each block, drain+evict the last block after the loop.
+// Overlapped staged-swap pipeline: seed reload(0) before the block loop, prefetch reload(b+1) /
+// defer offload(b) at each block, drain+evict the last block after the loop.
 void gpt2_kv_prefetch_first(Inference& inf, int n_blocks);
 void gpt2_kv_block_prologue(Inference& inf, int b, int n_blocks);
 void gpt2_kv_finalize_last(Inference& inf, int n_blocks);
@@ -40,14 +40,40 @@ void gpt2_generate_decode_masks(Inference& inf, std::vector<EncodedBlock>& block
                                 int n_blocks, int T);
 // Per-step mask residency: prime step `step`'s per-position masks (kc=step+1, right_rot=step%t,
 // pos=step) just before token `step`; evict step `step-1`'s after. Keeps the host mask set ~1 step.
-// Tail prefetch (2026-07-22): gpt2_prefill preps the lm_head tiles on the
-// residency worker during the first chunk's last block; the tail consumer
-// (GPT2Model::logit_tiles) takes them via this call (true once, then empty).
+// Tail prefetch: gpt2_prefill preps the lm_head tiles on the residency worker during the
+// first chunk's last block; the tail consumer (GPT2Model::logit_tiles) takes them via this
+// call (true once, then empty).
 bool gpt2_tail_lm_take(std::vector<EncodedBlock>& out, std::vector<std::string>& complex_keys);
+
+// Pipeline-fill overlap: encode chunk-0's block 0 on a worker so it runs under the deferred
+// key/bts setup (CKKSContext::complete_setup); gpt2_prefill's loader consumes the stash at
+// ACQ(0). One shot per process.
+void gpt2_prefill_early_block0(Inference& inf,
+                               const weight_loader::WeightStore& store,
+                               const config_loader::ParsedConfigs& parsed_configs,
+                               const BlockPlans& plans);
+void gpt2_prefill_early_block0_join(Inference& inf);
+
+// Chunk-weight cache: when every chunk's plan pins identical weight levels (and the arm
+// matches), chunk 0 keeps its weights device-resident and later chunks reuse them instead
+// of re-encoding. mode: 0=off, 1=fill, 2=reuse.
+void gpt2_prefill_wcache_configure(Inference& inf, int n_blocks, int mode);
+void gpt2_prefill_wcache_end(Inference& inf);
 void gpt2_prime_step_masks(Inference& inf, std::vector<EncodedBlock>& blocks, int n_blocks, int step);
 void gpt2_evict_step_masks(Inference& inf, std::vector<EncodedBlock>& blocks, int n_blocks, int step);
-// Prefetch one block's `step` masks from the decode body (block_prefix already set to the block's scope).
-void gpt2_prime_block_masks(Inference& inf, EncodedBlock& blk, int step);
+
+// Encode step `step`'s SHARED (unscoped) masks into `out` as (tag, level, pt). RUNS ON THE
+// RESIDENCY WORKER: touches neither inf.enc_cache nor inf.block_prefix. The caller adopts
+// `out` on the main thread.
+void gpt2_encode_shared_masks(Inference& inf, std::vector<EncodedBlock>& blocks, int n_blocks,
+                              int step,
+                              std::vector<std::tuple<std::string, uint32_t, Ptx>>& out);
+
+// Encode step `step`'s BLOCK-SCOPED masks into `out` as (tag, level, pt). RUNS ON THE SCOPED WORKER:
+// touches neither inf.enc_cache nor inf.block_prefix (the block scope is passed explicitly).
+void gpt2_encode_scoped_masks(Inference& inf, std::vector<EncodedBlock>& blocks, int n_blocks,
+                              int step,
+                              std::vector<std::tuple<std::string, uint32_t, Ptx>>& out);
 
 // Bridge a cachemir_filling prefill's per-block K/V into the cachemir decode KV
 // cache by re-pushing each of the m prefilled tokens through the verified

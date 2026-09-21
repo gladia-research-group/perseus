@@ -5,54 +5,74 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 
 namespace cachemir {
 
 namespace {
-// Decode-side 1-limb COEFFICIENT encode of block weights (2026-09-15, GPT-2 large scratch patch).
-// Mirror of diagonal_linear_utils.cu's coeff mode: encode at the q0 level (one limb, ~0.5 MB) with the
-// values pre-scaled by sf(target)/sf(q0), then MarkCoeffStaged so the staged load expands the limbs on
-// the GPU at the target level. The cached decode path (cached_block_op) always extracts (BeginStageBlock
-// + ExtractRawPlaintext into the pinned arena) two blocks ahead of the upload, which is what a
-// coeff-staged plaintext requires; the streamed loader (GPT2_CACHE=0) has no extract step, so this mode
-// is for GPT2_CACHE=1 only. Env-gated: FHE_DECODE_COEFF_ENCODE=1 (default OFF = the pinned behaviour,
-// full ~13 MB plaintexts at level 16, which is 660 GB of host memory for large's 36 x 1408).
-struct CoeffPlan { bool on = false; uint32_t lv1 = 0; double ratio = 1.0; double sf_target = 0.0; };
 
-bool decode_coeff_encode_enabled() {
-    static const bool v = [] {
-        const char* e = std::getenv("FHE_DECODE_COEFF_ENCODE");
-        return e && *e && std::atoi(e) != 0;
-    }();
-    return v;
+struct CoeffPlan {
+    bool     on = false;
+    uint32_t lv1 = 0;
+    double   ratio = 1.0;
+    double   sf_target = 0.0;
+};
+
+// Coefficient staging needs |w| < 2, which GPT-2's LN-folded weights exceed, so it is off
+// unless asked for. Read per call, not cached: EncGPT2.bind(coeff_encode=...) sets it around
+// one bind, and a cached read would silently ignore every bind after the first.
+bool cm_coeff_enabled() {
+    const char* e = std::getenv("FHE_PT_COEFF_ENCODE");
+    return e && *e && std::atoi(e) == 1;
 }
 
-CoeffPlan coeff_plan(Inference& inf, uint32_t lv, double wmax, const char* what) {
+// `mx` is the per-slot magnitude bound: max|w| for a real encode, max|z| (modulus) for a
+// complex one — the canonical-embedding coefficients obey |c_k| <= max_j|z_j| either way.
+// `what` names the matrix class in the refusal message, which is the only way to tell
+// "the flag did nothing" from "the flag is off".
+CoeffPlan cm_coeff_plan(Inference& inf, double mx, uint32_t lv, const char* what) {
     CoeffPlan c;
-    if (!decode_coeff_encode_enabled()) return c;
-    c.lv1       = static_cast<uint32_t>(inf.fhe->total_depth);   // 1-limb (q0) encode level
+    if (!cm_coeff_enabled() || !inf.pt_stage_hook) return c;
+    c.lv1 = static_cast<uint32_t>(inf.fhe->composite_degree * inf.fhe->total_depth);
     c.sf_target = inf.cc()->ScalingFactorReal(lv);
-    c.ratio     = c.sf_target / inf.cc()->ScalingFactorReal(c.lv1);
-    // Centered lift needs |round(w * sf_target)| < q0/2 (q0 = 2^FIRST_MOD_BITS-class), as in diagonal.
-    if (wmax * c.sf_target >= 0.45 * std::pow(2.0, 60)) {
+    c.ratio = c.sf_target / inf.cc()->ScalingFactorReal(c.lv1);
+    // The 1-limb coefficient encode needs |w|*scale inside the centered-lift bound;
+    // a matrix past it takes the full encode. GPT-2's LN-folded weights are past it on
+    // both chains, so this is the usual outcome rather than an exceptional one.
+    const double lift_bits = static_cast<double>(inf.fhe->first_mod_bits);
+    c.on = (mx * c.sf_target < 0.45 * std::pow(2.0, lift_bits));
+    if (!c.on) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            std::cerr << "[decode_coeff_encode] hybrid: |w|max=" << wmax << " (" << what
-                      << ") exceeds the centered-lift bound -> full encode for this matrix class\n";
+            std::cerr << "[coeff_encode] hybrid: |w|max=" << mx << " (" << what
+                      << ") exceeds the centered-lift bound -> this matrix class "
+                         "falls back to the full encode\n";
         }
-        return CoeffPlan{};
+        c.ratio = 1.0;
     }
-    c.on = true;
     return c;
 }
 
 double abs_max(const std::vector<std::vector<double>>& W) {
     double mx = 0.0;
-    for (const auto& row : W) for (double x : row) mx = std::max(mx, std::abs(x));
+    for (const auto& row : W)
+        for (double x : row) mx = std::max(mx, std::abs(x));
     return mx;
+}
+
+// Slot-modulus bound for the fused complex encode: max sqrt(re^2 + im^2) elementwise.
+double abs_max_complex(const std::vector<std::vector<double>>& W_re,
+                       const std::vector<std::vector<double>>& W_im) {
+    double mx2 = 0.0;
+    for (size_t r = 0; r < W_re.size(); ++r)
+        for (size_t j = 0; j < W_re[r].size(); ++j) {
+            const double re = W_re[r][j], im = W_im[r][j];
+            mx2 = std::max(mx2, re * re + im * im);
+        }
+    return std::sqrt(mx2);
 }
 }  // namespace
 
@@ -112,6 +132,11 @@ PackedCtx encode_linear_input(Inference& inf, const std::vector<double>& x,
 
 std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vector<double>>& W,
                                        int d_in, int d_out, int target_level) {
+    return encode_weight_matrix(inf, W, d_in, d_out, target_level, nullptr);
+}
+
+std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vector<double>>& W,
+                                       int d_in, int d_out, int target_level, cudaStream_t stream) {
     int N     = inf.slots;
     auto p    = compute_cm_params(N, d_in, d_out);
     int M_out         = N / p.tp_out;
@@ -132,36 +157,11 @@ std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vec
     }
 
     const uint32_t lv = static_cast<uint32_t>(target_level);
-    std::vector<Ptx> result(p.n_pt);
-    for (int i = 0; i < p.n_pt; ++i)
-        result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, lv);
-    return result;
-}
-
-std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vector<double>>& W,
-                                       int d_in, int d_out, int target_level, cudaStream_t stream) {
-    int N     = inf.slots;
-    auto p    = compute_cm_params(N, d_in, d_out);
-    int M_out         = N / p.tp_out;
-    int cascade_shift = (p.t * p.tp) / p.tp_out;
-    const CoeffPlan cp = coeff_plan(inf, static_cast<uint32_t>(target_level), abs_max(W), "real");
-
-    std::vector<std::vector<double>> pt(p.n_pt, std::vector<double>(N, 0.0));
-    for (int j = 0; j < p.r_i; ++j) {
-        const int  g   = j / p.bstep_c;
-        const int  s_g = g * p.bstep_c * p.t * p.t;   // < N (g*bstep_c < r_i, r_i*t*t = N)
-        for (int k = 0; k < p.r_o; ++k)
-            for (int i = 0; i < N; ++i) {
-                const int ip = ((i - s_g) % N + N) % N;
-                int row = ((ip / p.t + j * p.t + ip % p.tp_in) % p.d)
-                        + ((ip % p.t) / p.tp_in) * p.d;
-                int ms  = ((ip / p.tp_out - k * cascade_shift) % M_out + M_out) % M_out;
-                pt[j * p.r_o + k][i] = W[row][interleave_idx(ms, p.d, d_out)] * cp.ratio;
-            }
-    }
-
-    const uint32_t lv = static_cast<uint32_t>(target_level);
-    const uint32_t enc_lv = cp.on ? cp.lv1 : lv;
+    const CoeffPlan c = cm_coeff_plan(inf, abs_max(W), lv, "real");
+    if (c.on)
+        for (auto& v : pt)
+            for (double& x : v) x *= c.ratio;
+    const uint32_t enc_lv = c.on ? c.lv1 : lv;
     std::vector<Ptx> result(p.n_pt);
     for (int i = 0; i < p.n_pt; ++i) {
         if (stream != nullptr) {
@@ -169,7 +169,7 @@ std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vec
         } else {
             result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, enc_lv);
         }
-        if (cp.on) inf.cc()->MarkCoeffStaged(result[i], lv, cp.sf_target);
+        if (c.on) inf.cc()->MarkCoeffStaged(result[i], lv, c.sf_target, /*prescale_log2=*/0);
     }
     return result;
 }
@@ -183,8 +183,6 @@ std::vector<Ptx> encode_weight_matrix_complex(Inference& inf,
     auto p    = compute_cm_params(N, d_in, d_out);
     int M_out         = N / p.tp_out;
     int cascade_shift = (p.t * p.tp) / p.tp_out;
-    const CoeffPlan cp = coeff_plan(inf, static_cast<uint32_t>(target_level),
-                                    std::max(abs_max(W_re), abs_max(W_im)), "complex");
 
     std::vector<std::vector<std::complex<double>>> pt(
         p.n_pt, std::vector<std::complex<double>>(N, std::complex<double>(0.0, 0.0)));
@@ -198,19 +196,24 @@ std::vector<Ptx> encode_weight_matrix_complex(Inference& inf,
                         + ((ip % p.t) / p.tp_in) * p.d;
                 int ms  = ((ip / p.tp_out - k * cascade_shift) % M_out + M_out) % M_out;
                 int col = interleave_idx(ms, p.d, d_out);
-                pt[j * p.r_o + k][i] = std::complex<double>(W_re[row][col] * cp.ratio, W_im[row][col] * cp.ratio);
+                pt[j * p.r_o + k][i] = std::complex<double>(W_re[row][col], W_im[row][col]);
             }
     }
 
     const uint32_t lv = static_cast<uint32_t>(target_level);
-    const uint32_t enc_lv = cp.on ? cp.lv1 : lv;
+
+    const CoeffPlan c = cm_coeff_plan(inf, abs_max_complex(W_re, W_im), lv, "complex");
+    if (c.on)
+        for (auto& v : pt)
+            for (auto& z : v) z *= c.ratio;
+    const uint32_t enc_lv = c.on ? c.lv1 : lv;
     std::vector<Ptx> result(p.n_pt);
     for (int i = 0; i < p.n_pt; ++i) {
         if (stream != nullptr)
             result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, enc_lv, nullptr, 0, stream);
         else
             result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, enc_lv);
-        if (cp.on) inf.cc()->MarkCoeffStaged(result[i], lv, cp.sf_target);
+        if (c.on) inf.cc()->MarkCoeffStaged(result[i], lv, c.sf_target, /*prescale_log2=*/0);
     }
     return result;
 }
@@ -260,7 +263,6 @@ std::vector<Ptx> encode_weight_matrix_outputpack(Inference& inf,
     const int rop = p.r_o / 2;
     int M_out         = N / p.tp_out;
     int cascade_shift = (p.t * p.tp) / p.tp_out;
-    const CoeffPlan cp = coeff_plan(inf, static_cast<uint32_t>(target_level), abs_max(W), "outputpack");
 
     std::vector<std::vector<std::complex<double>>> pt(
         static_cast<size_t>(p.r_i) * rop, std::vector<std::complex<double>>(N, {0.0, 0.0}));
@@ -276,20 +278,26 @@ std::vector<Ptx> encode_weight_matrix_outputpack(Inference& inf,
                 const int ip = ((i - s_g) % N + N) % N;
                 int row = ((ip / p.t + j * p.t + ip % p.tp_in) % p.d)
                         + ((ip % p.t) / p.tp_in) * p.d;
-                pt[j * rop + kp][i] = std::complex<double>(W[row][col_at(ip, 2 * kp)] * cp.ratio,
-                                                           W[row][col_at(ip, 2 * kp + 1)] * cp.ratio);
+                pt[j * rop + kp][i] = std::complex<double>(W[row][col_at(ip, 2 * kp)],
+                                                           W[row][col_at(ip, 2 * kp + 1)]);
             }
     }
 
     const uint32_t lv = static_cast<uint32_t>(target_level);
-    const uint32_t enc_lv = cp.on ? cp.lv1 : lv;
+
+    const CoeffPlan c =
+        cm_coeff_plan(inf, std::sqrt(2.0) * abs_max(W), lv, "outputpack");
+    if (c.on)
+        for (auto& v : pt)
+            for (auto& z : v) z *= c.ratio;
+    const uint32_t enc_lv = c.on ? c.lv1 : lv;
     std::vector<Ptx> result(static_cast<size_t>(p.r_i) * rop);
     for (size_t i = 0; i < result.size(); ++i) {
         if (stream != nullptr)
             result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, enc_lv, nullptr, 0, stream);
         else
             result[i] = inf.cc()->MakeCKKSPackedPlaintext(pt[i], /*noiseScaleDeg=*/1, enc_lv);
-        if (cp.on) inf.cc()->MarkCoeffStaged(result[i], lv, cp.sf_target);
+        if (c.on) inf.cc()->MarkCoeffStaged(result[i], lv, c.sf_target, /*prescale_log2=*/0);
     }
     return result;
 }

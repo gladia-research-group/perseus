@@ -1,24 +1,13 @@
-"""Model discovery: classify any torch module tree against the registry.
-
-`discover(model, approximations)` walks `named_modules()` once and assigns
-every matched module to its approximation kind (keeping only leaf matches, so
-wrapper classes never shadow the module that actually computes). It then
-verifies COVERAGE: any remaining activation-family nonlinearity is unsupported
-and aborts calibration with a precise report — a model either calibrates fully
-or not at all.
-
-Works for anything from an `nn.Sequential` to a hub transformer; the optional
-HF helpers (`infer_dims`, `infer_block_size`) read the transformers config
-when one exists.
-"""
-
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch.nn as nn
 
 from perseus.calibrate.registry import Approximation
+
+log = logging.getLogger(__name__)
 
 _NONLINEAR_MODULES = ("torch.nn.modules.activation", "transformers.activations")
 
@@ -110,7 +99,7 @@ def discover(model: nn.Module, approximations: list[Approximation]) -> ModelMap:
 
     counts = {k: len(mm.by_kind(k)) for k in sorted({s.kind for s in sites})}
     dims = f" dims={mm.dims}" if mm.dims else ""
-    print(f"[discover] {model_name}: sites={counts}{dims} ctx={mm.block_size}")
+    log.info(f"[discover] {model_name}: sites={counts}{dims} ctx={mm.block_size}")
     if not sites:
         raise UnsupportedModelError("discovery matched no approximation sites — "
                                     "is this a supported model?")

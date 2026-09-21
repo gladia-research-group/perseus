@@ -5,12 +5,17 @@ from .module import EncModule
 class EncAttention(EncModule):
     """Causal MHA over the KV cache: qkv -> cache push -> qkt -> THOR softmax -> P·V -> out proj.
 
-    Mirrors the C++ mha_ops (step labels, hints, complex arm) so captures/plans bind.
+    A GPT-2 mirror, not a composable layer: it reads the canonical production weight names
+    ("kv"/"q"/"k"/"v"/"out") installed by the GPT-2 loader and mirrors the C++ mha_ops
+    (step labels, hints, complex arm) so captures/plans bind.
     """
 
     def __init__(self, softmax_cfg="attn"):
         super().__init__()
         self.softmax_cfg = softmax_cfg
+
+    def extra_repr(self):
+        return f"softmax_cfg={self.softmax_cfg!r}"
 
     def forward(self, x):
         inf, fhe = self.inf, self.inf.fhe

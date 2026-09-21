@@ -7,6 +7,7 @@
 #include "io/weight_io.h"
 #include "math/matrix_ops.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -47,30 +48,19 @@ public:
     }
 
     bool                          has(const std::string& name) const { return data_.count(name) > 0; }
+    std::vector<std::string>      names() const {
+        std::vector<std::string> out; out.reserve(meta_.size());
+        for (const auto& kv : meta_) out.push_back(kv.first);
+        std::sort(out.begin(), out.end());
+        return out;
+    }
     const weight_io::TensorMeta&  meta(const std::string& name)   const { return meta_.at(name); }
     const std::vector<double>&    tensor(const std::string& name) const { return data_.at(name); }
-
-    std::vector<double> tensor1d(const std::string& name, int n) const {
-        const auto& m = meta_.at(name);
-        if (m.shape.size() != 1 || m.shape[0] != n)
-            throw std::runtime_error("Shape mismatch for " + name);
-        return data_.at(name);
-    }
-
     std::vector<double> tensor1d_any(const std::string& name) const {
         const auto& m = meta_.at(name);
         if (m.shape.size() != 1) throw std::runtime_error("Expected 1D tensor: " + name);
         return data_.at(name);
     }
-
-    std::vector<std::vector<double>> tensor2d(const std::string& name,
-                                              int rows, int cols) const {
-        const auto& m = meta_.at(name);
-        if (m.shape.size() != 2 || m.shape[0] != rows || m.shape[1] != cols)
-            throw std::runtime_error("Shape mismatch for " + name);
-        return reshape(data_.at(name), rows, cols);
-    }
-
     std::vector<std::vector<double>> tensor2d_any(const std::string& name) const {
         const auto& m = meta_.at(name);
         if (m.shape.size() != 2) throw std::runtime_error("Expected 2D tensor: " + name);
@@ -326,19 +316,11 @@ inline EncodedGpt2Layer encode_gpt2_layer_weights(
     const int wlvl = static_cast<int>(inf.fhe->bootstrap_output_level());
     auto wl = [&](const char* key) { return static_cast<int>(plan.weight_level(key, static_cast<uint32_t>(wlvl))); };
 
-    // Family-interleaved staging: stage each family the moment it is encoded (worker-side
-    // pinned staging, inf.pt_stage_hook) so the host never holds a whole block of freshly
-    // encoded plaintexts — the hook (with FHE_STAGE_RELEASE_CPU) frees each family's OpenFHE
-    // payload before the next family encodes. No-op when the hook is unset.
     auto put = [&](const std::string& key, std::vector<Ptx> v) {
         if (inf.pt_stage_hook) inf.pt_stage_hook(key, v);
         out.w[key] = std::move(v);
     };
 
-    // LN gamma is inactive-lane-MASKED (filling/diagonal only, no-op for full
-    // chunks): unmasked, padding-lane junk re-enters the stream at every LN with
-    // gain c_eff·y_floor·gamma/s, compounds exponentially over blocks, and
-    // detonates the deg-31 GELU once it crosses the basin (ViT k=12, block 6).
     if (fold_ln_affine("ln_1")) {   // beta rides the input as a (beta/gamma) shift
         auto s1 = ln_input_shift(n1a, n1b, d_real);
         put("ln_1.shift", {encode_ln_affine_param(inf, s1, d_pad, d_real, wl("ln_1.shift"), /*mask_inactive=*/true, stream)});
@@ -387,9 +369,6 @@ inline EncodedGpt2Layer encode_gpt2_layer_weights(
         }
         put("down_bias", {encode_bias_vector(inf, b_down_pad, d_pad, d_pad, /*fill=*/true, stream)});
     } else if (inf.complex) {
-        // UP is output-packed (its +1 level is absorbed free by the following GELU). DOWN stays REAL:
-        // mlp.cu reads "down" with the plain linear, so the weight must be plain too — and its
-        // output-pack +1 would land on the residual (= +22 bts/token). out-proj likewise stays real.
         put("up",        encode_weight_matrix_outputpack(inf, W_up.pad,   d_pad,     d_exp_pad, /*target_level=*/wl("up"),   stream));
         put("up_bias",   {encode_bias_vector  (inf, b_up_pad,  d_pad,     d_exp_pad, /*fill=*/true, stream)});
         inf.complex_weight_names.insert("up");
@@ -404,36 +383,6 @@ inline EncodedGpt2Layer encode_gpt2_layer_weights(
 
     return out;
 }
-
-inline void prepare_gpt2_layer_weights(
-    Inference& inf,
-    const WeightStore& store,
-    const GPT2WeightNames& names,
-    int d_real, int d_exp_real,
-    int d_pad,  int d_exp_pad,
-    int num_heads,
-    cudaStream_t stream = nullptr) {
-    auto enc = encode_gpt2_layer_weights(inf, store, names, d_real, d_exp_real,
-                                         d_pad, d_exp_pad, num_heads, stream);
-    for (auto& kv : enc.raw_w) inf.raw_w[kv.first] = std::move(kv.second);
-    for (auto& kv : enc.w)     inf.w[kv.first]     = std::move(kv.second);
-}
-
-inline void prepare_gpt2_layer_configs(Inference& inf,
-                                       const config_loader::ParsedConfigs& parsed,
-                                       int block_idx) {
-    const std::string base = gpt2_block_base(block_idx);
-    inf.norm_cfg["ln_1"]   = parsed.norm.at(base + ".ln_1");
-    inf.norm_cfg["ln_2"]   = parsed.norm.at(base + ".ln_2");
-    inf.sm_cfg  ["attn"]   = parsed.softmax.at(base + ".attn");
-    inf.gelu_cfg["mlp.act"] = parsed.softgelu.at(base + ".mlp.act");
-}
-
-inline void prepare_gpt2_final_ln_config(Inference& inf,
-                                         const config_loader::ParsedConfigs& parsed) {
-    inf.norm_cfg["ln_f"] = parsed.norm.at(gpt2_final_ln_base());
-}
-
 inline EncodedGpt2Layer encode_gpt2_final_ln_weights(
     Inference& inf, const WeightStore& store,
     int d_real, int d_pad, const BootstrapPlan& plan = {},
@@ -455,14 +404,6 @@ inline EncodedGpt2Layer encode_gpt2_final_ln_weights(
     }
     return out;
 }
-
-inline void prepare_gpt2_final_ln_weights(Inference& inf, const WeightStore& store,
-                                          int d_real, int d_pad,
-                                          cudaStream_t stream = nullptr) {
-    auto enc = encode_gpt2_final_ln_weights(inf, store, d_real, d_pad, /*plan=*/BootstrapPlan{}, stream);
-    for (auto& kv : enc.w) inf.w[kv.first] = std::move(kv.second);
-}
-
 struct LMHeadWeights {
     std::vector<std::vector<double>> W_pad;   // (d_pad, vocab), gamma-folded when folding
     std::vector<double> bias;                 // (vocab) ln_f beta logit bias; empty if not folding

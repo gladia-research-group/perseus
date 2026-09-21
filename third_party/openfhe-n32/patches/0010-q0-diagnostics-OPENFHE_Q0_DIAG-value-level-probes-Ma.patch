@@ -1,0 +1,100 @@
+From ac583ec500545f831486cadccfee44926807cdfb Mon Sep 17 00:00:00 2001
+From: Davide-F5-Marincione <marincione@di.uniroma1.it>
+Date: Wed, 26 Aug 2026 18:50:32 +0200
+Subject: [PATCH 10/12] q0 diagnostics: OPENFHE_Q0_DIAG value-level probes
+ (MakeAuxPlaintext logc, Setup recovery constants)
+
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp | 58 ++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index 02f3df74..c747a95b 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -208,6 +208,20 @@ void FHECKKSRNS::EvalBootstrapSetup(const CryptoContextImpl<DCRTPoly>& cc, std::
+                 scaleDec = qDouble / sf0;
+         }
+ 
++        // OPENFHE_Q0_DIAG: recovery constants at value level, per arm (add.160 probe).
++        if (std::getenv("OPENFHE_Q0_DIAG")) {
++            std::cerr << "[q0_diag] Setup: q0=2^" << std::log2(qDouble)
++                      << " sf0=2^" << std::log2(cryptoParams->GetScalingFactorReal(0))
++                      << " scaleDec=" << scaleDec << " (2^" << std::log2(scaleDec) << ")"
++                      << " pre=" << pre << " scaleEnc=2^" << std::log2(std::fabs(scaleEnc))
++                      << " k=" << k << std::endl;
++            uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size();
++            for (uint32_t l = 0; l < std::min(numQ, 6u); ++l)
++                std::cerr << "[q0_diag]   sf[" << l << "]=2^"
++                          << std::log2(cryptoParams->GetScalingFactorReal(l)) << " qdrop=2^"
++                          << std::log2(cryptoParams->GetModReduceFactor(numQ - 1 - l)) << std::endl;
++        }
++
+         //uint32_t approxModDepth = GetModDepthInternal(cryptoParams->GetSecretKeyDist());
+         uint32_t approxModDepth = modevallevels == (uint32_t)-1 ? GetModDepthInternal(cryptoParams->GetSecretKeyDist()) : modevallevels;
+         uint32_t depthBT = approxModDepth + precom->m_paramsEnc[CKKS_BOOT_PARAMS::LEVEL_BUDGET] +
+@@ -1443,6 +1457,20 @@ void FHECKKSRNS::EvalBootstrapPrecompute(const CryptoContextImpl<DCRTPoly>& cc,
+             scaleDec = qDouble / sf0;
+     }
+ 
++    // OPENFHE_Q0_DIAG: the recovery constants at value level, per arm (add.160 probe).
++    if (std::getenv("OPENFHE_Q0_DIAG")) {
++        std::cerr << "[q0_diag] Precompute: q0=2^" << std::log2(qDouble)
++                  << " sf0=2^" << std::log2(cryptoParams->GetScalingFactorReal(0))
++                  << " scaleDec=" << scaleDec << " (2^" << std::log2(scaleDec) << ")"
++                  << " pre=" << pre << " scaleEnc=2^" << std::log2(std::fabs(scaleEnc))
++                  << " k=" << k << std::endl;
++        uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size();
++        for (uint32_t l = 0; l < std::min(numQ, 8u); ++l)
++            std::cerr << "[q0_diag]   sf[" << l << "]=2^" << std::log2(cryptoParams->GetScalingFactorReal(l))
++                      << " qdrop[" << l << "]=2^"
++                      << std::log2(cryptoParams->GetModReduceFactor(numQ - 1 - l)) << std::endl;
++    }
++
+     uint32_t approxModDepth = GetModDepthInternal(cryptoParams->GetSecretKeyDist());
+ 
+     uint32_t depthBT =
+@@ -3413,6 +3441,23 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+         }
+     }
+ 
++    // Q0_DIAG: the int128_t above is int64_t at NATIVEINT=32 and is128BitOverflow
++    // checks the 128-bit bound, so a >=2^63 coefficient wraps SILENTLY. Report the
++    // real peak width per aux plaintext to localize the deg>4 scaleDec detonation.
++    if (std::getenv("OPENFHE_Q0_DIAG")) {
++        double maxAbs = 0;
++        for (size_t i = 0; i < slots; ++i)
++            maxAbs = std::max(maxAbs, std::abs(inverse[i]));
++        double peakBits = (maxAbs > 0) ? std::log2(maxAbs) + static_cast<double>(pBits) : 0;
++        static double worst = 0;
++        if (peakBits > worst) {
++            worst = peakBits;
++            std::cerr << "[q0_diag] MakeAuxPlaintext peak coeff ~2^" << peakBits << " (max|inv|=" << maxAbs
++                      << " pBits=" << pBits << " slots=" << slots << ")"
++                      << (peakBits >= 63.0 ? "  ** >= 2^63: WRAPS int64 'int128_t' SILENTLY **" : "") << std::endl;
++        }
++    }
++
+     const std::shared_ptr<ILDCRTParams<BigInteger>> bigParams        = plainElement.GetParams();
+     const std::vector<std::shared_ptr<ILNativeParams>>& nativeParams = bigParams->GetParams();
+ 
+@@ -3524,6 +3569,19 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+     int32_t logApprox   = logc - logValid;
+     double approxFactor = pow(2, logApprox);
+ 
++    // OPENFHE_Q0_DIAG: localize the deg>4 scaleDec detonation. logc > 61 activates the
++    // approx-restore path below, which at NATIVEINT=32 multiplies by 2^logStep through
++    // a 32-BIT DCRTPoly::Integer — never exercised on this build before.
++    if (std::getenv("OPENFHE_Q0_DIAG")) {
++        static int32_t worstLogc = std::numeric_limits<int32_t>::min();
++        if (logc > worstLogc) {
++            worstLogc = logc;
++            std::cerr << "[q0_diag] MakeAuxPlaintext(n32): logc=" << logc << " powP=2^" << std::log2(powP)
++                      << " logApprox=" << logApprox << " slots=" << slots
++                      << (logApprox > 0 ? "  ** approx-restore path ACTIVE **" : "") << std::endl;
++        }
++    }
++
+     std::vector<int64_t> temp(2 * slots);
+ 
+     for (size_t i = 0; i < slots; ++i) {

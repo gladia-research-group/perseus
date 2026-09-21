@@ -4,7 +4,8 @@ from .module import EncModule
 
 
 class EncBlock(EncModule):
-    """GPT-2 transformer block; mirrors the C++ gpt2_block_ops step-for-step."""
+    """GPT-2 transformer block; mirrors the C++ gpt2_block_ops step-for-step over the
+    canonical loader weight names (ln_1/ln_2/up/down/...). Not a composable layer."""
 
     def __init__(self):
         super().__init__()

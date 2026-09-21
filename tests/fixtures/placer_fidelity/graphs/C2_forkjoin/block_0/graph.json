@@ -1,0 +1,226 @@
+{
+ "version": 1,
+ "nodes": [
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_a01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_a01",
+   "step": "synth.C2_forkjoin.a01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a01",
+    "pt_a02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_a02",
+   "step": "synth.C2_forkjoin.a02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a02",
+    "pt_a03"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_a03",
+   "step": "synth.C2_forkjoin.a03",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a03",
+    "pt_a04"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_a04",
+   "step": "synth.C2_forkjoin.a04",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a04",
+    "pt_a05"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_a05",
+   "step": "synth.C2_forkjoin.a05",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a05",
+    "pt_a06"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_a06",
+   "step": "synth.C2_forkjoin.a06",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_a06",
+    "pt_a07"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_a07",
+   "step": "synth.C2_forkjoin.a07",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_b01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_b01",
+   "step": "synth.C2_forkjoin.b01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_b01",
+    "pt_b02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_b02",
+   "step": "synth.C2_forkjoin.b02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "add",
+   "inputs": [
+    "v_a07",
+    "v_b02"
+   ],
+   "input_levels": [
+    23,
+    18
+   ],
+   "output": "v_join",
+   "step": "synth.C2_forkjoin.join",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_join",
+    "pt_t01"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_t01",
+   "step": "synth.C2_forkjoin.t01",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_t01",
+    "pt_t02"
+   ],
+   "input_levels": [
+    24,
+    24
+   ],
+   "output": "v_t02",
+   "step": "synth.C2_forkjoin.t02",
+   "output_level": 25,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_t02",
+    "pt_t03"
+   ],
+   "input_levels": [
+    25,
+    25
+   ],
+   "output": "v_t03",
+   "step": "synth.C2_forkjoin.t03",
+   "output_level": 26,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  }
+ ]
+}

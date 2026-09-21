@@ -11,11 +11,6 @@
 /// @param x, the input ciphertext at which to evaluate the polynomial
 /// @param coeffs, the coefficients of the polynomial in standard basis [a0, a1, a2, ..., an] representing a0 + a1*x + a2*x^2 + ... + an*x^n
 /// @return the ciphertext resulting from evaluating the polynomial at x
-/// @brief Evaluates a polynomial at a given point using Horner's method.
-/// @param cc, the crypto context
-/// @param x, the input ciphertext at which to evaluate the polynomial
-/// @param coeffs, the coefficients of the polynomial in standard basis [a0, a1, a2, ..., an] representing a0 + a1*x + a2*x^2 + ... + an*x^n
-/// @return the ciphertext resulting from evaluating the polynomial at x
 Ctx eval_polynomial(CKKSContext& cc, const Ctx& x, const std::vector<double>& coeffs) {
     size_t n = coeffs.size();
     Ctx result = cc.mult(x, coeffs[n - 1]);
@@ -33,7 +28,6 @@ Ctx eval_polynomial(CKKSContext& cc, const Ctx& x, const std::vector<double>& co
 /// @param cc, the crypto context
 /// @param x, the input ciphertext
 /// @param coeffs, coefficients [a0, a1, ..., an] for a0 + a1*x + ... + an*x^n
-/// @param pk, the public key (used for encrypting constant-only leaves)
 /// @param slots, number of slots
 /// @return the ciphertext resulting from evaluating the polynomial at x
 Ctx eval_polynomial_ps(CKKSContext& cc, const Ctx& x, const std::vector<double>& coeffs, size_t slots) {
@@ -145,8 +139,6 @@ Ctx eval_chebyshev_series(CKKSContext& cc, const Ctx& x,
 /// @param cc, the crypto context
 /// @param x, the input ciphertext
 /// @param coeffs, coefficients [a0, a1, ..., an] for a0 + a1*x + ... + an*x^n
-/// @param pk, the public key (used for encrypting constant-only leaves)
-/// @param slots, number of slots
 /// @return the ciphertext resulting from evaluating the polynomial at x
 Ctx eval_polynomial_deg4(CKKSContext& cc, const Ctx& x, const std::vector<double>& coeffs) {
     Ctx x2 = cc.square(x);

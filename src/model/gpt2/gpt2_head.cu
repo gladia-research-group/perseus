@@ -54,15 +54,6 @@ std::vector<double> decode_lm_head_logits(Inference& inf,
     return logits;
 }
 
-// Mirrors decode_coeff_encode_enabled() in cachemir_linear_utils.cu (anonymous namespace there).
-static bool decode_coeff_encode_env() {
-    static const bool v = [] {
-        const char* e = std::getenv("FHE_DECODE_COEFF_ENCODE");
-        return e && *e && std::atoi(e) != 0;
-    }();
-    return v;
-}
-
 static bool lm_head_streams() {
     const char* g = std::getenv("GPT2_LMHEAD_GRANULARITY");
     return g && *g && std::string(g) != "block";
@@ -83,6 +74,25 @@ static std::vector<Op> lm_head_ops(std::vector<PackedCtx>& tiles,
         ops.push_back(std::move(op));
     }
     return ops;
+}
+
+void gpt2_lm_head_prepare_block(Inference& inf, const weight_loader::WeightStore& store,
+                                int vocab, int W_tile, EncodedBlock& blk,
+                                const BootstrapPlan& plan) {
+    if (!blk.w.empty()) return;
+    const int d_pad  = inf.size.hidDim;
+    const int d_real = inf.size.getRealHidDim();
+    auto enc = weight_loader::encode_gpt2_lm_head_weights(
+        inf, store, d_real, d_pad, vocab, W_tile, plan);
+    blk.w    = std::move(enc.w);
+    blk.plan = plan;
+
+    inf.set_persistent_staging(true);
+    if (lm_head_streams())
+        evict_block_from_device(inf, blk);   // host-cached; tiles load per use
+    else
+        load_block_to_device(inf, blk, /*stream=*/nullptr);   // resident; not evicted when cached
+    inf.set_persistent_staging(false);
 }
 
 std::vector<PackedCtx> gpt2_lm_head(Inference& inf, const PackedCtx& x,
@@ -106,36 +116,18 @@ std::vector<PackedCtx> gpt2_lm_head(Inference& inf, const PackedCtx& x,
         if (cached_tiles->empty()) cached_tiles->emplace_back();
         blk = &cached_tiles->front();
     }
-    if (blk->w.empty()) {
-        auto enc = weight_loader::encode_gpt2_lm_head_weights(
-            inf, store, d_real, d_pad, vocab, W_tile, plan);
-        blk->w    = std::move(enc.w);
-        blk->plan = plan;
-        if (lm_head_streams()) {
-            evict_block_from_device(inf, *blk);   // host-cached; tiles load per use
-        } else if (decode_coeff_encode_env()) {
-            // FHE_DECODE_COEFF_ENCODE=1 (2026-09-15): the tiles are 1-limb coeff plaintexts, which
-            // LoadPlaintext accepts only from a staged entry — the first resident load goes through
-            // the PERSISTENT staging window (persistent arena, 0.5-1 GB); a plain load outside it
-            // throws "coeff-staged plaintext has no staged entry". Flag off = the original load below.
-            inf.set_persistent_staging(true);
-            load_block_to_device(inf, *blk, /*stream=*/nullptr);
-            inf.set_persistent_staging(false);
-        } else {
-            load_block_to_device(inf, *blk, /*stream=*/nullptr);   // resident; not evicted when cached
-        }
-    }
+    if (blk->w.empty()) gpt2_lm_head_prepare_block(inf, store, vocab, W_tile, *blk, plan);
 
     install_block_state_copy(inf, *blk);
 
+    const bool persist_run_ops = lm_head_streams();
     std::vector<PackedCtx> tiles(static_cast<size_t>(K_eff));
     { WithStep _w(inf, "lm_head");
       const PreparedLinearInput prep = prepare_linear_input(inf, h, d_pad, W_tile);
-      inf.set_persistent_staging(true);
+      if (persist_run_ops) inf.set_persistent_staging(true);
       run_ops(inf, h, lm_head_ops(tiles, prep, K_eff),
               /*stream_weights=*/lm_head_streams(), Overlap::Sync);
-      inf.set_persistent_staging(false);
-
+      if (persist_run_ops) inf.set_persistent_staging(false);
     }
 
     if (!cached) {

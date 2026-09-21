@@ -8,8 +8,13 @@ import torch
 import torch.nn as nn
 
 from perseus.calibrate.numerics import (
-    GS_INITS, cheb_exp_series, estimate_gs_iters, get_chebyshev_nodes,
-    polyval_torch, safe_quantile,
+    GS_INITS,
+    cheb_exp_series,
+    estimate_gs_iters,
+    fit_gs_under_noise,
+    get_chebyshev_nodes,
+    polyval_torch,
+    safe_quantile,
 )
 from perseus.calibrate.registry import Approximation, register
 
@@ -30,11 +35,6 @@ def _phase1_val(rows, valid, mid, scale, coeffs, n_sq):
 
 @torch.no_grad()
 def _refine_denominators(val, ref_iters, k_eff, row_q, C, q):
-    """Simulate the refine recurrence; per step return (a) the positive
-    denominator samples s (init/iteration estimation) and (b) the q-quantile
-    (collapse-driving tail) of s grouped by kc = row_q+1, for kc in 1..C,
-    nan where a kc is unseen — the mean s is misleading, the bts-noise
-    collapse is the peaked-attention tail."""
     kc = (row_q + 1).long()
     sqrt_k = k_eff.sqrt()
     S_steps, S_kc = [], []
@@ -53,23 +53,12 @@ def _refine_denominators(val, ref_iters, k_eff, row_q, C, q):
 
 
 def _next_pow2(x):
-    """Smallest power of two >= x (>=1). x is a positive float."""
     if x <= 1.0:
         return 1
     return 1 << math.ceil(math.log2(x))
 
 
 def _derive_per_layer_delta(M, cfg):
-    """Per-layer THOR (delta1, delta2) from this layer's measured score range M.
-
-    The two knobs are cleanly separable (docs/speed/differential_deltas.md):
-      * delta2 (refinement_iters) bounds the PRE-refinement un-normalized exp
-        peak exp(M/(2·delta2)) <= thor_magnitude_cap — the dominant compute
-        lever (~3 levels / refine iter);
-      * delta1 (n_squarings) bounds the exp-poly amplification
-        delta0 = M/(delta1·delta2) <= thor_target_delta0 (deg-8 safe ~2.5).
-    Both are the smallest power of two satisfying their constraint, clamped.
-    """
     delta2 = _next_pow2(M / (2.0 * math.log(cfg.magnitude_cap)))
     delta2 = min(max(delta2, int(cfg.delta2_min)), int(cfg.delta2_max))
     delta1 = _next_pow2(M / (cfg.target_delta0 * delta2))
@@ -78,12 +67,6 @@ def _derive_per_layer_delta(M, cfg):
 
 
 def fit_softmax(rows, row_q, T, cfg):
-    """Fit one attention site's THOR softmax config from its score rows.
-
-    cfg.bidirectional: every row attends all T keys — uniform kc = T. The
-    refine bands are then fit on the uniform-kc denominators themselves, so
-    the per-kc factors collapse to sm_kc_r = 1 (the runtime reads index T-1).
-    """
     win = int(cfg.decode_window) if cfg.decode_window else 0
     if cfg.bidirectional:
         win = 0
@@ -125,14 +108,21 @@ def fit_softmax(rows, row_q, T, cfg):
     init_d_max = safe_quantile(S_mean, cfg.init_q_hi) * d_safety
 
     gs_init_fn = GS_INITS[cfg.gs_init_method]
-    init_alpha, init_beta = gs_init_fn(init_d_min, init_d_max)
-    if cfg.gs_iters is not None:
-        gs_iters_scaled = int(cfg.gs_iters)
-    else:
-        gs_iters_scaled = estimate_gs_iters(
-            S_mean, init_d_min, init_d_max,
-            cfg.gs_target_err, cfg.gs_max_iters, cfg.gs_init_method,
+    eps = float(cfg.chain_noise)
+    if eps > 0.0:
+        init_alpha, init_beta, gs_iters_scaled, _e = fit_gs_under_noise(
+            S_mean, init_d_min, init_d_max, cfg.gs_max_iters, cfg.gs_init_method, eps,
+            iters=(int(cfg.gs_iters) if cfg.gs_iters is not None else None),
         )
+    else:
+        init_alpha, init_beta = gs_init_fn(init_d_min, init_d_max)
+        if cfg.gs_iters is not None:
+            gs_iters_scaled = int(cfg.gs_iters)
+        else:
+            gs_iters_scaled = estimate_gs_iters(
+                S_mean, init_d_min, init_d_max,
+                cfg.gs_target_err, cfg.gs_max_iters, cfg.gs_init_method,
+            )
 
     C = win if win else int(T)
     refine_S, S_kc = _refine_denominators(
@@ -142,11 +132,15 @@ def fit_softmax(rows, row_q, T, cfg):
         d_min_i = safe_quantile(s, cfg.init_q_lo) / d_safety
         d_max_i = safe_quantile(s, cfg.init_q_hi) * d_safety
         d_max_fit = d_max_i * cfg.refine_drift_margin
-        iters_i = estimate_gs_iters(
-            s, d_min_i, d_max_fit,
-            cfg.gs_target_err, cfg.gs_max_iters, cfg.gs_init_method,
-        )
-        a_i, b_i = gs_init_fn(d_min_i, d_max_fit)
+        if eps > 0.0:
+            a_i, b_i, iters_i, _e = fit_gs_under_noise(
+                s, d_min_i, d_max_fit, cfg.gs_max_iters, cfg.gs_init_method, eps)
+        else:
+            iters_i = estimate_gs_iters(
+                s, d_min_i, d_max_fit,
+                cfg.gs_target_err, cfg.gs_max_iters, cfg.gs_init_method,
+            )
+            a_i, b_i = gs_init_fn(d_min_i, d_max_fit)
         refine_alpha.append(a_i)
         refine_beta.append(b_i)
         per_step_iters.append(iters_i)
@@ -236,14 +230,6 @@ class _SoftmaxTapHandle:
 
 
 class _SoftmaxCollector:
-    """Pre-softmax score rows, tagged with their query position.
-
-    Two site flavors: an explicit `nn.Softmax` module is hooked directly; an
-    attention module (where HF applies softmax functionally) is scoped with
-    pre/post hooks and the scores are captured by a `nn.functional.softmax`
-    tap active only while that module is on the call stack. Only square
-    score matrices softmaxed over the last dim are recorded.
-    """
 
     def __init__(self, cfg):
         self.rows_per_batch = cfg.rows_per_batch

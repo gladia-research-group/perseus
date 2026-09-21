@@ -1,9 +1,5 @@
 #pragma once
 
-// Minimal dependency-free helpers for scanning the flat JSON we export from the
-// Python side (configs.json, weight manifests). These are pure text primitives
-// with no domain knowledge — config_loader.h builds its schema layer on top.
-
 #include <cctype>
 #include <cstddef>
 #include <fstream>

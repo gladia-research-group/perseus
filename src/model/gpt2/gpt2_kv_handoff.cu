@@ -57,21 +57,9 @@ void gpt2_kv_handoff_filling_to_cachemir(Inference& inf, int n_blocks, int m) {
 
         std::vector<PackedCtx> fV = itv->second;
         prepare_vcache(inf);
-        static const bool per_token = [] {
-            const char* e = std::getenv("FHE_HANDOFF_PER_TOKEN");
-            return e && *e == '1';
-        }();
-        if (per_token) {   // legacy per-token pushes (A/B fallback)
-            for (size_t g = 0; g < fV.size(); ++g) {
-                const int Lg = std::min(t, m - static_cast<int>(g) * t);
-                int i = 0;
-                for (; i + 1 < Lg; i += 2)   // 2 tokens per bootstrap under complex payload
-                    cache_v_push_pair(inf, extract_token_i_cachemir(inf, fV[g], i),
-                                           extract_token_i_cachemir(inf, fV[g], i + 1));
-                for (; i < Lg; ++i)
-                    cache_v_push(inf, extract_token_i_cachemir(inf, fV[g], i));
-            }
-        } else {
+        {
+            // Batched V repack: one masked mult per (group, feature) lane instead of a
+            // per-token push.
             const int d_head      = inf.size.hidDim / inf.size.numHeads;
             const int d_head_real = inf.size.getRealDHead();
             const int H_real      = inf.size.getRealNumHeads();

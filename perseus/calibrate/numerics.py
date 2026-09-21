@@ -1,21 +1,11 @@
-"""Shared numerical primitives for the calibration fits.
-
-- `rational_remez`: relative-error rational Remez exchange on Chebyshev nodes
-  (LM-solved per iteration) — the engine behind the LayerNorm inv-sqrt fit.
-  Returns ascending-order (p, q) plus the denominator range [q_min, q_max]
-  on the fit band (the Goldschmidt operand band).
-- `cheb_exp_series`: 0-normalized Chebyshev series of exp on a band — the
-  softmax phase-1 bounded-intermediate exp eval.
-- `safe_quantile`: subsampled `torch.quantile` (memory-bounded on the
-  multi-million-sample hook tensors).
-- Goldschmidt inits (`GS_INITS`): `linear` (secant, THOR paper) and `chebyshev`
-  (minimax — init error < 1 for any band ratio), plus the reciprocal-recurrence
-  convergence core (`gs_converged_iters`) behind every adaptive gs_iters count.
-"""
+import logging
+import math
 
 import numpy as np
 import torch
 from scipy.optimize import root
+
+log = logging.getLogger(__name__)
 
 
 def polyval_torch(x, coeffs):
@@ -80,7 +70,7 @@ def rational_remez(target_func, a, b, n, m, max_iter=50, tol=1e-12, grid_size=50
         sol = root(equations, guess, method="lm")
 
         if not sol.success and iteration > 0:
-            print("  Convergence stalled in solver. Returning previous best.")
+            log.info("  Convergence stalled in solver. Returning previous best.")
             break
 
         p_coeffs = sol.x[: n + 1]
@@ -92,7 +82,7 @@ def rational_remez(target_func, a, b, n, m, max_iter=50, tol=1e-12, grid_size=50
         den = np.polynomial.polynomial.polyval(x_dense, q_coeffs)
 
         if np.min(np.abs(den)) < 1e-9:
-            print("  Warning: Denominator near zero. Pole detected.")
+            log.warning("  Warning: Denominator near zero. Pole detected.")
 
         approx = num / den
         rel_error = (approx - y_dense) / y_dense
@@ -205,16 +195,100 @@ def goldschmidt_reciprocal(D, alpha, beta, iters):
     return N_cur
 
 
+def _perturb(x, eps, mode, gen):
+    if eps <= 0.0:
+        return x
+    if mode == "+":
+        return x + eps
+    if mode == "-":
+        return x - eps
+    u = torch.rand(x.shape, generator=gen, dtype=x.dtype, device=x.device)
+    return x + eps * (2.0 * u - 1.0)
+
+
+@torch.no_grad()
+def goldschmidt_reciprocal_noisy(D, alpha, beta, iters, eps, mode, gen):
+    F = alpha - beta * D
+    N_cur = _perturb(F, eps, mode, gen)
+    D_cur = _perturb(-D * F, eps, mode, gen)
+    F = 2.0 + D_cur
+    for _ in range(iters - 1):
+        N_cur = _perturb(N_cur * F, eps, mode, gen)
+        D_cur = _perturb(D_cur * F, eps, mode, gen)
+        F = 2.0 + D_cur
+    return N_cur
+
+
+@torch.no_grad()
+def gs_error_under_noise(S, alpha, beta, iters, eps, trials, seed, q=0.999):
+    gen = torch.Generator(device=S.device).manual_seed(int(seed))
+    worst = 0.0
+    modes = ["+", "-"] + ["rand"] * max(0, int(trials))
+    for mode in modes:
+        y = goldschmidt_reciprocal_noisy(S, alpha, beta, iters, eps, mode, gen)
+        e = ((y * S) - 1.0).abs()
+        e = e[torch.isfinite(e)]
+        if e.numel() == 0:
+            return float("inf")
+        err = float(torch.quantile(e, q)) if e.numel() > 1 else float(e[0])
+        if err > worst:
+            worst = err
+        if not math.isfinite(worst):
+            return float("inf")
+    return worst
+
+
+@torch.no_grad()
+def fit_gs_under_noise(S, d_min, d_max, max_iters, method, eps,
+                       trials=6, seed=20260822, span=0.25, grid=7, slack=1.0,
+                       max_samples=4096, iters=None):
+    alpha0, beta0 = GS_INITS[method](d_min, d_max)
+    in_band = S[(S >= d_min) & (S <= d_max)]
+    S_test = in_band if in_band.numel() > 0 else S
+    if S_test.numel() > max_samples:                      # deterministic thinning
+        step = int(S_test.numel() // max_samples) + 1
+        S_test = S_test[::step]
+    S_test = S_test.reshape(-1)
+
+    factors = [2.0 ** (span * (2.0 * i / (grid - 1) - 1.0)) for i in range(grid)] \
+        if grid > 1 else [1.0]
+    counts = [int(iters)] if iters is not None else list(range(1, int(max_iters) + 1))
+    scored = []
+    for fa in factors:
+        for fb in factors:
+            a, b = alpha0 * fa, beta0 * fb
+            for it in counts:
+                scored.append((a, b, it,
+                               gs_error_under_noise(S_test, a, b, it, eps, trials, seed)))
+    err_best = min(c[3] for c in scored)
+    ok = [c for c in scored if c[3] <= slack * err_best]
+    return min(ok, key=lambda c: (c[2], c[3]))
+
+
+@torch.no_grad()
+def fit_nr_iters_under_noise(z, seed_y, max_iters, eps, trials, seed, slack=1.05):
+    truth = z ** -0.5
+    gen = torch.Generator(device=z.device).manual_seed(int(seed))
+    modes = ["+", "-"] + ["rand"] * max(0, int(trials))
+    errs = []
+    for it in range(int(max_iters) + 1):
+        worst = 0.0
+        for mode in modes:
+            y = seed_y.clone()
+            for _ in range(it):
+                y = _perturb(0.5 * y * (3.0 - z * y * y), eps, mode, gen)
+            e = ((y - truth).abs() / truth).max().item()
+            worst = max(worst, e if math.isfinite(e) else float("inf"))
+        errs.append(worst)
+    best_it = min(range(len(errs)), key=lambda i: errs[i])
+    for it in range(best_it):                             # cheapest within slack
+        if errs[it] <= slack * errs[best_it]:
+            return it, errs[it]
+    return best_it, errs[best_it]
+
+
 @torch.no_grad()
 def nr_converged_iters(z, y0, target, max_iters):
-    """Newton steps y <- y·(3 - z·y²)/2 from seed `y0`, until the worst-case
-    RELATIVE error of y against z^{-1/2} falls below `target` over the samples.
-    0 = the seed alone suffices; None = no convergence within max_iters.
-
-    The Newton counterpart of gs_converged_iters: same criterion, same target,
-    applied to the stage the Goldschmidt seed feeds. Note it only converges from
-    inside the basin — a seed left coarse by a shallow `gs_iters` can return None
-    at any budget, which is the honest answer rather than a large count."""
     truth = z ** -0.5
     y = y0.clone()
     for it in range(max_iters + 1):
@@ -226,14 +300,12 @@ def nr_converged_iters(z, y0, target, max_iters):
 
 @torch.no_grad()
 def estimate_gs_iters(S, d_min, d_max, target, max_iters, method):
-    """Smallest Goldschmidt iteration count converging 1/S to `target` relative
-    error over the in-band samples (falls back to all samples if none in band)."""
     alpha, beta = GS_INITS[method](d_min, d_max)
     in_band = S[(S >= d_min) & (S <= d_max)]
     S_test = in_band if in_band.numel() > 0 else S
     it = gs_converged_iters(S_test, alpha, beta, target, max_iters)
     if it is None:
-        print(f"[gs] WARN: did not converge to {target:g} in {max_iters} iters "
+        log.warning(f"[gs] WARN: did not converge to {target:g} in {max_iters} iters "
               f"(range=[{float(d_min):.3g}, {float(d_max):.3g}], "
               f"|S|={int(S.numel())}, in_band={int(in_band.numel())}); "
               f"saturating at {max_iters}")

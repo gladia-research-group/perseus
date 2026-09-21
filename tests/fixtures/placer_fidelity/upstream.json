@@ -1,0 +1,335 @@
+{
+ "_provenance": {
+  "frozen": "upstream tool outputs on the exported synthetic graphs; regenerate by re-running each tool with the config recorded under `upstream`",
+  "upstream": {
+   "orion": "real upstream Orion level-DAG solver on the exported synthetic graphs, calibrated axis l_eff=6 (orion_up6; sweep in upstream_orion_leff_sweep.json)",
+   "dacapo": "real upstream DaCapo segment DP, cfg u8l2 (upstream_dacapo_u8.json)",
+   "fhelipe": "real upstream Fhelipe compiler, usable_levels=6, omission as published (ul6); sites mapped back to our var space by the structural matcher"
+  },
+  "ours_config": {
+   "bootstrap_level": 16,
+   "max_level": 22,
+   "source_level": 16,
+   "cache_read_level": 16,
+   "level_unit": 1,
+   "acc_chain": "n32",
+   "allow_prescale": true,
+   "entry_level": 16,
+   "entry_deg": 2,
+   "env": {
+    "PLAN_BASELINE_HINTS": "aware",
+    "orion": {
+     "PLAN_ORION_FREEDROP": "1",
+     "PLAN_ORION_EXIT_CAP": "5"
+    },
+    "fhelipe": {
+     "PLAN_FHELIPE_DEFER": "1"
+    },
+    "dacapo": {
+     "PLAN_DACAPO_BYPASS": "cut"
+    }
+   }
+  },
+  "known_divergences": "orion C2_forkjoin/C3_skip/C5_diamond and dacapo C5_diamond are site-divergent by design of the comparison (Orion validated on its OBJECTIVE, -1.6% vs upstream on the real graph); they are pinned here so drift in either direction fails.",
+  "orion_repin": "C3_skip and C5_diamond pinned-ours were re-pinned on the exact-degree simulator (the deg-true mixed rule moved these two known-divergent shapes; the 6 upstream-exact cases were unaffected). Orion's fidelity basis remains its objective (Sigma-w -1.6% vs upstream on the real graph)."
+ },
+ "C1_chain10": {
+  "upstream": {
+   "orion": [
+    "v_m05"
+   ],
+   "dacapo": [
+    "v_m05"
+   ],
+   "fhelipe": [
+    "v_m05"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_m05"
+   ],
+   "dacapo": [
+    "v_m05"
+   ],
+   "fhelipe": [
+    "v_m05"
+   ]
+  }
+ },
+ "C1_chain12": {
+  "upstream": {
+   "orion": [
+    "v_m05",
+    "v_m10"
+   ],
+   "dacapo": [
+    "v_m04",
+    "v_m08"
+   ],
+   "fhelipe": [
+    "v_m02",
+    "v_m07"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_m05",
+    "v_m10"
+   ],
+   "dacapo": [
+    "v_m04",
+    "v_m08"
+   ],
+   "fhelipe": [
+    "v_m02",
+    "v_m07"
+   ]
+  }
+ },
+ "C1_chain15": {
+  "upstream": {
+   "orion": [
+    "v_m05",
+    "v_m10"
+   ],
+   "dacapo": [
+    "v_m05",
+    "v_m10"
+   ],
+   "fhelipe": [
+    "v_m05",
+    "v_m10"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_m05",
+    "v_m10"
+   ],
+   "dacapo": [
+    "v_m05",
+    "v_m10"
+   ],
+   "fhelipe": [
+    "v_m05",
+    "v_m10"
+   ]
+  }
+ },
+ "C1_chain20": {
+  "upstream": {
+   "orion": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ],
+   "dacapo": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ],
+   "fhelipe": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ],
+   "dacapo": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ],
+   "fhelipe": [
+    "v_m05",
+    "v_m10",
+    "v_m15"
+   ]
+  }
+ },
+ "C1_chain8": {
+  "upstream": {
+   "orion": [
+    "v_m05"
+   ],
+   "dacapo": [
+    "v_m04"
+   ],
+   "fhelipe": [
+    "v_m03"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_m05"
+   ],
+   "dacapo": [
+    "v_m04"
+   ],
+   "fhelipe": [
+    "v_m03"
+   ]
+  }
+ },
+ "C2_forkjoin": {
+  "upstream": {
+   "orion": [
+    "v_a04"
+   ],
+   "dacapo": [
+    "v_a05"
+   ],
+   "fhelipe": [
+    "v_a05"
+   ]
+  },
+  "era_exact": {
+   "orion": false,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_a05"
+   ],
+   "dacapo": [
+    "v_a05"
+   ],
+   "fhelipe": [
+    "v_a05"
+   ]
+  }
+ },
+ "C3_skip": {
+  "upstream": {
+   "orion": [
+    "v_k04",
+    "v_k09"
+   ],
+   "dacapo": [
+    "v_k05",
+    "v_k10"
+   ],
+   "fhelipe": [
+    "v_k05",
+    "v_k10"
+   ]
+  },
+  "era_exact": {
+   "orion": false,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_k02",
+    "v_k05",
+    "v_k10"
+   ],
+   "dacapo": [
+    "v_k05",
+    "v_k10"
+   ],
+   "fhelipe": [
+    "v_k05",
+    "v_k10"
+   ]
+  }
+ },
+ "C4_fanout": {
+  "upstream": {
+   "orion": [
+    "v_p03"
+   ],
+   "dacapo": [
+    "v_p03"
+   ],
+   "fhelipe": [
+    "v_p03"
+   ]
+  },
+  "era_exact": {
+   "orion": true,
+   "dacapo": true,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_p03"
+   ],
+   "dacapo": [
+    "v_p03"
+   ],
+   "fhelipe": [
+    "v_p03"
+   ]
+  }
+ },
+ "C5_diamond": {
+  "upstream": {
+   "orion": [
+    "v_i03",
+    "v_outerjoin"
+   ],
+   "dacapo": [
+    "v_innerjoin",
+    "v_q02"
+   ],
+   "fhelipe": [
+    "v_i03",
+    "v_j01"
+   ]
+  },
+  "era_exact": {
+   "orion": false,
+   "dacapo": false,
+   "fhelipe": true
+  },
+  "era_ours": {
+   "orion": [
+    "v_outerjoin",
+    "v_p03",
+    "v_q02"
+   ],
+   "dacapo": [
+    "v_i03",
+    "v_q02"
+   ],
+   "fhelipe": [
+    "v_i03",
+    "v_j01"
+   ]
+  }
+ }
+}

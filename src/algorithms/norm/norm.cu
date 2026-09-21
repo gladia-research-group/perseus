@@ -63,8 +63,7 @@ void add_layernorm_epsilon(Inference& inf, PackedCtx& var_scaled, double epsilon
 }
 
 PackedCtx ln_inv_sqrt_tail(Inference& inf, PackedCtx xs, const NormConfig& cfg,
-                           int rD, int t, double c_eff_sq, bool sparse_var_scope,
-                           bool tp_probes) {
+                           int rD, int t, double c_eff_sq, bool sparse_var_scope) {
     WithStep _w2(inf, "mean");
     PackedCtx mean = compute_per_token_sum(inf, xs);
 
@@ -87,7 +86,6 @@ PackedCtx ln_inv_sqrt_tail(Inference& inf, PackedCtx xs, const NormConfig& cfg,
         const double floor_val = std::max(cfg.gs_lo, cfg.taylor_z0);
         PackedCtx var_scaled = floor_inactive_token_lanes(inf, var, floor_val);
         add_layernorm_epsilon(inf, var_scaled, cfg.epsilon, c_eff_sq, cfg.center_scale_sq);
-        if (tp_probes) inf.fhe->tp_probe("lnvar", var_scaled.ct);
 
         _w2.next("inv_sqrt_init");
         PackedCtx inv_sqrt_init_scaled;
@@ -115,12 +113,12 @@ PackedCtx ln_inv_sqrt_tail(Inference& inf, PackedCtx xs, const NormConfig& cfg,
                 ? 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale) : 1.0;
         inv_sqrt_var = inv_sqrt_newton(
             inf.cc_ctx(), var_scaled, inv_sqrt_init_scaled, cfg.nr_iters, nx_scale, rD, t);
-        if (tp_probes) inf.fhe->tp_probe("lninv", inv_sqrt_var.ct);
-        inf.fhe->bootstrap_hint(inv_sqrt_var, inf.fhe->level_limit() - 4);
+        inf.fhe->bootstrap_hint(inv_sqrt_var, inf.fhe->level_headroom(4));
     }  // sparse scope closes -> full-slot restored before the vector mult
 
     _w2.next("scale");
-    return inf.fhe->mult(centered_x, inv_sqrt_var);   // s·LN; weight prep folds 1/s into gamma
+    PackedCtx ln_out = inf.fhe->mult(centered_x, inv_sqrt_var);   // s·LN; weight prep folds 1/s into gamma
+    return ln_out;
 }
 
 PackedCtx norm(Inference& inf, const PackedCtx& x, const std::string& cfg_name) {
@@ -155,6 +153,5 @@ PackedCtx norm(Inference& inf, const PackedCtx& x, const std::string& cfg_name) 
     if (center_pos > 0 && cfg_name == "ln_f")
         inf.erase_enc_cache_all(cachemir::ln_center_mask_tag(inf, cfg_name, center_pos - 1));
 
-    return ln_inv_sqrt_tail(inf, std::move(xs), cfg, rD, t, c_eff_sq,
-                            sparse_var, /*tp_probes=*/false);
+    return ln_inv_sqrt_tail(inf, std::move(xs), cfg, rD, t, c_eff_sq, sparse_var);
 }

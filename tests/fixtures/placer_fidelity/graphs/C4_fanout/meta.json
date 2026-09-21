@@ -1,0 +1,8 @@
+{
+ "case": "C4_fanout",
+ "opt_count": 1,
+ "unique_sites": [
+  "v_p03"
+ ],
+ "note": "producer at depth 3 fanning out to 4 independent 5-mult chains; one refresh at the fan-out point serves all"
+}

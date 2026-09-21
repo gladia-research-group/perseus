@@ -1,0 +1,209 @@
+{
+ "version": 1,
+ "nodes": [
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_m01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_m01",
+   "step": "synth.C1_chain12.m01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m01",
+    "pt_m02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_m02",
+   "step": "synth.C1_chain12.m02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m02",
+    "pt_m03"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_m03",
+   "step": "synth.C1_chain12.m03",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m03",
+    "pt_m04"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_m04",
+   "step": "synth.C1_chain12.m04",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m04",
+    "pt_m05"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_m05",
+   "step": "synth.C1_chain12.m05",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m05",
+    "pt_m06"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_m06",
+   "step": "synth.C1_chain12.m06",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m06",
+    "pt_m07"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_m07",
+   "step": "synth.C1_chain12.m07",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m07",
+    "pt_m08"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_m08",
+   "step": "synth.C1_chain12.m08",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m08",
+    "pt_m09"
+   ],
+   "input_levels": [
+    24,
+    24
+   ],
+   "output": "v_m09",
+   "step": "synth.C1_chain12.m09",
+   "output_level": 25,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m09",
+    "pt_m10"
+   ],
+   "input_levels": [
+    25,
+    25
+   ],
+   "output": "v_m10",
+   "step": "synth.C1_chain12.m10",
+   "output_level": 26,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m10",
+    "pt_m11"
+   ],
+   "input_levels": [
+    26,
+    26
+   ],
+   "output": "v_m11",
+   "step": "synth.C1_chain12.m11",
+   "output_level": 27,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_m11",
+    "pt_m12"
+   ],
+   "input_levels": [
+    27,
+    27
+   ],
+   "output": "v_m12",
+   "step": "synth.C1_chain12.m12",
+   "output_level": 28,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  }
+ ]
+}

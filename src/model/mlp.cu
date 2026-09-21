@@ -16,7 +16,7 @@ std::vector<Op> mlp_ops() {
         { {}, [](Inference& i, PackedCtx& x) {
             i.name_graph_ct_if_absent(x, "mlp_block.x"); }, "up_linear" },
         { {}, [](Inference& i, PackedCtx& x) {
-            const int up_hint = i.fhe->level_limit() - (i.complex ? 2 : 1);
+            const int up_hint = i.fhe->level_headroom(i.complex ? 2 : 1);
             i.fhe->bootstrap_hint(x, up_hint, /*account_pending_rescale=*/true);
             i.fhe->level_hint(x, up_hint);
             x = i.complex
@@ -24,10 +24,13 @@ std::vector<Op> mlp_ops() {
                 : linear(i, x, "up", i.size.hidDim, i.size.expDim,
                          /*stream_pt=*/is_cachemir_filling(i.packing));}, "up_linear" },
         { {}, [](Inference& i, PackedCtx& x) {
+
+            CKKSContext::LiveLaneScope _ll(
+                *i.fhe, i.graph_capture_enabled() ? i.live_lane_mask_expanded() : nullptr);
             x = gelu_approx(i, x, "mlp.act"); }, "gelu" },
         { {}, [](Inference& i, PackedCtx& x) {
-            i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 1, /*account_pending_rescale=*/true);
-            i.fhe->level_hint(x, i.fhe->level_limit() - 1);   // ceiling-relative: hardcoded 23 confiscated the +1 level at ceiling 25
+            i.fhe->bootstrap_hint(x, i.fhe->level_headroom(1), /*account_pending_rescale=*/true);
+            i.fhe->level_hint(x, i.fhe->level_headroom(1));   // ceiling-relative: hardcoded 23 confiscated the +1 level at ceiling 25
             x =  linear(i, x, "down", i.size.expDim, i.size.hidDim,
                          /*stream_pt=*/is_cachemir_filling(i.packing)); }, "down_linear" },
     };
@@ -42,7 +45,7 @@ std::vector<Op> mlp_tiled_ops(int n_tiles) {
 
     ops.push_back({ {}, [prep, have_acc](Inference& i, PackedCtx& x) {
         i.name_graph_ct_if_absent(x, "mlp_block.x");
-        i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 3);
+        i.fhe->bootstrap_hint(x, i.fhe->level_headroom(3));
         *prep = prepare_linear_input(i, x, i.size.hidDim, i.size.hidDim);
         *have_acc = false; }, "up_linear" });
 
@@ -57,9 +60,13 @@ std::vector<Op> mlp_tiled_ops(int n_tiles) {
 
         ops.push_back({ {}, [cur](Inference& i, PackedCtx& /*x*/) {
             i.mlp_tile_dim = i.size.hidDim;          // gelu half-mask -> square layout
+            // Tiled: the tile stays in the square (hidDim) layout, so the token mask is
+            // the live-lane set for this elementwise region. Capture-only, as above.
+            CKKSContext::LiveLaneScope _ll(
+                *i.fhe, i.graph_capture_enabled() ? i.live_lane_mask_token() : nullptr);
             *cur = gelu_approx(i, *cur, "mlp.act");
             i.mlp_tile_dim = 0;
-            i.fhe->bootstrap_hint(*cur, i.fhe->level_limit() - 3); }, "gelu" });
+            i.fhe->bootstrap_hint(*cur, i.fhe->level_headroom(3)); }, "gelu" });
 
         ops.push_back({ {}, [dn, cur, acc, have_acc](Inference& i, PackedCtx& /*x*/) {
             PackedCtx part = linear(i, *cur, dn, i.size.hidDim, i.size.hidDim,
@@ -69,14 +76,12 @@ std::vector<Op> mlp_tiled_ops(int n_tiles) {
     }
 
     ops.push_back({ {}, [acc](Inference& i, PackedCtx& x) {
-        i.fhe->tp_probe("down_pre_bias", acc->ct);
         auto bit = i.w.find("down_bias");
         if (bit != i.w.end() && !bit->second.empty()) {
             Ptx pb = i.encode_additive_like(i.scoped("down_bias"), *acc,
                                             [&]{ return bit->second[0]->GetRealPackedValue(); });
             i.fhe->inplace_add(*acc, pb);
         }
-        i.fhe->tp_probe("down_post_bias", acc->ct);
         x = std::move(*acc); }, "down_linear" });
 
     return ops;

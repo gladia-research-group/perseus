@@ -1,44 +1,44 @@
 __pycache__/
-
-deps/
-logs/
-build/
-build2/
-weights*/
-input_data/*
-test_vectors/
-logs_backup/
-test_vectors_*/
-_backup/
-paper-fhe-library/
-docs/
-
-*.slurm
-
+*.egg-info/
+*pyc
 .venv/
 .claude/
-docs/
-level_margin_probe/
-
-*.csv
-*.json
 *.python-version
 *lock
-*pyc
-weights.bin.zip
-.cache/
-build_*/
+!uv.lock
+
+# build trees and dependency checkouts (both are chain-suffixed: deps_n32, build_py_n64)
+build/
 build-*/
-_deps/
+build_*/
 deps/
-kv_sandbox/
-deps_backup_*/
-logs/
+deps_n*/
+_deps/
+Testing/
 *.o
 *.so*
 *.bak*
-__pycache__/
+# vendored toolchain for a machine without system cmake/NCCL headers
+.local_deps
 
-archive/
-Testing/
-build-py/
+# run products
+logs/
+.cache/
+weights*/
+weights.bin.zip
+notebooks/*_executed.ipynb
+notebooks/*.error.txt
+
+# generated assets under docs/ are local; the documentation itself is tracked
+docs/*
+!docs/*.md
+
+# JSON is a run product by default; the tracked exceptions are the artifacts the paper needs
+*.csv
+*.json
+!perseus/**/*.json
+!tests/fixtures/**/*.json
+!bootstrap_placements/**/*.json
+!graphs/**/*.json
+# scratch plan directories from an A/B are named with a leading underscore
+bootstrap_placements/_*/

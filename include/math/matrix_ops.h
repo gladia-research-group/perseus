@@ -1,8 +1,5 @@
 #pragma once
 
-// Host-side (plaintext) vector/matrix helpers used when preparing weights for
-// encoding: padding, slicing, transpose, row scaling. No CKKS/CUDA dependency.
-
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -85,16 +82,6 @@ inline std::vector<std::vector<double>> mat_scale_rows(
         for (int j = 0; j < c; ++j) out[i][j] = W[i][j] * scale[i];
     return out;
 }
-
-inline std::vector<double> matmul_vec_mat(const std::vector<double>& x,
-                                          const std::vector<std::vector<double>>& W) {
-    int d_in = (int)x.size(), d_out = (int)W[0].size();
-    std::vector<double> y(d_out, 0.0);
-    for (int j = 0; j < d_out; ++j)
-        for (int i = 0; i < d_in; ++i) y[j] += x[i] * W[i][j];
-    return y;
-}
-
 inline std::string shape_str(int r, int c) {
     return std::to_string(r) + "x" + std::to_string(c);
 }

@@ -9,7 +9,4 @@ namespace cachemir {
 
 std::vector<int32_t> compute_gpt2_rot_indices(
     int slots, int hidDim, int ffDim, int numHeads);
-
-std::vector<int32_t> linear_rot_indices(int N, int d_in, int d_out);
-
 }  // namespace cachemir

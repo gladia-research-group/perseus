@@ -5,6 +5,7 @@
 #include "op_sequence.h"          // Op / run_ops — a block is just an Op
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -15,30 +16,22 @@
 #include <vector>
 
 struct EncodedBlock {
-    std::string prefix;   // per-block cache scope from the model naming
+    std::string prefix;
     std::unordered_map<std::string, std::vector<Ptx>> w;
     std::unordered_map<std::string, std::vector<std::vector<double>>> raw_w;
     std::unordered_map<std::string, NormConfig> norm_cfg;
     std::unordered_map<std::string, SoftmaxConfig> sm_cfg;
     std::unordered_map<std::string, GeLUConfig> gelu_cfg;
-    BootstrapPlan plan;   // per-block bootstrap placement (parsed once; install copies it live)
-
-    // Worker-side speculative mask pre-encodes (prefill loader): (scoped tag, level, pt),
-    // merged into inf.enc_cache at install (main thread). Always empty on the decode path.
+    BootstrapPlan plan;
     std::vector<std::tuple<std::string, uint32_t, Ptx>> staged_masks;
+
+    int stage_owner = -1;
 };
 
 void load_block_to_device(Inference& inf, EncodedBlock& blk, cudaStream_t stream);
 void cpu_extract_block(Inference& inf, EncodedBlock& blk);
 void evict_block_from_device(Inference& inf, EncodedBlock& blk);
 
-// Worker-side pinned staging (filling-packing loaders: ViT encoder, GPT-2 prefill) — the body's
-// per-mult/chunked loads become cheap async H2D enqueues from pinned memory instead of a ~1 ms
-// serial extract+pageable upload each. Protocol, all on the residency worker:
-//   1. loader wrap: inf.begin_stage_block()  (ONE ping-pong flip per block, BEFORE the encode)
-//   2. inf.pt_stage_hook = stage_plaintexts  → each family staged (+ originals freed under
-//      FHE_STAGE_RELEASE_CPU) as it is encoded — host peak = one family, not a block
-//   3. loader wrap: stage_block_weights(...) → sweep leftovers + malloc_trim
 void stage_plaintexts(Inference& inf, std::vector<Ptx>& pts, int n_threads);
 void stage_block_weights(Inference& inf, EncodedBlock& blk, int n_threads);
 
@@ -89,10 +82,20 @@ Op cached_block_op(std::vector<EncodedBlock>& blocks, int b, int n_blocks,
     Op op;
     op.label   = "block";
     if (!stream_inner) {
+        // Worker thread extracts the block's plaintexts into the staging arena
+        // (prefetch_cpu); the main thread then uploads them (acquire).
         op.acquire = [&blocks, b](Inference& i, cudaStream_t s) { load_block_to_device(i, blocks[b], s); };
         op.prefetch_cpu = [&blocks, b](Inference& i) { cpu_extract_block(i, blocks[b]); };
     }
     op.install = [&blocks, b](Inference& i) { install_block_state_copy(i, blocks[b]); };
+
+    // Circular staging: each block owns its staging half so the worker can
+    // extract block b+1 while block b runs; the release happens after the op.
+    if (!stream_inner) {
+        op.stage_owner = b; blocks[b].stage_owner = b;
+    } else {
+        blocks[b].stage_owner = -1;
+    }
     op.prefetch_next = !stream_inner;   // nothing to prefetch at block level when inner streams
     op.fwd     = [b, n_blocks, label, &body](Inference& i, PackedCtx& x) {
         log_block(b, n_blocks, label);
@@ -109,6 +112,7 @@ PackedCtx run_cached_blocks(Inference& inf, PackedCtx x,
                             BlockBody body, BlockRelease release = {}) {
     const int n = static_cast<int>(blocks.size());
     if (n <= 0) return x;
+
     for (auto& blk : blocks) evict_block_from_device(inf, blk);
 
     const bool stream_inner = streams_within_block(inf.weight_granularity);
@@ -121,7 +125,7 @@ PackedCtx run_cached_blocks(Inference& inf, PackedCtx x,
     for (int b = 0; b < n; ++b)
         ops.push_back(cached_block_op(blocks, b, n, body, stream_inner, release, label));
     PackedCtx out = run_ops(inf, std::move(x), std::move(ops), /*stream_weights=*/false, ov);
-    inf.evict_enc_cache_device();
+    { WithStep _w(inf, "enc_cache_evict"); inf.evict_enc_cache_device(); }
     return out;
 }
 template <class BlockBody>
@@ -138,6 +142,7 @@ PackedCtx run_blocks(Inference& inf, PackedCtx x, int n_blocks,
     for (int b = 0; b < n_blocks; ++b)
         ops.push_back(encode_block_op(b, n_blocks, loader, body, release, label));
     PackedCtx out = run_ops(inf, std::move(x), std::move(ops), /*stream_weights=*/false, overlap_of(mode));
-    inf.evict_enc_cache_device();   // residency release of the token's transient mask device copies
+    // residency release of the token's transient mask device copies
+    { WithStep _w(inf, "enc_cache_evict"); inf.evict_enc_cache_device(); }
     return out;
 }

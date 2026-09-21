@@ -23,13 +23,10 @@ endfunction()
 
 enable_testing()
 
-# Top level = the PUBLISHED, self-contained paper reproduction only: the packing
-# table bench + its one helper (test_helpers.h). Everything else lives in dev/.
-file(GLOB CACHEMIR_TESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cu")
+# The packing-table bench (paper reproduction); the python tiers live in tests/*.py.
+file(GLOB CACHEMIR_TESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test_*.cu"
+                                           "${CMAKE_CURRENT_SOURCE_DIR}/bts_accuracy_sweep.cu")
 foreach(src ${CACHEMIR_TESTS})
     get_filename_component(name ${src} NAME_WE)
     add_cachemir_test(${name})
 endforeach()
-
-# Dev/experimental test suite (reuses add_cachemir_test above).
-add_subdirectory(dev)

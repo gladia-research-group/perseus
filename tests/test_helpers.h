@@ -168,10 +168,8 @@ inline bool probe_io_file(const std::string& path) {
 
 // Default checkpoint location for GPT-2 tests; overridable via WEIGHTS_PATH.
 inline std::string default_weights_path() {
-    return env_or(
-        "WEIGHTS_PATH",
-        "/leonardo_work/IscrC_eff-SAM2/azirilli/he-aware-training/"
-        "checkpoints/openai-community/gpt2/lm_eval/classic/weights.bin.zip");
+    return env_or("WEIGHTS_PATH",
+                  ".cache/models/openai-community/gpt2/classic/weights.bin.zip");
 }
 
 // Default bootstrap iterations for tests; overridable via BTS_ITERATIONS env var.
@@ -208,10 +206,8 @@ inline CKKSContextOptions default_ckks_options() {
 
 // Default calibrated approximation configs (configs.json); overridable via CONFIGS_PATH.
 inline std::string default_configs_path() {
-    return env_or(
-        "CONFIGS_PATH",
-        "/leonardo_work/IscrC_eff-SAM2/azirilli/he-aware-training/"
-        "configs/model/approximation/hybrid/configs.json");
+    return env_or("CONFIGS_PATH",
+                  "configs/model/approximation/gpt2_base_n32/configs.json");
 }
 
 // Per-block bts placement plans from FHE_BOOTSTRAP_PLACEMENTS_DIR (empty = eager mode).
@@ -227,8 +223,7 @@ inline BlockPlans default_block_plans(int n_blocks) {
 // Default ground-truth IO directory (data/<subdir>); overridable via `env_key`.
 inline std::string default_io_dir(const char* env_key,
                                   const std::string& subdir) {
-    return env_or(env_key,
-        "/leonardo/pub/userexternal/azirilli/he-aware-training_data/" + subdir);
+    return env_or(env_key, ".cache/oracle/gpt2/" + subdir);
 }
 
 inline std::vector<double> decrypt_slots(CKKSContext& fhe, const Ctx& ct) {

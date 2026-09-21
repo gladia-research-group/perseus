@@ -1,0 +1,239 @@
+From 41401c19441568c28efeea5a8f6007600d2ff830 Mon Sep 17 00:00:00 2001
+From: dev <dev@perseus>
+Date: Sat, 25 Jul 2026 11:30:00 +0200
+Subject: [PATCH 06/12] NATIVEINT=32: fix bootstrap DFT encoding, composite
+ scaling factor lookup, sparse-encapsulated composite raise
+
+Three fixes that together make CKKS bootstrapping work at NATIVEINT=32, via composite
+scaling. All three were validated on the CPU alone, against the same symptom the GPU
+shows without them: all-NaN output, logstd=inf.
+
+1) FHECKKSRNS::FitToNativeVector (int64 overload) had no NATIVEINT == 32 branch.
+
+   The exact twin of the CKKSPackedEncoding::FitToNativeVector defect already fixed by this
+   patch series, and it was missed. MakeAuxPlaintext hands it int64_t coefficients in
+   [0, Max64BitValue()) with negatives stored as bigBound + x; with NativeInteger = uint32_t,
+   NativeInteger(vec[i]), bigValueHf = bigBound >> 1 and diff = bigBound - modulus all
+   truncate, so every coefficient gets a garbage CRT residue. This overload encodes EVERY
+   bootstrap DFT plaintext (the CoeffsToSlots / SlotsToCoeffs matrices), so the homomorphic
+   DFT was garbage even though the encoder-side twin was already correct.
+
+   Measured effect: bootstrap output goes from all-NaN (2048/2048 non-finite) to finite --
+   matching what a NATIVEINT=64 build produces on the same chain. The residual error is then
+   a parameter-regime limit, not a bug (below), so this alone does not fix the 27-bit chain.
+
+2) MakeAuxPlaintext's mixed-size-chain scale adjustment (from the mixedlimb patch) breaks
+   COMPOSITESCALING*.
+
+   COMPOSITESCALING* deliberately stores a SENTINEL 1 in m_scalingFactorsReal at every level
+   index that is not a multiple of compositeDegree (ckksrns-cryptoparameters.cpp, the
+   "else m_scalingFactorsReal[k] = 1" arm). The boundary formula
+       boundary = sf[level+1] * qDrop / sf[level]
+   reads that sentinel and collapses scFact to qDrop/sf[level] -- measured 2^-27 on a
+   2x27-bit composite chain -- killing bootstrap setup with "Scaling factor too small".
+   Composite chains are uniform by construction, so the mixed-size adjustment simply does
+   not apply; skip it there. Uniform and mixed FLEXIBLE* chains are bit-identical to before.
+
+3) SPARSE_ENCAPSULATED + COMPOSITESCALING: supported instead of rejected.
+
+   Upstream rejects the combination in gen-cryptocontext-params-validation.cpp. The blocker
+   is that KeySwitchGenSparse/KeySwitchSparse are a single-tower (q0, p) fast path: the
+   composite bottom level has compositeDegree towers whose integer representative lives mod
+   q0*...*q_{d-1}, so the per-tower SwitchModulus extension is not even well-defined there
+   -- and KeySwitchSparse returns a 1-tower ciphertext that the composite ExtendCiphertext
+   then over-reads (GetElementAtIndex(j), j < d) => segfault.
+
+   Fix: on composite chains generate the M-4 encapsulation key with the standard
+   algo->KeySwitchGen(dense -> sparse) and apply both directions with the standard hybrid
+   keyswitch around ExtendCiphertext -- exactly how the M-2 (sparse -> dense) direction has
+   always worked. The single-prime KeySwitchSparse fast path is untouched for d == 1.
+
+WHY THIS MATTERS (the parameter wall): CKKS bootstrapping needs a scaling factor of roughly
+42+ bits. Measured on a NATIVEINT=64 build, sweeping prime size with everything else fixed
+(logN=12, budget 4:3, SPARSE_ENCAPSULATED):
+
+    scale bits   27      30     34     38     42      46       50       53
+    err_max      13685   51.6   3.02   15.6   0.022   7.7e-4   8.8e-5   9.3e-6
+
+NATIVEINT=32 caps primes at 28 bits (MAX_MODULUS_SIZE), so a single-prime-per-level 32-bit
+chain CANNOT bootstrap -- arithmetic, not a code defect (a 64-bit build fails identically on
+a 27-bit chain; correction factor 1..13, secret dist, scaling technique, level budget, depth
+and big-q0/small-delta were all swept and eliminated). COMPOSITESCALING is the way out, and
+is exactly what (2) and (3) unblock. Validated results, NATIVEINT=32 build, logN=12,
+COMPOSITESCALINGMANUAL compositeDegree=2, 2x27-bit primes (effective 54-bit scale),
+budget 4:3, encode level = sizeQ - 2*d:
+
+    UNIFORM_TERNARY       -> 0/2048 non-finite, err_max 5.6e-4  = 10.8 bits
+    SPARSE_ENCAPSULATED   -> 0/2048 non-finite, err_max 1.6e-6  = 19.2 bits
+
+The sparse-encapsulated composite bootstrap EXCEEDS the NATIVEINT=64 single-prime baseline
+at the same ring size (17.8 bits): the raise under an h=32 secret lets EvalMod use the
+K=16 sparse coefficient set, and it exits with more towers (42 vs 34).
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp    | 97 +++++++++++++++++--
+ .../gen-cryptocontext-params-validation.cpp   |  7 +-
+ 2 files changed, 92 insertions(+), 12 deletions(-)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index 5f587f68..02f3df74 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -1345,7 +1345,18 @@ std::shared_ptr<std::map<uint32_t, EvalKey<DCRTPoly>>> FHECKKSRNS::EvalBootstrap
+ 
+         // we reserve M-4 and M-2 for the sparse encapsulation switching keys
+         // Even autorphism indices are not possible, so there will not be any conflict
+-        (*evalKeys)[M - 4] = KeySwitchGenSparse(privateKey, skNew);
++        //
++        // COMPOSITESCALING: KeySwitchGenSparse/KeySwitchSparse are a single-tower (q0, p)
++        // fast path — the composite bottom level has compositeDegree towers, whose integer
++        // representative lives mod q0*...*q_{d-1}, so the per-tower SwitchModulus extension
++        // is not even well-defined there (and KeySwitchSparse returns a 1-tower ciphertext
++        // that ExtendCiphertext then over-reads => segfault). Use the standard hybrid
++        // keyswitch machinery for the dense->sparse direction instead, exactly like the
++        // sparse->dense direction below always has; it works at any tower count.
++        if (cryptoParams->GetCompositeDegree() > 1)
++            (*evalKeys)[M - 4] = algo->KeySwitchGen(privateKey, skNew);
++        else
++            (*evalKeys)[M - 4] = KeySwitchGenSparse(privateKey, skNew);
+         (*evalKeys)[M - 2] = algo->KeySwitchGen(skNew, privateKey);
+     }
+ 
+@@ -1654,10 +1665,30 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+ 
+     uint32_t N = cc->GetRingDimension();
+     if (compositeDegree > 1) {
+-        // RNS basis extension from level 0 RNS limbs to the raised RNS basis
+-        auto& ctxtDCRT = raised->GetElements();
+-        ExtendCiphertext(ctxtDCRT, *cc, elementParamsRaisedPtr);
+-        raised->SetLevel(L0 - ctxtDCRT[0].GetNumOfElements());
++        if (cryptoParams->GetSecretKeyDist() == SPARSE_ENCAPSULATED) {
++            // Sparse encapsulation around the composite raise. The single-tower
++            // KeySwitchSparse fast path cannot represent a d-tower bottom level, so both
++            // directions use the standard hybrid keyswitch (the M-4 key is generated with
++            // algo->KeySwitchGen in EvalBootstrapKeyGen for composite chains).
++            auto evalKeyMap = cc->GetEvalAutomorphismKeyMap(raised->GetKeyTag());
++
++            // transform from a denser secret to a sparser one
++            algo->KeySwitchInPlace(raised, evalKeyMap.at(2 * N - 4));
++
++            // RNS basis extension from level 0 RNS limbs to the raised RNS basis
++            auto& ctxtDCRT = raised->GetElements();
++            ExtendCiphertext(ctxtDCRT, *cc, elementParamsRaisedPtr);
++            raised->SetLevel(L0 - ctxtDCRT[0].GetNumOfElements());
++
++            // go back to a denser secret
++            algo->KeySwitchInPlace(raised, evalKeyMap.at(2 * N - 2));
++        }
++        else {
++            // RNS basis extension from level 0 RNS limbs to the raised RNS basis
++            auto& ctxtDCRT = raised->GetElements();
++            ExtendCiphertext(ctxtDCRT, *cc, elementParamsRaisedPtr);
++            raised->SetLevel(L0 - ctxtDCRT[0].GetNumOfElements());
++        }
+     }
+     else {
+         if (cryptoParams->GetSecretKeyDist() == SPARSE_ENCAPSULATED) {
+@@ -3259,9 +3290,19 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+     // in a mixed-size chain it absorbs the segment-boundary scale jumps.
+     double scFact = cryptoParams->GetScalingFactorReal(level);
+     {
++        const auto scalTech = cryptoParams->GetScalingTechnique();
++        // COMPOSITESCALING* stores a SENTINEL 1 in m_scalingFactorsReal at every level index
++        // that is not a multiple of compositeDegree (ckksrns-cryptoparameters.cpp, the
++        // "else m_scalingFactorsReal[k] = 1" arm). The mixed-chain boundary formula below
++        // reads sf[level+1] and would pick up that sentinel, collapsing scFact to
++        // q_drop/sf[level] (= 2^-27 on a 2x27-bit composite chain) and killing every
++        // bootstrap DFT plaintext with "Scaling factor too small". Composite chains are
++        // uniform by construction, so the mixed-size adjustment does not apply to them.
++        const bool isComposite =
++            (scalTech == COMPOSITESCALINGAUTO || scalTech == COMPOSITESCALINGMANUAL);
+         uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size() -
+-                        (cryptoParams->GetScalingTechnique() == FLEXIBLEAUTOEXT);
+-        if (level + 1 < numQ) {
++                        (scalTech == FLEXIBLEAUTOEXT);
++        if (!isComposite && level + 1 < numQ) {
+             double qDrop    = cryptoParams->GetModReduceFactor(numQ - 1 - level);
+             double boundary = cryptoParams->GetScalingFactorReal(level + 1) * qDrop / scFact;
+             // keep the original value (bit-identical) inside uniform segments; the
+@@ -3422,9 +3463,19 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+     // in a mixed-size chain it absorbs the segment-boundary scale jumps.
+     double scFact = cryptoParams->GetScalingFactorReal(level);
+     {
++        const auto scalTech = cryptoParams->GetScalingTechnique();
++        // COMPOSITESCALING* stores a SENTINEL 1 in m_scalingFactorsReal at every level index
++        // that is not a multiple of compositeDegree (ckksrns-cryptoparameters.cpp, the
++        // "else m_scalingFactorsReal[k] = 1" arm). The mixed-chain boundary formula below
++        // reads sf[level+1] and would pick up that sentinel, collapsing scFact to
++        // q_drop/sf[level] (= 2^-27 on a 2x27-bit composite chain) and killing every
++        // bootstrap DFT plaintext with "Scaling factor too small". Composite chains are
++        // uniform by construction, so the mixed-size adjustment does not apply to them.
++        const bool isComposite =
++            (scalTech == COMPOSITESCALINGAUTO || scalTech == COMPOSITESCALINGMANUAL);
+         uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size() -
+-                        (cryptoParams->GetScalingTechnique() == FLEXIBLEAUTOEXT);
+-        if (level + 1 < numQ) {
++                        (scalTech == FLEXIBLEAUTOEXT);
++        if (!isComposite && level + 1 < numQ) {
+             double qDrop    = cryptoParams->GetModReduceFactor(numQ - 1 - level);
+             double boundary = cryptoParams->GetScalingFactorReal(level + 1) * qDrop / scFact;
+             // keep the original value (bit-identical) inside uniform segments; the
+@@ -3690,6 +3741,33 @@ void FHECKKSRNS::FitToNativeVector(uint32_t ringDim, const std::vector<int64_t>&
+                                    NativeVector* nativeVec) const {
+     if (nativeVec == nullptr)
+         OPENFHE_THROW("The passed native vector is empty.");
++#if NATIVEINT == 32
++    // Exact twin of the CKKSPackedEncoding::FitToNativeVector fix: MakeAuxPlaintext hands us
++    // int64_t coefficients in [0, bigBound) with bigBound = Max64BitValue() ~ 2^63 (negatives
++    // stored as bigBound + x). With NativeInteger = uint32_t, NativeInteger(vec[i]),
++    // bigValueHf = bigBound >> 1 and diff = bigBound - modulus all truncate, so every
++    // coefficient gets a garbage CRT residue. This overload encodes the bootstrap DFT
++    // matrices (CoeffsToSlots / SlotsToCoeffs), so leaving it unfixed makes every bootstrap
++    // linear transform garbage even when the encoder twin is correct.
++    // Do the sign split and the reduction in 64-bit arithmetic; narrow only at the store.
++    const int64_t bigValueHf = bigBound >> 1;
++    const uint64_t modulus   = nativeVec->GetModulus().ConvertToInt();
++    const uint32_t dslots    = vec.size();
++    const uint32_t gap       = ringDim / dslots;
++    for (uint32_t i = 0; i < vec.size(); i++) {
++        const int64_t val = vec[i];
++        uint64_t reduced;
++        if (val > bigValueHf) {
++            // val encodes the negative value (val - bigBound); reduce its magnitude and negate.
++            const uint64_t mag = static_cast<uint64_t>(bigBound - val) % modulus;
++            reduced            = (mag == 0) ? 0 : (modulus - mag);
++        }
++        else {
++            reduced = static_cast<uint64_t>(val) % modulus;
++        }
++        (*nativeVec)[gap * i] = NativeInteger(static_cast<uint32_t>(reduced));
++    }
++#else
+     NativeInteger bigValueHf(bigBound >> 1);
+     NativeInteger modulus(nativeVec->GetModulus());
+     NativeInteger diff = bigBound - modulus;
+@@ -3704,6 +3782,7 @@ void FHECKKSRNS::FitToNativeVector(uint32_t ringDim, const std::vector<int64_t>&
+             (*nativeVec)[gap * i] = n.Mod(modulus);
+         }
+     }
++#endif
+ }
+ 
+ #if NATIVEINT == 128
+diff --git a/src/pke/lib/scheme/gen-cryptocontext-params-validation.cpp b/src/pke/lib/scheme/gen-cryptocontext-params-validation.cpp
+index 13f929b8..f5c42c16 100644
+--- a/src/pke/lib/scheme/gen-cryptocontext-params-validation.cpp
++++ b/src/pke/lib/scheme/gen-cryptocontext-params-validation.cpp
+@@ -64,9 +64,10 @@ void validateParametersForCryptocontext(const Params& parameters) {
+                 OPENFHE_THROW("scalingModSize should be greater than 15 and less than " +
+                               std::to_string(COMPOSITESCALING_MAX_MODULUS_SIZE));
+             }
+-            if (SPARSE_ENCAPSULATED == parameters.GetSecretKeyDist()) {
+-                OPENFHE_THROW("SPARSE_ENCAPSULATED not yet supported with COMPOSITESCALING");
+-            }
++            // SPARSE_ENCAPSULATED + COMPOSITESCALING is supported: the encapsulation
++            // switches use the standard hybrid keyswitch on composite chains (see
++            // FHECKKSRNS::EvalBootstrapKeyGen / EvalBootstrap). Re-arm this guard if that
++            // wiring is ever reverted.
+         }
+         else {
+             if (MAX_MODULUS_SIZE <= parameters.GetScalingModSize() || 15 > parameters.GetScalingModSize()) {

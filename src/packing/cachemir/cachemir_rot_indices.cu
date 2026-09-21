@@ -68,13 +68,6 @@ static void collect_mha_rots(std::set<int32_t>& rots, int N, int hidDim, int num
     for (int step = 1; step < t; step *= 2)
         rots.insert(step);
 }
-
-std::vector<int32_t> linear_rot_indices(int N, int d_in, int d_out) {
-    std::set<int32_t> rots;
-    collect_linear_rots(rots, N, d_in, d_out);
-    return std::vector<int32_t>(rots.begin(), rots.end());
-}
-
 std::vector<int32_t> compute_gpt2_rot_indices(
     int slots, int hidDim, int ffDim, int numHeads) {
     std::set<int32_t> rots;

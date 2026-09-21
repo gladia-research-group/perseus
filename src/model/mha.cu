@@ -13,8 +13,8 @@ std::vector<Op> mha_ops() {
         { {}, [](Inference& i, PackedCtx& x) {
             const int d = i.size.hidDim;
             i.name_graph_ct_if_absent(x, "mha_block.x");
-            i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 1, /*account_pending_rescale=*/true);
-            i.fhe->level_hint(x, i.fhe->level_limit() - 1);
+            i.fhe->bootstrap_hint(x, i.fhe->level_headroom(1), /*account_pending_rescale=*/true);
+            i.fhe->level_hint(x, i.fhe->level_headroom(1));
             if (i.complex) {
                 auto qv = linear_multi(i, x, {"kv", "q"}, d, d,
                                        /*stream_pt=*/is_cachemir_filling(i.packing));
@@ -27,13 +27,13 @@ std::vector<Op> mha_ops() {
                 x = qkv[2];
             } }, "qkv" },
         { {}, [](Inference& i, PackedCtx& x) {
-            i.fhe->level_hint(x, i.fhe->level_limit() - 3);   // ceiling-relative (was 21 = 24-3)
+            i.fhe->level_hint(x, i.fhe->level_headroom(3));   // ceiling-relative (was 21 = 24-3)
             std::vector<PackedCtx> scores = qkt(i, x);
             scores = attention_softmax_thor(i, std::move(scores), "attn");
             x = softmax_v(i, std::move(scores)); }, "attn_core" },
         { {}, [](Inference& i, PackedCtx& x) {
-            i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 1, /*account_pending_rescale=*/true);
-            i.fhe->level_hint(x, i.fhe->level_limit() - 1);
+            i.fhe->bootstrap_hint(x, i.fhe->level_headroom(1), /*account_pending_rescale=*/true);
+            i.fhe->level_hint(x, i.fhe->level_headroom(1));
             x = linear(i, x, "out", i.size.hidDim, i.size.hidDim,
                        /*stream_pt=*/is_cachemir_filling(i.packing)); }, "out_proj" },
     };
@@ -43,16 +43,16 @@ std::vector<Op> mha_ops_token_pair() {
     return {
         { {}, [](Inference& i, PackedCtx& x) {
             i.name_graph_ct_if_absent(x, "mha_block.x");
-            i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 1, /*account_pending_rescale=*/true);
-            i.fhe->level_hint(x, i.fhe->level_limit() - 1);
+            i.fhe->bootstrap_hint(x, i.fhe->level_headroom(1), /*account_pending_rescale=*/true);
+            i.fhe->level_hint(x, i.fhe->level_headroom(1));
             cachemir_filling::mha_qkv_token_pair(i, x); }, "qkv" },
         { {}, [](Inference& i, PackedCtx& x) {
             x = cachemir_filling::delta_block_enabled()
                     ? cachemir_filling::mha_attn_token_pair_delta(i, x)
                     : mha_attn_token_pair(i, x); }, "attn_core" },
         { {}, [](Inference& i, PackedCtx& x) {
-            i.fhe->bootstrap_hint(x, i.fhe->level_limit() - 1, /*account_pending_rescale=*/true);
-            i.fhe->level_hint(x, i.fhe->level_limit() - 1);
+            i.fhe->bootstrap_hint(x, i.fhe->level_headroom(1), /*account_pending_rescale=*/true);
+            i.fhe->level_hint(x, i.fhe->level_headroom(1));
             x = linear(i, x, "out", i.size.hidDim, i.size.hidDim,
                        /*stream_pt=*/is_cachemir_filling(i.packing)); }, "out_proj" },
     };

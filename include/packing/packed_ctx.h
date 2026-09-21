@@ -1,22 +1,15 @@
 #pragma once
 
 #include "ckks_types.h"
+#include "packing/pack_tag.h"
 
 #include <stdexcept>
 #include <string>
 
-// A PackedCtx pairs a raw OpenFHE Ciphertext with a Packing tag describing
-// how its slots map to logical tensor coordinates.
-//
-// Adding a new packing family:
-//   1) add an entry to PackingKind (and to_string / parse_packing_kind);
-//   2) implement the family-namespaced algorithms (cachemir::, diagonal::, …);
-//   3) extend the dispatchers (linear.cu, attention.cu, norm.cu, …) with an
-//      `is_<kind>(packing)` branch.
 
 enum class PackingKind {
-    Cachemir,         // single-token decoding: lanes carry replicated-token diagonal bundles
-    Diagonal,         // multi-token batched: lanes carry independent tokens
+    Cachemir,         // single-token decoding, lanes carry replicated-token diagonal bundles
+    Diagonal,         // multi-token batched, lanes carry independent tokens
     CachemirFilling,  // batched prefill that fills the cachemir KV-cache layout;
                       // shares the token-in-lane (diagonal) linear, diverges at cache/attention
     CachemirComplex,  // same slot layout as Cachemir, but linears carry complex (W_re + i*W_im)
@@ -59,6 +52,7 @@ struct Packing {
 struct PackedCtx {
     Ctx     ct;
     Packing packing;
+    packtag::PackTag tag{};
 };
 
 inline void assert_same_packing(const Packing& a, const Packing& b) {

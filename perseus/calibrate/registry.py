@@ -1,29 +1,8 @@
-"""The approximation registry — the framework's extension point.
-
-An `Approximation` bundles everything the engine needs to support one
-FHE-approximable operation kind:
-
-    matches(module)      site detector over the model's module tree
-    make_collector(cfg)  one collector per kind; hooks its sites, gathers samples
-    fit_section(...)     collected samples -> one configs.json section
-
-A model is calibratable iff every nonlinearity it contains is matched by a
-registered approximation — `discovery.discover` enforces that and reports
-precisely what is missing otherwise. Registering a new `Approximation` is all
-it takes to support a new op kind; the engine, discovery, and CLI never change.
-
-A registered kind PARTICIPATES in a run iff the selected approximation set
-(`configs/approximation/*.yaml`) contains a subtree named after it; the `cfg`
-handed to `make_collector` / `fit_section` is that subtree, nothing else.
-
-Model-level approximations (`model_level=True`, e.g. the cutmax argmax
-schedule) attach to the model's outputs instead of matched sites.
-"""
-
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch.nn as nn
 

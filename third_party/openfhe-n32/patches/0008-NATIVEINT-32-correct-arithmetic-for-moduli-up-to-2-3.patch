@@ -1,0 +1,128 @@
+From 847a05f116e52665b5b9417b70b6a6438eae7d1e Mon Sep 17 00:00:00 2001
+From: dev <dev@perseus>
+Date: Sat, 1 Aug 2026 12:16:39 +0200
+Subject: [PATCH 08/12] NATIVEINT=32: correct arithmetic for moduli up to 2^31
+ (wide-prime chains)
+
+MAX_MODULUS_SIZE 28 -> 31. The 28-bit cap existed because the Dhem-Barrett
+mu = 2^(2k+3)/m must fit one word; the Shoup ModMulFastConst path further
+requires m < 2^30. Both now carry runtime-gated exact 64-bit fallbacks
+(m >= 2^28 for the mu paths via ModMu/ModMul*/ModMulFast*, m >= 2^30 for
+the Shoup pair), so any m < 2^31 is correct while chains of <= 28-bit
+primes keep the fast paths bit-identically.
+---
+ src/core/include/math/hal/basicint.h        |  7 +++-
+ src/core/include/math/hal/intnat/ubintnat.h | 40 +++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/include/math/hal/basicint.h b/src/core/include/math/hal/basicint.h
+index 0332e354..8a1b6621 100644
+--- a/src/core/include/math/hal/basicint.h
++++ b/src/core/include/math/hal/basicint.h
+@@ -58,7 +58,12 @@
+         using int128_t        = int64_t;
+     #endif
+ #elif NATIVEINT == 32
+-    #define MAX_MODULUS_SIZE 28
++    // 31 (was 28): the 25-30-bit prime system needs moduli that
++    // straddle 2^30 (all < 2^31). 28 was the widest size whose Barrett constant
++    // mu = 2^(2k+3)/m still fits a 32-bit word; ubintnat.h now carries exact
++    // 64-bit fallbacks (runtime-gated on m >= 2^28 / 2^30) for the mu-Barrett
++    // and Shoup paths, so any m < 2^31 is arithmetically correct.
++    #define MAX_MODULUS_SIZE 31
+     using BasicInteger    = uint32_t;
+     using DoubleNativeInt = uint64_t;
+     using uint128_t       = uint64_t;
+diff --git a/src/core/include/math/hal/intnat/ubintnat.h b/src/core/include/math/hal/intnat/ubintnat.h
+index 31a55412..2d5f403b 100644
+--- a/src/core/include/math/hal/intnat/ubintnat.h
++++ b/src/core/include/math/hal/intnat/ubintnat.h
+@@ -1125,6 +1125,11 @@ public:
+     template <typename T = NativeInt>
+     NativeIntegerT ModMul(const NativeIntegerT& b, const NativeIntegerT& modulus, const NativeIntegerT& mu,
+                           typename std::enable_if_t<!std::is_same_v<T, DNativeInt>, bool> = true) const {
++        if constexpr (sizeof(NativeInt) == 4) {  // wide modulus: mu is void, reduce exactly
++            if (modulus.m_value >> 28)
++                return {static_cast<DNativeInt>(m_value % modulus.m_value) * (b.m_value % modulus.m_value) %
++                        modulus.m_value};
++        }
+ #ifdef NATIVEINT_BARRET_MOD
+         auto av{*this};
+         auto& mv{modulus.m_value};
+@@ -1192,6 +1197,13 @@ public:
+     template <typename T = NativeInt>
+     NativeIntegerT& ModMulEq(const NativeIntegerT& b, const NativeIntegerT& modulus, const NativeIntegerT& mu,
+                              typename std::enable_if_t<!std::is_same_v<T, DNativeInt>, bool> = true) {
++        if constexpr (sizeof(NativeInt) == 4) {  // wide modulus: mu is void, reduce exactly
++            if (modulus.m_value >> 28) {
++                m_value = static_cast<NativeInt>(static_cast<DNativeInt>(m_value % modulus.m_value) *
++                                                 (b.m_value % modulus.m_value) % modulus.m_value);
++                return *this;
++            }
++        }
+ #ifdef NATIVEINT_BARRET_MOD
+         auto av{*this};
+         auto bv{b};
+@@ -1347,6 +1359,10 @@ public:
+     template <typename T = NativeInt>
+     NativeIntegerT ModMulFast(const NativeIntegerT& b, const NativeIntegerT& modulus, const NativeIntegerT& mu,
+                               typename std::enable_if_t<!std::is_same_v<T, DNativeInt>, bool> = true) const {
++        if constexpr (sizeof(NativeInt) == 4) {  // wide modulus: mu is void, reduce exactly
++            if (modulus.m_value >> 28)
++                return {static_cast<DNativeInt>(m_value) * b.m_value % modulus.m_value};
++        }
+         int64_t n = modulus.GetMSB() - 2;
+         auto& mv{modulus.m_value};
+         typeD tmp;
+@@ -1388,6 +1404,12 @@ public:
+     template <typename T = NativeInt>
+     NativeIntegerT& ModMulFastEq(const NativeIntegerT& b, const NativeIntegerT& modulus, const NativeIntegerT& mu,
+                                  typename std::enable_if_t<!std::is_same_v<T, DNativeInt>, bool> = true) {
++        if constexpr (sizeof(NativeInt) == 4) {  // wide modulus: mu is void, reduce exactly
++            if (modulus.m_value >> 28) {
++                m_value = static_cast<NativeInt>(static_cast<DNativeInt>(m_value) * b.m_value % modulus.m_value);
++                return *this;
++            }
++        }
+         typeD tmp;
+         MultD(m_value, b.m_value, tmp);
+         auto rv{GetD(tmp)};
+@@ -1463,6 +1485,10 @@ public:
+    */
+     NativeIntegerT ModMulFastConst(const NativeIntegerT& b, const NativeIntegerT& modulus,
+                                    const NativeIntegerT& bInv) const {
++        if constexpr (sizeof(NativeInt) == 4) {  // Shoup needs m < 2^30 on 32-bit words
++            if (modulus.m_value >> 30)
++                return {static_cast<DNativeInt>(m_value) * b.m_value % modulus.m_value};
++        }
+         NativeInt q = MultDHi(m_value, bInv.m_value) + 1;
+         auto yprime = static_cast<SignedNativeInt>(m_value * b.m_value - q * modulus.m_value);
+         return {yprime >= 0 ? yprime : yprime + modulus.m_value};
+@@ -1479,6 +1505,12 @@ public:
+    */
+     NativeIntegerT& ModMulFastConstEq(const NativeIntegerT& b, const NativeIntegerT& modulus,
+                                       const NativeIntegerT& bInv) {
++        if constexpr (sizeof(NativeInt) == 4) {  // Shoup needs m < 2^30 on 32-bit words
++            if (modulus.m_value >> 30) {
++                m_value = static_cast<NativeInt>(static_cast<DNativeInt>(m_value) * b.m_value % modulus.m_value);
++                return *this;
++            }
++        }
+         NativeInt q = MultDHi(m_value, bInv.m_value) + 1;
+         auto yprime = static_cast<SignedNativeInt>(m_value * b.m_value - q * modulus.m_value);
+         m_value     = static_cast<NativeInt>(yprime >= 0 ? yprime : yprime + modulus.m_value);
+@@ -2044,6 +2076,14 @@ private:
+     template <typename T = NativeInt>
+     static void ModMu(typeD& prod, NativeIntegerT& a, const T& mv, const T& mu, int64_t n,
+                       typename std::enable_if_t<!std::is_same_v<T, DNativeInt>, bool> = true) {
++        // 32-bit backend, wide modulus (>28 bits): mu = 2^(2k+3)/m no longer fits a
++        // word, so the Dhem-Barrett identity is void — reduce exactly instead.
++        if constexpr (sizeof(NativeInt) == 4) {
++            if (mv >> 28) {
++                a.m_value %= mv;
++                return;
++            }
++        }
+         prod = {0, a.m_value};
+         MultD(RShiftD(prod, n), mu, prod);
+         a.m_value -= static_cast<NativeInt>((GetD(prod) >> (n + 7)) * mv);

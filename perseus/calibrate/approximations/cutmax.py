@@ -17,10 +17,14 @@ searching over the plaintext runtime replica (`cutmax_sim`):
 Validation replays the measured bts envelopes at every noise site (see
 `cutmax_sim.noisy`) plus a hard-wall breach check per row.
 """
+import logging
+
 import numpy as np
 
 from perseus.calibrate.approximations import cutmax_sim as cs
 from perseus.calibrate.registry import Approximation, register
+
+log = logging.getLogger(__name__)
 
 
 def _calib_passes(s2, lo, hi, k, g, chord_ok, iters):
@@ -146,7 +150,7 @@ def fit_cutmax_section(rows, knobs):
                                   sum_band=emit_band)
         lines.append(f"{name}: {len(rows)-fails}/{len(rows)} "
                      f"min_mass={min(mass):.3f}")
-    print(f"[cutmax] T={len(sched)} passes={sum(e['passes'] for e in sched)} "
+    log.info(f"[cutmax] T={len(sched)} passes={sum(e['passes'] for e in sched)} "
           f"casc_iters={[e['cascade_iters'] for e in sched]} "
           f"(mass gate on {int(mass_mask.sum())}/{rows.shape[0]} rows, "
           f"gap_floor={knobs['gap_floor']}) | " + " | ".join(lines))

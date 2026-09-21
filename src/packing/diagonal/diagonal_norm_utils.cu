@@ -1,6 +1,7 @@
 #include "packing/diagonal/diagonal_norm_utils.h"
 #include "packing/diagonal/diagonal_linear_utils.h"
 #include "inference.h"
+#include "nonlinear.h"   // fused_ln_var_enabled()
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +21,13 @@ static PackedCtx feature_reduce_sum(Inference& inf, const PackedCtx& x_in) {
 }
 
 PackedCtx compute_per_token_sum(Inference& inf, const PackedCtx& x_in) {
-    return feature_reduce_sum(inf, x_in);
+    PackedCtx sum = feature_reduce_sum(inf, x_in);
+    // Strided reduce over residue classes mod t (one sum per token lane) — t-periodic.
+    // Named stamp so the placer can route a bootstrap here sparse.
+    const int t = inf.slots / inf.size.hidDim;
+    sum.tag = packtag::t_reduce_stride(packtag::PackTag::top(inf.slots), t);
+    inf.fhe->tag_ct(sum.ct, sum.tag);
+    return sum;
 }
 
 Ptx encode_ln_center_mask(Inference& inf, const PackedCtx& x, int d, int t,
@@ -67,10 +74,32 @@ void add_layernorm_epsilon(Inference& inf, PackedCtx& var_scaled,
 
 PackedCtx compute_per_token_var(Inference& inf, const PackedCtx& centered_x_in) {
     const int rD = inf.size.getRealHidDim();
+    const int S  = inf.slots;
+    const int t  = S / inf.size.hidDim;
 
-    PackedCtx var = inf.fhe->square(centered_x_in);
-    var = feature_reduce_sum(inf, var);
-    inf.fhe->inplace_mult(var, 1.0 / (double)rD);  // biased variance, matches nn.LayerNorm
+    PackedCtx var;
+    if (fused_ln_var_enabled()) {
+
+        CKKSContext::AutoBtsSuppressScope no_auto(*inf.fhe);
+        var = inf.fhe->square(centered_x_in);
+
+        const uint32_t s_eff = inf.fhe->fold_slots_for((uint32_t)t);
+        for (int s = t; s < (int)s_eff; s *= 2) {
+            PackedCtx tmp = inf.fhe->rotate(var, dg_rot(inf, s));
+            inf.fhe->inplace_add(var, tmp);
+        }
+
+        constexpr double kLnFoldPrescale = 1.0 / 16.0;   // keeps the folded sum in the EvalMod window
+        inf.fhe->fold_bootstrap(var.ct, s_eff, /*n_live=*/rD, kLnFoldPrescale);
+    } else {
+        var = inf.fhe->square(centered_x_in);
+        var = feature_reduce_sum(inf, var);
+        inf.fhe->inplace_mult(var, 1.0 / (double)rD);  // biased variance, matches nn.LayerNorm
+    }
+
+    var.tag = packtag::t_reduce_stride(packtag::PackTag::top(S), t);
+    // Raw-ct registration too: the inv_sqrt chain downstream runs on raw Ctx.
+    inf.fhe->tag_ct(var.ct, var.tag);
     return var;
 }
 

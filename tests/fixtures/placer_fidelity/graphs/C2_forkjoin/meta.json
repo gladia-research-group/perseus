@@ -1,0 +1,8 @@
+{
+ "case": "C2_forkjoin",
+ "opt_count": 1,
+ "unique_sites": [
+  "v_a05"
+ ],
+ "note": "A depth 7, B depth 2, tail 3; only A5 keeps the tail in budget"
+}

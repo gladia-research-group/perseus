@@ -1,0 +1,10 @@
+{
+ "case": "C3_skip",
+ "opt_count": 2,
+ "unique_sites": [
+  "v_k05",
+  "v_k10"
+ ],
+ "skip_var": "v_k02",
+ "note": "13-mult trunk + skip edge from depth 2 to the join; the skip rides free (add takes the max) and must NOT be refreshed"
+}

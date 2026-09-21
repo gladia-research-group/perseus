@@ -1,4 +1,5 @@
 #include "model/gpt2_model.h"
+#include "interrupt.h"
 #include "model/gpt2.h"
 #include "model/gpt2/internal.h"
 #include "weight_loader.h"
@@ -46,6 +47,7 @@ GPT2Model GPT2Model::load(const weight_loader::WeightStore& store,
     if (enable_prefill) {
         decode_steps = gpt2_decode_only_rot_steps(slots0, opts.hidDim, opts.expDim, opts.numHeads);
         opts.ckks.deferred_rot_steps.assign(decode_steps.begin(), decode_steps.end());
+        opts.ckks.defer_heavy_setup = true;
     }
 
     Inference inf      = make_gpt2_inference(opts);
@@ -83,11 +85,13 @@ GPT2Model::GPT2Model(Inference inf,
                                   : default_gpt2_cutmax_config();
     std::fprintf(stderr, cfg_.has_cutmax
         ? "[cutmax_cfg] calibrated \"cutmax\" section from CONFIGS_PATH\n"
-        : "[cutmax_cfg] WARNING: no \"cutmax\" section in CONFIGS_PATH -> BAKED 21s default "
-          "(splice the frozen 9.2s T5 section; see CLAUDE.md hard-won rules)\n");
+        : "[cutmax_cfg] WARNING: no \"cutmax\" section in CONFIGS_PATH -> baked default schedule\n");
+    fideslib::PrewarmStageArenas();
     if (inf_.cache_weights && !defer_block_cache_)
-        for (int b = 0; b < n_blocks_; ++b)
+        for (int b = 0; b < n_blocks_; ++b) {
+            perseus_interrupt::poll();
             blocks_.push_back(load_block_state(inf_, store_, cfg_, decode_plans_.at(b), b, nullptr));
+        }
     lnf_    = load_final_ln_state(inf_, store_, cfg_, decode_plans_.at(n_blocks_), nullptr);
     loader_ = make_block_loader(store_, cfg_, decode_plans_);
 }
@@ -96,8 +100,10 @@ void GPT2Model::ensure_decode_blocks() {
     if (!inf_.cache_weights || !defer_block_cache_ || !blocks_.empty()) return;
     configure_phase(Phase::Decode);
     const BlockPlans& p = active_decode_plans();
-    for (int b = 0; b < n_blocks_; ++b)
+    for (int b = 0; b < n_blocks_; ++b) {
+        perseus_interrupt::poll();
         blocks_.push_back(load_block_state(inf_, store_, cfg_, p.at(b), b, nullptr));
+    }
     if (p.any_valid() && mask_T_ > 0)
         gpt2_generate_decode_masks(inf_, blocks_, n_blocks_, mask_T_);
 }
@@ -130,7 +136,6 @@ void gpt2_reset_graph_runtime(Inference& inf) {
     inf.fhe->pt_vars.clear();
     inf.fhe->graph_ct_counter = 0;
     inf.fhe->graph_pt_counter = 0;
-    inf.fhe->current_runtime_node_id = 0;
 }
 
 namespace {
@@ -197,14 +202,45 @@ void GPT2Model::ensure_decode_rot_keys() {
     std::fflush(stderr);
 }
 
+void GPT2Model::overlap_setup_with_block0(int expected_tokens) {
+    if (!inf_.fhe->setup_pending()) return;
+    bool spawned = false;
+    if (prefill_enabled_ && expected_tokens > 0) {
+        const int  t  = inf_.slots / inf_.size.hidDim;
+        const bool tp = inf_.fhe->complex_payload && expected_tokens > t;
+        const int  mj = tp ? std::min(2 * t, expected_tokens)
+                           : std::min(t, expected_tokens);
+
+        if (expected_tokens > mj && !std::getenv("FHE_GRAPH_DIR"))
+            inf_.cc()->SuppressStageReleaseCpu(true);
+        inf_.token_pair = tp;
+        if (!tp) inf_.n_tok_imag = 0;
+        configure_phase(Phase::Prefill, mj);
+        const BlockPlans& b0_plans =
+            (prefill_chunk_plans_ && !prefill_chunk_plans_->empty())
+                ? prefill_chunk_plans_->front() : plans_;
+        gpt2_prefill_early_block0(inf_, store_, cfg_, b0_plans);
+        spawned = true;
+    }
+    inf_.fhe->complete_setup();
+    if (spawned) gpt2_prefill_early_block0_join(inf_);   // stage into the ARMED arena
+}
+
 Sequence GPT2Model::start() {
+    inf_.fhe->complete_setup();   // defensive: a caller that skipped the overlap entry
     configure_phase(Phase::Decode);
     gpt2_reset_kv_cache(inf_, n_blocks_);
     lm_tiles_.clear();
+    if (inf_.cache_weights) {
+        lm_tiles_.emplace_back();
+        gpt2_lm_head_prepare_block(inf_, store_, vocab_, w_tile_, lm_tiles_.front(),
+                                   active_decode_plans().at(n_blocks_));
+    }
     return Sequence{};
 }
 
 void GPT2Model::generate_decode_masks(int T) {
+    inf_.fhe->complete_setup();   // defensive: mask encodes may load device-side
     mask_T_ = T;   // replayed by ensure_decode_blocks when the block cache is deferred
     if (!decode_plans_.any_valid()) return;   // eager mode: keep masks online (lazy on demand)
     configure_phase(Phase::Decode);
@@ -245,6 +281,7 @@ PackedCtx GPT2Model::advance_ct(Sequence& s, PackedCtx x) {
 
 PackedCtx GPT2Model::prefill(Sequence& s,
                              const std::vector<std::vector<double>>& prompt) {
+    inf_.fhe->complete_setup();   // defensive: no-op when the overlap entry already ran
     if (prompt.empty())
         throw std::runtime_error("GPT2Model::prefill: empty prompt");
     if (!prefill_enabled_)
@@ -262,12 +299,6 @@ PackedCtx GPT2Model::prefill(Sequence& s,
     };
     inf_.token_pair = chunk_arm(0).first;
 
-    static const bool argmax_scan = [] {
-        const char* v = std::getenv("PREFILL_ARGMAX_SCAN");
-        return v && *v && *v != '0';
-    }();
-    prefill_lnf_chunks_.clear();
-
     ScopeExit phase_guard{ [this] { configure_phase(Phase::Decode); } };
 
     static const BlockPlans kEagerChunk;
@@ -282,6 +313,22 @@ PackedCtx GPT2Model::prefill(Sequence& s,
 
     configure_phase(Phase::Prefill, chunk_arm(0).second);
     gpt2_reset_kv_cache(inf_, n_blocks_);
+
+    int n_chunks = 0;
+    for (int off = 0; off < m; ++n_chunks) off += chunk_arm(off).second;
+    bool wcache_legal = n_chunks > 1;
+    if (wcache_legal) {
+        int off = chunk_arm(0).second;
+        for (int c = 1; c < n_chunks && wcache_legal; ++c) {
+            if (chunk_arm(off).first != chunk_arm(0).first) wcache_legal = false;
+            off += chunk_arm(off).second;
+            const BlockPlans& p0 = chunk_plan(0);
+            const BlockPlans& pc = chunk_plan(c);
+            for (int b = 0; b <= n_blocks_ && wcache_legal; ++b)
+                if (p0.at(b).weight_levels != pc.at(b).weight_levels) wcache_legal = false;
+        }
+    }
+    ScopeExit wcache_guard{ [this] { gpt2_prefill_wcache_end(inf_); } };
 
     PackedCtx h;
     int last_chunk = 0;
@@ -303,10 +350,11 @@ PackedCtx GPT2Model::prefill(Sequence& s,
             configure_phase(Phase::Prefill, mj);
             inf_.output.capture_t = s.abs_pos + off;
             inf_.output.capture_chunk = chunk_idx;   // capture -> chunk_<c>/ template dirs
+            gpt2_prefill_wcache_configure(
+                inf_, n_blocks_, !wcache_legal ? 0 : (chunk_idx == 0 ? 1 : 2));
             PackedCtx x = encode_prefill_input(inf_, chunk);
             h = gpt2_prefill(inf_, std::move(x), store_, cfg_, chunk_plan(last_chunk),
                              n_blocks_, PrefillMode::Chunk);
-            if (argmax_scan) prefill_lnf_chunks_.push_back(h);
             off += mj;
         }
 
@@ -316,23 +364,13 @@ PackedCtx GPT2Model::prefill(Sequence& s,
         EncodedBlock lnf = load_final_ln_state(inf_, store_, cfg_, tail_plans.at(n_blocks_), nullptr);
         hidden = apply_final_ln(inf_, h, lnf);
         end_subgraph_capture(inf_, n_blocks_);
-        if (argmax_scan && !prefill_lnf_chunks_.empty()) {
-            // ln_f every chunk while the filling rot keys are still live; tail reuses `hidden`
-            for (size_t c = 0; c + 1 < prefill_lnf_chunks_.size(); ++c)
-                prefill_lnf_chunks_[c] = apply_final_ln(inf_, prefill_lnf_chunks_[c], lnf);
-            prefill_lnf_chunks_.back() = hidden;
-        }
     }
 
     inf_.output.capture_chunk = -1;   // lnf rode the last chunk's template; decode captures flat
     free_filling_rot_keys();
     ensure_decode_rot_keys();
     configure_phase(Phase::Decode);
-    static const bool kv_handoff = [] {
-        const char* e = std::getenv("FHE_KV_HANDOFF");
-        return !(e && *e == '0');
-    }();
-    if (kv_handoff) {
+    {
         const auto h_t0     = std::chrono::steady_clock::now();
         const uint32_t h_b0 = inf_.fhe->total_bootstraps;
         gpt2_kv_handoff_filling_to_cachemir(inf_, n_blocks_, m);
@@ -341,15 +379,12 @@ PackedCtx GPT2Model::prefill(Sequence& s,
                      inf_.fhe->total_bootstraps - h_b0);
         std::fflush(stderr);
     }
-    else std::fprintf(stderr, "[prefill] FHE_KV_HANDOFF=0: K/V repack skipped (tail-only run)\n");
     phase_guard.disarm();
     s.abs_pos += m;
     return hidden;
 }
 
 std::vector<PackedCtx> GPT2Model::logit_tiles(const PackedCtx& hidden) {
-    // Adopt worker-prepped lm_head tiles (tail prefetch, gpt2_prefill.cu): the
-    // deferred complex-key registration happens HERE on the main thread.
     if (inf_.cache_weights && lm_tiles_.empty()) {
         std::vector<std::string> ckeys;
         if (gpt2_tail_lm_take(lm_tiles_, ckeys))

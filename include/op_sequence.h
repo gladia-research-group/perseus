@@ -34,14 +34,15 @@ inline bool streams_within_block(WeightGranularity g) {
 }
 
 struct Op {
-    std::vector<std::string>                      weights;   // {} = weight-free; shorthand residency
-    std::function<void(Inference&, PackedCtx&)>   fwd;       // transform activation in place
+    std::vector<std::string>                      weights; 
+    std::function<void(Inference&, PackedCtx&)>   fwd;     
     const char*                                   label = "";
-    std::function<void(Inference&, cudaStream_t)>  acquire;  // explicit residency (overrides `weights`)
+    std::function<void(Inference&, cudaStream_t)>  acquire;
     std::function<void(Inference&)>                install;
     std::function<void(Inference&)>                release;
-    std::function<void(Inference&)>                prefetch_cpu;  // CPU-only host pre-extraction (worker)
+    std::function<void(Inference&)>                prefetch_cpu;
     bool                                           prefetch_next = true;
+    int stage_owner = -1;
 };
 
 inline PackedCtx run_ops(Inference& inf, PackedCtx x, std::vector<Op> ops,
@@ -57,16 +58,17 @@ inline PackedCtx run_ops(Inference& inf, PackedCtx x, std::vector<Op> ops,
         st.release       = std::move(op.release);
         st.prefetch_cpu  = std::move(op.prefetch_cpu);
         st.prefetch_next = op.prefetch_next;
+        st.stage_owner = op.stage_owner;
         st.compute = [h, fwd = std::move(op.fwd), label = op.label](Inference& i) {
             WithStep _w(i, label);
             fwd(i, *h);
         };
-        // `weights` shorthand: stream the group when no explicit acquire was given.
+
         if (!st.acquire && stream_weights && !op.weights.empty()) {
             auto keys = op.weights;
             st.acquire = [keys](Inference& i, cudaStream_t s) { load_weight_keys(i, keys, s); };
             st.release = [keys](Inference& i) { evict_weight_keys(i, keys); };
-            st.prefetch_next = false;   // a heavy weighted op can't host the next group's load
+            st.prefetch_next = false;
         }
         stages.push_back(std::move(st));
     }

@@ -10,10 +10,6 @@
 
 class StagedEntries {
 public:
-    // prefix = the host-staging key namespace. Keys are index-based, so only ONE container per
-    // prefix may hold live staged data at a time (producer→consumer pairs must share the prefix
-    // AND the size-derived active flag). Concurrent datasets (token-pair A/B halves) use distinct
-    // prefixes.
     StagedEntries(Inference& inf, bool active, std::string prefix = "cf.stg.")
         : inf_(inf), active_(active), prefix_(std::move(prefix)) {}
 

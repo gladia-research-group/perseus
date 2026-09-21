@@ -115,7 +115,6 @@ InferenceMode parse_inference_mode(const std::string& s) {
     if (s == "sync")     return InferenceMode::Sync;
     if (s == "threaded") return InferenceMode::Threaded;
     if (s == "prefetch") return InferenceMode::Prefetch;
-    if (s == "cached")   return InferenceMode::Prefetch;  // legacy alias: caching is a separate axis now
     throw std::runtime_error("parse_inference_mode: unknown mode '" + s +
-                             "' (expected sync|threaded|prefetch|cached)");
+                             "' (expected sync|threaded|prefetch)");
 }

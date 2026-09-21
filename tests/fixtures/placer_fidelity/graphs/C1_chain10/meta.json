@@ -1,0 +1,8 @@
+{
+ "case": "C1_chain10",
+ "opt_count": 1,
+ "unique_sites": [
+  "v_m05"
+ ],
+ "note": "chain of 10 mults, l0=5"
+}

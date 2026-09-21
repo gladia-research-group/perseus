@@ -1,0 +1,18 @@
+{
+  "env": {
+    "CHAIN": "n64",
+    "LOGN": "16",
+    "AUTO_BTS_LEVEL": "24",
+    "BTS_ITERATIONS": "1",
+    "CKKS_COMPLEX": "1",
+    "GPT2_PACKING": "cachemir",
+    "GPT2_CACHE": "1",
+    "GPT2_FOLD_LN1": "1",
+    "GPT2_FOLD_LN2": "1",
+    "GPT2_FOLD_LNF": "0",
+    "CACHE_READ_LEVEL_K": "17",
+    "CACHE_READ_LEVEL_V": "17",
+    "FHE_LMHEAD_CAP": "22"
+  },
+  "session": {"level_limit": 24, "slots": 32768, "logN": 16}
+}

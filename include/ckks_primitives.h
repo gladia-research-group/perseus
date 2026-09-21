@@ -21,11 +21,6 @@ Ctx inv_sqrt_newton(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iter
                     int real_d = 0, int real_stride = 0);
 
 Ctx goldschmidt_inv_sqrt(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iters);
-
-Ctx exp_squaring(CKKSContext& cc, Ctx x, int iters);
-
-Ctx newton_inverse(CKKSContext& cc, const Ctx& res, Ctx dnm, int iters);
-
 Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& a, const Ctx& x0_init, int iters);
 
 // sparse_df routes the D_neg/F-track bootstraps to the sparse precomp — arm ONLY where
@@ -33,7 +28,8 @@ Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& a, const Ctx& x0_init, int iters
 Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& N_init, const Ctx& D_init, const Ctx& F_init,
                     int iters, bool sparse_df = false);
 
-Ctx goldschmidt_recip(CKKSContext& cc, const Ctx& D_init, const Ctx& F_init, int iters);
+Ctx goldschmidt_recip(CKKSContext& cc, const Ctx& D_init, const Ctx& F_init, int iters,
+                      bool sparse_df = false);
 
 Ctx eval_polynomial(CKKSContext& cc, const Ctx& x, const std::vector<double>& coeffs);
 
@@ -139,15 +135,18 @@ Ctx pow_odd(CKKSContext& cc, const Ctx& y, int p);
 Ctx inv_sqrt_newton_safe(CKKSContext& cc, const Ctx& x, const Ctx& y0, int iters);
 
 inline PackedCtx rotate_and_sum_all(CKKSContext& cc, const PackedCtx& x, int slots) {
-    return PackedCtx{rotate_and_sum_all(cc, x.ct, slots), x.packing};
+    return cc.tagged(rotate_and_sum_all(cc, x.ct, slots), x.packing,
+                     packtag::t_reduce_all(packtag::PackTag::top(slots)));
 }
 
 inline PackedCtx pow_odd(CKKSContext& cc, const PackedCtx& y, int p) {
-    return PackedCtx{pow_odd(cc, y.ct, p), y.packing};
+    Ctx out = pow_odd(cc, y.ct, p);
+    return PackedCtx{out, y.packing, cc.tag_of_ct(out)};
 }
 
 inline PackedCtx inv_sqrt_newton_safe(CKKSContext& cc, const PackedCtx& x,
                                       const PackedCtx& y0, int iters) {
     assert_same_packing(x.packing, y0.packing);
-    return PackedCtx{inv_sqrt_newton_safe(cc, x.ct, y0.ct, iters), x.packing};
+    Ctx out = inv_sqrt_newton_safe(cc, x.ct, y0.ct, iters);
+    return PackedCtx{out, x.packing, cc.tag_of_ct(out)};
 }

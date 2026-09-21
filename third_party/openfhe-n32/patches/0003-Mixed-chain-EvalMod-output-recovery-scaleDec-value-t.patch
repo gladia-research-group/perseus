@@ -1,0 +1,95 @@
+From 0787a1b0696be2af04338907a0ad10e940f01288 Mon Sep 17 00:00:00 2001
+From: dev <dev@perseus>
+Date: Fri, 12 Jun 2026 10:30:01 +0200
+Subject: [PATCH 03/12] Mixed-chain EvalMod output recovery (scaleDec) +
+ value-tracing
+
+- scaleDec = q0/(sf0 * 2^deg * pre) on mixed chains: the integer post-EvalMod
+  scalar 2^deg assumes sf0 = 2^p*2^deg (uniform coincidence); fold the
+  difference into the StC constants. corr sweep: was Decode-throw at every
+  corr; now decodes at corr=22 with ballpark values.
+- btsTrace: optional per-stage decrypt (g_btsTraceSk hook) for value-level
+  diagnosis; EXEC_NOISE_ESTIMATION contexts skip the Decode noise throw.
+- scaleEnc input-side adjustment tried and REVERTED (made values worse;
+  wrap-spacing theory falsified by measurement).
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp | 45 +++++++++++++++++++++-
+ 1 file changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index 8110c285..9625c271 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -194,6 +194,17 @@ void FHECKKSRNS::EvalBootstrapSetup(const CryptoContextImpl<DCRTPoly>& cc, std::
+         double scaleEnc = pre / k;
+         // TODO: YSP Can be extended to FLEXIBLE* scaling techniques as well as the closeness of 2^p to moduli is no longer needed
+         double scaleDec = (compositeDegree > 1) ? qDouble / cryptoParams->GetScalingFactorReal(0) : 1.0 / pre;
++        if (compositeDegree == 1) {
++            // The post-EvalMod integer mult applies 2^deg (deg = log2(q0/2^p_data)),
++            // but the fraction-to-scale conversion needs q0/sf[0]. These coincide in a
++            // uniform chain (sf[0] ~ 2^p); in a mixed-size chain fold the difference
++            // into the StC matrix constants. Uniform keeps 1/pre bit-identically.
++            double deg2pow =
++                std::pow(2.0, std::round(std::log2(qDouble / std::pow(2.0, cryptoParams->GetPlaintextModulus()))));
++            double mixedDec = qDouble / (cryptoParams->GetScalingFactorReal(0) * deg2pow * pre);
++            if (std::fabs(std::log2(mixedDec * pre)) > 0.5)
++                scaleDec = mixedDec;
++        }
+ 
+         //uint32_t approxModDepth = GetModDepthInternal(cryptoParams->GetSecretKeyDist());
+         uint32_t approxModDepth = modevallevels == (uint32_t)-1 ? GetModDepthInternal(cryptoParams->GetSecretKeyDist()) : modevallevels;
+@@ -1405,6 +1416,17 @@ void FHECKKSRNS::EvalBootstrapPrecompute(const CryptoContextImpl<DCRTPoly>& cc,
+     double scaleEnc = pre / k;
+     // TODO: YSP Can be extended to FLEXIBLE* scaling techniques as well as the closeness of 2^p to moduli is no longer needed
+     double scaleDec = (compositeDegree > 1) ? qDouble / cryptoParams->GetScalingFactorReal(0) : 1.0 / pre;
++    if (compositeDegree == 1) {
++        // The post-EvalMod integer mult applies 2^deg (deg = log2(q0/2^p_data)),
++        // but the fraction-to-scale conversion needs q0/sf[0]. These coincide in a
++        // uniform chain (sf[0] ~ 2^p); in a mixed-size chain fold the difference
++        // into the StC matrix constants. Uniform keeps 1/pre bit-identically.
++        double deg2pow =
++            std::pow(2.0, std::round(std::log2(qDouble / std::pow(2.0, cryptoParams->GetPlaintextModulus()))));
++        double mixedDec = qDouble / (cryptoParams->GetScalingFactorReal(0) * deg2pow * pre);
++        if (std::fabs(std::log2(mixedDec * pre)) > 0.5)
++            scaleDec = mixedDec;
++    }
+ 
+     uint32_t approxModDepth = GetModDepthInternal(cryptoParams->GetSecretKeyDist());
+ 
+@@ -1453,6 +1475,11 @@ void FHECKKSRNS::EvalBootstrapPrecompute(const CryptoContextImpl<DCRTPoly>& cc,
+     }
+ }
+ 
++// Diagnostic-only: when set (by a test), btsTrace decrypts each stage and prints
++// slot values. Requires the context to skip the Decode noise throw (e.g.
++// EXEC_NOISE_ESTIMATION execution mode).
++PrivateKey<DCRTPoly> g_btsTraceSk = nullptr;
++
+ static void btsTrace(const char* stage, const Ciphertext<DCRTPoly>& ct) {
+     static const bool on = []() {
+         const char* e = std::getenv("OPENFHE_BTS_TRACE");
+@@ -1462,7 +1489,23 @@ static void btsTrace(const char* stage, const Ciphertext<DCRTPoly>& ct) {
+         return;
+     std::cerr << "[bts_trace] " << stage << ": towers=" << ct->GetElements()[0].GetNumOfElements()
+               << " level=" << ct->GetLevel() << " deg=" << ct->GetNoiseScaleDeg()
+-              << " log2(scale)=" << std::log2(ct->GetScalingFactor()) << std::endl;
++              << " log2(scale)=" << std::log2(ct->GetScalingFactor());
++    if (g_btsTraceSk != nullptr) {
++        try {
++            Plaintext pt;
++            auto cc = ct->GetCryptoContext();
++            cc->Decrypt(g_btsTraceSk, ct, &pt);
++            const auto& v = pt->GetCKKSPackedValue();
++            double maxAbs = 0;
++            for (const auto& z : v)
++                maxAbs = std::max(maxAbs, std::abs(z));
++            std::cerr << " | max|z|=" << maxAbs << " z0=(" << v[0].real() << "," << v[0].imag() << ") z1=("
++                      << v[1].real() << "," << v[1].imag() << ")";
++        } catch (const std::exception& ex) {
++            std::cerr << " | decrypt-trace THREW: " << ex.what();
++        }
++    }
++    std::cerr << std::endl;
+ }
+ 
+ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& ciphertext, uint32_t numIterations,

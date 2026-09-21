@@ -76,7 +76,7 @@ PackedCtx qkt(Inference& inf, const PackedCtx& query) {
     return attn_ct;
 }
 
-PackedCtx head_reduce_sum(Inference& inf, const PackedCtx& x) {
+PackedCtx head_reduce_sum(Inference& inf, const PackedCtx& x, double s0_expected) {
     WithStep _w(inf, "head_reduce_sum");
     int N  = inf.slots;
     int d  = inf.size.hidDim;
@@ -95,52 +95,30 @@ PackedCtx head_reduce_sum(Inference& inf, const PackedCtx& x) {
     for (int step = 1; step < t; step *= 2)
         inf.fhe->inplace_add(out, inf.fhe->rotate(out, mha_rot(inf, -step)));
 
-    // TODO: Do we need replication here?
-    for (int s = tH; s < N; s *= 2) {
-        PackedCtx rot = inf.fhe->rotate(out, mha_rot(inf, s));
-        inf.fhe->inplace_add(out, rot);
+    if (fused_sm_den_enabled()) {
+        const uint32_t s_eff = inf.fhe->fold_slots_for((uint32_t)tH);
+        for (int s = tH; s < (int)s_eff; s *= 2) {
+            PackedCtx rot = inf.fhe->rotate(out, mha_rot(inf, s));
+            inf.fhe->inplace_add(out, rot);
+        }
+        const double p = fold_sm_prescale_for((double)N / (double)s_eff, s0_expected);
+        inf.fhe->fold_bootstrap(out.ct, s_eff, /*n_live=*/1, p);
+    } else {
+        for (int s = tH; s < N; s *= 2) {
+            PackedCtx rot = inf.fhe->rotate(out, mha_rot(inf, s));
+            inf.fhe->inplace_add(out, rot);
+        }
     }
+    out.tag = packtag::t_reduce_stride(packtag::PackTag::top(N), tH);
+    inf.fhe->tag_ct(out.ct, out.tag);
 
     return out;
-}
-
-// Plain linear init: α = 4/(d_min+d_max), β = α²/4
-static inline std::pair<double, double>
-gs_init_linear(double d_min, double d_max) {
-    const double alpha = 4.0 / (d_min + d_max);
-    const double beta  = alpha * alpha / 4.0;
-    return {alpha, beta};
-}
-
-// Chebyshev (sup-norm optimal) linear init.
-static inline std::pair<double, double>
-gs_init_chebyshev(double d_min, double d_max) {
-    const double s    = d_min + d_max;
-    const double beta = 8.0 / (s * s + 4.0 * d_min * d_max);
-    return {beta * s, beta};
-}
-
-static inline std::pair<double, double>
-gs_init(GSInitMethod m, double d_min, double d_max) {
-    switch (m) {
-        case GSInitMethod::LINEAR:    return gs_init_linear(d_min, d_max);
-        case GSInitMethod::CHEBYSHEV: return gs_init_chebyshev(d_min, d_max);
-    }
-    return {0.0, 0.0};
 }
 
 static PackedCtx softmax_recip(Inference& inf, const PackedCtx& z, const PackedCtx& s,
                                const PackedCtx& F_init, int iters) {
     return goldschmidt_inv(inf.cc_ctx(), z, s, F_init, iters,
                            /*sparse_df=*/sparse_sm_enabled());
-}
-
-static double sm_recip_margin() {
-    static const double m = [] {
-        const char* v = std::getenv("SM_RECIP_MARGIN");
-        return v && *v ? std::atof(v) : 0.0;
-    }();
-    return m;
 }
 
 PackedCtx attention_softmax_thor(Inference& inf, const PackedCtx& scores, const std::string& cfg_name) {
@@ -164,7 +142,7 @@ PackedCtx attention_softmax_thor(Inference& inf, const PackedCtx& scores, const 
     if (cfg.cheb_coeffs.empty())
         throw std::runtime_error(
             "attention_softmax_thor: cfg.cheb_coeffs is empty -- only the Chebyshev exp path "
-            "is supported (poly fallback removed; see docs/speed/chebyshev_fold.md)");
+            "is supported (the polynomial fallback was removed)");
     PackedCtx z = eval_chebyshev_series(inf.cc_ctx(), ct, cfg.cheb_coeffs,
                                         cfg.cheb_a / scale_factor,
                                         cfg.cheb_b / scale_factor);
@@ -185,10 +163,10 @@ PackedCtx attention_softmax_thor(Inference& inf, const PackedCtx& scores, const 
         [&] { return active_mask_vec(inf, inf.k_count()); });
     z = inf.fhe->mult(z, active_pt);
 
-    PackedCtx s = head_reduce_sum(inf, z);
+    PackedCtx s = head_reduce_sum(inf, z, /*s0_expected=*/2.0 / cfg.init_alpha);
 
     _w2.next("gs_inv_init");
-    PackedCtx F_init = inf.fhe->mult(s, -cfg.init_beta * (1.0 - sm_recip_margin()));
+    PackedCtx F_init = inf.fhe->mult(s, -cfg.init_beta);
     inf.fhe->inplace_add(F_init, cfg.init_alpha);
 
     PackedCtx y = softmax_recip(inf, z, s, F_init, cfg.gs_iters_scaled);
@@ -200,7 +178,6 @@ PackedCtx attention_softmax_thor(Inference& inf, const PackedCtx& scores, const 
         }
         z = inf.fhe->square(y);
         z = inf.fhe->mult(z, 0.5 * std::sqrt(kc) * 0.25);   // 0.25 absorbs the conj-doubling of y
-        s = head_reduce_sum(inf, z);
 
         double r = 1.0;
         if (!cfg.sm_kc_r.empty() && cfg.log2delta2 > 0) {
@@ -211,8 +188,10 @@ PackedCtx attention_softmax_thor(Inference& inf, const PackedCtx& scores, const 
             constexpr double kc_ref = 4.0;                       // fallback proxy
             r = std::min(1.0, kc_ref / kc);
         }
+        s = head_reduce_sum(inf, z,
+                            /*s0_expected=*/2.0 / (cfg.refine_alpha[i] * std::sqrt(r)));
         const double sa = std::sqrt(r), sb = r;
-        PackedCtx F_init = inf.fhe->mult(s, -cfg.refine_beta[i] * sb * (1.0 - sm_recip_margin()));
+        PackedCtx F_init = inf.fhe->mult(s, -cfg.refine_beta[i] * sb);
         inf.fhe->inplace_add(F_init, cfg.refine_alpha[i] * sa);
 
         const int it_i = static_cast<int>(cfg.per_step_refine_iters.at(i));
@@ -248,14 +227,34 @@ PackedCtx softmax_v(Inference& inf, const PackedCtx& softmax_scores) {
         lane_scores = inf.fhe->rotate_hoisted(softmax_scores, steps);
     }
 
-    for (int i = 1; i < d_head_real; ++i) {
-        WithStep _w2i(inf, "lane_mult");
-        PackedCtx scores = lane_scores[i - 1];
-        PackedCtx v = inf.cache[inf.scoped("v")][i];
-        inf.name_graph_ct(v, inf.scoped("cache.v." + std::to_string(i) + "-lvl=" + std::to_string(inf.fhe->level_for_ct(v.ct))));   // actual level (V dropped to CACHE_READ_LEVEL_V at push)
+    bool lanes_batched = false;
+    if (d_head_real > 1) {
+        auto& vc = inf.cache[inf.scoped("v")];
+        std::vector<const PackedCtx*> vptr, sptr;
+        vptr.reserve(d_head_real - 1);
+        sptr.reserve(d_head_real - 1);
+        for (int i = 1; i < d_head_real; ++i) {
+            vptr.push_back(&vc[i]);
+            sptr.push_back(&lane_scores[i - 1]);
+        }
+        if (inf.fhe->mult_add_many_usable(res, vptr, sptr)) {
+            WithStep _w2i(inf, "lane_mult");
+            for (int i = 1; i < d_head_real; ++i)
+                inf.name_graph_ct(vc[i], inf.scoped("cache.v." + std::to_string(i) + "-lvl=" + std::to_string(inf.fhe->level_for_ct(vc[i].ct))));
+            inf.fhe->mult_add_many(res, vptr, sptr);
+            lanes_batched = true;
+        }
+    }
+    if (!lanes_batched) {
+        for (int i = 1; i < d_head_real; ++i) {
+            WithStep _w2i(inf, "lane_mult");
+            PackedCtx scores = lane_scores[i - 1];
+            PackedCtx v = inf.cache[inf.scoped("v")][i];
+            inf.name_graph_ct(v, inf.scoped("cache.v." + std::to_string(i) + "-lvl=" + std::to_string(inf.fhe->level_for_ct(v.ct))));   // actual level (V dropped to CACHE_READ_LEVEL_V at push)
 
-        PackedCtx tmp = inf.fhe->mult(v, scores);
-        inf.fhe->inplace_add(res, tmp);
+            PackedCtx tmp = inf.fhe->mult(v, scores);
+            inf.fhe->inplace_add(res, tmp);
+        }
     }
 
     _w2.next("tok_reduce");

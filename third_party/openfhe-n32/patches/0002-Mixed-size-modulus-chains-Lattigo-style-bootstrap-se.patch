@@ -1,0 +1,494 @@
+From 0e2b42477c5c6e904f55e0112b4b9c51be8c72ee Mon Sep 17 00:00:00 2001
+From: dev <dev@perseus>
+Date: Fri, 12 Jun 2026 09:36:09 +0200
+Subject: [PATCH 02/12] Mixed-size modulus chains (Lattigo-style bootstrap
+ segment)
+
+- CCParams::SetScalingModSizePerLevel: per-level rescale-prime bit sizes
+  (empty = uniform, byte-identical)
+- MixedPrimeModuliGen: segment-aware FLEXIBLEAUTO prime selection
+- PrecomputeCRTTables: segment-aware scaling-factor table (ascending reset,
+  descending geometric descent), data-driven from the actual prime ladder
+- MakeAuxPlaintext: encode CtS/StC stage plaintexts at sf[l+1]*q_drop/sf[l]
+  (boundary-gated; uniform chains keep the original value bit-identically)
+- EvalBootstrap: eager final rescale on mixed chains (deg-1 on-table output)
+- btsTrace stage tracing under OPENFHE_BTS_TRACE=1
+---
+ .../ckksrns/ckksrns-parametergeneration.h     |   5 +
+ .../gen-cryptocontext-ckksrns-internal.h      |   1 +
+ .../include/scheme/gen-cryptocontext-params.h |  12 ++
+ .../include/schemerns/rns-cryptoparameters.h  |  12 ++
+ .../ckksrns/ckksrns-cryptoparameters.cpp      |  46 +++++-
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp    |  64 +++++++++
+ .../ckksrns/ckksrns-parametergeneration.cpp   | 136 +++++++++++++++++-
+ 7 files changed, 272 insertions(+), 4 deletions(-)
+
+diff --git a/src/pke/include/scheme/ckksrns/ckksrns-parametergeneration.h b/src/pke/include/scheme/ckksrns/ckksrns-parametergeneration.h
+index 10c79545..15dd955e 100644
+--- a/src/pke/include/scheme/ckksrns/ckksrns-parametergeneration.h
++++ b/src/pke/include/scheme/ckksrns/ckksrns-parametergeneration.h
+@@ -54,6 +54,11 @@ protected:
+                               ScalingTechnique scalTech, uint32_t numPrimes, uint32_t firstModSize, uint32_t dcrtBits,
+                               uint32_t cyclOrder, uint32_t extraModsize) const;
+ 
++    void MixedPrimeModuliGen(std::vector<NativeInteger>& moduliQ, std::vector<NativeInteger>& rootsQ,
++                             ScalingTechnique scalTech, uint32_t numPrimes, uint32_t firstModSize,
++                             const std::vector<uint32_t>& sizesPerLevel, uint32_t cyclOrder,
++                             uint32_t extraModsize) const;
++
+ public:
+     virtual ~ParameterGenerationCKKSRNS() = default;
+ 
+diff --git a/src/pke/include/scheme/ckksrns/gen-cryptocontext-ckksrns-internal.h b/src/pke/include/scheme/ckksrns/gen-cryptocontext-ckksrns-internal.h
+index 30b09c2e..a7e187ee 100644
+--- a/src/pke/include/scheme/ckksrns/gen-cryptocontext-ckksrns-internal.h
++++ b/src/pke/include/scheme/ckksrns/gen-cryptocontext-ckksrns-internal.h
+@@ -126,6 +126,7 @@ typename ContextGeneratorType::ContextType genCryptoContextCKKSRNSInternal(
+     params->SetFloodingDistributionParameter(floodingNoiseStd);
+     params->SetMultiplicativeDepth(parameters.GetMultiplicativeDepth());
+     params->SetNoiseEstimate(parameters.GetNoiseEstimate());
++    params->SetScalingModSizePerLevel(parameters.GetScalingModSizePerLevel());
+ 
+     uint32_t numLargeDigits =
+         ComputeNumLargeDigits(parameters.GetNumLargeDigits(), parameters.GetMultiplicativeDepth());
+diff --git a/src/pke/include/scheme/gen-cryptocontext-params.h b/src/pke/include/scheme/gen-cryptocontext-params.h
+index b3ffa8ad..9e723314 100644
+--- a/src/pke/include/scheme/gen-cryptocontext-params.h
++++ b/src/pke/include/scheme/gen-cryptocontext-params.h
+@@ -128,6 +128,12 @@ class Params {
+     uint32_t firstModSize;
+     uint32_t scalingModSize;
+ 
++    // Optional per-level bit sizes for the rescale primes q_1..q_n (bottom-up;
++    // size must be multiplicativeDepth when set). Empty (default) = uniform chain
++    // of scalingModSize. Enables mixed-size chains (e.g. a Lattigo-style bootstrap
++    // segment on larger primes above a small-prime data segment). FLEXIBLEAUTO(EXT) only.
++    std::vector<uint32_t> scalingModSizePerLevel;
++
+     // see KeySwitchTechnique - number of digits in HYBRID key switching
+     uint32_t numLargeDigits;
+ 
+@@ -329,6 +335,9 @@ public:
+     uint32_t GetScalingModSize() const {
+         return scalingModSize;
+     }
++    const std::vector<uint32_t>& GetScalingModSizePerLevel() const {
++        return scalingModSizePerLevel;
++    }
+     SecurityLevel GetSecurityLevel() const {
+         return securityLevel;
+     }
+@@ -428,6 +437,9 @@ public:
+     virtual void SetScalingModSize(uint32_t scalingModSize0) {
+         scalingModSize = scalingModSize0;
+     }
++    virtual void SetScalingModSizePerLevel(std::vector<uint32_t> scalingModSizePerLevel0) {
++        scalingModSizePerLevel = std::move(scalingModSizePerLevel0);
++    }
+     virtual void SetSecurityLevel(SecurityLevel securityLevel0) {
+         securityLevel = securityLevel0;
+     }
+diff --git a/src/pke/include/schemerns/rns-cryptoparameters.h b/src/pke/include/schemerns/rns-cryptoparameters.h
+index 272f7bd0..4b300095 100644
+--- a/src/pke/include/schemerns/rns-cryptoparameters.h
++++ b/src/pke/include/schemerns/rns-cryptoparameters.h
+@@ -1397,7 +1397,19 @@ public:
+         return m_ckksDataType;
+     }
+ 
++    const std::vector<uint32_t>& GetScalingModSizePerLevel() const {
++        return m_scalingModSizePerLevel;
++    }
++
++    void SetScalingModSizePerLevel(std::vector<uint32_t> sizes) {
++        m_scalingModSizePerLevel = std::move(sizes);
++    }
++
+ protected:
++    // Optional per-level bit sizes for the rescale primes q_1..q_n (bottom-up).
++    // Empty = uniform chain. See CCParams::scalingModSizePerLevel.
++    std::vector<uint32_t> m_scalingModSizePerLevel;
++
+     /////////////////////////////////////
+     // PrecomputeCRTTables
+     /////////////////////////////////////
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-cryptoparameters.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-cryptoparameters.cpp
+index c7723535..b5cd0a27 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-cryptoparameters.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-cryptoparameters.cpp
+@@ -38,6 +38,7 @@ CKKS implementation. See https://eprint.iacr.org/2020/1118 for details.
+ #include "cryptocontext.h"
+ #include "scheme/ckksrns/ckksrns-cryptoparameters.h"
+ 
++#include <cmath>
+ #include <vector>
+ 
+ namespace lbcrypto {
+@@ -121,6 +122,13 @@ void CryptoParametersCKKSRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Sca
+                                                 1 :
+                                                 2;
+ 
++            // Scale tracked against the current same-size prime segment. In a uniform
++            // chain there is a single segment and behavior is identical to the original
++            // recursion + guard. In a mixed-size chain (scalingModSizePerLevel), the
++            // scale resets to the next consumed prime at each segment boundary; ct-ct
++            // multiplications across a boundary are unsupported by construction.
++            double segmentBase = lastPresetFactor;
++
+             for (size_t k = numPresetFactors; k < sizeQ; k++) {
+                 if (m_scalTechnique == COMPOSITESCALINGAUTO || m_scalTechnique == COMPOSITESCALINGMANUAL) {
+                     if (k % compositeDegree == 0) {
+@@ -135,11 +143,43 @@ void CryptoParametersCKKSRNS::PrecomputeCRTTables(KeySwitchTechnique ksTech, Sca
+                     }
+                 }
+                 else {
+-                    double prevSF           = m_scalingFactorsReal[k - 1];
+-                    m_scalingFactorsReal[k] = prevSF * prevSF / moduliQ[sizeQ - k].ConvertToDouble();
++                    double prevSF = m_scalingFactorsReal[k - 1];
++                    double qDrop  = moduliQ[sizeQ - k].ConvertToDouble();
++                    double cand   = prevSF * prevSF / qDrop;
++
++                    // The drop k -> the rescale consuming moduliQ[sizeQ-k]. When that prime
++                    // belongs to a different size class than the running scale (mixed-size
++                    // chain), the recursion no longer describes the circuit:
++                    if (std::fabs(std::log2(cand) - std::log2(qDrop)) > 1.5) {
++                        if (qDrop > cand) {
++                            // ascending boundary (e.g. CtS -> EvalMod): the boundary-stage
++                            // plaintext encoding (see MakeAuxPlaintext) lands the ciphertext
++                            // exactly on the new segment's prime
++                            m_scalingFactorsReal[k] = qDrop;
++                        }
++                        else {
++                            // descending run (e.g. EvalMod -> StC -> data): descend
++                            // geometrically from the previous scale to the size class of the
++                            // segment that follows the run, one step per prime of the run
++                            size_t m       = 1;
++                            double runSize = std::log2(qDrop);
++                            while (sizeQ - k - m >= 1 &&
++                                   std::fabs(std::log2(moduliQ[sizeQ - k - m].ConvertToDouble()) - runSize) <= 1.5)
++                                ++m;
++                            double target = (sizeQ - k - m >= 1) ?
++                                                std::log2(moduliQ[sizeQ - k - m].ConvertToDouble()) :
++                                                static_cast<double>(GetPlaintextModulus());
++                            double step             = (std::log2(prevSF) - target) / static_cast<double>(m);
++                            m_scalingFactorsReal[k] = prevSF * std::pow(2.0, -step);
++                        }
++                        segmentBase = m_scalingFactorsReal[k];
++                        continue;
++                    }
++
++                    m_scalingFactorsReal[k] = cand;
+ 
+                     if (m_scalTechnique == FLEXIBLEAUTO || m_scalTechnique == FLEXIBLEAUTOEXT) {
+-                        double ratio = m_scalingFactorsReal[k] / lastPresetFactor;
++                        double ratio = m_scalingFactorsReal[k] / segmentBase;
+                         if (ratio <= 0.5 || ratio >= 2.0) {
+                             OPENFHE_THROW("FLEXIBLEAUTO scaling failed at level " + std::to_string(k) +
+                                           " with scaling factor ratio " + std::to_string(ratio) +
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index 4e1e9f82..8110c285 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -1453,6 +1453,18 @@ void FHECKKSRNS::EvalBootstrapPrecompute(const CryptoContextImpl<DCRTPoly>& cc,
+     }
+ }
+ 
++static void btsTrace(const char* stage, const Ciphertext<DCRTPoly>& ct) {
++    static const bool on = []() {
++        const char* e = std::getenv("OPENFHE_BTS_TRACE");
++        return e && e[0] == '1';
++    }();
++    if (!on)
++        return;
++    std::cerr << "[bts_trace] " << stage << ": towers=" << ct->GetElements()[0].GetNumOfElements()
++              << " level=" << ct->GetLevel() << " deg=" << ct->GetNoiseScaleDeg()
++              << " log2(scale)=" << std::log2(ct->GetScalingFactor()) << std::endl;
++}
++
+ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& ciphertext, uint32_t numIterations,
+                                                uint32_t precision) const {
+     const auto cryptoParams = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(ciphertext->GetCryptoParameters());
+@@ -1762,6 +1774,7 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+         // Running PartialSum
+         //------------------------------------------------------------------------------
+ 
++        btsTrace("raised", raised);
+         for (uint32_t j = 1; j < N / (2 * slots); j <<= 1)
+             cc->EvalAddInPlaceNoCheck(raised, cc->EvalRotate(raised, j * slots));
+ 
+@@ -1778,6 +1791,7 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+         auto ctxtEnc =
+             (isLTBootstrap) ? EvalLinearTransform(p.m_U0hatTPre, raised) : EvalCoeffsToSlots(p.m_U0hatTPreFFT, raised);
+ 
++        btsTrace("post-CtS", ctxtEnc);
+         auto evalKeyMap = cc->GetEvalAutomorphismKeyMap(ctxtEnc->GetKeyTag());
+         auto conj       = Conjugate(ctxtEnc, evalKeyMap);
+         cc->EvalAddInPlaceNoCheck(ctxtEnc, conj);
+@@ -1805,13 +1819,16 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+         //------------------------------------------------------------------------------
+ 
+         // Evaluate Chebyshev series for the sine wave
++        btsTrace("pre-Cheby", ctxtEnc);
+         ctxtEnc = cc->EvalChebyshevSeries(ctxtEnc, coefficients, coeffLowerBound, coeffUpperBound);
++        btsTrace("post-Cheby", ctxtEnc);
+ 
+         // Double-angle iterations
+         if (st != FIXEDMANUAL)
+             algo->ModReduceInternalInPlace(ctxtEnc, compositeDegree);
+         uint32_t numIter = (cryptoParams->GetSecretKeyDist() == UNIFORM_TERNARY) ? R_UNIFORM : R_SPARSE;
+         ApplyDoubleAngleIterations(ctxtEnc, numIter);
++        btsTrace("post-DA", ctxtEnc);
+ 
+         // TODO: YSP Can be extended to FLEXIBLE* scaling techniques as well as the closeness of 2^p to moduli is no longer needed
+         if (st != COMPOSITESCALINGAUTO && st != COMPOSITESCALINGMANUAL) {
+@@ -1836,7 +1853,9 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+             algo->ModReduceInternalInPlace(ctxtEnc, compositeDegree);
+ 
+         // linear transform for decoding
++        btsTrace("pre-StC", ctxtEnc);
+         ctxtDec = (isLTBootstrap) ? EvalLinearTransform(p.m_U0Pre, ctxtEnc) : EvalSlotsToCoeffs(p.m_U0PreFFT, ctxtEnc);
++        btsTrace("post-StC", ctxtDec);
+         cc->EvalAddInPlaceNoCheck(ctxtDec, cc->EvalRotate(ctxtDec, slots));
+     }
+ 
+@@ -1846,6 +1865,19 @@ Ciphertext<DCRTPoly> FHECKKSRNS::EvalBootstrap(ConstCiphertext<DCRTPoly>& cipher
+     algo->MultByIntegerInPlace(ctxtDec, corFactor);
+ #endif
+ 
++    // Mixed-size chain: rescale eagerly so the output lands deg-1 exactly on the
++    // per-level scaling-factor table (a lazy deg-2 output from the StC stage
++    // multiplication does not match scalingFactorsRealBig at that level). Uniform
++    // chains keep the lazy deg-2 output unchanged.
++    if (ctxtDec->GetNoiseScaleDeg() == 2) {
++        double sfTop = cryptoParams->GetScalingFactorReal(0);
++        double sfDec = cryptoParams->GetScalingFactorReal(ctxtDec->GetLevel());
++        if (std::fabs(std::log2(sfDec) - std::log2(sfTop)) > 1.5) {
++            algo->ModReduceInternalInPlace(ctxtDec, compositeDegree);
++            btsTrace("post-eager-rescale", ctxtDec);
++        }
++    }
++
+ #ifdef BOOTSTRAPTIMING
+     timeDecode = TOC(t);
+ 
+@@ -3157,7 +3189,23 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+                                        uint32_t level, uint32_t slots) const {
+     const auto cryptoParams = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(cc.GetCryptoParameters());
+ 
++    // Encode at the scale that lands the post-multiplication rescale exactly on the
++    // next level's scaling factor: scFact = sf[l+1] * q_drop(l) / sf[l]. In a uniform
++    // chain sf[l+1] == sf[l]^2 / q_drop exactly, so this reduces to sf[l] bit-identically;
++    // in a mixed-size chain it absorbs the segment-boundary scale jumps.
+     double scFact = cryptoParams->GetScalingFactorReal(level);
++    {
++        uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size() -
++                        (cryptoParams->GetScalingTechnique() == FLEXIBLEAUTOEXT);
++        if (level + 1 < numQ) {
++            double qDrop    = cryptoParams->GetModReduceFactor(numQ - 1 - level);
++            double boundary = cryptoParams->GetScalingFactorReal(level + 1) * qDrop / scFact;
++            // keep the original value (bit-identical) inside uniform segments; the
++            // formula only differs at segment boundaries of a mixed-size chain
++            if (std::fabs(std::log2(boundary) - std::log2(scFact)) > 0.1)
++                scFact = boundary;
++        }
++    }
+ 
+     Plaintext p = Plaintext(std::make_shared<CKKSPackedEncoding>(params, cc.GetEncodingParams(), value, noiseScaleDeg,
+                                                                  level, scFact, slots, COMPLEX));
+@@ -3304,7 +3352,23 @@ Plaintext FHECKKSRNS::MakeAuxPlaintext(const CryptoContextImpl<DCRTPoly>& cc, co
+                                        uint32_t level, uint32_t slots) const {
+     const auto cryptoParams = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(cc.GetCryptoParameters());
+ 
++    // Encode at the scale that lands the post-multiplication rescale exactly on the
++    // next level's scaling factor: scFact = sf[l+1] * q_drop(l) / sf[l]. In a uniform
++    // chain sf[l+1] == sf[l]^2 / q_drop exactly, so this reduces to sf[l] bit-identically;
++    // in a mixed-size chain it absorbs the segment-boundary scale jumps.
+     double scFact = cryptoParams->GetScalingFactorReal(level);
++    {
++        uint32_t numQ = cryptoParams->GetElementParams()->GetParams().size() -
++                        (cryptoParams->GetScalingTechnique() == FLEXIBLEAUTOEXT);
++        if (level + 1 < numQ) {
++            double qDrop    = cryptoParams->GetModReduceFactor(numQ - 1 - level);
++            double boundary = cryptoParams->GetScalingFactorReal(level + 1) * qDrop / scFact;
++            // keep the original value (bit-identical) inside uniform segments; the
++            // formula only differs at segment boundaries of a mixed-size chain
++            if (std::fabs(std::log2(boundary) - std::log2(scFact)) > 0.1)
++                scFact = boundary;
++        }
++    }
+ 
+     Plaintext p = Plaintext(std::make_shared<CKKSPackedEncoding>(params, cc.GetEncodingParams(), value, noiseScaleDeg,
+                                                                  level, scFact, slots, COMPLEX));
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-parametergeneration.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-parametergeneration.cpp
+index 3bab993c..33355ee4 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-parametergeneration.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-parametergeneration.cpp
+@@ -109,6 +109,21 @@ bool ParameterGenerationCKKSRNS::ParamsGenCKKSRNSInternal(std::shared_ptr<Crypto
+         OPENFHE_THROW(s.str());
+     }
+ 
++    const std::vector<uint32_t>& sizesPerLevel = cryptoParamsCKKSRNS->GetScalingModSizePerLevel();
++    if (!sizesPerLevel.empty()) {
++        if (scalTech != FLEXIBLEAUTO && scalTech != FLEXIBLEAUTOEXT)
++            OPENFHE_THROW("scalingModSizePerLevel requires FLEXIBLEAUTO or FLEXIBLEAUTOEXT.");
++        if (sizesPerLevel.size() != static_cast<size_t>(numPrimes - 1))
++            OPENFHE_THROW("scalingModSizePerLevel must have multiplicativeDepth (" + std::to_string(numPrimes - 1) +
++                          ") entries, got " + std::to_string(sizesPerLevel.size()) + ".");
++        for (auto s : sizesPerLevel) {
++            // 59 max: generated primes sit just above 2^size, so size 60 would produce
++            // 61-bit moduli, beyond the 60-bit NativeInteger modulus limit.
++            if (s < 20 || s > 59)
++                OPENFHE_THROW("scalingModSizePerLevel entries must be in [20, 59].");
++        }
++    }
++
+     // TODO: Allow the user to specify this?
+     uint32_t extraModSize = (scalTech == FLEXIBLEAUTOEXT) ? DCRT_MODULUS::DEFAULT_EXTRA_MOD_SIZE : 0;
+ 
+@@ -125,6 +140,14 @@ bool ParameterGenerationCKKSRNS::ParamsGenCKKSRNSInternal(std::shared_ptr<Crypto
+     DistributionType distType = (cryptoParamsCKKSRNS->GetSecretKeyDist() == GAUSSIAN) ? HEStd_error : HEStd_ternary;
+     if (stdLevel != HEStd_NotSet) {
+         uint32_t qBound = firstModSize + (numPrimes - 1) * scalingModSize + extraModSize;
++        uint32_t scalingModSizeForP = scalingModSize;
++        if (!sizesPerLevel.empty()) {
++            qBound = firstModSize + extraModSize;
++            for (auto s : sizesPerLevel) {
++                qBound += s;
++                scalingModSizeForP = std::max(scalingModSizeForP, s);
++            }
++        }
+ 
+         // we add an extra bit to account for the alternating logic of selecting the RNS moduli in CKKS
+         // ignore the case when there is only one max size modulus
+@@ -133,7 +156,7 @@ bool ParameterGenerationCKKSRNS::ParamsGenCKKSRNSInternal(std::shared_ptr<Crypto
+ 
+         // Estimate ciphertext modulus Q*P bound (in case of HYBRID P*Q)
+         if (ksTech == HYBRID)
+-            qBound += std::get<0>(CryptoParametersRNS::EstimateLogP(numPartQ, firstModSize, scalingModSize,
++            qBound += std::get<0>(CryptoParametersRNS::EstimateLogP(numPartQ, firstModSize, scalingModSizeForP,
+                                                                     extraModSize, numPrimes, auxBits, scalTech, true));
+ 
+         uint32_t he_std_n = StdLatticeParm::FindRingDim(distType, stdLevel, qBound);
+@@ -175,6 +198,9 @@ bool ParameterGenerationCKKSRNS::ParamsGenCKKSRNSInternal(std::shared_ptr<Crypto
+         CompositePrimeModuliGen(moduliQ, rootsQ, compositeDegree, numPrimes, firstModSize, dcrtBits, cyclOrder,
+                                 registerWordSize);
+     }
++    else if (!sizesPerLevel.empty())
++        MixedPrimeModuliGen(moduliQ, rootsQ, scalTech, numPrimes, firstModSize, sizesPerLevel, cyclOrder,
++                            extraModSize);
+     else
+         SinglePrimeModuliGen(moduliQ, rootsQ, scalTech, numPrimes, firstModSize, dcrtBits, cyclOrder, extraModSize);
+ 
+@@ -531,4 +557,112 @@ void ParameterGenerationCKKSRNS::SinglePrimeModuliGen(std::vector<NativeInteger>
+     }
+ }
+ 
++void ParameterGenerationCKKSRNS::MixedPrimeModuliGen(std::vector<NativeInteger>& moduliQ,
++                                                     std::vector<NativeInteger>& rootsQ, ScalingTechnique scalTech,
++                                                     uint32_t numPrimes, uint32_t firstModSize,
++                                                     const std::vector<uint32_t>& sizesPerLevel, uint32_t cyclOrder,
++                                                     uint32_t extraModSize) const {
++    // sizesPerLevel[i-1] = bit size of moduliQ[i] for i = 1..numPrimes-1 (bottom-up).
++    // Segment-aware FLEXIBLEAUTO prime selection: within a run of equal sizes the
++    // scaling-factor recursion is tracked exactly as in SinglePrimeModuliGen; at a
++    // size change the scaling-factor target resets to 2^{size}. The resulting chain
++    // only supports ct-ct multiplications within a segment; cross-segment transitions
++    // must be ct-pt operations whose plaintext encoding absorbs the scale jump
++    // (the CKKS bootstrapping circuit satisfies this by construction).
++    // Adjacent segments must differ by at least 2 bits so that the segment-boundary
++    // detection in PrecomputeCRTTables (threshold 1.5 bits) is unambiguous.
++    for (size_t i = 1; i + 1 < numPrimes; ++i) {
++        uint32_t a = sizesPerLevel[i - 1];
++        uint32_t b = sizesPerLevel[i];
++        if (a != b && (a > b ? a - b : b - a) < 2)
++            OPENFHE_THROW("scalingModSizePerLevel: adjacent segments must differ by >= 2 bits.");
++    }
++
++    uint32_t topSize       = sizesPerLevel[numPrimes - 2];
++    NativeInteger q        = FirstPrime<NativeInteger>(topSize, cyclOrder);
++    moduliQ[numPrimes - 1] = q;
++    rootsQ[numPrimes - 1]  = RootOfUnity(cyclOrder, moduliQ[numPrimes - 1]);
++
++    NativeInteger maxPrime{q};
++    NativeInteger minPrime{q};
++
++    double sf = moduliQ[numPrimes - 1].ConvertToDouble();
++    for (size_t i = numPrimes - 2, cnt = 0; i >= 1; --i, ++cnt) {
++        uint32_t sizeHere  = sizesPerLevel[i - 1];
++        uint32_t sizeAbove = sizesPerLevel[i];
++
++        if (sizeHere == sizeAbove) {
++            sf = pow(sf, 2) / moduliQ[i + 1].ConvertToDouble();
++        }
++        else {
++            // segment boundary: the ciphertext scale resets to the size class of the
++            // next prime to be consumed (ct-pt boundary op absorbs the jump)
++            sf = pow(2.0, static_cast<double>(sizeHere));
++        }
++
++        NativeInteger sfInt = std::llround(sf);
++        NativeInteger sfRem = sfInt.Mod(cyclOrder);
++        bool hasSameMod     = true;
++        if ((cnt % 2) == 0) {
++            NativeInteger qPrev = sfInt - NativeInteger(cyclOrder) - sfRem + NativeInteger(1);
++            while (hasSameMod) {
++                hasSameMod = false;
++                qPrev      = PreviousPrime(qPrev, cyclOrder);
++                for (size_t j = i + 1; j < numPrimes; j++) {
++                    if (qPrev == moduliQ[j]) {
++                        hasSameMod = true;
++                        break;
++                    }
++                }
++            }
++            moduliQ[i] = qPrev;
++        }
++        else {
++            NativeInteger qNext = sfInt + NativeInteger(cyclOrder) - sfRem + NativeInteger(1);
++            while (hasSameMod) {
++                hasSameMod = false;
++                qNext      = NextPrime(qNext, cyclOrder);
++                for (size_t j = i + 1; j < numPrimes; j++) {
++                    if (qNext == moduliQ[j]) {
++                        hasSameMod = true;
++                        break;
++                    }
++                }
++            }
++            moduliQ[i] = qNext;
++        }
++        if (moduliQ[i] > maxPrime)
++            maxPrime = moduliQ[i];
++        else if (moduliQ[i] < minPrime)
++            minPrime = moduliQ[i];
++
++        rootsQ[i] = RootOfUnity(cyclOrder, moduliQ[i]);
++    }
++
++    if (firstModSize == sizesPerLevel[0]) {  // this requires sizesPerLevel[0] < 60
++        moduliQ[0] = NextPrime<NativeInteger>(maxPrime, cyclOrder);
++    }
++    else {
++        moduliQ[0] = LastPrime<NativeInteger>(firstModSize, cyclOrder);
++
++        const auto pos = std::find(moduliQ.begin() + 1, moduliQ.end(), moduliQ[0]);
++        if (pos != moduliQ.end()) {
++            moduliQ[0] = NextPrime<NativeInteger>(maxPrime, cyclOrder);
++        }
++    }
++    if (moduliQ[0] > maxPrime)
++        maxPrime = moduliQ[0];
++
++    rootsQ[0] = RootOfUnity(cyclOrder, moduliQ[0]);
++
++    if (scalTech == FLEXIBLEAUTOEXT) {
++        auto tempMod      = FirstPrime<NativeInteger>(extraModSize - 1, cyclOrder);
++        const auto endPos = moduliQ.end() - 1;
++        auto pos          = std::find(moduliQ.begin(), endPos, tempMod);
++        moduliQ[numPrimes] = (pos != endPos) ? NextPrime<NativeInteger>(maxPrime, cyclOrder) : tempMod;
++
++        rootsQ[numPrimes] = RootOfUnity(cyclOrder, moduliQ[numPrimes]);
++    }
++}
++
+ }  // namespace lbcrypto

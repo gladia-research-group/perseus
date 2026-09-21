@@ -8,14 +8,6 @@
 #include <cuda_runtime.h>
 #include <string>
 
-// Model-agnostic block residency: the canonical-schema weight loader/evictor and
-// the host-reclaim policy. Every block-structured driver (GPT-2, ViT) rides this
-// unchanged — export adapters (perseus/export.py) map each arch's checkpoint onto
-// the canonical block schema (ln_1/ln_2, q/k/v/out, up/down), so the loader is
-// arch-agnostic by construction. KV-cache staging and decode-mask priming are the
-// DECODE arm's residency and stay in model/gpt2 (internal.h).
-
-// Per-block cache/weight scope prefix (= "transformer.h.{b}.").
 std::string block_scope(int b);
 
 EncodedBlock load_block_state(Inference& inf,

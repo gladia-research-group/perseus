@@ -1,0 +1,277 @@
+{
+ "version": 1,
+ "nodes": [
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_p01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_p01",
+   "step": "synth.C5_diamond.p01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p01",
+    "pt_p02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_p02",
+   "step": "synth.C5_diamond.p02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_p02",
+    "pt_p03"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_p03",
+   "step": "synth.C5_diamond.p03",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "x_in",
+    "pt_q01"
+   ],
+   "input_levels": [
+    16,
+    16
+   ],
+   "output": "v_q01",
+   "step": "synth.C5_diamond.q01",
+   "output_level": 17,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_q01",
+    "pt_q02"
+   ],
+   "input_levels": [
+    17,
+    17
+   ],
+   "output": "v_q02",
+   "step": "synth.C5_diamond.q02",
+   "output_level": 18,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_q02",
+    "pt_i01"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_i01",
+   "step": "synth.C5_diamond.i01",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_i01",
+    "pt_i02"
+   ],
+   "input_levels": [
+    19,
+    19
+   ],
+   "output": "v_i02",
+   "step": "synth.C5_diamond.i02",
+   "output_level": 20,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_i02",
+    "pt_i03"
+   ],
+   "input_levels": [
+    20,
+    20
+   ],
+   "output": "v_i03",
+   "step": "synth.C5_diamond.i03",
+   "output_level": 21,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_i03",
+    "pt_i04"
+   ],
+   "input_levels": [
+    21,
+    21
+   ],
+   "output": "v_i04",
+   "step": "synth.C5_diamond.i04",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_q02",
+    "pt_j01"
+   ],
+   "input_levels": [
+    18,
+    18
+   ],
+   "output": "v_j01",
+   "step": "synth.C5_diamond.j01",
+   "output_level": 19,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "add",
+   "inputs": [
+    "v_i04",
+    "v_j01"
+   ],
+   "input_levels": [
+    22,
+    19
+   ],
+   "output": "v_innerjoin",
+   "step": "synth.C5_diamond.innerjoin",
+   "output_level": 22,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_innerjoin",
+    "pt_r01"
+   ],
+   "input_levels": [
+    22,
+    22
+   ],
+   "output": "v_r01",
+   "step": "synth.C5_diamond.r01",
+   "output_level": 23,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_r01",
+    "pt_r02"
+   ],
+   "input_levels": [
+    23,
+    23
+   ],
+   "output": "v_r02",
+   "step": "synth.C5_diamond.r02",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "add",
+   "inputs": [
+    "v_p03",
+    "v_r02"
+   ],
+   "input_levels": [
+    19,
+    24
+   ],
+   "output": "v_outerjoin",
+   "step": "synth.C5_diamond.outerjoin",
+   "output_level": 24,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_outerjoin",
+    "pt_t01"
+   ],
+   "input_levels": [
+    24,
+    24
+   ],
+   "output": "v_t01",
+   "step": "synth.C5_diamond.t01",
+   "output_level": 25,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  },
+  {
+   "op_type": "mult",
+   "inputs": [
+    "v_t01",
+    "pt_t02"
+   ],
+   "input_levels": [
+    25,
+    25
+   ],
+   "output": "v_t02",
+   "step": "synth.C5_diamond.t02",
+   "output_level": 26,
+   "output_noise_level": 1,
+   "output_max_abs": 1.0,
+   "pack_period": 1
+  }
+ ]
+}

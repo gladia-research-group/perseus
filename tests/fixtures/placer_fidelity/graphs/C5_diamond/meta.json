@@ -1,0 +1,6 @@
+{
+ "case": "C5_diamond",
+ "opt_count": 2,
+ "unique_sites": null,
+ "note": "nested fork/join; minimum 2 refreshes, several minimal site families (one inside the inner deep branch at depth<=5, one on the right-branch tail / outer join)"
+}

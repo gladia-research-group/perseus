@@ -1,6 +1,0 @@
-name: eurosat
-kind: image
-path: tanganke/eurosat
-split: train
-image_field: image
-pool_images: 512

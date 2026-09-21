@@ -1,4 +1,5 @@
 #include "app/pipeline.h"
+#include "interrupt.h"
 
 #include "cutmax.h"
 #include "model/gpt2.h"          // parse_inference_mode
@@ -39,29 +40,6 @@ int argmax_index(const std::vector<double>& v) {
     for (int j = 1; j < static_cast<int>(v.size()); ++j)
         if (v[j] > v[am]) am = j;
     return am;
-}
-
-// --- CLASSIFY readout helpers (prefill-only tail; decode path never calls these) ---
-std::vector<int> parse_int_list(const char* s) {
-    std::vector<int> out;
-    for (const char* p = s; p && *p;) {
-        char* end = nullptr;
-        const long v = std::strtol(p, &end, 10);
-        if (end == p) break;
-        out.push_back(static_cast<int>(v));
-        p = end;
-        while (*p == ',' || *p == ' ') ++p;
-    }
-    return out;
-}
-
-void write_logits_bin(const char* path, const std::vector<double>& lg) {
-    // full-vocab logits as float32 (compact) for post-hoc full-vocab KL / top-k, no FHE re-run.
-    std::FILE* f = std::fopen(path, "wb");
-    if (!f) return;
-    const std::vector<float> buf(lg.begin(), lg.end());
-    std::fwrite(buf.data(), sizeof(float), buf.size(), f);
-    std::fclose(f);
 }
 
 std::vector<std::vector<double>> parse_2d_first(const std::string& text,
@@ -107,32 +85,28 @@ RunConfig RunConfig::from_env() {
     c.gen_prompt = std::stoi(env_or("GEN_PROMPT", "4"));
     c.gen_tokens = std::stoi(env_or("GEN_TOKENS", "4"));
     c.steps_t = std::stoi(env_or("STEPS_T", "16"));
-    c.configs_path = env_or("CONFIGS_PATH",
-        "/leonardo_work/IscrC_eff-SAM2/azirilli/he-aware-training/"
-        "configs/model/approximation/hybrid/configs.json");
-    c.weights_path = env_or("WEIGHTS_PATH",
-        "/leonardo_work/IscrC_eff-SAM2/azirilli/he-aware-training/"
-        "checkpoints/openai-community/gpt2/lm_eval/classic/weights.bin.zip");
-    c.io_dir = env_or("ALL_BLOCKS_IO_DIR",
-        "/leonardo/pub/userexternal/azirilli/he-aware-training_data/all_blocks_io");
+    // No defaults for the data paths: require_paths() rejects an empty one by name.
+    c.configs_path = env_or("CONFIGS_PATH", "");
+    c.weights_path = env_or("WEIGHTS_PATH", "");
+    c.io_dir       = env_or("ALL_BLOCKS_IO_DIR", "");
     c.plan_dir  = env_or("FHE_BOOTSTRAP_PLACEMENTS_DIR", "");
     c.decode_plan_dir = env_or("FHE_DECODE_PLACEMENTS_DIR", "");
     c.graph_dir = env_or("FHE_GRAPH_DIR", "");
     c.mode = parse_inference_mode(env_or("GPT2_INFERENCE_MODE", "threaded"));
     c.cache_weights = env_or("GPT2_CACHE", "1") != "0";
     c.teacher_forced = env_or("TEACHER_FORCED", "0") != "0";   // generate: GT tokens vs argmax feedback
-    return c;   // CUT_MAX removed 2026-07-05: encrypted CutMax always computed
+    return c;
+}
+
+void require_paths(const RunConfig& c) {
+    if (c.configs_path.empty()) throw std::runtime_error("CONFIGS_PATH is not set (no default)");
+    if (c.weights_path.empty()) throw std::runtime_error("WEIGHTS_PATH is not set (no default)");
+    if (c.io_dir.empty())       throw std::runtime_error("ALL_BLOCKS_IO_DIR is not set (no default)");
 }
 
 std::vector<std::vector<double>> read_teacher_forced_inputs(const RunConfig& cfg) {
     const int rows = std::max(1, cfg.tokens);
-    if (const char* cip = std::getenv("CLASSIFY_INPUT_JSON")) {
-        auto inp = parse_2d_first(json_utils::read_file_to_string(cip), "inp", rows);
-        if (static_cast<int>(inp.size()) < rows)
-            throw std::runtime_error("CLASSIFY_INPUT_JSON has < requested rows: " +
-                                     std::string(cip));
-        return inp;
-    }
+    if (cfg.io_dir.empty()) throw std::runtime_error("ALL_BLOCKS_IO_DIR is not set (no default)");
     const int horizon = std::max(cfg.steps_t, rows);
     auto path_for = [&](int T) {
         char buf[512];
@@ -199,7 +173,7 @@ struct DecodeSession::Impl {
     GPT2Model                    model;
 
     explicit Impl(const RunConfig& cfg)
-        : store(ends_with(cfg.weights_path, ".zip")
+        : store((require_paths(cfg), ends_with(cfg.weights_path, ".zip"))
                     ? weight_loader::WeightStore::from_zip(cfg.weights_path)
                     : weight_loader::WeightStore::from_dir(cfg.weights_path)),
           parsed(config_loader::parse_configs_json(
@@ -235,6 +209,7 @@ RunResult DecodeSession::decode(const std::vector<std::vector<double>>& inputs) 
     const int _prof_tok = (_pt && *_pt) ? std::atoi(_pt) : -1;
 
     for (int t = 0; t < cfg_.tokens; ++t) {
+        perseus_interrupt::poll();   // a Ctrl-C from Python lands between tokens
         const bool _prof_on = _prof_mode != StepProfiler::Mode::Off && (_prof_tok < 0 || t == _prof_tok);
         _prof.mode = _prof_on ? _prof_mode : StepProfiler::Mode::Off;
         if (_prof_on) _prof.reset();   // isolate THIS token's op composition (stack empty between tokens)
@@ -248,6 +223,7 @@ RunResult DecodeSession::decode(const std::vector<std::vector<double>>& inputs) 
                 std::ostringstream _oss; _oss << "[proftok] t=" << t;
                 _prof.dump(_oss);
                 std::fputs(_oss.str().c_str(), stdout); std::fflush(stdout);
+                _prof.reset();
             }
             const int fhe_am = argmax_index(lg);
             const double dt = std::chrono::duration<double>(    // PURE decode wall (advance + logits)
@@ -264,6 +240,11 @@ RunResult DecodeSession::decode(const std::vector<std::vector<double>>& inputs) 
                 std::vector<PackedCtx> z; double argmax_s = 0.0;
                 model.cutmax_step(tiles, /*position=*/-1, &z, &argmax_s);
                 argmax_total += argmax_s;
+                if (_prof_on) {   // the CutMax argmax stage on its own
+                    std::ostringstream _oss; _oss << "[profarg] t=" << t;
+                    _prof.dump(_oss);
+                    std::fputs(_oss.str().c_str(), stdout); std::fflush(stdout);
+                }
                 std::vector<double> zdec(model.vocab(), 0.0);
                 if (z.size() == 1 && model.vocab() > W_tile) {
                     auto pt = decrypt_pt(minf.cc(), z[0].ct, minf.fhe->sk());
@@ -303,7 +284,11 @@ RunResult DecodeSession::decode(const std::vector<std::vector<double>>& inputs) 
 
 RunResult run_decode(const RunConfig& cfg,
                      const std::vector<std::vector<double>>& inputs) {
-    return DecodeSession(cfg).decode(inputs);   // byte-identical to the pre-refactor run_decode
+    // The session is parked, never destroyed: its teardown would race the CUDA driver's
+    // exit handlers (static destruction order across OpenFHE / FIDESlib / libcuda).
+    static std::vector<std::unique_ptr<DecodeSession>> parked;
+    parked.emplace_back(std::make_unique<DecodeSession>(cfg));
+    return parked.back()->decode(inputs);
 }
 
 RunResult run_generate(const RunConfig& cfg,
@@ -325,13 +310,13 @@ RunResult run_generate(const RunConfig& cfg,
         return r;
     }
 
+    require_paths(cfg);
     auto parsed = config_loader::parse_configs_json(
         config_loader::read_file_to_string(cfg.configs_path));
 
     weight_loader::WeightStore store = ends_with(cfg.weights_path, ".zip")
         ? weight_loader::WeightStore::from_zip(cfg.weights_path)
         : weight_loader::WeightStore::from_dir(cfg.weights_path);
-
 
     const bool use_prefill = P > 1;
     const int N_blocks = parsed.model.n_layers;
@@ -369,9 +354,9 @@ RunResult run_generate(const RunConfig& cfg,
                           ckks_options_from_env());
 
 
-    model.set_entry_bts(!cfg.teacher_forced ||
-                        [] { const char* v = std::getenv("FHE_FORCE_ENTRY_BTS");
-                             return v && *v && std::atoi(v) != 0; }());
+    model.set_entry_bts(!cfg.teacher_forced);   // fed-back CutMax embeddings enter through a bootstrap
+
+    model.overlap_setup_with_block0(P);   // no-op unless load() armed the deferred setup
 
     Sequence seq = model.start();
     model.generate_decode_masks(P + M);
@@ -397,18 +382,6 @@ RunResult run_generate(const RunConfig& cfg,
             std::vector<double> lg = decode_lm_head_logits(
                 model.inference(), tiles, model.vocab(), W_tile);
             const int fhe_am = argmax_index(lg);
-            // FHE_LOGIT_AUDIT=1: perpetrator-vs-victim discriminator for cutmax-side
-            // explosions — are the logits already hot BEFORE cutmax runs?
-            static const bool logit_audit = [] {
-                const char* v = std::getenv("FHE_LOGIT_AUDIT");
-                return v && *v && std::atoi(v) != 0;
-            }();
-            if (logit_audit) {
-                double mx = 0.0, mn = 0.0;
-                for (double x : lg) { mx = std::max(mx, x); mn = std::min(mn, x); }
-                fprintf(stderr, "[logit_audit] pos=%d logit_max=%.6g logit_min=%.6g\n",
-                        pos, mx, mn);
-            }
             const int gt_am = (pos < gt.T && !gt.logits[pos].empty())
                 ? argmax_index(gt.logits[pos]) : -1;
             const bool want_fb = (j + 1 < M);
@@ -513,6 +486,7 @@ RunResult run_prefill(const RunConfig& cfg,
         return r;
     }
 
+    require_paths(cfg);
     auto parsed = config_loader::parse_configs_json(
         config_loader::read_file_to_string(cfg.configs_path));
     const int N_blocks = parsed.model.n_layers;
@@ -580,6 +554,8 @@ RunResult run_prefill(const RunConfig& cfg,
                                       chunk_plans.empty() ? nullptr : &chunk_plans,
                                       decode_windows.empty() ? nullptr : &decode_windows);
 
+    model.overlap_setup_with_block0(prefill_n);
+
     Sequence seq = model.start();
     model.generate_decode_masks(total_n);
 
@@ -614,56 +590,7 @@ RunResult run_prefill(const RunConfig& cfg,
                                                            model.vocab(), W_tile);
             int next_tok = argmax_index(lg);   // lm_head plaintext argmax (== full-vocab argmax of lg)
 
-            if (const char* cont_start_s = std::getenv("CLASSIFY_CONT_START")) {
-                const int cont_start = std::atoi(cont_start_s);
-                const char* cont_ids_s = std::getenv("CLASSIFY_CONT_IDS");
-                const std::vector<int> cont_ids =
-                    cont_ids_s ? parse_int_list(cont_ids_s) : std::vector<int>{};
-                double ll = 0.0;
-                bool finite = !cont_ids.empty();
-                std::string per;
-                for (size_t j = 0; j < cont_ids.size(); ++j) {
-                    const int ppos = cont_start - 1 + static_cast<int>(j);
-                    auto tj = model.tail_logit_tiles_at(tail_hidden, prefill_n, ppos);
-                    std::vector<double> lj =
-                        decode_lm_head_logits(model.inference(), tj, model.vocab(), W_tile);
-                    double mx = lj.empty() ? 0.0 : lj[0];
-                    for (double v : lj) mx = std::max(mx, v);
-                    double se = 0.0;
-                    for (double v : lj) se += std::exp(v - mx);
-                    const double lse = mx + std::log(se);
-                    const int t = cont_ids[j];
-                    const double lp = (t >= 0 && t < static_cast<int>(lj.size()))
-                                          ? lj[t] - lse : std::nan("");
-                    finite = finite && std::isfinite(lp);
-                    ll += lp;
-                    char b[48];
-                    std::snprintf(b, sizeof(b), "%s%.6g", j ? "," : "", lp);
-                    per += b;
-                }
-                std::fprintf(stderr,
-                    "[classify_mc] cont_ll=%.8g ntok=%zu per_tok=%s finite=%d\n",
-                    ll, cont_ids.size(), per.c_str(), finite ? 1 : 0);
-                std::fflush(stderr);
-            } else if (const char* classify_ids = std::getenv("CLASSIFY_CAND_IDS")) {
-                const std::vector<int> ids = parse_int_list(classify_ids);
-                double absmax = 0.0;
-                bool finite = true;
-                for (double v : lg) { absmax = std::max(absmax, std::fabs(v)); finite = finite && std::isfinite(v); }
-                std::string cand;
-                for (size_t k = 0; k < ids.size(); ++k) {
-                    const bool ok = ids[k] >= 0 && ids[k] < static_cast<int>(lg.size());
-                    char b[48];
-                    std::snprintf(b, sizeof(b), "%s%.8g", k ? "," : "", ok ? lg[ids[k]] : std::nan(""));
-                    cand += b;
-                }
-                std::fprintf(stderr,
-                    "[classify] cand_logits=%s vocab_argmax=%d vocab_argmax_logit=%.8g absmax=%.6g finite=%d\n",
-                    cand.c_str(), next_tok, (next_tok >= 0 ? lg[next_tok] : std::nan("")),
-                    absmax, finite ? 1 : 0);
-                std::fflush(stderr);
-                if (const char* out = std::getenv("CLASSIFY_LOGITS_OUT")) write_logits_bin(out, lg);
-            } else {
+            {
                 Inference& minf = model.inference();
                 std::vector<PackedCtx> z;
                 double argmax_s = 0.0;
@@ -687,27 +614,6 @@ RunResult run_prefill(const RunConfig& cfg,
                     cm_am, next_tok, cm_am == next_tok ? "OK" : "MISS", argmax_s);
                 std::fflush(stderr);
                 next_tok = cm_am;
-            }
-
-            if (std::getenv("PREFILL_ARGMAX_SCAN")) {
-                const auto& chunks = model.prefill_lnf_chunks();
-                Inference& minf = model.inference();
-                const int t_cap = minf.slots / minf.size.hidDim;
-                const int cap = (minf.fhe->complex_payload && prefill_n > t_cap) ? 2 * t_cap
-                                                                                 : t_cap;
-                const char* st = std::getenv("PREFILL_ARGMAX_SCAN_STRIDE");
-                const int stride = (st && atoi(st) > 0) ? atoi(st) : 1;
-                for (int pos = 0; pos + 1 < prefill_n; pos += stride) {
-                    const size_t c = static_cast<size_t>(pos / cap);
-                    if (c >= chunks.size()) break;
-                    auto tj = model.tail_logit_tiles_at(chunks[c], prefill_n, pos);
-                    r.logits.push_back(decode_lm_head_logits(minf, tj, model.vocab(), W_tile));
-                    r.top1.push_back(argmax_index(r.logits.back()));
-                    r.positions.push_back(pos);
-                    std::fprintf(stderr, "[prefill_scan] pos=%d/%d top1=%d\n",
-                                 pos, prefill_n - 1, r.top1.back());
-                    std::fflush(stderr);
-                }
             }
             r.logits.push_back(lg);
             r.top1.push_back(next_tok);

@@ -67,12 +67,11 @@ PackedCtx encode_linear_input(Inference& inf, const std::vector<double>& x,
 
 namespace {
 
+// Same rule and the same polarity as the cachemir path (cachemir_linear_utils.cu): one
+// name must not mean opposite things in one process.
 bool coeff_encode_enabled() {
-    static const bool v = [] {
-        const char* e = std::getenv("FHE_PT_COEFF_ENCODE");
-        return !(e && *e && std::atoi(e) == 0);
-    }();
-    return v;
+    const char* e = std::getenv("FHE_PT_COEFF_ENCODE");
+    return e && *e && std::atoi(e) == 1;
 }
 }  // namespace
 
@@ -84,16 +83,20 @@ std::vector<Ptx> encode_weight_matrix(Inference& inf,
     const uint32_t lv = static_cast<uint32_t>(target_level);
 
     bool coeff = coeff_encode_enabled() && static_cast<bool>(inf.pt_stage_hook);
-    const uint32_t lv1 = static_cast<uint32_t>(inf.fhe->total_depth);   // 1-limb (q0) encode level
+
+    const uint32_t lv1 = static_cast<uint32_t>(
+        inf.fhe->composite_degree * inf.fhe->total_depth);
     double ratio = 1.0, sf_target = 0.0;
     if (coeff) {
         sf_target = inf.cc()->ScalingFactorReal(lv);
         ratio     = sf_target / inf.cc()->ScalingFactorReal(lv1);
-        // Centered lift needs |round(w * sf_target)| < q0/2 (q0 = 2^FIRST_MOD_BITS-class).
         double mx = 0.0;
         for (const auto& row : W)
             for (double x : row) mx = std::max(mx, std::abs(x));
-        if (mx * sf_target >= 0.45 * std::pow(2.0, 60)) {
+
+        const double lift_bits = (double)inf.fhe->first_mod_bits;
+        if (mx * sf_target >= 0.45 * std::pow(2.0, lift_bits)) {
+            // Past the centered-lift bound: this matrix class takes the full encode.
             static bool warned = false;
             if (!warned) {
                 warned = true;
@@ -131,7 +134,7 @@ std::vector<Ptx> encode_weight_matrix(Inference& inf,
                         shifted[(i + shift) % N] = diag[i];
                 Ptx pt = inf.cc()->MakeCKKSPackedPlaintext(
                     shift == 0 ? diag : shifted, /*noiseScaleDeg=*/1, coeff ? lv1 : lv);
-                if (coeff) inf.cc()->MarkCoeffStaged(pt, lv, sf_target);
+                if (coeff) inf.cc()->MarkCoeffStaged(pt, lv, sf_target, /*prescale_log2=*/0);
                 result[b * p.G + g] = std::move(pt);
             }
         }

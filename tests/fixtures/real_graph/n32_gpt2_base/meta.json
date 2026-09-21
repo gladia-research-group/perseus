@@ -1,0 +1,6 @@
+{
+  "what": "GPT-2 (124M) block 0 operation graph captured by the C++ decode driver on the n32 composite chain",
+  "source": "block_0 of a sync decode capture on the 32-bit composite chain",
+  "why": "so the planner's real-graph tests run from a checkout, without a captured graph",
+  "override": "PERSEUS_REAL_GRAPH=/path/to/graph_dir points the tests at a full 13-block capture instead"
+}

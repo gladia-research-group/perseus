@@ -1,8 +1,0 @@
-defaults:
-  - vit_base
-  - _self_
-
-name: bert_base
-
-gelu:
-  raw_max_safety: 1.0

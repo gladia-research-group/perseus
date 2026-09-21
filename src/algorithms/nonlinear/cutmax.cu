@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -17,16 +18,6 @@ namespace {
 
 constexpr int kCutmaxHintLevel = 16;
 
-bool cutmax_trace() {
-    static const bool on = [] {
-        const char* v = std::getenv("CUTMAX_TRACE");
-        return v && *v && std::string(v) != "0";
-    }();
-    return on;
-}
-
-// vector-lane meta-iters override (entry/y hints, pow_odd, sum GS); 0 = follow
-// CUTMAX_BTS_ITERS. Cascade re-scopes itself per iteration (casc_iters).
 int cutmax_vec_bts_iters() {
     static const int v = [] {
         const char* e = std::getenv("CUTMAX_VEC_BTS_ITERS");
@@ -44,8 +35,6 @@ bool cutmax_precise_scoped() {
     return on;
 }
 
-// route cascade + sum-GS bootstraps (broadcast scalars only) to the sparse
-// arcsine precomp; needs SPARSE_BTS_SLOTS + FIDESLIB_SPARSE_ARCSINE at build
 bool cutmax_sparse_bts() {
     static const bool on = [] {
         const char* v = std::getenv("CUTMAX_SPARSE_BTS");
@@ -53,44 +42,25 @@ bool cutmax_sparse_bts() {
 
         const char* a = std::getenv("FIDESLIB_SPARSE_ARCSINE");
         if (!(a && *a && *a != '0')) {
+
+            const char* o = std::getenv("CUTMAX_SPARSE_NO_ARCSINE");
+            if (o && *o && *o != '0') {
+                std::fprintf(stderr,
+                    "[cutmax]  CUTMAX_SPARSE_NO_ARCSINE=1: routing cutmax bootstraps sparse "
+                    "WITHOUT the arcsine correction. The config's T5 cascade schedule was "
+                    "calibrated WITH it — this is OUTSIDE its calibrated envelope. "
+                    "Measurement only.\n");
+                return true;
+            }
             std::fprintf(stderr,
                 "[cutmax] CUTMAX_SPARSE_BTS ignored: FIDESLIB_SPARSE_ARCSINE not armed "
-                "(sparse cutmax routing is arcsine-envelope-calibrated)\n");
+                "(sparse cutmax routing is arcsine-envelope-calibrated; "
+                "set CUTMAX_SPARSE_NO_ARCSINE=1 to measure without it)\n");
             return false;
         }
         return true;
     }();
     return on;
-}
-
-void trace_ct(Inference& inf, const PackedCtx& x, const char* tag) {
-    if (!cutmax_trace()) return;
-    try {
-        Ctx c = x.ct;
-        auto pt = decrypt_pt(inf.cc(), c, inf.fhe->sk());
-        const auto& cv = pt->GetCKKSPackedValue();
-        double am = 0.0, mx = -1e300, im_am = 0.0, im_sum = 0.0;
-        double junk_am = 0.0;                  // pair junk region: Im slots past the vocab tail
-        const size_t junk_lo = 50257 - 32768;  // ids [50257, 65536) ride Im[17489..)
-        size_t im_arg = 0;
-        for (size_t i = 0; i < cv.size(); ++i) {
-            const double d = cv[i].real(), b = std::abs(cv[i].imag());
-            if (std::abs(d) > am) am = std::abs(d);
-            if (d > mx) mx = d;
-            if (b > im_am) { im_am = b; im_arg = i; }
-            im_sum += b;
-            if (i >= junk_lo && b > junk_am) junk_am = b;
-        }
-        std::fprintf(stderr,
-                     "[cutmax_trace] %-14s level=%u slot0=%.6g max=%.6g "
-                     "|abs|max=%.6g |im|max=%.3g@%zu |im|mean=%.3g junk|im|max=%.3g\n",
-                     tag, level_of(x.ct), cv[0].real(), mx, am,
-                     im_am, im_arg, im_sum / cv.size(), junk_am);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "[cutmax_trace] %-14s level=%u DECODE_FAILED (%s)\n",
-                     tag, level_of(x.ct), e.what());
-    }
-    std::fflush(stderr);
 }
 
 PackedCtx rotsum_all(Inference& inf, const PackedCtx& x) {
@@ -118,6 +88,15 @@ PackedCtx rotsum_tiles(Inference& inf, const std::vector<PackedCtx>& tiles) {
     return s;
 }
 
+PackedCtx make_cutmax_ones(Inference& inf, const PackedCtx& x_in) {
+    auto& F = *inf.fhe;
+    if (F.const_one_available())
+        return F.tagged(F.const_one_clone(inf.slots),
+                        x_in.packing, packtag::PackTag::constant(inf.slots));
+    PackedCtx ones = F.sub(F.add(x_in, 1.0), x_in);
+    return F.tagged(ones.ct, x_in.packing, packtag::PackTag::constant(inf.slots));
+}
+
 PackedCtx inv_sigma_cascade(Inference& inf, const PackedCtx& x_in,
                             const CutMaxConfig& cfg,
                             const CutMaxConfig::Iter& it) {
@@ -128,9 +107,9 @@ PackedCtx inv_sigma_cascade(Inference& inf, const PackedCtx& x_in,
         F, it.casc_iters > 0 ? static_cast<uint32_t>(it.casc_iters) : 2);
     CKKSContext::SparseBtsScope sparse_scope(F, cutmax_sparse_bts());
     PackedCtx x = x_in;
-    PackedCtx ones{encrypt_const(F.cc, 1.0, static_cast<size_t>(inf.slots),
-                                 F.pk()),
-                   x_in.packing};
+
+    PackedCtx ones;
+    { WithStep _o(inf, "ones_seed"); ones = make_cutmax_ones(inf, x_in); }
     PackedCtx u_prod;
     for (int j = 0; j < it.passes; ++j) {
         WithStep _p(inf, "p" + std::to_string(j));
@@ -152,14 +131,39 @@ PackedCtx inv_sigma_cascade(Inference& inf, const PackedCtx& x_in,
     return F.mult(u_prod, 0.5 / (std::sqrt(it.s2_hi) * it.c * it.m));
 }
 
+template <class Gen>
+static Ptx cutmax_cached_pt(Inference& inf, const std::string& tag, uint32_t lv, bool tagged,
+                            Gen&& gen) {
+    const std::string key = Inference::enc_cache_key(tag, lv, 1);
+    auto it = inf.enc_cache.find(key);
+    if (it != inf.enc_cache.end()) { ++inf.enc_cache_hit; return it->second; }
+    ++inf.enc_cache_miss;
+    const auto vals = gen();
+    Ptx pt = tagged ? inf.encode_tagged(vals, lv)
+                    : encode(inf.fhe->cc, vals, static_cast<int>(lv));
+    inf.enc_cache.emplace(key, pt);
+    return pt;
+}
+
 PackedCtx cutmax_packed(Inference& inf, const PackedCtx& pair_in,
                         int vocab, const CutMaxConfig& cfg,
                         const std::vector<std::vector<double>>& mask) {
     auto& F = *inf.fhe;
     const int n = vocab;
+    const std::string cfg_fp = [&] {
+        size_t h = std::hash<double>{}(cfg.entry_scale) ^ (static_cast<size_t>(vocab) << 1);
+        for (const auto& it : cfg.iters) {
+            h ^= std::hash<double>{}(it.s2_hi) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= std::hash<double>{}(it.m)     + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h ^= static_cast<size_t>(it.p)     + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+        char buf[20];
+        std::snprintf(buf, sizeof buf, ".%llx",
+                      static_cast<unsigned long long>(h & 0xffffffffULL));
+        return std::string(buf);
+    }();
     std::vector<uint64_t> bts_marks{F.total_bootstraps};
 
-    trace_ct(inf, pair_in, "entry pair");   // raw chain output: Re=t0, Im=t1 (+residue/junk)
 
     // lanes: A real-axis (t0), B imag-axis (i*sgn*t1), canonical values
     PackedCtx pin, A, B;
@@ -170,9 +174,12 @@ PackedCtx cutmax_packed(Inference& inf, const PackedCtx& pair_in,
       B = F.sub(pin, F.conjugate(pin));                      // 2i*t1
       A = F.mult(A, 0.5);                                    // entry only:
 
-      std::vector<double> bmask = mask[1];
-      for (auto& x : bmask) x *= 0.5;
-      Ptx bmask_pt = inf.encode_at(bmask, B);
+      const uint32_t _blv = static_cast<uint32_t>(level_of(B.ct)) + inf.pending_rescale_primes(B.ct);
+      Ptx bmask_pt = cutmax_cached_pt(inf, "cutmax.bmask" + cfg_fp, _blv, /*tagged=*/true, [&]() {
+          std::vector<double> bmask = mask[1];
+          for (auto& x : bmask) x *= 0.5;
+          return bmask;
+      });
       B = F.mult(B, bmask_pt);                               // -> canonical, junk-free
     }
     bts_marks.push_back(F.total_bootstraps);
@@ -188,50 +195,60 @@ PackedCtx cutmax_packed(Inference& inf, const PackedCtx& pair_in,
         PackedCtx R_c = rotsum_all(inf, P);                  // S0 + i*sgn*S1
         Ptx ext = inf.encode_complex_const_at(0.5, -0.5 * sgn, R_c.ct);
         PackedCtx R = F.im_cleanse(F.mult(R_c, ext));        // S0 + S1
-        trace_ct(inf, R, "R (n*mu)");
 
         PackedCtx kA = F.mult(A, kf);
         PackedCtx kB = F.mult(B, kf);
         if (!it.ex2) {
-            std::vector<double> mu0 = mask[0], mu1 = mask[1];
-            for (auto& x : mu0) x *= kf / n;
-            for (auto& x : mu1) x *= kf / n;
-            Ptx m0 = inf.encode_at(mu0, R);
+            const uint32_t _rlv = static_cast<uint32_t>(level_of(R.ct))
+                                + inf.pending_rescale_primes(R.ct);
+            Ptx m0 = cutmax_cached_pt(inf, "cutmax.m0.i" + std::to_string(ii) + cfg_fp, _rlv,
+                                      /*tagged=*/true, [&]() {
+                std::vector<double> mu0 = mask[0];
+                for (auto& x : mu0) x *= kf / n;
+                return mu0;
+            });
             kA = F.sub(kA, F.mult(R, m0));
 
-            std::vector<std::complex<double>> mu1c(mu1.size());
-            for (size_t j = 0; j < mu1.size(); ++j)
-                mu1c[j] = {0.0, sgn * mu1[j]};
-            Ptx m1 = encode(F.cc, mu1c, static_cast<int>(level_of(R.ct)) +
-                            (R.ct->GetNoiseScaleDeg() == 2 ? 1 : 0));
+            Ptx m1 = cutmax_cached_pt(inf, "cutmax.m1.i" + std::to_string(ii) + cfg_fp, _rlv,
+                                      /*tagged=*/false, [&]() {
+                std::vector<std::complex<double>> mu1c(mask[1].size());
+                for (size_t j = 0; j < mask[1].size(); ++j)
+                    mu1c[j] = {0.0, sgn * mask[1][j] * kf / n};
+                return mu1c;
+            });
             kB = F.sub(kB, F.mult(R, m1));
         }
         PackedCtx S2 = rotsum_all(inf, F.sub(F.square(kA), F.square(kB)));
-        trace_ct(inf, S2, "S2 (s2/hi)");
         PackedCtx f = inv_sigma_cascade(inf, S2, cfg, it);   // 0.5/(c*m) fold
-        trace_ct(inf, f, "f (.5/csm)");
 
         PackedCtx Rf = F.mult(R, f);
         PackedCtx a = F.mult(P, f);
-        std::vector<std::complex<double>> bc(mask[0].size()), sh(mask[0].size());
-        for (size_t j = 0; j < mask[0].size(); ++j) {
-            bc[j] = {mask[0][j] / n, sgn * mask[1][j] / n};
-            sh[j] = {mask[0][j] * 0.5 / it.m, sgn * mask[1][j] * 0.5 / it.m};
-        }
-        Ptx b_pt = encode(F.cc, bc, static_cast<int>(level_of(Rf.ct)) +
-                          (Rf.ct->GetNoiseScaleDeg() == 2 ? 1 : 0));
+        Ptx b_pt = cutmax_cached_pt(
+            inf, "cutmax.b.i" + std::to_string(ii) + cfg_fp,
+            static_cast<uint32_t>(level_of(Rf.ct)) + inf.pending_rescale_primes(Rf.ct),
+            /*tagged=*/false, [&]() {
+                std::vector<std::complex<double>> bc(mask[0].size());
+                for (size_t j = 0; j < mask[0].size(); ++j)
+                    bc[j] = {mask[0][j] / n, sgn * mask[1][j] / n};
+                return bc;
+            });
         PackedCtx b = F.mult(Rf, b_pt);
-        Ptx sh_pt = encode(F.cc, sh, static_cast<int>(level_of(a.ct)) +
-                           (a.ct->GetNoiseScaleDeg() == 2 ? 1 : 0));
+        Ptx sh_pt = cutmax_cached_pt(
+            inf, "cutmax.sh.i" + std::to_string(ii) + cfg_fp,
+            static_cast<uint32_t>(level_of(a.ct)) + inf.pending_rescale_primes(a.ct),
+            /*tagged=*/false, [&]() {
+                std::vector<std::complex<double>> sh(mask[0].size());
+                for (size_t j = 0; j < mask[0].size(); ++j)
+                    sh[j] = {mask[0][j] * 0.5 / it.m, sgn * mask[1][j] * 0.5 / it.m};
+                return sh;
+            });
         PackedCtx yP = F.add(F.sub(a, b), sh_pt);
-        trace_ct(inf, yP, "y shift");
         F.bootstrap_hint(yP.ct, kCutmaxHintLevel);   // ONE packed vector bts
 
         // deg-preserving unpack -> canonical lanes; odd power per lane
         A = pow_odd(inf.cc_ctx(), F.add(yP, F.conjugate(yP)), it.p);          // y0^p
         B = pow_odd(inf.cc_ctx(), F.sub(yP, F.conjugate(yP)), it.p);  // i^p*sgn*y1^p
         sgn *= (it.p % 4 == 1) ? 1.0 : -1.0;
-        trace_ct(inf, A, "y^p (re)");
         bts_marks.push_back(F.total_bootstraps);
     }
 
@@ -242,7 +259,6 @@ PackedCtx cutmax_packed(Inference& inf, const PackedCtx& pair_in,
       PackedCtx S_c = rotsum_all(inf, P);
       Ptx ext = inf.encode_complex_const_at(0.5, -0.5 * sgn, S_c.ct);
       PackedCtx S = F.im_cleanse(F.mult(S_c, ext));
-      trace_ct(inf, S, "final sum");
       const double g = 1.0 / std::sqrt(cfg.sum_lo * cfg.sum_hi);
       const double lo = cfg.sum_lo * g, hi = cfg.sum_hi * g;
       const double bsum = 8.0 / ((lo + hi) * (lo + hi) + 4.0 * lo * hi);
@@ -256,7 +272,6 @@ PackedCtx cutmax_packed(Inference& inf, const PackedCtx& pair_in,
         r = goldschmidt_inv(inf.cc_ctx(), Sn, F_init, cfg.gs_sum_iters);
         r = F.mult(r, g);
       }
-      trace_ct(inf, r, "1/sum");
       // packed Z, canonical sign: fold sgn into the imag lane before return
       Z = F.mult(P, r);
       if (sgn < 0) {
@@ -429,7 +444,6 @@ std::vector<PackedCtx> cutmax_argmax(Inference& inf,
         const double kf = 1.0 / std::sqrt(static_cast<double>(vocab) *
                                           it.s2_hi);
         PackedCtx R = rotsum_tiles(inf, tiles);
-        trace_ct(inf, R, "R (n*mu)");
 
         PackedCtx S2;
         for (int k = 0; k < K; ++k) {
@@ -446,9 +460,7 @@ std::vector<PackedCtx> cutmax_argmax(Inference& inf,
             if (k == 0) S2 = sq;
             else        F.inplace_add(S2, sq);
         }
-        trace_ct(inf, S2, "S2 (s2/hi)");
         PackedCtx f = inv_sigma_cascade(inf, S2, cfg, it);
-        trace_ct(inf, f, "f (.5/csm)");
 
         PackedCtx Rf = F.mult(R, f);   // scalar lane: n*mu * f
         for (int k = 0; k < K; ++k) {
@@ -461,17 +473,14 @@ std::vector<PackedCtx> cutmax_argmax(Inference& inf,
             for (auto& x : sh_v) x *= 0.5 / it.m;
             Ptx shift_pt = inf.encode_at(sh_v, a);
             PackedCtx y = F.im_cleanse(F.add(F.sub(a, b), shift_pt));
-            if (k == 0) trace_ct(inf, y, "y shift");
             F.bootstrap_hint(y.ct, kCutmaxHintLevel);
             tiles[k] = pow_odd(inf.cc_ctx(), y, it.p);
-            if (k == 0) trace_ct(inf, tiles[0], "y^p");
         }
         bts_marks.push_back(F.total_bootstraps);
     }
 
     { WithStep _s(inf, "sum");
       PackedCtx S = rotsum_tiles(inf, tiles);
-      trace_ct(inf, S, "final sum");
       const double g = 1.0 / std::sqrt(cfg.sum_lo * cfg.sum_hi);
       const double lo = cfg.sum_lo * g, hi = cfg.sum_hi * g;
       const double bsum = 8.0 / ((lo + hi) * (lo + hi) + 4.0 * lo * hi);
@@ -485,7 +494,6 @@ std::vector<PackedCtx> cutmax_argmax(Inference& inf,
         r = goldschmidt_inv(inf.cc_ctx(), Sn, F_init, cfg.gs_sum_iters);
         r = F.mult(r, g);
       }
-      trace_ct(inf, r, "1/sum");
       for (int k = 0; k < K; ++k)
           tiles[k] = F.mult(tiles[k], r);
     }

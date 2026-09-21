@@ -4,10 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
 #include <ostream>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,9 +48,11 @@ std::vector<double> softmax_of(const std::vector<double>& v) {
 }
 
 double kl_div(const std::vector<double>& p, const std::vector<double>& q) {
+    // Clamp q instead of skipping q==0 terms: an underflowed q where p has mass is exactly
+    // the divergence a degenerate distribution carries. Mirrors the python dist_report clamp.
     double kl = 0.0;
     for (size_t i = 0; i < p.size(); ++i)
-        if (p[i] > 0.0 && q[i] > 0.0) kl += p[i] * std::log(p[i] / q[i]);
+        if (p[i] > 0.0) kl += p[i] * std::log(p[i] / std::max(q[i], 1e-30));
     return kl;
 }
 
@@ -103,70 +103,6 @@ void report_decode(std::ostream& os, const std::string& cmd,
     os << std::endl;
 }
 
-int run_decode_multi_cli(const RunConfig& cfg) {
-    const char* listp = std::getenv("HE128_SAMPLE_LIST");
-    if (!listp || !*listp) {
-        std::cerr << "decode_multi: env HE128_SAMPLE_LIST (file of '<id> <dir>' lines) required\n";
-        return 2;
-    }
-    std::ifstream lf(listp);
-    if (!lf) { std::cerr << "decode_multi: cannot open HE128_SAMPLE_LIST=" << listp << "\n"; return 2; }
-    const char* od  = std::getenv("HE128_LOG_DIR");
-    const std::string outdir = (od && *od) ? od : ".";
-    const char* jid = std::getenv("SLURM_JOB_ID");
-    const std::string jobid = (jid && *jid) ? jid : "0";
-
-    std::vector<std::pair<std::string, std::string>> samples;
-    std::string line;
-    while (std::getline(lf, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream is(line);
-        std::string id, dir;
-        if (is >> id >> dir) samples.emplace_back(id, dir);
-    }
-    if (samples.empty()) { std::cerr << "decode_multi: empty sample list " << listp << "\n"; return 2; }
-
-    std::cout << "[decode_multi] samples=" << samples.size() << " tokens=" << cfg.tokens
-              << " outdir=" << outdir << " job=" << jobid
-              << " (model built ONCE, reused per sample)\n" << std::flush;
-
-    DecodeSession sess(cfg);   // FHE context + rotation/bootstrap keys + weights: paid once here
-    int failures = 0;
-    for (const auto& s : samples) {
-        const std::string& id  = s.first;
-        const std::string& dir = s.second;
-        const std::string path = outdir + "/decode_" + id + "_" + jobid + ".out";
-        RunConfig rc = cfg;
-        rc.io_dir = dir;
-        std::vector<std::vector<double>> inputs;
-        try {
-            inputs = read_teacher_forced_inputs(rc);
-        } catch (const std::exception& e) {
-            std::cerr << "[decode_multi] sample=" << id << " input load FAILED: " << e.what()
-                      << " (skipping)\n" << std::flush;
-            ++failures;
-            continue;
-        }
-        RunResult r = sess.decode(inputs);
-        std::ofstream of(path);
-        of << "[cuda_cachemir] cmd=decode_multi sample=" << id << " io=" << dir
-           << " tokens=" << cfg.tokens << "\n";
-        report_decode(of, "decode", rc, r);
-        of.close();
-        std::cout << "[decode_multi] sample=" << id
-                  << " completed=" << r.completed << "/" << r.requested
-                  << " relevels=" << r.weight_relevels
-                  << " s/tok=" << r.avg_s_per_tok
-                  << " argmax_s/tok=" << r.avg_argmax_s
-                  << (r.threw ? " THREW" : "")
-                  << " -> " << path << std::endl;
-        if (r.threw || r.completed != r.requested) ++failures;
-    }
-    std::cout << "[decode_multi] DONE samples=" << samples.size()
-              << " failures=" << failures << std::endl;
-    return failures == 0 ? 0 : 1;
-}
-
 bool resolve(int argc, char** argv, int start, const std::string& cmd, RunConfig& cfg,
              bool& eager) {
     for (int i = start; i < argc; ++i) {
@@ -210,10 +146,6 @@ bool resolve(int argc, char** argv, int start, const std::string& cmd, RunConfig
             if (!only_for("generate")) return false;
             cfg.gen_tokens = std::stoi(next());
         }
-        else if (a == "--cut-max") {   // removed 2026-07-05 (CutMax always on); accept+ignore
-            std::cerr << "--cut-max is deprecated/removed (encrypted CutMax is always on); ignoring\n";
-            next();
-        }
         else if (a == "--steps-t")   cfg.steps_t        = std::stoi(next());
         else if (a == "--plan")      cfg.plan_dir       = next();
         else if (a == "--decode-plan") cfg.decode_plan_dir = next();
@@ -254,14 +186,18 @@ bool normalize_prefill_counts(RunConfig& cfg) {
 int cli_main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
     const std::string cmd = argv[1];
-    if (cmd != "capture" && cmd != "decode" && cmd != "decode_multi" &&
-        cmd != "prefill" && cmd != "generate") { usage(); return 2; }
+    if (cmd != "capture" && cmd != "decode" && cmd != "prefill" && cmd != "generate") {
+        usage(); return 2;
+    }
 
     RunConfig cfg = RunConfig::from_env();
     bool eager = false;
     if (!resolve(argc, argv, /*start=*/2, cmd, cfg, eager)) return 2;
     if (!cfg.graph_dir.empty())
         setenv("FHE_GRAPH_DIR", cfg.graph_dir.c_str(), 1);
+    if (cfg.configs_path.empty()) { std::cerr << "CONFIGS_PATH (or --configs) is required\n"; return 2; }
+    if (cfg.weights_path.empty()) { std::cerr << "WEIGHTS_PATH is required\n"; return 2; }
+    if (cfg.io_dir.empty())       { std::cerr << "ALL_BLOCKS_IO_DIR is required\n"; return 2; }
 
     if (cmd == "capture") {
         cfg.tokens = 1;                                       // token-0 trace
@@ -269,7 +205,7 @@ int cli_main(int argc, char** argv) {
             std::cerr << "capture: FHE_GRAPH_DIR / --graph-dir required\n";
             return 2;
         }
-    } else if (cmd == "decode" || cmd == "decode_multi") {
+    } else if (cmd == "decode") {
         if (cfg.decode_tokens >= 0)
             cfg.tokens = cfg.decode_tokens;
         if (cfg.tokens < 1) {
@@ -330,9 +266,6 @@ int cli_main(int argc, char** argv) {
               << " lmhead_cap=" << env_show("FHE_LMHEAD_CAP", "22")
               << " rot_band=" << env_show("FIDESLIB_ROT_KEY_BAND", "-1")
               << std::endl;
-
-    // Multi-sample sweep: build the model ONCE, loop samples (per-sample inputs/GT + report).
-    if (cmd == "decode_multi") return run_decode_multi_cli(cfg);
 
     std::vector<std::vector<double>> inputs;
     try {

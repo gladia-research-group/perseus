@@ -1,4 +1,5 @@
 #include "model/gpt2.h"
+#include "slot_layout.h"
 #include "packing/cachemir_filling/cachemir_filling.h"
 
 #include <algorithm>
@@ -28,8 +29,10 @@ std::vector<std::vector<double>> unpack_tokens(Inference& inf, const PackedCtx& 
 // ---- named entry points (thin wrappers) ----
 
 PackedCtx encode_token_input(Inference& inf, const std::vector<double>& x_real) {
-    return pack_tokens(inf, {x_real},
-                       static_cast<int>(inf.fhe->bootstrap_output_level()));
+    PackedCtx pc = pack_tokens(inf, {x_real},
+                               static_cast<int>(inf.fhe->bootstrap_output_level()));
+    slotlayout::set(pc.ct, slotlayout::Kind::Token);   // fresh-encode feature order
+    return pc;
 }
 
 PackedCtx encode_prefill_input(Inference& inf,

@@ -1,0 +1,46 @@
+From 231bdbb9ff467ccfd451f719c4f09805d203c06b Mon Sep 17 00:00:00 2001
+From: Davide-F5-Marincione <marincione@di.uniroma1.it>
+Date: Thu, 27 Aug 2026 11:32:34 +0200
+Subject: [PATCH 12/12] q0 diagnostics: StC per-diagonal norms (all four encode
+ sites)
+
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index efb63429..60fcb7d5 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -2636,6 +2636,7 @@ std::vector<std::vector<ReadOnlyPlaintext>> FHECKKSRNS::EvalSlotsToCoeffsPrecomp
+                         }
+ 
+                         auto rotateTemp      = Rotate(coeff[s][g * i + j], rot);
++                        if (std::getenv("OPENFHE_Q0_DIAG")) { double mx=0; for (const auto& z : rotateTemp) mx=std::max({mx,std::abs(z.real()),std::abs(z.imag())}); std::ostringstream _o; _o << "[q0_diag] STCdiag s=" << s << " idx=" << (g * i + j) << " max=" << mx << "\n"; std::cerr << _o.str(); }
+                         result[s][g * i + j] = MakeAuxPlaintext(cc, paramsVector[s], rotateTemp, 1,
+                                                                 level0 + compositeDegree * s, rotateTemp.size());
+                     }
+@@ -2655,6 +2656,7 @@ std::vector<std::vector<ReadOnlyPlaintext>> FHECKKSRNS::EvalSlotsToCoeffsPrecomp
+                         }
+ 
+                         auto rotateTemp         = Rotate(coeff[s][gRem * i + j], rot);
++                        if (std::getenv("OPENFHE_Q0_DIAG")) { double mx=0; for (const auto& z : rotateTemp) mx=std::max({mx,std::abs(z.real()),std::abs(z.imag())}); std::ostringstream _o; _o << "[q0_diag] STCdiag s=" << s << " idx=" << (gRem * i + j) << " max=" << mx << "\n"; std::cerr << _o.str(); }
+                         result[s][gRem * i + j] = MakeAuxPlaintext(cc, paramsVector[s], rotateTemp, 1,
+                                                                    level0 + compositeDegree * s, rotateTemp.size());
+                     }
+@@ -2688,6 +2690,7 @@ std::vector<std::vector<ReadOnlyPlaintext>> FHECKKSRNS::EvalSlotsToCoeffsPrecomp
+                         }
+ 
+                         auto rotateTemp      = Rotate(clearTemp, rot);
++                        if (std::getenv("OPENFHE_Q0_DIAG")) { double mx=0; for (const auto& z : rotateTemp) mx=std::max({mx,std::abs(z.real()),std::abs(z.imag())}); std::ostringstream _o; _o << "[q0_diag] STCdiag s=" << s << " idx=" << (g * i + j) << " max=" << mx << "\n"; std::cerr << _o.str(); }
+                         result[s][g * i + j] = MakeAuxPlaintext(cc, paramsVector[s], rotateTemp, 1,
+                                                                 level0 + compositeDegree * s, rotateTemp.size());
+                     }
+@@ -2711,6 +2714,7 @@ std::vector<std::vector<ReadOnlyPlaintext>> FHECKKSRNS::EvalSlotsToCoeffsPrecomp
+                         }
+ 
+                         auto rotateTemp         = Rotate(clearTemp, rot);
++                        if (std::getenv("OPENFHE_Q0_DIAG")) { double mx=0; for (const auto& z : rotateTemp) mx=std::max({mx,std::abs(z.real()),std::abs(z.imag())}); std::ostringstream _o; _o << "[q0_diag] STCdiag s=" << s << " idx=" << (gRem * i + j) << " max=" << mx << "\n"; std::cerr << _o.str(); }
+                         result[s][gRem * i + j] = MakeAuxPlaintext(cc, paramsVector[s], rotateTemp, 1,
+                                                                    level0 + compositeDegree * s, rotateTemp.size());
+                     }

@@ -4,7 +4,10 @@
 #include "packing/cachemir/cachemir_linear.h"
 #include "packing/cachemir/cachemir_linear_utils.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -41,6 +44,9 @@ std::vector<PackedCtx> prepare_linear_input(Inference& inf, const PackedCtx& x_i
         std::vector<PackedCtx> rots = inf.fhe->rotate_hoisted(x, steps);
         for (int b = 1; b < p.bstep_c; ++b) x_rotated[b] = rots[b - 1];
     }
+    // Realize the pending rescale on the rotated inputs once, before the pt-mult fan-out.
+    if (!inf.graph_capture_enabled())
+        for (auto& xr : x_rotated) inf.fhe->realize_pending_rescale_raw(xr.ct);
 
     return x_rotated;
 }

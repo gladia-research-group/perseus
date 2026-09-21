@@ -74,7 +74,7 @@ double cf_sm_kc_r(const SoftmaxConfig& cfg, int step, int kc) {
 
 
 PackedCtx fresh_recip(Inference& inf, const PackedCtx& D, const PackedCtx& F_init, int iters) {
-    PackedCtx R{goldschmidt_recip(inf.cc_ctx(), D.ct, F_init.ct, iters), D.packing};
+    PackedCtx R{goldschmidt_recip(inf.cc_ctx(), D.ct, F_init.ct, iters, sparse_sm_enabled()), D.packing};
     inf.fhe->inplace_mult(R, 0.5);     // half-scale bts input (|R|<=~3-10 -> <=~5, EvalMod-safe)
     inf.fhe->bootstrap(R.ct);
     inf.fhe->inplace_im_cleanse(R);    // 2*Re -> R; strips chain+bts imag, pairs the 0.5

@@ -3,7 +3,7 @@
 #include "attention.h"
 #include "encoded_block.h"    // run_ops / run_blocks / install/evict block state
 #include "model/layer_norm.h"
-#include "nonlinear.h"        // norm() — split from ln_affine for diagnostics
+#include "nonlinear.h"        // norm()
 #include "model/mha.h"
 #include "model/mlp.h"
 #include "weight_loader.h"
@@ -33,7 +33,7 @@ inline int graph_capture_token() {
 }
 
 // Chunked prefill (capture_chunk >= 0) captures EVERY chunk into chunk_<c>/;
-// flat captures (decode/gen/ViT) keep the capture_t gate and flat block dirs.
+// flat captures (decode, generation) keep the capture_t gate and flat block dirs.
 inline bool capture_wanted(const Inference& inf) {
     return inf.output.capture_chunk >= 0
         || inf.output.capture_t == graph_capture_token();
@@ -53,7 +53,7 @@ static std::vector<Op> gpt2_block_ops(bool tiled_mlp, int n_tiles, bool token_pa
 
     ops.push_back({ {}, [skip](Inference& i, PackedCtx& x) {
         const int res_lvl = i.fhe->level_for_ct(x.ct)
-                          + (x.ct && x.ct->GetNoiseScaleDeg() == 2 ? 1 : 0);
+                          + static_cast<int>(i.pending_rescale_primes(x.ct));
         i.name_graph_ct_if_absent(x, "transformer_block.x-lvl=" + std::to_string(res_lvl));
         *skip = x; }, "block_in" });
 
@@ -111,7 +111,6 @@ PackedCtx transformer_block(Inference& inf, PackedCtx& x) {
     const int  n_tiles   = inf.size.getRealFfDim() / inf.size.hidDim;
     const bool token_pair = is_cachemir_filling(inf.packing) && inf.token_pair;
     auto out = run_ops(inf, x, gpt2_block_ops(tiled_mlp, n_tiles, token_pair), stream, ov);
-    inf.fhe->tp_probe("block_out", out.ct);
     if (graph_capture) {
         std::filesystem::path out_dir = capture_block_dir(inf, graph_dir, inf.output.capture_b);
         std::error_code ec;
@@ -161,7 +160,8 @@ PackedCtx apply_final_ln(Inference& inf, PackedCtx& x, EncodedBlock& lnf) {
     inf.name_graph_ct_if_absent(x, "ln_f.x");
     PackedCtx h = layer_norm(inf, x, "ln_f");
     if (const char* cap = std::getenv("FHE_LMHEAD_CAP"); cap && *cap)
-        inf.fhe->bootstrap_hint(h, std::atoi(cap), /*account_pending_rescale=*/true);    { WithStep _w(inf, "lnf_sync"); cudaDeviceSynchronize(); }
+        inf.fhe->bootstrap_hint(h, std::atoi(cap), /*account_pending_rescale=*/true);
+    { WithStep _w(inf, "lnf_sync"); cudaDeviceSynchronize(); }
     evict_block_from_device(inf, lnf);
     inf.weight_store = nullptr;
     return h;

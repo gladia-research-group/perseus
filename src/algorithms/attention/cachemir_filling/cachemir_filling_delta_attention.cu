@@ -48,9 +48,6 @@ bool entry_slot_active(const Inference& inf, bool current, int delta, int n_cur,
     return l >= 0 && l < (Lg >= 0 ? Lg : (current ? n_cur : t));
 }
 
-// δ-block union activity: slot (b,h,i) of big ct ci is live iff its absolute
-// diagonal D = ci*nblk + b − block_shift satisfies 0 <= D <= P + i (causal), or
-// key = i − D in [0, P) (bidirectional; P carries the total key count K).
 bool view_slot_active(const Inference& inf, const DeltaView& v, const DeltaDims& dd,
                       int ci, int slot) {
     const int b = slot / dd.tH, s = slot % dd.tH;
@@ -102,9 +99,6 @@ std::vector<double> dsm_zscale_vec(const Inference& inf, const DeltaView& v, int
     return out;
 }
 
-// tH-periodic (every block): 1.0 on invalid (h,i) rows so the shared GS recip is
-// well-posed there; valid rows carry the row denominator in EVERY block after the
-// stride-tH all-reduce (genuinely 512-periodic — see the sim's periodicity assert).
 std::vector<double> dsm_floor_vec(const Inference& inf, int n_cur) {
     const auto dd = delta_dims(inf);
     std::vector<double> out(dd.N, 0.0);
@@ -125,10 +119,6 @@ double dsm_kc_r(const SoftmaxConfig& cfg, int step, int kc) {
     return 1.0;
 }
 
-// Denominators run at the D2 = 2·D convention (row-sum cleanse doubles them), so
-// the GS init constants carry 1/4 (beta: acts on D2) and 1/2 (alpha): the init
-// F' = F/2 keeps the error trajectory e0 = 1 − D2·F' = 1 − D·F IDENTICAL to the
-// per-entry path — calibration untouched.
 std::vector<double> dsm_refine_vec(const Inference& inf, const SoftmaxConfig& cfg,
                                    const DeltaView& v, int r, bool beta) {
     const auto dd = delta_dims(inf);
@@ -145,8 +135,6 @@ std::vector<double> dsm_refine_vec(const Inference& inf, const SoftmaxConfig& cf
     return out;
 }
 
-// Per-entry extraction fold: the final refine's zscale values on the entry's own
-// active pattern at its δ-block — same op count and level as the per-entry zscale.
 std::vector<double> dsm_zext_vec(const Inference& inf, const DeltaView& v,
                                  const DeltaEntry& e) {
     const auto dd = delta_dims(inf);
@@ -158,12 +146,8 @@ std::vector<double> dsm_zext_vec(const Inference& inf, const DeltaView& v,
     return out;
 }
 
-// fresh_recip twin at the D2 = 2·D convention: GS(D2, F/2) emits 0.5·recip —
-// ALREADY the half-scale bts input the per-entry fresh_recip creates with its
-// 0.5 pre-mult — and the post-bts cleanse restores the 2×. Pairs the row-sum
-// im_cleanse; one mult cheaper than the per-entry twin, level-identical output.
 PackedCtx fresh_recip_2x(Inference& inf, const PackedCtx& D2, const PackedCtx& F_init, int iters) {
-    PackedCtx R{goldschmidt_recip(inf.cc_ctx(), D2.ct, F_init.ct, iters), D2.packing};
+    PackedCtx R{goldschmidt_recip(inf.cc_ctx(), D2.ct, F_init.ct, iters, sparse_sm_enabled()), D2.packing};
     inf.fhe->bootstrap(R.ct);
     inf.fhe->inplace_im_cleanse(R);
     return R;
@@ -190,9 +174,6 @@ std::vector<PackedCtx> qkt_delta_groups(Inference& inf, const PackedCtx& query,
     const int P     = bd ? K : K - n_cur;
     const int G     = (dd.t > 0) ? P / dd.t : 0;
     const int Gtot  = (dd.t > 0) ? (K + dd.t - 1) / dd.t : 0;
-    // shape-fixed ct count (partial chunks keep the full-32 schedule; entries past
-    // the real key count carry all-zero masks, exactly like the per-entry path).
-    // bd: max block = (Gtot-1)*t + (n_cur-1) + (t-1), blocks query-chunk-independent.
     const int n_cts = bd ? ((Gtot - 1) * dd.t + n_cur + dd.t - 2) / dd.nblk + 1
                          : (P + dd.t + dd.nblk - 1) / dd.nblk;
 
@@ -236,8 +217,6 @@ std::vector<PackedCtx> qkt_delta_groups(Inference& inf, const PackedCtx& query,
             inf.fhe->inplace_add(res, rot);
         }
 
-        // the all-reduce put the reduced score in EVERY tH-block; the retargeted
-        // mask selects block Δ instead of block 0 — the scatter costs nothing.
         const int blk = bd ? (Gtot - 1 - e.g) * dd.t + e.delta + (dd.t - 1)
                            : (G - e.g) * dd.t + e.delta;
         const int Lg = bd ? e.Lg : -1;
@@ -321,6 +300,13 @@ std::vector<PackedCtx> attention_softmax_thor_delta_core(
     for (int ci = 0; ci < n_cts; ++ci) {
         CKKSContext::MagnitudeReuseScope _rm(*inf.fhe, ci == 0, false);
         WithStep _wd(inf, "exp_delta");
+        std::shared_ptr<std::vector<uint8_t>> live_score;
+        if (inf.graph_capture_enabled()) {   // the probe is the mask's only consumer
+            live_score = std::make_shared<std::vector<uint8_t>>(dd.N, uint8_t(0));
+            for (int slot = 0; slot < dd.N; ++slot)
+                if (view_slot_active(inf, view, dd, ci, slot)) (*live_score)[slot] = 1;
+        }
+        CKKSContext::LiveLaneScope _ll(*inf.fhe, live_score);
         const std::string stag = "cf.dsm.shift" + vtag + ".ci" + std::to_string(ci);
         Ptx shift_pt = inf.encode_at_cached(
             inf.scoped(stag), S[ci], [&] { return dsm_shift_vec(inf, cfg, view, ci); });
@@ -344,31 +330,43 @@ std::vector<PackedCtx> attention_softmax_thor_delta_core(
         E[ci] = inf.fhe->mult(z, amask_pt);
     }
 
-    // row-sum over diagonals: log2(N/tH) stride-tH rotations per ct + cross-ct adds
-    // (replaces the per-entry free adds; the result is broadcast to every block).
-    auto row_sum = [&](const std::vector<PackedCtx>& v) {
+    auto row_sum = [&](const std::vector<PackedCtx>& v, double s0_expected) {
         PackedCtx acc;
-        for (int ci = 0; ci < n_cts; ++ci) {
-            PackedCtx r = inf.fhe->clone(v[ci]);
-            for (int s = dd.tH; s < dd.N; s *= 2) {
-                PackedCtx rot = inf.fhe->rotate(r, cachemir::mha_rot(inf, s));
-                inf.fhe->inplace_add(r, rot);
+        if (fused_sm_den_enabled()) {
+            for (int ci = 0; ci < n_cts; ++ci) {
+                if (ci == 0) acc = inf.fhe->clone(v[0]);
+                else         inf.fhe->inplace_add(acc, v[ci]);
             }
-            if (ci == 0) acc = std::move(r);
-            else         inf.fhe->inplace_add(acc, r);
+            const uint32_t s_eff = inf.fhe->fold_slots_for((uint32_t)dd.tH);
+            for (int s = dd.tH; s < (int)s_eff; s *= 2) {
+                PackedCtx rot = inf.fhe->rotate(acc, cachemir::mha_rot(inf, s));
+                inf.fhe->inplace_add(acc, rot);
+            }
+            const double p = fold_sm_prescale_for((double)dd.N / (double)s_eff, s0_expected);
+            inf.fhe->fold_bootstrap(acc.ct, s_eff, /*n_live=*/1, p);
+        } else {
+            for (int ci = 0; ci < n_cts; ++ci) {
+                PackedCtx r = inf.fhe->clone(v[ci]);
+                for (int s = dd.tH; s < dd.N; s *= 2) {
+                    PackedCtx rot = inf.fhe->rotate(r, cachemir::mha_rot(inf, s));
+                    inf.fhe->inplace_add(r, rot);
+                }
+                if (ci == 0) acc = std::move(r);
+                else         inf.fhe->inplace_add(acc, r);
+            }
         }
+        acc.tag = packtag::t_reduce_stride(packtag::PackTag::top(dd.N), dd.tH);
+        inf.fhe->tag_ct(acc.ct, acc.tag);
         return acc;
     };
 
     const std::string ftag = "cf.dsm.floor.nt" + std::to_string(view.n_cur);
     auto make_floor = [&] { return dsm_floor_vec(inf, view.n_cur); };
 
-    PackedCtx sden = row_sum(E);
+    PackedCtx sden = row_sum(E, /*s0_expected=*/2.0 / cfg.init_alpha);
     Ptx floor_pt = inf.encode_at_cached(ftag, sden, make_floor);
     sden = inf.fhe->add(sden, floor_pt);
-    {   // strip the row-sum rotations' imaginary keyswitch noise BEFORE the GS
-        // chain squares it into Re (per-entry sums are noise-free adds). The 2×
-        // rides the D2 convention (constants + fresh_recip_2x below).
+    {
         WithStep _wc(inf, "im_cleanse");
         inf.fhe->inplace_im_cleanse(sden);
     }
@@ -402,7 +400,12 @@ std::vector<PackedCtx> attention_softmax_thor_delta_core(
             if (last) Ysq[ci] = std::move(ysq);   // extraction reads the pre-zscale square
         }
 
-        PackedCtx s2 = row_sum(Z2);
+        double min_alpha_eff = cfg.refine_alpha[r];
+        for (int i2 = 0; i2 < view.n_cur; ++i2) {
+            const double kr = dsm_kc_r(cfg, r, view_kc(view, i2));
+            min_alpha_eff = std::min(min_alpha_eff, cfg.refine_alpha[r] * std::sqrt(kr));
+        }
+        PackedCtx s2 = row_sum(Z2, /*s0_expected=*/2.0 / min_alpha_eff);
         Ptx floor_pt2 = inf.encode_at_cached(ftag, s2, make_floor);
         s2 = inf.fhe->add(s2, floor_pt2);
         {
@@ -432,10 +435,6 @@ std::vector<PackedCtx> attention_softmax_thor_delta_core(
             continue;
         }
 
-        // FINAL refine: per-entry extraction folded into the zscale mask — z2_e at
-        // the exact chain position and level of the per-entry path's zscale, then
-        // y_e = z2_e·rrec. softmax_v consumes the result unchanged (its stride-tH
-        // broadcast all-reduce is position-agnostic — block Δ broadcasts like block 0).
         size_t n_alive = 0;
         for (const DeltaEntry& e : view.entries) n_alive += e.alive ? 1 : 0;
         StagedEntries y(inf, StagedEntries::auto_active(n_alive), stage_prefix);

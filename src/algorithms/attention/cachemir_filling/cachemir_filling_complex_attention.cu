@@ -176,7 +176,7 @@ void split_scores(Inference& inf, std::vector<PackedCtx>&& packed,
 }  // namespace
 
 PackedCtx mha_attn_token_pair(Inference& inf, PackedCtx& q_cplx) {
-    inf.fhe->level_hint(q_cplx, inf.fhe->level_limit() - 3);   // mirror the real attn_core level_hint
+    inf.fhe->level_hint(q_cplx, inf.fhe->level_headroom(3));   // mirror the real attn_core level_hint
     PackedCtx K = std::move(inf.cache[inf.scoped("tp.k")][0]);
     PackedCtx V = std::move(inf.cache[inf.scoped("tp.v")][0]);
     const int nA = inf.n_tok, nB = inf.n_tok_imag;
@@ -241,7 +241,6 @@ PackedCtx mha_attn_token_pair(Inference& inf, PackedCtx& q_cplx) {
     inf.n_tok = nA;
     inf.cache.erase(inf.scoped("tp.k"));
     inf.cache.erase(inf.scoped("tp.v"));
-    inf.fhe->tp_probe("mha", out.ct);
     return out;
 }
 

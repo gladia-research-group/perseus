@@ -1,22 +1,11 @@
-"""Plaintext replica of the runtime CutMax op (numpy only).
-
-The mechanics behind the schedule calibration (`cutmax.py`): the cascaded
-inv_sqrt (Newton passes, chord / const from-below inits, geo-mid prescale)
-and the packed iteration simulator `Sim` — with the MEASURED bootstrap
-envelopes (abs floor + value walls per cascade bts regime) injectable at
-every scalar refresh and vector shift point via `noisy`.
-"""
 import numpy as np
 
-np.seterr(over="ignore", invalid="ignore")  
+np.seterr(over="ignore", invalid="ignore")
 
-# Unarmed until set_envelopes: the measured bts envelopes live in the yaml
-# (cutmax_floor1/... knobs) — using the sim without arming them fails loudly.
 FLOOR = WALL_X = WALL_Y = CONV = WALL_VEC = None
 
 
 def set_envelopes(knobs):
-    """Measured-envelope knobs (yaml cutmax_floor1/... fields) -> module state."""
     global FLOOR, WALL_X, WALL_Y, CONV, WALL_VEC
     FLOOR = {1: knobs["floor1"], 2: knobs["floor2"]}
     WALL_X = {1: knobs["wall_x1"], 2: knobs["wall_x2"]}
@@ -26,19 +15,11 @@ def set_envelopes(knobs):
 
 
 def noisy(rng, x, rel, absf):
-    """One bts refresh: relative AND absolute-floor noise (the absolute floor
-    is what killed the two live bts1 attempts; relative-only blessed them)."""
     return x + rng.normal(0, rel, x.shape) * np.abs(x) \
              + rng.normal(0, absf, x.shape)
 
 
 def pick_prescale(lo, hi, floor_safety):
-    """Mixed-precision prescale: the scalar band must fit
-    [floor_safety*floor, WALL_X] after x/g (floor_safety = the SNR margin
-    against the ABS floor — the mixed-gate explosions were laggard x at
-    SNR~1.4 flipping negative between passes; keep >= 5). Returns
-    (g, cascade_iters). If even the 2-iter budget fails, ceiling wins.
-    """
     for iters in (1, 2):
         g_min = hi / WALL_X[iters]                   # ceiling
         g_max = lo / (floor_safety * FLOOR[iters])   # floor
@@ -48,8 +29,6 @@ def pick_prescale(lo, hi, floor_safety):
 
 
 def chord(lo, hi):
-    """From-below chord of x^-1/2 over [lo, hi]; returns folded (a, b) with
-    y0 = a - b*x guaranteed <= x^-1/2 on the band."""
     va, vb = lo ** -0.5, hi ** -0.5
     beta = (va - vb) / (hi - lo)
     alpha = va + beta * lo
@@ -60,11 +39,6 @@ def chord(lo, hi):
 
 def cascade(s2, lo, hi, k, passes, g=None, chord_init=True, rng=None, rel=0.0,
             absf=0.0, wall_x=None, wall_y=None):
-    """Explicit cascaded inv_sqrt on per-token scalars. `chord_init`: True =
-    fit the chord here, False = const from-below 1/sqrt(xhi), (ca, cb) tuple =
-    exact emitted init (ca==0 -> legacy ones). Returns (inv_sigma, max ct
-    value, crossed): crossed = per-row wall breach at any cascade bts site
-    (None when walls not given)."""
     if g is None:
         g = np.sqrt(lo * hi)
     x = s2 / g
@@ -101,7 +75,6 @@ def cascade(s2, lo, hi, k, passes, g=None, chord_init=True, rng=None, rel=0.0,
 
 
 class Sim:
-    """Joint plaintext simulation of the packed cutmax over all rows."""
 
     def __init__(self, rows):
         self.vocab = rows.shape[1]

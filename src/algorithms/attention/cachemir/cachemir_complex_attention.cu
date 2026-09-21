@@ -136,15 +136,39 @@ PackedCtx complex_softmax_v(Inference& inf, const PackedCtx& softmax_scores) {
     }
     auto conj_S_at = [&](int j) -> const PackedCtx& { return (j == 0) ? conj_S_all : pair_scores[j - 1]; };
 
-    bool have = false;
     PackedCtx res;
-    for (int j = 0; j < d_head_real / 2; ++j) {
-        WithStep _wm(inf, j == 0 ? "lane0_mult" : "lane_mult");
-        const int g_lvl = inf.fhe->level_for_ct(vc[j].ct);
-        inf.name_graph_ct(vc[j], inf.scoped("cache.v." + std::to_string(j) + "-lvl=" + std::to_string(g_lvl)));
-        PackedCtx contrib = inf.fhe->mult(vc[j], conj_S_at(j));
-        if (!have) { res = std::move(contrib); have = true; }
-        else         inf.fhe->inplace_add(res, contrib);
+    {
+        WithStep _wm(inf, "lane0_mult");
+        const int g_lvl = inf.fhe->level_for_ct(vc[0].ct);
+        inf.name_graph_ct(vc[0], inf.scoped("cache.v.0-lvl=" + std::to_string(g_lvl)));
+        res = inf.fhe->mult(vc[0], conj_S_at(0));
+    }
+    bool lanes_batched = false;
+    if (d_head_real / 2 > 1) {
+        std::vector<const PackedCtx*> vptr, sptr;
+        vptr.reserve(d_head_real / 2 - 1);
+        sptr.reserve(d_head_real / 2 - 1);
+        for (int j = 1; j < d_head_real / 2; ++j) {
+            vptr.push_back(&vc[j]);
+            sptr.push_back(&conj_S_at(j));
+        }
+        if (inf.fhe->mult_add_many_usable(res, vptr, sptr)) {
+            // Batched lanes: one relinearization for all pair products.
+            WithStep _wm(inf, "lane_mult");
+            for (int j = 1; j < d_head_real / 2; ++j)
+                inf.name_graph_ct(vc[j], inf.scoped("cache.v." + std::to_string(j) + "-lvl=" + std::to_string(inf.fhe->level_for_ct(vc[j].ct))));
+            inf.fhe->mult_add_many(res, vptr, sptr);
+            lanes_batched = true;
+        }
+    }
+    if (!lanes_batched) {
+        for (int j = 1; j < d_head_real / 2; ++j) {
+            WithStep _wm(inf, "lane_mult");
+            const int g_lvl = inf.fhe->level_for_ct(vc[j].ct);
+            inf.name_graph_ct(vc[j], inf.scoped("cache.v." + std::to_string(j) + "-lvl=" + std::to_string(g_lvl)));
+            PackedCtx contrib = inf.fhe->mult(vc[j], conj_S_at(j));
+            inf.fhe->inplace_add(res, contrib);
+        }
     }
 
     { WithStep _wr(inf, "tok_reduce");

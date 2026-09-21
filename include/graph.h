@@ -21,7 +21,25 @@ struct GraphNode {
     int output_noise_level = -1;
     bool has_output_max_abs = false;
     double output_max_abs = 0.0;
-    std::string step;   // primitive/step scope (step_path) — groups atomic nodes for the placer
+    bool has_output_stats = false;
+    double output_mean = 0.0;
+    double output_max_dev = 0.0;
+    // max plaintext coefficient of the output (what EvalMod sees); _ac excludes the X^0 term
+    bool has_output_max_coeff = false;
+    double output_max_coeff = 0.0;
+    double output_max_coeff_ac = 0.0;
+    std::string step;
+    bool has_pack_tag = false;
+    int  pack_period  = 0;
+    int  pack_kind    = 0;   // packtag::Support::Kind: 0=Empty, 1=AP, 2=Dense
+    int  pack_offset  = 0;
+    int  pack_stride  = 0;
+    int  pack_count   = 0;
+    int  pack_width   = 1;   // Block support width (1 = classic AP)
+
+    bool   has_fold       = false;
+    double fold_stride    = 0.0;
+    double recovery_const = 0.0;
 };
 
 class ComputationGraph {
@@ -65,6 +83,34 @@ public:
         return nodes_;
     }
 
+    GraphNode* last_node() {
+        return nodes_.empty() ? nullptr : &nodes_.back();
+    }
+
+    std::size_t size() const { return nodes_.size(); }
+
+    void set_output_stats(std::size_t idx, double mean, double max_dev) {
+        if (idx < nodes_.size()) {
+            nodes_[idx].has_output_stats = true;
+            nodes_[idx].output_mean = mean;
+            nodes_[idx].output_max_dev = max_dev;
+        }
+    }
+
+    void set_output_max_coeff(std::size_t idx, double max_coeff, double max_coeff_ac) {
+        if (idx < nodes_.size()) {
+            nodes_[idx].has_output_max_coeff = true;
+            nodes_[idx].output_max_coeff = max_coeff;
+            nodes_[idx].output_max_coeff_ac = max_coeff_ac;
+        }
+    }
+    void set_output_max_abs(std::size_t idx, double v) {
+        if (idx < nodes_.size()) {
+            nodes_[idx].has_output_max_abs = true;
+            nodes_[idx].output_max_abs = v;
+        }
+    }
+
     void clear() {
         nodes_.clear();
     }
@@ -104,10 +150,39 @@ public:
             if (node.has_output_max_abs) {
                 out << ",\n";
                 out << "      \"output_max_abs\": "
-                    << std::setprecision(17) << node.output_max_abs << "\n";
-            } else {
-                out << "\n";
+                    << std::setprecision(17) << node.output_max_abs;
             }
+            if (node.has_output_stats) {
+                out << ",\n";
+                out << "      \"output_mean\": "
+                    << std::setprecision(17) << node.output_mean << ",\n";
+                out << "      \"output_max_dev\": "
+                    << std::setprecision(17) << node.output_max_dev;
+            }
+            if (node.has_output_max_coeff) {
+                out << ",\n";
+                out << "      \"output_max_coeff\": "
+                    << std::setprecision(17) << node.output_max_coeff << ",\n";
+                out << "      \"output_max_coeff_ac\": "
+                    << std::setprecision(17) << node.output_max_coeff_ac;
+            }
+            if (node.has_pack_tag) {
+                out << ",\n";
+                out << "      \"pack_period\": " << node.pack_period << ",\n";
+                out << "      \"pack_kind\": " << node.pack_kind << ",\n";
+                out << "      \"pack_offset\": " << node.pack_offset << ",\n";
+                out << "      \"pack_stride\": " << node.pack_stride << ",\n";
+                out << "      \"pack_count\": " << node.pack_count << ",\n";
+                out << "      \"pack_width\": " << node.pack_width;
+            }
+            if (node.has_fold) {
+                out << ",\n";
+                out << "      \"fold_stride\": "
+                    << std::setprecision(17) << node.fold_stride << ",\n";
+                out << "      \"recovery_const\": "
+                    << std::setprecision(17) << node.recovery_const;
+            }
+            out << "\n";
             out << "    }";
             if (i + 1 < nodes_.size()) {
                 out << ",";
@@ -204,6 +279,10 @@ public:
         return graph_->add_node(op_type, inputs, output, input_levels, output_level,
                         has_output_noise_level, output_noise_level,
                         has_output_max_abs, output_max_abs, step);
+    }
+
+    GraphNode* last_node() {
+        return graph_ ? graph_->last_node() : nullptr;
     }
 
     std::string to_json() const {

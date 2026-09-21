@@ -1,0 +1,67 @@
+From 3cd71975d89740a608b0ca18993df6c93cdc81a3 Mon Sep 17 00:00:00 2001
+From: dev <dev@perseus>
+Date: Fri, 24 Jul 2026 21:24:40 +0200
+Subject: [PATCH 05/12] NATIVEINT=32: fix CKKS encode FitToNativeVector
+ coefficient truncation
+
+CKKSPackedEncoding::Encode hands FitToNativeVector int64_t coefficients in
+[0, Max64BitValue()) with negatives represented as bigBound + x. With
+NATIVEINT=32 NativeInteger is uint32_t, so NativeInteger(vec[i]),
+bigValueHf = bigBound >> 1 and diff = bigBound - modulus all truncate: the
+sign test degenerates and every coefficient gets a garbage CRT residue.
+Fingerprint: encrypt/decrypt of -0.4 comes back as ~31.57 (= 2^32 + x
+scaled), and any chain built on it decodes noise.
+
+Take a NATIVEINT == 32 branch that does the sign split and the modular
+reduction in 64-bit arithmetic and narrows only at the store. NATIVEINT 64
+and 128 are untouched (same preprocessor style as the existing int128
+overload).
+---
+ src/pke/lib/encoding/ckkspackedencoding.cpp | 27 +++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/pke/lib/encoding/ckkspackedencoding.cpp b/src/pke/lib/encoding/ckkspackedencoding.cpp
+index 7a80bf25..66d99a2d 100644
+--- a/src/pke/lib/encoding/ckkspackedencoding.cpp
++++ b/src/pke/lib/encoding/ckkspackedencoding.cpp
+@@ -525,6 +525,32 @@ void CKKSPackedEncoding::Destroy() {}
+ 
+ void CKKSPackedEncoding::FitToNativeVector(const std::vector<int64_t>& vec, int64_t bigBound,
+                                            NativeVector* nativeVec) const {
++#if NATIVEINT == 32
++    // NativeInteger is uint32_t here, but the encoder hands us int64_t coefficients in
++    // [0, bigBound) with bigBound = Max64BitValue() ~ 2^63 (negatives are stored as
++    // bigBound + x). NativeInteger(vec[i]) truncates that to 32 bits and both bigValueHf
++    // and diff overflow, so every coefficient - not just the negative ones - gets a
++    // garbage CRT residue. Do the sign split and the reduction in 64-bit arithmetic and
++    // only narrow at the store. Fingerprint of the unfixed path: enc/dec(-0.4) ~ 31.57.
++    const int64_t bigValueHf = bigBound >> 1;
++    const uint64_t modulus   = nativeVec->GetModulus().ConvertToInt();
++    const uint32_t ringDim   = GetElementRingDimension();
++    const uint32_t dslots    = vec.size();
++    const uint32_t gap       = ringDim / dslots;
++    for (uint32_t i = 0; i < vec.size(); i++) {
++        const int64_t val = vec[i];
++        uint64_t reduced;
++        if (val > bigValueHf) {
++            // val encodes the negative value (val - bigBound); reduce its magnitude and negate.
++            const uint64_t mag = static_cast<uint64_t>(bigBound - val) % modulus;
++            reduced            = (mag == 0) ? 0 : (modulus - mag);
++        }
++        else {
++            reduced = static_cast<uint64_t>(val) % modulus;
++        }
++        (*nativeVec)[gap * i] = NativeInteger(static_cast<uint32_t>(reduced));
++    }
++#else
+     NativeInteger bigValueHf(bigBound >> 1);
+     NativeInteger modulus(nativeVec->GetModulus());
+     NativeInteger diff = bigBound - modulus;
+@@ -540,6 +566,7 @@ void CKKSPackedEncoding::FitToNativeVector(const std::vector<int64_t>& vec, int6
+             (*nativeVec)[gap * i] = n.Mod(modulus);
+         }
+     }
++#endif
+ }
+ 
+ #if NATIVEINT == 128

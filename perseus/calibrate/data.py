@@ -1,23 +1,12 @@
-"""Calibration data: token pools built straight from HuggingFace datasets.
-
-No pre-tokenized `.bin` corpora: the first run streams the configured HF
-dataset, tokenizes it with the MODEL'S OWN tokenizer (architecture-agnostic),
-and materializes exactly `pool_tokens` tokens into a small cached `.npy` in
-the HF cache home (`hub.cache_dir("pools")`, relocatable via `HF_HOME`).
-Later runs — including offline compute nodes — memory-map that pool. Batches
-are random `block_size` windows over it.
-
-On clusters whose compute nodes have no internet, run any calibration command
-once on a login node first (or call `build_token_pool` directly) to populate
-the pool cache.
-"""
-
+import logging
 import os
 
 import numpy as np
 import torch
 
 from perseus.hub import cache_dir
+
+log = logging.getLogger(__name__)
 
 
 def _pool_path(dataset_name, model_name, n_tokens):
@@ -36,7 +25,7 @@ def build_token_pool(model_name, dataset_path, split, n_tokens, text_field="text
     sep_id = tok.eos_token_id if tok.eos_token_id is not None else tok.sep_token_id
     eos = [sep_id] if sep_id is not None else []
 
-    print(f"[data] streaming {dataset_path}[{split}] -> {n_tokens} tokens "
+    log.info(f"[data] streaming {dataset_path}[{split}] -> {n_tokens} tokens "
           f"({tok.name_or_path} tokenizer, {np.dtype(dtype).name})")
     stream = load_dataset(dataset_path, split=split, streaming=True)
     buf = np.empty(n_tokens, dtype=dtype)
@@ -55,7 +44,7 @@ def build_token_pool(model_name, dataset_path, split, n_tokens, text_field="text
 
 def load_token_pool(model_name, dataset):
     """Return the cached token pool for (dataset, model tokenizer), building it
-    on first use (needs network — do that once on a login node)."""
+    on first use (the build streams the dataset and needs network)."""
     path = _pool_path(dataset.name, model_name, dataset.pool_tokens)
     if os.path.exists(path):
         return np.load(path, mmap_mode="r")
@@ -63,7 +52,7 @@ def load_token_pool(model_name, dataset):
     pool = build_token_pool(model_name, dataset.path, dataset.split, dataset.pool_tokens,
                            text_field=getattr(dataset, "text_field", "text"))
     np.save(path, pool)
-    print(f"[data] cached token pool -> {path}")
+    log.info(f"[data] cached token pool -> {path}")
     return pool
 
 
@@ -75,7 +64,7 @@ def build_image_pool(model_name, dataset_path, split, n_images, image_field="ima
     from transformers import AutoImageProcessor
 
     proc = AutoImageProcessor.from_pretrained(model_name)
-    print(f"[data] streaming {dataset_path}[{split}] -> {n_images} images "
+    log.info(f"[data] streaming {dataset_path}[{split}] -> {n_images} images "
           f"({proc.__class__.__name__})")
     stream = load_dataset(dataset_path, split=split, streaming=True)
     out = []
@@ -98,7 +87,7 @@ def load_image_pool(model_name, dataset):
     pool = build_image_pool(model_name, dataset.path, dataset.split,
                             dataset.pool_images, dataset.image_field)
     np.save(path, pool)
-    print(f"[data] cached image pool -> {path}")
+    log.info(f"[data] cached image pool -> {path}")
     return pool
 
 
