@@ -1,0 +1,11 @@
+device: cuda
+n_calib_batches: 32
+
+calib_out_path: null
+
+defaults:
+  - model: gpt2
+  - dataset: openwebtext
+  - approximation: gpt2
+  - hydra: default
+  - _self_

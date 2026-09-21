@@ -1,0 +1,4 @@
+[submodule "third_party/FIDESlib"]
+	path = third_party/FIDESlib
+	url = https://github.com/gladia-research-group/FIDESlib32bits.git
+	branch = main

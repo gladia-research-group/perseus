@@ -1,0 +1,36 @@
+{
+  "arm": "gpt2_heat",
+  "config": "src/perseus/configs/model/approximation/gpt2_heat/configs.json",
+  "config_md5": "75b0dc145f487e9488d25815a9f1fd5d",
+  "blocks": 13,
+  "blocks_expected": 13,
+  "placements": 157,
+  "captured_on": {
+    "host": "behemoth",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "graph_mtime": "2026-07-28T17:33:36"
+  },
+  "fideslib_pin": {
+    "commit": "509990c0091ee2f9ccc505f5b650dfc2c79f5cce",
+    "branch": "behemoth-port",
+    "commit_date": "2026-08-10T11:04:46+02:00"
+  },
+  "captured_before_current_pin": true,
+  "validity": "A plan binds only to the (config, FIDESlib binary) pair recorded here. If either differs at the destination, recapture and replan -- a stale plan fails as a silent wrong answer, not an error. Captures are deterministic: to prove a carried-forward plan is still valid, recapture and diff the graph against the archived one; node-identical means the plan holds. This plan's graph predates the current pin, but the plan was EXECUTED on the current binary and passed -- see validated_on_current_pin. Carried forward deliberately: the replan was measured no better.",
+  "validated_on_current_pin": {
+    "fideslib_pin": "509990c0091ee2f9ccc505f5b650dfc2c79f5cce",
+    "host": "behemoth",
+    "date": "2026-08-14",
+    "verdict": "PASS",
+    "method": "executed this exact plan on the current binary",
+    "**": {
+      "gate": "planned decode T=32, solo",
+      "top1": "31/32",
+      "unplanned_bts": 0,
+      "weight_relevels": 0,
+      "bootstraps": 10433,
+      "e2e_s_per_tok": 23.3,
+      "note": "miss at pos=13 (2267 vs ref 1366) reproduces IDENTICALLY on a plan replanned from a fresh capture on this pin, so it is a property of the heat circuit vs its oracle, not of this plan."
+    }
+  }
+}

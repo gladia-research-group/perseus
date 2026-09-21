@@ -1,0 +1,6 @@
+name: tiny_imagenet
+kind: image
+path: zh-plus/tiny-imagenet     # any HF RGB image dataset works; the model's own
+split: train                    # processor resizes/normalizes to its input size
+image_field: image
+pool_images: 512                # image-pool size materialized for calibration

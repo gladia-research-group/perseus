@@ -1,0 +1,5 @@
+name: openwebtext
+kind: text
+path: Skylion007/openwebtext    # any HF dataset with a text field works (e.g. HuggingFaceFW/fineweb)
+split: train
+pool_tokens: 2000000            # token-pool size materialized for calibration
