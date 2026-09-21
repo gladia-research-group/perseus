@@ -1,0 +1,31 @@
+defaults:
+  - gpt2
+  - _self_
+
+cutmax:
+  rows: 128
+  entry_scale: 0.00390625
+  noise: 2.0e-4
+  margin: 1.15
+  c0: 5.0
+  c_late: 10.0
+  shift_max: 8.0
+  spread_cap: 1.0e8
+  t_max: 10
+  mass_target: 0.97
+  gap_floor: 0.75
+  p_candidates: [9, 7, 5, 3]
+  newton_polish: 0
+  sum_margin: 0.08
+  newton_per_pass: 5
+  gs_sum_iters: 6
+  band_margin: 2.0
+  floor_safety: 5.0
+  floor1: 2.0e-4
+  floor2: 2.0e-4
+  wall_x1: 150.0
+  wall_x2: 150.0
+  wall_y1: 150.0
+  wall_y2: 150.0
+  wall_vec: 10.0
+  conv: 0.05

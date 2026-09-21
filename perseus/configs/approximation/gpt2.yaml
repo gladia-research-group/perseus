@@ -1,0 +1,67 @@
+# GPT-2 approximation set.
+
+name: gpt2_base
+
+norm:
+  per_layer: true
+  center_target: 12.0
+  inv_y_max: 3.0
+  range_q_lo: 0.0
+  range_q_hi: 1.0
+  range_margin: 0.15
+  z_max_safety: 2.0
+  z_min_safety: 1.0
+  remez_d_num: 3
+  remez_d_den: 1
+  gs_init_method: linear
+  gs_target_err: 1.0e-3
+  gs_max_iters: 18
+  gs_iters: 12
+  gs_drift_margin: 1.0
+  nr_iters: 3          # explicit count; set null to derive it from gs_target_err
+  nr_max_iters: 8
+  denom_floor_frac: 1.0e-3
+  rescale_target_df: 0.35
+  rescale_basin_safety: 0.85
+  rescale_max_var_scaled: 1.0e9
+  rescale_min_var_scaled: 0.0
+  rescale_min_var_scaled_nl: 0.0
+
+gelu:
+  per_layer: true
+  d1: 31
+  d2: 27
+  range_q_hi: 1.0
+  range_margin: 0.15
+  raw_max_safety: 3.0
+
+softmax:
+  per_layer: true
+  bidirectional: false
+  fixed_delta_per_layer: false
+  rows_per_batch: 2048
+  decode_window: 160
+  range_q_lo: 0.0
+  range_q_hi: 1.0
+  range_margin: 0.15
+  delta0: null
+  delta1: 4
+  delta2: 16
+  delta1_min: 1
+  delta1_max: 16
+  delta2_min: 2
+  delta2_max: 32
+  poly_degree: 8
+  target_delta0: 2.5
+  magnitude_cap: 2885.0
+  gs_init_method: chebyshev
+  init_q_lo: 0.01
+  init_q_hi: 1.0
+  d_safety: 3.0
+  gs_target_err: 1.0e-3
+  gs_max_iters: 16
+  gs_iters: 8
+  refine_drift_margin: 1.0
+  denom_floor_frac: 1.0e-3
+  sm_kc_anchor: 4
+  sm_kc_tail_margin: 0.0

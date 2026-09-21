@@ -1,0 +1,11 @@
+name: "openai-community/gpt2"
+batch_size: 5          # calibration micro-batch
+block_size: null       # null = infer from the model config (discovery)
+
+instance:
+  _target_: transformers.AutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ${model.name}
+  device_map: null
+  torch_dtype: "auto"
+  trust_remote_code: False
+  attn_implementation: "eager"   # required: the softmax tap needs the eager path

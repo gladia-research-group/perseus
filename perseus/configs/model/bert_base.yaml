@@ -1,0 +1,8 @@
+name: "textattack/bert-base-uncased-SST-2"
+batch_size: 5          # calibration micro-batch
+block_size: 64
+
+instance:
+  _target_: perseus.hub.load_model
+  name: ${model.name}
+  encoder_only: true
