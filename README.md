@@ -116,8 +116,8 @@ TASK=decode STAGE=eager RUNNER=cuda bash scripts/run_task.sh          # eager (n
 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/baselines/dacapo TASK=decode RUNNER=cuda bash scripts/run_task.sh
 FIDESLIB_KSK_REGEN=0 TASK=decode RUNNER=cuda bash scripts/run_task.sh # stored keys, no in-kernel regeneration
 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/ablations/kappa_8 TASK=decode RUNNER=cuda bash scripts/run_task.sh
-SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/gpt2_decode_n32_dense \
-  TASK=decode RUNNER=cuda bash scripts/run_task.sh                     # dense only, no sparse bootstraps
+FUSED_SM_DEN=0 SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/gpt2_decode_n32_dense \
+  TASK=decode RUNNER=cuda bash scripts/run_task.sh                     # dense only: no sparse bootstraps, no fused denominator
 ```
 
 A run passes when the driver prints `[decode] PASS` (python) or `SUMMARY … completed=16/16`
@@ -138,6 +138,8 @@ The planner works on a captured graph of one forward:
 TASK=decode STAGE=capture bash scripts/run_task.sh      # graphs/gpt2_decode_n32/block_<b>/graph.json (sync forward)
 bash scripts/make_plans.sh main                          # -> bootstrap_placements/gpt2_decode_n32 (CPU, seconds)
 bash scripts/make_plans.sh                               # every plan in the paper
+FUSED_SM_DEN=0 SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0 FHE_GRAPH_DIR=graphs/gpt2_decode_n32_dense \
+  TASK=decode STAGE=capture bash scripts/run_task.sh     # the dense capture the two dense 32-bit arms are planned from
 ```
 
 `python -m perseus.plan --help` lists the planner options (`--mag-safety` κ, `--err-target` τ,

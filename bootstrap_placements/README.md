@@ -10,12 +10,12 @@ checks the result is identical.
 |---|---|---|---|
 | `gpt2_decode_n32` | Table 1, Perseus 32-bit (main row) | 418 | 552 |
 | `gpt2_decode_n64` | Table 1, Perseus 64-bit | 373 | 470 |
-| `gpt2_decode_n32_dense` | Table 6, Perseus 32-bit, dense only | 481 | 643 |
+| `gpt2_decode_n32_dense` | Table 6, Perseus 32-bit, dense only | 502 | 621 |
 | `gpt2_decode_n64_dense` | Table 6, Perseus 64-bit, dense only | 411 | 517 |
 | `baselines/dacapo` | Table 1, DaCapo (rescued) | 577 | 711 |
 | `baselines/orion` | Table 1, Orion (upstream tool on our graph, rescued) | 668 | 802 |
 | `baselines/fhelipe` | Table 1, Fhelipe (era contract, rescued) | 1140 | 1274 |
-| `baselines/fhelipe_dense` | Table 6, Fhelipe dense only | 2828 | 2990 |
+| `baselines/fhelipe_dense` | Table 6, Fhelipe dense only | 2528 | 2647 |
 | `ablations/cf_fixed_{7,8,9,10}` | Table 4, one fixed correction factor | 418–442 | see paper |
 | `ablations/kappa_{1,...,128}` | Table 5, margin κ | 418 each | 552 |
 
@@ -25,6 +25,10 @@ Notes.
   per-token count.
 * The 32-bit arms are priced with the measured accuracy table; the 64-bit arms with the
   analytic error model, which is how the paper planned them (`PLAN_ACC_CHAIN=`).
+* The two 32-bit dense arms are planned from their own capture, `graphs/gpt2_decode_n32_dense`,
+  taken under the dense run env (`FUSED_SM_DEN=0 SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0`): a dense plan
+  cut from the sparse capture expects the fused softmax denominator's 512-slot refresh landing,
+  which a dense run does not reproduce (strict plan-level error at block 0).
 * The two 64-bit arms are captured and planned with automatic sparse routing on
   (`SPARSE_AUTO=2`, which needs `CORRECTION_FACTOR=7` on that chain), which is the shipped
   configuration.
