@@ -12,7 +12,25 @@ from .sim import Budget, SimResult, simulate
 log = logging.getLogger(__name__)
 
 QUALITY_LAMBDA = 1.0 / 4096.0
+#: Deepest absolute level (in PRIMES) a refresh may start at. The runtime's own guard is
+#: chain-relative -- one CKKS level above the reactive ceiling, so 46+2=48 on the 32-bit
+#: composite chain and 24+1=25 on the 64-bit one (fideslib_wrapper.h, BTS_MAX_INPUT_LEVEL).
+#: The planner cannot see that ceiling: no plan recipe sources scripts/local_env.sh, so
+#: AUTO_BTS_LEVEL is not in its environment. Hence a knob with the 32-bit value as the
+#: default, which is what every shipped recipe was planned under.
 REFRESH_ENV_CAP_ABS = 48.0
+
+
+def refresh_env_cap() -> float:
+    """REFRESH_ENV_CAP_ABS, or PLAN_REFRESH_ENV_CAP when the recipe pins the chain's own."""
+    import os as _os
+    e = _os.environ.get("PLAN_REFRESH_ENV_CAP")
+    if e and e.strip():
+        try:
+            return float(e)
+        except ValueError:
+            pass
+    return REFRESH_ENV_CAP_ABS
 
 
 class PlanInfeasible(RuntimeError):
@@ -91,6 +109,17 @@ class Placer:
     # cfg.dissolve_hints; PLAN_HARD_ENV_CAP overrides either way.
     hard_env_cap: bool = False
     verbose: bool = True
+
+    #: Set when `run` had to allow a refresh past REFRESH_ENV_CAP_ABS because no plan that
+    #: respects the envelope exists. The deep site is then forced, not chosen, so the
+    #: planner's P3c check reports it instead of refusing.
+    env_cap_relaxed: bool = False
+    #: Resolved per `run`; `_capacity` reads this, never `hard_env_cap` directly.
+    _env_cap_hard: bool = False
+    #: Hints vetoed because the sim predicts them firing past the envelope. A hint never goes
+    #: through `_capacity`, so the envelope policy cannot price it; forcing it off hands the
+    #: branch to the cut, which can.
+    vetoed_hints: set[str] = field(default_factory=set)
 
     placed: set[str] = field(default_factory=set)
     realized: set[str] = field(default_factory=set)
@@ -174,20 +203,14 @@ class Placer:
         if spec.hopeless:
             return float("inf")
         eff_v = (self._last_sim.consumed.get(v, 0.0) + (self.g.level_unit if self._last_sim.deg.get(v, 1) == 2 else 0)) if self._last_sim is not None else 0.0
-        if self.bootstrap_level + eff_v > REFRESH_ENV_CAP_ABS:
+        if self.bootstrap_level + eff_v > refresh_env_cap():
             # Past the refresh envelope. Payable (1e4, large but finite) by default: an
             # inf here can starve the cut entirely when whole paths sit past the envelope,
             # and with hints live they absorb the deep values so the penalty is never
             # exercised. Hard (inf) when the cut is the sole refresher (`hard_env_cap`,
             # set by the planner from dissolve_hints): a bootstrap started past the
             # envelope silently returns garbage. PLAN_HARD_ENV_CAP=0/1 overrides either way.
-            import os as _os
-            _ov = _os.environ.get("PLAN_HARD_ENV_CAP")
-            if _ov == "1":
-                return float("inf")
-            if _ov == "0":
-                return 1.0e4
-            return float("inf") if self.hard_env_cap else 1.0e4
+            return float("inf") if self._env_cap_hard else 1.0e4
         cap = 1.0 + self.miss_penalty * spec.overshoot(self.err_target)
         if self.quality_weight > 0.0:
             q = min(1.0, max(0.0, spec.rel_err / max(self.err_target, 1e-300)))
@@ -195,6 +218,110 @@ class Placer:
         return cap
 
     def run(self) -> SimResult:
+        """Place the refreshes, keeping every one inside the refresh envelope if any plan can.
+
+        A bootstrap started past REFRESH_ENV_CAP_ABS returns garbage silently, so the envelope
+        is what the cut should respect. Making it an outright refusal is too blunt: an `inf`
+        there starves the cut on graphs whose deep paths have no shallower cut point, and the
+        plan dies with nothing placed. So: price it as unreachable first, and only if THAT
+        cannot be planned fall back to the payable cap, which is the old behaviour. A deep
+        refresh then means there was nowhere else to put one, and `env_cap_relaxed` says so.
+
+        PLAN_HARD_ENV_CAP pins one pass: 1 = envelope absolute (no fallback), 0 = payable
+        throughout (what the shipped 32-bit recipe asked for before this was two-pass).
+        """
+        import os as _os
+        _ov = _os.environ.get("PLAN_HARD_ENV_CAP")
+        if _ov in ("0", "1"):
+            self._env_cap_hard = (_ov == "1")
+            return self._run_with_hint_veto()
+        if self.hard_env_cap:
+            # the cut is the sole refresher (hints dissolved): there is no hint to absorb a
+            # deep value, so the envelope is absolute and a fallback would only hide it
+            self._env_cap_hard = True
+            return self._run_with_hint_veto()
+
+        saved = (set(self.placed), set(self.realized),
+                 set(self.ever_eligible), set(self.ever_pressured))
+        self._env_cap_hard = True
+        try:
+            return self._run_with_hint_veto()
+        except PlanInfeasible:
+            self.placed, self.realized, self.ever_eligible, self.ever_pressured = (
+                set(saved[0]), set(saved[1]), set(saved[2]), set(saved[3]))
+            self._env_cap_hard = False
+            self.env_cap_relaxed = True
+            res = self._run_with_hint_veto()  # its own refusal is the honest one: nowhere to place
+            if self.verbose:
+                log.info("[plan] refresh envelope RELAXED: no placement keeps every refresh at "
+                         f"or below absolute level {refresh_env_cap():g}; the deep sites below "
+                         "are forced, not chosen")
+            return res
+
+    def _deep_hints(self, sim: SimResult) -> list[str]:
+        """Hints the sim has firing on an input already past the envelope.
+
+        The hint's own output is post-refresh and always shallow; what matters is the level of
+        the ciphertext entering it, which is what the runtime's bts_depth_error guard sees.
+        """
+        out = []
+        unit = self.g.level_unit
+        for n in self.g.nodes:
+            if n.hint_level is None or not sim.hint_fired.get(n.idx, False) or not n.output:
+                continue
+            ins = n.cipher_inputs
+            if not ins:
+                continue
+            eff = sim.consumed.get(ins[0], 0.0) + (unit if sim.deg.get(ins[0], 1) == 2 else 0)
+            if self.bootstrap_level + eff > refresh_env_cap():
+                out.append(n.output)
+        return out
+
+    def _run_with_hint_veto(self, passes: int = 4) -> SimResult:
+        """`_run_once`, then force off any hint predicted to fire past the envelope and replan.
+
+        Vetoing makes the value keep accumulating, so the op below it goes over budget and the
+        cut has to cover the branch -- under `_capacity`, which respects the envelope. If the
+        veto makes the graph unplannable the veto is taken back: a plan with a deep hint beats
+        no plan, and the runtime guard still covers it.
+
+        OFF unless PLAN_HINT_ENV_VETO=1. It moves refreshes, so it would rewrite every shipped
+        plan; the arms that want the envelope guarantee to cover hints ask for it.
+        """
+        res = self._run_once()
+        import os as _os
+        if _os.environ.get("PLAN_HINT_ENV_VETO") != "1":
+            return res
+        for _ in range(passes):
+            deep = [v for v in self._deep_hints(res) if v not in self.vetoed_hints]
+            if not deep:
+                return res
+            saved_force = dict(self.hint_force) if self.hint_force else None
+            saved_state = (set(self.placed), set(self.realized),
+                           set(self.ever_eligible), set(self.ever_pressured))
+            self.hint_force = dict(self.hint_force or {})
+            for v in deep:
+                self.hint_force[v] = False
+            self.vetoed_hints.update(deep)
+            self.placed, self.realized = set(), set()
+            try:
+                res = self._run_once()
+            except PlanInfeasible:
+                self.hint_force = saved_force
+                self.vetoed_hints.difference_update(deep)
+                (self.placed, self.realized,
+                 self.ever_eligible, self.ever_pressured) = (set(saved_state[0]),
+                    set(saved_state[1]), set(saved_state[2]), set(saved_state[3]))
+                if self.verbose:
+                    log.info(f"[plan] hint veto taken back for {len(deep)} hint(s): the cut "
+                             "cannot cover the branch, so the deep hint stays")
+                return self._run_once()
+            if self.verbose:
+                log.info(f"[plan] vetoed {len(deep)} hint(s) predicted to fire past absolute "
+                         f"level {refresh_env_cap():g}; the cut covers them instead")
+        return res
+
+    def _run_once(self) -> SimResult:
         # useless if the graph has been cleaned of auto_bootstrap nodes (as we do)
         from .sim import step_bts_offsets
         self._step_offsets = step_bts_offsets(self.g, self.bootstrap_level)

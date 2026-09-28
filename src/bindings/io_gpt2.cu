@@ -48,6 +48,15 @@ void bind_io_gpt2(py::module_& m) {
           "Reset the runtime-graph naming state (ct/pt vars + counters) for capture/planned runs.");
     m.def("reset_kv_cache", &gpt2_reset_kv_cache, py::arg("inf"), py::arg("n_blocks"), kRelease,
           "Reset every block's K/V caches for a fresh sequence (also prewarms the pinned arenas).");
+    m.def("prewarm_stage_arenas", [](Inference& inf) {
+              inf.cc()->PrewarmKvArena();
+              fideslib::PrewarmStageArenas();
+          }, py::arg("inf"), kRelease,
+          "Pin the residency ring's stage arenas (2 x FHE_STAGE_ARENA_GB) and the KV arena now, "
+          "on a background thread, instead of on the first staged block. Call it BEFORE encoding "
+          "weights: the arenas are the hot host memory of every token, and pinning them while the "
+          "process is small keeps them on the GPU's NUMA node (the C++ decode arm does this in "
+          "reset_kv_cache).");
 
     m.def("configure_prefill_phase", [](Inference& inf, int n_tok) {
         inf.packing.kind = PackingKind::CachemirFilling;

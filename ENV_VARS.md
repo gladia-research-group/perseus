@@ -88,7 +88,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_DELTA_BLOCK` | Delta-block attention for the filling (prefill) packing. |
 | `FHE_LMHEAD_CAP` | Level the LM-head weights are encoded at. |
 | `FUSED_LN_VAR` | Fold the LayerNorm variance refresh (default 0). |
-| `FUSED_SM_DEN` | Refresh the softmax denominator inside the fold (default 1). |
+| `FUSED_SM_DEN` | Refresh the softmax denominator inside the fold (C++ decode default 1; the Python implementation's `env.py` sets 0). |
 | `GPT2_FOLD_LN1` | Fold the first LayerNorm's affine part into the following weights. |
 | `GPT2_FOLD_LN2` | Same for the second LayerNorm. |
 | `GPT2_FOLD_LNF` | Same for the final LayerNorm (default 0). |

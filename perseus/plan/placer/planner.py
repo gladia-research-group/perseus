@@ -447,14 +447,23 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # 3.7e-1 at level 48 -> 1.96e4 at level 50) and the runtime raises nothing.
     # `_capacity` already refuses these for cut-chosen sites; hint-fired refreshes never
     # pass through it, hence this check covers both.
-    from .place import REFRESH_ENV_CAP_ABS as _ENV_CAP
+    from .place import refresh_env_cap as _refresh_env_cap
+    _ENV_CAP = _refresh_env_cap()
     _bad_cut, _bad_hint = [], []
+    # A var past the envelope that nothing refreshes is NOT harmless: the runtime meets it
+    # there and fires a REACTIVE bootstrap, which is the one class neither the cut nor the
+    # hint check covers, and it stops the run with [bts_depth_error]. Collect it.
+    _hint_covered = {n.output for n in g.nodes
+                     if n.hint_level is not None and sim.hint_fired.get(n.idx) and n.output}
+    _bad_reactive = []
     for _v, _c in sim.consumed.items():
         _eff = cfg.bootstrap_level + _c + (cfg.level_unit if sim.deg.get(_v, 1) == 2 else 0)
         if _eff <= _ENV_CAP:
             continue
         if _v in placer.placed:
             _bad_cut.append((_v, _eff))
+        elif _v not in _hint_covered:
+            _bad_reactive.append((_v, _eff))
     # Hint-fired refreshes: `hint_fired` is keyed by node index, and the depth that
     # matters is the level of the ct entering the hint (its input var) — the hint's own
     # output is post-refresh and always shallow. Warning, not a refusal: the sim
@@ -476,7 +485,16 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
               + ", ".join(f"{v}@{l:g}" for v, l in _bad_hint[:6])
               + " — WARNING ONLY: this prediction is known to over-fire; the runtime "
                 "[bts_depth_error] guard is the authority.")
-    if _bad_cut:
+    if _bad_cut and getattr(placer, "env_cap_relaxed", False):
+        # the placer already proved no envelope-respecting placement exists (it tried that
+        # pass first and it could not be planned), so these sites are forced, not chosen
+        log.warning(
+            f"[plan] P3c: {len(_bad_cut)} refresh(es) start past the measured envelope "
+            f"(abs level > {_ENV_CAP:g}) and NO placement avoids them -- a bootstrap there "
+            f"returns garbage silently, so the runtime [bts_depth_error] guard is what "
+            f"stands between this plan and a wrong answer:\n  "
+            + ", ".join(f"{v}@{l:g}" for v, l in _bad_cut[:6]))
+    elif _bad_cut:
         _msg = (f"P3c violated: {len(_bad_cut)} CUT-CHOSEN refresh(es) start past the "
                 f"measured envelope (abs level > {_ENV_CAP:g}) — a bootstrap there returns "
                 f"GARBAGE SILENTLY (rel_err 1.96e4 at level 50 vs 3.7e-1 at 48).\n  "
@@ -522,6 +540,32 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     result["summary"]["bts_quality"]["blind_branches"] = {
         "count": len(result_blind),
         "vars": result_blind[:32],
+    }
+    # The absolute level the sim PREDICTS each placed refresh starts at, so a run can be
+    # audited against it (scripts/utils/bts_level_audit.py). The runtime prints the level it
+    # actually met as `[planted_bts] ... in=`; the two disagreeing is how a refresh ends up
+    # past the envelope on a plan that looked clean, which no placement policy can catch.
+    result["summary"]["bts_quality"]["placed_input_levels"] = {
+        v: cfg.bootstrap_level + sim.consumed.get(v, 0.0)
+           + (cfg.level_unit if sim.deg.get(v, 1) == 2 else 0)
+        for v in sorted(placer.placed)
+    }
+    if _bad_reactive:
+        log.warning(
+            f"[plan] P3c(reactive): {len(_bad_reactive)} var(s) are predicted past the envelope "
+            f"(abs level > {_ENV_CAP:g}) with NO placed or hinted refresh -- the runtime will "
+            f"refresh them there and stop with [bts_depth_error]: "
+            + ", ".join(f"{v}@{l:g}" for v, l in _bad_reactive[:6])
+            + "  -> lower --max-level. (--baseline-depth-cap does NOT cover this class: it "
+            "bounds a PLACED refresh's input depth, and these are precisely the vars nothing "
+            "places.)")
+    result["summary"]["bts_quality"]["env_cap"] = {
+        "limit": _ENV_CAP,
+        "relaxed": bool(getattr(placer, "env_cap_relaxed", False)),
+        "vetoed_hints": sorted(getattr(placer, "vetoed_hints", ()) or ()),
+        "placed_past_cap": [v for v, _ in _bad_cut],
+        "hints_predicted_past_cap": [v for v, _ in _bad_hint],
+        "reactive_past_cap": [v for v, _ in _bad_reactive],
     }
     # Which hints survived dissolution, and why: that residue is exactly the set whose
     # refresh level is still decided at runtime.

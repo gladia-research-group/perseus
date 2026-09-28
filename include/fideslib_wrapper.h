@@ -2323,7 +2323,17 @@ struct CKKSContext {
         // silently. Plan-time cannot catch the hint-fired ones (the level is decided here),
         // so this is the only place that sees every case.
         {
-            constexpr int kMaxBtsInputLevel = 48;
+            // Chain-relative: ONE CKKS level above the reactive ceiling. On the 32-bit
+            // composite chain that is 46 + 2 = 48 primes, the level the round-trip error was
+            // measured at (rel_err 3.7e-1 at 48 -> 1.96e4 at 50). A bare 48 means nothing on
+            // a d=1 chain whose levels stop at 24, so express it in the prime-granular units
+            // `level_headroom` already exists for. BTS_MAX_INPUT_LEVEL overrides (primes).
+            static const int kEnvOverride = [] {
+                const char* e = std::getenv("BTS_MAX_INPUT_LEVEL");
+                return (e && *e) ? std::atoi(e) : -1;
+            }();
+            const int kMaxBtsInputLevel =
+                (kEnvOverride >= 0) ? kEnvOverride : level_headroom(-1);
             const int lvl = static_cast<int>(level_of(ct));
             if (lvl > kMaxBtsInputLevel) {
                 std::ostringstream oss;

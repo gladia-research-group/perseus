@@ -162,8 +162,8 @@ struct Inference {
     }
 
     template <class Vec>
-    Ptx encode_tagged(const Vec& v, uint32_t lv) const {
-        Ptx pt = cc()->MakeCKKSPackedPlaintext(v, /*noiseScaleDeg=*/1, lv);
+    Ptx encode_tagged(const Vec& v, uint32_t lv, uint32_t nsd = 1) const {
+        Ptx pt = cc()->MakeCKKSPackedPlaintext(v, nsd, lv);
         if (fhe) fhe->tag_plaintext(pt, v);   // real and complex overloads
         return pt;
     }

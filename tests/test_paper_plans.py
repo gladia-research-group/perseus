@@ -1,5 +1,9 @@
 """Every shipped plan regenerates from its graph with the recipe in its PLAN_CMD.txt.
 
+A plan whose PLAN_CMD.txt names ``tool=examples/gpt2_from_primitives/make_plan.sh`` (the
+Python implementation's plans) is regenerated with that tool: the blocks, then the argmax stage
+(block 13, entered at the tail plan's exit), each stamped with the capture contract.
+
 The main plan is always checked; the baselines and ablations (about 20 planner runs, a few
 minutes) run when PERSEUS_ALL_PLANS=1. baselines/orion is the released Orion tool's output
 and is skipped. Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;
@@ -30,17 +34,20 @@ def _plan_dirs():
 
 
 def _recipe(plan_dir: Path):
-    """(graph, recipe flags) from PLAN_CMD.txt; None for a measured artifact (no `recipe=`)."""
-    graph = recipe = None
+    """(graph, recipe flags, tool) from PLAN_CMD.txt; None for a measured artifact (no
+    `recipe=`). tool is None for the plain run_bootstrap_all_blocks.sh recipe."""
+    graph = recipe = tool = None
     for line in (plan_dir / "PLAN_CMD.txt").read_text().splitlines():
         if line.startswith("graph="):
             graph = line[len("graph="):].split(" ")[0]
         elif line.startswith("recipe="):
             recipe = shlex.split(line[len("recipe="):])
+        elif line.startswith("tool="):
+            tool = line[len("tool="):].split(" ")[0]
     if recipe is None:
         return None
     assert graph, f"{plan_dir}/PLAN_CMD.txt lacks graph="
-    return graph, recipe
+    return graph, recipe, tool
 
 
 @pytest.fixture(scope="module")
@@ -57,17 +64,23 @@ def test_plan_regenerates(name, equiv, tmp_path):
     parsed = _recipe(plan_dir)
     if parsed is None:
         pytest.skip(f"{name} is a measured artifact, not regenerated")
-    graph, recipe = parsed
+    graph, recipe, tool = parsed
     if not (REPO / graph).is_dir():
         pytest.skip(f"graph {graph} not present")
     out_name = f"_regen_{name.replace('/', '_')}"
     env = dict(os.environ, GRAPH_DIR=graph, OUT_NAME=out_name, PYTHON=sys.executable,
                CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="4")
     env.update(kv.split("=", 1) for kv in recipe)
+    if tool is None:
+        cmds = [["bash", "scripts/utils/run_bootstrap_all_blocks.sh"]]
+    else:
+        cmds = [["bash", tool, graph, out_name], ["bash", tool, graph, out_name, "argmax"]]
     log = tmp_path / "plan.log"
+    rc = 0
     with log.open("w") as f:
-        rc = subprocess.run(["bash", "scripts/utils/run_bootstrap_all_blocks.sh"],
-                            cwd=REPO, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
+        for cmd in cmds:
+            rc = rc or subprocess.run(cmd, cwd=REPO, env=env, stdout=f,
+                                      stderr=subprocess.STDOUT).returncode
     regen = BP / out_name
     try:
         assert rc == 0, log.read_text()[-2000:]

@@ -12,6 +12,9 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include "residency_pipeline.h"
+#include <future>
+#include <memory>
 
 #include <cuda_runtime.h>
 
@@ -23,7 +26,39 @@ namespace {
 constexpr auto kRelease = py::call_guard<py::gil_scoped_release>();
 }
 
+// The circular ring of the C++ decode arm: the next token's first blocks are extracted on
+// the residency worker while the current token's argmax runs, so the next token's pipeline
+// starts warm (its EXTRACT(0) / EXTRACT(1) early out).
+struct RingPrefetch {
+    std::future<void> fut;
+    bool joined = false;
+};
+
 void bind_io(py::module_& m) {
+    py::class_<RingPrefetch, std::shared_ptr<RingPrefetch>>(m, "RingPrefetch",
+        "A prefetch_states job on the residency worker; join it with wait() before the main "
+        "thread touches those states (the next token's run_stages).")
+        .def("wait", [](RingPrefetch& r) {
+            py::gil_scoped_release nogil;
+            if (!r.joined && r.fut.valid()) r.fut.get();
+            r.joined = true;
+        });
+    m.def("prefetch_states",
+          [](Inference& inf, std::vector<EncodedBlock*> states) {
+              auto r = std::make_shared<RingPrefetch>();
+              Inference* pinf = &inf;
+              py::gil_scoped_release nogil;
+              // raw pointers: the caller keeps the states alive (its per-block state map)
+              r->fut = residency_submit([pinf, states = std::move(states)]() mutable {
+                  for (auto* st : states) if (st) cpu_extract_block(*pinf, *st);
+              });
+              return r;
+          },
+          py::arg("inf"), py::arg("states"), py::keep_alive<0, 2>(),
+          "Extract these block states' plaintexts into the pinned staging arena on the "
+          "residency worker (the C++ circular ring: issue it under the argmax tail, wait() at "
+          "the start of the next token).");
+
     py::class_<weight_loader::WeightStore>(m, "WeightStore")
         .def_static("from_zip", &weight_loader::WeightStore::from_zip, py::arg("zip_path"), kRelease,
                     "Load a WeightStore from a zip export (manifest.json + tensor entries).")
@@ -184,6 +219,25 @@ void bind_io(py::module_& m) {
              },
              py::arg("inf"), py::arg("name"), py::arg("b"), py::arg("d_in"), py::arg("d_out"),
              py::arg("fill") = true, kRelease)
+        .def("adopt_slot_pts",
+             [](EncodedBlock& blk, Inference& inf, const std::string& prefix) {
+                 py::gil_scoped_release nogil;
+                 std::vector<std::string> keys;
+                 for (auto& kv : inf.w)
+                     if (kv.first.compare(0, prefix.size(), prefix) == 0) keys.push_back(kv.first);
+                 for (auto& k : keys) {
+                     auto it = inf.w.find(k);
+                     for (auto& pt : it->second) inf.evict_plaintext(pt);   // host copy stays
+                     blk.w[k] = std::move(it->second);
+                     inf.w.erase(it);
+                 }
+                 return keys.size();
+             },
+             py::arg("inf"), py::arg("prefix"),
+             "Move the session's named slot plaintexts `prefix*` (set_slot_pt) into this block "
+             "state, so a Stage(state=blk) streams them through the residency ring like a C++ "
+             "block's weights: extracted on the worker, uploaded on the side stream, installed "
+             "for the stage's compute and evicted after it.")
         .def("set_norm_cfg", [](EncodedBlock& blk, const std::string& name, NormConfig cfg) {
             blk.norm_cfg[name] = std::move(cfg);
         }, py::arg("name"), py::arg("cfg"),

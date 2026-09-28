@@ -42,6 +42,7 @@ if [[ -n "${FIRST_ENTRY_LEVEL:-}"   ]]; then args+=(--first-entry-level "$FIRST_
 if [[ -n "${FIRST_ENTRY_DEG:-}"     ]]; then args+=(--first-entry-deg "$FIRST_ENTRY_DEG");    fi
 if [[ -n "${PLAN_BIND_HINTS:-}"     ]]; then args+=(--bind-hints);                            fi
 if [[ -n "${PLAN_DISSOLVE_HINTS:-}" ]]; then args+=(--dissolve-hints);                        fi
+if [[ -n "${PLAN_DELIBERATE_CLAMP0:-}" ]]; then args+=(--deliberate-clamp0);                 fi
 if [[ -n "${PLAN_PLACER:-}"         ]]; then args+=(--placer "$PLAN_PLACER");                 fi
 if [[ -n "${PLAN_BASELINE_RESCUE:-}"   ]]; then args+=(--baseline-rescue);                          fi
 if [[ -n "${PLAN_BASELINE_DEPTH_CAP:-}" ]]; then args+=(--baseline-depth-cap "$PLAN_BASELINE_DEPTH_CAP"); fi

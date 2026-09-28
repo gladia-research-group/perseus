@@ -9,10 +9,15 @@
 #include "model/mha.h"
 #include "model/mlp.h"
 #include "nonlinear.h"
+#include "packing/pack_tag.h"
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include "residency_pipeline.h"
+#include <future>
+#include <chrono>
+#include <tuple>
 
 namespace py = pybind11;
 
@@ -24,6 +29,34 @@ constexpr auto kRelease = py::call_guard<py::gil_scoped_release>();
 struct StepScope {
     Inference* inf;
     std::string label;
+};
+
+// `with fhe.suppress_auto_bts():` — the runtime's AutoBtsSuppressScope (no reactive refresh
+// inside; the fused reductions square at the ceiling and refresh inside the fold instead).
+struct AutoBtsScope {
+    CKKSContext* fhe;
+    bool saved = false;
+};
+
+// The K/V cache residency of the Python implementation: ciphertexts parked in the runtime's
+// pinned KV arena between the blocks of a token (KvStoreStaged / KvLoadStaged on one side
+// stream, KvEvict once the store has landed), the C++ decode arm's offload_block_kv.
+cudaStream_t impl_kv_stream() {
+    static cudaStream_t s = [] {
+        cudaStream_t st = nullptr;
+        cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+        return st;
+    }();
+    return s;
+}
+
+// A batch of plaintexts encoded on the runtime's mask worker (residency_pipeline.h:
+// mask_submit) while the main thread keeps issuing GPU work, adopted into inf.enc_cache
+// afterwards -- the C++ decode arm's next-step mask staging (gpt2_decode.cu:138-150).
+struct StagedPts {
+    std::future<void> fut;
+    std::vector<std::tuple<std::string, uint32_t, Ptx>> out;   // written by the worker only
+    bool adopted = false;
 };
 
 std::vector<double> roundtrip(CKKSContext& fhe, std::vector<double> values) {
@@ -42,10 +75,86 @@ std::string repr_field(const T& v) { return py::str(py::cast(v)); }
 template <typename T>
 std::string repr_field(const std::vector<T>& v) { return "[" + std::to_string(v.size()) + "]"; }
 
+
+// The named slot plaintext `name` at the level of `ct`, re-encoded (host side) and re-uploaded
+// when the level differs — the weights_at contract without its weight_store canon pointer,
+// which the block loader leaves dangling once a block state dies.
+Ptx& slot_pt_at(Inference& inf, const std::string& name, const PackedCtx& ct) {
+    auto it = inf.w.find(name);
+    if (it == inf.w.end() || it->second.empty())
+        throw std::out_of_range("slot plaintext '" + name + "' is not set (set_slot_pt)");
+    Ptx& pt = it->second[0];
+    // `encode_like_params` is chain-dependent: on a d=1 chain a plaintext meets the ct at the
+    // ct's OWN level and degree, so adding it leaves a pending rescale pending; only on a d>1
+    // chain does it go to level+pending at degree 1. Hardcoding the latter forced a realize
+    // the composites do not do, which is level 17/deg 2 against 18/deg 1 on n64.
+    const auto [lv, nsd] = inf.encode_like_params(ct.ct);
+    // Level only: a plaintext does not carry its noiseScaleDeg, and it does not have to. The
+    // caller names one slot per (level, degree) pair -- the composites likewise KEY their
+    // encode cache by both and never query the plaintext -- so a given name holds exactly one
+    // degree and a level match means the pair matches.
+    if (static_cast<uint32_t>(pt->GetLevel()) != lv) {
+        Ptx adapted = inf.fhe->complex_payload
+            ? inf.cc()->MakeCKKSPackedPlaintext(pt->GetCKKSPackedValue(), nsd, lv)
+            : inf.cc()->MakeCKKSPackedPlaintext(pt->GetRealPackedValue(), nsd, lv);
+        inf.evict_plaintext(pt);
+        pt = adapted;
+        ++inf.fhe->weight_relevel_count;
+    }
+    inf.load_plaintext(pt);
+    return pt;
+}
+// Encode a real or complex slot vector at ct's level (+ pending rescale), pack-tagged unless
+// `tagged` is false (the C++ CutMax leaves its complex masks untagged: no sparse routing).
+Ptx encode_any_at(Inference& inf, const perseus_np::AnyVec& v, const PackedCtx& ct, bool tagged = true) {
+    const auto [lv, nsd] = inf.encode_like_params(ct.ct);
+    if (v.cplx) return tagged ? inf.encode_tagged(v.c, lv, nsd)
+                              : inf.cc()->MakeCKKSPackedPlaintext(v.c, nsd, lv);
+    return tagged ? inf.encode_tagged(v.re, lv, nsd)
+                  : inf.cc()->MakeCKKSPackedPlaintext(v.re, nsd, lv);
+}
+
+Ptx encode_any(Inference& inf, const perseus_np::AnyVec& v, uint32_t lv, bool tagged = true,
+               uint32_t nsd = 1) {
+    if (v.cplx) return tagged ? inf.encode_tagged(v.c, lv, nsd)
+                              : inf.cc()->MakeCKKSPackedPlaintext(v.c, nsd, lv);
+    return tagged ? inf.encode_tagged(v.re, lv, nsd)
+                  : inf.cc()->MakeCKKSPackedPlaintext(v.re, nsd, lv);
+}
+
+// inf.enc_cache lookup keyed like encode_at_cached (tag + level), encoding on a miss.
+Ptx cached_any_at(Inference& inf, const std::string& tag, const perseus_np::AnyVec& v,
+                  const PackedCtx& ct, bool tagged) {
+    const auto [lv, nsd] = inf.encode_like_params(ct.ct);
+    const std::string key = Inference::enc_cache_key(tag, lv, nsd);
+    auto it = inf.enc_cache.find(key);
+    if (it != inf.enc_cache.end()) { ++inf.enc_cache_hit; return it->second; }
+    ++inf.enc_cache_miss;
+    if (inf.strict_masks) {
+        ++inf.mask_strict_miss;
+        throw fhe::MaskError("[mask_miss] strict planned-mask cache miss: '" + key + "'");
+    }
+    Ptx pt = encode_any(inf, v, lv, tagged);
+    inf.enc_cache.emplace(key, pt);
+    return pt;
+}
 }  // namespace
 
 void bind_ops(py::module_& m) {
     // ── context ────────────────────────────────────────────────────────────
+    py::class_<AutoBtsScope>(m, "AutoBtsScope")
+        .def("__enter__", [](AutoBtsScope& s) {
+            s.saved = s.fhe->auto_bts_suppressed; s.fhe->auto_bts_suppressed = true; return &s;
+        }, py::return_value_policy::reference)
+        .def("__exit__", [](AutoBtsScope& s, py::object, py::object, py::object) {
+            s.fhe->auto_bts_suppressed = s.saved; return false;
+        });
+    py::class_<StagedPts, std::shared_ptr<StagedPts>>(m, "StagedPts",
+        "A stage_pts job: plaintexts being encoded on the mask worker, adopted with adopt_pts.")
+        .def_property_readonly("ready", [](const StagedPts& s) {
+            return !s.fut.valid() || s.fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        })
+        .def_property_readonly("adopted", [](const StagedPts& s) { return s.adopted; });
     py::class_<CKKSContext, std::shared_ptr<CKKSContext>>(m, "Context")
         .def("roundtrip", &roundtrip, py::arg("values"), kRelease,
              "encode -> encrypt -> decrypt -> decode `values` (a context self-test).")
@@ -67,14 +176,28 @@ void bind_ops(py::module_& m) {
              py::arg("a"), kRelease, "a * a.")
         .def("inplace_add", static_cast<void (CKKSContext::*)(PackedCtx&, const PackedCtx&)>(&CKKSContext::inplace_add),
              py::arg("a"), py::arg("b"), kRelease, "a += b.")
-        .def("bootstrap", [](CKKSContext& c, PackedCtx& p) { c.bootstrap(p.ct); },
-             py::arg("ct"), kRelease, "Refresh `ct` to the bootstrap output level (in place).")
+        .def("bootstrap",
+             [](CKKSContext& c, PackedCtx& p, int iterations) {
+                 if (iterations <= 1) { c.bootstrap(p.ct); return; }
+                 CKKSContext::BtsItersScope scope(c, static_cast<uint32_t>(iterations));
+                 c.bootstrap(p.ct);
+             },
+             py::arg("ct"), py::arg("iterations") = 1, kRelease,
+             "Refresh `ct` to the bootstrap output level (in place). iterations=2 runs the "
+             "runtime's two-iteration bootstrap (eval_bootstrap_iter: bootstrap the residual "
+             "scaled by 2^bts_precision and add it back) as ONE recorded op, the way the C++ "
+             "CutMax refreshes under its BtsItersScope.")
         .def("maybe_bootstrap", [](CKKSContext& c, PackedCtx& p) { c.maybe_bootstrap(p.ct); },
              py::arg("ct"), kRelease, "Bootstrap `ct` only if its level is below the auto threshold.")
         .def("bootstrap_hint",
-             static_cast<void (CKKSContext::*)(PackedCtx&, int, bool)>(&CKKSContext::bootstrap_hint),
+             [](CKKSContext& c, PackedCtx& p, int thr, bool acct, int iterations) {
+                 if (iterations <= 1) { c.bootstrap_hint(p, thr, acct); return; }
+                 CKKSContext::BtsItersScope scope(c, static_cast<uint32_t>(iterations));
+                 c.bootstrap_hint(p, thr, acct);
+             },
              py::arg("ct"), py::arg("level_threshold"), py::arg("account_pending_rescale") = false,
-             "Bootstrap `ct` if it has fewer than `level_threshold` levels left.")
+             py::arg("iterations") = 1,
+             "Bootstrap `ct` if its level exceeds `level_threshold`; iterations=2 as for bootstrap.")
         .def("level_hint", static_cast<void (CKKSContext::*)(PackedCtx&, int)>(&CKKSContext::level_hint),
              py::arg("ct"), py::arg("level"), "Drop `ct` to `level` if it is above it.")
         // ── leaf primitives for Python-authored ops ────────────────────────────
@@ -82,6 +205,90 @@ void bind_ops(py::module_& m) {
              py::arg("ct"), py::arg("steps"), kRelease,
              "Cyclic slot rotation by `steps` (out[i] = in[i + steps]); the rotation key for "
              "`steps` must exist in the session's band.")
+        .def("rotate_hoisted",
+             [](CKKSContext& c, const PackedCtx& ct, const std::vector<int32_t>& steps) {
+                 return c.rotate_hoisted(ct, steps);
+             },
+             py::arg("ct"), py::arg("steps"), kRelease,
+             "Several rotations of one ciphertext sharing one key-switch decomposition (the "
+             "runtime's hoisted rotation); one PackedCtx per step, recorded like plain rotations.")
+        .def("rotate_and_sum",
+             [](CKKSContext& c, const PackedCtx& ct, int32_t start, int32_t stop) {
+                 if (start == 0) throw std::invalid_argument("rotate_and_sum: start must be non-zero");
+                 if (stop <= 0) throw std::invalid_argument("rotate_and_sum: stop must be positive");
+                 py::gil_scoped_release nogil;
+                 const int32_t sign = start < 0 ? -1 : 1;
+                 int32_t gap = start < 0 ? -start : start;
+                 if (gap >= stop) return c.add(ct, 0.0);        // empty ladder: a clone
+                 PackedCtx acc = c.add(ct, c.rotate(ct, sign * gap));
+                 for (gap *= 2; gap < stop; gap *= 2)
+                     c.inplace_add(acc, c.rotate(acc, sign * gap));
+                 return acc;
+             },
+             py::arg("ct"), py::arg("start"), py::arg("stop"),
+             "The rotate-and-sum ladder: x += rotate(x, g) for g = start, 2 start, 4 start, ... "
+             "while |g| < stop (start < 0 rotates the other way). start=1, stop=slots is the "
+             "all-slots total broadcast to every slot (rotate_and_sum_all); start=t sums the "
+             "slots congruent mod t; start=-1, stop=t replicates slot 0 of each t-group "
+             "rightwards. Issued in C++ (one Python call instead of 2 log2(stop/start)), "
+             "recorded as the same rotate + add stream a Python loop would emit, so plans "
+             "captured either way stay valid. Needs the rotation keys for every gap.")
+        // ── folds: a sparse bootstrap that finishes a rotate-and-sum ladder ──────────────
+        .def("fold_slots_for",
+             [](const CKKSContext& c, uint32_t s_wanted) { return c.fold_slots_for(s_wanted); },
+             py::arg("s_wanted"),
+             "The slot count a fold wanting `s_wanted` can run at: `s_wanted` when a sparse "
+             "bootstrap precomputation exists for it (SPARSE_BTS_SLOTS), else the smallest built "
+             "count above it (pre-ladder the gap with rotate_and_sum(ct, s_wanted, s)), else the "
+             "full slot count (a plain bootstrap; the caller ladders everything).")
+        .def("fold_bootstrap",
+             [](CKKSContext& c, PackedCtx& ct, uint32_t s, int n_live, double prescale) {
+                 py::gil_scoped_release nogil;
+                 c.fold_bootstrap(ct.ct, s, n_live, prescale);
+             },
+             py::arg("ct"), py::arg("s"), py::arg("n_live"), py::arg("prescale") = 1.0,
+             "In place: bootstrap `ct` at `s` slots, folding the slots/s copies of every "
+             "residue class into one and scaling by 1/n_live, so a ladder stopped at stride `s` "
+             "comes out as the full class sum divided by n_live (the biased mean over n_live "
+             "entries when the class holds them). `prescale` multiplies the input first (one "
+             "level) and is undone in the recovery; use it to land a large sum inside the "
+             "bootstrap's range. One recorded deliberate refresh (plannable).")
+        .def("suppress_auto_bts",
+             [](CKKSContext& c) { return AutoBtsScope{&c}; }, py::keep_alive<0, 1>(),
+             "`with fhe.suppress_auto_bts():` no reactive refresh fires inside (the runtime's "
+             "AutoBtsSuppressScope): a product may sit at the ceiling when a fold follows.")
+        .def("ensure_const_one", [](CKKSContext& c, const PackedCtx& src, int slots) {
+                 py::gil_scoped_release nogil; c.ensure_const_one(src.ct, slots);
+             }, py::arg("src"), py::arg("slots"),
+             "Seed the runtime's constant-one ciphertext from `src` (first call wins): the C++ "
+             "decode does this from the freshest input, and its CutMax cascades start from it.")
+        .def("const_one_available", &CKKSContext::const_one_available)
+        .def("mult_i", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&)>(&CKKSContext::mult_i),
+             py::arg("ct"), kRelease,
+             "i * ct: the monomial x^(N/2), a level-free integer rotation of the complex plane "
+             "(no rescale, no key switch). With conjugate it isolates the lanes of a complex "
+             "payload: a = (z + conj z)/2, i b = (z - conj z)/2.")
+        .def("mult_add_many",
+             [](CKKSContext& c, PackedCtx& acc, const std::vector<PackedCtx>& vs,
+                const std::vector<PackedCtx>& ss) {
+                 if (vs.size() != ss.size())
+                     throw std::invalid_argument("mult_add_many: vs and ss differ in length");
+                 py::gil_scoped_release nogil;
+                 std::vector<const PackedCtx*> vp, sp;
+                 vp.reserve(vs.size()); sp.reserve(ss.size());
+                 for (auto& v : vs) vp.push_back(&v);
+                 for (auto& t : ss) sp.push_back(&t);
+                 if (!vs.empty() && c.mult_add_many_usable(acc, vp, sp)) {
+                     c.mult_add_many(acc, vp, sp);
+                     return true;
+                 }
+                 for (size_t i = 0; i < vs.size(); ++i) c.inplace_add(acc, c.mult(vs[i], ss[i]));
+                 return false;
+             },
+             py::arg("acc"), py::arg("vs"), py::arg("ss"),
+             "acc += sum_j vs[j] * ss[j] with ONE relinearization when the runtime's fused lane "
+             "accumulate applies (returns True), else the plain loop; the recorded op stream is "
+             "the loop's either way.")
         .def("conjugate", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&)>(&CKKSContext::conjugate),
              py::arg("ct"), kRelease, "Complex conjugate of every slot (identity on real payloads).")
         .def("negate", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&)>(&CKKSContext::negate),
@@ -90,6 +297,11 @@ void bind_ops(py::module_& m) {
                                [](const CKKSContext& c) { return c.complex_payload; })
         .def("bootstrap_output_level",
              [](CKKSContext& c) { return static_cast<int>(c.bootstrap_output_level()); })
+        .def_property_readonly("total_bootstraps",
+                               [](const CKKSContext& c) { return static_cast<long long>(c.total_bootstraps); },
+                               "Bootstraps run so far in this context (deliberate + reactive + iterations).")
+        .def_property_readonly("weight_relevel_count",
+                               [](const CKKSContext& c) { return static_cast<long long>(c.weight_relevel_count); })
         .def_property_readonly("has_secret_key",
                                [](const CKKSContext& c) { return static_cast<bool>(c.keys.secretKey); })
         .def_property_readonly("loaded_rot_steps",
@@ -439,20 +651,32 @@ void bind_ops(py::module_& m) {
                                "Names of the weights currently installed (bind order not preserved).")
         // ── plaintext-vector operands (encoded at the ciphertext's level) ─────
         .def("mult_pt",
-             [](Inference& inf, const PackedCtx& ct, const perseus_np::Arr1& values) {
-                 const auto v = perseus_np::to_vec(values);
+             [](Inference& inf, const PackedCtx& ct, const py::array& values) {
+                 auto v = perseus_np::to_any(values);
                  py::gil_scoped_release nogil;
-                 Ptx pt = inf.encode_at(v, ct);
+                 v.resize(static_cast<size_t>(inf.slots));
+                 Ptx pt = encode_any_at(inf, v, ct);
                  return inf.fhe->mult(ct, pt);
              },
              py::arg("ct"), py::arg("values"),
              "ct * values (slot-wise): `values` is encoded as a plaintext at ct's level; "
-             "shorter than the slot count is zero-filled.")
-        .def("add_pt",
-             [](Inference& inf, const PackedCtx& ct, const perseus_np::Arr1& values) {
-                 const auto v = perseus_np::to_vec(values);
+             "shorter than the slot count is zero-filled; a complex array encodes a complex "
+             "plaintext.")
+        .def("mult_const",
+             [](Inference& inf, const PackedCtx& ct, double re, double im) {
                  py::gil_scoped_release nogil;
-                 Ptx pt = inf.encode_at(v, ct);
+                 Ptx pt = inf.encode_complex_const_at(re, im, ct);
+                 return inf.fhe->mult(ct, pt);
+             },
+             py::arg("ct"), py::arg("re"), py::arg("im"),
+             "ct * (re + i im) as a plaintext product (the runtime's cached complex constant; "
+             "a level like any mask). mult_const(ct, 0, 1) packs: a + i b = add(a, mult_const(b, 0, 1)).")
+        .def("add_pt",
+             [](Inference& inf, const PackedCtx& ct, const py::array& values) {
+                 auto v = perseus_np::to_any(values);
+                 py::gil_scoped_release nogil;
+                 v.resize(static_cast<size_t>(inf.slots));
+                 Ptx pt = encode_any_at(inf, v, ct);
                  return inf.fhe->add(ct, pt);
              },
              py::arg("ct"), py::arg("values"), "ct + values (slot-wise plaintext add).")
@@ -466,6 +690,277 @@ void bind_ops(py::module_& m) {
              "Evaluate sum_k coeffs[k] * T_k(x) slot-wise for x in [a, b] (the runtime's "
              "Chebyshev evaluator — what the GELU/softmax composites use). Levels consumed "
              "grow with the degree; the argument must lie inside [a, b].")
+        // The (level, noiseScaleDeg) a plaintext must carry to meet `ct` without forcing a
+        // rescale -- chain-dependent, so the port asks rather than assuming (inference.h).
+        .def("encode_like_level",
+             [](Inference& inf, const PackedCtx& ct) {
+                 const auto [lv, nsd] = inf.encode_like_params(ct.ct);
+                 return py::make_tuple(lv, nsd);
+             }, py::arg("ct"),
+             "(level, noise_deg) a plaintext needs to meet this ciphertext as the composites "
+             "encode it: the ct's own level and degree on a d=1 chain, level+pending at degree "
+             "1 on a composite chain.")
+        // ── named slot-vector plaintexts (encode once, reuse; the port's weight path) ─────
+        .def("set_slot_pt",
+             [](Inference& inf, const std::string& name, const py::array& values, int level,
+                int deg) {
+                 auto v = perseus_np::to_any(values);
+                 if (static_cast<int>(v.size()) > inf.slots)
+                     throw std::invalid_argument("set_slot_pt: more values than slots");
+                 v.resize(static_cast<size_t>(inf.slots));
+                 py::gil_scoped_release nogil;
+                 const uint32_t lv = level <= 0 ? inf.fhe->bootstrap_output_level()
+                                                : static_cast<uint32_t>(level);
+                 inf.w[name] = {encode_any(inf, v, lv, true, static_cast<uint32_t>(deg))};
+             },
+             py::arg("name"), py::arg("values"), py::arg("level") = 0, py::arg("deg") = 1,
+             "Encode a slot vector ONCE as the plaintext `name` at `level` (<= 0: the bootstrap "
+             "output level), host-resident until loaded. mult_slot_pt / add_slot_pt re-level it "
+             "on a level mismatch (weights_at), so pass the level it will be used at. A complex "
+             "array (dtype kind 'c') encodes a complex plaintext (complex payload sessions).")
+        .def("has_slot_pt", [](const Inference& inf, const std::string& name) {
+                 return inf.w.find(name) != inf.w.end();
+             }, py::arg("name"))
+        .def("mult_slot_pt",
+             [](Inference& inf, const PackedCtx& ct, const std::string& name) {
+                 py::gil_scoped_release nogil;
+                 Ptx& pt = slot_pt_at(inf, name, ct);
+                 return inf.fhe->mult(ct, pt);
+             },
+             py::arg("ct"), py::arg("name"), "ct * the named slot plaintext (uploaded on first use).")
+        .def("add_slot_pt",
+             [](Inference& inf, const PackedCtx& ct, const std::string& name) {
+                 py::gil_scoped_release nogil;
+                 Ptx& pt = slot_pt_at(inf, name, ct);
+                 return inf.fhe->add(ct, pt);
+             },
+             py::arg("ct"), py::arg("name"), "ct + the named slot plaintext.")
+        .def("mult_slot_pt_many",
+             [](Inference& inf, const PackedCtx& ct, const std::vector<std::string>& names) {
+                 py::gil_scoped_release nogil;
+                 std::vector<Ptx> pts;
+                 pts.reserve(names.size());
+                 for (const auto& n : names) pts.push_back(slot_pt_at(inf, n, ct));
+                 std::vector<PackedCtx> out;
+                 out.reserve(names.size());
+                 if (!pts.empty() && inf.fhe->lane_batch_usable(ct.ct, pts)) {
+                     auto raw = inf.fhe->mult_batch_exec(ct.ct, pts);
+                     for (size_t i = 0; i < pts.size(); ++i)
+                         out.push_back(inf.fhe->mult_finish(ct, pts[i], std::move(raw[i])));
+                 } else {
+                     for (auto& pt : pts) out.push_back(inf.fhe->mult(ct, pt));
+                 }
+                 return out;
+             },
+             py::arg("ct"), py::arg("names"),
+             "ct * each named slot plaintext, as one fused batch of lane products when the "
+             "runtime allows (the C++ V-push path), else one product each.")
+        // ── slot-period stamps (what the C++ reductions do with packtag::t_reduce_*) ─────
+        .def("tag_reduce",
+             [](Inference& inf, PackedCtx& ct, int stride) {
+                 const auto top = packtag::PackTag::top(inf.slots);
+                 ct.tag = stride <= 1 ? packtag::t_reduce_all(top)
+                                      : packtag::t_reduce_stride(top, stride);
+                 inf.fhe->tag_ct(ct.ct, ct.tag);
+             },
+             py::arg("ct"), py::arg("stride"),
+             "Stamp `ct` as the output of a rotate-and-sum reduction: constant over the slots "
+             "(stride <= 1, e.g. an all-slot sum) or stride-periodic (a mod-stride class sum). "
+             "The planner routes a refresh of such a ciphertext through a sparse bootstrap.")
+        .def("load_slot_pts",
+             [](Inference& inf, const std::string& prefix) {
+                 py::gil_scoped_release nogil;
+                 size_t n = 0;
+                 for (auto& kv : inf.w)
+                     if (kv.first.compare(0, prefix.size(), prefix) == 0)
+                         for (auto& pt : kv.second) { inf.load_plaintext(pt); ++n; }
+                 return n;
+             },
+             py::arg("prefix"), "Upload every slot plaintext whose name starts with `prefix`.")
+        .def("evict_slot_pts",
+             [](Inference& inf, const std::string& prefix) {
+                 py::gil_scoped_release nogil;
+                 size_t n = 0;
+                 for (auto& kv : inf.w)
+                     if (kv.first.compare(0, prefix.size(), prefix) == 0)
+                         for (auto& pt : kv.second) { inf.evict_plaintext(pt); ++n; }
+                 return n;
+             },
+             py::arg("prefix"), "Free the device copies of the slot plaintexts named `prefix*` (host copies stay).")
+        .def("drop_slot_pts",
+             [](Inference& inf, const std::string& prefix) {
+                 py::gil_scoped_release nogil;
+                 std::vector<std::string> keys;
+                 for (auto& kv : inf.w)
+                     if (kv.first.compare(0, prefix.size(), prefix) == 0) keys.push_back(kv.first);
+                 for (auto& k : keys) inf.evict_weights(k);
+                 return keys.size();
+             },
+             py::arg("prefix"), "Forget the slot plaintexts named `prefix*` entirely.")
+        // ── K/V residency: park cache ciphertexts in the pinned KV arena between blocks ────
+        .def("kv_store",
+             [](Inference& inf, std::vector<PackedCtx>& cts, const std::vector<std::string>& keys) {
+                 if (cts.size() != keys.size())
+                     throw std::invalid_argument("kv_store: cts and keys differ in length");
+                 py::gil_scoped_release nogil;
+                 inf.cc()->PrewarmKvArena();
+                 for (size_t i = 0; i < cts.size(); ++i)
+                     if (cts[i].ct) inf.cc()->KvStoreStaged(cts[i].ct, keys[i], impl_kv_stream());
+             },
+             py::arg("cts"), py::arg("keys"),
+             "Enqueue the device-to-host copy of each ciphertext into its pinned KV-arena slot "
+             "`key` on the KV stream (async; no evict). kv_sync then kv_evict complete it.")
+        .def("kv_load",
+             [](Inference& inf, std::vector<PackedCtx>& cts, const std::vector<std::string>& keys) {
+                 if (cts.size() != keys.size())
+                     throw std::invalid_argument("kv_load: cts and keys differ in length");
+                 py::gil_scoped_release nogil;
+                 for (size_t i = 0; i < cts.size(); ++i)
+                     if (cts[i].ct) inf.cc()->KvLoadStaged(cts[i].ct, keys[i], impl_kv_stream());
+             },
+             py::arg("cts"), py::arg("keys"),
+             "Enqueue the host-to-device reload of each evicted ciphertext from its slot on the "
+             "KV stream (async); kv_sync before the ciphertext is used.")
+        .def("kv_evict",
+             [](Inference& inf, std::vector<PackedCtx>& cts) {
+                 py::gil_scoped_release nogil;
+                 for (auto& pc : cts)
+                     if (pc.ct) inf.cc()->KvEvict(pc.ct);
+             },
+             py::arg("cts"), "Free the device copy of stored ciphertexts (after kv_sync).")
+        .def("kv_sync", [](Inference&) { py::gil_scoped_release nogil; cudaStreamSynchronize(impl_kv_stream()); },
+             "Wait for the KV stream (every enqueued store or load has landed).")
+        // ── the runtime's encode cache (inf.enc_cache: what the C++ masks go through) ──────
+        // Keyed by tag AND level, like encode_at_cached. A miss encodes synchronously (and
+        // counts); with strict_masks set a miss throws (planned-mask discipline).
+        .def("mult_cached",
+             [](Inference& inf, const PackedCtx& ct, const std::string& tag,
+                const py::array& values, bool tagged) {
+                 auto v = perseus_np::to_any(values);
+                 py::gil_scoped_release nogil;
+                 v.resize(static_cast<size_t>(inf.slots));
+                 Ptx pt = cached_any_at(inf, tag, v, ct, tagged);
+                 inf.load_plaintext(pt);
+                 return inf.fhe->mult(ct, pt);
+             },
+             py::arg("ct"), py::arg("tag"), py::arg("values"), py::arg("tagged") = true,
+             "ct * the plaintext cached under `tag` at ct's level (encode_at_cached: encoded "
+             "on a miss, uploaded on first use, shared by every later use at that level).")
+        .def("add_cached",
+             [](Inference& inf, const PackedCtx& ct, const std::string& tag,
+                const py::array& values, bool tagged) {
+                 auto v = perseus_np::to_any(values);
+                 py::gil_scoped_release nogil;
+                 v.resize(static_cast<size_t>(inf.slots));
+                 Ptx pt = cached_any_at(inf, tag, v, ct, tagged);
+                 inf.load_plaintext(pt);
+                 return inf.fhe->add(ct, pt);
+             },
+             py::arg("ct"), py::arg("tag"), py::arg("values"), py::arg("tagged") = true,
+             "ct + the plaintext cached under `tag` at ct's level.")
+        .def("mult_cached_many",
+             [](Inference& inf, const PackedCtx& ct, const std::vector<std::string>& tags,
+                const std::vector<py::array>& values) {
+                 if (tags.size() != values.size())
+                     throw std::invalid_argument("mult_cached_many: tags and values differ in length");
+                 std::vector<perseus_np::AnyVec> vs;
+                 vs.reserve(values.size());
+                 for (const auto& a : values) vs.push_back(perseus_np::to_any(a));
+                 py::gil_scoped_release nogil;
+                 std::vector<Ptx> pts;
+                 pts.reserve(tags.size());
+                 for (size_t i = 0; i < tags.size(); ++i) {
+                     vs[i].resize(static_cast<size_t>(inf.slots));
+                     pts.push_back(cached_any_at(inf, tags[i], vs[i], ct, true));
+                     inf.load_plaintext(pts.back());
+                 }
+                 std::vector<PackedCtx> out;
+                 out.reserve(pts.size());
+                 if (!pts.empty() && inf.fhe->lane_batch_usable(ct.ct, pts)) {
+                     auto raw = inf.fhe->mult_batch_exec(ct.ct, pts);
+                     for (size_t i = 0; i < pts.size(); ++i)
+                         out.push_back(inf.fhe->mult_finish(ct, pts[i], std::move(raw[i])));
+                 } else {
+                     for (auto& pt : pts) out.push_back(inf.fhe->mult(ct, pt));
+                 }
+                 return out;
+             },
+             py::arg("ct"), py::arg("tags"), py::arg("values"),
+             "ct * each cached plaintext, as one fused batch of lane products when the runtime "
+             "allows (the C++ V-push path), else one product each.")
+        .def("prime_pt",
+             [](Inference& inf, const std::string& tag, const py::array& values, int level) {
+                 auto v = perseus_np::to_any(values);
+                 py::gil_scoped_release nogil;
+                 v.resize(static_cast<size_t>(inf.slots));
+                 if (v.cplx) inf.prime_enc_cache(tag, v.c, static_cast<uint32_t>(level));
+                 else        inf.prime_enc_cache(tag, v.re, static_cast<uint32_t>(level));
+             },
+             py::arg("tag"), py::arg("values"), py::arg("level"),
+             "Encode `values` under `tag` at `level` into the cache now, on this thread, if "
+             "absent (the C++ prime_step_masks safety net).")
+        .def("stage_pts",
+             [](Inference& inf, const std::vector<std::tuple<std::string, int, py::array>>& items) {
+                 auto st = std::make_shared<StagedPts>();
+                 std::vector<std::tuple<std::string, uint32_t, perseus_np::AnyVec>> work;
+                 work.reserve(items.size());
+                 for (const auto& it : items) {
+                     auto v = perseus_np::to_any(std::get<2>(it));
+                     v.resize(static_cast<size_t>(inf.slots));
+                     work.emplace_back(std::get<0>(it), static_cast<uint32_t>(std::get<1>(it)), std::move(v));
+                 }
+                 Inference* pinf = &inf;
+                 py::gil_scoped_release nogil;
+                 // The worker encodes only (no CUDA, no inf.enc_cache access): the same
+                 // contract as gpt2_encode_shared_masks. Adoption happens on the main thread.
+                 // The job owns a reference to the handle, so dropping it in Python early is safe.
+                 st->fut = mask_submit([pinf, st, work = std::move(work)]() mutable {
+                     st->out.reserve(work.size());
+                     for (auto& w : work)
+                         st->out.emplace_back(std::get<0>(w), std::get<1>(w),
+                                              encode_any(*pinf, std::get<2>(w), std::get<1>(w)));
+                 });
+                 return st;
+             },
+             py::arg("items"),
+             "Encode (tag, level, values) items on the runtime's mask worker while this thread "
+             "keeps issuing GPU work; `adopt_pts(handle)` later moves them into the cache. The "
+             "C++ decode arm stages the next token's masks this way under the argmax tail.")
+        .def("adopt_pts",
+             [](Inference& inf, std::shared_ptr<StagedPts> st) {
+                 py::gil_scoped_release nogil;
+                 if (!st || st->adopted) return static_cast<size_t>(0);
+                 if (st->fut.valid()) st->fut.get();
+                 size_t n = 0;
+                 for (auto& e : st->out) {
+                     inf.adopt_enc_cache(std::get<0>(e), std::get<1>(e), std::move(std::get<2>(e)));
+                     ++n;
+                 }
+                 st->out.clear();
+                 st->adopted = true;
+                 return n;
+             },
+             py::arg("staged"),
+             "Join a stage_pts job and adopt its plaintexts into the cache (a key already "
+             "present wins; the staged copy is dropped). Returns the number adopted.")
+        .def("erase_pts",
+             [](Inference& inf, const std::vector<std::string>& tags) {
+                 py::gil_scoped_release nogil;
+                 size_t n = 0;
+                 for (const auto& t : tags) n += inf.erase_enc_cache_all(t);
+                 return n;
+             },
+             py::arg("tags"), "Drop these tags from the cache at every level (device copies freed).")
+        .def("enc_cache_stats",
+             [](const Inference& inf) {
+                 py::dict d;
+                 d["size"] = inf.enc_cache.size();
+                 d["hits"] = inf.enc_cache_hit;
+                 d["misses"] = inf.enc_cache_miss;
+                 d["strict_misses"] = inf.mask_strict_miss;
+                 return d;
+             },
+             "Cache size and the hit / miss counters of encode_at_cached.")
         .def("sum_slots",
              [](Inference& inf, const PackedCtx& ct, int width) {
                  if (width < 1 || (width & (width - 1)))
@@ -507,6 +1002,8 @@ void bind_ops(py::module_& m) {
           "and returned to the device at process exit. The CKKS context itself (keys, "
           "bootstrap precomputation) stays alive — ciphertexts still reference it — so a "
           "closed session cannot compute, but a new one can be created.");
+    m.def("device_sync", []() { py::gil_scoped_release nogil; cudaDeviceSynchronize(); },
+          "cudaDeviceSynchronize: wait for every stream (a diagnostic fence).");
     m.def("device_free_gb", []() {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
@@ -569,6 +1066,18 @@ void bind_ops(py::module_& m) {
     m.def("decrypt_slots",
           [](Inference& inf, const PackedCtx& pc) { return decrypt(inf.cc(), pc.ct, inf.fhe->sk()); },
           py::arg("inf"), py::arg("x"), kRelease);
+    m.def("decrypt_slots_complex",
+          [](Inference& inf, const PackedCtx& pc) {
+              std::vector<std::complex<double>> v;
+              {
+                  py::gil_scoped_release nogil;
+                  auto pt = decrypt_pt(inf.cc(), pc.ct, inf.fhe->sk());
+                  v = pt->GetCKKSPackedValue();
+              }
+              return perseus_np::from_cvec(v);
+          },
+          py::arg("inf"), py::arg("x"),
+          "Every slot of a ciphertext as complex values (the imaginary lane of a complex payload).");
     // Custom LayerNorm affine (gamma/beta) under `tag`: the per-feature tiles ln_affine reads
     // as <tag>.weight / <tag>.bias when the fold is off for that name (custom names never fold).
     m.def("set_ln_affine",

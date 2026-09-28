@@ -167,6 +167,26 @@ out = fhe.mult(xg, r)                                         # ciphertext produ
   with `AUTO_BTS_LEVEL=46` exported it is 5, `degree <= 2`). The returned `RMSNormResult`
   reports `level_before` / `level_after`.
 
+A whole model built the same way is the point of `perseus.impl`: the ops protocol, the
+polynomial / iterative kernels, the cachemir layout, the BSGS linear, LayerNorm, attention
+with its K/V cache, the THOR GELU, and the runtime services a model needs to run at the
+C++'s speed — the residency ring for weights (`Stage(state=EncodedBlock)` through
+`EncodedBlock.adopt_slot_pts`), the encode cache for masks (`Inference.mult_cached`, staged
+ahead on the runtime's worker with `stage_pts` / `adopt_pts` and evicted per step with
+`erase_pts`), the C++ rotate-and-sum ladder (`Context.rotate_and_sum`), the fold bootstrap
+that finishes a ladder inside a sparse refresh (`Context.fold_bootstrap`,
+`fold_slots_for`, `suppress_auto_bts`: the fused softmax denominator and LayerNorm
+variance), graph capture and
+planned bootstrapping (`ImplModel`). A model subclasses `ImplModel` and names its stages, its
+per-step masks and its weights. The reference model is `examples/gpt2_from_primitives/`
+(GPT-2 decode / generate with the tiled LM head, the CutMax argmax and the encrypted feedback,
+each module citing the C++ it mirrors; `python -m examples.gpt2_from_primitives.run_decode`,
+`run_generate`; eager, capture and planned modes; CPU tests on a numpy fake session and GPU
+tests against the C++ composites; at parity with the C++ decode per token). Plaintext
+operands take real or complex numpy arrays (`CKKS_COMPLEX=1` sessions: a complex mask, a
+complex weight, `Inference.mult_const` for a complex constant, `decrypt_slots_complex` for
+the imaginary lane); the GPT-2 example runs the C++ decode's complex payload by default, `--payload real` the real one.
+
 `rmsnorm_ref` applies the same series, so the approximation error (8e-5 relative at
 degree 7 on `[0.04, 0.16]`) is separable from FHE noise; `rmsnorm_exact` is the closed
 form. Tests: `tests/test_rmsnorm_example.py` (CPU: fit, mirror vs exact, guard, interval

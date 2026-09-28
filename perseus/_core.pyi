@@ -8,7 +8,7 @@ import collections.abc
 import numpy
 import numpy.typing
 import typing
-__all__: list[str] = ['BootstrapPlan', 'CKKSOptions', 'Context', 'CutMaxCalib', 'CutMaxConfig', 'DecodeSession', 'EncodedBlock', 'FHEError', 'GSInitMethod', 'GeLUConfig', 'GeLUMethod', 'GtSteps', 'Inference', 'InferenceMode', 'InferenceOptions', 'LMHeadCache', 'LayoutError', 'MaskError', 'ModelConfig', 'ModelSize', 'NRInitMethod', 'NormConfig', 'PackedCtx', 'PackingKind', 'ParsedConfigs', 'PlanError', 'RunConfig', 'RunResult', 'SoftmaxConfig', 'Stage', 'StepScope', 'WeightGranularity', 'WeightStore', 'apply_final_ln', 'attention_softmax_thor', 'begin_subgraph_capture', 'block_release', 'block_scope', 'block_state_diff', 'build_info', 'cache_k_push', 'cache_kv_push', 'cache_kv_push_packed', 'cache_v_push', 'chain', 'close_session', 'configure_decode_phase', 'configure_prefill_phase', 'cutmax_argmax', 'cutmax_config_from_calib', 'cutmax_feedback', 'decode_linear_output', 'decode_lm_head_logits', 'decode_token_output', 'decode_tokens_output', 'decrypt_slots', 'default_cutmax_config', 'deserialize_ct', 'device_free_gb', 'encode_block_state_coeff', 'encode_prefill_input', 'encode_token_input', 'end_subgraph_capture', 'evict_block_from_device', 'exp_approx', 'extract_token_i_cachemir', 'filling_rot_steps', 'fold_ln_affine', 'free_rotation_steps', 'gelu_approx', 'gpt2_prefill', 'hard_exit', 'head_reduce_sum', 'install_block_state', 'install_fatal_exit_handler', 'install_plan_live', 'kv_block_prologue', 'kv_finalize_last', 'kv_handoff_filling_to_cachemir', 'kv_prefetch_first', 'layer_norm', 'layout_of', 'linear', 'linear_multi', 'linear_outputpack', 'lm_head', 'lm_head_tile_width', 'lm_head_vocab', 'ln_affine', 'load_block_state', 'load_block_state_file', 'load_block_to_device', 'load_configs', 'load_final_ln_state', 'make_context', 'make_gpt2_inference', 'make_inference', 'mha_block', 'mlp_block', 'native_int_bits', 'norm', 'pack_tokens', 'parse_bootstrap_plan_file', 'prepare_feedback_weights', 'prepare_mha_masks', 'prepare_vcache', 'qkt', 'read_lm_head_steps', 'read_teacher_forced_inputs', 'realize_pending_rescale', 'reset_graph_runtime', 'reset_kv_cache', 'run_decode', 'run_generate', 'run_prefill', 'run_stages', 'save_block_state', 'save_keys', 'save_secret_key', 'serialize_ct', 'set_ln_affine', 'set_strict_layout', 'softmax_v', 'throw_test', 'token_embedding', 'transformer_block', 'unpack_tokens']
+__all__: list[str] = ['BootstrapPlan', 'CKKSOptions', 'Context', 'CutMaxCalib', 'CutMaxConfig', 'DecodeSession', 'EncodedBlock', 'FHEError', 'GSInitMethod', 'GeLUConfig', 'GeLUMethod', 'GtSteps', 'Inference', 'InferenceMode', 'InferenceOptions', 'LMHeadCache', 'LayoutError', 'MaskError', 'ModelConfig', 'ModelSize', 'NRInitMethod', 'NormConfig', 'PackedCtx', 'PackingKind', 'ParsedConfigs', 'PlanError', 'RunConfig', 'RunResult', 'SoftmaxConfig', 'Stage', 'StepScope', 'WeightGranularity', 'WeightStore', 'apply_final_ln', 'attention_softmax_thor', 'begin_subgraph_capture', 'bert_forward', 'block_release', 'block_scope', 'block_state_diff', 'build_info', 'cache_k_push', 'cache_kv_push', 'cache_kv_push_packed', 'cache_v_push', 'chain', 'close_session', 'configure_decode_phase', 'configure_prefill_phase', 'cutmax_argmax', 'cutmax_config_from_calib', 'cutmax_feedback', 'decode_linear_output', 'decode_lm_head_logits', 'decode_token_output', 'decode_tokens_output', 'decrypt_slots', 'default_cutmax_config', 'deserialize_ct', 'device_free_gb', 'encode_block_state_coeff', 'encode_prefill_input', 'encode_token_input', 'end_subgraph_capture', 'evict_block_from_device', 'exp_approx', 'extract_token_i_cachemir', 'filling_rot_steps', 'fold_ln_affine', 'free_rotation_steps', 'gelu_approx', 'gpt2_prefill', 'hard_exit', 'head_reduce_sum', 'install_block_state', 'install_fatal_exit_handler', 'install_plan_live', 'kv_block_prologue', 'kv_finalize_last', 'kv_handoff_filling_to_cachemir', 'kv_prefetch_first', 'layer_norm', 'layout_of', 'linear', 'linear_multi', 'linear_outputpack', 'lm_head', 'lm_head_tile_width', 'lm_head_vocab', 'ln_affine', 'load_block_state', 'load_block_state_file', 'load_block_to_device', 'load_configs', 'load_final_ln_state', 'make_bert_inference', 'make_context', 'make_gpt2_inference', 'make_inference', 'make_vit_inference', 'mha_block', 'mlp_block', 'native_int_bits', 'norm', 'pack_tokens', 'parse_bootstrap_plan_file', 'prepare_feedback_weights', 'prepare_mha_masks', 'prepare_vcache', 'qkt', 'read_lm_head_steps', 'read_teacher_forced_inputs', 'realize_pending_rescale', 'reset_graph_runtime', 'reset_kv_cache', 'run_decode', 'run_generate', 'run_prefill', 'run_stages', 'save_block_state', 'save_keys', 'save_secret_key', 'serialize_ct', 'set_ln_affine', 'set_strict_layout', 'softmax_v', 'throw_test', 'token_embedding', 'transformer_block', 'unpack_tokens', 'vit_forward']
 class BootstrapPlan:
     def __init__(self) -> None:
         """
@@ -196,13 +196,13 @@ class Context:
         """
         a + scalar.
         """
-    def bootstrap(self, ct: PackedCtx) -> None:
+    def bootstrap(self, ct: PackedCtx, iterations: typing.SupportsInt | typing.SupportsIndex = 1) -> None:
         """
-        Refresh `ct` to the bootstrap output level (in place).
+        Refresh `ct` to the bootstrap output level (in place). iterations=2 runs the runtime's two-iteration bootstrap (eval_bootstrap_iter: bootstrap the residual scaled by 2^bts_precision and add it back) as ONE recorded op, the way the C++ CutMax refreshes under its BtsItersScope.
         """
-    def bootstrap_hint(self, ct: PackedCtx, level_threshold: typing.SupportsInt | typing.SupportsIndex, account_pending_rescale: bool = False) -> None:
+    def bootstrap_hint(self, ct: PackedCtx, level_threshold: typing.SupportsInt | typing.SupportsIndex, account_pending_rescale: bool = False, iterations: typing.SupportsInt | typing.SupportsIndex = 1) -> None:
         """
-        Bootstrap `ct` if it has fewer than `level_threshold` levels left.
+        Bootstrap `ct` if its level exceeds `level_threshold`; iterations=2 as for bootstrap.
         """
     def bootstrap_output_level(self) -> int:
         ...
@@ -240,6 +240,10 @@ class Context:
         """
         a * scalar.
         """
+    def mult_add_many(self, acc: PackedCtx, vs: collections.abc.Sequence[PackedCtx], ss: collections.abc.Sequence[PackedCtx]) -> bool:
+        """
+        acc += sum_j vs[j] * ss[j] with ONE relinearization when the runtime's fused lane accumulate applies (returns True), else the plain loop; the recorded op stream is the loop's either way.
+        """
     def negate(self, ct: PackedCtx) -> PackedCtx:
         """
         -ct.
@@ -247,6 +251,30 @@ class Context:
     def rotate(self, ct: PackedCtx, steps: typing.SupportsInt | typing.SupportsIndex) -> PackedCtx:
         """
         Cyclic slot rotation by `steps` (out[i] = in[i + steps]); the rotation key for `steps` must exist in the session's band.
+        """
+    def rotate_hoisted(self, ct: PackedCtx, steps: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex]) -> list[PackedCtx]:
+        """
+        Several rotations of one ciphertext sharing one key-switch decomposition (the runtime's hoisted rotation); one PackedCtx per step, recorded like plain rotations.
+        """
+    def mult_i(self, ct: PackedCtx) -> PackedCtx:
+        """
+        i * ct: the monomial x^(N/2), a level-free integer rotation of the complex plane (no rescale, no key switch).
+        """
+    def fold_slots_for(self, s_wanted: typing.SupportsInt | typing.SupportsIndex) -> int:
+        """
+        The slot count a fold wanting `s_wanted` can run at: `s_wanted` when a sparse bootstrap precomputation exists for it (SPARSE_BTS_SLOTS), else the smallest built count above it (pre-ladder the gap with rotate_and_sum(ct, s_wanted, s)), else the full slot count (a plain bootstrap; the caller ladders everything).
+        """
+    def fold_bootstrap(self, ct: PackedCtx, s: typing.SupportsInt | typing.SupportsIndex, n_live: typing.SupportsInt | typing.SupportsIndex, prescale: typing.SupportsFloat = 1.0) -> None:
+        """
+        In place: bootstrap `ct` at `s` slots, folding the slots/s copies of every residue class into one and scaling by 1/n_live, so a ladder stopped at stride `s` comes out as the full class sum divided by n_live. `prescale` multiplies the input first (one level) and is undone in the recovery. One recorded deliberate refresh (plannable).
+        """
+    def suppress_auto_bts(self) -> AutoBtsScope:
+        """
+        `with fhe.suppress_auto_bts():` no reactive refresh fires inside (the runtime's AutoBtsSuppressScope): a product may sit at the ceiling when a fold follows.
+        """
+    def rotate_and_sum(self, ct: PackedCtx, start: typing.SupportsInt | typing.SupportsIndex, stop: typing.SupportsInt | typing.SupportsIndex) -> PackedCtx:
+        """
+        The rotate-and-sum ladder: x += rotate(x, g) for g = start, 2 start, 4 start, ... while |g| < stop (start < 0 rotates the other way). start=1, stop=slots is the all-slots total broadcast to every slot (rotate_and_sum_all); start=t sums the slots congruent mod t; start=-1, stop=t replicates slot 0 of each t-group rightwards. Issued in C++ (one Python call instead of 2 log2(stop/start)), recorded as the same rotate + add stream a Python loop would emit, so plans captured either way stay valid. Needs the rotation keys for every gap.
         """
     def roundtrip(self, values: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex]) -> list[float]:
         """
@@ -277,6 +305,14 @@ class Context:
         """
         Rotation steps this session loaded (keygen band + load_rotation_steps - free_rotation_steps); empty after close_session. The ones shared with the bootstrap precomputation stay resident with the context.
         """
+    @property
+    def total_bootstraps(self) -> int:
+        """
+        Bootstraps run so far in this context (deliberate + reactive + iterations).
+        """
+    @property
+    def weight_relevel_count(self) -> int:
+        ...
 class CutMaxCalib:
     """
     Parsed 'cutmax' calibration section (opaque).
@@ -316,6 +352,10 @@ class EncodedBlock:
     def __init__(self) -> None:
         """
         An empty block state; fill it via set_weight/set_bias/set_*_cfg.
+        """
+    def adopt_slot_pts(self, inf: Inference, prefix: str) -> int:
+        """
+        Move the session's named slot plaintexts `prefix*` (set_slot_pt) into this block state, so a Stage(state=blk) streams them through the residency ring like a C++ block's weights: extracted on the worker, uploaded on the side stream, installed for the stage's compute and evicted after it.
         """
     @typing.overload
     def set_bias(self, inf: Inference, name: str, b: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], d_in: typing.SupportsInt | typing.SupportsIndex, d_out: typing.SupportsInt | typing.SupportsIndex, fill: bool = True) -> None:
@@ -607,6 +647,7 @@ class GtSteps:
         Ground-truth lm_head logits per step, [T][vocab].
         """
 class Inference:
+    bidirectional: bool
     block_prefix: str
     cache_weights: bool
     complex: bool
@@ -624,6 +665,10 @@ class Inference:
         """
         ct + values (slot-wise plaintext add).
         """
+    def add_slot_pt(self, ct: PackedCtx, name: str) -> PackedCtx:
+        """
+        ct + the named slot plaintext.
+        """
     def clear_bootstrap_plan(self) -> None:
         """
         Drop the installed bootstrap placement plan.
@@ -636,6 +681,10 @@ class Inference:
         """
         Detach the graph builder from the context and drop it.
         """
+    def drop_slot_pts(self, prefix: str) -> int:
+        """
+        Forget the slot plaintexts named `prefix*` entirely.
+        """
     def enable_graph_capture(self) -> None:
         """
         Start graph capture: a fresh (or cleared) GraphBuilder attached to the context.
@@ -643,6 +692,10 @@ class Inference:
     def eval_chebyshev(self, ct: PackedCtx, coeffs: collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex], a: typing.SupportsFloat | typing.SupportsIndex = -1.0, b: typing.SupportsFloat | typing.SupportsIndex = 1.0) -> PackedCtx:
         """
         Evaluate sum_k coeffs[k] * T_k(x) slot-wise for x in [a, b] (the runtime's Chebyshev evaluator — what the GELU/softmax composites use). Levels consumed grow with the degree; the argument must lie inside [a, b].
+        """
+    def evict_slot_pts(self, prefix: str) -> int:
+        """
+        Free the device copies of the slot plaintexts named `prefix*` (host copies stay).
         """
     def evict_weights(self, key: str) -> None:
         """
@@ -656,13 +709,27 @@ class Inference:
         """
         True while a graph builder is attached and enabled.
         """
+    def has_slot_pt(self, name: str) -> bool:
+        ...
     def load_bootstrap_plan_json(self, path: str) -> bool:
         """
         Install the bootstrap placement plan at `path`; returns whether planned bootstraps are enabled.
         """
+    def load_slot_pts(self, prefix: str) -> int:
+        """
+        Upload every slot plaintext whose name starts with `prefix`.
+        """
     def mult_pt(self, ct: PackedCtx, values: typing.Annotated[numpy.typing.ArrayLike, numpy.float64]) -> PackedCtx:
         """
         ct * values (slot-wise): `values` is encoded as a plaintext at ct's level; shorter than the slot count is zero-filled.
+        """
+    def mult_slot_pt(self, ct: PackedCtx, name: str) -> PackedCtx:
+        """
+        ct * the named slot plaintext (uploaded on first use).
+        """
+    def mult_slot_pt_many(self, ct: PackedCtx, names: collections.abc.Sequence[str]) -> list[PackedCtx]:
+        """
+        ct * each named slot plaintext, as one fused batch of lane products when the runtime allows (the C++ V-push path), else one product each.
         """
     def name_ct(self, ct: PackedCtx, name: str) -> None:
         """
@@ -694,6 +761,10 @@ class Inference:
         """
         Store `cfg` as the NormConfig norm/layer_norm look up by `name`.
         """
+    def set_slot_pt(self, name: str, values: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], level: typing.SupportsInt | typing.SupportsIndex = 0) -> None:
+        """
+        Encode a slot vector ONCE as the plaintext `name` at `level` (<= 0: the bootstrap output level), host-resident until loaded. mult_slot_pt / add_slot_pt re-level it on a level mismatch (weights_at), so pass the level it will be used at.
+        """
     def set_softmax_cfg(self, name: str, cfg: SoftmaxConfig) -> None:
         """
         Store `cfg` as the SoftmaxConfig attention_softmax_thor looks up by `name`.
@@ -714,9 +785,65 @@ class Inference:
         """
         `with inf.step(label):` scopes the ops inside under a step label, as the C++ WithStep does.
         """
+    def mult_const(self, ct: PackedCtx, re: typing.SupportsFloat, im: typing.SupportsFloat) -> PackedCtx:
+        """
+        ct * (re + i im) as a plaintext product (the runtime's cached complex constant; a level like any mask). mult_const(ct, 0, 1) packs: a + i b = add(a, mult_const(b, 0, 1)).
+        """
+    def kv_store(self, cts: collections.abc.Sequence[PackedCtx], keys: collections.abc.Sequence[str]) -> None:
+        """
+        Enqueue the device-to-host copy of each ciphertext into its pinned KV-arena slot `key` on the KV stream (async; no evict). kv_sync then kv_evict complete it.
+        """
+    def kv_load(self, cts: collections.abc.Sequence[PackedCtx], keys: collections.abc.Sequence[str]) -> None:
+        """
+        Enqueue the host-to-device reload of each evicted ciphertext from its slot on the KV stream (async); kv_sync before the ciphertext is used.
+        """
+    def kv_evict(self, cts: collections.abc.Sequence[PackedCtx]) -> None:
+        """
+        Free the device copy of stored ciphertexts (after kv_sync).
+        """
+    def kv_sync(self) -> None:
+        """
+        Wait for the KV stream (every enqueued store or load has landed).
+        """
+    def mult_cached(self, ct: PackedCtx, tag: str, values: numpy.typing.ArrayLike, tagged: bool = True) -> PackedCtx:
+        """
+        ct * the plaintext cached under `tag` at ct's level (encode_at_cached: encoded on a miss, uploaded on first use, shared by every later use at that level).
+        """
+    def add_cached(self, ct: PackedCtx, tag: str, values: numpy.typing.ArrayLike, tagged: bool = True) -> PackedCtx:
+        """
+        ct + the plaintext cached under `tag` at ct's level.
+        """
+    def mult_cached_many(self, ct: PackedCtx, tags: collections.abc.Sequence[str], values: collections.abc.Sequence[numpy.typing.ArrayLike]) -> list[PackedCtx]:
+        """
+        ct * each cached plaintext, as one fused batch of lane products when the runtime allows (the C++ V-push path), else one product each.
+        """
+    def prime_pt(self, tag: str, values: typing.Annotated[numpy.typing.ArrayLike, numpy.float64], level: typing.SupportsInt | typing.SupportsIndex) -> None:
+        """
+        Encode `values` under `tag` at `level` into the cache now, on this thread, if absent (the C++ prime_step_masks safety net).
+        """
+    def stage_pts(self, items: collections.abc.Sequence[tuple[str, int, numpy.typing.ArrayLike]]) -> StagedPts:
+        """
+        Encode (tag, level, values) items on the runtime's mask worker while this thread keeps issuing GPU work; `adopt_pts(handle)` later moves them into the cache. The C++ decode arm stages the next token's masks this way under the argmax tail.
+        """
+    def adopt_pts(self, staged: StagedPts) -> int:
+        """
+        Join a stage_pts job and adopt its plaintexts into the cache (a key already present wins; the staged copy is dropped). Returns the number adopted.
+        """
+    def erase_pts(self, tags: collections.abc.Sequence[str]) -> int:
+        """
+        Drop these tags from the cache at every level (device copies freed).
+        """
+    def enc_cache_stats(self) -> dict:
+        """
+        Cache size and the hit / miss counters of encode_at_cached.
+        """
     def sum_slots(self, ct: PackedCtx, width: typing.SupportsInt | typing.SupportsIndex) -> PackedCtx:
         """
         Rotate-and-add: slot i receives the sum of slots i .. i+width-1 (width a power of two; needs rotation keys for 1, 2, 4, ... width/2). The lane-0 slot of each width-aligned group holds that group's total.
+        """
+    def tag_reduce(self, ct: PackedCtx, stride: typing.SupportsInt | typing.SupportsIndex) -> None:
+        """
+        Stamp `ct` as the output of a rotate-and-sum reduction: constant over the slots (stride <= 1, e.g. an all-slot sum) or stride-periodic (a mod-stride class sum). The planner routes a refresh of such a ciphertext through a sparse bootstrap.
         """
     @property
     def capture_b(self) -> int:
@@ -1536,6 +1663,22 @@ class Stage:
     @weights.setter
     def weights(self, arg0: collections.abc.Sequence[str]) -> None:
         ...
+class AutoBtsScope:
+    def __enter__(self) -> AutoBtsScope: ...
+    def __exit__(self, *args) -> bool: ...
+class RingPrefetch:
+    """
+    A prefetch_states job on the residency worker; join it with wait() before the main thread touches those states.
+    """
+    def wait(self) -> None: ...
+class StagedPts:
+    """
+    A stage_pts job: plaintexts being encoded on the mask worker, adopted with adopt_pts.
+    """
+    @property
+    def ready(self) -> bool: ...
+    @property
+    def adopted(self) -> bool: ...
 class StepScope:
     def __enter__(self) -> None:
         """
@@ -1641,6 +1784,10 @@ def begin_subgraph_capture(inf: Inference, block: typing.SupportsInt | typing.Su
     """
     Start capturing block `block` (FHE_GRAPH_DIR set, capture wanted, no graph.json there yet); returns whether capture began.
     """
+def bert_forward(inf: Inference, chunks: collections.abc.Sequence[PackedCtx], n_toks: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex], store: WeightStore, configs: ParsedConfigs, n_blocks: typing.SupportsInt | typing.SupportsIndex, n_toks_imag: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex] = []) -> PackedCtx:
+    """
+    BERT forward over the packed chunks; returns the CLS token as a cachemir ct.
+    """
 def block_release(inf: Inference, block_idx: typing.SupportsInt | typing.SupportsIndex) -> None:
     """
     Decode-arm block release: device sync, evict the block weights, offload its KV.
@@ -1719,9 +1866,17 @@ def default_cutmax_config() -> CutMaxConfig:
     """
     The oracle-locked default GPT-2 CutMax schedule.
     """
+def decrypt_slots_complex(inf: Inference, x: PackedCtx) -> numpy.typing.NDArray[numpy.complex128]:
+    """
+    Every slot of a ciphertext as complex values (the imaginary lane of a complex payload).
+    """
 def deserialize_ct(inf: Inference, data: bytes) -> PackedCtx:
     """
     bytes -> PackedCtx in this session's context; host-resident until first use.
+    """
+def device_sync() -> None:
+    """
+    cudaDeviceSynchronize: wait for every stream (a diagnostic fence).
     """
 def device_free_gb() -> float:
     """
@@ -1871,9 +2026,13 @@ def load_final_ln_state(inf: Inference, store: WeightStore, configs: ParsedConfi
     """
     Encode the final LayerNorm (ln_f) weights + config into an EncodedBlock.
     """
+def make_bert_inference(options: ... = ...) -> Inference:
+    """
+    Encoder Inference for BERT: CachemirFilling packing, bidirectional, no KV cache.
+    """
 def make_context(options: CKKSOptions = ...) -> Context:
     """
-    Create a bare CKKS context (keygen) from CKKSOptions; model sessions use make_gpt2_inference / make_inference.
+    Create a bare CKKS context (keygen) from CKKSOptions; model sessions use make_gpt2_inference / make_vit_inference / make_bert_inference / make_inference.
     """
 def make_gpt2_inference(options: ... = ...) -> Inference:
     """
@@ -1882,6 +2041,10 @@ def make_gpt2_inference(options: ... = ...) -> Inference:
 def make_inference(options: ... = ...) -> Inference:
     """
     Build a generic Inference session from `options`: CKKS context, model sizes and packing.
+    """
+def make_vit_inference(options: ... = ...) -> Inference:
+    """
+    Encoder Inference: CachemirFilling packing, bidirectional, explicit ViT rot-key set.
     """
 def mha_block(inf: Inference, x: PackedCtx) -> PackedCtx:
     """
@@ -1941,9 +2104,17 @@ def reset_graph_runtime(inf: Inference) -> None:
     """
     Reset the runtime-graph naming state (ct/pt vars + counters) for capture/planned runs.
     """
+def prefetch_states(inf: Inference, states: collections.abc.Sequence[EncodedBlock]) -> RingPrefetch:
+    """
+    Extract these block states' plaintexts into the pinned staging arena on the residency worker (the C++ circular ring: issue it under the argmax tail, wait() at the start of the next token).
+    """
 def reset_kv_cache(inf: Inference, n_blocks: typing.SupportsInt | typing.SupportsIndex) -> None:
     """
     Reset every block's K/V caches for a fresh sequence (also prewarms the pinned arenas).
+    """
+def prewarm_stage_arenas(inf: Inference) -> None:
+    """
+    Pin the residency ring's stage arenas (2 x FHE_STAGE_ARENA_GB) and the KV arena now, on a background thread, instead of on the first staged block. Call it BEFORE encoding weights: the arenas are the hot host memory of every token, and pinning them while the process is small keeps them on the GPU's NUMA node (the C++ decode arm does this in reset_kv_cache).
     """
 def run_decode(config: RunConfig, inputs: collections.abc.Sequence[collections.abc.Sequence[typing.SupportsFloat | typing.SupportsIndex]], raise_on_error: bool = True) -> RunResult:
     """
@@ -2000,6 +2171,10 @@ def transformer_block(inf: Inference, x: PackedCtx) -> PackedCtx:
 def unpack_tokens(inf: Inference, ct: PackedCtx, T: typing.SupportsInt | typing.SupportsIndex) -> list[list[float]]:
     """
     Decrypt `ct` and decode its T packed tokens to [T][d_real].
+    """
+def vit_forward(inf: Inference, chunks: collections.abc.Sequence[PackedCtx], n_toks: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex], store: WeightStore, configs: ParsedConfigs, n_blocks: typing.SupportsInt | typing.SupportsIndex, n_toks_imag: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex] = []) -> list[PackedCtx]:
+    """
+    ViT forward over the packed chunks + CLS tail; returns the lm_head logit tiles.
     """
 __version__: str = '0.1.0'
 chain: str = 'n32'
