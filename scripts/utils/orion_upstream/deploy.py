@@ -3,8 +3,12 @@
 marks.py marks steps on a graph; this replays those marks through our planner so the
 resulting arm runs here. Nothing about the selection is ours: choose_sites is replaced by
 upstream's marks, and only the level bookkeeping, the chain hand-off and the rescue repair
-come from perseus. Every block plan is stamped with the capture contract (a dense plan with
-the dense routing env).
+come from perseus, and redundant refreshes are pruned (PLAN_PRUNE=0 keeps them; the forced
+exit refresh is never pruned). Each block's exit is refreshed so the next block enters at the landing (the
+solver plans every block from a fresh input). The argmax stage (the last block, entered from
+the tail's exit) is planned like make_plan.sh's second stage: hints dissolved and the refresh
+envelope hard. Every block plan is stamped with the capture contract (a dense plan with the
+dense routing env).
 
   RESULTS=<marks.json> GRAPH_DIR=<graph> OUT=<name> [PLAN_DENSE=1] [ML=48] \
       python scripts/utils/orion_upstream/deploy.py
@@ -33,8 +37,13 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 CFG = dict(bootstrap_level=36, max_level=ML, source_level=34, cache_read_level=34,
            level_unit=2, acc_chain="n32", cf_min=2, cf_max=CF_MAX, allow_prescale=False,
+           prune=os.environ.get("PLAN_PRUNE", "1") == "1",
            sparse_precomps=() if DENSE else (512, 1),
            sparse_out_levels=() if DENSE else ((1, 26), (512, 36)), verbose=False)
+# a dense plan runs every refresh on the dense route: the code's deliberate bootstraps land at
+# the bootstrap level whatever route they took in the capture (make_plan.sh does the same)
+if DENSE:
+    CFG["deliberate_clamp0"] = True
 
 
 class _Caught(Exception):
@@ -44,7 +53,7 @@ class _Caught(Exception):
 _orig = ob.OrionPlacer.choose_sites
 
 
-def upstream_sites(bi, entry):
+def upstream_sites(bi, entry, stage):
     """Upstream's marked steps -> the vars whose chains cross them."""
     cap = {}
 
@@ -55,7 +64,7 @@ def upstream_sites(bi, entry):
     ob.OrionPlacer.choose_sites = spy
     try:
         plan_block(GRAPHS / f"block_{bi}" / "graph.json",
-                   PlanConfig(placer="orion", baseline_rescue=False, **CFG), **entry)
+                   PlanConfig(placer="orion", baseline_rescue=False, **CFG, **stage), **entry)
     except _Caught:
         pass
     finally:
@@ -69,19 +78,42 @@ def upstream_sites(bi, entry):
     return w
 
 
+class _Stage:
+    """The argmax stage's planner settings (make_plan.sh's second stage)."""
+    def __init__(self, on):
+        self.kw = dict(dissolve_hints=True) if on else {}
+
+    def __enter__(self):
+        self.hard = os.environ.get("PLAN_HARD_ENV_CAP")
+        if self.kw:
+            os.environ["PLAN_HARD_ENV_CAP"] = "1"
+        return self.kw
+
+    def __exit__(self, *a):
+        if self.kw:
+            if self.hard is None:
+                os.environ.pop("PLAN_HARD_ENV_CAP", None)
+            else:
+                os.environ["PLAN_HARD_ENV_CAP"] = self.hard
+
+
+N = len(UP)
+ARGMAX = N - 1 if N > 13 else None
 el = ed = None
 tot = feas = 0
-for bi in range(13):
+for bi in range(N):
     entry = {} if el is None else dict(entry_level=el, entry_deg=ed)
-    w = upstream_sites(bi, entry)
+    with _Stage(bi == ARGMAX) as stage:
+        w = upstream_sites(bi, entry, stage)
 
     def run(extra=None, resc=False, _w=w, _bi=bi, _entry=entry):
         sites = set(_w) | set(extra or ())
         ob.OrionPlacer.choose_sites = lambda self, s0, _s=sites: set(_s)
         try:
-            return plan_block(GRAPHS / f"block_{_bi}" / "graph.json",
-                              PlanConfig(placer="orion", baseline_rescue=resc, **CFG),
-                              **_entry)
+            with _Stage(_bi == ARGMAX) as stage:
+                cfg = PlanConfig(placer="orion", baseline_rescue=resc, **CFG, **stage,
+                                 prune_keep=tuple(extra or ()))
+                return plan_block(GRAPHS / f"block_{_bi}" / "graph.json", cfg, **_entry)
         finally:
             ob.OrionPlacer.choose_sites = _orig
 
@@ -96,7 +128,7 @@ for bi in range(13):
             break
     # force the terminal exit refresh so the next block enters at the landing
     ev = r["summary"].get("exit_var")
-    if ev and bi < 12:
+    if ev and bi < N - 1:
         for kw in (dict(extra={ev}), dict(extra={ev}, resc=True)):
             try:
                 r = run(**kw)
@@ -115,5 +147,5 @@ if DENSE:
     cap["env"].update(SPARSE_AUTO="0", SPARSE_BTS_SLOTS="0")
 for bi in range(feas):
     contract.stamp_file(str(OUT / f"block_{bi}_placement.json"), cap)
-print(f"\nUPSTREAM ORION ARM: {feas}/13 feasible, TOTAL={tot} -> {OUT}")
-sys.exit(0 if feas == 13 else 1)
+print(f"\nUPSTREAM ORION ARM: {feas}/{N} feasible, TOTAL={tot} -> {OUT}")
+sys.exit(0 if feas == N else 1)

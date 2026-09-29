@@ -71,11 +71,6 @@
     },
     {
       "type": "bootstrap_after_node",
-      "node_op": "square",
-      "target_var": "v_492"
-    },
-    {
-      "type": "bootstrap_after_node",
       "node_op": "mult",
       "target_var": "v_493"
     },
@@ -169,7 +164,6 @@
     "v_431",
     "v_474",
     "v_475",
-    "v_492",
     "v_493",
     "v_536",
     "v_537",
@@ -216,7 +210,6 @@
     "v_431": 2,
     "v_474": 2,
     "v_475": 10,
-    "v_492": 2,
     "v_493": 2,
     "v_536": 2,
     "v_537": 10,
@@ -238,7 +231,7 @@
     "v_1348": 2
   },
   "summary": {
-    "num_placements": 24,
+    "num_placements": 23,
     "num_hint_bootstraps": 6,
     "num_hints_total": 9,
     "num_deliberate_bootstrap_nodes": 1,
@@ -734,7 +727,7 @@
       "v_489": 44,
       "v_490": 44,
       "v_491": 44,
-      "v_492": 36,
+      "v_492": 46,
       "v_493": 36,
       "v_494": 36,
       "v_495": 36,
@@ -2255,7 +2248,7 @@
       "v_489": 2,
       "v_490": 2,
       "v_491": 2,
-      "v_492": 1,
+      "v_492": 2,
       "v_493": 1,
       "v_494": 1,
       "v_495": 1,
@@ -3284,7 +3277,7 @@
       "v_1518": 1,
       "v_1519": 1
     },
-    "total_bootstraps": 31,
+    "total_bootstraps": 30,
     "num_weight_levels": 5,
     "exit_var": "v_1519",
     "exit_level": 46,
@@ -3292,7 +3285,7 @@
     "bts_quality": {
       "err_target": 0.01,
       "table_measured": true,
-      "num_sites": 30,
+      "num_sites": 29,
       "predicted_rel_err": {
         "median": 4.463956146712213e-05,
         "p90": 0.0010544816925672966,
@@ -3301,7 +3294,7 @@
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
-        "2": 10,
+        "2": 9,
         "3": 1,
         "4": 1,
         "6": 5,
@@ -3312,7 +3305,7 @@
       },
       "out_level_histogram": {
         "26": 10,
-        "36": 20
+        "36": 19
       },
       "num_offset": 0,
       "num_prescale": 0,
@@ -3434,7 +3427,6 @@
         "v_431": 36.0,
         "v_474": 36.0,
         "v_475": 36.0,
-        "v_492": 36.0,
         "v_493": 36.0,
         "v_536": 36.0,
         "v_537": 36.0,

@@ -18,16 +18,17 @@ The algorithm, as published:
   * A post-pass greedily prunes bootstraps that turn out to be unnecessary.
 
 Adaptations to this repo (documented in summary.placer_meta.deviations):
-  * depth = monotone accumulation of per-op level cost in composite units (hint sites
-    do NOT reset depth here — hints are runtime-owned in every arm; deliberate/fold
-    refreshes DO reset, they always execute). The shared sim remains the feasibility
-    oracle, and it is strictly more permissive than this model (hints only lower
-    levels), so DP-feasible stays twin-feasible.
+  * depth = monotone accumulation of per-op level cost in composite units; hint,
+    deliberate and fold sites reset it (they are runtime-owned in every arm). The shared
+    sim remains the feasibility oracle.
   * ct count = 1 per var (our IR is ciphertext-level, not tensor-level).
   * shortcut omission uses a per-edge carry bound (carry + window residue <= l0)
     instead of the paper's persistent level-vector shaving; omissions decided
     independently, which the paper's tie-break approximates anyway.
-  * the pruning post-pass consults the shared simulate() twin directly.
+  * the pruning post-pass consults the shared simulate() twin directly and runs only on a
+    feasible DP plan; on an infeasible one (every block of the GPT-2 decode) the plan is
+    repaired by the rescue and then pruned by the planner's own pass (PlanConfig.prune),
+    which plays the published post-pass's role on the repaired plan.
 """
 
 from __future__ import annotations
@@ -84,8 +85,8 @@ class FhelipePlacer(BaselinePlacer):
         # Only same-depth crossers form the (chokepoint-narrowed) boundary. Upstream
         # as published defers earlier-produced crossers (the residuals) to the shortcut
         # omission pass, but that rule emits an infeasible leveling on this IR; the
-        # port folds them into the boundary instead, which is the configuration
-        # upstream itself needs to execute (its shortcut omission disabled).
+        # port folds them into the boundary instead (the published tool with its shortcut
+        # omission disabled still aborts on most of these blocks).
         defer_mode = False
         self.meta["defer_shortcuts"] = defer_mode
         frontier: dict[int, set[str]] = {}

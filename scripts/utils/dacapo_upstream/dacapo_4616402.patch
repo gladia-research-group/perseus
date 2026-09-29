@@ -1,0 +1,47 @@
+diff --git a/lib/Dialect/Earth/Transforms/DaCapoPlanner.cpp b/lib/Dialect/Earth/Transforms/DaCapoPlanner.cpp
+index 5b43d1a..63f9e0d 100644
+--- a/lib/Dialect/Earth/Transforms/DaCapoPlanner.cpp
++++ b/lib/Dialect/Earth/Transforms/DaCapoPlanner.cpp
+@@ -202,6 +202,15 @@ struct DaCapoPlannerPass
+                                  std::get<0>(bestPlan[ca.getRetOpid()]) /
+                                      1000000);
+     llvm::outs() << "Number of Bootstrapping: " << targets.size() << '\n';
++    // [perseus] print the DP cut points and bootstrap target opids
++    llvm::outs() << "DACAPO_CUT_EDGES:";
++    for (auto a : std::get<1>(bestPlan[ca.getRetOpid()]))
++      llvm::outs() << " " << a;
++    llvm::outs() << '\n';
++    llvm::outs() << "DACAPO_BTP_TARGETS:";
++    for (auto a : targets)
++      llvm::outs() << " " << a;
++    llvm::outs() << '\n';
+ 
+     LLVM_DEBUG(llvm::dbgs() << "Estimated Latency : "
+                             << std::get<0>(bestPlan[ca.getRetOpid()]) << '\n';
+diff --git a/tools/optimizer.cpp b/tools/optimizer.cpp
+index 61fd548..7a4bf3c 100644
+--- a/tools/optimizer.cpp
++++ b/tools/optimizer.cpp
+@@ -233,6 +233,22 @@ void registerHecatePipeline(cl::opt<std::string> &outputFilename) {
+   static cl::opt<int64_t> gamma_elasm{"gamma-elasm", cl::desc("Gamma of ELASM"),
+                                       cl::init(50)};
+ 
++  PassPipelineRegistration<>(
++      "dacapo-plan", "DaCapo placement only, no lowering ([perseus])",
++      [&](OpPassManager &pm) {
++        pm.addNestedPass<func::FuncOp>(hecate::earth::createRemoveBootstrap());
++        pm.addNestedPass<func::FuncOp>(
++            hecate::earth::createBypassDetection({waterline, 0.5}));
++        pm.addNestedPass<func::FuncOp>(
++            hecate::earth::createCandidateSelection({waterline, output_val}));
++        pm.addNestedPass<func::FuncOp>(
++            hecate::earth::createDaCapoPlanner({waterline, output_val}));
++        pm.addNestedPass<func::FuncOp>(
++            hecate::earth::createBootstrapPlacement());
++        pm.addNestedPass<func::FuncOp>(
++            hecate::earth::createProactiveRescaling({waterline, output_val}));
++      });
++
+   PassPipelineRegistration<>(
+       "eva", "Perform waterline rescaling and early modswitch",
+       [&](OpPassManager &pm) {

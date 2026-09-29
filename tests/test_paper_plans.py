@@ -6,8 +6,10 @@ Python implementation's plans) is regenerated with that tool: the blocks, then t
 
 The main plan is always checked; the baselines and ablations (about 20 planner runs, a few
 minutes) run when PERSEUS_ALL_PLANS=1. baselines/orion is the released Orion tool's output and
-is skipped; python/orion is regenerated with scripts/utils/orion_upstream/plan.sh when an
-upstream clone is present (ORION_SRC or .cache/orion_upstream; the test does not clone). Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;
+is skipped. The python/ DaCapo and Orion plans are regenerated with the released tools
+(scripts/utils/{dacapo,orion}_upstream/plan.sh) when they are present: hecate-opt at
+HECATE_OPT or .cache/dacapo_upstream (build_hecate.sh), an Orion clone at ORION_SRC or
+.cache/orion_upstream. The test neither clones nor builds them. Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;
 summary additive only).
 """
 import importlib.util
@@ -22,7 +24,12 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 BP = REPO / "bootstrap_placements"
 MAIN = "gpt2_decode_python_n32"
-ORION_TOOL = "scripts/utils/orion_upstream/plan.sh"
+# upstream-tool recipes: tool -> (env var, default location, what must exist there)
+UPSTREAM = {
+    "scripts/utils/orion_upstream/plan.sh": ("ORION_SRC", ".cache/orion_upstream", "orion/core"),
+    "scripts/utils/dacapo_upstream/plan.sh": (
+        "HECATE_OPT", ".cache/dacapo_upstream/build/bin/hecate-opt", ""),
+}
 
 
 def _plan_dirs():
@@ -36,9 +43,11 @@ def _plan_dirs():
 
 
 def _recipe(plan_dir: Path):
-    """(graph, recipe flags, tool) from PLAN_CMD.txt; None for a measured artifact (no
-    `recipe=`). tool is None for the plain run_bootstrap_all_blocks.sh recipe."""
+    """(graph, recipe flags, tool, route) from PLAN_CMD.txt; None for a measured artifact (no
+    `recipe=`). tool is None for the plain run_bootstrap_all_blocks.sh recipe; route is
+    `dense` for an upstream tool's dense plan."""
     graph = recipe = tool = None
+    route = "sparse"
     for line in (plan_dir / "PLAN_CMD.txt").read_text().splitlines():
         if line.startswith("graph="):
             graph = line[len("graph="):].split(" ")[0]
@@ -46,10 +55,12 @@ def _recipe(plan_dir: Path):
             recipe = shlex.split(line[len("recipe="):])
         elif line.startswith("tool="):
             tool = line[len("tool="):].split(" ")[0]
+        elif line.startswith("route="):
+            route = line[len("route="):].strip()
     if recipe is None:
         return None
     assert graph, f"{plan_dir}/PLAN_CMD.txt lacks graph="
-    return graph, recipe, tool
+    return graph, recipe, tool, route
 
 
 @pytest.fixture(scope="module")
@@ -66,7 +77,7 @@ def test_plan_regenerates(name, equiv, tmp_path):
     parsed = _recipe(plan_dir)
     if parsed is None:
         pytest.skip(f"{name} is a measured artifact, not regenerated")
-    graph, recipe, tool = parsed
+    graph, recipe, tool, route = parsed
     if not (REPO / graph).is_dir():
         pytest.skip(f"graph {graph} not present")
     out_name = f"_regen_{name.replace('/', '_')}"
@@ -75,12 +86,13 @@ def test_plan_regenerates(name, equiv, tmp_path):
     env.update(kv.split("=", 1) for kv in recipe)
     if tool is None:
         cmds = [["bash", "scripts/utils/run_bootstrap_all_blocks.sh"]]
-    elif tool == ORION_TOOL:
-        src = os.environ.get("ORION_SRC") or str(REPO / ".cache" / "orion_upstream")
-        if not (Path(src) / "orion" / "core").is_dir():
-            pytest.skip(f"no upstream Orion clone at {src}")
-        env["ORION_SRC"] = src
-        cmds = [["bash", tool, graph, out_name]]
+    elif tool in UPSTREAM:
+        var, default, inside = UPSTREAM[tool]
+        src = os.environ.get(var) or str(REPO / default)
+        if not (Path(src) / inside).exists():
+            pytest.skip(f"no {var} at {src}")
+        env[var] = src
+        cmds = [["bash", tool, graph, out_name, route]]
     else:
         cmds = [["bash", tool, graph, out_name], ["bash", tool, graph, out_name, "argmax"]]
     log = tmp_path / "plan.log"

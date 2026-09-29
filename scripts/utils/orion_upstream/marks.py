@@ -87,7 +87,10 @@ CFG = dict(bootstrap_level=36, max_level=50, source_level=36, cache_read_level=3
            level_unit=2, acc_chain="n32", cf_max=20,
            sparse_precomps=() if DENSE else (512, 1),
            sparse_out_levels=() if DENSE else ((1, 26), (512, 36)),
-           allow_prescale=False, verbose=False)
+           allow_prescale=False, verbose=False,
+           # a dense plan lands the code's deliberate bootstraps at the bootstrap level (as
+           # deploy.py and make_plan.sh do), so the solver sees the same step graph
+           deliberate_clamp0=DENSE)
 
 
 class _Captured(Exception):
@@ -213,4 +216,6 @@ def main(blocks):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:] or [f"block_{i}" for i in range(13)]))
+    sys.exit(main(sys.argv[1:] or sorted(
+        (d.name for d in GRAPHS.glob("block_*") if (d / "graph.json").exists()),
+        key=lambda n: int(n.split("_")[1]))))

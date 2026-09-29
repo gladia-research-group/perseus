@@ -111,6 +111,13 @@ class PlanConfig:
     #: The paper's dense Fhelipe arm uses 48, the chain's measured refresh envelope.
     baseline_depth_cap: float | None = None
     latency_table_path: str | None = None
+    #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
+    #: each placed refresh whose removal keeps the block within budget, lowers the bootstrap
+    #: count and adds no refresh input past the envelope.
+    prune: bool = False
+    #: vars the prune never removes (a caller's forced refreshes, e.g. an upstream deploy's
+    #: block-exit refresh)
+    prune_keep: tuple = ()
 
 
 @dataclass
@@ -123,6 +130,52 @@ class PlanDiagnostics:
     object with the site tuples is only available here.
     """
     cf_clamp: CfClampReport | None = None
+
+
+def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
+    """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune)."""
+    from .place import refresh_env_cap
+    g = placer.g
+    env = refresh_env_cap() - placer.bootstrap_level
+
+    def count(s):
+        return len(placer.placed) + sum(1 for f in s.hint_fired.values() if f)
+
+    def past_env(s):
+        # a refresh's input level: its producer's output before the refresh, which for a
+        # refresh on a hint's output is the hint's input (the sim records a placed hint's
+        # output as already refreshed)
+        k = 0
+        for v in placer.placed:
+            p = g.producer_of.get(v)
+            if p is None:
+                continue
+            if p.hint_level is not None and p.cipher_inputs:
+                lvl = s.effective(p.cipher_inputs[0], g.level_unit)
+            else:
+                lvl = s.node_out.get(p.idx, 0.0)
+            if lvl > env + 1e-9:
+                k += 1
+        for n in g.nodes:
+            if n.hint_level is not None and s.hint_fired.get(n.idx) and n.cipher_inputs:
+                if s.consumed.get(n.cipher_inputs[0], 0.0) > env + 1e-9:
+                    k += 1
+        return k
+
+    best, deep, removed = count(sim), past_env(sim), 0
+    origin = getattr(placer, "_origin", None)
+    for v in sorted(placer.placed - set(keep)):
+        kept = placer.placed
+        placer.placed = kept - {v}
+        s2 = placer._sim()
+        if not s2.over_budget and count(s2) < best and past_env(s2) <= deep:
+            sim, best = s2, count(s2)
+            removed += 1
+            if origin is not None:
+                origin.pop(v, None)
+        else:
+            placer.placed = kept
+    return placer._sim(), removed
 
 
 def _hint_nodes(g: Graph) -> list:
@@ -381,6 +434,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         if cfg.verbose:
             log.info(f"[plan] rescale_opt: {len(rescale_anchors)} realize anchor(s), "
                   f"bootstraps {base} -> {best}")
+
+    if cfg.prune:
+        sim, n_pruned = _prune_redundant(placer, sim, cfg.prune_keep)
+        if hasattr(placer, "meta"):
+            placer.meta["pruned"] = n_pruned
+        if cfg.verbose:
+            log.info(f"[plan] prune: {n_pruned} redundant refresh(es) removed")
 
     assert not sim.over_budget, "P1 violated: final sim has over-budget ops"
     # P2 covers every refresh the plan will execute, not only the min-cut placements:

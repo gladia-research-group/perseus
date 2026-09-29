@@ -8,8 +8,8 @@ Perseus runs GPT-2 under CKKS fully homomorphic encryption on one GPU and decide
 with its packing period and the largest coefficient of its polynomial, and an iterated minimum
 cut places the refreshes, each typed with the correction factor its data admits and, where the
 packing is periodic, with a cheaper sparse bootstrap. On encrypted GPT-2 decoding it executes
-455 bootstraps per token against 599–1987 for prior placers and decodes at 12.67 s/token against
-15.25–51.49 s/token. The runtime is a 32-bit composite-scaling port of
+416 bootstraps per token against 584–894 for prior placers and decodes at 11.78 s/token against
+16.09–21.40 s/token. The runtime is a 32-bit composite-scaling port of
 [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)
 ([FIDESlib32bits](https://github.com/gladia-research-group/FIDESlib32bits)) that regenerates the
 random half of every key-switching key in-kernel and bit-packs the rest.
@@ -26,29 +26,34 @@ KL is the median over decoded tokens of the divergence between encrypted and pla
 next-token distributions; latency is the mean (± 95% confidence interval) over the steady-state
 tokens of two isolated 16-token sessions.
 
-GPT-2 decode, per token. Baselines run with our correction-factor selection and sparse dispatch
-at the sites they chose (their published algorithms produce no feasible plan on this workload).
-Orion is the released Orion solver's own site selection. The three baselines run with 48
-levels: at 50 their refreshes can start past the measured bootstrap envelope, which the runtime
-refuses. Orion misses the reference-rank gate at one token (rank 9, limit 8).
+GPT-2 decode, per token. DaCapo is the released DaCapo compiler's (`hecate-opt`) own site
+selection and Orion the released Orion solver's (patched to run on transformer graphs), both on
+every block including the encrypted argmax; Fhelipe is our reimplementation (the released tool
+does not produce a plan on these graphs). Every baseline runs with our correction-factor
+selection, sparse dispatch and level bookkeeping; the planner repairs what a baseline's model
+misses with counted refreshes (Orion 68 per token, DaCapo none). Perseus and Fhelipe plans are
+pruned of redundant refreshes (Fhelipe's published post-pass); DaCapo and Orion run unpruned, as
+released (`PLAN_PRUNE=1` gives their pruned variants). The three baselines run with 48 levels:
+at 50 their refreshes can start past the measured bootstrap envelope, which the runtime refuses.
+Orion misses the reference-rank gate at one token (rank 9, limit 8).
 
 | placer | planned bts | executed bts | median KL | e2e s/token | plan directory |
 |---|---|---|---|---|---|
 | eager, 64-bit | — | 552 | 0.024 | 20.74 ± 0.04 | (no plan, `--chain n64`) |
-| eager, 32-bit | — | 912 | 0.061 | 23.49 ± 0.05 | (no plan) |
-| Fhelipe | 1964 | 1987 | 0.034 | 51.49 ± 0.04 | `python/fhelipe` |
-| Orion | 858 | 926 | 0.141 | 21.80 ± 0.07 | `python/orion` |
-| DaCapo | 576 | 599 | 0.025 | 15.25 ± 0.06 | `python/dacapo` |
-| **Perseus, 64-bit** | 385 | 408 | 0.002 | 16.38 ± 0.06 | `gpt2_decode_python_n64` |
-| **Perseus, 32-bit** | **432** | **455** | **0.025** | **12.67 ± 0.07** | `gpt2_decode_python_n32` |
+| eager, 32-bit | — | 912 | 0.064 | 23.49 ± 0.05 | (no plan) |
+| Fhelipe | 561 | 584 | 0.034 | 16.10 ± 0.04 | `python/fhelipe` |
+| Orion | 871 | 894 | 0.141 | 21.40 ± 0.06 | `python/orion` |
+| DaCapo | 595 | 618 | 0.067 | 16.09 ± 0.18 | `python/dacapo` |
+| **Perseus, 64-bit** | 384 | 407 | 0.002 | 16.38 ± 0.06 | `gpt2_decode_python_n64` |
+| **Perseus, 32-bit** | **393** | **416** | **0.025** | **11.78 ± 0.11** | `gpt2_decode_python_n32` |
 
 Key-switching keys (GPT-2 decode, the Perseus 32-bit plan):
 
 | configuration | s/token | used VRAM |
 |---|---|---|
-| in-kernel `a` regeneration + `b` packing (shipping) | 12.67 | 32.55 GiB |
-| regeneration only (`FIDESLIB_KSK_PACK=0`) | 13.11 (+3%) | 34.49 GiB |
-| packing only (`FIDESLIB_KSK_REGEN=0`) | 15.44 (+22%) | 41.61 GiB |
+| in-kernel `a` regeneration + `b` packing (shipping) | 11.86 | 32.55 GiB |
+| regeneration only (`FIDESLIB_KSK_PACK=0`) | 12.19 (+3%) | 34.49 GiB |
+| packing only (`FIDESLIB_KSK_REGEN=0`) | 14.18 (+20%) | 41.61 GiB |
 
 `bootstrap_placements/README.md` maps every plan directory to its paper row and records the
 recipe that regenerates it; `tests/test_paper_plans.py` checks the regeneration.
@@ -116,7 +121,7 @@ and the oracle.
 ```bash
 source scripts/local_env.sh                                           # CHAIN=n32 unless exported
 DECODE=".venv/bin/python -m examples.gpt2_from_primitives.run_decode --tokens 16 --argmax"
-$DECODE --plan bootstrap_placements/gpt2_decode_python_n32            # the 32-bit row: 455 bts/token
+$DECODE --plan bootstrap_placements/gpt2_decode_python_n32            # the 32-bit row: 416 bts/token
 $DECODE                                                               # eager (no plan)
 $DECODE --plan bootstrap_placements/python/dacapo                     # a baseline (python/orion, python/fhelipe)
 FIDESLIB_KSK_REGEN=0 $DECODE --plan bootstrap_placements/gpt2_decode_python_n32   # stored keys, no in-kernel regeneration
@@ -140,7 +145,7 @@ the encrypted computation: the reference token stays near the top of our distrib
 (`ref_rank`, gated by `GATE_REF_RANK_MAX`) and the divergence stays far below the value a
 broken chain saturates at (`GATE_KL_MAX`; a detonated run reads KL > 50). Exact top1 agreement
 is printed, not required, because it depends on the reference sequence: with the shipped
-oracle the 32-bit row reads 15/16 and the 64-bit row 14–15/16, but a self-generated oracle
+oracle the 32-bit row reads 15/16 and the 64-bit row 15–16/16, but a self-generated oracle
 resolves near-ties differently. `GATE_MIN_TOP1=15` demands an exact count. Latency depends on
 the host: the walls above were taken on an idle machine with the process pinned to the GPU's NUMA node (`numactl --cpunodebind=<node> --preferred=<node>`).
 

@@ -96,9 +96,11 @@ def simulate(
                 base = (n.output_level - bootstrap_level
                         if n.output_level is not None
                         else max(0.0, offs.get(n.step, 0.0)))
-                if deliberate_clamp0:
-                    # landings never richer than the bts level
-                    base = max(0.0, base)
+                if deliberate_clamp0 and base + unit < 0:
+                    # a landing richer than the bts level even with its pending rescale is a
+                    # sparse one; a dense run lands it at the bts level. A dense landing
+                    # (bts level - unit, degree 2: the K/V push) is left alone.
+                    base = 0.0
                 lc[n.output] = base
                 dg[n.output] = 2
             continue

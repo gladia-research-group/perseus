@@ -1,0 +1,5 @@
+graph=graphs/gpt2_decode_python_n32 (md5 4a8b3433454986f3721efb419d84a363)
+tool=scripts/utils/orion_upstream/plan.sh (the released Orion solver's marks on every block, argmax stage included, one call)
+recipe=PYTHONHASHSEED=0 ML=50 PLAN_PRUNE=0
+route=dense
+acc_table=8dc653fa405969c75f3804a0edfdfe80

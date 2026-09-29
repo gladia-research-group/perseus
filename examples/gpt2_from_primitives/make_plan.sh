@@ -21,6 +21,8 @@ OUT_NAME="${2:?out name under bootstrap_placements/}"
 STAGE="${3:-blocks}"
 export CUDA_VISIBLE_DEVICES=""
 export PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
+# redundant refreshes are pruned from every stage's plan (PLAN_PRUNE=0 keeps them)
+export PLAN_PRUNE="${PLAN_PRUNE-1}"
 # a dense plan (PLAN_SPARSE_SLOTS set and empty) runs every refresh on the dense route, so the
 # code's own bootstraps land at the bootstrap level whatever route they took in the capture
 if [[ -n "${PLAN_SPARSE_SLOTS+x}" && -z "$PLAN_SPARSE_SLOTS" ]]; then

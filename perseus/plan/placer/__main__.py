@@ -115,6 +115,8 @@ def main() -> None:
                    help="pending-rescale degree the first refresh enters at")
     p.add_argument("--placer", type=str,
                    help="min_cut (default) or a baseline: orion|dacapo|fhelipe")
+    p.add_argument("--prune", action="store_true", default=None,
+                   help="remove redundant refreshes from the final plan, any placer")
     p.add_argument("--baseline-depth-cap", type=float, dest="baseline_depth_cap",
                    help="baseline placers: cap a placed refresh's input depth at this "
                         "absolute prime level (the paper's dense Fhelipe arm uses 48)")

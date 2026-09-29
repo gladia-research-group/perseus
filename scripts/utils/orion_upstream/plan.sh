@@ -4,8 +4,8 @@
 # 1. marks.py runs baahl-nyu/orion's BootstrapSolver (commit be8a827 + orion_be8a827.patch,
 #    cloned into .cache/orion_upstream unless ORION_SRC points at such a clone) on each block's
 #    step graph; 2. deploy.py replays the marked steps through the planner (level bookkeeping,
-#    chain hand-off, rescue) and stamps the capture contract; 3. make_plan.sh plans the argmax
-#    stage with PLAN_PLACER=orion from the tail's exit.
+#    chain hand-off, rescue) and stamps the capture contract, the argmax stage (block 13)
+#    included, entered from the tail's exit.
 # The solver iterates Python sets of node names, so its marks depend on the hash seed:
 # PYTHONHASHSEED is pinned (0 unless exported). ML (default 48) is the top of the deployed
 # chain: the solver marks sites in its own 50-level frame (marks.py), and deployed at 50 some
@@ -30,14 +30,8 @@ if [ -z "${ORION_SRC:-}" ]; then
     fi
 fi
 export ORION_SRC
-DENSE=0; SLOTS="512,1"; SOUT="1:26,512:36"
-[ "$ROUTE" = dense ] && { DENSE=1; SLOTS=""; SOUT=""; }
+DENSE=0; [ "$ROUTE" = dense ] && DENSE=1
 MARKS="$(mktemp --suffix=.json)"; trap 'rm -f "$MARKS"' EXIT
 rm -rf "bootstrap_placements/$OUT_NAME"
 GRAPH_DIR="$GRAPH_DIR" OUT_JSON="$MARKS" PLAN_DENSE=$DENSE "$PYTHON" $HERE/marks.py
 RESULTS="$MARKS" GRAPH_DIR="$GRAPH_DIR" OUT="$OUT_NAME" PLAN_DENSE=$DENSE ML=$ML "$PYTHON" $HERE/deploy.py
-env MAX_LEVEL=$ML BTS_LEVEL=36 SRC_LEVEL=34 CACHE_READ_LEVEL=34 PLAN_LEVEL_UNIT=2 \
-    PLAN_CF_MAX=20 PLAN_NO_PRESCALE=1 PLAN_ACC_CHAIN=n32 PLAN_MAG_SAFETY=2 \
-    PLAN_HINT_ENV_VETO=0 PLAN_PLACER=orion PLAN_BASELINE_RESCUE=1 \
-    PLAN_SPARSE_SLOTS="$SLOTS" PLAN_SPARSE_BTS_OUT="$SOUT" PYTHON="$PYTHON" \
-    bash examples/gpt2_from_primitives/make_plan.sh "$GRAPH_DIR" "$OUT_NAME" argmax
