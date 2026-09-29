@@ -1,4 +1,3 @@
-graph=.cache/graph_n32_gpt2_base (coeff canon)
-deploy=orion_upstream_deploy.py RESULTS=results_forbid2 no-CF-pin 
-date=Thu Sep  3 01:21:40 AM CEST 2026
-graph_md5=daa081db2a76eff66d9eec4c373add5a
+graph=graphs/gpt2_decode_n32 (md5 daa081db2a76eff66d9eec4c373add5a)
+note=the released Orion solver's marks (with per-step refresh-entry forbids), deployed like scripts/utils/orion_upstream/deploy.py and repaired by the rescue pass; shipped as an artifact, not regenerated
+acc_table=8dc653fa405969c75f3804a0edfdfe80

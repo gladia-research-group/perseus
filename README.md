@@ -8,50 +8,55 @@ Perseus runs GPT-2 under CKKS fully homomorphic encryption on one GPU and decide
 with its packing period and the largest coefficient of its polynomial, and an iterated minimum
 cut places the refreshes, each typed with the correction factor its data admits and, where the
 packing is periodic, with a cheaper sparse bootstrap. On encrypted GPT-2 decoding it executes
-552 bootstraps per token against 711–1274 for prior placers and decodes at 15.44 s/token against
-18.06–27.01 s/token. The runtime is a 32-bit composite-scaling port of
+455 bootstraps per token against 599–1987 for prior placers and decodes at 12.67 s/token against
+15.25–51.49 s/token. The runtime is a 32-bit composite-scaling port of
 [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)
 ([FIDESlib32bits](https://github.com/gladia-research-group/FIDESlib32bits)) that regenerates the
 random half of every key-switching key in-kernel and bit-packs the rest.
 
 ## Results
 
-Measured on one NVIDIA RTX PRO 6000 Blackwell with logN = 16, 128-bit security, 27 composite
-levels over 54 primes (pairs of 27-bit primes per level, q0 a pair of 28-bit primes). The 64-bit
+Results of the Python implementation (`perseus.impl`, `examples/gpt2_from_primitives`) in its
+default configuration, measured on one NVIDIA RTX PRO 6000 Blackwell with logN = 16, 128-bit
+security, 27 composite levels over 54 primes (pairs of 27-bit primes per level, q0 a pair of 28-bit primes). The 64-bit
 reference chain uses 28 levels of 53-bit primes, with automatic sparse routing (`SPARSE_AUTO=2`)
 and `CORRECTION_FACTOR=7` — the chain default of 0 is safe for a dense refresh and not for a
 sparse one. Workload: GPT-2 (124M) decoding through all 12 blocks, encrypted argmax included;
 KL is the median over decoded tokens of the divergence between encrypted and plaintext
-next-token distributions; latency is the mean over the steady-state tokens of isolated 16-token
-sessions.
+next-token distributions; latency is the mean (± 95% confidence interval) over the steady-state
+tokens of two isolated 16-token sessions.
 
 GPT-2 decode, per token. Baselines run with our correction-factor selection and sparse dispatch
 at the sites they chose (their published algorithms produce no feasible plan on this workload).
+Orion is the released Orion solver's own site selection. The three baselines run with 48
+levels: at 50 their refreshes can start past the measured bootstrap envelope, which the runtime
+refuses. Orion misses the reference-rank gate at one token (rank 9, limit 8).
 
 | placer | planned bts | executed bts | median KL | e2e s/token | plan directory |
 |---|---|---|---|---|---|
-| eager, 64-bit | — | 782 | 0.002 | 32.71 ± 0.03 | (`STAGE=eager CHAIN=n64`) |
-| eager, 32-bit | — | 1310 | 0.102 | 37.64 ± 0.05 | (`STAGE=eager`) |
-| Fhelipe | 1140 | 1274 | 0.055 | 27.01 ± 0.02 | `baselines/fhelipe` |
-| Orion | 668 | 802 | 0.037 | 20.43 ± 0.03 | `baselines/orion` |
-| DaCapo | 577 | 711 | 0.050 | 18.06 ± 0.04 | `baselines/dacapo` |
-| **Perseus, 64-bit** | 373 | 470 | 0.001 | 18.03 ± 0.04 | `gpt2_decode_n64` |
-| **Perseus, 32-bit** | **418** | **552** | **0.041** | **15.44 ± 0.03** | `gpt2_decode_n32` |
+| eager, 64-bit | — | 552 | 0.024 | 20.74 ± 0.04 | (no plan, `--chain n64`) |
+| eager, 32-bit | — | 912 | 0.061 | 23.49 ± 0.05 | (no plan) |
+| Fhelipe | 1964 | 1987 | 0.034 | 51.49 ± 0.04 | `python/fhelipe` |
+| Orion | 858 | 926 | 0.141 | 21.80 ± 0.07 | `python/orion` |
+| DaCapo | 576 | 599 | 0.025 | 15.25 ± 0.06 | `python/dacapo` |
+| **Perseus, 64-bit** | 385 | 408 | 0.002 | 16.38 ± 0.06 | `gpt2_decode_python_n64` |
+| **Perseus, 32-bit** | **432** | **455** | **0.025** | **12.67 ± 0.07** | `gpt2_decode_python_n32` |
 
 Key-switching keys (GPT-2 decode, the Perseus 32-bit plan):
 
 | configuration | s/token | used VRAM |
 |---|---|---|
-| in-kernel `a` regeneration + `b` packing (shipping) | 15.44 | 47.52 GiB |
-| regeneration only (`FIDESLIB_KSK_PACK=0`) | 16.05 (+4%) | 48.46 GiB |
-| packing only (`FIDESLIB_KSK_REGEN=0`) | 18.63 (+21%) | 56.59 GiB |
+| in-kernel `a` regeneration + `b` packing (shipping) | 12.67 | 32.55 GiB |
+| regeneration only (`FIDESLIB_KSK_PACK=0`) | 13.11 (+3%) | 34.49 GiB |
+| packing only (`FIDESLIB_KSK_REGEN=0`) | 15.44 (+22%) | 41.61 GiB |
 
 `bootstrap_placements/README.md` maps every plan directory to its paper row and records the
 recipe that regenerates it; `tests/test_paper_plans.py` checks the regeneration.
 
 ## Install
 
-Linux, CUDA 12.6 or newer, a GPU with 64 GB or more (the decode row holds about 48 GB of keys),
+Linux, CUDA 12.6 or newer, a GPU with 64 GB or more (the decode peaks at about 33 GiB, the C++
+decode at about 48 GiB),
 Python 3.11+, CMake 3.24+, gcc 12+, `libarchive-dev`, and NCCL (`libnccl2` + `libnccl-dev`,
 or `NCCL_HOME` pointing at a prefix with `lib/libnccl.so` and `include/nccl.h`). Clone with the FIDESlib32bits submodule:
 
@@ -109,15 +114,24 @@ and the oracle.
 ## Reproduce a row
 
 ```bash
-TASK=decode CHAIN=n32 RUNNER=cuda bash scripts/run_task.sh            # the 32-bit row: 552 bts/token
-TASK=decode CHAIN=n32 RUNNER=python bash scripts/run_task.sh          # the same through the Python session (parity gate)
-TASK=decode CHAIN=n64 RUNNER=cuda bash scripts/run_task.sh            # Perseus 64-bit
-TASK=decode STAGE=eager RUNNER=cuda bash scripts/run_task.sh          # eager (no plan)
+source scripts/local_env.sh                                           # CHAIN=n32 unless exported
+DECODE=".venv/bin/python -m examples.gpt2_from_primitives.run_decode --tokens 16 --argmax"
+$DECODE --plan bootstrap_placements/gpt2_decode_python_n32            # the 32-bit row: 455 bts/token
+$DECODE                                                               # eager (no plan)
+$DECODE --plan bootstrap_placements/python/dacapo                     # a baseline (python/orion, python/fhelipe)
+FIDESLIB_KSK_REGEN=0 $DECODE --plan bootstrap_placements/gpt2_decode_python_n32   # stored keys, no in-kernel regeneration
+```
+
+The 64-bit row runs the same command with `CHAIN=n64` exported before `source scripts/local_env.sh`,
+the import symlink pointed at `_core.n64.so`, and
+`--chain n64 --plan bootstrap_placements/gpt2_decode_python_n64`.
+
+The C++ decode runs the same model through the runtime's composites, with its own plans
+(`gpt2_decode_n32`, `gpt2_decode_n64`, `baselines/`, `ablations/`):
+
+```bash
+TASK=decode CHAIN=n32 RUNNER=cuda bash scripts/run_task.sh
 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/baselines/dacapo TASK=decode RUNNER=cuda bash scripts/run_task.sh
-FIDESLIB_KSK_REGEN=0 TASK=decode RUNNER=cuda bash scripts/run_task.sh # stored keys, no in-kernel regeneration
-FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/ablations/kappa_8 TASK=decode RUNNER=cuda bash scripts/run_task.sh
-FUSED_SM_DEN=0 SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0 FHE_BOOTSTRAP_PLACEMENTS_DIR=bootstrap_placements/gpt2_decode_n32_dense \
-  TASK=decode RUNNER=cuda bash scripts/run_task.sh                     # dense only: no sparse bootstraps, no fused denominator
 ```
 
 A run passes when the driver prints `[decode] PASS` (python) or `SUMMARY … completed=16/16`
@@ -126,9 +140,9 @@ the encrypted computation: the reference token stays near the top of our distrib
 (`ref_rank`, gated by `GATE_REF_RANK_MAX`) and the divergence stays far below the value a
 broken chain saturates at (`GATE_KL_MAX`; a detonated run reads KL > 50). Exact top1 agreement
 is printed, not required, because it depends on the reference sequence: with the shipped
-oracle the 32-bit row reads 15/16 and the 64-bit row 16/16, but a self-generated oracle
-resolves near-ties differently. `GATE_MIN_TOP1=15` demands an exact count. Latency depends on the host: the paper's walls were taken on an idle machine with the
-process pinned to the GPU's NUMA node (`numactl --cpunodebind=<node> --preferred=<node>`).
+oracle the 32-bit row reads 15/16 and the 64-bit row 14–15/16, but a self-generated oracle
+resolves near-ties differently. `GATE_MIN_TOP1=15` demands an exact count. Latency depends on
+the host: the walls above were taken on an idle machine with the process pinned to the GPU's NUMA node (`numactl --cpunodebind=<node> --preferred=<node>`).
 
 ## Capture and plan
 

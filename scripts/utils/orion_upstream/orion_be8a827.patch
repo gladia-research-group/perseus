@@ -1,0 +1,213 @@
+diff --git a/orion/core/auto_bootstrap.py b/orion/core/auto_bootstrap.py
+index 0cf94d1..a8f477e 100644
+--- a/orion/core/auto_bootstrap.py
++++ b/orion/core/auto_bootstrap.py
+@@ -29,24 +29,56 @@ class BootstrapSolver:
+         residuals = []
+         for i, (fork, join) in enumerate(self.network_dag.residuals.items()):
+             subgraph = all_residual_subgraphs[i]
+-            paths = list(nx.all_simple_paths(subgraph, fork, join))
++
++            # [perseus] The original materialized EVERY simple fork->join path
++            #   paths = list(nx.all_simple_paths(subgraph, fork, join))
++            # and then used only (a) len(paths) as the sort key and (b) the FIRST
++            # path per distinct first child (`unique_paths`). On transformer-shaped
++            # graphs len(paths) is astronomical, so the eager list never finishes.
++            # Both quantities are recovered exactly and cheaply below:
++            #   (a) the number of simple paths in a DAG by a reverse-topological DP;
++            #   (b) the DFS-first path from each child c to join, prefixed by fork --
++            #       identical to what the full DFS enumeration would have yielded
++            #       first for that child (nx.all_simple_paths is a DFS in adjacency
++            #       order, and after descending into c the remaining traversal is the
++            #       same as a fresh DFS from c: fork can never be revisited in a DAG).
++            num_paths = self._count_simple_paths(subgraph, fork, join)
+ 
+             unique_paths = []
+             visited_children = set()
+-            for path in paths:
+-                if path[1] not in visited_children:
+-                    unique_paths.append(path)
+-                    visited_children.add(path[1])
+-
+-            residuals.append((fork, paths, unique_paths))
++            for child in subgraph.successors(fork):
++                if child in visited_children:
++                    continue
++                if child == join:
++                    unique_paths.append([fork, join])
++                    visited_children.add(child)
++                    continue
++                rest = next(nx.all_simple_paths(subgraph, child, join), None)
++                if rest is None:
++                    continue  # this child reaches no join: yielded no path upstream
++                unique_paths.append([fork] + list(rest))
++                visited_children.add(child)
++
++            residuals.append((fork, num_paths, unique_paths))
+ 
+         # Sort by the number of simple paths from fork to join in the graph.
+         # This way, we're guaranteed to always solve the "inner-most"
+         # residual subgraph in the event it is entirely encapsulated by
+         # a larger residual connection.
+-        sorted_subgraphs = sorted(residuals, key=lambda x: len(x[1]))
+-        
++        sorted_subgraphs = sorted(residuals, key=lambda x: x[1])
++
+         return sorted_subgraphs
++
++    @staticmethod
++    def _count_simple_paths(subgraph, fork, join):
++        """[perseus] Exact number of simple fork->join paths in a DAG, in
++        O(V+E). Replaces len(list(nx.all_simple_paths(...)))."""
++        counts = {join: 1}
++        for node in reversed(list(nx.topological_sort(subgraph))):
++            if node == join:
++                continue
++            counts[node] = sum(counts.get(c, 0) for c in subgraph.successors(node))
++        return counts.get(fork, 0)
+        
+     def first_solve_residual_subgraphs(self):
+         # We'll first extract all residual subgraphs in the network and create
+@@ -199,15 +231,27 @@ class BootstrapSolver:
+         total_bootstraps = 0
+         bootstrapper_slots = []
+ 
++        # [perseus] Only nodes that lie on a modeled (representative) path get a
++        # level. In a 2-branch ResNet residual that is every node; in a graph whose
++        # regions hold many parallel paths, the nodes off the chosen representatives
++        # are never levelled and `node_map[node]` raised KeyError. Skip them and
++        # report how many were left unmodeled instead of crashing.
++        self.unmodeled_nodes = [n for n in self.network_dag.nodes if n not in node_map]
++
+         for node in self.network_dag.nodes:
++            if node not in node_map:
++                self.network_dag.nodes[node]["bootstrap"] = False
++                continue
+             node_w_level = node_map[node]
+-            
++
+             children = self.network_dag.successors(node)
+             self.network_dag.nodes[node]["bootstrap"] = False
+-            
++
+             # Iterate over the layer's children to determine if their assigned
+             # levels necessitate a bootstrap of the current layer.
+             for child in children:
++                if child not in node_map:
++                    continue
+                 child_w_level = node_map[child]
+                 _, curr_boots = query.estimate_bootstrap_latency(
+                     node_w_level, child_w_level)
+diff --git a/orion/core/level_dag.py b/orion/core/level_dag.py
+index 38c7cdc..b16ffe5 100644
+--- a/orion/core/level_dag.py
++++ b/orion/core/level_dag.py
+@@ -35,7 +35,17 @@ class LevelDAG(nx.DiGraph):
+         elif other.number_of_nodes() == 0:
+             return self
+ 
+-        fork, join = self.topo_path[0], self.topo_path[-1]
++        # [perseus] `topo_path` only exists on a LevelDAG built FROM a path.
++        # The result of a previous __add__ is a path-less aggregate, so folding a
++        # THIRD branch path in (any fork with >2 children reaching the join)
++        # raised AttributeError upstream. The aggregate's head/tail columns are
++        # exactly the fork/join level columns, so recover them from there; the
++        # 2-path case is untouched.
++        if hasattr(self, "topo_path"):
++            fork, join = self.topo_path[0], self.topo_path[-1]
++        else:
++            fork = self.head()[0].split("@")[0]
++            join = self.tail()[0].split("@")[0]
+         if fork == join:
+             raise ValueError(
+                 "Level DAGs can only be added if they represent paths in a " 
+@@ -127,7 +137,15 @@ class LevelDAG(nx.DiGraph):
+         visited_nodes = set()
+         for curr_path_node in self.topo_path:
+             if curr_path_node not in visited_nodes:
+-                if curr_path_node in solved_dags.keys():
++                # [perseus] `... in solved_dags` alone assumes every region met
++                # on a path is fully NESTED inside it. With overlapping regions the
++                # region's join is off-path and `self.topo_path.index(tail)` raised
++                # ValueError. When the region is not contained in this path, price
++                # its fork as an ordinary layer instead of splicing (same rule our
++                # port uses). Nested regions are spliced exactly as before.
++                if (curr_path_node in solved_dags.keys()
++                        and self.network_dag.residuals[curr_path_node]
++                        in self.topo_path):
+                     # Then there already exists a solved LevelDAG for this SESE
+                     # region. We'll append it into the LevelDAG we're building.
+                     solved_level_dag = solved_dags[curr_path_node]
+diff --git a/orion/core/network_dag.py b/orion/core/network_dag.py
+index b206776..bf97d91 100644
+--- a/orion/core/network_dag.py
++++ b/orion/core/network_dag.py
+@@ -83,21 +83,32 @@ class NetworkDAG(nx.DiGraph):
+         fork = f"{start}_fork"
+         join = f"{end}_join"
+ 
++        # [perseus] Two different forks can share the SAME join node `end`
++        # (extremely common outside of plain ResNet-style nets). The original
++        # re-inserted `end_join` a second time; by then the only predecessor of
++        # `end` IS `end_join`, so the rewire produced the self-loop
++        # end_join -> end_join and every later nx.topological_sort raised
++        # NetworkXUnfeasible. The join is already normalized, so reuse it.
++        join_exists = join in self
++        fork_exists = fork in self
++
+         # Add fork/join nodes to the network
+         self.add_node(fork, op="fork", module=None)
+         self.add_node(join, op="join", module=None)
+ 
+         # Insert fork node and update edges
+-        for child in list(self.successors(start)):
+-            self.remove_edge(start, child)
+-            self.add_edge(fork, child)
+-        self.add_edge(start, fork)
++        if not fork_exists:
++            for child in list(self.successors(start)):
++                self.remove_edge(start, child)
++                self.add_edge(fork, child)
++            self.add_edge(start, fork)
+ 
+         # Insert join node and update edges
+-        for parent in list(self.predecessors(end)):
+-            self.remove_edge(parent, end)
+-            self.add_edge(parent, join)
+-        self.add_edge(join, end)
++        if not join_exists:
++            for parent in list(self.predecessors(end)):
++                self.remove_edge(parent, end)
++                self.add_edge(parent, join)
++            self.add_edge(join, end)
+ 
+         return fork, join
+ 
+@@ -105,15 +116,19 @@ class NetworkDAG(nx.DiGraph):
+         """A helper function designed to extract the subgraphs between
+         the fork/join nodes of a residual connection."""
+ 
+-        nodes_in_residual = set()
+-        edges_in_residual = set()
+-
+-        # Get all paths from fork -> join and build up a set of unique
+-        # nodes/edges in its subgraph
++        # [perseus] The original enumerated every simple fork->join path just to
++        # take the UNION of their nodes/edges. In a DAG that union is exactly
++        # descendants(fork) & ancestors(join) (plus the endpoints), and an edge lies
++        # on some fork->join path iff both endpoints are in that set. Computing it
++        # directly is O(V+E) instead of O(#paths), and yields the identical subgraph.
+         join = self.residuals[fork]
+-        for path in nx.all_simple_paths(self, fork, join):
+-            nodes_in_residual.update(path)
+-            edges_in_residual.update(zip(path[:-1], path[1:]))
++        nodes_in_residual = (
++            (nx.descendants(self, fork) | {fork}) & (nx.ancestors(self, join) | {join})
++        )
++        edges_in_residual = {
++            (u, v) for u, v in self.edges
++            if u in nodes_in_residual and v in nodes_in_residual
++        }
+ 
+         # Rebuild the subgraph from the nodes/edges
+         residual_subgraph = nx.DiGraph()

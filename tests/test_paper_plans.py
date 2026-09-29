@@ -5,8 +5,9 @@ Python implementation's plans) is regenerated with that tool: the blocks, then t
 (block 13, entered at the tail plan's exit), each stamped with the capture contract.
 
 The main plan is always checked; the baselines and ablations (about 20 planner runs, a few
-minutes) run when PERSEUS_ALL_PLANS=1. baselines/orion is the released Orion tool's output
-and is skipped. Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;
+minutes) run when PERSEUS_ALL_PLANS=1. baselines/orion is the released Orion tool's output and
+is skipped; python/orion is regenerated with scripts/utils/orion_upstream/plan.sh when an
+upstream clone is present (ORION_SRC or .cache/orion_upstream; the test does not clone). Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;
 summary additive only).
 """
 import importlib.util
@@ -20,7 +21,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 BP = REPO / "bootstrap_placements"
-MAIN = "gpt2_decode_n32"
+MAIN = "gpt2_decode_python_n32"
+ORION_TOOL = "scripts/utils/orion_upstream/plan.sh"
 
 
 def _plan_dirs():
@@ -73,6 +75,12 @@ def test_plan_regenerates(name, equiv, tmp_path):
     env.update(kv.split("=", 1) for kv in recipe)
     if tool is None:
         cmds = [["bash", "scripts/utils/run_bootstrap_all_blocks.sh"]]
+    elif tool == ORION_TOOL:
+        src = os.environ.get("ORION_SRC") or str(REPO / ".cache" / "orion_upstream")
+        if not (Path(src) / "orion" / "core").is_dir():
+            pytest.skip(f"no upstream Orion clone at {src}")
+        env["ORION_SRC"] = src
+        cmds = [["bash", tool, graph, out_name]]
     else:
         cmds = [["bash", tool, graph, out_name], ["bash", tool, graph, out_name, "argmax"]]
     log = tmp_path / "plan.log"
