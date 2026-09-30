@@ -90,6 +90,66 @@ keys on the 32-bit row:
 - `third_party/` the FIDESlib32bits submodule and the OpenFHE patch series.
 - `assets/` the logos and the results table (`results-table.tex`, rendered by `render.sh`).
 
+## Python API
+
+Two layers share one session. `perseus.impl` is the one the results run on: an encrypted model
+written in Python on the runtime's leaf primitives, with graph capture and planned execution
+built in. `examples/gpt2_from_primitives` is GPT-2 written on it. From the repository root,
+after the install below and `source scripts/local_env.sh`, which sets `WEIGHTS_PATH` and the
+oracle the embedded tokens are read from:
+
+```python
+import os
+from examples.gpt2_from_primitives import env, weights
+from examples.gpt2_from_primitives.model import Gpt2Primitives
+
+PACKING = "cachemir_complex"                    # the packing the shipped plans were cut under
+sess = env.open_session(device=0, chain="n32", GPT2_PACKING=PACKING)   # decode env + keygen
+from perseus import _core                       # after the session has exported its env
+from perseus.impl import config
+
+model = Gpt2Primitives(sess.inf, weights.RawStore(os.environ["WEIGHTS_PATH"]),
+                       config.load_configs("configs/model/approximation/gpt2_base_n32/configs.json"),
+                       core=_core, packing=PACKING)
+model.load_plans("bootstrap_placements/gpt2_decode_python_n32")      # without it: eager
+cfg = _core.RunConfig.from_env(); cfg.tokens = 4
+out = model.run_decode(_core.read_teacher_forced_inputs(cfg), argmax=True)   # one record per token
+print([(r["top1"], r["cutmax"]) for r in out])  # argmax of the decrypted logits, encrypted argmax
+model.close(); sess.close()
+```
+
+`model.set_capture(dir)` in place of `load_plans` records the graph the planner reads (step 2
+below). A new model is an `ImplModel` subclass that names its stages, its per-step masks and its
+weights; `perseus/impl/__init__.py` lists the modules, and `docs/PYTHON_API.md` writes an op
+from the primitives.
+
+`perseus.nn` is the module API: modules over the runtime's C++ composites, whose
+approximations are calibrated on your data:
+
+```python
+import numpy as np
+from perseus import session
+from perseus.profile import SessionProfile
+from perseus.nn import EncGELU, EncLinear, EncSequential, calibrate_sequential
+
+d, e, real = 1024, 4096, 768                       # packed widths; 768 real features
+rng = np.random.default_rng(0)
+W1 = rng.standard_normal((d, e)) * 0.5 / np.sqrt(real); W1[real:, :] = 0; W1[:, 3072:] = 0
+W2 = rng.standard_normal((e, d)) * 0.5 / np.sqrt(3072); W2[3072:, :] = 0; W2[:, real:] = 0
+
+with session(profile=SessionProfile.custom_n32()) as s:     # keygen + GPU context
+    model = EncSequential(EncLinear("fc1", d, e, weight=W1), EncGELU("act"),
+                          EncLinear("fc2", e, d, weight=W2)).bind(s)
+    calibrate_sequential(model, rng.standard_normal((32, real)) * 0.3)   # fit GELU on your data
+    x = rng.standard_normal(real) * 0.3
+    y = s.decrypt(model(s.encrypt(x)), d=real)               # encrypted forward
+```
+
+`EncClient` / `EncServer` split the roles across a trust boundary (`docs/SECURITY_MODEL.md`);
+`docs/PYTHON_API.md` is the reference. The notebooks (`NB=<name> bash scripts/run_notebooks.sh`
+runs one headless) cover the artifacts, generation, a custom encrypted model and the
+client-server protocol.
+
 ## Pipeline
 
 One full pass for GPT-2 on the 32-bit chain, with the 64-bit differences. Every artifact a
@@ -126,7 +186,7 @@ an exported variable always wins:
 | `CHAIN` | `n32` (32-bit composite chain) or `n64` | `n32` |
 | `PERSEUS_DATA` | root of the weights, the calibration pool and the oracle | `.cache/` |
 | `WEIGHTS_PATH` | the exported weights (`weights.bin.zip`) | under `PERSEUS_DATA` |
-| `CONFIGS_PATH` | the calibrated approximation config | `gpt2_base_n32` (`gpt2_base` on n64) |
+| `CONFIGS_PATH` | the calibrated approximation config | unset: the drivers take `gpt2_base_n32` (`gpt2_base` on n64) |
 | `ALL_BLOCKS_IO_DIR` | the teacher-forced decode oracle | under `PERSEUS_DATA` |
 
 On a machine without root, the prefix `NCCL_HOME` points at must hold **both**
@@ -227,32 +287,6 @@ The walls above were taken on an idle machine with the process pinned to the GPU
 The runtime also carries a native C++ driver of the same model (`scripts/run_task.sh`,
 `RUNNER=cuda`); it ships no capture or plan, and needs its own (`STAGE=capture`, then
 `perseus-plan`).
-
-## Python API
-
-```python
-import numpy as np
-from perseus import session
-from perseus.profile import SessionProfile
-from perseus.nn import EncGELU, EncLinear, EncSequential, calibrate_sequential
-
-d, e, real = 1024, 4096, 768                       # packed widths; 768 real features
-rng = np.random.default_rng(0)
-W1 = rng.standard_normal((d, e)) * 0.5 / np.sqrt(real); W1[real:, :] = 0; W1[:, 3072:] = 0
-W2 = rng.standard_normal((e, d)) * 0.5 / np.sqrt(3072); W2[3072:, :] = 0; W2[:, real:] = 0
-
-with session(profile=SessionProfile.custom_n32()) as s:     # keygen + GPU context
-    model = EncSequential(EncLinear("fc1", d, e, weight=W1), EncGELU("act"),
-                          EncLinear("fc2", e, d, weight=W2)).bind(s)
-    calibrate_sequential(model, rng.standard_normal((32, real)) * 0.3)   # fit GELU on your data
-    x = rng.standard_normal(real) * 0.3
-    y = s.decrypt(model(s.encrypt(x)), d=real)               # encrypted forward
-```
-
-`EncClient` / `EncServer` split the roles across a trust boundary (`docs/SECURITY_MODEL.md`);
-`docs/PYTHON_API.md` is the reference. The notebooks (`NB=<name> bash scripts/run_notebooks.sh`
-runs one headless) cover the artifacts, generation, a custom encrypted model and the
-client-server protocol.
 
 ## Citation
 
