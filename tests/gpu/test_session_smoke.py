@@ -22,7 +22,7 @@ def test_encrypt_decrypt_round_trip(sess):
 
 
 def test_custom_mlp_matches_the_plaintext_reference(sess):
-    """The custom_encrypted_model notebook's forward, as a test (rel < 5e-2)."""
+    """A small custom encrypted model's forward (rel < 5e-2)."""
     rng = np.random.default_rng(0)
 
     def w(di, do, ir, orr, s=0.5):

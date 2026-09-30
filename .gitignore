@@ -26,8 +26,6 @@ logs/
 .cache/
 weights*/
 weights.bin.zip
-notebooks/*_executed.ipynb
-notebooks/*.error.txt
 
 # generated assets under docs/ are local; the documentation itself is tracked
 docs/*

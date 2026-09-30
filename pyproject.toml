@@ -39,7 +39,7 @@ hf = [
     "scipy>=1.17.1",
     "mpmath>=1.3",
 ]
-# Building the extension, running the tests, generating stubs, executing notebooks.
+# Building the extension, running the tests, generating stubs.
 dev = [
     "pytest>=8",
     "ruff>=0.6",
@@ -120,7 +120,6 @@ extend-exclude = [
     "third_party",
     "build*",
     "deps_*",
-    "notebooks",
     "paper-workshop",
 ]
 
