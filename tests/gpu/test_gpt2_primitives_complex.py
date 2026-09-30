@@ -22,7 +22,7 @@ penv.export_env(DEVICE, chain=CHAIN, CKKS_COMPLEX="1")
 from perseus.impl import attention, config, layout  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 from examples.gpt2_from_primitives import head, weights  # noqa: E402
-from examples.gpt2_from_primitives.model import Gpt2Primitives  # noqa: E402
+from examples.gpt2_from_primitives.model import Gpt2Model  # noqa: E402
 
 CFG = ROOT / ("configs/model/approximation/"
               + ("gpt2_base_n32" if CHAIN == "n32" else "gpt2_base")
@@ -91,7 +91,7 @@ def test_kv_pair_push_and_attention_vs_core(S):
 
 def test_cutmax_packed_vs_core(S):
     inf, core, rt = S["inf"], S["core"], S["rt"]
-    model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1)
+    model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1)
     assert model.complex
     os.environ["STEPS_T"] = "128"
     gt = core.read_lm_head_steps(core.RunConfig.from_env())
@@ -245,7 +245,7 @@ def test_complex_kv_buckets_vs_real_path(S):
 
 def test_paired_lm_head_and_cutmax(S):
     inf, core, rt = S["inf"], S["core"], S["rt"]
-    model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1, packing="cachemir_complex")
+    model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1, packing="cachemir_complex")
     os.environ["STEPS_T"] = "128"
     gt = core.read_lm_head_steps(core.RunConfig.from_env())
     Wlm = weights.lm_head_matrix(S["store"], S["cfgs"].ln_f, rt.dims, model.vocab)
@@ -269,7 +269,7 @@ def test_kv_offload_matches_resident(S):
     inputs = core.read_teacher_forced_inputs(cfg)[:3]
     out = {}
     for offload in (False, True):
-        model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=2, kv_offload=offload)
+        model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=2, kv_offload=offload)
         assert model.kv_offload == offload
         res = model.run_decode(inputs)
         out[offload] = [r["logits"] for r in res]

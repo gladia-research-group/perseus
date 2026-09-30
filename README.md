@@ -101,16 +101,16 @@ oracle the embedded tokens are read from:
 ```python
 import os
 from examples.gpt2_from_primitives import env, weights
-from examples.gpt2_from_primitives.model import Gpt2Primitives
+from examples.gpt2_from_primitives.model import Gpt2Model
 
 PACKING = "cachemir_complex"                    # the packing the shipped plans were cut under
 sess = env.open_session(device=0, chain="n32", GPT2_PACKING=PACKING)   # decode env + keygen
 from perseus import _core                       # after the session has exported its env
 from perseus.impl import config
 
-model = Gpt2Primitives(sess.inf, weights.RawStore(os.environ["WEIGHTS_PATH"]),
-                       config.load_configs("configs/model/approximation/gpt2_base_n32/configs.json"),
-                       core=_core, packing=PACKING)
+model = Gpt2Model(sess.inf, weights.RawStore(os.environ["WEIGHTS_PATH"]),
+                  config.load_configs("configs/model/approximation/gpt2_base_n32/configs.json"),
+                  core=_core, packing=PACKING)
 model.load_plans("bootstrap_placements/gpt2_decode_python_n32")      # without it: eager
 cfg = _core.RunConfig.from_env(); cfg.tokens = 4
 out = model.run_decode(_core.read_teacher_forced_inputs(cfg), argmax=True)   # one record per token

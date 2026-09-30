@@ -25,7 +25,7 @@ from .head import (cutmax_argmax, cutmax_argmax_packed, decode_logits, decode_z,
 from . import weights as W
 
 
-class Gpt2Primitives(ImplModel):
+class Gpt2Model(ImplModel):
     def __init__(self, inf, store, cfgs: Configs, *, core=None, n_layers=None,
                  fold_ln1=True, fold_ln2=True, fold_lnf=False, lmhead_cap=44,
                  unit=None, profile=False, packing="cachemir", kv_offload=None):

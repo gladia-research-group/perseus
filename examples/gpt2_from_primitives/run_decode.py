@@ -73,7 +73,7 @@ def main(argv=None):
     from perseus import _core
     from perseus.impl import config
     from . import weights
-    from .model import Gpt2Primitives, dist_gate
+    from .model import Gpt2Model, dist_gate
 
     # `over` has to reach open_session as well: it calls export_env a second time, and a
     # second call re-applies env.ENV over anything set here.
@@ -82,7 +82,7 @@ def main(argv=None):
     inf = sess.inf
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
-    model = Gpt2Primitives(inf, store, cfgs, core=_core, n_layers=a.layers, profile=a.profile, packing=a.packing)
+    model = Gpt2Model(inf, store, cfgs, core=_core, n_layers=a.layers, profile=a.profile, packing=a.packing)
     missing = env.rotation_audit(inf.fhe, model.rt.dims)
     if missing:
         print(f"rotation keys missing from the band: {missing}", file=sys.stderr)

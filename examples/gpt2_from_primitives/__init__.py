@@ -13,7 +13,7 @@ layout, linear, norm, attention, activation, config, Rt, ImplModel, fake)
     weights     export zip -> padded / folded / rearranged matrices -> EncodedLinear
     block       transformer_block()
     head        final_ln, lm_head, decode_logits, cutmax_argmax, feedback_embed
-    model       Gpt2Primitives(ImplModel): stages, per-step masks, decode_token /
+    model       Gpt2Model(ImplModel): stages, per-step masks, decode_token /
                 argmax_encrypted / feedback / run_decode / generate
     ref         the plaintext mirror (norm_ref, gelu_ref, softmax_ref, attention_ref, cutmax_ref)
     env         the session env (the C++ n32 decode preset, folded ln_1/ln_2) and factory

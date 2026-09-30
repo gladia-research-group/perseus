@@ -40,8 +40,8 @@ def test_unplanned_model_has_no_plans(tmp_path):
 
 def test_generate_refuses_a_plan_without_the_feedback_variant(tmp_path):
     pytest.importorskip("examples.gpt2_from_primitives.model")
-    from examples.gpt2_from_primitives.model import Gpt2Primitives
+    from examples.gpt2_from_primitives.model import Gpt2Model
     m = _model(tmp_path, ["block_0_placement.json"])
-    m.__class__ = Gpt2Primitives
+    m.__class__ = Gpt2Model
     with pytest.raises(RuntimeError, match="block_0_feedback_placement.json"):
         m.generate([[0.0]], 1)

@@ -23,7 +23,7 @@ from perseus.impl import attention, config, layout, linear, norm  # noqa: E402
 from perseus.impl import activation as gelu  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 from examples.gpt2_from_primitives import block, head, weights  # noqa: E402
-from examples.gpt2_from_primitives.model import Gpt2Primitives  # noqa: E402
+from examples.gpt2_from_primitives.model import Gpt2Model  # noqa: E402
 
 CFG = ROOT / ("configs/model/approximation/"
               + ("gpt2_base_n32" if CHAIN == "n32" else "gpt2_base")
@@ -166,7 +166,7 @@ def test_block_vs_core(S):
     st = _block_state(S, 0)
     core.reset_kv_cache(inf, 1)
     inf.block_prefix = core.block_scope(0)
-    model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1)
+    model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1)
     model.start()
     w = model.block_weights(0)
     os.environ["MULTI_T"] = "4"
@@ -192,7 +192,7 @@ def test_block_vs_core(S):
 
 def test_lm_head_and_cutmax_vs_core(S):
     inf, core, rt = S["inf"], S["core"], S["rt"]
-    model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1)
+    model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1)
     # a hidden state that reproduces the oracle's token-0 logits (CutMax's schedule is
     # calibrated for GPT-2 logit statistics, so a random vector is outside its envelope)
     os.environ["STEPS_T"] = "128"
@@ -220,7 +220,7 @@ def test_capture_plan_planned_one_block(S, tmp_path):
     forward must match the eager one."""
     import subprocess
     inf, core, rt = S["inf"], S["core"], S["rt"]
-    model = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1)
+    model = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1)
     os.environ["MULTI_T"] = "4"
     inputs = core.read_teacher_forced_inputs(core.RunConfig.from_env())
     graph_dir = tmp_path / "graphs"
@@ -234,7 +234,7 @@ def test_capture_plan_planned_one_block(S, tmp_path):
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     plan_dir = ROOT / "bootstrap_placements" / out_name
     try:
-        model2 = Gpt2Primitives(inf, S["store"], S["cfgs"], core=core, n_layers=1)
+        model2 = Gpt2Model(inf, S["store"], S["cfgs"], core=core, n_layers=1)
         model2.load_plans(str(plan_dir))
         planned = model2.run_decode(inputs[:2])
         for e, p in zip(eager, planned):

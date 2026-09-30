@@ -56,12 +56,12 @@ def main(argv=None):
     from perseus import _core
     from perseus.impl import config
     from . import weights
-    from .model import Gpt2Primitives
+    from .model import Gpt2Model
 
     sess = env.open_session(a.device, complex_payload=(a.payload == "complex"),
                             chain=a.chain, **over)
-    model = Gpt2Primitives(sess.inf, weights.RawStore(a.weights), config.load_configs(a.configs),
-                           core=_core, n_layers=a.layers, packing=a.packing)
+    model = Gpt2Model(sess.inf, weights.RawStore(a.weights), config.load_configs(a.configs),
+                      core=_core, n_layers=a.layers, packing=a.packing)
     if a.capture:
         model.set_capture(a.capture)
     if a.plan:
