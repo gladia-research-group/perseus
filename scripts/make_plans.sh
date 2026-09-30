@@ -33,6 +33,10 @@ for d in "${dirs[@]}"; do
         env $recipe bash "$tool" "$graph" "$d" > "$log" 2>&1
         # shellcheck disable=SC2086
         env $recipe bash "$tool" "$graph" "$d" argmax >> "$log" 2>&1
+        if grep -q "^tool=.*feedback" "$cmd"; then      # block 0 for a fed-back token (generation)
+            # shellcheck disable=SC2086
+            env $recipe bash "$tool" "$graph" "$d" feedback >> "$log" 2>&1
+        fi
     else
         # shellcheck disable=SC2086
         env $recipe bash "$tool" "$graph" "$d" ${route:-sparse} > "$log" 2>&1

@@ -8,7 +8,9 @@ Modes (the same loop the C++ / EncGPT2 runs):
     capture   ``set_capture(graph_dir)``: block_<b>/graph.json per stage for the capture token
               (FHE_GRAPH_CAPTURE_TOKEN, default 0) plus capture_env.json (the plan contract)
     planned   ``load_plans(plan_dir)``: block_<b>_placement.json installed live per stage,
-              strict (the op sequence must match the capture)
+              strict (the op sequence must match the capture); a variant
+              block_<b>_<variant>_placement.json replaces it while ``plan_variant`` is set
+              (a stage entered in another state than the capture's, e.g. a fed-back token)
 
 Stages. ``token_stages(x, pos)`` returns ``[(label, prefix, fn)]``: ``fn(x) -> x`` runs the
 stage's ops; ``prefix`` names the block's cached weight plaintexts (``set_slot_pt`` names
@@ -49,6 +51,8 @@ class ImplModel:
             ops = FheOps(inf, core, unit, prec)
         self.rt = Rt(ops, dims or Dims.from_inf(inf))
         self.plans = None
+        self.plan_variants = {}
+        self.plan_variant = None
         self.graph_dir = None
         # weight-upload overlap through the runtime's residency ring (needs the real core)
         self.overlap = (hasattr(core, "run_stages") and hasattr(core, "Stage")
@@ -101,19 +105,33 @@ class ImplModel:
             json.dump(_contract.capture_contract(self.inf), f, indent=2)
         self.graph_dir = str(graph_dir)
 
-    def load_plans(self, plan_dir, blocks, validate=True):
+    def load_plans(self, plan_dir, blocks, validate=True, variants=()):
         """PLANNED: block_<b>_placement.json for b in `blocks`, contract-checked against this
-        session. A stage without a plan file runs eager under the planned model."""
+        session, and block_<b>_<v>_placement.json for each of `variants` where present. A
+        stage without a plan file runs eager under the planned model."""
         from perseus.plan import contract as _contract
-        self.plans = {}
-        for b in blocks:
-            p = os.path.join(plan_dir, f"block_{b}_placement.json")
-            if not os.path.exists(p):
-                continue
+
+        def load(p):
             if validate:
                 _contract.validate_contract(_contract.read_stamp(p), self.inf, source=p)
-            self.plans[b] = self.core.parse_bootstrap_plan_file(p)
+            return self.core.parse_bootstrap_plan_file(p)
+
+        self.plans, self.plan_variants = {}, {v: {} for v in variants}
+        for b in blocks:
+            p = os.path.join(plan_dir, f"block_{b}_placement.json")
+            if os.path.exists(p):
+                self.plans[b] = load(p)
+            for v in variants:
+                p = os.path.join(plan_dir, f"block_{b}_{v}_placement.json")
+                if os.path.exists(p):
+                    self.plan_variants[v][b] = load(p)
         return self
+
+    def _plan_for(self, b):
+        if self.plans is None:
+            return None
+        plan = self.plan_variants.get(self.plan_variant, {}).get(b)
+        return plan if plan is not None else self.plans.get(b)
 
     def enter_stage(self, b, pos):
         """Per-stage graph / plan setup (the C++ decode body: reset the naming state, scope,
@@ -121,12 +139,12 @@ class ImplModel:
         inf, core = self.inf, self.core
         if self.plans is not None or os.environ.get("FHE_GRAPH_DIR"):
             core.reset_graph_runtime(inf)
-            if self.plans is not None and b not in self.plans:
+            if self.plans is not None and self._plan_for(b) is None:
                 inf.clear_bootstrap_plan()      # this stage runs eager under a planned model
         inf.block_prefix = core.block_scope(b)
         inf.capture_b = b
         inf.capture_t = pos
-        plan = (self.plans or {}).get(b)
+        plan = self._plan_for(b)
         if plan is not None:
             core.install_plan_live(inf, plan)
         return core.begin_subgraph_capture(inf, b)

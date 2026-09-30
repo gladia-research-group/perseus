@@ -235,6 +235,37 @@ def _load_table(cfg: PlanConfig) -> btserr.AccuracyTable:
     return btserr.AccuracyTable.for_chain(cfg.acc_chain)
 
 
+def fed_back_entry(graph_file: Path | str) -> tuple[int, int]:
+    """(level, deg) at which a token fed back by generation enters the block: the landing of
+    the feedback's refresh, as the capture's own refreshes record it (the dense landing; a
+    sparse one is richer). A block planned from this entry serves that token."""
+    nodes = json.loads(Path(graph_file).read_text())["nodes"]
+    n = max((n for n in nodes if n["op_type"].endswith("bootstrap")),
+            key=lambda n: n["output_level"])
+    return int(n["output_level"]), int(n["output_noise_level"])
+
+
+
+def plan_fed_back_block0(plan_fn, graph_dir: Path | str, out_dir: Path | str) -> Path:
+    """Block 0 once more, for a token fed back by generation: ``plan_fn(0, entry)`` from
+    :func:`fed_back_entry`, written as block_0_feedback_placement.json next to the plan. Its
+    exit must be block 0's, since block 1's plan binds to that exit."""
+    lvl, deg = fed_back_entry(Path(graph_dir) / "block_0" / "graph.json")
+    r = plan_fn(0, dict(entry_level=lvl, entry_deg=deg))
+    if r is None:
+        raise ValueError(f"block 0 is infeasible from the fed-back entry ({lvl}, deg {deg})")
+    key = lambda s: (s.get("exit_var"), s.get("exit_level"), s.get("exit_deg") or 1)  # noqa: E731
+    b0 = json.loads((Path(out_dir) / "block_0_placement.json").read_text())["summary"]
+    if key(r["summary"]) != key(b0):
+        raise ValueError(f"the fed-back entry moves block 0's exit {key(b0)} -> "
+                         f"{key(r['summary'])}: block 1's plan would not bind")
+    p = Path(out_dir) / "block_0_feedback_placement.json"
+    p.write_text(json.dumps(r, indent=1), encoding="utf-8")
+    print(f"block_0 fed back from ({lvl}, deg {deg}): total={r['summary']['total_bootstraps']}",
+          flush=True)
+    return p
+
+
 def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                entry_level: int | None = None,
                entry_deg: int | None = None,

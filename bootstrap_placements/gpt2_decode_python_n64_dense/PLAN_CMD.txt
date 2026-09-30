@@ -1,4 +1,4 @@
 graph=graphs/gpt2_decode_python_n64 (md5 6a9d0daeb2a411eaf59aaafbcf87853f)
-tool=examples/gpt2_from_primitives/make_plan.sh (blocks, then argmax)
+tool=examples/gpt2_from_primitives/make_plan.sh (blocks, argmax, then feedback)
 recipe=MAX_LEVEL=24 BTS_LEVEL=18 SRC_LEVEL=17 CACHE_READ_LEVEL=18 PLAN_LEVEL_UNIT=1 PLAN_ACC_CHAIN= PLAN_NO_PRESCALE=1 PLAN_CF_MIN=7 PLAN_CF_MAX=20 PLAN_MAG_SAFETY=2 PLAN_SPARSE_SLOTS=512,1 PLAN_SPARSE_BTS_OUT=1:13,512:18 PLAN_REFRESH_ENV_CAP=25 PLAN_HINT_ENV_VETO=0 PLAN_SPARSE_SLOTS= PLAN_SPARSE_BTS_OUT= PLAN_PRUNE=1
 acc_table=analytic error model (no measured table)

@@ -31,6 +31,13 @@ excludes the 23 deliberate bootstraps per token the code itself runs; `executed`
 A dense plan (`PLAN_SPARSE_SLOTS=`) runs with `SPARSE_AUTO=0 SPARSE_BTS_SLOTS=0`, which its
 contract stamp demands.
 
+Every plan above except the ablations and `python/orion_dense` also carries
+`block_0_feedback_placement.json`: block 0 planned once more, the same way, for a token fed back
+by generation, which enters as the landing of a bootstrap rather than as a fresh encryption
+(`make_plan.sh ... feedback`; the DaCapo and Orion deploys replay the tool's block-0 sites from
+that entry). On the dense route Orion's marks leave block 0's first LayerNorm product over
+budget from that entry, rescue included, so generation refuses that plan.
+
 Notes.
 * The 32-bit plans are priced with the measured accuracy table; the 64-bit plans with the
   analytic error model (`PLAN_ACC_CHAIN=`).

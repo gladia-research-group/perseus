@@ -201,7 +201,7 @@ print(f"  the capture fired {eager} reactive bootstraps")
 ## 6. Plan the bootstraps
 
 `scripts/make_plans.sh gpt2_decode_python_n32` runs the min-cut placer over the captured graph
-with the recipe in the directory's `PLAN_CMD.txt` (blocks, then the argmax stage) and writes one
+with the recipe in the directory's `PLAN_CMD.txt` (blocks, the argmax stage, the fed-back block 0) and writes one
 `block_<b>_placement.json` per block. Pure Python, seconds on the CPU. `bash
 scripts/make_plans.sh` (no argument) regenerates every shipped plan, the baselines included;
 `bootstrap_placements/README.md` maps each directory to its table row.

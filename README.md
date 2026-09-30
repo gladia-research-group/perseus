@@ -245,7 +245,7 @@ Pure Python, seconds on the CPU. Each plan directory's `PLAN_CMD.txt` holds its 
 `make_plans.sh` replays them:
 
 ```bash
-bash scripts/make_plans.sh gpt2_decode_python_n32     # the 32-bit plan: blocks, then the argmax stage
+bash scripts/make_plans.sh gpt2_decode_python_n32     # the 32-bit plan: blocks, argmax, fed-back block 0
 bash scripts/make_plans.sh                            # every shipped plan
 ```
 
@@ -271,7 +271,12 @@ $DECODE --plan bootstrap_placements/gpt2_decode_python_n32     # the 32-bit row:
 $DECODE --plan bootstrap_placements/python/dacapo              # a baseline (python/orion, python/fhelipe)
 $DECODE                                                        # eager: refreshes reactively, no plan
 $DECODE --plan bootstrap_placements/gpt2_decode_python_n32_dense --set SPARSE_AUTO=0 --set SPARSE_BTS_SLOTS=0
+.venv/bin/python -m examples.gpt2_from_primitives.run_generate --prompt 4 --tokens 8 \
+    --plan bootstrap_placements/gpt2_decode_python_n32          # generation: the argmax fed back encrypted
 ```
+
+Generation enters block 0 with the fed-back token, which arrives as the landing of a bootstrap
+rather than as a fresh encryption; the plan's `block_0_feedback_placement.json` covers that entry.
 
 The 64-bit row runs with `CHAIN=n64` exported before `source scripts/local_env.sh`, the import
 symlink pointed at `_core.n64.so`, and `--chain n64 --plan bootstrap_placements/gpt2_decode_python_n64`.

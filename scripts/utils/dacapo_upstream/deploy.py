@@ -7,8 +7,9 @@ rescue repair come from perseus, and redundant refreshes are pruned (PLAN_PRUNE=
 the forced exit refresh is never pruned). As hecate assumes fresh block inputs, each block's exit is
 refreshed so the next block enters at the landing (as the Orion deploy does). The argmax stage
 (the last block, entered from the tail's exit) is planned like make_plan.sh's second stage:
-hints dissolved and the refresh envelope hard. Every block plan is stamped with the capture
-contract (a dense plan with the dense routing env).
+hints dissolved and the refresh envelope hard; block 0 is replayed once more from a fed-back
+token's entry (block_0_feedback_placement.json, generation). Every block plan is stamped with
+the capture contract (a dense plan with the dense routing env).
 
     SITES=<sites.json> GRAPH_DIR=<graph> OUT=<name> [ML=48] [PLAN_DENSE=1] \\
         python scripts/utils/dacapo_upstream/deploy.py
@@ -21,7 +22,7 @@ from pathlib import Path
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 sys.path.insert(0, ".")
 
-from perseus.plan.placer.planner import PlanConfig, plan_block          # noqa: E402
+from perseus.plan.placer.planner import PlanConfig, plan_block, plan_fed_back_block0  # noqa: E402
 from perseus.plan.placer.place import PlanInfeasible                    # noqa: E402
 from perseus.plan import contract                                       # noqa: E402
 import perseus.plan.placer.baselines.dacapo as db                       # noqa: E402
@@ -48,28 +49,29 @@ if DENSE:
 
 _orig = db.DaCapoPlacer.choose_sites
 
-el = ed = None
-tot = feas = 0
 n_blocks = len(SITES)
 ARGMAX = n_blocks - 1 if (GRAPHS / f"block_{n_blocks - 1}").is_dir() and n_blocks > 13 else None
-for bi in range(n_blocks):
-    entry = {} if el is None else dict(entry_level=el, entry_deg=ed)
+
+
+def deploy_block(bi, entry):
+    """hecate's targets for block bi replayed from `entry`, the exit refresh forced; None if
+    infeasible even with the rescue."""
     sites = set(SITES[f"block_{bi}"]["sites"])
     stage = dict(dissolve_hints=True) if bi == ARGMAX else {}
 
-    def run(extra=None, resc=False, _s=sites, _bi=bi, _entry=entry, _stage=stage):
-        chosen = set(_s) | set(extra or ())
+    def run(extra=None, resc=False):
+        chosen = sites | set(extra or ())
         db.DaCapoPlacer.choose_sites = lambda self, s0, _c=chosen: set(_c)
         hard = os.environ.get("PLAN_HARD_ENV_CAP")
-        if _stage:
+        if stage:
             os.environ["PLAN_HARD_ENV_CAP"] = "1"
         try:
-            cfg = PlanConfig(placer="dacapo", baseline_rescue=resc, **CFG, **_stage,
+            cfg = PlanConfig(placer="dacapo", baseline_rescue=resc, **CFG, **stage,
                              prune_keep=tuple(extra or ()))
-            return plan_block(GRAPHS / f"block_{_bi}" / "graph.json", cfg, **_entry)
+            return plan_block(GRAPHS / f"block_{bi}" / "graph.json", cfg, **entry)
         finally:
             db.DaCapoPlacer.choose_sites = _orig
-            if _stage:
+            if stage:
                 if hard is None:
                     os.environ.pop("PLAN_HARD_ENV_CAP", None)
                 else:
@@ -82,7 +84,7 @@ for bi in range(n_blocks):
             r = run(resc=True)
         except PlanInfeasible as e:
             print(f"block_{bi}: INFEASIBLE {str(e).splitlines()[0][:70]}")
-            break
+            return None
     ev = r["summary"].get("exit_var")
     if ev and bi < n_blocks - 1:
         for kw in (dict(extra={ev}), dict(extra={ev}, resc=True)):
@@ -91,6 +93,15 @@ for bi in range(n_blocks):
                 break
             except PlanInfeasible:
                 continue
+    return r
+
+
+el = ed = None
+tot = feas = 0
+for bi in range(n_blocks):
+    r = deploy_block(bi, {} if el is None else dict(entry_level=el, entry_deg=ed))
+    if r is None:
+        break
     s = r["summary"]
     (OUT / f"block_{bi}_placement.json").write_text(json.dumps(r, indent=1), encoding="utf-8")
     tot += s["total_bootstraps"]
@@ -98,10 +109,16 @@ for bi in range(n_blocks):
     el, ed = s.get("exit_level"), s.get("exit_deg") or 1
     print(f"block_{bi}: total={s['total_bootstraps']} exit={el}/d{ed} "
           f"placements={len(r.get('placements', []))}", flush=True)
+out = [OUT / f"block_{bi}_placement.json" for bi in range(feas)]
+if feas == n_blocks:
+    try:
+        out.append(plan_fed_back_block0(deploy_block, GRAPHS, OUT))
+    except ValueError as e:     # the tool's sites do not fit that entry: generation refuses the plan
+        print(f"no fed-back block 0: {e}", flush=True)
 cap = json.load(open(GRAPHS / "capture_env.json"))
 if DENSE:
     cap["env"].update(SPARSE_AUTO="0", SPARSE_BTS_SLOTS="0")
-for bi in range(feas):
-    contract.stamp_file(str(OUT / f"block_{bi}_placement.json"), cap)
+for p in out:
+    contract.stamp_file(str(p), cap)
 print(f"\nUPSTREAM DACAPO ARM: {feas}/{n_blocks} feasible, TOTAL={tot} -> {OUT}")
 sys.exit(0 if feas == n_blocks else 1)

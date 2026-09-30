@@ -93,9 +93,11 @@ class Gpt2Primitives(ImplModel):
         """block_<b>_placement.json for the transformer blocks, the tail and, when present,
         CutMax (n_layers+1, planned from the same capture with the tail plan's exit as its
         entry: make_plan.sh ... argmax) and the feedback (n_layers+2); a stage without a
-        plan file runs eager."""
+        plan file runs eager. block_0_feedback_placement.json (make_plan.sh ... feedback) is
+        block 0 planned for a fed-back token, which enters at the landing of the feedback's
+        bootstrap instead of as the fresh encryption the capture recorded; generate() uses it."""
         return super().load_plans(plan_dir, range(self.n_layers + (3 if argmax_blocks else 1)),
-                                  validate=validate)
+                                  validate=validate, variants=("feedback",))
 
     # ── the hooks ──
     def start(self):
@@ -234,6 +236,9 @@ class Gpt2Primitives(ImplModel):
     def generate(self, prompt_rows, n_tokens, gt_logits=None, on_step=None):
         """src/app/pipeline.cu / perseus.nn.gpt2.stream: the prompt through decode
         steps (LM head on the last), then CutMax argmax + encrypted feedback."""
+        if self.plans and 0 in self.plans and 0 not in self.plan_variants.get("feedback", {}):
+            raise RuntimeError("planned generation needs block_0_feedback_placement.json in the "
+                               "plan dir: make_plan.sh <graph> <plan> feedback")
         self.start()
         P = len(prompt_rows)
         for p, row in enumerate(prompt_rows):
@@ -261,7 +266,11 @@ class Gpt2Primitives(ImplModel):
             if j + 1 < n_tokens:
                 self.token_begin(pos + 1)
                 x = self.feedback(z, pos + 1)
-                tiles = self.decode_token(x, pos + 1)
+                self.plan_variant = "feedback"
+                try:
+                    tiles = self.decode_token(x, pos + 1)
+                finally:
+                    self.plan_variant = None
                 self.token_tail(pos + 1)
             rec["step_s"] = time.time() - t0
         return out

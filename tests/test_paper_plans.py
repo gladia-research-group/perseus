@@ -1,8 +1,9 @@
 """Every shipped plan regenerates from its graph with the recipe in its PLAN_CMD.txt.
 
 A plan whose PLAN_CMD.txt names ``tool=examples/gpt2_from_primitives/make_plan.sh`` (the
-Python implementation's plans) is regenerated with that tool: the blocks, then the argmax stage
-(block 13, entered at the tail plan's exit), each stamped with the capture contract.
+Python implementation's plans) is regenerated with that tool: the blocks, the argmax stage
+(block 13, entered at the tail plan's exit) and, where the plan ships one, the feedback stage
+(block 0 entered as a fed-back token), each stamped with the capture contract.
 
 The main plan is always checked; the baselines and ablations (about 20 planner runs, a few
 minutes) run when PERSEUS_ALL_PLANS=1. The python/ DaCapo and Orion plans are regenerated with the released tools
@@ -94,6 +95,8 @@ def test_plan_regenerates(name, equiv, tmp_path):
         cmds = [["bash", tool, graph, out_name, route]]
     else:
         cmds = [["bash", tool, graph, out_name], ["bash", tool, graph, out_name, "argmax"]]
+        if (plan_dir / "block_0_feedback_placement.json").exists():
+            cmds.append(["bash", tool, graph, out_name, "feedback"])
     log = tmp_path / "plan.log"
     rc = 0
     with log.open("w") as f:

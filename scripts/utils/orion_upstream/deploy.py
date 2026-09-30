@@ -7,8 +7,9 @@ come from perseus, and redundant refreshes are pruned (PLAN_PRUNE=0 keeps them; 
 exit refresh is never pruned). Each block's exit is refreshed so the next block enters at the landing (the
 solver plans every block from a fresh input). The argmax stage (the last block, entered from
 the tail's exit) is planned like make_plan.sh's second stage: hints dissolved and the refresh
-envelope hard. Every block plan is stamped with the capture contract (a dense plan with the
-dense routing env).
+envelope hard; block 0 is replayed once more from a fed-back token's entry
+(block_0_feedback_placement.json, generation). Every block plan is stamped with the capture
+contract (a dense plan with the dense routing env).
 
   RESULTS=<marks.json> GRAPH_DIR=<graph> OUT=<name> [PLAN_DENSE=1] [ML=48] \
       python scripts/utils/orion_upstream/deploy.py
@@ -22,7 +23,7 @@ os.environ.setdefault("PLAN_ACC_CHAIN", "n32")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 sys.path.insert(0, ".")
 
-from perseus.plan.placer.planner import PlanConfig, plan_block          # noqa: E402
+from perseus.plan.placer.planner import PlanConfig, plan_block, plan_fed_back_block0  # noqa: E402
 from perseus.plan.placer.place import PlanInfeasible                    # noqa: E402
 from perseus.plan import contract                                       # noqa: E402
 import perseus.plan.placer.baselines.orion as ob                        # noqa: E402
@@ -99,25 +100,25 @@ class _Stage:
 
 N = len(UP)
 ARGMAX = N - 1 if N > 13 else None
-el = ed = None
-tot = feas = 0
-for bi in range(N):
-    entry = {} if el is None else dict(entry_level=el, entry_deg=ed)
+
+
+def deploy_block(bi, entry):
+    """Upstream's marks for block bi replayed from `entry`, the exit refresh forced; None if
+    infeasible even with the rescue."""
     with _Stage(bi == ARGMAX) as stage:
         w = upstream_sites(bi, entry, stage)
 
-    def run(extra=None, resc=False, _w=w, _bi=bi, _entry=entry):
-        sites = set(_w) | set(extra or ())
+    def run(extra=None, resc=False):
+        sites = set(w) | set(extra or ())
         ob.OrionPlacer.choose_sites = lambda self, s0, _s=sites: set(_s)
         try:
-            with _Stage(_bi == ARGMAX) as stage:
+            with _Stage(bi == ARGMAX) as stage:
                 cfg = PlanConfig(placer="orion", baseline_rescue=resc, **CFG, **stage,
                                  prune_keep=tuple(extra or ()))
-                return plan_block(GRAPHS / f"block_{_bi}" / "graph.json", cfg, **_entry)
+                return plan_block(GRAPHS / f"block_{bi}" / "graph.json", cfg, **entry)
         finally:
             ob.OrionPlacer.choose_sites = _orig
 
-    r = None
     try:
         r = run()
     except PlanInfeasible:
@@ -125,7 +126,7 @@ for bi in range(N):
             r = run(resc=True)
         except PlanInfeasible as e:
             print(f"block_{bi}: INFEASIBLE {str(e).splitlines()[0][:70]}")
-            break
+            return None
     # force the terminal exit refresh so the next block enters at the landing
     ev = r["summary"].get("exit_var")
     if ev and bi < N - 1:
@@ -135,6 +136,15 @@ for bi in range(N):
                 break
             except PlanInfeasible:
                 continue
+    return r
+
+
+el = ed = None
+tot = feas = 0
+for bi in range(N):
+    r = deploy_block(bi, {} if el is None else dict(entry_level=el, entry_deg=ed))
+    if r is None:
+        break
     s = r["summary"]
     (OUT / f"block_{bi}_placement.json").write_text(json.dumps(r, indent=1), encoding="utf-8")
     tot += s["total_bootstraps"]
@@ -142,10 +152,16 @@ for bi in range(N):
     el, ed = s.get("exit_level"), s.get("exit_deg") or 1
     print(f"block_{bi}: total={s['total_bootstraps']} exit={el}/d{ed} "
           f"placements={len(r.get('placements', []))}", flush=True)
+out = [OUT / f"block_{bi}_placement.json" for bi in range(feas)]
+if feas == N:
+    try:
+        out.append(plan_fed_back_block0(deploy_block, GRAPHS, OUT))
+    except ValueError as e:     # the tool's sites do not fit that entry: generation refuses the plan
+        print(f"no fed-back block 0: {e}", flush=True)
 cap = json.load(open(GRAPHS / "capture_env.json"))
 if DENSE:
     cap["env"].update(SPARSE_AUTO="0", SPARSE_BTS_SLOTS="0")
-for bi in range(feas):
-    contract.stamp_file(str(OUT / f"block_{bi}_placement.json"), cap)
+for p in out:
+    contract.stamp_file(str(p), cap)
 print(f"\nUPSTREAM ORION ARM: {feas}/{N} feasible, TOTAL={tot} -> {OUT}")
 sys.exit(0 if feas == N else 1)
