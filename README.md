@@ -153,6 +153,17 @@ nonlinearity (the shipped `gpt2_base_n32/configs.json` is the one the results us
 oracle holds the plaintext logits the decode gate compares against.
 `notebooks/setup_artifacts.ipynb` walks through the same steps and skips any that exist.
 
+An HE-aware-trained checkpoint, such as the HEAT GPT-2, is exported onto its base model with
+`--checkpoint` (a `model.pt` or a hub repo id):
+
+```bash
+.venv/bin/perseus-export --model openai-community/gpt2 \
+    --checkpoint gladia/heat-gpt2-small-openwebtext --tag heat --out .cache/models/gladia/heat-gpt2
+.venv/bin/python scripts/utils/gen_gpt2_oracle.py --model openai-community/gpt2 \
+    --checkpoint gladia/heat-gpt2-small-openwebtext \
+    --pool .cache/pools/openwebtext_gpt2.npy --out .cache/oracle/gpt2_heat/all_blocks_io
+```
+
 ### 2. Capture
 
 The planner works on a record of one forward: every ciphertext edge with its packing period and

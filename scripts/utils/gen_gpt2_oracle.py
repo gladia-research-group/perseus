@@ -38,6 +38,8 @@ def main():
                     help="horizons to emit; a single forward over max(T) serves all")
     ap.add_argument("--pool-offset", type=int, default=4096,
                     help="start token index into the pool (skip the leading doc boundary)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="HE-aware-trained weights for --model (perseus-export --checkpoint)")
     args = ap.parse_args()
 
     from perseus.hub import load_model
@@ -53,6 +55,9 @@ def main():
     ids = torch.tensor(toks, dtype=torch.long).unsqueeze(0)  # (1, Tmax)
 
     model = load_model(args.model, device="cpu")  # raw HF, fp32, eval
+    if args.checkpoint:
+        from perseus.export import load_trained_backbone
+        load_trained_backbone(model, args.checkpoint)
     model.eval()
 
     with torch.no_grad():

@@ -12,8 +12,9 @@ that grammar — tensors for the store, optional plaintext client-side tensors
 bridge scripts exist. GPT-2 is the identity (HF names ARE the grammar; Conv1D
 weights transpose to the nn.Linear ``(d_out, d_in)`` convention).
 
-Loading an HE-aware-TRAINED backbone checkpoint into the export is not vendored
-(that path lives in he-aware-training's save_weights.py).
+An HE-aware-TRAINED backbone (he-aware-training's ``model.pt``, e.g. the HEAT GPT-2 on the
+hub) is exported with ``--checkpoint``: its weights are loaded into the stock hub model by
+``load_trained_backbone`` (the trainer's own ``save_weights`` rules) and exported as usual.
 """
 
 import argparse
@@ -49,6 +50,57 @@ def _gpt2_client(model):
     so it can build the next input itself (perseus.nn.serve.EncGenerationClient)."""
     sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
     return {"wte": sd["transformer.wte.weight"], "wpe": sd["transformer.wpe.weight"]}
+
+
+# Trained checkpoints keep some Conv1D weights as nn.Linear (the trainer's attention surgery).
+# A rectangular one is recognised by its reversed shape; a square one cannot be, so the adapter
+# names it (he-aware-training: transpose_keys=(".attn.c_proj.weight",)).
+SQUARE_LINEAR = {"gpt2": (".attn.c_proj.weight",)}
+
+
+def _resolve_checkpoint(ref):
+    """A local file, or a hub repo id (``org/name`` -> its ``model.pt``, ``org/name:file``)."""
+    if os.path.exists(ref):
+        return ref
+    from huggingface_hub import hf_hub_download
+    repo, _, fname = ref.partition(":")
+    return hf_hub_download(repo, fname or "model.pt")
+
+
+def load_trained_backbone(model, checkpoint):
+    """Load an HE-aware-trained state dict into the stock hub ``model``, in place.
+
+    The rules of he-aware-training's checkpoint loader: ``model_state_dict`` is unwrapped;
+    a weight stored transposed is transposed back (by shape, or by name when square); the
+    training-only extras (halting logits, approximation parameters and buffers) are dropped.
+    Anything else that does not fit is an error, never a silent re-initialisation.
+    """
+    import torch
+
+    path = _resolve_checkpoint(checkpoint)
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ck.get("model_state_dict", ck)
+    ref = model.state_dict()
+    square = SQUARE_LINEAR.get(model.config.model_type, ())
+    out, dropped = {}, 0
+    for k, t in sd.items():
+        if k not in ref:
+            dropped += 1
+            continue
+        want = tuple(ref[k].shape)
+        if t.dim() == 2 and want[0] == want[1] and k.endswith(square):
+            t = t.t()
+        elif tuple(t.shape) != want and t.dim() == 2 and tuple(t.shape) == want[::-1]:
+            t = t.t()
+        if tuple(t.shape) != want:
+            raise ValueError(f"{k}: checkpoint shape {tuple(t.shape)} != model shape {want}")
+        out[k] = t.contiguous()
+    missing, _ = model.load_state_dict(out, strict=False)
+    missing = [k for k in missing if not k.endswith((".attn.bias", ".attn.masked_bias"))]
+    if missing:
+        raise ValueError(f"{path}: no weights for {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+    log.info(f"Loaded {len(out)} trained tensors from {path} ({dropped} training-only entries dropped)")
+    return path
 
 
 ADAPTERS = {
@@ -110,11 +162,16 @@ def main():
     p.add_argument("--tag", default="classic", help="subdir/tag for this export")
     p.add_argument("--vocab-size", type=int, default=None,
                    help="resize token embeddings (e.g. 50257 for GPT-2)")
+    p.add_argument("--checkpoint", default=None,
+                   help="HE-aware-trained weights for --model: a model.pt, or a hub repo id "
+                        "(org/name[:file])")
     args = p.parse_args()
 
     from perseus.hub import cache_dir, load_model
 
     model = load_model(args.model, vocab_size=args.vocab_size)
+    if args.checkpoint:
+        load_trained_backbone(model, args.checkpoint)
     out = args.out or cache_dir("models", args.model)
     export_weights(model, out, args.tag)
 
