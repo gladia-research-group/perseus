@@ -21,33 +21,35 @@
 \renewcommand{\arraystretch}{1.18}
 \begin{tabular}{lcccccc}
 \toprule
- & \multicolumn{2}{c}{bootstraps / token} & s / token & \multicolumn{2}{c}{fidelity} \\
+ & \multicolumn{2}{c}{bootstraps / token} & s / token & \multicolumn{2}{c}{accuracy} \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-4}\cmidrule(lr){5-6}
-\textbf{System} ($\lambda$=128) & planned\dn & executed\dn & e2e\dn & KL\dn & top-1 (\%)\up \\
+\textbf{System} & planned\dn & executed\dn & total\dn & KL\dn & top-1 (\%)\up \\
 \midrule
-\rowcolor{shade} Eager, 64-bit chain & -- & 552 & 20.74\ci{0.04} & 0.026 & 75.0 \\
-\rowcolor{shade} Eager, 32-bit chain & -- & 912 & 23.49\ci{0.05} & 0.063 & 93.8 \\
+\rowcolor{shade} No plan, 64-bit & -- & 552 & 20.74\ci{0.04} & 0.026 & 75.0 \\
+\rowcolor{shade} No plan, 32-bit & -- & 912 & 23.49\ci{0.05} & 0.063 & 93.8 \\
 \hdashline
 Fhelipe (Krastev et al., 2024)$^{\star}$ & 561 & 584 & 16.10\ci{0.04} & 0.034 & 87.5 \\
 Orion (Ebel et al., 2025)$^{\dagger}$ & 871 & 894 & 21.40\ci{0.06} & 0.142 & 68.8 \\
 DaCapo (Cheon et al., 2024) & 595 & 618 & 16.09\ci{0.18} & 0.067 & 68.8 \\
 \hdashline
-Perseus, 64-bit chain (ours) & 384 & 407 & 16.38\ci{0.06} & 0.002 & 100.0 \\
-\textbf{Perseus, 32-bit chain (ours)} & \textbf{393} & \textbf{416} & \textbf{11.78}\ci{0.11} & 0.026 & 93.8 \\
+Perseus, 64-bit (ours) & 384 & 407 & 16.38\ci{0.06} & 0.002 & 100.0 \\
+\textbf{Perseus, 32-bit (ours)} & \textbf{393} & \textbf{416} & \textbf{11.78}\ci{0.11} & 0.026 & 93.8 \\
 \bottomrule
 \end{tabular}
 
 \vspace{10pt}
 \begin{minipage}{\linewidth}\fontsize{11.5}{14.5}\selectfont
-Encrypted GPT-2 decode through all 12 blocks with the encrypted argmax, 16 teacher-forced
-positions, two isolated sessions per system. \textit{Planned}: refreshes the plan places
-(cut sites and hint-triggered); \textit{executed}: bootstraps per token, including the 23
-deliberate ones the model runs. \textit{e2e}: steady-state wall time per token, mean with its
-95\% interval. \textit{KL}: median over positions of the divergence between the encrypted and
-the plaintext next-token distributions; \textit{top-1}: agreement with the plaintext argmax.
-DaCapo and Orion are the released tools' site selections, unpruned; every baseline runs with
-our correction factors and sparse routing, 48 levels. $^{\star}$Our reimplementation, pruned
-by its published post-pass: the released tool produces no plan on these graphs.
-$^{\dagger}$Misses the reference-rank gate at one position (rank 9, limit 8).
+Encrypted GPT-2 small (all 12 blocks and the encrypted argmax) on 16 consecutive tokens of a
+fixed text, 128-bit security. \textit{Bootstraps per token}: \textit{planned}
+counts those the system's plan places, \textit{executed} all that run, including the ones the
+model itself performs regardless of the plan. \textit{No plan}: bootstrap whenever a value runs
+out of levels. \textit{s / token}: average time per token after the first, with its 95\%
+interval. \textit{KL}: median divergence between the encrypted and the plaintext next-token
+distributions; \textit{top-1}: how often the encrypted top token equals the plaintext one.
+DaCapo and Orion place bootstraps as their released tools output them; all systems run on the
+same runtime with the same bootstrap types and a budget of 48 levels.
+$^{\star}$Our reimplementation, with the redundant-bootstrap removal its paper describes; the
+released tool cannot plan these models. $^{\dagger}$Fails our accuracy check at one position
+(reference token ranked 9th; the limit is 8).
 \end{minipage}
 \end{document}
