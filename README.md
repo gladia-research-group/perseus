@@ -33,8 +33,8 @@ factor its data admits and, where the packing is periodic, with a cheaper sparse
 encrypted GPT-2 decoding it executes 416 bootstraps per token against 584–894 for prior
 placers, and decodes at 11.78 s/token against 16.09–21.40 s/token.
 
-This repository contains the planner, the encrypted GPT-2 model written on the runtime's
-primitives (`perseus.impl`, `examples/gpt2_from_primitives`), the captured graphs and every
+This repository contains the planner, the encrypted GPT-2 model in Python (`perseus.impl`,
+`examples/gpt2_from_primitives`), the captured graphs and every
 bootstrap plan behind the results, and the drivers that regenerate the baselines from the
 released DaCapo and Orion tools. The runtime is a 32-bit composite-scaling port of
 [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)
@@ -72,8 +72,8 @@ keys on the 32-bit row:
 ## Layout
 
 - `perseus/`
-  - `impl/` the model layer on the runtime's primitives: kernels, masks, the residency ring and
-    the capture / planned execution modes.
+  - `impl/` the Python implementation: kernels, masks, the residency ring and the capture /
+    planned execution modes.
   - `plan/` the planner: the captured-graph IR, the level simulator, the min-cut placer, the
     refresh typing (correction factor, sparse route) and the ports of the baseline placers.
   - `nn/`, `calibrate/`, `export.py` the module API, the approximation calibration and the
@@ -92,9 +92,9 @@ keys on the 32-bit row:
 
 ## Python API
 
-Two layers share one session. `perseus.impl` is the one the results run on: an encrypted model
-written in Python on the runtime's leaf primitives, with graph capture and planned execution
-built in. `examples/gpt2_from_primitives` is GPT-2 written on it. From the repository root,
+Two layers share one session. `perseus.impl` is the one the results run on: encrypted models
+written in Python, with graph capture and planned execution built in.
+`examples/gpt2_from_primitives` is GPT-2 written on it. From the repository root,
 after the install below and `source scripts/local_env.sh`, which sets `WEIGHTS_PATH` and the
 oracle the embedded tokens are read from:
 
@@ -120,8 +120,8 @@ model.close(); sess.close()
 
 `model.set_capture(dir)` in place of `load_plans` records the graph the planner reads (step 2
 below). A new model is an `ImplModel` subclass that names its stages, its per-step masks and its
-weights; `perseus/impl/__init__.py` lists the modules, and `docs/PYTHON_API.md` writes an op
-from the primitives.
+weights; `perseus/impl/__init__.py` lists the modules, and `docs/PYTHON_API.md` shows how to
+write a new op.
 
 `perseus.nn` is the module API: modules over the runtime's C++ composites, whose
 approximations are calibrated on your data:
