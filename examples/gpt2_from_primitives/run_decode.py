@@ -92,7 +92,7 @@ def main(argv=None):
     if a.plan:
         model.load_plans(a.plan, argmax_blocks=not a.no_plan_argmax)
 
-    os.environ.setdefault("ALL_BLOCKS_IO_DIR", a.io_dir or "")
+    os.environ["ALL_BLOCKS_IO_DIR"] = a.io_dir or ""   # --io-dir wins over an exported default
     os.environ.setdefault("STEPS_T", "128")   # the shipped per-step logits oracle horizon
     os.environ["MULTI_T"] = str(a.tokens)
     cfg = _core.RunConfig.from_env()
