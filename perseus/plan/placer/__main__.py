@@ -1,7 +1,7 @@
 """Place bootstraps on a captured operation graph.
 
-  perseus-plan --graph-dir graphs/gpt2_decode_n32
-               --out-dir bootstrap_placements/gpt2_decode_n32 [options]
+  perseus-plan --graph-dir graphs/gpt2_decode_python_n32
+               --out-dir bootstrap_placements/gpt2_decode_python_n32 [options]
 
 Levels are given in the chain's own units; --level-unit says how many primes one level
 costs (2 on the 32-bit composite chain, 1 on the 64-bit reference chain).

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # run_bootstrap_all_blocks.sh — env-driven wrapper over `python -m perseus.plan`.
-#   GRAPH_DIR=graphs/gpt2_decode_n32 OUT_NAME=gpt2_decode_n32 <PLAN_* knobs> bash scripts/utils/run_bootstrap_all_blocks.sh
+#   GRAPH_DIR=graphs/gpt2_decode_python_n32 OUT_NAME=<name> <PLAN_* knobs> bash scripts/utils/run_bootstrap_all_blocks.sh
 # Every PLAN_* variable below maps to one planner flag; unset = the planner's default
-# (`python -m perseus.plan --help`). scripts/make_plans.sh holds the paper's recipes.
+# (`python -m perseus.plan --help`). Each shipped plan's recipe is in its PLAN_CMD.txt.
 set -euo pipefail
 GRAPH_DIR="${GRAPH_DIR:?set GRAPH_DIR=<dir with block_N/graph.json>}"
 OUT_NAME="${OUT_NAME:?set OUT_NAME=<bootstrap_placements/<name>>}"

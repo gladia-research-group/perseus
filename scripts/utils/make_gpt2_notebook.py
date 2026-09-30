@@ -39,9 +39,9 @@ A prompt in, a continuation out, under CKKS. The prompt is prefilled, the model 
 to the decode phase and then generates token by token with **encrypted argmax feedback**:
 the sampled token never leaves the ciphertext domain until the end.
 
-The run is **eager**: the shipped bootstrap plans (`bootstrap_placements/gpt2_decode_n32`,
-`gpt2_decode_n64`) are for the paper's oracle-fed decode row (`TASK=decode`), and eager
-generation refreshes reactively whenever a ciphertext runs out of levels.
+The run is **eager**: the checkout ships no plan for the C++ driver (the shipped plans are the
+Python implementation's), and eager generation refreshes reactively whenever a ciphertext runs
+out of levels.
 
 Only the embedding (`wte` + `wpe`) runs client-side. The environment comes from the runner
 (`NB=gpt2_torch bash scripts/run_notebooks.sh`).

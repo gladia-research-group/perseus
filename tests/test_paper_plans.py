@@ -5,8 +5,7 @@ Python implementation's plans) is regenerated with that tool: the blocks, then t
 (block 13, entered at the tail plan's exit), each stamped with the capture contract.
 
 The main plan is always checked; the baselines and ablations (about 20 planner runs, a few
-minutes) run when PERSEUS_ALL_PLANS=1. baselines/orion is the released Orion tool's output and
-is skipped. The python/ DaCapo and Orion plans are regenerated with the released tools
+minutes) run when PERSEUS_ALL_PLANS=1. The python/ DaCapo and Orion plans are regenerated with the released tools
 (scripts/utils/{dacapo,orion}_upstream/plan.sh) when they are present: hecate-opt at
 HECATE_OPT or .cache/dacapo_upstream (build_hecate.sh), an Orion clone at ORION_SRC or
 .cache/orion_upstream. The test neither clones nor builds them. Comparison: scripts/utils/plan_equiv.py (runtime content byte-identical;

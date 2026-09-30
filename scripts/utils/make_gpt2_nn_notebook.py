@@ -209,11 +209,9 @@ parameters; `EncServer` refuses a bundle that disagrees with the options it was 
 the server session here, as in `client_server_minimal.ipynb`; a real deployment runs the
 client in its own process (`scripts/utils/probe_client_server.py` is the two-process form).
 
-**Plans.** The bind is eager. The shipped plans (`bootstrap_placements/gpt2_decode_n32`,
-`gpt2_decode_n64`) are decode-shaped — the oracle-fed decode row of the paper — and
-`generate(feedback="encrypted")` refuses them: the encrypted feedback needs placements for
-the CutMax and the re-embedding tail that those plans do not carry. Planning a generation
-session is a capture of its own (`FHE_GRAPH_DIR`) followed by `perseus-plan`.
+**Plans.** The bind is eager: the shipped plans are the Python implementation's
+(`examples/gpt2_from_primitives`), captured on its own op sequence. Planning a session of these
+modules is a capture of its own (`FHE_GRAPH_DIR`) followed by `perseus-plan`.
 
 **Cost.** Keygen is about a minute of CPU; the bundle is tens of GB on `TMPDIR`; the server
 session takes about a minute to build; the eager, loader-shaped decode is slower per token

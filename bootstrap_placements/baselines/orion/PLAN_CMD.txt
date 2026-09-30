@@ -1,3 +1,0 @@
-graph=graphs/gpt2_decode_n32 (md5 daa081db2a76eff66d9eec4c373add5a)
-note=the released Orion solver's marks (with per-step refresh-entry forbids), deployed like scripts/utils/orion_upstream/deploy.py and repaired by the rescue pass; shipped as an artifact, not regenerated
-acc_table=8dc653fa405969c75f3804a0edfdfe80

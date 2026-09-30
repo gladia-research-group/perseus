@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-PLAN = REPO / "bootstrap_placements" / "gpt2_decode_n32" / "block_0_placement.json"
+PLAN = REPO / "bootstrap_placements" / "gpt2_decode_python_n32" / "block_0_placement.json"
 
 
 @pytest.fixture(scope="module")

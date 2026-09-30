@@ -38,8 +38,8 @@ row — a captured operation graph and the bootstrap plan computed from it.
 | 2 | calibration token pool (`.npy`) | `perseus.calibrate.data` | needs network once |
 | 3 | `configs.json` — the fitted approximations | `perseus-calibrate` (shipped) | minutes, GPU |
 | 4 | the decode oracle (`all_blocks_io/`) | `scripts/utils/gen_gpt2_oracle.py` | seconds, CPU |
-| 5 | the captured graph (`graphs/gpt2_decode_n32`) | `scripts/run_task.sh` (shipped) | minutes, GPU |
-| 6 | the bootstrap plan (`bootstrap_placements/gpt2_decode_n32`) | `scripts/make_plans.sh` (shipped) | seconds, CPU |
+| 5 | the captured graph (`graphs/gpt2_decode_python_n32`) | `examples.gpt2_from_primitives.run_decode --capture` (shipped) | an hour, GPU |
+| 6 | the bootstrap plan (`bootstrap_placements/gpt2_decode_python_n32`) | `scripts/make_plans.sh` (shipped) | seconds, CPU |
 
 Steps 1-4 land under `PERSEUS_DATA` (default `.cache/` in the checkout), which is where
 `scripts/local_env.sh` and the runner look for them; the graph and the plan land in the
@@ -64,8 +64,8 @@ POOL = DATA / "pools" / "openwebtext_gpt2.npy"            # calibration token po
 CONFIGS = Path(os.environ.get("CONFIGS_PATH",
                               REPO / "configs/model/approximation/gpt2_base_n32/configs.json"))
 ORACLE = DATA / "oracle" / "gpt2" / "all_blocks_io"       # the teacher-forced decode oracle
-GRAPHS = REPO / "graphs" / "gpt2_decode_n32"              # captured graph of one forward
-PLAN = REPO / "bootstrap_placements" / "gpt2_decode_n32"  # the paper's main plan
+GRAPHS = REPO / "graphs" / "gpt2_decode_python_n32"              # captured graph of one forward
+PLAN = REPO / "bootstrap_placements" / "gpt2_decode_python_n32"  # the main plan
 
 PYTHON = sys.executable
 
@@ -175,10 +175,10 @@ print(f"oracle: {sorted(p.name for p in ORACLE.glob('*.json'))}")
 ## 5. Capture the graph
 
 The planner works on a record of one forward: every ciphertext edge with its packing period
-and largest coefficient. `STAGE=capture` runs one synchronous forward on the GPU and writes
-`graphs/gpt2_decode_n32/block_<b>/graph.json`; the checkout ships the capture the paper's
-plans were computed on, so this cell normally does nothing. A capture is bound to the
-runtime build and to `configs.json`: change either and re-capture.
+and largest coefficient. `run_decode --capture` runs the first token eagerly on the GPU and
+writes `graphs/gpt2_decode_python_n32/block_<b>/graph.json`, the argmax stage included; the
+checkout ships the capture the plans were computed on, so this cell normally does nothing. A
+capture is bound to the runtime build and to `configs.json`: change either and re-capture.
 """)
 
     code("capture", '''
@@ -186,25 +186,25 @@ graphs = sorted(GRAPHS.glob("block_*/graph.json"))
 if graphs:
     print(f"captured graph present: {len(graphs)} blocks in {GRAPHS.relative_to(REPO)}")
 else:
-    run("bash", "scripts/run_task.sh", TASK="decode", STAGE="capture", CHAIN="n32")
+    run(PYTHON, "-m", "examples.gpt2_from_primitives.run_decode", "--tokens", "1", "--argmax",
+        "--capture", GRAPHS)
     graphs = sorted(GRAPHS.glob("block_*/graph.json"))
 
 eager = sum(sum(n["op_type"] == "auto_bootstrap" for n in json.load(open(g))["nodes"])
             for g in graphs)
-# one forward of the 12 blocks and the LM head; the paper's eager row is a decode session,
-# which also pays the encrypted-argmax tail every token (1310 per token, README Table 1)
+# one forward of the 12 blocks, the LM head and the encrypted argmax; the eager decode row
+# of the README runs 912 per token
 print(f"  the capture fired {eager} reactive bootstraps")
 ''')
 
     md("plan-md", """
 ## 6. Plan the bootstraps
 
-`scripts/make_plans.sh main` runs the min-cut placer over the captured graph with the paper's
-recipe and writes one `block_<b>_placement.json` per block plus `PLAN_CMD.txt` with the exact
-command. Pure Python, seconds on the CPU. `bash scripts/make_plans.sh` (no argument)
-regenerates every plan the paper reports except `baselines/orion`, which is the released
-Orion tool's output and ships as an artifact; `bootstrap_placements/README.md` maps each
-directory to its table row.
+`scripts/make_plans.sh gpt2_decode_python_n32` runs the min-cut placer over the captured graph
+with the recipe in the directory's `PLAN_CMD.txt` (blocks, then the argmax stage) and writes one
+`block_<b>_placement.json` per block. Pure Python, seconds on the CPU. `bash
+scripts/make_plans.sh` (no argument) regenerates every shipped plan, the baselines included;
+`bootstrap_placements/README.md` maps each directory to its table row.
 """)
 
     code("plan", '''
@@ -212,7 +212,7 @@ plans = sorted(PLAN.glob("block_*_placement.json"))
 if plans:
     print(f"plan present: {len(plans)} blocks in {PLAN.relative_to(REPO)}")
 else:
-    run("bash", "scripts/make_plans.sh", "main")
+    run("bash", "scripts/make_plans.sh", "gpt2_decode_python_n32")
     plans = sorted(PLAN.glob("block_*_placement.json"))
 
 # what the paper counts: cut placements + hint-triggered + deliberate refreshes
@@ -228,8 +228,9 @@ print(f"  {total} planned bootstraps ({placed} from the cut, the rest hint-fired
 The artifacts are in place. The measured row is one command:
 
 ```bash
-TASK=decode CHAIN=n32 bash scripts/run_task.sh        # planned decode, prints [decode] PASS
-TASK=decode STAGE=eager bash scripts/run_task.sh      # the same without a plan
+python -m examples.gpt2_from_primitives.run_decode --tokens 16 --argmax \
+    --plan bootstrap_placements/gpt2_decode_python_n32     # planned decode, prints [decode] PASS
+python -m examples.gpt2_from_primitives.run_decode --tokens 16 --argmax   # the same without a plan
 ```
 
 The notebooks run the model interactively (`NB=<name> bash scripts/run_notebooks.sh`

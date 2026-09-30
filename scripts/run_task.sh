@@ -36,6 +36,8 @@ export GPT2_FOLD_LN2="${GPT2_FOLD_LN2:-1}"
 export GPT2_FOLD_LNF="${GPT2_FOLD_LNF:-0}"
 export CUTMAX_PRECISE_SCOPED="${CUTMAX_PRECISE_SCOPED:-1}"
 export CUTMAX_VEC_BTS_ITERS="${CUTMAX_VEC_BTS_ITERS:-1}"
+# The C++ decode ships no capture or plan: STAGE=capture writes GRAPH_DEFAULT, and
+# `perseus-plan --graph-dir <graph> --out-dir <plan>` writes the plan a planned run reads.
 if [ "$CHAIN" = "n32" ]; then
     export CONFIGS_PATH="${CONFIGS_PATH:-$CFG/gpt2_base_n32/configs.json}"
     PLAN_DEFAULT="$BP/gpt2_decode_n32"; GRAPH_DEFAULT="$REPO/graphs/gpt2_decode_n32"

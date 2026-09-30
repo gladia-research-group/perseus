@@ -97,7 +97,8 @@ def test_gpt2_torch_notebook_runs_the_driver_eager(generators):
 def test_setup_notebook_covers_every_artifact(generators):
     code = _sources(generators["setup_artifacts.ipynb"].build(), "code")
     for name in ("perseus.export", "load_token_pool(", "perseus.calibrate",
-                 "gen_gpt2_oracle.py", "scripts/run_task.sh", "scripts/make_plans.sh",
+                 "gen_gpt2_oracle.py", "examples.gpt2_from_primitives.run_decode",
+                 "scripts/make_plans.sh",
                  "PERSEUS_DATA"):
         assert name in code, f"{name} not used by any code cell"
 
