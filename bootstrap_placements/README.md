@@ -44,6 +44,17 @@ plan above has one except the ablations and `python/orion_dense`: on full-size b
 Orion's choices cannot fit block 0's first LayerNorm in the level budget from that starting
 point, even after repair, so generation refuses that plan.
 
+The HEAT GPT-2 ([`gladia/heat-gpt2-small-openwebtext`](https://huggingface.co/gladia/heat-gpt2-small-openwebtext),
+approximations in `configs/model/approximation/gpt2_heat_n32`) has two plans, both computed from
+`graphs/gpt2_heat_decode_python_n32` on the 32-bit parameters with the cheaper bootstraps and
+redundant ones removed, and both with the block-0 plan for generation. They run with the HEAT
+weights, config and reference outputs (README, step 1).
+
+| directory | placement algorithm | bootstraps / token |
+|---|---|---|
+| `gpt2_heat_decode_python_n32_ilp` | exact (`--placer ilp`) | 259 |
+| `gpt2_heat_decode_python_n32` | minimum cut (the default) | 267 |
+
 Notes.
 * The 32-bit plans estimate each bootstrap's error from measurements; the 64-bit plans use a
   formula (`PLAN_ACC_CHAIN=`).

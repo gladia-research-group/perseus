@@ -1,0 +1,28 @@
+{
+  "env": {
+    "CHAIN": "n32",
+    "LOGN": "16",
+    "AUTO_BTS_LEVEL": "46",
+    "BTS_ITERATIONS": "1",
+    "CKKS_COMPLEX": "1",
+    "GPT2_PACKING": "cachemir_complex",
+    "GPT2_CACHE": "1",
+    "GPT2_FOLD_LN1": "1",
+    "GPT2_FOLD_LN2": "1",
+    "GPT2_FOLD_LNF": "0",
+    "CACHE_READ_LEVEL_K": "34",
+    "CACHE_READ_LEVEL_V": "34",
+    "FHE_LMHEAD_CAP": "44",
+    "SPARSE_BTS_SLOTS": "512,1",
+    "SPARSE_AUTO": "2",
+    "FUSED_SM_DEN": "0",
+    "FUSED_LN_VAR": "0",
+    "CORRECTION_FACTOR": "6",
+    "FHE_PT_COEFF_ENCODE": "0"
+  },
+  "session": {
+    "level_limit": 46,
+    "slots": 32768,
+    "logN": 16
+  }
+}

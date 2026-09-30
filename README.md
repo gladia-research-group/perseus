@@ -47,8 +47,9 @@ rotations and multiplications need, so that they fit in GPU memory.
 `dev` is `main` plus work the paper does not report: ViT-B/16 and BERT-base running encrypted
 end to end, the GPU test suite under `tests/dev`, the approximation configs of the other models,
 the notebooks, and an exact placement algorithm, `--placer ilp`, which solves the same placement
-problem as a mixed-integer program (`docs/PLACER_ILP.md`). Changes to shared code are made on
-`main` first and then brought over here.
+problem as a mixed-integer program (`docs/PLACER_ILP.md`), and the HEAT GPT-2, a GPT-2 fine-tuned
+for encryption, with its recorded forward pass and plans (`bootstrap_placements/README.md`).
+Changes to shared code are made on `main` first and then brought over here.
 
 ## Results
 
