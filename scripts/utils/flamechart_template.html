@@ -1,0 +1,220 @@
+<title>__TITLE__</title>
+<style>
+:root{
+  color-scheme: light;
+  --bg:#f7f7f6; --surface:#fcfcfb; --surface-2:#f1f1ef; --line:#dedcd7;
+  --ink:#14161a; --ink-2:#4d5158; --ink-3:#7c8089;
+  --bd:#1b4f91; --b5:#2a78d6; --b1:#78ade9; --res:#eb6834; --math:#1baf7a; --par:#b9bcc4;
+  --focus:#2a78d6;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --bg:#141413; --surface:#1a1a19; --surface-2:#232322; --line:#33332f;
+    --ink:#f4f3ee; --ink-2:#c3c2b7; --ink-3:#8d8c84;
+    --bd:#1e5fae; --b5:#3987e5; --b1:#8ec2f5; --res:#d95926; --math:#199e70; --par:#55554f;
+    --focus:#3987e5;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#141413; --surface:#1a1a19; --surface-2:#232322; --line:#33332f;
+  --ink:#f4f3ee; --ink-2:#c3c2b7; --ink-3:#8d8c84;
+  --bd:#1e5fae; --b5:#3987e5; --b1:#8ec2f5; --res:#d95926; --math:#199e70; --par:#55554f;
+  --focus:#3987e5;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  font-size:15px;line-height:1.55}
+.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+.wrap{max-width:1180px;margin:0 auto;padding:40px 24px 72px;display:flex;flex-direction:column;gap:28px}
+header{display:flex;flex-direction:column;gap:10px;border-bottom:1px solid var(--line);padding-bottom:22px}
+.eyebrow{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+h1{margin:0;font-size:28px;line-height:1.2;font-weight:640;letter-spacing:-.015em;text-wrap:balance}
+.sub{margin:0;color:var(--ink-2);max-width:66ch}
+.prov{font-size:12.5px;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:4px 18px}
+.note{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--res);
+  border-radius:5px;padding:14px 16px;font-size:13.5px;color:var(--ink-2);
+  display:flex;flex-direction:column;gap:7px}
+.note b{color:var(--ink);font-weight:620}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px 16px;
+  display:flex;flex-direction:column;gap:3px}
+.tile .k{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+.tile .v{font-size:25px;font-weight:640;letter-spacing:-.02em;font-variant-numeric:tabular-nums;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.tile .d{font-size:12.5px;color:var(--ink-2)}
+.swatch{width:9px;height:9px;border-radius:2px;display:inline-block;flex:none}
+.controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+.legend{display:flex;flex-wrap:wrap;gap:6px 15px;font-size:12.5px;color:var(--ink-2);align-items:center}
+.legend i{display:flex;gap:6px;align-items:center;font-style:normal}
+input[type=search]{font:inherit;font-size:13.5px;padding:6px 11px;border-radius:5px;
+  border:1px solid var(--line);background:var(--surface);color:var(--ink);min-width:210px}
+input[type=search]:focus-visible,button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+button{font:inherit;font-size:13px;padding:6px 13px;border-radius:5px;border:1px solid var(--line);
+  background:var(--surface);color:var(--ink);cursor:pointer}
+button:hover{background:var(--surface-2)}
+.crumb{font-size:12.5px;color:var(--ink-2);min-height:19px;word-break:break-all;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+#flame{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:6px;
+  overflow:hidden;width:100%}
+.fr{position:absolute;height:17px;border-radius:2px;overflow:hidden;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;line-height:17px;
+  padding:0 4px;white-space:nowrap;color:#fff;border:0}
+.fr.lo{color:#0d1b2a}
+.fr.dim{opacity:.22}
+.js #flame .fr{cursor:pointer}
+.js #flame .fr:hover{filter:brightness(1.14)}
+#tip{position:fixed;z-index:9;pointer-events:none;background:var(--surface);border:1px solid var(--line);
+  border-radius:5px;padding:9px 11px;font-size:12.5px;max-width:440px;
+  box-shadow:0 4px 18px rgba(0,0,0,.17);display:none;color:var(--ink)}
+#tip .p{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;
+  color:var(--ink-2);word-break:break-all;margin-bottom:5px}
+#tip dl{margin:0;display:grid;grid-template-columns:auto auto;gap:1px 14px;font-variant-numeric:tabular-nums}
+#tip dt{color:var(--ink-3)} #tip dd{margin:0;text-align:right;font-family:ui-monospace,Menlo,monospace}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)}
+th{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
+td.n{text-align:right;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace}
+.scroll{overflow-x:auto}
+details{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:0 16px}
+details[open]{padding-bottom:14px}
+summary{cursor:pointer;padding:13px 0;font-weight:600;font-size:14px}
+h2{font-size:16px;margin:0;font-weight:640;letter-spacing:-.01em}
+footer{color:var(--ink-3);font-size:12.5px;border-top:1px solid var(--line);padding-top:18px}
+.jsonly{display:none} .js .jsonly{display:revert}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">__EYEBROW__</div>
+  <h1>__H1__</h1>
+  <p class="sub">__SUB__</p>
+  <div class="prov mono">__PROV__</div>
+</header>
+
+<div class="note">
+  <span><b>Read the shares, not the milliseconds.</b> <span class="mono">FHE_PROFILE=wall</span> syncs the
+  device at every scope boundary, which inflates the token roughly 1.4x. Relative width is meaningful;
+  absolute width is not.</span>
+  <span><b>Check what this was measured on.</b> The provenance line above names the plan, the binary and
+  the config tier — numbers do not transfer between tiers (base vs heat) or across a replan. If another
+  job held a GPU during the run, wall figures are unusable; attribution still holds.</span>
+</div>
+
+<section class="tiles">__TILES__</section>
+
+<section style="display:flex;flex-direction:column;gap:12px">
+  <h2>Flame chart</h2>
+  <div class="controls">
+    <input type="search" id="q" class="jsonly" placeholder="Highlight frames… e.g. bootstrap" aria-label="Highlight frames">
+    <button id="reset" class="jsonly">Reset zoom</button>
+    <span class="legend">__LEGEND__</span>
+  </div>
+  <div class="crumb" id="crumb">Width = wall duration · left-to-right = elapsed time · gaps = the parent's own work<span class="jsonly"> · click a frame to zoom</span></div>
+  <div id="flame" style="height:__HEIGHT__px">__FRAMES__</div>
+</section>
+
+<details>
+  <summary>Table view — the 40 heaviest frames by self time</summary>
+  <div class="scroll"><table>
+    <thead><tr><th>Frame</th><th>Family</th><th class="n">Self ms</th><th class="n">% of profile</th><th class="n">Inclusive ms</th></tr></thead>
+    <tbody>__TABLE__</tbody></table></div>
+</details>
+
+<details>
+  <summary>Gate — what this run actually returned</summary>
+  <div class="scroll"><pre class="mono" style="font-size:12px;margin:0 0 8px">__GATE__</pre></div>
+</details>
+
+<footer>
+  Self time is exclusive of children, so a subtree's frames sum to its width. <b>Parent / unattributed</b>
+  is self time on container scopes — measured to be overwhelmingly the profiler's own per-scope
+  <span class="mono">cudaDeviceSynchronize</span>, not un-instrumented work. Colour encodes op family;
+  every frame is also labelled and tooltipped, so identity is never colour-alone.
+  <b>This is a flame CHART, not a flamegraph</b>: x is real elapsed time from
+  <span class="mono">[proftrace]</span>, one record per scope instance, so every frame sits where it
+  actually ran and a gap is the parent genuinely working rather than a packing artifact. Nothing here
+  depends on an ordering heuristic — verified by checking that every nested frame falls inside a
+  parent's interval. The timestamps bracket a device sync, which is what makes them measure GPU work
+  rather than host enqueue, and also what inflates the total.
+  <br><br>The chart above is rendered server-side, so it is readable with scripting disabled or broken;
+  zoom, search and tooltips are enhancements layered on top.
+  <br>Regenerate: <span class="mono">bash scripts/flamechart.sh &lt;TAG&gt; [env…]</span>
+</footer>
+</div>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script>
+// Everything above is already in the markup. This block only ADDS zoom, search and tooltips —
+// if it throws, the chart stays exactly as the server drew it.
+document.documentElement.classList.add('js');
+const DATA = __PAYLOAD__;
+const FAM = {
+  bd:  ['Bootstrap — dense',       'var(--bd)',   0],
+  b5:  ['Bootstrap — sparse s=512','var(--b5)',   0],
+  b1:  ['Bootstrap — sparse s=1',  'var(--b1)',   1],
+  math:['Model math',              'var(--math)', 0],
+  res: ['Residency / plumbing',    'var(--res)',  0],
+  par: ['Parent / unattributed',   'var(--par)',  1]
+};
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const frames = DATA.frames.map(f => ({n:f[0], d:f[1], x:f[2], t:f[3], s:f[4], f:f[5]}));
+const TOTAL = DATA.meta.total;
+const el = document.getElementById('flame'), tip = document.getElementById('tip'), ROW = 18;
+let view = {x:0, w:TOTAL};
+const fmt = v => v>=100 ? v.toFixed(0) : v>=10 ? v.toFixed(1) : v.toFixed(2);
+const DEFAULT_CRUMB = el.previousElementSibling.innerHTML;
+
+function render(){
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  const px = el.clientWidth || 1000;
+  const frag = document.createDocumentFragment();
+  for (const f of frames){
+    const x0 = (f.x - view.x)/view.w, w = f.t/view.w;
+    if (x0 > 1 || x0 + w < 0 || w*px < 0.2) continue;
+    const d = document.createElement('div');
+    d.className = 'fr' + (FAM[f.f][2] ? ' lo' : '') + (q && !f.n.toLowerCase().includes(q) ? ' dim' : '');
+    d.style.left  = (Math.max(0,x0)*100) + '%';
+    d.style.width = (Math.min(1,x0+w) - Math.max(0,x0))*100 + '%';
+    d.style.top   = (f.d*ROW + 1) + 'px';
+    d.style.background = FAM[f.f][1];
+    if (w*px > 26) d.textContent = f.n;
+    d._f = f; frag.appendChild(d);
+  }
+  el.replaceChildren(frag);
+}
+el.addEventListener('mousemove', e => {
+  const t = e.target.closest('.fr');
+  if (!t || !t._f){ tip.style.display='none'; return; }
+  const f = t._f;
+  tip.innerHTML = '<div class="p">'+esc(f.n)+'</div><dl>'
+    + '<dt>family</dt><dd>'+FAM[f.f][0]+'</dd>'
+    + '<dt>starts at</dt><dd>'+fmt(f.x)+' ms</dd>'
+    + '<dt>duration</dt><dd>'+fmt(f.t)+' ms</dd>'
+    + '<dt>self</dt><dd>'+fmt(f.s)+' ms</dd>'
+    + '<dt>share</dt><dd>'+(100*f.t/TOTAL).toFixed(2)+'%</dd></dl>';
+  tip.style.display='block';
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.min(e.clientX+14, innerWidth-r.width-10)+'px';
+  tip.style.top  = Math.min(e.clientY+16, innerHeight-r.height-10)+'px';
+});
+el.addEventListener('mouseleave', ()=> tip.style.display='none');
+el.addEventListener('click', e => {
+  const t = e.target.closest('.fr'); if(!t || !t._f) return;
+  view = {x:t._f.x, w:t._f.t};
+  document.getElementById('crumb').textContent = t._f.n + ' — starts ' + fmt(t._f.x) + ' ms, '
+    + fmt(t._f.t) + ' ms long, ' + (100*t._f.t/TOTAL).toFixed(2) + '% of the profile';
+  render();
+});
+document.getElementById('reset').onclick = ()=>{
+  view={x:0,w:TOTAL};
+  document.getElementById('crumb').innerHTML = DEFAULT_CRUMB;
+  render();
+};
+document.getElementById('q').addEventListener('input', render);
+</script>

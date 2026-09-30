@@ -1,5 +1,6 @@
 #include "attention.h"
 #include "inference.h"
+#include "packing/bidirectional/bi_attention.h"
 #include "packing/cachemir/cachemir_attention.h"
 #include "packing/cachemir/cachemir_attention_utils.h"
 #include "packing/cachemir_filling/cachemir_filling_attention.h"
@@ -91,6 +92,24 @@ std::vector<PackedCtx> attention_softmax_thor(
                    ? cachemir_filling::attention_softmax_thor_delta(inf, std::move(scores), cfg_name)
                    : cachemir_filling::attention_softmax_thor(inf, std::move(scores), cfg_name);
     throw std::runtime_error("attention_softmax_thor: unsupported packing");
+}
+
+std::vector<PackedCtx> bi_attention(Inference& inf,
+                                    std::vector<PackedCtx> qs,
+                                    std::vector<PackedCtx> ks,
+                                    std::vector<PackedCtx> vs,
+                                    const std::vector<int>& ns) {
+    if (!is_cachemir_filling(inf.packing) || !inf.bidirectional)
+        throw std::runtime_error("bi_attention: filling bidirectional only");
+    if (inf.token_pair && ns.size() == 2) {
+        std::vector<PackedCtx> out;
+        out.push_back(bidirectional::complex_bi_attention(
+            inf, std::move(qs.at(0)), std::move(ks.at(0)), std::move(vs.at(0)),
+            ns[0], ns[1]));
+        return out;
+    }
+    return bidirectional::delta_bi_attention(inf, std::move(qs), std::move(ks),
+                                             std::move(vs), ns);
 }
 
 PackedCtx mha_attn_token_pair(Inference& inf, PackedCtx& q_cplx) {

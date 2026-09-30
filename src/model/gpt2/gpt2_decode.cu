@@ -207,6 +207,8 @@ PackedCtx gpt2_decode_forward(Inference& inf, PackedCtx x, int t, int n_blocks,
                     h.ct ? (int)h.ct->GetNoiseScaleDeg() : -1);
         p_bts = bts; p_rlv = rlv; p_enc = enc; p_miss = miss;
     }
+    residency_perf_report(t);   // host-side residency cost; valid unprofiled
+
     std::fflush(stdout);
     return h;
 }

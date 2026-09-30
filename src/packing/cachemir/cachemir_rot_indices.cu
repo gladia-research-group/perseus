@@ -90,4 +90,10 @@ std::vector<int32_t> compute_gpt2_rot_indices(
     return std::vector<int32_t>(rots.begin(), rots.end());
 }
 
+std::vector<int32_t> linear_rot_indices(int N, int d_in, int d_out) {
+    std::set<int32_t> rots;
+    collect_linear_rots(rots, N, d_in, d_out);
+    return std::vector<int32_t>(rots.begin(), rots.end());
+}
+
 }  // namespace cachemir

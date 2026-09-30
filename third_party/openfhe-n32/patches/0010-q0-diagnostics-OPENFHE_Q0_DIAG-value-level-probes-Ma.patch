@@ -16,7 +16,7 @@ index 02f3df74..c747a95b 100644
                  scaleDec = qDouble / sf0;
          }
  
-+        // OPENFHE_Q0_DIAG: recovery constants at value level, per arm (add.160 probe).
++        // OPENFHE_Q0_DIAG: recovery constants at value level, per arm.              
 +        if (std::getenv("OPENFHE_Q0_DIAG")) {
 +            std::cerr << "[q0_diag] Setup: q0=2^" << std::log2(qDouble)
 +                      << " sf0=2^" << std::log2(cryptoParams->GetScalingFactorReal(0))
@@ -37,7 +37,7 @@ index 02f3df74..c747a95b 100644
              scaleDec = qDouble / sf0;
      }
  
-+    // OPENFHE_Q0_DIAG: the recovery constants at value level, per arm (add.160 probe).
++    // OPENFHE_Q0_DIAG: the recovery constants at value level, per arm.              
 +    if (std::getenv("OPENFHE_Q0_DIAG")) {
 +        std::cerr << "[q0_diag] Precompute: q0=2^" << std::log2(qDouble)
 +                  << " sf0=2^" << std::log2(cryptoParams->GetScalingFactorReal(0))

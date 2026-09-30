@@ -72,6 +72,8 @@ if [ "$STAGE" = feedback ]; then
 print(*fed_back_entry(sys.argv[1]))' "$GRAPH_DIR/block_0/graph.json")
     TMP="$(mktemp -d "$GRAPH_DIR/../_feedback_XXXX")"; ln -s "$(cd "$GRAPH_DIR/block_0" && pwd)" "$TMP/block_0"
     cp "$GRAPH_DIR/capture_env.json" "$TMP/" 2>/dev/null || true
+    # alone, block 0 is the final block, whose exit the ILP caps; in the chain it is not
+    [ "${PLAN_PLACER:-}" = ilp ] && export PLAN_ILP_FREE_EXIT=1
     plan_blocks "$TMP" "${OUT_NAME}_feedback" FIRST_ENTRY_LEVEL="$ENTRY_LEVEL" FIRST_ENTRY_DEG="$ENTRY_DEG"
     FB="bootstrap_placements/${OUT_NAME}_feedback/block_0_placement.json"
     "$PYTHON" - "$B0" "$FB" <<'PY'

@@ -23,6 +23,9 @@ is walked structurally with type-strict leaves (`True` is not `1`).
 import json
 import sys
 
+# summary leaves that record wall time (the ILP's solve), never equal across two runs
+WALL_CLOCK = {"solve_s"}
+
 
 def _diff_subset(ref, new, path="summary"):
     """First (path, reason) where `ref` is not a value-identical subset of `new`."""
@@ -30,6 +33,8 @@ def _diff_subset(ref, new, path="summary"):
         if not isinstance(new, dict):
             return path, "was an object"
         for k, v in ref.items():
+            if k in WALL_CLOCK:
+                continue
             if k not in new:
                 return f"{path}.{k}", "missing"
             r = _diff_subset(v, new[k], f"{path}.{k}")

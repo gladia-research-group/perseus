@@ -42,6 +42,14 @@ our 32-bit port of the GPU CKKS library [FIDESlib](https://github.com/CAPS-UMU/F
 included as a submodule. It also shrinks the key-switching keys, the large public keys that
 rotations and multiplications need, so that they fit in GPU memory.
 
+## This branch
+
+`dev` is `main` plus work the paper does not report: ViT-B/16 and BERT-base running encrypted
+end to end, the GPU test suite under `tests/dev`, the approximation configs of the other models,
+the notebooks, and an exact placement algorithm, `--placer ilp`, which solves the same placement
+problem as a mixed-integer program (`docs/PLACER_ILP.md`). Changes to shared code are made on
+`main` first and then brought over here.
+
 ## Results
 
 Encrypted GPT-2 small generating text on one NVIDIA RTX PRO 6000 Blackwell GPU, with a ring
@@ -95,7 +103,9 @@ the recipe that regenerates each one.
 - `src/`, `include/` the CUDA runtime and its Python bindings: `perseus._core`, and
   `perseus._client`, the client side that runs without a GPU.
 - `third_party/` the FIDESlib32bits submodule and our OpenFHE patches.
-- `docs/` the Python API reference and the security model.
+- `docs/` the Python API reference, the security model and the exact placement algorithm.
+- `tests/dev/` the GPU test suite (one program per check; needs a built tree).
+- `notebooks/` walkthroughs for GPT-2, ViT and BERT.
 - `assets/` the logos and the results table (`results-table.tex`, rendered by `render.sh`).
 
 ## Python API
@@ -154,7 +164,9 @@ with session(profile=SessionProfile.custom_n32()) as s:     # parameters, keys, 
 ```
 
 `EncClient` and `EncServer` split the key holder from the server that computes
-(`docs/SECURITY_MODEL.md`); `docs/PYTHON_API.md` is the full reference.
+(`docs/SECURITY_MODEL.md`); `docs/PYTHON_API.md` is the full reference. The notebooks cover
+preparing the files, generation, a custom encrypted model and the client-server split;
+`NB=<name> bash scripts/run_notebooks.sh` runs one without opening Jupyter.
 
 ## Pipeline
 
@@ -260,8 +272,9 @@ bash scripts/make_plans.sh                            # every plan in the reposi
 recorded magnitudes (`--mag-safety`), the accuracy target (`--err-target`), the largest scaling
 setting (`--cf-max`), the sizes of the cheaper bootstrap (`--sparse-slots`), removing bootstraps
 that turn out redundant (`--prune`) and the placement algorithm
-(`--placer {min_cut,orion,dacapo,fhelipe}`). The 32-bit plans estimate each bootstrap's error
-from measurements (`perseus/plan/data/bts_accuracy_n32.json`), the 64-bit plans from a formula.
+(`--placer {min_cut,ilp,orion,dacapo,fhelipe}`, where `ilp` is the exact algorithm). The 32-bit
+plans estimate each bootstrap's error from measurements (`perseus/plan/data/bts_accuracy_n32.json`),
+the 64-bit plans from a formula.
 
 The comparison plans come from the released tools. DaCapo needs its compiler, `hecate-opt`,
 built once (LLVM/MLIR 18); Orion's solver is downloaded and patched on first use:

@@ -535,6 +535,7 @@ void bind_ops(py::module_& m) {
         .def_readwrite("n_tok", &Inference::n_tok)
         .def_readwrite("n_tok_imag", &Inference::n_tok_imag)
         .def_readwrite("token_pair", &Inference::token_pair)
+        .def_readwrite("bidirectional", &Inference::bidirectional)
         .def_readwrite("use_cache", &Inference::use_cache)
         .def_readwrite("cache_weights", &Inference::cache_weights)
         .def_readwrite("block_prefix", &Inference::block_prefix)

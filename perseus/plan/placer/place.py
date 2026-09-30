@@ -104,6 +104,34 @@ class Placer:
     err_target: float = 1e-2
     miss_penalty: float = 4.0
     quality_weight: float = 0.0    # the "pre-score" weight; 0 = count-only (default)
+    # Depth-aware pricing. A site's capacity is scaled by how many levels its refresh
+    # RESTORES: restored = effective input depth - the spec's landing, so a sparse route
+    # landing richer than dense restores more, and a prescaled site less. Three forms:
+    #   ratio   budget / restored, blended    cap *= (1 - w) + w * ratio
+    #   linear  the levels NOT regained, W = M - restored, normalised by M, same blend
+    #   ab      W = a * min_runway / (M - R) + b * (M - L) / M, used directly
+    # 0 disables it and the cut is count-only, which is what every shipped plan uses.
+    # Above 0 count no longer strictly dominates: two shallow refreshes can outprice one
+    # deep one, which is the point of the knob.
+    depth_weight: float = 0.0
+    depth_form: str = "ratio"       # "ratio" | "linear" | "ab"
+    depth_a: float = 1.0            # ab form: landing-yield coefficient
+    depth_b: float = 1.0            # ab form: early-refresh coefficient
+    # Input-level pricing. A bootstrap's own error grows with the depth of its input, and
+    # the accuracy table does not price that. Linear ramp on the effective absolute input
+    # level: 0 at bootstrap_level, `level_weight` at the refresh envelope. Pulls against
+    # depth_weight, which rewards deep high-yield refreshes.
+    level_weight: float = 0.0
+    # Measured per-route bootstrap latency in milliseconds, keyed by sparse slot count with
+    # 0 for a dense refresh (paper Table 7). With depth_form="ms" the cut minimises the
+    # bootstrap milliseconds a plan will actually spend instead of the number of refreshes,
+    # which are not the same thing: a dense refresh costs nearly twice a 1-slot one.
+    bts_ms: dict[int, float] = field(default_factory=lambda: {0: 28.77, 512: 18.59, 1: 16.10})
+    # How much of a sparse route's extra restored runway to credit back. A refresh landing
+    # richer buys depth later refreshes then do not have to buy, which its own latency does
+    # not show. cost = ms / (restored / L) ** ms_discount: 0 prices pure milliseconds, 1
+    # prices milliseconds per unit of runway regained.
+    ms_discount: float = 1.0
     # Refresh-input envelope hardness. MUST be True exactly when the cut is the SOLE
     # refresher (hints dissolved) — see _capacity. The planner sets it from
     # cfg.dissolve_hints; PLAN_HARD_ENV_CAP overrides either way.
@@ -122,6 +150,9 @@ class Placer:
     vetoed_hints: set[str] = field(default_factory=set)
 
     placed: set[str] = field(default_factory=set)
+    #: effective (pre-refresh) consumed depth of each placed site, as _capacity saw it
+    #: when the cut chose it — what the pricing knobs above are judged on.
+    placed_in_eff: dict[str, float] = field(default_factory=dict)
     realized: set[str] = field(default_factory=set)
     hint_force: dict[str, bool] | None = None
     deliberate_clamp0: bool = False
@@ -188,6 +219,11 @@ class Placer:
             hint_force=self.hint_force,
             deliberate_clamp0=self.deliberate_clamp0)
 
+    def _min_runway(self, M: float) -> float:
+        """min over routes of (M - R): the runway the worst landing leaves."""
+        lands = [float(self.bootstrap_level)] + [float(lv) for lv in self.refresh.sparse_out_levels.values()]
+        return M - max(lands)
+
     def _capacity(self, v: str, sim: SimResult) -> float:
         self._last_sim = sim
         if v in self.placed:
@@ -212,6 +248,27 @@ class Placer:
             # envelope silently returns garbage. PLAN_HARD_ENV_CAP=0/1 overrides either way.
             return float("inf") if self._env_cap_hard else 1.0e4
         cap = 1.0 + self.miss_penalty * spec.overshoot(self.err_target)
+        if self.depth_weight > 0.0:
+            restored = eff_v - float(spec.out_consumed)
+            unit = float(self.g.level_unit)
+            M = float(self.bootstrap_level) + float(self.budget.L)
+            if self.depth_form == "ms":
+                route = spec.route or 0
+                ms = self.bts_ms.get(route) or self.bts_ms.get(0, 1.0)
+                yield_ = max(restored, unit) / max(float(self.budget.L), unit)
+                cap *= ms / max(yield_, 1e-9) ** self.ms_discount
+            elif self.depth_form == "ab":
+                R = float(self.bootstrap_level) + float(spec.out_consumed)
+                L = float(self.bootstrap_level) + eff_v
+                cap *= (self.depth_a * self._min_runway(M) / max(M - R, unit)
+                        + self.depth_b * max(M - L, 0.0) / max(M, 1.0))
+            else:
+                ratio = (max(M - restored, 0.0) / max(M, 1.0) if self.depth_form == "linear"
+                         else float(self.budget.L) / max(restored, unit))
+                cap *= (1.0 - self.depth_weight) + self.depth_weight * ratio
+        if self.level_weight > 0.0:
+            span = max(REFRESH_ENV_CAP_ABS - self.bootstrap_level, 1.0)
+            cap *= 1.0 + self.level_weight * min(1.0, max(0.0, eff_v / span))
         if self.quality_weight > 0.0:
             q = min(1.0, max(0.0, spec.rel_err / max(self.err_target, 1e-300)))
             cap += QUALITY_LAMBDA * self.quality_weight * q
@@ -345,6 +402,8 @@ class Placer:
                             f"min-cut selected '{v}' but its refresh is destructive",
                             [spec])
                     self.placed.add(v)
+                    self.placed_in_eff[v] = (sim.consumed.get(v, 0.0)
+                        + (self.g.level_unit if sim.deg.get(v, 1) == 2 else 0))
                     progressed = True
             if not progressed:
                 raise PlanInfeasible(

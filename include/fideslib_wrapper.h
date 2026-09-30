@@ -491,11 +491,59 @@ struct CKKSContext {
         uint64_t hits      = 0;
     };
     std::map<std::string, WeightRelevelStat> weight_relevel_stats;
+
+    // Report the weights whose pre-baked encode level did not match the level the runtime
+    // met them at. An over-pin of exactly +1 on a deg-2 ciphertext is the expected
+    // self-heal; anything else means the plan's weight levels and the run disagree.
+    void dump_weight_relevel_report(std::ostream& os = std::cerr) const {
+        if (weight_relevel_stats.empty()) {
+            os << "[weight_relevel_report] clean: no pre-baked plaintext re-leveled "
+                  "(plan levels == runtime levels)\n";
+            return;
+        }
+        os << "[weight_relevel_report] " << weight_relevel_stats.size()
+           << " weight(s) drifted (total re-encodes=" << weight_relevel_count << "):\n";
+        for (const auto& kv : weight_relevel_stats) {
+            const WeightRelevelStat& s = kv.second;
+            const char* cls =
+                (s.delta == 1 && s.ct_deg == 1) ? "INFO  over-pin+1 (deg-2->deg-1 self-heal, expected)" :
+                (s.delta  > 1)                  ? "WARN  over-pin>+1 (unexpected; check plan)" :
+                (s.delta  < 0)                  ? "ERROR under-pin (weight fell back to default; plan gap)" :
+                                                  "INFO  drift";
+            os << "  " << std::left << std::setw(16) << kv.first << std::right
+               << " enc L" << s.enc_level << "/d" << s.enc_deg
+               << " -> ct L" << s.ct_level << "/d" << s.ct_deg
+               << "  delta=" << (s.delta >= 0 ? "+" : "") << s.delta
+               << "  hits=" << s.hits
+               << "   " << cls << "\n";
+        }
+    }
+
     bool placement_plan_enabled = false;
     std::unordered_set<std::string> planned_warned_;   // dedup keys for one-shot planned-mode warnings
 
     PublicKey<DCRTPoly>&  pk()  { return keys.publicKey; }
     PrivateKey<DCRTPoly>& sk()  { return keys.secretKey; }
+
+    std::pair<double, double> debug_max_abs_re_im(const Ctx& ct) {
+        Plaintext pt;
+        Ctx c = ct;   // Decrypt takes a non-const Ctx&
+        cc->Decrypt(c, keys.secretKey, &pt);
+        const auto v = pt->GetCKKSPackedValue();
+        double mr = 0.0, mi = 0.0;
+        for (const auto& z : v) {
+            mr = std::max(mr, std::abs(z.real()));
+            mi = std::max(mi, std::abs(z.imag()));
+        }
+        return {mr, mi};
+    }
+
+    // TP_PROBE=1: print {max|Re(A)|, max|Im(B)|} of a ct with a label (token-pair lane trace).
+    void tp_probe(const std::string& tag, const Ctx& ct) {
+        if (!std::getenv("TP_PROBE")) return;
+        auto ri = debug_max_abs_re_im(ct);
+        fprintf(stderr, "[tp_probe:%s] |Re(A)|=%.5g |Im(B)|=%.5g\n", tag.c_str(), ri.first, ri.second);
+    }
 
     void sync_ciphertext_cpu_from_device(Ctx& ct) {
         if (!ct || !ct->loaded) return;

@@ -337,6 +337,20 @@ std::vector<int32_t> compute_gpt2_rot_indices(PackingKind kind, int slots, int h
     throw fhe::FHEError("compute_gpt2_rot_indices: unsupported packing");
 }
 
+// vit_model.cu / bert_model.cu: filling blocks ∪ the cachemir tail.
+std::vector<int32_t> vit_rot_indices(int slots, int hidDim, int ffDim, int numHeads) {
+    std::set<int32_t> rots;
+    for (int32_t r : cachemir_filling::compute_gpt2_rot_indices(slots, hidDim, ffDim, numHeads))
+        rots.insert(r);
+    for (int32_t r : cachemir::compute_gpt2_rot_indices(slots, hidDim, ffDim, numHeads))
+        rots.insert(r);
+    return {rots.begin(), rots.end()};
+}
+
+std::vector<int32_t> bert_rot_indices(int slots, int hidDim, int ffDim, int numHeads) {
+    return vit_rot_indices(slots, hidDim, ffDim, numHeads);
+}
+
 std::vector<int32_t> family_rot_steps(const std::string& family, const InferenceOptions& o) {
     const int slots = static_cast<int>(slots_of(o.ckks));
     std::vector<int32_t> steps;
@@ -349,6 +363,10 @@ std::vector<int32_t> family_rot_steps(const std::string& family, const Inference
             for (int32_t r : compute_gpt2_rot_indices(aux, slots, o.hidDim, o.expDim, o.numHeads))
                 steps.push_back(r);
         }
+    } else if (family == "vit") {
+        steps = vit_rot_indices(slots, o.hidDim, o.expDim, o.numHeads);
+    } else if (family == "bert") {
+        steps = bert_rot_indices(slots, o.hidDim, o.expDim, o.numHeads);
     } else if (family == "generic") {
         // make_inference adds nothing
     } else {
@@ -387,6 +405,8 @@ ClientInference make_inference(InferenceOptions o) {
 }
 
 InferenceOptions prepare_family_options(const std::string& family, InferenceOptions o) {
+    if (family == "vit" || family == "bert")
+        o.packing_kind = PackingKind::CachemirFilling;     // vit_model.cu:131 / bert_model.cu:154
     if (o.packing_kind == PackingKind::CachemirComplex)
         o.ckks.ckks_complex_payload = true;                // inference.h make_inference
     for (int32_t r : family_rot_steps(family, o)) o.ckks.extra_rot_steps.push_back(r);
@@ -395,6 +415,14 @@ InferenceOptions prepare_family_options(const std::string& family, InferenceOpti
 
 ClientInference make_gpt2_inference(InferenceOptions opts) {
     return make_inference(prepare_family_options("gpt2", std::move(opts)));
+}
+
+ClientInference make_vit_inference(InferenceOptions opts) {
+    return make_inference(prepare_family_options("vit", std::move(opts)));
+}
+
+ClientInference make_bert_inference(InferenceOptions opts) {
+    return make_inference(prepare_family_options("bert", std::move(opts)));
 }
 
 // ── tokens ───────────────────────────────────────────────────────────────────────────

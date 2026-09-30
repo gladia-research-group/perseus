@@ -22,7 +22,7 @@ index c747a95b..efb63429 100644
  
                          auto rotateTemp = Rotate(coeff[s][g * i + j], rot);
  
-+                        // OPENFHE_Q0_DIAG: per-diagonal constant norms (add.165 comb hunt).
++                        // OPENFHE_Q0_DIAG: per-diagonal constant norms.                   
 +                        if (std::getenv("OPENFHE_Q0_DIAG")) {
 +                            double mx = 0;
 +                            for (const auto& z : rotateTemp)

@@ -30,12 +30,15 @@ using perseus_stamp::kNativeIntBits;
 //   1 CKKSOptions (this file)      -> make_context(options=CKKSOptions{}) in step 8
 //   2 bind_ops     Context, PackedCtx, ModelSize, InferenceOptions, Norm/Softmax/GeLUConfig,
 //                  Inference, decrypt_slots -> make_inference / make_gpt2_inference (here)
-//                  default to InferenceOptions{}; _debug aliases decrypt_slots (step 8)
+//                  and make_vit_inference / make_bert_inference (step 5) default to
+//                  InferenceOptions{}; _debug aliases decrypt_slots (step 8)
 //   3 bind_io      WeightStore, ModelConfig, CutMaxCalib/CutMaxConfig, ParsedConfigs,
 //                  BootstrapPlan, EncodedBlock (set_*_cfg take the step-2 config types)
 //                  + the block-state loaders
 //   4 bind_io_gpt2 LMHeadCache first, then the defs defaulting to LMHeadCache* /
 //                  BootstrapPlan* = nullptr (needs 3)
+//   5 bind_io_encoders  make_vit_inference / vit_forward / make_bert_inference /
+//                  bert_forward (needs 2 and 3)
 //   6 bind_pipeline Stage / run_stages (hold EncodedBlock: needs 3)
 //   7 bind_serial  ciphertext / key / block-artifact transport (EncodedBlock, WeightStore,
 //                  ParsedConfigs, BootstrapPlan arguments: needs 3)
@@ -46,6 +49,7 @@ using perseus_stamp::kNativeIntBits;
 void bind_ops(py::module_& m);          // 2
 void bind_io(py::module_& m);           // 3
 void bind_io_gpt2(py::module_& m);      // 4
+void bind_io_encoders(py::module_& m);  // 5
 void bind_pipeline(py::module_& m);     // 6
 void bind_serial(py::module_& m);       // 7
 void bind_session(py::module_& m);      // 9
@@ -186,6 +190,7 @@ PYBIND11_MODULE(_core, m) {
     bind_ops(m);          // 2
     bind_io(m);           // 3
     bind_io_gpt2(m);      // 4
+    bind_io_encoders(m);  // 5
     bind_pipeline(m);     // 6
     bind_serial(m);       // 7
 
@@ -193,7 +198,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("options") = CKKSContextOptions{},
           py::call_guard<py::gil_scoped_release>(),
           "Create a bare CKKS context (keygen) from CKKSOptions; model sessions use "
-          "make_gpt2_inference / make_inference.");
+          "make_gpt2_inference / make_vit_inference / make_bert_inference / make_inference.");
     auto dbg = m.def_submodule("_debug",
         "Harness and research taps (hard_exit, throw_test, install_fatal_exit_handler, "
         "decrypt_slots): for probes, tests and diagnostics, not an application API.");

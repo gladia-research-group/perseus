@@ -4,10 +4,10 @@ from .remote import EncClient, EncServer
 from .serve import EncGenerationClient, EncGenerationServer
 
 __all__ = [
-    "EncAttention", "EncBlock", "EncClient", "EncCutMax", "EncGELU",
+    "EncAttention", "EncBert", "EncBlock", "EncClient", "EncCutMax", "EncGELU",
     "EncGenerationClient", "EncGenerationServer", "EncGPT2",
     "EncLMHead", "EncLayerNorm", "EncLinear", "EncModule", "EncModuleList", "EncSequential",
-    "EncServer", "Stage", "calibrate_sequential", "load", "run_stages",
+    "EncServer", "EncViT", "EncViTBlock", "Stage", "calibrate_sequential", "load", "run_stages",
     "save", "stage_of",
 ]
 
@@ -15,6 +15,7 @@ __all__ = [
 _LAZY = {
     "EncGELU": ".activation",
     "EncAttention": ".attention",
+    "EncBert": ".bert",
     "EncBlock": ".block",
     "calibrate_sequential": ".calibrate",
     "EncModuleList": ".container",
@@ -30,6 +31,8 @@ _LAZY = {
     "stage_of": ".pipeline",
     "load": ".serialization",
     "save": ".serialization",
+    "EncViT": ".vit",
+    "EncViTBlock": ".vit",
 }
 
 

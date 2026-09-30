@@ -39,7 +39,7 @@ hf = [
     "scipy>=1.17.1",
     "mpmath>=1.3",
 ]
-# Building the extension, running the tests, generating stubs.
+# Building the extension, running the tests, generating stubs, executing notebooks.
 dev = [
     "pytest>=8",
     "ruff>=0.6",
@@ -120,7 +120,10 @@ extend-exclude = [
     "third_party",
     "build*",
     "deps_*",
+    "notebooks",
     "paper-workshop",
+    "scripts/_backup",
+    "tests/dev/_backup",
 ]
 
 [tool.ruff.lint]
@@ -136,8 +139,24 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["E402"]          # imports after pytest.importorskip / sys.path setup
+"scripts/dev/*.py" = ["F403", "F405", "E402", "F841", "B007"]   # numpy prototypes, run as scripts
 "perseus/plan/placer/planner.py" = ["E402"]
 "scripts/modes_baseline.py" = ["E402"]   # the extension is imported after the mode check
+# Research tooling: analysis drivers and the ViT/BERT notebook generators. Kept
+# runnable, not held to the package style bar.
+"scripts/utils/bump_ln_css.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/compare_placers.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/decode_gen_text.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/delta_block_sim.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/fit_evalmod_cheby.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/make_bert_notebook.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/make_flamechart.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/make_vit_notebook.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/placer_matrix.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/probe_gpt2_gen_planned.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/probe_pipeline.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/vit_tap_compare.py" = ["E402", "E731", "B007", "F841", "UP031"]
+"scripts/utils/vit_tap_ref.py" = ["E402", "E731", "B007", "F841", "UP031"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["perseus"]

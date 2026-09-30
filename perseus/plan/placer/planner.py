@@ -75,6 +75,18 @@ class PlanConfig:
     miss_penalty: float = 4.0
     prescale_bits_max: float = 9.5
     quality_weight: float = 0.0
+    # Cut pricing experiments (place.py): 0 leaves the cut count-only, which is what every
+    # shipped plan uses. depth_weight prices a site by the levels its refresh restores,
+    # level_weight by how deep its input sits.
+    depth_weight: float = 0.0
+    depth_form: str = "ratio"       # "ratio" | "linear" | "ab"
+    depth_a: float = 1.0
+    depth_b: float = 1.0
+    level_weight: float = 0.0
+    #: measured bootstrap latency per route in ms, 0 = dense (paper Table 7, 32-bit chain).
+    #: The 64-bit chain is {0: 36.69, 512: 23.59, 1: 19.95}.
+    bts_ms: tuple[tuple[int, float], ...] = ((0, 28.77), (512, 18.59), (1, 16.10))
+    ms_discount: float = 1.0
     sparse_precomps: tuple[int, ...] = ()
     sparse_out_levels: tuple[tuple[int, int], ...] = ()
     forbid_steps: tuple[str, ...] = (".var", ".mean", ".qkv")
@@ -111,6 +123,15 @@ class PlanConfig:
     #: The paper's dense Fhelipe arm uses 48, the chain's measured refresh envelope.
     baseline_depth_cap: float | None = None
     latency_table_path: str | None = None
+    #: placer "ilp" (ilp.py): solver time cap per block (s), relative optimality gap at
+    #: which it may stop, and what it minimises -- "total" (placed + fired hints) or
+    #: "placed" (the min-cut's own objective) or "ms" (per-route latency, `bts_ms`)
+    ilp_time_limit: float = 300.0
+    ilp_gap: float = 0.0
+    ilp_objective: str = "total"
+    #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
+    #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
+    ilp_cap_exit: bool = True
     #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
     #: each placed refresh whose removal keeps the block within budget, lowers the bootstrap
     #: count and adds no refresh input past the envelope.
@@ -272,7 +293,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                table: btserr.AccuracyTable | None = None,
                force_place: set | None = None,
                hint_force: dict[str, bool] | None = None,
-               diagnostics: PlanDiagnostics | None = None) -> dict:
+               diagnostics: PlanDiagnostics | None = None,
+               final_block: bool = False) -> dict:
     """Plan one block's graph.json; returns the plan document, written to disk verbatim.
 
     `diagnostics`, if given, is filled with what must stay OUT of that document (the
@@ -371,7 +393,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # min_cut only: the baseline placers model hints inside their own world-model
     # (`hint_aware`) with hints live; dissolving them there would change what the
     # benchmark measures.
-    if cfg.dissolve_hints and cfg.placer == "min_cut":
+    exact = cfg.placer in ("min_cut", "ilp")     # ours: the cut, or its exact twin
+    if cfg.dissolve_hints and exact:
         dissolve_pins, hints_retained = _dissolve_hints(g, cfg, refresh)
 
     # stage 4 — ours, or a baseline placer (same seam, different site selection)
@@ -383,13 +406,24 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         forbid_steps=cfg.forbid_steps,
         err_target=cfg.err_target, miss_penalty=cfg.miss_penalty,
         quality_weight=cfg.quality_weight, verbose=cfg.verbose,
+        depth_weight=cfg.depth_weight, level_weight=cfg.level_weight,
+        depth_form=cfg.depth_form, depth_a=cfg.depth_a, depth_b=cfg.depth_b,
+        bts_ms=dict(cfg.bts_ms), ms_discount=cfg.ms_discount,
         deliberate_clamp0=cfg.deliberate_clamp0,
         # Coupled to dissolution: with hints live they absorb the deep values and a
         # payable envelope penalty is never exercised; with them dissolved the cut is the
         # sole refresher and must be forbidden from deep sites, not merely discouraged.
-        hard_env_cap=bool(cfg.dissolve_hints and cfg.placer == "min_cut"),
+        hard_env_cap=bool(cfg.dissolve_hints and exact),
     )
-    if cfg.placer == "min_cut":
+    PlacerCls = Placer
+    if cfg.placer == "ilp":
+        from functools import partial
+
+        from .ilp import IlpPlacer
+        PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
+                            objective=cfg.ilp_objective,
+                            cap_exit=bool(final_block and cfg.ilp_cap_exit))
+    if exact:
         # force_place: pre-seeded placements (the terminal-exit refresh retry in
         # plan_graph_dir, and the magnitude keep-anchors). The cut still adds
         # whatever else it needs; every forced site goes through P2.
@@ -411,8 +445,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         caller_force = dict(hint_force or {})
         for _round in range(4):
             hint_force = {**dissolve_pins, **caller_force}
-            placer = Placer(**placer_kwargs, placed=set(forced),
-                            hint_force=hint_force)
+            placer = PlacerCls(**placer_kwargs, placed=set(forced),
+                               hint_force=hint_force)
             try:
                 sim = placer.run()
                 break
@@ -437,7 +471,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         sim = placer.run()
 
     rescale_anchors: set = set()
-    if cfg.rescale_opt and cfg.placer == "min_cut":
+    if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
         def _count(s: SimResult, p: Placer) -> int:
@@ -451,8 +485,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = Placer(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                        hint_force=hint_force)
+            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
+                           hint_force=hint_force)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -628,6 +662,19 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         boundary_realize=cfg.boundary_realize,
         realize_anchors=rescale_anchors,
     )
+    # Refresh-input absolute levels of the placed sites: what the pricing knobs move.
+    # eff = nominal + pending rescale, as _capacity sees it.
+    _hist: dict[str, int] = {}
+    for _v in placer.placed:
+        _c = placer.placed_in_eff.get(_v)          # forced/pinned sites never went through the cut
+        if _c is None:
+            _c = sim.consumed.get(_v, 0.0) + (cfg.level_unit if sim.deg.get(_v, 1) == 2 else 0)
+        _key = str(int(cfg.bootstrap_level + _c))
+        _hist[_key] = _hist.get(_key, 0) + 1
+    _hist = dict(sorted(_hist.items(), key=lambda kv: int(kv[0])))
+    result["summary"]["bts_quality"]["placed_input_level_hist"] = _hist
+    if cfg.verbose:
+        log.info("[plan] placed_input_level_hist " + " ".join(f"{k}:{c}" for k, c in _hist.items()))
     result["summary"]["bts_quality"]["blind_branches"] = {
         "count": len(result_blind),
         "vars": result_blind[:32],
@@ -636,6 +683,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # audited against it (scripts/utils/bts_level_audit.py). The runtime prints the level it
     # actually met as `[planted_bts] ... in=`; the two disagreeing is how a refresh ends up
     # past the envelope on a plan that looked clean, which no placement policy can catch.
+    # (placed_input_level_hist holds the histogram of the same levels.)
     result["summary"]["bts_quality"]["placed_input_levels"] = {
         v: cfg.bootstrap_level + sim.consumed.get(v, 0.0)
            + (cfg.level_unit if sim.deg.get(v, 1) == 2 else 0)
@@ -741,7 +789,7 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
         diag = PlanDiagnostics()
         try:
             result = plan_block(gf, cfg, entry_level=entry_level, entry_deg=entry_deg,
-                                table=table, diagnostics=diag)
+                                table=table, diagnostics=diag, final_block=bd == blocks[-1])
         except PlanInfeasible:
             if prev is None or prev.get("retried") or not prev.get("exit_var"):
                 raise
@@ -765,7 +813,7 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                 log.info(f"[plan] [{bd.name}] (retry entry={entry_level}/d{entry_deg})")
             diag = PlanDiagnostics()
             result = plan_block(gf, cfg, entry_level=entry_level, entry_deg=entry_deg,
-                                table=table, diagnostics=diag)
+                                table=table, diagnostics=diag, final_block=bd == blocks[-1])
         out_file = out_dir / f"{bd.name}_placement.json"
         if (st := _capture_stamp(bd)) is not None:   # plan/env contract (perseus.plan.contract)
             result[CONTRACT_KEY] = st

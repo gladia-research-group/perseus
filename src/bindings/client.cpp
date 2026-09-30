@@ -231,6 +231,12 @@ PYBIND11_MODULE(_client, m) {
     m.def("make_gpt2_inference", [](const InferenceOptions& o) { return make_gpt2_inference(o); },
           py::arg("options") = InferenceOptions{}, kRelease,
           "make_inference plus the GPT-2 rotation keys for `options`' packing (and aux packings).");
+    m.def("make_vit_inference", [](const InferenceOptions& o) { return make_vit_inference(o); },
+          py::arg("options") = InferenceOptions{}, kRelease,
+          "make_inference with the ViT band (CachemirFilling packing forced).");
+    m.def("make_bert_inference", [](const InferenceOptions& o) { return make_bert_inference(o); },
+          py::arg("options") = InferenceOptions{}, kRelease,
+          "make_inference with the BERT band (CachemirFilling packing forced).");
     m.def("make_context", [](const CKKSContextOptions& o) { return make_client_context(o); },
           py::arg("options") = CKKSContextOptions{}, kRelease,
           "Create a bare CKKS context (keygen, or a bundle's context when keys_dir is set).");

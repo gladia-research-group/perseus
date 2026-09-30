@@ -72,6 +72,25 @@ def main() -> None:
                    help="max bits of restore amplification a prescale may spend")
     p.add_argument("--quality-weight", type=float,
                    help="the pre-score weight in the cut (0 = count-first, default)")
+    p.add_argument("--depth-weight", type=float,
+                   help="price each cut site by how many levels its refresh restores, blended "
+                        "by this weight (0 = count-only, the default and what every shipped "
+                        "plan uses)")
+    p.add_argument("--depth-form", type=str, choices=["ratio", "linear", "ab", "ms"],
+                   help="how --depth-weight prices a site: ratio = budget/restored, "
+                        "linear = the levels not regained, ab = landing yield plus wasted runway")
+    p.add_argument("--depth-a", type=float, help="ab form: landing-yield coefficient (default 1)")
+    p.add_argument("--depth-b", type=float, help="ab form: early-refresh coefficient (default 1)")
+    p.add_argument("--bts-ms", type=str,
+                   help="measured bootstrap latency per route for --depth-form ms, "
+                        "e.g. 0:28.77,512:18.59,1:16.10 (0 = dense; this is the 32-bit "
+                        "chain, the 64-bit one is 0:36.69,512:23.59,1:19.95)")
+    p.add_argument("--ms-discount", type=float,
+                   help="how much of a sparse route's extra restored runway to credit back "
+                        "(0 = pure milliseconds, 1 = milliseconds per unit of runway, default)")
+    p.add_argument("--level-weight", type=float,
+                   help="charge a refresh for the depth of its input: capacity is scaled by "
+                        "1 + w x depth/envelope (0 = off, default)")
     p.add_argument("--sparse-slots", type=str,
                    help="runtime sparse precomps, e.g. 512,1")
     p.add_argument("--sparse-bts-out", type=str,
@@ -114,7 +133,24 @@ def main() -> None:
     p.add_argument("--first-entry-deg", type=int,
                    help="pending-rescale degree the first refresh enters at")
     p.add_argument("--placer", type=str,
-                   help="min_cut (default) or a baseline: orion|dacapo|fhelipe")
+                   help="min_cut (default), ilp (the same decision solved exactly as a "
+                        "mixed-integer program; needs scipy) or a baseline: "
+                        "orion|dacapo|fhelipe")
+    p.add_argument("--ilp-time-limit", type=float,
+                   help="placer ilp: solver time cap per block in seconds (default 300); "
+                        "on timeout the best placement found is kept, with its gap")
+    p.add_argument("--ilp-gap", type=float,
+                   help="placer ilp: relative optimality gap at which the solver may stop "
+                        "(default 0 = prove the optimum)")
+    p.add_argument("--ilp-objective", type=str, choices=["total", "placed", "ms"],
+                   help="placer ilp: minimise placed refreshes plus fired hints (total, "
+                        "default), placed refreshes only (placed, the min-cut's objective), "
+                        "or bootstrap milliseconds, each refresh at its route's --bts-ms "
+                        "latency (ms)")
+    p.add_argument("--ilp-free-exit", action="store_false", default=None,
+                   dest="ilp_cap_exit",
+                   help="placer ilp: let the final block exit deeper than the min-cut's plan "
+                        "(off by default: that exit feeds the unplanned encrypted argmax)")
     p.add_argument("--prune", action="store_true", default=None,
                    help="remove redundant refreshes from the final plan, any placer")
     p.add_argument("--baseline-depth-cap", type=float, dest="baseline_depth_cap",
@@ -139,6 +175,12 @@ def main() -> None:
             (pair.split(":") for pair in args.pop("sparse_bts_out").split(",") if pair))
     else:
         args.pop("sparse_bts_out", None)
+    if args.get("bts_ms") is not None:
+        args["bts_ms"] = tuple(
+            (int(k), float(v)) for k, v in
+            (pair.split(":") for pair in args.pop("bts_ms").split(",") if pair))
+    else:
+        args.pop("bts_ms", None)
     if args.get("hint_veto_steps_csv") is not None:
         args["hint_veto_steps"] = tuple(
             s for s in args.pop("hint_veto_steps_csv").split(",") if s)

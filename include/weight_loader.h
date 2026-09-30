@@ -66,6 +66,20 @@ public:
         if (m.shape.size() != 2) throw std::runtime_error("Expected 2D tensor: " + name);
         return reshape(data_.at(name), m.shape[0], m.shape[1]);
     }
+    // As above, but with the expected shape asserted by the caller.
+    std::vector<double> tensor1d(const std::string& name, int n) const {
+        const auto& m = meta_.at(name);
+        if (m.shape.size() != 1 || m.shape[0] != n)
+            throw std::runtime_error("Shape mismatch for " + name);
+        return data_.at(name);
+    }
+    std::vector<std::vector<double>> tensor2d(const std::string& name,
+                                              int rows, int cols) const {
+        const auto& m = meta_.at(name);
+        if (m.shape.size() != 2 || m.shape[0] != rows || m.shape[1] != cols)
+            throw std::runtime_error("Shape mismatch for " + name);
+        return reshape(data_.at(name), rows, cols);
+    }
 
 private:
     void load_manifest(const std::string& text) {
@@ -252,6 +266,17 @@ inline std::string gpt2_lm_head_name() { return "transformer.wte.weight"; }
 inline std::string gpt2_lm_head_tile_key(int k) { return "lm_head_tile_" + std::to_string(k); }
 inline std::string gpt2_final_ln_base() { return "transformer.ln_f"; }
 
+// Point `inf`'s per-site approximation configs at one block's entries.
+inline void prepare_gpt2_layer_configs(Inference& inf,
+                                       const config_loader::ParsedConfigs& parsed,
+                                       int block_idx) {
+    const std::string base = gpt2_block_base(block_idx);
+    inf.norm_cfg["ln_1"]    = parsed.norm.at(base + ".ln_1");
+    inf.norm_cfg["ln_2"]    = parsed.norm.at(base + ".ln_2");
+    inf.sm_cfg  ["attn"]    = parsed.softmax.at(base + ".attn");
+    inf.gelu_cfg["mlp.act"] = parsed.softgelu.at(base + ".mlp.act");
+}
+
 struct EncodedGpt2Layer {
     std::unordered_map<std::string, std::vector<Ptx>> w;
     std::unordered_map<std::string, std::vector<std::vector<double>>> raw_w;
@@ -383,6 +408,23 @@ inline EncodedGpt2Layer encode_gpt2_layer_weights(
 
     return out;
 }
+
+// Encode one block's weights and install them straight into `inf`, for callers that do not
+// need the intermediate EncodedGpt2Layer (the block pipeline keeps it to stage the upload).
+inline void prepare_gpt2_layer_weights(
+    Inference& inf,
+    const WeightStore& store,
+    const GPT2WeightNames& names,
+    int d_real, int d_exp_real,
+    int d_pad,  int d_exp_pad,
+    int num_heads,
+    cudaStream_t stream = nullptr) {
+    auto enc = encode_gpt2_layer_weights(inf, store, names, d_real, d_exp_real,
+                                         d_pad, d_exp_pad, num_heads, stream);
+    for (auto& kv : enc.raw_w) inf.raw_w[kv.first] = std::move(kv.second);
+    for (auto& kv : enc.w)     inf.w[kv.first]     = std::move(kv.second);
+}
+
 inline EncodedGpt2Layer encode_gpt2_final_ln_weights(
     Inference& inf, const WeightStore& store,
     int d_real, int d_pad, const BootstrapPlan& plan = {},

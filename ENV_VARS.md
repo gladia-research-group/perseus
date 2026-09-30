@@ -14,15 +14,19 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `CONFIGS_PATH` | Approximation config the model runs with (configs/model/approximation/<name>/configs.json). Required. |
 | `CUDA_VISIBLE_DEVICES` | GPU this process uses; the runtime has no per-context device selection, so it must be set before the first session. |
 | `DECODE_TOKENS` | Tokens decoded after a prefill hand-off. |
+| `GEN_FEEDBACK` | How a generation loop feeds the next token back: `encrypted` (the CutMax argmax, default) or `client` (decrypt, pick, re-encode). Read by notebooks/gpt2_perseus_nn.ipynb. |
 | `GEN_PROMPT` | Prompt length for the generation modes. |
 | `GEN_TOKENS` | Tokens generated after the prompt. |
 | `GPT2_CACHE` | Keep the encoded block weights across tokens (default 1). |
 | `GPT2_INFERENCE_MODE` | `threaded` (default), `prefetch` or `sync`; sync is required for a capture. |
+| `GPT2_MODEL` | HuggingFace checkpoint the notebooks load the tokenizer and embeddings from (openai-community/gpt2). |
 | `GPT2_PACKING` | Slot packing of the GPT-2 driver (`cachemir`). |
 | `MULTI_T` | Tokens a decode session runs (16 in the paper's row). |
 | `PERSEUS_CLIENT_EXTENSION` | Force the client role onto `core` or `client` instead of whichever extension loads. |
 | `PERSEUS_DATA` | Root the run scripts resolve the weights and oracle under (default `.cache/`). |
 | `PERSEUS_FATAL_EXIT` | Install the terminate handler that exits the process on a fatal CUDA error instead of unwinding. |
+| `PERSEUS_PROMPT` | Prompt text for the notebook generation demos (GEN_PROMPT is a token count, not text). |
+| `PIN_PROFILE` | Pass SessionProfile.gpt2_decode_n32() explicitly instead of taking the CKKS parameters from the environment. Read by notebooks/gpt2_perseus_nn.ipynb. |
 | `PREFILL_TOKENS` | Prompt length for the prefill modes. |
 | `STEPS_T` | Context length the KV cache is sized for (128). |
 | `TEACHER_FORCED` | Feed the oracle's tokens instead of the model's own argmax. |

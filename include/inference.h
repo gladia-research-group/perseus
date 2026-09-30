@@ -142,6 +142,8 @@ struct Inference {
     void begin_stage_block(int owner) { cc()->BeginStageBlockOwned(owner); }
     void release_stage_block(int owner) { cc()->ReleaseStageBlock(owner); }
     void set_persistent_staging(bool on) { cc()->SetPersistentStaging(on); }
+    // BERT's multi-consume staging: one staged plaintext feeds several consumers.
+    void set_stage_multi_consume(bool on) { cc()->SetStageMultiConsume(on); }
     void evict_plaintext(Ptx& pt) {
         if (!pt || !pt->loaded || pt->gpu == 0) return;
         cc()->EvictDevicePlaintext(pt->gpu);
@@ -159,6 +161,12 @@ struct Inference {
     uint32_t pending_rescale_primes(const Ctx& ct) const {
         if (fhe) return fhe->pending_rescale_primes(ct);
         return (ct && ct->GetNoiseScaleDeg() == 2) ? 1u : 0u;
+    }
+
+    // Give a plaintext a graph name if it does not already have one, so a captured graph
+    // reports it by name instead of by an anonymous literal.
+    void name_graph_pt_if_absent(const Ptx& pt, const std::string& name) {
+        if (fhe) fhe->name_pt_if_absent(pt, name);
     }
 
     template <class Vec>

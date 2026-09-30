@@ -26,6 +26,10 @@ PLACERS = {
     DaCapoPlacer.NAME_KEY: DaCapoPlacer,
 }
 
+#: Flat per-op latency weights in ms for the DaCapo segment DP, on the n32 chain.
+#: `bootstrap` is the measured dense 4:3 wall; the rest are order-of-magnitude op costs.
+#: The bootstrap dominates by 60-500x, so per-level refinement of the others is
+#: second-order. Swap the file via --latency-table to test sensitivity.
 _DEFAULT_LATENCY = Path(__file__).with_name("latency_n32.json")
 
 

@@ -18,8 +18,8 @@ Usage:
   python scripts/utils/gen_gpt2_oracle.py --model openai-community/gpt2 \
       --pool .cache/pools/openwebtext_gpt2.npy --out .cache/oracle/gpt2/all_blocks_io \
       --T 16 32 64 128 --pool-offset 4096
-The token pool is the calibration pool (perseus.calibrate.data.load_token_pool; README step 1
-writes it).
+The token pool is the calibration pool (perseus.calibrate.data.load_token_pool; the
+setup_artifacts notebook writes it).
 """
 import argparse
 import json

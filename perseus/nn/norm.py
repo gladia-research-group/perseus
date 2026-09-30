@@ -143,7 +143,7 @@ class EncLayerNorm(EncModule):
                 f"run-to-run repeatable on this chain (r_g={r_g:.4g} then "
                 f"{r_g2:.4g}) — the standalone inv-sqrt is chaotic at this "
                 f"precision; use the block-context LN (folded gamma) or a plan-"
-                f"managed chain. See docs/PYTHON_BINDING_STATUS.md (LN, n32).")
+                f"managed chain.")
         r_b = 1.0
         if np.abs(beta).max() > 0:
             self._install_affine(inf, gamma=gamma.tolist(), bias=beta.tolist())

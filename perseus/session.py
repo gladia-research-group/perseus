@@ -114,7 +114,7 @@ def session(profile=None, options=None, family: str = "gpt2", mode: str | None =
     profile: a perseus.profile.SessionProfile (its env view is applied as defaults,
     then CKKSOptions are read); options: an explicit _core.InferenceOptions (wins over
     profile); neither: the environment. family picks the rotation-key band
-    ("gpt2" | "generic"). mode overrides the residency scheduling
+    ("gpt2" | "vit" | "bert" | "generic"). mode overrides the residency scheduling
     ("sync" | "prefetch" | "threaded"). device: the GPU index this process should use
     (sets CUDA_VISIBLE_DEVICES before the runtime's first CUDA call; the runtime has no
     per-context device selection, so this must be the first session of the process).

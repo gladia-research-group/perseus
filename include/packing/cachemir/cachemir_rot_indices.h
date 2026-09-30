@@ -7,6 +7,9 @@
 
 namespace cachemir {
 
+// The rotation steps a d_in -> d_out linear needs on a ring of N slots.
+std::vector<int32_t> linear_rot_indices(int N, int d_in, int d_out);
+
 std::vector<int32_t> compute_gpt2_rot_indices(
     int slots, int hidDim, int ffDim, int numHeads);
 }  // namespace cachemir

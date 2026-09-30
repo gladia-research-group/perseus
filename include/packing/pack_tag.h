@@ -65,6 +65,20 @@ struct PackTag {
             if (periodic_at(s) || fold_collision_free_at(s)) return s;
         return slots;
     }
+
+    // True when every live slot already sits below s, so a fold at s moves nothing: the
+    // support survives a sparse route in place. Stricter than fold_collision_free_at,
+    // which only asks that no two live values land in the same residue class.
+    bool fold_transparent_at(int s) const {
+        if (support.is_empty()) return true;
+        if (support.is_dense()) return s >= slots;
+        if (support.count <= 0 || support.offset < 0) return false;
+        // Highest live index is offset + (count-1)*stride + (width-1); strictly below s.
+        const long long hi = (long long)support.offset +
+                             (long long)(support.count - 1) * (long long)support.stride +
+                             (long long)(support.width - 1);
+        return hi < (long long)s;
+    }
 };
 
 inline int lcm_capped(int a, int b, int cap) {

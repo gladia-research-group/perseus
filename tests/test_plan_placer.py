@@ -364,3 +364,63 @@ class RealGraphTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class CutPricingKnobs(unittest.TestCase):
+    """depth_weight / level_weight: off by default, and each form moves the cut when on.
+
+    Off is what every shipped plan uses, so the default must reproduce the count-only cut
+    exactly; tests/test_paper_plans.py is the end-to-end form of that guarantee.
+    """
+
+    GRAPH = REAL_GRAPH / "block_0" / "graph.json"
+
+    def _cfg(self, **kw):
+        return PlanConfig(bootstrap_level=36, source_level=36, cache_read_level=36,
+                          level_unit=2, max_level=50, cf_max=20, mag_safety=2.0,
+                          allow_prescale=False, acc_chain="n32", verbose=False, **kw)
+
+    def _plan(self, **kw):
+        if not self.GRAPH.is_file():
+            self.skipTest("real-graph fixture not present")
+        return plan_block(self.GRAPH, self._cfg(**kw))["summary"]
+
+    def test_defaults_are_off(self):
+        cfg = PlanConfig()
+        for name in ("depth_weight", "level_weight"):
+            self.assertEqual(getattr(cfg, name), 0.0, f"{name} must default to off")
+        self.assertEqual(cfg.depth_form, "ratio")
+
+    def test_zero_weight_reproduces_the_count_only_cut(self):
+        base = self._plan()
+        for kw in ({"depth_weight": 0.0}, {"level_weight": 0.0},
+                   {"depth_weight": 0.0, "depth_form": "linear"}):
+            self.assertEqual(self._plan(**kw)["num_placements"], base["num_placements"],
+                             f"a zero weight changed the cut: {kw}")
+
+    def test_each_form_is_reachable_and_prices_differently(self):
+        base = self._plan()["num_placements"]
+        moved = {f: self._plan(depth_weight=1.0, depth_form=f)["num_placements"]
+                 for f in ("ratio", "linear", "ab", "ms")}
+        moved["level"] = self._plan(level_weight=1.0)["num_placements"]
+        self.assertTrue(any(v != base for v in moved.values()),
+                        f"no pricing form moved the cut off {base}: {moved}")
+
+    def test_placed_input_levels_is_reported(self):
+        hist = self._plan()["bts_quality"].get("placed_input_level_hist")
+        self.assertIsInstance(hist, dict)
+        self.assertTrue(all(k.isdigit() for k in hist), hist)
+
+    def test_ms_form_prefers_the_cheaper_route(self):
+        """Pricing by measured latency plus the runway credit must not route MORE sites
+        dense than the count-only cut does."""
+        def dense_share(**kw):
+            cfg = self._cfg(**kw)
+            r = plan_block(self.GRAPH, cfg)
+            placed = r["summary"]["num_placements"]
+            routed = len(r.get("sparse_slots") or {})
+            return placed - routed
+        if not self.GRAPH.is_file():
+            self.skipTest("real-graph fixture not present")
+        self.assertLessEqual(dense_share(depth_weight=1.0, depth_form="ms"),
+                             dense_share())

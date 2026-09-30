@@ -30,3 +30,6 @@ foreach(src ${CACHEMIR_TESTS})
     get_filename_component(name ${src} NAME_WE)
     add_cachemir_test(${name})
 endforeach()
+
+# Dev/experimental test suite (reuses add_cachemir_test above).
+add_subdirectory(dev)

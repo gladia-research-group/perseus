@@ -60,5 +60,11 @@ std::future<void> residency_submit(std::function<void()> job);
 // head-of-line block the per-block extractions. Do not add other callers.
 std::future<void> mask_submit(std::function<void()> job);
 
+// Print and reset the per-token host-side residency timers as one `[residperf] tokN ...`
+// line, when FHE_RESIDPERF is set. steady_clock only, no CUDA call, so unlike the step
+// profiler these are valid on an unprofiled run. `xwait` is the staging the pipeline failed
+// to hide behind compute: 0 on a warm token means the overlap is complete. Call once a token.
+void residency_perf_report(int tok);
+
 void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
                             Overlap mode);

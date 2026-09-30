@@ -224,7 +224,11 @@ std::vector<int32_t> family_rot_band(const std::string& family, const InferenceO
 InferenceOptions prepare_family_options(const std::string& family, InferenceOptions o);
 
 ClientInference make_inference(InferenceOptions o);
+std::vector<int32_t> vit_rot_indices(int slots, int hidDim, int ffDim, int numHeads);
+std::vector<int32_t> bert_rot_indices(int slots, int hidDim, int ffDim, int numHeads);
 ClientInference make_gpt2_inference(InferenceOptions o);
+ClientInference make_vit_inference(InferenceOptions o);
+ClientInference make_bert_inference(InferenceOptions o);
 
 ClientCt pack_tokens(ClientInference& inf, const std::vector<std::vector<double>>& embeddings,
                      int target_level);

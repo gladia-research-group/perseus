@@ -136,7 +136,7 @@ class SessionProfile:
 
     @classmethod
     def custom_n64(cls):
-        """A small custom model on the 64-bit chain, planning its own bootstraps."""
+        """run_notebooks.sh `custom`: the self-planning custom-model toy env."""
         return cls(chain="n64", auto_bts_level=24, mode="sync")
 
     @classmethod

@@ -1,0 +1,20 @@
+defaults:
+  - gpt2
+  - _self_
+
+name: vit_base
+
+norm:
+  rescale_max_var_scaled: 5.0
+  rescale_min_var_scaled_nl: 0.03
+  rescale_min_var_scaled: 0.35
+
+  z_min_safety: 6.0
+  inv_y_max: 2.5
+
+gelu:
+  raw_max_safety: 1.5
+
+softmax:
+  bidirectional: true
+  decode_window: null

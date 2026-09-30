@@ -231,3 +231,24 @@ Ctx inv_sqrt_newton_safe(CKKSContext& cc, const Ctx& x, const Ctx& y0,
     }
     return y;
 }
+
+/// @brief Newton's iteration for 1/dnm: y_{i+1} = y_i * (2 - dnm*y_i). Two levels per
+///        iteration. `res` is the initial guess.
+Ctx newton_inverse(CKKSContext& cc, const Ctx& res, Ctx dnm, int iters) {
+    Ctx y = res;
+    for (int i = 0; i < iters; ++i) {
+        Ctx t = cc.mult(dnm, y);   // d·y
+        cc.inplace_negate(t);
+        cc.inplace_add(t, 2.0);    // 2 − d·y (scalar add: no level)
+        y = cc.mult(y, t);         // y · (2 − d·y)
+    }
+    return y;
+}
+
+/// @brief Square `x` in place `iters` times.
+Ctx exp_squaring(CKKSContext& cc, Ctx x, int iters) {
+    for (int i = 0; i < iters; ++i) {
+        cc.inplace_square(x);
+    }
+    return x;
+}

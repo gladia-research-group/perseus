@@ -23,6 +23,10 @@ Ctx inv_sqrt_newton(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iter
 Ctx goldschmidt_inv_sqrt(CKKSContext& cc, const Ctx& x, const Ctx& ans_init, int iters);
 Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& a, const Ctx& x0_init, int iters);
 
+// Repeated squaring, and Newton's iteration for 1/dnm from an initial guess.
+Ctx exp_squaring(CKKSContext& cc, Ctx x, int iters);
+Ctx newton_inverse(CKKSContext& cc, const Ctx& res, Ctx dnm, int iters);
+
 // sparse_df routes the D_neg/F-track bootstraps to the sparse precomp — arm ONLY where
 // D_init is proven slot-periodic (decode softmax s); the N-track always bootstraps dense.
 Ctx goldschmidt_inv(CKKSContext& cc, const Ctx& N_init, const Ctx& D_init, const Ctx& F_init,

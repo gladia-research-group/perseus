@@ -22,6 +22,12 @@ PackedCtx softmax_v(Inference& inf, std::vector<PackedCtx> softmax_scores);
 
 PackedCtx mha_attn_token_pair(Inference& inf, PackedCtx& q_cplx);
 
+std::vector<PackedCtx> bi_attention(Inference& inf,
+                                    std::vector<PackedCtx> qs,
+                                    std::vector<PackedCtx> ks,
+                                    std::vector<PackedCtx> vs,
+                                    const std::vector<int>& ns);
+
 std::vector<std::vector<double>> rearrange_qkv_weights(
     const Inference& inf, const std::vector<std::vector<double>>& W, int H);
 

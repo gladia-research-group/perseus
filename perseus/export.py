@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import zipfile
 
 import numpy as np
@@ -43,6 +44,142 @@ def _gpt2_tensors(model):
             arr = arr.T
         out[name] = arr
     return out
+
+
+def _vit_tensors(model):
+    sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+    out = {}
+    for b in range(model.config.num_hidden_layers):
+        p = f"vit.encoder.layer.{b}."
+        g = f"transformer.h.{b}."
+        for s in ("weight", "bias"):
+            out[g + "attn.c_attn." + s] = np.concatenate(
+                [sd[p + f"attention.attention.{m}.{s}"]
+                 for m in ("query", "key", "value")])
+            out[g + "attn.c_proj." + s] = sd[p + "attention.output.dense." + s]
+            out[g + "mlp.c_fc." + s]    = sd[p + "intermediate.dense." + s]
+            out[g + "mlp.c_proj." + s]  = sd[p + "output.dense." + s]
+            out[g + "ln_1." + s] = sd[p + "layernorm_before." + s]
+            out[g + "ln_2." + s] = sd[p + "layernorm_after." + s]
+    out["transformer.ln_f.weight"] = sd["vit.layernorm.weight"]
+    out["transformer.ln_f.bias"]   = sd["vit.layernorm.bias"]
+    out["transformer.wte.weight"]  = sd["classifier.weight"]
+    return out
+
+
+def _vit_client(model):
+    sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+    conv = sd["vit.embeddings.patch_embeddings.projection.weight"]
+    return {
+        "patch_weight": conv.reshape(conv.shape[0], -1),
+        "patch_bias": sd["vit.embeddings.patch_embeddings.projection.bias"],
+        "cls_token": sd["vit.embeddings.cls_token"].reshape(-1),
+        "position_embeddings": sd["vit.embeddings.position_embeddings"][0],
+        "classifier_bias": sd["classifier.bias"],
+    }
+
+
+def _vit_section(site):
+    if site == "vit.layernorm":
+        return "transformer.ln_f"
+    m = re.match(r"vit\.encoder\.layer\.(\d+)\.(.+)", site)
+    if not m:
+        return site
+    b, rest = m.group(1), m.group(2)
+    suffix = {"layernorm_before": "ln_1", "layernorm_after": "ln_2",
+              "attention.attention": "attn"}.get(rest)
+    if suffix is None:
+        if not rest.startswith("intermediate."):
+            raise ValueError(f"unmapped ViT site: {site}")
+        suffix = "mlp.act"
+    return f"transformer.h.{b}.{suffix}"
+
+
+def _bert_tensors(model):
+    """BERT encoder -> the runtime's transformer.h.<b>.* grammar.
+
+    POST-LN mapping (BERT is NOT ViT's pre-LN): `ln_1` carries the
+    post-ATTENTION LayerNorm and `ln_2` the post-MLP one, so the BERT driver
+    applies each AFTER its residual add. The names match the shared loader
+    (weight_loader.h gpt2_layer_names) — only the placement differs, which is
+    why BERT needs its own block body rather than a weight remap.
+
+    No `transformer.ln_f`: BERT has no terminal LayerNorm (its last op IS
+    output.LayerNorm of block N-1). Emitting an identity LN would be WRONG —
+    LayerNorm still centers/normalizes with gamma=1, beta=0 — so the driver
+    must skip the final-LN stage entirely.
+
+    No server-side head either. BertForSequenceClassification classifies
+    tanh(dense(CLS)), and `tanh` has no registered FHE approximation, so the
+    encrypted stage ends at the encoder: the server returns the CLS ciphertext
+    and the client applies pooler-dense + tanh + classifier (see _bert_client).
+    Moving the pooler dense server-side is trivial (it is a linear); only the
+    tanh would need a calibrated polynomial to close the gap.
+    """
+    sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+    out = {}
+    for b in range(model.config.num_hidden_layers):
+        p = f"bert.encoder.layer.{b}."
+        g = f"transformer.h.{b}."
+        for s in ("weight", "bias"):
+            out[g + "attn.c_attn." + s] = np.concatenate(
+                [sd[p + f"attention.self.{m}.{s}"] for m in ("query", "key", "value")])
+            out[g + "attn.c_proj." + s] = sd[p + "attention.output.dense." + s]
+            out[g + "mlp.c_fc." + s]    = sd[p + "intermediate.dense." + s]
+            out[g + "mlp.c_proj." + s]  = sd[p + "output.dense." + s]
+            out[g + "ln_1." + s] = sd[p + "attention.output.LayerNorm." + s]
+            out[g + "ln_2." + s] = sd[p + "output.LayerNorm." + s]
+    return out
+
+
+def _bert_client(model):
+    """Both plaintext ends of the pipeline.
+
+    FRONT: the client sums the three embedding tables and applies the embeddings
+    LayerNorm before encryption (the one fold step ViT has no analogue for), so
+    the server receives a ready [T][d] activation.
+
+    BACK: pooler dense + tanh + classifier, applied to the decrypted CLS vector
+    (see _bert_tensors — tanh has no FHE approximation, so the head stays
+    client-side for this bring-up).
+    """
+    sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+    e = "bert.embeddings."
+    return {
+        "word_embeddings": sd[e + "word_embeddings.weight"],
+        "position_embeddings": sd[e + "position_embeddings.weight"],
+        "token_type_embeddings": sd[e + "token_type_embeddings.weight"],
+        "emb_ln_weight": sd[e + "LayerNorm.weight"],
+        "emb_ln_bias": sd[e + "LayerNorm.bias"],
+        "pooler_weight": sd["bert.pooler.dense.weight"],
+        "pooler_bias": sd["bert.pooler.dense.bias"],
+        "classifier_weight": sd["classifier.weight"],
+        "classifier_bias": sd["classifier.bias"],
+    }
+
+
+def _bert_section(site):
+    """Calibration site -> runtime section name.
+
+    Both block LayerNorms are literally named `.LayerNorm`, so the role is
+    carried by the PARENT path, not the leaf.
+
+    The `bert.` prefix is optional: calibration runs on a bare BertModel
+    (hub.load_model(encoder_only=True)), whose modules are `encoder.layer.N.…`,
+    while the export loads the task model, whose tensors are `bert.encoder.…`.
+    """
+    m = re.match(r"(?:bert\.)?encoder\.layer\.(\d+)\.(.+)", site)
+    if not m:
+        return site
+    b, rest = m.group(1), m.group(2)
+    suffix = {"attention.output.LayerNorm": "ln_1",   # post-attention residual LN
+              "output.LayerNorm": "ln_2",             # post-MLP residual LN
+              "attention.self": "attn"}.get(rest)
+    if suffix is None:
+        if not rest.startswith("intermediate."):
+            raise ValueError(f"unmapped BERT site: {site}")
+        suffix = "mlp.act"
+    return f"transformer.h.{b}.{suffix}"
 
 
 def _gpt2_client(model):
@@ -105,6 +242,8 @@ def load_trained_backbone(model, checkpoint):
 
 ADAPTERS = {
     "gpt2": {"tensors": _gpt2_tensors, "client": _gpt2_client, "section": lambda s: s},
+    "vit":  {"tensors": _vit_tensors, "client": _vit_client, "section": _vit_section},
+    "bert": {"tensors": _bert_tensors, "client": _bert_client, "section": _bert_section},
 }
 
 

@@ -2,6 +2,8 @@
 #include "interrupt.h"
 #include "residency_pipeline.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <condition_variable>
@@ -12,6 +14,38 @@
 #include <thread>
 
 namespace {
+
+// Host-side residency cost, per token. steady_clock only, no CUDA call, ~50 ns a site, so
+// unlike the step profiler these stay valid on an UNPROFILED run — which is the point: the
+// profiler serialises what it measures, and `xwait` is what says whether the staging worker
+// was actually hidden behind compute. 0 on a warm token means fully hidden.
+struct ResidPerf {
+    std::atomic<uint64_t> acquire_ns{0}, install_ns{0}, release_ns{0},
+                          extract_wait_ns{0}, arena_drain_ns{0}, pipeline_sync_ns{0};
+};
+ResidPerf g_residperf;
+
+struct HostTimer {
+    std::atomic<uint64_t>& sink;
+    std::chrono::steady_clock::time_point t0;
+    explicit HostTimer(std::atomic<uint64_t>& s)
+        : sink(s), t0(std::chrono::steady_clock::now()) {}
+    ~HostTimer() {
+        sink.fetch_add(static_cast<uint64_t>(
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - t0).count()),
+                       std::memory_order_relaxed);
+    }
+};
+
+bool residperf_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FHE_RESIDPERF");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 
 class PersistentWorker {
 public:
@@ -79,6 +113,20 @@ std::future<void> mask_submit(std::function<void()> job) {
     return submit_mask(std::move(job));
 }
 
+void residency_perf_report(int tok) {
+    if (!residperf_enabled()) return;
+    auto ms = [](std::atomic<uint64_t>& a) {
+        return static_cast<double>(a.exchange(0, std::memory_order_relaxed)) / 1e6;
+    };
+    // acq/ins/rel are ENQUEUE plus host cost, not transfer time: nothing syncs in here, so an
+    // async copy that retires later is not charged to them. xwait is the whole truth — fut.get()
+    // is a pure host block, so it is exactly the staging the pipeline failed to hide.
+    std::printf("[residperf] tok%d acq=%.1f ins=%.1f rel=%.1f xwait=%.1f drain=%.1f sync=%.1f ms\n",
+                tok, ms(g_residperf.acquire_ns), ms(g_residperf.install_ns),
+                ms(g_residperf.release_ns), ms(g_residperf.extract_wait_ns),
+                ms(g_residperf.arena_drain_ns), ms(g_residperf.pipeline_sync_ns));
+}
+
 void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
                             Overlap mode) {
     const int n = static_cast<int>(stages.size());
@@ -89,12 +137,12 @@ void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
 
     auto ACQ = [&](int i, cudaStream_t s) {
         if (!stages[i].acquire) return;
-        if (on_main()) { WithStep _w(inf, "res_acquire"); stages[i].acquire(inf, s); }
+        if (on_main()) { HostTimer _ht(g_residperf.acquire_ns); WithStep _w(inf, "res_acquire"); stages[i].acquire(inf, s); }
         else            stages[i].acquire(inf, s);
     };
     auto INS = [&](int i) {
         if (!stages[i].install) return;
-        if (on_main()) { WithStep _w(inf, "res_install"); stages[i].install(inf); }
+        if (on_main()) { HostTimer _ht(g_residperf.install_ns); WithStep _w(inf, "res_install"); stages[i].install(inf); }
         else            stages[i].install(inf);
     };
     auto CMP = [&](int i) {
@@ -103,7 +151,7 @@ void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
     };
     auto REL = [&](int i) {
         if (!stages[i].release) return;
-        if (on_main()) { WithStep _w(inf, "res_release"); stages[i].release(inf); }
+        if (on_main()) { HostTimer _ht(g_residperf.release_ns); WithStep _w(inf, "res_release"); stages[i].release(inf); }
         else            stages[i].release(inf);
     };
 
@@ -138,23 +186,23 @@ void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
 
         EXTRACT(0);
         ACQ(0, astream);
-        if (use_stream) { WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
+        if (use_stream) { HostTimer _ht(g_residperf.pipeline_sync_ns); WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
         EXTRACT(1);
 
         for (int i = 0; i < n; ++i) {
             INS(i);
             const bool ext2 = (i + 2 < n) && static_cast<bool>(stages[i + 2].prefetch_cpu);
-            if (ext2 && use_stream) { WithStep _w(inf, "res_arena_drain"); cudaStreamSynchronize(astream); }
+            if (ext2 && use_stream) { HostTimer _ht(g_residperf.arena_drain_ns); WithStep _w(inf, "res_arena_drain"); cudaStreamSynchronize(astream); }
             if (stages[i].stage_owner >= 0) inf.release_stage_block(stages[i].stage_owner);
             if (ext2) fut = submit_prefetch([&, i] { EXTRACT(i + 2); });
             if (i + 1 < n) ACQ(i + 1, astream);   // upload i+1 (stash hit) on astream — overlaps CMP(i)
             CMP(i);
-            if (ext2) { WithStep _w(inf, "res_extract_wait"); fut.get(); }
+            if (ext2) { HostTimer _ht(g_residperf.extract_wait_ns); WithStep _w(inf, "res_extract_wait"); fut.get(); }
             REL(i);                               // block_sync drains the astream upload(i+1)
         }
     } else {
         ACQ(0, astream);
-        if (use_stream) { WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
+        if (use_stream) { HostTimer _ht(g_residperf.pipeline_sync_ns); WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
         for (int i = 0; i < n; ++i) {
             INS(i);
             const bool overlap = (mode != Overlap::Sync) && (i + 1 < n) && stages[i].prefetch_next;
@@ -165,12 +213,12 @@ void run_residency_pipeline(Inference& inf, std::vector<ResidencyStage> stages,
                     ACQ(i + 1, astream);
             }
             CMP(i);
-            if (overlap && mode == Overlap::Stream && use_stream) { WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
+            if (overlap && mode == Overlap::Stream && use_stream) { HostTimer _ht(g_residperf.pipeline_sync_ns); WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
             REL(i);
-            if (overlap && mode == Overlap::Threaded) { WithStep _w(inf, "res_acquire_wait"); fut.get(); }  // join before next install
+            if (overlap && mode == Overlap::Threaded) { HostTimer _ht(g_residperf.extract_wait_ns); WithStep _w(inf, "res_acquire_wait"); fut.get(); }  // join before next install
             if (!overlap && i + 1 < n) {                           // Sync boundary
                 ACQ(i + 1, astream);
-                if (use_stream) { WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
+                if (use_stream) { HostTimer _ht(g_residperf.pipeline_sync_ns); WithStep _w(inf, "res_pipeline_sync"); cudaDeviceSynchronize(); }
             }
         }
     }

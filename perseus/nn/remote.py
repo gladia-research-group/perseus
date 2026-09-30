@@ -46,6 +46,8 @@ MANIFEST_FORMAT = 1
 
 _FAMILIES = {
     "gpt2": "make_gpt2_inference",
+    "vit": "make_vit_inference",
+    "bert": "make_bert_inference",
     "generic": "make_inference",
 }
 

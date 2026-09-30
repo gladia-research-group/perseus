@@ -32,6 +32,10 @@ DOC = {
     "DECODE_TOKENS": ("Session", "Tokens decoded after a prefill hand-off."),
     "GEN_PROMPT": ("Session", "Prompt length for the generation modes."),
     "GEN_TOKENS": ("Session", "Tokens generated after the prompt."),
+    "GEN_FEEDBACK": ("Session", "How a generation loop feeds the next token back: `encrypted` (the CutMax argmax, default) or `client` (decrypt, pick, re-encode). Read by notebooks/gpt2_perseus_nn.ipynb."),
+    "GPT2_MODEL": ("Session", "HuggingFace checkpoint the notebooks load the tokenizer and embeddings from (openai-community/gpt2)."),
+    "PERSEUS_PROMPT": ("Session", "Prompt text for the notebook generation demos (GEN_PROMPT is a token count, not text)."),
+    "PIN_PROFILE": ("Session", "Pass SessionProfile.gpt2_decode_n32() explicitly instead of taking the CKKS parameters from the environment. Read by notebooks/gpt2_perseus_nn.ipynb."),
     "TEACHER_FORCED": ("Session", "Feed the oracle's tokens instead of the model's own argmax."),
     "PERSEUS_FATAL_EXIT": ("Session", "Install the terminate handler that exits the process on a fatal CUDA error instead of unwinding."),
     "PERSEUS_CLIENT_EXTENSION": ("Session", "Force the client role onto `core` or `client` instead of whichever extension loads."),
@@ -103,6 +107,7 @@ DOC = {
     "FIDESLIB_KSK_PACK": ("Keys", "Store the `b` half as a dense 28-bit bit-stream (default 1)."),
     "FIDESLIB_KS_DIGIT_INTT": ("Keys", "1 restores upstream's redundant per-digit INTT in the key switch."),
     # ── profiling ─────────────────────────────────────────────────────────────────────
+    "FHE_RESIDPERF": ("Profiling", "Per-token host-side residency timings on stdout; `xwait` is the staging the pipeline failed to hide behind compute (0 = fully hidden). Valid on an unprofiled run, unlike FHE_PROFILE."),
     "FHE_PROFILE": ("Profiling", "Per-operation timing table on stderr (default off)."),
     "FHE_PROFILE_TOKEN": ("Profiling", "Restrict that profile to one token index."),
     "FHE_GRAPH_CAPTURE_TOKEN": ("Profiling", "Capture the op-graph of one token only."),

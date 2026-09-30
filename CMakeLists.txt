@@ -111,6 +111,8 @@ add_library(cachemir_lib STATIC
     src/algorithms/attention/cachemir_filling/cachemir_filling_complex_attention.cu
     src/algorithms/attention/cachemir_filling/cachemir_filling_delta_attention.cu
     src/algorithms/attention/cachemir_filling/cachemir_filling_delta_complex_attention.cu
+    src/algorithms/attention/bidirectional/delta_bi_attention.cu
+    src/algorithms/attention/bidirectional/complex_bi_attention.cu
     src/packing/cachemir/cachemir_kv_cache.cu
     src/packing/cachemir/cachemir_complex_kv_cache.cu
     src/packing/cachemir/cachemir_norm_utils.cu
@@ -138,6 +140,8 @@ add_library(cachemir_lib STATIC
     src/model/gpt2/gpt2_embedding.cu
     src/model/gpt2/gpt2_io.cu
     src/model/gpt2/gpt2_model_api.cu
+    src/model/vit/vit_model.cu
+    src/model/bert/bert_model.cu
     src/model/mha.cu
     src/model/mlp.cu
     src/model/layer_norm.cu
@@ -193,6 +197,7 @@ if(CACHEMIR_BUILD_PYTHON)
         src/bindings/ops.cu
         src/bindings/io.cu
         src/bindings/io_gpt2.cu
+        src/bindings/io_encoders.cu
         src/bindings/pipeline.cu
         src/bindings/serial.cu
         src/bindings/session.cu
