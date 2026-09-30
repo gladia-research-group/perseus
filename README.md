@@ -10,7 +10,7 @@
   </a>
 </p>
 
-<h1 align="center">Perseus: A Bootstrap Placer for Faster Encrypted Transformer Inference</h1>
+<h1 align="center">Perseus: Faster FHE Transformer Inference via Complex-Packing and Sparse Bootstraps</h1>
 
 <p align="center">
   <a href="https://github.com/gladia-research-group/FIDESlib32bits">FIDESlib32bits runtime</a> ·
