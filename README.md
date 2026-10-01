@@ -8,6 +8,8 @@
       <img src="assets/gladia-logo.svg" alt="GLADIA Research Group" height="84">
     </picture>
   </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.gmu.edu"><img src="assets/GM-monogramRGB-r.png" alt="George Mason University" height="76"></a>
 </p>
 
 <h1 align="center">Perseus: Faster FHE Transformer Inference via Complex-Packing and Sparse Bootstraps</h1>
