@@ -1,14 +1,6 @@
 <p align="center">
   <a href="https://www.uniroma1.it/en"><img src="assets/sapienza-logo.svg" alt="Sapienza University of Rome" height="76"></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://gladia.di.uniroma1.it">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/gladia-logo-white.svg">
-      <source media="(prefers-color-scheme: light)" srcset="assets/gladia-logo.svg">
-      <img src="assets/gladia-logo.svg" alt="GLADIA Research Group" height="84">
-    </picture>
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://www.gmu.edu"><img src="assets/GM-monogramRGB-r.png" alt="George Mason University" height="76"></a>
   &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <picture>
@@ -332,3 +324,13 @@ Perseus is released under the [Business Source License 1.1](LICENSE): free for a
 non-commercial use (research, academic, evaluation); commercial use requires prior written
 permission from the authors. On the Change Date (2030-08-18) the license converts to GPLv2.
 `third_party/FIDESlib` keeps its own license.
+
+<p align="center">
+  <a href="https://gladia.di.uniroma1.it">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/gladia-logo-white.svg">
+      <source media="(prefers-color-scheme: light)" srcset="assets/gladia-logo.svg">
+      <img src="assets/gladia-logo.svg" alt="GLADIA Research Group" height="56">
+    </picture>
+  </a>
+</p>
