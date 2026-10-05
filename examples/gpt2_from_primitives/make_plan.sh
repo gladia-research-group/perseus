@@ -74,7 +74,8 @@ print(*fed_back_entry(sys.argv[1]))' "$GRAPH_DIR/block_0/graph.json")
     cp "$GRAPH_DIR/capture_env.json" "$TMP/" 2>/dev/null || true
     # alone, block 0 is the final block, whose exit the ILP caps; in the chain it is not
     [ "${PLAN_PLACER:-}" = ilp ] && export PLAN_ILP_FREE_EXIT=1
-    plan_blocks "$TMP" "${OUT_NAME}_feedback" FIRST_ENTRY_LEVEL="$ENTRY_LEVEL" FIRST_ENTRY_DEG="$ENTRY_DEG"
+    # FEEDBACK_ENTRY_LEVEL/DEG override the capture-derived entry (a bootstrap landing that differs from the capture)
+    plan_blocks "$TMP" "${OUT_NAME}_feedback" FIRST_ENTRY_LEVEL="${FEEDBACK_ENTRY_LEVEL:-$ENTRY_LEVEL}" FIRST_ENTRY_DEG="${FEEDBACK_ENTRY_DEG:-$ENTRY_DEG}"
     FB="bootstrap_placements/${OUT_NAME}_feedback/block_0_placement.json"
     "$PYTHON" - "$B0" "$FB" <<'PY'
 import json, sys
@@ -111,5 +112,11 @@ if [ "$STAGE" = argmax ]; then
 fi
 # block 0's feedback variant is derived from this block 0: a replan invalidates it
 rm -f "bootstrap_placements/$OUT_NAME/block_0_feedback_placement.json"
-plan_blocks "$GRAPH_DIR" "$OUT_NAME"
+# BLOCKS_ENTRY_LEVEL/DEG pin block 0's entry (the runtime encrypts the first token at the probed bootstrap landing,
+# deg 1); unset = capture-derived
+if [ -n "${BLOCKS_ENTRY_LEVEL:-}" ]; then
+    plan_blocks "$GRAPH_DIR" "$OUT_NAME" FIRST_ENTRY_LEVEL="$BLOCKS_ENTRY_LEVEL" FIRST_ENTRY_DEG="${BLOCKS_ENTRY_DEG:-1}"
+else
+    plan_blocks "$GRAPH_DIR" "$OUT_NAME"
+fi
 stamp bootstrap_placements/"$OUT_NAME"/block_*_placement.json

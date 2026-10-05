@@ -1,3 +1,10 @@
+#include <fstream>
+#include <NTT.cuh>  // FIDESlib::setDiscardScratch (scratch-discard A/B)
+#include <CKKS/Discard.cuh>
+#include <CKKS/RNSPoly.cuh>
+#include <CKKS/SmallInt.cuh>  // setModupMerge
+#include <NTTcluster.cuh>
+#include <NTTtc.cuh>    // setNttCluster
 #include "ckks_fixture.h"
 #include "ckks_primitives.h"
 
@@ -12,6 +19,9 @@
 #include <random>
 #include <thread>
 #include <vector>
+namespace FIDESlib { namespace CKKS { class Ciphertext;
+extern std::vector<std::pair<std::string, std::shared_ptr<Ciphertext>>>* g_btsStageStash;  // Bootstrap.cuh
+} }
 
 using namespace test_helpers;
 
@@ -116,6 +126,452 @@ TEST_F(BtsProfileTest, SteadyStateBootstrap) {
  std::cout << "[bts_prof] err_max = " << e << " bits = " << (e > 0 ? -std::log2(e) : 64.0)
  << " nonfinite = " << nnan << "\n";
  EXPECT_EQ(nnan, 0);
+}
+
+// In-process A/B for FIDESLIB_LT_CHUNK (traffic campaign, lever 1): the chunked
+// LinearTransform re-orders the same hoisted-dot / LT-dot kernels over limb ranges, so the
+// bootstrap output must be bit-identical to the whole-ciphertext path. BTS_PROF_LT_CHUNK sets
+// the chunk under test (default 6 limbs).
+TEST_F(BtsProfileTest, LtChunkBitExact) {
+ const int S = slots();
+ const std::string chA = env_or("BTS_PROF_LT_CHUNK_A", "0");  // control: A=B=0 must be exact
+ const std::string chB = env_or("BTS_PROF_LT_CHUNK", "6");
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+
+ auto run = [&](const std::string& v, FIDESlib::CKKS::RawCipherText& raw) {
+ setenv("FIDESLIB_LT_CHUNK", v.c_str(), 1);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaDeviceSynchronize();
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);  // device -> host, no OpenFHE import
+ auto got = decrypt_slots(fhe(), y);
+ double e = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) e = std::max(e, std::fabs(got[i] - want[i]));
+ std::cout << "[lt_chunk] FIDESLIB_LT_CHUNK=" << v << " bits = " << (e > 0 ? -std::log2(e) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(chA, ra);
+ run(chB, rb);
+ setenv("FIDESLIB_LT_CHUNK", "0", 1);
+
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[lt_chunk] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[lt_chunk] A=" << chA << " B=" << chB << " words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// In-process A/B for the transient-scratch discard (FIDESlib NTT.cu, g_fides_discard_scratch):
+// the permuted NTT scratch layout + discard.global.L2 must not change a single output word.
+TEST_F(BtsProfileTest, ScratchDiscardBitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::setDiscardScratch(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaDeviceSynchronize();
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double e = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) e = std::max(e, std::fabs(got[i] - want[i]));
+ std::cout << "[discard] flag=" << flag << " bits = " << (e > 0 ? -std::log2(e) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(1, rb);
+ run(0, ra);  // and back: the flag must not leave state behind
+ cudaDeviceSynchronize();
+ ::FIDESlib::setDiscardScratch(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[discard] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[discard] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// In-process A/B for FIDESLIB_MODUP_MERGE (lever B1: coarser ModUp launches; pure launch geometry).
+TEST_F(BtsProfileTest, ModupMergeBitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::CKKS::setModupMerge(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaDeviceSynchronize();
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double e = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) e = std::max(e, std::fabs(got[i] - want[i]));
+ std::cout << "[modup_merge] flag=" << flag << " bits = " << (e > 0 ? -std::log2(e) : 64.0) << "\n";
+ };
+ const int lvl = env_i("BTS_PROF_MERGE", 1);  // 1 = merged INTT + specials, 2 = + one BConv/NTT over all digits
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(lvl, rb);
+ ::FIDESlib::CKKS::setModupMerge(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[modup_merge] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[modup_merge] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// In-process A/B for the single-pass cluster NTT/INTT (FIDESlib NTTcluster.cu): same butterflies, same
+// twiddles, one launch per transform — the bootstrap output must be bit-identical.
+TEST_F(BtsProfileTest, NttClusterBitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::setNttCluster(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaError_t e = cudaDeviceSynchronize();
+ std::cout << "[ntt_cluster] flag=" << flag << " cuda=" << cudaGetErrorString(e) << "\n";
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double err = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) err = std::max(err, std::fabs(got[i] - want[i]));
+ std::cout << "[ntt_cluster] flag=" << flag << " bits = " << (err > 0 ? -std::log2(err) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(1, rb);
+ ::FIDESlib::setNttCluster(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[ntt_cluster] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[ntt_cluster] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// Per-limb unit check of the cluster transforms against the two-pass kernels on one ciphertext poly:
+// INTT (flag 0 vs 1) on identical input, then NTT (flag 0 vs 1) on the INTT'd data. Reports the first
+// mismatching (limb, index) for each direction. Everything through the LimbPartition API, no decrypt.
+TEST_F(BtsProfileTest, NttClusterUnit) {
+ using FIDESlib::CKKS::Limb;
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ fhe().cc->LoadCiphertext(ct);
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(ct->gpu));
+ auto& part = gpu->c0.GPU[0];
+ const int N = part.cc.N;
+ const int nl = part.getLimbSize(*part.level);
+ std::vector<std::vector<uint32_t>> orig(nl, std::vector<uint32_t>(N));
+ auto dev = [&](int l) { return std::get<Limb<uint32_t>>(part.limb[l]).v.data; };
+ auto snap = [&](std::vector<std::vector<uint32_t>>& dst) {
+ cudaDeviceSynchronize();
+ for (int l = 0; l < nl; ++l) cudaMemcpy(dst[l].data(), dev(l), N * 4, cudaMemcpyDeviceToHost);
+ };
+ auto restore = [&](const std::vector<std::vector<uint32_t>>& src) {
+ cudaDeviceSynchronize();
+ for (int l = 0; l < nl; ++l) cudaMemcpy(dev(l), src[l].data(), N * 4, cudaMemcpyHostToDevice);
+ cudaDeviceSynchronize();
+ };
+ auto compare = [&](const char* tag, const std::vector<std::vector<uint32_t>>& a, const std::vector<std::vector<uint32_t>>& b) {
+ size_t bad = 0; int shown = 0;
+ for (int l = 0; l < nl; ++l)
+ for (int i = 0; i < N; ++i)
+ if (a[l][i] != b[l][i]) {
+ if (shown < 6) { std::cout << "[ntt_unit] " << tag << " limb " << l << " idx " << i << " two-pass=" << a[l][i] << " cluster=" << b[l][i] << "\n"; ++shown; }
+ ++bad;
+ }
+ std::cout << "[ntt_unit] " << tag << " limbs=" << nl << " mismatches=" << bad << " of " << (size_t)nl * N << "\n";
+ return bad;
+ };
+ snap(orig);
+ std::vector<std::vector<uint32_t>> a(nl, std::vector<uint32_t>(N)), b = a, c = a, d = a;
+ ::FIDESlib::setNttCluster(0); part.INTT<FIDESlib::ALGO_SHOUP, FIDESlib::INTT_NONE>(part.cc.batch, true); snap(a);
+ restore(orig);
+ ::FIDESlib::setNttCluster(1); part.INTT<FIDESlib::ALGO_SHOUP, FIDESlib::INTT_NONE>(part.cc.batch, true); snap(b);
+ const size_t bad_i = compare("INTT", a, b);
+ restore(a);  // coefficient domain (two-pass result) as the NTT input
+ ::FIDESlib::setNttCluster(0); part.NTT<FIDESlib::ALGO_SHOUP, FIDESlib::NTT_NONE>(part.cc.batch, true); snap(c);
+ restore(a);
+ ::FIDESlib::setNttCluster(1); part.NTT<FIDESlib::ALGO_SHOUP, FIDESlib::NTT_NONE>(part.cc.batch, true); snap(d);
+ const size_t bad_f = compare("NTT", c, d);
+ const size_t bad_rt = compare("NTT(INTT) round trip vs input (two-pass)", orig, c);
+ ::FIDESlib::setNttCluster(0);
+ restore(orig);
+ EXPECT_EQ(bad_i, 0u);
+ EXPECT_EQ(bad_f, 0u);
+ (void)bad_rt;
+}
+
+// Lever A (fused ModDown + composite rescale in EvalMod's relins): NOT bit-exact by design (the
+// approximate base conversion rounds differently), so the gate is precision: bits within 0.5 of the
+// unfused bootstrap on the same ciphertext, both arms decrypting cleanly.
+TEST_F(BtsProfileTest, FusedRescaleBits) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::CKKS::setFusedRescale(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaError_t e = cudaDeviceSynchronize();
+ auto got = decrypt_slots(fhe(), y);
+ double err = 0; int nnan = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) { if (!std::isfinite(got[i])) { ++nnan; continue; } err = std::max(err, std::fabs(got[i] - want[i])); }
+ const double bits = err > 0 ? -std::log2(err) : 64.0;
+ std::cout << "[fused_rescale] flag=" << flag << " cuda=" << cudaGetErrorString(e) << " out_level=" << (int)y->GetLevel()
+ << " bits = " << bits << " nonfinite=" << nnan << "\n";
+ return bits;
+ };
+ const double b0 = run(0), b1 = run(1), b0b = run(0);
+ ::FIDESlib::CKKS::setFusedRescale(0);
+ std::cout << "[fused_rescale] unfused " << b0 << " / " << b0b << "  fused " << b1 << "\n";
+ EXPECT_GT(b1, std::min(b0, b0b) - 0.5);
+}
+
+// Lever E (FIDESLIB_PW_FUSE): out-of-place mult/square + fused copy*P are pure reorderings -> bit-exact.
+TEST_F(BtsProfileTest, PwFuseBitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::CKKS::setPwFuse(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaError_t e = cudaDeviceSynchronize();
+ std::cout << "[pw_fuse] flag=" << flag << " cuda=" << cudaGetErrorString(e) << "\n";
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double err = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) err = std::max(err, std::fabs(got[i] - want[i]));
+ std::cout << "[pw_fuse] flag=" << flag << " bits = " << (err > 0 ? -std::log2(err) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(1, rb);
+ ::FIDESlib::CKKS::setPwFuse(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[pw_fuse] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[pw_fuse] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// Tensor-core NTT core (FIDESLIB_TC_NTT): exact integer matmul of the probed core matrix -> bit-exact.
+TEST_F(BtsProfileTest, TcNttBitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::setTcNtt(flag);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaError_t e = cudaDeviceSynchronize();
+ std::cout << "[tc_ntt] flag=" << flag << " cuda=" << cudaGetErrorString(e) << "\n";
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double err = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) err = std::max(err, std::fabs(got[i] - want[i]));
+ std::cout << "[tc_ntt] flag=" << flag << " bits = " << (err > 0 ? -std::log2(err) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(1, rb);
+ ::FIDESlib::setTcNtt(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[tc_ntt] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[tc_ntt] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+TEST_F(BtsProfileTest, TcNtt2BitExact) {
+ const int S = slots();
+ const auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+ Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+ auto run = [&](int flag, FIDESlib::CKKS::RawCipherText& raw) {
+ cudaDeviceSynchronize();
+ ::FIDESlib::setTcNtt(flag ? 2 : 0);
+ Ctx y = fhe().eval_bootstrap_iter(ct, 1, 0);
+ cudaError_t e = cudaDeviceSynchronize();
+ std::cout << "[tc_ntt2] flag=" << flag << " cuda=" << cudaGetErrorString(e) << "\n";
+ auto gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(y->gpu));
+ gpu->store(raw);
+ auto got = decrypt_slots(fhe(), y);
+ double err = 0;
+ for (size_t i = 0; i < want.size() && i < got.size(); ++i) err = std::max(err, std::fabs(got[i] - want[i]));
+ std::cout << "[tc_ntt2] flag=" << flag << " bits = " << (err > 0 ? -std::log2(err) : 64.0) << "\n";
+ };
+ FIDESlib::CKKS::RawCipherText ra, rb;
+ run(0, ra);
+ run(1, rb);
+ ::FIDESlib::setTcNtt(0);
+ size_t bad = 0, total = 0;
+ auto cmp = [&](const char* tag, const std::vector<std::vector<uint64_t>>& x, const std::vector<std::vector<uint64_t>>& y) {
+ ASSERT_EQ(x.size(), y.size()) << tag;
+ for (size_t l = 0; l < x.size(); ++l) {
+ ASSERT_EQ(x[l].size(), y[l].size()) << tag << " limb " << l;
+ size_t badl = 0;
+ for (size_t i = 0; i < x[l].size(); ++i) badl += (x[l][i] != y[l][i]);
+ if (badl) std::cout << "[tc_ntt2] " << tag << " limb" << l << " mismatches=" << badl << "\n";
+ bad += badl;
+ total += x[l].size();
+ }
+ };
+ cmp("c0", ra.sub_0, rb.sub_0);
+ cmp("c1", ra.sub_1, rb.sub_1);
+ std::cout << "[tc_ntt2] words=" << total << " mismatches=" << bad << "\n";
+ EXPECT_EQ(bad, 0u);
+}
+
+// Per-stage trace of one bootstrap: every stage the bootstrap stashes (FIDESlib btsStageProbe / CtS-StC stage
+// inputs) is copied into the output handle, decrypted and dumped to $BTS_TRACE_DIR/<stage>.bin (doubles) with
+// level / NoiseFactor on stdout. Stages under the ephemeral sparse key (MR-atob, MR-raised) are skipped.
+// Run it twice under two env settings and diff with logs/bts_traffic/trace_cmp.py.
+TEST_F(BtsProfileTest, BtsStageTrace) {
+    const int S = slots();
+    const char* dir = std::getenv("BTS_TRACE_DIR");
+    ASSERT_TRUE(dir && *dir) << "set BTS_TRACE_DIR";
+    auto want = varied_pattern(S, S / 2, 1.0, 0xC0FFEEu);
+    Ctx ct = encrypt(fhe().cc, encode(fhe().cc, want), fhe().pk());
+    std::vector<std::pair<std::string, std::shared_ptr<::FIDESlib::CKKS::Ciphertext>>> stash;
+    ::FIDESlib::CKKS::g_btsStageStash = &stash;
+    Ctx out = fhe().eval_bootstrap_iter(ct, 1, 0);
+    cudaDeviceSynchronize();
+    ::FIDESlib::CKKS::g_btsStageStash = nullptr;
+    auto gpu = std::static_pointer_cast<::FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(out->gpu));
+    {   // FIDESlib coefficient order for the exact decoder
+        auto pi = fhe().cc->CoefficientOrderProbe();
+        std::ofstream f(std::string(dir) + "/coef_perm.bin", std::ios::binary);
+        f.write((const char*)pi.data(), pi.size() * sizeof(uint32_t));
+    }
+    {   // final error first (the handle still holds the real output); also dump it for a decode self-check
+        auto got = decrypt_slots(fhe(), out);
+        double e = 0;
+        for (size_t i = 0; i < want.size() && i < got.size(); ++i) e = std::max(e, std::fabs(got[i] - want[i]));
+        std::cout << "[trace] end err_max=" << e << " bits=" << (e > 0 ? -std::log2(e) : 64.0) << "\n";
+        std::ofstream f(std::string(dir) + "/direct-end.bin", std::ios::binary);
+        f.write((const char*)got.data(), got.size() * sizeof(double));
+        std::ofstream fw(std::string(dir) + "/want.bin", std::ios::binary);
+        fw.write((const char*)want.data(), want.size() * sizeof(double));
+        {
+            auto g0 = std::static_pointer_cast<::FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(out->gpu));
+            ::FIDESlib::CKKS::exactDecryptDump(*g0, (std::string(dir) + "/direct-end.ct").c_str());
+        }
+        // decode self-check: the same ciphertext decrypted twice through the stash path must be identical
+        auto gpu0 = std::static_pointer_cast<::FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(out->gpu));
+        auto snap = std::make_shared<::FIDESlib::CKKS::Ciphertext>(gpu0->cc_);
+        snap->copy(*gpu0);
+        cudaDeviceSynchronize();
+        stash.emplace_back("same-A", snap);
+        stash.emplace_back("same-B", snap);
+    }
+    int k = 0;
+    for (auto& [name, c] : stash) {
+        if (name == "MR-raised") {  // under the sparse key: no decrypt, but the small-integer structure is checkable
+            ::FIDESlib::CKKS::smallIntConsistencyCheck(c->cc, c->c1, 3, "MR-raised c1");
+            ::FIDESlib::CKKS::smallIntConsistencyCheck(c->cc, c->c0, 3, "MR-raised c0");
+            ::FIDESlib::CKKS::smallIntScalarCheck(c->cc, *c, 2.31672e-07, "MR-raised");
+            continue;
+        }
+        if (name == "MR-atob") continue;
+        gpu->copy(*c);
+        cudaDeviceSynchronize();  // the API download does not wait on the copy's streams
+        auto got = decrypt_slots(fhe(), out);
+        double mx = 0;
+        for (double v : got) if (std::isfinite(v)) mx = std::max(mx, std::fabs(v));
+        const double sfl = c->cc.sfAtLimb(c->getLevel());
+        const double canon = c->NoiseLevel == 2 ? sfl * sfl : sfl;
+        std::cout << "[trace] " << std::setw(2) << k++ << " " << name << " level=" << c->getLevel()
+                  << " noiseLevel=" << c->NoiseLevel << " NF=2^" << std::log2(c->NoiseFactor) << " max|v|=" << mx
+                  << " rho-1=" << std::setprecision(3) << (c->NoiseFactor / canon - 1.0) << std::setprecision(6)
+                  << "\n";
+        std::ofstream f(std::string(dir) + "/" + name + ".bin", std::ios::binary);
+        f.write((const char*)got.data(), got.size() * sizeof(double));
+        ::FIDESlib::CKKS::exactDecryptDump(*c, (std::string(dir) + "/" + name + ".ct").c_str());
+    }
+}
+
+// Unit test of the exact small-integer division (CKKS/SmallInt.cuh) against a host reference: synthetic signed
+// integers |x| < q0 (the raised ciphertext's range) on the first 3 limbs, every Q limb := round(x / D).
+TEST_F(BtsProfileTest, SmallIntDivideUnit) {
+    Ctx keep = fhe().eval_bootstrap_iter(  // a GPU-resident ciphertext: supplies the context to the library-side test
+        encrypt(fhe().cc, encode(fhe().cc, std::vector<double>(slots(), 0.0)), fhe().pk()), 1, 0);
+    auto gpu = std::static_pointer_cast<::FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(keep->gpu));
+    ASSERT_TRUE(gpu);
+    const long bad = ::FIDESlib::CKKS::smallIntSelfTest(*gpu, 2.31672e-07);
+    EXPECT_EQ(bad, 0);
 }
 
 // Multi-ciphertext THROUGHPUT probe. The workloads bootstrap cts in

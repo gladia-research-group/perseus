@@ -24,6 +24,7 @@ namespace FIDESlib::CKKS { int BootstrapPrecapture(Context& cc); }  // Bootstrap
 namespace FIDESlib::CKKS { void setArcsineOverride(int v); }  // ApproxModEval.cu
 
 #include <any>
+#include <cstdio>
 #include <vector>
 #include <complex>
 #include <string>
@@ -59,6 +60,20 @@ namespace FIDESlib::CKKS { void setArcsineOverride(int v); }  // ApproxModEval.c
 
 struct Inference;  // ctor below takes Inference&; full definition in inference.h
 struct CKKSContext;
+
+// BTS_DIM1="cts,stc": OpenFHE's BSGS baby-step sizes for the CtS and StC linear transforms
+// (0 = OpenFHE's automatic split = the shipped default). Traffic campaign lever D.
+inline std::vector<uint32_t> bts_dim1_from_env() {
+    std::vector<uint32_t> d{0, 0};
+    if (const char* e = std::getenv("BTS_DIM1")) {
+        unsigned a = 0, b = 0;
+        if (std::sscanf(e, "%u,%u", &a, &b) >= 1) {
+            d[0] = a;
+            d[1] = b;
+        }
+    }
+    return d;
+}
 
 struct WithStep {
     CKKSContext* ctx_;
@@ -3771,7 +3786,7 @@ make_ckks_context(const CKKSContextOptions& o = {})
             uint32_t btp_slots = (bootstrap_slots == 0) ? slots : bootstrap_slots;
             // Setup is parameter-only precomputation (public): always re-run. KeyGen needs
             // the secret key: only on the keygen side. dim1={0,0} = OpenFHE's auto BSGS split.
-            cc->EvalBootstrapSetup(level_budget, {0, 0}, btp_slots, correction_factor);
+            cc->EvalBootstrapSetup(level_budget, bts_dim1_from_env(), btp_slots, correction_factor);
             if (!from_keys) cc->EvalBootstrapKeyGen(ctx->keys.secretKey, btp_slots);
             // One extra precomp + keygen per distinct requested sparse slot count (fold
             // reductions want several: e.g. 512 for the softmax denominator, 32 for the
@@ -3783,14 +3798,26 @@ make_ckks_context(const CKKSContextOptions& o = {})
                     ? level_budget : sparse_level_budget;
                 for (uint32_t s : sparse_bts_slots_list) {
                     if (s == 0 || s >= slots || !built.insert(s).second) continue;
-                    cc->EvalBootstrapSetup(slb, {0, 0}, s, correction_factor);
+                    cc->EvalBootstrapSetup(slb, bts_dim1_from_env(), s, correction_factor);
                     if (!from_keys) cc->EvalBootstrapKeyGen(ctx->keys.secretKey, s);
                 }
             }
         }
 
+        // Lever 1b: hold the sparse encapsulation secret (regenerated keys) before the GPU load reads the keys
+        if (!from_keys && enable_bootstrap) {
+            const char* e = std::getenv("FIDESLIB_AKS");
+            if (e && std::atoi(e) > 0) cc->RegenerateEncapsulationKeys(ctx->keys.secretKey);
+        }
         cc->deferred_rotation_indexes = deferred_rot_steps;
         if (!skip_gpu_load) cc->LoadContext(ctx->keys.publicKey);
+        // Lever 1b: aggregated key switching for CtS stage 0 (FIDESLIB_AKS=1; needs FIDESLIB_BTS_SHIFT>=1).
+        if (!skip_gpu_load && !from_keys && enable_bootstrap) {
+            const char* e = std::getenv("FIDESLIB_AKS");
+            if (e && std::atoi(e) > 0) cc->LoadAksKeys(ctx->keys.secretKey);
+            const char* d = std::getenv("FIDESLIB_DIAG_SK");  // noise-flooding-free diagnostic decryptions
+            if (d && std::atoi(d) > 0) cc->LoadDiagSecret(ctx->keys.secretKey);
+        }
         // Setup-time pre-capture of cached bootstrap graphs. Inside heavy so BOTH branches
         // get it; LoadContext just ran, so the GPU context and precomputes are live. No-op
         // unless FIDESlib's graph journal is configured (FIDESLIB_BTS_GRAPH / _JOURNAL).
