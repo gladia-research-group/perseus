@@ -240,6 +240,8 @@ struct BootstrapPlan {
     //     and EXACT whatever the runtime value turns out to be: it is a plaintext add and
     //     its exact inverse, so a stale c loses benefit but can never corrupt.
     std::unordered_map<std::string, int>         correction_factor;
+    // Level-aware ModRaise: composite levels below the chain top the site's raise stops at (0 = full).
+    std::unordered_map<std::string, int>         raise_drop;
     std::unordered_map<std::string, double>      offset;
     bool valid = false;
 
@@ -368,6 +370,11 @@ inline BootstrapPlan parse_bootstrap_plan_file(const std::string& path) {
             if (kv.second.is_number())
                 plan.offset[kv.first] = kv.second.number;
 
+    if (const auto* d = find_any("raise_drop"); d && d->is_object())
+        for (const auto& kv : d->obj)
+            if (kv.second.is_number() && kv.second.number > 0)
+                plan.raise_drop[kv.first] = static_cast<int>(kv.second.number);
+
     if (const auto* d = find_any("sparse_bts_slots"); d && d->is_array())
         for (const auto& x : d->arr)
             if (x.is_number())
@@ -485,6 +492,7 @@ struct CKKSContext {
     // Per-site correction factor and offset DC, same keying. Absent = the context-wide
     // CORRECTION_FACTOR and no offset.
     std::unordered_map<std::string, int>      plan_correction_factor;
+    std::unordered_map<std::string, int>      plan_raise_drop;
     std::unordered_map<std::string, double>   plan_offset;
     int active_cache_pin_level = -1;   // placer-chosen KV read level for the live block plan (-1 = unset)
     uint64_t graph_ct_counter = 0;
@@ -840,6 +848,7 @@ struct CKKSContext {
         plan_sparse_slots.clear();
         plan_prescale.clear();
         plan_correction_factor.clear();
+        plan_raise_drop.clear();
         plan_offset.clear();
         expected_levels.clear();
         expected_producers.clear();
@@ -958,6 +967,14 @@ struct CKKSContext {
                 ++hist[cf];
             }
             plan_correction_factor = plan.correction_factor;
+            plan_raise_drop = plan.raise_drop;
+            if (!plan_raise_drop.empty()) {
+                std::map<int, int> h;
+                for (const auto& kv : plan_raise_drop) ++h[kv.second];
+                std::cerr << "[plan_raise] " << plan_raise_drop.size() << " site(s) raise below the chain top:";
+                for (const auto& kv : h) std::cerr << " drop" << kv.first << "=" << kv.second;
+                std::cerr << " (needs FIDESLIB_BTS_RAISE_DROPS to cover them)\n";
+            }
             std::cerr << "[plan_cf] " << plan_correction_factor.size()
                       << " site(s) carry a per-site correction factor (chain deg=" << deg
                       << "), histogram:";
@@ -1046,6 +1063,8 @@ struct CKKSContext {
             CorrectionScope cs(*this,
                                cit != plan_correction_factor.end() ? cit->second : -1,
                                cit != plan_correction_factor.end());
+            auto rit = plan_raise_drop.find(var_name);
+            RaiseScope rs(*this, rit != plan_raise_drop.end() ? rit->second : 0);
             inner_bootstrap(ct, pit != plan_prescale.end() ? pit->second : 1.0);
         }
         // Adding a broadcast constant back cannot lower the output's period (a constant is
@@ -1150,14 +1169,15 @@ struct CKKSContext {
             auto oit = plan_offset.find(var_name);
             std::fprintf(stderr,
                          "[planted_bts] var=%s s=%u prescale=%g cf=%d offset=%g "
-                         "in=%d out=%d in_deg=%d out_deg=%d fold=%d\n",
+                         "in=%d out=%d in_deg=%d out_deg=%d fold=%d drop=%d\n",
                          var_name.c_str(),
                          sit != plan_sparse_slots.end() ? sit->second : 0u,
                          pit != plan_prescale.end() ? pit->second : 1.0,
                          cit != plan_correction_factor.end() ? cit->second : -1,
                          oit != plan_offset.end() ? oit->second : 0.0,
                          in_level, (int)level_for_ct(ct),
-                         in_deg, out_deg, (int)in_route.fold);
+                         in_deg, out_deg, (int)in_route.fold,
+                         plan_raise_drop.count(var_name) ? plan_raise_drop.at(var_name) : 0);
         }
         record_primitive("auto_bootstrap", {var_name}, out, {in_level}, level_for_ct(ct), ct);
         // Post-refresh deg pin: final_named_degs keys are graph vars, and the sim's
@@ -2122,6 +2142,24 @@ struct CKKSContext {
     // |m|<=10 wall). Arms ContextData::correctionFactorOverride around the scoped calls;
     // same single-threaded scoping discipline as SparseBtsScope. cf < deg still throws
     // the Bootstrap deg-guard, per call. No-op before LoadContext.
+    // Level-aware ModRaise for one planted bootstrap: the raise stops `drop` composite levels below the
+    // chain top (plan 'raise_drop'), so every stage runs on fewer limbs and the refresh lands that much
+    // deeper -- exactly the room the plan's simulation gave this site. Needs the matching DFT plaintext
+    // variant built at LoadContext (FIDESLIB_BTS_RAISE_DROPS); FIDESlib throws otherwise.
+    struct RaiseScope {
+        FIDESlib::CKKS::ContextData* g = nullptr;
+        int saved = 0;
+        RaiseScope(CKKSContext& ctx, int drop) {
+            if (drop <= 0 || !ctx.cc->gpu.has_value()) return;
+            g = std::any_cast<FIDESlib::CKKS::Context&>(ctx.cc->gpu).get();
+            saved = g->getBtsRaiseDrop();
+            g->setBtsRaiseDrop(drop);
+        }
+        ~RaiseScope() {
+            if (g) g->setBtsRaiseDrop(saved);
+        }
+    };
+
     struct CorrectionScope {
         FIDESlib::CKKS::ContextData* g = nullptr;
         int saved = -1;
@@ -2468,6 +2506,9 @@ struct CKKSContext {
     }
 
     Ctx eval_bootstrap_iter(const Ctx& ct, uint32_t numIterations = 1, uint32_t precision = 0) {
+        // BTS_RAISE_VARIANT=k (harness experiments only): run this bootstrap on the route's raise variant k
+        static const int raise_variant = [] { const char* e = std::getenv("BTS_RAISE_VARIANT"); return e && *e ? std::atoi(e) : 0; }();
+        RaiseScope rs(*this, raise_variant);
         Ctx y = cc->EvalBootstrap(ct, /*numIterations=*/1, /*precision=*/0);
         ++total_bootstraps;
         if (numIterations <= 1) {

@@ -117,6 +117,14 @@ def main() -> None:
                    dest="dissolve_hints",
                    help="explicitly bind each hint's threshold decision into the plan "
                         "(the default; kept so scripts can state it)")
+    p.add_argument("--raise-drop-max", dest="raise_drop_max", type=int, default=None,
+                   help="level-aware ModRaise: max composite levels a placed site may raise short of the chain top (0 = off)")
+    p.add_argument("--raise-drop-landing-max", dest="raise_drop_landing_max", type=int, default=None,
+                   help="deepest absolute landing for a raise-dropped site (default 44 = AUTO_BTS_LEVEL - unit)")
+    p.add_argument("--raise-drop-routes", dest="raise_drop_routes", type=lambda s: tuple(int(x) for x in s.split(",") if x), default=None,
+                   help="routes (slot counts, 0 = dense) that may take a raise drop; default 0,512")
+    p.add_argument("--raise-drop-env-rule", dest="raise_drop_env_rule", type=str, default=None,
+                   choices=["effective", "nominal"], help="envelope rule for the raise-drop slack")
     p.add_argument("--site-bts-out-file", dest="site_bts_out_file", type=str,
                    help="JSON {block_dir: {var: absolute_out_level}} of measured "
                         "per-site refresh landings (landing feedback)")

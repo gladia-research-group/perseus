@@ -23,6 +23,7 @@ class RefreshSpec:
     out_consumed: float = 0.0
     out_deg: int = 1
     reason: str = ""
+    raise_drop: int = 0
     # `cf == policy.cf_max` because the search ran out of range (btserr.ceiling_binds).
     # Never enters a plan file: emit reads the named fields it needs, nothing dumps a spec.
     clamped: bool = False
@@ -106,19 +107,25 @@ class RefreshPlanner:
         # one extra search, only for a site pinned at cf_max; the choice above is unchanged
         clamped = btserr.ceiling_binds(self.table, self.policy, choice.cf, **site)
 
-        if v in self.site_out_levels:
-            base = float(self.site_out_levels[v]) - self.bootstrap_level
-        elif choice.route and choice.route in self.sparse_out_levels:
-            base = float(self.sparse_out_levels[choice.route]) - self.bootstrap_level
+        if choice.route and choice.route in self.sparse_out_levels:
+            base_route = float(self.sparse_out_levels[choice.route]) - self.bootstrap_level
         elif choice.route:
             if choice.route not in self._warned_routes:
                 self._warned_routes.add(choice.route)
                 log.info(f"[plan]  routing sites sparse at s={choice.route} with no measured "
                       f"landing level; assuming dense. Measure it from a "
                       f"`[planted_bts] ... out=` ledger and pass --sparse-bts-out.")
-            base = max(0.0, self.step_bts_offset.get(p.step, 0.0)) if p else 0.0
+            base_route = max(0.0, self.step_bts_offset.get(p.step, 0.0)) if p else 0.0
         else:
-            base = max(0.0, self.step_bts_offset.get(p.step, 0.0)) if p else 0.0
+            base_route = max(0.0, self.step_bts_offset.get(p.step, 0.0)) if p else 0.0
+        raise_drop = 0
+        if v in self.site_out_levels:
+            base = float(self.site_out_levels[v]) - self.bootstrap_level
+            # a landing deeper than the route's own is a level-aware (partial) ModRaise
+            unit = float(self.graph.level_unit) or 1.0
+            raise_drop = max(0, int(round((base - base_route) / unit)))
+        else:
+            base = base_route
         restore = float(self.graph.level_unit) if choice.prescale is not None else 0.0
         return RefreshSpec(
             var=v,
@@ -132,6 +139,7 @@ class RefreshPlanner:
             out_consumed=base + restore,
             out_deg=self.out_deg,
             reason=choice.reason,
+            raise_drop=raise_drop,
             clamped=clamped,
         )
 

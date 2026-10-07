@@ -205,6 +205,7 @@ def assemble(
     off_map: dict[str, float] = {}
     ps_map: dict[str, float] = {}
     sp_map: dict[str, int] = {}
+    rd_map: dict[str, int] = {}
     errs: list[float] = []
     cf_hist: dict[int, int] = {}
     n_missed = 0
@@ -220,6 +221,8 @@ def assemble(
             ps_map[v] = float(s.prescale)
         if s.route:
             sp_map[v] = int(s.route)
+        if s.raise_drop:
+            rd_map[v] = int(s.raise_drop)
         if math.isfinite(s.rel_err):
             errs.append(s.rel_err)
         if not s.feasible:
@@ -269,6 +272,7 @@ def assemble(
         **({"prescale": ps_map} if ps_map else {}),
         **({"correction_factor": cf_map} if cf_map else {}),
         **({"offset": off_map} if off_map else {}),
+        **({"raise_drop": rd_map} if rd_map else {}),
         "summary": {
             **({"placer_meta": placer_meta} if placer_meta else {}),
             "num_placements": len(all_sites),
@@ -296,6 +300,7 @@ def assemble(
                                         sorted(out_level_hist.items())},
                 "num_offset": len(off_map),
                 "num_prescale": len(ps_map),
+            "num_raise_drop": len(rd_map),
                 "num_sparse": len(sp_map),
                 "worst_sites": [
                     {"var": v, "rel_err": e,
