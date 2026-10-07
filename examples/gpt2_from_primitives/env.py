@@ -6,6 +6,8 @@ references in tests see the same graph.
 from __future__ import annotations
 
 import os
+import shlex
+from pathlib import Path
 
 # GPT2_FOLD_LN1/LN2 = 1, LNF = 0: the scripts/run_task.sh defaults.
 # CHAIN is not here: it is `export_env`'s argument, because everything chain-specific (level
@@ -34,6 +36,41 @@ ENV = {
     "CUTMAX_PRECISE_SCOPED": "1",
     "OMP_NUM_THREADS": "16",
 }
+
+
+# Bootstrap levers that move where a refresh LANDS are bound to the plan, which was cut for those landings: the
+# exact post-raise scaling (FIDESLIB_BTS_SHIFT, eprint 2025/1403) and SPRU on the 1-slot route (FIDESLIB_SPRU = h,
+# Coron-Koestler arXiv 2607.27401; Python bootstrap only). A plan declares them in a `runtime=` line of its
+# PLAN_CMD.txt; a plan without one predates them and runs with both off. Eager (no plan) on n32: both on.
+RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64"}
+RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0"}
+
+
+def plan_runtime(plan=None, chain="n32"):
+    """The landing-bound bootstrap levers for `plan` (a plan dir or None) on `chain`."""
+    if chain != "n32":
+        return dict(RUNTIME_LEGACY)
+    if not plan:
+        return dict(RUNTIME_N32)
+    cmd = Path(plan) / "PLAN_CMD.txt"
+    if cmd.exists():
+        for line in cmd.read_text().splitlines():
+            if line.startswith("runtime="):
+                return dict(kv.split("=", 1) for kv in shlex.split(line[len("runtime="):]))
+    return dict(RUNTIME_LEGACY)
+
+
+def bootstrap_setup(fhe, runtime, cpp_bootstrap=False):
+    """Install the Python-orchestrated bootstrap (the default) with SPRU on the 1-slot route when the runtime asks
+    for it. A SPRU plan cannot run on the C++ bootstrap (its 1-slot refreshes land 16 primes lower there)."""
+    spru = int(runtime.get("FIDESLIB_SPRU", "0") or 0)
+    if cpp_bootstrap:
+        if spru:
+            raise SystemExit("this plan needs SPRU on the 1-slot route, which runs only on the Python bootstrap: "
+                             "drop --cpp-bootstrap or pass --set FIDESLIB_SPRU=0 with a non-SPRU plan")
+        return
+    from perseus.impl import bootstrap as _pyb
+    _pyb.install(fhe=fhe, spru_h=spru)
 
 
 def export_env(device=3, chain=None, **overrides):

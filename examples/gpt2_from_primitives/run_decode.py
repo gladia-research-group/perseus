@@ -45,6 +45,10 @@ def main(argv=None):
     ap.add_argument("--payload", choices=("complex", "real"), default="complex",
                     help="complex: CKKS_COMPLEX=1, the C++ decode configuration (K/V pair bootstrap, "
                          "packed CutMax); real: real slots only (no shipped plan)")
+    ap.add_argument("--cpp-bootstrap", action="store_true",
+                    help="run FIDESlib's C++ bootstrap instead of the default Python stage orchestration "
+                         "(perseus/impl/bootstrap.py); not with a SPRU plan")
+    ap.add_argument("--py-bootstrap", action="store_true", help=argparse.SUPPRESS)  # the default now
     ap.add_argument("--chain", choices=("n32", "n64"),
                     default=os.environ.get("CHAIN") or "n32",
                     help="CKKS chain; source scripts/local_env.sh for the SAME chain")
@@ -62,7 +66,9 @@ def main(argv=None):
     from . import env
     # GPT2_PACKING is only read back by the plan contract: a plan cut under one packing
     # must not load under the other
-    over = {"GPT2_PACKING": a.packing, **dict(kv.split("=", 1) for kv in a.set)}
+    # the plan's landing-bound bootstrap levers (post-raise scaling, SPRU); --set wins
+    over = {**env.plan_runtime(a.plan, a.chain), "GPT2_PACKING": a.packing,
+            **dict(kv.split("=", 1) for kv in a.set)}
     env.export_env(a.device, chain=a.chain,
                    CKKS_COMPLEX="1" if a.payload == "complex" else "0", **over)
     if not a.configs:
@@ -80,6 +86,9 @@ def main(argv=None):
     sess = env.open_session(a.device, complex_payload=(a.payload == "complex"),
                             chain=a.chain, **over)
     inf = sess.inf
+    env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+    print(f"[bootstrap] {'C++' if a.cpp_bootstrap else 'Python'}; shift={over.get('FIDESLIB_BTS_SHIFT')} "
+          f"spru={over.get('FIDESLIB_SPRU')}", file=sys.stderr)
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
     model = Gpt2Model(inf, store, cfgs, core=_core, n_layers=a.layers, profile=a.profile, packing=a.packing)

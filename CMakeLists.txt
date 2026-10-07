@@ -201,6 +201,7 @@ if(CACHEMIR_BUILD_PYTHON)
         src/bindings/pipeline.cu
         src/bindings/serial.cu
         src/bindings/session.cu
+        src/bindings/bts.cu
     )
     target_link_libraries(_core PRIVATE cachemir_lib)
     target_compile_options(_core PRIVATE

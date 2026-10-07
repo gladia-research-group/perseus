@@ -38,6 +38,8 @@ def main(argv=None):
                     help="CKKS chain; source scripts/local_env.sh for the SAME chain")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override one of the port's session env values (env.ENV), repeatable")
+    ap.add_argument("--cpp-bootstrap", action="store_true",
+                    help="run FIDESlib's C++ bootstrap instead of the default Python orchestration; not with a SPRU plan")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args(argv)
     busy = gpu_busy(a.device)
@@ -45,7 +47,8 @@ def main(argv=None):
         print(f"GPU {a.device} has other processes: {busy}; refusing", file=sys.stderr)
         return 2
     from . import env
-    over = {"GPT2_PACKING": a.packing, **dict(kv.split("=", 1) for kv in a.set)}
+    over = {**env.plan_runtime(a.plan, a.chain), "GPT2_PACKING": a.packing,
+            **dict(kv.split("=", 1) for kv in a.set)}
     env.export_env(a.device, chain=a.chain,
                    CKKS_COMPLEX="1" if a.payload == "complex" else "0", **over)
     if not a.configs:
@@ -60,6 +63,7 @@ def main(argv=None):
 
     sess = env.open_session(a.device, complex_payload=(a.payload == "complex"),
                             chain=a.chain, **over)
+    env.bootstrap_setup(sess.inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     model = Gpt2Model(sess.inf, weights.RawStore(a.weights), config.load_configs(a.configs),
                       core=_core, n_layers=a.layers, packing=a.packing)
     if a.capture:

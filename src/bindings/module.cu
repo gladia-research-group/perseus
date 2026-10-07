@@ -53,6 +53,7 @@ void bind_io_encoders(py::module_& m);  // 5
 void bind_pipeline(py::module_& m);     // 6
 void bind_serial(py::module_& m);       // 7
 void bind_session(py::module_& m);      // 9
+void bind_bts(py::module_& m);          // 10 (independent: FIDESlib bootstrap stages)
 
 namespace {
 // Tag types for the typed exception hierarchy (never thrown; py::exception keys on them).
@@ -247,4 +248,5 @@ PYBIND11_MODULE(_core, m) {
     m.attr("hard_exit") = dbg.attr("hard_exit");
 
     bind_session(m);      // 9
+    bind_bts(m);          // 10
 }
