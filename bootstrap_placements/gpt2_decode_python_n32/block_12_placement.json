@@ -4703,6 +4703,7 @@
       },
       "num_offset": 0,
       "num_prescale": 0,
+      "num_raise_drop": 0,
       "num_sparse": 2,
       "worst_sites": [
         {
@@ -4731,6 +4732,10 @@
         "38": 1,
         "46": 1,
         "48": 1
+      },
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {
+        "hint_downstream": 3
       },
       "blind_branches": {
         "count": 12,
