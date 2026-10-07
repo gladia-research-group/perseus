@@ -61,6 +61,8 @@ def main() -> None:
                    help="how far a prescale may reach when one is allowed")
     p.add_argument("--mag-safety", type=float,
                    help="margin kappa on every magnitude the graph recorded")
+    p.add_argument("--slim-cubic", type=float, dest="slim_cubic",
+                   help="StC-first order: price each site's sine cubic (2 pi m 2^-CF)^2/6 x this (1 = measured)")
     p.add_argument("--emit-offset", action="store_true", default=None,
                    help="emit the offset transform alongside each placement")
     p.add_argument("--no-prescale", action="store_false", default=None,

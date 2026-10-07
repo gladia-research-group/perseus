@@ -4,6 +4,7 @@ import heapq
 import json
 import re
 from collections import defaultdict
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,6 +107,15 @@ class Graph:
         if not raw:
             raise ValueError("graph has no nodes")
 
+        # PLAN_DELIB_LANDING_REMAP="old:new,...": captured landings of the code's own (deliberate) bootstraps re-mapped,
+        # for a library whose route landings differ from the capture's (e.g. FIDESLIB_BTS_RAISE_DROP moves the s=1 route);
+        # the planner re-routes auto bootstraps itself, but a deliberate one keeps its captured output level.
+        remap: dict[float, float] = {}
+        for tok in os.environ.get("PLAN_DELIB_LANDING_REMAP", "").split(","):
+            if ":" in tok:
+                a, b = tok.split(":", 1)
+                remap[float(a)] = float(b)
+
         drafts: list[dict] = []
         for n in raw:
             inputs = tuple(str(x) for x in n.get("inputs", []))
@@ -119,7 +129,10 @@ class Graph:
                 inputs=inputs,
                 input_levels=input_levels,
                 output=str(n.get("output", "")),
-                output_level=(float(n["output_level"])
+                output_level=(remap.get(float(n["output_level"]), float(n["output_level"]))
+                              if str(n.get("op_type", "")) == "deliberate_bootstrap" and remap
+                              and isinstance(n.get("output_level"), (int, float)) and n["output_level"] >= 0
+                              else float(n["output_level"])
                               if isinstance(n.get("output_level"), (int, float))
                               and n["output_level"] >= 0 else None),
                 output_deg=(int(n["output_noise_level"])

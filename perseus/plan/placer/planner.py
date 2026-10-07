@@ -70,6 +70,7 @@ class PlanConfig:
     err_hopeless: float = 0.5
     prescale_reach: float = 2000.0
     mag_safety: float = 2.0
+    slim_cubic: float = 0.0   # StC-first order: price the sine cubic (btserr.SitePolicy.slim_cubic)
     emit_offset: bool = False
     allow_prescale: bool = True
     miss_penalty: float = 4.0
@@ -355,6 +356,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         allow_offset=cfg.emit_offset,
         allow_sparse=bool(cfg.sparse_precomps),
         mag_safety=cfg.mag_safety,
+        slim_cubic=cfg.slim_cubic,
         miss_penalty=cfg.miss_penalty,
         prescale_bits_max=cfg.prescale_bits_max,
     )

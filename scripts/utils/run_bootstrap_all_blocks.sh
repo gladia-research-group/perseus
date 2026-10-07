@@ -29,6 +29,7 @@ if [[ -n "${PLAN_ERR_TARGET:-}"     ]]; then args+=(--err-target "$PLAN_ERR_TARG
 if [[ -n "${PLAN_ERR_HOPELESS:-}"   ]]; then args+=(--err-hopeless "$PLAN_ERR_HOPELESS");     fi
 if [[ -n "${PLAN_PRESCALE_REACH:-}" ]]; then args+=(--prescale-reach "$PLAN_PRESCALE_REACH"); fi
 if [[ -n "${PLAN_MAG_SAFETY:-}"     ]]; then args+=(--mag-safety "$PLAN_MAG_SAFETY");         fi
+if [[ -n "${PLAN_SLIM_CUBIC:-}"     ]]; then args+=(--slim-cubic "$PLAN_SLIM_CUBIC");         fi
 if [[ -n "${PLAN_EMIT_OFFSET:-}"    ]]; then args+=(--emit-offset);                           fi
 if [[ -n "${PLAN_NO_PRESCALE:-}"    ]]; then args+=(--no-prescale);                           fi
 if [[ -n "${PLAN_MISS_PENALTY:-}"   ]]; then args+=(--miss-penalty "$PLAN_MISS_PENALTY");     fi

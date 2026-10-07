@@ -29,6 +29,7 @@ import bisect
 import json
 import logging
 import math
+import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -335,6 +336,10 @@ class SitePolicy:
     # the magnitude every decision is taken on (CF, route, prescale). 2.0 matches upstream
     # Orion's own margin, so the baseline comparison is margin-matched.
     mag_safety: float = 2.0
+    # StC-first ("slim") bootstrap order: EvalMod sees the SLOT value itself, so a site adds the sine-linearization
+    # cubic (2*pi*m*2^-CF)^2/6 relative error on top of the table (measured in-model: amp 4.5 @ CF 6 -> 3 %,
+    # amp 0.85 @ CF 2 -> 29 %). 0 = off (the shipped order); 1 = the measured coefficient.
+    slim_cubic: float = 0.0
     # ── the two-tier refusal ─────────────────────────────────────────────────────────
     # A chain MUST be refreshed somewhere: if every candidate on it misses the target, a
     # hard refusal does not produce a safer plan, it produces NO plan. So only genuinely
@@ -429,14 +434,21 @@ def choose_site(
 
     best_score = float("inf")
 
+    # PLAN_PREFER_SPARSE=1: a sparse route that meets err_target wins over a more accurate dense candidate (the
+    # error-only argmin never sees that the sparse route is cheaper and, for repetition-aware transforms, lands higher)
+    prefer_sparse = os.environ.get("PLAN_PREFER_SPARSE", "0") not in ("", "0")
+    feasible_sparse: SiteChoice | None = None
+
     def consider(cand: SiteChoice, score: float | None = None) -> None:
         """Rank by `score`, which defaults to the predicted error.
 
         The two differ only for prescale candidates, where the table cannot separate the
         CFs (each lands on its own band centre at ~2e-3) but the restore depth can.
         """
-        nonlocal best, best_score
+        nonlocal best, best_score, feasible_sparse
         s = cand.rel_err if score is None else score
+        if cand.feasible and cand.route and (feasible_sparse is None or cand.rel_err < feasible_sparse.rel_err):
+            feasible_sparse = cand
         if best is None or s < best_score:
             best, best_score = cand, s
 
@@ -450,8 +462,9 @@ def choose_site(
     # a DC-dominated site looks WORSE offset than not, and the measurement says the exact
     # opposite: even with CF free to pick its best value per site, the offset still wins
     # 26x at DC=1, 150x at DC=5 and 2467x at DC=16 on the n32 sweep.
-    offset_arms: list[tuple[float | None, float, int, float]] = [
-        (None, q_mag, q_period, q_rescale)]
+    # the 5th entry is the SLOT-domain magnitude the slim order's EvalMod sees (coefficient pricing does not apply there)
+    offset_arms: list[tuple[float | None, float, int, float, float]] = [
+        (None, q_mag, q_period, q_rescale, slot_mag * kappa)]
     if policy.allow_offset and mean is not None and residual_mag is not None:
         # Apply only where it pays: below the band centre the transform is neutral to
         # slightly negative (0.8-1.0x below DC=0.05).
@@ -467,24 +480,32 @@ def choose_site(
             # Rescale against the SLOT signal (what the site carries after the DC is
             # added back), not against q_mag — with coeff pricing q_mag is the
             # coefficient, and r/q_mag would compare the two arms on different bases.
-            offset_arms.append((float(mean), r, q_period, r / (slot_mag * kappa)))
+            offset_arms.append((float(mean), r, q_period, r / (slot_mag * kappa), residual_mag * kappa))
 
-    for off, mag, per, rescale in offset_arms:
+    def slim_err(slot_m: float, cf: int) -> float:
+        if policy.slim_cubic <= 0.0:
+            return 0.0
+        x = 2.0 * math.pi * slot_m * 2.0 ** (-cf)
+        return policy.slim_cubic * x * x / 6.0
+
+    for off, mag, per, rescale, slot_m in offset_arms:
         for cf in range(policy.cf_min, policy.cf_max + 1):
             for route in routes:
-                e = table.rel_err(mag, cf, per, route) * rescale
+                e = max(table.rel_err(mag, cf, per, route) * rescale, slim_err(slot_m, cf))
                 consider(SiteChoice(e <= policy.err_target, e, cf=cf, route=route,
                                     offset=off, extra_levels=0,
                                     reason="offset+cf+route" if off is not None
                                            else "cf+route"))
 
+    if prefer_sparse and feasible_sparse is not None:
+        return feasible_sparse
     if best is not None and best.feasible:
         return best
 
     # ── arm 4: prescale, the last resort — it is the only knob that costs a level ─────
     n_over_budget = 0
     if policy.allow_prescale and levels_free >= 1:
-        for off, mag, per, rescale in offset_arms:
+        for off, mag, per, rescale, slot_m in offset_arms:
             for cf in range(policy.cf_min, policy.cf_max + 1):
                 lo, hi = band(cf)
                 if mag > policy.prescale_reach * hi:
@@ -500,7 +521,7 @@ def choose_site(
                     n_over_budget += 1
                     continue
                 for route in routes:
-                    e = table.rel_err(mag * f, cf, per, route) * rescale
+                    e = max(table.rel_err(mag * f, cf, per, route) * rescale, slim_err(slot_m * f, cf))
                     # Rank by predicted error PLUS a depth preference. Every CF lands on
                     # its own band centre with near-identical measured error, so without
                     # this term the winner is arbitrary — and the arbitrary winner was the
