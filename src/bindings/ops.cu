@@ -759,7 +759,8 @@ void bind_ops(py::module_& m) {
         // ── slot-period stamps (what the C++ reductions do with packtag::t_reduce_*) ─────
         .def("tag_reduce",
              [](Inference& inf, PackedCtx& ct, int stride) {
-                 const auto top = packtag::PackTag::top(inf.slots);
+                 auto top = packtag::PackTag::top(inf.slots);
+                 top.field = inf.fhe->tag_of_ct(ct.ct).field;
                  ct.tag = stride <= 1 ? packtag::t_reduce_all(top)
                                       : packtag::t_reduce_stride(top, stride);
                  inf.fhe->tag_ct(ct.ct, ct.tag);

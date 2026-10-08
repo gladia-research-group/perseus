@@ -242,6 +242,8 @@ struct BootstrapPlan {
     std::unordered_map<std::string, int>         correction_factor;
     // Level-aware ModRaise: composite levels below the chain top the site's raise stops at (0 = full).
     std::unordered_map<std::string, int>         raise_drop;
+    // Dense refreshes of real payloads: one EvalMod chain (FIDESLIB_BTS_REAL).
+    std::unordered_set<std::string>              real_route;
     std::unordered_map<std::string, double>      offset;
     bool valid = false;
 
@@ -329,6 +331,9 @@ inline BootstrapPlan parse_bootstrap_plan_file(const std::string& path) {
         for (const auto& x : d->arr)
             if (x.is_string()) plan.hint_fire.insert(x.str);
     }
+    if (const auto* d = find_any("real_route"); d && d->is_array())
+        for (const auto& x : d->arr)
+            if (x.is_string()) plan.real_route.insert(x.str);
 
     // Plan-bound rescale decisions: key presence (even an empty list) binds every
     // landing-realize decision to the plan (same rule as hint_fire).
@@ -493,6 +498,7 @@ struct CKKSContext {
     // CORRECTION_FACTOR and no offset.
     std::unordered_map<std::string, int>      plan_correction_factor;
     std::unordered_map<std::string, int>      plan_raise_drop;
+    std::unordered_set<std::string>           plan_real_route;
     std::unordered_map<std::string, double>   plan_offset;
     int active_cache_pin_level = -1;   // placer-chosen KV read level for the live block plan (-1 = unset)
     uint64_t graph_ct_counter = 0;
@@ -756,17 +762,33 @@ struct CKKSContext {
         if (!pt) return;
         const PackSignature sig = analyze_packing(values);
         std::lock_guard<std::mutex> lk(tags_mtx);
-        pt_tags[(const void*)pt.get()] = packtag::from_signature(
+        packtag::PackTag t = packtag::from_signature(
             sig.slots, sig.period, sig.live_exact, sig.stride_exact, sig.window_exact,
             sig.offset_exact);
+        t.field = packtag::Field::Real;
+        pt_tags[(const void*)pt.get()] = t;
     }
     void tag_plaintext(const Ptx& pt, const std::vector<std::complex<double>>& values) const {
         if (!pt) return;
         const PackSignature sig = analyze_packing(values);
+        bool re = false, im = false;
+        for (const auto& v : values) {
+            re |= v.real() != 0.0;
+            im |= v.imag() != 0.0;
+        }
         std::lock_guard<std::mutex> lk(tags_mtx);
-        pt_tags[(const void*)pt.get()] = packtag::from_signature(
+        packtag::PackTag t = packtag::from_signature(
             sig.slots, sig.period, sig.live_exact, sig.stride_exact, sig.window_exact,
             sig.offset_exact);
+        t.field = im ? (re ? packtag::Field::Complex : packtag::Field::Imag) : packtag::Field::Real;
+        pt_tags[(const void*)pt.get()] = t;
+    }
+    // x + conj x is real and x - conj x imaginary whatever x holds: the realify steps of the complex packings
+    static packtag::PackTag conj_pair(packtag::PackTag t, const void* a, const void* b, const packtag::PackTag& ta,
+                                      const packtag::PackTag& tb, bool sub) {
+        if ((tb.conj_of && tb.conj_of == a) || (ta.conj_of && ta.conj_of == b))
+            t.field = sub ? packtag::Field::Imag : packtag::Field::Real;
+        return t;
     }
     packtag::PackTag tag_of(const Ptx& pt) const {
         if (!pt) return packtag::PackTag{};
@@ -849,6 +871,7 @@ struct CKKSContext {
         plan_prescale.clear();
         plan_correction_factor.clear();
         plan_raise_drop.clear();
+        plan_real_route.clear();
         plan_offset.clear();
         expected_levels.clear();
         expected_producers.clear();
@@ -985,6 +1008,10 @@ struct CKKSContext {
         if (!plan_offset.empty())
             std::cerr << "[plan_offset] " << plan_offset.size()
                       << " site(s) carry an offset-transform DC\n";
+        plan_real_route = plan.real_route;
+        if (!plan_real_route.empty())
+            std::cerr << "[plan_real] " << plan_real_route.size()
+                      << " dense site(s) refresh a real payload (needs FIDESLIB_BTS_REAL)\n";
 
         // Warn (once) when a planned plan is missing the level data it relies on.
         if (plan.expected_levels.empty() && planned_warned_.insert("no_expected_levels").second)
@@ -1065,6 +1092,7 @@ struct CKKSContext {
                                cit != plan_correction_factor.end());
             auto rit = plan_raise_drop.find(var_name);
             RaiseScope rs(*this, rit != plan_raise_drop.end() ? rit->second : 0);
+            RealScope rl(*this, plan_real_route.count(var_name) > 0);
             inner_bootstrap(ct, pit != plan_prescale.end() ? pit->second : 1.0);
         }
         // Adding a broadcast constant back cannot lower the output's period (a constant is
@@ -1487,13 +1515,15 @@ struct CKKSContext {
         // emit nothing — absent means dense to the planner, the sound direction.
         if (output_ct) {
             const packtag::PackTag tg = tag_of_ct(output_ct);
-            if (tg.known()) {
-                if (GraphNode* n = graph_builder->last_node()) stamp_pack_tag(n, tg);
+            if (GraphNode* n = graph_builder->last_node()) {
+                if (tg.known()) stamp_pack_tag(n, tg);
+                n->pack_field = static_cast<int>(tg.field);
             }
         }
     }
 
     static void stamp_pack_tag(GraphNode* n, const packtag::PackTag& tg) {
+        n->pack_field = static_cast<int>(tg.field);
         n->has_pack_tag = true;
         n->pack_period  = tg.period;
         n->pack_kind    = static_cast<int>(tg.support.kind);
@@ -1936,7 +1966,7 @@ struct CKKSContext {
     // ct *= i via the monomial x^{N/2}: deg- and level-preserving, no keyswitch. Recorded so
     // token-pair captures see the lane swap (decode never calls it).
     Ctx mult_i(const Ctx& ct) {
-        const packtag::PackTag _tg = tag_of_ct(ct);
+        const packtag::PackTag _tg = packtag::t_mult_i(tag_of_ct(ct));
         const int in_a_level = level_for_ct(ct);
         const std::string in_a = var_for_ct(ct);
         Ctx out_ct = ct->Clone();
@@ -2171,6 +2201,22 @@ struct CKKSContext {
         }
         ~RaiseScope() {
             if (g) g->setBtsRaiseDrop(saved);
+        }
+    };
+
+    // A dense refresh of a real payload (plan 'real_route'): one EvalMod chain and the real StC stage 0, built at
+    // LoadContext under FIDESLIB_BTS_REAL; FIDESlib throws otherwise.
+    struct RealScope {
+        FIDESlib::CKKS::ContextData* g = nullptr;
+        bool saved = false;
+        RealScope(CKKSContext& ctx, bool on) {
+            if (!on || !ctx.cc->gpu.has_value()) return;
+            g = std::any_cast<FIDESlib::CKKS::Context&>(ctx.cc->gpu).get();
+            saved = g->getBtsRealPayload();
+            g->setBtsRealPayload(true);
+        }
+        ~RealScope() {
+            if (g) g->setBtsRealPayload(saved);
         }
     };
 
@@ -2594,7 +2640,8 @@ struct CKKSContext {
     }
 
     void inplace_add(Ctx& ct, const Ctx& other) {
-        const packtag::PackTag _tg = packtag::t_add(tag_of_ct(ct), tag_of_ct(other));
+        const packtag::PackTag _ta = tag_of_ct(ct), _tb = tag_of_ct(other);
+        const packtag::PackTag _tg = conj_pair(packtag::t_add(_ta, _tb), ct.get(), other.get(), _ta, _tb, false);
         const int in_a_level = level_for_ct(ct);
         const int in_b_level = level_for_ct(other);
         const std::string in_a = var_for_ct(ct);
@@ -2646,7 +2693,8 @@ struct CKKSContext {
     }
 
     Ctx add(const Ctx& ct, const Ctx& other) {
-        const packtag::PackTag _tg = packtag::t_add(tag_of_ct(ct), tag_of_ct(other));
+        const packtag::PackTag _ta = tag_of_ct(ct), _tb = tag_of_ct(other);
+        const packtag::PackTag _tg = conj_pair(packtag::t_add(_ta, _tb), ct.get(), other.get(), _ta, _tb, false);
 
         const int in_a_level = level_for_ct(ct);
         const int in_b_level = level_for_ct(other);
@@ -2702,7 +2750,8 @@ struct CKKSContext {
     }
 
     Ctx sub(const Ctx& ct, const Ctx& other) {
-        const packtag::PackTag _tg = packtag::t_add(tag_of_ct(ct), tag_of_ct(other));
+        const packtag::PackTag _ta = tag_of_ct(ct), _tb = tag_of_ct(other);
+        const packtag::PackTag _tg = conj_pair(packtag::t_add(_ta, _tb), ct.get(), other.get(), _ta, _tb, true);
 
         const int in_a_level = level_for_ct(ct);
         const int in_b_level = level_for_ct(other);
@@ -2759,7 +2808,8 @@ struct CKKSContext {
     }
 
     void inplace_sub(Ctx& ct, const Ctx& other) {
-        const packtag::PackTag _tg = packtag::t_add(tag_of_ct(ct), tag_of_ct(other));
+        const packtag::PackTag _ta = tag_of_ct(ct), _tb = tag_of_ct(other);
+        const packtag::PackTag _tg = conj_pair(packtag::t_add(_ta, _tb), ct.get(), other.get(), _ta, _tb, true);
         
         const int in_a_level = level_for_ct(ct);
         const int in_b_level = level_for_ct(other);
@@ -3126,7 +3176,8 @@ struct CKKSContext {
     }
 
     Ctx conjugate(const Ctx& ct) {
-        const packtag::PackTag _tg = packtag::t_conjugate(tag_of_ct(ct));
+        packtag::PackTag _tg = packtag::t_conjugate(tag_of_ct(ct));
+        _tg.conj_of = ct.get();
 
         const int in_a_level = level_for_ct(ct);
         const std::string in_a = var_for_ct(ct);
@@ -3342,7 +3393,8 @@ struct CKKSContext {
     PackedCtx add(const PackedCtx& a, const PackedCtx& b) {
         check_packing(a.packing, b.packing);
         slotlayout::check_binary(a.ct, b.ct, "add");
-        return slotlayout::keep(a.ct, b.ct, tagged(add(a.ct, b.ct), a.packing, packtag::t_add(a.tag, b.tag)));
+        return slotlayout::keep(a.ct, b.ct, tagged(add(a.ct, b.ct), a.packing,
+                                                   conj_pair(packtag::t_add(a.tag, b.tag), a.ct.get(), b.ct.get(), a.tag, b.tag, false)));
     }
     // ct(+/x)pt: the ordinary algebra applies once the plaintext is tagged — identical tags
     // give lcm(P,P)=P and union/intersect of identical supports, i.e. the result keeps the
@@ -3359,7 +3411,8 @@ struct CKKSContext {
         check_packing(a.packing, b.packing);
         slotlayout::check_binary(a.ct, b.ct, "sub");
         // t_add is the sub rule too: period lcm + support union — sign is irrelevant.
-        return slotlayout::keep(a.ct, b.ct, tagged(sub(a.ct, b.ct), a.packing, packtag::t_add(a.tag, b.tag)));
+        return slotlayout::keep(a.ct, b.ct, tagged(sub(a.ct, b.ct), a.packing,
+                                                   conj_pair(packtag::t_add(a.tag, b.tag), a.ct.get(), b.ct.get(), a.tag, b.tag, true)));
     }
     PackedCtx sub(const PackedCtx& a, Ptx& pt)      { return slotlayout::keep(a.ct, tagged(sub(a.ct, pt),     a.packing, packtag::t_add(a.tag, tag_of(pt)))); }
     PackedCtx sub(const PackedCtx& a, double scalar){ return slotlayout::keep(a.ct, tagged(sub(a.ct, scalar), a.packing, packtag::t_add_scalar(a.tag, scalar))); }
@@ -3439,7 +3492,11 @@ struct CKKSContext {
                                  packtag::t_rotate(a.tag, steps[i])));
         return out;
     }
-    PackedCtx conjugate(const PackedCtx& a) { return slotlayout::keep(a.ct, tagged(conjugate(a.ct), a.packing, packtag::t_conjugate(a.tag))); }
+    PackedCtx conjugate(const PackedCtx& a) {
+        packtag::PackTag t = packtag::t_conjugate(a.tag);
+        t.conj_of = a.ct.get();
+        return slotlayout::keep(a.ct, tagged(conjugate(a.ct), a.packing, t));
+    }
     void inplace_rotate(PackedCtx& a, int32_t index)    { inplace_rotate(a.ct, index); a.tag = tag_of_ct(a.ct); }
 
     PackedCtx im_cleanse(const PackedCtx& a) { return add(a, conjugate(a)); }
@@ -3463,7 +3520,7 @@ struct CKKSContext {
     PackedCtx pair_pack(const PackedCtx& a_re, const PackedCtx& b_im) {
         return PackedCtx{ pair_pack(a_re.ct, b_im.ct), a_re.packing };
     }
-    PackedCtx mult_i(const PackedCtx& a) { return tagged(mult_i(a.ct), a.packing, a.tag); }
+    PackedCtx mult_i(const PackedCtx& a) { return tagged(mult_i(a.ct), a.packing, packtag::t_mult_i(a.tag)); }
 
     // Repack two independently-computed real halves (token-pair): strip the Im contamination each
     // half accrued, pack A + i*B, cancel the cleanses' 2x. Levels must already agree.

@@ -138,6 +138,9 @@ class PlanConfig:
     # drop is rounded down to the largest of them (None: any drop up to raise_drop_max). Each
     # variant is a full CtS/StC plaintext set per route, so the runtime cannot afford them all.
     raise_drop_set: tuple[int, ...] | None = None
+    # Dense refreshes whose slots the capture tagged real run one EvalMod chain (plan 'real_route'; the runtime
+    # builds the real StC stage under FIDESLIB_BTS_REAL).
+    real_route: bool = False
     first_entry_level: int | None = None
     first_entry_deg: int | None = None
     verbose: bool = True
@@ -804,6 +807,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         placer_meta=getattr(placer, "meta", None),
         boundary_realize=cfg.boundary_realize,
         realize_anchors=rescale_anchors,
+        real_route=cfg.real_route,
     )
     # Refresh-input absolute levels of the placed sites: what the pricing knobs move.
     # eff = nominal + pending rescale, as _capacity sees it.

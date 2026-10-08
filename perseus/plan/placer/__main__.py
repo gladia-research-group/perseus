@@ -123,6 +123,9 @@ def main() -> None:
                    help="deepest absolute landing for a raise-dropped site (default 44 = AUTO_BTS_LEVEL - unit)")
     p.add_argument("--raise-drop-routes", dest="raise_drop_routes", type=lambda s: tuple(int(x) for x in s.split(",") if x), default=None,
                    help="routes (slot counts, 0 = dense) that may take a raise drop; default 0,512")
+    p.add_argument("--real-route", dest="real_route", action="store_true", default=None,
+                   help="refresh dense sites whose slots the capture tagged real with one EvalMod chain "
+                        "(plan 'real_route'; run with FIDESLIB_BTS_REAL=1)")
     p.add_argument("--raise-drop-set", dest="raise_drop_set", type=lambda s: tuple(int(x) for x in s.split(",") if x), default=None,
                    help="the drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS), e.g. 1,3,5: a site's drop is rounded down to one of them")
     p.add_argument("--raise-drop-env-rule", dest="raise_drop_env_rule", type=str, default=None,

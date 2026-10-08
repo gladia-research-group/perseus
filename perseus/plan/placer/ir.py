@@ -8,6 +8,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# packtag::Field::Real (include/packing/pack_tag.h): the slots hold a real payload.
+FIELD_REAL = 1
+
 # Table depth costs, in CKKS levels (x level_unit at use sites).
 DEPTH_COSTS: dict[str, int] = {
     "mult": 1, "mult_inplace": 1, "square": 1, "square_inplace": 1,
@@ -69,6 +72,7 @@ class Node:
     max_coeff: float | None
     pack_period: int | None
     max_coeff_ac: float | None = None   # max_coeff with the DC (X^0) coefficient excluded
+    pack_field: int = 0                 # packtag::Field of the slots (FIELD_REAL: a real payload)
     # derived, precomputed once
     cipher_inputs: tuple[str, ...] = ()
     hint_level: float | None = None
@@ -151,6 +155,7 @@ class Graph:
                              if isinstance(n.get("pack_period"), (int, float)) else None),
                 max_coeff_ac=(float(n["output_max_coeff_ac"])
                               if isinstance(n.get("output_max_coeff_ac"), (int, float)) else None),
+                pack_field=int(n.get("pack_field") or 0),
             ))
 
         for d in drafts:
@@ -259,4 +264,5 @@ def _node_to_raw(n: Node) -> dict:
         "output_max_coeff": n.max_coeff,
         "output_max_coeff_ac": n.max_coeff_ac,
         "pack_period": n.pack_period,
+        **({"pack_field": n.pack_field} if n.pack_field else {}),
     }

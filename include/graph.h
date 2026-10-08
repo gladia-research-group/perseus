@@ -36,6 +36,7 @@ struct GraphNode {
     int  pack_stride  = 0;
     int  pack_count   = 0;
     int  pack_width   = 1;   // Block support width (1 = classic AP)
+    int  pack_field   = 0;   // packtag::Field: 0 unknown, 1 real, 2 imaginary, 3 complex
 
     bool   has_fold       = false;
     double fold_stride    = 0.0;
@@ -181,6 +182,10 @@ public:
                 out << "      \"pack_stride\": " << node.pack_stride << ",\n";
                 out << "      \"pack_count\": " << node.pack_count << ",\n";
                 out << "      \"pack_width\": " << node.pack_width;
+            }
+            if (node.pack_field != 0) {
+                out << ",\n";
+                out << "      \"pack_field\": " << node.pack_field;
             }
             if (node.has_fold) {
                 out << ",\n";

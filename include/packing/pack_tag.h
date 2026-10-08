@@ -32,13 +32,31 @@ struct Support {
     bool is_empty() const { return kind == Kind::Empty; }
 };
 
+// What the slots hold: a real payload, i times one, or a general complex payload (Unknown: not tracked). A dense
+// bootstrap of a Real payload may run one EvalMod chain (FIDESLIB_BTS_REAL). Tracked apart from the period: a fresh
+// encryption of real values is Real with its period unknown.
+enum class Field : int { Unknown = 0, Real = 1, Imag = 2, Complex = 3 };
+
+inline Field field_add(Field a, Field b) {
+    if (a == Field::Unknown || b == Field::Unknown) return Field::Unknown;
+    return a == b ? a : Field::Complex;
+}
+inline Field field_mult(Field a, Field b) {
+    if (a == Field::Unknown || b == Field::Unknown) return Field::Unknown;
+    if (a == Field::Complex || b == Field::Complex) return Field::Complex;
+    return a == b ? Field::Real : Field::Imag;   // i * i is real, i * real imaginary
+}
+
 struct PackTag {
     int slots = 0;
     int period = 0;        // 0 = unknown/aperiodic sentinel filled by top(); else the bound
     Support support{};
+    Field field = Field::Unknown;
+    const void* conj_of = nullptr;   // set by the runtime's conjugate: x + conj x is Real, x - conj x Imag
 
     static PackTag top(int slots) { return {slots, slots, Support::dense()}; }
     static PackTag constant(int slots) { return {slots, 1, Support::dense()}; }
+    static PackTag real() { PackTag t; t.field = Field::Real; return t; }
     bool known() const { return slots > 0 && period > 0; }
 
     bool periodic_at(int s) const { return period > 0 && s % period == 0; }
@@ -117,37 +135,51 @@ inline Support support_intersect(const Support& a, const Support& b) {
     return ((long long)a.count * a.width <= (long long)b.count * b.width) ? a : b;
 }
 
+inline PackTag with_field(PackTag t, Field f) {
+    t.field = f;
+    t.conj_of = nullptr;
+    return t;
+}
+
 inline PackTag t_mult_scalar(const PackTag& x, double c) {
-    if (!x.known()) return PackTag{};
-    if (c == 0.0) return {x.slots, 1, Support::empty()};
-    return x;
+    if (!x.known()) return with_field(PackTag{}, x.field);
+    if (c == 0.0) return with_field({x.slots, 1, Support::empty()}, x.field);
+    return with_field(x, x.field);
 }
 
 inline PackTag t_add_scalar(const PackTag& x, double c) {
-    if (!x.known()) return PackTag{};
-    if (c == 0.0) return x;
-    return {x.slots, x.period, Support::dense()};
+    const Field f = c == 0.0 ? x.field : field_add(x.field, Field::Real);
+    if (!x.known()) return with_field(PackTag{}, f);
+    if (c == 0.0) return with_field(x, f);
+    return with_field({x.slots, x.period, Support::dense()}, f);
 }
 
-inline PackTag t_square(const PackTag& x) { return x; }
+inline PackTag t_square(const PackTag& x) { return with_field(x, field_mult(x.field, x.field)); }
 
 inline PackTag t_add(const PackTag& a, const PackTag& b) {
-    if (!a.known() || !b.known()) return PackTag{};
-    return {a.slots, lcm_capped(a.period, b.period, a.slots),
-            support_union(a.support, b.support)};
+    const Field f = field_add(a.field, b.field);
+    if (!a.known() || !b.known()) return with_field(PackTag{}, f);
+    return with_field({a.slots, lcm_capped(a.period, b.period, a.slots),
+                       support_union(a.support, b.support)}, f);
 }
 
 inline PackTag t_mult(const PackTag& a, const PackTag& b) {
-    if (!a.known() && !b.known()) return PackTag{};
-    if (!a.known()) return {b.slots, b.slots, b.support};
-    if (!b.known()) return {a.slots, a.slots, a.support};
-    return {a.slots, lcm_capped(a.period, b.period, a.slots),
-            support_intersect(a.support, b.support)};
+    const Field f = field_mult(a.field, b.field);
+    if (!a.known() && !b.known()) return with_field(PackTag{}, f);
+    if (!a.known()) return with_field({b.slots, b.slots, b.support}, f);
+    if (!b.known()) return with_field({a.slots, a.slots, a.support}, f);
+    return with_field({a.slots, lcm_capped(a.period, b.period, a.slots),
+                       support_intersect(a.support, b.support)}, f);
+}
+
+inline PackTag t_mult_i(const PackTag& x) {
+    const Field f = x.field == Field::Real ? Field::Imag : x.field == Field::Imag ? Field::Real : x.field;
+    return with_field(x, f);
 }
 
 inline PackTag t_rotate(const PackTag& x, int k) {
-    if (!x.known()) return PackTag{};
-    PackTag r = x;
+    if (!x.known()) return with_field(PackTag{}, x.field);
+    PackTag r = with_field(x, x.field);
     if (x.support.kind == Support::Kind::AP) {
         int off = (x.support.offset - k) % x.slots;
         if (off < 0) off += x.slots;
@@ -157,28 +189,28 @@ inline PackTag t_rotate(const PackTag& x, int k) {
 }
 
 inline PackTag t_conjugate(const PackTag& x) {
-    if (!x.known()) return PackTag{};
-    PackTag r = x;
+    if (!x.known()) return with_field(PackTag{}, x.field);
+    PackTag r = with_field(x, x.field);
     if (x.support.kind == Support::Kind::AP) r.support = Support::dense();  // mirrored: not an AP
     return r;
 }
 
-inline PackTag t_reduce_all(const PackTag& x) { return PackTag::constant(x.slots); }
+inline PackTag t_reduce_all(const PackTag& x) { return with_field(PackTag::constant(x.slots), x.field); }
 
 inline PackTag t_reduce_stride(const PackTag& x, int g) {
-    return {x.slots, std::min(g, x.slots), Support::dense()};
+    return with_field({x.slots, std::min(g, x.slots), Support::dense()}, x.field);
 }
 
 inline PackTag t_bootstrap(const PackTag& x, int routed_s, int slots) {
-    if (routed_s <= 0) return x;
-    if (slots <= 0) return PackTag{};
-    return {slots, std::min(routed_s, slots), Support::dense()};
+    if (routed_s <= 0) return with_field(x, x.field);
+    if (slots <= 0) return with_field(PackTag{}, x.field);
+    return with_field({slots, std::min(routed_s, slots), Support::dense()}, x.field);
 }
 
 inline PackTag t_bootstrap(const PackTag& x, int routed_s) {
-    if (routed_s <= 0) return x;
-    if (x.slots <= 0) return PackTag{};
-    return {x.slots, std::min(routed_s, x.slots), Support::dense()};
+    if (routed_s <= 0) return with_field(x, x.field);
+    if (x.slots <= 0) return with_field(PackTag{}, x.field);
+    return with_field({x.slots, std::min(routed_s, x.slots), Support::dense()}, x.field);
 }
 
 inline PackTag from_signature(int slots, int period, int live, int stride, int window,

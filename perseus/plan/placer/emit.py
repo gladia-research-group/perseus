@@ -4,7 +4,7 @@ import math
 import re
 from collections.abc import Callable
 
-from .ir import Graph, Node, is_literal_input, is_plaintext_name
+from .ir import FIELD_REAL, Graph, Node, is_literal_input, is_plaintext_name
 from .refresh import RefreshPlanner
 from .sim import SimResult
 
@@ -159,6 +159,7 @@ def assemble(
     placer_meta: dict | None = None,
     boundary_realize: bool = False,
     realize_anchors: set | None = None,
+    real_route: bool = False,
 ) -> dict:
     unit = g.level_unit
 
@@ -206,6 +207,7 @@ def assemble(
     ps_map: dict[str, float] = {}
     sp_map: dict[str, int] = {}
     rd_map: dict[str, int] = {}
+    real: list[str] = []
     errs: list[float] = []
     cf_hist: dict[int, int] = {}
     n_missed = 0
@@ -223,6 +225,8 @@ def assemble(
             sp_map[v] = int(s.route)
         if s.raise_drop:
             rd_map[v] = int(s.raise_drop)
+        if real_route and not s.route and v in g.producer_of and g.producer_of[v].pack_field == FIELD_REAL:
+            real.append(v)
         if math.isfinite(s.rel_err):
             errs.append(s.rel_err)
         if not s.feasible:
@@ -273,6 +277,7 @@ def assemble(
         **({"correction_factor": cf_map} if cf_map else {}),
         **({"offset": off_map} if off_map else {}),
         **({"raise_drop": rd_map} if rd_map else {}),
+        **({"real_route": real} if real else {}),
         "summary": {
             **({"placer_meta": placer_meta} if placer_meta else {}),
             "num_placements": len(all_sites),
@@ -301,6 +306,7 @@ def assemble(
                 "num_offset": len(off_map),
                 "num_prescale": len(ps_map),
             "num_raise_drop": len(rd_map),
+                "num_real_route": len(real),
                 "num_sparse": len(sp_map),
                 "worst_sites": [
                     {"var": v, "rel_err": e,

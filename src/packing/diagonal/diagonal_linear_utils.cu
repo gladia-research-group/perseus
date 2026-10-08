@@ -62,7 +62,10 @@ PackedCtx encode_linear_input(Inference& inf, const std::vector<double>& x,
         inf.cc()->MakeCKKSPackedPlaintext(ptx, /*noiseScaleDeg=*/1,
                                           static_cast<uint32_t>(target_level)),
         inf.fhe->pk());
-    return inf.pack(ct, inf.packing.kind);
+    PackedCtx pc = inf.pack(ct, inf.packing.kind);
+    pc.tag = packtag::PackTag::real();   // an encryption of real slots
+    inf.fhe->tag_ct(pc.ct, pc.tag);
+    return pc;
 }
 
 namespace {

@@ -155,6 +155,11 @@ void bind_bts(py::module_& root) {
         r["product"] = g_spruAcc.t.product_ms / n; r["finish"] = g_spruAcc.t.finish_ms / n; r["total"] = g_spruAcc.t.total_ms / n;
         return r;
     }, "Mean SPRU phase times (ms) over the calls made with PERSEUS_BTS_PROFILE set.");
+    m.def("set_real_payload",
+          [](CKKSContext& fhe, bool on) { std::any_cast<FC::Context&>(fhe.cc->gpu)->setBtsRealPayload(on); },
+          py::arg("fhe"), py::arg("on"),
+          "Route the following dense bootstraps as real payloads (one EvalMod chain; needs FIDESLIB_BTS_REAL=1 at "
+          "session build). The planned runtime sets it per site from the plan.");
     m.def("spru_setup",
           [](CKKSContext& fhe, int h) {
               auto& lcc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(fhe.cc->cpu);

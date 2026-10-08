@@ -127,7 +127,10 @@ PackedCtx encode_linear_input(Inference& inf, const std::vector<double>& x,
         inf.cc()->MakeCKKSPackedPlaintext(ptx, /*noiseScaleDeg=*/1,
                                           static_cast<uint32_t>(target_level)),
         inf.fhe->pk());
-    return inf.pack(ct, PackingKind::Cachemir);
+    PackedCtx pc = inf.pack(ct, PackingKind::Cachemir);
+    pc.tag = packtag::PackTag::real();   // an encryption of real slots
+    inf.fhe->tag_ct(pc.ct, pc.tag);
+    return pc;
 }
 
 std::vector<Ptx> encode_weight_matrix(Inference& inf, const std::vector<std::vector<double>>& W,

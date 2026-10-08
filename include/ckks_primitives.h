@@ -139,8 +139,9 @@ Ctx pow_odd(CKKSContext& cc, const Ctx& y, int p);
 Ctx inv_sqrt_newton_safe(CKKSContext& cc, const Ctx& x, const Ctx& y0, int iters);
 
 inline PackedCtx rotate_and_sum_all(CKKSContext& cc, const PackedCtx& x, int slots) {
-    return cc.tagged(rotate_and_sum_all(cc, x.ct, slots), x.packing,
-                     packtag::t_reduce_all(packtag::PackTag::top(slots)));
+    packtag::PackTag top = packtag::PackTag::top(slots);
+    top.field = x.tag.field;
+    return cc.tagged(rotate_and_sum_all(cc, x.ct, slots), x.packing, packtag::t_reduce_all(top));
 }
 
 inline PackedCtx pow_odd(CKKSContext& cc, const PackedCtx& y, int p) {
