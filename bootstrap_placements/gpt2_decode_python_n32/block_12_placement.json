@@ -4689,10 +4689,10 @@
       "table_measured": true,
       "num_sites": 3,
       "predicted_rel_err": {
-        "median": 8.54616097229835e-06,
-        "p90": 1.0227809155154932e-05,
-        "p99": 1.0227809155154932e-05,
-        "max": 1.0227809155154932e-05
+        "median": 8.654050512768582e-06,
+        "p90": 1.016343538075278e-05,
+        "p99": 1.016343538075278e-05,
+        "max": 1.016343538075278e-05
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -4711,22 +4711,22 @@
       "worst_sites": [
         {
           "var": "v_101",
-          "rel_err": 1.0227809155154932e-05,
-          "max_abs": 0.4340384211557194,
+          "rel_err": 1.016343538075278e-05,
+          "max_abs": 0.43180052875008174,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_58",
-          "rel_err": 8.54616097229835e-06,
-          "max_abs": 0.3746781077631749,
+          "rel_err": 8.654050512768582e-06,
+          "max_abs": 0.3785463066622665,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_3",
-          "rel_err": 2.318498349943258e-06,
-          "max_abs": 16.72655199449416,
+          "rel_err": 2.318380748293389e-06,
+          "max_abs": 16.812409364602246,
           "pack_period": 32768,
           "step": "tail"
         }
@@ -4800,7 +4800,8 @@
       "FUSED_LN_VAR": "0",
       "CORRECTION_FACTOR": "6",
       "FHE_PT_COEFF_ENCODE": "0",
-      "SM_DEN_RECIP": "1"
+      "SM_DEN_RECIP": "1",
+      "GELU_FOLD": "1"
     },
     "session": {
       "level_limit": 46,

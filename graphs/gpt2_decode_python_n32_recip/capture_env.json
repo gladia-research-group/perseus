@@ -19,7 +19,8 @@
     "FUSED_LN_VAR": "0",
     "CORRECTION_FACTOR": "6",
     "FHE_PT_COEFF_ENCODE": "0",
-    "SM_DEN_RECIP": "1"
+    "SM_DEN_RECIP": "1",
+    "GELU_FOLD": "1"
   },
   "session": {
     "level_limit": 46,
