@@ -61,8 +61,11 @@ class Gpt2Model(ImplModel):
     # ── weights (host numpy, lazily encoded) ──
     def block_weights(self, b):
         if b not in self._bw:
+            ge = self.cfgs.block(b)[3]
+            fold = self.rt.ops.gelu_fold and ge.method == "thor_composite"
             self._bw[b] = W.block_weights(self.store, self.cfgs, b, self.rt.dims,
-                                          self.fold[0], self.fold[1], self.complex_packing)
+                                          self.fold[0], self.fold[1], self.complex_packing,
+                                          up_scale=1.0 / ge.xmax if fold else 1.0)
         return self._bw[b]
 
     def lnf_params(self):

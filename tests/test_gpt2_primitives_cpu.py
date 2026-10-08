@@ -495,6 +495,19 @@ def test_softmax_den_recip_matches_goldschmidt(complex_payload):
     np.testing.assert_allclose(run(True), run(False), rtol=1e-9, atol=1e-12)
 
 
+def test_gelu_fold_matches_gelu():
+    """GELU_FOLD: fed x / xmax (the up-projection carries the scaling) and with xmax on the
+    mask, the GELU returns what the default form returns on x."""
+    rt, fhe, inf = _rt(complex_payload=True)
+    d = rt.dims
+    cfg = _cfgs().gelu["transformer.h.3.mlp.act"]
+    x = np.random.default_rng(12).normal(0.0, cfg.xmax / 4, d.N) * (layout.active_expanded_mask(d, 1.0) != 0)
+    want = gelu.gelu(rt, fake.FakeCt(x.astype(complex), 34), cfg).vec
+    rt.ops.gelu_fold = True
+    got = gelu.gelu(rt, fake.FakeCt((x / cfg.xmax).astype(complex), 34), cfg).vec
+    np.testing.assert_allclose(got, want, rtol=1e-9, atol=1e-12)
+
+
 # ── the cachemir_complex packing ─────────────────────────────────────────────────────
 
 def test_outputpack_linear_matches_dense():

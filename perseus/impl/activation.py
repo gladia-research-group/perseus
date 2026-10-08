@@ -9,17 +9,20 @@ from .poly import eval_chebyshev, eval_polynomial_ps, im_cleanse
 
 
 def gelu_thor_core(rt, t, cfg: GeluCfg):
-    """nonlinear.cu."""
+    """nonlinear.cu. With GELU_FOLD the refreshes are the plan's, not these hints."""
     ops = rt.ops
-    ops.bootstrap_hint(t, 16)
+    hints = not ops.gelu_fold
+    if hints:
+        ops.bootstrap_hint(t, 16)
     cheb = bool(cfg.thor_p1_cheb)
     p1 = (eval_chebyshev(ops, t, cfg.thor_p1_cheb, cfg.thor_p1_a, cfg.thor_p1_b) if cheb
           else eval_polynomial_ps(ops, t, cfg.thor_p1))
-    ops.bootstrap_hint(p1, ops.headroom(4))
+    if hints:
+        ops.bootstrap_hint(p1, ops.headroom(4))
     g = (eval_chebyshev(ops, p1, cfg.thor_p2_cheb, cfg.thor_p2_a, cfg.thor_p2_b) if cheb
          else eval_polynomial_ps(ops, p1, cfg.thor_p2))
     g = ops.add(g, 0.5)
-    if ops.unit > 1:
+    if hints and ops.unit > 1:
         ops.bootstrap_hint(g, ops.level_limit() - 4)
     return g
 
@@ -32,6 +35,9 @@ def gelu(rt, x, cfg: GeluCfg):
         return eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b)
     if cfg.method != "thor_composite":
         raise ValueError(f"gelu: method {cfg.method!r} not ported")
+    if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries it): xmax rides the mask
+        g = ops.mult(gelu_thor_core(rt, x, cfg), im_cleanse(ops, x))
+        return rt.mult_mask(g, ("gelu.half", cfg.xmax), lambda: active_expanded_mask(d, 0.5 * cfg.xmax))
     t = ops.mult(x, 1.0 / cfg.xmax)
     g = gelu_thor_core(rt, t, cfg)
     xs = im_cleanse(ops, x)

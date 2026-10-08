@@ -25,6 +25,8 @@ LOAD_BEARING_ENV = (
     "FHE_PT_COEFF_ENCODE",
     # the softmax division form (impl attention.softmax_thor): a different op sequence
     "SM_DEN_RECIP",
+    # the GELU form (impl activation.gelu, examples weights up_scale): a different op sequence
+    "GELU_FOLD",
 )
 
 

@@ -179,11 +179,13 @@ def block_matrices(store, cfgs: Configs, b: int, dims: Dims, fold_ln1=True, fold
 
 
 def block_weights(store, cfgs: Configs, b: int, dims: Dims, fold_ln1=True, fold_ln2=True,
-                  complex_packing=False):
+                  complex_packing=False, up_scale=1.0):
     """The block's EncodedLinears (weight_loader.h, untiled) plus the LN shifts (folded) or
     descaled gamma/beta (unfolded). `complex_packing` (cachemir_complex): one fused K + iV
-    linear with a complex bias, and the up- and down-projections output-packed."""
+    linear with a complex bias, and the up- and down-projections output-packed. `up_scale`
+    multiplies the up-projection (GELU_FOLD: the GELU's 1/xmax input scaling)."""
     m = block_matrices(store, cfgs, b, dims, fold_ln1, fold_ln2)
+    m.Up, m.bup = m.Up * up_scale, m.bup * up_scale
     N, dp, ep = dims.N, dims.hid, dims.E
     enc = EncodedLinear.encode
     pre = f"b{b}."

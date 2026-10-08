@@ -59,6 +59,9 @@ class FheOps:
         # (tH-periodic, sparse-routed) ciphertext and multiplying the scores by it once per round,
         # instead of multiplying the scores at every Goldschmidt iteration (attention.softmax_thor)
         self.sm_den_recip = os.environ.get("SM_DEN_RECIP", "0") not in ("", "0")
+        # GELU_FOLD=1: the GELU's 1/xmax rides the up-projection weights and its refreshes are
+        # placed by the planner instead of its own hints (activation.gelu)
+        self.gelu_fold = os.environ.get("GELU_FOLD", "0") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
@@ -331,7 +334,7 @@ class NumpyOps:
     def headroom(self, k): return 1 << 30
     def bootstrap(self, a): return a
     def bootstrap_hint(self, a, thr, acct=False): return a
-    folds = fused_sm_den = fused_ln_var = sm_den_recip = False
+    folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = False
     def fold_slots_for(self, s_wanted): return int(s_wanted)
     def fold_bootstrap(self, a, s, n_live, prescale=1.0):
         out = self.rotate_and_sum(a, s, a.shape[0]) / n_live   # the fold: the remaining ladder, /n_live
