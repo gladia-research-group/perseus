@@ -53,6 +53,9 @@
     "v_58": 10,
     "v_101": 10
   },
+  "real_route": [
+    "v_3"
+  ],
   "summary": {
     "num_placements": 3,
     "num_hint_bootstraps": 0,
@@ -4686,10 +4689,10 @@
       "table_measured": true,
       "num_sites": 3,
       "predicted_rel_err": {
-        "median": 8.702659078549851e-06,
-        "p90": 1.0134822666368668e-05,
-        "p99": 1.0134822666368668e-05,
-        "max": 1.0134822666368668e-05
+        "median": 8.54616097229835e-06,
+        "p90": 1.0227809155154932e-05,
+        "p99": 1.0227809155154932e-05,
+        "max": 1.0227809155154932e-05
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -4703,26 +4706,27 @@
       "num_offset": 0,
       "num_prescale": 0,
       "num_raise_drop": 0,
+      "num_real_route": 1,
       "num_sparse": 2,
       "worst_sites": [
         {
           "var": "v_101",
-          "rel_err": 1.0134822666368668e-05,
-          "max_abs": 0.43080499699548874,
+          "rel_err": 1.0227809155154932e-05,
+          "max_abs": 0.4340384211557194,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_58",
-          "rel_err": 8.702659078549851e-06,
-          "max_abs": 0.3802862243695993,
+          "rel_err": 8.54616097229835e-06,
+          "max_abs": 0.3746781077631749,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_3",
-          "rel_err": 2.320604579456995e-06,
-          "max_abs": 16.85087520085863,
+          "rel_err": 2.318498349943258e-06,
+          "max_abs": 16.72655199449416,
           "pack_period": 32768,
           "step": "tail"
         }
