@@ -52,7 +52,7 @@ import time
 from dataclasses import dataclass, field
 
 from .ir import ADD_FAMILY, MULT_FAMILY, is_kv_cache_read, is_literal_input, is_plaintext_name
-from .place import QUALITY_LAMBDA, REFRESH_ENV_CAP_ABS, Placer, PlanInfeasible
+from .place import QUALITY_LAMBDA, Placer, PlanInfeasible, refresh_env_cap
 from .sim import SimResult
 
 log = logging.getLogger(__name__)
@@ -576,7 +576,7 @@ class IlpPlacer(Placer):
         # refresh envelope, on the input of every refresh a decision can place
         env_pen: dict[int, float] = {}
         hard = self._env_hard() if env_hard is None else env_hard
-        cap_rel = REFRESH_ENV_CAP_ABS - bts
+        cap_rel = refresh_env_cap() - bts   # PLAN_REFRESH_ENV_CAP, as the min-cut's _capacity
         for v, pe in (pre.items() if constrain else ()):
             xv = x.get(v, ZERO)
             deep = pe.gt(cap_rel)
