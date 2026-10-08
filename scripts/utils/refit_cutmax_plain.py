@@ -56,7 +56,7 @@ KNOBS = dict(
 )
 
 
-def load_rows(model_name, pool_path, n_rows, window, cache):
+def load_rows(model_name, pool_path, n_rows, window, cache, checkpoint=None):
     """(n_rows, vocab) plaintext lm_head logit rows from the model's own forward."""
     if cache and os.path.exists(cache):
         rows = np.load(cache)
@@ -69,6 +69,9 @@ def load_rows(model_name, pool_path, n_rows, window, cache):
 
     pool = np.load(pool_path, mmap_mode="r")
     model = load_model(model_name, device="cpu")
+    if checkpoint:
+        from perseus.export import load_trained_backbone
+        load_trained_backbone(model, checkpoint)
     model.eval()
 
     n_win = int(np.ceil(n_rows / window))
@@ -186,6 +189,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="openai-community/gpt2-medium")
+    ap.add_argument("--checkpoint", default=None,
+                    help="HE-aware-trained weights for --model (perseus-export --checkpoint)")
     ap.add_argument("--pool", required=True)
     ap.add_argument("--ref-config", default="configs/model/approximation/gpt2_base/configs.json")
     ap.add_argument("--out-config", required=True)
@@ -215,7 +220,8 @@ def main():
         print(f"[frozen] passes OVERRIDE {PASSES} -> {override} "
               f"(p/cascade_iters still frozen)")
         PASSES = override
-    rows = load_rows(args.model, args.pool, args.rows, args.window, args.rows_cache)
+    rows = load_rows(args.model, args.pool, args.rows, args.window, args.rows_cache,
+                     args.checkpoint)
     sched, mass_mask = constrained_derive(rows, KNOBS, P, PASSES, CI, IT0)
     k = KNOBS["newton_per_pass"]
 
