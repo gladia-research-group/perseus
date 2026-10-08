@@ -23,6 +23,8 @@ LOAD_BEARING_ENV = (
     # routing and fold decisions: they change which bootstraps exist and at which degree
     "SPARSE_BTS_SLOTS", "SPARSE_AUTO", "FUSED_SM_DEN", "FUSED_LN_VAR", "CORRECTION_FACTOR",
     "FHE_PT_COEFF_ENCODE",
+    # the softmax division form (impl attention.softmax_thor): a different op sequence
+    "SM_DEN_RECIP",
 )
 
 

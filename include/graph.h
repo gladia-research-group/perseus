@@ -87,6 +87,13 @@ public:
         return nodes_.empty() ? nullptr : &nodes_.back();
     }
 
+    // The latest node that produced `output` (nullptr if none).
+    GraphNode* last_node_for(const std::string& output) {
+        for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it)
+            if (it->output == output) return &*it;
+        return nullptr;
+    }
+
     std::size_t size() const { return nodes_.size(); }
 
     void set_output_stats(std::size_t idx, double mean, double max_dev) {
@@ -283,6 +290,10 @@ public:
 
     GraphNode* last_node() {
         return graph_ ? graph_->last_node() : nullptr;
+    }
+
+    GraphNode* last_node_for(const std::string& output) {
+        return graph_ ? graph_->last_node_for(output) : nullptr;
     }
 
     std::string to_json() const {

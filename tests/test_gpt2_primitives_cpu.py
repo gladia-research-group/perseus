@@ -470,6 +470,31 @@ def test_fused_softmax_den_matches_dense():
     np.testing.assert_allclose(out_f.vec, out_d.vec, rtol=1e-7, atol=1e-9)
 
 
+@pytest.mark.parametrize("complex_payload", [False, True])
+def test_softmax_den_recip_matches_goldschmidt(complex_payload):
+    """SM_DEN_RECIP: the reciprocal of the head sum built on its own ciphertext (packed as
+    D/2 + iR/2 on a complex payload) and the scores multiplied once per round compute the
+    same thing as the per-iteration Goldschmidt products of the default path."""
+    cfg = _cfgs().softmax["transformer.h.0.attn"]
+
+    def run(recip):
+        rt, fhe, inf = _rt(complex_payload=complex_payload)
+        rt.ops.sm_den_recip = recip
+        d = rt.dims
+        rng = np.random.default_rng(11)
+        kv = attention.KVCache(d.d_head)
+        for tok in range(5):
+            k, v, q = (rng.standard_normal(d.hid) for _ in range(3))
+            for arr in (k, v, q):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            attention.cache_k_push(rt, kv, fake.FakeCt(layout.lane_vec(k, d.N, d.t), 34))
+            attention.cache_v_push(rt, kv, fake.FakeCt(layout.lane_vec(v, d.N, d.t), 34))
+        scores = attention.qkt(rt, kv, fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34))
+        return attention.softmax_thor(rt, scores, cfg, kv.k_count).vec
+
+    np.testing.assert_allclose(run(True), run(False), rtol=1e-9, atol=1e-12)
+
+
 # ── the cachemir_complex packing ─────────────────────────────────────────────────────
 
 def test_outputpack_linear_matches_dense():

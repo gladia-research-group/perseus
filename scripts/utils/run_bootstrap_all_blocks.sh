@@ -48,6 +48,7 @@ if [[ -n "${PLAN_RAISE_DROP_MAX:-}" ]]; then args+=(--raise-drop-max "$PLAN_RAIS
 if [[ -n "${PLAN_RAISE_ENV_RULE:-}" ]]; then args+=(--raise-drop-env-rule "$PLAN_RAISE_ENV_RULE"); fi
 if [[ -n "${PLAN_RAISE_LANDING_MAX:-}" ]]; then args+=(--raise-drop-landing-max "$PLAN_RAISE_LANDING_MAX"); fi
 if [[ -n "${PLAN_RAISE_ROUTES:-}" ]]; then args+=(--raise-drop-routes "$PLAN_RAISE_ROUTES"); fi
+if [[ -n "${PLAN_RAISE_DROP_SET:-}" ]]; then args+=(--raise-drop-set "$PLAN_RAISE_DROP_SET"); fi
 if [[ -n "${PLAN_BOUNDARY_REALIZE:-}" ]]; then args+=(--boundary-realize);                    fi
 if [[ -n "${FORBID_STEPS+x}"        ]]; then args+=(--forbid-steps "$FORBID_STEPS");          fi
 if [[ -n "${FIRST_ENTRY_LEVEL:-}"   ]]; then args+=(--first-entry-level "$FIRST_ENTRY_LEVEL");fi

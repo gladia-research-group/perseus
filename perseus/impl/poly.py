@@ -158,6 +158,31 @@ def goldschmidt_inv_ndf(ops, N_init, D_init, F_init, iters: int):
     return N
 
 
+def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0):
+    """1/D by the goldschmidt_inv_ndf recurrence with its numerator left out, the seed
+    F_init = alpha - beta x calibrated for x = scale D (F_k = 2 - D_k, D_{k+1} = D_k F_k on
+    scale D; the product of the F's, times scale, is 1/D). A caller dividing a wide payload by a
+    narrow D then multiplies the payload once instead of at every iteration. On a complex payload
+    the running D and the reciprocal share one ciphertext, P = D_neg/2 + i R/2, so one product
+    (P <- P F, F = 2 + P + conj P) and one refresh serve both; R = i (conj P - P). A real payload
+    carries them as two ciphertexts."""
+    a, b = alpha * scale, beta * scale * scale        # scale F_init(scale D) = a - b D
+    if ops.complex_payload:
+        G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a)                       # -scale F_init / 2
+        P = ops.add(ops.mult(D, G), ops.mult_i(ops.add(ops.mult(D, -0.5 * b), 0.5 * a)))
+        for _ in range(1, iters):
+            P = ops.mult(P, ops.add(ops.add(P, ops.conjugate(P)), 2.0))
+        return ops.mult_i(ops.sub(ops.conjugate(P), P))
+    R = ops.add(ops.mult(D, -b), a)                                       # scale F_init
+    D_neg = ops.mult(D, ops.add(ops.mult(D, b), -a))                      # -scale D F_init
+    for i in range(1, iters):
+        F = ops.add(D_neg, 2.0)
+        R = ops.mult(R, F)
+        if i + 1 < iters:
+            D_neg = ops.mult(D_neg, F)
+    return R
+
+
 def goldschmidt_inv_x0(ops, a, x0_init, iters: int):
     """1/a from an initial guess (primitives.cu)."""
     x0 = x0_init

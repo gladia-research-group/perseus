@@ -26,6 +26,9 @@ ENV = {
     # denominator is reduced by its rotation ladder, the LayerNorm variance likewise
     "FUSED_SM_DEN": "0",
     "FUSED_LN_VAR": "0",
+    # the softmax divides through 1/denominator built on the denominator's own ciphertext
+    # (attention.softmax_thor); off by default, a plan cut for it turns it on in its runtime= line
+    "SM_DEN_RECIP": "0",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",

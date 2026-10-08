@@ -11,7 +11,8 @@ from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
                      vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
-from .poly import eval_chebyshev, goldschmidt_inv_ndf, im_cleanse, rotsum, rotsum_neg
+from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cleanse, rotsum,
+                   rotsum_neg)
 
 
 class KVCache:
@@ -284,8 +285,8 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0):
     return ops.tag_reduce(out, d.tH)                        # tH-periodic
 
 
-def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int):
-    """cachemir_attention.cu."""
+def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int):
+    """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     ct = rt.add_mask(scores, ("sm.score", cfg.clip_lo, mean, kc),
@@ -297,7 +298,36 @@ def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int):
     for _ in range(cfg.log2delta1):
         z = ops.square(z)
     z = im_cleanse(ops, z)
-    z = rt.mult_mask(z, ("sm.active", kc), lambda: active_mask(d, kc))
+    return rt.mult_mask(z, ("sm.active", kc), lambda: active_mask(d, kc))
+
+
+def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
+    """softmax_thor's divisions as z * (1/s) (SM_DEN_RECIP=1): the Goldschmidt iterations run
+    on the head sum's own tH-periodic ciphertext (goldschmidt_recip), whose refreshes route
+    sparse, and the scores take one product per round instead of one per iteration. The
+    refinement scalar c leaves the scores, z / s = (c z) / (c s): it only calibrates the seed.
+    Same arithmetic as the default path."""
+    ops = rt.ops
+    c = 0.5 * math.sqrt(kc) * 0.25
+    rounds = [(cfg.init_alpha, cfg.init_beta, cfg.gs_iters_scaled, 1.0)]
+    for i in range(cfg.log2delta2):
+        r = cfg.kc_r(i, kc)
+        rounds.append((cfg.refine_alpha[i] * math.sqrt(r), cfg.refine_beta[i] * r,
+                       int(cfg.per_step_refine_iters[i]), c))
+    for k, (alpha, beta, iters, scale) in enumerate(rounds):
+        if k:
+            z = ops.square(im_cleanse(ops, y))
+        s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale))
+        y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale))
+    return y
+
+
+def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int):
+    """cachemir_attention.cu; with SM_DEN_RECIP=1 the divisions are _softmax_recip's."""
+    ops = rt.ops
+    z = _thor_exp(rt, scores, cfg, kc)
+    if ops.sm_den_recip:
+        return _softmax_recip(rt, z, cfg, kc)
     s = head_reduce_sum(rt, z, s0_expected=2.0 / cfg.init_alpha)
     F_init = ops.mult(s, -cfg.init_beta)
     F_init = ops.add(F_init, cfg.init_alpha)

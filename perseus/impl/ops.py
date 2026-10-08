@@ -55,6 +55,10 @@ class FheOps:
         self.folds = hasattr(inf.fhe, "fold_bootstrap")
         self.fused_sm_den = self.folds and os.environ.get("FUSED_SM_DEN", "0") not in ("", "0")
         self.fused_ln_var = self.folds and os.environ.get("FUSED_LN_VAR", "0") not in ("", "0")
+        # SM_DEN_RECIP=1: the softmax divides by building 1/denominator on the denominator's own
+        # (tH-periodic, sparse-routed) ciphertext and multiplying the scores by it once per round,
+        # instead of multiplying the scores at every Goldschmidt iteration (attention.softmax_thor)
+        self.sm_den_recip = os.environ.get("SM_DEN_RECIP", "0") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
@@ -327,7 +331,7 @@ class NumpyOps:
     def headroom(self, k): return 1 << 30
     def bootstrap(self, a): return a
     def bootstrap_hint(self, a, thr, acct=False): return a
-    folds = fused_sm_den = fused_ln_var = False
+    folds = fused_sm_den = fused_ln_var = sm_den_recip = False
     def fold_slots_for(self, s_wanted): return int(s_wanted)
     def fold_bootstrap(self, a, s, n_live, prescale=1.0):
         out = self.rotate_and_sum(a, s, a.shape[0]) / n_live   # the fold: the remaining ladder, /n_live

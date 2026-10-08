@@ -134,6 +134,10 @@ class PlanConfig:
     # Routes (sparse slot counts, 0 = dense) a raise drop may be assigned to. The 1-slot route runs SPRU on the
     # shipped n32 runtime, which has no raise variant, so it is excluded by default.
     raise_drop_routes: tuple[int, ...] = (0, 512)
+    # The drops the runtime builds plaintext variants for (FIDESLIB_BTS_RAISE_DROPS); a site's
+    # drop is rounded down to the largest of them (None: any drop up to raise_drop_max). Each
+    # variant is a full CtS/StC plaintext set per route, so the runtime cannot afford them all.
+    raise_drop_set: tuple[int, ...] | None = None
     first_entry_level: int | None = None
     first_entry_deg: int | None = None
     verbose: bool = True
@@ -383,6 +387,8 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
             restore = float(g.level_unit) if s.prescale is not None else 0.0
             landing = cfg.bootstrap_level + s.out_consumed - restore
             k = min(k, int(math.floor((cfg.raise_drop_landing_max - landing) / unit + 1e-9)))
+        if cfg.raise_drop_set:
+            k = max((a for a in cfg.raise_drop_set if a <= k), default=0)
         if k <= 0:
             skipped["no_slack"] += 1
             continue

@@ -763,6 +763,7 @@ void bind_ops(py::module_& m) {
                  ct.tag = stride <= 1 ? packtag::t_reduce_all(top)
                                       : packtag::t_reduce_stride(top, stride);
                  inf.fhe->tag_ct(ct.ct, ct.tag);
+                 inf.fhe->restamp_graph_tag(ct.ct);   // the recorded ladder output, too
              },
              py::arg("ct"), py::arg("stride"),
              "Stamp `ct` as the output of a rotate-and-sum reduction: constant over the slots "

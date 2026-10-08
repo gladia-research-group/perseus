@@ -1488,17 +1488,30 @@ struct CKKSContext {
         if (output_ct) {
             const packtag::PackTag tg = tag_of_ct(output_ct);
             if (tg.known()) {
-                if (GraphNode* n = graph_builder->last_node()) {
-                    n->has_pack_tag = true;
-                    n->pack_period  = tg.period;
-                    n->pack_kind    = static_cast<int>(tg.support.kind);
-                    n->pack_offset  = tg.support.offset;
-                    n->pack_stride  = tg.support.stride;
-                    n->pack_count   = tg.support.count;
-                    n->pack_width   = tg.support.width;
-                }
+                if (GraphNode* n = graph_builder->last_node()) stamp_pack_tag(n, tg);
             }
         }
+    }
+
+    static void stamp_pack_tag(GraphNode* n, const packtag::PackTag& tg) {
+        n->has_pack_tag = true;
+        n->pack_period  = tg.period;
+        n->pack_kind    = static_cast<int>(tg.support.kind);
+        n->pack_offset  = tg.support.offset;
+        n->pack_stride  = tg.support.stride;
+        n->pack_count   = tg.support.count;
+        n->pack_width   = tg.support.width;
+    }
+
+    // A tag stamped after its producing op was recorded (tag_reduce: a rotate-and-sum ladder's
+    // output is periodic, which the ladder's own propagation does not derive) goes back onto
+    // that op's graph node too, so a planned refresh of the reduction output itself can route
+    // sparse instead of dense.
+    void restamp_graph_tag(const Ctx& ct) {
+        if (!ct || !graph_builder || !graph_builder->enabled()) return;
+        const packtag::PackTag tg = tag_of_ct(ct);
+        if (!tg.known()) return;
+        if (GraphNode* n = graph_builder->last_node_for(var_for_ct(ct))) stamp_pack_tag(n, tg);
     }
 
     uint32_t auto_bts_level_override = 24;  // decode sweet spot; set from CKKSContextOptions at build
@@ -1929,6 +1942,7 @@ struct CKKSContext {
         Ctx out_ct = ct->Clone();
         cc->EvalMultMonomialInPlace(out_ct, static_cast<uint32_t>(cc->GetRingDimension() / 2));
         const std::string out = set_new_var_for_ct(out_ct);
+        tag_ct(out_ct, _tg);   // before the graph node is stamped and a planted bootstrap can fire
         const int out_level = level_for_ct(out_ct);
         record_primitive("mult_i", {in_a}, out, {in_a_level}, out_level, out_ct);
         maybe_apply_planned_bootstrap_after(out, out_ct);
