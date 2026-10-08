@@ -106,7 +106,7 @@ def test_gelu_vs_core(S):
     Wu = rng.standard_normal((1024, 4096)) * 0.2
     x = linear.linear(rt, xin, linear.EncodedLinear.encode(Wu, rt.dims.N, 1024, 4096))
     y_ref = core.gelu_approx(inf, x, "mlp.act")
-    y = gelu.gelu(rt, x, cfg)
+    y = gelu.gelu(rt, rt.ops.mult(x, 1.0 / cfg.xmax) if rt.ops.gelu_fold else x, cfg)   # GELU_FOLD: x / xmax
     a, r = _slots(S, y), _slots(S, y_ref)
     assert _rel(a, r) < 2e-2, _rel(a, r)
 

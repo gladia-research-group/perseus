@@ -198,7 +198,7 @@ def test_gelu_fake_matches_ref():
     v = np.zeros(d.N)
     ok = feat < d.E_real
     v[m[ok] * d.tp_E] = x[feat[ok]]
-    ct = fake.FakeCt(v, 34)
+    ct = fake.FakeCt(v / cfg.xmax if rt.ops.gelu_fold else v, 34)   # GELU_FOLD: the up-projection carries 1/xmax
     y = gelu.gelu(rt, ct, cfg)
     got = np.zeros(d.E_real); got[feat[ok]] = y.vec[m[ok] * d.tp_E]
     np.testing.assert_allclose(got, ref.gelu_ref(x, cfg), rtol=1e-9, atol=1e-9)
@@ -497,11 +497,12 @@ def test_softmax_den_recip_matches_goldschmidt(complex_payload):
 
 def test_gelu_fold_matches_gelu():
     """GELU_FOLD: fed x / xmax (the up-projection carries the scaling) and with xmax on the
-    mask, the GELU returns what the default form returns on x."""
+    mask, the GELU returns what the unfolded form returns on x."""
     rt, fhe, inf = _rt(complex_payload=True)
     d = rt.dims
     cfg = _cfgs().gelu["transformer.h.3.mlp.act"]
     x = np.random.default_rng(12).normal(0.0, cfg.xmax / 4, d.N) * (layout.active_expanded_mask(d, 1.0) != 0)
+    rt.ops.gelu_fold = False
     want = gelu.gelu(rt, fake.FakeCt(x.astype(complex), 34), cfg).vec
     rt.ops.gelu_fold = True
     got = gelu.gelu(rt, fake.FakeCt((x / cfg.xmax).astype(complex), 34), cfg).vec

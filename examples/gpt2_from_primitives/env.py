@@ -27,11 +27,11 @@ ENV = {
     "FUSED_SM_DEN": "0",
     "FUSED_LN_VAR": "0",
     # the softmax divides through 1/denominator built on the denominator's own ciphertext
-    # (attention.softmax_thor); off by default, a plan cut for it turns it on in its runtime= line
-    "SM_DEN_RECIP": "0",
+    # (attention.softmax_thor); a plan cut before it runs it off (RUNTIME_LEGACY)
+    "SM_DEN_RECIP": "1",
     # the GELU's 1/xmax folded into the up-projection weights, its refreshes left to the plan
-    # (activation.gelu); off by default, a plan cut for it turns it on in its runtime= line
-    "GELU_FOLD": "0",
+    # (activation.gelu); a plan cut before it runs it off (RUNTIME_LEGACY)
+    "GELU_FOLD": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
@@ -44,12 +44,15 @@ ENV = {
 }
 
 
-# Bootstrap levers that move where a refresh LANDS are bound to the plan, which was cut for those landings: the
-# exact post-raise scaling (FIDESLIB_BTS_SHIFT, eprint 2025/1403) and SPRU on the 1-slot route (FIDESLIB_SPRU = h,
-# Coron-Koestler arXiv 2607.27401; Python bootstrap only). A plan declares them in a `runtime=` line of its
-# PLAN_CMD.txt; a plan without one predates them and runs with both off. Eager (no plan) on n32: both on.
-RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64"}
-RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0"}
+# Switches a plan is bound to, because it was cut for them: the bootstrap levers that move where a refresh LANDS
+# (the exact post-raise scaling FIDESLIB_BTS_SHIFT, eprint 2025/1403; SPRU on the 1-slot route FIDESLIB_SPRU = h,
+# Coron-Koestler arXiv 2607.27401, Python bootstrap only), the real-payload dense route (FIDESLIB_BTS_REAL) and the
+# op sequences of the softmax and the GELU (SM_DEN_RECIP, GELU_FOLD). A plan declares them in a `runtime=` line of
+# its PLAN_CMD.txt; one it does not declare predates it and runs at its RUNTIME_LEGACY value (a plan without the
+# line runs all of them legacy). Eager (no plan) on n32: all on.
+RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1"}
+RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
+                  "SM_DEN_RECIP": "0", "GELU_FOLD": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):
@@ -62,7 +65,7 @@ def plan_runtime(plan=None, chain="n32"):
     if cmd.exists():
         for line in cmd.read_text().splitlines():
             if line.startswith("runtime="):
-                return dict(kv.split("=", 1) for kv in shlex.split(line[len("runtime="):]))
+                return {**RUNTIME_LEGACY, **dict(kv.split("=", 1) for kv in shlex.split(line[len("runtime="):]))}
     return dict(RUNTIME_LEGACY)
 
 

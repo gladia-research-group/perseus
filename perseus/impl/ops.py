@@ -58,10 +58,10 @@ class FheOps:
         # SM_DEN_RECIP=1: the softmax divides by building 1/denominator on the denominator's own
         # (tH-periodic, sparse-routed) ciphertext and multiplying the scores by it once per round,
         # instead of multiplying the scores at every Goldschmidt iteration (attention.softmax_thor)
-        self.sm_den_recip = os.environ.get("SM_DEN_RECIP", "0") not in ("", "0")
+        self.sm_den_recip = os.environ.get("SM_DEN_RECIP", "1") not in ("", "0")
         # GELU_FOLD=1: the GELU's 1/xmax rides the up-projection weights and its refreshes are
         # placed by the planner instead of its own hints (activation.gelu)
-        self.gelu_fold = os.environ.get("GELU_FOLD", "0") not in ("", "0")
+        self.gelu_fold = os.environ.get("GELU_FOLD", "1") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
