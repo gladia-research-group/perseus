@@ -59,14 +59,17 @@ ENV = {
 
 # Switches a plan is bound to, because it was cut for them: the bootstrap levers that move where a refresh LANDS
 # (the exact post-raise scaling FIDESLIB_BTS_SHIFT, eprint 2025/1403; SPRU on the 1-slot route FIDESLIB_SPRU = h,
-# Coron-Koestler arXiv 2607.27401, Python bootstrap only), the real-payload dense route (FIDESLIB_BTS_REAL) and the
-# op sequences of the softmax, the GELU and the LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB). A plan
-# declares them in a `runtime=` line of its PLAN_CMD.txt; one it does not declare predates it and runs at its
-# RUNTIME_LEGACY value (a plan without the line runs all of them legacy). Eager (no plan) on n32: all on.
-RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1"}
+# Coron-Koestler arXiv 2607.27401, Python bootstrap only), the real-payload dense route (FIDESLIB_BTS_REAL), the
+# depth-1 CtS/StC of the 512-slot route (FIDESLIB_BTS_SPARSE_B, eprint 2026/1023; it lands 10 primes higher, so the
+# model rotation keys are banded at 32, FIDESLIB_ROT_KEY_BAND) and the op sequences of the softmax, the GELU and the
+# LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB). A plan declares them in a `runtime=` line of its
+# PLAN_CMD.txt; one it does not declare predates it and runs at its RUNTIME_LEGACY value (a plan without the line runs
+# all of them legacy). Eager (no plan) on n32: all on.
+RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1",
+               "FIDESLIB_BTS_SPARSE_B": "1", "FIDESLIB_ROT_KEY_BAND": "32"}
 RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
                   "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0",
-                  "SM_FOLD": "0"}
+                  "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):

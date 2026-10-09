@@ -64,6 +64,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_MAG_WORKERS` | Worker threads for that measurement. |
 | `FHE_PREFILL_CAPTURE_RANGES` | Capture the per-chunk token ranges of a prefill. |
 | `FHE_PREFILL_PLACEMENTS_DIR` | Plan used for the prefill phase of a generation run. |
+| `FIDESLIB_BTS_SPARSE_B` | Depth-1 CtS/StC on the 512-slot bootstrap route (eprint 2026/1023): it lands 10 primes higher and takes no raise variants, so the model rotation keys need `FIDESLIB_ROT_KEY_BAND=32` (on in the GPT-2 port's n32 runtime; off for plans that do not declare it). |
 | `FIDESLIB_SPARSE_ARCSINE` | Arcsine-corrected sparse bootstrap (needed by the encrypted argmax). |
 | `OPENFHE_DECODE_NO_THROW` | Let a capture decode a low-precision plaintext instead of throwing (capture only). |
 | `PLAN_HARD_ENV_CAP` | Planner: make the refresh-input depth envelope absolute (1) or payable (0, the shipped recipes). |
