@@ -71,9 +71,9 @@ class Gpt2Model(ImplModel):
         return self._bw[b]
 
     def _slot_key(self):
-        """The slot-vector cache's model key (slotcache.model_key), once per model."""
+        """The slot-vector cache's model reference (slotcache.model_ref), once per model."""
         if getattr(self, "_skey", None) is None:
-            self._skey = slotcache.model_key(self.store._zip.filename, self.cfgs) if slotcache.enabled() else ""
+            self._skey = slotcache.model_ref(self.store._zip.filename, self.cfgs) if slotcache.enabled() else None
         return self._skey
 
     def lnf_params(self):

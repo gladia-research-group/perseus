@@ -113,6 +113,8 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
 | `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
+| `PERSEUS_SLOTVEC_CACHE_GB` | Size cap of that cache; least recently used model variants past it are dropped (default 32). |
+| `PERSEUS_SLOTVEC_CACHE_VARIANTS` | Model variants (weights, configs, builder code) kept per model family in that cache (default 2). |
 | `MALLOC_ARENA_MAX` | glibc allocator arenas; 2 keeps host fragmentation down on the decode row. |
 | `OMP_NUM_THREADS` | OpenMP threads the host-side encode and staging use. |
 
