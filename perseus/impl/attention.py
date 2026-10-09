@@ -23,17 +23,73 @@ def sm_periodic(rt, kc: int) -> bool:
             and not getattr(rt.ops, "fused_sm_den", False))     # FUSED_SM_DEN=1 keeps its block-0 ladder + fold
 
 
-def _group_mask_item(d, num_tok: int, g: int, per: bool):
+def sm_fold_affine(rt, cfg: SoftmaxCfg):
+    """(alpha, beta) of the exp's Chebyshev input map y = alpha x - beta when SM_FOLD=1 folds it into the q.K^T
+    group masks (alpha) and the score mask (alpha mask - beta); (1, 0) otherwise."""
+    if not getattr(rt.ops, "sm_fold", False):
+        return 1.0, 0.0
+    sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
+    a, b = cfg.cheb_a / sf, cfg.cheb_b / sf
+    return 2.0 / (b - a), (a + b) / (b - a)
+
+
+def _group_mask_item(d, num_tok: int, g: int, per: bool, scale: float = 1.0):
     if per:
-        return ("qkt.gmask.p", num_tok, g), lambda: qkt_group_mask(d, num_tok, g, periodic=True)
-    return ("qkt.gmask", num_tok, g), lambda: qkt_group_mask(d, num_tok, g)
+        key, build = ("qkt.gmask.p", num_tok, g), lambda: qkt_group_mask(d, num_tok, g, periodic=True)
+    else:
+        key, build = ("qkt.gmask", num_tok, g), lambda: qkt_group_mask(d, num_tok, g)
+    if scale == 1.0:
+        return key, build
+    return key + ("x", scale), lambda: scale * build()
 
 
-def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: bool):
+def _odd_mask_item(d, num_tok: int, g: int, scale: float = 1.0):
+    key, build = ("qkt.gmask.c", num_tok, g), lambda: qkt_complex_odd_mask(d, num_tok, g)
+    if scale == 1.0:
+        return key, build
+    return key + ("x", scale), lambda: scale * build()
+
+
+def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
+    """The per-step masks SM_FOLD adds: one seed-scaled head-sum mask per reciprocal round."""
+    if not (getattr(rt.ops, "sm_fold", False) and getattr(rt.ops, "sm_den_recip", False)):
+        return []
+    return [_hrs_seed_item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
+            for k, (_a, beta, _i, scale) in enumerate(_recip_rounds(cfg, kc, getattr(rt.ops, "sm_gs_first", False)))]
+
+
+def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: bool, affine=(1.0, 0.0)):
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sfx = ".p" if per else ""
-    return [(("sm.score" + sfx, cfg.clip_lo, mean, kc), lambda: score_mask(d, cfg.clip_lo, mean, kc, periodic=per)),
-            (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+    al, be = affine
+    if (al, be) == (1.0, 0.0):
+        score = (("sm.score" + sfx, cfg.clip_lo, mean, kc), lambda: score_mask(d, cfg.clip_lo, mean, kc, periodic=per))
+    else:
+        score = (("sm.score" + sfx, cfg.clip_lo, mean, kc, "affine", al, be),
+                 lambda: al * score_mask(d, cfg.clip_lo, mean, kc, periodic=per) - be)
+    return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+
+
+def _recip_rounds(cfg: SoftmaxCfg, kc: int, lean: bool):
+    """(alpha, beta, iters, scale) of each reciprocal round of _softmax_recip (`lean`: SM_GS_FIRST's first count)."""
+    c = 0.5 * math.sqrt(kc) * 0.25
+    rounds = [(cfg.init_alpha, cfg.init_beta, first_iters(cfg, lean), 1.0)]
+    for i in range(cfg.log2delta2):
+        r = cfg.kc_r(i, kc)
+        rounds.append((cfg.refine_alpha[i] * math.sqrt(r), cfg.refine_beta[i] * r,
+                       int(cfg.per_step_refine_iters[i]), c))
+    return rounds
+
+
+def _seed_site(cfg: SoftmaxCfg, rnd: int) -> str:
+    """The staging site of a reciprocal round's seed mask: one per (round, layer config), so a per-token seed is
+    encoded only at the level its own block's round runs at (a shared site accumulates every block's level)."""
+    tag = abs(hash((cfg.init_alpha, cfg.init_beta, tuple(cfg.refine_alpha), tuple(cfg.refine_beta)))) % 10 ** 8
+    return f"hrs.seed{rnd}.{tag}"
+
+
+def _hrs_seed_item(d, seed: float, site: str):
+    return (site, seed), lambda: seed * hrs_pos0(d)
 
 
 class KVCache:
@@ -135,7 +191,7 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
     kv.v_count += 1
 
 
-def complex_qkt(rt, kv: ComplexKVCache, query):
+def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0):
     """complex_qkt (cachemir_complex_attention.cu): one product per K bucket serves two
     token groups; the even group's scores come out of 2 Re, the odd group's out of the
     imaginary axis through the odd mask; pending real groups run the real q.K^T."""
@@ -157,13 +213,11 @@ def complex_qkt(rt, kv: ComplexKVCache, query):
         conj = ops.conjugate(result)
         res_e = ops.add(result, conj)
         n_even = min(d.t, kc - g_even * d.t)
-        accum(rt.mult_mask(res_e, ("qkt.gmask", n_even, g_even),
-                           lambda n=n_even, g=g_even: qkt_group_mask(d, n, g)))
+        accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g_even, False, scale)))
         if g_odd * d.t < kc:
             res_o = ops.sub(result, conj)
             n_odd = min(d.t, kc - g_odd * d.t)
-            accum(rt.mult_mask(res_o, ("qkt.gmask.c", n_odd, g_odd),
-                               lambda n=n_odd, g=g_odd: qkt_complex_odd_mask(d, n, g)))
+            accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g_odd, scale)))
     per = sm_periodic(rt, kc)
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
@@ -172,7 +226,7 @@ def complex_qkt(rt, kv: ComplexKVCache, query):
         if per:
             result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
         n = min(d.t, kc - g * d.t)
-        result = rt.mult_mask(result, *_group_mask_item(d, n, g, per))
+        result = rt.mult_mask(result, *_group_mask_item(d, n, g, per, scale))
         accum(im_cleanse(ops, result))
     return attn
 
@@ -272,7 +326,7 @@ def cache_kv_push_pair(rt, kv: KVCache, key, value):
     kv.v_count += 1
 
 
-def qkt(rt, kv: KVCache, query):
+def qkt(rt, kv: KVCache, query, scale: float = 1.0):
     """cachemir_attention.cu: scores at slot g*tH + h*t + tok%t."""
     ops, d = rt.ops, rt.dims
     q = rt.mult_mask(query, "tok0", lambda: real_head_tok0_mask(d))
@@ -285,7 +339,7 @@ def qkt(rt, kv: KVCache, query):
         res = rotsum(ops, res, d.tH, d.N)
         if per:
             res = ops.tag_reduce(res, d.tH)
-        res = rt.mult_mask(res, *_group_mask_item(d, num_tok, g, per))
+        res = rt.mult_mask(res, *_group_mask_item(d, num_tok, g, per, scale))
         res = im_cleanse(ops, res)
         if attn is None:
             attn = res
@@ -302,16 +356,27 @@ def fold_sm_prescale(copies: float, s0_expected: float) -> float:
     return max(1e-6, min(1.0, 0.3 * copies / s0_expected))
 
 
-def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False):
+def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, seed: float | None = None,
+                    seed_site: str = "hrs.seed"):
     """cachemir_attention.cu: per-head total broadcast over the head's t slots and
     over the lane copies. With FUSED_SM_DEN the lane-copy ladder stops at the sparse slot
     count and a fold bootstrap finishes it (the denominator comes out refreshed);
     `s0_expected` sizes the fold's prescale. `periodic`: x is already tH-periodic (SM_PERIODIC), every lane copy
-    holds the sum after the head ladder."""
+    holds the sum after the head ladder. `seed`: also return seed * the sum, from a second position mask on the same
+    head ladder (SM_FOLD: the reciprocal's seed slope rides the mask instead of a ciphertext x constant product)."""
     ops, d = rt.ops, rt.dims
     out = rotsum(ops, x, 1, d.t)
+    if seed is not None:
+        tot = out
     out = rt.mult_mask(out, "hrs.pos0", lambda: hrs_pos0(d))
     out = rotsum_neg(ops, out, d.t)
+    if seed is not None:
+        if ops.fused_sm_den:
+            raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
+        h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), d.t)
+        if not periodic:
+            h = rotsum(ops, h, d.tH, d.N)
+        h = ops.tag_reduce(h, d.tH)
     if periodic:
         if ops.fused_sm_den:
             raise ValueError("SM_PERIODIC=1 does not combine with FUSED_SM_DEN=1")
@@ -323,18 +388,23 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False):
         ops.fold_bootstrap(out, s_eff, 1, p)
     else:
         out = rotsum(ops, out, d.tH, d.N)
-    return ops.tag_reduce(out, d.tH)                        # tH-periodic
+    out = ops.tag_reduce(out, d.tH)                         # tH-periodic
+    return out if seed is None else (out, h)
 
 
 def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int):
     """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
-    score_item, active_item = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc))
+    affine = sm_fold_affine(rt, cfg)
+    score_item, active_item = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine)
     ct = rt.add_mask(scores, *score_item)
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     if not cfg.cheb_coeffs:
         raise ValueError("softmax: cfg.cheb_coeffs is empty (only the Chebyshev exp is ported)")
-    z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+    if affine != (1.0, 0.0):    # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
+        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, -1.0, 1.0)
+    else:
+        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
     for _ in range(cfg.log2delta1):
         z = ops.square(z)
     z = im_cleanse(ops, z)
@@ -354,17 +424,17 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     refinement scalar c leaves the scores, z / s = (c z) / (c s): it only calibrates the seed.
     Same arithmetic as the default path."""
     ops = rt.ops
-    c = 0.5 * math.sqrt(kc) * 0.25
-    rounds = [(cfg.init_alpha, cfg.init_beta, first_iters(cfg, ops.sm_gs_first), 1.0)]
-    for i in range(cfg.log2delta2):
-        r = cfg.kc_r(i, kc)
-        rounds.append((cfg.refine_alpha[i] * math.sqrt(r), cfg.refine_beta[i] * r,
-                       int(cfg.per_step_refine_iters[i]), c))
-    for k, (alpha, beta, iters, scale) in enumerate(rounds):
+    fold = getattr(ops, "sm_fold", False)
+    for k, (alpha, beta, iters, scale) in enumerate(_recip_rounds(cfg, kc, ops.sm_gs_first)):
         if k:
             z = ops.square(im_cleanse(ops, y))
-        s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc))
-        y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale))
+        if fold:
+            s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
+                                    seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k))
+            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh))
+        else:
+            s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc))
+            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale))
     return y
 
 
@@ -434,7 +504,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
             cache_k_push(rt, kv, k)
             cache_v_push(rt, kv, v)
     with rt.step("qkt"):
-        scores = complex_qkt(rt, kv, q) if cplx else qkt(rt, kv, q)
+        a = sm_fold_affine(rt, sm_cfg)[0]
+        scores = complex_qkt(rt, kv, q, a) if cplx else qkt(rt, kv, q, a)
     with rt.step("softmax"):
         probs = softmax_thor(rt, scores, sm_cfg, kv.k_count)
     with rt.step("softmax_v"):
@@ -450,19 +521,20 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     and the V pair masks of the push at `pos_in_group`."""
     d = rt.dims
     per = sm_periodic(rt, kc)
-    items = _softmax_mask_items(d, cfg, kc, per)
+    affine = sm_fold_affine(rt, cfg)
+    items = _softmax_mask_items(d, cfg, kc, per, affine) + _fold_mask_items(rt, cfg, kc)
     Nb = kc // (2 * d.t)
     G = (kc + d.t - 1) // d.t
     for gc in range(Nb):
         ge, go = 2 * gc, 2 * gc + 1
         n = min(d.t, kc - ge * d.t)
-        items.append((("qkt.gmask", n, ge), lambda n=n, g=ge: qkt_group_mask(d, n, g)))
+        items.append(_group_mask_item(d, n, ge, False, affine[0]))
         if go * d.t < kc:
             n = min(d.t, kc - go * d.t)
-            items.append((("qkt.gmask.c", n, go), lambda n=n, g=go: qkt_complex_odd_mask(d, n, g)))
+            items.append(_odd_mask_item(d, n, go, affine[0]))
     for g in range(2 * Nb, G):
         n = min(d.t, kc - g * d.t)
-        items.append(_group_mask_item(d, n, g, per))
+        items.append(_group_mask_item(d, n, g, per, affine[0]))
     rr = pos_in_group
     c = (kc - 1) // d.t                     # the push's v_count // t
     for p in range(d.d_head_real // 2):
@@ -480,11 +552,12 @@ def attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int):
     the C++ step_mask_walk_block)."""
     d = rt.dims
     per = sm_periodic(rt, kc)
-    items = _softmax_mask_items(d, cfg, kc, per)
+    affine = sm_fold_affine(rt, cfg)
+    items = _softmax_mask_items(d, cfg, kc, per, affine) + _fold_mask_items(rt, cfg, kc)
     n_groups = (kc + d.t - 1) // d.t
     for g in range(n_groups):
         num_tok = min(d.t, kc - g * d.t)
-        items.append(_group_mask_item(d, num_tok, g, per))
+        items.append(_group_mask_item(d, num_tok, g, per, affine[0]))
     rr = pos_in_group
     if rt.ops.complex_payload:
         for i in range(d.d_head_real):

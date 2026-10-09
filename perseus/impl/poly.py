@@ -158,23 +158,29 @@ def goldschmidt_inv_ndf(ops, N_init, D_init, F_init, iters: int):
     return N
 
 
-def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0):
+def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0, Dh=None):
     """1/D by the goldschmidt_inv_ndf recurrence with its numerator left out, the seed
     F_init = alpha - beta x calibrated for x = scale D (F_k = 2 - D_k, D_{k+1} = D_k F_k on
     scale D; the product of the F's, times scale, is 1/D). A caller dividing a wide payload by a
     narrow D then multiplies the payload once instead of at every iteration. On a complex payload
     the running D and the reciprocal share one ciphertext, P = D_neg/2 + i R/2, so one product
     (P <- P F, F = 2 + P + conj P) and one refresh serve both; R = i (conj P - P). A real payload
-    carries them as two ciphertexts."""
+    carries them as two ciphertexts. `Dh` = (b/2) D supplied by the caller (a second mask on D's reduction,
+    SM_FOLD) takes the seed's ciphertext x constant products off the chain: one level less per call."""
     a, b = alpha * scale, beta * scale * scale        # scale F_init(scale D) = a - b D
     if ops.complex_payload:
-        G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a)                       # -scale F_init / 2
-        P = ops.add(ops.mult(D, G), ops.mult_i(ops.add(ops.mult(D, -0.5 * b), 0.5 * a)))
+        if Dh is None:
+            G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a)                   # -scale F_init / 2
+            P = ops.add(ops.mult(D, G), ops.mult_i(ops.add(ops.mult(D, -0.5 * b), 0.5 * a)))
+        else:
+            G = ops.add(Dh, -0.5 * a)
+            P = ops.add(ops.mult(D, G), ops.mult_i(ops.add(ops.negate(Dh), 0.5 * a)))
         for _ in range(1, iters):
             P = ops.mult(P, ops.add(ops.add(P, ops.conjugate(P)), 2.0))
         return ops.mult_i(ops.sub(ops.conjugate(P), P))
-    R = ops.add(ops.mult(D, -b), a)                                       # scale F_init
-    D_neg = ops.mult(D, ops.add(ops.mult(D, b), -a))                      # -scale D F_init
+    bD = ops.mult(D, b) if Dh is None else ops.add(Dh, Dh)
+    R = ops.add(ops.negate(bD), a) if Dh is not None else ops.add(ops.mult(D, -b), a)   # scale F_init
+    D_neg = ops.mult(D, ops.add(bD, -a))                                  # -scale D F_init
     for i in range(1, iters):
         F = ops.add(D_neg, 2.0)
         R = ops.mult(R, F)

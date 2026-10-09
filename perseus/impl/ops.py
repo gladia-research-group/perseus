@@ -70,6 +70,9 @@ class FheOps:
         # denominators stay tH-periodic instead of living in block 0, so their refreshes route sparse and P.V is one
         # product (attention.qkt / softmax_thor / softmax_v)
         self.sm_periodic = os.environ.get("SM_PERIODIC", "1") not in ("", "0")
+        # SM_FOLD=1: the softmax's ciphertext x constant products folded into masks (the exp's Chebyshev affine into
+        # the q.K^T group and score masks; each reciprocal round's seed slope into a second head-sum mask)
+        self.sm_fold = os.environ.get("SM_FOLD", "0") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
@@ -342,7 +345,7 @@ class NumpyOps:
     def headroom(self, k): return 1 << 30
     def bootstrap(self, a): return a
     def bootstrap_hint(self, a, thr, acct=False): return a
-    folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = sm_periodic = False
+    folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = sm_periodic = sm_fold = False
     def fold_slots_for(self, s_wanted): return int(s_wanted)
     def fold_bootstrap(self, a, s, n_live, prescale=1.0):
         out = self.rotate_and_sum(a, s, a.shape[0]) / n_live   # the fold: the remaining ladder, /n_live
