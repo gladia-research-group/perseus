@@ -106,8 +106,10 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_PT_STAGE_BLOCK` | Plaintext limbs staged per block (0 = no staging). |
 | `FHE_STAGE_ARENA_GB` | Pinned host arena each staging half gets. |
 | `FHE_STAGE_RELEASE_CPU` | Release the host copy of a staged plaintext after upload. |
+| `FIDESLIB_GPU_ENCODE` | Encode full-slot plaintexts on the GPU; an evicted one reloads from a pinned dump of its limbs. |
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
+| `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
 | `MALLOC_ARENA_MAX` | glibc allocator arenas; 2 keeps host fragmentation down on the decode row. |
 | `OMP_NUM_THREADS` | OpenMP threads the host-side encode and staging use. |
 

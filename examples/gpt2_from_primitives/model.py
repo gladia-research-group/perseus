@@ -19,6 +19,7 @@ from perseus.impl.config import Configs
 from perseus.impl.driver import ImplModel
 from perseus.impl.norm import norm_step_masks
 
+from . import slotcache
 from .block import transformer_block
 from .head import (cutmax_argmax, cutmax_argmax_packed, decode_logits, decode_z, feedback_embed,
                    final_ln, lm_head, make_ones, pack_tiles)
@@ -63,10 +64,17 @@ class Gpt2Model(ImplModel):
         if b not in self._bw:
             ge = self.cfgs.block(b)[3]
             fold = self.rt.ops.gelu_fold and ge.method == "thor_composite"
-            self._bw[b] = W.block_weights(self.store, self.cfgs, b, self.rt.dims,
-                                          self.fold[0], self.fold[1], self.complex_packing,
-                                          up_scale=1.0 / ge.xmax if fold else 1.0)
+            args = (b, self.rt.dims, self.fold[0], self.fold[1], self.complex_packing,
+                    1.0 / ge.xmax if fold else 1.0)
+            self._bw[b] = slotcache.cached(self._slot_key(), "block", args, lambda: W.block_weights(
+                self.store, self.cfgs, b, self.rt.dims, args[2], args[3], args[4], up_scale=args[5]))
         return self._bw[b]
+
+    def _slot_key(self):
+        """The slot-vector cache's model key (slotcache.model_key), once per model."""
+        if getattr(self, "_skey", None) is None:
+            self._skey = slotcache.model_key(self.store._zip.filename, self.cfgs) if slotcache.enabled() else ""
+        return self._skey
 
     def lnf_params(self):
         if self._lnf is None:
@@ -75,16 +83,20 @@ class Gpt2Model(ImplModel):
 
     def lm_tiles(self):
         if self._lm is None:
-            Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
-            self._lm = W.lm_head_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile,
-                                       paired=self.complex_packing)
+            def build():
+                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+                return W.lm_head_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, paired=self.complex_packing)
+            self._lm = slotcache.cached(self._slot_key(), "lm", (self.rt.dims, self.vocab, self.W_tile,
+                                                                 self.complex_packing, self.fold[2]), build)
         return self._lm
 
     def fb_tiles(self):
         if self._fb is None:
-            Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
-            self._fb = W.feedback_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile,
-                                        packed=self.complex)
+            def build():
+                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+                return W.feedback_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, packed=self.complex)
+            self._fb = slotcache.cached(self._slot_key(), "fb", (self.rt.dims, self.vocab, self.W_tile,
+                                                                 self.complex, self.fold[2]), build)
         return self._fb
 
     def preload(self):
