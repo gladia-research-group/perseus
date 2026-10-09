@@ -19,7 +19,8 @@ def sm_periodic(rt, kc: int) -> bool:
     """SM_PERIODIC=1 while every cached token fits one group (kc <= t): q.K^T keeps the score of (h, tok) in every
     tH block instead of block 0 only, so the THOR softmax and its head sums run on tH-periodic ciphertexts (their
     refreshes route sparse, the head sum needs no lane-copy ladder) and P.V is one product with the summed V."""
-    return bool(getattr(rt.ops, "sm_periodic", False)) and kc <= rt.dims.t
+    return (bool(getattr(rt.ops, "sm_periodic", False)) and kc <= rt.dims.t
+            and not getattr(rt.ops, "fused_sm_den", False))     # FUSED_SM_DEN=1 keeps its block-0 ladder + fold
 
 
 def _group_mask_item(d, num_tok: int, g: int, per: bool):

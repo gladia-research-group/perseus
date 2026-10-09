@@ -69,7 +69,7 @@ class FheOps:
         # SM_PERIODIC=1: while every cached token fits one group (kc <= t) the scores, the softmax and its
         # denominators stay tH-periodic instead of living in block 0, so their refreshes route sparse and P.V is one
         # product (attention.qkt / softmax_thor / softmax_v)
-        self.sm_periodic = os.environ.get("SM_PERIODIC", "0") not in ("", "0")
+        self.sm_periodic = os.environ.get("SM_PERIODIC", "1") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):

@@ -39,9 +39,9 @@ ENV = {
     # plaintexts encoded on the GPU (FIDESlib DeviceEncode.cu): bit-identical to a reload of the host encode within
     # 1e-14, an evicted weight kept as its first composite group and lifted back on reload
     "FIDESLIB_GPU_ENCODE": "1",
-    # the scores kept tH-periodic while the cache fits one group (attention.sm_periodic); opt-in, a plan cut for it
-    # declares it in its runtime= line
-    "SM_PERIODIC": "0",
+    # the scores kept tH-periodic while the cache fits one group (attention.sm_periodic); a plan cut before it runs it
+    # off (RUNTIME_LEGACY)
+    "SM_PERIODIC": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
