@@ -36,6 +36,9 @@ ENV = {
     # first division at gs_iters_first; a plan cut before them runs them off (RUNTIME_LEGACY)
     "LN_CHEB": "1",
     "SM_GS_FIRST": "1",
+    # plaintexts encoded on the GPU (FIDESlib DeviceEncode.cu): bit-identical to a reload of the host encode within
+    # 1e-14, an evicted weight kept as its first composite group and lifted back on reload
+    "FIDESLIB_GPU_ENCODE": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
