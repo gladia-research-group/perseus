@@ -301,6 +301,12 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int):
     return rt.mult_mask(z, ("sm.active", kc), lambda: active_mask(d, kc))
 
 
+def first_iters(cfg: SoftmaxCfg, lean: bool) -> int:
+    """The first division's Goldschmidt count: the refine rounds renormalize after it, so
+    SM_GS_FIRST runs it at the config's gs_iters_first when there is one."""
+    return cfg.gs_iters_first if lean and cfg.gs_iters_first else cfg.gs_iters_scaled
+
+
 def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     """softmax_thor's divisions as z * (1/s) (SM_DEN_RECIP=1): the Goldschmidt iterations run
     on the head sum's own tH-periodic ciphertext (goldschmidt_recip), whose refreshes route
@@ -309,7 +315,7 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     Same arithmetic as the default path."""
     ops = rt.ops
     c = 0.5 * math.sqrt(kc) * 0.25
-    rounds = [(cfg.init_alpha, cfg.init_beta, cfg.gs_iters_scaled, 1.0)]
+    rounds = [(cfg.init_alpha, cfg.init_beta, first_iters(cfg, ops.sm_gs_first), 1.0)]
     for i in range(cfg.log2delta2):
         r = cfg.kc_r(i, kc)
         rounds.append((cfg.refine_alpha[i] * math.sqrt(r), cfg.refine_beta[i] * r,
@@ -331,7 +337,7 @@ def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int):
     s = head_reduce_sum(rt, z, s0_expected=2.0 / cfg.init_alpha)
     F_init = ops.mult(s, -cfg.init_beta)
     F_init = ops.add(F_init, cfg.init_alpha)
-    y = goldschmidt_inv_ndf(ops, z, s, F_init, cfg.gs_iters_scaled)
+    y = goldschmidt_inv_ndf(ops, z, s, F_init, first_iters(cfg, ops.sm_gs_first))
     for i in range(cfg.log2delta2):
         y = im_cleanse(ops, y)
         z = ops.square(y)

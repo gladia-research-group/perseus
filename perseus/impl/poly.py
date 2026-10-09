@@ -228,6 +228,16 @@ def inv_sqrt_newton(ops, x, ans_init, iters: int, x_scale: float = 1.0):
     return ct
 
 
+def inv_sqrt_newton_d2(ops, x, y, iters: int, x_scale: float = 1.0):
+    """inv_sqrt_newton with the product order (c*y)*y^2: two levels per iteration, not three."""
+    c = ops.mult(x, -0.5 * x_scale)
+    for _ in range(iters):
+        a = ops.square(y)
+        b = ops.mult(ops.mult(c, y), a)
+        y = ops.add(ops.mult(y, 1.5), b)
+    return y
+
+
 def inv_sqrt_newton_safe(ops, x, y0, iters: int):
     """primitives.cu (inv_sqrt_newton_safe): the from-below Newton iteration for 1/sqrt(x).
     `y0=None` means the seed 1, and then the first iteration is closed-form: with y = 1 the

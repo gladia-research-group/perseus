@@ -8,15 +8,22 @@ mask; the mirror applies both, i.e. nothing."""
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
+from perseus.impl.attention import first_iters
 from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg
 from perseus.impl.poly import (NumpyOps, eval_chebyshev, eval_polynomial_ps, eval_remez_31,
                    eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0,
-                   inv_sqrt_newton, inv_sqrt_newton_safe, pow_odd, taylor_inv_sqrt_coeffs)
+                   inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, pow_odd,
+                   taylor_inv_sqrt_coeffs)
 
 _ops = NumpyOps()
+
+
+def _on(key):
+    return os.environ.get(key, "1") not in ("", "0")
 
 
 def norm_ref(x, cfg: NormCfg, pos: int):
@@ -27,6 +34,10 @@ def norm_ref(x, cfg: NormCfg, pos: int):
     xs = math.sqrt(c2) * x
     centered = xs - xs.mean()
     var = np.array([np.mean(centered * centered) + cfg.epsilon * c2])
+    if cfg.cheb_coeffs and _on("LN_CHEB"):
+        init = eval_chebyshev(_ops, var, cfg.cheb_coeffs, cfg.cheb_lo, cfg.cheb_hi)
+        inv = inv_sqrt_newton_d2(_ops, var, init, cfg.cheb_nr_iters, 1.0 / (cfg.inv_out_scale ** 2))
+        return centered * inv[0]
     if cfg.method == "remez":
         init = eval_remez_31(_ops, var, cfg.Ncoeffs, cfg.Dcoeffs, cfg.lin_alpha, cfg.lin_beta,
                              cfg.gs_iters)
@@ -80,7 +91,7 @@ def softmax_ref(scores, cfg: SoftmaxCfg, kc: int):
     z = z / kc                                   # im_cleanse (x2) then the 0.5/kc active mask
     tot = z.sum(axis=-1, keepdims=True) * np.ones_like(z)
     F = cfg.init_alpha - cfg.init_beta * tot
-    y = goldschmidt_inv_ndf(_ops, z, tot, F, cfg.gs_iters_scaled)
+    y = goldschmidt_inv_ndf(_ops, z, tot, F, first_iters(cfg, _on("SM_GS_FIRST")))
     for i in range(cfg.log2delta2):
         y = 2.0 * y                              # im_cleanse
         z = (y * y) * (0.5 * math.sqrt(kc) * 0.25)

@@ -27,6 +27,10 @@ class NormCfg:
     gs_iters: int = 0
     center_scale_sq: tuple = ()
     precise_var_bts: bool = False
+    cheb_coeffs: tuple = ()          # Chebyshev seed of inv_out_scale/sqrt on [cheb_lo, cheb_hi]
+    cheb_lo: float = 0.0
+    cheb_hi: float = 0.0
+    cheb_nr_iters: int = 0
 
     @property
     def descale(self) -> float:
@@ -59,6 +63,7 @@ class SoftmaxCfg:
     cheb_a: float = -1.0
     cheb_b: float = 1.0
     sm_kc_r: tuple = ()
+    gs_iters_first: int = 0          # the first division's count under SM_GS_FIRST
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -157,6 +162,10 @@ def parse_norm(j: dict) -> NormCfg:
         cfg.gs_iters = int(j["gs_iters"])
         cfg.center_scale_sq = _tup(j.get("center_scale_sq"))
         cfg.precise_var_bts = bool(j.get("precise_var_bts", False))
+        if "cheb_coeffs" in j:
+            cfg.cheb_coeffs = _tup(j["cheb_coeffs"])
+            cfg.cheb_lo, cfg.cheb_hi = float(j["cheb_lo"]), float(j["cheb_hi"])
+            cfg.cheb_nr_iters = int(j["cheb_nr_iters"])
     return cfg
 
 
@@ -170,7 +179,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         gs_iters_refine_scaled=int(j["gs_iters_refine_scaled"]),
         per_step_refine_iters=_tup(j["per_step_refine_iters"]),
         cheb_coeffs=_tup(j.get("cheb_coeffs")), cheb_a=float(j.get("cheb_a", -1.0)),
-        cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")))
+        cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")),
+        gs_iters_first=int(j.get("gs_iters_first", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:

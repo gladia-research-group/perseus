@@ -6,8 +6,8 @@ import math
 
 from .config import NormCfg
 from .layout import active_token_mask, lane_vec, stride_mask
-from .poly import (eval_remez_31, eval_taylor_inv_sqrt, im_cleanse, inv_sqrt_newton, rotsum,
-                   taylor_inv_sqrt_coeffs)
+from .poly import (eval_chebyshev, eval_remez_31, eval_taylor_inv_sqrt, im_cleanse, inv_sqrt_newton,
+                   inv_sqrt_newton_d2, rotsum, taylor_inv_sqrt_coeffs)
 
 
 def norm(rt, x, cfg: NormCfg, pos: int):
@@ -41,7 +41,14 @@ def norm(rt, x, cfg: NormCfg, pos: int):
         var = ops.tag_reduce(rotsum(ops, var, 1, N), 1)   # broadcast constant
         var = ops.mult(var, 1.0 / dr)
     var = ops.add(var, cfg.epsilon * c2)
-    # inverse sqrt: init + Newton (norm.cu)
+    # inverse sqrt: init + Newton (norm.cu); under LN_CHEB a cheb_* config replaces the Remez
+    # seed with a Chebyshev one on the data band
+    if cfg.cheb_coeffs and ops.ln_cheb:
+        init = eval_chebyshev(ops, var, cfg.cheb_coeffs, cfg.cheb_lo, cfg.cheb_hi)
+        inv = inv_sqrt_newton_d2(ops, var, init, cfg.cheb_nr_iters,
+                                 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale))
+        ops.bootstrap_hint(inv, ops.headroom(4))
+        return ops.mult(centered, inv)
     if cfg.method == "remez":
         init = eval_remez_31(ops, var, cfg.Ncoeffs, cfg.Dcoeffs, cfg.lin_alpha, cfg.lin_beta,
                              cfg.gs_iters)

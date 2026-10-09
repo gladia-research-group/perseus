@@ -27,6 +27,8 @@ LOAD_BEARING_ENV = (
     "SM_DEN_RECIP",
     # the GELU form (impl activation.gelu, examples weights up_scale): a different op sequence
     "GELU_FOLD",
+    # the LayerNorm inverse sqrt seed (impl norm.norm) and the softmax's first division count
+    "LN_CHEB", "SM_GS_FIRST",
 )
 
 

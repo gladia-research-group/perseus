@@ -62,6 +62,10 @@ class FheOps:
         # GELU_FOLD=1: the GELU's 1/xmax rides the up-projection weights and its refreshes are
         # placed by the planner instead of its own hints (activation.gelu)
         self.gelu_fold = os.environ.get("GELU_FOLD", "1") not in ("", "0")
+        # LN_CHEB=1: the LayerNorm inverse sqrt from the config's Chebyshev seed (norm.norm);
+        # SM_GS_FIRST=1: the softmax's first division at its gs_iters_first count
+        self.ln_cheb = os.environ.get("LN_CHEB", "1") not in ("", "0")
+        self.sm_gs_first = os.environ.get("SM_GS_FIRST", "1") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):

@@ -154,11 +154,13 @@ def _cfgs():
     return config.load_configs(str(CFG))
 
 
-def test_norm_fake_matches_ref():
+@pytest.mark.parametrize("ln_cheb", ["0", "1"])
+def test_norm_fake_matches_ref(monkeypatch, ln_cheb):
+    monkeypatch.setenv("LN_CHEB", ln_cheb)
     rt, fhe, inf = _rt()
     cfg = _cfgs().norm["transformer.h.3.ln_1"]
     rng = np.random.default_rng(3)
-    x = rng.standard_normal(inf.size.dim) * 0.3
+    x = rng.standard_normal(inf.size.dim) * 2.5     # a residual-stream scale: inside both seeds' bands
     ct = fake.core.encode_token_input(inf, x)
     y = norm.norm(rt, ct, cfg, pos=5)
     got = fake.core.decode_token_output(inf, y)
