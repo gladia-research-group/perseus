@@ -52,7 +52,8 @@ def _odd_mask_item(d, num_tok: int, g: int, scale: float = 1.0):
 
 def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
     """The per-step masks SM_FOLD adds: one seed-scaled head-sum mask per reciprocal round."""
-    if not (getattr(rt.ops, "sm_fold", False) and getattr(rt.ops, "sm_den_recip", False)):
+    if not (getattr(rt.ops, "sm_fold", False) and getattr(rt.ops, "sm_den_recip", False)
+            and not getattr(rt.ops, "fused_sm_den", False)):
         return []
     return [_hrs_seed_item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
             for k, (_a, beta, _i, scale) in enumerate(_recip_rounds(cfg, kc, getattr(rt.ops, "sm_gs_first", False)))]
@@ -392,10 +393,10 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     return out if seed is None else (out, h)
 
 
-def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int):
+def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
-    affine = sm_fold_affine(rt, cfg)
+    affine = sm_fold_affine(rt, cfg) if folded else (1.0, 0.0)   # `folded`: q.K^T already applied alpha (mha)
     score_item, active_item = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine)
     ct = rt.add_mask(scores, *score_item)
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
@@ -424,7 +425,7 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     refinement scalar c leaves the scores, z / s = (c z) / (c s): it only calibrates the seed.
     Same arithmetic as the default path."""
     ops = rt.ops
-    fold = getattr(ops, "sm_fold", False)
+    fold = getattr(ops, "sm_fold", False) and not getattr(ops, "fused_sm_den", False)
     for k, (alpha, beta, iters, scale) in enumerate(_recip_rounds(cfg, kc, ops.sm_gs_first)):
         if k:
             z = ops.square(im_cleanse(ops, y))
@@ -438,10 +439,11 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     return y
 
 
-def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int):
-    """cachemir_attention.cu; with SM_DEN_RECIP=1 the divisions are _softmax_recip's."""
+def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
+    """cachemir_attention.cu; with SM_DEN_RECIP=1 the divisions are _softmax_recip's. `folded`: the scores come from a
+    q.K^T scaled by sm_fold_affine's alpha (SM_FOLD), the exp's input map rides the score mask."""
     ops = rt.ops
-    z = _thor_exp(rt, scores, cfg, kc)
+    z = _thor_exp(rt, scores, cfg, kc, folded)
     if ops.sm_den_recip:
         return _softmax_recip(rt, z, cfg, kc)
     s = head_reduce_sum(rt, z, s0_expected=2.0 / cfg.init_alpha, periodic=sm_periodic(rt, kc))
@@ -506,8 +508,9 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
     with rt.step("qkt"):
         a = sm_fold_affine(rt, sm_cfg)[0]
         scores = complex_qkt(rt, kv, q, a) if cplx else qkt(rt, kv, q, a)
+        folded = bool(getattr(ops, "sm_fold", False))
     with rt.step("softmax"):
-        probs = softmax_thor(rt, scores, sm_cfg, kv.k_count)
+        probs = softmax_thor(rt, scores, sm_cfg, kv.k_count, folded)
     with rt.step("softmax_v"):
         x = complex_softmax_v(rt, kv, probs) if cplx else softmax_v(rt, kv, probs)
     with rt.step("out_proj"):

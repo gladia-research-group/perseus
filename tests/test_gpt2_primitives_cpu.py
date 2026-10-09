@@ -564,7 +564,7 @@ def test_softmax_fold_matches_unfolded(complex_packing, periodic, kc):
         qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
         a = attention.sm_fold_affine(rt, cfg)[0]
         scores = (attention.complex_qkt if complex_packing else attention.qkt)(rt, kv, qct, a)
-        probs = attention.softmax_thor(rt, scores, cfg, kc)
+        probs = attention.softmax_thor(rt, scores, cfg, kc, folded=fold)
         out = (attention.complex_softmax_v if complex_packing else attention.softmax_v)(rt, kv, probs)
         return probs.vec, out.vec
 

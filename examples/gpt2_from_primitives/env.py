@@ -42,8 +42,9 @@ ENV = {
     # the scores kept tH-periodic while the cache fits one group (attention.sm_periodic); a plan cut before it runs it
     # off (RUNTIME_LEGACY)
     "SM_PERIODIC": "1",
-    # the softmax's constant products folded into masks (attention.sm_fold_affine, the reciprocal's seed); opt-in
-    "SM_FOLD": "0",
+    # the softmax's constant products folded into masks (attention.sm_fold_affine, the reciprocal's seed); a plan cut
+    # before it runs it off (RUNTIME_LEGACY)
+    "SM_FOLD": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
