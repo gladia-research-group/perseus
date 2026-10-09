@@ -47,6 +47,7 @@ if [[ -n "${PLAN_SITE_BTS_OUT_FILE:-}" ]]; then args+=(--site-bts-out-file "$PLA
 if [[ -n "${PLAN_RAISE_DROP_MAX:-}" ]]; then args+=(--raise-drop-max "$PLAN_RAISE_DROP_MAX"); fi
 if [[ -n "${PLAN_RAISE_ENV_RULE:-}" ]]; then args+=(--raise-drop-env-rule "$PLAN_RAISE_ENV_RULE"); fi
 if [[ -n "${PLAN_RAISE_LANDING_MAX:-}" ]]; then args+=(--raise-drop-landing-max "$PLAN_RAISE_LANDING_MAX"); fi
+if [[ -n "${PLAN_HINT_VETO_STEPS:-}" ]]; then args+=(--hint-veto-steps "$PLAN_HINT_VETO_STEPS"); fi
 if [[ -n "${PLAN_RAISE_ROUTES:-}" ]]; then args+=(--raise-drop-routes "$PLAN_RAISE_ROUTES"); fi
 if [[ -n "${PLAN_RAISE_DROP_SET:-}" ]]; then args+=(--raise-drop-set "$PLAN_RAISE_DROP_SET"); fi
 if [[ "${PLAN_REAL_ROUTE:-0}" != 0 ]]; then args+=(--real-route); fi

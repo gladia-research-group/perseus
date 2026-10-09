@@ -23,7 +23,8 @@
     "GELU_FOLD": "1",
     "LN_CHEB": "1",
     "SM_GS_FIRST": "1",
-    "SM_PERIODIC": "1"
+    "SM_PERIODIC": "1",
+    "SM_FOLD": "1"
   },
   "session": {
     "level_limit": 46,
