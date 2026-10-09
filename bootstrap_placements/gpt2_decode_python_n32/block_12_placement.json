@@ -3,7 +3,7 @@
   "heuristic_config": "min_cut",
   "input_graph": {
     "version": 1,
-    "num_nodes": 2403,
+    "num_nodes": 2404,
     "num_nodes_deliberate_bootstrap": 0,
     "num_nodes_optimized": 2384
   },
@@ -4835,10 +4835,10 @@
       "table_measured": true,
       "num_sites": 2,
       "predicted_rel_err": {
-        "median": 9.273205401430743e-06,
-        "p90": 9.273205401430743e-06,
-        "p99": 9.273205401430743e-06,
-        "max": 9.273205401430743e-06
+        "median": 9.273997259050973e-06,
+        "p90": 9.273997259050973e-06,
+        "p99": 9.273997259050973e-06,
+        "max": 9.273997259050973e-06
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -4857,15 +4857,15 @@
       "worst_sites": [
         {
           "var": "v_56",
-          "rel_err": 9.273205401430743e-06,
-          "max_abs": 142.5594210963391,
+          "rel_err": 9.273997259050973e-06,
+          "max_abs": 141.5873395146027,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_190",
-          "rel_err": 6.115193736430075e-06,
-          "max_abs": 7.1952015324463,
+          "rel_err": 6.111010741887581e-06,
+          "max_abs": 7.200126619216779,
           "pack_period": 32768,
           "step": "tail"
         }
