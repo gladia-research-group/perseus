@@ -4835,10 +4835,10 @@
       "table_measured": true,
       "num_sites": 2,
       "predicted_rel_err": {
-        "median": 9.273997259050973e-06,
-        "p90": 9.273997259050973e-06,
-        "p99": 9.273997259050973e-06,
-        "max": 9.273997259050973e-06
+        "median": 9.273884848934534e-06,
+        "p90": 9.273884848934534e-06,
+        "p99": 9.273884848934534e-06,
+        "max": 9.273884848934534e-06
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -4857,15 +4857,15 @@
       "worst_sites": [
         {
           "var": "v_56",
-          "rel_err": 9.273997259050973e-06,
-          "max_abs": 141.5873395146027,
+          "rel_err": 9.273884848934534e-06,
+          "max_abs": 141.72492651002614,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_190",
-          "rel_err": 6.111010741887581e-06,
-          "max_abs": 7.200126619216779,
+          "rel_err": 6.112697210243814e-06,
+          "max_abs": 7.198140163508156,
           "pack_period": 32768,
           "step": "tail"
         }
@@ -4928,7 +4928,8 @@
       "LN_CHEB": "1",
       "SM_GS_FIRST": "1",
       "SM_PERIODIC": "1",
-      "SM_FOLD": "1"
+      "SM_FOLD": "1",
+      "KV_LANES": "1"
     },
     "session": {
       "level_limit": 46,
