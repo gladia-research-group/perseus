@@ -280,30 +280,35 @@ def _tok_slot(dims: Dims, h: int, tok: int) -> int:
     return tok // dims.t * dims.t * dims.H + h * dims.t + tok % dims.t
 
 
-def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int) -> np.ndarray:
+def _tile_tH(dims: Dims, out: np.ndarray, periodic: bool) -> np.ndarray:
+    """`periodic`: block 0 repeated over every tH block (the scores of a single group, kc <= t, kept tH-periodic)."""
+    return np.tile(out[:dims.tH], dims.N // dims.tH) if periodic else out
+
+
+def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int, periodic: bool = False) -> np.ndarray:
     """score_mask_vec (cachemir_attention_utils.h)."""
     out = np.full(dims.N, clip_lo - mean)
     for h in range(dims.H):
         for tok in range(kc):
             out[_tok_slot(dims, h, tok)] = -mean
-    return out
+    return _tile_tH(dims, out, periodic)
 
 
-def active_mask(dims: Dims, kc: int) -> np.ndarray:
+def active_mask(dims: Dims, kc: int, periodic: bool = False) -> np.ndarray:
     """active_mask_vec (cachemir_attention_utils.h): 0.5/kc on the active slots."""
     out = np.zeros(dims.N)
     for h in range(dims.H):
         for tok in range(kc):
             out[_tok_slot(dims, h, tok)] = 0.5 / kc
-    return out
+    return _tile_tH(dims, out, periodic)
 
 
-def qkt_group_mask(dims: Dims, num_tok: int, g: int) -> np.ndarray:
-    """qkt_group_mask_vec (cachemir_attention_utils.h)."""
+def qkt_group_mask(dims: Dims, num_tok: int, g: int, periodic: bool = False) -> np.ndarray:
+    """qkt_group_mask_vec (cachemir_attention_utils.h); `periodic` (group 0 only) keeps every tH block."""
     gscale = 0.5 / math.sqrt(dims.d_head_real)
     i = np.arange(dims.N)
     h = (i % dims.tH) // dims.t
-    ok = (i // dims.tH == g) & (i % dims.t < num_tok) & (h < dims.H_real)
+    ok = ((i // dims.tH == g) | periodic) & (i % dims.t < num_tok) & (h < dims.H_real)
     return np.where(ok, gscale, 0.0)
 
 

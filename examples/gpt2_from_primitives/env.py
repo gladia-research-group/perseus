@@ -39,6 +39,9 @@ ENV = {
     # plaintexts encoded on the GPU (FIDESlib DeviceEncode.cu): bit-identical to a reload of the host encode within
     # 1e-14, an evicted weight kept as its first composite group and lifted back on reload
     "FIDESLIB_GPU_ENCODE": "1",
+    # the scores kept tH-periodic while the cache fits one group (attention.sm_periodic); opt-in, a plan cut for it
+    # declares it in its runtime= line
+    "SM_PERIODIC": "0",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
@@ -59,7 +62,7 @@ ENV = {
 # RUNTIME_LEGACY value (a plan without the line runs all of them legacy). Eager (no plan) on n32: all on.
 RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1"}
 RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
-                  "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0"}
+                  "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):

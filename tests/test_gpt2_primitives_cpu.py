@@ -497,6 +497,45 @@ def test_softmax_den_recip_matches_goldschmidt(complex_payload):
     np.testing.assert_allclose(run(True), run(False), rtol=1e-9, atol=1e-12)
 
 
+@pytest.mark.parametrize("complex_packing", [False, True])
+@pytest.mark.parametrize("recip", [False, True])
+@pytest.mark.parametrize("kc", [1, 5, 32])
+def test_softmax_periodic_matches_block0(complex_packing, recip, kc):
+    """SM_PERIODIC: scores kept tH-periodic (periodic group / score / active masks, no lane-copy ladder in the head
+    sum, P.V as one product with the summed V) give the attention output of the block-0 layout."""
+    cfg = _cfgs().softmax["transformer.h.0.attn"]
+
+    def run(periodic):
+        rt, fhe, inf = _rt(complex_payload=True)
+        rt.ops.sm_den_recip, rt.ops.sm_periodic = recip, periodic
+        d = rt.dims
+        rng = np.random.default_rng(17)
+        kv = attention.ComplexKVCache(d.d_head) if complex_packing else attention.KVCache(d.d_head)
+        for tok in range(kc):
+            k, v = rng.standard_normal(d.hid) * 0.5, rng.standard_normal(d.hid) * 0.5
+            for arr in (k, v):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            kct, vct = layout.lane_vec(k, d.N, d.t), layout.lane_vec(v, d.N, d.t)
+            if complex_packing:
+                attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(kct + 1j * vct, 34))
+            else:
+                attention.cache_k_push(rt, kv, fake.FakeCt(kct, 34))
+                attention.cache_v_push(rt, kv, fake.FakeCt(vct, 34))
+        q = rng.standard_normal(d.hid); q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+        scores = (attention.complex_qkt if complex_packing else attention.qkt)(rt, kv, qct)
+        probs = attention.softmax_thor(rt, scores, cfg, kc)
+        out = (attention.complex_softmax_v if complex_packing else attention.softmax_v)(rt, kv, probs)
+        return scores.vec, probs.vec, out.vec, d.tH
+
+    s0, p0, o0, tH = run(False)
+    s1, p1, o1, _ = run(True)
+    np.testing.assert_allclose(s1, np.tile(s0[:tH], s0.shape[0] // tH), rtol=1e-12, atol=1e-12)   # block 0, tiled
+    np.testing.assert_allclose(p1[:tH], p0[:tH], rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(np.real(o1), np.real(o0), rtol=1e-9, atol=1e-12)
+    assert np.abs(np.imag(o1)).max() < 1e-9
+
+
 def test_gelu_fold_matches_gelu():
     """GELU_FOLD: fed x / xmax (the up-projection carries the scaling) and with xmax on the
     mask, the GELU returns what the unfolded form returns on x."""
