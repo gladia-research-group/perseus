@@ -75,7 +75,7 @@ class FheOps:
         self.sm_fold = os.environ.get("SM_FOLD", "1") not in ("", "0")
         # KV_LANES=1: the K + iV linear output refreshed as one REAL payload (K on token lane 0, V on lane 1) by the
         # real-payload route instead of a complex refresh (attention.cache_kv_push_packed_complex)
-        self.kv_lanes = os.environ.get("KV_LANES", "0") not in ("", "0")
+        self.kv_lanes = os.environ.get("KV_LANES", "1") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):

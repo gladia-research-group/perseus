@@ -45,8 +45,9 @@ ENV = {
     # the softmax's constant products folded into masks (attention.sm_fold_affine, the reciprocal's seed); a plan cut
     # before it runs it off (RUNTIME_LEGACY)
     "SM_FOLD": "1",
-    # the K + iV refresh as one real payload on two token lanes (attention.cache_kv_push_packed_complex); opt-in
-    "KV_LANES": "0",
+    # the K + iV refresh as one real payload on two token lanes (attention.cache_kv_push_packed_complex); a plan cut
+    # before it runs it off (RUNTIME_LEGACY)
+    "KV_LANES": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
@@ -64,7 +65,7 @@ ENV = {
 # Coron-Koestler arXiv 2607.27401, Python bootstrap only), the real-payload dense route (FIDESLIB_BTS_REAL), the
 # depth-1 CtS/StC of the 512-slot route (FIDESLIB_BTS_SPARSE_B, eprint 2026/1023; it lands 10 primes higher, so the
 # model rotation keys are banded at 32, FIDESLIB_ROT_KEY_BAND) and the op sequences of the softmax, the GELU and the
-# LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB). A plan declares them in a `runtime=` line of its
+# LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB, KV_LANES). A plan declares them in a `runtime=` line of its
 # PLAN_CMD.txt; one it does not declare predates it and runs at its RUNTIME_LEGACY value (a plan without the line runs
 # all of them legacy). Eager (no plan) on n32: all on.
 RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1",
