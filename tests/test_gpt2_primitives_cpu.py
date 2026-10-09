@@ -574,6 +574,30 @@ def test_softmax_fold_matches_unfolded(complex_packing, periodic, kc):
     np.testing.assert_allclose(np.real(o1), np.real(o0), rtol=1e-9, atol=1e-12)
 
 
+@pytest.mark.parametrize("kc", [1, 5, 33, 70])
+def test_kv_lanes_push_matches_complex_refresh(kc):
+    """KV_LANES: K on token lane 0 and V on lane 1 of one real payload fill the same K buckets and V pair buckets as
+    the complex K + iV refresh (any position in the group: the V lane rotation is 1 - rr)."""
+    def run(kvl):
+        rt, fhe, inf = _rt(complex_payload=True)
+        rt.ops.kv_lanes = kvl
+        d = rt.dims
+        rng = np.random.default_rng(23)
+        kv = attention.ComplexKVCache(d.d_head)
+        for tok in range(kc):
+            k, v = rng.standard_normal(d.hid) * 0.5, rng.standard_normal(d.hid) * 0.5
+            for arr in (k, v):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            # the fused linear's output: K + iV on every token lane
+            full = np.repeat(k, d.t) + 1j * np.repeat(v, d.t)
+            attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(full, 34))
+        return ([b.vec for b in kv.k_buckets] + [b.vec for b in kv.k_pend]
+                + [b.vec for b in kv.v_buckets if b is not None])
+
+    for a, b in zip(run(True), run(False)):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+
+
 def test_gelu_fold_matches_gelu():
     """GELU_FOLD: fed x / xmax (the up-projection carries the scaling) and with xmax on the
     mask, the GELU returns what the unfolded form returns on x."""

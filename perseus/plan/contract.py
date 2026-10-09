@@ -33,6 +33,8 @@ LOAD_BEARING_ENV = (
     "SM_PERIODIC",
     # the softmax constants folded into masks (impl attention.sm_fold_affine): a different op sequence
     "SM_FOLD",
+    # the K/V push form (impl attention.cache_kv_push_packed_complex): a different op sequence
+    "KV_LANES",
 )
 
 

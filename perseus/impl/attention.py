@@ -9,7 +9,7 @@ import math
 from .config import SoftmaxCfg
 from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_mask,
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
-                     vlane_mask, vpair_mask_complex)
+                     stride_mask, vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
 from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cleanse, rotsum,
                    rotsum_neg)
@@ -149,18 +149,36 @@ class ComplexKVCache:
         return cts, keys
 
 
+def _vpair_item(d, i_re: int, i_im: int, rr: int, kv_lanes: bool):
+    """The V pair selector of a push: on 2 V_raw (scale 0.5), or on V_raw itself under KV_LANES (scale 1)."""
+    if kv_lanes:
+        return ("v.cpc.l", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr, 1.0)
+    return ("v.cpc", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr)
+
+
 def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
     """cache_kv_push_packed_complex: the fused K + iV linear output refreshed by ONE
     bootstrap, split by conjugation (2K on the real axis, -2iV on the imaginary one), K
     masked and bucketed (odd groups packed by the monomial i), V realified (times i, the
     monomial: no level) and scattered into the pair buckets."""
     ops, d = rt.ops, rt.dims
-    P = ops.copy(P_in)
-    ops.bootstrap(P)
-    conj = ops.conjugate(P)
-    K = ops.add(P, conj)                                   # 2 K_raw
-    V = ops.sub(conj, P)                                   # -2i V_raw, realified by the monomial i
-    K = rt.mult_mask(K, "kpush.tok0h", lambda: real_head_half_mask(d))
+    kvl = getattr(ops, "kv_lanes", False)
+    if kvl:
+        # KV_LANES: realify first (both halves fill every token lane), keep K on lane 0 and V on lane 1, and refresh
+        # that real payload by the real route; the K mask and the V pair masks below select the two lanes
+        conj = ops.conjugate(P_in)
+        Kc = rt.mult_mask(ops.add(P_in, conj), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))   # K_raw
+        Vc = rt.mult_mask(ops.mult_i(ops.sub(conj, P_in)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
+        X = ops.add(Kc, ops.rotate(Vc, -1))
+        ops.bootstrap_real(X)
+        K = rt.mult_mask(X, "kpush.tok0", lambda: real_head_tok0_mask(d))
+    else:
+        P = ops.copy(P_in)
+        ops.bootstrap(P)
+        conj = ops.conjugate(P)
+        K = ops.add(P, conj)                               # 2 K_raw
+        V = ops.sub(conj, P)                               # -2i V_raw, realified by the monomial i
+        K = rt.mult_mask(K, "kpush.tok0h", lambda: real_head_half_mask(d))
     K = ops.rotate(K, -(kv.k_count % d.t))
     # bucket_k_complex
     if kv.k_count % d.t == 0:
@@ -173,16 +191,19 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
         kv.k_buckets.append(bucket)
         kv.k_pend.clear()
     rr = kv.v_count % d.t
-    v = ops.rotate(V, -rr) if rr else ops.copy(V)
-    v = ops.mult_i(v)                                      # 2 V_raw, no level
+    if kvl:
+        v = ops.rotate(X, 1 - rr) if rr != 1 else ops.copy(X)   # V_raw, lane 1 -> lane rr
+    else:
+        v = ops.rotate(V, -rr) if rr else ops.copy(V)
+        v = ops.mult_i(v)                                  # 2 V_raw, no level
     # bucket_v_complex
     c = kv.v_count // d.t
     keys, builds, lanes = [], [], []
     for p in range(d.d_head_real // 2):
         i_re = ((c - 2 * p) % d.d_head + d.d_head) % d.d_head
         i_im = ((c - 2 * p - 1) % d.d_head + d.d_head) % d.d_head
-        keys.append(("v.cpc", i_re, i_im, rr))
-        builds.append(lambda i_re=i_re, i_im=i_im: vpair_mask_complex(d, i_re, i_im, rr))
+        key, build = _vpair_item(d, i_re, i_im, rr, kvl)
+        keys.append(key); builds.append(build)
     tmps = rt.mult_masks(v, keys, builds)
     for p, tmp in enumerate(tmps):
         if kv.v_buckets[p] is None:
@@ -543,8 +564,7 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     for p in range(d.d_head_real // 2):
         i_re = ((c - 2 * p) % d.d_head + d.d_head) % d.d_head
         i_im = ((c - 2 * p - 1) % d.d_head + d.d_head) % d.d_head
-        items.append((("v.cpc", i_re, i_im, rr),
-                      lambda i_re=i_re, i_im=i_im: vpair_mask_complex(d, i_re, i_im, rr)))
+        items.append(_vpair_item(d, i_re, i_im, rr, getattr(rt.ops, "kv_lanes", False)))
     return items
 
 
