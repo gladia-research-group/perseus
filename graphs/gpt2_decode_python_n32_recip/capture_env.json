@@ -22,7 +22,8 @@
     "SM_DEN_RECIP": "1",
     "GELU_FOLD": "1",
     "LN_CHEB": "1",
-    "SM_GS_FIRST": "1"
+    "SM_GS_FIRST": "1",
+    "SM_PERIODIC": "1"
   },
   "session": {
     "level_limit": 46,

@@ -4843,10 +4843,10 @@
       "table_measured": true,
       "num_sites": 3,
       "predicted_rel_err": {
-        "median": 9.470204445407471e-06,
-        "p90": 1.131114746346047e-05,
-        "p99": 1.131114746346047e-05,
-        "max": 1.131114746346047e-05
+        "median": 8.89159151862698e-06,
+        "p90": 1.1319047132155818e-05,
+        "p99": 1.1319047132155818e-05,
+        "max": 1.1319047132155818e-05
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -4866,22 +4866,22 @@
       "worst_sites": [
         {
           "var": "v_60",
-          "rel_err": 1.131114746346047e-05,
-          "max_abs": 0.8920263154002493,
+          "rel_err": 1.1319047132155818e-05,
+          "max_abs": 0.8878780357855297,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_173",
-          "rel_err": 9.470204445407471e-06,
-          "max_abs": 1.2880656718827412,
+          "rel_err": 8.89159151862698e-06,
+          "max_abs": 1.3358719575689153,
           "pack_period": 1,
           "step": "tail"
         },
         {
           "var": "v_3",
-          "rel_err": 2.4230532766276574e-06,
-          "max_abs": 11.485168999333826,
+          "rel_err": 2.277519748673798e-06,
+          "max_abs": 11.797990634384064,
           "pack_period": 32768,
           "step": "tail"
         }
@@ -4956,7 +4956,8 @@
       "SM_DEN_RECIP": "1",
       "GELU_FOLD": "1",
       "LN_CHEB": "1",
-      "SM_GS_FIRST": "1"
+      "SM_GS_FIRST": "1",
+      "SM_PERIODIC": "1"
     },
     "session": {
       "level_limit": 46,
