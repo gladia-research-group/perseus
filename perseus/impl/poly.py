@@ -188,36 +188,40 @@ def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float):
         T[k] = ops.add(ops.add(sq, sq), -1.0)
         k *= 2
 
-    def leaf(c):
-        r = None
-        for i in range(1, len(c)):
-            if c[i] == 0.0:
-                continue
-            term = ops.mult(T[i], c[i])
-            if r is None:
-                r = term
-            else:
-                ops.inplace_add(r, term)
+    return _cheb_rec(ops, T, y, m, coeffs)
+
+
+def _cheb_leaf(ops, T, y, c):
+    """sum_i c_i T_i over the baby steps (module-level: no closure, so no reference cycle pins the T_i)."""
+    r = None
+    for i in range(1, len(c)):
+        if c[i] == 0.0:
+            continue
+        term = ops.mult(T[i], c[i])
         if r is None:
-            z = ops.sub(y, y)
-            return ops.add(z, c[0])
-        return ops.add(r, c[0]) if c[0] != 0.0 else r
+            r = term
+        else:
+            ops.inplace_add(r, term)
+    if r is None:
+        z = ops.sub(y, y)
+        return ops.add(z, c[0])
+    return ops.add(r, c[0]) if c[0] != 0.0 else r
 
-    def rec(c):
-        d = len(c) - 1
-        while d > 0 and c[d] == 0.0:
-            d -= 1
-        c = c[: d + 1]
-        if d < m:
-            return leaf(c)
-        k = 1 << (d.bit_length() - 1)     # largest power of two <= d (a giant since d >= m)
-        q, r = _cheb_split(c, k)
-        qv = rec(q)
-        prod = ops.mult(qv, T[k])
-        rv = rec(r)
-        return ops.add(prod, rv)
 
-    return rec(coeffs)
+def _cheb_rec(ops, T, y, m, c):
+    """q(T) T_k + r(T) recursively down to the baby steps (k = the largest giant <= deg c)."""
+    d = len(c) - 1
+    while d > 0 and c[d] == 0.0:
+        d -= 1
+    c = c[: d + 1]
+    if d < m:
+        return _cheb_leaf(ops, T, y, c)
+    k = 1 << (d.bit_length() - 1)     # largest power of two <= d (a giant since d >= m)
+    q, r = _cheb_split(c, k)
+    qv = _cheb_rec(ops, T, y, m, q)
+    prod = ops.mult(qv, T[k])
+    rv = _cheb_rec(ops, T, y, m, r)
+    return ops.add(prod, rv)
 
 
 class _NoBsgs:
