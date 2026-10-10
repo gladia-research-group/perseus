@@ -25,17 +25,28 @@ QUALITY_LAMBDA = 1.0 / 4096.0
 REFRESH_ENV_CAP_ABS = 48.0
 
 
-def refresh_env_cap(step: str | None = None) -> float:
-    """REFRESH_ENV_CAP_ABS, or PLAN_REFRESH_ENV_CAP when the recipe pins the chain's own. PLAN_REFRESH_ENV_CAP_STEPS
+def refresh_env_cap(step: str | None = None, route: int | None = None) -> float:
+    """REFRESH_ENV_CAP_ABS, or PLAN_REFRESH_ENV_CAP when the recipe pins the chain's own. A route listed in
+    PLAN_REFRESH_ENV_CAP_ROUTES (route:cap pairs, 0 = dense) has its own: the StC-first dense route pays its StC
+    levels on the input side (FIDESLIB_BTS_STC_FIRST), so its input must stop higher. PLAN_REFRESH_ENV_CAP_STEPS
     (`name:cap,...`) pins it per step for the nodes whose step name contains `name` after its `blkN.` prefix: the
-    decode blocks can take the measured envelope while the tail and CutMax keep a stricter one."""
+    decode blocks can take the measured envelope while the tail and CutMax keep a stricter one. The tighter of a
+    route cap and a step cap applies."""
     import os as _os
+    caps = []
+    if route is not None:
+        for kv in (_os.environ.get("PLAN_REFRESH_ENV_CAP_ROUTES") or "").split(","):
+            r, _, c = kv.partition(":")
+            if c.strip() and int(r) == route:
+                caps.append(float(c))
     if step:
         bare = step.split(".", 1)[1] if step.startswith("blk") and "." in step else step
         for kv in (_os.environ.get("PLAN_REFRESH_ENV_CAP_STEPS") or "").split(","):
             name, _, c = kv.partition(":")
             if name.strip() and c.strip() and name.strip() in bare:
-                return float(c)
+                caps.append(float(c))
+    if caps:
+        return min(caps)
     e = _os.environ.get("PLAN_REFRESH_ENV_CAP")
     if e and e.strip():
         try:
@@ -255,7 +266,7 @@ class Placer:
         if spec.hopeless:
             return float("inf")
         eff_v = (self._last_sim.consumed.get(v, 0.0) + (self.g.level_unit if self._last_sim.deg.get(v, 1) == 2 else 0)) if self._last_sim is not None else 0.0
-        if self.bootstrap_level + eff_v > refresh_env_cap(self._step_of(v)):
+        if self.bootstrap_level + eff_v > refresh_env_cap(self._step_of(v), route=spec.route or 0):
             # Past the refresh envelope. Payable (1e4, large but finite) by default: an
             # inf here can starve the cut entirely when whole paths sit past the envelope,
             # and with hints live they absorb the deep values so the penalty is never
@@ -349,7 +360,7 @@ class Placer:
             if not ins:
                 continue
             eff = sim.consumed.get(ins[0], 0.0) + (unit if sim.deg.get(ins[0], 1) == 2 else 0)
-            if self.bootstrap_level + eff > refresh_env_cap(n.step):
+            if self.bootstrap_level + eff > refresh_env_cap(n.step, route=self.refresh.route_for(n.output) or 0):
                 out.append(n.output)
         return out
 
@@ -487,7 +498,7 @@ class Placer:
             p = self.g.producer_of.get(v)
             if p is None or p.is_deliberate_bts or p.hint_level is not None or self.refresh.spec(v).route:
                 continue
-            if self.bootstrap_level + sim.input_eff(self.g, v, self.g.level_unit) > refresh_env_cap(self._step_of(v)) + 1e-9:
+            if self.bootstrap_level + sim.input_eff(self.g, v, self.g.level_unit) > refresh_env_cap(self._step_of(v), route=0) + 1e-9:
                 out.append(v)
         return sorted(out)
 

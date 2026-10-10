@@ -233,7 +233,6 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
     """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune)."""
     from .place import refresh_env_cap
     g = placer.g
-    env = refresh_env_cap() - placer.bootstrap_level
 
     def count(s):
         return len(placer.placed) + sum(1 for f in s.hint_fired.values() if f)
@@ -251,11 +250,12 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
                 lvl = s.effective(p.cipher_inputs[0], g.level_unit)
             else:
                 lvl = s.node_out.get(p.idx, 0.0)
-            if lvl > env + 1e-9:
+            if lvl > refresh_env_cap(route=placer.refresh.spec(v).route or 0) - placer.bootstrap_level + 1e-9:
                 k += 1
         for n in g.nodes:
             if n.hint_level is not None and s.hint_fired.get(n.idx) and n.cipher_inputs:
-                if s.consumed.get(n.cipher_inputs[0], 0.0) > env + 1e-9:
+                env_n = refresh_env_cap(n.step, route=placer.refresh.route_for(n.output) or 0) - placer.bootstrap_level
+                if s.consumed.get(n.cipher_inputs[0], 0.0) > env_n + 1e-9:
                     k += 1
         return k
 
@@ -427,9 +427,14 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
             if c in placed and c in g.producer_of:
                 return sim.node_out.get(g.producer_of[c].idx, sim.consumed.get(c, 0.0))
             return sim.consumed.get(c, 0.0)
-        deepest_nom = max(in_level(c) for c in ends)
-        deepest_eff = deepest_nom + (float(cfg.level_unit) if cfg.raise_drop_env_rule != "nominal" else 0.0)
-        slack = min(L - deepest_nom, env_rel - deepest_eff)
+        # each downstream refresh meets its own route's envelope (PLAN_REFRESH_ENV_CAP_ROUTES); a deliberate one is
+        # dense
+        def env_of(c: str) -> float:
+            if refresh is None:
+                return env_rel
+            return _refresh_env_cap(route=int(refresh.spec(c).route or 0) if c in placed else 0) - cfg.bootstrap_level
+        rule = float(cfg.level_unit) if cfg.raise_drop_env_rule != "nominal" else 0.0
+        slack = min(min(L - in_level(c), env_of(c) - in_level(c) - rule) for c in ends)
         k = min(cfg.raise_drop_max, int(math.floor(slack / unit + 1e-9)))
         if refresh is not None and int(refresh.spec(p).route or 0) not in cfg.raise_drop_routes:
             skipped["route"] += 1

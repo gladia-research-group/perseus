@@ -482,8 +482,8 @@ def choose_site(
             # coefficient, and r/q_mag would compare the two arms on different bases.
             offset_arms.append((float(mean), r, q_period, r / (slot_mag * kappa), residual_mag * kappa))
 
-    def slim_err(slot_m: float, cf: int) -> float:
-        if policy.slim_cubic <= 0.0:
+    def slim_err(slot_m: float, cf: int, route: int = 0) -> float:
+        if policy.slim_cubic <= 0.0 or route:     # only the dense route runs the slim order (STC_FIRST_ROUTES=dense)
             return 0.0
         x = 2.0 * math.pi * slot_m * 2.0 ** (-cf)
         return policy.slim_cubic * x * x / 6.0
@@ -491,7 +491,7 @@ def choose_site(
     for off, mag, per, rescale, slot_m in offset_arms:
         for cf in range(policy.cf_min, policy.cf_max + 1):
             for route in routes:
-                e = max(table.rel_err(mag, cf, per, route) * rescale, slim_err(slot_m, cf))
+                e = max(table.rel_err(mag, cf, per, route) * rescale, slim_err(slot_m, cf, route))
                 consider(SiteChoice(e <= policy.err_target, e, cf=cf, route=route,
                                     offset=off, extra_levels=0,
                                     reason="offset+cf+route" if off is not None
@@ -521,7 +521,7 @@ def choose_site(
                     n_over_budget += 1
                     continue
                 for route in routes:
-                    e = max(table.rel_err(mag * f, cf, per, route) * rescale, slim_err(slot_m * f, cf))
+                    e = max(table.rel_err(mag * f, cf, per, route) * rescale, slim_err(slot_m * f, cf, route))
                     # Rank by predicted error PLUS a depth preference. Every CF lands on
                     # its own band centre with near-identical measured error, so without
                     # this term the winner is arbitrary — and the arbitrary winner was the

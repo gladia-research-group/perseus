@@ -160,6 +160,16 @@ void bind_bts(py::module_& root) {
           py::arg("fhe"), py::arg("on"),
           "Route the following dense bootstraps as real payloads (one EvalMod chain; needs FIDESLIB_BTS_REAL=1 at "
           "session build). The planned runtime sets it per site from the plan.");
+    m.def("set_correction_factor",
+          [](CKKSContext& fhe, int cf) { std::any_cast<FC::Context&>(fhe.cc->gpu)->setCorrectionFactorOverride(cf); },
+          py::arg("fhe"), py::arg("cf"),
+          "Bootstrap the following ciphertexts with correction factor `cf` (-1 = the route's own). The planned "
+          "runtime sets it per site from the plan.");
+    m.def("set_raise_drop",
+          [](CKKSContext& fhe, int drop) { std::any_cast<FC::Context&>(fhe.cc->gpu)->setBtsRaiseDrop(drop); },
+          py::arg("fhe"), py::arg("drop"),
+          "Raise the following bootstraps `drop` composite levels below the top (a variant FIDESLIB_BTS_RAISE_DROPS "
+          "built at session start; 0 = the top). The planned runtime sets it per site from the plan.");
     m.def("spru_setup",
           [](CKKSContext& fhe, int h) {
               auto& lcc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(fhe.cc->cpu);

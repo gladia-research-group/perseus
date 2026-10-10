@@ -59,6 +59,7 @@ if [[ -n "${FIRST_ENTRY_LEVEL:-}"   ]]; then args+=(--first-entry-level "$FIRST_
 if [[ -n "${FIRST_ENTRY_DEG:-}"     ]]; then args+=(--first-entry-deg "$FIRST_ENTRY_DEG");    fi
 if [[ -n "${PLAN_BIND_HINTS:-}"     ]]; then args+=(--bind-hints);                            fi
 if [[ -n "${PLAN_DISSOLVE_HINTS:-}" ]]; then args+=(--dissolve-hints);                        fi
+if [[ -n "${PLAN_HINT_VETO_STEPS:-}" ]]; then args+=(--hint-veto-steps "$PLAN_HINT_VETO_STEPS"); fi
 if [[ -n "${PLAN_DELIBERATE_CLAMP0:-}" ]]; then args+=(--deliberate-clamp0);                 fi
 if [[ -n "${PLAN_PLACER:-}"         ]]; then args+=(--placer "$PLAN_PLACER");                 fi
 if [[ -n "${PLAN_ILP_TIME_LIMIT:-}" ]]; then args+=(--ilp-time-limit "$PLAN_ILP_TIME_LIMIT"); fi
