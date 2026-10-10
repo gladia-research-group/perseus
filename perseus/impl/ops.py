@@ -78,7 +78,7 @@ class FheOps:
         self.kv_lanes = os.environ.get("KV_LANES", "1") not in ("", "0")
         # CHEB_BSGS=1: every Chebyshev series (GELU P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step
         # giant-step (poly.eval_chebyshev_bsgs): a third of the ciphertext products at the same depth
-        self.cheb_bsgs = os.environ.get("CHEB_BSGS", "0") not in ("", "0")
+        self.cheb_bsgs = os.environ.get("CHEB_BSGS", "1") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):

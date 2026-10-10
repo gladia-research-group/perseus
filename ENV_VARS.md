@@ -97,6 +97,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `GPT2_LMHEAD_GRANULARITY` | `plaintext` or `linear` weight granularity for the LM head. |
 | `GPT2_PREFILL_GRANULARITY` | Same for the prefill linears. |
 | `KV_LANES` | The K + iV linear output refreshed as one real payload, K on token lane 0 and V on lane 1, by the real-payload route instead of a complex refresh (Python implementation; default 1, off for plans that do not declare it). |
+| `CHEB_BSGS` | Every Chebyshev series (the GELU's P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step giant-step: a degree-31 series costs 11 ciphertext products instead of 30 at the same depth (Python implementation; default 1, off for plans that do not declare it). |
 | `SM_FOLD` | The softmax's constant products folded into masks: the exp's input map into the q.K^T group and score masks, each reciprocal round's seed slope into a second head-sum mask (Python implementation; default 1, off for plans that do not declare it). |
 | `SM_PERIODIC` | Attention scores kept 512-periodic while the cache fits one 32-token group: the softmax refreshes route sparse and P.V is one product (Python implementation; default 1, off for plans that do not declare it). |
 

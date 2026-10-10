@@ -50,7 +50,7 @@ ENV = {
     "KV_LANES": "1",
     # the Chebyshev series by baby-step giant-step (poly.eval_chebyshev_bsgs); a plan cut before it runs it off
     # (RUNTIME_LEGACY)
-    "CHEB_BSGS": "0",
+    "CHEB_BSGS": "1",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
