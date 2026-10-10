@@ -128,6 +128,51 @@ def test_iterative_inverses_converge():
     np.testing.assert_allclose(r, cfg.inv_out_scale / np.sqrt(z), rtol=2e-2)
 
 
+class _CountingOps(poly.NumpyOps):
+    """NumpyOps counting ciphertext x ciphertext products (mult of two arrays, square)."""
+    def __init__(self, bsgs):
+        self.cheb_bsgs = bsgs; self.ct_products = 0
+    def mult(self, a, b):
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            self.ct_products += 1
+        return a * b
+    def square(self, a):
+        self.ct_products += 1
+        return a * a
+
+
+@pytest.mark.parametrize("deg", [4, 5, 7, 8, 12, 15, 16, 18, 23, 27, 31, 32, 40])
+def test_chebyshev_bsgs_matches_direct(deg):
+    rng = np.random.default_rng(deg)
+    c = rng.standard_normal(deg + 1) * (0.8 ** np.arange(deg + 1))   # above the 1e-6 coefficient trim
+    x = rng.uniform(-3.0, 5.0, 64)
+    a, b = -3.0, 5.0
+    from numpy.polynomial import chebyshev as C
+    direct, bsgs = _CountingOps(False), _CountingOps(True)
+    ref = poly.eval_chebyshev(direct, x, c, a, b)
+    got = poly.eval_chebyshev(bsgs, x, c, a, b)
+    np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(got, C.chebval((2 * x - (a + b)) / (b - a), c), rtol=1e-11, atol=1e-11)
+    if deg >= 8:
+        assert bsgs.ct_products < direct.ct_products, (deg, bsgs.ct_products, direct.ct_products)
+    if deg == 31:
+        assert bsgs.ct_products == 11 and direct.ct_products == 30
+
+
+def test_chebyshev_bsgs_depth_matches_direct():
+    """Same multiplicative depth on the fake's level accounting (the plan windows do not move)."""
+    rt, fhe, inf = _rt()
+    g = next(v for v in _cfgs().gelu.values() if v.thor_p1_cheb)
+    for coeffs, a, b in ((g.thor_p1_cheb, g.thor_p1_a, g.thor_p1_b), (g.thor_p2_cheb, g.thor_p2_a, g.thor_p2_b)):
+        levels = []
+        for flag in (False, True):
+            rt.ops.cheb_bsgs = flag
+            ct = fake.FakeCt(np.linspace(-1, 1, inf.slots), 34)
+            levels.append(poly.eval_chebyshev(rt.ops, ct, coeffs, a, b).level)
+        rt.ops.cheb_bsgs = False
+        assert levels[0] == levels[1], levels
+
+
 def test_bts2_is_a_refresh_on_the_fake():
     rt, fhe, inf = _rt()
     ct = fake.FakeCt(np.arange(inf.slots, dtype=float), 44)

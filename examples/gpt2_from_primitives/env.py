@@ -48,6 +48,9 @@ ENV = {
     # the K + iV refresh as one real payload on two token lanes (attention.cache_kv_push_packed_complex); a plan cut
     # before it runs it off (RUNTIME_LEGACY)
     "KV_LANES": "1",
+    # the Chebyshev series by baby-step giant-step (poly.eval_chebyshev_bsgs); a plan cut before it runs it off
+    # (RUNTIME_LEGACY)
+    "CHEB_BSGS": "0",
     "FHE_PT_COEFF_ENCODE": "0",
     "GPT2_FOLD_LN1": "1",
     "GPT2_FOLD_LN2": "1",
@@ -72,7 +75,7 @@ RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_R
                "FIDESLIB_BTS_SPARSE_B": "1", "FIDESLIB_ROT_KEY_BAND": "32"}
 RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
                   "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0",
-                  "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0", "KV_LANES": "0"}
+                  "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0", "KV_LANES": "0", "CHEB_BSGS": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):

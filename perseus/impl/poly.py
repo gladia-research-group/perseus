@@ -85,6 +85,8 @@ CHEB_COEFF_EPS = 1e-6
 
 def eval_chebyshev(ops, x, coeffs, a: float, b: float):
     """sum_k c_k T_k(y), y = (2x - (a+b))/(b-a) (polynomial.cu), c0 unhalved."""
+    if getattr(ops, "cheb_bsgs", False):
+        return eval_chebyshev_bsgs(ops, x, coeffs, a, b)
     coeffs = [float(c) for c in coeffs]
     cmax = max((abs(c) for c in coeffs), default=0.0)
     tol = CHEB_COEFF_EPS * cmax
@@ -128,6 +130,105 @@ def eval_chebyshev(ops, x, coeffs, a: float, b: float):
         else:
             ops.inplace_add(r, term)
     return ops.add(r, coeffs[0])
+
+
+def _cheb_trim(coeffs):
+    """The coefficient trim of eval_chebyshev: tiny coefficients dropped, trailing zeros cut."""
+    coeffs = [float(c) for c in coeffs]
+    cmax = max((abs(c) for c in coeffs), default=0.0)
+    tol = CHEB_COEFF_EPS * cmax
+    coeffs = [0.0 if abs(c) <= tol else c for c in coeffs]
+    n = len(coeffs) - 1
+    while n > 0 and coeffs[n] == 0.0:
+        n -= 1
+    return coeffs[: n + 1]
+
+
+def _cheb_split(c, k):
+    """sum_i c_i T_i = q(T) T_k + r(T) with deg q = deg c - k < k, deg r < k (T_k T_j = (T_{k+j} + T_{k-j}) / 2)."""
+    d = len(c) - 1
+    q = [0.0] * (d - k + 1)
+    r = list(c[:k])
+    q[0] = c[k]
+    for j in range(1, d - k + 1):
+        q[j] = 2.0 * c[k + j]
+        r[k - j] -= c[k + j]
+    return q, r
+
+
+def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float):
+    """eval_chebyshev with a baby-step giant-step schedule (Bossuat et al.): babies T_1..T_{m-1} and giants
+    T_m, T_2m, ..., the series split recursively as q(T) T_k + r(T) and recombined with k - 1 products per
+    level, so a degree-31 series costs 11 ciphertext products instead of 30. Same value, same depth
+    (ceil(log2 n) + 1), same coefficient trim; CHEB_BSGS=1 routes every eval_chebyshev here."""
+    coeffs = _cheb_trim(coeffs)
+    n = len(coeffs) - 1
+    if n <= 3:
+        return eval_chebyshev(_NoBsgs(ops), x, coeffs, a, b)
+    alpha = 2.0 / (b - a)
+    beta = (a + b) / (b - a)
+    y = x if alpha == 1.0 else ops.mult(x, alpha)
+    if beta != 0.0:
+        y = ops.add(y, -beta)
+    L = n.bit_length()                   # 2^(L-1) <= n < 2^L
+    l = (L + 1) // 2                     # baby bits: m = 2^l babies, giants T_m .. T_2^(L-1)
+    m = 1 << l
+    T = {1: y}
+    for i in range(2, m):                # babies T_2 .. T_{m-1}
+        if i % 2 == 0:
+            sq = ops.square(T[i // 2])
+            T[i] = ops.add(ops.add(sq, sq), -1.0)
+        else:
+            j = i // 2
+            prod = ops.mult(T[j + 1], T[j])
+            T[i] = ops.sub(ops.add(prod, prod), y)
+    k = m
+    while k <= n:                        # giants T_m, T_2m, ... (T_{m/2} is a baby)
+        sq = ops.square(T[k // 2])
+        T[k] = ops.add(ops.add(sq, sq), -1.0)
+        k *= 2
+
+    def leaf(c):
+        r = None
+        for i in range(1, len(c)):
+            if c[i] == 0.0:
+                continue
+            term = ops.mult(T[i], c[i])
+            if r is None:
+                r = term
+            else:
+                ops.inplace_add(r, term)
+        if r is None:
+            z = ops.sub(y, y)
+            return ops.add(z, c[0])
+        return ops.add(r, c[0]) if c[0] != 0.0 else r
+
+    def rec(c):
+        d = len(c) - 1
+        while d > 0 and c[d] == 0.0:
+            d -= 1
+        c = c[: d + 1]
+        if d < m:
+            return leaf(c)
+        k = 1 << (d.bit_length() - 1)     # largest power of two <= d (a giant since d >= m)
+        q, r = _cheb_split(c, k)
+        qv = rec(q)
+        prod = ops.mult(qv, T[k])
+        rv = rec(r)
+        return ops.add(prod, rv)
+
+    return rec(coeffs)
+
+
+class _NoBsgs:
+    """ops view with the BSGS switch off (tiny series take the direct recursion)."""
+    cheb_bsgs = False
+
+    def __init__(self, ops):
+        self._ops = ops
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
 
 
 def taylor_inv_sqrt_coeffs(z0: float):
