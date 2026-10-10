@@ -68,6 +68,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_SPARSE_ARCSINE` | Arcsine-corrected sparse bootstrap (needed by the encrypted argmax). |
 | `OPENFHE_DECODE_NO_THROW` | Let a capture decode a low-precision plaintext instead of throwing (capture only). |
 | `PLAN_HARD_ENV_CAP` | Planner: make the refresh-input depth envelope absolute (1) or payable (0, the shipped recipes). |
+| `PLAN_REFRESH_ENV_CAP_STEPS` | Planner: per-step refresh-input envelope, `name:cap,...` for nodes whose step contains `name` (e.g. `cutmax:48,tail:48` keeps the measured-safe 48 there while PLAN_REFRESH_ENV_CAP=50 serves the decode blocks). |
 | `PLAN_DRIFT_RECUT` | Planner: 1 = un-place a cut-chosen refresh whose input drifted past the envelope after a later cut disarmed a hint upstream, and let the cut re-cover it (kept as forced if nothing envelope-respecting exists). Off by default: the shipped plans carry such sites and the runtime guard reads the nominal level. P3c reports them either way. |
 | `SPARSE_AUTO` | Route a periodic payload to a sparse bootstrap automatically (2 = on). |
 | `SPARSE_BTS_SLOTS` | Sparse bootstrap precomputations to build, e.g. `512,1`; 0 = none. |

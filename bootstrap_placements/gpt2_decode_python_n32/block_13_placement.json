@@ -2023,7 +2023,7 @@
         "v_81": 2
       },
       "env_cap": {
-        "limit": 48.0,
+        "limit": 50.0,
         "relaxed": false,
         "vetoed_hints": [],
         "placed_past_cap": [],

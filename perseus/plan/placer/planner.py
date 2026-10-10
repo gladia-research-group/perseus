@@ -720,6 +720,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # pass through it, hence this check covers both.
     from .place import refresh_env_cap as _refresh_env_cap
     _ENV_CAP = _refresh_env_cap()
+
+    def _cap_of(v: str) -> float:          # the envelope of the step that produces `v` (PLAN_REFRESH_ENV_CAP_STEPS)
+        _pn = g.producer_of.get(v)
+        return _refresh_env_cap(getattr(_pn, "step", None) if _pn is not None else None)
     _bad_cut, _bad_hint = [], []
     # A var past the envelope that nothing refreshes is NOT harmless: the runtime meets it
     # there and fires a REACTIVE bootstrap, which is the one class neither the cut nor the
@@ -741,12 +745,12 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 continue
             _nom, _deg = sim.input_state(g, _v)
             _eff = cfg.bootstrap_level + _nom + (cfg.level_unit if _deg == 2 else 0)
-            if _eff > _ENV_CAP + 1e-9:
+            if _eff > _cap_of(_v) + 1e-9:
                 _bad_cut.append((_v, _eff))
                 _bad_nom[_v] = cfg.bootstrap_level + _nom
             continue
         _eff = cfg.bootstrap_level + _c + (cfg.level_unit if sim.deg.get(_v, 1) == 2 else 0)
-        if _eff <= _ENV_CAP:
+        if _eff <= _cap_of(_v):
             continue
         if _v not in _hint_covered:
             _bad_reactive.append((_v, _eff))
@@ -763,7 +767,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             continue
         _eff = (cfg.bootstrap_level + sim.consumed.get(_in, 0.0)
                 + (cfg.level_unit if sim.deg.get(_in, 1) == 2 else 0))
-        if _eff > _ENV_CAP:
+        if _eff > _refresh_env_cap(_n.step):
             _bad_hint.append((_n.output or _in, _eff))
     if _bad_hint and cfg.verbose:
         log.info(f"[plan] P3c(hint): {len(_bad_hint)} hint-fired refresh(es) PREDICTED past the "
@@ -787,8 +791,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         # pending rescale runs (the shipped recipes carry such sites: report), while a nominal level past
         # the cap stops the run with [bts_depth_error] (warn). PLAN_DRIFT_RECUT=1 re-cuts both.
         _forced = getattr(placer, "drift_forced", set())
-        _stop = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) > _ENV_CAP + 1e-9]
-        _pend = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) <= _ENV_CAP + 1e-9]
+        _stop = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) > _cap_of(v) + 1e-9]
+        _pend = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) <= _cap_of(v) + 1e-9]
         _tail = (f" ({sum(1 for v, _ in _bad_cut if v in _forced)} with no envelope-respecting cover)"
                  if _forced else "") + "; PLAN_DRIFT_RECUT=1 re-cuts them."
         if _stop:

@@ -4806,7 +4806,7 @@
         "v_56": 2
       },
       "env_cap": {
-        "limit": 48.0,
+        "limit": 50.0,
         "relaxed": true,
         "vetoed_hints": [],
         "placed_past_cap": [],
