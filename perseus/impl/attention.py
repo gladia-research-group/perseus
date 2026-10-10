@@ -196,10 +196,11 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None):
     else:
         ops.inplace_add(kv.k_pend[-1], K)
     kv.k_count += 1
-    if len(kv.k_pend) == 2 and kv.k_count % d.t == 0:      # even + odd pair complete
-        bucket = ops.add(kv.k_pend[0], ops.mult_i(kv.k_pend[1]))   # pack: even + i odd (monomial)
-        kv.k_buckets.append(bucket)
-        kv.k_pend.clear()
+    # with step-scoped names the pair pack (2 ops, every 2t tokens) runs last, so it cannot move
+    # the names of the V half below
+    late_pack = getattr(rt, "scoped_names_requested", False)
+    if not late_pack:
+        _pack_k_pair(ops, kv, d)
     rr = kv.v_count % d.t
     if kvl:
         v = ops.rotate(X, 1 - rr) if rr != 1 else ops.copy(X)   # V_raw, lane 1 -> lane rr
@@ -221,7 +222,17 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None):
         else:
             ops.inplace_add(kv.v_buckets[p], tmp)
     kv.v_count += 1
+    if late_pack:
+        _pack_k_pair(ops, kv, d)
     return q_out
+
+
+def _pack_k_pair(ops, kv: ComplexKVCache, d):
+    """Pack the two pending K groups into one complex bucket (even + i odd, the monomial) once
+    both are complete."""
+    if len(kv.k_pend) == 2 and kv.k_count % d.t == 0:
+        kv.k_buckets.append(ops.add(kv.k_pend[0], ops.mult_i(kv.k_pend[1])))
+        kv.k_pend.clear()
 
 
 def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0):
@@ -543,7 +554,10 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
         else:
             cache_k_push(rt, kv, k)
             cache_v_push(rt, kv, v)
-    with rt.step("qkt"):
+    # the q.K^T issues one product per cache group: its op count is the cache's shape
+    shape = (f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if cplx else f"{len(kv.k_groups)}") \
+        if getattr(rt, "scoped_names", False) else None
+    with rt.step("qkt", shape=shape):
         a = sm_fold_affine(rt, sm_cfg)[0]
         scores = complex_qkt(rt, kv, q, a) if cplx else qkt(rt, kv, q, a)
         folded = bool(getattr(ops, "sm_fold", False))

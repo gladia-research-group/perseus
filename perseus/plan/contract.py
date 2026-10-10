@@ -35,6 +35,8 @@ LOAD_BEARING_ENV = (
     "SM_FOLD",
     # the K/V push form (impl attention.cache_kv_push_packed_complex): a different op sequence
     "KV_LANES",
+    # step-scoped ciphertext names (impl rt.Rt): different variable names, the plan's keys
+    "IMPL_SCOPED_NAMES",
 )
 
 

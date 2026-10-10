@@ -59,6 +59,14 @@ graph without them and ``capture_mags.py`` fills them from the numpy fake runnin
     run_decode --tokens 1 --capture graphs/X --structure-only    (add --argmax to capture CutMax)
     capture_mags graphs/X [--argmax]
 
+Long contexts. A plan names ciphertexts by a per-block counter, so it binds only while every token issues the same
+ops: the q.K^T adds a product per 32-token cache group and SM_PERIODIC switches the softmax's path when the cache
+outgrows one group, so a plan captured at token 0 stops binding at token 32. With ``IMPL_SCOPED_NAMES=1`` every step
+names its ciphertexts on its own counter (the q.K^T keyed by the cache's group count) and, with ``SM_PERIODIC=0``, one
+capture plans every length; the plan declares both in its ``runtime=`` line::
+
+    run_decode --tokens 1 --capture graphs/X --structure-only --set IMPL_SCOPED_NAMES=1 --set SM_PERIODIC=0
+
 Planning CutMax (block 13) is a second round, ``make_plan.sh <graph> <name> argmax``, from
 the same eager capture. Its entry is taken from the tail plan's exit (level and degree)
 rather than from the capture: what enters CutMax is what the planned tail produces, and a

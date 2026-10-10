@@ -315,7 +315,22 @@ void bind_ops(py::module_& m) {
              "defensively at every phase entry.")
         .def_property("magnitude_suppressed",
              [](const CKKSContext& c) { return c.magnitude_capture_suppressed; },
-             [](CKKSContext& c, bool v) { c.magnitude_capture_suppressed = v; });
+             [](CKKSContext& c, bool v) { c.magnitude_capture_suppressed = v; })
+        // graph-variable naming scope: with a scope set, new ciphertexts are named <scope>_<n>
+        // (n = the scope's own counter) instead of v_<n> from the block-wide counter, so a
+        // step's names do not move when an earlier step issues more ops (a plan stays bound
+        // across token positions whose op counts differ). Setting the scope keeps the counter;
+        // a caller entering a new scope saves and resets both, and restores them on exit.
+        .def_property("graph_scope",
+             [](const CKKSContext& c) { return c.graph_var_scope; },
+             [](CKKSContext& c, const std::string& s) { c.graph_var_scope = s; })
+        .def_property("graph_scope_counter",
+             [](const CKKSContext& c) { return c.graph_var_scope_counter; },
+             [](CKKSContext& c, uint64_t n) { c.graph_var_scope_counter = n; })
+        // naming-only scopes (perseus.impl's step-scoped names): planned mode stays strict under them
+        .def_property("graph_scope_strict",
+             [](const CKKSContext& c) { return c.graph_scope_strict; },
+             [](CKKSContext& c, bool v) { c.graph_scope_strict = v; });
 
     // ── data types ─────────────────────────────────────────────────────────
     py::enum_<InferenceMode>(m, "InferenceMode")

@@ -21,6 +21,9 @@ a used mask that was not staged is primed on the spot and counted (``rt.mask_mis
 """
 from __future__ import annotations
 
+import os
+import re
+
 import numpy as np
 
 from .layout import Dims
@@ -37,6 +40,18 @@ class Rt:
         self._staged = {}         # step -> (handle, [tags])
         self.mask_misses = 0      # uses of a per-step mask that was not staged
         self.mask_stats = {}      # last begin_step's numbers
+        # IMPL_SCOPED_NAMES=1: every step names its ciphertexts <step path>_<n> on its own counter
+        # (Context.graph_scope), so a plan made at one token stays bound at tokens where an
+        # earlier step issues more ops (the q.K^T over a cache with more groups)
+        # (the op ORDER changes the scoping implies, e.g. attention's late pair pack, follow the
+        # request even on a session without the binding, so the fake mirrors the device's stream)
+        self.scoped_names_requested = os.environ.get("IMPL_SCOPED_NAMES", "0") not in ("", "0")
+        self.scoped_names = (self.scoped_names_requested
+                             and hasattr(getattr(ops, "fhe", None), "graph_scope"))
+        if self.scoped_names and hasattr(ops.fhe, "graph_scope_strict"):
+            ops.fhe.graph_scope_strict = True       # naming only: planned mode stays strict
+        self._scope_path = []
+        self._scope_visits = {}
 
     # ── mask vectors ──
     def mask(self, key, build):
@@ -123,6 +138,7 @@ class Rt:
             self._masks.pop(k, None)          # the numpy copy too
         handle, _tags = self._staged.pop(step, (None, None))
         adopted = self.ops.adopt_pts(handle) if handle is not None else 0
+        self._scope_visits.clear()
         self._declared_now = cur
         self.mask_stats = {"adopted": adopted, "evicted": evicted, "misses": self.mask_misses}
         self.mask_misses = 0
@@ -143,10 +159,11 @@ class Rt:
             self.declare_step(step + 1, next_items)
         return self.stage_step(step + 1)
 
-    def step(self, label):
+    def step(self, label, shape=None):
         """`with rt.step("label"):` scopes ops under a step label in the captured graph and,
-        for the timing layer, attributes the time of the ops inside to `label`."""
-        return _StepScope(self, label)
+        for the timing layer, attributes the time of the ops inside to `label`. `shape`: what
+        the step's op count depends on (e.g. the cache's group count), part of its name scope."""
+        return _StepScope(self, label, shape)
 
     @classmethod
     def from_inf(cls, inf, core, unit=2, bts_precision=12):
@@ -155,17 +172,31 @@ class Rt:
 
 
 class _StepScope:
-    def __init__(self, rt, label):
-        self.rt, self.label = rt, label
+    def __init__(self, rt, label, shape=None):
+        self.rt, self.label, self.shape = rt, label, shape
         self.inner = rt.ops.inf.step(label)
+        self.saved = None
 
     def __enter__(self):
         self.inner.__enter__()
-        ops = self.rt.ops
+        rt, ops = self.rt, self.rt.ops
         self.prev = getattr(ops, "step_label", None)
         ops.step_label = self.label
+        if rt.scoped_names:
+            fhe = ops.fhe
+            self.saved = (fhe.graph_scope, fhe.graph_scope_counter)
+            rt._scope_path.append(str(self.label) + ("" if self.shape is None else f"~{self.shape}"))
+            path = "_".join(re.sub(r"[^A-Za-z0-9~]+", "", p) for p in rt._scope_path)
+            n = rt._scope_visits.get(path, 0)
+            rt._scope_visits[path] = n + 1
+            fhe.graph_scope = f"sc_{path}" + (f"~{n}" if n else "")
+            fhe.graph_scope_counter = 0
         return self
 
     def __exit__(self, *a):
-        self.rt.ops.step_label = self.prev
+        rt = self.rt
+        rt.ops.step_label = self.prev
+        if self.saved is not None:
+            rt._scope_path.pop()
+            rt.ops.fhe.graph_scope, rt.ops.fhe.graph_scope_counter = self.saved
         return self.inner.__exit__(*a)

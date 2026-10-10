@@ -508,6 +508,9 @@ struct CKKSContext {
 
     std::string graph_var_scope;
     uint64_t    graph_var_scope_counter = 0;
+    // a scope that only NAMES (step-scoped ciphertext names, perseus.impl Rt): planned mode keeps its
+    // strict reactive-refresh check under it (an unflagged scope skips it)
+    bool        graph_scope_strict = false;
     uint64_t weight_relevel_count = 0;
     uint64_t unplanned_bootstrap_count = 0;
 
@@ -2610,7 +2613,7 @@ struct CKKSContext {
         if (level_of(ct) < level_limit()) {
             return;
         }
-        if (placement_plan_enabled && !graph_scope_active()) {
+        if (placement_plan_enabled && (!graph_scope_active() || graph_scope_strict)) {
             // A ceiling-level ct the plan PREDICTED is not divergence: a planned
             // trajectory may legally touch level_limit when the next planned op
             // is the bootstrap itself (in the capture the auto fired here; the

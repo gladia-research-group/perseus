@@ -98,6 +98,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `GPT2_FOLD_LN_AFFINE` | Fold the affine scale/bias generally. |
 | `GPT2_LMHEAD_GRANULARITY` | `plaintext` or `linear` weight granularity for the LM head. |
 | `GPT2_PREFILL_GRANULARITY` | Same for the prefill linears. |
+| `IMPL_SCOPED_NAMES` | Step-scoped ciphertext names (`<step path>_<n>` on a per-step counter, the q.K^T scope keyed by the cache's group count) so one plan stays bound at every cache length; use with `SM_PERIODIC=0` (Python implementation; default 0, off for plans that do not declare it). |
 | `KV_LANES` | The K + iV linear output refreshed as one real payload, K on token lane 0 and V on lane 1, by the real-payload route instead of a complex refresh (Python implementation; default 1, off for plans that do not declare it). |
 | `QKV_LANES` | The Q linear output rides the K/V push refresh on token lane 2 (one real refresh for Q, K and V), and the qkv / up input hints fire only past the session limit, so both linears run on the LayerNorm output as is and their OUTPUT is refreshed at the top of the envelope (Python implementation; default 1, off for plans that do not declare it; the plan's runtime line carries `BTS_MAX_INPUT_LEVEL=50` for the up output at nominal 50). |
 | `CHEB_BSGS` | Every Chebyshev series (the GELU's P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step giant-step: a degree-31 series costs 11 ciphertext products instead of 30 at the same depth (Python implementation; default 1, off for plans that do not declare it). |
