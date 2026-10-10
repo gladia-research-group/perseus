@@ -4928,8 +4928,12 @@
         ]
       },
       "placed_input_levels": {
-        "v_3": 34.0,
-        "v_60": 16.0
+        "v_3": 46.0,
+        "v_60": 40.0
+      },
+      "placed_input_degs": {
+        "v_3": 2,
+        "v_60": 2
       },
       "env_cap": {
         "limit": 48.0,

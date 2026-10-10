@@ -4719,6 +4719,8 @@
       },
       "num_offset": 0,
       "num_prescale": 0,
+      "num_raise_drop": 0,
+      "num_real_route": 0,
       "num_sparse": 0,
       "worst_sites": [
         {
@@ -4771,6 +4773,12 @@
           "step": "tail"
         }
       ],
+      "placed_input_level_hist": {
+        "42": 1,
+        "48": 5
+      },
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {},
       "blind_branches": {
         "count": 7,
         "vars": [
@@ -4784,12 +4792,20 @@
         ]
       },
       "placed_input_levels": {
-        "v_106": 36.0,
-        "v_3": 36.0,
-        "v_58": 36.0,
-        "v_77": 36.0,
-        "v_78": 36.0,
-        "v_95": 36.0
+        "v_106": 46.0,
+        "v_3": 46.0,
+        "v_58": 40.0,
+        "v_77": 46.0,
+        "v_78": 46.0,
+        "v_95": 46.0
+      },
+      "placed_input_degs": {
+        "v_106": 2,
+        "v_3": 2,
+        "v_58": 2,
+        "v_77": 2,
+        "v_78": 2,
+        "v_95": 2
       },
       "env_cap": {
         "limit": 48.0,

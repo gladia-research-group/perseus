@@ -2455,6 +2455,8 @@
       },
       "num_offset": 0,
       "num_prescale": 0,
+      "num_raise_drop": 0,
+      "num_real_route": 0,
       "num_sparse": 3,
       "worst_sites": [
         {
@@ -2493,22 +2495,39 @@
           "step": "tail"
         }
       ],
+      "placed_input_level_hist": {
+        "32": 1,
+        "40": 1,
+        "48": 1,
+        "50": 2
+      },
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {},
       "blind_branches": {
         "count": 0,
         "vars": []
       },
       "placed_input_levels": {
-        "v_101": 26.0,
-        "v_24": 36.0,
-        "v_25": 36.0,
-        "v_57": 26.0,
-        "v_95": 26.0
+        "v_101": 30.0,
+        "v_24": 48.0,
+        "v_25": 46.0,
+        "v_57": 38.0,
+        "v_95": 48.0
+      },
+      "placed_input_degs": {
+        "v_101": 2,
+        "v_24": 2,
+        "v_25": 2,
+        "v_57": 2,
+        "v_95": 2
       },
       "env_cap": {
         "limit": 48.0,
         "relaxed": false,
         "vetoed_hints": [],
-        "placed_past_cap": [],
+        "placed_past_cap": [
+          "v_24"
+        ],
         "hints_predicted_past_cap": [],
         "reactive_past_cap": []
       },

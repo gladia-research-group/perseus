@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .ir import ADD_FAMILY, MULT_FAMILY, Graph, Node, is_literal_input, is_plaintext_name
 
@@ -13,9 +13,30 @@ class SimResult:
     node_out: dict[int, float]
     hint_fired: dict[int, bool]
     over_budget: list[tuple[int, float]]
+    #: pending-rescale degree of each node's output BEFORE any refresh override (node_out holds the level)
+    node_deg: dict[int, int] = field(default_factory=dict)
 
     def effective(self, v: str, unit: int) -> float:
         return self.consumed.get(v, 0.0) + (unit if self.deg.get(v, 1) == 2 else 0)
+
+    def input_state(self, g: Graph, v: str) -> tuple[float, int]:
+        """(consumed depth, pending-rescale degree) a refresh of `v` STARTS at: the producing node's own output
+        before the sim overwrote it with the landing, or, for a hint node, the ciphertext entering the hint.
+        `consumed[v]`/`deg[v]` are the landing for a placed site, which is the one level a refresh-envelope
+        check must not read. Unknown degree counts as pending (deg 2)."""
+        p = g.producer_of.get(v)
+        if p is not None and p.hint_level is not None and p.cipher_inputs:
+            src = p.cipher_inputs[0]
+            return self.consumed.get(src, 0.0), self.deg.get(src, 1)
+        if p is None or p.idx not in self.node_out:
+            return self.consumed.get(v, 0.0), self.deg.get(v, 1)
+        return self.node_out[p.idx], self.node_deg.get(p.idx, 2)
+
+    def input_eff(self, g: Graph, v: str, unit: int) -> float:
+        """Effective consumed depth a refresh of `v` STARTS at (`input_state`, plus one unit when a rescale is
+        pending): what the refresh envelope is measured in."""
+        c, d = self.input_state(g, v)
+        return c + (unit if d == 2 else 0)
 
 
 @dataclass(frozen=True)
@@ -78,6 +99,7 @@ def simulate(
         dg[v] = d
 
     node_out: dict[int, float] = {}
+    node_deg: dict[int, int] = {}
     hint_fired: dict[int, bool] = {}
     over: list[tuple[int, float]] = []
 
@@ -180,6 +202,7 @@ def simulate(
                 lc[n.output] += unit
                 dg[n.output] = 1
         node_out[n.idx] = c
+        node_deg[n.idx] = d
 
         b = budget.node_budget(
             n, is_terminal=(n is terminal),
@@ -189,4 +212,4 @@ def simulate(
             over.append((n.idx, c - b))
 
     return SimResult(consumed=lc, deg=dg, node_out=node_out,
-                     hint_fired=hint_fired, over_budget=over)
+                     hint_fired=hint_fired, over_budget=over, node_deg=node_deg)

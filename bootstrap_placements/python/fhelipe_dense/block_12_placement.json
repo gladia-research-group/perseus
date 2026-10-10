@@ -2484,6 +2484,8 @@
       },
       "num_offset": 0,
       "num_prescale": 0,
+      "num_raise_drop": 0,
+      "num_real_route": 0,
       "num_sparse": 0,
       "worst_sites": [
         {
@@ -2557,27 +2559,50 @@
           "step": "tail"
         }
       ],
+      "placed_input_level_hist": {
+        "40": 1,
+        "46": 2,
+        "48": 5,
+        "50": 2
+      },
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {},
       "blind_branches": {
         "count": 0,
         "vars": []
       },
       "placed_input_levels": {
-        "v_103": 36.0,
-        "v_108": 36.0,
-        "v_109": 36.0,
-        "v_110": 36.0,
-        "v_25": 36.0,
-        "v_57": 36.0,
-        "v_77": 36.0,
-        "v_78": 36.0,
-        "v_92": 36.0,
-        "v_93": 36.0
+        "v_103": 46.0,
+        "v_108": 48.0,
+        "v_109": 46.0,
+        "v_110": 46.0,
+        "v_25": 48.0,
+        "v_57": 38.0,
+        "v_77": 46.0,
+        "v_78": 46.0,
+        "v_92": 44.0,
+        "v_93": 44.0
+      },
+      "placed_input_degs": {
+        "v_103": 2,
+        "v_108": 2,
+        "v_109": 2,
+        "v_110": 2,
+        "v_25": 2,
+        "v_57": 2,
+        "v_77": 2,
+        "v_78": 2,
+        "v_92": 2,
+        "v_93": 2
       },
       "env_cap": {
         "limit": 48.0,
         "relaxed": false,
         "vetoed_hints": [],
-        "placed_past_cap": [],
+        "placed_past_cap": [
+          "v_108",
+          "v_25"
+        ],
         "hints_predicted_past_cap": [],
         "reactive_past_cap": [
           "v_24"

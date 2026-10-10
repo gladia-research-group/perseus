@@ -727,13 +727,28 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     _hint_covered = {n.output for n in g.nodes
                      if n.hint_level is not None and sim.hint_fired.get(n.idx) and n.output}
     _bad_reactive = []
+    _bad_nom: dict[str, float] = {}      # nominal input level of each entry in _bad_cut (eff = nominal + pending unit)
+    _refresh_obj = getattr(placer, "refresh", None)
     for _v, _c in sim.consumed.items():
+        if _v in placer.placed:
+            # a placed site's `consumed` is its LANDING; the envelope applies to the level its refresh STARTS
+            # at. Cut-chosen dense sites only: a deliberate fixed point is the capture's, a hint has its own
+            # check below, and the envelope was measured on the dense route (a sparse route tolerates a
+            # deeper input; its ceiling stays the runtime guard's, as before).
+            _p = g.producer_of.get(_v)
+            _sparse = _refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+            if _p is None or _p.is_deliberate_bts or _p.hint_level is not None or _sparse:
+                continue
+            _nom, _deg = sim.input_state(g, _v)
+            _eff = cfg.bootstrap_level + _nom + (cfg.level_unit if _deg == 2 else 0)
+            if _eff > _ENV_CAP + 1e-9:
+                _bad_cut.append((_v, _eff))
+                _bad_nom[_v] = cfg.bootstrap_level + _nom
+            continue
         _eff = cfg.bootstrap_level + _c + (cfg.level_unit if sim.deg.get(_v, 1) == 2 else 0)
         if _eff <= _ENV_CAP:
             continue
-        if _v in placer.placed:
-            _bad_cut.append((_v, _eff))
-        elif _v not in _hint_covered:
+        if _v not in _hint_covered:
             _bad_reactive.append((_v, _eff))
     # Hint-fired refreshes: `hint_fired` is keyed by node index, and the depth that
     # matters is the level of the ct entering the hint (its input var) — the hint's own
@@ -766,14 +781,27 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             f"stands between this plan and a wrong answer:\n  "
             + ", ".join(f"{v}@{l:g}" for v, l in _bad_cut[:6]))
     elif _bad_cut:
-        _msg = (f"P3c violated: {len(_bad_cut)} CUT-CHOSEN refresh(es) start past the "
-                f"measured envelope (abs level > {_ENV_CAP:g}) — a bootstrap there returns "
-                f"GARBAGE SILENTLY (rel_err 1.96e4 at level 50 vs 3.7e-1 at 48).\n  "
-                + ", ".join(f"{v}@{l:g}" for v, l in _bad_cut[:6])
-                + "  -> lower --max-level (ceiling is REFRESH_ENV_CAP_ABS + level_unit"
-                  f" = {_ENV_CAP + cfg.level_unit:g}), or PLAN_HARD_ENV_CAP=0 to allow"
-                  " (the 32-bit recipe does; the envelope is then the runtime guard's).")
-        raise PlanInfeasible(_msg)
+        # Cut-chosen sites priced inside the envelope that the FINAL sim puts past it: a later cut disarmed
+        # a hint upstream, or the raise-drop pass moved a landing below them. The cut never saw them
+        # there. The runtime guard reads the nominal level, so a site past the envelope only by its
+        # pending rescale runs (the shipped recipes carry such sites: report), while a nominal level past
+        # the cap stops the run with [bts_depth_error] (warn). PLAN_DRIFT_RECUT=1 re-cuts both.
+        _forced = getattr(placer, "drift_forced", set())
+        _stop = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) > _ENV_CAP + 1e-9]
+        _pend = [(v, l) for v, l in _bad_cut if _bad_nom.get(v, l) <= _ENV_CAP + 1e-9]
+        _tail = (f" ({sum(1 for v, _ in _bad_cut if v in _forced)} with no envelope-respecting cover)"
+                 if _forced else "") + "; PLAN_DRIFT_RECUT=1 re-cuts them."
+        if _stop:
+            log.warning(
+                f"[plan] P3c(drift): {len(_stop)} cut-chosen refresh(es) priced inside the envelope now "
+                f"start past it NOMINALLY (level > {_ENV_CAP:g}) in the final sim -- the runtime "
+                "[bts_depth_error] guard stops the run there: "
+                + ", ".join(f"{v}@{l:g}" for v, l in _stop[:6]) + _tail)
+        if _pend and cfg.verbose:
+            log.info(
+                f"[plan] P3c(drift): {len(_pend)} cut-chosen refresh(es) priced inside the envelope now "
+                f"start past it by their pending rescale (nominal <= {_ENV_CAP:g}, within the runtime "
+                "guard) in the final sim: " + ", ".join(f"{v}@{l:g}" for v, l in _pend[:6]) + _tail)
 
     # P4 — LINEAGE COVERAGE.
     # A branch that fed an over-budget op but was NEVER eligible for a cut is a branch the
@@ -813,9 +841,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # eff = nominal + pending rescale, as _capacity sees it.
     _hist: dict[str, int] = {}
     for _v in placer.placed:
-        _c = placer.placed_in_eff.get(_v)          # forced/pinned sites never went through the cut
-        if _c is None:
-            _c = sim.consumed.get(_v, 0.0) + (cfg.level_unit if sim.deg.get(_v, 1) == 2 else 0)
+        _c = sim.input_eff(g, _v, cfg.level_unit)   # the final sim, not the level the cut priced
         _key = str(int(cfg.bootstrap_level + _c))
         _hist[_key] = _hist.get(_key, 0) + 1
     _hist = dict(sorted(_hist.items(), key=lambda kv: int(kv[0])))
@@ -828,16 +854,18 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         "count": len(result_blind),
         "vars": result_blind[:32],
     }
-    # The absolute level the sim PREDICTS each placed refresh starts at, so a run can be
-    # audited against it (scripts/utils/bts_level_audit.py). The runtime prints the level it
-    # actually met as `[planted_bts] ... in=`; the two disagreeing is how a refresh ends up
-    # past the envelope on a plan that looked clean, which no placement policy can catch.
-    # (placed_input_level_hist holds the histogram of the same levels.)
-    result["summary"]["bts_quality"]["placed_input_levels"] = {
-        v: cfg.bootstrap_level + sim.consumed.get(v, 0.0)
-           + (cfg.level_unit if sim.deg.get(v, 1) == 2 else 0)
-        for v in sorted(placer.placed)
-    }
+    # The absolute level and pending-rescale degree the sim PREDICTS each placed refresh starts
+    # at, so a run can be audited against it (scripts/utils/bts_level_audit.py). The runtime
+    # prints what it actually met as `[planted_bts] ... in=<level> ... in_deg=<deg>`; the two
+    # disagreeing is how a refresh ends up past the envelope on a plan that looked clean, which
+    # no placement policy can catch. (placed_input_level_hist holds the effective levels, level
+    # plus one unit when a rescale is pending, which is what the envelope is measured in.)
+    result["summary"]["bts_quality"]["placed_input_levels"] = {}
+    result["summary"]["bts_quality"]["placed_input_degs"] = {}
+    for v in sorted(placer.placed):
+        _lvl, _deg = sim.input_state(g, v)
+        result["summary"]["bts_quality"]["placed_input_levels"][v] = float(cfg.bootstrap_level + _lvl)
+        result["summary"]["bts_quality"]["placed_input_degs"][v] = int(_deg)
     if _bad_reactive:
         log.warning(
             f"[plan] P3c(reactive): {len(_bad_reactive)} var(s) are predicted past the envelope "

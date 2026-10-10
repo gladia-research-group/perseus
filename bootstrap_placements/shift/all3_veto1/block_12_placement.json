@@ -4708,6 +4708,8 @@
       },
       "num_offset": 0,
       "num_prescale": 0,
+      "num_raise_drop": 0,
+      "num_real_route": 0,
       "num_sparse": 3,
       "worst_sites": [
         {
@@ -4743,6 +4745,8 @@
         "40": 1,
         "48": 2
       },
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {},
       "blind_branches": {
         "count": 19,
         "vars": [
@@ -4768,9 +4772,14 @@
         ]
       },
       "placed_input_levels": {
-        "v_3": 34.0,
-        "v_58": 24.0,
-        "v_95": 24.0
+        "v_3": 46.0,
+        "v_58": 38.0,
+        "v_95": 46.0
+      },
+      "placed_input_degs": {
+        "v_3": 2,
+        "v_58": 2,
+        "v_95": 2
       },
       "env_cap": {
         "limit": 48.0,

@@ -148,6 +148,10 @@ class Placer:
     #: through `_capacity`, so the envelope policy cannot price it; forcing it off hands the
     #: branch to the cut, which can.
     vetoed_hints: set[str] = field(default_factory=set)
+    #: Cut-chosen sites whose refresh input drifted past the envelope after they were priced (a later cut
+    #: disarmed a hint upstream) and that PLAN_DRIFT_RECUT could not re-cover: kept, reported by P3c as forced.
+    drift_forced: set[str] = field(default_factory=set)
+    _drift_rounds: int = 0
 
     placed: set[str] = field(default_factory=set)
     #: effective (pre-refresh) consumed depth of each placed site, as _capacity saw it
@@ -385,9 +389,39 @@ class Placer:
         self.refresh.step_bts_offset = self._step_offsets
 
         max_iters = 2 * len(self.g.nodes)
+        import os as _os
+        recut = _os.environ.get("PLAN_DRIFT_RECUT") == "1" and self._env_cap_hard
         for it in range(max_iters):
             sim = self._sim()
             if not sim.over_budget:
+                # A site is priced by `_capacity` at the level the sim showed when it was cut. A later cut can
+                # disarm a hint upstream of it (the hint's input drops below its trigger), and the depth the
+                # hint absorbed then lands on the site: legal when chosen, past the envelope now. With
+                # PLAN_DRIFT_RECUT=1, un-place such sites and let the cut cover the branch again under
+                # `_capacity`; if no envelope-respecting cover exists, keep them and report them as forced.
+                # Off by default: the shipped recipes carry such sites (the runtime guard reads the nominal
+                # level, which is what their refreshes meet) and a re-cut would rewrite their plans.
+                deep = [v for v in (self._deep_placed(sim) if recut and self._drift_rounds < 32 else [])
+                        if v not in self.drift_forced]
+                if deep:
+                    self._drift_rounds += 1
+                    saved = (set(self.placed), dict(self.placed_in_eff))
+                    for v in deep:
+                        self.placed.discard(v)
+                        self.placed_in_eff.pop(v, None)
+                    if self.verbose:
+                        log.info(f"[plan] {len(deep)} placed refresh(es) drifted past the envelope after a hint "
+                                 f"upstream stopped firing; un-placed, the cut re-covers them: "
+                                 + ", ".join(deep[:6]))
+                    try:
+                        return self._run_once()
+                    except PlanInfeasible:
+                        self.placed, self.placed_in_eff = saved
+                        self.drift_forced.update(deep)
+                        if self.verbose:
+                            log.info(f"[plan] no envelope-respecting cover for {len(deep)} drifted site(s); "
+                                     "kept as forced: " + ", ".join(deep[:6]))
+                        continue
                 if self.verbose:
                     log.info(f"[plan] feasible after {it} cut pass(es); "
                           f"{len(self.placed)} refresh(es) placed")
@@ -421,6 +455,22 @@ class Placer:
         raise PlanInfeasible(
             f"still {len(sim.over_budget)} op(s) over budget after {max_iters} passes — "
             "every remaining cut point is unrefreshable", refusals)
+
+    def _deep_placed(self, sim: SimResult) -> list[str]:
+        """Placed (cut-chosen) DENSE sites whose refresh now starts past the envelope.
+
+        The measured envelope is the dense route's. A sparse route raises less and tolerates a deeper input
+        (the shipped n32 plan runs 512-slot sites at 48 with a rescale pending), and its ceiling is not
+        measured, so those stay with the runtime guard.
+        """
+        out = []
+        for v in self.placed:
+            p = self.g.producer_of.get(v)
+            if p is None or p.is_deliberate_bts or p.hint_level is not None or self.refresh.spec(v).route:
+                continue
+            if self.bootstrap_level + sim.input_eff(self.g, v, self.g.level_unit) > refresh_env_cap() + 1e-9:
+                out.append(v)
+        return sorted(out)
 
     def _one_cut(self, sim: SimResult) -> list[str]:
         """Deep-operand wiring first, binding-operand-only as the fallback.
