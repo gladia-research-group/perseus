@@ -52,6 +52,13 @@ The three modes, the same loop the C++ / EncGPT2 run:
               live per block (strict: the op sequence must match the capture); CutMax is planned
               too when its plan is present; ``--no-plan-argmax`` runs it eager
 
+A capture spends most of its time decrypting every node for its magnitudes. ``--structure-only`` records the
+graph without them and ``capture_mags.py`` fills them from the numpy fake running the same kernels on the same token
+(perseus/impl/magtape.py: exact values, the nodes matched one by one by op type and step)::
+
+    run_decode --tokens 1 --capture graphs/X --structure-only    (add --argmax to capture CutMax)
+    capture_mags graphs/X [--argmax]
+
 Planning CutMax (block 13) is a second round, ``make_plan.sh <graph> <name> argmax``, from
 the same eager capture. Its entry is taken from the tail plan's exit (level and degree)
 rather than from the capture: what enters CutMax is what the planned tail produces, and a

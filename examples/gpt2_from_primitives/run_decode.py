@@ -32,6 +32,8 @@ def main(argv=None):
     ap.add_argument("--device", type=int, default=3)
     ap.add_argument("--argmax", action="store_true", help="also run the encrypted CutMax per token")
     ap.add_argument("--capture", default=None, help="graph dir: capture block graphs at token 0")
+    ap.add_argument("--structure-only", action="store_true",
+                    help="capture without the per-node magnitude decrypts (fast); fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
     ap.add_argument("--no-plan-argmax", action="store_true", help="run CutMax / feedback eager even if planned")
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS_PATH"))
@@ -98,6 +100,8 @@ def main(argv=None):
         return 3
     if a.capture:
         model.set_capture(a.capture)
+        if a.structure_only:
+            inf.fhe.magnitude_suppressed = True
     if a.plan:
         model.load_plans(a.plan, argmax_blocks=not a.no_plan_argmax)
 
