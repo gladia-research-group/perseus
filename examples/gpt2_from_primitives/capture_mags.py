@@ -19,6 +19,20 @@ import sys
 import time
 
 
+def fake_model(store_path, configs_path, packing):
+    """The GPT-2 port on the numpy fake at full size: (model, fhe, inf)."""
+    from perseus.impl import config, fake
+    from perseus.impl.layout import Dims
+    from . import weights
+    from .model import Gpt2Model
+    d = Dims.gpt2()
+    fhe, inf = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real,
+                              complex_payload=True)
+    model = Gpt2Model(inf, weights.RawStore(store_path), config.load_configs(configs_path), core=fake.core,
+                      packing=packing, kv_offload=False)
+    return model, fhe, inf
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("graph_dir")
@@ -39,20 +53,13 @@ def main(argv=None):
     if not a.configs:
         a.configs = "configs/model/approximation/gpt2_base_n32/configs.json"
     from perseus import _core
-    from perseus.impl import config, fake, magtape
-    from perseus.impl.layout import Dims
-    from . import weights
-    from .model import Gpt2Model
-    d = Dims.gpt2()
-    fhe, inf = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real,
-                              complex_payload=True)
+    from perseus.impl import magtape
+    model, fhe, inf = fake_model(a.weights, a.configs, a.packing)
     tape = magtape.attach(fhe, inf)
-    model = Gpt2Model(inf, weights.RawStore(a.weights), config.load_configs(a.configs), core=fake.core,
-                      packing=a.packing, kv_offload=False)
-    tapes = magtape.tape_stages(model, tape, 0)
+    tapes = magtape.tape_stages(model, tape, a.pos)
     os.environ.setdefault("STEPS_T", "128")
-    os.environ["MULTI_T"] = "1"
-    rows = _core.read_teacher_forced_inputs(_core.RunConfig.from_env())[:1]
+    os.environ["MULTI_T"] = str(a.pos + 1)
+    rows = _core.read_teacher_forced_inputs(_core.RunConfig.from_env())[:a.pos + 1]
     t0 = time.time()
     model.run_decode(rows, argmax=a.argmax)
     print(f"[mags] fake tape: {len(tapes)} stages, {sum(map(len, tapes.values()))} records, {time.time() - t0:.0f}s",

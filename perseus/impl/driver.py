@@ -91,6 +91,41 @@ class ImplModel:
         `kv_offload` they are parked in the pinned KV arena between the stage's uses."""
         return None
 
+    def replay_kv_pushes(self, payloads, level=36):
+        """Fill the caches with positions 0..n-1 computed elsewhere (a numpy fake run, a public prefix): every
+        position's pushes are replayed on this session from its payloads (attention.kv_push's `payload_log`),
+        each encrypted as a public value (a fresh encryption of zero plus it) at `level`. The pushes themselves
+        (refresh, masks, bucketing) run here, so the caches carry this session's levels, degrees and pack tags.
+        `payloads[b]` is block b's log. Run after start(); decode then begins at position n."""
+        import numpy as np
+        from .attention import kv_push
+        ops = self.rt.ops
+        zero = np.zeros(self.rt.dims.dim)
+
+        def enc(v):
+            ct = ops.add_pt(self.core.encode_token_input(self.inf, zero), np.asarray(v))
+            return ops.level_drop(ct, level)
+        n = len(payloads[0]) if payloads else 0
+        for pos in range(n):
+            self.rt.declare_step(pos, self.step_masks(pos))
+            self.rt.begin_step(pos)
+            for b, (kv, log) in enumerate(zip(self.kv, payloads)):
+                p = log[pos]
+                with self.rt.step(f"blk{b}"), self.rt.step("kv_push"):
+                    kv_push(self.rt, kv, tuple(enc(c) for c in p) if isinstance(p, tuple) else enc(p))
+        if self.kv_offload:
+            # parked as a decode leaves them: in the pinned KV arena, reloaded by the stage loop
+            ops.device_sync()
+            for i in range(len(self.kv)):
+                caches = self.stage_caches(i)
+                if caches and caches[0]:
+                    cts, ks = caches
+                    self.inf.kv_store(cts, ks)
+                    self.inf.kv_sync()
+                    self.inf.kv_evict(cts)
+                    self._parked[i] = set(ks)
+        return n
+
     def start(self):
         """Reset per-sequence state (K/V caches, seeds)."""
 

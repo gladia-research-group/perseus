@@ -528,6 +528,27 @@ def softmax_v(rt, kv: KVCache, probs):
     return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
 
 
+def kv_push(rt, kv, payload, q=None):
+    """Push one token into the caches: `payload` is the fused K + iV linear output (a ComplexKVCache) or (k, v).
+    `q` (QKV_LANES): the Q linear output riding the same refresh; the refreshed Q is returned (else None).
+    A cache with a `payload_log` list (the fake's prefix run) also keeps a copy of the payload's slot vectors, to
+    replay the pushes on another session (driver.ImplModel.replay_kv_pushes; a replay pushes without Q, which
+    leaves the K / V lanes and their levels as they are)."""
+    ops = rt.ops
+    log = getattr(kv, "payload_log", None)
+    if log is not None:
+        import numpy as np
+        vec = lambda c: np.array(getattr(c, "vec", c))
+        log.append(vec(payload) if isinstance(kv, ComplexKVCache) else tuple(vec(c) for c in payload))
+    if isinstance(kv, ComplexKVCache):
+        return cache_kv_push_packed_complex(rt, kv, payload, q)
+    elif ops.complex_payload:
+        cache_kv_push_pair(rt, kv, *payload)           # one bootstrap for K and V
+    else:
+        cache_k_push(rt, kv, payload[0])
+        cache_v_push(rt, kv, payload[1])
+
+
 def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
     """src/model/mha.cu: qkv -> cache push -> attention core -> out projection.
     ``w`` has .q .k .v .out (EncodedLinear), or .kv (the fused K + iV linear) and .q for
@@ -546,14 +567,9 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
             k, v, q = linear_multi(rt, x, [w.k, w.v, w.q])
     with rt.step("kv_push"):
         if qkvl:
-            q = cache_kv_push_packed_complex(rt, kv, P, q)
-        elif cplx:
-            cache_kv_push_packed_complex(rt, kv, P)
-        elif ops.complex_payload:
-            cache_kv_push_pair(rt, kv, k, v)           # one bootstrap for K and V
+            q = kv_push(rt, kv, P, q)
         else:
-            cache_k_push(rt, kv, k)
-            cache_v_push(rt, kv, v)
+            kv_push(rt, kv, P if cplx else (k, v))
     # the q.K^T issues one product per cache group: its op count is the cache's shape
     shape = (f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if cplx else f"{len(kv.k_groups)}") \
         if getattr(rt, "scoped_names", False) else None

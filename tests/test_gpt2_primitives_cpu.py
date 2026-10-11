@@ -797,3 +797,32 @@ def test_unit_seed_newton_matches_ones_ciphertext():
     np.testing.assert_allclose(b.vec, a.vec, rtol=1e-12, atol=1e-12)
     assert b.level == a.level - fhe.unit                     # the folded first iteration: one level fewer
     assert fhe.calls.count("mult_cc") == 3 * 4               # three products per remaining iteration
+
+
+@pytest.mark.parametrize("complex_packing", [False, True])
+def test_replay_kv_pushes(complex_packing):
+    """ImplModel.replay_kv_pushes: the payloads one session logs (attention.kv_push) rebuild the same caches,
+    vectors and counts, when replayed on another."""
+    from perseus.impl.driver import ImplModel
+    rt, fhe, inf = _rt(complex_payload=True)
+    d = rt.dims
+    rng = np.random.default_rng(29)
+    Cache = attention.ComplexKVCache if complex_packing else attention.KVCache
+    src = [Cache(d.d_head) for _ in range(2)]
+    for kv in src:
+        kv.payload_log = []
+    for _ in range(d.t + 3):
+        for kv in src:
+            k, v = (layout.lane_vec(rng.standard_normal(d.hid) * 0.5, d.N, d.t) for _ in range(2))
+            p = fake.FakeCt(k + 1j * v, 34) if complex_packing else (fake.FakeCt(k, 34), fake.FakeCt(v, 34))
+            attention.kv_push(rt, kv, p)
+    _fhe2, inf2 = fake.make_fake(complex_payload=True)
+    m = ImplModel(inf2, core=fake.core, kv_offload=False)
+    m.kv = [Cache(d.d_head) for _ in range(2)]
+    assert m.replay_kv_pushes([kv.payload_log for kv in src], level=36) == d.t + 3
+    for a, b in zip(src, m.kv):
+        assert (a.k_count, a.v_count) == (b.k_count, b.v_count)
+        ca, ka = a.cts("p."); cb, kb = b.cts("p.")
+        assert ka == kb
+        for x, y in zip(ca, cb):
+            np.testing.assert_allclose(y.vec, x.vec, atol=1e-9)

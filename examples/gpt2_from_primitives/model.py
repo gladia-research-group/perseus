@@ -220,12 +220,18 @@ class Gpt2Model(ImplModel):
         return decode_z(self.rt, z, self.vocab, self.W_tile)
 
     # ── drivers ──
-    def run_decode(self, inputs, gt_logits=None, on_token=None, argmax=False):
+    def run_decode(self, inputs, gt_logits=None, on_token=None, argmax=False, first=0):
         """Teacher-forced decode (src/app/pipeline.cu): one forward per oracle row,
-        logits decrypted per token, optional CutMax on the tiles. Returns per-token dicts."""
-        self.start()
+        logits decrypted per token, optional CutMax on the tiles. Returns per-token dicts.
+        `first` > 0: positions before it are already in the caches (replay_kv_pushes)."""
+        if first == 0:
+            self.start()
+        else:
+            self.ones = None
         results = []
         for t, row in enumerate(inputs):
+            if t < first:
+                continue
             self.token_begin(t)
             x = self.encode_input(row)
             tiles = self.decode_token(x, t)

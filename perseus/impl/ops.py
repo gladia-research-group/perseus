@@ -324,6 +324,12 @@ class FheOps:
         self.core.realize_pending_rescale(self.inf, a)
         return a
 
+    def level_drop(self, a, level):
+        """In place: drop `a` to `level` (a value-preserving modulus reduction) if it is above it."""
+        if hasattr(self.fhe, "drop_to_level"):
+            self.fhe.drop_to_level(a, int(level))
+        return a
+
     # data plane
     def encode_token(self, x): return self.core.encode_token_input(self.inf, np.asarray(x, dtype=np.float64))
     def pack_tokens(self, rows, level): return self.core.pack_tokens(self.inf, np.asarray(rows, dtype=np.float64), int(level))
@@ -378,5 +384,6 @@ class NumpyOps:
         return a
     def suppress_auto_bts(self): return contextlib.nullcontext()
     def realize(self, a): return a
+    def level_drop(self, a, level): return a
 
 

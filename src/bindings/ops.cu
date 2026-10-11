@@ -198,6 +198,10 @@ void bind_ops(py::module_& m) {
              py::arg("ct"), py::arg("level_threshold"), py::arg("account_pending_rescale") = false,
              py::arg("iterations") = 1,
              "Bootstrap `ct` if its level exceeds `level_threshold`; iterations=2 as for bootstrap.")
+        .def("drop_to_level", static_cast<void (CKKSContext::*)(PackedCtx&, int)>(&CKKSContext::drop_to_level),
+             py::arg("ct"), py::arg("level"), kRelease,
+             "Drop `ct` to `level` in place (a value-preserving modulus reduction, recorded as "
+             "level_reduce) when it is above it; level_hint only records a planner hint.")
         .def("level_hint", static_cast<void (CKKSContext::*)(PackedCtx&, int)>(&CKKSContext::level_hint),
              py::arg("ct"), py::arg("level"), "Drop `ct` to `level` if it is above it.")
         // ── leaf primitives for Python-authored ops ────────────────────────────

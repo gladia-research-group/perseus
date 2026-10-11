@@ -32,6 +32,11 @@ def main(argv=None):
     ap.add_argument("--device", type=int, default=3)
     ap.add_argument("--argmax", action="store_true", help="also run the encrypted CutMax per token")
     ap.add_argument("--capture", default=None, help="graph dir: capture block graphs at token 0")
+    ap.add_argument("--fake-prefix", type=int, default=0, metavar="N",
+                    help="run positions 0..N-1 on the numpy fake (CPU) and start the device at N from their caches "
+                         "(their K/V pushes replayed from payloads encrypted as public values at --prefix-level): a capture of position N without "
+                         "decoding the positions before it")
+    ap.add_argument("--prefix-level", type=int, default=36, help="the level of the replayed push payloads")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts (fast); fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
@@ -144,8 +149,21 @@ def main(argv=None):
             line += f" cutmax={r['cutmax']} {'OK' if r['cutmax'] == r['top1'] else 'MISS'} z_mass={r['z_mass']:.4f} argmax={r['argmax_s']:.1f}s bts={r.get('argmax_bts', '?')}"
         print(line, flush=True)
 
+    first = 0
+    if a.fake_prefix:
+        # the fake's run needs the session's switches, already exported above
+        from .capture_mags import fake_model
+        t0 = time.time()
+        fmodel, _ffhe, _finf = fake_model(a.weights, a.configs, a.packing)
+        for kv in fmodel.kv:
+            kv.payload_log = []
+        fmodel.run_decode(inputs[:a.fake_prefix])
+        model.start()
+        first = model.replay_kv_pushes([kv.payload_log for kv in fmodel.kv], a.prefix_level)
+        print(f"[impl] positions 0..{first - 1} on the fake, their pushes replayed from level {a.prefix_level} "
+              f"({time.time() - t0:.0f}s)", flush=True)
     t0 = time.time()
-    res = model.run_decode(inputs, gt_logits, on_token=on_token, argmax=a.argmax)
+    res = model.run_decode(inputs, gt_logits, on_token=on_token, argmax=a.argmax, first=first)
     ok, bad = dist_gate(res)
     hits = sum(1 for r in res if r.get("hit"))
     kls = sorted(r["kl"] for r in res if "kl" in r)
