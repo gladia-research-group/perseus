@@ -61,6 +61,30 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     return ops.mult(centered, inv)
 
 
+def rms_norm(rt, x, cfg: NormCfg, pos: int):
+    """RMSNorm without its gamma (the next linear carries gamma / inv_out_scale):
+    inv_out_scale * x / sqrt(mean(x^2) + eps) on the lanes. The norm() pipeline minus the mean:
+    the centering scale c, the all-slot ladder of (c x)^2, and the Chebyshev seed + Newton
+    inverse sqrt of z = c^2 (mean(x^2) + eps) (LN_CHEB's path; the config carries no Remez
+    seed). The 1/d of the mean rides the seed's interval and the Newton constant, so the sum
+    S = sum (c x)^2 + d eps c^2 enters both directly (examples/rmsnorm_from_primitives.py)."""
+    ops, d = rt.ops, rt.dims
+    N, t, dr = d.N, d.t, d.dim
+    if not cfg.cheb_coeffs:
+        raise ValueError("rms_norm: the config has no Chebyshev seed (cheb_coeffs)")
+    c2 = cfg.c_eff_sq(pos)
+    c = math.sqrt(c2)
+    x2 = im_cleanse(ops, x)
+    xs = rt.mult_mask(x2, ("ln.center", c), lambda: active_token_mask(N, dr, t, 0.5 * c))
+    S = ops.tag_reduce(rotsum(ops, ops.square(xs), 1, N), 1)       # broadcast constant
+    S = ops.add(S, dr * cfg.epsilon * c2)
+    init = eval_chebyshev(ops, S, cfg.cheb_coeffs, dr * cfg.cheb_lo, dr * cfg.cheb_hi)
+    inv = inv_sqrt_newton_d2(ops, S, init, cfg.cheb_nr_iters,
+                             1.0 / (dr * cfg.inv_out_scale * cfg.inv_out_scale))
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(xs, inv)
+
+
 def _lane(rt, tag, part, v):
     """`lane_vec(v)` memoised per site. The slot plaintext behind it is encoded once, but the
     numpy lane vector was being rebuilt (a scatter over N slots) at every visit."""

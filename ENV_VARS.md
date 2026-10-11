@@ -101,6 +101,11 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `GPT2_LMHEAD_GRANULARITY` | `plaintext` or `linear` weight granularity for the LM head. |
 | `GPT2_PREFILL_GRANULARITY` | Same for the prefill linears. |
 | `IMPL_SCOPED_NAMES` | Step-scoped ciphertext names (`<step path>_<n>` on a per-step counter, the q.K^T scope keyed by the cache's group count) so one plan stays bound at every cache length; use with `SM_PERIODIC=0` (Python implementation; default 0, off for plans that do not declare it). |
+| `IMPL_PT_SUM_FUSED` | A streamed weight's inner sums encoded on the device from its raw slot rows (`Inference.mult_pt_sum_raw`) instead of host plaintexts; superseded by the coefficient rows (Python implementation; default 0). |
+| `LLAMA_MODEL` | Llama checkpoint the Llama port reads (HF repo id or directory; default `meta-llama/Llama-3.1-8B`). |
+| `LLAMA_PACKING` | Slot packing of the Llama port (`cachemir_complex`, default, or `cachemir`). |
+| `LLAMA_LINEAR_BOTTOM` | Llama port: every projection runs at the bottom of the chain (input dropped to one level above the refresh limit), its output refreshed where it lands (default 0). |
+| `LLAMA_PLAN_SPARSE_SLOTS` | Llama `make_plan.sh`: the sparse routes the plan may use (default `256,1`, from Llama's 256-slot attention block). |
 | `KV_LANES` | The K + iV linear output refreshed as one real payload, K on token lane 0 and V on lane 1, by the real-payload route instead of a complex refresh (Python implementation; default 1, off for plans that do not declare it). |
 | `QKV_LANES` | The Q linear output rides the K/V push refresh on token lane 2 (one real refresh for Q, K and V), and the qkv / up input hints fire only past the session limit, so both linears run on the LayerNorm output as is and their OUTPUT is refreshed at the top of the envelope (Python implementation; default 1, off for plans that do not declare it; the plan's runtime line carries `BTS_MAX_INPUT_LEVEL=50` for the up output at nominal 50). |
 | `CHEB_BSGS` | Every Chebyshev series (the GELU's P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step giant-step: a degree-31 series costs 11 ciphertext products instead of 30 at the same depth (Python implementation; default 1, off for plans that do not declare it). |
@@ -120,6 +125,8 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_STAGE_RELEASE_CPU` | Release the host copy of a staged plaintext after upload. |
 | `FIDESLIB_GPU_ENCODE` | Encode full-slot plaintexts on the GPU; an evicted one reloads from a pinned dump of its first composite group, lifted back on the GPU (on in the GPT-2 port's environment). |
 | `FIDESLIB_GPU_ENCODE_CHECK` | Check every such reload against a fresh device encode, limb for limb. |
+| `PERSEUS_LLAMA_CACHE` | Disk cache of the Llama slot vectors and their coefficient rows (default `$HF_HOME/perseus/llama_slots`; ~75 GB). |
+| `FIDESLIB_COEFF_CHUNK` | Plaintexts per batch of a coefficient-row weight sum (`EvalMultCoeffRowsSum`: rounding, one NTT launch, one fused product kernel; default 16, at most 32). |
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
 | `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
@@ -148,3 +155,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_GRAPH_CAPTURE_TOKEN` | Capture the op-graph of one token only. |
 | `FHE_PROFILE` | Per-operation timing table on stderr (default off). |
 | `FHE_PROFILE_TOKEN` | Restrict that profile to one token index. |
+| `IMPL_PROFILE_SYNC` | `run_decode --profile` (Python implementation): a device fence after every timed primitive, so each is charged its own GPU time. |
+| `PT_SUM_TIMING` | Host-side timing of the streamed-weight inner sums on stderr. |
+| `PLAN_TRACE_STEP` | Every op recorded in that step path (e.g. `blk0.softmax`), as executed, on stderr (plan/run divergence hunts). |
+| `PLAN_TRACE_DECRYPT` | With `PLAN_TRACE_STEP`: also each traced op's decrypted max \|z\| and max \|Im\| (where a planned run's values go wrong). |

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from .config import SoftmaxCfg
 from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_mask,
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
@@ -119,6 +121,65 @@ def _hrs_seed_item(d, seed: float, site: str):
     return (site, seed), lambda: seed * hrs_pos0(d)
 
 
+class Rope:
+    """Rotary position embedding (RoPE, the rotate-half convention of HF Llama) on the
+    head-interleaved cachemir layout. Feature r = lane * H + h sits at slot r * t, so lane j of
+    every head lives in the slot block [j tH, (j + 1) tH) and its rotary partner, lane j +- d_head/2,
+    is exactly N/2 slots away: rope(x) = x cos + rotate(x, N/2) sin', with sin' = -sin on the
+    first half of the lanes and +sin on the second. The cos / sin' vectors fold into the selection
+    mask the site multiplies by anyway (the q tok0 mask, the K push mask), so RoPE costs one
+    rotation and one plaintext product, no level. `inv_freq`: the d_head/2 frequencies (HF's
+    rotary_emb.inv_freq, scaling included)."""
+
+    def __init__(self, inv_freq):
+        self.inv_freq = tuple(float(f) for f in inv_freq)
+
+    def lane_cs(self, d, pos: int):
+        if d.d_head_real != d.d_head or 2 * len(self.inv_freq) != d.d_head:
+            raise ValueError(f"RoPE needs unpadded heads and d_head/2 frequencies "
+                             f"(d_head={d.d_head}, real {d.d_head_real}, {len(self.inv_freq)} freqs)")
+        ang = pos * np.asarray(self.inv_freq)
+        c, sn = np.cos(ang), np.sin(ang)
+        return np.concatenate([c, c]), np.concatenate([-sn, sn])
+
+    def slot_vecs(self, d, pos: int):
+        """(cos, sin') per slot: lane j = slot // tH."""
+        c, sn = self.lane_cs(d, pos)
+        return np.repeat(c, d.tH), np.repeat(sn, d.tH)
+
+
+def _rope_items(rt, rope, pos, site, base_build):
+    d = rt.dims
+    def build(k):
+        return lambda: rope.slot_vecs(d, pos)[k] * base_build()
+    return [((site + ".rope.c", pos), build(0)), ((site + ".rope.s", pos), build(1))]
+
+
+def rope_mask(rt, x, site, base_build, rope=None, pos=None):
+    """rt.mult_mask(x, site, base_build), with RoPE at position `pos` folded in when `rope` is
+    given: x (base cos) + rotate(x, N/2) (base sin')."""
+    if rope is None:
+        return rt.mult_mask(x, site, base_build)
+    (kc, bc), (ks, bs) = _rope_items(rt, rope, pos, site, base_build)
+    a = rt.mult_mask(x, kc, bc)
+    b = rt.mult_mask(rt.ops.rotate(x, rt.dims.N // 2), ks, bs)
+    return rt.ops.add(a, b)
+
+
+def rope_step_masks(rt, rope, pos: int, packing: str = "cachemir"):
+    """The per-step RoPE masks of position `pos`: the q.K^T query mask and the K push mask of
+    `packing` ("cachemir" on a complex payload pushes K + iV; "cachemir_complex"; "real")."""
+    d = rt.dims
+    if packing == "cachemir_complex" and getattr(rt.ops, "kv_lanes", False):
+        packing = "cachemir_complex.lanes"
+    push = {"cachemir_complex": ("kpush.tok0h", lambda: real_head_half_mask(d)),
+            "cachemir_complex.lanes": ("kpush.tok0", lambda: real_head_tok0_mask(d)),
+            "cachemir": ("kpush.tok0h.c", lambda: 0.5 * real_head_half_mask(d)),
+            "real": ("kpush.tok0h", lambda: real_head_half_mask(d))}[packing]
+    return (_rope_items(rt, rope, pos, "tok0", lambda: real_head_tok0_mask(d))
+            + _rope_items(rt, rope, pos, *push))
+
+
 class KVCache:
     """One block's caches: K accumulated t tokens per group ciphertext, V scattered over
     d_head lane ciphertexts (cachemir_kv_cache.cu)."""
@@ -182,7 +243,7 @@ def _vpair_item(d, i_re: int, i_im: int, rr: int, kv_lanes: bool):
     return ("v.cpc", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr)
 
 
-def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None):
+def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None, pos=None):
     """cache_kv_push_packed_complex: the fused K + iV linear output refreshed by ONE
     bootstrap, split by conjugation (2K on the real axis, -2iV on the imaginary one), K
     masked and bucketed (odd groups packed by the monomial i), V realified (times i, the
@@ -207,14 +268,14 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None):
         ops.bootstrap_real(X)
         if q is not None:
             q_out = ops.rotate(X, 2)        # lane 2 back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
-        K = rt.mult_mask(X, "kpush.tok0", lambda: real_head_tok0_mask(d))
+        K = rope_mask(rt, X, "kpush.tok0", lambda: real_head_tok0_mask(d), rope, pos)
     else:
         P = ops.copy(P_in)
         ops.bootstrap(P)
         conj = ops.conjugate(P)
         K = ops.add(P, conj)                               # 2 K_raw
         V = ops.sub(conj, P)                               # -2i V_raw, realified by the monomial i
-        K = rt.mult_mask(K, "kpush.tok0h", lambda: real_head_half_mask(d))
+        K = rope_mask(rt, K, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
     K = ops.rotate(K, -(kv.k_count % d.t))
     # bucket_k_complex
     if kv.k_count % d.t == 0:
@@ -261,12 +322,12 @@ def _pack_k_pair(ops, kv: ComplexKVCache, d):
         kv.k_pend.clear()
 
 
-def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0):
+def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None):
     """complex_qkt (cachemir_complex_attention.cu): one product per K bucket serves two
     token groups; the even group's scores come out of 2 Re, the odd group's out of the
     imaginary axis through the odd mask; pending real groups run the real q.K^T."""
     ops, d = rt.ops, rt.dims
-    q = rt.mult_mask(query, "tok0", lambda: real_head_tok0_mask(d))
+    q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
     q = rotsum_neg(ops, q, d.t)
     kc = kv.k_count
     attn = None
@@ -356,10 +417,10 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs):
     return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
 
 
-def cache_k_push(rt, kv: KVCache, key):
+def cache_k_push(rt, kv: KVCache, key, rope=None, pos=None):
     """cachemir_kv_cache.cu: mask, rotate, bootstrap, im_cleanse, accumulate."""
     ops, d = rt.ops, rt.dims
-    m = rt.mult_mask(key, "kpush.tok0h", lambda: real_head_half_mask(d))
+    m = rope_mask(rt, key, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
     # the C++ rotates unconditionally (a rotation by 0 at the first token of a group), which
     # keeps the op sequence, hence the graph variable names a plan pins, identical per token
     r = ops.rotate(m, -(kv.k_count % d.t))
@@ -390,13 +451,13 @@ def cache_v_push(rt, kv: KVCache, value):
     kv.v_count += 1
 
 
-def cache_kv_push_pair(rt, kv: KVCache, key, value):
+def cache_kv_push_pair(rt, kv: KVCache, key, value, rope=None, pos=None):
     """cachemir_kv_cache.cu, the complex-payload arm (CKKS_COMPLEX=1, "Mode-A"): K
     and V are packed as K + iV, refreshed by ONE bootstrap and split by conjugation. The K
     mask carries an extra 0.5 (its 2 Re doubling happens before the pack), the V lanes are
     selected on the imaginary axis (2i V times -0.5 i = V)."""
     ops, d = rt.ops, rt.dims
-    m = rt.mult_mask(key, "kpush.tok0h.c", lambda: 0.5 * real_head_half_mask(d))
+    m = rope_mask(rt, key, "kpush.tok0h.c", lambda: 0.5 * real_head_half_mask(d), rope, pos)
     r = ops.rotate(m, -(kv.k_count % d.t))
     rr = kv.v_count % d.t
     v = ops.rotate(value, -rr) if rr else ops.copy(value)
@@ -423,10 +484,10 @@ def cache_kv_push_pair(rt, kv: KVCache, key, value):
     kv.v_count += 1
 
 
-def qkt(rt, kv: KVCache, query, scale: float = 1.0):
+def qkt(rt, kv: KVCache, query, scale: float = 1.0, rope=None, pos=None):
     """cachemir_attention.cu: scores at slot g*tH + h*t + tok%t."""
     ops, d = rt.ops, rt.dims
-    q = rt.mult_mask(query, "tok0", lambda: real_head_tok0_mask(d))
+    q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
     q = rotsum_neg(ops, q, d.t)
     attn = None
     per = sm_periodic(rt, kv.k_count)
@@ -610,12 +671,12 @@ def softmax_v(rt, kv: KVCache, probs):
     return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
 
 
-def kv_push(rt, kv, payload, q=None):
+def kv_push(rt, kv, payload, q=None, rope=None, pos=None):
     """Push one token into the caches: `payload` is the fused K + iV linear output (a ComplexKVCache) or (k, v).
     `q` (QKV_LANES): the Q linear output riding the same refresh; the refreshed Q is returned (else None).
     A cache with a `payload_log` list (the fake's prefix run) also keeps a copy of the payload's slot vectors, to
     replay the pushes on another session (driver.ImplModel.replay_kv_pushes; a replay pushes without Q, which
-    leaves the K / V lanes and their levels as they are)."""
+    leaves the K / V lanes and their levels as they are). `rope` / `pos`: RoPE of K at position `pos`."""
     ops = rt.ops
     log = getattr(kv, "payload_log", None)
     if log is not None:
@@ -623,19 +684,27 @@ def kv_push(rt, kv, payload, q=None):
         vec = lambda c: np.array(getattr(c, "vec", c))
         log.append(vec(payload) if isinstance(kv, ComplexKVCache) else tuple(vec(c) for c in payload))
     if isinstance(kv, ComplexKVCache):
-        return cache_kv_push_packed_complex(rt, kv, payload, q)
+        return cache_kv_push_packed_complex(rt, kv, payload, q, rope=rope, pos=pos)
     elif ops.complex_payload:
-        cache_kv_push_pair(rt, kv, *payload)           # one bootstrap for K and V
+        cache_kv_push_pair(rt, kv, *payload, rope=rope, pos=pos)   # one bootstrap for K and V
     else:
-        cache_k_push(rt, kv, payload[0])
+        cache_k_push(rt, kv, payload[0], rope=rope, pos=pos)
         cache_v_push(rt, kv, payload[1])
 
 
-def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
+def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
+        pre_linear=None):
     """src/model/mha.cu: qkv -> cache push -> attention core -> out projection.
     ``w`` has .q .k .v .out (EncodedLinear), or .kv (the fused K + iV linear) and .q for
-    the cachemir_complex packing, whose ``kv`` is a ComplexKVCache."""
+    the cachemir_complex packing, whose ``kv`` is a ComplexKVCache. ``rope``: rotary position
+    embedding of q and K at position ``pos`` (folded into their selection masks). ``pre_linear``:
+    called on each projection's input after its refresh hint (e.g. a level drop that runs the
+    projection at the bottom of the chain)."""
+    if rope is not None and pos is None:
+        raise ValueError("mha: RoPE needs the token position")
+    rp = dict(rope=rope, pos=pos)
     ops = rt.ops
+    tap = getattr(rt, "tap", None) or (lambda name, ct: None)     # debug hook (the model's taps)
     cplx = isinstance(kv, ComplexKVCache)
     qkvl = cplx and getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
     with rt.step("qkv"):
@@ -643,28 +712,38 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
         # output as is and its output, K, V and Q on three token lanes, is what the push refreshes (one unit deeper:
         # the lane masks), at the top of the envelope
         ops.bootstrap_hint(x, ops.headroom(0 if qkvl else 1), True)
+        if pre_linear is not None:
+            x = pre_linear(x)
         if cplx:
             P, q = linear_multi(rt, x, [w.kv, w.q])
         else:
             k, v, q = linear_multi(rt, x, [w.k, w.v, w.q])
+    tap("attn.q", q)
+    tap("attn.kv", P if cplx else k)
     with rt.step("kv_push"):
         if qkvl:
-            q = kv_push(rt, kv, P, q)
+            q = kv_push(rt, kv, P, q, **rp)
         else:
-            kv_push(rt, kv, P if cplx else (k, v))
+            kv_push(rt, kv, P if cplx else (k, v), **rp)
     # the q.K^T issues one product per cache group: its op count is the cache's shape
     shape = (f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if cplx else f"{len(kv.k_groups)}") \
         if getattr(rt, "scoped_names", False) else None
     with rt.step("qkt", shape=shape):
         a = sm_fold_affine(rt, sm_cfg)[0]
-        scores = complex_qkt(rt, kv, q, a) if cplx else qkt(rt, kv, q, a)
+        scores = complex_qkt(rt, kv, q, a, **rp) if cplx else qkt(rt, kv, q, a, **rp)
         folded = bool(getattr(ops, "sm_fold", False))
+    tap("attn.q_pushed", q)
+    tap("attn.scores", scores)
     with rt.step("softmax"):
         probs = softmax_thor(rt, scores, sm_cfg, kv.k_count, folded)
+    tap("attn.probs", probs)
     with rt.step("softmax_v"):
         x = complex_softmax_v(rt, kv, probs) if cplx else softmax_v(rt, kv, probs)
+    tap("attn.pv", x)
     with rt.step("out_proj"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
+        if pre_linear is not None:
+            x = pre_linear(x)
         return linear(rt, x, w.out)
 
 

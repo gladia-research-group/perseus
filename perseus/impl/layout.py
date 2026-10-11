@@ -186,6 +186,53 @@ def encode_weight_matrix_outputpack(W, N: int, d_in: int, d_out: int) -> np.ndar
     return pt
 
 
+@functools.lru_cache(maxsize=8)
+def weight_index(N: int, d_in: int, d_out: int, outputpack: bool = False):
+    """The gather behind encode_weight_matrix (and _outputpack): the flat index row * d_out +
+    col of W each plaintext slot reads, as an (n_pt, N) int32 array (a pair of them, the real
+    and imaginary lanes, for `outputpack`). It depends on the shape only, so a model whose layers
+    share shapes builds each once and encodes a matrix as one take (a Llama-sized layer is ~4.6k
+    plaintexts; the per-plaintext index arithmetic dominated its encode)."""
+    p = cm_params(N, d_in, d_out)
+    M_out = N // p.tp_out
+    cascade_shift = (p.t * p.tp) // p.tp_out
+    i = np.arange(N)
+    ks = [(2 * k, 2 * k + 1) for k in range(p.r_o // 2)] if outputpack else [(k,) for k in range(p.r_o)]
+    if outputpack and p.r_o % 2:
+        raise ValueError(f"output pack needs an even r_o, got {p.r_o}")
+    out = [np.empty((p.r_i * len(ks), N), dtype=np.int32) for _ in ks[0]]
+    for j in range(p.r_i):
+        g = j // p.bstep_c
+        ip = (i - g * p.bstep_c * p.t * p.t) % N
+        row = ((ip // p.t + j * p.t + ip % p.tp_in) % p.d) + ((ip % p.t) // p.tp_in) * p.d
+        for kk, group in enumerate(ks):
+            for lane, k in enumerate(group):
+                col = interleave_idx((ip // p.tp_out - k * cascade_shift) % M_out, p.d, d_out)
+                out[lane][j * len(ks) + kk] = row * d_out + col
+    for a in out:
+        a.setflags(write=False)
+    return tuple(out) if outputpack else out[0]
+
+
+def encode_weight_matrix_fast(W, N: int, d_in: int, d_out: int, outputpack: bool = False) -> np.ndarray:
+    """encode_weight_matrix / encode_weight_matrix_outputpack through weight_index: the same
+    values (a gather), without the per-plaintext index arithmetic."""
+    W = np.asarray(W)
+    if W.shape != (d_in, d_out):
+        raise ValueError(f"weight must be ({d_in}, {d_out}), got {W.shape}")
+    flat = W.reshape(-1)
+    if outputpack:
+        if np.iscomplexobj(W):
+            raise ValueError("output pack needs a real weight")
+        re, im = weight_index(N, d_in, d_out, True)
+        out = np.empty(re.shape, dtype=np.complex128)
+        out.real = flat.take(re)
+        out.imag = flat.take(im)
+        return out
+    idx = weight_index(N, d_in, d_out)
+    return flat.astype(np.complex128 if np.iscomplexobj(W) else np.float64, copy=False).take(idx)
+
+
 def encode_bias_vector(b, N: int, d_in: int, d_out: int, fill: bool = True) -> np.ndarray:
     """encode_bias_vector (cachemir_linear_utils.cu)."""
     b = np.asarray(b).ravel()
@@ -410,4 +457,39 @@ def cutmax_tile_mask(N: int, k: int, vocab: int, W_tile: int, d: int) -> np.ndar
     m = np.arange(W_tile)
     out = np.zeros(N)
     out[:W_tile] = (cutmax_tile_col_of_slot(m, d, W_tile) < wreal).astype(np.float64)
+    return out
+
+
+_COEFF_TABLES = {}
+
+
+def _coeff_tables(slots: int):
+    """The FFT positions of slot j (zeta^{5^j}) and of its conjugate, and the twist zeta^{-k}, for ring 2 * slots."""
+    if slots not in _COEFF_TABLES:
+        n = 2 * slots
+        t = np.empty(slots, dtype=np.int64)
+        t[0] = 1
+        for j in range(1, slots):
+            t[j] = t[j - 1] * 5 % (2 * n)
+        _COEFF_TABLES[slots] = ((t - 1) // 2, (2 * n - t - 1) // 2, np.exp(-1j * np.pi * np.arange(n) / n))
+    return _COEFF_TABLES[slots]
+
+
+def coeff_rows(values, out=None, block=64):
+    """The CKKS plaintext polynomials of slot-value rows (n, slots), divided by the scaling factor: (n, 2 slots)
+    float32 (or written into `out`). The device encoder's map (FIDESlib DeviceEncode: the values at the FFT
+    positions of zeta^{5^j}, their conjugates at those of zeta^{-5^j}, a forward FFT, the twist zeta^{-k}, 1/N),
+    so round(row * scale) is the plaintext encode would produce up to the float32 rounding of the row."""
+    values = np.asarray(values)
+    n, slots = values.shape
+    up, un, tw = _coeff_tables(slots)
+    N = 2 * slots
+    if out is None:
+        out = np.empty((n, N), dtype=np.float32)
+    for r0 in range(0, n, block):
+        v = np.asarray(values[r0:r0 + block], dtype=np.complex128)
+        w = np.zeros((len(v), N), dtype=np.complex128)
+        w[:, up] = v
+        w[:, un] = np.conj(v)
+        out[r0:r0 + len(v)] = (np.fft.fft(w, axis=1) * tw).real / N
     return out
