@@ -1,4 +1,7 @@
 #pragma once
+#include <cstdint>
+#include <cstdlib>
+namespace FIDESlib { void ForgetDevicePlaintextDump(uint32_t handle); }   // FIDESlib api/CryptoContext.cpp
 #include <filesystem>
 #include <fstream>
 
@@ -144,6 +147,16 @@ struct Inference {
     void set_persistent_staging(bool on) { cc()->SetPersistentStaging(on); }
     // BERT's multi-consume staging: one staged plaintext feeds several consumers.
     void set_stage_multi_consume(bool on) { cc()->SetStageMultiConsume(on); }
+    // IMPL_NODUMP_ERASE=1: a plaintext erased from the encode cache (a per-step mask) is freed without its host
+    // dump (2 x D2H + two legacy-stream syncs per plaintext otherwise)
+    static bool nodump_erase() {
+        static const bool v = [] { const char* e = std::getenv("IMPL_NODUMP_ERASE"); return e && std::atoi(e) > 0; }();
+        return v;
+    }
+    void erase_plaintext(Ptx& pt) {
+        if (nodump_erase() && pt && pt->loaded && pt->gpu != 0) FIDESlib::ForgetDevicePlaintextDump(pt->gpu);
+        evict_plaintext(pt);
+    }
     void evict_plaintext(Ptx& pt) {
         if (!pt || !pt->loaded || pt->gpu == 0) return;
         cc()->EvictDevicePlaintext(pt->gpu);
@@ -439,7 +452,7 @@ struct Inference {
     bool erase_enc_cache(const std::string& tag, uint32_t lv) {
         auto it = enc_cache.find(enc_cache_key(tag, lv, 1));
         if (it == enc_cache.end()) return false;
-        if (it->second) evict_plaintext(it->second);
+        if (it->second) erase_plaintext(it->second);
         enc_cache.erase(it);
         return true;
     }
@@ -449,7 +462,7 @@ struct Inference {
         size_t n = 0;
         for (auto it = enc_cache.begin(); it != enc_cache.end(); ) {
             if (it->first.compare(0, prefix.size(), prefix) == 0) {
-                if (it->second) evict_plaintext(it->second);
+                if (it->second) erase_plaintext(it->second);
                 it = enc_cache.erase(it);
                 ++n;
             } else {

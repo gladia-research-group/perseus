@@ -20,6 +20,11 @@ namespace {
 // Block stages keep their weight plaintexts on the device across tokens: no per-token evict, reload, lift or
 // block_sync drain after the first token (the GPT-2 n32 decode keeps all 12 with ~29 GB still free).
 // IMPL_RESIDENT_BLOCKS=k keeps only the first k (0 = every block evicted after its stage, the old ring).
+// IMPL_KEEP_MASKS=1: the encode cache's device copies survive the end of the token (reloaded from their dumps otherwise)
+bool keep_masks() {
+    static const bool v = [] { const char* e = std::getenv("IMPL_KEEP_MASKS"); return e && std::atoi(e) > 0; }();
+    return v;
+}
 int resident_blocks() {
     static const int k = [] { const char* e = std::getenv("IMPL_RESIDENT_BLOCKS"); return e ? std::atoi(e) : 1 << 30; }();
     return k;
@@ -210,7 +215,7 @@ py::object run_stages(Inference& inf, py::object x, std::vector<PyStage> specs,
         py::gil_scoped_release nogil;
         run_residency_pipeline(inf, std::move(stages), ov);
         // residency release of the transient mask device copies (mirrors run_cached_blocks)
-        { WithStep _w(inf, "enc_cache_evict"); inf.evict_enc_cache_device(); }
+        if (!keep_masks()) { WithStep _w(inf, "enc_cache_evict"); inf.evict_enc_cache_device(); }
         if (any_loader) finish_host_reclaim();   // mirrors run_blocks' callers
     }
     return x;
