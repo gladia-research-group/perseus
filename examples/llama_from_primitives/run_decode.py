@@ -114,6 +114,10 @@ def main(argv=None):
         print(line, flush=True)
         if a.profile and hasattr(model.rt.ops, "report_steps"):
             print("[llama] steps: " + " | ".join(t.split("%")[0].strip() for t in model.rt.ops.report_steps(1).split("\n")[:8]), flush=True)
+            print("[llama] primitives: " + " | ".join(t.split("%")[0].strip() for t in model.rt.ops.report(10).split("\n")[:10]), flush=True)
+            if os.environ.get("LLAMA_PROFILE_STEPS"):
+                for st in sorted(model.rt.ops.t_step, key=lambda k: -model.rt.ops.t_step[k]):
+                    print(f"[llama] step {st}: " + model.rt.ops.report_step_split(st, 1, 6), flush=True)
             model.rt.ops.reset()
 
     t1 = time.time()

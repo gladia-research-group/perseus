@@ -693,13 +693,13 @@ def kv_push(rt, kv, payload, q=None, rope=None, pos=None):
 
 
 def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
-        pre_linear=None):
+        pre_linear=None, pre_out=None):
     """src/model/mha.cu: qkv -> cache push -> attention core -> out projection.
     ``w`` has .q .k .v .out (EncodedLinear), or .kv (the fused K + iV linear) and .q for
     the cachemir_complex packing, whose ``kv`` is a ComplexKVCache. ``rope``: rotary position
     embedding of q and K at position ``pos`` (folded into their selection masks). ``pre_linear``:
-    called on each projection's input after its refresh hint (e.g. a level drop that runs the
-    projection at the bottom of the chain)."""
+    called on the qkv projection's input after its refresh hint (e.g. a level drop that runs the
+    projection at the bottom of the chain), ``pre_out`` on the out projection's."""
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)
@@ -742,8 +742,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     tap("attn.pv", x)
     with rt.step("out_proj"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
-        if pre_linear is not None:
-            x = pre_linear(x)
+        if pre_out is not None:
+            x = pre_out(x)
         return linear(rt, x, w.out)
 
 

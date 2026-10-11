@@ -104,7 +104,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `IMPL_PT_SUM_FUSED` | A streamed weight's inner sums encoded on the device from its raw slot rows (`Inference.mult_pt_sum_raw`) instead of host plaintexts; superseded by the coefficient rows (Python implementation; default 0). |
 | `LLAMA_MODEL` | Llama checkpoint the Llama port reads (HF repo id or directory; default `meta-llama/Llama-3.1-8B`). |
 | `LLAMA_PACKING` | Slot packing of the Llama port (`cachemir_complex`, default, or `cachemir`). |
-| `LLAMA_LINEAR_BOTTOM` | Llama port: every projection runs at the bottom of the chain (input dropped to one level above the refresh limit), its output refreshed where it lands (default 0). |
+| `LLAMA_LINEAR_BOTTOM` | Llama port: these projections (qkv, out_proj, gate_up, down; `1` = all) run at the bottom of the chain (default 0). |
 | `LLAMA_PLAN_SPARSE_SLOTS` | Llama `make_plan.sh`: the sparse routes the plan may use (default `256,1`, from Llama's 256-slot attention block). |
 | `KV_LANES` | The K + iV linear output refreshed as one real payload, K on token lane 0 and V on lane 1, by the real-payload route instead of a complex refresh (Python implementation; default 1, off for plans that do not declare it). |
 | `QKV_LANES` | The Q linear output rides the K/V push refresh on token lane 2 (one real refresh for Q, K and V), and the qkv / up input hints fire only past the session limit, so both linears run on the LayerNorm output as is and their OUTPUT is refreshed at the top of the envelope (Python implementation; default 1, off for plans that do not declare it; the plan's runtime line carries `BTS_MAX_INPUT_LEVEL=50` for the up output at nominal 50). |
@@ -157,6 +157,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_GRAPH_CAPTURE_TOKEN` | Capture the op-graph of one token only. |
 | `FHE_PROFILE` | Per-operation timing table on stderr (default off). |
 | `FHE_PROFILE_TOKEN` | Restrict that profile to one token index. |
+| `LLAMA_PROFILE_STEPS` | Llama `run_decode --profile`: also each step's primitive split. |
 | `IMPL_PROFILE_SYNC` | `run_decode --profile` (Python implementation): a device fence after every timed primitive, so each is charged its own GPU time. |
 | `PT_SUM_TIMING` | Host-side timing of the streamed-weight inner sums on stderr. |
 | `PLAN_TRACE_STEP` | Every op recorded in that step path (e.g. `blk0.softmax`), as executed, on stderr (plan/run divergence hunts). |

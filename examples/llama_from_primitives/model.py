@@ -160,7 +160,7 @@ class LlamaModel(ImplModel):
                 cap = self.enter_stage(b, pos)
                 with self.rt.step(f"blk{b}"):
                     x = llama_block(self.rt, x, self.block_weights(b), self.kv[b], self.cfgs.block(b),
-                                    pos, self.rope)
+                                    pos, self.rope, last=b == self.n_layers - 1)
                 self.exit_stage(b, cap)
                 if self.taps is not None:           # debug: every block's output, decrypted
                     self.taps[(pos, b)] = self.hidden(x)
