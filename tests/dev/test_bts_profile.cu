@@ -1218,6 +1218,11 @@ TEST_F(BtsProfileTest, DiagSparsityDump) {
 // BCONV2_GATE=1.
 TEST_F(BtsProfileTest, Bconv2Gate) {
     if (!std::getenv("BCONV2_GATE")) GTEST_SKIP() << "set BCONV2_GATE=1";
+// FIDESLIB_NOCLONE=2 gate: the write-once wrappers (EvalAdd ct+ct, EvalMult ct*ct and ct*pt, EvalSquare) against clone +
+// in-place on the same operands in one process, raw residues bit-exact, plus a level-mismatched add (fallback path).
+// Opt-in: NOCLONE_GATE=1.
+TEST_F(BtsProfileTest, NoCloneGate) {
+    if (!std::getenv("NOCLONE_GATE")) GTEST_SKIP() << "set NOCLONE_GATE=1";
     const int S = slots();
     auto& cc = fhe().cc;
     using FC = ::FIDESlib::CKKS::Ciphertext;
@@ -1281,5 +1286,37 @@ TEST_F(BtsProfileTest, Bconv2Gate) {
                   << 100.0 * (tp[1] - tp[0]) / tp[0] << " %)\n";
     }
     ::FIDESlib::CKKS::setModUpConv2(0);
+        return std::make_tuple(r0, g->getLevel(), g->NoiseLevel, g->NoiseFactor);
+    };
+    long total_bad = 0;
+    for (int lv : {4, 12, 20}) {
+        Ctx A = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x11u + lv), lv), fhe().pk());
+        Ctx B = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x22u + lv), lv), fhe().pk());
+        Ctx Bd = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x44u + lv), lv + 2), fhe().pk());  // 2 levels deeper
+        auto P = encode(cc, varied_pattern(S, S, 0.9, 0x33u + lv), lv);
+        cc->LoadCiphertext(A);
+        cc->LoadCiphertext(B);
+        cc->LoadCiphertext(Bd);
+        std::vector<std::pair<const char*, std::function<Ctx()>>> ops = {
+            {"add", [&] { return cc->EvalAdd(A, B); }},
+            {"add_mismatch", [&] { return cc->EvalAdd(A, Bd); }},
+            {"mult", [&] { return cc->EvalMult(A, B); }},
+            {"multpt", [&] { return cc->EvalMult(A, P); }},
+            {"square", [&] { return cc->EvalSquare(A); }},
+        };
+        for (auto& [name, op] : ops) {
+            ::fideslib::SetNoCloneLevelForTest(0);
+            auto [x, lx, nx, fx] = raw(op());
+            ::fideslib::SetNoCloneLevelForTest(2);
+            auto [y, ly, ny, fy] = raw(op());
+            long bad = (x.size() != y.size() || lx != ly || nx != ny || fx != fy) ? -1 : 0;
+            for (size_t l = 0; bad >= 0 && l < x.size(); ++l)
+                for (size_t i = 0; i < x[l].size(); ++i) bad += x[l][i] != y[l][i];
+            std::cout << "[noclone] level " << lv << " " << name << ": residues differing " << bad << " (limbs " << x.size() / 2
+                      << ", level " << lx << "/" << ly << ", noise " << nx << "/" << ny << ")\n";
+            total_bad += bad != 0;
+        }
+    }
+    ::fideslib::SetNoCloneLevelForTest(0);
     EXPECT_EQ(total_bad, 0);
 }
