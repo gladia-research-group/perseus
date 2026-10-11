@@ -1247,7 +1247,7 @@ TEST_F(BtsProfileTest, Bconv2Gate) {
         for (auto& [name, op] : ops) {
             ::FIDESlib::CKKS::setModUpConv2(0);
             auto x = raw(op());
-            ::FIDESlib::CKKS::setModUpConv2(1);
+            ::FIDESlib::CKKS::setModUpConv2(std::getenv("BCONV2_LEVEL") ? std::atoi(std::getenv("BCONV2_LEVEL")) : 1);
             auto y = raw(op());
             long bad = x.size() != y.size() ? -1 : 0;
             for (size_t l = 0; bad >= 0 && l < x.size(); ++l)
@@ -1268,7 +1268,7 @@ TEST_F(BtsProfileTest, Bconv2Gate) {
         for (int k = 0; k < 16; ++k) xs.emplace_back(std::make_unique<FC>(DA.second->cc_));
         for (int rep = 0; rep < 6; ++rep)
             for (int arm = 0; arm < 2; ++arm) {
-                ::FIDESlib::CKKS::setModUpConv2(arm);
+                ::FIDESlib::CKKS::setModUpConv2(arm ? (std::getenv("BCONV2_LEVEL") ? std::atoi(std::getenv("BCONV2_LEVEL")) : 1) : 0);
                 for (auto& x : xs) x->copy(*DA.second);
                 cudaDeviceSynchronize();
                 auto t0 = std::chrono::steady_clock::now();
