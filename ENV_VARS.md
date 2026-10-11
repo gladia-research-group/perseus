@@ -168,3 +168,4 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `PLAN_TRACE_DECRYPT` | With `PLAN_TRACE_STEP`: also each traced op's decrypted max \|z\| and max \|Im\| (where a planned run's values go wrong). |
 | `FIDESLIB_ERRCHECK` | 1 polls cudaGetLastError after every FIDESlib launch (off by default: ~1.8M calls per decode token). |
 | `FIDESLIB_OMP_REGIONS` | 1 enters FIDESlib's OpenMP regions on a single GPU (off by default: they run inline). |
+| `FIDESLIB_BCONV2` | Key-switch base conversions: 2 (default) = the shared-memory ModUp and ModDown kernels, 1 = ModUp only, 0 = the original kernels (same residues either way). |
