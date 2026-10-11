@@ -1218,11 +1218,6 @@ TEST_F(BtsProfileTest, DiagSparsityDump) {
 // BCONV2_GATE=1.
 TEST_F(BtsProfileTest, Bconv2Gate) {
     if (!std::getenv("BCONV2_GATE")) GTEST_SKIP() << "set BCONV2_GATE=1";
-// FIDESLIB_NOCLONE=2 gate: the write-once wrappers (EvalAdd ct+ct, EvalMult ct*ct and ct*pt, EvalSquare) against clone +
-// in-place on the same operands in one process, raw residues bit-exact, plus a level-mismatched add (fallback path).
-// Opt-in: NOCLONE_GATE=1.
-TEST_F(BtsProfileTest, NoCloneGate) {
-    if (!std::getenv("NOCLONE_GATE")) GTEST_SKIP() << "set NOCLONE_GATE=1";
     const int S = slots();
     auto& cc = fhe().cc;
     using FC = ::FIDESlib::CKKS::Ciphertext;
@@ -1286,6 +1281,25 @@ TEST_F(BtsProfileTest, NoCloneGate) {
                   << 100.0 * (tp[1] - tp[0]) / tp[0] << " %)\n";
     }
     ::FIDESlib::CKKS::setModUpConv2(0);
+    EXPECT_EQ(total_bad, 0);
+}
+
+
+// FIDESLIB_NOCLONE=2 gate: the write-once wrappers (EvalAdd ct+ct, EvalMult ct*ct and ct*pt, EvalSquare) against clone +
+// in-place on the same operands in one process, raw residues bit-exact, plus a level-mismatched add (fallback path).
+// Opt-in: NOCLONE_GATE=1.
+TEST_F(BtsProfileTest, NoCloneGate) {
+    if (!std::getenv("NOCLONE_GATE")) GTEST_SKIP() << "set NOCLONE_GATE=1";
+    const int S = slots();
+    auto& cc = fhe().cc;
+    using FC = ::FIDESlib::CKKS::Ciphertext;
+    auto raw = [&](const Ctx& r) {
+        cudaDeviceSynchronize();
+        auto g = std::static_pointer_cast<FC>(cc->GetDeviceCiphertext(r->gpu));
+        std::vector<std::vector<uint64_t>> r0, r1;
+        g->c0.store(r0);
+        g->c1.store(r1);
+        r0.insert(r0.end(), r1.begin(), r1.end());
         return std::make_tuple(r0, g->getLevel(), g->NoiseLevel, g->NoiseFactor);
     };
     long total_bad = 0;
@@ -1297,17 +1311,27 @@ TEST_F(BtsProfileTest, NoCloneGate) {
         cc->LoadCiphertext(A);
         cc->LoadCiphertext(B);
         cc->LoadCiphertext(Bd);
+        Ctx AB = cc->EvalMult(A, B);  // a degree-2 operand: the scalar product falls back (rescale first)
         std::vector<std::pair<const char*, std::function<Ctx()>>> ops = {
             {"add", [&] { return cc->EvalAdd(A, B); }},
             {"add_mismatch", [&] { return cc->EvalAdd(A, Bd); }},
             {"mult", [&] { return cc->EvalMult(A, B); }},
             {"multpt", [&] { return cc->EvalMult(A, P); }},
             {"square", [&] { return cc->EvalSquare(A); }},
+            {"sub", [&] { return cc->EvalSub(A, B); }},
+            {"sub_mismatch", [&] { return cc->EvalSub(A, Bd); }},
+            {"multscalar", [&] { return cc->EvalMult(A, 0.731); }},
+            {"multscalar_deg2", [&] { return cc->EvalMult(AB, -1.5); }},
+            {"addscalar", [&] { return cc->EvalAdd(A, 0.7); }},
+            {"addscalar_neg", [&] { return cc->EvalAdd(A, -0.3); }},
+            {"addscalar_deg2", [&] { return cc->EvalAdd(AB, 0.25); }},
+            {"subscalar", [&] { return cc->EvalSub(A, 0.25); }},
         };
+        const int lvl = std::getenv("NOCLONE_GATE_LEVEL") ? std::atoi(std::getenv("NOCLONE_GATE_LEVEL")) : 3;
         for (auto& [name, op] : ops) {
             ::fideslib::SetNoCloneLevelForTest(0);
             auto [x, lx, nx, fx] = raw(op());
-            ::fideslib::SetNoCloneLevelForTest(2);
+            ::fideslib::SetNoCloneLevelForTest(lvl);
             auto [y, ly, ny, fy] = raw(op());
             long bad = (x.size() != y.size() || lx != ly || nx != ny || fx != fy) ? -1 : 0;
             for (size_t l = 0; bad >= 0 && l < x.size(); ++l)
@@ -1315,6 +1339,35 @@ TEST_F(BtsProfileTest, NoCloneGate) {
             std::cout << "[noclone] level " << lv << " " << name << ": residues differing " << bad << " (limbs " << x.size() / 2
                       << ", level " << lx << "/" << ly << ", noise " << nx << "/" << ny << ")\n";
             total_bad += bad != 0;
+        }
+    }
+    // fast rotations (the rotation keys are banded to 22 limbs: levels 32 on)
+    for (int lv : {32, 36}) {
+        Ctx A = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x55u + lv), lv), fhe().pk());
+        cc->LoadCiphertext(A);
+        const uint32_t m = 2 * (uint32_t)cc->GetRingDimension();
+        auto pre = cc->EvalFastRotationPrecompute(A);
+        const int lvl = std::getenv("NOCLONE_GATE_LEVEL") ? std::atoi(std::getenv("NOCLONE_GATE_LEVEL")) : 3;
+        std::vector<std::pair<std::string, std::function<std::vector<Ctx>()>>> ops = {
+            {"fastrot+1", [&] { return std::vector<Ctx>{cc->EvalFastRotation(A, 1, m, pre)}; }},
+            {"fastrot0", [&] { return std::vector<Ctx>{cc->EvalFastRotation(A, 0, m, pre)}; }},
+            {"fastrot{0,1,-4}", [&] { return cc->EvalFastRotation(A, std::vector<int32_t>{0, 1, -4}, m, pre); }},
+        };
+        for (auto& [name, op] : ops) {
+            ::fideslib::SetNoCloneLevelForTest(0);
+            auto xs = op();
+            ::fideslib::SetNoCloneLevelForTest(lvl);
+            auto ys = op();
+            for (size_t k = 0; k < xs.size(); ++k) {
+                auto [x, lx, nx, fx] = raw(xs[k]);
+                auto [y, ly, ny, fy] = raw(ys[k]);
+                long bad = (xs.size() != ys.size() || x.size() != y.size() || lx != ly || nx != ny || fx != fy) ? -1 : 0;
+                for (size_t l = 0; bad >= 0 && l < x.size(); ++l)
+                    for (size_t i = 0; i < x[l].size(); ++i) bad += x[l][i] != y[l][i];
+                std::cout << "[noclone] level " << lv << " " << name << "[" << k << "]: residues differing " << bad
+                          << " (limbs " << x.size() / 2 << ")\n";
+                total_bad += bad != 0;
+            }
         }
     }
     ::fideslib::SetNoCloneLevelForTest(0);
