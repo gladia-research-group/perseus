@@ -643,6 +643,41 @@ def test_kv_lanes_push_matches_complex_refresh(kc):
         np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
 
 
+@pytest.mark.parametrize("kc", [1, 3])
+def test_qkv_lanes_q_rides_push_refresh(kc):
+    """QKV_LANES: the Q linear output on token lane 2 of the K/V push payload leaves the K buckets and V pair buckets
+    untouched and comes back on lane 0, where complex_qkt's tok0 mask reads it."""
+    from perseus.impl.layout import real_head_tok0_mask
+    def run(with_q):
+        rt, fhe, inf = _rt(complex_payload=True)
+        rt.ops.kv_lanes = True
+        d = rt.dims
+        rng = np.random.default_rng(29)
+        kv = attention.ComplexKVCache(d.d_head)
+        qs = []
+        for tok in range(kc):
+            k, v, q = (rng.standard_normal(d.hid) * 0.5 for _ in range(3))
+            for arr in (k, v, q):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            full = np.repeat(k, d.t) + 1j * np.repeat(v, d.t)
+            qfull = np.repeat(q, d.t) + 1j * rng.standard_normal(d.N) * 1e-3   # a real output with im noise
+            out = attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(full, 34),
+                                                         fake.FakeCt(qfull, 34) if with_q else None)
+            qs.append((q, out))
+        return ([b.vec for b in kv.k_buckets] + [b.vec for b in kv.k_pend]
+                + [b.vec for b in kv.v_buckets if b is not None]), qs, d
+    bufs_q, qs, d = run(True)
+    bufs_0, qs0, _ = run(False)
+    for a, b in zip(bufs_q, bufs_0):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+    assert all(o is None for _, o in qs0)
+    m = real_head_tok0_mask(d) > 0
+    for q, out in qs:
+        assert out is not None
+        got = (out.vec * (real_head_tok0_mask(d))).real
+        np.testing.assert_allclose(got[m], np.repeat(q, d.t)[m], rtol=1e-12, atol=1e-12)
+
+
 def test_gelu_fold_matches_gelu():
     """GELU_FOLD: fed x / xmax (the up-projection carries the scaling) and with xmax on the
     mask, the GELU returns what the unfolded form returns on x."""

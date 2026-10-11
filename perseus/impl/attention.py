@@ -156,13 +156,16 @@ def _vpair_item(d, i_re: int, i_im: int, rr: int, kv_lanes: bool):
     return ("v.cpc", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr)
 
 
-def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
+def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None):
     """cache_kv_push_packed_complex: the fused K + iV linear output refreshed by ONE
     bootstrap, split by conjugation (2K on the real axis, -2iV on the imaginary one), K
     masked and bucketed (odd groups packed by the monomial i), V realified (times i, the
-    monomial: no level) and scattered into the pair buckets."""
+    monomial: no level) and scattered into the pair buckets.
+    `q` (KV_LANES + QKV_LANES): the Q linear output rides the same real payload on token lane
+    2 and comes back refreshed, on lane 0 (the one refresh serves Q, K and V)."""
     ops, d = rt.ops, rt.dims
     kvl = getattr(ops, "kv_lanes", False)
+    q_out = None
     if kvl:
         # KV_LANES: realify first (both halves fill every token lane), keep K on lane 0 and V on lane 1, and refresh
         # that real payload by the real route; the K mask and the V pair masks below select the two lanes
@@ -170,7 +173,14 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
         Kc = rt.mult_mask(ops.add(P_in, conj), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))   # K_raw
         Vc = rt.mult_mask(ops.mult_i(ops.sub(conj, P_in)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
         X = ops.add(Kc, ops.rotate(Vc, -1))
+        if q is not None:
+            # QKV_LANES: Q (real; 2 Re by its conjugate, the lane mask's 0.5) on lane 2 of the same payload. The
+            # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q
+            Qc = rt.mult_mask(ops.add(q, ops.conjugate(q)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
+            X = ops.add(X, ops.rotate(Qc, -2))
         ops.bootstrap_real(X)
+        if q is not None:
+            q_out = ops.rotate(X, 2)        # lane 2 back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
         K = rt.mult_mask(X, "kpush.tok0", lambda: real_head_tok0_mask(d))
     else:
         P = ops.copy(P_in)
@@ -211,6 +221,7 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in):
         else:
             ops.inplace_add(kv.v_buckets[p], tmp)
     kv.v_count += 1
+    return q_out
 
 
 def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0):
@@ -512,14 +523,20 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg):
     the cachemir_complex packing, whose ``kv`` is a ComplexKVCache."""
     ops = rt.ops
     cplx = isinstance(kv, ComplexKVCache)
+    qkvl = cplx and getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
     with rt.step("qkv"):
-        ops.bootstrap_hint(x, ops.headroom(1), True)
+        # QKV_LANES: the hint fires only past the session limit; at or under it the linear runs on the LayerNorm
+        # output as is and its output, K, V and Q on three token lanes, is what the push refreshes (one unit deeper:
+        # the lane masks), at the top of the envelope
+        ops.bootstrap_hint(x, ops.headroom(0 if qkvl else 1), True)
         if cplx:
             P, q = linear_multi(rt, x, [w.kv, w.q])
         else:
             k, v, q = linear_multi(rt, x, [w.k, w.v, w.q])
     with rt.step("kv_push"):
-        if cplx:
+        if qkvl:
+            q = cache_kv_push_packed_complex(rt, kv, P, q)
+        elif cplx:
             cache_kv_push_packed_complex(rt, kv, P)
         elif ops.complex_payload:
             cache_kv_push_pair(rt, kv, k, v)           # one bootstrap for K and V

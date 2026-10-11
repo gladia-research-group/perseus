@@ -9,9 +9,10 @@ from perseus.impl.linear import linear
 from perseus.impl.norm import norm, ln_shift, ln_affine
 
 
-def transformer_block(rt, x, w, kv, cfgs, pos: int):
+def transformer_block(rt, x, w, kv, cfgs, pos: int, last: bool = False):
     """``w``: BlockWeights (q,k,v,out,up,down EncodedLinear; shift1/shift2 or the unfolded
-    gamma/beta); ``cfgs``: (ln_1, ln_2, softmax, gelu) configs; ``pos``: token position."""
+    gamma/beta); ``cfgs``: (ln_1, ln_2, softmax, gelu) configs; ``pos``: token position;
+    ``last``: the model's final block (its exit feeds the tail, not another block)."""
     ops = rt.ops
     ln1, ln2, sm, ge = cfgs
     skip = x
@@ -30,11 +31,22 @@ def transformer_block(rt, x, w, kv, cfgs, pos: int):
             ops.fhe.maybe_bootstrap(n)
             x = ln_affine(rt, n, w.gamma2, w.beta2, w.tag + "ln_2")
     with rt.step("up"):
-        ops.bootstrap_hint(x, ops.headroom(1), True)   # mlp.cu (the output-pack unpack costs no level)
+        # mlp.cu (the output-pack unpack costs no level). QKV_LANES: the hint fires only past the limit plus one
+        # unit, so the up-projection runs on the LayerNorm output as is and the plan refreshes its OUTPUT at the
+        # GELU entry, at the top of the envelope
+        ops.bootstrap_hint(x, ops.headroom(-1 if ops.qkv_lanes else 1), True)
         x = linear(rt, x, w.up)
     with rt.step("gelu"):
         x = gelu(rt, x, ge)
     with rt.step("down"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
         x = linear(rt, x, w.down)
-    return ops.add(x, skip)
+    out = ops.add(x, skip)
+    if ops.qkv_lanes and not last:
+        # QKV_LANES: the residual stream leaves the block at or under headroom(3) (40 primes on n32), so the next
+        # block's LayerNorm output, six primes deeper, enters its qkv linear at or under the session limit and the
+        # push refresh covers it with no hint. The planner reads the cap (lvl_cap), the runtime passes through. Not
+        # on the last block: its exit feeds the tail, whose plan is cheaper from the deeper entry (+0.05 s/token
+        # planned otherwise).
+        ops.fhe.level_hint(out, ops.headroom(3))
+    return out

@@ -151,7 +151,7 @@ class Gpt2Model(ImplModel):
                 cap = self.enter_stage(b, pos)
                 with self.rt.step(f"blk{b}"):
                     x = transformer_block(self.rt, x, self.block_weights(b), self.kv[b],
-                                          self.cfgs.block(b), pos)
+                                          self.cfgs.block(b), pos, last=(b == self.n_layers - 1))
                 self.exit_stage(b, cap)
                 return x
             return compute
