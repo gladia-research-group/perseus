@@ -3445,9 +3445,10 @@ struct CKKSContext {
 
     void drop_to_level(Ctx& ct, int target_level) {
         const int cur = level_for_ct(ct);
-        if (target_level <= cur) return;
         const std::string in_a = var_for_ct(ct);
-        cc->DropToLevel(ct, static_cast<uint32_t>(target_level));
+        // recorded even when it is a no-op, so the names after it match the capture's
+        if (target_level > cur)
+            cc->DropToLevel(ct, static_cast<uint32_t>(target_level));
         const std::string out = set_new_var_for_ct(ct);
         record_primitive("level_reduce", {in_a}, out, {cur}, level_for_ct(ct), ct);
         maybe_apply_planned_bootstrap_after(out, ct);

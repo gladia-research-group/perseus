@@ -185,6 +185,8 @@ def simulate(
             c = (n.output_level - bootstrap_level if n.output_level is not None
                  else (lc.get(ins[0], 0.0) if ins else 0.0))
             d = n.output_deg if n.output_deg is not None else (dg.get(ins[0], 1) if ins else 1)
+            if ins and lc.get(ins[0], 0.0) >= c:     # no-op drop
+                c, d = lc.get(ins[0], 0.0), dg.get(ins[0], 1)
         elif n.op == "fold_bootstrap":
             c = (n.output_level - bootstrap_level
                  if n.output_level is not None else float(unit))
