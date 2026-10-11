@@ -26,6 +26,8 @@ struct EncodedBlock {
     std::vector<std::tuple<std::string, uint32_t, Ptx>> staged_masks;
 
     int stage_owner = -1;
+    bool resident = false;          // IMPL_RESIDENT_BLOCKS: never evicted by run_stages
+    bool resident_synced = false;   // its first upload has been drained
 };
 
 void load_block_to_device(Inference& inf, EncodedBlock& blk, cudaStream_t stream);

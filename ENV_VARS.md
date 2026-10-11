@@ -132,6 +132,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
 | `IMPL_KV_OFFLOAD` | 1 parks each block's K/V cache ciphertexts in the pinned KV arena between uses (Python implementation); off by default: the caches stay on the device (2.2 GB on the n32 decode) and the per-stage fences go away. |
+| `IMPL_RESIDENT_BLOCKS` | Block stages whose weight plaintexts stay on the device across tokens (default all: no per-token reload, lift or per-block device drain; the GPT-2 n32 decode keeps ~29 GB free); 0 evicts every block after its stage. |
 | `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
 | `PERSEUS_SLOTVEC_CACHE_GB` | Size cap of that cache; least recently used model variants past it are dropped (default 32). |
 | `PERSEUS_SLOTVEC_CACHE_VARIANTS` | Model variants (weights, configs, builder code) kept per model family in that cache (default 2). |
