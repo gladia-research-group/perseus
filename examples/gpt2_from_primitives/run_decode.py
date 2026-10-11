@@ -133,6 +133,8 @@ def main(argv=None):
             line += f" ref={r['ref']} ref_rank={r['ref_rank']} KL={r['kl']:.4g} {'OK' if r['hit'] else 'MISS'}"
         if "free_gb" in r:
             line += f" free={r['free_gb']}GB"
+        if "pool_gb" in r:
+            line += " pool={}/{}GB(trim {}, recycler {})".format(*r["pool_gb"])
         if "rss_gb" in r:
             line += f" rss={r['rss_gb']}GB"
         if "cpu_s" in r:

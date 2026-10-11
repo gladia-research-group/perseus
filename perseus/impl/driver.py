@@ -341,6 +341,11 @@ class ImplModel:
                        minflt=ru1.ru_minflt - ru0.ru_minflt, majflt=ru1.ru_majflt - ru0.ru_majflt)
         if hasattr(self.core, "device_free_gb"):
             rec["free_gb"] = round(float(self.core.device_free_gb()), 1)
+        if hasattr(self.core, "gpu_pool_stats"):
+            st = self.core.gpu_pool_stats()
+            rc = self.inf.recycled_polys() if hasattr(self.inf, "recycled_polys") else (0, 0.0)
+            rec["pool_gb"] = (round(st["reserved_gb"] - st["idle_gb"] - rc[1], 1), round(st["reserved_gb"], 1),
+                              round(st["trimmable_gb"], 1), round(rc[1], 1))
         try:
             with open("/proc/self/status") as f:
                 for line in f:

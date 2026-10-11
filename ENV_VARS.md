@@ -65,6 +65,8 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_PREFILL_CAPTURE_RANGES` | Capture the per-chunk token ranges of a prefill. |
 | `FHE_PREFILL_PLACEMENTS_DIR` | Plan used for the prefill phase of a generation run. |
 | `FIDESLIB_BTS_SPARSE_B` | Depth-1 CtS/StC on the 512-slot bootstrap route (eprint 2026/1023): it lands 10 primes higher and takes no raise variants, so the model rotation keys need `FIDESLIB_ROT_KEY_BAND=32` (on in the GPT-2 port's n32 runtime; off for plans that do not declare it). |
+| `FIDESLIB_BTS_SPARSE_B_MAX` | SparseB only on routes of at most this many slots; larger routes stay multi-stage (default: all). |
+| `FIDESLIB_BTS_ROUTE_K24` | 0 keeps the shipped K = 16 EvalMod on multi-stage sparse routes (default: SparseB's K = 24 series). |
 | `FIDESLIB_SPARSE_ARCSINE` | Arcsine-corrected sparse bootstrap (needed by the encrypted argmax). |
 | `OPENFHE_DECODE_NO_THROW` | Let a capture decode a low-precision plaintext instead of throwing (capture only). |
 | `PLAN_HARD_ENV_CAP` | Planner: make the refresh-input depth envelope absolute (1) or payable (0, the shipped recipes). |
@@ -124,6 +126,11 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `PERSEUS_SLOTVEC_CACHE_VARIANTS` | Model variants (weights, configs, builder code) kept per model family in that cache (default 2). |
 | `MALLOC_ARENA_MAX` | glibc allocator arenas; 2 keeps host fragmentation down on the decode row. |
 | `OMP_NUM_THREADS` | OpenMP threads the host-side encode and staging use. |
+| `FIDESLIB_PT_SCRATCH` | 0 keeps the NTT scratch of finished plaintexts (device-encoded weights and masks, bootstrap tables, SparseB copies); by default it is released, halving their footprint (a plaintext is only read once built). |
+| `FIDESLIB_PT_COMPACT` | 0 stores the bootstrap stage tables in full (default: one value per NTT block). |
+| `FIDESLIB_AUX_POLY_MAX` | Cap on FIDESlib's polynomial recycler (destroyed ciphertexts' polynomials kept with their limbs for reuse; default unbounded). Without recycling a token is ~4x slower; a full device frees the recycler before failing either way. |
+| `FIDESLIB_BTS_RAISE_EAGER` | 1 builds every raise variant (`FIDESLIB_BTS_RAISE_DROPS`) at context load; by default each is built when a planted bootstrap first asks for it (each is a full copy of a route's tables). |
+| `FIDESLIB_POOL_TRACE` | Record a backtrace per live pooled block: `_core.gpu_pool_trace()` lists the live bytes by allocation site (diagnostic, slow). |
 
 ## Keys
 

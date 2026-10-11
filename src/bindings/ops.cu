@@ -973,6 +973,38 @@ void bind_ops(py::module_& m) {
                  return n;
              },
              py::arg("tags"), "Drop these tags from the cache at every level (device copies freed).")
+        .def("recycled_polys",
+             [](Inference& inf, bool release) {
+                 auto& cc = inf.cc();
+                 if (!cc->gpu.has_value()) return py::make_tuple(static_cast<size_t>(0), 0.0);
+                 auto& g = *std::any_cast<FIDESlib::CKKS::Context&>(cc->gpu);
+                 auto [n, bytes] = g.auxilarPolyStats();
+                 if (release) {
+                     py::gil_scoped_release nogil;
+                     g.releaseAuxilarPolys();
+                 }
+                 return py::make_tuple(static_cast<size_t>(n), static_cast<double>(bytes) / (1 << 30));
+             },
+             py::arg("release") = false,
+             "FIDESlib's polynomial recycler (destroyed ciphertexts' polynomials kept with their limbs for reuse): "
+             "(polynomials, GiB); `release` frees them (also done automatically when the device is full).")
+        .def("add_sparse_route",
+             [](Inference& inf, uint32_t s) {
+                 py::gil_scoped_release nogil;
+                 inf.fhe->add_sparse_route(s);
+             },
+             py::arg("slots"),
+             "Build the sparse bootstrap route of `slots` slots now (OpenFHE setup + keys, device tables + keys), "
+             "for a layout whose period grew (SM_PERIODIC=2); needs the session's secret key.")
+        .def("drop_sparse_route",
+             [](Inference& inf, uint32_t s) {
+                 py::gil_scoped_release nogil;
+                 return inf.fhe->drop_sparse_route(s);
+             },
+             py::arg("slots"), "Drop a sparse route: its device tables and the rotation keys only it uses.")
+        .def_property_readonly("sparse_routes", [](const Inference& inf) {
+                 return std::vector<uint32_t>(inf.fhe->sparse_precomp_slots.begin(), inf.fhe->sparse_precomp_slots.end());
+             }, "The sparse bootstrap routes built.")
         .def("enc_cache_stats",
              [](const Inference& inf) {
                  py::dict d;
@@ -1031,6 +1063,33 @@ void bind_ops(py::module_& m) {
         cudaMemGetInfo(&free_b, &total_b);
         return static_cast<double>(free_b) / (1 << 30);
     }, "Free memory on the current CUDA device, in GiB (cudaMemGetInfo).");
+    m.def("gpu_pool_stats", []() {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const auto st = FIDESlib::GPUpoolStatsOf(dev);
+        const double gb = 1 << 30;
+        return py::dict(py::arg("reserved_gb") = st.reserved / gb, py::arg("idle_gb") = st.idle / gb,
+                        py::arg("trimmable_gb") = st.trimmable / gb, py::arg("slabs") = st.slabs);
+    }, "FIDESlib's pooled allocator on the current device: the GiB its slabs reserve, the idle part, and the part "
+       "in wholly idle slabs (what gpu_pool_trim releases).");
+    m.def("gpu_pool_by_size", []() {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        return FIDESlib::GPUpoolBySize(dev);
+    }, "Per pooled block size: [block bytes, reserved bytes, in-use bytes, slabs].");
+    m.def("gpu_pool_trace", [](int depth) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        return FIDESlib::GPUpoolTrace(dev, depth);
+    }, py::arg("depth") = 6,
+       "FIDESLIB_POOL_TRACE=1 only: live pooled bytes per allocation call chain, largest first.");
+    m.def("gpu_pool_trim", []() {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        py::gil_scoped_release nogil;
+        return static_cast<double>(FIDESlib::GPUpoolTrim(dev)) / (1 << 30);
+    }, "Hand FIDESlib's wholly idle slabs back to the CUDA stream-ordered pool, which every allocation draws from; "
+       "returns the GiB released. Also done automatically before an allocation fails.");
     m.def("make_inference", [](const InferenceOptions& o) { return make_inference(o); },
           py::arg("options") = InferenceOptions{}, kRelease,
           "Build a generic Inference session from `options`: CKKS context, model sizes and packing.");

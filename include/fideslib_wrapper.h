@@ -683,6 +683,26 @@ struct CKKSContext {
     uint32_t sparse_bts_active = 0;
     std::set<uint32_t> sparse_precomp_slots;
 
+    // Sparse routes built / dropped at run time (SM_PERIODIC=2: Gp x tH slots); building needs the secret key.
+    std::vector<uint32_t> route_level_budget;
+    uint32_t route_correction_factor = 0;
+    void add_sparse_route(uint32_t s) {
+        if (s == 0 || sparse_precomp_slots.count(s)) return;
+        if (!keys.secretKey)
+            throw std::runtime_error("add_sparse_route: this session holds no secret key; route " + std::to_string(s) +
+                                     "'s bootstrap keys come from the client");
+        cc->EvalBootstrapSetup(route_level_budget, bts_dim1_from_env(), s, route_correction_factor);
+        cc->EvalBootstrapKeyGen(keys.secretKey, s);
+        cc->AddBootstrapRoute(keys.publicKey, s);
+        sparse_precomp_slots.insert(s);
+    }
+    size_t drop_sparse_route(uint32_t s) {
+        if (!sparse_precomp_slots.count(s)) return 0;
+        const size_t n = cc->DropBootstrapRoute(keys.publicKey, s);
+        sparse_precomp_slots.erase(s);
+        return n;
+    }
+
     // The slot count a fold wanting `s_wanted` can actually run at: `s_wanted` itself
     // when a precomp exists, else the smallest built s' > s_wanted (any larger power of
     // two is a multiple, so the caller can pre-ladder the gap: rotate+add at strides
@@ -1073,6 +1093,24 @@ struct CKKSContext {
     //
     //  THREADING: CorrectionScope mutates process-global ContextData, so a per-site CF is
     // only safe where bootstraps are serialised.
+    // The planned sparse route `s`, or the smallest built route the value's period allows when it outgrew `s`
+    // (SM_PERIODIC=2: the period grows with the cache, refreshing at `s` would fold it). Planned folds stay.
+    uint32_t planned_route_for(const Ctx& ct, uint32_t s) {
+        if (s == 0 || sparse_precomp_slots.empty()) return s;
+        const packtag::PackTag t = tag_of_ct(ct);
+        if (!t.known() || t.periodic_at(static_cast<int>(s)) || t.fold_collision_free_at(static_cast<int>(s))) return s;
+        uint32_t want = s;
+        while (want < static_cast<uint32_t>(t.period)) want <<= 1;
+        const uint32_t s2 = fold_slots_for(want);
+        if (s2 > s && sparse_precomp_slots.count(s2) && t.periodic_at(static_cast<int>(s2))) return s2;
+        static std::atomic<bool> warned{false};
+        if (t.period < t.slots && !warned.exchange(true))   // a periodic value whose route is not built
+            std::cerr << "[plan_route] a planned " << s << "-slot refresh carries a " << t.period
+                      << "-periodic value and no route >= " << want << " is built (SPARSE_BTS_SLOTS): refreshed at "
+                      << s << " as planned" << std::endl;
+        return s;
+    }
+
     void inner_bootstrap_planned(const std::string& var_name, Ctx& ct) {
         auto sit = plan_sparse_slots.find(var_name);
         auto pit = plan_prescale.find(var_name);
@@ -1088,8 +1126,8 @@ struct CKKSContext {
             // The planner proved s-periodicity from the captured static pack tag;
             // install_plan_live validated s against the built precomps and cf against
             // the chain's deg guard.
-            FoldBtsScope fs(*this, sit != plan_sparse_slots.end()
-                                       ? sit->second : sparse_bts_active);
+            FoldBtsScope fs(*this, planned_route_for(ct, sit != plan_sparse_slots.end()
+                                                             ? sit->second : sparse_bts_active));
             CorrectionScope cs(*this,
                                cit != plan_correction_factor.end() ? cit->second : -1,
                                cit != plan_correction_factor.end());
@@ -2619,9 +2657,9 @@ struct CKKSContext {
             // is the bootstrap itself (in the capture the auto fired here; the
             // cut carries it as the following deliberate/placement, e.g. the
             // fresh_recip deliberate after the GS chain). Only an UNPREDICTED
-            // ceiling is a plan/run divergence.
+            // ceiling is a plan/run divergence; nor is a shallower one (a PLAN_STEP_LANDING floor leaves headroom).
             auto it = expected_levels.find(var_for_ct(ct));
-            if (it != expected_levels.end() && it->second == level_of(ct)) {
+            if (it != expected_levels.end() && static_cast<int>(level_of(ct)) <= static_cast<int>(it->second)) {
                 return;
             }
             ++unplanned_bootstrap_count;
@@ -3950,6 +3988,8 @@ make_ckks_context(const CKKSContextOptions& o = {})
     ctx->bts_precision           = o.bts_precision;
     ctx->auto_bts_level_override = o.auto_bts_level_override;
     ctx->complex_payload         = o.ckks_complex_payload;
+    ctx->route_level_budget = o.sparse_level_budget.empty() ? o.level_budget : o.sparse_level_budget;
+    ctx->route_correction_factor = o.correction_factor;
     for (uint32_t s : o.sparse_bts_slots_list)
         if (s > 0 && s < slots) ctx->sparse_precomp_slots.insert(s);
     // Routing default = the FIRST configured entry (what SparseBtsScope arms).
