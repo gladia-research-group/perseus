@@ -52,6 +52,8 @@ class ImplModel:
         self.rt = Rt(ops, dims or Dims.from_inf(inf))
         self.plans = None
         self.plan_variants = {}
+        self._route_class = None       # ensure_routes
+        self._base_routes = None
         self.plan_variant = None
         self.graph_dir = None
         # weight-upload overlap through the runtime's residency ring (needs the real core)
@@ -161,6 +163,39 @@ class ImplModel:
                 if os.path.exists(p):
                     self.plan_variants[v][b] = load(p)
         return self
+
+    def routes_for(self, pos):
+        """(class, {slots}): the sparse routes position `pos` needs beyond the session's own (hook; None: none)."""
+        return None
+
+    def ensure_routes(self, pos):
+        """Make the resident sparse routes those position `pos` (+ SM_ROUTE_AHEAD) needs: unneeded routes are dropped
+        first, then missing ones built, so the device never holds both sets. Routes are not part of the plan: the
+        runtime refreshes a planned site on the route its value's period needs (planned_route_for). Building needs
+        the secret key (in a deployment: the client's keys, asked for ahead of the boundary)."""
+        if not hasattr(self.inf, "add_sparse_route"):
+            return
+        if self._base_routes is None:
+            self._base_routes = set(self.inf.sparse_routes)
+        ahead = int(os.environ.get("SM_ROUTE_AHEAD", "0") or 0)
+        want = self.routes_for(pos + ahead)
+        if want is None:
+            return
+        cls, slots = want
+        if cls == self._route_class:
+            return
+        target = self._base_routes | set(slots)
+        current = set(self.inf.sparse_routes)
+        t0 = time.time()
+        dropped = sorted(current - target)
+        for s in dropped:
+            self.inf.drop_sparse_route(int(s))
+        built = sorted(target - current)
+        for s in built:
+            self.inf.add_sparse_route(int(s))
+        self._route_class = cls
+        print(f"[routes] position {pos}: class {cls}, routes {sorted(self.inf.sparse_routes)} "
+              f"(dropped {dropped}, built {built}) in {time.time() - t0:.1f}s", flush=True)
 
     def _plan_for(self, b):
         if self.plans is None:
@@ -294,7 +329,8 @@ class ImplModel:
 
     # ── per-token bookkeeping ──
     def token_begin(self, pos):
-        """Adopt this step's staged masks, evict the previous step's, start the counters."""
+        """Adopt this step's staged masks, evict the previous step's, start the counters, build its routes."""
+        self.ensure_routes(pos)
         if pos not in self.rt._step_items:
             self.rt.declare_step(pos, self.step_masks(pos))
         t_wait = time.time()

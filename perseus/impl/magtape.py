@@ -24,8 +24,8 @@ import json
 
 import numpy as np
 
-# the runtime's own nodes, not the kernels' ops: refreshes and level drops (value-preserving)
-_REFRESH = ("auto_bootstrap", "deliberate_bootstrap", "hint", "fold_bootstrap", "level_reduce")
+# the runtime's own nodes, not the kernels' ops: refreshes, level drops and level hints (value-preserving)
+_REFRESH = ("auto_bootstrap", "deliberate_bootstrap", "hint", "fold_bootstrap", "level_reduce", "level_hint")
 
 
 @functools.lru_cache(maxsize=4)

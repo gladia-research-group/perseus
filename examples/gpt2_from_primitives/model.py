@@ -115,6 +115,14 @@ class Gpt2Model(ImplModel):
                                   validate=validate, variants=("feedback",))
 
     # ── the hooks ──
+    def routes_for(self, pos):
+        """SM_PERIODIC=2: the Gp x tH-slot route of the softmax's (Gp tH)-periodic values."""
+        from perseus.impl.attention import sm_periodic
+        if not getattr(self.rt.ops, "sm_periodic_general", False):
+            return None
+        gp = max(1, sm_periodic(self.rt, pos + 1))
+        return gp, ({gp * self.rt.dims.tH} if gp > 1 else set())
+
     def start(self):
         for kv in self.kv:
             kv.reset()

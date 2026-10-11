@@ -70,6 +70,8 @@ class FheOps:
         # denominators stay tH-periodic instead of living in block 0, so their refreshes route sparse and P.V is one
         # product (attention.qkt / softmax_thor / softmax_v)
         self.sm_periodic = os.environ.get("SM_PERIODIC", "1") not in ("", "0")
+        # SM_PERIODIC=2: past one group too, with period Gp tH (attention.sm_periodic)
+        self.sm_periodic_general = os.environ.get("SM_PERIODIC", "1") == "2"
         # SM_FOLD=1: the softmax's ciphertext x constant products folded into masks (the exp's Chebyshev affine into
         # the q.K^T group and score masks; each reciprocal round's seed slope into a second head-sum mask)
         self.sm_fold = os.environ.get("SM_FOLD", "1") not in ("", "0")

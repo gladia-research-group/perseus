@@ -582,6 +582,48 @@ def test_softmax_periodic_matches_block0(complex_packing, recip, kc):
 
 
 @pytest.mark.parametrize("complex_packing", [False, True])
+@pytest.mark.parametrize("recip", [False, True])
+@pytest.mark.parametrize("kc", [33, 70, 140, 256])
+def test_softmax_periodic_general_matches_block0(complex_packing, recip, kc):
+    """SM_PERIODIC=2: past one group the scores keep period Gp tH (group g in every block b with b % Gp == g, Gp the
+    power of two >= the group count): the head sums ladder over one period and P.V takes Gp products, and the
+    attention output is the block layout's."""
+    cfg = _cfgs().softmax["transformer.h.0.attn"]
+
+    def run(mode):
+        rt, fhe, inf = _rt(complex_payload=True)
+        rt.ops.sm_den_recip = recip
+        rt.ops.sm_periodic, rt.ops.sm_periodic_general = mode > 0, mode == 2
+        d = rt.dims
+        rng = np.random.default_rng(23)
+        kv = attention.ComplexKVCache(d.d_head) if complex_packing else attention.KVCache(d.d_head)
+        for tok in range(kc):
+            k, v = rng.standard_normal(d.hid) * 0.5, rng.standard_normal(d.hid) * 0.5
+            for arr in (k, v):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            kct, vct = layout.lane_vec(k, d.N, d.t), layout.lane_vec(v, d.N, d.t)
+            if complex_packing:
+                attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(kct + 1j * vct, 34))
+            else:
+                attention.cache_k_push(rt, kv, fake.FakeCt(kct, 34))
+                attention.cache_v_push(rt, kv, fake.FakeCt(vct, 34))
+        q = rng.standard_normal(d.hid); q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+        a = attention.sm_fold_affine(rt, cfg)[0]
+        scores = (attention.complex_qkt if complex_packing else attention.qkt)(rt, kv, qct, a)
+        probs = attention.softmax_thor(rt, scores, cfg, kc, folded=rt.ops.sm_fold)
+        out = (attention.complex_softmax_v if complex_packing else attention.softmax_v)(rt, kv, probs)
+        return scores.vec, out.vec, attention.sm_periodic(rt, kc), d.tH
+
+    s0, o0, per0, tH = run(0)
+    s2, o2, per, _ = run(2)
+    assert per0 == 0 and per == 1 << ((kc + 31) // 32 - 1).bit_length()
+    np.testing.assert_allclose(np.real(s2), np.real(np.tile(s0[:per * tH], s0.shape[0] // (per * tH))),
+                               rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(np.real(o2), np.real(o0), rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("complex_packing", [False, True])
 @pytest.mark.parametrize("periodic", [False, True])
 @pytest.mark.parametrize("kc", [1, 5, 32, 70])
 def test_softmax_fold_matches_unfolded(complex_packing, periodic, kc):
@@ -826,3 +868,29 @@ def test_replay_kv_pushes(complex_packing):
         assert ka == kb
         for x, y in zip(ca, cb):
             np.testing.assert_allclose(y.vec, x.vec, atol=1e-9)
+
+
+def test_ensure_routes_drops_before_it_builds(monkeypatch):
+    """ImplModel.ensure_routes: at a length-class change the routes no longer needed go first, then the missing ones
+    are built (the device holds the larger set, never both); the session's base routes are never dropped."""
+    from perseus.impl.driver import ImplModel
+    monkeypatch.delenv("SM_ROUTE_AHEAD", raising=False)
+    log = []
+
+    class Inf:
+        sparse_routes = [1, 512]
+
+        def add_sparse_route(self, s):
+            log.append(("add", s)); self.sparse_routes = sorted(set(self.sparse_routes) | {s})
+
+        def drop_sparse_route(self, s):
+            log.append(("drop", s)); self.sparse_routes = sorted(set(self.sparse_routes) - {s}); return 1
+
+    m = ImplModel.__new__(ImplModel)
+    m.inf, m._route_class, m._base_routes = Inf(), None, None
+    gp = lambda pos: 1 << ((pos // 32).bit_length())                       # 1, 2, 4 ... by 32-token group
+    m.routes_for = lambda pos: (gp(pos), {gp(pos) * 512} if gp(pos) > 1 else set())
+    for pos in range(0, 130):
+        m.ensure_routes(pos)
+    assert log == [("add", 1024), ("drop", 1024), ("add", 2048), ("drop", 2048), ("add", 4096)]
+    assert m.inf.sparse_routes == [1, 512, 4096]

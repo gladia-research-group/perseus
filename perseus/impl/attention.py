@@ -15,12 +15,36 @@ from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cl
                    rotsum_neg)
 
 
-def sm_periodic(rt, kc: int) -> bool:
-    """SM_PERIODIC=1 while every cached token fits one group (kc <= t): q.K^T keeps the score of (h, tok) in every
-    tH block instead of block 0 only, so the THOR softmax and its head sums run on tH-periodic ciphertexts (their
-    refreshes route sparse, the head sum needs no lane-copy ladder) and P.V is one product with the summed V."""
-    return (bool(getattr(rt.ops, "sm_periodic", False)) and kc <= rt.dims.t
-            and not getattr(rt.ops, "fused_sm_den", False))     # FUSED_SM_DEN=1 keeps its block-0 ladder + fold
+def sm_periodic(rt, kc: int) -> int:
+    """The scores' period in tH blocks, Gp (0: not periodic). SM_PERIODIC=1 while every cached token fits one group
+    (kc <= t): q.K^T keeps the score of (h, tok) in every tH block instead of block 0 only, so the THOR softmax and
+    its head sums run on tH-periodic ciphertexts (their refreshes route sparse, the head sum needs no lane-copy
+    ladder) and P.V is one product with the summed V. SM_PERIODIC=2 carries this past one group: group g's scores sit
+    in every block b with b % Gp == g, Gp the power of two >= the group count."""
+    ops, d = rt.ops, rt.dims
+    if not getattr(ops, "sm_periodic", False) or getattr(ops, "fused_sm_den", False):
+        return 0                                     # FUSED_SM_DEN=1 keeps its block-0 ladder + fold
+    if kc <= d.t:
+        return 1
+    if getattr(ops, "sm_periodic_general", False):
+        gp = 1 << ((kc + d.t - 1) // d.t - 1).bit_length()
+        return gp if gp * d.tH <= d.N else 0
+    return 0
+
+
+def _general(rt) -> bool:
+    return bool(getattr(rt.ops, "sm_periodic_general", False))
+
+
+def _gp_scope(rt, per: int):
+    """SM_PERIODIC=2: the ops whose count depends on Gp run in a sub-step keyed by it, so every name a plan pins is
+    the same at every cache length (one token-0 plan binds throughout; plan with FORBID_STEPS .gp)."""
+    return rt.step("gp", shape=f"p{int(per)}")
+
+
+def _gp_out(rt, x):
+    """The sub-step's result named in the enclosing step (an identity add)."""
+    return rt.ops.add(x, 0.0)
 
 
 def sm_fold_affine(rt, cfg: SoftmaxCfg):
@@ -33,9 +57,10 @@ def sm_fold_affine(rt, cfg: SoftmaxCfg):
     return 2.0 / (b - a), (a + b) / (b - a)
 
 
-def _group_mask_item(d, num_tok: int, g: int, per: bool, scale: float = 1.0):
+def _group_mask_item(d, num_tok: int, g: int, per: int, scale: float = 1.0):
     if per:
-        key, build = ("qkt.gmask.p", num_tok, g), lambda: qkt_group_mask(d, num_tok, g, periodic=True)
+        key = ("qkt.gmask.p", num_tok, g) + ((int(per),) if per > 1 else ())
+        build = lambda: qkt_group_mask(d, num_tok, g, periodic=per)
     else:
         key, build = ("qkt.gmask", num_tok, g), lambda: qkt_group_mask(d, num_tok, g)
     if scale == 1.0:
@@ -43,8 +68,9 @@ def _group_mask_item(d, num_tok: int, g: int, per: bool, scale: float = 1.0):
     return key + ("x", scale), lambda: scale * build()
 
 
-def _odd_mask_item(d, num_tok: int, g: int, scale: float = 1.0):
-    key, build = ("qkt.gmask.c", num_tok, g), lambda: qkt_complex_odd_mask(d, num_tok, g)
+def _odd_mask_item(d, num_tok: int, g: int, scale: float = 1.0, per: int = 0):
+    key = ("qkt.gmask.c", num_tok, g) + ((int(per),) if per else ())
+    build = lambda: qkt_complex_odd_mask(d, num_tok, g, per)
     if scale == 1.0:
         return key, build
     return key + ("x", scale), lambda: scale * build()
@@ -59,9 +85,9 @@ def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
             for k, (_a, beta, _i, scale) in enumerate(_recip_rounds(cfg, kc, getattr(rt.ops, "sm_gs_first", False)))]
 
 
-def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: bool, affine=(1.0, 0.0)):
+def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)):
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
-    sfx = ".p" if per else ""
+    sfx = (".p" if per == 1 else f".p{int(per)}") if per else ""
     al, be = affine
     if (al, be) == (1.0, 0.0):
         score = (("sm.score" + sfx, cfg.clip_lo, mean, kc), lambda: score_mask(d, cfg.clip_lo, mean, kc, periodic=per))
@@ -250,19 +276,21 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0):
             attn = r
         else:
             ops.inplace_add(attn, r)
+    per = sm_periodic(rt, kc)
     for gc, bucket in enumerate(kv.k_buckets):
         g_even, g_odd = 2 * gc, 2 * gc + 1
         result = ops.mult(q, bucket)
         result = rotsum(ops, result, d.tH, d.N)
+        if per:
+            result = ops.tag_reduce(result, d.tH)
         conj = ops.conjugate(result)
         res_e = ops.add(result, conj)
         n_even = min(d.t, kc - g_even * d.t)
-        accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g_even, False, scale)))
+        accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g_even, per, scale)))
         if g_odd * d.t < kc:
             res_o = ops.sub(result, conj)
             n_odd = min(d.t, kc - g_odd * d.t)
-            accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g_odd, scale)))
-    per = sm_periodic(rt, kc)
+            accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g_odd, scale, per)))
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
         result = ops.mult(q, pend)
@@ -281,7 +309,32 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs):
     the pair products, then the token ladder, 2 Re and the tok0 half mask."""
     ops, d = rt.ops, rt.dims
     n_pairs = d.d_head_real // 2
-    if sm_periodic(rt, kv.k_count):
+    per = sm_periodic(rt, kv.k_count)
+    if per and _general(rt):
+        # SM_PERIODIC=2 (every Gp, 1 included): pair j's rotation 2j tH only matters mod Gp, so the buckets of each
+        # class are summed and each class takes one product
+        scores_b = ops.copy(probs)
+        rot1 = ops.rotate(scores_b, d.tH)
+        conj_S_all = ops.sub(scores_b, ops.mult_i(rot1))   # s_2j - i s_2j+1 (monomial)
+        with _gp_scope(rt, per):
+            classes = {}
+            for j in range(n_pairs):
+                r = (2 * j) % per
+                if r in classes:
+                    ops.inplace_add(classes[r], kv.v_buckets[j])
+                else:
+                    classes[r] = ops.copy(kv.v_buckets[j])
+            rs = sorted(classes)
+        res = ops.mult(classes[rs[0]], conj_S_all)
+        with _gp_scope(rt, per):
+            if len(rs) > 1:
+                ops.mult_add_many(res, [classes[r] for r in rs[1:]],
+                                  ops.rotate_many(conj_S_all, [r * d.tH for r in rs[1:]]))
+        res = _gp_out(rt, res)
+        res = rotsum(ops, res, 1, d.t)
+        res = im_cleanse(ops, res)
+        return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
+    if per == 1:
         # tH-periodic scores: every pair's rotated score vector is (1 - i) P, so the pair products collapse into
         # one with the summed buckets; Re((V_re + i V_im)(1 - i) P) puts V P on both lanes of every pair
         vs = ops.copy(kv.v_buckets[0])
@@ -420,10 +473,20 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), d.t)
         if not periodic:
             h = rotsum(ops, h, d.tH, d.N)
+        elif _general(rt):
+            with _gp_scope(rt, periodic):
+                if periodic > 1:
+                    h = rotsum(ops, h, d.tH, int(periodic) * d.tH)
+            h = _gp_out(rt, h)
         h = ops.tag_reduce(h, d.tH)
     if periodic:
         if ops.fused_sm_den:
             raise ValueError("SM_PERIODIC=1 does not combine with FUSED_SM_DEN=1")
+        if _general(rt):     # the groups' partial sums sit in the Gp blocks of one period
+            with _gp_scope(rt, periodic):
+                if periodic > 1:
+                    out = rotsum(ops, out, d.tH, int(periodic) * d.tH)
+            out = _gp_out(rt, out)
     elif ops.fused_sm_den:
         s_eff = ops.fold_slots_for(d.tH)
         if s_eff > d.tH:
@@ -511,7 +574,26 @@ def softmax_v(rt, kv: KVCache, probs):
     """cachemir_attention.cu: sum_i V_lane_i * rotate(P, i*tH), token reduction,
     im_cleanse and the tok0 half mask."""
     ops, d = rt.ops, rt.dims
-    if sm_periodic(rt, kv.k_count):
+    per = sm_periodic(rt, kv.k_count)
+    if per and _general(rt):
+        # SM_PERIODIC=2 (every Gp): the lanes of each class i mod Gp summed, one product per class
+        with _gp_scope(rt, per):
+            vs = [None] * per
+            for i, lane in enumerate(kv.v_lanes[:d.d_head_real]):
+                r = i % per
+                if vs[r] is None:
+                    vs[r] = ops.copy(lane)
+                else:
+                    ops.inplace_add(vs[r], lane)
+        res = ops.mult(vs[0], probs)
+        with _gp_scope(rt, per):
+            if per > 1:
+                ops.mult_add_many(res, vs[1:], ops.rotate_many(probs, [r * d.tH for r in range(1, per)]))
+        res = _gp_out(rt, res)
+        res = rotsum(ops, res, 1, d.t)
+        res = im_cleanse(ops, res)
+        return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
+    if per:
         # tH-periodic scores: every rotate(P, i tH) is P, so the lane products collapse into one with the summed lanes
         vs = ops.copy(kv.v_lanes[0])
         for lane in kv.v_lanes[1:d.d_head_real]:
@@ -599,10 +681,10 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     for gc in range(Nb):
         ge, go = 2 * gc, 2 * gc + 1
         n = min(d.t, kc - ge * d.t)
-        items.append(_group_mask_item(d, n, ge, False, affine[0]))
+        items.append(_group_mask_item(d, n, ge, per, affine[0]))
         if go * d.t < kc:
             n = min(d.t, kc - go * d.t)
-            items.append(_odd_mask_item(d, n, go, affine[0]))
+            items.append(_odd_mask_item(d, n, go, affine[0], per))
     for g in range(2 * Nb, G):
         n = min(d.t, kc - g * d.t)
         items.append(_group_mask_item(d, n, g, per, affine[0]))

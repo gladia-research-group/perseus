@@ -42,6 +42,7 @@ def main(argv=None):
     ap.add_argument("--configs", default=os.environ.get("CONFIGS_PATH"))
     ap.add_argument("--plan", default=None, help="the plan dir whose runtime the device capture ran under, if any")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--pos", type=int, default=0, help="the captured position (FHE_GRAPH_CAPTURE_TOKEN)")
     ap.add_argument("--check", default=None, help="a capture with device magnitudes to compare against")
     a = ap.parse_args(argv)
     from . import env

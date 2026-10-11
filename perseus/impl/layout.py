@@ -280,12 +280,14 @@ def _tok_slot(dims: Dims, h: int, tok: int) -> int:
     return tok // dims.t * dims.t * dims.H + h * dims.t + tok % dims.t
 
 
-def _tile_tH(dims: Dims, out: np.ndarray, periodic: bool) -> np.ndarray:
-    """`periodic`: block 0 repeated over every tH block (the scores of a single group, kc <= t, kept tH-periodic)."""
-    return np.tile(out[:dims.tH], dims.N // dims.tH) if periodic else out
+def _tile_tH(dims: Dims, out: np.ndarray, periodic) -> np.ndarray:
+    """`periodic` = Gp (True = 1): the first Gp tH blocks repeated over the vector, i.e. group g's scores in every block
+    b with b % Gp == g (Gp = 1: the scores of a single group, kc <= t, in every block)."""
+    gp = int(periodic)
+    return np.tile(out[:gp * dims.tH], dims.N // (gp * dims.tH)) if gp else out
 
 
-def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int, periodic: bool = False) -> np.ndarray:
+def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int, periodic=False) -> np.ndarray:
     """score_mask_vec (cachemir_attention_utils.h)."""
     out = np.full(dims.N, clip_lo - mean)
     for h in range(dims.H):
@@ -294,7 +296,7 @@ def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int, periodic: bool 
     return _tile_tH(dims, out, periodic)
 
 
-def active_mask(dims: Dims, kc: int, periodic: bool = False) -> np.ndarray:
+def active_mask(dims: Dims, kc: int, periodic=False) -> np.ndarray:
     """active_mask_vec (cachemir_attention_utils.h): 0.5/kc on the active slots."""
     out = np.zeros(dims.N)
     for h in range(dims.H):
@@ -303,12 +305,15 @@ def active_mask(dims: Dims, kc: int, periodic: bool = False) -> np.ndarray:
     return _tile_tH(dims, out, periodic)
 
 
-def qkt_group_mask(dims: Dims, num_tok: int, g: int, periodic: bool = False) -> np.ndarray:
-    """qkt_group_mask_vec (cachemir_attention_utils.h); `periodic` (group 0 only) keeps every tH block."""
+def qkt_group_mask(dims: Dims, num_tok: int, g: int, periodic=False) -> np.ndarray:
+    """qkt_group_mask_vec (cachemir_attention_utils.h); `periodic` = Gp (True = 1) keeps every tH block b with
+    b % Gp == g instead of block g only."""
     gscale = 0.5 / math.sqrt(dims.d_head_real)
     i = np.arange(dims.N)
     h = (i % dims.tH) // dims.t
-    ok = ((i // dims.tH == g) | periodic) & (i % dims.t < num_tok) & (h < dims.H_real)
+    gp = int(periodic)
+    blk = (i // dims.tH) % gp == g if gp else i // dims.tH == g
+    ok = blk & (i % dims.t < num_tok) & (h < dims.H_real)
     return np.where(ok, gscale, 0.0)
 
 
@@ -333,10 +338,10 @@ def complex_vlane_mask(dims: Dims, i: int, right_rot: int, imag_scale: float = -
     return 1j * imag_scale * vlane_mask(dims, i, right_rot, 0.5)
 
 
-def qkt_complex_odd_mask(dims: Dims, num_tok: int, g: int) -> np.ndarray:
+def qkt_complex_odd_mask(dims: Dims, num_tok: int, g: int, periodic=False) -> np.ndarray:
     """qkt_complex_odd_mask_vec: the group mask on the negative imaginary axis, for the odd
     group of a complex K bucket (its scores come out as 2i q.K_odd)."""
-    return -1j * qkt_group_mask(dims, num_tok, g)
+    return -1j * qkt_group_mask(dims, num_tok, g, periodic)
 
 
 def vpair_mask_complex(dims: Dims, i_re: int, i_im: int, right_rot: int, scale: float = 0.5) -> np.ndarray:
