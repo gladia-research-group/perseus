@@ -5,6 +5,7 @@
 #include <CKKS/Discard.cuh>
 #include <CKKS/RNSPoly.cuh>
 #include <CKKS/SmallInt.cuh>
+#include <CKKS/ModUpConv2.cuh>
 #include <CKKS/LinearKS.cuh>  // setModupMerge
 #include <CKKS/Omr.cuh>
 #include <CKKS/SparseB.cuh>
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <chrono>
 #include <cmath>
@@ -1209,4 +1211,75 @@ TEST_F(BtsProfileTest, DiagSparsityDump) {
     fhe().cc->LoadCiphertext(probe);
     auto gct = std::static_pointer_cast<::FIDESlib::CKKS::Ciphertext>(fhe().cc->GetDeviceCiphertext(probe->gpu));
     ::FIDESlib::CKKS::dumpLtDiagCoeffs(gct->cc, dir, std::atoi(e));  // library-side: its own struct layout
+}
+
+// FIDESLIB_BCONV2 gate: the rewritten ModUp base conversion against the original kernel on the same operands in one
+// process (relinearized products and rotations), raw residues bit-exact, plus relin timings both ways. Opt-in:
+// BCONV2_GATE=1.
+TEST_F(BtsProfileTest, Bconv2Gate) {
+    if (!std::getenv("BCONV2_GATE")) GTEST_SKIP() << "set BCONV2_GATE=1";
+    const int S = slots();
+    auto& cc = fhe().cc;
+    using FC = ::FIDESlib::CKKS::Ciphertext;
+    auto raw = [&](const Ctx& r) {
+        cudaDeviceSynchronize();
+        auto g = std::static_pointer_cast<FC>(cc->GetDeviceCiphertext(r->gpu));
+        std::vector<std::vector<uint64_t>> r0, r1;
+        g->c0.store(r0);
+        g->c1.store(r1);
+        r0.insert(r0.end(), r1.begin(), r1.end());
+        return r0;
+    };
+    long total_bad = 0;
+    for (int lv : {4, 12, 20, 32, 36}) {  // rotation keys are banded to 22 limbs: rotations from level 32 on
+        Ctx A = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x51u + lv), lv), fhe().pk());
+        Ctx B = encrypt(cc, encode(cc, varied_pattern(S, S, 0.9, 0x62u + lv), lv), fhe().pk());
+        cc->LoadCiphertext(A);
+        cc->LoadCiphertext(B);
+        std::vector<std::pair<std::string, std::function<Ctx()>>> ops = {
+            {"mult", [&] { return cc->EvalMult(A, B); }},
+            {"square", [&] { return cc->EvalSquare(A); }},
+        };
+        if (lv >= 32) {
+            ops.push_back({"rot+1", [&] { return cc->EvalRotate(A, 1); }});
+            ops.push_back({"rot-4", [&] { return cc->EvalRotate(A, -4); }});
+        }
+        for (auto& [name, op] : ops) {
+            ::FIDESlib::CKKS::setModUpConv2(0);
+            auto x = raw(op());
+            ::FIDESlib::CKKS::setModUpConv2(1);
+            auto y = raw(op());
+            long bad = x.size() != y.size() ? -1 : 0;
+            for (size_t l = 0; bad >= 0 && l < x.size(); ++l)
+                for (size_t i = 0; i < x[l].size(); ++i) bad += x[l][i] != y[l][i];
+            std::cout << "[bconv2] level " << lv << " " << name << ": residues differing " << bad << " (limbs "
+                      << x.size() / 2 << ")\n";
+            total_bad += bad != 0;
+        }
+        // relin timing, pipelined: 16 products back to back, min of 5 reps per arm
+        auto dev = [&](const Ctx& h) {
+            Ctx c = h->Clone();
+            cc->LoadCiphertext(c);
+            return std::make_pair(c, std::static_pointer_cast<FC>(cc->GetDeviceCiphertext(c->gpu)));
+        };
+        auto DA = dev(A), DB = dev(B);
+        double tp[2] = {0, 0};
+        std::vector<std::unique_ptr<FC>> xs;
+        for (int k = 0; k < 16; ++k) xs.emplace_back(std::make_unique<FC>(DA.second->cc_));
+        for (int rep = 0; rep < 6; ++rep)
+            for (int arm = 0; arm < 2; ++arm) {
+                ::FIDESlib::CKKS::setModUpConv2(arm);
+                for (auto& x : xs) x->copy(*DA.second);
+                cudaDeviceSynchronize();
+                auto t0 = std::chrono::steady_clock::now();
+                for (auto& x : xs) x->mult(*DB.second, false);
+                cudaDeviceSynchronize();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 16;
+                if (rep >= 1 && (tp[arm] == 0 || ms < tp[arm])) tp[arm] = ms;
+            }
+        std::cout << "[bconv2] level " << lv << " relin pipelined: original " << tp[0] << " ms, bconv2 " << tp[1] << " ms ("
+                  << 100.0 * (tp[1] - tp[0]) / tp[0] << " %)\n";
+    }
+    ::FIDESlib::CKKS::setModUpConv2(0);
+    EXPECT_EQ(total_bad, 0);
 }

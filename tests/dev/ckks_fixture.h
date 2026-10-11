@@ -19,6 +19,7 @@ class CkksFixture : public ::testing::Test {
         // FIRST_MOD_BITS, ...); a bare make_ckks_context() silently pinned every
         // fixture-based probe to the production 58-bit chain.
         CKKSContextOptions o = default_ckks_options();
+        if (const char* e = std::getenv("FIXTURE_NO_BTS"); e && *e && *e != '0') o.enable_bootstrap = false;   // probes on contexts too shallow to bootstrap
         // Generic power-of-2 (+ 1024/j, ±5) rotation keys the primitive probes rely on
         // (e.g. the 1..512 reductions). make_ckks_context used
         // to inject these via include_default_rot_keys; now seeded explicitly per the same
