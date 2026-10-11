@@ -10,6 +10,7 @@
 #include <CKKS/Omr.cuh>
 #include <CKKS/SparseB.cuh>
 #include <CKKS/Spru.cuh>
+#include <CKKS/GpuEncrypt.cuh>  // setGpuEncrypt
 #include <complex>
 #include <NTTcluster.cuh>
 #include <NTTtc.cuh>    // setNttCluster
@@ -1372,4 +1373,161 @@ TEST_F(BtsProfileTest, NoCloneGate) {
     }
     ::fideslib::SetNoCloneLevelForTest(0);
     EXPECT_EQ(total_bad, 0);
+}
+
+
+// FIDESLIB_GPU_ENCRYPT gate: the device public-key encryption against the host one, same plaintexts. Per level: the
+// decryption error (max and RMS over the slots, 24 encryptions per arm) must match the host's (the noise is the same
+// distribution), two device encryptions of one plaintext must differ (fresh randomness), and the wall time per call.
+TEST_F(BtsProfileTest, GpuEncryptGate) {
+    if (!std::getenv("GPU_ENCRYPT_GATE")) GTEST_SKIP() << "set GPU_ENCRYPT_GATE=1";
+    setenv("FIDESLIB_GPU_ENCODE", "1", 1);
+    const int S = slots();
+    auto& cc = fhe().cc;
+    using FC = ::FIDESlib::CKKS::Ciphertext;
+    const int reps = 24;
+    bool ok = true;
+    for (int lv : {0, 4, 12, 24, 36}) {
+        const auto want = varied_pattern(S, S, 0.9, 0x5eedu + lv);
+        double rms[2] = {0, 0}, mx[2] = {0, 0}, ms[2] = {0, 0};
+        std::vector<std::vector<uint64_t>> c1a, c1b;
+        for (int arm = 0; arm < 2; ++arm) {
+            ::FIDESlib::CKKS::setGpuEncrypt(arm);
+            if (arm) {  // the first device-path call per shape runs on the host and records the shape
+                Ctx warm = encrypt(cc, encode(cc, want, lv), fhe().pk());
+                cudaDeviceSynchronize();
+            }
+            double se = 0;
+            long n = 0;
+            for (int r = 0; r < reps; ++r) {
+                Ptx pt = encode(cc, want, lv);
+                cudaDeviceSynchronize();
+                auto t0 = std::chrono::steady_clock::now();
+                Ctx c = encrypt(cc, pt, fhe().pk());
+                cudaDeviceSynchronize();
+                ms[arm] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+                if (arm && r < 2) {
+                    auto g = std::static_pointer_cast<FC>(cc->GetDeviceCiphertext(c->gpu));
+                    g->c1.store(r == 0 ? c1a : c1b);
+                }
+                auto got = decrypt(cc, c, fhe().sk());
+                for (int i = 0; i < S; ++i) {
+                    const double e = got[i] - want[i];
+                    se += e * e;
+                    mx[arm] = std::max(mx[arm], std::fabs(e));
+                    ++n;
+                }
+            }
+            rms[arm] = std::sqrt(se / n);
+        }
+        long same = 0, tot = 0;
+        for (size_t l = 0; l < c1a.size() && l < c1b.size(); ++l)
+            for (size_t i = 0; i < c1a[l].size(); ++i) same += c1a[l][i] == c1b[l][i], ++tot;
+        const double ratio = rms[1] / rms[0];
+        std::cout << "[genc] level " << lv << ": rms host " << rms[0] << " gpu " << rms[1] << " (x" << ratio
+                  << "), max host " << mx[0] << " gpu " << mx[1] << ", c1 residues equal across two gpu encryptions "
+                  << same << "/" << tot << ", ms/call host " << ms[0] << " gpu " << ms[1] << "\n";
+        ok = ok && ratio > 0.8 && ratio < 1.25 && mx[1] < 8 * mx[0] && same < tot / 1000 + 16;
+    }
+    ::FIDESlib::CKKS::setGpuEncrypt(0);
+    EXPECT_TRUE(ok);
+}
+
+
+// Host decrypt cost of a GPU-resident ciphertext (the per-token logits / CutMax z decrypts): ms per call by stage,
+// for a perf profile of where the host time goes.
+TEST_F(BtsProfileTest, DecryptBench) {
+    if (!std::getenv("DECRYPT_BENCH")) GTEST_SKIP() << "set DECRYPT_BENCH=1";
+    const int S = slots();
+    auto& cc = fhe().cc;
+    const int lv = std::getenv("DECRYPT_LEVEL") ? std::atoi(std::getenv("DECRYPT_LEVEL")) : 40;
+    const auto want = varied_pattern(S, S, 0.9, 0xdecu);
+    Ctx c = encrypt(cc, encode(cc, want, lv), fhe().pk());
+    cc->LoadCiphertext(c);
+    const int reps = 20;
+    double t_view = 0, t_dec = 0, t_vals = 0;
+    for (int r = 0; r < reps; ++r) {
+        cudaDeviceSynchronize();
+        auto t0 = std::chrono::steady_clock::now();
+        Ctx view = decrypt_view(cc, c);
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::steady_clock::now();
+        Plaintext pt;
+        cc->Decrypt(view, fhe().sk(), &pt);
+        auto t2 = std::chrono::steady_clock::now();
+        auto v = pt->GetRealPackedValue();
+        auto t3 = std::chrono::steady_clock::now();
+        t_view += std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
+        t_dec += std::chrono::duration<double, std::milli>(t2 - t1).count() / reps;
+        t_vals += std::chrono::duration<double, std::milli>(t3 - t2).count() / reps;
+    }
+    std::cout << "[decbench] level " << lv << ": view " << t_view << " ms, Decrypt " << t_dec << " ms, values " << t_vals
+              << " ms\n";
+}
+
+
+// FIDESLIB_FAST_DECRYPT gate: the host ciphertext a device ciphertext is decrypted in must be identical through the
+// empty container and through the dummy-encryption container (every residue; level, scale, degree, slots, key tag,
+// encoding), for fresh (degree-1) and product (degree-2) ciphertexts at several levels. The decoded values are compared
+// across arms next to two decodes within one arm (OpenFHE's CKKS decode adds fresh noise each time). ms per decrypt.
+TEST_F(BtsProfileTest, FastDecryptGate) {
+    if (!std::getenv("FAST_DECRYPT_GATE")) GTEST_SKIP() << "set FAST_DECRYPT_GATE=1";
+    const int S = slots();
+    auto& cc = fhe().cc;
+    using LCt = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
+    long bad = 0;
+    for (int lv : {0, 12, 24, 36, 44}) {
+        const auto a = varied_pattern(S, S, 0.9, 0xfdu + lv), b = varied_pattern(S, S, 0.7, 0xfeu + lv);
+        Ctx x = encrypt(cc, encode(cc, a, lv), fhe().pk());
+        Ctx y = encrypt(cc, encode(cc, b, lv), fhe().pk());
+        cc->LoadCiphertext(x);
+        cc->LoadCiphertext(y);
+        Ctx xy = cc->EvalMult(x, y);
+        for (auto& [name, src] : std::vector<std::pair<std::string, Ctx>>{{"fresh", x}, {"product", xy}}) {
+            std::vector<std::complex<double>> v[2][2];
+            LCt host[2];
+            double ms[2] = {0, 0};
+            for (int arm = 0; arm < 2; ++arm) {
+                ::fideslib::SetFastDecrypt(arm);
+                for (int r = 0; r < 6; ++r) {
+                    Ctx view = decrypt_view(cc, src->Clone());   // a metadata-only shadow, like every device result
+                    cudaDeviceSynchronize();
+                    auto t0 = std::chrono::steady_clock::now();
+                    Plaintext pt;
+                    cc->Decrypt(view, fhe().sk(), &pt);
+                    auto vals = pt->GetCKKSPackedValue();
+                    ms[arm] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 6;
+                    if (r < 2) v[arm][r] = vals;
+                    if (r == 0) host[arm] = std::any_cast<LCt&>(view->cpu);
+                }
+            }
+            const auto &h0 = host[0], &h1 = host[1];
+            long d = 0;
+            const bool meta = h0->GetLevel() == h1->GetLevel() && h0->GetNoiseScaleDeg() == h1->GetNoiseScaleDeg() &&
+                              h0->GetScalingFactor() == h1->GetScalingFactor() && h0->GetSlots() == h1->GetSlots() &&
+                              h0->GetKeyTag() == h1->GetKeyTag() && h0->GetEncodingType() == h1->GetEncodingType() &&
+                              h0->GetElements().size() == h1->GetElements().size();
+            for (size_t e = 0; meta && e < h0->GetElements().size(); ++e) {
+                const auto &p0 = h0->GetElements()[e], &p1 = h1->GetElements()[e];
+                if (p0.GetNumOfElements() != p1.GetNumOfElements() || p0.GetFormat() != p1.GetFormat()) { d = -1; break; }
+                for (size_t t = 0; t < p0.GetNumOfElements(); ++t) {
+                    const auto &u = p0.GetElementAtIndex(t).GetValues(), &w = p1.GetElementAtIndex(t).GetValues();
+                    for (size_t i = 0; i < u.GetLength(); ++i) d += u[i] != w[i];
+                }
+            }
+            auto maxdiff = [](const std::vector<std::complex<double>>& p, const std::vector<std::complex<double>>& q) {
+                double m = 0;
+                for (size_t i = 0; i < p.size() && i < q.size(); ++i) m = std::max(m, std::abs(p[i] - q[i]));
+                return m;
+            };
+            std::cout << "[fdec] level " << lv << " " << name << ": metadata " << (meta ? "equal" : "DIFFER")
+                      << ", residues differing " << d << " (towers " << h0->GetElements()[0].GetNumOfElements()
+                      << ", level " << h0->GetLevel() << ", deg " << h0->GetNoiseScaleDeg() << "), decoded max |diff| across arms "
+                      << maxdiff(v[0][0], v[1][0]) << " within dummy " << maxdiff(v[0][0], v[0][1]) << " within empty "
+                      << maxdiff(v[1][0], v[1][1]) << ", ms/decrypt dummy " << ms[0] << " empty " << ms[1] << "\n";
+            bad += !meta || d != 0;
+        }
+    }
+    ::fideslib::SetFastDecrypt(0);
+    EXPECT_EQ(bad, 0);
 }
