@@ -1,6 +1,7 @@
 // perseus._core op layer: Inference, PackedCtx, data plane, weights, configs,
 // packing-dispatched ops, GPT-2 composites, graph/plan controls.
 #include "attention.h"
+#include "CKKS/Plaintext.cuh"   // device_registry: the plaintext registry entries' limbs
 #include "checks.h"
 #include "ckks_primitives.h"
 #include "npconv.h"
@@ -16,6 +17,7 @@
 #include <pybind11/stl.h>
 #include "residency_pipeline.h"
 #include <future>
+#include <optional>
 #include <chrono>
 #include <tuple>
 
@@ -357,6 +359,8 @@ void bind_ops(py::module_& m) {
     py::class_<PackedCtx>(m, "PackedCtx")
         .def_property_readonly("level", [](const PackedCtx& p) { return level_of(p.ct); })
         .def_property_readonly("noise_deg", [](const PackedCtx& p) { return p.ct->GetNoiseScaleDeg(); })
+        .def_property_readonly("on_device", [](const PackedCtx& p) { return p.ct && p.ct->loaded; },
+                               "Whether the ciphertext's device copy exists (false once parked by kv_evict).")
         .def_property_readonly("packing", [](const PackedCtx& p) { return std::string(to_string(p.packing.kind)); })
         .def("__repr__", [](const PackedCtx& p) {
             return "<PackedCtx " + std::string(to_string(p.packing.kind)) +
@@ -682,6 +686,120 @@ void bind_ops(py::module_& m) {
              "ct * values (slot-wise): `values` is encoded as a plaintext at ct's level; "
              "shorter than the slot count is zero-filled; a complex array encodes a complex "
              "plaintext.")
+        .def("mult_pt_sum_raw",
+             [](Inference& inf, const std::vector<PackedCtx>& cts, const py::array& values) {
+                 // C-contiguous (n, width) float32 / float64 / complex64 / complex128, width <= slots
+                 if (values.ndim() != 2 || static_cast<size_t>(values.shape(0)) != cts.size() || cts.empty())
+                     throw std::invalid_argument("mult_pt_sum_raw: values must be (len(cts), width)");
+                 if (!(values.flags() & py::array::c_style))
+                     throw std::invalid_argument("mult_pt_sum_raw: values must be C-contiguous");
+                 const auto k = values.dtype().kind();
+                 const auto sz = values.dtype().itemsize();
+                 const int dtype = (k == 'f' && sz == 4) ? 0 : (k == 'f' && sz == 8) ? 1 : (k == 'c' && sz == 8) ? 2
+                                 : (k == 'c' && sz == 16) ? 3 : -1;
+                 if (dtype < 0) throw std::invalid_argument("mult_pt_sum_raw: float32/64 or complex64/128 only");
+                 const size_t w = static_cast<size_t>(values.shape(1));
+                 if (w != static_cast<size_t>(inf.slots))
+                     throw std::invalid_argument("mult_pt_sum_raw: rows must hold exactly the slot count");
+                 if (!inf.fhe->mult_pt_sum_usable(cts)) return py::object(py::none());   // caller falls back
+                 const void* ptr = values.data();
+                 PackedCtx out;
+                 { py::gil_scoped_release nogil; out = inf.fhe->mult_pt_sum_raw(cts, ptr, dtype, w); }
+                 return py::cast(std::move(out));
+             },
+             py::arg("cts"), py::arg("values"),
+             "sum_i cts[i] * values[i] with every row encoded on the device from the raw buffer (no host "
+             "conversion) and folded into one accumulator; the loop's op stream is replayed. Returns None when "
+             "the fused path does not apply (capture, mixed levels, a planned refresh inside): use mult_pt_sum.")
+        .def("mult_coeff_sum",
+             [](Inference& inf, const std::vector<PackedCtx>& cts, const py::array& rows, const py::array& tags) {
+                 // rows: (len(cts), N) float32 with a unit inner stride, in pinned host or device-visible memory
+                 // (pinned_empty); tags: (len(cts), 7) int32 from pt_tag_fields
+                 if (rows.ndim() != 2 || static_cast<size_t>(rows.shape(0)) != cts.size() || cts.empty())
+                     throw std::invalid_argument("mult_coeff_sum: rows must be (len(cts), N)");
+                 if (rows.dtype().kind() != 'f' || rows.dtype().itemsize() != 4 || rows.strides(1) != 4)
+                     throw std::invalid_argument("mult_coeff_sum: rows must be float32 with contiguous rows");
+                 if (static_cast<size_t>(rows.shape(1)) != static_cast<size_t>(2 * inf.slots))
+                     throw std::invalid_argument("mult_coeff_sum: rows must hold the ring degree's coefficients");
+                 if (tags.ndim() != 2 || tags.shape(0) != rows.shape(0) || tags.shape(1) != 7 ||
+                     tags.dtype().kind() != 'i' || tags.dtype().itemsize() != 4 || !(tags.flags() & py::array::c_style))
+                     throw std::invalid_argument("mult_coeff_sum: tags must be C-contiguous (len(cts), 7) int32");
+                 cudaPointerAttributes at{};
+                 if (cudaPointerGetAttributes(&at, rows.data()) != cudaSuccess || at.type == cudaMemoryTypeUnregistered) {
+                     cudaGetLastError();
+                     throw std::invalid_argument("mult_coeff_sum: rows must live in pinned host or device memory");
+                 }
+                 if (!inf.fhe->mult_pt_sum_usable(cts)) return py::object(py::none());   // caller falls back
+                 const float* ptr = static_cast<const float*>(rows.data());
+                 const size_t stride = static_cast<size_t>(rows.strides(0)) / 4;
+                 const int32_t* tg = static_cast<const int32_t*>(tags.data());
+                 PackedCtx out;
+                 { py::gil_scoped_release nogil; out = inf.fhe->mult_coeff_sum(cts, ptr, stride, tg); }
+                 return py::cast(std::move(out));
+             },
+             py::arg("cts"), py::arg("rows"), py::arg("tags"),
+             "sum_i cts[i] * pt_i where pt_i's coefficients are rows[i] times the level's scaling factor (rows: "
+             "coeff_rows of the slot values, in pinned_empty memory), encoded and multiplied on the device in "
+             "batches; the loop's op stream is replayed with tags[i] as the plaintexts' tags. None when the fused "
+             "path does not apply (capture, mixed levels, a planned refresh inside): use mult_pt_sum.")
+        .def_property_readonly("coeff_rows_overflows", [](Inference& inf) { return inf.fhe->coeff_rows_overflows(); },
+             "Coefficients mult_coeff_sum clamped since the start (nonzero: some row exceeded the int64 range).")
+        .def("mult_pt_sum",
+             [](Inference& inf, const std::vector<PackedCtx>& cts, const py::array& values) {
+                 if (values.ndim() != 2 || static_cast<size_t>(values.shape(0)) != cts.size() || cts.empty())
+                     throw std::invalid_argument("mult_pt_sum: values must be (len(cts), slots), cts non-empty");
+                 const auto t_in = std::chrono::steady_clock::now();
+                 const size_t n = cts.size(), w = static_cast<size_t>(values.shape(1));
+                 if (w > static_cast<size_t>(inf.slots))
+                     throw std::invalid_argument("mult_pt_sum: more values than slots");
+                 std::vector<perseus_np::AnyVec> vs(n);
+                 if (values.dtype().kind() == 'c') {
+                     py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> a(values);
+                     const auto r = a.unchecked<2>();
+                     for (size_t i = 0; i < n; ++i) {
+                         vs[i].cplx = true;
+                         vs[i].c.assign(&r(i, 0), &r(i, 0) + w);
+                     }
+                 } else {
+                     py::array_t<double, py::array::c_style | py::array::forcecast> a(values);
+                     const auto r = a.unchecked<2>();
+                     for (size_t i = 0; i < n; ++i) vs[i].re.assign(&r(i, 0), &r(i, 0) + w);
+                 }
+                 py::gil_scoped_release nogil;
+                 static const bool timing = std::getenv("PT_SUM_TIMING") != nullptr;
+                 static double t_conv = 0; static long n_conv = 0;
+                 if (timing) {
+                     t_conv += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_in).count();
+                     if (++n_conv % 50 == 0)
+                         std::cerr << "[pt_sum_timing] numpy->rows " << t_conv / n_conv << " ms/call\n";
+                 }
+                 // the device-encoded fused path when it cannot change what the loop records
+                 if (std::getenv("IMPL_PT_SUM_FUSED") && std::atoi(std::getenv("IMPL_PT_SUM_FUSED")) > 0
+                     && inf.fhe->mult_pt_sum_usable(cts)) {
+                     const bool cplx = vs[0].cplx;
+                     if (cplx) {
+                         std::vector<std::vector<std::complex<double>>> rows(n);
+                         for (size_t i = 0; i < n; ++i) { vs[i].resize(static_cast<size_t>(inf.slots)); rows[i] = std::move(vs[i].c); }
+                         return inf.fhe->mult_pt_sum(cts, rows);
+                     }
+                     std::vector<std::vector<double>> rows(n);
+                     for (size_t i = 0; i < n; ++i) { vs[i].resize(static_cast<size_t>(inf.slots)); rows[i] = std::move(vs[i].re); }
+                     return inf.fhe->mult_pt_sum(cts, rows);
+                 }
+                 std::optional<PackedCtx> acc;
+                 for (size_t i = 0; i < n; ++i) {
+                     vs[i].resize(static_cast<size_t>(inf.slots));
+                     Ptx pt = encode_any_at(inf, vs[i], cts[i]);
+                     PackedCtx p = inf.fhe->mult(cts[i], pt);
+                     if (!acc) acc.emplace(std::move(p));
+                     else inf.fhe->inplace_add(*acc, p);
+                 }
+                 return std::move(*acc);
+             },
+             py::arg("cts"), py::arg("values"),
+             "sum_i cts[i] * values[i] (each row encoded at its ciphertext's level, like mult_pt): "
+             "the baby-step inner sum of a streamed-weight linear in one call. The recorded op stream "
+             "is the loop's (mult, then inplace_add), so a plan cut on either form fits the other.")
         .def("mult_const",
              [](Inference& inf, const PackedCtx& ct, double re, double im) {
                  py::gil_scoped_release nogil;
@@ -1063,6 +1181,46 @@ void bind_ops(py::module_& m) {
         cudaMemGetInfo(&free_b, &total_b);
         return static_cast<double>(free_b) / (1 << 30);
     }, "Free memory on the current CUDA device, in GiB (cudaMemGetInfo).");
+    m.def("pinned_empty", [](size_t rows, size_t cols) {
+        // page-locked, device-mapped host memory (kernels read it in place) as a float32 numpy array
+        void* p = nullptr;
+        const size_t bytes = std::max<size_t>(rows * cols * sizeof(float), 1);
+        if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            throw std::runtime_error("pinned_empty: cudaHostAlloc failed for " + std::to_string(bytes) + " bytes");
+        }
+        py::capsule owner(p, [](void* q) { cudaFreeHost(q); });
+        return py::array_t<float>({rows, cols}, {cols * sizeof(float), sizeof(float)}, static_cast<float*>(p), owner);
+    }, py::arg("rows"), py::arg("cols"),
+       "A (rows, cols) float32 array in pinned, device-mapped host memory (cudaHostAlloc): the backing store "
+       "Inference.mult_coeff_sum reads weight coefficient rows from.");
+    m.def("pt_tag_fields", [](const py::array& values) {
+        // the plaintext tag mult_pt_sum_raw derives from each slot-value row, as 7 int32 fields
+        if (values.ndim() != 2 || !(values.flags() & py::array::c_style))
+            throw std::invalid_argument("pt_tag_fields: values must be a C-contiguous 2-D array");
+        const auto k = values.dtype().kind();
+        const auto sz = values.dtype().itemsize();
+        const int dtype = (k == 'f' && sz == 4) ? 0 : (k == 'f' && sz == 8) ? 1 : (k == 'c' && sz == 8) ? 2
+                        : (k == 'c' && sz == 16) ? 3 : -1;
+        if (dtype < 0) throw std::invalid_argument("pt_tag_fields: float32/64 or complex64/128 only");
+        const size_t n = values.shape(0), w = values.shape(1);
+        const size_t elem = (dtype == 0 ? 4 : dtype == 1 || dtype == 2 ? 8 : 16);
+        py::array_t<int32_t> out({n, (size_t)7});
+        auto o = out.mutable_unchecked<2>();
+        const char* base = static_cast<const char*>(values.data());
+        for (size_t i = 0; i < n; ++i) {
+            const char* row = base + i * w * elem;
+            PackSignature sig;
+            if (dtype == 0) sig = analyze_tag_fields((const float*)row, (const float*)nullptr, (int)w, 1);
+            else if (dtype == 1) sig = analyze_tag_fields((const double*)row, (const double*)nullptr, (int)w, 1);
+            else if (dtype == 2) sig = analyze_tag_fields((const float*)row, (const float*)row + 1, (int)w, 2);
+            else sig = analyze_tag_fields((const double*)row, (const double*)row + 1, (int)w, 2);
+            o(i, 0) = std::max<int>(sig.slots, 0); o(i, 1) = sig.period; o(i, 2) = sig.live_exact;
+            o(i, 3) = sig.stride_exact; o(i, 4) = sig.window_exact; o(i, 5) = sig.offset_exact;
+            o(i, 6) = (dtype >= 2 && sig.im_amax != 0.0) ? (sig.amax != 0.0 ? 2 : 1) : 0;
+        }
+        return out;
+    }, py::arg("values"), "Per row of slot values, the plaintext tag fields mult_coeff_sum takes.");
     m.def("gpu_pool_stats", []() {
         int dev = 0;
         cudaGetDevice(&dev);

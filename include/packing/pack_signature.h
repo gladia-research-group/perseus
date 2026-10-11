@@ -111,3 +111,47 @@ inline PackSignature analyze_packing(const std::vector<double>& v) {
     for (size_t i = 0; i < v.size(); ++i) c[i] = {v[i], 0.0};
     return analyze_packing(c);
 }
+
+
+// The fields of analyze_packing a plaintext's pack tag reads (period, live_exact, stride_exact, window_exact,
+// offset_exact), in two allocation-free passes over a raw row of n values (re[i * step], im[i * step] when im):
+// the streamed-weight path tags ~150k rows per token, where analyze_packing's index vectors and complex copies
+// dominated. Same semantics: the period uses the 1e-2 relative tolerance, the exact support every nonzero.
+template <class T>
+inline PackSignature analyze_tag_fields(const T* re, const T* im, int n, int step) {
+    PackSignature s;
+    s.slots = n;
+    if (n == 0) return s;
+    double amax = 0.0, imax = 0.0;
+    int first = -1, last = -1, live = 0, g = 0;
+    for (int i = 0; i < n; ++i) {
+        const double a = (double)re[(size_t)i * step], b = im ? (double)im[(size_t)i * step] : 0.0;
+        amax = std::max(amax, std::fabs(a));
+        imax = std::max(imax, std::fabs(b));
+        if (a != 0.0 || b != 0.0) {
+            if (first < 0) first = i; else g = std::gcd(g, i - first);
+            last = i;
+            ++live;
+        }
+    }
+    s.amax = amax; s.im_amax = imax;
+    s.im_is_data = imax > 1e-3 * std::max(amax, 1e-300);
+    const double ref = s.im_is_data ? std::max(amax, imax) : amax;
+    const double tol = std::max(1e-2 * ref, 1e-12);
+    s.period = n;
+    for (int p = 1; p < n; p <<= 1) {
+        bool ok = true;
+        for (int i = p; i < n && ok; ++i) {
+            const size_t a = (size_t)i * step, b = (size_t)(i % p) * step;
+            if (std::fabs((double)re[a] - (double)re[b]) > tol ||
+                (s.im_is_data && im && std::fabs((double)im[a] - (double)im[b]) > tol))
+                ok = false;
+        }
+        if (ok) { s.period = p; break; }
+    }
+    s.live_exact = live;
+    s.window_exact = live ? last + 1 : 0;
+    s.offset_exact = live ? first : 0;
+    s.stride_exact = live >= 2 ? g : (live == 1 ? n : 0);
+    return s;
+}

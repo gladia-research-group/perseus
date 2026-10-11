@@ -8,7 +8,7 @@ import dataclasses
 
 import numpy as np
 
-from .layout import cm_params, encode_bias_vector, encode_weight_matrix, encode_weight_matrix_outputpack
+from .layout import cm_params, encode_bias_vector, encode_weight_matrix_fast
 
 
 @dataclasses.dataclass
@@ -21,6 +21,10 @@ class EncodedLinear:
     name: str | None = None          # plaintext cache prefix (None: encode at every use)
 
     outputpack: bool = False         # plaintexts pair output blocks (apply_linear_outputpack)
+    # the plaintexts as coefficient rows (layout.coeff_rows, (n_pt, 2N) float32 in pinned memory) and their tags
+    # (pt_tag_fields): a streamed weight's inner sums then encode on the device (FheOps.mult_coeff_sum)
+    coeffs: np.ndarray | None = None
+    tags: np.ndarray | None = None
 
     @classmethod
     def encode(cls, W, N: int, d_in: int, d_out: int, bias=None, fill=True, name=None,
@@ -28,7 +32,7 @@ class EncodedLinear:
         """A real or complex W (W_re + i W_im: the fused K+iV linear) as its slot vectors;
         `outputpack` pairs output blocks into one complex plaintext instead, with the
         unpack's 1/2 folded in (apply_linear_outputpack's unpack then costs no level)."""
-        pts = (encode_weight_matrix_outputpack if outputpack else encode_weight_matrix)(W, N, d_in, d_out)
+        pts = encode_weight_matrix_fast(W, N, d_in, d_out, outputpack)
         if outputpack:
             pts = 0.5 * pts
         b = None if bias is None else encode_bias_vector(bias, N, d_in, d_out, fill)
@@ -36,6 +40,20 @@ class EncodedLinear:
 
     def key(self, i):
         return None if self.name is None else f"{self.name}.{i}"
+
+
+def _baby_sum(ops, x_rot, w: EncodedLinear, idx):
+    """sum_b x_rot[b] * w.pts[idx[b]]: named weights through the plaintext caches one product at
+    a time; a streamed weight (no name: encoded at use) as one fused call when the ops have it."""
+    if w.name is None and hasattr(ops, "mult_pt_sum"):
+        sl = slice(idx[0], idx[-1] + 1, idx[1] - idx[0]) if len(idx) > 1 else slice(idx[0], idx[0] + 1)
+        if w.coeffs is not None and hasattr(ops, "mult_coeff_sum"):
+            return ops.mult_coeff_sum(x_rot[:len(idx)], w.coeffs[sl], np.ascontiguousarray(w.tags[sl]), w.pts[sl])
+        return ops.mult_pt_sum(x_rot[:len(idx)], w.pts[sl])
+    tmp = ops.mult_pt(x_rot[0], w.pts[idx[0]], key=w.key(idx[0]))
+    for b in range(1, len(idx)):
+        ops.inplace_add(tmp, ops.mult_pt(x_rot[b], w.pts[idx[b]], key=w.key(idx[b])))
+    return tmp
 
 
 def prepare_linear_input(rt, x, d_in: int, d_out: int):
@@ -63,11 +81,7 @@ def apply_linear(rt, x_rot, w: EncodedLinear):
         acc = None
         for g in range(p.gstep_c):
             j0 = g * p.bstep_c
-            i0 = j0 * p.r_o + k
-            tmp = ops.mult_pt(x_rot[0], w.pts[i0], key=w.key(i0))
-            for b in range(1, p.bstep_c):
-                i = (j0 + b) * p.r_o + k
-                ops.inplace_add(tmp, ops.mult_pt(x_rot[b], w.pts[i], key=w.key(i)))
+            tmp = _baby_sum(ops, x_rot, w, [(j0 + b) * p.r_o + k for b in range(p.bstep_c)])
             if g > 0:
                 tmp = ops.rotate(tmp, g * giant_rot)
             if acc is None:
@@ -100,11 +114,7 @@ def apply_linear_outputpack(rt, x_rot, w: EncodedLinear):
         acc = None
         for g in range(p.gstep_c):
             j0 = g * p.bstep_c
-            i0 = j0 * rop + kp
-            tmp = ops.mult_pt(x_rot[0], w.pts[i0], key=w.key(i0))
-            for b in range(1, p.bstep_c):
-                i = (j0 + b) * rop + kp
-                ops.inplace_add(tmp, ops.mult_pt(x_rot[b], w.pts[i], key=w.key(i)))
+            tmp = _baby_sum(ops, x_rot, w, [(j0 + b) * rop + kp for b in range(p.bstep_c)])
             if g > 0:
                 tmp = ops.rotate(tmp, g * giant_rot)
             if acc is None:

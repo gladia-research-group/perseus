@@ -1202,6 +1202,9 @@ struct CKKSContext {
         oss << "[plan_deg_error] " << var_name << " expected deg " << it->second
             << " actual " << actual << " step=" << step_path()
             << " (planned mode is strict)";
+        // PLAN_DEG_WARN=1 (debugging a plan/run divergence): report every mismatch and go on
+        static const bool warn_only = std::getenv("PLAN_DEG_WARN") && std::atoi(std::getenv("PLAN_DEG_WARN")) > 0;
+        if (warn_only) { std::cerr << oss.str() << " [warn only]\n"; return; }
         throw fhe::PlanError(oss.str());
     }
 
@@ -1421,6 +1424,28 @@ struct CKKSContext {
                           const Ctx& output_ct) {
         FIDESlib::CudaNvtxRange _nvr_pw("pw::record6");
         if (op_tally_active) ++op_tally[op_type];
+        {   // PLAN_TRACE_STEP=<step path>: every op recorded in that step, as executed (plan/run divergence hunts)
+            static const char* trace = std::getenv("PLAN_TRACE_STEP");
+            if (trace && *trace && step_path() == trace) {
+                std::string ins;
+                for (size_t i = 0; i < inputs.size(); ++i)
+                    ins += inputs[i] + "@" + std::to_string(i < input_levels.size() ? input_levels[i] : -9) + " ";
+                // PLAN_TRACE_DECRYPT=1: also the output's decrypted max |z| (and max |Im|): where values go wrong
+                static const bool dec = std::getenv("PLAN_TRACE_DECRYPT") && std::getenv("PLAN_TRACE_DECRYPT")[0] == '1';
+                double mz = -1, mi = -1;
+                if (dec && output_ct) {
+                    try {
+                        Plaintext pt;
+                        Ctx c = output_ct;
+                        cc->Decrypt(c, keys.secretKey, &pt);
+                        mz = 0; mi = 0;
+                        for (const auto& z : pt->GetCKKSPackedValue()) { mz = std::max(mz, std::abs(z)); mi = std::max(mi, std::abs(z.imag())); }
+                    } catch (const std::exception&) {}
+                }
+                std::fprintf(stderr, "[trace] %s %s -> %s @%d d%d |z|=%.3e |im|=%.3e\n", op_type.c_str(), ins.c_str(),
+                             output.c_str(), output_level, output_ct ? (int)output_ct->GetNoiseScaleDeg() : -1, mz, mi);
+            }
+        }
         if (!graph_enabled()) {
             return;
         }
@@ -3491,6 +3516,207 @@ struct CKKSContext {
         for (auto* s : ss) s_raw.push_back(&s->ct);
         mult_add_many(res.ct, v_raw, s_raw);
         res.tag = tag_of_ct(res.ct);   // the Ctx-level replay updated the registry tag per lane
+    }
+    // ---- Streamed-weight inner sum ----
+    // acc = Σ_i cts[i] * encode(vals[i]) with every plaintext encoded on the device at its
+    // ciphertext's level and folded into ONE accumulator (EvalMultPtSumEncode): no host
+    // plaintext objects, no per-product ciphertexts. The serial loop's node stream (mult, then
+    // per further term a phantom mult + add_inplace) is replayed with the loop's names, tags
+    // and plan verification, so a plan cut on either form fits the other. Usable when it cannot
+    // change observable semantics: not during a capture that records magnitudes op by op, every
+    // input NoiseLevel 1 at one level below the refresh ceiling, and no planned refresh on any
+    // name but the final accumulator's.
+    // planned mode with the safety net as a check only (maybe_bootstrap throws or returns, never refreshes)
+    bool planned_strict() const { return placement_plan_enabled && (!graph_scope_active() || graph_scope_strict); }
+    // maybe_bootstrap's planned-mode check for a product the fused sum never materializes
+    void planned_ceiling_check(const std::string& name, int level) {
+        if (auto_bts_suppressed || !planned_strict() || level < level_limit()) return;
+        auto it = expected_levels.find(name);
+        if (it != expected_levels.end() && level <= static_cast<int>(it->second)) return;
+        ++unplanned_bootstrap_count;
+        throw fhe::PlanError("[plan_bts_error] unplanned safety-net bootstrap at step=" + step_path() + " var=" + name +
+                             " level=" + std::to_string(level) + " (planned mode is strict)");
+    }
+    bool mult_pt_sum_usable(const std::vector<PackedCtx>& cts) {
+        // a capture records magnitudes op by op, except a structure-only one (magnitude_suppressed: the numpy fake
+        // fills them), which the replay records node for node
+        if ((graph_enabled() && !magnitude_capture_suppressed) || cts.empty()) return false;
+        const int lvl = level_for_ct(cts.front().ct);
+        for (const auto& c : cts)
+            if (!c.ct || c.ct->GetNoiseScaleDeg() != 1 || level_for_ct(c.ct) != lvl) return false;
+        // at the ceiling the loop's products would take the safety-net refresh, except in strict planned mode, where
+        // that net only checks the plan's prediction (replay_pt_sum repeats the check)
+        if (!auto_bts_suppressed && !planned_strict() && level_of(cts.front().ct) >= level_limit()) return false;
+        if (placement_plan_enabled && naming_active()) {
+            const size_t n2 = 2 * cts.size() - 1;
+            for (size_t k = 1; k < n2; ++k) {
+                const std::string name = graph_var_scope.empty()
+                    ? "v_" + std::to_string(graph_ct_counter + k)
+                    : (graph_var_scope + "_" + std::to_string(graph_var_scope_counter + k));
+                if (placement_after.find(name) != placement_after.end()) return false;
+            }
+        }
+        return true;
+    }
+    // The same from n raw rows of `width` values (dtype 0 float32, 1 float64, 2 complex64, 3 complex128).
+    PackedCtx mult_pt_sum_raw(const std::vector<PackedCtx>& cts, const void* rows, int dtype, size_t width) {
+        static const bool timing = std::getenv("PT_SUM_TIMING") != nullptr;
+        static double t_tag = 0; static long n_t = 0;
+        std::vector<Ctx> raw;
+        raw.reserve(cts.size());
+        for (const auto& c : cts) raw.push_back(c.ct);
+        Ctx acc = cc->EvalMultPtSumEncodeRaw(raw, rows, dtype, width);
+        const auto tb = std::chrono::steady_clock::now();
+        const bool cplx = dtype >= 2;
+        const size_t elem = (dtype == 0 ? 4 : dtype == 1 || dtype == 2 ? 8 : 16);
+        auto pt_tag = [&](size_t i) {
+            const char* row = static_cast<const char*>(rows) + i * width * elem;
+            PackSignature sig;
+            if (dtype == 0) sig = analyze_tag_fields((const float*)row, (const float*)nullptr, (int)width, 1);
+            else if (dtype == 1) sig = analyze_tag_fields((const double*)row, (const double*)nullptr, (int)width, 1);
+            else if (dtype == 2) sig = analyze_tag_fields((const float*)row, (const float*)row + 1, (int)width, 2);
+            else sig = analyze_tag_fields((const double*)row, (const double*)row + 1, (int)width, 2);
+            // rows shorter than the slot count are zero-padded, as the loop's resize does
+            const int slots = static_cast<int>(width) > 0 ? std::max<int>(sig.slots, 0) : 0;
+            packtag::PackTag t = packtag::from_signature(slots, sig.period, sig.live_exact, sig.stride_exact,
+                                                         sig.window_exact, sig.offset_exact);
+            t.field = (cplx && sig.im_amax != 0.0) ? (sig.amax != 0.0 ? packtag::Field::Complex : packtag::Field::Imag)
+                                                   : packtag::Field::Real;
+            return t;
+        };
+        replay_pt_sum(cts, acc, pt_tag);
+        if (timing) {
+            t_tag += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb).count();
+            if (++n_t % 50 == 0) std::cerr << "[pt_sum_timing raw] tags+replay " << t_tag / n_t << " ms/call\n";
+        }
+        return tagged(acc, cts.front().packing, tag_of_ct(acc));
+    }
+    // The same from plaintext COEFFICIENT rows (EvalMultCoeffRowsSum): rows[r * stride + k] float32 is plaintext
+    // r's coefficient k divided by the level's scaling factor, device-accessible (pinned host or device memory);
+    // tags[r] = (slots, period, live, stride, window, offset, field 0 real / 1 imag / 2 complex) is the tag the
+    // loop's encode of the plaintext's slot values would carry (pt_tag_fields).
+    PackedCtx mult_coeff_sum(const std::vector<PackedCtx>& cts, const float* rows, size_t stride, const int32_t* tags) {
+        static std::once_flag announced;
+        std::call_once(announced, [&] {
+            std::cerr << "[coeff_sum] active: weight inner sums from coefficient rows, n=" << cts.size() << "\n";
+        });
+        std::vector<Ctx> raw;
+        raw.reserve(cts.size());
+        for (const auto& c : cts) raw.push_back(c.ct);
+        Ctx acc = cc->EvalMultCoeffRowsSum(raw, rows, stride);
+        auto pt_tag = [&](size_t i) {
+            const int32_t* t = tags + 7 * i;
+            packtag::PackTag tg = packtag::from_signature(t[0], t[1], t[2], t[3], t[4], t[5]);
+            tg.field = t[6] == 2 ? packtag::Field::Complex : t[6] == 1 ? packtag::Field::Imag : packtag::Field::Real;
+            return tg;
+        };
+        replay_pt_sum(cts, acc, pt_tag);
+        return tagged(acc, cts.front().packing, tag_of_ct(acc));
+    }
+    unsigned long long coeff_rows_overflows() const { return cc->CoeffRowsOverflows(); }
+    // the serial loop's node stream for an inner sum computed fused (see mult_pt_sum)
+    template <class TagFn>
+    void replay_pt_sum(const std::vector<PackedCtx>& cts, Ctx& acc, TagFn pt_tag) {
+        for (size_t i = 0; i < cts.size(); ++i) {
+            const Ctx& x = cts[i].ct;
+            const packtag::PackTag prod_tg = packtag::t_mult(tag_of_ct(x), pt_tag(i));
+            const int in_x_level = level_for_ct(x);
+            const std::string in_x = var_for_ct(x);
+            const std::string in_pt = naming_active() ? next_pt("pt") : "x";
+            if (op_tally_active) ++op_tally["mult_pt"];
+            if (i == 0) {   // the first product IS the accumulator
+                tag_ct(acc, prod_tg);
+                const std::string out = set_new_var_for_ct(acc);
+                record_primitive("mult", {in_x, in_pt}, out, {in_x_level, in_x_level}, level_for_ct(acc), acc);
+                maybe_apply_planned_bootstrap_after(out, acc);
+                verify_expected_level(out, "mult", level_of(acc));
+                planned_ceiling_check(out, level_of(acc));
+                continue;
+            }
+            const std::string tmp_var = graph_var_scope.empty()
+                ? next_ct("v")
+                : (graph_var_scope + "_" + std::to_string(++graph_var_scope_counter));
+            record_primitive("mult", {in_x, in_pt}, {in_x_level, in_x_level}, tmp_var);
+            verify_expected_level(tmp_var, "mult", level_of(x));
+            planned_ceiling_check(tmp_var, level_of(acc));
+            const packtag::PackTag acc_tg = packtag::t_add(tag_of_ct(acc), prod_tg);
+            const int in_r_level = level_for_ct(acc);
+            const std::string in_r = var_for_ct(acc);
+            tag_ct(acc, acc_tg);
+            const std::string out = set_new_var_for_ct(acc);
+            record_primitive("add_inplace", {in_r, tmp_var}, out, {in_r_level, in_x_level}, level_for_ct(acc), acc);
+            maybe_apply_planned_bootstrap_after(out, acc);
+            verify_expected_level(out, "add_inplace", level_of(acc));
+            tag_ct(acc, acc_tg);
+        }
+    }
+    template <class V>
+    PackedCtx mult_pt_sum(const std::vector<PackedCtx>& cts, const std::vector<std::vector<V>>& vals) {
+        static std::once_flag announced;
+        std::call_once(announced, [&] {
+            std::cerr << "[pt_sum] active: device-encoded weight inner sums, n=" << cts.size() << "\n";
+        });
+        std::vector<Ctx> raw;
+        raw.reserve(cts.size());
+        for (const auto& c : cts) raw.push_back(c.ct);
+        std::vector<std::vector<std::complex<double>>> cv(vals.size());
+        for (size_t i = 0; i < vals.size(); ++i) cv[i].assign(vals[i].begin(), vals[i].end());
+        static const bool timing = std::getenv("PT_SUM_TIMING") != nullptr;
+        static double t_cv = 0, t_tag = 0; static long n_t = 0;
+        const auto ta = std::chrono::steady_clock::now();
+        Ctx acc = cc->EvalMultPtSumEncode(raw, cv);
+        const auto tb = std::chrono::steady_clock::now();
+        // the plaintexts' tags, as tag_plaintext computes them for the loop's encodes
+        auto pt_tag = [&](size_t i) {
+            const PackSignature sig = analyze_packing(vals[i]);
+            packtag::PackTag t = packtag::from_signature(sig.slots, sig.period, sig.live_exact, sig.stride_exact,
+                                                         sig.window_exact, sig.offset_exact);
+            bool im = false;
+            if constexpr (std::is_same_v<V, std::complex<double>>)
+                for (const auto& z : vals[i]) im |= z.imag() != 0.0;
+            t.field = im ? packtag::Field::Complex : packtag::Field::Real;
+            return t;
+        };
+        for (size_t i = 0; i < cts.size(); ++i) {
+            const Ctx& x = cts[i].ct;
+            const packtag::PackTag prod_tg = packtag::t_mult(tag_of_ct(x), pt_tag(i));
+            const int in_x_level = level_for_ct(x);
+            const std::string in_x = var_for_ct(x);
+            const std::string in_pt = naming_active() ? next_pt("pt") : "x";
+            if (op_tally_active) ++op_tally["mult_pt"];
+            if (i == 0) {   // the first product IS the accumulator
+                tag_ct(acc, prod_tg);
+                const std::string out = set_new_var_for_ct(acc);
+                record_primitive("mult", {in_x, in_pt}, out, {in_x_level, in_x_level}, level_for_ct(acc), acc);
+                maybe_apply_planned_bootstrap_after(out, acc);
+                verify_expected_level(out, "mult", level_of(acc));
+                planned_ceiling_check(out, level_of(acc));
+                continue;
+            }
+            const std::string tmp_var = graph_var_scope.empty()
+                ? next_ct("v")
+                : (graph_var_scope + "_" + std::to_string(++graph_var_scope_counter));
+            record_primitive("mult", {in_x, in_pt}, {in_x_level, in_x_level}, tmp_var);
+            verify_expected_level(tmp_var, "mult", level_of(x));
+            planned_ceiling_check(tmp_var, level_of(acc));
+            const packtag::PackTag acc_tg = packtag::t_add(tag_of_ct(acc), prod_tg);
+            const int in_r_level = level_for_ct(acc);
+            const std::string in_r = var_for_ct(acc);
+            tag_ct(acc, acc_tg);
+            const std::string out = set_new_var_for_ct(acc);
+            record_primitive("add_inplace", {in_r, tmp_var}, out, {in_r_level, in_x_level}, level_for_ct(acc), acc);
+            maybe_apply_planned_bootstrap_after(out, acc);
+            verify_expected_level(out, "add_inplace", level_of(acc));
+            tag_ct(acc, acc_tg);
+        }
+        if (timing) {
+            const auto tc = std::chrono::steady_clock::now();
+            t_tag += std::chrono::duration<double, std::milli>(tc - tb).count();
+            if (++n_t % 50 == 0)
+                std::cerr << "[pt_sum_timing] tags+replay " << t_tag / n_t << " ms/call\n";
+            (void)ta; (void)t_cv;
+        }
+        return tagged(acc, cts.front().packing, tag_of_ct(acc));
     }
     PackedCtx mult(const PackedCtx& a, double scalar) { return slotlayout::keep(a.ct, tagged(mult(a.ct, scalar), a.packing, packtag::t_mult_scalar(a.tag, scalar))); }
 

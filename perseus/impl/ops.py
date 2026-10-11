@@ -86,6 +86,9 @@ class FheOps:
         # CHEB_BSGS=1: every Chebyshev series (GELU P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step
         # giant-step (poly.eval_chebyshev_bsgs): a third of the ciphertext products at the same depth
         self.cheb_bsgs = os.environ.get("CHEB_BSGS", "1") not in ("", "0")
+        # IMPL_PT_SUM_FUSED=1: a streamed weight's inner sums encode their plaintexts on the device from the raw rows
+        # and accumulate there (Inference.mult_pt_sum_raw; same values and op stream as the loop)
+        self.pt_sum_fused = os.environ.get("IMPL_PT_SUM_FUSED", "0") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
@@ -178,6 +181,30 @@ class FheOps:
             if self.slot_pts:
                 return self.inf.add_slot_pt(a, self._slot(key, a, v))
         return self.inf.add_pt(a, self._vec(v))
+
+    def mult_pt_sum(self, cts, vecs):
+        """sum_i cts[i] * vecs[i] for plaintexts encoded at use (streamed weights, no key): one
+        runtime call when it has `mult_pt_sum`, else the loop. Both record mult + inplace_add."""
+        if self.pt_sum_fused and hasattr(self.inf, "mult_pt_sum_raw"):
+            out = self.inf.mult_pt_sum_raw(list(cts), np.ascontiguousarray(vecs))
+            if out is not None:
+                return out
+        if hasattr(self.inf, "mult_pt_sum"):
+            return self.inf.mult_pt_sum(list(cts), np.asarray(vecs))
+        acc = self.mult_pt(cts[0], vecs[0])
+        for c, v in zip(cts[1:], vecs[1:]):
+            self.inplace_add(acc, self.mult_pt(c, v))
+        return acc
+
+    def mult_coeff_sum(self, cts, rows, tags, vecs):
+        """mult_pt_sum from the plaintexts' coefficient rows (layout.coeff_rows of `vecs`, in pinned memory, with
+        their pt_tag_fields `tags`): encoded and multiplied on the device in batches. Falls back to
+        mult_pt_sum(cts, vecs) where the fused path does not apply (capture, a planned refresh inside)."""
+        if hasattr(self.inf, "mult_coeff_sum"):
+            out = self.inf.mult_coeff_sum(list(cts), rows, tags)
+            if out is not None:
+                return out
+        return self.mult_pt_sum(cts, vecs)
 
     def mult_const(self, a, re, im):
         """a * (re + i im): a plaintext product with a complex constant (the runtime's cached
@@ -363,6 +390,7 @@ class NumpyOps:
     def inplace_add(self, a, b): a += b
     def copy(self, a): return np.array(a)
     def mult_pt(self, a, v, key=None, kind="weight", tagged=True): return a * np.asarray(v)
+    def mult_pt_sum(self, cts, vecs): return sum(c * np.asarray(v) for c, v in zip(cts, vecs))
     def add_pt(self, a, v, key=None, kind="weight", tagged=True): return a + np.asarray(v)
     def mult_const(self, a, re, im): return a * complex(re, im)
     def mult_i(self, a): return a * 1j
