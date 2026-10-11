@@ -131,6 +131,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_COEFF_WAVES` | Row groups of the fused sums, in waves of two blocks per SM (default 2). |
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
+| `IMPL_KV_OFFLOAD` | 1 parks each block's K/V cache ciphertexts in the pinned KV arena between uses (Python implementation); off by default: the caches stay on the device (2.2 GB on the n32 decode) and the per-stage fences go away. |
 | `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
 | `PERSEUS_SLOTVEC_CACHE_GB` | Size cap of that cache; least recently used model variants past it are dropped (default 32). |
 | `PERSEUS_SLOTVEC_CACHE_VARIANTS` | Model variants (weights, configs, builder code) kept per model family in that cache (default 2). |
@@ -149,6 +150,8 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_KSK_PACK` | Store the `b` half as a dense 28-bit bit-stream (default 1). |
 | `FIDESLIB_KSK_REGEN` | Regenerate the `a` half of every key-switching key in-kernel from its seed (2 = both readers, the default; 0 = stored keys). |
 | `FIDESLIB_KS_DIGIT_INTT` | 1 restores upstream's redundant per-digit INTT in the key switch. |
+| `FIDESLIB_SMALLINT_NOSYNC` | 0 restores the exact post-raise scaling's host readback of the limb pointer tables (a stream sync and two blocking device-to-host copies per call, two device drains per bootstrap). |
+| `FIDESLIB_SPRU_NOSYNC` | 0 restores the SPRU bootstrap's three per-call cudaDeviceSynchronize fences (156 device drains per decode token). |
 
 ## Profiling
 
@@ -162,3 +165,5 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `PT_SUM_TIMING` | Host-side timing of the streamed-weight inner sums on stderr. |
 | `PLAN_TRACE_STEP` | Every op recorded in that step path (e.g. `blk0.softmax`), as executed, on stderr (plan/run divergence hunts). |
 | `PLAN_TRACE_DECRYPT` | With `PLAN_TRACE_STEP`: also each traced op's decrypted max \|z\| and max \|Im\| (where a planned run's values go wrong). |
+| `FIDESLIB_ERRCHECK` | 1 polls cudaGetLastError after every FIDESlib launch (off by default: ~1.8M calls per decode token). |
+| `FIDESLIB_OMP_REGIONS` | 1 enters FIDESlib's OpenMP regions on a single GPU (off by default: they run inline). |

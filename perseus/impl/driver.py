@@ -65,11 +65,13 @@ class ImplModel:
         # on a remote node and every token then stalls on remote pinned memory).
         if self.overlap and hasattr(core, "prewarm_stage_arenas"):
             core.prewarm_stage_arenas(inf)
-        # K/V residency (the C++ offload_block_kv): a stage's cache ciphertexts are copied to
-        # the pinned KV arena on a side stream after the stage and reloaded ahead of its next
-        # use, so only two blocks' caches sit on the device at any time
+        # K/V residency (the C++ offload_block_kv), IMPL_KV_OFFLOAD=1: a stage's cache ciphertexts are copied
+        # to the pinned KV arena on a side stream after the stage and reloaded ahead of its next use, so only two
+        # blocks' caches sit on the device at any time. Off by default: the caches stay resident (2.2 GB on the
+        # n32 decode) and the per-stage device fences the offload needs go away (-0.08 s/token with the other
+        # barrier removals, 2026-10-11)
         if kv_offload is None:
-            kv_offload = os.environ.get("IMPL_KV_OFFLOAD", "1") not in ("", "0")
+            kv_offload = os.environ.get("IMPL_KV_OFFLOAD", "0") not in ("", "0")
         self.kv_offload = bool(kv_offload) and hasattr(inf, "kv_store")
         self._parked = {}              # stage -> keys whose ciphertexts live in the arena
         self._ring_order = []          # prefixes of the ring's stages, in order
