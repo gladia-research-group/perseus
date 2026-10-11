@@ -126,7 +126,9 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_GPU_ENCODE` | Encode full-slot plaintexts on the GPU; an evicted one reloads from a pinned dump of its first composite group, lifted back on the GPU (on in the GPT-2 port's environment). |
 | `FIDESLIB_GPU_ENCODE_CHECK` | Check every such reload against a fresh device encode, limb for limb. |
 | `PERSEUS_LLAMA_CACHE` | Disk cache of the Llama slot vectors and their coefficient rows (default `$HF_HOME/perseus/llama_slots`; ~75 GB). |
-| `FIDESLIB_COEFF_CHUNK` | Plaintexts per batch of a coefficient-row weight sum (`EvalMultCoeffRowsSum`: rounding, one NTT launch, one fused product kernel; default 16, at most 32). |
+| `FIDESLIB_COEFF_CHUNK` | Plaintexts per batch of a coefficient-row weight sum (`EvalMultCoeffRowsSum`; default 32 fused, 16 otherwise; at most 32). |
+| `FIDESLIB_COEFF_FUSED` | Coefficient-row sums as one fused kernel (default 1). |
+| `FIDESLIB_COEFF_WAVES` | Row groups of the fused sums, in waves of two blocks per SM (default 2). |
 | `FIDESLIB_ROT_KEY_BAND` | Keep only rotation keys whose step is within +-2^band (-1 = all); the 32-bit decode row uses 22. |
 | `KV_ARENA_GB` | Pinned host arena for the KV cache. |
 | `PERSEUS_SLOTVEC_CACHE` | Disk cache of the GPT-2 port's prepared slot vectors (default on; 0 = off). |
