@@ -303,6 +303,9 @@ class Placer:
         PLAN_HARD_ENV_CAP pins one pass: 1 = envelope absolute (no fallback), 0 = payable
         throughout (what the shipped 32-bit recipe asked for before this was two-pass).
         """
+        # replans below start from the caller's pre-seeded placements (force_place)
+        if not hasattr(self, "_forced"):
+            self._forced = set(self.placed)
         import os as _os
         _ov = _os.environ.get("PLAN_HARD_ENV_CAP")
         if _ov in ("0", "1"):
@@ -380,7 +383,7 @@ class Placer:
             for v in deep:
                 self.hint_force[v] = False
             self.vetoed_hints.update(deep)
-            self.placed, self.realized = set(), set()
+            self.placed, self.realized = set(getattr(self, "_forced", ())), set()
             try:
                 res = self._run_once()
             except PlanInfeasible:

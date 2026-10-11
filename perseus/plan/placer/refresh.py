@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -53,6 +54,19 @@ class CfClampReport:
     @property
     def num_clamped(self) -> int:
         return len(self.clamped)
+
+
+def _step_landing_floor(step: str):
+    """The PLAN_STEP_LANDING floor (absolute level) of a refresh in `step`, or None."""
+    spec = os.environ.get("PLAN_STEP_LANDING", "")
+    best = None
+    for item in spec.split(","):
+        if ":" not in item:
+            continue
+        key, lv = item.rsplit(":", 1)
+        if key and key in step.split("."):
+            best = max(best or 0, int(lv))
+    return best
 
 
 @dataclass
@@ -126,6 +140,11 @@ class RefreshPlanner:
             raise_drop = max(0, int(round((base - base_route) / unit)))
         else:
             base = base_route
+        # PLAN_STEP_LANDING="softmax:32,...": refreshes in those steps are planned to land no shallower than that
+        # (their route changes with the cache length under SM_PERIODIC=2; a shallower landing is headroom)
+        floor = _step_landing_floor(p.step if p else "")
+        if floor is not None:
+            base = max(base, float(floor) - self.bootstrap_level)
         restore = float(self.graph.level_unit) if choice.prescale is not None else 0.0
         return RefreshSpec(
             var=v,

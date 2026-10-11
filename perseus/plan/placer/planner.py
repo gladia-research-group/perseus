@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import logging
 import math
@@ -433,11 +434,21 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if v not in first_consumer_seed and n.output_level is not None:
                 first_consumer_seed[v] = float(n.output_level) - n.cost
 
+    # With an `entry_level`, the unnamed graph inputs other than the block input are K/V cache reads: they keep the
+    # captured level, at degree 2
+    entry_var = next((v for n in g.nodes for v in n.inputs if v in g.inputs), None)
+
+    def is_cache_side_input(v: str) -> bool:
+        return (entry_level is not None and v != entry_var and v.startswith("anon_")
+                and v in input_level_of)
+
     def seed_consumed(v: str) -> float:
         exp = parse_lvl_suffix(v)
         if "cache." in v:
             lv = exp if exp is not None else cfg.cache_read_level
             return lv - cfg.bootstrap_level
+        if is_cache_side_input(v):
+            return input_level_of[v] - cfg.bootstrap_level
         if entry_level is not None:
             return entry_level - cfg.bootstrap_level
         if v in first_consumer_seed:
@@ -449,7 +460,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         return cfg.source_level - cfg.bootstrap_level
 
     def seed_deg(v: str) -> int:
-        if "cache." in v:
+        if "cache." in v or is_cache_side_input(v):
             return 2
         if entry_deg is not None:
             return entry_deg
@@ -614,7 +625,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                   f"bootstraps {base} -> {best}")
 
     if cfg.prune:
-        sim, n_pruned = _prune_redundant(placer, sim, cfg.prune_keep)
+        # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)
+        sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(force_place or ()))
         if hasattr(placer, "meta"):
             placer.meta["pruned"] = n_pruned
         if cfg.verbose:
@@ -879,6 +891,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             + "  -> lower --max-level. (--baseline-depth-cap does NOT cover this class: it "
             "bounds a PLACED refresh's input depth, and these are precisely the vars nothing "
             "places.)")
+        # PLAN_REACTIVE_STRICT=1: refuse the block, so the chain retries the previous one with an exit refresh
+        if os.environ.get("PLAN_REACTIVE_STRICT", "0") not in ("", "0"):
+            raise PlanInfeasible(f"P3c(reactive): {len(_bad_reactive)} var(s) past the envelope with no refresh: "
+                                 + ", ".join(f"{v}@{l:g}" for v, l in _bad_reactive[:6]))
     result["summary"]["bts_quality"]["env_cap"] = {
         "limit": _ENV_CAP,
         "relaxed": bool(getattr(placer, "env_cap_relaxed", False)),
