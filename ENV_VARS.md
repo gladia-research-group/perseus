@@ -173,5 +173,5 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_GPU_ENCRYPT_DEBUG` | Per-call stage timing of the device encryption on stderr. |
 | `FIDESLIB_NOCLONE` | API wrappers that write their result once instead of cloning an operand first: 1 = rotations / conjugation / batch products, 2 (default) = also add / mult / mult-pt / square, 3 = also sub and scalar ops and fast rotations, 0 = always clone. |
 | `FIDESLIB_CLONE_CENSUS` | Count every device clone per call stack, printed at exit. |
-| `FIDESLIB_FAST_DECRYPT` | Decrypt a device ciphertext in an empty host container instead of one built by a dummy encryption (identical result). |
+| `FIDESLIB_FAST_DECRYPT` | Decrypt a device ciphertext in an empty host container instead of one built by a dummy encryption (default 1; identical result, ~30 ms less per decrypt). |
 | `FIDESLIB_DECRYPT_DEBUG` | Per-call stage timing of the host decrypt on stderr. |
