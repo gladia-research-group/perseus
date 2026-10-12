@@ -487,22 +487,28 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     return Y
 
 
-def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None):
+def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False):
     """Causal attention on dense complex Q/K/V (scale 1/2); returns dense outputs (scale 1) as the decode's P.V.
-    `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt."""
+    `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt.
+    `shared`: Qd is a list of query sets attending to the same K / V (GQA): one output list per set."""
     ops, d = rt.ops, rt.dims
     nc = ch.n_chunks
-    Q, K, V = [None] * nc, [None] * nc, [None] * nc
-    for dst, src in ((Q, Qd), (K, Kd), (V, Vd)):
+
+    def halves(src):
+        dst = [None] * nc
         for c, X in enumerate(src):
             ops.bootstrap_hint(X, ops.headroom(2), True)
             A, B = split(ops, X)
             dst[2 * c] = A
             if ch.has(2 * c + 1):
                 dst[2 * c + 1] = B
+        return dst
+    Qs = [halves(q) for q in (Qd if shared else [Qd])]
+    K, V = halves(Kd), halves(Vd)
     if rope is not None:
         for k in range(nc):
-            Q[k] = rope_lanes(rt, Q[k], rope, ch.lanes(k), "pf.rope.q")
+            for Q in Qs:
+                Q[k] = rope_lanes(rt, Q[k], rope, ch.lanes(k), "pf.rope.q")
             K[k] = rope_lanes(rt, K[k], rope, ch.lanes(k), "pf.rope.k")
     if kv is not None:
         kv["K"], kv["V"] = K, V
@@ -523,11 +529,15 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             rotV[(cp, e)] = lane_rotate(rt, V[cp], e, "pf.vrot")
         return rotV[(cp, e)]
 
-    def qkt_stage(c):
+    owns, vowns = {}, {}
+
+    def qkt_stage(c, Q):
         """Chunk c's packed scores and what its P.V needs."""
         offs = _offsets(ch, c)
         nq = len(ch.lanes(c))
-        own = [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)])
+        if c not in owns:
+            owns[c] = [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)])
+        own = owns[c]
         u_pre = c * ch.t + ch.t                                    # prefix key's offset
         M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
         S = [None] * M
@@ -574,7 +584,9 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
     def pv_stage(c, st, P):
         offs, nq, u_pre, pre, groups = st["offs"], st["nq"], st["u_pre"], st["pre"], st["groups"]
         with rt.step("softmax_v"):
-            vown = [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)])
+            if c not in vowns:
+                vowns[c] = [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)])
+            vown = vowns[c]
             acc = None
             if pre:
                 m, blk = divmod(u_pre, d.d_head)
@@ -606,27 +618,31 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                     ops.inplace_add(acc, prod)
             return im_cleanse(ops, acc)
 
-    outs = [None] * nc
-    if _SM_JOINT:
-        for k in range(0, nc, 2):
-            cs = [c for c in (k, k + 1) if c < nc]
-            sts = {c: qkt_stage(c) for c in cs}
-            with rt.step("softmax"):
-                zs = {c: _sm_cheb(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"]) for c in cs}
-                fac = {c: None for c in cs}
-                if len(cs) == 2:
-                    fac[cs[0]], fac[cs[1]] = _sm_joint(rt, zs[cs[0]], zs[cs[1]], cfg)
-                Ps = {c: prefill_softmax(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"],
-                                         Z=_sm_tail(rt, zs[c], cfg, ch, c, sts[c]["pre"], fac[c])) for c in cs}
-            for c in cs:
-                outs[c] = pv_stage(c, sts[c], Ps[c])
-    else:
-        for c in range(nc):
-            st = qkt_stage(c)
-            with rt.step("softmax"):
-                P = prefill_softmax(rt, st["S"], cfg, ch, c, st["pre"])
-            outs[c] = pv_stage(c, st, P)
-    return [join(ops, outs[2 * c], outs[2 * c + 1] if ch.has(2 * c + 1) else None) for c in range(ch.n_ct)]
+    def attend(Q):
+        outs = [None] * nc
+        if _SM_JOINT:
+            for k in range(0, nc, 2):
+                cs = [c for c in (k, k + 1) if c < nc]
+                sts = {c: qkt_stage(c, Q) for c in cs}
+                with rt.step("softmax"):
+                    zs = {c: _sm_cheb(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"]) for c in cs}
+                    fac = {c: None for c in cs}
+                    if len(cs) == 2:
+                        fac[cs[0]], fac[cs[1]] = _sm_joint(rt, zs[cs[0]], zs[cs[1]], cfg)
+                    Ps = {c: prefill_softmax(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"],
+                                             Z=_sm_tail(rt, zs[c], cfg, ch, c, sts[c]["pre"], fac[c])) for c in cs}
+                for c in cs:
+                    outs[c] = pv_stage(c, sts[c], Ps[c])
+        else:
+            for c in range(nc):
+                st = qkt_stage(c, Q)
+                with rt.step("softmax"):
+                    P = prefill_softmax(rt, st["S"], cfg, ch, c, st["pre"])
+                outs[c] = pv_stage(c, st, P)
+        return [join(ops, outs[2 * c], outs[2 * c + 1] if ch.has(2 * c + 1) else None) for c in range(ch.n_ct)]
+
+    res = [attend(Q) for Q in Qs]
+    return res if shared else res[0]
 
 
 def prefill_rot_steps(dims) -> set[int]:

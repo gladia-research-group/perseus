@@ -99,3 +99,35 @@ def test_attention_blocked_matches_unblocked(T):
             want[:, cols] = p @ v[:, cols]
         err = np.abs(got - want)
         assert err.max() < 3e-2 and np.median(err) < 1e-3
+
+
+@pytest.mark.parametrize("T", [40, 128, 200])
+def test_attention_blocked_gqa_matches_expanded(T):
+    """G = 2: K / V blocks hold each KV head once, shared by two query blocks == attention on the expanded K / V."""
+    rt, _, _ = _rt(N=4096, hid=256, dim=256, H=4, H_real=4, E=512, E_real=512)
+    d = rt.dims
+    B = blocked.Blocks(d, nch=64, G=2)
+    sm = config.load_configs(str(CFG)).block(0)[2]
+    rng = np.random.default_rng(T + 5)
+    q = 0.5 * rng.standard_normal((T, d.hid))
+    kv = [0.5 * rng.standard_normal((T, d.d_head, d.H // 2)) for _ in range(2)]
+    k, v = (np.repeat(x, 2, axis=2).reshape(T, d.hid) for x in kv)     # head h reads KV head h // 2
+    chb = prefill.Chunks(T, B.t)
+    perm = B.head_perm()
+
+    def grouped(M):
+        G = np.zeros_like(M)
+        G[:, perm] = M
+        return blocked.encode_blocked(rt, 0.5 * G, chb, B)
+
+    def kv_blocks(M):
+        src, dst = B.kv_perm()
+        G = np.zeros_like(M)
+        G[:, dst] = M[:, src]
+        return [x[:B.Kkv] for x in blocked.encode_blocked(rt, 0.5 * G, chb, B)]
+    O = blocked.attention_blocked(rt, grouped(q), kv_blocks(k), kv_blocks(v), sm, chb, B)
+    got = blocked.decrypt_blocked(rt, O, chb, B, d.hid)[:, perm]
+    ch = prefill.Chunks(T, d.t)
+    enc = lambda M: prefill.encode_prompt(rt, 0.5 * M, ch)
+    ref = prefill.decrypt_prompt(rt, prefill.prefill_attention(rt, enc(q), enc(k), enc(v), sm, ch), ch, d.hid)
+    np.testing.assert_allclose(got, ref, atol=1e-10)

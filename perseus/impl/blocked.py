@@ -17,10 +17,13 @@ class Blocks:
     """K = hid / nch channel blocks of the model dims `d`; group k holds heads [k H', (k + 1) H')."""
     d: Dims
     nch: int = 512
+    G: int = 1                  # query heads per KV head: K / V blocks hold each KV head once
 
     def __post_init__(self):
         if self.d.hid % self.nch or self.nch % self.d.d_head or self.t > self.d.d_head:
             raise ValueError("Blocks: nch must split hid into whole heads, with t <= d_head (score ct coverage)")
+        if self.G > 1 and (self.K % self.G or self.d.H_real != self.d.H):
+            raise ValueError("Blocks: GQA needs whole KV blocks and no padded heads")
 
     @property
     def K(self): return self.d.hid // self.nch
@@ -28,6 +31,8 @@ class Blocks:
     def t(self): return self.d.N // self.nch
     @property
     def hg(self): return self.nch // self.d.d_head          # heads per block
+    @property
+    def Kkv(self): return self.K // self.G                  # K / V blocks; Q block q reads K / V block q % Kkv
 
     def real(self, k):
         """Real residual channels of block k."""
@@ -39,11 +44,33 @@ class Blocks:
         return Dims(self.d.N, self.nch, self.d.d_head_real * hr, self.hg, hr, self.d.N, self.d.N)
 
     def head_perm(self):
-        """new index of the interleaved attention feature r = j H + h: block h // H', local j H' + h % H'."""
+        """new index of the interleaved attention feature r = j H + h. Query head h reads KV head kv = h // G and sits
+        in block (h % G) Kkv + kv // H', local j H' + kv % H' (G = 1: block h // H', local j H' + h % H')."""
         r = np.arange(self.d.hid)
         H, hg = self.d.H, self.hg
         j, h = r // H, r % H
-        return (h // hg) * self.nch + j * hg + (h % hg)
+        kv, g = h // self.G, h % self.G
+        return (g * self.Kkv + kv // hg) * self.nch + j * hg + (kv % hg)
+
+    def kv_perm(self):
+        """(source column of the expanded interleaved K / V, its index in the K / V blocks): KV head kv once."""
+        r = np.arange(self.d.hid)
+        h = r % self.d.H
+        keep = h % self.G == 0
+        return r[keep], self.head_perm()[keep]
+
+    def kv_cols(self, W):
+        """The expanded K / V weight's columns, each KV head once, in the K / V blocks' order."""
+        src, dst = self.kv_perm()
+        out = np.zeros((W.shape[0], self.Kkv * self.nch), W.dtype)
+        out[:, dst] = W[:, src]
+        return out
+
+    def kv_vec(self, v):
+        src, dst = self.kv_perm()
+        out = np.zeros(self.Kkv * self.nch, np.asarray(v).dtype)
+        out[dst] = np.asarray(v)[src]
+        return out
 
     def group_cols(self, W):
         """W's columns (interleaved attention features) in head-grouped order."""
@@ -252,7 +279,19 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
 
 
 def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None):
-    """prefill_attention per head group (block k of Q / K / V, its own sub-runtime): outputs O[g][k]."""
+    """prefill_attention per head group (block k of Q / K / V, its own sub-runtime): outputs O[g][k]. GQA (G > 1):
+    K / V hold Kkv blocks, each shared by the G query blocks b, Kkv + b, ... (one rotation set per K / V block)."""
+    if B.G > 1:
+        outs = [[None] * B.K for _ in Q]
+        for b in range(B.Kkv):
+            qs = [b + g * B.Kkv for g in range(B.G)]
+            pre = prefixes[b] if prefixes is not None else None
+            o = prefill_attention(sub_rt(rt, B, b), [[q[i] for q in Q] for i in qs], [x[b] for x in K],
+                                  [x[b] for x in V], cfg, ch, rope=rope, prefix=pre, shared=True)
+            for i, oi in zip(qs, o):
+                for g in range(len(Q)):
+                    outs[g][i] = oi[g]
+        return outs
     outs = []
     for k in range(B.K):
         if B.group_dims(k).H_real == 0:

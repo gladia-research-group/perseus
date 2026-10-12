@@ -144,7 +144,7 @@ def llama_prefill_block_pcmm(rt, Xs, P, cfgs, ch: Chunks, rope, prefix_kv):
 
 def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B):
     """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block)."""
-    ops, K = rt.ops, B.K
+    ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
     skip = Xs
     with rt.step("ln_1"):
@@ -194,14 +194,15 @@ class LlamaPrefill(LlamaModel):
         vf = PX.expanded_heads(v, self.H, self.H_kv, dh)
         if _layout_blocked():               # per head group: its slice of the head-grouped vectors
             B = self.blocks
-            kg, vg = B.group_vec(kf), B.group_vec(vf)
+            kg, vg = B.kv_vec(kf), B.kv_vec(vf)
             return [(np.repeat(kg[k * B.nch:(k + 1) * B.nch], B.t), np.repeat(vg[k * B.nch:(k + 1) * B.nch], B.t))
-                    for k in range(B.K)]
+                    for k in range(B.Kkv)]
         return np.repeat(kf, d.t), np.repeat(vf, d.t)
 
     @property
     def blocks(self):
-        return BL.Blocks(self.rt.dims, int(os.environ.get("PF_NCH", "512")))
+        G = self.H // self.H_kv if os.environ.get("PF_GQA", "") == "1" else 1
+        return BL.Blocks(self.rt.dims, int(os.environ.get("PF_NCH", "512")), G)
 
     def prefill(self, tokens, on_block=None):
         """tokens[0] = BOS (public prefix), tokens[1:] the prompt -> the dense residual stream after the blocks."""
@@ -264,10 +265,11 @@ class LlamaPrefill(LlamaModel):
 
         def enc(name, build, scale):
             # cached at scale 1: a power-of-two scale only moves w_scale
-            f = self.w.dir / f"pcmm3.w{wb}.{tag}b{b}.{name}.npz"
+            tg = f"blk{t_enc}g{B.G}." if blk_l and name in ("qkv", "out") else tag
+            f = self.w.dir / f"pcmm3.w{wb}.{tg}b{b}.{name}.npz"
             if not f.exists():
                 lin = PcmmLinear.encode(build(), t_enc, 1.0, name=name, wbits=wb)
-                tmp = self.w.dir / f".pcmm3.w{wb}.{tag}b{b}.{name}.{os.getpid()}.tmp.npz"
+                tmp = self.w.dir / f".pcmm3.w{wb}.{tg}b{b}.{name}.{os.getpid()}.tmp.npz"
                 np.savez(tmp, Wd=lin.Wd, ws=lin.w_scale, n=np.array([lin.n_in, lin.n_out]))
                 os.replace(tmp, f)
             z = np.load(f)
@@ -278,7 +280,7 @@ class LlamaPrefill(LlamaModel):
         sc = [float(x) for x in os.environ.get("PF_PCMM_LLAMA_SCALES", "0.25,1,0.25,0.5").split(",")]
         if blk_l:
             Er = d.E_real
-            cache[b] = {"qkv": enc("qkv", lambda: np.hstack([B.group_cols(mats().K), B.group_cols(mats().V),
+            cache[b] = {"qkv": enc("qkv", lambda: np.hstack([B.kv_cols(mats().K), B.kv_cols(mats().V),
                                                              B.group_cols(mats().Q)]), sc[0]),
                         "out": enc("out", lambda: B.group_rows(mats().O), sc[1]),
                         "gate_up": enc("gate_up", lambda: np.hstack([mats().Gate[:, :Er], mats().Up[:, :Er]]), sc[2]),
