@@ -178,6 +178,8 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `PLAN_TRACE_DECRYPT` | With `PLAN_TRACE_STEP`: also each traced op's decrypted max \|z\| and max \|Im\| (where a planned run's values go wrong). |
 | `FIDESLIB_ERRCHECK` | 1 polls cudaGetLastError after every FIDESlib launch (off by default: ~1.8M calls per decode token). |
 | `FIDESLIB_OMP_REGIONS` | 1 enters FIDESlib's OpenMP regions on a single GPU (off by default: they run inline). |
+| `FIDESLIB_AKS` | DEPRECATED: aggregated key switching for the first CoeffsToSlots stage (ePrint 2025/1403). Measured slower on the n32 decode (+0.03..+0.06 s/token) and its key generation uses a predictable error term, so it is refused unless `FIDESLIB_AKS_ALLOW_INSECURE=1`. |
+| `FIDESLIB_AKS_ALLOW_INSECURE` | Lets the deprecated `FIDESLIB_AKS` run anyway, for timing experiments only (its keys are not secure). |
 | `FIDESLIB_BCONV2` | Key-switch base conversions: 2 (default) = the shared-memory ModUp and ModDown kernels, 1 = ModUp only, 0 = the original kernels (same residues either way). |
 | `FIDESLIB_LAZY_PS` | EvalMod's Chebyshev series sums its top-level products under one relinearization (lazy-BSGS Paterson-Stockmeyer, default 1; 0 = one relinearization per product). |
 | `FIDESLIB_MODRAISE_COEFF` | ModRaise keeps the raised polynomials in coefficient form, because the exact post-raise scaling reads only the first limbs back in coefficient form and rewrites every limb before its own NTT (bit-exact; default 1, 0 = the NTT of all raised limbs). |

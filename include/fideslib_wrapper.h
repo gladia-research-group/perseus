@@ -4231,14 +4231,15 @@ make_ckks_context(const CKKSContextOptions& o = {})
             }
         }
 
-        // Lever 1b: hold the sparse encapsulation secret (regenerated keys) before the GPU load reads the keys
+        // Lever 1b (AKS, DEPRECATED 2026-10-12: slower here and insecure keygen; FIDESlib refuses it unless
+        // FIDESLIB_AKS_ALLOW_INSECURE=1): hold the sparse encapsulation secret before the GPU load reads the keys
         if (!from_keys && enable_bootstrap) {
             const char* e = std::getenv("FIDESLIB_AKS");
             if (e && std::atoi(e) > 0) cc->RegenerateEncapsulationKeys(ctx->keys.secretKey);
         }
         cc->deferred_rotation_indexes = deferred_rot_steps;
         if (!skip_gpu_load) cc->LoadContext(ctx->keys.publicKey);
-        // Lever 1b: aggregated key switching for CtS stage 0 (FIDESLIB_AKS=1; needs FIDESLIB_BTS_SHIFT>=1).
+        // Lever 1b: aggregated key switching for CtS stage 0 (FIDESLIB_AKS=1, deprecated; needs FIDESLIB_BTS_SHIFT>=1).
         if (!skip_gpu_load && !from_keys && enable_bootstrap) {
             const char* e = std::getenv("FIDESLIB_AKS");
             if (e && std::atoi(e) > 0) cc->LoadAksKeys(ctx->keys.secretKey);
