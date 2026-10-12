@@ -83,7 +83,8 @@ def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
     if not (getattr(rt.ops, "sm_fold", False) and getattr(rt.ops, "sm_den_recip", False)
             and not getattr(rt.ops, "fused_sm_den", False)):
         return []
-    return [_hrs_seed_item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
+    item = _hrs_pack_item if getattr(rt.ops, "hrs_pack", False) else _hrs_seed_item
+    return [item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
             for k, (_a, beta, _i, scale) in enumerate(_recip_rounds(cfg, kc, getattr(rt.ops, "sm_gs_first", False)))]
 
 
@@ -178,6 +179,12 @@ def rope_step_masks(rt, rope, pos: int, packing: str = "cachemir"):
             "real": ("kpush.tok0h", lambda: real_head_half_mask(d))}[packing]
     return (_rope_items(rt, rope, pos, "tok0", lambda: real_head_tok0_mask(d))
             + _rope_items(rt, rope, pos, *push))
+
+
+def _hrs_pack_item(d, seed: float, site: str):
+    """SM_HRS_PACK: both head-sum masks on one ciphertext, the sum on the real part and seed * the sum on the
+    imaginary part, halved so that z + conj(z) and i (conj(z) - z) return them unscaled."""
+    return (site + ".pk", seed), lambda: (0.5 + 0.5j * seed) * hrs_pos0(d)
 
 
 class KVCache:
@@ -524,14 +531,24 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     head ladder (SM_FOLD: the reciprocal's seed slope rides the mask instead of a ciphertext x constant product)."""
     ops, d = rt.ops, rt.dims
     out = rotsum(ops, x, 1, d.t)
-    if seed is not None:
-        tot = out
-    out = rt.mult_mask(out, "hrs.pos0", lambda: hrs_pos0(d))
-    out = rotsum_neg(ops, out, d.t)
-    if seed is not None:
+    if seed is not None and getattr(ops, "hrs_pack", False) and ops.complex_payload:
         if ops.fused_sm_den:
             raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
-        h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), d.t)
+        # SM_HRS_PACK: one replicate ladder for both sums (the input is real), split by one conjugation
+        z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
+        cz = ops.conjugate(z)
+        h = ops.mult_i(ops.sub(cz, z))
+        out = ops.add(z, cz)
+    else:
+        if seed is not None:
+            tot = out
+        out = rt.mult_mask(out, "hrs.pos0", lambda: hrs_pos0(d))
+        out = rotsum_neg(ops, out, d.t)
+        if seed is not None:
+            if ops.fused_sm_den:
+                raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
+            h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), d.t)
+    if seed is not None:
         if not periodic:
             h = rotsum(ops, h, d.tH, d.N)
         elif _general(rt):

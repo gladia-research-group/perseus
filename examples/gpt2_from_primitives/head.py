@@ -89,6 +89,9 @@ def inv_sigma_cascade(ops, x, cfg: CutMaxCfg, it: CutMaxIter, ones, tap=None, it
     # ciphertext is needed. Pass `ones` (the constant stamped as such) to reproduce the C++
     # op stream instead.
     u_prod = None
+    # the pair rides re + i im of one payload: a real-slot payload (conjugate = identity) runs them unpaired
+    pair = getattr(ops, "cutmax_pair", False) and getattr(ops, "complex_payload", False)
+    pending, kpair = None, 1.0
     for j in range(it.passes):
         iters = cfg.newton_per_pass + (cfg.newton_polish if j + 1 == it.passes else 0)
         y0 = ops.add(ops.mult(x, -it.cb), it.ca) if (j == 0 and it.ca != 0.0) else ones
@@ -96,13 +99,28 @@ def inv_sigma_cascade(ops, x, cfg: CutMaxCfg, it: CutMaxIter, ones, tap=None, it
         if tap: tap(f"casc.u{j}", u)
         if j + 1 < it.passes:
             x = ops.mult(ops.mult(x, u), u)
-        if iters == 2:
+        if pair and iters != 2:
+            # CUTMAX_PAIR: u_j's refresh is off the path to u_{j+1} (x above uses the unrefreshed u), so two of them
+            # ride one 1-slot refresh as z = u_a + i u_b; u_a u_b = Im(z^2) / 2 = i (conj(z^2) - z^2) / 4
+            if pending is None and j + 1 < it.passes:
+                pending = u
+                continue
+            if pending is not None:
+                z = ops.add(pending, ops.mult_i(u))
+                pending = None
+                ops.bootstrap(z)
+                sq = ops.square(z)
+                u = ops.mult_i(ops.sub(ops.conjugate(sq), sq))
+                kpair *= 0.25
+            else:
+                u = ops.copy(u); ops.bootstrap(u)
+        elif iters == 2:
             u = bts2(ops, u)
         else:
             u = ops.copy(u); ops.bootstrap(u)
         if tap: tap(f"casc.u{j}.bts", u)
-        u_prod = u if j == 0 else ops.mult(u_prod, u)
-    return ops.mult(u_prod, 0.5 / (math.sqrt(it.s2_hi) * it.c * it.m))
+        u_prod = u if u_prod is None else ops.mult(u_prod, u)
+    return ops.mult(u_prod, kpair * 0.5 / (math.sqrt(it.s2_hi) * it.c * it.m))
 
 
 def cutmax_argmax(rt, tiles_in, vocab: int, cfg: CutMaxCfg, ones=None, tap=None):

@@ -37,6 +37,15 @@ LOAD_BEARING_ENV = (
     "KV_LANES",
     # step-scoped ciphertext names (impl rt.Rt): different variable names, the plan's keys
     "IMPL_SCOPED_NAMES",
+    # the softmax head sums on one complex ladder (impl attention.head_reduce_sum) and the CutMax cascade's paired
+    # 1-slot refreshes (examples head.inv_sigma_cascade): different op sequences
+    "SM_HRS_PACK", "CUTMAX_PAIR",
+    # graph ops nobody reads skipped (impl poly.eval_chebyshev_bsgs / inv_sqrt_newton_d2): a different op sequence
+    "IMPL_DEAD_OPS",
+    # rotate-and-sum ladders in hoisted radix groups (src/bindings/ops.cu rotate_and_sum): a different op sequence
+    "LADDER_RADIX_BITS",
+    # Chebyshev leaves on pre-aligned babies (impl poly._AlignedBabies): a different op sequence
+    "CHEB_ALIGN",
 )
 
 

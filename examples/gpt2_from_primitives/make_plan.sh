@@ -34,6 +34,9 @@ export PLAN_PRUNE="${PLAN_PRUNE-1}"
 # raise drops stay within the variants the runtime builds (FIDESLIB_BTS_RAISE_DROPS=1,3,5); PLAN_REAL_ROUTE=0 and
 # PLAN_RAISE_DROP_SET= lift them
 export PLAN_REAL_ROUTE="${PLAN_REAL_ROUTE-1}" PLAN_RAISE_DROP_SET="${PLAN_RAISE_DROP_SET-1,3,5}"
+# a deg-2 value read only by products / key switches gets its pending rescale realized once (planner
+# _shared_candidates) instead of one rescale per consumer; PLAN_SHARED_REALIZE= turns it off
+export PLAN_SHARED_REALIZE="${PLAN_SHARED_REALIZE-1}"
 # a dense plan (PLAN_SPARSE_SLOTS set and empty) runs every refresh on the dense route, so the
 # code's own bootstraps land at the bootstrap level whatever route they took in the capture
 if [[ -n "${PLAN_SPARSE_SLOTS+x}" && -z "$PLAN_SPARSE_SLOTS" ]]; then

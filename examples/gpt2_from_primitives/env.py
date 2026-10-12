@@ -54,6 +54,14 @@ ENV = {
     # the Chebyshev series by baby-step giant-step (poly.eval_chebyshev_bsgs); a plan cut before it runs it off
     # (RUNTIME_LEGACY)
     "CHEB_BSGS": "1",
+    # the softmax head sum and its seed-scaled copy on one complex mask and one replicate ladder (attention.head_reduce_sum),
+    # two CutMax cascade passes on one 1-slot refresh (head.inv_sigma_cascade), no dead graph ops (the odd GELU series'
+    # T_6, the LayerNorm Newton constant at 0 iterations), rotate-and-sum ladders as hoisted radix-8 groups
+    # (layout.rotsum); a plan cut before them runs them off (RUNTIME_LEGACY)
+    "SM_HRS_PACK": "1",
+    "CUTMAX_PAIR": "1",
+    "IMPL_DEAD_OPS": "1",
+    "LADDER_RADIX_BITS": "3",
     # step-scoped ciphertext names (perseus.impl Rt): a plan captured at one token stays bound at every cache
     # length (the q.K^T's per-group ops no longer renumber the block); with SM_PERIODIC=0, whose general softmax
     # path does not switch at t tokens. Off by default: the shipped plans name by the block-wide counter
@@ -83,7 +91,8 @@ RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_R
 RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
                   "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0",
                   "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0", "KV_LANES": "0", "CHEB_BSGS": "0",
-                  "QKV_LANES": "0", "IMPL_SCOPED_NAMES": "0"}
+                  "QKV_LANES": "0", "IMPL_SCOPED_NAMES": "0", "SM_HRS_PACK": "0", "CUTMAX_PAIR": "0",
+                  "IMPL_DEAD_OPS": "0", "LADDER_RADIX_BITS": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):
@@ -145,6 +154,15 @@ def open_session(device=3, complex_payload=True, chain=None, **overrides):
     prof.extra = dict(prof.extra)
     prof.extra.update({k: v for k, v in ENV.items()})
     prof.extra.update({k: str(v) for k, v in overrides.items()})
+    from perseus.impl.layout import Dims, ladder_radix_bits, ladder_radix_steps
+    if ladder_radix_bits() >= 2:
+        # LADDER_RADIX_BITS: the radix ladders' extra rotation keys (perseus.impl.layout.ladder_radix_steps)
+        prof.apply()
+        opts = prof.options()
+        ck = opts.ckks
+        ck.extra_rot_steps = sorted(set(ck.extra_rot_steps) | ladder_radix_steps(Dims.gpt2(), ladder_radix_bits()))
+        opts.ckks = ck
+        return session(options=opts, mode="sync")
     return session(profile=prof, mode="sync")
 
 

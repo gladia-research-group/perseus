@@ -104,7 +104,33 @@ class FakeFhe:
         self.calls.append(f"rotate{steps}")
         return FakeCt(np.roll(a.vec, -steps), a.level, a.noise_deg, a.packing)
 
+    def has_rot_keys(self, steps):
+        return all(int(k) % self.slots == 0 or (int(k) % self.slots) in self._rot
+                   or (int(k) % self.slots - self.slots) in self._rot or int(k) in self._rot for k in steps)
+
+    def rotate_sum(self, a, steps):
+        """a + sum_k rot(a, k): one hoisted radix group of a rotate-and-sum ladder (LADDER_RADIX_BITS)."""
+        if not self.has_rot_keys(steps):
+            raise KeyError(f"no rotation keys for {steps}")
+        x = FakeCt(a.vec.copy(), a.level, a.noise_deg, a.packing)
+        for k in steps:                  # np.roll, not self.rotate: a taped rotate would record extra nodes
+            x.vec = x.vec + np.roll(a.vec, -int(k))
+        self.calls.append("rotate_sum")
+        return x
+
     def rotate_and_sum(self, a, start, stop):
+        from .layout import ladder_chunks, ladder_radix_bits
+        bits = ladder_radix_bits() if self.slots is not None else 0
+        if bits >= 2:
+            x = None
+            for g in ladder_chunks(start, stop, bits):
+                if len(g) > 1 and self.has_rot_keys(g):
+                    x = self.rotate_sum(a if x is None else x, g)
+                else:
+                    for k in (g if len(g) == 1 else [g[(1 << i) - 1] for i in range(len(g).bit_length())]):
+                        y = a if x is None else x
+                        x = self.add(y, self.rotate(y, k))
+            return x if x is not None else self.add(a, 0.0)
         gap, sign = abs(int(start)), (1 if start > 0 else -1)
         x = self.add(a, 0.0)
         while gap < stop:
@@ -402,6 +428,8 @@ def make_fake(N=1024, hid=32, dim=24, H=4, H_real=3, E=128, E_real=96, limit=46,
         for d_in, d_out in ((hid, hid), (hid, E), (E, hid), (hid, N), (N, hid)):
             steps |= linear_rot_steps(N, d_in, d_out)
         steps |= attention_rot_steps(dims)
+        from .layout import ladder_radix_bits, ladder_radix_steps
+        steps |= ladder_radix_steps(dims, ladder_radix_bits())
         rot_steps = steps | {(-s) % N for s in steps} | {s - N for s in steps}
     fhe = FakeFhe(rot_steps, limit=limit, bts_out=bts_out, unit=unit, strict=strict, slots=N,
                   complex_payload=complex_payload, sparse_slots=sparse_slots)

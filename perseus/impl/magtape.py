@@ -108,11 +108,27 @@ def attach(fhe, inf) -> Tape:
         tape.add("add_inplace", a)
     fhe.inplace_add = inplace_add
 
+    from .layout import ladder_chunks, ladder_radix_bits
+    f_rs = fhe.rotate_sum
+
     def rotate_and_sum(a, start, stop):
         # the runtime's ladder records add (first rung) then inplace_add (FheOps' fallback stream)
         gap, sign = abs(int(start)), (1 if start > 0 else -1)
         if gap >= stop:
             return fhe.add(a, 0.0)
+        bits = ladder_radix_bits()
+        if bits >= 2:     # src/bindings/ops.cu rotate_and_sum: radix groups record one rotate_sum each
+            x = None
+            for g in ladder_chunks(start, stop, bits):
+                if len(g) > 1 and fhe.has_rot_keys(g):
+                    x = tape.add("rotate_sum", f_rs(a if x is None else x, g))
+                    continue
+                for k in (g if len(g) == 1 else [g[(1 << i) - 1] for i in range(len(g).bit_length())]):
+                    if x is None:
+                        x = fhe.add(a, fhe.rotate(a, k))
+                    else:
+                        fhe.inplace_add(x, fhe.rotate(x, k))
+            return x
         x = fhe.add(a, fhe.rotate(a, sign * gap))
         gap *= 2
         while gap < stop:

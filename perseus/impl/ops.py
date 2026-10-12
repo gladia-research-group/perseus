@@ -89,6 +89,21 @@ class FheOps:
         # IMPL_PT_SUM_FUSED=1: a streamed weight's inner sums encode their plaintexts on the device from the raw rows
         # and accumulate there (Inference.mult_pt_sum_raw; same values and op stream as the loop)
         self.pt_sum_fused = os.environ.get("IMPL_PT_SUM_FUSED", "0") not in ("", "0")
+        # IMPL_REALIZE_SHARED=1: a deg-2 value read only by products (the BSGS Chebyshev bases T_2.., the LayerNorm's
+        # centered input) has its pending rescale realized once in place; FIDESlib otherwise rescales a copy inside
+        # every product that reads it. Same rescale on the same values, same output levels and degrees: plans bind
+        self.realize_shared = os.environ.get("IMPL_REALIZE_SHARED", "0") not in ("", "0")
+        # SM_HRS_PACK (default 1): the softmax head sum and its seed-scaled copy (SM_FOLD) ride one complex mask and one replicate
+        # ladder, split by a conjugation (attention.head_reduce_sum): 4 key switches fewer per reciprocal round
+        self.hrs_pack = os.environ.get("SM_HRS_PACK", "1") not in ("", "0")
+        # (SM_HRS_PACK and CUTMAX_PAIR need a complex payload; a real-slot session runs both unpacked)
+        # CUTMAX_PAIR (default 1): two inverse-sigma cascade passes share one 1-slot refresh (examples/.../head.py)
+        self.cutmax_pair = os.environ.get("CUTMAX_PAIR", "1") not in ("", "0")
+        # IMPL_DEAD_OPS (default 1): skip graph ops nothing reads (unused Chebyshev bases such as the odd GELU series' T_6, the
+        # LayerNorm Newton constant when the seed takes no Newton iteration)
+        self.dead_ops = os.environ.get("IMPL_DEAD_OPS", "1") not in ("", "0")
+        # CHEB_ALIGN=1: the Chebyshev leaves read their babies pre-aligned to one level (poly._AlignedBabies)
+        self.cheb_align = os.environ.get("CHEB_ALIGN", "0") not in ("", "0")
 
     # arithmetic
     def add(self, a, b):
@@ -407,6 +422,11 @@ class NumpyOps:
     def bootstrap_hint(self, a, thr, acct=False): return a
     folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = sm_periodic = sm_fold = kv_lanes = False
     qkv_lanes = False
+    realize_shared = False
+    hrs_pack = False
+    cutmax_pair = False
+    dead_ops = False
+    cheb_align = False
     def fold_slots_for(self, s_wanted): return int(s_wanted)
     def fold_bootstrap(self, a, s, n_live, prescale=1.0):
         out = self.rotate_and_sum(a, s, a.shape[0]) / n_live   # the fold: the remaining ladder, /n_live

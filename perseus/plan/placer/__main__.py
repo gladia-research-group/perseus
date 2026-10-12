@@ -137,6 +137,12 @@ def main() -> None:
                    dest="rescale_opt",
                    help="phase 2: search planted-realize anchors at deg-raising joins, "
                         "keep them when the re-cut plan needs no more bootstraps")
+    p.add_argument("--shared-realize", action="store_true", default=None, dest="shared_realize",
+                   help="realize anchors on deg-2 values read by two or more products / key switches, kept when the "
+                        "re-cut plan needs no more bootstraps")
+    p.add_argument("--ks-realize", action="store_true", default=None, dest="ks_realize",
+                   help="realize anchors on the deg-2 inputs of rotations/conjugations, kept when the re-cut plan "
+                        "needs no more bootstraps (cheaper key switches)")
     p.add_argument("--boundary-realize", action="store_true", default=None,
                    dest="boundary_realize",
                    help="realize a deg-2 terminal exit so the next block enters deg-1 "

@@ -226,6 +226,40 @@ void bind_ops(py::module_& m) {
                  const int32_t sign = start < 0 ? -1 : 1;
                  int32_t gap = start < 0 ? -start : start;
                  if (gap >= stop) return c.add(ct, 0.0);        // empty ladder: a clone
+                 // LADDER_RADIX_BITS = b >= 2: the rungs in groups of b from the bottom, each group as
+                 // x + sum_j rot(x, j h), j < 2^len (h its first gap), from one hoisted decomposition and one
+                 // ModDown (perseus.impl.layout.ladder_chunks is the same rule); a group without all its keys,
+                 // and a 1-rung group, run rung by rung
+                 static const int radix_bits = [] {
+                     const char* e = std::getenv("LADDER_RADIX_BITS");
+                     return e ? std::atoi(e) : 0;
+                 }();
+                 if (radix_bits >= 2) {
+                     std::vector<int32_t> gaps;
+                     for (int32_t g = gap; g < stop; g *= 2) gaps.push_back(g);
+                     PackedCtx acc = ct;
+                     bool have = false;
+                     for (size_t i0 = 0; i0 < gaps.size(); i0 += radix_bits) {
+                         const size_t n = std::min<size_t>(radix_bits, gaps.size() - i0);
+                         std::vector<int32_t> steps, rungs;
+                         for (int32_t j = 1; j < (1 << n); ++j) steps.push_back(sign * j * gaps[i0]);
+                         for (size_t r = 0; r < n; ++r) rungs.push_back(sign * gaps[i0 + r]);
+                         if (n > 1 && c.has_rot_keys(steps)) {
+                             acc = c.rotate_sum(have ? acc : ct, steps, rungs);
+                             have = true;
+                             continue;
+                         }
+                         for (int32_t g : rungs) {
+                             if (!have) {
+                                 acc = c.add(ct, c.rotate(ct, g));
+                                 have = true;
+                             } else {
+                                 c.inplace_add(acc, c.rotate(acc, g));
+                             }
+                         }
+                     }
+                     return acc;
+                 }
                  PackedCtx acc = c.add(ct, c.rotate(ct, sign * gap));
                  for (gap *= 2; gap < stop; gap *= 2)
                      c.inplace_add(acc, c.rotate(acc, sign * gap));

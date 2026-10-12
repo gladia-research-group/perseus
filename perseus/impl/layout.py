@@ -397,6 +397,51 @@ def vpair_mask_complex(dims: Dims, i_re: int, i_im: int, right_rot: int, scale: 
     return vlane_mask(dims, i_re, right_rot, scale) + 1j * vlane_mask(dims, i_im, right_rot, scale)
 
 
+def ladder_chunks(start: int, stop: int, bits: int) -> list[list[int]]:
+    """The radix grouping of the rotate-and-sum ladder x += rot(x, g), g = start, 2 start, ... (|g| < stop) under
+    LADDER_RADIX_BITS = bits: consecutive rungs in groups of `bits` from the bottom, each group done as
+    x + sum_j rot(x, j h) for j = 1 .. 2^len - 1 (h its first gap) from one hoisted decomposition. Returns the
+    step lists; a 1-rung group is the plain rung. src/bindings/ops.cu rotate_and_sum mirrors this rule."""
+    sign, gap = (1 if start > 0 else -1), abs(int(start))
+    gaps = []
+    while gap < stop:
+        gaps.append(gap)
+        gap *= 2
+    out = []
+    for i in range(0, len(gaps), max(1, bits)):
+        n = min(max(1, bits), len(gaps) - i)
+        out.append([sign * j * gaps[i] for j in range(1, 1 << n)])
+    return out
+
+
+def gpt2_ladders(dims: Dims) -> list[tuple[int, int]]:
+    """The (start, stop) of every rotate-and-sum ladder the GPT-2 port issues (head sums, LN mean and
+    variance, the all-slot sums, the linear input/output ladders; census of a fake decode)."""
+    t, tH, N = dims.t, dims.tH, dims.N
+    return [(-1, t), (1, t), (1, 8), (1, N), (t - 1, 8 * (t - 1)), (t - 1, t * (t - 1)), (t, N), (tH, N)]
+
+
+def ladder_radix_steps(dims: Dims, bits: int) -> set[int]:
+    """The extra rotation keys the radix ladders need (every step of every multi-rung group), mod N."""
+    steps = set()
+    if bits < 2:
+        return steps
+    for start, stop in gpt2_ladders(dims):
+        for g in ladder_chunks(start, stop, bits):
+            if len(g) > 1:
+                steps.update(s % dims.N for s in g)
+    return {s for s in steps if s}
+
+
+def ladder_radix_bits() -> int:
+    """LADDER_RADIX_BITS (default 3; 0/1 = the plain ladder)."""
+    import os
+    try:
+        return int(os.environ.get("LADDER_RADIX_BITS", "3") or 0)
+    except ValueError:
+        return 0
+
+
 def attention_rot_steps(dims: Dims) -> set[int]:
     """Every rotation the attention/norm ports issue (collect_mha_rots / collect_norm_rots)."""
     steps = set()

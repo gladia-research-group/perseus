@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .. import btserr
 from ..contract import CONTRACT_KEY
-from .ir import ADD_FAMILY, Graph, parse_lvl_suffix
+from .ir import ADD_FAMILY, MULT_FAMILY, Graph, parse_lvl_suffix
 from .place import Placer, PlanInfeasible, erase_reactive_bootstraps
 from .refresh import CfClampReport, RefreshPlanner
 from .sim import Budget, SimResult, step_bts_offsets
@@ -55,6 +55,48 @@ def _raise_candidates(g: Graph, sim: SimResult, forbid_steps, hint_outs, placed)
     return out
 
 
+KS_OPS = frozenset({"rotate", "conjugate", "rotate_sum"})
+
+
+def _ks_candidates(g: Graph, sim: SimResult, hint_outs, placed) -> set:
+    """Deg-2 values a key switch reads (rotations, conjugations; a rotate-and-sum ladder is recorded as its rotates).
+    Realizing the pending rescale first runs every key switch on one composite level (2 limbs) fewer, sometimes one
+    gadget digit fewer; the rescale itself happens anyway at the next product, so effective levels are unchanged."""
+    out = set()
+    for n in g.nodes:
+        if n.op not in KS_OPS or n.is_deliberate_bts or n.hint_level is not None:
+            continue
+        for v in n.cipher_inputs:
+            if sim.deg.get(v, 1) != 2 or v in placed or v in hint_outs or v in g.inputs:
+                continue
+            if g.producer_of.get(v) is None:
+                continue
+            out.add(v)
+    return out
+
+
+def _shared_candidates(g: Graph, sim: SimResult, hint_outs, placed) -> set:
+    """Deg-2 values read only by products and key switches, at least two of them: every product rescales its own
+    copy of a deg-2 operand (FIDESlib mult / multPt / multScalar / square) and a key switch carries its 2 extra limbs,
+    so realizing the pending rescale once serves them all (the generic form of IMPL_REALIZE_SHARED). Effective levels
+    are unchanged; the planner's own simulation tracks the degrees, so the plan's degree pins stay exact."""
+    consumers = {}
+    for n in g.nodes:
+        if n.is_deliberate_bts or n.hint_level is not None:
+            continue
+        for v in set(n.cipher_inputs):
+            consumers.setdefault(v, []).append(n)
+    out = set()
+    for v, cs in consumers.items():
+        if sim.deg.get(v, 1) != 2 or v in placed or v in hint_outs or v in g.inputs:
+            continue
+        if g.producer_of.get(v) is None or len(cs) < 2:
+            continue
+        if all(n.op in MULT_FAMILY or n.op in KS_OPS for n in cs):
+            out.add(v)
+    return out
+
+
 @dataclass(frozen=True)
 class PlanConfig:
     bootstrap_level: int = 16
@@ -94,6 +136,12 @@ class PlanConfig:
     forbid_steps: tuple[str, ...] = (".var", ".mean", ".qkv")
     boundary_realize: bool = False
     rescale_opt: bool = False
+    # Realize anchors on the deg-2 inputs of key switches (_ks_candidates), kept when the re-cut plan needs no more
+    # bootstraps (PLAN_KS_REALIZE): cheaper rotations and conjugations, same effective levels.
+    ks_realize: bool = False
+    # Realize anchors on deg-2 values read by two or more products / key switches (_shared_candidates), kept when the
+    # re-cut plan needs no more bootstraps (PLAN_SHARED_REALIZE): one rescale instead of one per consumer.
+    shared_realize: bool = False
     # Landing feedback: {block_dir_name: {var: absolute_out_level}} of measured per-site
     # refresh landings from a prior run's [planted_bts] ledger. Overrides the route table
     # at exactly the named sites.
@@ -623,6 +671,57 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         if cfg.verbose:
             log.info(f"[plan] rescale_opt: {len(rescale_anchors)} realize anchor(s), "
                   f"bootstraps {base} -> {best}")
+
+    if cfg.shared_realize and exact:
+        hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
+        best_sr = len(placer.placed) + sum(1 for f in sim.hint_fired.values() if f)
+        base_sr, n_sr = best_sr, 0
+        for _ in range(6):
+            cands = _shared_candidates(g, sim, hint_outs, placer.placed) - rescale_anchors
+            if not cands:
+                break
+            trial = rescale_anchors | cands
+            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial), hint_force=hint_force)
+            try:
+                s2 = p2.run()
+            except PlanInfeasible:
+                break
+            c2 = len(p2.placed) + sum(1 for f in s2.hint_fired.values() if f)
+            if c2 <= best_sr:
+                rescale_anchors, sim, placer, best_sr = trial, s2, p2, c2
+                n_sr += len(cands)
+            else:
+                break
+        if cfg.verbose:
+            log.info(f"[plan] shared_realize: {n_sr} shared-operand realize anchor(s), bootstraps {base_sr} -> {best_sr}")
+
+    if cfg.ks_realize and exact:
+        hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
+
+        def _count_ks(s: SimResult, p: Placer) -> int:
+            return len(p.placed) + sum(1 for f in s.hint_fired.values() if f)
+
+        best_ks = _count_ks(sim, placer)
+        base_ks, n_ks = best_ks, 0
+        for _ in range(6):               # a ladder realized at its root makes its later steps deg-1: re-derive
+            cands = _ks_candidates(g, sim, hint_outs, placer.placed) - rescale_anchors
+            if not cands:
+                break
+            trial = rescale_anchors | cands
+            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
+                           hint_force=hint_force)
+            try:
+                s2 = p2.run()
+            except PlanInfeasible:
+                break
+            c2 = _count_ks(s2, p2)
+            if c2 <= best_ks:
+                rescale_anchors, sim, placer, best_ks = trial, s2, p2, c2
+                n_ks += len(cands)
+            else:
+                break
+        if cfg.verbose:
+            log.info(f"[plan] ks_realize: {n_ks} key-switch realize anchor(s), bootstraps {base_ks} -> {best_ks}")
 
     if cfg.prune:
         # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)

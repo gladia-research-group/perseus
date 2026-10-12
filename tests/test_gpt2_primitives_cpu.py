@@ -314,6 +314,49 @@ def test_cutmax_fake_matches_ref_and_picks_argmax():
     assert int(np.argmax(zdec)) == 123 and zdec[123] > 0.99
 
 
+@pytest.mark.parametrize("pair", ["0", "1"])
+def test_cutmax_pair_complex_matches_ref(monkeypatch, pair):
+    """CUTMAX_PAIR packs two cascade passes as u_a + i u_b on one refresh: on a complex payload the result is the
+    unpaired one (ref); on a real-slot payload the switch is a no-op (test above)."""
+    monkeypatch.setenv("CUTMAX_PAIR", pair)
+    rt, fhe, inf = _rt(complex_payload=True)
+    cfg = _cfgs().cutmax
+    d = rt.dims
+    vocab = 50257
+    rng = np.random.default_rng(7)
+    logits = rng.standard_normal(vocab) * 3.0
+    logits[123] = logits.max() + 5.0
+    tiles = []
+    for k in range((vocab + d.N - 1) // d.N):
+        col0 = k * d.N; wreal = min(d.N, vocab - col0)
+        v = np.zeros(d.N)
+        m = np.arange(d.N); col = layout.cutmax_tile_col_of_slot(m, d.hid, d.N)
+        ok = col < wreal
+        v[m[ok]] = logits[col0 + col[ok]]
+        tiles.append(fake.FakeCt(v, 34))
+    z = head.cutmax_argmax(rt, tiles, vocab, cfg)
+    zdec = head.decode_z(rt, z, vocab, d.N)
+    np.testing.assert_allclose(zdec, ref.cutmax_ref(logits, cfg), rtol=1e-6, atol=1e-9)
+    assert int(np.argmax(zdec)) == 123
+
+
+@pytest.mark.parametrize("complex_payload", [False, True])
+def test_head_reduce_sum_pack_matches_unpacked(monkeypatch, complex_payload):
+    """SM_HRS_PACK: the head sum and seed * the sum from one complex ladder equal the two unpacked sums."""
+    monkeypatch.setenv("FUSED_SM_DEN", "0")
+    rng = np.random.default_rng(3)
+    outs = {}
+    for pack in ("0", "1"):
+        monkeypatch.setenv("SM_HRS_PACK", pack)
+        rt, fhe, inf = _rt(complex_payload=complex_payload)
+        x = fake.FakeCt(rng.standard_normal(rt.dims.N) if pack == "0" else outs["x"], 30)
+        outs["x"] = x.vec.copy()
+        s, h = attention.head_reduce_sum(rt, x, s0_expected=2.0, periodic=1, seed=0.37)
+        outs[pack] = (np.real(s.vec).copy(), np.real(h.vec).copy())
+    np.testing.assert_allclose(outs["1"][0], outs["0"][0], rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(outs["1"][1], outs["0"][1], rtol=1e-9, atol=1e-9)
+
+
 def test_block_fake_runs_and_matches_ref_shape(tmp_path):
     """A whole block on the fake with random small weights: finite output on the lanes and
     the level accounting alive (the eager C++ relies on reactive refreshes inside the

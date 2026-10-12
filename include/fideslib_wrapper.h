@@ -3241,6 +3241,45 @@ struct CKKSContext {
         return outs;
     }
 
+    // Whether every step has a loaded rotation key (in any of its equivalent forms: s, s mod slots, s mod slots - slots).
+    bool has_rot_keys(const std::vector<int32_t>& steps) const {
+        const auto& a = cc->rotation_indexes;
+        const int64_t n = static_cast<int64_t>(cc->GetRingDimension() / 2);
+        auto has = [&](int64_t v) { return std::find(a.begin(), a.end(), static_cast<int32_t>(v)) != a.end(); };
+        for (int32_t s : steps) {
+            if (s == 0) continue;
+            const int64_t m = ((static_cast<int64_t>(s) % n) + n) % n;
+            if (!has(s) && !has(m) && !has(m - n)) return false;
+        }
+        return true;
+    }
+
+    // a + sum_k rot(a, steps[k]) from one hoisted decomposition, summed in the extended basis with ONE ModDown: a
+    // radix group of a rotate-and-sum ladder (LADDER_RADIX_BITS, src/bindings/ops.cu). One recorded node,
+    // "rotate_sum" (level- and degree-neutral like a rotation).
+    Ctx rotate_sum(const Ctx& ct, const std::vector<int32_t>& steps) {
+        // the pack tag the rung-by-rung ladder produces (x <- x + rot(x, g) per rung; the rungs are the steps
+        // 2^i - 1 of the group), set before the node is recorded and before a planned refresh can fire on it
+        packtag::PackTag _tg = tag_of_ct(ct);
+        for (size_t i = 0; ((size_t(1) << i) - 1) < steps.size(); ++i)
+            _tg = packtag::t_add(_tg, packtag::t_rotate(_tg, steps[(size_t(1) << i) - 1]));
+        const int in_a_level = level_for_ct(ct);
+        if (!has_rot_keys(steps)) throw std::runtime_error("rotate_sum: a step has no loaded rotation key");
+        const std::string in_a = var_for_ct(ct);
+        std::string in_b = "rot(";
+        for (size_t i = 0; i < steps.size(); ++i) in_b += (i ? "," : "") + std::to_string(steps[i]);
+        in_b += ")";
+        Ctx out_ct = cc->EvalRotateSumHoisted(ct, steps);
+        tag_ct(out_ct, _tg);
+        const std::string out = set_new_var_for_ct(out_ct);
+        const int out_level = level_for_ct(out_ct);
+        record_primitive("rotate_sum", {in_a, in_b}, out, {in_a_level, -1}, out_level, out_ct);
+        maybe_apply_planned_bootstrap_after(out, out_ct);
+        verify_expected_level(out, "rotate_sum", level_of(out_ct));
+        tag_ct(out_ct, _tg);
+        return out_ct;
+    }
+
     Ctx conjugate(const Ctx& ct) {
         packtag::PackTag _tg = packtag::t_conjugate(tag_of_ct(ct));
         _tg.conj_of = ct.get();
@@ -3751,6 +3790,14 @@ struct CKKSContext {
     PackedCtx clone(const PackedCtx& a) { return slotlayout::keep(a.ct, tagged(clone(a.ct), a.packing, a.tag)); }
 
     PackedCtx rotate(const PackedCtx& a, int32_t index) { return tagged(rotate(a.ct, index), a.packing, packtag::t_rotate(a.tag, index)); }
+    // A radix group of a rotate-and-sum ladder; `rungs` are the plain ladder's gaps it replaces (the pack tag the
+    // rung-by-rung ladder would have produced: x <- x + rot(x, g) per rung).
+    PackedCtx rotate_sum(const PackedCtx& a, const std::vector<int32_t>& steps, const std::vector<int32_t>& rungs) {
+        (void)rungs;   // the Ctx-level rotate_sum derives the same rungs from the steps
+        Ctx out = rotate_sum(a.ct, steps);
+        const packtag::PackTag tg = tag_of_ct(out);
+        return slotlayout::keep(a.ct, tagged(std::move(out), a.packing, tg));
+    }
     std::vector<PackedCtx> rotate_hoisted(const PackedCtx& a, const std::vector<int32_t>& steps) {
         std::vector<Ctx> raw = rotate_hoisted(a.ct, steps);
         std::vector<PackedCtx> out;

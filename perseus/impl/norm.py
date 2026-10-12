@@ -24,6 +24,8 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     mean = ops.tag_reduce(rotsum(ops, xs, t, N), t)       # t-periodic (mod-t class sum)
     mean = rt.mult_mask(mean, "ln.scalemask", lambda: stride_mask(N, dr, t, -1.0 / dr))
     centered = ops.add(xs, mean)
+    if getattr(ops, "realize_shared", False):
+        ops.realize(centered)                             # read by the square and the final product only
     # biased variance broadcast to every slot (cachemir_norm_utils.cu) + eps*c^2.
     # FUSED_LN_VAR: the square may sit at the ceiling (no reactive refresh), the all-slot
     # ladder stops at the sparse slot count and the fold bootstrap finishes it and divides

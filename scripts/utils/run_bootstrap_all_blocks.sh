@@ -43,6 +43,8 @@ if [[ -n "${PLAN_LEVEL_WEIGHT:-}"   ]]; then args+=(--level-weight "$PLAN_LEVEL_
 if [[ -n "${PLAN_BTS_MS:-}"         ]]; then args+=(--bts-ms "$PLAN_BTS_MS");                   fi
 if [[ -n "${PLAN_MS_DISCOUNT:-}"    ]]; then args+=(--ms-discount "$PLAN_MS_DISCOUNT");         fi
 if [[ -n "${PLAN_RESCALE_OPT:-}"    ]]; then args+=(--rescale-opt);                           fi
+if [[ -n "${PLAN_KS_REALIZE:-}" && "${PLAN_KS_REALIZE}" != 0 ]]; then args+=(--ks-realize); fi
+if [[ -n "${PLAN_SHARED_REALIZE:-}" && "${PLAN_SHARED_REALIZE}" != 0 ]]; then args+=(--shared-realize); fi
 if [[ -n "${PLAN_SITE_BTS_OUT_FILE:-}" ]]; then args+=(--site-bts-out-file "$PLAN_SITE_BTS_OUT_FILE"); fi
 if [[ -n "${PLAN_RAISE_DROP_MAX:-}" ]]; then args+=(--raise-drop-max "$PLAN_RAISE_DROP_MAX"); fi
 if [[ -n "${PLAN_RAISE_ENV_RULE:-}" ]]; then args+=(--raise-drop-env-rule "$PLAN_RAISE_ENV_RULE"); fi
