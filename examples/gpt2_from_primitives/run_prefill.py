@@ -80,6 +80,7 @@ def main(argv=None):
 
     extra = prefill_rot_steps(Dims.gpt2()) | diag_rot_steps(Dims.gpt2()) | (pcmm_rot_steps() if pcmm else set()) \
         | blocked_steps
+    pruned = None
     if a.fake:
         from perseus.impl import fakecap
         from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
@@ -90,7 +91,13 @@ def main(argv=None):
         sess = fakecap.FakeSession(inf)
         core = fakecap.core
     else:
-        sess = env.open_session(a.device, complex_payload=True, chain="n32", extra_rot_steps=extra, **over)
+        from perseus.impl.magtape import plan_rot_steps
+        pruned = plan_rot_steps(a.plan) if a.plan and os.environ.get("PF_ROT_PRUNE", "1") != "0" else None
+        if pruned:          # a planned run issues its graph's rotations only: the other keys are VRAM
+            extra = pruned
+            print(f"[prefill] rotation keys from the plan's graph: {len(extra)}", flush=True)
+        sess = env.open_session(a.device, complex_payload=True, chain="n32", extra_rot_steps=extra, base=not pruned,
+                                **over)
         inf = sess.inf
         env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
         core = _core
@@ -99,7 +106,7 @@ def main(argv=None):
     model = Gpt2Prefill(inf, store, cfgs, core=core, n_layers=a.layers, profile=a.profile)
     d = model.rt.dims
     loaded = {int(s) % d.N for s in inf.fhe.loaded_rot_steps}
-    missing = [] if a.fake else \
+    missing = [] if (a.fake or pruned) else \
         sorted(set(env.rotation_audit(inf.fhe, d)) | ((prefill_rot_steps(d) | diag_rot_steps(d)) - loaded))
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)

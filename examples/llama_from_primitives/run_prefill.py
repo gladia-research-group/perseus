@@ -75,6 +75,7 @@ def main(argv=None):
         from perseus.impl.blocked import Blocks, blocked_rot_steps
         rot |= blocked_rot_steps(Blocks(dims, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
     t0 = time.time()
+    pruned = None
     if a.fake:
         from perseus.impl import fakecap
         env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
@@ -83,11 +84,17 @@ def main(argv=None):
         _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | rot)
         sess = fakecap.FakeSession(inf)
     else:
-        sess = env.open_session(dims, a.device, complex_payload=True, extra_rot_steps=rot, **over)
+        from perseus.impl.magtape import plan_rot_steps
+        pruned = plan_rot_steps(a.plan) if a.plan and os.environ.get("PF_ROT_PRUNE", "1") != "0" else None
+        if pruned:          # a planned run issues its graph's rotations only: the other keys are VRAM
+            rot = pruned
+            print(f"[llama-prefill] rotation keys from the plan's graph: {len(rot)}", flush=True)
+        sess = env.open_session(dims, a.device, complex_payload=True, extra_rot_steps=rot, base=not pruned, **over)
         inf = sess.inf
         env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     loaded = {int(s) % dims.N for s in inf.fhe.loaded_rot_steps}
-    missing = [] if a.fake else sorted(set(env.rotation_audit(inf.fhe, dims)) | ({s % dims.N for s in rot} - loaded))
+    missing = [] if a.fake else sorted((set() if pruned else set(env.rotation_audit(inf.fhe, dims)))
+                                       | ({s % dims.N for s in rot} - loaded))
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)
         return 3
