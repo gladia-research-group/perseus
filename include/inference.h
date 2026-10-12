@@ -147,10 +147,10 @@ struct Inference {
     void set_persistent_staging(bool on) { cc()->SetPersistentStaging(on); }
     // BERT's multi-consume staging: one staged plaintext feeds several consumers.
     void set_stage_multi_consume(bool on) { cc()->SetStageMultiConsume(on); }
-    // IMPL_NODUMP_ERASE=1: a plaintext erased from the encode cache (a per-step mask) is freed without its host
+    // IMPL_NODUMP_ERASE (default 1; 0 restores the dump): a plaintext erased from the encode cache (a per-step mask) is freed without its host
     // dump (2 x D2H + two legacy-stream syncs per plaintext otherwise)
     static bool nodump_erase() {
-        static const bool v = [] { const char* e = std::getenv("IMPL_NODUMP_ERASE"); return e && std::atoi(e) > 0; }();
+        static const bool v = [] { const char* e = std::getenv("IMPL_NODUMP_ERASE"); return !e || std::atoi(e) > 0; }();   // default on
         return v;
     }
     void erase_plaintext(Ptx& pt) {

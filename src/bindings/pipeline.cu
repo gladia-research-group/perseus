@@ -20,9 +20,9 @@ namespace {
 // Block stages keep their weight plaintexts on the device across tokens: no per-token evict, reload, lift or
 // block_sync drain after the first token (the GPT-2 n32 decode keeps all 12 with ~29 GB still free).
 // IMPL_RESIDENT_BLOCKS=k keeps only the first k (0 = every block evicted after its stage, the old ring).
-// IMPL_KEEP_MASKS=1: the encode cache's device copies survive the end of the token (reloaded from their dumps otherwise)
+// IMPL_KEEP_MASKS (default 1; 0 = evict them): the encode cache's device copies survive the end of the token (reloaded from their dumps otherwise)
 bool keep_masks() {
-    static const bool v = [] { const char* e = std::getenv("IMPL_KEEP_MASKS"); return e && std::atoi(e) > 0; }();
+    static const bool v = [] { const char* e = std::getenv("IMPL_KEEP_MASKS"); return !e || std::atoi(e) > 0; }();   // default on
     return v;
 }
 int resident_blocks() {
