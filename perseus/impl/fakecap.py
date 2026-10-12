@@ -461,6 +461,9 @@ class CapFhe(FakeFhe):
     def inner_bootstrap(self, ct):
         self._in_level = ct.level
         s = self.auto_route(ct)
+        if s and os.environ.get("FAKECAP_SPARSE_EXACT"):   # a sparse route returns the s-periodic projection
+            v = np.asarray(ct.vec).reshape(-1, s).mean(0)
+            ct.vec = np.tile(v, self.slots // s)
         ct.level, ct.noise_deg = self.landing[s]
         if s == 0 and ct.level and self.stc_first() and self._in_level <= self.stc_entry:
             ct.level -= self.stc_drop
