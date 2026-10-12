@@ -138,7 +138,7 @@ def export_env(device=3, chain=None, **overrides):
         os.environ["OMP_NUM_THREADS"] = "36"
 
 
-def open_session(device=3, complex_payload=True, chain=None, **overrides):
+def open_session(device=3, complex_payload=True, chain=None, extra_rot_steps=(), **overrides):
     """perseus.session on the gpt2_decode_n32 preset with the overrides above.
     `complex_payload`: CKKS_COMPLEX=1, the C++ decode configuration (K/V pair bootstrap, packed
     CutMax, complex feedback tile; weights and linears stay real); False: real slots only."""
@@ -155,15 +155,17 @@ def open_session(device=3, complex_payload=True, chain=None, **overrides):
     prof.extra.update({k: v for k, v in ENV.items()})
     prof.extra.update({k: str(v) for k, v in overrides.items()})
     from perseus.impl.layout import Dims, ladder_radix_bits, ladder_radix_steps
+    steps = {int(s) for s in extra_rot_steps}
     if ladder_radix_bits() >= 2:
-        # LADDER_RADIX_BITS: the radix ladders' extra rotation keys (perseus.impl.layout.ladder_radix_steps)
-        prof.apply()
-        opts = prof.options()
-        ck = opts.ckks
-        ck.extra_rot_steps = sorted(set(ck.extra_rot_steps) | ladder_radix_steps(Dims.gpt2(), ladder_radix_bits()))
-        opts.ckks = ck
-        return session(options=opts, mode="sync")
-    return session(profile=prof, mode="sync")
+        steps |= ladder_radix_steps(Dims.gpt2(), ladder_radix_bits())
+    if not steps:
+        return session(profile=prof, mode="sync")
+    prof.apply()
+    opts = prof.options()
+    ck = opts.ckks
+    ck.extra_rot_steps = sorted(set(ck.extra_rot_steps) | steps)
+    opts.ckks = ck
+    return session(options=opts, mode="sync")
 
 
 def rotation_audit(fhe, dims):

@@ -49,6 +49,7 @@ def run_tape(cfgs, configs_path, toks, pos, n_layers=None, packing="cachemir_com
 
     def exit_stage(b, cap):
         if tape.active:
+            tape.flush()
             per_stage[b] = tape.records
             tape.active = False
         return exit_(b, cap)

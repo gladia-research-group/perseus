@@ -54,7 +54,7 @@ def export_env(device=3, chain="n32", **overrides):
                                                 **overrides})
 
 
-def open_session(dims: Dims, device=3, complex_payload=True, chain="n32", **overrides):
+def open_session(dims: Dims, device=3, complex_payload=True, chain="n32", extra_rot_steps=(), **overrides):
     """perseus.session on the n32 decode preset, Llama dims, the port's rotation keys."""
     overrides = {"CKKS_COMPLEX": "1" if complex_payload else "0", **overrides}
     export_env(device, chain=chain, **overrides)
@@ -71,7 +71,8 @@ def open_session(dims: Dims, device=3, complex_payload=True, chain="n32", **over
     opts.dim, opts.hidDim = dims.dim, dims.hid
     opts.expanded, opts.expDim = dims.E_real, dims.E
     opts.numHeads, opts.numHeadsReal = dims.H, dims.H_real
-    opts.ckks.extra_rot_steps = rot_steps(dims)      # a whole list: the binding copies on access
+    # a whole list: the binding copies on access
+    opts.ckks.extra_rot_steps = sorted(set(rot_steps(dims)) | {int(s) for s in extra_rot_steps})
     return session(options=opts, family="generic", mode="sync")
 
 
