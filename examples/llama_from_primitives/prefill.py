@@ -265,7 +265,7 @@ class LlamaPrefill(LlamaModel):
 
         def enc(name, build, scale):
             # cached at scale 1: a power-of-two scale only moves w_scale
-            tg = f"blk{t_enc}g{B.G}." if blk_l and name in ("qkv", "out") else tag
+            tg = f"blk{t_enc}g{B.G}." if blk_l and B.G > 1 and name in ("qkv", "out") else tag
             f = self.w.dir / f"pcmm3.w{wb}.{tg}b{b}.{name}.npz"
             if not f.exists():
                 lin = PcmmLinear.encode(build(), t_enc, 1.0, name=name, wbits=wb)
