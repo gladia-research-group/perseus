@@ -21,8 +21,9 @@ _DBG = bool(os.environ.get("PF_DEBUG"))
 _ATTN_PAIR = os.environ.get("PF_ATTN_PAIR", "1") not in ("", "0")
 # PF_SM_JOINT=1: both chunks of a ciphertext share one refresh point after the softmax exp's Chebyshev
 _SM_JOINT = os.environ.get("PF_SM_JOINT", "0") not in ("", "0")
-# PF_LANE_HOIST=1: an earlier chunk's K / V lane rotations, all offsets at once from one hoisted decomposition
-_LANE_HOIST = os.environ.get("PF_LANE_HOIST", "0") not in ("", "0")
+# PF_LANE_HOIST=B: an earlier chunk's K / V lane rotations from hoisted decompositions, B offsets per call (all at
+# once materializes 2 (t - 1) rotations: the pool runs out at t = 64)
+_LANE_HOIST = int(os.environ.get("PF_LANE_HOIST", "0") or 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -322,19 +323,20 @@ def lane_rotate(rt, x, e: int, site: str):
     return ops.add(hi, lo)
 
 
-def lane_rotate_all(rt, x, site):
-    """lane_rotate(x, e) for e = 1 .. t - 1 from one hoisted rotation batch: {e: ct}."""
+def lane_rotate_all(rt, x, site, batch: int):
+    """lane_rotate(x, e) for e = 1 .. t - 1, `batch` offsets per hoisted rotation call: {e: ct}."""
     ops, d = rt.ops, rt.dims
     N, t = d.N, d.t
-    es = list(range(1, t))
-    rots = ops.rotate_many(x, [-e for e in es] + [t - e for e in es])
     out = {}
-    for i, e in enumerate(es):
-        hi = rt.mult_mask(rots[i], (site + ".hi", e),
-                          lambda e=e: lanes_mask(N, N // t, t, [1.0 if j >= e else 0.0 for j in range(t)]))
-        lo = rt.mult_mask(rots[len(es) + i], (site + ".lo", e),
-                          lambda e=e: lanes_mask(N, N // t, t, [1.0 if j < e else 0.0 for j in range(t)]))
-        out[e] = ops.add(hi, lo)
+    for e0 in range(1, t, batch):
+        es = list(range(e0, min(t, e0 + batch)))
+        rots = ops.rotate_many(x, [-e for e in es] + [t - e for e in es])
+        for i, e in enumerate(es):
+            hi = rt.mult_mask(rots[i], (site + ".hi", e),
+                              lambda e=e: lanes_mask(N, N // t, t, [1.0 if j >= e else 0.0 for j in range(t)]))
+            lo = rt.mult_mask(rots[len(es) + i], (site + ".lo", e),
+                              lambda e=e: lanes_mask(N, N // t, t, [1.0 if j < e else 0.0 for j in range(t)]))
+            out[e] = ops.add(hi, lo)
     return out
 
 
@@ -538,7 +540,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             return None
         if (cp, e) not in rotK:
             if _LANE_HOIST and e:
-                for f, y in lane_rotate_all(rt, K[cp], "pf.krot").items():
+                for f, y in lane_rotate_all(rt, K[cp], "pf.krot", _LANE_HOIST).items():
                     rotK[(cp, f)] = y
             else:
                 rotK[(cp, e)] = lane_rotate(rt, K[cp], e, "pf.krot")
@@ -549,7 +551,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             return None
         if (cp, e) not in rotV:
             if _LANE_HOIST and e:
-                for f, y in lane_rotate_all(rt, V[cp], "pf.vrot").items():
+                for f, y in lane_rotate_all(rt, V[cp], "pf.vrot", _LANE_HOIST).items():
                     rotV[(cp, f)] = y
             else:
                 rotV[(cp, e)] = lane_rotate(rt, V[cp], e, "pf.vrot")
