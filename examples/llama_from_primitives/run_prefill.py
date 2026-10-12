@@ -79,6 +79,7 @@ def main(argv=None):
         from perseus.impl import fakecap
         env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
         _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | rot)
         sess = fakecap.FakeSession(inf)
     else:

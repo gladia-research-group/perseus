@@ -78,6 +78,7 @@ def main(argv=None):
         from perseus.impl import fakecap
         env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
         from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
         _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | (
             ladder_radix_steps(dims, ladder_radix_bits()) if ladder_radix_bits() >= 2 else set()))

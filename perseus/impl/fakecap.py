@@ -983,6 +983,18 @@ class FakeSession:
         pass
 
 
+def session_env(env_defaults, overrides, chain="n32", complex_payload=True):
+    """The env a device session's profile exports (examples/*/env.open_session: the decode preset's extras, the port's
+    ENV, the overrides; setdefault), so a fake capture stamps the same contract."""
+    from perseus.profile import SessionProfile
+    prof = SessionProfile.gpt2_decode_n64() if chain == "n64" else SessionProfile.gpt2_decode_n32()
+    prof.ckks_complex = bool(complex_payload)
+    prof.extra = dict(prof.extra)
+    prof.extra.update({k: v for k, v in env_defaults.items()})
+    prof.extra.update({k: str(v) for k, v in overrides.items()})
+    prof.apply()
+
+
 def make_session(dims, rot_steps, limit=None, bts_out=32, unit=2, complex_payload=True, pcmm_landing=(26, 2)):
     """(fhe, inf) recording fakes at `dims` with the session's rotation keys; the reactive ceiling is AUTO_BTS_LEVEL."""
     N = dims.N

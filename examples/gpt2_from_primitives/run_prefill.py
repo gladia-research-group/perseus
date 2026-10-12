@@ -83,6 +83,7 @@ def main(argv=None):
     if a.fake:
         from perseus.impl import fakecap
         from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
+        fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
         rot = extra | fakecap.GPT2_BAND | (ladder_radix_steps(Dims.gpt2(), ladder_radix_bits())
                                            if ladder_radix_bits() >= 2 else set())
         fhe_f, inf = fakecap.make_session(Dims.gpt2(), rot)

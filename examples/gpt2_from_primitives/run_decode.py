@@ -97,6 +97,8 @@ def main(argv=None):
         from perseus.impl.layout import Dims
         env.export_env(a.device, chain=a.chain, CKKS_COMPLEX="1" if a.payload == "complex" else "0", **over)
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1" if a.payload == "complex" else "0", **over}, a.chain,
+                            a.payload == "complex")
         d = Dims.gpt2()
         band, _ = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real)
         _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND)
