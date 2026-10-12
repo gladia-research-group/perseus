@@ -34,6 +34,7 @@ def main(argv=None):
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--kv-offload", action="store_true", help="park K/V caches in the pinned KV arena")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--tap-blocks", default="", help="blocks whose sub-steps are tapped too (comma list)")
     ap.add_argument("--taps", default=None, help="decrypt every block output; save {pos_block: vec} to this .npz")
     ap.add_argument("--profile", action="store_true")
@@ -44,7 +45,7 @@ def main(argv=None):
     import signal
     faulthandler.register(signal.SIGUSR1, all_threads=True)    # kill -USR1 <pid>: a stack dump
 
-    busy = gpu_busy(a.device)
+    busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
@@ -61,8 +62,8 @@ def main(argv=None):
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(a.device)
-    gt = hf.oracle_logits(toks, cache)          # before the session: the fp32 model needs the GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else str(a.device)
+    gt = None if a.fake else hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
 
     over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": a.packing,
             **dict(kv.split("=", 1) for kv in a.set)}
@@ -73,20 +74,29 @@ def main(argv=None):
     cfgs = load_configs(a.configs)
     dims = W.llama_dims(store.config)
     t0 = time.time()
-    sess = env.open_session(dims, a.device, complex_payload=True, **over)
-    inf = sess.inf
-    env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+    if a.fake:
+        from perseus.impl import fakecap
+        env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
+        _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | (
+            ladder_radix_steps(dims, ladder_radix_bits()) if ladder_radix_bits() >= 2 else set()))
+        sess = fakecap.FakeSession(inf)
+    else:
+        sess = env.open_session(dims, a.device, complex_payload=True, **over)
+        inf = sess.inf
+        env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     print(f"[llama] session {time.time() - t0:.0f}s", flush=True)
-    missing = env.rotation_audit(inf.fhe, dims)
+    missing = [] if a.fake else env.rotation_audit(inf.fhe, dims)
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)
         return 3
     from perseus import _core
     from .model import LlamaModel
     lw = W.LlamaWeights(store, cfgs, a.configs, dims, a.packing,
-                        pinned=None if a.no_coeff_rows else _core.pinned_empty)
-    model = LlamaModel(inf, lw, cfgs, core=_core, n_layers=a.layers, packing=a.packing,
-                       profile=a.profile, kv_offload=a.kv_offload)
+                        pinned=None if (a.no_coeff_rows or a.fake) else _core.pinned_empty)
+    model = LlamaModel(inf, lw, cfgs, core=fakecap.core if a.fake else _core, n_layers=a.layers,
+                       packing=a.packing, profile=a.profile, kv_offload=a.kv_offload)
     print(f"[llama] model {time.time() - t0:.0f}s", flush=True)
     model.preload()
     print(f"[llama] session+weights {time.time() - t0:.0f}s; decode {len(toks) - 1} positions, "

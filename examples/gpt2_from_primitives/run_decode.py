@@ -62,10 +62,11 @@ def main(argv=None):
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override one of the port's session env values (env.ENV), repeatable")
     ap.add_argument("--force", action="store_true", help="run even if GPU is busy")
+    ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--profile", action="store_true", help="per-primitive wall-time split")
     a = ap.parse_args(argv)
 
-    busy = gpu_busy(a.device)
+    busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
@@ -90,15 +91,27 @@ def main(argv=None):
 
     # `over` has to reach open_session as well: it calls export_env a second time, and a
     # second call re-applies env.ENV over anything set here.
-    sess = env.open_session(a.device, complex_payload=(a.payload == "complex"),
-                            chain=a.chain, **over)
-    inf = sess.inf
-    env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
-    print(f"[bootstrap] {'C++' if a.cpp_bootstrap else 'Python'}; shift={over.get('FIDESLIB_BTS_SHIFT')} "
-          f"spru={over.get('FIDESLIB_SPRU')}", file=sys.stderr)
+    core = _core
+    if a.fake:
+        from perseus.impl import fake, fakecap
+        from perseus.impl.layout import Dims
+        env.export_env(a.device, chain=a.chain, CKKS_COMPLEX="1" if a.payload == "complex" else "0", **over)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        d = Dims.gpt2()
+        band, _ = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real)
+        _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND)
+        sess, core = fakecap.FakeSession(inf), fakecap.core
+    else:
+        sess = env.open_session(a.device, complex_payload=(a.payload == "complex"),
+                                chain=a.chain, **over)
+        inf = sess.inf
+        env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+        print(f"[bootstrap] {'C++' if a.cpp_bootstrap else 'Python'}; shift={over.get('FIDESLIB_BTS_SHIFT')} "
+              f"spru={over.get('FIDESLIB_SPRU')}", file=sys.stderr)
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
-    model = Gpt2Model(inf, store, cfgs, core=_core, n_layers=a.layers, profile=a.profile, packing=a.packing)
+    model = Gpt2Model(inf, store, cfgs, core=core, n_layers=a.layers, profile=a.profile, packing=a.packing,
+                      **({"kv_offload": False} if a.fake else {}))
     missing = env.rotation_audit(inf.fhe, model.rt.dims)
     if missing:
         print(f"rotation keys missing from the band: {missing}", file=sys.stderr)

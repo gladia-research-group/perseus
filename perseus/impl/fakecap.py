@@ -326,6 +326,8 @@ class CapFhe(FakeFhe):
         self.sparse_mode = int(os.environ.get("SPARSE_AUTO", "0") or 0)
         self.sparse_precomp_slots = sorted({int(x) for x in os.environ.get("SPARSE_BTS_SLOTS", "").split(",") if x})
         self.pcmm_landing = None           # (level, deg) of a PCMM output, set by the session
+        self.stc_drop = int(os.environ.get("FAKECAP_STC_DROP", "6"))      # StC-first lands this much lower (n32)
+        self.stc_entry = int(os.environ.get("FAKECAP_STC_ENTRY", "46"))   # deepest input with room for StC-first
         self.stats = True
         self.total_bootstraps = 0
         self.magnitude_suppressed = False
@@ -441,9 +443,27 @@ class CapFhe(FakeFhe):
             return 0
         return s
 
+    def stc_first(self):
+        """Whether a dense refresh now takes the StC-first order (FIDESLIB_BTS_STC_FIRST on the dense route, allowed by
+        perseus.impl.bootstrap.stc_first, not staged-only)."""
+        if int(os.environ.get("FIDESLIB_BTS_STC_FIRST", "0") or 0) <= 0:
+            return False
+        if os.environ.get("FIDESLIB_BTS_STC_FIRST_STAGED_ONLY", "0") not in ("", "0"):
+            return False
+        if "dense" not in os.environ.get("FIDESLIB_BTS_STC_FIRST_ROUTES", "dense"):
+            return False
+        from . import bootstrap as _pyb
+        return bool(_pyb._stc_first["on"])
+
+    def bootstrap_output_level(self):
+        return self.landing[0][0] - (self.stc_drop if self.stc_first() else 0)
+
     def inner_bootstrap(self, ct):
+        self._in_level = ct.level
         s = self.auto_route(ct)
         ct.level, ct.noise_deg = self.landing[s]
+        if s == 0 and ct.level and self.stc_first() and self._in_level <= self.stc_entry:
+            ct.level -= self.stc_drop
         ct.tag = t_bootstrap(ct.tag, s, self.slots)
         self.n_bootstraps += 1
         self.total_bootstraps += 1
@@ -504,6 +524,7 @@ class CapFhe(FakeFhe):
 
     # ── arithmetic ──
     def _binary(self, op, a, b, vec, tag, level, deg, rec_op, b_name, b_level, product=False):
+        """`product`: the op ends in maybe_bootstrap (the products, negate, and ct - ct)."""
         la, na = a.level, self.var(a)
         out_ct = self._new(vec, level, deg, a)
         self.tag_ct(out_ct, tag)
@@ -541,7 +562,7 @@ class CapFhe(FakeFhe):
             tag = conj_pair(t_add(ta, tb), a, b, ta, tb, True)
             lv, dg = self._sum_level(a, b)
             nb = self.var(b)
-            return self._binary("sub", a, b, a.vec - b.vec, tag, lv, dg, "sub_ct", nb, b.level)
+            return self._binary("sub", a, b, a.vec - b.vec, tag, lv, dg, "sub_ct", nb, b.level, product=True)
         c = float(b)
         return self._binary("sub", a, b, a.vec - c, t_add_scalar(a.tag, c), a.level, a.noise_deg, "sub",
                             _fmt_scalar(c), -1)
@@ -948,9 +969,10 @@ class FakeSession:
         pass
 
 
-def make_session(dims, rot_steps, limit=46, bts_out=32, unit=2, complex_payload=True, pcmm_landing=(26, 2)):
-    """(fhe, inf) recording fakes at `dims` with the session's rotation keys."""
+def make_session(dims, rot_steps, limit=None, bts_out=32, unit=2, complex_payload=True, pcmm_landing=(26, 2)):
+    """(fhe, inf) recording fakes at `dims` with the session's rotation keys; the reactive ceiling is AUTO_BTS_LEVEL."""
     N = dims.N
+    limit = int(limit or os.environ.get("AUTO_BTS_LEVEL") or 46)
     steps = {int(s) % N for s in rot_steps}
     steps = steps | {s - N for s in steps}
     fhe = CapFhe(steps, limit=limit, bts_out=bts_out, unit=unit, slots=N, complex_payload=complex_payload,
@@ -992,7 +1014,9 @@ def compare_graphs(ref_dir, got_dir, fields=("op_type", "inputs", "input_levels"
             continue
         A, B = canon(json.load(open(p))["nodes"]), canon(json.load(open(q))["nodes"])
         for i, (x, y) in enumerate(zip(A, B)):
-            diff = [f for f in fields if x.get(f) != y.get(f)]
+            # a fused inner sum's replayed product (output_level -1, no degree / tag): the loop's node, unannotated
+            fs = ("op_type", "inputs", "output", "step") if x.get("output_level") == -1 else fields
+            diff = [f for f in fs if x.get(f) != y.get(f)]
             if diff:
                 log(f"[fakecap] block {b} node {i}/{len(A)}: " + "; ".join(f"{f}: {x.get(f)!r} vs {y.get(f)!r}"
                                                                           for f in diff))
