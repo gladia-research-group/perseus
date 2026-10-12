@@ -32,12 +32,13 @@ def main(argv=None):
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--check", action="store_true", help="also compare every block with the float64 reference")
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 reference")
+    ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--random-ids", type=int, default=None, metavar="SEED",
                     help="a random prompt (wte[ids] + wpe), gated against the float64 model instead of the oracle "
                          "(any T up to the 1024 positions)")
     a = ap.parse_args(argv)
 
-    busy = gpu_busy(a.device)
+    busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
@@ -58,6 +59,8 @@ def main(argv=None):
         over = {"FIDESLIB_BTS_STC_FIRST": "2", "FIDESLIB_BTS_STC_FIRST_ROUTES": "dense",
                 "FIDESLIB_BTS_STC_FIRST_STAGED_ONLY": os.environ.get("PF_PCMM_STAGED_ONLY", "1"), **over}
     env.export_env(a.device, chain="n32", CKKS_COMPLEX="1", **over)
+    if a.fake:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if not a.configs:   # the prefill keeps the composite GELU its plans were cut for
         a.configs = env.plan_configs(a.plan, "n32", env.CONFIGS_N32_LEGACY)
     if a.capture:
@@ -75,17 +78,28 @@ def main(argv=None):
     from . import weights
     from .prefill import Gpt2Prefill, exact_blocks, plain_logits, report
 
-    sess = env.open_session(a.device, complex_payload=True, chain="n32",
-                            extra_rot_steps=prefill_rot_steps(Dims.gpt2()) | diag_rot_steps(Dims.gpt2())
-                            | (pcmm_rot_steps() if pcmm else set()) | blocked_steps, **over)
-    inf = sess.inf
-    env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+    extra = prefill_rot_steps(Dims.gpt2()) | diag_rot_steps(Dims.gpt2()) | (pcmm_rot_steps() if pcmm else set()) \
+        | blocked_steps
+    if a.fake:
+        from perseus.impl import fakecap
+        from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
+        rot = extra | fakecap.GPT2_BAND | (ladder_radix_steps(Dims.gpt2(), ladder_radix_bits())
+                                           if ladder_radix_bits() >= 2 else set())
+        fhe_f, inf = fakecap.make_session(Dims.gpt2(), rot)
+        sess = fakecap.FakeSession(inf)
+        core = fakecap.core
+    else:
+        sess = env.open_session(a.device, complex_payload=True, chain="n32", extra_rot_steps=extra, **over)
+        inf = sess.inf
+        env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+        core = _core
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
-    model = Gpt2Prefill(inf, store, cfgs, core=_core, n_layers=a.layers, profile=a.profile)
+    model = Gpt2Prefill(inf, store, cfgs, core=core, n_layers=a.layers, profile=a.profile)
     d = model.rt.dims
     loaded = {int(s) % d.N for s in inf.fhe.loaded_rot_steps}
-    missing = sorted(set(env.rotation_audit(inf.fhe, d)) | ((prefill_rot_steps(d) | diag_rot_steps(d)) - loaded))
+    missing = [] if a.fake else \
+        sorted(set(env.rotation_audit(inf.fhe, d)) | ((prefill_rot_steps(d) | diag_rot_steps(d)) - loaded))
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)
         return 3

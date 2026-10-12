@@ -407,7 +407,10 @@ class Pcmm:
             for c in range(lin.n_in):
                 blk = Wi[m * nch:(m + 1) * nch, c * nch:(c + 1) * nch].astype(np.float64)[inv[:, None], inv[None, :]]
                 y += blk @ X[c]
-            outs.append(FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land, 1, xr[0].packing))
+            o = FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land, 1, xr[0].packing)
+            if hasattr(xr[0], "ptag"):       # fakecap: the device's outputs are the input handles (spares: input 0)
+                o.ptag = xr[m if m < lin.n_in else 0].ptag
+            outs.append(o)
         _record_calib(lin.name, [o.vec for o in outs])
         return outs
 

@@ -32,8 +32,9 @@ def main(argv=None):
     ap.add_argument("--check", action="store_true", help="compare every block with the float64 model")
     ap.add_argument("--no-coeff-rows", action="store_true")
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 model")
+    ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     a = ap.parse_args(argv)
-    busy = gpu_busy(a.device)
+    busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
@@ -44,8 +45,8 @@ def main(argv=None):
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(a.device)
-    gt = hf.oracle_logits(toks, cache)
+    os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else str(a.device)
+    gt = None if a.fake else hf.oracle_logits(toks, cache)
     # the prefill keeps the host wait on device-encoded plaintexts that FIDESlib f12c06e restored for this path;
     # the decode runs without it (FIDESLIB_ENCODE_NOSYNC default 1). --set FIDESLIB_ENCODE_NOSYNC=1 overrides.
     over = {"FIDESLIB_ENCODE_NOSYNC": "0", **env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": "cachemir_complex",
@@ -74,19 +75,27 @@ def main(argv=None):
         from perseus.impl.blocked import Blocks, blocked_rot_steps
         rot |= blocked_rot_steps(Blocks(dims, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
     t0 = time.time()
-    sess = env.open_session(dims, a.device, complex_payload=True, extra_rot_steps=rot, **over)
-    inf = sess.inf
-    env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
+    if a.fake:
+        from perseus.impl import fakecap
+        env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | rot)
+        sess = fakecap.FakeSession(inf)
+    else:
+        sess = env.open_session(dims, a.device, complex_payload=True, extra_rot_steps=rot, **over)
+        inf = sess.inf
+        env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     loaded = {int(s) % dims.N for s in inf.fhe.loaded_rot_steps}
-    missing = sorted(set(env.rotation_audit(inf.fhe, dims)) | ({s % dims.N for s in rot} - loaded))
+    missing = [] if a.fake else sorted(set(env.rotation_audit(inf.fhe, dims)) | ({s % dims.N for s in rot} - loaded))
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)
         return 3
     from perseus import _core
     from .prefill import LlamaPrefill, exact_hidden, plain_logits, report
+    core = fakecap.core if a.fake else _core
     lw = W.LlamaWeights(store, cfgs, a.configs, dims, "cachemir_complex",
-                        pinned=None if (a.no_coeff_rows or pcmm) else _core.pinned_empty)
-    model = LlamaPrefill(inf, lw, cfgs, core=_core, n_layers=a.layers, packing="cachemir_complex", profile=a.profile)
+                        pinned=None if (a.no_coeff_rows or pcmm or a.fake) else _core.pinned_empty)
+    model = LlamaPrefill(inf, lw, cfgs, core=core, n_layers=a.layers, packing="cachemir_complex", profile=a.profile)
     if a.capture:
         model.set_capture(a.capture)
         from perseus.impl.magtape import save_rot_steps
@@ -145,7 +154,7 @@ def main(argv=None):
                                                         pc.times))
               + f" | stc_in={pc.t_in:.2f}s pcmm={pc.t_mm:.2f}s finish={pc.t_out:.2f}s", flush=True)
     out = {}
-    if model.n_layers == int(store.config["num_hidden_layers"]):
+    if model.n_layers == int(store.config["num_hidden_layers"]) and gt is not None:
         rows, out = report(plain_logits(model, model.hidden_rows(Xs, ch)), gt[1:a.tokens + 1])
         print("[llama-prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows), flush=True)
     print(f"[llama-prefill] SUMMARY T={a.tokens} wall={wall:.1f}s per_token={wall / a.tokens:.3f}s "
