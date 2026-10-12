@@ -9,8 +9,11 @@
 #include <CKKS/Bootstrap.cuh>
 #include <CKKS/Ciphertext.cuh>
 #include <CKKS/Spru.cuh>
+#include <CKKS/Pcmm.cuh>
+#include <CKKS/ApproxModEval.cuh>
 
 #include <pybind11/functional.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -40,6 +43,11 @@ DeviceCt device_of(CKKSContext& fhe, PackedCtx& p) {
     auto sp = std::static_pointer_cast<FC::Ciphertext>(fhe.cc->GetDeviceCiphertext(p.ct->gpu));
     return DeviceCt{sp.get(), std::shared_ptr<void>(p.ct, (void*)p.ct.get())};
 }
+
+// PcmmKeys is opaque in FIDESlib: a complete handle for pybind
+struct PcmmKeysHandle {
+    std::shared_ptr<FC::PcmmKeys> k;
+};
 
 long mismatches(const DeviceCt& a, const DeviceCt& b) {
     auto& x = a.get();
@@ -110,6 +118,154 @@ void bind_bts(py::module_& root) {
           "Residues that differ between two device ciphertexts (both polynomials, every limb); -1 = different shape.");
     m.def("sync", [] { cudaDeviceSynchronize(); }, kRelease);
 
+    // Coefficient residues of a device ciphertext and back. ContextData's layout differs in this TU (NCCL members):
+    // moduli come from the OpenFHE parameters, N from the data.
+    auto moduli_of = [](CKKSContext& fhe, int n) {
+        const auto& lcc = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(fhe.cc->cpu);
+        const auto& ps = lcc->GetCryptoParameters()->GetElementParams()->GetParams();
+        std::vector<uint64_t> mod(n);
+        for (int i = 0; i < n; ++i) mod[i] = ps.at(i)->GetModulus().ConvertToInt<uint64_t>();
+        return mod;
+    };
+    m.def("export_limbs", [moduli_of](CKKSContext& fhe, DeviceCt& d) {
+        auto& x = d.get();
+        cudaDeviceSynchronize();
+        std::vector<std::vector<uint64_t>> v[2];
+        const int L = x.getLevel();
+        for (int part = 0; part < 2; ++part) {
+            FC::RNSPoly m(x.cc, L);
+            m.copy(part ? x.c1 : x.c0);
+            m.INTT(1, true);
+            cudaDeviceSynchronize();
+            m.store(v[part]);
+        }
+        cudaDeviceSynchronize();
+        const int nl = (int)v[0].size();
+        if ((int)v[1].size() != nl) throw std::runtime_error("export_limbs: c0 / c1 limb counts differ");
+        const int N = nl ? (int)v[0][0].size() : 0;
+        const std::vector<uint64_t> mod = moduli_of(fhe, nl);
+        py::dict out;
+        for (int part = 0; part < 2; ++part) {
+            py::array_t<uint64_t> a({(py::ssize_t)nl, (py::ssize_t)N});
+            auto w = a.mutable_unchecked<2>();
+            for (int i = 0; i < nl; ++i) {
+                if ((int)v[part][i].size() != N) throw std::runtime_error("export_limbs: ragged limbs");
+                for (int k = 0; k < N; ++k) w(i, k) = v[part][i][k];
+            }
+            out[part ? "c1" : "c0"] = a;
+        }
+        out["moduli"] = mod;
+        out["level"] = x.getLevel();
+        out["noise_level"] = x.NoiseLevel;
+        out["noise_factor"] = x.NoiseFactor;
+        return out;
+    }, py::arg("fhe"), py::arg("ct"), "c0 / c1 coefficient residues (limbs, N) uint64, moduli, level, noise level / factor.");
+    m.def("import_limbs", [moduli_of](CKKSContext& fhe, DeviceCt& d, py::array_t<uint64_t, py::array::c_style> c0,
+                             py::array_t<uint64_t, py::array::c_style> c1, double noise_factor, int noise_level) {
+        auto& x = d.get();
+        const int nl = x.getLevel() + 1;
+        const py::ssize_t N = c0.ndim() == 2 ? c0.shape(1) : 0;
+        if (c0.ndim() != 2 || c0.shape(0) != nl || c1.ndim() != 2 || c1.shape(0) != nl || c1.shape(1) != N)
+            throw std::invalid_argument("import_limbs: c0 / c1 must be (limbs at the ciphertext's level, N)");
+        const std::vector<uint64_t> mod = moduli_of(fhe, nl);
+        for (int part = 0; part < 2; ++part) {
+            auto r = (part ? c1 : c0).unchecked<2>();
+            std::vector<std::vector<uint64_t>> v(nl, std::vector<uint64_t>(N));
+            for (int i = 0; i < nl; ++i)
+                for (py::ssize_t k = 0; k < N; ++k) v[i][k] = r(i, k);
+            FC::RNSPoly m(x.cc, nl - 1);
+            m.load(v, mod);
+            m.NTT(1, true);
+            cudaDeviceSynchronize();
+            (part ? x.c1 : x.c0).copy(m);
+        }
+        cudaDeviceSynchronize();
+        x.NoiseFactor = noise_factor;
+        x.NoiseLevel = noise_level;
+    }, py::arg("fhe"), py::arg("ct"), py::arg("c0"), py::arg("c1"), py::arg("noise_factor"), py::arg("noise_level"),
+       "Overwrite a device ciphertext (at its current level) from coefficient residues (export_limbs' inverse).");
+    py::class_<PcmmKeysHandle>(m, "PcmmKeys")
+        .def_property_readonly("channels", [](const PcmmKeysHandle& k) { return FC::pcmmChannels(*k.k); });
+    m.def("pcmm_keys", [](py::dict d) {
+        FC::PcmmKeySource src;
+        auto u32 = [](py::handle h) {
+            auto a = py::array_t<uint32_t, py::array::c_style | py::array::forcecast>::ensure(h);
+            if (!a) throw std::invalid_argument("pcmm_keys: expected a uint32 array");
+            return std::vector<uint32_t>(a.data(), a.data() + a.size());
+        };
+        auto prim = u32(d["primes"]);
+        auto split = u32(d["split"]);
+        if (prim.size() != 3 || split.size() != 4) throw std::invalid_argument("pcmm_keys: primes (3) / split (4)");
+        src.q[0] = prim[0]; src.q[1] = prim[1]; src.P = prim[2];
+        for (int i = 0; i < 4; ++i) src.split[i] = split[i];
+        auto ni16 = u32(d["ninv16"]), ni12 = u32(d["ninv12"]);
+        for (int i = 0; i < 3; ++i) {
+            src.psi16[i] = u32(py::list(d["psi16"])[i]);
+            src.ipsi16[i] = u32(py::list(d["ipsi16"])[i]);
+            src.psi12[i] = u32(py::list(d["psi12"])[i]);
+            src.ipsi12[i] = u32(py::list(d["ipsi12"])[i]);
+            src.ninv16[i] = ni16[i]; src.ninv12[i] = ni12[i];
+        }
+        src.fwd = u32(d["fwd"]); src.back = u32(d["back"]); src.pack = u32(d["pack"]);
+        return PcmmKeysHandle{FC::pcmmUploadKeys(src)};
+    }, py::arg("keys"), "Upload the PCMM keys (Pcmm.cuh PcmmKeySource as a dict).");
+    m.def("pcmm_multi", [](std::vector<DeviceCt> ins, std::vector<DeviceCt> outs, PcmmKeysHandle& k,
+                           py::array_t<int16_t, py::array::c_style | py::array::forcecast> W, double noise_factor) {
+        const py::ssize_t c = FC::pcmmChannels(*k.k);
+        if (W.ndim() != 2 || W.shape(0) != c * (py::ssize_t)outs.size() || W.shape(1) != c * (py::ssize_t)ins.size())
+            throw std::invalid_argument("pcmm_multi: W must be (nch len(outs), nch len(ins)) int16");
+        std::vector<FC::Ciphertext*> pin, pout;
+        for (auto& d : ins) pin.push_back(&d.get());
+        for (auto& d : outs) pout.push_back(&d.get());
+        std::vector<double> t(6, 0.0);
+        {
+            py::gil_scoped_release nogil;
+            FC::pcmmMulti(pin, pout, *k.k, W.data(), t.data());
+        }
+        for (auto* c : pout) c->NoiseFactor = noise_factor;
+        return t;
+    }, py::arg("ins"), py::arg("outs"), py::arg("keys"), py::arg("W"), py::arg("noise_factor"),
+       "Y = W X at the split point (Pcmm.cuh pcmmMulti); returns per-step times (ms).");
+    m.def("pcmm_multi_planes", [](std::vector<DeviceCt> ins, std::vector<DeviceCt> outs, PcmmKeysHandle& k,
+                                  py::array_t<int8_t, py::array::c_style | py::array::forcecast> Wd,
+                                  double noise_factor) {
+        const py::ssize_t c = FC::pcmmChannels(*k.k);
+        if (Wd.ndim() != 3 || Wd.shape(1) != c * (py::ssize_t)outs.size() || Wd.shape(2) != c * (py::ssize_t)ins.size())
+            throw std::invalid_argument("pcmm_multi_planes: Wd must be (nW, nch len(outs), nch len(ins)) int8");
+        std::vector<FC::Ciphertext*> pin, pout;
+        for (auto& d : ins) pin.push_back(&d.get());
+        for (auto& d : outs) pout.push_back(&d.get());
+        std::vector<double> t(6, 0.0);
+        {
+            py::gil_scoped_release nogil;
+            FC::pcmmMultiPlanes(pin, pout, *k.k, Wd.data(), (int)Wd.shape(0), t.data());
+        }
+        for (auto* c : pout) c->NoiseFactor = noise_factor;
+        return t;
+    }, py::arg("ins"), py::arg("outs"), py::arg("keys"), py::arg("Wd"), py::arg("noise_factor"),
+       "pcmm_multi with W as int8 digit planes (W = sum_u Wd[u] 256^u).");
+    m.def("noise_factor", [](DeviceCt& d) { return d.get().NoiseFactor; }, py::arg("ct"),
+          "NoiseFactor of a device ciphertext.");
+    m.def("scale_noise_factor", [](DeviceCt& d, double f) { d.get().NoiseFactor *= f; }, py::arg("ct"),
+          py::arg("factor"), "NoiseFactor *= factor.");
+    m.def("mult_int", [](DeviceCt& d, uint64_t k) { FC::multIntScalar(d.get(), k); }, py::arg("ct"), py::arg("k"),
+          kRelease, "Exact product by a positive integer (no level).");
+    m.def("secret_key_coeffs", [](CKKSContext& fhe) {
+        const auto& lsk = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(fhe.keys.secretKey->pimpl);
+        auto sk = lsk->GetPrivateElement();
+        sk.SetFormat(Format::COEFFICIENT);
+        const auto& e0 = sk.GetElementAtIndex(0);
+        const uint64_t q = e0.GetModulus().ConvertToInt<uint64_t>();
+        const size_t n = e0.GetLength();
+        py::array_t<int8_t> a((py::ssize_t)n);
+        auto w = a.mutable_unchecked<1>();
+        for (size_t k = 0; k < n; ++k) {
+            const uint64_t v = e0[k].ConvertToInt<uint64_t>();
+            w(k) = v == 0 ? 0 : (v == 1 ? 1 : (v == q - 1 ? -1 : 99));
+        }
+        return a;
+    }, py::arg("fhe"), "Secret key coefficients (int8; 99 = non-ternary), for client-side PCMM keygen.");
+
     // ---- C++ references
     m.def("cpp_bootstrap", [](DeviceCt& d, int slots, bool prescaled) { FC::Bootstrap(d.get(), slots, prescaled); },
           py::arg("ct"), py::arg("slots"), py::arg("prescaled") = false, kRelease,
@@ -124,8 +280,10 @@ void bind_bts(py::module_& root) {
               return FC::btsBegin(d.get(), slots, prescaled, allow_stc_first);
           },
           py::arg("ct"), py::arg("slots"), py::arg("prescaled") = false, py::arg("allow_stc_first") = true, kRelease);
-    m.def("stc_first_input", [](DeviceCt& d, const FC::BtsState& s) { FC::btsStcFirstInput(d.get(), s); },
-          py::arg("ct"), py::arg("st"), kRelease);
+    m.def("stc_first_entry", [](DeviceCt& d, int slots) { return FC::btsStcFirstEntry(d.get(), slots); },
+          py::arg("ct"), py::arg("slots"), "StC-first input limb index (-1: none).");
+    m.def("stc_first_input", [](DeviceCt& d, const FC::BtsState& s, bool own_cf) { FC::btsStcFirstInput(d.get(), s, own_cf); },
+          py::arg("ct"), py::arg("st"), py::arg("own_cf") = false, kRelease);
     m.def("mod_raise", [](DeviceCt& d, FC::BtsState& s) { FC::btsModRaise(d.get(), s); }, py::arg("ct"),
           py::arg("st"), kRelease);
     m.def("fold", [](DeviceCt& d, const FC::BtsState& s) { FC::btsFold(d.get(), s); }, py::arg("ct"), py::arg("st"),

@@ -3514,6 +3514,16 @@ struct CKKSContext {
         maybe_apply_planned_bootstrap_after(out, ct);
     }
 
+    // A refresh made outside the recorded ops (the PCMM): recorded as a deliberate bootstrap of `ins`, tag reset.
+    void record_external_bootstrap(Ctx& ct, const std::vector<std::string>& ins, const std::vector<int>& in_levels) {
+        ++total_bootstraps;
+        const std::string out = set_new_var_for_ct(ct);
+        tag_ct(ct, packtag::PackTag{});
+        record_primitive("deliberate_bootstrap", ins, out, in_levels, level_for_ct(ct), ct);
+        maybe_apply_planned_bootstrap_after(out, ct);
+    }
+    std::string var_name(const Ctx& ct) { return var_for_ct(ct); }
+
     void drop_to_level(Ctx& ct, int target_level) {
         const int cur = level_for_ct(ct);
         const std::string in_a = var_for_ct(ct);

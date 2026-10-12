@@ -206,6 +206,14 @@ void bind_ops(py::module_& m) {
              "level_reduce) when it is above it; level_hint only records a planner hint.")
         .def("level_hint", static_cast<void (CKKSContext::*)(PackedCtx&, int)>(&CKKSContext::level_hint),
              py::arg("ct"), py::arg("level"), "Drop `ct` to `level` if it is above it.")
+        .def("record_external_bootstrap",
+             [](CKKSContext& c, PackedCtx& p, const std::vector<std::string>& ins, const std::vector<int>& lv) {
+                 c.record_external_bootstrap(p.ct, ins, lv);
+             },
+             py::arg("ct"), py::arg("inputs"), py::arg("input_levels"), kRelease,
+             "Record `ct` (refreshed outside the recorded ops: the PCMM) as a deliberate bootstrap of `inputs`.")
+        .def("var_name", [](CKKSContext& c, const PackedCtx& p) { return c.var_name(p.ct); }, py::arg("ct"),
+             "The graph var naming `ct`.")
         // ── leaf primitives for Python-authored ops ────────────────────────────
         .def("rotate", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&, int32_t)>(&CKKSContext::rotate),
              py::arg("ct"), py::arg("steps"), kRelease,

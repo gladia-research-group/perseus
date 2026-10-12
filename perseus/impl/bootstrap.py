@@ -44,6 +44,8 @@ class stc_first:
         _stc_first["on"] = self.prev
         return False
 
+# FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1: StC-first only for the PCMM (perseus/impl/pcmm.py)
+_STAGED_ONLY = os.environ.get("FIDESLIB_BTS_STC_FIRST_STAGED_ONLY", "0") not in ("", "0")
 
 def bootstrap(ct, slots: int, prescaled: bool = False, *, trace: list | None = None, probe=None):
     """In place on a ``bts.DeviceCt``. ``trace``: append (stage, limbs, deg, ms) per stage (syncs the device,
@@ -64,7 +66,7 @@ def bootstrap(ct, slots: int, prescaled: bool = False, *, trace: list | None = N
     if timed:
         bts.sync()
         t0[0] = time.perf_counter()
-    st = bts.begin(ct, slots, prescaled, bool(_stc_first["on"]))
+    st = bts.begin(ct, slots, prescaled, bool(_stc_first["on"]) and not _STAGED_ONLY)
     if slots == 1 and _spru["fhe"] is not None:  # SPRU for the single-value route (CKKS/Spru.cuh)
         bts.spru(_spru["fhe"], ct, st.correction)
         mark("spru")
