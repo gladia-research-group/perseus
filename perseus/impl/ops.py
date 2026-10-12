@@ -229,7 +229,7 @@ class FheOps:
             out = self.inf.mult_coeff_sum(list(cts), rows, tags)
             if out is not None:
                 return out
-        return self.mult_pt_sum(cts, vecs)
+        return self.mult_pt_sum(cts, np.asarray(vecs))
 
     def mult_const(self, a, re, im):
         """a * (re + i im): a plaintext product with a complex constant (the runtime's cached

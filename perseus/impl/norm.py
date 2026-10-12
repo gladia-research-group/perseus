@@ -5,9 +5,65 @@ from __future__ import annotations
 import math
 
 from .config import NormCfg
-from .layout import active_token_mask, lane_vec, stride_mask
+from .layout import active_token_mask, lane_vec, lanes_mask, lanes_periodic, stride_mask
 from .poly import (eval_chebyshev, eval_remez_31, eval_taylor_inv_sqrt, im_cleanse, inv_sqrt_newton,
                    inv_sqrt_newton_d2, rotsum, taylor_inv_sqrt_coeffs)
+
+
+def _seed_mid(cfg: NormCfg, dr: float = 1.0) -> float:
+    """A variance in the inverse-sqrt seed's band (for empty prefill lanes)."""
+    if cfg.cheb_coeffs and cfg.cheb_hi > cfg.cheb_lo:
+        return dr * 0.5 * (cfg.cheb_lo + cfg.cheb_hi)
+    return dr * 1.0
+
+
+def norm_lanes(rt, x, cfg: NormCfg, lanes):
+    """norm() on every lane of a prefill chunk (`lanes`: absolute positions); empty lanes stay in the seed's band."""
+    ops, d = rt.ops, rt.dims
+    N, t, dr = d.N, d.t, d.dim
+    cs = tuple(round(math.sqrt(cfg.c_eff_sq(p)), 12) for p in lanes)
+    n = len(cs)
+    x2 = im_cleanse(ops, x)
+    xs = rt.mult_mask(x2, ("ln.center.L", cs), lambda: lanes_mask(N, dr, t, [0.5 * c for c in cs]))
+    mean = ops.tag_reduce(rotsum(ops, xs, t, N), t)
+    mean = rt.mult_mask(mean, ("ln.scalemask.L", n), lambda: lanes_mask(N, dr, t, [-1.0 / dr] * n))
+    centered = ops.add(xs, mean)
+    var = ops.square(centered)
+    var = ops.tag_reduce(rotsum(ops, var, t, N), t)
+    var = ops.mult(var, 1.0 / dr)
+    var = rt.add_mask(var, ("ln.eps.L", cfg.epsilon, cs, _seed_mid(cfg)),
+                      lambda: lanes_periodic(N, t, [cfg.epsilon * c * c for c in cs], _seed_mid(cfg)))
+    if cfg.cheb_coeffs and ops.ln_cheb:
+        init = eval_chebyshev(ops, var, cfg.cheb_coeffs, cfg.cheb_lo, cfg.cheb_hi)
+        inv = inv_sqrt_newton_d2(ops, var, init, cfg.cheb_nr_iters,
+                                 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale))
+    elif cfg.method == "remez":
+        init = eval_remez_31(ops, var, cfg.Ncoeffs, cfg.Dcoeffs, cfg.lin_alpha, cfg.lin_beta, cfg.gs_iters)
+        inv = inv_sqrt_newton(ops, var, init, cfg.nr_iters, 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale))
+    else:
+        init = eval_taylor_inv_sqrt(ops, var, taylor_inv_sqrt_coeffs(cfg.taylor_z0), cfg.taylor_z0)
+        inv = inv_sqrt_newton(ops, var, init, cfg.nr_iters, 1.0)
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(centered, inv)
+
+
+def rms_norm_lanes(rt, x, cfg: NormCfg, lanes):
+    """rms_norm() on every token lane of a prefill chunk (see norm_lanes)."""
+    ops, d = rt.ops, rt.dims
+    N, t, dr = d.N, d.t, d.dim
+    if not cfg.cheb_coeffs:
+        raise ValueError("rms_norm: the config has no Chebyshev seed (cheb_coeffs)")
+    cs = tuple(round(math.sqrt(cfg.c_eff_sq(p)), 12) for p in lanes)
+    x2 = im_cleanse(ops, x)
+    xs = rt.mult_mask(x2, ("ln.center.L", cs), lambda: lanes_mask(N, dr, t, [0.5 * c for c in cs]))
+    S = ops.tag_reduce(rotsum(ops, ops.square(xs), t, N), t)
+    S = rt.add_mask(S, ("rms.eps.L", cfg.epsilon, cs, _seed_mid(cfg, dr)),
+                    lambda: lanes_periodic(N, t, [dr * cfg.epsilon * c * c for c in cs], _seed_mid(cfg, dr)))
+    init = eval_chebyshev(ops, S, cfg.cheb_coeffs, dr * cfg.cheb_lo, dr * cfg.cheb_hi)
+    inv = inv_sqrt_newton_d2(ops, S, init, cfg.cheb_nr_iters,
+                             1.0 / (dr * cfg.inv_out_scale * cfg.inv_out_scale))
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(xs, inv)
 
 
 def norm(rt, x, cfg: NormCfg, pos: int):

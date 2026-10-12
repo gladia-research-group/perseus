@@ -60,20 +60,66 @@ def node_stats(vec) -> dict:
             "output_max_coeff": float(mag.max()), "output_max_coeff_ac": float(ac.max())}
 
 
+def node_stats_batch(V) -> list:
+    """node_stats of every row of V (B, n), vectorized (one multi-worker FFT)."""
+    import os
+    import scipy.fft
+    Z = np.asarray(V, dtype=np.complex128)
+    B, n = Z.shape
+    m, tw = _coeff_perm(n)
+    Y = np.empty_like(Z)
+    Y[:, m] = Z
+    U = scipy.fft.fft(Y, axis=1, workers=int(os.environ.get("MAGTAPE_THREADS", "8"))) * (tw / n)
+    mag = np.maximum(np.abs(U.real), np.abs(U.imag))
+    mean = Z.real.mean(axis=1)
+    mx = mag.max(axis=1)
+    ac = np.maximum(mag[:, 1:].max(axis=1), np.abs(U[:, 0].imag))
+    amax = np.abs(Z).max(axis=1)
+    dev = np.abs(Z - mean[:, None]).max(axis=1)
+    return [{"output_max_abs": float(amax[i]), "output_mean": float(mean[i]), "output_max_dev": float(dev[i]),
+             "output_max_coeff": float(mx[i]), "output_max_coeff_ac": float(ac[i])} for i in range(B)]
+
+
+class _Pending:
+    """A record's statistics, computed with its batch."""
+    __slots__ = ("value",)
+
+    def result(self):
+        return self.value
+
+
 class Tape:
-    """Records (op_type, step path, stats) per leaf op of a fake session while `active`."""
+    """Records (op_type, step path, stats) per leaf op of a fake session while `active`; MAGTAPE_BATCH > 1 batches
+    the stats (a record holds a _Pending until flush)."""
 
     def __init__(self):
+        import os
         self.active = False
         self.records = []
         self.steps = []
+        self._batch = int(os.environ.get("MAGTAPE_BATCH", "1"))
+        self._pend, self._vecs = [], []
 
     def path(self):
         return ".".join(self.steps)
 
+    def flush(self):
+        if self._pend:
+            for p, st in zip(self._pend, node_stats_batch(np.stack(self._vecs))):
+                p.value = st
+            self._pend, self._vecs = [], []
+
     def add(self, op_type, ct):
         if self.active:
-            self.records.append((op_type, self.path(), node_stats(ct.vec)))
+            if self._batch <= 1:          # default: stats per record
+                self.records.append((op_type, self.path(), node_stats(ct.vec)))
+                return ct
+            p = _Pending()
+            self._pend.append(p)
+            self._vecs.append(np.array(ct.vec, dtype=np.complex128))
+            self.records.append((op_type, self.path(), p))
+            if len(self._pend) >= self._batch:
+                self.flush()
         return ct
 
 
@@ -172,6 +218,8 @@ def fill_graph(graph_path: str, records, start: int = 0, out_path: str | None = 
         if i >= len(records):
             raise ValueError(f"{graph_path}: tape exhausted at node {n['output']} ({op}, {n.get('step')})")
         r_op, r_step, st = records[i]
+        if hasattr(st, "result"):
+            st = st.result()
         if r_op != op or r_step != n.get("step", r_step):
             raise ValueError(f"{graph_path}: node {n['output']} is {op} @ {n.get('step')} but tape[{i}] is "
                              f"{r_op} @ {r_step}")
@@ -197,6 +245,7 @@ def tape_stages(model, tape, pos: int):
 
     def exit_stage(b, cap):
         if tape.active:
+            tape.flush()
             per_stage[b] = tape.records
             tape.active = False
         return exit_(b, cap)
@@ -231,3 +280,20 @@ def compare(ref_graph: str, filled_graph: str):
         if r.size:
             out[k] = (float(np.median(r)), float(np.quantile(r, 0.99)), float(r.max()))
     return out
+
+
+def save_rot_steps(graph_dir: str, steps):
+    """The capturing session's rotation keys, so the fake takes the same ladder forms (rot_steps.json)."""
+    import os
+    with open(os.path.join(graph_dir, "rot_steps.json"), "w") as f:
+        json.dump(sorted(int(s) for s in steps), f)
+
+
+def load_rot_steps(graph_dir: str, N: int):
+    """save_rot_steps' keys in every form FakeFhe matches (None: not saved)."""
+    import os
+    path = os.path.join(graph_dir, "rot_steps.json")
+    if not os.path.exists(path):
+        return None
+    steps = {int(s) % N for s in json.load(open(path))}
+    return steps | {s - N for s in steps}

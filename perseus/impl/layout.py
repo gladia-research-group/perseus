@@ -299,6 +299,22 @@ def active_token_mask(N: int, d: int, t: int, scale: float) -> np.ndarray:
     return stride_mask(N, d, t, scale)
 
 
+def lanes_mask(N: int, d: int, stride: int, vals) -> np.ndarray:
+    """Prefill: vals[l] on the slots i*stride + l (i < d) of every token lane l < len(vals)."""
+    out = np.zeros(N, dtype=np.complex128 if np.iscomplexobj(np.asarray(vals)) else np.float64)
+    idx = np.arange(d) * stride
+    for lane, v in enumerate(vals):
+        out[idx + lane] = v
+    return out
+
+
+def lanes_periodic(N: int, stride: int, vals, fill: float = 0.0) -> np.ndarray:
+    """Prefill: vals[s % stride] on every slot s (lanes past len(vals) at `fill`)."""
+    per = np.full(stride, float(fill))
+    per[:len(vals)] = vals
+    return np.tile(per, N // stride)
+
+
 def active_expanded_mask(dims: Dims, scale: float, fill: float = 0.0) -> np.ndarray:
     """active_expanded_mask_vec (inference.h + cachemir_masks.h): slot m*tp_E
     for every m whose interleaved feature lies below the real MLP width."""
@@ -307,6 +323,12 @@ def active_expanded_mask(dims: Dims, scale: float, fill: float = 0.0) -> np.ndar
     ok = interleave_idx(m, dims.hid, dims.E) < dims.E_real
     out[m[ok] * dims.tp_E] = scale
     return out
+
+
+def active_expanded_lanes(dims: Dims, scale: float, n_lanes: int) -> np.ndarray:
+    """active_expanded_mask on token lanes 0..n_lanes-1 of the stride tp_E (prefill)."""
+    base = active_expanded_mask(dims, scale)
+    return sum(np.roll(base, lane) for lane in range(n_lanes))
 
 
 def real_head_tok0_mask(dims: Dims, tok_offset: int = 0) -> np.ndarray:
