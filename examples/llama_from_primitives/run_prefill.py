@@ -106,7 +106,8 @@ def main(argv=None):
         b0[0] = tb
         if ref is not None:
             from perseus.impl.prefill import Chunks
-            h = model.hidden_rows(Xs, Chunks(a.tokens, dims.t, base=1))
+            lt = model.blocks.t if os.environ.get("PF_LAYOUT", "") == "blocked" else dims.t
+            h = model.hidden_rows(Xs, Chunks(len(toks) - 1, lt, base=1))
             err = np.abs(h - ref[b]).max(1)
             line += f" maxerr={err.max():.3g} (pos {int(err.argmax()) + 1}) |x|={np.abs(ref[b]).max():.3g}"
         print(line, flush=True)
