@@ -329,6 +329,7 @@ class CapFhe(FakeFhe):
         self.stc_drop = int(os.environ.get("FAKECAP_STC_DROP", "6"))      # StC-first lands this much lower (n32)
         self.stc_entry = int(os.environ.get("FAKECAP_STC_ENTRY", "46"))   # deepest input with room for StC-first
         self.stats = True
+        self._pend, self._batch = [], int(os.environ.get("FAKECAP_BATCH", "128"))
         self.total_bootstraps = 0
         self.magnitude_suppressed = False
 
@@ -379,14 +380,23 @@ class CapFhe(FakeFhe):
         if out_ct is not None:
             n["output_noise_level"] = int(out_ct.noise_deg)
             if self.stats and not self.magnitude_suppressed:
-                from .magtape import node_stats
-                n.update(node_stats(out_ct.vec))
+                self._pend.append((n, np.array(out_ct.vec, dtype=np.complex128)))
+                if len(self._pend) >= self._batch:
+                    self.flush_stats()
             tg = out_ct.tag
             if tg.known():
                 self._stamp(n, tg)
             if tg.field:
                 n["pack_field"] = int(tg.field)
         self.nodes.append(n)
+
+    def flush_stats(self):
+        """The pending nodes' magnitudes (magtape.node_stats), one multi-worker FFT per batch."""
+        if self._pend:
+            from .magtape import node_stats_batch
+            for (n, _), st in zip(self._pend, node_stats_batch(np.stack([v for _, v in self._pend]))):
+                n.update(st)
+            self._pend = []
 
     @staticmethod
     def _stamp(n, tg):
@@ -947,6 +957,7 @@ class CapCore(_Core):
         fhe = inf.fhe
         if fhe.nodes is None:
             return
+        fhe.flush_stats()
         d = os.path.join(os.environ["FHE_GRAPH_DIR"], f"block_{b}")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "graph.json"), "w") as f:
