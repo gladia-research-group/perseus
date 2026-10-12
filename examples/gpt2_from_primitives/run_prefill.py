@@ -66,13 +66,18 @@ def main(argv=None):
     from perseus.impl import config
     from perseus.impl.layout import Dims
     from perseus.impl.pcmm import rot_steps as pcmm_rot_steps
+    blocked_steps = set()
+    if os.environ.get("PF_LAYOUT", "") == "blocked":
+        from perseus.impl.blocked import Blocks, blocked_rot_steps
+        from perseus.impl.layout import ladder_radix_bits
+        blocked_steps = blocked_rot_steps(Blocks(Dims.gpt2(), int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
     from perseus.impl.prefill import diag_rot_steps, prefill_rot_steps
     from . import weights
     from .prefill import Gpt2Prefill, exact_blocks, plain_logits, report
 
     sess = env.open_session(a.device, complex_payload=True, chain="n32",
                             extra_rot_steps=prefill_rot_steps(Dims.gpt2()) | diag_rot_steps(Dims.gpt2())
-                            | (pcmm_rot_steps() if pcmm else set()), **over)
+                            | (pcmm_rot_steps() if pcmm else set()) | blocked_steps, **over)
     inf = sess.inf
     env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     store = weights.RawStore(a.weights)
@@ -119,7 +124,7 @@ def main(argv=None):
             line += f" maxerr={err.max():.3g} (pos {int(err.argmax())}) |x|={np.abs(ref[b]).max():.3g}"
         print(line, flush=True)
 
-    if a.taps:
+    if a.taps and os.environ.get("PF_LAYOUT", "") != "blocked":
         from .prefill import block0_taps, tap_rows
         from perseus.impl.prefill import Chunks
         want = block0_taps(store, rows, d)

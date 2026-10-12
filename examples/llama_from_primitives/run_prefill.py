@@ -70,12 +70,15 @@ def main(argv=None):
     from perseus.impl.pcmm import rot_steps as pcmm_rot_steps
     from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
     rot = prefill_rot_steps(dims) | (pcmm_rot_steps() if pcmm else set()) | ladder_radix_steps(dims, ladder_radix_bits())
+    if os.environ.get("PF_LAYOUT", "") == "blocked":
+        from perseus.impl.blocked import Blocks, blocked_rot_steps
+        rot |= blocked_rot_steps(Blocks(dims, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
     t0 = time.time()
     sess = env.open_session(dims, a.device, complex_payload=True, extra_rot_steps=rot, **over)
     inf = sess.inf
     env.bootstrap_setup(inf.fhe, over, cpp_bootstrap=a.cpp_bootstrap)
     loaded = {int(s) % dims.N for s in inf.fhe.loaded_rot_steps}
-    missing = sorted(set(env.rotation_audit(inf.fhe, dims)) | (rot - loaded))
+    missing = sorted(set(env.rotation_audit(inf.fhe, dims)) | ({s % dims.N for s in rot} - loaded))
     if missing:
         print(f"rotation keys missing: {missing}", file=sys.stderr)
         return 3
@@ -108,7 +111,7 @@ def main(argv=None):
             line += f" maxerr={err.max():.3g} (pos {int(err.argmax()) + 1}) |x|={np.abs(ref[b]).max():.3g}"
         print(line, flush=True)
 
-    if a.taps:
+    if a.taps and os.environ.get("PF_LAYOUT", "") != "blocked":
         from perseus.impl.prefill import Chunks
         from examples.gpt2_from_primitives.prefill import tap_rows
         from .prefill import block0_taps

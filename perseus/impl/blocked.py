@@ -9,7 +9,7 @@ import numpy as np
 
 from .layout import Dims, lanes_mask, lanes_periodic, ladder_chunks
 from .poly import eval_chebyshev, im_cleanse, inv_sqrt_newton_d2, rotsum
-from .prefill import Chunks, join, prefill_attention, prefill_rot_steps
+from .prefill import Chunks, join, prefill_attention
 
 
 @dataclass(frozen=True)
@@ -273,12 +273,17 @@ def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefix
 
 
 def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
-    """The lane moves at t, the region spread, and the radix groups of the (t, N) / (tH, N) / (t, 512) ladders."""
-    steps = set(prefill_rot_steps(B.group_dims(0)))
+    """Signed steps as the code rotates by them (the runtime matches indexes exactly): lane moves (+-k, k < t), the
+    region spread (-r), and the radix groups of the (t, N) / (tH, N) / (t, 512) ladders."""
     gd = B.group_dims(0)
+    steps = {k for k in range(1, B.t)} | {-k for k in range(1, B.t)}
+    r = B.t
+    while r < 512:
+        steps.add(-r)
+        r *= 2
     if radix_bits >= 2:
         for a, b in ((B.t, gd.N), (gd.tH, gd.N), (B.t, 512)):
             for grp in ladder_chunks(a, b, radix_bits):
                 if len(grp) > 1:
-                    steps.update(s % gd.N for s in grp)
-    return {s for s in steps if s}
+                    steps.update(grp)
+    return steps

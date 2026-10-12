@@ -14,6 +14,7 @@ from perseus.impl.poly import im_cleanse
 from perseus.impl.prefill import (name_inputs, gelu_joint, Chunks, decrypt_prompt, dense_linear, encode_prompt, join, norm_all, norm_pair,
                                   prefill_attention, split)
 
+from perseus.impl import blocked as BL
 from perseus.impl.pcmm import run as pcmm_run
 
 from . import prefix as PX
@@ -141,6 +142,42 @@ def llama_prefill_block_pcmm(rt, Xs, P, cfgs, ch: Chunks, rope, prefix_kv):
     return [ops.add(a, s) for a, s in zip(out, skip)]
 
 
+def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B):
+    """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block)."""
+    ops, K = rt.ops, B.K
+    ln1, ln2, sm, act = cfgs
+    skip = Xs
+    with rt.step("ln_1"):
+        Y = BL.norm_blocked(rt, Xs, ln1, ch, B, rms=True, max_period=_NORM_PERIOD)
+    with rt.step("qkv"):
+        Q, Kc, V = [], [], []
+        for y in Y:
+            o = pcmm_run(rt, y, P["qkv"])
+            Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+    with rt.step("attn"):
+        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes)
+    with rt.step("out_proj"):
+        A = [pcmm_run(rt, o, P["out"]) for o in O]
+    Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
+    skip = Xs
+    with rt.step("ln_2"):
+        Y = BL.norm_blocked(rt, Xs, ln2, ch, B, rms=True, max_period=_NORM_PERIOD)
+    out = []
+    for y in Y:
+        with rt.step("gate_up"):
+            GU = pcmm_run(rt, y, P["gate_up"])
+            nb = len(GU) // 2
+        with rt.step("glu"):
+            H = [glu_pair(rt, g, u, act, dense=True) for g, u in zip(GU[:nb], GU[nb:])]
+        with rt.step("down"):
+            out.append(pcmm_run(rt, H, P["down"]))
+    return [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(out, skip)]
+
+
+def _layout_blocked():
+    return os.environ.get("PF_LAYOUT", "") == "blocked"
+
+
 class LlamaPrefill(LlamaModel):
     def __init__(self, inf, weights, cfgs, **kw):
         kw.setdefault("kv_offload", False)
@@ -155,15 +192,39 @@ class LlamaPrefill(LlamaModel):
         dh = d.dim // self.H
         kf = PX.expanded_heads(k, self.H, self.H_kv, dh)
         vf = PX.expanded_heads(v, self.H, self.H_kv, dh)
+        if _layout_blocked():               # per head group: its slice of the head-grouped vectors
+            B = self.blocks
+            kg, vg = B.group_vec(kf), B.group_vec(vf)
+            return [(np.repeat(kg[k * B.nch:(k + 1) * B.nch], B.t), np.repeat(vg[k * B.nch:(k + 1) * B.nch], B.t))
+                    for k in range(B.K)]
         return np.repeat(kf, d.t), np.repeat(vf, d.t)
+
+    @property
+    def blocks(self):
+        return BL.Blocks(self.rt.dims, int(os.environ.get("PF_NCH", "512")))
 
     def prefill(self, tokens, on_block=None):
         """tokens[0] = BOS (public prefix), tokens[1:] the prompt -> the dense residual stream after the blocks."""
         d = self.rt.dims
         T = len(tokens) - 1
-        ch = Chunks(T, d.t, base=1)
+        blk_l = _layout_blocked()
+        B = self.blocks if blk_l else None
+        ch = Chunks(T, B.t if blk_l else d.t, base=1)
         self.token_begin(0)
         rows = np.stack([self.w.embedding(t) for t in tokens[1:]])
+        if blk_l:
+            Xs = BL.encode_blocked(self.rt, rows, ch, B)
+            for b in range(self.n_layers):
+                t0 = time.time()
+                cap = self.enter_stage(b, 1)
+                BL.name_blocked(self.inf, Xs)
+                with self.rt.step(f"blk{b}"):
+                    Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
+                                                     self.rope, self.prefix_kv(b), B)
+                self.exit_stage(b, cap)
+                if on_block is not None:
+                    on_block(b, Xs, time.time() - t0)
+            return Xs, ch, self.token_end(0)
         Xs = encode_prompt(self.rt, rows, ch)
         ops = self.rt.ops
         for b in range(self.n_layers):
@@ -196,20 +257,33 @@ class LlamaPrefill(LlamaModel):
 
         wb = weight_bits()
 
+        blk_l = _layout_blocked()
+        B = self.blocks if blk_l else None
+        t_enc = B.t if blk_l else d.t
+        tag = f"blk{t_enc}." if blk_l else ""
+
         def enc(name, build, scale):
             # cached at scale 1: a power-of-two scale only moves w_scale
-            f = self.w.dir / f"pcmm3.w{wb}.b{b}.{name}.npz"
+            f = self.w.dir / f"pcmm3.w{wb}.{tag}b{b}.{name}.npz"
             if not f.exists():
-                lin = PcmmLinear.encode(build(), d.t, 1.0, name=name, wbits=wb)
-                tmp = self.w.dir / f".pcmm3.w{wb}.b{b}.{name}.{os.getpid()}.tmp.npz"
+                lin = PcmmLinear.encode(build(), t_enc, 1.0, name=name, wbits=wb)
+                tmp = self.w.dir / f".pcmm3.w{wb}.{tag}b{b}.{name}.{os.getpid()}.tmp.npz"
                 np.savez(tmp, Wd=lin.Wd, ws=lin.w_scale, n=np.array([lin.n_in, lin.n_out]))
                 os.replace(tmp, f)
             z = np.load(f)
             nm = f"b{b}.{name}"
             return PcmmLinear(int(z["n"][0]), int(z["n"][1]), pinned_planes(self.core, z["Wd"]), float(z["ws"]) / scale,
-                              band_shift(nm), None, nm)
+                              band_shift(nm), None, nm, t_enc if blk_l else 0)
 
         sc = [float(x) for x in os.environ.get("PF_PCMM_LLAMA_SCALES", "0.25,1,0.25,0.5").split(",")]
+        if blk_l:
+            Er = d.E_real
+            cache[b] = {"qkv": enc("qkv", lambda: np.hstack([B.group_cols(mats().K), B.group_cols(mats().V),
+                                                             B.group_cols(mats().Q)]), sc[0]),
+                        "out": enc("out", lambda: B.group_rows(mats().O), sc[1]),
+                        "gate_up": enc("gate_up", lambda: np.hstack([mats().Gate[:, :Er], mats().Up[:, :Er]]), sc[2]),
+                        "down": enc("down", lambda: mats().Down[:Er], sc[3])}
+            return cache[b]
         cache[b] = {"qkv": enc("qkv", lambda: np.hstack([mats().K, mats().V, mats().Q]), sc[0]),
                     "out": enc("out", lambda: mats().O, sc[1]),
                     "gate_up": enc("gate_up", lambda: np.hstack([mats().Gate, mats().Up]), sc[2]),
@@ -217,6 +291,8 @@ class LlamaPrefill(LlamaModel):
         return cache[b]
 
     def hidden_rows(self, Xs, ch):
+        if _layout_blocked():
+            return BL.decrypt_blocked(self.rt, Xs, ch, self.blocks, self.rt.dims.dim)
         return decrypt_prompt(self.rt, Xs, ch, self.rt.dims.dim)
 
 
