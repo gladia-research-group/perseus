@@ -16,6 +16,7 @@ from perseus.impl.prefill import (name_inputs, gelu_joint, Chunks, DiagLinear, P
                                   encode_prompt, gelu_pair, join, lockstep_rt, norm_all, norm_pair, prefill_attention,
                                   shift_lanes, split)
 
+from perseus.impl import blocked as BL
 from perseus.impl.pcmm import PcmmLinear, band_shift, run as pcmm_run
 
 from .model import Gpt2Model, dist_report
@@ -142,6 +143,65 @@ def prefill_block_diag(rt, Xs, w, cfgs, ch: Chunks):
     return [ops.add(a, s) for a, s in zip(out, skip)]
 
 
+def _bias_blocks(rt, ys, lin, ch: Chunks, g: int, B):
+    sub = BL.sub_rt(rt, B, 0)
+    return [diag_bias(sub, y, lin, m, ch, g) for m, y in enumerate(ys)]
+
+
+def _gelu_blocks(rt, H, ge):
+    ops, d = rt.ops, rt.dims
+    mask = ("pf.gelu.dense", lambda s: np.full(d.N, s))
+    out = []
+    for h in H:
+        a, b = split(ops, h)
+        if _GELU_JOINT:
+            ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
+        else:
+            ga = im_cleanse(ops, gelu(rt, a, ge, mask=mask))
+            gb = im_cleanse(ops, gelu(rt, b, ge, mask=mask))
+        out.append(join(ops, ga, gb))
+    return out
+
+
+def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B):
+    """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order)."""
+    ops, K = rt.ops, B.K
+    ln1, ln2, sm, ge = cfgs
+    skip = Xs
+    with rt.step("ln_1"):
+        N1 = BL.norm_blocked(rt, Xs, ln1, ch, B)
+        Y = [[BL.shift_blocked(rt, n, w["shift1"], ch, g, k, B, 2.0) for k, n in enumerate(row)]
+             for g, row in enumerate(N1)]
+    with rt.step("qkv"):
+        Q, Kc, V = [], [], []
+        for g, y in enumerate(Y):
+            o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
+            Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+    with rt.step("attn"):
+        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
+    with rt.step("out_proj"):
+        A = [_bias_blocks(rt, pcmm_run(rt, o, w["out"]), w["out"], ch, g, B) for g, o in enumerate(O)]
+    Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
+    skip = Xs
+    with rt.step("ln_2"):
+        N2 = BL.norm_blocked(rt, Xs, ln2, ch, B)
+        Y = [[BL.shift_blocked(rt, n, w["shift2"], ch, g, k, B, 2.0) for k, n in enumerate(row)]
+             for g, row in enumerate(N2)]
+    out = []
+    for g, y in enumerate(Y):
+        with rt.step("up"):
+            H = _bias_blocks(rt, pcmm_run(rt, y, w["up"]), w["up"], ch, g, B)
+        with rt.step("gelu"):
+            G = _gelu_blocks(rt, H, ge)
+        with rt.step("down"):
+            out.append(_bias_blocks(rt, pcmm_run(rt, G, w["down"]), w["down"], ch, g, B))
+    return [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(out, skip)]
+
+
+def _layout_blocked():
+    return os.environ.get("PF_LAYOUT", "") == "blocked"
+
+
 class Gpt2Prefill(Gpt2Model):
     """Gpt2Model with the prefill block; real linears (the complex payload carries the second chunk)."""
 
@@ -203,6 +263,18 @@ class Gpt2Prefill(Gpt2Model):
                 enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, d.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                                    name=f"b{b}.{name}")
             Er = d.E_real
+            if _layout_blocked():
+                B = self.blocks
+                enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
+                                                                   name=f"b{b}.{name}")
+                cache[b] = {
+                    "qkv": enc("qkv", np.hstack([B.group_cols(m.K), B.group_cols(m.V), B.group_cols(m.Q)]), 0.25,
+                               2.0 * np.concatenate([B.group_vec(m.bk), B.group_vec(m.bv), B.group_vec(m.bq)])),
+                    "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
+                    "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
+                    "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
+                    "shift1": self.block_weights(b).shift1, "shift2": self.block_weights(b).shift2}
+                return cache[b]
             cache[b] = {
                 "qkv": enc("qkv", np.hstack([m.K, m.V, m.Q]), 0.25, 2.0 * np.concatenate([m.bk, m.bv, m.bq])),
                 "out": enc("out", m.O, 1.0, m.bo),
@@ -219,7 +291,12 @@ class Gpt2Prefill(Gpt2Model):
                 cap = self.enter_stage(b, 0)
                 name_inputs(self.inf, Xs)
                 with self.rt.step(f"blk{b}"):
-                    if diag:
+                    if _layout_blocked():
+                        B = self.blocks
+                        Xg = [Xs[g * B.K:(g + 1) * B.K] for g in range(len(Xs) // B.K)]
+                        Xg = prefill_block_blocked(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B)
+                        Xs = [x for row in Xg for x in row]
+                    elif diag:
                         Xs = prefill_block_diag(self.rt, Xs, self.diag_weights(b), self.cfgs.block(b), ch)
                     else:
                         Xs = prefill_block(self.rt, Xs, self.prefill_weights(b), self.cfgs.block(b), ch)
@@ -236,10 +313,14 @@ class Gpt2Prefill(Gpt2Model):
 
     def prefill(self, rows, on_block=None):
         """Embedding rows (T, 768) -> the dense residual stream after the last block."""
-        ch = Chunks(len(rows), self.rt.dims.t)
+        blk = _layout_blocked()
+        ch = Chunks(len(rows), self.blocks.t if blk else self.rt.dims.t)
         self.start()
         self.token_begin(0)
-        Xs = encode_prompt(self.rt, rows, ch)
+        if blk:
+            Xs = [x for row in BL.encode_blocked(self.rt, rows, ch, self.blocks) for x in row]
+        else:
+            Xs = encode_prompt(self.rt, rows, ch)
         stages = self.prefill_stages(ch)
         if on_block is not None:
             stages = [(lab, pre, _tapped(fn, b, on_block)) for b, (lab, pre, fn) in enumerate(stages)]
@@ -247,7 +328,15 @@ class Gpt2Prefill(Gpt2Model):
         rec = self.token_end(0)
         return Xs, ch, rec
 
+    @property
+    def blocks(self):
+        return BL.Blocks(self.rt.dims, int(os.environ.get("PF_NCH", "512")))
+
     def hidden(self, Xs, ch):
+        if _layout_blocked():
+            B = self.blocks
+            return BL.decrypt_blocked(self.rt, [Xs[g * B.K:(g + 1) * B.K] for g in range(len(Xs) // B.K)], ch, B,
+                                      self.rt.dims.dim)
         return decrypt_prompt(self.rt, Xs, ch, self.rt.dims.dim)
 
 

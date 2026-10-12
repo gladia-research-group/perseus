@@ -235,6 +235,7 @@ class PcmmLinear:
     shift: int
     bias: list | None = None
     name: str | None = None
+    t: int = 0                  # token lanes it was encoded for (0: the runtime's)
 
     @classmethod
     def encode(cls, W, t, scale=1.0, bias=None, shift=0, name=None, wbits=None):
@@ -255,7 +256,7 @@ class PcmmLinear:
         if bias is not None:
             bias = np.asarray(bias, dtype=np.float64) * scale
             bvec = [np.repeat(bias[m * sh.nch:(m + 1) * sh.nch], t) for m in range(n_out)]
-        return cls(n_in, n_out, digit_planes(Wi, (wbits + 7) // 8), ws, int(shift), bvec, name)
+        return cls(n_in, n_out, digit_planes(Wi, (wbits + 7) // 8), ws, int(shift), bvec, name, int(t))
 
 
 # ── band shifts ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -293,17 +294,19 @@ def _record_calib(name, ys):
         json.dump(_calib, f, indent=1, sort_keys=True)
 
 
-def engine(rt):
-    """The runtime's PCMM engine (made on first use)."""
-    pc = getattr(rt, "pcmm", None)
-    if pc is None:
-        pc = rt.pcmm = Pcmm(rt.ops, rt.dims.t, seed=int(os.environ.get("PF_PCMM_SEED", "0")))
-    return pc
+def engine(rt, t=None):
+    """The runtime's PCMM engine for t token lanes (default the runtime's; made on first use)."""
+    t = int(t or rt.dims.t)
+    engines = rt.__dict__.setdefault("_pcmm_engines", {})
+    if t not in engines:
+        engines[t] = Pcmm(rt.ops, t, seed=int(os.environ.get("PF_PCMM_SEED", "0")))
+    rt.pcmm = engines[t]
+    return engines[t]
 
 
 def run(rt, xs, lin):
-    """lin on the dense blocks xs through the runtime's PCMM engine."""
-    return engine(rt).apply(xs, lin)
+    """lin on the dense blocks xs through the runtime's PCMM engine for its lanes."""
+    return engine(rt, lin.t).apply(xs, lin)
 
 
 def pinned_planes(core, a):
