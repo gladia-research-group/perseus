@@ -12,7 +12,7 @@ import time
 from .ops import FheOps
 
 _TIMED = ("add", "sub", "mult", "square", "negate", "rotate", "conjugate", "inplace_add", "copy",
-          "mult_pt", "add_pt", "mult_pt_many", "mult_pt_sum", "mult_coeff_sum", "mult_i", "mult_const",
+          "mult_pt", "add_pt", "mult_pt_many", "mult_pt_sum", "mult_slot_pt_sum", "mult_coeff_sum", "mult_i", "mult_const",
           "fold_bootstrap", "rotate_and_sum", "rotate_many", "mult_add_many",
           "bootstrap", "bootstrap_hint", "realize", "encode_token",
           "decrypt_slots", "decode_linear_output", "decode_token", "load_pts", "evict_pts")

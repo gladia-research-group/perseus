@@ -900,6 +900,26 @@ void bind_ops(py::module_& m) {
                  return inf.fhe->mult(ct, pt);
              },
              py::arg("ct"), py::arg("name"), "ct * the named slot plaintext (uploaded on first use).")
+        .def("mult_slot_pt_sum",
+             [](Inference& inf, const std::vector<PackedCtx>& cts, const std::vector<std::string>& names) {
+                 if (cts.empty() || cts.size() != names.size())
+                     throw std::invalid_argument("mult_slot_pt_sum: one name per ciphertext, cts non-empty");
+                 py::gil_scoped_release nogil;
+                 std::vector<Ptx> pts;
+                 pts.reserve(names.size());
+                 for (size_t i = 0; i < names.size(); ++i) pts.push_back(slot_pt_at(inf, names[i], cts[i]));
+                 if (inf.fhe->mult_slot_pt_sum_usable(cts, pts)) return inf.fhe->mult_slot_pt_sum(cts, pts);
+                 PackedCtx acc = inf.fhe->mult(cts[0], pts[0]);
+                 for (size_t i = 1; i < cts.size(); ++i) {
+                     PackedCtx p = inf.fhe->mult(cts[i], pts[i]);
+                     inf.fhe->inplace_add(acc, p);
+                 }
+                 return acc;
+             },
+             py::arg("cts"), py::arg("names"),
+             "sum_i cts[i] * the named slot plaintext names[i]: the baby-step inner sum of a resident-weight linear "
+             "in one fused kernel where the runtime allows (LIN_PT_DOT), else the loop. The recorded op stream is the "
+             "loop's (mult, then inplace_add) either way.")
         .def("add_slot_pt",
              [](Inference& inf, const PackedCtx& ct, const std::string& name) {
                  py::gil_scoped_release nogil;

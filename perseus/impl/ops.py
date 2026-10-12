@@ -89,6 +89,11 @@ class FheOps:
         # IMPL_PT_SUM_FUSED=1: a streamed weight's inner sums encode their plaintexts on the device from the raw rows
         # and accumulate there (Inference.mult_pt_sum_raw; same values and op stream as the loop)
         self.pt_sum_fused = os.environ.get("IMPL_PT_SUM_FUSED", "0") not in ("", "0")
+        # LIN_PT_DOT (default 1): a resident-weight linear's baby-step inner sums (sum_b x_rot[b] * pt_b) in one fused
+        # kernel each (Inference.mult_slot_pt_sum) instead of a product and an add per term; same residues, same recorded
+        # op stream (-0.066 s/token, 2026-10-12); 0 = the loop
+        self.pt_dot = (self.slot_pts and hasattr(inf, "mult_slot_pt_sum")
+                       and os.environ.get("LIN_PT_DOT", "1") not in ("", "0"))
         # IMPL_REALIZE_SHARED=1: a deg-2 value read only by products (the BSGS Chebyshev bases T_2.., the LayerNorm's
         # centered input) has its pending rescale realized once in place; FIDESlib otherwise rescales a copy inside
         # every product that reads it. Same rescale on the same values, same output levels and degrees: plans bind
@@ -210,6 +215,11 @@ class FheOps:
         for c, v in zip(cts[1:], vecs[1:]):
             self.inplace_add(acc, self.mult_pt(c, v))
         return acc
+
+    def mult_slot_pt_sum(self, cts, keys, vecs):
+        """sum_i cts[i] * the named plaintext keys[i] (vecs[i] its values, encoded once like mult_pt with a key): the
+        baby-step inner sum of a resident-weight linear in one runtime call; records mult + inplace_add like the loop."""
+        return self.inf.mult_slot_pt_sum(list(cts), [self._slot(k, c, v) for k, c, v in zip(keys, cts, vecs)])
 
     def mult_coeff_sum(self, cts, rows, tags, vecs):
         """mult_pt_sum from the plaintexts' coefficient rows (layout.coeff_rows of `vecs`, in pinned memory, with

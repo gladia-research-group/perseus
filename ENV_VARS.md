@@ -111,6 +111,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `KV_LANES` | The K + iV linear output refreshed as one real payload, K on token lane 0 and V on lane 1, by the real-payload route instead of a complex refresh (Python implementation; default 1, off for plans that do not declare it). |
 | `QKV_LANES` | The Q linear output rides the K/V push refresh on token lane 2 (one real refresh for Q, K and V), and the qkv / up input hints fire only past the session limit, so both linears run on the LayerNorm output as is and their OUTPUT is refreshed at the top of the envelope (Python implementation; default 1, off for plans that do not declare it; the plan's runtime line carries `BTS_MAX_INPUT_LEVEL=50` for the up output at nominal 50). |
 | `CHEB_BSGS` | Every Chebyshev series (the GELU's P1/P2, the LayerNorm seed, the softmax exp) evaluated by baby-step giant-step: a degree-31 series costs 11 ciphertext products instead of 30 at the same depth (Python implementation; default 1, off for plans that do not declare it). |
+| `LIN_PT_DOT` | A resident-weight linear's baby-step inner sums (sum of the rotated inputs times their weight plaintexts) in one fused kernel each instead of a plaintext product and an add per term; bit-exact, same recorded op stream (Python implementation; default 1, 0 = the loop). |
 | `SM_HRS_PACK` | The softmax head sum and its seed-scaled copy (SM_FOLD) ride one complex mask `(0.5 + 0.5i seed) pos0` and one replicate ladder, split by one conjugation: four key switches fewer per reciprocal round (Python implementation; default 1, off for plans that do not declare it). |
 | `CUTMAX_PAIR` | Two passes of the CutMax inverse-sigma cascade share one 1-slot refresh as `u_a + i u_b` (the refresh of u_j is off the path to u_{j+1}); 11 -> 7 cascade refreshes per token (Python implementation; default 1, off for plans that do not declare it). |
 | `IMPL_DEAD_OPS` | Graph ops nothing reads are not emitted: the odd GELU series' T_6, the LayerNorm Newton constant when the seed takes no Newton iteration (Python implementation; default 1, off for plans that do not declare it). |
@@ -174,6 +175,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `LLAMA_PROFILE_STEPS` | Llama `run_decode --profile`: also each step's primitive split. |
 | `IMPL_PROFILE_SYNC` | `run_decode --profile` (Python implementation): a device fence after every timed primitive, so each is charged its own GPU time. |
 | `PT_SUM_TIMING` | Host-side timing of the streamed-weight inner sums on stderr. |
+| `FIDESLIB_PTDOT_VERIFY` | Checking only: every fused inner sum (`LIN_PT_DOT`) is recomputed as the product-and-add loop and compared residue for residue on stderr. |
 | `PLAN_TRACE_STEP` | Every op recorded in that step path (e.g. `blk0.softmax`), as executed, on stderr (plan/run divergence hunts). |
 | `PLAN_TRACE_DECRYPT` | With `PLAN_TRACE_STEP`: also each traced op's decrypted max \|z\| and max \|Im\| (where a planned run's values go wrong). |
 | `FIDESLIB_ERRCHECK` | 1 polls cudaGetLastError after every FIDESlib launch (off by default: ~1.8M calls per decode token). |

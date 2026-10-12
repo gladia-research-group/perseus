@@ -3654,15 +3654,44 @@ struct CKKSContext {
         return tagged(acc, cts.front().packing, tag_of_ct(acc));
     }
     unsigned long long coeff_rows_overflows() const { return cc->CoeffRowsOverflows(); }
+    // ---- Named-weight inner sum (LIN_PT_DOT) ----
+    // acc = Σ_i cts[i] * pts[i] over already-encoded plaintexts (the resident slot weights) in one fused kernel
+    // (EvalMultPtSum). The loop's node stream (mult, then per further term a phantom mult + add_inplace) is replayed with
+    // the plaintexts' own vars and tags, so plans and level checks see the loop. Usable where mult_pt_sum is and every
+    // plaintext sits at the ciphertexts' level (the loop's products then make no adjustment).
+    bool mult_slot_pt_sum_usable(const std::vector<PackedCtx>& cts, const std::vector<Ptx>& pts) {
+        if (pts.size() != cts.size() || !mult_pt_sum_usable(cts)) return false;
+        const int lvl = level_for_ct(cts.front().ct);
+        for (const auto& pt : pts)
+            if (!pt || level_for_pt(pt) != lvl) return false;
+        return true;
+    }
+    PackedCtx mult_slot_pt_sum(const std::vector<PackedCtx>& cts, std::vector<Ptx>& pts) {
+        static std::once_flag announced;
+        std::call_once(announced, [&] {
+            std::cerr << "[pt_dot] active: named-weight inner sums in one kernel, n=" << cts.size() << "\n";
+        });
+        std::vector<Ctx> raw;
+        raw.reserve(cts.size());
+        for (const auto& c : cts) raw.push_back(c.ct);
+        Ctx acc = cc->EvalMultPtSum(raw, pts);
+        replay_pt_sum(cts, acc, [&](size_t i) { return tag_of(pts[i]); }, [&](size_t i) { return var_for_pt(pts[i]); });
+        return slotlayout::keep(cts.front().ct, tagged(acc, cts.front().packing, tag_of_ct(acc)));
+    }
     // the serial loop's node stream for an inner sum computed fused (see mult_pt_sum)
     template <class TagFn>
     void replay_pt_sum(const std::vector<PackedCtx>& cts, Ctx& acc, TagFn pt_tag) {
+        replay_pt_sum(cts, acc, pt_tag, [&](size_t) { return naming_active() ? next_pt("pt") : std::string("x"); });
+    }
+    // the same with the plaintexts' vars from `pt_var` (a named weight's own var: var_for_pt)
+    template <class TagFn, class VarFn>
+    void replay_pt_sum(const std::vector<PackedCtx>& cts, Ctx& acc, TagFn pt_tag, VarFn pt_var) {
         for (size_t i = 0; i < cts.size(); ++i) {
             const Ctx& x = cts[i].ct;
             const packtag::PackTag prod_tg = packtag::t_mult(tag_of_ct(x), pt_tag(i));
             const int in_x_level = level_for_ct(x);
             const std::string in_x = var_for_ct(x);
-            const std::string in_pt = naming_active() ? next_pt("pt") : "x";
+            const std::string in_pt = pt_var(i);
             if (op_tally_active) ++op_tally["mult_pt"];
             if (i == 0) {   // the first product IS the accumulator
                 tag_ct(acc, prod_tg);

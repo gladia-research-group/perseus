@@ -50,6 +50,8 @@ def _baby_sum(ops, x_rot, w: EncodedLinear, idx):
         if w.coeffs is not None and hasattr(ops, "mult_coeff_sum"):
             return ops.mult_coeff_sum(x_rot[:len(idx)], w.coeffs[sl], np.ascontiguousarray(w.tags[sl]), w.pts[sl])
         return ops.mult_pt_sum(x_rot[:len(idx)], w.pts[sl])
+    if w.name is not None and getattr(ops, "pt_dot", False) and len(idx) > 1:
+        return ops.mult_slot_pt_sum(x_rot[:len(idx)], [w.key(i) for i in idx], [w.pts[i] for i in idx])
     tmp = ops.mult_pt(x_rot[0], w.pts[idx[0]], key=w.key(idx[0]))
     for b in range(1, len(idx)):
         ops.inplace_add(tmp, ops.mult_pt(x_rot[b], w.pts[idx[b]], key=w.key(idx[b])))
