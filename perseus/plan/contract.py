@@ -48,6 +48,8 @@ LOAD_BEARING_ENV = (
     "CHEB_ALIGN",
     # Chebyshev-scaled Goldschmidt softmax rounds (impl smcheb): different counts and constants
     "SM_CHEB_GS",
+    # the decode attention on un-expanded K / V (impl attention.mha_gqa): a different op sequence
+    "LLAMA_GQA",
 )
 
 

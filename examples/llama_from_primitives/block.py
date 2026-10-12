@@ -5,7 +5,7 @@ prepared input) -> SiLU(gate) * up -> down -> residual."""
 from __future__ import annotations
 
 from perseus.impl.activation import gelu
-from perseus.impl.attention import mha
+from perseus.impl.attention import mha, mha_gqa
 from perseus.impl.linear import linear, linear_multi
 from perseus.impl.norm import rms_norm
 
@@ -33,7 +33,7 @@ def _tap(rt, name, ct):
         f(name, ct)
 
 
-def llama_block(rt, x, w, kv, cfgs, pos: int, rope, last: bool = False):
+def llama_block(rt, x, w, kv, cfgs, pos: int, rope, last: bool = False, gqa=None):
     """``w``: weights.BlockWeights; ``cfgs``: (ln_1, ln_2, softmax, silu) configs; ``pos``: the
     token's absolute position (the BOS prefix holds 0); ``last``: the model's final block (its exit feeds the
     tail, not another block)."""
@@ -43,7 +43,11 @@ def llama_block(rt, x, w, kv, cfgs, pos: int, rope, last: bool = False):
     with rt.step("ln_1"):
         x = rms_norm(rt, x, ln1, pos)
     _tap(rt, "ln_1", x)
-    x = mha(rt, x, w, kv, sm, rope=rope, pos=pos, pre_linear=_bottom(rt, "qkv"), pre_out=_bottom(rt, "out_proj"))
+    if gqa is not None:        # (sub-runtime, G): the un-expanded K / V cache (LLAMA_GQA)
+        x = mha_gqa(rt, gqa[0], gqa[1], x, w, kv, sm, rope=rope, pos=pos, pre_linear=_bottom(rt, "qkv"),
+                    pre_out=_bottom(rt, "out_proj"))
+    else:
+        x = mha(rt, x, w, kv, sm, rope=rope, pos=pos, pre_linear=_bottom(rt, "qkv"), pre_out=_bottom(rt, "out_proj"))
     x = ops.add(x, skip)
     _tap(rt, "attn_res", x)
     skip = x

@@ -11,6 +11,7 @@ import os
 import numpy as np
 
 from .config import SoftmaxCfg
+from .layout import Dims
 from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_mask,
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
                      stride_mask, vlane_mask, vpair_mask_complex)
@@ -287,15 +288,23 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
         Kc = rt.mult_mask(ops.add(P_in, conj), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))   # K_raw
         Vc = rt.mult_mask(ops.mult_i(ops.sub(conj, P_in)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
         X = ops.add(Kc, ops.rotate(Vc, -1))
-        if q is not None:
+        qs = None if q is None else (q if isinstance(q, list) else [q])
+        if qs is not None:
             # QKV_LANES: Q (real; 2 Re by its conjugate, the lane mask's 0.5) on lane 2 of the same payload. The
-            # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q
-            Qc = rt.mult_mask(ops.add(q, ops.conjugate(q)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
-            X = ops.add(X, ops.rotate(Qc, -2))
+            # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q.
+            # A list (GQA: one query per head of a KV group, each already rotated onto the KV heads' slots) rides
+            # lanes 2, 3, ...
+            for i, qi in enumerate(qs):
+                Qc = rt.mult_mask(ops.add(qi, ops.conjugate(qi)), "kv.lane0",
+                                  lambda: stride_mask(d.N, d.hid, d.t, 0.5))
+                X = ops.add(X, ops.rotate(Qc, -2 - i))
         with _kv_bts_scope():
             ops.bootstrap_real(X)
-        if q is not None:
-            q_out = ops.rotate(X, 2)        # lane 2 back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
+        if qs is not None:
+            # lane 2 (+ i) back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
+            q_out = [ops.rotate(X, 2 + i) for i in range(len(qs))]
+            if not isinstance(q, list):
+                q_out = q_out[0]
         K = rope_mask(rt, X, "kpush.tok0", lambda: real_head_tok0_mask(d), rope, pos)
     else:
         P = ops.copy(P_in)
@@ -781,6 +790,57 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     with rt.step("softmax_v"):
         x = complex_softmax_v(rt, kv, probs) if cplx else softmax_v(rt, kv, probs)
     tap("attn.pv", x)
+    with rt.step("out_proj"):
+        ops.bootstrap_hint(x, ops.headroom(1), True)
+        if pre_out is not None:
+            x = pre_out(x)
+        return linear(rt, x, w.out)
+
+
+def gqa_dims(d: Dims, G: int) -> Dims:
+    """The un-expanded K / V geometry of a G-query-group model: hid / G channels (each KV head once, in the expanded
+    order's g = 0 slots), so G times the token lanes."""
+    return Dims(d.N, d.hid // G, d.dim // G, d.H // G, d.H_real // G, d.E, d.E_real)
+
+
+def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
+            pre_linear=None, pre_out=None):
+    """mha with the K / V cache un-expanded (GQA): the push runs on the sub-runtime `sub` (gqa_dims), whose lane-0
+    masks keep exactly one copy of every KV head, so a cache group holds G t tokens; the attention core runs once per
+    query head of a group (g: the query rotated by g t onto its KV head's slots) and the G outputs are rotated back
+    into the head-interleaved order for the out projection."""
+    if rope is not None and pos is None:
+        raise ValueError("mha: RoPE needs the token position")
+    rp = dict(rope=rope, pos=pos)
+    ops, d = rt.ops, rt.dims
+    qkvl = getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
+    with rt.step("qkv"):
+        ops.bootstrap_hint(x, ops.headroom(0 if qkvl else 1), True)
+        if pre_linear is not None:
+            x = pre_linear(x)
+        P, q = linear_multi(rt, x, [w.kv, w.q])
+    qs = [q] + [ops.rotate(q, g * d.t) for g in range(1, G)]
+    with rt.step("kv_push"):
+        if qkvl:
+            qs = kv_push(sub, kv, P, qs, **rp)
+        else:
+            kv_push(sub, kv, P, **rp)
+    a = sm_fold_affine(sub, sm_cfg)[0]
+    folded = bool(getattr(ops, "sm_fold", False))
+    outs = []
+    for g in range(G):
+        with rt.step(f"g{g}"):
+            shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
+            with rt.step("qkt", shape=shape):
+                scores = complex_qkt(sub, kv, qs[g], a, **rp)
+            with rt.step("softmax"):
+                probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
+            with rt.step("softmax_v"):
+                outs.append(complex_softmax_v(sub, kv, probs))
+    with rt.step("gather"):
+        x = outs[0]
+        for g in range(1, G):
+            ops.inplace_add(x, ops.rotate(outs[g], -g * d.t))
     with rt.step("out_proj"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
         if pre_out is not None:

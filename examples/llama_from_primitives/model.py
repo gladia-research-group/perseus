@@ -10,6 +10,7 @@ Block numbering: 0..n_layers-1 the transformer blocks, n_layers the tail (final 
 """
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -45,6 +46,15 @@ class LlamaModel(ImplModel):
         self.rope = Rope(cfgs.model["rope_inv_freq"])
         Cache = ComplexKVCache if packing == "cachemir_complex" else KVCache
         self.kv = [Cache(self.rt.dims.d_head) for _ in range(self.n_layers)]
+        # LLAMA_GQA=1: the K / V caches hold every KV head once (attention.mha_gqa on the sub-runtime self.sub)
+        self.G = self.H // self.H_kv if os.environ.get("LLAMA_GQA", "0") not in ("", "0") else 1
+        self.sub = None
+        if self.G > 1:
+            if packing != "cachemir_complex":
+                raise ValueError("LLAMA_GQA needs the cachemir_complex packing")
+            from perseus.impl.attention import gqa_dims
+            from perseus.impl.blocked import SubRt
+            self.sub = SubRt(self.rt, gqa_dims(self.rt.dims, self.G), f"gqa{self.G}")
         self._prefix = None
         self.taps = None                # {(pos, block): decrypted block output} when a dict
         self._bw = {}
@@ -84,10 +94,12 @@ class LlamaModel(ImplModel):
             d = self.rt.dims
             dh = d.dim // self.H
             out = []
+            Hc = self.H_kv if self.G > 1 else self.H
+            dc = self.sub.dims if self.G > 1 else d
             for k, v in self.w.bos_kv(self.n_layers):
-                kf = P.expanded_heads(k, self.H, self.H_kv, dh)
-                vf = P.expanded_heads(v, self.H, self.H_kv, dh)
-                out.append(P.plain_cache(d, kf, vf, self.packing, self.rope))
+                kf = P.expanded_heads(k, Hc, self.H_kv, dh)
+                vf = P.expanded_heads(v, Hc, self.H_kv, dh)
+                out.append(P.plain_cache(dc, kf, vf, self.packing, self.rope))
             self._prefix = out
         return self._prefix
 
@@ -124,13 +136,16 @@ class LlamaModel(ImplModel):
     def step_masks(self, pos):
         """Per block the attention masks at cache count pos + 1 (the prefix included) and the
         RoPE masks of position `pos` (shared by every block)."""
-        d = self.rt.dims
+        art = self.sub if self.G > 1 else self.rt
+        d = art.dims
         step = complex_attention_step_masks if self.packing == "cachemir_complex" else attention_step_masks
         items = []
         for b in range(self.n_layers):
-            items += step(self.rt, self.cfgs.block(b)[2], pos + 1, pos % d.t)
+            items += step(art, self.cfgs.block(b)[2], pos + 1, pos % d.t)
         kind = self.packing if self.rt.ops.complex_payload else "real"
-        items += rope_step_masks(self.rt, self.rope, pos, kind)
+        items += rope_step_masks(art, self.rope, pos, kind)
+        if self.G > 1:
+            items = [(art._key(k), b) for k, b in items]
         seen, out = set(), []
         for key, build in items:
             if key not in seen:
@@ -142,8 +157,9 @@ class LlamaModel(ImplModel):
         from perseus.impl.attention import sm_periodic
         if not getattr(self.rt.ops, "sm_periodic_general", False):
             return None
-        gp = max(1, sm_periodic(self.rt, pos + 1))
-        return gp, ({gp * self.rt.dims.tH} if gp > 1 else set())
+        art = self.sub if self.G > 1 else self.rt
+        gp = max(1, sm_periodic(art, pos + 1))
+        return gp, ({gp * art.dims.tH} if gp > 1 else set())
 
     def stage_caches(self, i):
         if i < self.n_layers:
@@ -160,7 +176,8 @@ class LlamaModel(ImplModel):
                 cap = self.enter_stage(b, pos)
                 with self.rt.step(f"blk{b}"):
                     x = llama_block(self.rt, x, self.block_weights(b), self.kv[b], self.cfgs.block(b),
-                                    pos, self.rope, last=b == self.n_layers - 1)
+                                    pos, self.rope, last=b == self.n_layers - 1,
+                                    gqa=(self.sub, self.G) if self.G > 1 else None)
                 self.exit_stage(b, cap)
                 if self.taps is not None:           # debug: every block's output, decrypted
                     self.taps[(pos, b)] = self.hidden(x)

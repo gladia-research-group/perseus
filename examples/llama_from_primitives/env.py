@@ -45,7 +45,15 @@ def rot_steps(dims: Dims) -> list[int]:
     steps.add(N // 2)
     pos = {s % N for s in steps if s % N and s % N > N - dims.t}
     steps = {s % N for s in steps if s % N} - pos
-    return sorted(steps | {-k for k in range(1, dims.t)})
+    steps |= {-k for k in range(1, dims.t)}
+    if os.environ.get("LLAMA_GQA", "0") not in ("", "0") and dims.H % 8 == 0 and dims.H > 8:
+        # the un-expanded K / V cache (attention.mha_gqa): the sub-geometry's steps, the queries' g t moves and their
+        # lanes 2 .. G + 1 on the push refresh
+        from perseus.impl.attention import gqa_dims
+        G = dims.H // 8
+        steps |= set(rot_steps(gqa_dims(dims, G)))
+        steps |= {s * g * dims.t for g in range(1, G) for s in (1, -1)} | {s * (2 + i) for i in range(G) for s in (1, -1)}
+    return sorted(steps)
 
 
 def export_env(device=3, chain="n32", **overrides):
