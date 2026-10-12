@@ -207,6 +207,14 @@ class FakeFhe:
     def level_hint(self, a, level):
         pass
 
+    # bookkeeping for ops computed outside the recorded primitives (pcmm)
+    def var_name(self, a):
+        return "x"
+
+    def record_external_bootstrap(self, a, inputs, input_levels):
+        self.n_bootstraps += 1
+        self.calls.append("bootstrap")
+
 
 class FakeInf:
     """Inference fake: ``size`` fields, ``mult_pt``/``add_pt`` and the module-level data-plane
