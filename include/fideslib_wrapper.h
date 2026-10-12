@@ -244,6 +244,8 @@ struct BootstrapPlan {
     std::unordered_map<std::string, int>         raise_drop;
     // Dense refreshes of real payloads: one EvalMod chain (FIDESLIB_BTS_REAL).
     std::unordered_set<std::string>              real_route;
+    // StC-first runs (FIDESLIB_BTS_STC_FIRST): dense sites that bootstrap in the shipped order.
+    std::unordered_set<std::string>              shipped_order;
     std::unordered_map<std::string, double>      offset;
     bool valid = false;
 
@@ -334,6 +336,9 @@ inline BootstrapPlan parse_bootstrap_plan_file(const std::string& path) {
     if (const auto* d = find_any("real_route"); d && d->is_array())
         for (const auto& x : d->arr)
             if (x.is_string()) plan.real_route.insert(x.str);
+    if (const auto* d = find_any("shipped_order"); d && d->is_array())
+        for (const auto& x : d->arr)
+            if (x.is_string()) plan.shipped_order.insert(x.str);
 
     // Plan-bound rescale decisions: key presence (even an empty list) binds every
     // landing-realize decision to the plan (same rule as hint_fire).
@@ -499,6 +504,7 @@ struct CKKSContext {
     std::unordered_map<std::string, int>      plan_correction_factor;
     std::unordered_map<std::string, int>      plan_raise_drop;
     std::unordered_set<std::string>           plan_real_route;
+    std::unordered_set<std::string>           plan_shipped_order;
     std::unordered_map<std::string, double>   plan_offset;
     int active_cache_pin_level = -1;   // placer-chosen KV read level for the live block plan (-1 = unset)
     uint64_t graph_ct_counter = 0;
@@ -895,6 +901,7 @@ struct CKKSContext {
         plan_correction_factor.clear();
         plan_raise_drop.clear();
         plan_real_route.clear();
+        plan_shipped_order.clear();
         plan_offset.clear();
         expected_levels.clear();
         expected_producers.clear();
@@ -1032,6 +1039,10 @@ struct CKKSContext {
             std::cerr << "[plan_offset] " << plan_offset.size()
                       << " site(s) carry an offset-transform DC\n";
         plan_real_route = plan.real_route;
+        plan_shipped_order = plan.shipped_order;
+        if (!plan_shipped_order.empty())
+            std::cerr << "[plan_shipped] " << plan_shipped_order.size()
+                      << " dense site(s) bootstrap in the shipped order under StC-first\n";
         if (!plan_real_route.empty())
             std::cerr << "[plan_real] " << plan_real_route.size()
                       << " dense site(s) refresh a real payload (needs FIDESLIB_BTS_REAL)\n";
@@ -1134,6 +1145,12 @@ struct CKKSContext {
             auto rit = plan_raise_drop.find(var_name);
             RaiseScope rs(*this, rit != plan_raise_drop.end() ? rit->second : 0);
             RealScope rl(*this, plan_real_route.count(var_name) > 0);
+            ShippedScope so(*this, plan_shipped_order.count(var_name) > 0);
+            if (static const bool dbg = [] { const char* e = std::getenv("FIDESLIB_BTS_DEBUG_STC"); return e && std::atoi(e) > 0; }(); dbg)
+                std::cerr << "[stc_dbg] planned " << var_name << " shipped=" << plan_shipped_order.count(var_name)
+                          << " (" << plan_shipped_order.size() << " listed) real=" << plan_real_route.count(var_name)
+                          << " cf=" << (cit != plan_correction_factor.end() ? cit->second : -1)
+                          << " ctx=" << (cc->gpu.has_value() ? (void*)std::any_cast<FIDESlib::CKKS::Context&>(cc->gpu).get() : nullptr) << "\n";
             inner_bootstrap(ct, pit != plan_prescale.end() ? pit->second : 1.0);
         }
         // Adding a broadcast constant back cannot lower the output's period (a constant is
@@ -2283,6 +2300,21 @@ struct CKKSContext {
         }
         ~RealScope() {
             if (g) g->setBtsRealPayload(saved);
+        }
+    };
+
+    // A plan 'shipped_order' site: StC-first forbidden for this one bootstrap (FIDESlib ContextData::stcFirstForbid).
+    struct ShippedScope {
+        FIDESlib::CKKS::ContextData* g = nullptr;
+        bool saved = false;
+        ShippedScope(CKKSContext& ctx, bool on) {
+            if (!on || !ctx.cc->gpu.has_value()) return;
+            g = std::any_cast<FIDESlib::CKKS::Context&>(ctx.cc->gpu).get();
+            saved = g->getStcFirstForbid();
+            g->setStcFirstForbid(true);
+        }
+        ~ShippedScope() {
+            if (g) g->setStcFirstForbid(saved);
         }
     };
 

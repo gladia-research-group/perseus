@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -84,6 +86,7 @@ def simulate(
     realized: set[str] | None = None,
     hint_force: dict[str, bool] | None = None,
     deliberate_clamp0: bool = False,
+    dense_fallback: tuple[float, float, int] | None = None,
 ) -> SimResult:
     unit = g.level_unit
     offs = step_offsets if step_offsets is not None else step_bts_offsets(g, bootstrap_level)
@@ -125,6 +128,12 @@ def simulate(
                     base = 0.0
                 lc[n.output] = base
                 dg[n.output] = 2
+                # StC-first runs with the K/V push in the shipped order (IMPL_STC_FIRST_KV=0): it lands where that
+                # order lands (PLAN_STC_FIRST_KV_LANDING = level:deg, absolute)
+                _kvl = os.environ.get("PLAN_STC_FIRST_KV_LANDING")
+                if _kvl:
+                    _lv, _, _dg = _kvl.partition(":")
+                    lc[n.output], dg[n.output] = float(_lv) - bootstrap_level, int(_dg or 2)
             continue
 
         if n.hint_level is not None:
@@ -140,6 +149,11 @@ def simulate(
                     c, d = refreshed[n.output]
                 else:
                     c, d = 0.0, 2
+                # StC-first (PLAN_STC_FIRST_ENTRY): a dense refresh whose input has no room for the StC levels takes
+                # the shipped order at run time and lands where that order lands
+                if (dense_fallback is not None and n.output not in (sparse_refreshed or ())
+                        and bootstrap_level + ic_eff > dense_fallback[0] + 1e-9):
+                    c, d = dense_fallback[1], dense_fallback[2]
             else:
                 c, d = ic, (dg.get(ins[0], 1) if ins else 1)
         elif not ins:
@@ -197,6 +211,9 @@ def simulate(
         if n.output:
             if n.output in refreshed and n.hint_level is None:
                 lc[n.output], dg[n.output] = refreshed[n.output]
+                if (dense_fallback is not None and n.output not in (sparse_refreshed or ())
+                        and bootstrap_level + c + (unit if d == 2 else 0) > dense_fallback[0] + 1e-9):
+                    lc[n.output], dg[n.output] = dense_fallback[1], dense_fallback[2]
             else:
                 lc[n.output] = c
                 dg[n.output] = d

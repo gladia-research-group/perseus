@@ -28,6 +28,8 @@ class RefreshSpec:
     # `cf == policy.cf_max` because the search ran out of range (btserr.ceiling_binds).
     # Never enters a plan file: emit reads the named fields it needs, nothing dumps a spec.
     clamped: bool = False
+    # StC-first runs: a dense site bootstrapped in the shipped order (plan 'shipped_order', PLAN_STC_FIRST_MAG_MAX)
+    shipped: bool = False
 
     def overshoot(self, target: float) -> float:
         import math
@@ -118,6 +120,24 @@ class RefreshPlanner:
             levels_free=1 if self.policy.allow_prescale else 0,
         )
         choice = btserr.choose_site(self.table, self.policy, **site)
+        # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
+        # shipped order's precision (PLAN_STC_FIRST_MAG_MAX, after the drift margin) bootstraps in the shipped order:
+        # priced without the slim term, landed where that order lands (PLAN_STC_FIRST_FALLBACK = level:deg)
+        shipped = False
+        _mag_max = os.environ.get("PLAN_STC_FIRST_MAG_MAX")
+        _fb = os.environ.get("PLAN_STC_FIRST_FALLBACK")
+        # PLAN_STC_FIRST_STEPS (comma list of step names, the last dotted part): only those steps' dense sites keep
+        # StC-first, every other dense site takes the shipped order
+        _steps = os.environ.get("PLAN_STC_FIRST_STEPS")
+        _step_ok = True
+        if _steps is not None and p is not None:
+            _step_ok = (p.step or "").split(".")[-1] in {x.strip() for x in _steps.split(",") if x.strip()}
+        _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * self.policy.mag_safety > float(_mag_max)
+        if (self.policy.slim_cubic > 0 and not choice.route and _fb and p is not None
+                and (_too_big or not _step_ok)):
+            import dataclasses as _dc
+            choice = btserr.choose_site(self.table, _dc.replace(self.policy, slim_cubic=0.0), **site)
+            shipped = not choice.route
         # one extra search, only for a site pinned at cf_max; the choice above is unchanged
         clamped = btserr.ceiling_binds(self.table, self.policy, choice.cf, **site)
 
@@ -145,6 +165,10 @@ class RefreshPlanner:
         floor = _step_landing_floor(p.step if p else "")
         if floor is not None:
             base = max(base, float(floor) - self.bootstrap_level)
+        out_deg = self.out_deg
+        if shipped:
+            _lv, _, _dg = _fb.partition(":")
+            base, out_deg = float(_lv) - self.bootstrap_level, int(_dg or 1)
         restore = float(self.graph.level_unit) if choice.prescale is not None else 0.0
         return RefreshSpec(
             var=v,
@@ -156,10 +180,11 @@ class RefreshPlanner:
             prescale=choice.prescale,
             offset=choice.offset,
             out_consumed=base + restore,
-            out_deg=self.out_deg,
+            out_deg=out_deg,
             reason=choice.reason,
             raise_drop=raise_drop,
             clamped=clamped,
+            shipped=shipped,
         )
 
     def cf_clamp_report(self, sites: Iterable[str]) -> CfClampReport:

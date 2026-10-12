@@ -197,7 +197,10 @@ class Gpt2Model(ImplModel):
         if os.environ.get("IMPL_CUTMAX_MARKS"):          # refreshes per phase, like [cutmax_bts]
             tap = lambda name, ct: marks.__setitem__(name, int(self.inf.fhe.total_bootstraps))
             b0 = int(self.inf.fhe.total_bootstraps)
-        with self.rt.step("cutmax"):
+        # IMPL_STC_FIRST_ARGMAX=0: the CutMax stage bootstraps in the shipped order (its near-tie decisions need that
+        # order's precision; its plan is cut at the shipped landing), the decode blocks keep StC-first
+        from perseus.impl import bootstrap as _pyb
+        with self.rt.step("cutmax"), _pyb.stc_first(os.environ.get("IMPL_STC_FIRST_ARGMAX", "1") not in ("", "0")):
             if self.complex and len(tiles) == 1:              # the paired LM-head tile
                 z = [cutmax_argmax_packed(self.rt, tiles[0], self.vocab, self.cfgs.cutmax, None, tap=tap)]
             elif self.complex and len(tiles) == 2:

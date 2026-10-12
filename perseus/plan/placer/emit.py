@@ -208,6 +208,7 @@ def assemble(
     sp_map: dict[str, int] = {}
     rd_map: dict[str, int] = {}
     real: list[str] = []
+    shipped: list[str] = []
     errs: list[float] = []
     cf_hist: dict[int, int] = {}
     n_missed = 0
@@ -227,6 +228,8 @@ def assemble(
             rd_map[v] = int(s.raise_drop)
         if real_route and not s.route and v in g.producer_of and g.producer_of[v].pack_field == FIELD_REAL:
             real.append(v)
+        if getattr(s, "shipped", False):
+            shipped.append(v)
         if math.isfinite(s.rel_err):
             errs.append(s.rel_err)
         if not s.feasible:
@@ -278,6 +281,7 @@ def assemble(
         **({"offset": off_map} if off_map else {}),
         **({"raise_drop": rd_map} if rd_map else {}),
         **({"real_route": real} if real else {}),
+        **({"shipped_order": sorted(shipped)} if shipped else {}),
         "summary": {
             **({"placer_meta": placer_meta} if placer_meta else {}),
             "num_placements": len(all_sites),

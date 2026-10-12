@@ -25,6 +25,26 @@ bts = _core.bts
 _spru = {"fhe": None}
 
 
+# StC-first (FIDESLIB_BTS_STC_FIRST) is allowed per call: a stage that needs the shipped order's precision (the CutMax
+# argmax, IMPL_STC_FIRST_ARGMAX=0) runs its bootstraps with it off (stc_first(False)); the default lets FIDESlib decide.
+_stc_first = {"on": os.environ.get("PERSEUS_STC_FIRST_ALLOW", "1") not in ("", "0")}   # 0: every call shipped
+
+
+class stc_first:
+    """Context manager: allow (True) or forbid (False) the StC-first order for the bootstraps inside."""
+
+    def __init__(self, on: bool):
+        self.on, self.prev = bool(on), None
+
+    def __enter__(self):
+        self.prev, _stc_first["on"] = _stc_first["on"], self.on
+        return self
+
+    def __exit__(self, *exc):
+        _stc_first["on"] = self.prev
+        return False
+
+
 def bootstrap(ct, slots: int, prescaled: bool = False, *, trace: list | None = None, probe=None):
     """In place on a ``bts.DeviceCt``. ``trace``: append (stage, limbs, deg, ms) per stage (syncs the device,
     so it perturbs the timing it reports less than a profiler but more than nothing). ``probe(stage, ct)``:
@@ -44,7 +64,7 @@ def bootstrap(ct, slots: int, prescaled: bool = False, *, trace: list | None = N
     if timed:
         bts.sync()
         t0[0] = time.perf_counter()
-    st = bts.begin(ct, slots, prescaled, True)
+    st = bts.begin(ct, slots, prescaled, bool(_stc_first["on"]))
     if slots == 1 and _spru["fhe"] is not None:  # SPRU for the single-value route (CKKS/Spru.cuh)
         bts.spru(_spru["fhe"], ct, st.correction)
         mark("spru")

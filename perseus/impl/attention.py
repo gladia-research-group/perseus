@@ -4,7 +4,9 @@ reductions and P.V (src/algorithms/attention/cachemir/cachemir_attention.cu), an
 sublayer order with its bootstrap hints (src/model/mha.cu)."""
 from __future__ import annotations
 
+import contextlib
 import math
+import os
 
 import numpy as np
 
@@ -250,6 +252,15 @@ def _vpair_item(d, i_re: int, i_im: int, rr: int, kv_lanes: bool):
     return ("v.cpc", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr)
 
 
+def _kv_bts_scope():
+    """IMPL_STC_FIRST_KV=0: the K/V push refresh takes the shipped order under FIDESLIB_BTS_STC_FIRST (its payload is
+    small in the slots but tiny in the coefficients, where the shipped order is ~4 bits more precise)."""
+    if os.environ.get("IMPL_STC_FIRST_KV", "1") not in ("", "0"):
+        return contextlib.nullcontext()
+    from perseus.impl import bootstrap as _pyb
+    return _pyb.stc_first(False)
+
+
 def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None, pos=None):
     """cache_kv_push_packed_complex: the fused K + iV linear output refreshed by ONE
     bootstrap, split by conjugation (2K on the real axis, -2iV on the imaginary one), K
@@ -272,13 +283,15 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
             # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q
             Qc = rt.mult_mask(ops.add(q, ops.conjugate(q)), "kv.lane0", lambda: stride_mask(d.N, d.hid, d.t, 0.5))
             X = ops.add(X, ops.rotate(Qc, -2))
-        ops.bootstrap_real(X)
+        with _kv_bts_scope():
+            ops.bootstrap_real(X)
         if q is not None:
             q_out = ops.rotate(X, 2)        # lane 2 back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
         K = rope_mask(rt, X, "kpush.tok0", lambda: real_head_tok0_mask(d), rope, pos)
     else:
         P = ops.copy(P_in)
-        ops.bootstrap(P)
+        with _kv_bts_scope():
+            ops.bootstrap(P)
         conj = ops.conjugate(P)
         K = ops.add(P, conj)                               # 2 K_raw
         V = ops.sub(conj, P)                               # -2i V_raw, realified by the monomial i

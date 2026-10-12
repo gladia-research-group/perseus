@@ -244,7 +244,18 @@ class Placer:
             placed=set(self.placed), sparse_refreshed=sparse_refreshed,
             realized=set(self.realized) if self.realized else None,
             hint_force=self.hint_force,
-            deliberate_clamp0=self.deliberate_clamp0)
+            deliberate_clamp0=self.deliberate_clamp0,
+            dense_fallback=self._dense_fallback())
+
+    def _dense_fallback(self):
+        """PLAN_STC_FIRST_ENTRY (the StC-first dense route's highest effective input level) and PLAN_STC_FIRST_FALLBACK
+        (`level:deg`, where the shipped order lands): a dense refresh past the entry lands there instead."""
+        import os as _os
+        e, f = _os.environ.get("PLAN_STC_FIRST_ENTRY"), _os.environ.get("PLAN_STC_FIRST_FALLBACK")
+        if not (e and f):
+            return None
+        lv, _, dg = f.partition(":")
+        return (float(e), float(lv) - self.bootstrap_level, int(dg or 1))
 
     def _min_runway(self, M: float) -> float:
         """min over routes of (M - R): the runway the worst landing leaves."""
@@ -394,7 +405,9 @@ class Placer:
             for v in deep:
                 self.hint_force[v] = False
             self.vetoed_hints.update(deep)
-            self.placed, self.realized = set(getattr(self, "_forced", ())), set()
+            # the realize anchors are the planner's (constructor input), not a cut decision: they stay through the
+            # veto re-run, else the sim drops them while the plan still lists them (runtime plan_deg_error)
+            self.placed = set(getattr(self, "_forced", ()))
             try:
                 res = self._run_once()
             except PlanInfeasible:
