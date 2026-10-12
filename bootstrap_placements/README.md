@@ -113,3 +113,15 @@ encrypted argmax; `deploy.py` turns those into a plan the same way the DaCapo sc
 The solver iterates over Python sets of node names, so its choices depend on Python's hash seed;
 the recipe fixes `PYTHONHASHSEED=0`. Both scripts remove redundant bootstraps unless
 `PLAN_PRUNE=0`; the shipped DaCapo and Orion plans are the ones without that removal.
+
+## StC-first main plan (32-bit)
+
+The main 32-bit plan, `gpt2_decode_python_n32`, runs its full-size refreshes StC-first: the
+slots-to-coefficients transform is applied to the input at the bottom of the chain, before the
+raise, CoeffsToSlots and EvalMod (`FIDESLIB_BTS_STC_FIRST=2`, set by the plan's `runtime=` line).
+That is about 0.18 s per token faster than the shipped order, at a mean KL of about 1e-4 against
+the plaintext model instead of about 1e-6. To switch back, run the previous main plan:
+`--plan bootstrap_placements/gpt2_decode_python_n32_shipped` (shipped order everywhere).
+`gpt2_decode_python_n32_stcf_accurate` is the middle ground: StC-first except the residual-stream
+refreshes and the K/V push (mean KL about 3e-5, about 0.05 s per token faster than shipped). The
+StC-first plans are cut from `graphs/gpt2_decode_python_n32_stcf`.
