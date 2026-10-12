@@ -25,7 +25,13 @@
     "SM_GS_FIRST": "1",
     "SM_PERIODIC": "1",
     "SM_FOLD": "1",
-    "KV_LANES": "1"
+    "KV_LANES": "1",
+    "IMPL_SCOPED_NAMES": "0",
+    "SM_HRS_PACK": "1",
+    "CUTMAX_PAIR": "1",
+    "IMPL_DEAD_OPS": "1",
+    "LADDER_RADIX_BITS": "3",
+    "CHEB_ALIGN": null
   },
   "session": {
     "level_limit": 46,
