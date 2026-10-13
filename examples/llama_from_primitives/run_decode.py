@@ -32,7 +32,9 @@ def main(argv=None):
     ap.add_argument("--packing", choices=("cachemir", "cachemir_complex"), default="cachemir_complex")
     ap.add_argument("--cpp-bootstrap", action="store_true")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
-    ap.add_argument("--kv-offload", action="store_true", help="park K/V caches in the pinned KV arena")
+    ap.add_argument("--kv-offload", action=argparse.BooleanOptionalAction, default=True,
+                    help="park K/V caches in the pinned KV arena (default: resident K/V leave ~16 GB free and the "
+                         "decode turns host-bound, ~2.5x slower)")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--tap-blocks", default="", help="blocks whose sub-steps are tapped too (comma list)")
@@ -67,6 +69,8 @@ def main(argv=None):
 
     over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": a.packing,
             **dict(kv.split("=", 1) for kv in a.set)}
+    if a.kv_offload and "KV_ARENA_GB" not in over:
+        over["KV_ARENA_GB"] = os.environ.get("LLAMA_KV_ARENA_GB", "56")     # the offloaded K/V of 32 layers
     if a.capture:
         os.environ["FHE_GRAPH_DIR"] = a.capture
         # the first encrypted position is 1 (the BOS prefix is plaintext)
@@ -112,6 +116,14 @@ def main(argv=None):
         model.taps = {}
         model.tap_blocks = tuple(int(b) for b in a.tap_blocks.split(",")) if a.tap_blocks else ()
 
+    def _cuda_profile_range(pos):
+        """CUDA_PROFILE_POS=p: the cudaProfiler range covers position p + 1 (for nsys --capture-range)."""
+        p = int(os.environ.get("CUDA_PROFILE_POS", "0") or 0)
+        if p and pos in (p, p + 1):
+            import ctypes
+            rt = ctypes.CDLL("libcudart.so")
+            (rt.cudaProfilerStart if pos == p else rt.cudaProfilerStop)()
+
     def on_token(r):
         line = (f"[llama] pos{r['pos']} top1={r['top1']} decode={r['decode_s']:.1f}s bts={r['bootstraps']}")
         if "kl" in r:
@@ -126,6 +138,7 @@ def main(argv=None):
             for site, nb in _core.gpu_pool_trace(6)[:8]:
                 line += f"\n  [trace] {nb / 2**30:.2f} GB  {site[:260]}"
         print(line, flush=True)
+        _cuda_profile_range(r["pos"])
         if a.profile and hasattr(model.rt.ops, "report_steps"):
             print("[llama] steps: " + " | ".join(t.split("%")[0].strip() for t in model.rt.ops.report_steps(1).split("\n")[:8]), flush=True)
             print("[llama] primitives: " + " | ".join(t.split("%")[0].strip() for t in model.rt.ops.report(10).split("\n")[:10]), flush=True)
