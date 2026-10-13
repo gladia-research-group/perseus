@@ -43,7 +43,7 @@ def llama_block(rt, x, w, kv, cfgs, pos: int, rope, last: bool = False, gqa=None
     with rt.step("ln_1"):
         x = rms_norm(rt, x, ln1, pos)
     _tap(rt, "ln_1", x)
-    if gqa is not None:        # (sub-runtime, G): the un-expanded K / V cache (LLAMA_GQA)
+    if gqa is not None:        # (sub-runtime, G): LLAMA_GQA
         x = mha_gqa(rt, gqa[0], gqa[1], x, w, kv, sm, rope=rope, pos=pos, pre_linear=_bottom(rt, "qkv"),
                     pre_out=_bottom(rt, "out_proj"))
     else:

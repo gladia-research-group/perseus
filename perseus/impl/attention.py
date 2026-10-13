@@ -291,9 +291,8 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
         qs = None if q is None else (q if isinstance(q, list) else [q])
         if qs is not None:
             # QKV_LANES: Q (real; 2 Re by its conjugate, the lane mask's 0.5) on lane 2 of the same payload. The
-            # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q.
-            # A list (GQA: one query per head of a KV group, each already rotated onto the KV heads' slots) rides
-            # lanes 2, 3, ...
+            # three masks sit at one level, so the refresh input is the linear output plus one unit, as without Q;
+            # a list (GQA, pre-rotated per query head) rides lanes 2, 3, ...
             for i, qi in enumerate(qs):
                 Qc = rt.mult_mask(ops.add(qi, ops.conjugate(qi)), "kv.lane0",
                                   lambda: stride_mask(d.N, d.hid, d.t, 0.5))
@@ -376,8 +375,7 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         else:
             ops.inplace_add(attn, r)
     per = sm_periodic(rt, kc)
-    # merge = (G, g) (mha_gqa): query head g of a KV group writes its token group c into blocks b with
-    # b % (G Gp) == g Gp + c, so the G heads' scores share one ciphertext
+    # merge = (G, g): head g's group c goes to blocks b % (G Gp) == g Gp + c, so G heads share one ciphertext
     per_m, g0 = (merge[0] * per, merge[1] * per) if merge else (per, 0)
     for gc, bucket in enumerate(kv.k_buckets):
         g_even, g_odd = 2 * gc, 2 * gc + 1
@@ -607,7 +605,7 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         ops.fold_bootstrap(out, s_eff, 1, p)
     else:
         out = rotsum(ops, out, d.tH, d.N)
-    # tH-periodic (merged GQA scores, mha_gqa: G tH, one tH block per query head of a group)
+    # tH-periodic (G tH for merged GQA scores)
     out = ops.tag_reduce(out, getattr(rt, "gq_merge", 1) * d.tH)
     return out if seed is None else (out, h)
 
@@ -805,22 +803,18 @@ _GQA_MERGE = os.environ.get("LLAMA_GQA_MERGE", "1") not in ("", "0")
 
 
 def _gqa_psel(d: Dims, G: int, g: int):
-    """The tH blocks b with b % G == g (query head g of a merged GQA softmax)."""
+    """tH blocks b with b % G == g (query head g of a merged GQA softmax)."""
     return ((np.arange(d.N) // d.tH) % G == g).astype(np.float64)
 
 
 def gqa_dims(d: Dims, G: int) -> Dims:
-    """The un-expanded K / V geometry of a G-query-group model: hid / G channels (each KV head once, in the expanded
-    order's g = 0 slots), so G times the token lanes."""
+    """Un-expanded K / V geometry for G query groups: hid / G channels, G times the token lanes."""
     return Dims(d.N, d.hid // G, d.dim // G, d.H // G, d.H_real // G, d.E, d.E_real)
 
 
 def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
             pre_linear=None, pre_out=None):
-    """mha with the K / V cache un-expanded (GQA): the push runs on the sub-runtime `sub` (gqa_dims), whose lane-0
-    masks keep exactly one copy of every KV head, so a cache group holds G t tokens; the attention core runs once per
-    query head of a group (g: the query rotated by g t onto its KV head's slots) and the G outputs are rotated back
-    into the head-interleaved order for the out projection."""
+    """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims)."""
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)
@@ -842,8 +836,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
     outs = []
     per = sm_periodic(sub, kv.k_count)
     if _GQA_MERGE and per == 1 and G * sub.dims.tH <= sub.dims.N:
-        # one softmax for the G heads: their scores in interleaved tH blocks (block b: head b % G), the head sums
-        # per block, every tag G tH-periodic (sub.gq_merge); P split back per head for its P.V
+        # one softmax for all G heads (tH block b: head b % G, tags G tH-periodic); P split per head for P.V
         shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
         with rt.step("qkt", shape=shape):
             scores = None

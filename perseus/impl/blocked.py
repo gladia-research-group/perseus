@@ -1,5 +1,4 @@
-"""Channel-blocked prefill: the hidden split across K ciphertexts of nch channels (t = N / nch token lanes each), the
-attention channels in head-grouped order so every ciphertext holds whole heads and attends on its own."""
+"""Channel-blocked prefill: the hidden over K ciphertexts of nch channels, each holding whole heads."""
 from __future__ import annotations
 
 import math
@@ -35,17 +34,15 @@ class Blocks:
     def Kkv(self): return self.K // self.G                  # K / V blocks; Q block q reads K / V block q % Kkv
 
     def real(self, k):
-        """Real residual channels of block k."""
         return int(min(max(self.d.dim - k * self.nch, 0), self.nch))
 
     def group_dims(self, k):
-        """The head group's own geometry (t lanes, H' heads, d_head and d_head_real kept)."""
+        """The head group's own geometry (t lanes, H' heads)."""
         hr = int(min(max(self.d.H_real - k * self.hg, 0), self.hg))
         return Dims(self.d.N, self.nch, self.d.d_head_real * hr, self.hg, hr, self.d.N, self.d.N)
 
     def head_perm(self):
-        """new index of the interleaved attention feature r = j H + h. Query head h reads KV head kv = h // G and sits
-        in block (h % G) Kkv + kv // H', local j H' + kv % H' (G = 1: block h // H', local j H' + h % H')."""
+        """Head-grouped index of interleaved feature r = j H + h: block (h % G) Kkv + kv // H', local j H' + kv % H'."""
         r = np.arange(self.d.hid)
         H, hg = self.d.H, self.hg
         j, h = r // H, r % H
@@ -53,14 +50,13 @@ class Blocks:
         return (g * self.Kkv + kv // hg) * self.nch + j * hg + (kv % hg)
 
     def kv_perm(self):
-        """(source column of the expanded interleaved K / V, its index in the K / V blocks): KV head kv once."""
+        """(source column, index in the K / V blocks) of each KV head once."""
         r = np.arange(self.d.hid)
         h = r % self.d.H
         keep = h % self.G == 0
         return r[keep], self.head_perm()[keep]
 
     def kv_cols(self, W):
-        """The expanded K / V weight's columns, each KV head once, in the K / V blocks' order."""
         src, dst = self.kv_perm()
         out = np.zeros((W.shape[0], self.Kkv * self.nch), W.dtype)
         out[:, dst] = W[:, src]
@@ -73,7 +69,6 @@ class Blocks:
         return out
 
     def group_cols(self, W):
-        """W's columns (interleaved attention features) in head-grouped order."""
         out = np.zeros_like(W)
         out[:, self.head_perm()] = W
         return out
@@ -165,14 +160,14 @@ def name_blocked(inf, Xs):
             inf.name_ct(X, f"pf_in{c}")
 
 
-# ── norms: the statistic summed over the K blocks, one inverse-sqrt chain per region group ─────────────────────────
+# ── norms ───────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def _region(N, t, R, k, val):
     return np.where((np.arange(N) // t) % R == k, val, 0.0)
 
 
 def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512):
-    """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block (LN over the whole real hidden)."""
+    """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks."""
     ops, N, t, dr = rt.ops, B.d.N, B.t, B.d.dim
     halves = []                              # (g, half, lane scales, [x_k], statistic)
     for g, blk in enumerate(Xs):
@@ -250,7 +245,7 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
         row = []
         for k in range(len(blk)):
             a = outs[(g, 0)][k]
-            if a is None:                        # a block with no real channel: zero
+            if a is None:
                 row.append(ops.sub(blk[k], blk[k]))
                 continue
             row.append(a if (g, 1) not in outs else join(ops, a, ops.negate(outs[(g, 1)][k])))
@@ -280,8 +275,7 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
 
 
 def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None):
-    """prefill_attention per head group (block k of Q / K / V, its own sub-runtime): outputs O[g][k]. GQA (G > 1):
-    K / V hold Kkv blocks, each shared by the G query blocks b, Kkv + b, ... (one rotation set per K / V block)."""
+    """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ..."""
     if B.G > 1:
         outs = [[None] * B.K for _ in Q]
         for b in range(B.Kkv):
@@ -313,8 +307,7 @@ def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefix
 
 
 def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
-    """Signed steps as the code rotates by them (the runtime matches indexes exactly): lane moves (+-k, k < t), the
-    region spread (-r), and the radix groups of the (t, N) / (tH, N) / (t, 512) ladders."""
+    """Signed rotation steps (keys match exactly): lane moves, region spread (-r), radix ladder groups."""
     gd = B.group_dims(0)
     steps = {k for k in range(1, B.t)} | {-k for k in range(1, B.t)}
     r = B.t

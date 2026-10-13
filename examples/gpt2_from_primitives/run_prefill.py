@@ -38,7 +38,7 @@ def main(argv=None):
                          "(any T up to the 1024 positions)")
     a = ap.parse_args(argv)
 
-    # prefill keeps its K / V on the device: the decode preset's pinned KV arena would only lock host memory
+    # prefill K / V stay on the device: a pinned KV arena would only lock host memory
     os.environ.setdefault("KV_ARENA_GB", "0")
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
@@ -95,7 +95,7 @@ def main(argv=None):
     else:
         from perseus.impl.magtape import plan_rot_steps
         pruned = plan_rot_steps(a.plan) if a.plan and os.environ.get("PF_ROT_PRUNE", "1") != "0" else None
-        if pruned:          # a planned run issues its graph's rotations only: the other keys are VRAM
+        if pruned:          # a planned run needs only its graph's rotation keys (VRAM)
             extra = pruned
             print(f"[prefill] rotation keys from the plan's graph: {len(extra)}", flush=True)
         sess = env.open_session(a.device, complex_payload=True, chain="n32", extra_rot_steps=extra, base=not pruned,

@@ -41,7 +41,7 @@ def test_head_perm_groups_whole_heads():
     assert sorted(p) == list(range(d.hid))
     r = np.arange(d.hid)
     j, h = r // d.H, r % d.H
-    assert np.all(p // B.nch == h // B.hg)                      # head h lives in block h // H'
+    assert np.all(p // B.nch == h // B.hg)
     loc = p % B.nch
     assert np.all(loc // B.hg == j) and np.all(loc % B.hg == h % B.hg)
 
@@ -103,7 +103,7 @@ def test_attention_blocked_matches_unblocked(T):
 
 @pytest.mark.parametrize("T", [40, 128, 200])
 def test_attention_blocked_gqa_matches_expanded(T):
-    """G = 2: K / V blocks hold each KV head once, shared by two query blocks == attention on the expanded K / V."""
+    """G = 2: shared un-expanded K / V blocks == attention on the expanded K / V."""
     rt, _, _ = _rt(N=4096, hid=256, dim=256, H=4, H_real=4, E=512, E_real=512)
     d = rt.dims
     B = blocked.Blocks(d, nch=64, G=2)

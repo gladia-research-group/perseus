@@ -144,7 +144,7 @@ def llama_prefill_block_pcmm(rt, Xs, P, cfgs, ch: Chunks, rope, prefix_kv):
 
 
 def _memdbg(rt, tag):
-    """PF_MEMDBG=1: device free and pool reserved after a stage (where the non-pool memory goes)."""
+    """PF_MEMDBG=1: print device free / pool reserved after a stage."""
     if not os.environ.get("PF_MEMDBG"):
         return
     core = rt.ops.core
@@ -210,7 +210,7 @@ class LlamaPrefill(LlamaModel):
         dh = d.dim // self.H
         kf = PX.expanded_heads(k, self.H, self.H_kv, dh)
         vf = PX.expanded_heads(v, self.H, self.H_kv, dh)
-        if _layout_blocked():               # per head group: its slice of the head-grouped vectors
+        if _layout_blocked():
             B = self.blocks
             kg, vg = B.kv_vec(kf), B.kv_vec(vf)
             return [(np.repeat(kg[k * B.nch:(k + 1) * B.nch], B.t), np.repeat(vg[k * B.nch:(k + 1) * B.nch], B.t))

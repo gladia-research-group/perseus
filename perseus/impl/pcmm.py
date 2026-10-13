@@ -235,7 +235,7 @@ class PcmmLinear:
     shift: int
     bias: list | None = None
     name: str | None = None
-    t: int = 0                  # token lanes it was encoded for (0: the runtime's)
+    t: int = 0                  # token lanes (0: the runtime's)
 
     @classmethod
     def encode(cls, W, t, scale=1.0, bias=None, shift=0, name=None, wbits=None):
@@ -295,7 +295,7 @@ def _record_calib(name, ys):
 
 
 def engine(rt, t=None):
-    """The runtime's PCMM engine for t token lanes (default the runtime's; made on first use)."""
+    """The runtime's PCMM engine for t token lanes (made on first use)."""
     t = int(t or rt.dims.t)
     engines = rt.__dict__.setdefault("_pcmm_engines", {})
     if t not in engines:
@@ -305,7 +305,7 @@ def engine(rt, t=None):
 
 
 def run(rt, xs, lin):
-    """lin on the dense blocks xs through the runtime's PCMM engine for its lanes."""
+    """lin on the dense blocks xs through the runtime's PCMM engine."""
     return engine(rt, lin.t).apply(xs, lin)
 
 
@@ -408,7 +408,7 @@ class Pcmm:
                 blk = Wi[m * nch:(m + 1) * nch, c * nch:(c + 1) * nch].astype(np.float64)[inv[:, None], inv[None, :]]
                 y += blk @ X[c]
             o = FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land, 1, xr[0].packing)
-            if hasattr(xr[0], "ptag"):       # fakecap: the device's outputs are the input handles (spares: input 0)
+            if hasattr(xr[0], "ptag"):       # fakecap: outputs reuse the input handles (spares: input 0)
                 o.ptag = xr[m if m < lin.n_in else 0].ptag
             outs.append(o)
         _record_calib(lin.name, [o.vec for o in outs])

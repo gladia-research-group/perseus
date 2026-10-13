@@ -1,12 +1,4 @@
-"""Structure capture on the numpy fake: the device recorder (include/fideslib_wrapper.h record_primitive,
-include/graph.h) replayed on fake.FakeFhe, so a capture needs no GPU.
-
-Per op the wrapper's bookkeeping: graph var names (v_N / pt_N counters reset per block, anon_N global, names keyed
-by ciphertext identity), physical level + noise degree (lazy rescale on the composite chain: a product lands at the
-max effective input level with degree 2; a plaintext add realizes), the pack tag (include/packing/pack_tag.h) and
-its stamp, the reactive / deliberate / hint refreshes with their sparse routes and landings, and the magnitudes of
-every node (magtape.node_stats). The planner reads the result exactly like a device capture.
-"""
+"""Device graph capture (fideslib_wrapper.h record_primitive) replayed on the numpy fake: no GPU."""
 from __future__ import annotations
 
 import json
@@ -283,19 +275,17 @@ class CapCt(FakeCt):
     def __init__(self, vec, level, noise_deg=1, packing="cachemir"):
         super().__init__(vec, level, noise_deg, packing)
         self.name, self.gen, self.tag = None, -1, Tag()
-        self.ptag = Tag()           # the PackedCtx's own tag (the registry's `tag` is the Ciphertext's)
+        self.ptag = Tag()           # the PackedCtx's own tag (`tag` is the Ciphertext's)
 
 
 _CHECK_FIELD = bool(os.environ.get("FAKECAP_CHECK_FIELD"))
 
-# ciphertexts made outside the recorder (the PCMM's fake products) start unnamed and untagged
+# cts made outside the recorder (PCMM fake products) start unnamed and untagged
 FakeCt.name, FakeCt.gen, FakeCt.tag, FakeCt.ptag = None, -1, Tag(), Tag()
 
 
 class Pt:
-    """A plaintext object: its identity names it (pt_vars). The device keys pt_vars by address, so a recycled
-    temporary can inherit a stale pt_N; plaintext names carry no plan semantics (the planner reads only that an input
-    is a plaintext, and its level), so the fake names every plaintext afresh."""
+    """Plaintext named afresh by identity (device pt_N names can go stale and carry no plan semantics)."""
     __slots__ = ("vec", "level", "deg", "tag", "name", "gen")
 
     def __init__(self, vec, level, deg=1, tag=None):
@@ -305,7 +295,7 @@ class Pt:
 
 
 def _landings():
-    """route s -> (level, deg) of a refresh landing; 0 = dense (FAKECAP_LANDINGS, the n32 chain's by default)."""
+    """route s -> (level, deg) of a refresh landing; 0 = dense (FAKECAP_LANDINGS, default n32)."""
     spec = os.environ.get("FAKECAP_LANDINGS", "0:32,1:14,256:22,512:22")
     out = {}
     for kv in spec.split(","):
@@ -399,7 +389,7 @@ class CapFhe(FakeFhe):
         self.nodes.append(n)
 
     def flush_stats(self):
-        """The pending nodes' magnitudes (magtape.node_stats), one multi-worker FFT per batch."""
+        """Pending nodes' magnitudes (magtape.node_stats), one FFT per batch."""
         if self._pend:
             from .magtape import node_stats_batch
             for (n, _), st in zip(self._pend, node_stats_batch(np.stack([v for _, v in self._pend]))):
@@ -462,8 +452,7 @@ class CapFhe(FakeFhe):
         return s
 
     def stc_first(self):
-        """Whether a dense refresh now takes the StC-first order (FIDESLIB_BTS_STC_FIRST on the dense route, allowed by
-        perseus.impl.bootstrap.stc_first, not staged-only)."""
+        """Whether a dense refresh now takes the StC-first order (FIDESLIB_BTS_STC_FIRST*)."""
         if int(os.environ.get("FIDESLIB_BTS_STC_FIRST", "0") or 0) <= 0:
             return False
         if os.environ.get("FIDESLIB_BTS_STC_FIRST_STAGED_ONLY", "0") not in ("", "0"):
@@ -742,7 +731,7 @@ class CapFhe(FakeFhe):
             self.inplace_add(acc, self.mult(v, t))
         return False
 
-    # ── the PackedCtx overlay (what Python calls): Ctx op, then the result tagged from the handles' own tags ──
+    # ── PackedCtx overlay: Ctx op, then retagged from the handles' own tags ──
     def _tagged(self, out, tag):
         out.tag = tag
         out.ptag = tag
@@ -992,8 +981,7 @@ class FakeSession:
 
 
 def session_env(env_defaults, overrides, chain="n32", complex_payload=True):
-    """The env a device session's profile exports (examples/*/env.open_session: the decode preset's extras, the port's
-    ENV, the overrides; setdefault), so a fake capture stamps the same contract."""
+    """Export a device session's profile env, so a fake capture stamps the same contract."""
     from perseus.profile import SessionProfile
     prof = SessionProfile.gpt2_decode_n64() if chain == "n64" else SessionProfile.gpt2_decode_n32()
     prof.ckks_complex = bool(complex_payload)
@@ -1019,8 +1007,7 @@ def make_session(dims, rot_steps, limit=None, bts_out=32, unit=2, complex_payloa
 def compare_graphs(ref_dir, got_dir, fields=("op_type", "inputs", "input_levels", "output", "step", "output_level",
                                              "output_noise_level", "pack_period", "pack_kind", "pack_offset",
                                              "pack_stride", "pack_count", "pack_width", "pack_field"), log=print):
-    """First structural divergence per block (anon names canonicalized by first appearance, plaintext names as a
-    class). Returns #bad blocks."""
+    """Log the first structural divergence per block (anon / pt names canonicalized); returns #bad blocks."""
     import glob
     import re
     bad = 0
@@ -1048,7 +1035,7 @@ def compare_graphs(ref_dir, got_dir, fields=("op_type", "inputs", "input_levels"
             continue
         A, B = canon(json.load(open(p))["nodes"]), canon(json.load(open(q))["nodes"])
         for i, (x, y) in enumerate(zip(A, B)):
-            # a fused inner sum's replayed product (output_level -1, no degree / tag): the loop's node, unannotated
+            # a fused inner sum's replayed product (output_level -1): structure only
             fs = ("op_type", "inputs", "output", "step") if x.get("output_level") == -1 else fields
             diff = [f for f in fs if x.get(f) != y.get(f)]
             if diff:

@@ -21,8 +21,7 @@ _DBG = bool(os.environ.get("PF_DEBUG"))
 _ATTN_PAIR = os.environ.get("PF_ATTN_PAIR", "1") not in ("", "0")
 # PF_SM_JOINT=1: both chunks of a ciphertext share one refresh point after the softmax exp's Chebyshev
 _SM_JOINT = os.environ.get("PF_SM_JOINT", "0") not in ("", "0")
-# PF_LANE_HOIST=B: an earlier chunk's K / V lane rotations from hoisted decompositions, B offsets per call (all at
-# once materializes 2 (t - 1) rotations: the pool runs out at t = 64)
+# PF_LANE_HOIST=B: hoisted K / V lane rotations, B offsets per call (all at once exhausts the pool at t = 64)
 _LANE_HOIST = int(os.environ.get("PF_LANE_HOIST", "0") or 0)
 
 
@@ -324,20 +323,18 @@ def lane_rotate(rt, x, e: int, site: str):
 
 
 _EVICT = os.environ.get("PF_EVICT_MASKS", "1") not in ("", "0")
-_EVICT_SITES = ("",)        # every mask: the next block re-encodes them at its own levels
+_EVICT_SITES = ("",)        # every mask: each block re-encodes at its own levels
 
 
 _POOL_TRIM = os.environ.get("PF_POOL_TRIM", "1") not in ("", "0")
-_EVICT_BELOW_GB = float(os.environ.get("PF_EVICT_BELOW_GB", "12"))     # both run only under memory pressure
+_EVICT_BELOW_GB = float(os.environ.get("PF_EVICT_BELOW_GB", "12"))     # evict/trim only below this
 
 
 def evict_block_masks(rt):
-    """End of a prefill block: free its masks' device plaintexts (PF_EVICT_MASKS, default on; every block re-encodes
-    them at its own levels) and hand the pools' idle memory back to the device (PF_POOL_TRIM, default on: the CUDA
-    stream-ordered pool otherwise keeps every peak, out of reach of plain allocations)."""
+    """End of a prefill block, under memory pressure: evict mask plaintexts and trim the stream-ordered pools."""
     core = rt.ops.core
     if hasattr(core, "device_free_gb") and core.device_free_gb() >= _EVICT_BELOW_GB:
-        return 0          # no pressure: keep the masks for the next block (re-encoding them costs a few %)
+        return 0          # re-encoding the masks costs a few %
     n = rt.evict_masks(_EVICT_SITES) if _EVICT and hasattr(rt.ops, "erase_pts") else 0
     if _POOL_TRIM and hasattr(core, "gpu_pool_trim"):
         core.gpu_pool_trim()
@@ -372,8 +369,7 @@ def _offsets(ch: Chunks, c: int):
 
 
 def prefix_offset(ch: Chunks, c: int) -> int:
-    """The score offset of the public prefix key for query chunk c: the first own-chunk offset no lane uses when the
-    chunk is partial (nq < t: offsets nq .. t - 1 hold no valid lane), else (c + 1) t, past every real offset."""
+    """Score offset of the public prefix key for chunk c: first unused own-chunk offset if partial, else (c + 1) t."""
     nq = len(ch.lanes(c))
     return nq if nq < ch.t else c * ch.t + ch.t
 
@@ -539,7 +535,7 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
 def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False):
     """Causal attention on dense complex Q/K/V (scale 1/2); returns dense outputs (scale 1) as the decode's P.V.
     `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt.
-    `shared`: Qd is a list of query sets attending to the same K / V (GQA): one output list per set."""
+    `shared`: Qd is a list of query sets on the same K / V (GQA), one output list each."""
     ops, d = rt.ops, rt.dims
     nc = ch.n_chunks
 

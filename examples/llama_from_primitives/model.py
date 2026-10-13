@@ -46,7 +46,7 @@ class LlamaModel(ImplModel):
         self.rope = Rope(cfgs.model["rope_inv_freq"])
         Cache = ComplexKVCache if packing == "cachemir_complex" else KVCache
         self.kv = [Cache(self.rt.dims.d_head) for _ in range(self.n_layers)]
-        # LLAMA_GQA=1: the K / V caches hold every KV head once (attention.mha_gqa on the sub-runtime self.sub)
+        # LLAMA_GQA=1: K / V caches hold each KV head once (attention.mha_gqa on self.sub)
         self.G = self.H // self.H_kv if os.environ.get("LLAMA_GQA", "0") not in ("", "0") else 1
         self.sub = None
         if self.G > 1:

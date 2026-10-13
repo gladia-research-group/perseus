@@ -283,14 +283,13 @@ def compare(ref_graph: str, filled_graph: str):
 
 
 def plan_rot_steps(plan_dir: str):
-    """The rotation steps the captured graph of `plan_dir` (PLAN_CMD.txt graph=) issues: a planned run repeats that op
-    stream, so these are all the keys it needs (None: no graph found)."""
+    """Rotation steps issued by the captured graph of `plan_dir` (None: no graph found)."""
     import glob
     import os
     try:
         line = next(l for l in open(os.path.join(plan_dir, "PLAN_CMD.txt")) if l.startswith("graph="))
         g = line[len("graph="):].split(" (md5")[0].strip()
-    except (OSError, StopIteration):      # the pipelines name the graph like the plan
+    except (OSError, StopIteration):      # graph named like the plan
         g = os.path.join("graphs", os.path.basename(os.path.normpath(plan_dir)))
     paths = glob.glob(os.path.join(g, "block_*", "graph.json"))
     if not paths:

@@ -68,7 +68,7 @@ class Rt:
     def mask_key(key):
         return "mask." + (key if isinstance(key, str) else ".".join(str(k) for k in key))
 
-    sub_tags = frozenset()      # SubRt namespaces (blocked.SubRt): a key's site is the one under the tag
+    sub_tags = frozenset()      # SubRt namespaces: a key's site is the one under the tag
 
     def site(self, key):
         if isinstance(key, str):
@@ -150,9 +150,7 @@ class Rt:
         return self.mask_stats
 
     def evict_masks(self, prefixes):
-        """Drop the encoded plaintexts of every mask whose site starts with one of `prefixes` (all levels): a prefill
-        block's attention masks, which the next block re-encodes at its own levels instead of piling up on the device.
-        Returns the number of plaintexts freed."""
+        """Free the encoded plaintexts of masks whose site starts with one of `prefixes`; returns the count."""
         keys = [k for k in self._kinfo if self.site(k).startswith(tuple(prefixes))]
         if not keys:
             return 0
