@@ -128,6 +128,9 @@ def main(argv=None):
                 line += f" enc={inf.enc_cache_stats().get('size')}"
             if hasattr(_core, "gpu_pool_stats"):
                 line += f" pool={_core.gpu_pool_stats()}"
+            if os.environ.get("FIDESLIB_POOL_TRACE") and hasattr(_core, "gpu_pool_trace"):
+                for site, nb in _core.gpu_pool_trace(6)[:6]:
+                    line += f"\n  [trace] {nb / 2**30:.2f} GB  {site[:300]}"
         b0[0] = tb
         if ref is not None:
             from perseus.impl.prefill import Chunks
