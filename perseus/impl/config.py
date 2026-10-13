@@ -94,6 +94,7 @@ class GeluCfg:
     cheb_coeffs: tuple = ()
     cheb_a: float = -1.0
     cheb_b: float = 1.0
+    cheb_eps: float | None = None     # coefficient trim (relative to the largest), None = poly.CHEB_COEFF_EPS
 
 
 @dataclasses.dataclass
@@ -196,8 +197,10 @@ def parse_gelu(j: dict) -> GeluCfg:
                        thor_p1_a=float(j.get("thor_p1_a", -1.0)), thor_p1_b=float(j.get("thor_p1_b", 1.0)),
                        thor_p2_a=float(j.get("thor_p2_a", -1.0)), thor_p2_b=float(j.get("thor_p2_b", 1.0)))
     if method == "chebyshev":
-        return GeluCfg(method=method, cheb_coeffs=_tup(j["cheb_coeffs"]),
-                       cheb_a=float(j["cheb_a"]), cheb_b=float(j["cheb_b"]))
+        # xmax: with GELU_FOLD the up-projection carries 1/xmax and the output mask xmax (as for thor_composite)
+        return GeluCfg(method=method, xmax=float(j.get("xmax", 1.0)), cheb_coeffs=_tup(j["cheb_coeffs"]),
+                       cheb_a=float(j["cheb_a"]), cheb_b=float(j["cheb_b"]),
+                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None))
     raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
 
 

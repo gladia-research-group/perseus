@@ -114,9 +114,21 @@ The solver iterates over Python sets of node names, so its choices depend on Pyt
 the recipe fixes `PYTHONHASHSEED=0`. Both scripts remove redundant bootstraps unless
 `PLAN_PRUNE=0`; the shipped DaCapo and Orion plans are the ones without that removal.
 
+## Chebyshev GELU main plan (32-bit)
+
+Since the per-block Chebyshev GELU, the main 32-bit plan `gpt2_decode_python_n32` evaluates each block's GELU as one
+Chebyshev series on 1.25x the block's input range (degree 63 to 511, 7 to 10 levels) instead of the composite THOR
+polynomial (two composed series, about 12 levels), with the same 1/xmax fold into the up projection. The shallower
+GELU lets the MLP chain fit between refreshes: 184 bootstraps per token instead of 191, about 0.14 s per token
+faster, at a mean KL of a few 1e-4 against the plaintext model instead of about 1e-4. The configs live in
+`configs/model/approximation/gpt2_base_n32`; a plan names its configs in a `configs=` line of its PLAN_CMD.txt, and
+an n32 plan without the line (every plan cut before this one, the prefill plans included) runs the composite GELU of
+`gpt2_base_n32_thor`. To switch back, run `--plan bootstrap_placements/gpt2_decode_python_n32_thor` (the previous
+main plan); the last composite-GELU state is the `composite-gelu` branch and the `composite-gelu-3.98s` tag.
+
 ## StC-first main plan (32-bit)
 
-The main 32-bit plan, `gpt2_decode_python_n32`, runs its full-size refreshes StC-first: the
+The main 32-bit plans run their full-size refreshes StC-first: the
 slots-to-coefficients transform is applied to the input at the bottom of the chain, before the
 raise, CoeffsToSlots and EvalMod (`FIDESLIB_BTS_STC_FIRST=2`, set by the plan's `runtime=` line).
 That is about 0.18 s per token faster than the shipped order, at a mean KL of about 1e-4 against

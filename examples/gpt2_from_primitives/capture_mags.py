@@ -52,7 +52,7 @@ def main(argv=None):
         os.environ[k] = str(v)
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if not a.configs:
-        a.configs = "configs/model/approximation/gpt2_base_n32/configs.json"
+        a.configs = env.plan_configs(a.plan, "n32", env.CONFIGS_N32)
     from perseus import _core
     from perseus.impl import magtape
     model, fhe, inf = fake_model(a.weights, a.configs, a.packing)

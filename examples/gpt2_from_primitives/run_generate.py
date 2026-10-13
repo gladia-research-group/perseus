@@ -53,7 +53,7 @@ def main(argv=None):
                    CKKS_COMPLEX="1" if a.payload == "complex" else "0", **over)
     if not a.configs:
         _cfg = "gpt2_base_n32" if a.chain == "n32" else "gpt2_base"
-        a.configs = f"configs/model/approximation/{_cfg}/configs.json"
+        a.configs = env.plan_configs(a.plan, a.chain, f"configs/model/approximation/{_cfg}/configs.json")
     if a.capture:
         os.environ["FHE_GRAPH_DIR"] = a.capture
     from perseus import _core

@@ -83,13 +83,14 @@ def eval_polynomial_ps(ops, x, coeffs):
 CHEB_COEFF_EPS = 1e-6
 
 
-def eval_chebyshev(ops, x, coeffs, a: float, b: float):
-    """sum_k c_k T_k(y), y = (2x - (a+b))/(b-a) (polynomial.cu), c0 unhalved."""
+def eval_chebyshev(ops, x, coeffs, a: float, b: float, eps: float | None = None):
+    """sum_k c_k T_k(y), y = (2x - (a+b))/(b-a) (polynomial.cu), c0 unhalved. `eps`: the coefficient trim
+    relative to the largest coefficient (None = CHEB_COEFF_EPS)."""
     if getattr(ops, "cheb_bsgs", False):
-        return eval_chebyshev_bsgs(ops, x, coeffs, a, b)
+        return eval_chebyshev_bsgs(ops, x, coeffs, a, b, eps)
     coeffs = [float(c) for c in coeffs]
     cmax = max((abs(c) for c in coeffs), default=0.0)
-    tol = CHEB_COEFF_EPS * cmax
+    tol = (CHEB_COEFF_EPS if eps is None else eps) * cmax
     coeffs = [0.0 if abs(c) <= tol else c for c in coeffs]
     n = len(coeffs) - 1
     while n > 0 and coeffs[n] == 0.0:
@@ -132,11 +133,11 @@ def eval_chebyshev(ops, x, coeffs, a: float, b: float):
     return ops.add(r, coeffs[0])
 
 
-def _cheb_trim(coeffs):
+def _cheb_trim(coeffs, eps: float | None = None):
     """The coefficient trim of eval_chebyshev: tiny coefficients dropped, trailing zeros cut."""
     coeffs = [float(c) for c in coeffs]
     cmax = max((abs(c) for c in coeffs), default=0.0)
-    tol = CHEB_COEFF_EPS * cmax
+    tol = (CHEB_COEFF_EPS if eps is None else eps) * cmax
     coeffs = [0.0 if abs(c) <= tol else c for c in coeffs]
     n = len(coeffs) - 1
     while n > 0 and coeffs[n] == 0.0:
@@ -156,15 +157,15 @@ def _cheb_split(c, k):
     return q, r
 
 
-def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float):
+def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float, eps: float | None = None):
     """eval_chebyshev with a baby-step giant-step schedule (Bossuat et al.): babies T_1..T_{m-1} and giants
     T_m, T_2m, ..., the series split recursively as q(T) T_k + r(T) and recombined with k - 1 products per
     level, so a degree-31 series costs 11 ciphertext products instead of 30. Same value, same depth
     (ceil(log2 n) + 1), same coefficient trim; CHEB_BSGS=1 routes every eval_chebyshev here."""
-    coeffs = _cheb_trim(coeffs)
+    coeffs = _cheb_trim(coeffs, eps)
     n = len(coeffs) - 1
     if n <= 3:
-        return eval_chebyshev(_NoBsgs(ops), x, coeffs, a, b)
+        return eval_chebyshev(_NoBsgs(ops), x, coeffs, a, b, eps)
     alpha = 2.0 / (b - a)
     beta = (a + b) / (b - a)
     y = x if alpha == 1.0 else ops.mult(x, alpha)

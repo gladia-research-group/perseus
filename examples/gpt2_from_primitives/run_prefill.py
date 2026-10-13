@@ -58,8 +58,8 @@ def main(argv=None):
         over = {"FIDESLIB_BTS_STC_FIRST": "2", "FIDESLIB_BTS_STC_FIRST_ROUTES": "dense",
                 "FIDESLIB_BTS_STC_FIRST_STAGED_ONLY": os.environ.get("PF_PCMM_STAGED_ONLY", "1"), **over}
     env.export_env(a.device, chain="n32", CKKS_COMPLEX="1", **over)
-    if not a.configs:
-        a.configs = "configs/model/approximation/gpt2_base_n32/configs.json"
+    if not a.configs:   # the prefill keeps the composite GELU its plans were cut for
+        a.configs = env.plan_configs(a.plan, "n32", env.CONFIGS_N32_LEGACY)
     if a.capture:
         os.environ["FHE_GRAPH_DIR"] = a.capture
     from perseus import _core

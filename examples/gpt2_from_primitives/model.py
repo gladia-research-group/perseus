@@ -63,7 +63,7 @@ class Gpt2Model(ImplModel):
     def block_weights(self, b):
         if b not in self._bw:
             ge = self.cfgs.block(b)[3]
-            fold = self.rt.ops.gelu_fold and ge.method == "thor_composite"
+            fold = self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")
             args = (b, self.rt.dims, self.fold[0], self.fold[1], self.complex_packing,
                     1.0 / ge.xmax if fold else 1.0)
             self._bw[b] = slotcache.cached(self._slot_key(), "block", args, lambda: W.block_weights(

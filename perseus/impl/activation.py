@@ -63,8 +63,12 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         g = ops.mult(gelu_thor_core(rt, x, cfg), im_cleanse(ops, x))
         return rt.mult_mask(g, (mask[0], cfg.xmax), lambda: mask[1](0.5 * cfg.xmax))
     if cfg.method == "chebyshev":
+        if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries 1/xmax): GELU(x) = xmax q(x / xmax),
+            # q the Chebyshev series on [cheb_a, cheb_b]; xmax rides the lane mask, the refreshes are the plan's
+            g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+            return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
         ops.bootstrap_hint(x, ops.headroom(4))
-        return eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b)
+        return eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
     if cfg.method != "thor_composite":
         raise ValueError(f"gelu: method {cfg.method!r} not ported")
     if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries it): xmax rides the mask

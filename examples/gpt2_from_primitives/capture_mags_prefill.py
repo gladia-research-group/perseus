@@ -16,7 +16,7 @@ def main(argv=None):
     ap.add_argument("graph_dir")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS_PATH"))
-    ap.add_argument("--configs", default="configs/model/approximation/gpt2_base_n32/configs.json")
+    ap.add_argument("--configs", default="configs/model/approximation/gpt2_base_n32_thor/configs.json")
     ap.add_argument("--plan", default=None)
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--check", default=None)

@@ -111,6 +111,25 @@ def plan_runtime(plan=None, chain="n32"):
     return dict(RUNTIME_LEGACY)
 
 
+# The approximation configs a plan was cut for. The n32 default (gpt2_base_n32) runs the GELU as one Chebyshev series
+# per block; a plan declares its configs in a `configs=` line of its PLAN_CMD.txt, and an n32 plan without the line
+# predates it and runs the composite (THOR) GELU of gpt2_base_n32_thor.
+CONFIGS_N32 = "configs/model/approximation/gpt2_base_n32/configs.json"
+CONFIGS_N32_LEGACY = "configs/model/approximation/gpt2_base_n32_thor/configs.json"
+
+
+def plan_configs(plan=None, chain="n32", default=None):
+    """The configs.json for `plan` (a plan dir or None) on `chain`; `default` when the plan is None or not n32."""
+    if chain != "n32" or not plan:
+        return default
+    cmd = Path(plan) / "PLAN_CMD.txt"
+    if cmd.exists():
+        for line in cmd.read_text().splitlines():
+            if line.startswith("configs="):
+                return line[len("configs="):].split()[0]
+    return CONFIGS_N32_LEGACY
+
+
 def bootstrap_setup(fhe, runtime, cpp_bootstrap=False):
     """Install the Python-orchestrated bootstrap (the default) with SPRU on the 1-slot route when the runtime asks
     for it. A SPRU plan cannot run on the C++ bootstrap (its 1-slot refreshes land 16 primes lower there)."""
