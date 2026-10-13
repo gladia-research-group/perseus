@@ -286,6 +286,8 @@ class CapCt(FakeCt):
         self.ptag = Tag()           # the PackedCtx's own tag (the registry's `tag` is the Ciphertext's)
 
 
+_CHECK_FIELD = bool(os.environ.get("FAKECAP_CHECK_FIELD"))
+
 # ciphertexts made outside the recorder (the PCMM's fake products) start unnamed and untagged
 FakeCt.name, FakeCt.gen, FakeCt.tag, FakeCt.ptag = None, -1, Tag(), Tag()
 
@@ -379,6 +381,12 @@ class CapFhe(FakeFhe):
              "step": self.path(), "output_level": int(out_ct.level if out_ct is not None else out_level)}
         if out_ct is not None:
             n["output_noise_level"] = int(out_ct.noise_deg)
+            if _CHECK_FIELD and out_ct.tag.field in (F_REAL, F_IMAG) and np.iscomplexobj(out_ct.vec):
+                v = np.asarray(out_ct.vec)
+                bad = np.abs(v.imag if out_ct.tag.field == F_REAL else v.real).max()
+                if bad > 1e-6 * max(float(np.abs(v).max()), 1e-30):
+                    print(f"[fakecap] field tag {out_ct.tag.field} unsound: {op} {out} @ {self.path()} "
+                          f"off-axis {bad:.3g} of {float(np.abs(v).max()):.3g}", flush=True)
             if self.stats and not self.magnitude_suppressed:
                 self._pend.append((n, np.array(out_ct.vec, dtype=np.complex128)))
                 if len(self._pend) >= self._batch:
