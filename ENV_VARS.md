@@ -164,6 +164,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_KSK_REGEN` | Regenerate the `a` half of every key-switching key in-kernel from its seed (2 = both readers, the default; 0 = stored keys). |
 | `FIDESLIB_KS_DIGIT_INTT` | 1 restores upstream's redundant per-digit INTT in the key switch. |
 | `FIDESLIB_SMALLINT_NOSYNC` | 0 restores the exact post-raise scaling's host readback of the limb pointer tables (a stream sync and two blocking device-to-host copies per call, two device drains per bootstrap). |
+| `FIDESLIB_ENCODE_NOSYNC` | 0 restores the host wait on every device-encoded plaintext load (the encode is already ordered on the plaintext's own stream). |
 | `FIDESLIB_AUX_NOSYNC` | 0 restores the aux-buffer release's read-back of the limb pointer tables behind a stream sync (by default the live buffers are normalized on the device). |
 | `FIDESLIB_SCRATCH_RETIRE` | 0 restores exact-size ciphertext scratch slots that grow behind a stream sync and a device-wide cudaFree inside bootstraps (by default a slot starts at a floor, grows geometrically and keeps outgrown buffers until the ciphertext dies). |
 | `FIDESLIB_SPRU_NOSYNC` | 0 restores the SPRU bootstrap's three per-call cudaDeviceSynchronize fences (156 device drains per decode token). |
