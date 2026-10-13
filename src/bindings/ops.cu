@@ -1289,7 +1289,8 @@ void bind_ops(py::module_& m) {
         const auto st = FIDESlib::GPUpoolStatsOf(dev);
         const double gb = 1 << 30;
         return py::dict(py::arg("reserved_gb") = st.reserved / gb, py::arg("idle_gb") = st.idle / gb,
-                        py::arg("trimmable_gb") = st.trimmable / gb, py::arg("slabs") = st.slabs);
+                        py::arg("trimmable_gb") = st.trimmable / gb, py::arg("slabs") = st.slabs,
+                        py::arg("cuda_reserved_gb") = st.cuda_reserved / gb, py::arg("cuda_used_gb") = st.cuda_used / gb);
     }, "FIDESlib's pooled allocator on the current device: the GiB its slabs reserve, the idle part, and the part "
        "in wholly idle slabs (what gpu_pool_trim releases).");
     m.def("gpu_pool_by_size", []() {

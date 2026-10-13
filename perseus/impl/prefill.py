@@ -327,12 +327,18 @@ _EVICT = os.environ.get("PF_EVICT_MASKS", "1") not in ("", "0")
 _EVICT_SITES = ("",)        # every mask: the next block re-encodes them at its own levels
 
 
+_POOL_TRIM = os.environ.get("PF_POOL_TRIM", "1") not in ("", "0")
+
+
 def evict_block_masks(rt):
-    """End of a prefill block: free its attention masks' device plaintexts (PF_EVICT_MASKS, default on); every block
-    re-encodes them at its own levels, and kept they fill the device within a few dozen blocks at T = 128."""
-    if _EVICT and hasattr(rt.ops, "erase_pts"):
-        return rt.evict_masks(_EVICT_SITES)
-    return 0
+    """End of a prefill block: free its masks' device plaintexts (PF_EVICT_MASKS, default on; every block re-encodes
+    them at its own levels) and hand the pools' idle memory back to the device (PF_POOL_TRIM, default on: the CUDA
+    stream-ordered pool otherwise keeps every peak, out of reach of plain allocations)."""
+    n = rt.evict_masks(_EVICT_SITES) if _EVICT and hasattr(rt.ops, "erase_pts") else 0
+    core = rt.ops.core
+    if _POOL_TRIM and hasattr(core, "gpu_pool_trim"):
+        core.gpu_pool_trim()
+    return n
 
 
 def lane_rotate_all(rt, x, site, batch: int):
