@@ -148,3 +148,10 @@ and the same bootstrap count, about 0.065 s per token faster. To switch back, ru
 Goldschmidt on exact per-cache-length bands (`SM_CHEB_GS=1`, in its `runtime=` line; graph
 `graphs/gpt2_decode_python_n32_smcheb`). It keeps the softmax accurate past 32 cached tokens, where the default
 seeds drift, at about 0.01 s per token faster and a mean KL about 2-3x the main plan's within 32 tokens.
+
+## Channel-blocked prefill plans (32-bit)
+
+`gpt2_prefill_python_n32_blocked`, `llama31_8b_prefill_python_n32_blocked` and `llama31_8b_prefill_python_n32_blocked_gqa`
+are 128-token PCMM prefills on the channel-blocked layout (`PF_LAYOUT=blocked`: 512 channels and 128 tokens per
+ciphertext, whole heads per block; `_gqa` keeps each Llama KV head once, `PF_GQA=1`). Their switches are in the
+`runtime=` line, so `--plan` alone runs them: GPT-2 0.46 s per token, Llama 3.8 s (blocked) and 3.5 s (GQA).
