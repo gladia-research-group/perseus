@@ -360,7 +360,7 @@ def _pack_k_pair(ops, kv: ComplexKVCache, d):
         kv.k_pend.clear()
 
 
-def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None):
+def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None, merge=None):
     """complex_qkt (cachemir_complex_attention.cu): one product per K bucket serves two
     token groups; the even group's scores come out of 2 Re, the odd group's out of the
     imaginary axis through the odd mask; pending real groups run the real q.K^T."""
@@ -376,6 +376,9 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         else:
             ops.inplace_add(attn, r)
     per = sm_periodic(rt, kc)
+    # merge = (G, g) (mha_gqa): query head g of a KV group writes its token group c into blocks b with
+    # b % (G Gp) == g Gp + c, so the G heads' scores share one ciphertext
+    per_m, g0 = (merge[0] * per, merge[1] * per) if merge else (per, 0)
     for gc, bucket in enumerate(kv.k_buckets):
         g_even, g_odd = 2 * gc, 2 * gc + 1
         result = ops.mult(q, bucket)
@@ -385,11 +388,11 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         conj = ops.conjugate(result)
         res_e = ops.add(result, conj)
         n_even = min(d.t, kc - g_even * d.t)
-        accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g_even, per, scale)))
+        accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g0 + g_even, per_m, scale)))
         if g_odd * d.t < kc:
             res_o = ops.sub(result, conj)
             n_odd = min(d.t, kc - g_odd * d.t)
-            accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g_odd, scale, per)))
+            accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g0 + g_odd, scale, per_m)))
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
         result = ops.mult(q, pend)
@@ -397,7 +400,7 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         if per:
             result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
         n = min(d.t, kc - g * d.t)
-        result = rt.mult_mask(result, *_group_mask_item(d, n, g, per, scale))
+        result = rt.mult_mask(result, *_group_mask_item(d, n, g0 + g, per_m, scale))
         accum(im_cleanse(ops, result))
     return attn
 
@@ -587,7 +590,7 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
                 if periodic > 1:
                     h = rotsum(ops, h, d.tH, int(periodic) * d.tH)
             h = _gp_out(rt, h)
-        h = ops.tag_reduce(h, d.tH)
+        h = ops.tag_reduce(h, getattr(rt, "gq_merge", 1) * d.tH)
     if periodic:
         if ops.fused_sm_den:
             raise ValueError("SM_PERIODIC=1 does not combine with FUSED_SM_DEN=1")
@@ -604,7 +607,8 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         ops.fold_bootstrap(out, s_eff, 1, p)
     else:
         out = rotsum(ops, out, d.tH, d.N)
-    out = ops.tag_reduce(out, d.tH)                         # tH-periodic
+    # tH-periodic (merged GQA scores, mha_gqa: G tH, one tH block per query head of a group)
+    out = ops.tag_reduce(out, getattr(rt, "gq_merge", 1) * d.tH)
     return out if seed is None else (out, h)
 
 
@@ -797,6 +801,14 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
         return linear(rt, x, w.out)
 
 
+_GQA_MERGE = os.environ.get("LLAMA_GQA_MERGE", "1") not in ("", "0")
+
+
+def _gqa_psel(d: Dims, G: int, g: int):
+    """The tH blocks b with b % G == g (query head g of a merged GQA softmax)."""
+    return ((np.arange(d.N) // d.tH) % G == g).astype(np.float64)
+
+
 def gqa_dims(d: Dims, G: int) -> Dims:
     """The un-expanded K / V geometry of a G-query-group model: hid / G channels (each KV head once, in the expanded
     order's g = 0 slots), so G times the token lanes."""
@@ -828,7 +840,34 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
     a = sm_fold_affine(sub, sm_cfg)[0]
     folded = bool(getattr(ops, "sm_fold", False))
     outs = []
-    for g in range(G):
+    per = sm_periodic(sub, kv.k_count)
+    if _GQA_MERGE and per == 1 and G * sub.dims.tH <= sub.dims.N:
+        # one softmax for the G heads: their scores in interleaved tH blocks (block b: head b % G), the head sums
+        # per block, every tag G tH-periodic (sub.gq_merge); P split back per head for its P.V
+        shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
+        with rt.step("qkt", shape=shape):
+            scores = None
+            for g in range(G):
+                s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), **rp)
+                scores = s_g if scores is None else ops.add(scores, s_g)
+            scores = ops.tag_reduce(scores, G * sub.dims.tH)
+        sub.gq_merge = G
+        try:
+            with rt.step("softmax"):
+                probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
+        finally:
+            sub.gq_merge = 1
+        for g in range(G):
+            with rt.step(f"g{g}"):
+                with rt.step("softmax_v"):
+                    d_s = sub.dims
+                    p = sub.mult_mask(probs, ("gqa.psel", G, g), lambda g=g: _gqa_psel(d_s, G, g))
+                    p = ops.tag_reduce(rotsum(ops, p, d_s.tH, G * d_s.tH), d_s.tH)
+                    outs.append(complex_softmax_v(sub, kv, p))
+        G_loop = 0
+    else:
+        G_loop = G
+    for g in range(G_loop):
         with rt.step(f"g{g}"):
             shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
             with rt.step("qkt", shape=shape):
