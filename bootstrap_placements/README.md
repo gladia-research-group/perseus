@@ -131,3 +131,8 @@ The main plan also raises the 512-slot refreshes one composite level below the t
 recipe): those bootstraps run on two fewer limbs and land one level lower, at the same precision
 and the same bootstrap count, about 0.065 s per token faster. To switch back, run
 `--plan bootstrap_placements/gpt2_decode_python_n32_top512` (the 512-slot route raised to the top).
+
+`gpt2_decode_python_n32_smcheb` is an option, off by default: the softmax reciprocal rounds run Chebyshev-scaled
+Goldschmidt on exact per-cache-length bands (`SM_CHEB_GS=1`, in its `runtime=` line; graph
+`graphs/gpt2_decode_python_n32_smcheb`). It keeps the softmax accurate past 32 cached tokens, where the default
+seeds drift, at about 0.01 s per token faster and a mean KL about 2-3x the main plan's within 32 tokens.
