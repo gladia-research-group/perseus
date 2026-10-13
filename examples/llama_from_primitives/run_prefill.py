@@ -124,6 +124,10 @@ def main(argv=None):
         line = f"[llama-prefill] block {b} {s:.2f}s bts={tb - b0[0]}"
         if not a.fake and hasattr(_core, "device_free_gb"):
             line += f" free={_core.device_free_gb():.1f}GB"
+            if hasattr(inf, "enc_cache_stats"):
+                line += f" enc={inf.enc_cache_stats().get('size')}"
+            if hasattr(_core, "gpu_pool_stats"):
+                line += f" pool={_core.gpu_pool_stats()}"
         b0[0] = tb
         if ref is not None:
             from perseus.impl.prefill import Chunks
