@@ -329,7 +329,7 @@ class CapFhe(FakeFhe):
         self.stc_drop = int(os.environ.get("FAKECAP_STC_DROP", "6"))      # StC-first lands this much lower (n32)
         self.stc_entry = int(os.environ.get("FAKECAP_STC_ENTRY", "46"))   # deepest input with room for StC-first
         self.stats = True
-        self._pend, self._batch = [], int(os.environ.get("FAKECAP_BATCH", "128"))
+        self._pend, self._batch = [], int(os.environ.get("FAKECAP_BATCH", "1"))
         self.total_bootstraps = 0
         self.magnitude_suppressed = False
 
