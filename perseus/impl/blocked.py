@@ -94,6 +94,7 @@ class SubRt:
 
     def __init__(self, rt, dims, tag):
         self._rt, self.dims, self._tag = rt, dims, tag
+        rt.sub_tags = frozenset(rt.sub_tags) | {tag}    # its masks keep their own sites (Rt.site)
 
     def __getattr__(self, name):
         return getattr(self._rt, name)

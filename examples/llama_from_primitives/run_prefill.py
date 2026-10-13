@@ -122,6 +122,8 @@ def main(argv=None):
     def on_block(b, Xs, s):
         tb = int(inf.fhe.total_bootstraps)
         line = f"[llama-prefill] block {b} {s:.2f}s bts={tb - b0[0]}"
+        if not a.fake and hasattr(_core, "device_free_gb"):
+            line += f" free={_core.device_free_gb():.1f}GB"
         b0[0] = tb
         if ref is not None:
             from perseus.impl.prefill import Chunks

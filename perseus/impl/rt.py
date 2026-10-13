@@ -68,9 +68,14 @@ class Rt:
     def mask_key(key):
         return "mask." + (key if isinstance(key, str) else ".".join(str(k) for k in key))
 
-    @staticmethod
-    def site(key):
-        return key if isinstance(key, str) else str(key[0])
+    sub_tags = frozenset()      # SubRt namespaces (blocked.SubRt): a key's site is the one under the tag
+
+    def site(self, key):
+        if isinstance(key, str):
+            return key
+        if len(key) > 1 and key[0] in self.sub_tags:
+            return str(key[1])
+        return str(key[0])
 
     def _key_info(self, key):
         """(tag, the site's level set) for `key`, derived once. `mask_key`/`site` build a
