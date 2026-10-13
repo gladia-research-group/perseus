@@ -17,6 +17,7 @@ from perseus.impl.prefill import (name_inputs, gelu_joint, Chunks, DiagLinear, P
                                   shift_lanes, split)
 
 from perseus.impl import blocked as BL
+from perseus.impl.prefill import evict_block_masks
 from perseus.impl.pcmm import PcmmLinear, band_shift, run as pcmm_run
 
 from .model import Gpt2Model, dist_report
@@ -301,6 +302,7 @@ class Gpt2Prefill(Gpt2Model):
                     else:
                         Xs = prefill_block(self.rt, Xs, self.prefill_weights(b), self.cfgs.block(b), ch)
                 self.exit_stage(b, cap)
+                evict_block_masks(self.rt)
                 return Xs
             return compute
         return [(f"blk{b}", f"b{b}.", block_fn(b)) for b in range(self.n_layers)]

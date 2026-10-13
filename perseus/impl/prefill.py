@@ -323,6 +323,18 @@ def lane_rotate(rt, x, e: int, site: str):
     return ops.add(hi, lo)
 
 
+_EVICT = os.environ.get("PF_EVICT_MASKS", "1") not in ("", "0")
+_EVICT_SITES = ("pf.", "hg", "gqa")
+
+
+def evict_block_masks(rt):
+    """End of a prefill block: free its attention masks' device plaintexts (PF_EVICT_MASKS, default on); every block
+    re-encodes them at its own levels, and kept they fill the device within a few dozen blocks at T = 128."""
+    if _EVICT and hasattr(rt.ops, "erase_pts"):
+        return rt.evict_masks(_EVICT_SITES)
+    return 0
+
+
 def lane_rotate_all(rt, x, site, batch: int):
     """lane_rotate(x, e) for e = 1 .. t - 1, `batch` offsets per hoisted rotation call: {e: ct}."""
     ops, d = rt.ops, rt.dims
@@ -350,17 +362,25 @@ def _offsets(ch: Chunks, c: int):
     return out
 
 
+def prefix_offset(ch: Chunks, c: int) -> int:
+    """The score offset of the public prefix key for query chunk c: the first own-chunk offset no lane uses when the
+    chunk is partial (nq < t: offsets nq .. t - 1 hold no valid lane), else (c + 1) t, past every real offset."""
+    nq = len(ch.lanes(c))
+    return nq if nq < ch.t else c * ch.t + ch.t
+
+
 def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
-    """(N,) bool: slots of score ciphertext m of query chunk c holding a real score (`prefix`: offset (c + 1) t)."""
+    """(N,) bool: slots of score ciphertext m of query chunk c holding a real score (`prefix`: at prefix_offset)."""
     nq = len(ch.lanes(c))
     i = np.arange(d.N)
     blk, h, lane = i // d.tH, (i % d.tH) // d.t, i % d.t
     u = m * d.d_head + blk
     same = u < ch.t
-    U = c * ch.t + ch.t + (1 if prefix else 0)
-    ok = (h < d.H_real) & (lane < nq) & (u < U)
-    ok &= np.where(same, lane >= u, True)
-    return ok
+    reg = (u < c * ch.t + ch.t) & np.where(same, lane >= u, True)
+    if prefix:
+        bos = u == prefix_offset(ch, c)
+        reg = (reg & ~bos) | bos
+    return (h < d.H_real) & (lane < nq) & reg
 
 
 def rope_lanes(rt, x, rope, positions, site):
@@ -566,7 +586,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         if c not in owns:
             owns[c] = [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)])
         own = owns[c]
-        u_pre = c * ch.t + ch.t                                    # prefix key's offset
+        u_pre = prefix_offset(ch, c)                               # prefix key's offset
         M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
         S = [None] * M
         pre = prefix is not None

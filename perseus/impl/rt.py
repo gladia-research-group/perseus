@@ -144,6 +144,15 @@ class Rt:
         self.mask_misses = 0
         return self.mask_stats
 
+    def evict_masks(self, prefixes):
+        """Drop the encoded plaintexts of every mask whose site starts with one of `prefixes` (all levels): a prefill
+        block's attention masks, which the next block re-encodes at its own levels instead of piling up on the device.
+        Returns the number of plaintexts freed."""
+        keys = [k for k in self._kinfo if self.site(k).startswith(tuple(prefixes))]
+        if not keys:
+            return 0
+        return self.ops.erase_pts([self._kinfo[k][0] for k in keys])
+
     def drain(self):
         """Join every staged job still in flight (before the session closes: a job that
         outlives the Inference it encodes for is a use-after-free at exit)."""

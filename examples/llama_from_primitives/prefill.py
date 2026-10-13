@@ -15,6 +15,7 @@ from perseus.impl.prefill import (name_inputs, gelu_joint, Chunks, decrypt_promp
                                   prefill_attention, split)
 
 from perseus.impl import blocked as BL
+from perseus.impl.prefill import evict_block_masks
 from perseus.impl.pcmm import run as pcmm_run
 
 from . import prefix as PX
@@ -223,6 +224,7 @@ class LlamaPrefill(LlamaModel):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
                                                      self.rope, self.prefix_kv(b), B)
                 self.exit_stage(b, cap)
+                evict_block_masks(self.rt)
                 if on_block is not None:
                     on_block(b, Xs, time.time() - t0)
             return Xs, ch, self.token_end(0)
@@ -237,6 +239,7 @@ class LlamaPrefill(LlamaModel):
             with self.rt.step(f"blk{b}"):
                 Xs = blk(self.rt, Xs, w, self.cfgs.block(b), ch, self.rope, self.prefix_kv(b))
             self.exit_stage(b, cap)
+            evict_block_masks(self.rt)
             if on_block is not None:
                 on_block(b, Xs, time.time() - t0)
         return Xs, ch, self.token_end(0)
