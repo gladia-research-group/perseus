@@ -93,7 +93,8 @@ RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS
                   "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0",
                   "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0", "KV_LANES": "0", "CHEB_BSGS": "0",
                   "QKV_LANES": "0", "IMPL_SCOPED_NAMES": "0", "SM_HRS_PACK": "0", "CUTMAX_PAIR": "0",
-                  "IMPL_DEAD_OPS": "0", "LADDER_RADIX_BITS": "0", "FIDESLIB_BTS_RAISE_DROP": "0"}
+                  "IMPL_DEAD_OPS": "0", "LADDER_RADIX_BITS": "0", "FIDESLIB_BTS_RAISE_DROP": "0",
+                  "SM_CHEB_GS": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):

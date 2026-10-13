@@ -46,6 +46,8 @@ LOAD_BEARING_ENV = (
     "LADDER_RADIX_BITS",
     # Chebyshev leaves on pre-aligned babies (impl poly._AlignedBabies): a different op sequence
     "CHEB_ALIGN",
+    # Chebyshev-scaled Goldschmidt softmax rounds (impl smcheb): different counts and constants
+    "SM_CHEB_GS",
 )
 
 

@@ -29269,7 +29269,19 @@
    "delta2": 8,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 5
+   "gs_iters_first": 5,
+   "recip_iters_cheb": [
+    5,
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.01,
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.1.attn": {
    "mid_x": -3.946160316467285,
@@ -29647,7 +29659,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 3
+   "gs_iters_first": 3,
+   "recip_iters_cheb": [
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.1,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.10.attn": {
    "mid_x": -7.16173267364502,
@@ -30025,7 +30047,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 3
+   "gs_iters_first": 3,
+   "recip_iters_cheb": [
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.11.attn": {
    "mid_x": 1.3557415008544922,
@@ -30566,7 +30598,19 @@
    "delta2": 8,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 5
+   "gs_iters_first": 5,
+   "recip_iters_cheb": [
+    5,
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.01,
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.2.attn": {
    "mid_x": -28.842597484588623,
@@ -31107,7 +31151,19 @@
    "delta2": 8,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 2
+   "gs_iters_first": 2,
+   "recip_iters_cheb": [
+    3,
+    5,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.3,
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.3.attn": {
    "mid_x": -24.809497833251953,
@@ -31648,7 +31704,19 @@
    "delta2": 8,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 2
+   "gs_iters_first": 2,
+   "recip_iters_cheb": [
+    5,
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.03,
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.4.attn": {
    "mid_x": -39.26888656616211,
@@ -32515,7 +32583,23 @@
    "delta2": 32,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 2
+   "gs_iters_first": 2,
+   "recip_iters_cheb": [
+    3,
+    5,
+    4,
+    5,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.2,
+    0.1,
+    0.3,
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.5.attn": {
    "mid_x": -11.126691341400145,
@@ -32893,7 +32977,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 3
+   "gs_iters_first": 3,
+   "recip_iters_cheb": [
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.6.attn": {
    "mid_x": -12.452764034271238,
@@ -33271,7 +33365,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 4
+   "gs_iters_first": 4,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.1,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.7.attn": {
    "mid_x": -9.628583431243898,
@@ -33649,7 +33753,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 4
+   "gs_iters_first": 4,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.1,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.8.attn": {
    "mid_x": -8.69322919845581,
@@ -34027,7 +34141,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 3
+   "gs_iters_first": 3,
+   "recip_iters_cheb": [
+    4,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.2,
+    0.1,
+    0.001
+   ]
   },
   "transformer.h.9.attn": {
    "mid_x": -8.666134595870972,
@@ -34405,7 +34529,17 @@
    "delta2": 4,
    "decode_window": 160,
    "calib_T": 1024,
-   "gs_iters_first": 4
+   "gs_iters_first": 4,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6
+   ],
+   "recip_targets": [
+    0.03,
+    0.03,
+    0.001
+   ]
   }
  },
  "cutmax": {

@@ -12,10 +12,11 @@ import os
 
 import numpy as np
 
+from perseus.impl import smcheb
 from perseus.impl.attention import first_iters
 from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg
 from perseus.impl.poly import (NumpyOps, eval_chebyshev, eval_polynomial_ps, eval_remez_31,
-                   eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0,
+                   eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0, goldschmidt_recip,
                    inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, pow_odd,
                    taylor_inv_sqrt_coeffs)
 
@@ -89,6 +90,16 @@ def softmax_ref(scores, cfg: SoftmaxCfg, kc: int):
     for _ in range(cfg.log2delta1):
         z = z * z
     z = z / kc                                   # im_cleanse (x2) then the 0.5/kc active mask
+    if os.environ.get("SM_CHEB_GS", "0") not in ("", "0"):
+        # attention._softmax_recip under SM_CHEB_GS=1: the packed goldschmidt_recip with the impl smcheb constants
+        y = None
+        for k, (alpha, beta, iters, scale, cheb) in enumerate(smcheb.rounds(cfg, kc)):
+            if k:
+                z = (2.0 * y) ** 2                # square(im_cleanse(y))
+            d = z.sum(axis=-1, keepdims=True) * np.ones_like(z)
+            r = goldschmidt_recip(_ops, d, alpha, beta, iters, scale, Dh=0.5 * beta * scale * scale * d, cheb=cheb)
+            y = z * np.real(r)
+        return 2.0 * y * 0.5                     # softmax_v's im_cleanse and tok0 half mask
     tot = z.sum(axis=-1, keepdims=True) * np.ones_like(z)
     F = cfg.init_alpha - cfg.init_beta * tot
     y = goldschmidt_inv_ndf(_ops, z, tot, F, first_iters(cfg, _on("SM_GS_FIRST")))

@@ -66,6 +66,9 @@ class FheOps:
         # SM_GS_FIRST=1: the softmax's first division at its gs_iters_first count
         self.ln_cheb = os.environ.get("LN_CHEB", "1") not in ("", "0")
         self.sm_gs_first = os.environ.get("SM_GS_FIRST", "1") not in ("", "0")
+        # SM_CHEB_GS=1: the softmax reciprocal rounds run Chebyshev-scaled Goldschmidt on exact per-kc bands (impl smcheb;
+        # the counts and constants differ, so plan-bound; off by default)
+        self.sm_cheb_gs = os.environ.get("SM_CHEB_GS", "0") not in ("", "0")
         # SM_PERIODIC=1: while every cached token fits one group (kc <= t) the scores, the softmax and its
         # denominators stay tH-periodic instead of living in block 0, so their refreshes route sparse and P.V is one
         # product (attention.qkt / softmax_thor / softmax_v)

@@ -15,6 +15,7 @@ from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
                      stride_mask, vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
+from . import smcheb
 from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cleanse, rotsum,
                    rotsum_neg)
 
@@ -87,7 +88,7 @@ def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
         return []
     item = _hrs_pack_item if getattr(rt.ops, "hrs_pack", False) else _hrs_seed_item
     return [item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
-            for k, (_a, beta, _i, scale) in enumerate(_recip_rounds(cfg, kc, getattr(rt.ops, "sm_gs_first", False)))]
+            for k, (_a, beta, _i, scale, _c) in enumerate(_recip_rounds_ops(rt.ops, cfg, kc))]
 
 
 def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)):
@@ -111,6 +112,14 @@ def _recip_rounds(cfg: SoftmaxCfg, kc: int, lean: bool):
         rounds.append((cfg.refine_alpha[i] * math.sqrt(r), cfg.refine_beta[i] * r,
                        int(cfg.per_step_refine_iters[i]), c))
     return rounds
+
+
+def _recip_rounds_ops(ops, cfg: SoftmaxCfg, kc: int):
+    """(alpha, beta, iters, scale, cheb) of each reciprocal round under the session's switches: SM_CHEB_GS=1 takes the
+    Chebyshev-scaled rounds of impl smcheb (cheb = (kappas, mu)), else _recip_rounds with cheb None."""
+    if getattr(ops, "sm_cheb_gs", False):
+        return smcheb.rounds(cfg, kc)
+    return [r + (None,) for r in _recip_rounds(cfg, kc, getattr(ops, "sm_gs_first", False))]
 
 
 def _seed_site(cfg: SoftmaxCfg, rnd: int) -> str:
@@ -623,16 +632,16 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     Same arithmetic as the default path."""
     ops = rt.ops
     fold = getattr(ops, "sm_fold", False) and not getattr(ops, "fused_sm_den", False)
-    for k, (alpha, beta, iters, scale) in enumerate(_recip_rounds(cfg, kc, ops.sm_gs_first)):
+    for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
         if k:
             z = ops.square(im_cleanse(ops, y))
         if fold:
             s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
                                     seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k))
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh))
+            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
         else:
             s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc))
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale))
+            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
     return y
 
 
@@ -643,6 +652,8 @@ def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     z = _thor_exp(rt, scores, cfg, kc, folded)
     if ops.sm_den_recip:
         return _softmax_recip(rt, z, cfg, kc)
+    if getattr(ops, "sm_cheb_gs", False):
+        raise ValueError("SM_CHEB_GS=1 needs SM_DEN_RECIP=1")
     s = head_reduce_sum(rt, z, s0_expected=2.0 / cfg.init_alpha, periodic=sm_periodic(rt, kc))
     F_init = ops.mult(s, -cfg.init_beta)
     F_init = ops.add(F_init, cfg.init_alpha)

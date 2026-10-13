@@ -350,7 +350,7 @@ def goldschmidt_inv_ndf(ops, N_init, D_init, F_init, iters: int):
     return N
 
 
-def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0, Dh=None):
+def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0, Dh=None, cheb=None):
     """1/D by the goldschmidt_inv_ndf recurrence with its numerator left out, the seed
     F_init = alpha - beta x calibrated for x = scale D (F_k = 2 - D_k, D_{k+1} = D_k F_k on
     scale D; the product of the F's, times scale, is 1/D). A caller dividing a wide payload by a
@@ -358,8 +358,28 @@ def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: floa
     the running D and the reciprocal share one ciphertext, P = D_neg/2 + i R/2, so one product
     (P <- P F, F = 2 + P + conj P) and one refresh serve both; R = i (conj P - P). A real payload
     carries them as two ciphertexts. `Dh` = (b/2) D supplied by the caller (a second mask on D's reduction,
-    SM_FOLD) takes the seed's ciphertext x constant products off the chain: one level less per call."""
+    SM_FOLD) takes the seed's ciphertext x constant products off the chain: one level less per call.
+    `cheb` = (kappas, mu) (SM_CHEB_GS, impl smcheb): the Chebyshev-scaled steps, F = 2 kappa_j + P + conj P, on a
+    seed already scaled by kappa_0 (alpha, beta); the reciprocal's seed is scaled by mu = 1/lambda_K, which on a
+    complex payload rides the seed product itself: P = G (D - i mu) = -i (G (i D + mu)) (no extra level or product)."""
     a, b = alpha * scale, beta * scale * scale        # scale F_init(scale D) = a - b D
+    if cheb is not None:
+        kap, mu = cheb
+        if ops.complex_payload:
+            G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a) if Dh is None else ops.add(Dh, -0.5 * a)
+            P = ops.negate(ops.mult_i(ops.mult(G, ops.add(ops.mult_i(D), mu))))   # -kappa_0 D F / 2 + i mu kappa_0 F / 2
+            for j in range(iters - 1):
+                P = ops.mult(P, ops.add(ops.add(P, ops.conjugate(P)), 2.0 * kap[j]))
+            return ops.mult_i(ops.sub(ops.conjugate(P), P))
+        bD = ops.mult(D, b) if Dh is None else ops.add(Dh, Dh)
+        R = ops.add(ops.mult(bD, -mu), mu * a)                                  # mu kappa_0 F
+        D_neg = ops.mult(D, ops.add(bD, -a))                                   # -kappa_0 D F
+        for j in range(iters - 1):
+            F = ops.add(D_neg, 2.0 * kap[j])
+            R = ops.mult(R, F)
+            if j + 2 < iters:
+                D_neg = ops.mult(D_neg, F)
+        return R
     if ops.complex_payload:
         if Dh is None:
             G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a)                   # -scale F_init / 2

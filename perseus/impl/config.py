@@ -64,6 +64,9 @@ class SoftmaxCfg:
     cheb_b: float = 1.0
     sm_kc_r: tuple = ()
     gs_iters_first: int = 0          # the first division's count under SM_GS_FIRST
+    # SM_CHEB_GS (impl smcheb): Chebyshev-scaled Goldschmidt counts per round and the mid-round residual targets
+    recip_iters_cheb: tuple = ()
+    recip_targets: tuple = ()
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -180,7 +183,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         per_step_refine_iters=_tup(j["per_step_refine_iters"]),
         cheb_coeffs=_tup(j.get("cheb_coeffs")), cheb_a=float(j.get("cheb_a", -1.0)),
         cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")),
-        gs_iters_first=int(j.get("gs_iters_first", 0)))
+        gs_iters_first=int(j.get("gs_iters_first", 0)),
+        recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
