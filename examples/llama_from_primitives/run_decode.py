@@ -122,6 +122,9 @@ def main(argv=None):
         if r.get("masks"):
             m = r["masks"]
             line += f" masks={m.get('adopted', 0)}/{m.get('evicted', 0)}/{m.get('misses', 0)}"
+        if os.environ.get("FIDESLIB_POOL_TRACE") and hasattr(_core, "gpu_pool_trace"):
+            for site, nb in _core.gpu_pool_trace(6)[:8]:
+                line += f"\n  [trace] {nb / 2**30:.2f} GB  {site[:260]}"
         print(line, flush=True)
         if a.profile and hasattr(model.rt.ops, "report_steps"):
             print("[llama] steps: " + " | ".join(t.split("%")[0].strip() for t in model.rt.ops.report_steps(1).split("\n")[:8]), flush=True)

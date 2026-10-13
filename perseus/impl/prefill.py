@@ -328,14 +328,17 @@ _EVICT_SITES = ("",)        # every mask: the next block re-encodes them at its 
 
 
 _POOL_TRIM = os.environ.get("PF_POOL_TRIM", "1") not in ("", "0")
+_EVICT_BELOW_GB = float(os.environ.get("PF_EVICT_BELOW_GB", "12"))     # both run only under memory pressure
 
 
 def evict_block_masks(rt):
     """End of a prefill block: free its masks' device plaintexts (PF_EVICT_MASKS, default on; every block re-encodes
     them at its own levels) and hand the pools' idle memory back to the device (PF_POOL_TRIM, default on: the CUDA
     stream-ordered pool otherwise keeps every peak, out of reach of plain allocations)."""
-    n = rt.evict_masks(_EVICT_SITES) if _EVICT and hasattr(rt.ops, "erase_pts") else 0
     core = rt.ops.core
+    if hasattr(core, "device_free_gb") and core.device_free_gb() >= _EVICT_BELOW_GB:
+        return 0          # no pressure: keep the masks for the next block (re-encoding them costs a few %)
+    n = rt.evict_masks(_EVICT_SITES) if _EVICT and hasattr(rt.ops, "erase_pts") else 0
     if _POOL_TRIM and hasattr(core, "gpu_pool_trim"):
         core.gpu_pool_trim()
     return n
