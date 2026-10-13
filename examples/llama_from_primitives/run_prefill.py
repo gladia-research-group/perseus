@@ -46,7 +46,9 @@ def main(argv=None):
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
     os.environ["CUDA_VISIBLE_DEVICES"] = str(a.device)
     gt = hf.oracle_logits(toks, cache)
-    over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": "cachemir_complex",
+    # the prefill keeps the host wait on device-encoded plaintexts that FIDESlib f12c06e restored for this path;
+    # the decode runs without it (FIDESLIB_ENCODE_NOSYNC default 1). --set FIDESLIB_ENCODE_NOSYNC=1 overrides.
+    over = {"FIDESLIB_ENCODE_NOSYNC": "0", **env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": "cachemir_complex",
             **dict(kv.split("=", 1) for kv in a.set)}
     for k, v in over.items():          # a plan's PF_* switches (the arm it was made for); the shell's win
         if k.startswith("PF_"):

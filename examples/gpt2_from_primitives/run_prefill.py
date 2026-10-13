@@ -42,7 +42,9 @@ def main(argv=None):
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
     from . import env
-    over = {**env.plan_runtime(a.plan, "n32"), "GPT2_PACKING": "cachemir",
+    # the prefill keeps the host wait on device-encoded plaintexts that FIDESlib f12c06e restored for this path;
+    # the decode runs without it (FIDESLIB_ENCODE_NOSYNC default 1). --set FIDESLIB_ENCODE_NOSYNC=1 overrides.
+    over = {"FIDESLIB_ENCODE_NOSYNC": "0", **env.plan_runtime(a.plan, "n32"), "GPT2_PACKING": "cachemir",
             **dict(kv.split("=", 1) for kv in a.set)}
     for k, v in over.items():          # a plan's PF_* switches (the arm it was made for); the shell's win
         if k.startswith("PF_"):
