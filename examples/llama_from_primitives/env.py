@@ -51,7 +51,10 @@ def rot_steps(dims: Dims) -> list[int]:
         # lanes 2 .. G + 1 on the push refresh
         from perseus.impl.attention import gqa_dims
         G = dims.H // 8
-        steps |= set(rot_steps(gqa_dims(dims, G)))
+        sub = gqa_dims(dims, G)
+        # the attention core and the push on the sub-geometry only (its linears never run)
+        steps |= {s % N for s in attention_rot_steps(sub) if s % N} | {-k for k in range(1, sub.t)} | {N // 2}
+        steps -= {N - k for k in range(1, sub.t)}      # the code rotates by -k: N - k would be a second key
         steps |= {s * g * dims.t for g in range(1, G) for s in (1, -1)} | {s * (2 + i) for i in range(G) for s in (1, -1)}
     return sorted(steps)
 
