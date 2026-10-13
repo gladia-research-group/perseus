@@ -143,10 +143,22 @@ def llama_prefill_block_pcmm(rt, Xs, P, cfgs, ch: Chunks, rope, prefix_kv):
     return [ops.add(a, s) for a, s in zip(out, skip)]
 
 
+def _memdbg(rt, tag):
+    """PF_MEMDBG=1: device free and pool reserved after a stage (where the non-pool memory goes)."""
+    if not os.environ.get("PF_MEMDBG"):
+        return
+    core = rt.ops.core
+    if hasattr(core, "device_free_gb"):
+        rt.ops.device_sync()
+        st = core.gpu_pool_stats() if hasattr(core, "gpu_pool_stats") else {}
+        print(f"[memdbg] {tag}: free={core.device_free_gb():.2f}GB pool={st.get('reserved_gb', 0):.2f}GB", flush=True)
+
+
 def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B):
     """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block)."""
     ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
+    _memdbg(rt, "in")
     skip = Xs
     with rt.step("ln_1"):
         Y = BL.norm_blocked(rt, Xs, ln1, ch, B, rms=True, max_period=_NORM_PERIOD)
@@ -155,14 +167,18 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B):
         for y in Y:
             o = pcmm_run(rt, y, P["qkv"])
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+    _memdbg(rt, "qkv")
     with rt.step("attn"):
         O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes)
+    _memdbg(rt, "attn")
     with rt.step("out_proj"):
         A = [pcmm_run(rt, o, P["out"]) for o in O]
     Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
+    _memdbg(rt, "out_proj")
     skip = Xs
     with rt.step("ln_2"):
         Y = BL.norm_blocked(rt, Xs, ln2, ch, B, rms=True, max_period=_NORM_PERIOD)
+    _memdbg(rt, "ln_2")
     out = []
     for y in Y:
         with rt.step("gate_up"):
@@ -172,6 +188,7 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B):
             H = [glu_pair(rt, g, u, act, dense=True) for g, u in zip(GU[:nb], GU[nb:])]
         with rt.step("down"):
             out.append(pcmm_run(rt, H, P["down"]))
+    _memdbg(rt, "mlp")
     return [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(out, skip)]
 
 

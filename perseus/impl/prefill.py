@@ -324,7 +324,7 @@ def lane_rotate(rt, x, e: int, site: str):
 
 
 _EVICT = os.environ.get("PF_EVICT_MASKS", "1") not in ("", "0")
-_EVICT_SITES = ("pf.",)
+_EVICT_SITES = ("",)        # every mask: the next block re-encodes them at its own levels
 
 
 def evict_block_masks(rt):
