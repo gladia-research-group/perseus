@@ -83,9 +83,7 @@ def main(argv=None):
         env.export_env(a.device, chain="n32", **{"CKKS_COMPLEX": "1", **over})
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
-        from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
-        _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)) | (
-            ladder_radix_steps(dims, ladder_radix_bits()) if ladder_radix_bits() >= 2 else set()))
+        _, inf = fakecap.make_session(dims, set(env.rot_steps(dims)))      # the GPU session's keys exactly
         sess = fakecap.FakeSession(inf)
     else:
         sess = env.open_session(dims, a.device, complex_payload=True, **over)
@@ -112,6 +110,9 @@ def main(argv=None):
             inf.fhe.magnitude_suppressed = True
     if a.plan:
         model.load_plans(a.plan)
+    if os.environ.get("LLAMA_GC_FREEZE", "0") not in ("", "0"):
+        import gc
+        gc.collect(); gc.freeze(); gc.disable()
     if a.taps:
         model.taps = {}
         model.tap_blocks = tuple(int(b) for b in a.tap_blocks.split(",")) if a.tap_blocks else ()

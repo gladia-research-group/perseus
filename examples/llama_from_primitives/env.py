@@ -46,6 +46,7 @@ def rot_steps(dims: Dims) -> list[int]:
     pos = {s % N for s in steps if s % N and s % N > N - dims.t}
     steps = {s % N for s in steps if s % N} - pos
     steps |= {-k for k in range(1, dims.t)}
+    steps |= _radix_steps(dims)
     if os.environ.get("LLAMA_GQA", "0") not in ("", "0") and dims.H % 8 == 0 and dims.H > 8:
         # the un-expanded K / V cache (attention.mha_gqa): the sub-geometry's steps, the queries' g t moves and their
         # lanes 2 .. G + 1 on the push refresh
@@ -56,7 +57,20 @@ def rot_steps(dims: Dims) -> list[int]:
         steps |= {s % N for s in attention_rot_steps(sub) if s % N} | {-k for k in range(1, sub.t)} | {N // 2}
         steps -= {N - k for k in range(1, sub.t)}      # the code rotates by -k: N - k would be a second key
         steps |= {s * g * dims.t for g in range(1, G) for s in (1, -1)} | {s * (2 + i) for i in range(G) for s in (1, -1)}
+        steps |= _radix_steps(sub)
     return sorted(steps)
+
+
+def _radix_steps(dims: Dims) -> set[int]:
+    """The radix ladders' group steps (LADDER_RADIX_BITS): without them ops.cu rotate_and_sum runs the plain ladder
+    while a capture with them (the fake) records the hoisted groups, and plans fail plan_deg_error. The steps just
+    below N are the replicate-right ladders' -k (keyed as -k, not N - k)."""
+    from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
+    bits = ladder_radix_bits()
+    if bits < 2:
+        return set()
+    N = dims.N
+    return {s - N if s > N - dims.t else s for s in ladder_radix_steps(dims, bits)}
 
 
 def export_env(device=3, chain="n32", **overrides):
