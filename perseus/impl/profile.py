@@ -27,16 +27,18 @@ class TimedOps(FheOps):
         self.n_step = collections.defaultdict(int)
         self.t_sp = collections.defaultdict(float)     # (step, primitive) -> time
         self.n_sp = collections.defaultdict(int)
+        self.b_sp = collections.defaultdict(int)       # (step, primitive) -> bootstraps fired inside
         self.step_label = None
 
     def reset(self):
         self.t.clear(); self.n.clear(); self.t_step.clear(); self.n_step.clear()
-        self.t_sp.clear(); self.n_sp.clear()
+        self.t_sp.clear(); self.n_sp.clear(); self.b_sp.clear()
 
     def report_step_split(self, step, tokens=1, top=10):
         """The primitives inside one step label (e.g. "cutmax"): time and calls per token."""
         rows = sorted(((k[1], v) for k, v in self.t_sp.items() if k[0] == step), key=lambda kv: -kv[1])[:top]
-        return " | ".join(f"{k} {v / tokens:.2f}s n={self.n_sp[(step, k)] // tokens}" for k, v in rows)
+        return " | ".join(f"{k} {v / tokens:.2f}s n={self.n_sp[(step, k)] // tokens} bts={self.b_sp[(step, k)]}"
+                          for k, v in rows)
 
     def report_steps(self, tokens=1):
         tot = sum(self.t_step.values())
@@ -63,6 +65,7 @@ def _wrap(name):
     @functools.wraps(base)
     def f(self, *a, **k):
         t0 = time.perf_counter()
+        b0 = getattr(self.fhe, "total_bootstraps", 0)
         try:
             out = base(self, *a, **k)
             if _SYNC:                      # charge each primitive its own GPU time
@@ -77,6 +80,7 @@ def _wrap(name):
             self.n_step[lab] += 1
             self.t_sp[(lab, name)] += dt
             self.n_sp[(lab, name)] += 1
+            self.b_sp[(lab, name)] += getattr(self.fhe, "total_bootstraps", 0) - b0
     return f
 
 

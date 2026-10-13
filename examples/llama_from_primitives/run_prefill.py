@@ -21,7 +21,7 @@ def main(argv=None):
     ap.add_argument("--window", default="0")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=3)
-    ap.add_argument("--configs", default=DEFAULT_CONFIGS)
+    ap.add_argument("--configs", default=None)
     ap.add_argument("--capture", default=None)
     ap.add_argument("--structure-only", action="store_true")
     ap.add_argument("--plan", default=None)
@@ -34,6 +34,13 @@ def main(argv=None):
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 model")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     a = ap.parse_args(argv)
+    if not a.configs:
+        a.configs = DEFAULT_CONFIGS
+        cmd = os.path.join(a.plan, "PLAN_CMD.txt") if a.plan else ""
+        if cmd and os.path.exists(cmd):
+            for line in open(cmd).read().splitlines():
+                if line.startswith("configs="):
+                    a.configs = line[len("configs="):].split()[0]
     # prefill K / V stay on the device: a pinned KV arena would only lock host memory
     os.environ.setdefault("KV_ARENA_GB", "0")
     busy = None if a.fake else gpu_busy(a.device)
@@ -183,6 +190,8 @@ def main(argv=None):
     if a.profile and hasattr(model.rt.ops, "report"):
         print("[llama-prefill] time split:\n" + model.rt.ops.report())
         print("[llama-prefill] per step:\n" + model.rt.ops.report_steps(1))
+        for st in sorted(model.rt.ops.t_step, key=lambda k: -model.rt.ops.t_step[k])[:8]:
+            print(f"[llama-prefill] split {st}: " + model.rt.ops.report_step_split(st))
     model.close()
     sess.close()
     return 0
