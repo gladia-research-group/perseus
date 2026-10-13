@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 
+from . import smcheb
 from .attention import _recip_rounds, first_iters
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
@@ -23,6 +24,13 @@ _ATTN_PAIR = os.environ.get("PF_ATTN_PAIR", "1") not in ("", "0")
 _SM_JOINT = os.environ.get("PF_SM_JOINT", "0") not in ("", "0")
 # PF_LANE_HOIST=B: hoisted K / V lane rotations, B offsets per call (all at once exhausts the pool at t = 64)
 _LANE_HOIST = int(os.environ.get("PF_LANE_HOIST", "0") or 0)
+# PF_ATTN_PACK=l: paired q.K^T / P.V reductions packed 2^l products per ciphertext over windows of d_head / 2^l blocks
+_PACK = int(os.environ.get("PF_ATTN_PACK", "0") or 0)
+# PF_KV_SHARE=1: GQA query sets walk each K / V pair together (one complex K / V combination per pair, not per set)
+_KV_SHARE = os.environ.get("PF_KV_SHARE", "0") not in ("", "0")
+# PF_PRE_PERIODIC=1: a prefix score alone in its score ciphertext stays tH-periodic (sparse refreshes, no block select);
+# the prefix key / value plaintexts are encoded once per level
+_PRE_PERIODIC = os.environ.get("PF_PRE_PERIODIC", "0") not in ("", "0")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,14 +336,25 @@ _EVICT_SITES = ("",)        # every mask: each block re-encodes at its own level
 
 _POOL_TRIM = os.environ.get("PF_POOL_TRIM", "1") not in ("", "0")
 _EVICT_BELOW_GB = float(os.environ.get("PF_EVICT_BELOW_GB", "12"))     # evict/trim only below this
+# PF_EVICT_UNUSED=1: evict only the masks the block did not use (all of them below PF_EVICT_ALL_BELOW_GB)
+_EVICT_UNUSED = os.environ.get("PF_EVICT_UNUSED", "1") not in ("", "0")
+_EVICT_ALL_BELOW_GB = float(os.environ.get("PF_EVICT_ALL_BELOW_GB", "4"))
 
 
 def evict_block_masks(rt):
     """End of a prefill block, under memory pressure: evict mask plaintexts and trim the stream-ordered pools."""
     core = rt.ops.core
     if hasattr(core, "device_free_gb") and core.device_free_gb() >= _EVICT_BELOW_GB:
+        rt._used = set()
         return 0          # re-encoding the masks costs a few %
-    n = rt.evict_masks(_EVICT_SITES) if _EVICT and hasattr(rt.ops, "erase_pts") else 0
+    can = _EVICT and hasattr(rt.ops, "erase_pts")
+    if _EVICT_UNUSED and can:
+        n = rt.evict_unused()
+        if _POOL_TRIM and hasattr(core, "gpu_pool_trim"):
+            core.gpu_pool_trim()
+        if not hasattr(core, "device_free_gb") or core.device_free_gb() >= _EVICT_ALL_BELOW_GB:
+            return n
+    n = rt.evict_masks(_EVICT_SITES) if can else 0
     if _POOL_TRIM and hasattr(core, "gpu_pool_trim"):
         core.gpu_pool_trim()
     return n
@@ -388,6 +407,17 @@ def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
     return (h < d.H_real) & (lane < nq) & reg
 
 
+def _periodic_valid(d, ch: Chunks, c: int):
+    """(N,) bool: the slots of a tH-periodic prefix score ciphertext holding a real score."""
+    i = np.arange(d.N)
+    return ((i % d.tH) // d.t < d.H_real) & (i % d.t < len(ch.lanes(c)))
+
+
+def _vkey(v):
+    import hashlib
+    return hashlib.blake2b(np.ascontiguousarray(v).tobytes(), digest_size=8).hexdigest()
+
+
 def rope_lanes(rt, x, rope, positions, site):
     """RoPE of every lane at its own position: x cos + rotate(x, N/2) sin' (one level)."""
     ops, d = rt.ops, rt.dims
@@ -428,13 +458,23 @@ class _KcExtrapolated:
         return r
 
 
-def recip_lanes(rt, D, a_vals, b_vals, iters: int, key):
-    """1 / D by Goldschmidt with per-lane seed a - b D; D and the reciprocal share one complex ciphertext."""
+def recip_lanes(rt, D, a_vals, b_vals, iters: int, key, cheb=None):
+    """1 / D by Goldschmidt with per-lane seed a - b D; D and the reciprocal share one complex ciphertext.
+    `cheb` = (per-step kappa lanes, mu lanes): SM_CHEB_GS's scaled steps (poly.goldschmidt_recip)."""
     ops, d = rt.ops, rt.dims
     av = np.asarray(a_vals, dtype=np.float64)
     bv = np.asarray(b_vals, dtype=np.float64)
     hb = rt.mult_mask(D, ("pf.rcp.hb",) + key, lambda: _lane_vec(d, 0.5 * bv))
     G = rt.add_mask(hb, ("pf.rcp.ha",) + key, lambda: _lane_vec(d, -0.5 * av))
+    if cheb is not None:
+        kap, mu = cheb
+        X = rt.add_mask(ops.mult_i(D), ("pf.rcp.mu",) + key, lambda: _lane_vec(d, mu))
+        P = ops.negate(ops.mult_i(ops.mult(G, X)))
+        for j in range(iters - 1):
+            F = rt.add_mask(ops.add(P, ops.conjugate(P)), ("pf.rcp.kap", j) + key,
+                            lambda j=j: _lane_vec(d, 2.0 * np.asarray(kap[j])))
+            P = ops.mult(P, F)
+        return ops.mult_i(ops.sub(ops.conjugate(P), P))
     nb = rt.mult_mask(D, ("pf.rcp.nb",) + key, lambda: _lane_vec(d, -0.5 * bv))
     im = rt.add_mask(nb, ("pf.rcp.pa",) + key, lambda: _lane_vec(d, 0.5 * av))
     P = ops.add(ops.mult(D, G), ops.mult_i(im))
@@ -443,21 +483,22 @@ def recip_lanes(rt, D, a_vals, b_vals, iters: int, key):
     return ops.mult_i(ops.sub(ops.conjugate(P), P))
 
 
-def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0):
+def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic=None):
     """Score masks and the exp's Chebyshev of chunk c's score ciphertexts m0, m0 + 1, ...: [(z, valid)]."""
     ops, d = rt.ops, rt.dims
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     out = []
     for m, s in enumerate(S, m0):
-        valid = _score_valid(d, ch, c, m, prefix)
-        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean, ch.T, ch.base, prefix),
+        per = m == periodic
+        valid = _periodic_valid(d, ch, c) if per else _score_valid(d, ch, c, m, prefix)
+        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean, ch.T, ch.base, prefix) + (("per",) if per else ()),
                         lambda valid=valid: np.where(valid, -mean, cfg.clip_lo - mean))
         out.append((eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf), valid))
     return out
 
 
-def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int = 0):
+def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int = 0, periodic=None):
     """Squarings, cleanse and active mask (0.5 / kc per lane, times factor[j]) of chunk c's exps."""
     ops, d = rt.ops, rt.dims
     kcs = [p + 1 for p in ch.lanes(c)]
@@ -469,7 +510,8 @@ def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int
         z = im_cleanse(ops, z)
         f = 1.0 if factor is None else factor[j]
         lane_scale = np.array([f * 0.5 / kcs[i] if i < len(kcs) else 0.0 for i in range(d.t)])
-        key = ("pf.sm.active", c, m, ch.T, ch.base, prefix) + ((f,) if f != 1.0 else ())
+        key = ("pf.sm.active", c, m, ch.T, ch.base, prefix) + ((f,) if f != 1.0 else ()) + \
+            (("per",) if m == periodic else ())
         Z.append(rt.mult_mask(z, key,
                               lambda valid=valid, ls=lane_scale: np.where(valid, ls[np.arange(d.N) % d.t], 0.0)))
     return Z
@@ -493,7 +535,7 @@ def _sm_joint(rt, za, zb, cfg):
     return fa, fb
 
 
-def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None):
+def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None, periodic=None):
     """softmax_thor over chunk c's packed scores S with per-lane (kc-dependent) reciprocal seeds.
     `Z`: precomputed masked exps (the joint path)."""
     ops, d = rt.ops, rt.dims
@@ -502,24 +544,30 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     if Z is None:     # cheb then tail per score ct: the captured op order
         Z = []
         for m in range(len(S)):
-            (zc,) = _sm_cheb(rt, [S[m]], cfg, ch, c, prefix, m0=m)
-            Z += _sm_tail(rt, [zc], cfg, ch, c, prefix, m0=m)
+            (zc,) = _sm_cheb(rt, [S[m]], cfg, ch, c, prefix, m0=m, periodic=periodic)
+            Z += _sm_tail(rt, [zc], cfg, ch, c, prefix, m0=m, periodic=periodic)
     lean = ops.sm_gs_first
-    per_lane = [_recip_rounds(_KcExtrapolated(cfg), kc, lean) for kc in kcs]
+    cheb = getattr(ops, "sm_cheb_gs", False)
+    per_lane = [smcheb.rounds(cfg, kc) if cheb else _recip_rounds(_KcExtrapolated(cfg), kc, lean) for kc in kcs]
     Y = Z
     for k in range(len(per_lane[0])):
         if k:
             Z = [ops.square(im_cleanse(ops, y)) for y in Y]
-        D = Z[0] if len(Z) == 1 else ops.add(Z[0], Z[1])
-        for z in Z[2:]:
+        Zr = [z for m, z in enumerate(Z) if m != periodic]
+        D = Zr[0] if len(Zr) == 1 else ops.add(Zr[0], Zr[1])
+        for z in Zr[2:]:
             ops.inplace_add(D, z)
-        D = ops.tag_reduce(rotsum(ops, D, d.tH, d.N), d.tH)
+        D = rotsum(ops, D, d.tH, d.N)
+        if periodic is not None:
+            D = ops.add(D, Z[periodic])
+        D = ops.tag_reduce(D, d.tH)
         rnd = [pl[k] for pl in per_lane]
         iters = rnd[0][2]
-        a_vals = [al * sc for (al, _b, _i, sc) in rnd]
-        b_vals = [be * sc * sc for (_a, be, _i, sc) in rnd]
+        a_vals = [r[0] * r[3] for r in rnd]
+        b_vals = [r[1] * r[3] * r[3] for r in rnd]
+        cv = None if not cheb else ([[r[4][0][j] for r in rnd] for j in range(iters - 1)], [r[4][1] for r in rnd])
         R = recip_lanes(rt, D, a_vals, b_vals, iters,
-                        (tuple(round(v, 12) for v in a_vals), tuple(round(v, 15) for v in b_vals)))
+                        (tuple(round(v, 12) for v in a_vals), tuple(round(v, 15) for v in b_vals)), cv)
         if _DBG:
             dv = np.real(D.vec).reshape(-1, d.t)[:, :len(pos)]; rv = np.real(R.vec).reshape(-1, d.t)[:, :len(pos)]
             hv = (np.arange(d.N) % d.tH) // d.t < d.H_real
@@ -584,8 +632,85 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
 
     owns, vowns = {}, {}
 
-    def qkt_stage(c, Q):
-        """Chunk c's packed scores and what its P.V needs."""
+    nw = 1 << _PACK
+    W = d.d_head // nw
+    blk_of = np.arange(d.N) // d.tH
+
+    def win_mask(a, lo=0):
+        """Blocks [aW - lo, aW - lo + W): window a (pack), lo = W - 1: what the forward broadcast fills from aW."""
+        return ((blk_of - a * W + lo) % d.d_head < W).astype(float)
+
+    def qkt_packed(c, QL, SL, groups, own, pre):
+        """Pair products summed over the nw windows (leaf ladder), packed one per window, summed inside the windows,
+        shifted to their score blocks with the real / imaginary parts split to u, u + 1 (per query set of QL)."""
+        by = {}
+        for grp in groups:
+            u = grp[0][0]
+            m, r = divmod(u, d.d_head)
+            a, o = divmod(r, W)
+            krs = [own[e] if cp == c else k_rot(cp, e, c) for _, cp, e in grp]
+            kc = krs[0] if len(krs) == 1 else ops.add(krs[0], ops.mult_i(krs[1]))
+            for i, Q in enumerate(QL):
+                p = rotsum(ops, ops.mult(Q[c], kc), W * d.tH, d.N)
+                v = rt.mult_mask(p, ("pf.qpk", a, W), lambda a=a: win_mask(a))
+                if (i, m, o) in by:
+                    ops.inplace_add(by[(i, m, o)], v)
+                else:
+                    by[(i, m, o)] = v
+        for (i, m, o), w in sorted(by.items()):
+            S = SL[i]
+            w = rotsum(ops, w, d.tH, W * d.tH)
+
+            def build(sh, coef, m=m):
+                start = (blk_of % W == 0)
+                valid = np.roll(_score_valid(d, ch, c, m, pre), -sh * d.tH)
+                return np.where(start & valid, coef, 0.0)
+            for sh, coef in ((o, 0.5 * gscale), (o + 1, -0.5j * gscale)):
+                x = rt.mult_mask(w, ("pf.qpl", c, m, sh, W, complex(coef), ch.T, ch.base, pre),
+                                 lambda sh=sh, coef=coef: build(sh, coef))
+                if sh:
+                    x = ops.rotate(x, d.N - sh * d.tH)
+                if S[m] is None:
+                    S[m] = x
+                else:
+                    ops.inplace_add(S[m], x)
+
+    def pv_packed(c, PL, groups, vown):
+        """Inverse of qkt_packed: each pair's 0.5 p_u - 0.5i p_(u+1) moved to its window's first block, broadcast over
+        the window, unpacked per window and broadcast over the nw windows (leaf ladder); per query set of PL
+        sum_pairs pb * vc."""
+        accs = [None] * len(PL)
+        by = {}
+        for grp in groups:
+            u = grp[0][0]
+            m, r = divmod(u, d.d_head)
+            a, o = divmod(r, W)
+            by.setdefault((m, o), []).append((a, grp))
+        for (m, o), items in sorted(by.items()):
+            ys = []
+            for P in PL:
+                y = None
+                for sh, coef in ((o, 0.5), (o + 1, -0.5j)):
+                    x = P[m] if sh == 0 else ops.rotate(P[m], sh * d.tH)
+                    x = rt.mult_mask(x, ("pf.vpk", W, complex(coef)),
+                                     lambda coef=coef: np.where(blk_of % W == 0, coef, 0.0))
+                    y = x if y is None else ops.add(y, x)
+                ys.append(rotsum(ops, y, d.tH, W * d.tH))
+            for a, grp in items:
+                pbs = [rotsum(ops, rt.mult_mask(y, ("pf.vup", a, W), lambda a=a: win_mask(a, W - 1)), W * d.tH, d.N)
+                       for y in ys]
+                vrs = [vown[e] if cp == c else v_rot(cp, e, c) for _, cp, e in grp]
+                vc = vrs[0] if len(vrs) == 1 else ops.add(vrs[0], ops.mult_i(vrs[1]))
+                for i, pb in enumerate(pbs):
+                    prod = ops.mult(pb, vc)
+                    if accs[i] is None:
+                        accs[i] = prod
+                    else:
+                        ops.inplace_add(accs[i], prod)
+        return accs
+
+    def qkt_stage(c, QL):
+        """Chunk c's packed scores and what its P.V needs, per query set of QL (one K pass)."""
         offs = _offsets(ch, c)
         nq = len(ch.lanes(c))
         if c not in owns:
@@ -593,11 +718,20 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         own = owns[c]
         u_pre = prefix_offset(ch, c)                               # prefix key's offset
         M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
-        S = [None] * M
+        SL = [[None] * M for _ in QL]
         pre = prefix is not None
+        per_m = (u_pre // d.d_head) if (pre and _PRE_PERIODIC and u_pre % d.d_head == 0
+                                        and all(u < u_pre for u, _, _ in offs)) else None
         pair = _ATTN_PAIR
         half = 0.5 if pair else 1.0          # paired: scores at 1/2, one cleanse per score ct
-        groups = [offs[i:i + 2] for i in range(0, len(offs), 2)] if pair else [[o] for o in offs]
+        packed = pair and _PACK > 0
+        if packed:
+            by_u = {}
+            for o in offs:
+                by_u.setdefault(o[0] // 2, []).append(o)
+            groups = [sorted(g) for _, g in sorted(by_u.items())]
+        else:
+            groups = [offs[i:i + 2] for i in range(0, len(offs), 2)] if pair else [[o] for o in offs]
 
         def smask(m, blk, coef):
             def build():
@@ -621,80 +755,113 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
 
         with rt.step("qkt"):
             if pre:
-                s = rotsum(ops, ops.mult_pt(Q[c], prefix[0]), d.tH, d.N)
-                m, blk = divmod(u_pre, d.d_head)
-                place(S, s, [(m, blk, half * gscale)], "pf.qkt")
-            for grp in groups:
-                krs = [own[e] if cp == c else k_rot(cp, e, c) for _, cp, e in grp]
-                kc = krs[0] if len(krs) == 1 else ops.add(krs[0], ops.mult_i(krs[1]))
-                s = rotsum(ops, ops.mult(Q[c], kc), d.tH, d.N)
-                coefs = (half * gscale, -0.5j * gscale)
-                place(S, s, [(*divmod(u, d.d_head), coefs[i]) for i, (u, _, _) in enumerate(grp)], "pf.qkt")
+                for Q, S in zip(QL, SL):
+                    m, blk = divmod(u_pre, d.d_head)
+                    if per_m is not None:
+                        k0 = np.asarray(prefix[0]) * (half * gscale)
+                        S[m] = ops.tag_reduce(rotsum(ops, rt.mult_mask(Q[c], ("pf.pre.k", _vkey(k0)), lambda: k0),
+                                                     d.tH, d.N), d.tH)
+                        continue
+                    q0 = rt.mult_mask(Q[c], ("pf.pre.k", _vkey(prefix[0])), lambda: np.asarray(prefix[0])) \
+                        if _PRE_PERIODIC else ops.mult_pt(Q[c], prefix[0])
+                    s = rotsum(ops, q0, d.tH, d.N)
+                    place(S, s, [(m, blk, half * gscale)], "pf.qkt")
+            if packed:
+                qkt_packed(c, QL, SL, groups, own, pre)
+            else:
+                for grp in groups:
+                    krs = [own[e] if cp == c else k_rot(cp, e, c) for _, cp, e in grp]
+                    kc = krs[0] if len(krs) == 1 else ops.add(krs[0], ops.mult_i(krs[1]))
+                    for Q, S in zip(QL, SL):
+                        s = rotsum(ops, ops.mult(Q[c], kc), d.tH, d.N)
+                        coefs = (half * gscale, -0.5j * gscale)
+                        place(S, s, [(*divmod(u, d.d_head), coefs[i]) for i, (u, _, _) in enumerate(grp)], "pf.qkt")
             if pair:
-                S = [im_cleanse(ops, x) for x in S]
-        return dict(S=S, offs=offs, nq=nq, u_pre=u_pre, pre=pre, groups=groups)
+                SL = [[im_cleanse(ops, x) for x in S] for S in SL]
+        return [dict(S=S, offs=offs, nq=nq, u_pre=u_pre, pre=pre, groups=groups, per=per_m) for S in SL]
 
-    def pv_stage(c, st, P):
+    def pv_stage(c, sts, PL):
+        st = sts[0]
         offs, nq, u_pre, pre, groups = st["offs"], st["nq"], st["u_pre"], st["pre"], st["groups"]
         with rt.step("softmax_v"):
             if c not in vowns:
                 vowns[c] = [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)])
             vown = vowns[c]
-            acc = None
+            accs = [None] * len(PL)
             if pre:
                 m, blk = divmod(u_pre, d.d_head)
-                pb = rt.mult_mask(P[m], ("pf.bsel", blk), lambda blk=blk: np.where(
-                    np.arange(d.N) // d.tH == blk, 0.5, 0.0))
-                acc = ops.mult_pt(rotsum(ops, pb, d.tH, d.N), prefix[1])
+                for i, P in enumerate(PL):
+                    if st["per"] is not None:
+                        v0 = 0.5 * np.asarray(prefix[1])
+                        accs[i] = rt.mult_mask(P[m], ("pf.pre.v", _vkey(v0)), lambda: v0)
+                        continue
+                    pb = rt.mult_mask(P[m], ("pf.bsel", blk), lambda blk=blk: np.where(
+                        np.arange(d.N) // d.tH == blk, 0.5, 0.0))
+                    pb = rotsum(ops, pb, d.tH, d.N)
+                    accs[i] = rt.mult_mask(pb, ("pf.pre.v", _vkey(prefix[1])), lambda: np.asarray(prefix[1])) \
+                        if _PRE_PERIODIC else ops.mult_pt(pb, prefix[1])
+            if _ATTN_PAIR and _PACK > 0:
+                pas = pv_packed(c, PL, groups, vown)
+                accs = [pa if acc is None else ops.add(acc, pa) for acc, pa in zip(accs, pas)]
+                groups = []
             for grp in groups:
-                sel = [None] * len(P)
-                coefs = (0.5, -0.5j)
-                for i, (u, _, _) in enumerate(grp):
-                    m, blk = divmod(u, d.d_head)
-                    mk = lambda blk=blk, cf=coefs[i]: np.where(np.arange(d.N) // d.tH == blk, cf, 0.0)
-                    v = rt.mult_mask(P[m], ("pf.bsel", blk, complex(coefs[i])), mk)
-                    if sel[m] is None:
-                        sel[m] = v
-                    else:
-                        ops.inplace_add(sel[m], v)
-                pb = None
-                for v in sel:
-                    if v is not None:
-                        pb = v if pb is None else ops.add(pb, v)
-                pb = rotsum(ops, pb, d.tH, d.N)
+                pbs = []
+                for P in PL:
+                    sel = [None] * len(P)
+                    coefs = (0.5, -0.5j)
+                    for i, (u, _, _) in enumerate(grp):
+                        m, blk = divmod(u, d.d_head)
+                        mk = lambda blk=blk, cf=coefs[i]: np.where(np.arange(d.N) // d.tH == blk, cf, 0.0)
+                        v = rt.mult_mask(P[m], ("pf.bsel", blk, complex(coefs[i])), mk)
+                        if sel[m] is None:
+                            sel[m] = v
+                        else:
+                            ops.inplace_add(sel[m], v)
+                    pb = None
+                    for v in sel:
+                        if v is not None:
+                            pb = v if pb is None else ops.add(pb, v)
+                    pbs.append(rotsum(ops, pb, d.tH, d.N))
                 vrs = [vown[e] if cp == c else v_rot(cp, e, c) for _, cp, e in grp]
                 vc = vrs[0] if len(vrs) == 1 else ops.add(vrs[0], ops.mult_i(vrs[1]))
-                prod = ops.mult(pb, vc)
-                if acc is None:
-                    acc = prod
-                else:
-                    ops.inplace_add(acc, prod)
-            return im_cleanse(ops, acc)
+                for i, pb in enumerate(pbs):
+                    prod = ops.mult(pb, vc)
+                    if accs[i] is None:
+                        accs[i] = prod
+                    else:
+                        ops.inplace_add(accs[i], prod)
+            return [im_cleanse(ops, acc) for acc in accs]
 
-    def attend(Q):
-        outs = [None] * nc
+    def attend(QL):
+        outs = [[None] * nc for _ in QL]
         if _SM_JOINT:
             for k in range(0, nc, 2):
                 cs = [c for c in (k, k + 1) if c < nc]
-                sts = {c: qkt_stage(c, Q) for c in cs}
-                with rt.step("softmax"):
-                    zs = {c: _sm_cheb(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"]) for c in cs}
-                    fac = {c: None for c in cs}
-                    if len(cs) == 2:
-                        fac[cs[0]], fac[cs[1]] = _sm_joint(rt, zs[cs[0]], zs[cs[1]], cfg)
-                    Ps = {c: prefill_softmax(rt, sts[c]["S"], cfg, ch, c, sts[c]["pre"],
-                                             Z=_sm_tail(rt, zs[c], cfg, ch, c, sts[c]["pre"], fac[c])) for c in cs}
-                for c in cs:
-                    outs[c] = pv_stage(c, sts[c], Ps[c])
+                sts = {c: qkt_stage(c, QL) for c in cs}
+                for i in range(len(QL)):
+                    with rt.step("softmax"):
+                        zs = {c: _sm_cheb(rt, sts[c][i]["S"], cfg, ch, c, sts[c][i]["pre"]) for c in cs}
+                        fac = {c: None for c in cs}
+                        if len(cs) == 2:
+                            fac[cs[0]], fac[cs[1]] = _sm_joint(rt, zs[cs[0]], zs[cs[1]], cfg)
+                        Ps = {c: prefill_softmax(rt, sts[c][i]["S"], cfg, ch, c, sts[c][i]["pre"],
+                                                 Z=_sm_tail(rt, zs[c], cfg, ch, c, sts[c][i]["pre"], fac[c]))
+                              for c in cs}
+                    for c in cs:
+                        outs[i][c] = pv_stage(c, [sts[c][i]], [Ps[c]])[0]
         else:
             for c in range(nc):
-                st = qkt_stage(c, Q)
-                with rt.step("softmax"):
-                    P = prefill_softmax(rt, st["S"], cfg, ch, c, st["pre"])
-                outs[c] = pv_stage(c, st, P)
-        return [join(ops, outs[2 * c], outs[2 * c + 1] if ch.has(2 * c + 1) else None) for c in range(ch.n_ct)]
+                sts = qkt_stage(c, QL)
+                PL = []
+                for st in sts:
+                    with rt.step("softmax"):
+                        PL.append(prefill_softmax(rt, st["S"], cfg, ch, c, st["pre"], periodic=st["per"]))
+                for i, o in enumerate(pv_stage(c, sts, PL)):
+                    outs[i][c] = o
+        return [[join(ops, o[2 * c], o[2 * c + 1] if ch.has(2 * c + 1) else None) for c in range(ch.n_ct)]
+                for o in outs]
 
-    res = [attend(Q) for Q in Qs]
+    res = attend(Qs) if (shared and _KV_SHARE) else [attend([Q])[0] for Q in Qs]
     return res if shared else res[0]
 
 

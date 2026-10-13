@@ -117,6 +117,95 @@ def test_attention_matches_softmax(T):
     assert err.max() < 3e-2 and np.median(err) < 1e-3
 
 
+@pytest.mark.parametrize("T,pack", [(5, 1), (47, 2), (64, 3), (96, 2), (128, 3)])
+def test_attention_packed_matches_unpacked(T, pack, monkeypatch):
+    rt, fhe, inf = _rt(N=4096, hid=128, dim=128, H=4, H_real=4)
+    d = rt.dims
+    rng = np.random.default_rng(T)
+    ch = prefill.Chunks(T, d.t)
+    sm = config.load_configs(str(CFG)).block(0)[2]
+    q, k, v = (0.5 * rng.standard_normal((T, d.hid)) for _ in range(3))
+
+    def dense(M):
+        out = []
+        for c in range(ch.n_ct):
+            vec = np.zeros(d.N, dtype=np.complex128)
+            for half in (0, 1):
+                for lane, p in enumerate(ch.lanes(2 * c + half)):
+                    vec[np.arange(d.hid) * d.t + lane] += 0.5 * (1j if half else 1.0) * M[p]
+            out.append(fake.FakeCt(vec, 30))
+        return out
+    pre = (rng.standard_normal(d.N) * 0.3, rng.standard_normal(d.N) * 0.3)
+    outs = []
+    for p in (0, pack):
+        monkeypatch.setattr(prefill, "_PACK", p)
+        O = prefill.prefill_attention(rt, dense(q), dense(k), dense(v), sm, ch, prefix=pre)
+        outs.append(_dense_rows(rt, O, ch, d.t, d.hid))
+    assert np.abs(outs[0] - outs[1]).max() < 1e-9
+
+
+@pytest.mark.parametrize("pack", [0, 3])
+def test_attention_kv_share(pack, monkeypatch):
+    rt, fhe, inf = _rt(N=4096, hid=128, dim=128, H=4, H_real=4)
+    d = rt.dims
+    T = 96
+    rng = np.random.default_rng(5)
+    ch = prefill.Chunks(T, d.t)
+    sm = config.load_configs(str(CFG)).block(0)[2]
+
+    def dense(M):
+        out = []
+        for c in range(ch.n_ct):
+            vec = np.zeros(d.N, dtype=np.complex128)
+            for half in (0, 1):
+                for lane, p in enumerate(ch.lanes(2 * c + half)):
+                    vec[np.arange(d.hid) * d.t + lane] += 0.5 * (1j if half else 1.0) * M[p]
+            out.append(fake.FakeCt(vec, 30))
+        return out
+    qs = [dense(0.5 * rng.standard_normal((T, d.hid))) for _ in range(3)]
+    k, v = (dense(0.5 * rng.standard_normal((T, d.hid))) for _ in range(2))
+    pre = (rng.standard_normal(d.N) * 0.3, rng.standard_normal(d.N) * 0.3)
+    monkeypatch.setattr(prefill, "_PACK", pack)
+    outs = []
+    for share in (False, True):
+        monkeypatch.setattr(prefill, "_KV_SHARE", share)
+        O = prefill.prefill_attention(rt, qs, k, v, sm, ch, prefix=pre, shared=True)
+        outs.append([_dense_rows(rt, o, ch, d.t, d.hid) for o in O])
+    for a, b in zip(*outs):
+        assert np.abs(a - b).max() < 1e-12
+
+
+@pytest.mark.parametrize("T,pack,share", [(32, 0, False), (64, 3, True), (96, 0, True), (128, 2, False)])
+def test_attention_periodic_prefix(T, pack, share, monkeypatch):
+    rt, fhe, inf = _rt(N=4096, hid=128, dim=128, H=4, H_real=4)
+    d = rt.dims
+    rng = np.random.default_rng(T + 7)
+    ch = prefill.Chunks(T, d.t)
+    sm = config.load_configs(str(CFG)).block(0)[2]
+
+    def dense(M):
+        out = []
+        for c in range(ch.n_ct):
+            vec = np.zeros(d.N, dtype=np.complex128)
+            for half in (0, 1):
+                for lane, p in enumerate(ch.lanes(2 * c + half)):
+                    vec[np.arange(d.hid) * d.t + lane] += 0.5 * (1j if half else 1.0) * M[p]
+            out.append(fake.FakeCt(vec, 30))
+        return out
+    qs = [dense(0.5 * rng.standard_normal((T, d.hid))) for _ in range(2)]
+    k, v = (dense(0.5 * rng.standard_normal((T, d.hid))) for _ in range(2))
+    pre = (np.repeat(rng.standard_normal(d.hid) * 0.3, d.t), np.repeat(rng.standard_normal(d.hid) * 0.3, d.t))
+    monkeypatch.setattr(prefill, "_PACK", pack)
+    monkeypatch.setattr(prefill, "_KV_SHARE", share)
+    outs = []
+    for per in (False, True):
+        monkeypatch.setattr(prefill, "_PRE_PERIODIC", per)
+        O = prefill.prefill_attention(rt, qs, k, v, sm, ch, prefix=pre, shared=True)
+        outs.append([_dense_rows(rt, o, ch, d.t, d.hid) for o in O])
+    for a, b in zip(*outs):
+        assert np.abs(a - b).max() < 1e-9
+
+
 @pytest.mark.skipif(not os.environ.get("WEIGHTS_PATH") or not os.path.exists(os.environ.get("WEIGHTS_PATH", "")),
                     reason="needs the GPT-2 export (WEIGHTS_PATH)")
 def test_gpt2_two_blocks():

@@ -40,6 +40,7 @@ class Rt:
         self._staged = {}         # step -> (handle, [tags])
         self.mask_misses = 0      # uses of a per-step mask that was not staged
         self.mask_stats = {}      # last begin_step's numbers
+        self._used = set()        # keys used since the last evict_unused
         # IMPL_SCOPED_NAMES=1: every step names its ciphertexts <step path>_<n> on its own counter
         # (Context.graph_scope), so a plan made at one token stays bound at tokens where an
         # earlier step issues more ops (the q.K^T over a cache with more groups)
@@ -90,6 +91,7 @@ class Rt:
 
     def _use(self, key, ct):
         tag, levels = self._key_info(key)
+        self._used.add(key)
         lv = self.ops.lvl(ct)
         if key in self._declared_now and lv not in levels:
             self.mask_misses += 1     # a per-step mask used at a level nobody staged
@@ -155,6 +157,12 @@ class Rt:
         if not keys:
             return 0
         return self.ops.erase_pts([self._kinfo[k][0] for k in keys])
+
+    def evict_unused(self):
+        """Free the encoded plaintexts of masks not used since the last call; returns the count."""
+        keys = [k for k in self._kinfo if k not in self._used]
+        self._used = set()
+        return self.ops.erase_pts([self._kinfo[k][0] for k in keys]) if keys else 0
 
     def drain(self):
         """Join every staged job still in flight (before the session closes: a job that

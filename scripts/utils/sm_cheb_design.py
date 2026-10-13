@@ -27,7 +27,7 @@ def main(argv=None):
     doc = json.load(open(a.config))
     kcs = tuple(sorted({k for k in smcheb.KC_DESIGN if k <= a.kc_max} | {a.kc_max}))
     tot_today = tot_new = 0
-    for name in sorted(doc["softmax"], key=lambda n: int(n.split(".")[2])):
+    for name in sorted(doc["softmax"], key=lambda n: [int(p) for p in n.split(".") if p.isdigit()]):
         j = doc["softmax"][name]
         cfg = parse_softmax(j)
         ks, tg = smcheb.design(cfg.init_alpha, cfg.init_beta, cfg.log2delta2, a.tgt_last, kcs)
