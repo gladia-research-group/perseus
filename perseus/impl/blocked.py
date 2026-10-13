@@ -274,15 +274,17 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
     return rt.add_mask(X2, ("bl.shift", id(shift), k, na, nb, scale), build)
 
 
-def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None):
-    """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ..."""
+def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None):
+    """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ...
+    `kv`: a list receiving each K / V block's per-chunk real K (post-RoPE) / V (GQA only)."""
     if B.G > 1:
         outs = [[None] * B.K for _ in Q]
         for b in range(B.Kkv):
             qs = [b + g * B.Kkv for g in range(B.G)]
             pre = prefixes[b] if prefixes is not None else None
             o = prefill_attention(sub_rt(rt, B, b), [[q[i] for q in Q] for i in qs], [x[b] for x in K],
-                                  [x[b] for x in V], cfg, ch, rope=rope, prefix=pre, shared=True)
+                                  [x[b] for x in V], cfg, ch, rope=rope, prefix=pre, shared=True,
+                                  kv=None if kv is None else kv[b])
             for i, oi in zip(qs, o):
                 for g in range(len(Q)):
                     outs[g][i] = oi[g]

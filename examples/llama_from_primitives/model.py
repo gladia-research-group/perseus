@@ -232,12 +232,30 @@ class LlamaModel(ImplModel):
         return self.rt.ops.decode_token(x)
 
     # ── drivers ──
-    def run_decode(self, tokens, gt_logits=None, on_token=None):
+    def adopt_cache(self, i, src):
+        """Block i starts from a handed-off cache (handoff.to_decode_cache) instead of the BOS prefix."""
+        kv = self.kv[i]
+        kv.k_buckets, kv.k_pend, kv.v_buckets = src.k_buckets, src.k_pend, src.v_buckets
+        kv.k_count, kv.v_count = src.k_count, src.v_count
+        if self.kv_offload:
+            self.park(i)
+
+    def park(self, i):
+        cts, keys = self.stage_caches(i)
+        self.rt.ops.device_sync()
+        self.inf.kv_store(cts, keys)
+        self.inf.kv_sync()
+        self.inf.kv_evict(cts)
+        self._parked[i] = set(keys)
+
+    def run_decode(self, tokens, gt_logits=None, on_token=None, start=None):
         """Teacher-forced decode of tokens[1:] after the BOS prefix (tokens[0] must be BOS):
-        one forward per position, logits decrypted per token. Returns per-token dicts."""
-        self.start()
+        one forward per position, logits decrypted per token. Returns per-token dicts.
+        `start`: first position, the caches already adopted (adopt_cache) up to it."""
+        if start is None:
+            self.start()
         results = []
-        for pos in range(1, len(tokens)):
+        for pos in range(start or 1, len(tokens)):
             self.token_begin(pos)
             x = self.encode_input(tokens[pos])
             tiles = self.decode_token(x, pos)

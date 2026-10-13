@@ -132,6 +132,9 @@ def main(argv=None):
         for k in ("free_gb", "rss_gb", "cpu_s"):
             if k in r:
                 line += f" {k}={r[k]}"
+        if os.environ.get("LLAMA_KV_LEVELS", "0") not in ("", "0"):
+            cts, _ = model.kv[0].cts("")
+            line += f" kv0={sorted({(model.rt.ops.level(c), model.rt.ops.noise_deg(c)) for c in cts})}"
         if r.get("masks"):
             m = r["masks"]
             line += f" masks={m.get('adopted', 0)}/{m.get('evicted', 0)}/{m.get('misses', 0)}"
