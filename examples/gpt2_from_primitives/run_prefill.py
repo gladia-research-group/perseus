@@ -38,6 +38,8 @@ def main(argv=None):
                          "(any T up to the 1024 positions)")
     a = ap.parse_args(argv)
 
+    # prefill keeps its K / V on the device: the decode preset's pinned KV arena would only lock host memory
+    os.environ.setdefault("KV_ARENA_GB", "0")
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)

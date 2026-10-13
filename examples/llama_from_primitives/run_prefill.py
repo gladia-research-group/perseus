@@ -34,6 +34,8 @@ def main(argv=None):
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 model")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     a = ap.parse_args(argv)
+    # prefill keeps its K / V on the device: the decode preset's pinned KV arena would only lock host memory
+    os.environ.setdefault("KV_ARENA_GB", "0")
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
