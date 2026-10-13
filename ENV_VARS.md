@@ -152,6 +152,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FIDESLIB_PT_SCRATCH` | 0 keeps the NTT scratch of finished plaintexts (device-encoded weights and masks, bootstrap tables, SparseB copies); by default it is released, halving their footprint (a plaintext is only read once built). |
 | `FIDESLIB_PT_COMPACT` | 0 stores the bootstrap stage tables in full (default: one value per NTT block). |
 | `FIDESLIB_AUX_POLY_MAX` | Cap on FIDESlib's polynomial recycler (destroyed ciphertexts' polynomials kept with their limbs for reuse; default unbounded). Without recycling a token is ~4x slower; a full device frees the recycler before failing either way. |
+| `FIDESLIB_BTS_RAISE_DROP` | Per-route raise below the top modulus, `slots:k,...` in composite levels (e.g. `512:1`): that route's bootstraps run on fewer limbs and land k levels lower; a plan that uses it declares it in its `runtime=` line (the main n32 plan: `512:1`). Unset or 0: raise to the top. |
 | `FIDESLIB_BTS_RAISE_EAGER` | 1 builds every raise variant (`FIDESLIB_BTS_RAISE_DROPS`) at context load; by default each is built when a planted bootstrap first asks for it (each is a full copy of a route's tables). |
 | `FIDESLIB_POOL_TRACE` | Record a backtrace per live pooled block: `_core.gpu_pool_trace()` lists the live bytes by allocation site (diagnostic, slow). |
 

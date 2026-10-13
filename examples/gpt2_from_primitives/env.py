@@ -82,17 +82,18 @@ ENV = {
 # (the exact post-raise scaling FIDESLIB_BTS_SHIFT, eprint 2025/1403; SPRU on the 1-slot route FIDESLIB_SPRU = h,
 # Coron-Koestler arXiv 2607.27401, Python bootstrap only), the real-payload dense route (FIDESLIB_BTS_REAL), the
 # depth-1 CtS/StC of the 512-slot route (FIDESLIB_BTS_SPARSE_B, eprint 2026/1023; it lands 10 primes higher, so the
-# model rotation keys are banded at 32, FIDESLIB_ROT_KEY_BAND) and the op sequences of the softmax, the GELU and the
-# LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB, KV_LANES). A plan declares them in a `runtime=` line of its
-# PLAN_CMD.txt; one it does not declare predates it and runs at its RUNTIME_LEGACY value (a plan without the line runs
-# all of them legacy). Eager (no plan) on n32: all on.
+# model rotation keys are banded at 32, FIDESLIB_ROT_KEY_BAND), a route raised below the top modulus
+# (FIDESLIB_BTS_RAISE_DROP, e.g. 512:1: that route lands one composite level lower) and the op sequences of the softmax,
+# the GELU and the LayerNorm (SM_DEN_RECIP, SM_GS_FIRST, GELU_FOLD, LN_CHEB, KV_LANES). A plan declares them in a
+# `runtime=` line of its PLAN_CMD.txt; one it does not declare predates it and runs at its RUNTIME_LEGACY value (a plan
+# without the line runs all of them legacy). Eager (no plan) on n32: all on except the raise drop (plan-only).
 RUNTIME_N32 = {"FIDESLIB_BTS_SHIFT": "1", "FIDESLIB_SPRU": "64", "FIDESLIB_BTS_REAL": "1",
                "FIDESLIB_BTS_SPARSE_B": "1", "FIDESLIB_ROT_KEY_BAND": "32"}
 RUNTIME_LEGACY = {"FIDESLIB_BTS_SHIFT": "0", "FIDESLIB_SPRU": "0", "FIDESLIB_BTS_REAL": "0",
                   "SM_DEN_RECIP": "0", "GELU_FOLD": "0", "LN_CHEB": "0", "SM_GS_FIRST": "0", "SM_PERIODIC": "0",
                   "SM_FOLD": "0", "FIDESLIB_BTS_SPARSE_B": "0", "KV_LANES": "0", "CHEB_BSGS": "0",
                   "QKV_LANES": "0", "IMPL_SCOPED_NAMES": "0", "SM_HRS_PACK": "0", "CUTMAX_PAIR": "0",
-                  "IMPL_DEAD_OPS": "0", "LADDER_RADIX_BITS": "0"}
+                  "IMPL_DEAD_OPS": "0", "LADDER_RADIX_BITS": "0", "FIDESLIB_BTS_RAISE_DROP": "0"}
 
 
 def plan_runtime(plan=None, chain="n32"):

@@ -125,3 +125,9 @@ the plaintext model instead of about 1e-6. To switch back, run the previous main
 `gpt2_decode_python_n32_stcf_accurate` is the middle ground: StC-first except the residual-stream
 refreshes and the K/V push (mean KL about 3e-5, about 0.05 s per token faster than shipped). The
 StC-first plans are cut from `graphs/gpt2_decode_python_n32_stcf`.
+
+The main plan also raises the 512-slot refreshes one composite level below the top
+(`FIDESLIB_BTS_RAISE_DROP=512:1` in its `runtime=` line, `PLAN_SPARSE_BTS_OUT=1:16,512:26` in its
+recipe): those bootstraps run on two fewer limbs and land one level lower, at the same precision
+and the same bootstrap count, about 0.065 s per token faster. To switch back, run
+`--plan bootstrap_placements/gpt2_decode_python_n32_top512` (the 512-slot route raised to the top).
