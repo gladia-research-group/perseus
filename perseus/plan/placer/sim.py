@@ -72,6 +72,9 @@ def step_bts_offsets(g: Graph, bootstrap_level: float) -> dict[str, float]:
     return out
 
 
+_DELIB_DEG_CAPTURED = os.environ.get("PLAN_DELIB_DEG", "") == "captured"
+
+
 def simulate(
     g: Graph,
     *,
@@ -127,7 +130,9 @@ def simulate(
                     # (bts level - unit, degree 2: the K/V push) is left alone.
                     base = 0.0
                 lc[n.output] = base
-                dg[n.output] = 2
+                # PLAN_DELIB_DEG=captured: the captured landing degree (a CCMM's SinCBoot ends rescaled), else the
+                # PCMM's pending rescale
+                dg[n.output] = (n.output_deg if _DELIB_DEG_CAPTURED and n.output_deg is not None else 2)
                 # StC-first runs with the K/V push in the shipped order (IMPL_STC_FIRST_KV=0): it lands where that
                 # order lands (PLAN_STC_FIRST_KV_LANDING = level:deg, absolute)
                 _kvl = os.environ.get("PLAN_STC_FIRST_KV_LANDING")
