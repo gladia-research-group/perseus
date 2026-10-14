@@ -154,7 +154,7 @@ def _memdbg(rt, tag):
         print(f"[memdbg] {tag}: free={core.device_free_gb():.2f}GB pool={st.get('reserved_gb', 0):.2f}GB", flush=True)
 
 
-def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None):
+def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0):
     """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block)."""
     ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
@@ -169,7 +169,7 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     _memdbg(rt, "qkv")
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv)
+        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
     _memdbg(rt, "attn")
     with rt.step("out_proj"):
         A = [pcmm_run(rt, o, P["out"]) for o in O]
@@ -241,7 +241,7 @@ class LlamaPrefill(LlamaModel):
                 kvs = None if on_kv is None else [{} for _ in range(B.Kkv)]
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
-                                                     self.rope, self.prefix_kv(b), B, kvs)
+                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b)
                 self.exit_stage(b, cap)
                 if on_kv is not None:
                     on_kv(b, [x["K"] for x in kvs], [x["V"] for x in kvs])

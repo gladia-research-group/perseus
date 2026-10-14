@@ -68,7 +68,8 @@ def main(argv=None):
         cal = os.path.join(a.plan, "pcmm_calib.json")
         if os.path.exists(cal):
             os.environ["PF_PCMM_CALIB_IN"] = cal
-    if pcmm:   # StC-first on the dense route, for the PCMM only
+    ccmm_on = os.environ.get("PF_ATTN", "") == "ccmm"
+    if pcmm or ccmm_on:
         over = {"FIDESLIB_BTS_STC_FIRST": "2", "FIDESLIB_BTS_STC_FIRST_ROUTES": "dense",
                 "FIDESLIB_BTS_STC_FIRST_STAGED_ONLY": os.environ.get("PF_PCMM_STAGED_ONLY", "1"), **over}
     if a.capture:
@@ -80,6 +81,9 @@ def main(argv=None):
     from perseus.impl.pcmm import rot_steps as pcmm_rot_steps
     from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
     rot = prefill_rot_steps(dims) | (pcmm_rot_steps() if pcmm else set()) | ladder_radix_steps(dims, ladder_radix_bits())
+    if ccmm_on:
+        from perseus.impl.sinc import rot_steps as sinc_rot_steps
+        rot |= sinc_rot_steps() | {16, -16}
     if os.environ.get("PF_LAYOUT", "") == "blocked":
         from perseus.impl.blocked import Blocks, blocked_rot_steps
         rot |= blocked_rot_steps(Blocks(dims, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
@@ -170,6 +174,13 @@ def main(argv=None):
             model.pcmm_weights(b)
         engine(model.rt).prepare(dims.dim)
         print(f"[llama-prefill] pcmm weights + keys {time.time() - t_pre:.1f}s", flush=True)
+    if ccmm_on:
+        from perseus.impl.ccmm import engine as ccmm_engine
+        t_pre = time.time()
+        ce = ccmm_engine(model.rt)
+        ce.prepare(dims.dim)
+        print(f"[llama-prefill] ccmm keys + calibration {time.time() - t_pre:.1f}s c_unit={ce.c_unit} land={ce.land}",
+              flush=True)
     t1 = time.time()
     Xs, ch, rec = model.prefill(toks, on_block=on_block)
     wall = time.time() - t1
@@ -179,6 +190,10 @@ def main(argv=None):
               + " ".join(f"{k}={v:.0f}" for k, v in zip(("rescale", "ring_switch", "mlwe", "gemm", "pack", "back"),
                                                         pc.times))
               + f" | stc_in={pc.t_in:.2f}s pcmm={pc.t_mm:.2f}s finish={pc.t_out:.2f}s", flush=True)
+    ce = getattr(model.rt, "ccmm", None)
+    if ce is not None:
+        print(f"[ccmm] calls={ce.calls} cap={ce.cap} land={ce.land} in={ce.t_in:.2f}s mm={ce.t_mm:.2f}s "
+              f"out={ce.t_out:.2f}s C++ ms " + " ".join(f"{v:.0f}" for v in ce.times), flush=True)
     out = {}
     if model.n_layers == int(store.config["num_hidden_layers"]) and gt is not None:
         rows, out = report(plain_logits(model, model.hidden_rows(Xs, ch)), gt[1:a.tokens + 1])

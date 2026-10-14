@@ -274,9 +274,16 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
     return rt.add_mask(X2, ("bl.shift", id(shift), k, na, nb, scale), build)
 
 
-def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None):
+def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None, layer=0):
     """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ...
-    `kv`: a list receiving each K / V block's per-chunk real K (post-RoPE) / V (GQA only)."""
+    `kv`: a list receiving each K / V block's per-chunk real K (post-RoPE) / V (GQA only).
+    PF_ATTN=ccmm: the CCMM path (ccmm_attn.py)."""
+    from . import ccmm
+    if ccmm.enabled():
+        from .ccmm_attn import attention_ccmm
+        if kv is None:
+            kv = [dict() for _ in range(B.Kkv)]
+        return attention_ccmm(rt, Q, K, V, cfg, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
     if B.G > 1:
         outs = [[None] * B.K for _ in Q]
         for b in range(B.Kkv):

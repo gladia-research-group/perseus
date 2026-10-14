@@ -407,6 +407,7 @@ class NumpyOps:
     def square(self, a): return a * a
     def negate(self, a): return -a
     def rotate(self, a, k): return np.roll(a, -int(k))
+    def rotate_many(self, a, steps): return [np.roll(a, -int(k)) for k in steps]
     def rotate_and_sum(self, a, start, stop):
         gap, sign = abs(int(start)), (1 if start > 0 else -1)
         x = np.array(a)

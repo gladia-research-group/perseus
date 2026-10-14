@@ -211,7 +211,7 @@ class FakeFhe:
     def var_name(self, a):
         return "x"
 
-    def record_external_bootstrap(self, a, inputs, input_levels):
+    def record_external_bootstrap(self, a, inputs, input_levels, landing=None):
         self.n_bootstraps += 1
         self.calls.append("bootstrap")
 

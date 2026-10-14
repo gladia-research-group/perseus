@@ -517,10 +517,12 @@ class CapFhe(FakeFhe):
         out = self.new_var(a)
         self.record("level_reduce", [nin], out, [lin], a)
 
-    def record_external_bootstrap(self, a, inputs, input_levels):
+    def record_external_bootstrap(self, a, inputs, input_levels, landing=None):
         self.n_bootstraps += 1
         self.total_bootstraps += 1
-        if self.pcmm_landing is not None:
+        if landing is not None:
+            a.level, a.noise_deg = landing
+        elif self.pcmm_landing is not None:
             a.level, a.noise_deg = self.pcmm_landing
         out = self.new_var(a)
         a.tag = Tag()

@@ -9,6 +9,7 @@
 #include <CKKS/Bootstrap.cuh>
 #include <CKKS/Ciphertext.cuh>
 #include <CKKS/Spru.cuh>
+#include <CKKS/Ccmm.cuh>
 #include <CKKS/Pcmm.cuh>
 #include <CKKS/ApproxModEval.cuh>
 
@@ -47,6 +48,10 @@ DeviceCt device_of(CKKSContext& fhe, PackedCtx& p) {
 // PcmmKeys is opaque in FIDESlib: a complete handle for pybind
 struct PcmmKeysHandle {
     std::shared_ptr<FC::PcmmKeys> k;
+};
+
+struct CcmmKeysHandle {
+    std::shared_ptr<FC::CcmmKeys> k;
 };
 
 long mismatches(const DeviceCt& a, const DeviceCt& b) {
@@ -244,6 +249,60 @@ void bind_bts(py::module_& root) {
         return t;
     }, py::arg("ins"), py::arg("outs"), py::arg("keys"), py::arg("Wd"), py::arg("noise_factor"),
        "pcmm_multi with W as int8 digit planes (W = sum_u Wd[u] 256^u).");
+    py::class_<CcmmKeysHandle>(m, "CcmmKeys");
+    m.def("ccmm_keys", [](py::dict d) {
+        FC::CcmmKeySource src;
+        auto u32 = [](py::handle h) {
+            auto a = py::array_t<uint32_t, py::array::c_style | py::array::forcecast>::ensure(h);
+            if (!a) throw std::invalid_argument("ccmm_keys: expected a uint32 array");
+            return std::vector<uint32_t>(a.data(), a.data() + a.size());
+        };
+        auto prim = u32(d["primes"]);
+        if (prim.size() != 5) throw std::invalid_argument("ccmm_keys: primes (5)");
+        for (int i = 0; i < 5; ++i) src.p[i] = prim[i];
+        const char* names[3] = {"16", "13", "6"};
+        for (int s = 0; s < 3; ++s) {
+            auto ni = u32(d[(std::string("ninv") + names[s]).c_str()]);
+            for (int i = 0; i < 5; ++i) {
+                src.psi[s][i] = u32(py::list(d[(std::string("psi") + names[s]).c_str()])[i]);
+                src.ipsi[s][i] = u32(py::list(d[(std::string("ipsi") + names[s]).c_str()])[i]);
+                src.ninv[s][i] = ni[i];
+            }
+        }
+        src.fwd = u32(d["fwd"]); src.back = u32(d["back"]); src.autos = u32(d["autos"]); src.rlk = u32(d["rlk"]);
+        return CcmmKeysHandle{FC::ccmmUploadKeys(src)};
+    }, py::arg("keys"), "Upload the CCMM keys (Ccmm.cuh CcmmKeySource as a dict).");
+    m.def("ccmm_transpose", [](std::vector<DeviceCt> ins, std::vector<DeviceCt> outs, CcmmKeysHandle& k) {
+        std::vector<FC::Ciphertext*> pin, pout;
+        for (auto& d : ins) pin.push_back(&d.get());
+        for (auto& d : outs) pout.push_back(&d.get());
+        std::vector<double> t(5, 0.0);
+        {
+            py::gil_scoped_release nogil;
+            FC::ccmmTranspose(pin, pout, *k.k, t.data());
+        }
+        return t;
+    }, py::arg("ins"), py::arg("outs"), py::arg("keys"), "Column-wise M (16 SinC cts) -> M^T; per-step times (ms).");
+    m.def("ccmm_mul", [](std::vector<DeviceCt> a, std::vector<DeviceCt> b, std::vector<DeviceCt> outs,
+                         CcmmKeysHandle& k, bool b_transposed) {
+        std::vector<FC::Ciphertext*> pa, pb, pout;
+        for (auto& d : a) pa.push_back(&d.get());
+        for (auto& d : b) pb.push_back(&d.get());
+        for (auto& d : outs) pout.push_back(&d.get());
+        std::vector<double> t(5, 0.0);
+        {
+            py::gil_scoped_release nogil;
+            FC::ccmmMul(pa, pb, pout, *k.k, t.data(), b_transposed);
+        }
+        return t;
+    }, py::arg("m"), py::arg("mp"), py::arg("outs"), py::arg("keys"), py::arg("b_transposed") = false,
+       "Batch CCMM M M' (CKL Alg. 4) on SinC column encryptions (mp = M'^T when b_transposed); per-step times (ms).");
+    m.def("set_scale", [](DeviceCt& d, double nf, int noise_level) {
+              d.get().NoiseFactor = nf;
+              d.get().NoiseLevel = noise_level;
+          },
+          py::arg("ct"), py::arg("noise_factor"), py::arg("noise_level"),
+          "Restamp a device ciphertext's NoiseFactor and NoiseLevel (no data change).");
     m.def("noise_factor", [](DeviceCt& d) { return d.get().NoiseFactor; }, py::arg("ct"),
           "NoiseFactor of a device ciphertext.");
     m.def("scale_noise_factor", [](DeviceCt& d, double f) { d.get().NoiseFactor *= f; }, py::arg("ct"),
@@ -284,6 +343,12 @@ void bind_bts(py::module_& root) {
           py::arg("ct"), py::arg("slots"), "StC-first input limb index (-1: none).");
     m.def("stc_first_input", [](DeviceCt& d, const FC::BtsState& s, bool own_cf) { FC::btsStcFirstInput(d.get(), s, own_cf); },
           py::arg("ct"), py::arg("st"), py::arg("own_cf") = false, kRelease);
+    m.def("stc_high", [](DeviceCt& d, int slots, int out_limb, double factor, int skip_mask, double nf_ref) {
+              FC::btsStcHigh(d.get(), slots, out_limb, factor, skip_mask, nf_ref);
+          },
+          py::arg("ct"), py::arg("slots"), py::arg("out_limb"), py::arg("factor") = 1.0, py::arg("skip_mask") = 0,
+          py::arg("nf_ref") = 0.0, kRelease,
+          "Slot -> coefficient transform outside a bootstrap, rescaled output at limb index out_limb.");
     m.def("mod_raise", [](DeviceCt& d, FC::BtsState& s) { FC::btsModRaise(d.get(), s); }, py::arg("ct"),
           py::arg("st"), kRelease);
     m.def("fold", [](DeviceCt& d, const FC::BtsState& s) { FC::btsFold(d.get(), s); }, py::arg("ct"), py::arg("st"),
