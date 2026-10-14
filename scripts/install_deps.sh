@@ -6,7 +6,8 @@
 #
 # The 32-bit OpenFHE is a fixed upstream commit plus the patch series in
 # third_party/openfhe-n32/patches (every shipped plan was measured against it); the 64-bit
-# one is v1.4.2 plus FIDESlib's patches. Env: DEPS_DIR (default deps_n<NATIVE_SIZE>), CUDA_HOME
+# one is v1.4.2 plus FIDESlib's patches and the series' uniform main key (0014).
+# Env: DEPS_DIR (default deps_n<NATIVE_SIZE>), CUDA_HOME
 # (default: the nvcc on PATH, else /usr/local/cuda), NCCL_HOME (a prefix holding lib/libnccl.so and include/nccl.h,
 # when NCCL is not installed system-wide), JOBS (default 16), GPU_ARCH (default: the first visible GPU's compute
 # capability, else 80-real), OPENFHE_SRC (a local openfhe-development clone, for offline use),
@@ -94,6 +95,8 @@ else
         git am "$FIDESLIB_SRC/deps/openfhe-1.4.2.patch"
         git am "$FIDESLIB_SRC/deps/openfhe-1.4.2-mixedlimb.patch"
         git am "$FIDESLIB_SRC/deps/openfhe-1.4.2-kska-seed.patch"
+        # the 32-bit series' main-key fix: v1.4.2 also draws an h=192 main key under SPARSE_ENCAPSULATED
+        git am "$OPENFHE_N32_SERIES/0014-Uniform-main-key-under-SPARSE_ENCAPSULATED.patch"
         cmp -s src/core/include/utils/kskseedexpand.h "$FIDESLIB_SRC/src/CKKS/KskSeedExpand.cuh" \
             || { echo "ERROR: kskseedexpand.h (OpenFHE patch) differs from FIDESlib's KskSeedExpand.cuh" >&2; exit 1; }
     fi
