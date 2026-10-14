@@ -1836,17 +1836,16 @@ struct CKKSContext {
     }
     // ── Device magnitude probe (FHE_MAG_GPU=1, default off) ─────────────────────────
     // The same three statistics as the host path (max|z|, Re mean / max|z - mean|, the max
-    // coefficient with and without X^0) computed where the ciphertext is: c0 + c1*s per limb
-    // with the secret key resident on the device, the library's INTT, an exact mixed-radix
-    // reconstruction of the coefficients and one inverse cuFFT (include/gpu_mag_probe.h).
-    // Replaces the D2H snapshot + host decrypt per node (~35 ms each at ring 2^16, 93 % of a
-    // capture block); borrows and copy-inheritance resolve at drain exactly as before. A failure
-    // while issuing a probe switches the probe off and the node takes the host path (a CUDA error
-    // left pending by earlier work stops the capture instead: it is not the probe's); a failure at
-    // fetch (the device work itself) aborts the capture, since a graph with nodes that carry no
-    // magnitude would plan silently worse. The [mag_lanes] live/dead report of a lane-masked
-    // capture is a host-path diagnostic (lane_split reads decoded host values): nodes measured
-    // here do not feed it.
+    // coefficient with and without X^0) computed where the ciphertext is: c0 + c1*s per limb with
+    // the secret key resident on the device, the library's INTT, an exact mixed-radix
+    // reconstruction of the coefficients and one inverse cuFFT (include/gpu_mag_probe.h). Replaces
+    // the D2H snapshot + host decrypt per node; borrows and copy-inheritance resolve at drain
+    // exactly as before. A failure while issuing a probe switches the probe off and the node takes
+    // the host path (a CUDA error left pending by earlier work stops the capture instead: it is not
+    // the probe's); a failure at fetch (the device work itself) aborts the capture, since a graph
+    // with nodes that carry no magnitude would plan silently worse. The [mag_lanes] live/dead
+    // report of a lane-masked capture is a host-path diagnostic (lane_split reads decoded host
+    // values): nodes measured here do not feed it.
     static bool mag_gpu_enabled() {
         static const bool on = [] {
             const char* e = std::getenv("FHE_MAG_GPU");
@@ -1884,8 +1883,12 @@ struct CKKSContext {
                 if (p) gpu_encode::zero_plaintext_limbs(*p);
             }
         } key_guard{gs};
-        // the host copies of the key (raw.sub_0 and the OpenFHE plaintext raw.originalPlainText
-        // shares with spt) are zeroed before they are freed
+        // the host copies of the key go: after a successful upload raw.sub_0 is wiped before it is
+        // freed (if the upload throws, it is freed as it is). Two more are freed unwiped: the
+        // OpenFHE plaintext's buffer (shared by raw.originalPlainText and spt; SetValuesToZero swaps
+        // in a zero buffer and frees the old one as it is) and, on a 32-bit chain, the staging copy
+        // FIDESlib's upload converts each limb through. The session's secret key stays on the host
+        // for the whole session regardless.
         for (auto& limb : raw.sub_0) wipe_u64(limb);
         raw.sub_0.clear();
         raw.originalPlainText.reset();

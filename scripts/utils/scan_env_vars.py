@@ -64,6 +64,7 @@ DOC = {
     "PLAN_HARD_ENV_CAP": ("Plan", "Planner: make the refresh-input depth envelope absolute (1) or payable (0, the shipped recipes)."),
     "FHE_ASYNC_MAG": ("Plan", "Measure capture magnitudes on worker threads instead of inline (default 1)."),
     "FHE_MAG_WORKERS": ("Plan", "Worker threads for that measurement."),
+    "FHE_MAG_GPU": ("Plan", "Measure a capture's magnitudes on the device (decrypt, inverse NTT, decode and the statistics where the ciphertext is; include/gpu_mag_probe.h) instead of copying every node to the host; default off. Only on the asynchronous capture path (`FHE_ASYNC_MAG=1`, the default) and on 32-bit-limb chains: on n64 the capture reports `[mag_gpu] disabled` and the host path measures every node. The `[mag_lanes]` live/dead report of a lane-masked capture is a host-path diagnostic and does not count device-measured nodes."),
     "OPENFHE_DECODE_NO_THROW": ("Plan", "Let a capture decode a low-precision plaintext instead of throwing (capture only)."),
     "FHE_PREFILL_CAPTURE_RANGES": ("Plan", "Capture the per-chunk token ranges of a prefill."),
     "SPARSE_BTS_SLOTS": ("Plan", "Sparse bootstrap precomputations to build, e.g. `512,1`; 0 = none."),

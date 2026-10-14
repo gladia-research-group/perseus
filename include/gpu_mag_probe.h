@@ -1,27 +1,29 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Alexander Ananyev
 // gpu_mag_probe.h — the graph capture's magnitude probe on the device.
 //
 // The capture prices every recorded node by three statistics of its decrypted value: the slot
 // magnitude max|z|, the Re-mean and max|z - mean| (the offset arm), and the largest plaintext
 // coefficient with and without the X^0 term (what EvalMod's range constraint is on). The host path
-// copies each ciphertext down and decrypts it with OpenFHE: at ring 2^16 that is ~35 ms per node and
-// ~29k nodes per block, i.e. the capture's wall. Here the same numbers are computed where the
-// ciphertext already is: d = c0 + c1*s per limb (the secret key resident on the device in the
-// library's own EVAL layout), the library's inverse NTT, an exact mixed-radix reconstruction of every
-// coefficient to a double in scale units, one inverse cuFFT for the slots (the capture's statistics
-// are invariant under the slot permutation, so the special FFT's output order is not needed), and
-// two reductions. Sparse-slot ciphertexts decode as OpenFHE does: the coefficients at stride N/2/slots
-// through a transform of size `slots`.
+// copies each ciphertext down and decrypts it with OpenFHE. Here the same numbers are computed
+// where the ciphertext already is: d = c0 + c1*s per limb (the secret key resident on the device in
+// the library's own EVAL layout), the library's inverse NTT, an exact mixed-radix reconstruction of
+// every coefficient, converted to a double in scale units (the coefficient maxima are taken here),
+// one inverse cuFFT for the slots (the slot statistics are invariant under the slot permutation, so
+// the special FFT's output order is not needed), and two reductions. Sparse-slot ciphertexts decode
+// as OpenFHE does: the coefficients at stride N/2/slots through a transform of size `slots`. Parity
+// with the host path is checked on complex payloads, the shipped setting
+// (tests/dev/gpu_mag_probe_check.cu).
 //
 // Everything runs on the legacy default stream, which orders after every ciphertext operation that
 // produced the value and before every one that may change it in place — provided the library's
 // streams are blocking ones, which the first probe checks. The key lives on the device for the
 // probe's lifetime. When the probe goes, the key and the scratch polynomial (both buffers of every
 // limb, over their whole allocation) and the decoded coefficients and slots of the last probe are
-// zeroed before their memory returns to the pool; the statistics buffer is the capture's own
-// output. The two debug accessors (the decrypted residues, the key's limbs) exist only in builds
-// with GPU_MAG_PROBE_DEBUG (CMake: CACHEMIR_MAG_PROBE_DEBUG=ON, the probe check's diag mode).
+// zeroed before their memory is released; the statistics buffer is the capture's own output.
+// cuFFT's own work area, which the library allocates and frees, is not wiped.
+//
+// The capture reaches the probe only on its asynchronous magnitude path (FHE_ASYNC_MAG=1, the
+// default), and the probe handles 32-bit limbs only: on a 64-bit chain its construction throws, the
+// capture reports `[mag_gpu] disabled` and every node takes the host path.
 #pragma once
 
 #include <cstddef>
@@ -79,14 +81,6 @@ class GpuMagProbe {
     // Wait for every probe issued since the last fetch and return their results in issue order.
     std::vector<Result> fetch();
     const Stats& stats() const { return stats_; }
-
-#ifdef GPU_MAG_PROBE_DEBUG
-    // Diagnostics: the decrypted polynomial's residues per limb after the INTT (natural order, host
-    // vectors), with the ciphertext components in the stored order or swapped; and the secret key's
-    // limbs as imported.
-    std::vector<std::vector<uint64_t>> debug_decrypt(const FIDESlib::CKKS::Ciphertext& ct, bool swap_components);
-    std::vector<std::vector<uint64_t>> debug_secret_limbs();
-#endif
 
   private:
     struct Impl;

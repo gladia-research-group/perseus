@@ -1,8 +1,5 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Alexander Ananyev
-// gpu_cuda_raii.h — owners for the CUDA handles the magnitude probe holds:
-// device buffers, streams, events, cuFFT plans, and a guard that restores the caller's current
-// device. Each is move-only and releases in its destructor, so a constructor that throws halfway
+// gpu_cuda_raii.h — owners for the CUDA handles the magnitude probe holds: device buffers and
+// cuFFT plans. Each is move-only and releases in its destructor, so a constructor that throws halfway
 // (typically cudaMalloc out of memory) frees what it had already acquired.
 #pragma once
 
@@ -16,11 +13,11 @@
 #include <string>
 #include <utility>
 
-// Both GPU paths order their work against the ciphertext operations through the legacy default
-// stream (gpu_encode.h, gpu_mag_probe.h); a translation unit compiled for the per-thread default
-// stream would silently lose that ordering.
+// The magnitude probe orders its work against the ciphertext operations through the legacy default
+// stream (gpu_mag_probe.h); a translation unit compiled for the per-thread default stream would
+// silently lose that ordering.
 #if defined(CUDA_API_PER_THREAD_DEFAULT_STREAM)
-#error "gpu_encode: built with --default-stream per-thread; the legacy default stream is required"
+#error "gpu_mag_probe: built with --default-stream per-thread; the legacy default stream is required"
 #endif
 
 namespace gpu_encode {
@@ -72,68 +69,10 @@ DevicePtr<T> device_alloc(std::size_t count, const char* who, const char* what) 
     return DevicePtr<T>(static_cast<T*>(p));
 }
 
-class Stream {
-  public:
-    Stream() = default;
-    Stream(unsigned flags, const char* who) {
-        cuda_check(cudaStreamCreateWithFlags(&s_, flags), who, "cudaStreamCreateWithFlags");
-    }
-    ~Stream() {
-        if (s_) cudaStreamDestroy(s_);
-    }
-    Stream(const Stream&) = delete;
-    Stream& operator=(const Stream&) = delete;
-    Stream(Stream&& o) noexcept : s_(std::exchange(o.s_, nullptr)) {}
-    Stream& operator=(Stream&& o) noexcept {
-        if (this != &o) {
-            if (s_) cudaStreamDestroy(s_);
-            s_ = std::exchange(o.s_, nullptr);
-        }
-        return *this;
-    }
-    cudaStream_t get() const { return s_; }
-    explicit operator bool() const { return s_ != nullptr; }
-
-  private:
-    cudaStream_t s_ = nullptr;
-};
-
-class Event {
-  public:
-    Event() = default;
-    Event(unsigned flags, const char* who) {
-        cuda_check(cudaEventCreateWithFlags(&e_, flags), who, "cudaEventCreateWithFlags");
-    }
-    ~Event() {
-        if (e_) cudaEventDestroy(e_);
-    }
-    Event(const Event&) = delete;
-    Event& operator=(const Event&) = delete;
-    Event(Event&& o) noexcept : e_(std::exchange(o.e_, nullptr)) {}
-    Event& operator=(Event&& o) noexcept {
-        if (this != &o) {
-            if (e_) cudaEventDestroy(e_);
-            e_ = std::exchange(o.e_, nullptr);
-        }
-        return *this;
-    }
-    cudaEvent_t get() const { return e_; }
-    explicit operator bool() const { return e_ != nullptr; }
-
-  private:
-    cudaEvent_t e_ = nullptr;
-};
-
-// A cuFFT plan handle; created empty (cufftCreate) so the caller configures it, or by cufftPlan1d.
+// A cuFFT plan handle, made by cufftPlan1d.
 class FftPlan {
   public:
     FftPlan() = default;
-    static FftPlan create(const char* who) {
-        FftPlan p;
-        cufft_check(cufftCreate(&p.h_), who, "cufftCreate");
-        p.live_ = true;
-        return p;
-    }
     static FftPlan plan1d(int size, cufftType type, int batch, const char* who) {
         FftPlan p;
         cufft_check(cufftPlan1d(&p.h_, size, type, batch), who, "cufftPlan1d");
@@ -159,27 +98,6 @@ class FftPlan {
   private:
     cufftHandle h_ = 0;
     bool live_ = false;
-};
-
-// Makes `device` current for the scope and restores the caller's device after it.
-class DeviceGuard {
-  public:
-    DeviceGuard(int device, const char* who) {
-        cuda_check(cudaGetDevice(&saved_), who, "cudaGetDevice");
-        if (saved_ != device) {
-            cuda_check(cudaSetDevice(device), who, "cudaSetDevice");
-            switched_ = true;
-        }
-    }
-    ~DeviceGuard() {
-        if (switched_) cudaSetDevice(saved_);
-    }
-    DeviceGuard(const DeviceGuard&) = delete;
-    DeviceGuard& operator=(const DeviceGuard&) = delete;
-
-  private:
-    int saved_ = 0;
-    bool switched_ = false;
 };
 
 // True when `s` was created without cudaStreamNonBlocking (the legacy default stream itself counts).

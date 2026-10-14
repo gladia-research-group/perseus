@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Alexander Ananyev
 // gpu_mag_probe.cu — see include/gpu_mag_probe.h.
 #include "gpu_mag_probe.h"
 
@@ -436,42 +434,6 @@ std::size_t GpuMagProbe::probe(const FIDESlib::CKKS::Ciphertext& ct) {
     stats_.enqueue_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return I.count++;
 }
-
-#ifdef GPU_MAG_PROBE_DEBUG
-std::vector<std::vector<uint64_t>> GpuMagProbe::debug_decrypt(const FIDESlib::CKKS::Ciphertext& ct,
-                                                              bool swap_components) {
-    Impl& I = *impl_;
-    const int nlimbs = ct.c0.getLevel() + 1;
-    DecParams dp{};
-    dp.c0 = swap_components ? ct.c1.GPU[0].limbptr.data : ct.c0.GPU[0].limbptr.data;
-    dp.c1 = swap_components ? ct.c0.GPU[0].limbptr.data : ct.c1.GPU[0].limbptr.data;
-    dp.s = I.s_table;
-    dp.out = I.d_table;
-    for (int l = 0; l < nlimbs; ++l) {
-        dp.q[l] = I.q[l];
-        dp.mu[l] = I.mu[l];
-    }
-    const int nblocks = (I.N + kThreads - 1) / kThreads;
-    drain_pending(kWho, "k_decrypt launch");
-    k_decrypt<<<dim3(nblocks, nlimbs), kThreads, 0, I.s0>>>(dp, I.N);
-    check(cudaGetLastError(), "k_decrypt launch");
-    I.scratch->c0.setLevel(nlimbs - 1);
-    I.scratch->c0.INTT(I.cc.param.batch, true);
-    check(cudaDeviceSynchronize(), "debug sync");
-    std::vector<std::vector<uint64_t>> out;
-    I.scratch->c0.store(out);
-    check(cudaDeviceSynchronize(), "debug store sync");
-    return out;
-}
-
-std::vector<std::vector<uint64_t>> GpuMagProbe::debug_secret_limbs() {
-    Impl& I = *impl_;
-    std::vector<std::vector<uint64_t>> out;
-    I.secret->c0.store(out);
-    check(cudaDeviceSynchronize(), "debug secret store");
-    return out;
-}
-#endif
 
 std::vector<GpuMagProbe::Result> GpuMagProbe::fetch() {
     Impl& I = *impl_;
