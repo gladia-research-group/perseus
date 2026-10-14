@@ -61,6 +61,7 @@ Regenerate this file with `python scripts/utils/scan_env_vars.py`.
 | `FHE_BOOTSTRAP_PLACEMENTS_DIR` | Plan directory a run binds to; unset = eager. |
 | `FHE_DECODE_PLACEMENTS_DIR` | Plan used for the decode phase of a generation run. |
 | `FHE_GRAPH_DIR` | Directory a capture writes the op-graph into (STAGE=capture). |
+| `FHE_MAG_GPU` | Measure a capture's magnitudes on the device (decrypt, inverse NTT, decode and the statistics where the ciphertext is; include/gpu_mag_probe.h) instead of copying every node to the host; default off. The `[mag_lanes]` live/dead report of a lane-masked capture is a host-path diagnostic and does not count device-measured nodes. |
 | `FHE_MAG_WORKERS` | Worker threads for that measurement. |
 | `FHE_PREFILL_CAPTURE_RANGES` | Capture the per-chunk token ranges of a prefill. |
 | `FHE_PREFILL_PLACEMENTS_DIR` | Plan used for the prefill phase of a generation run. |

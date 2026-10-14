@@ -16,8 +16,10 @@ project(cuda_cachemir LANGUAGES CXX)
 # configuration is unchanged: CUDA enabled, everything below built as before.
 option(CACHEMIR_CLIENT_ONLY "Build only perseus._client (OpenFHE, no CUDA toolchain, no FIDESlib)" OFF)
 option(CACHEMIR_BUILD_CLIENT "Build the perseus._client pybind11 module" ${CACHEMIR_CLIENT_ONLY})
+option(CACHEMIR_MAG_PROBE_DEBUG "Compile the device magnitude probe's debug accessors (decrypted residues, key limbs)" OFF)
 if(NOT CACHEMIR_CLIENT_ONLY)
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)   # CUDA::cufft for the device magnitude probe
 endif()
 
 if(POLICY CMP0144)
@@ -121,6 +123,7 @@ add_library(cachemir_lib STATIC
     src/packing/cachemir/cachemir_rot_indices.cu
     src/packing/diagonal/diagonal_linear_utils.cu
     src/packing/diagonal/diagonal_norm_utils.cu
+    src/encode/gpu_mag_probe.cu
     src/packing/diagonal/diagonal_rot_indices.cu
     src/packing/cachemir_filling/cachemir_filling_kv_cache.cu
     src/packing/cachemir_filling/cachemir_filling_complex_io.cu
@@ -148,7 +151,10 @@ add_library(cachemir_lib STATIC
     src/app/pipeline.cu
 )
 target_include_directories(cachemir_lib PUBLIC include ${_openfhe_incdirs})
-target_link_libraries(cachemir_lib PUBLIC fideslib::fideslib OpenMP::OpenMP_CXX)
+target_link_libraries(cachemir_lib PUBLIC fideslib::fideslib OpenMP::OpenMP_CXX CUDA::cufft)   # cufft: the device magnitude probe (src/encode)
+if(CACHEMIR_MAG_PROBE_DEBUG)
+    target_compile_definitions(cachemir_lib PUBLIC GPU_MAG_PROBE_DEBUG=1)
+endif()
 if(LibArchive_FOUND)
     target_link_libraries(cachemir_lib PUBLIC LibArchive::LibArchive)
     # LibArchive::LibArchive marks its include dir SYSTEM; nvcc drops imported-target
