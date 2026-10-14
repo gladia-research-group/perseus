@@ -4148,8 +4148,8 @@ inline void log_ckks_params(const CC& cc, const CKKSContextOptions& o, uint32_t 
               << "  correction_factor=" << o.correction_factor
               << "  bts_iters=" << o.bts_iterations << "  bts_prec=" << o.bts_precision
               << "  auto_bts_level=" << o.auto_bts_level_override << "\n"
-              << "  secret=" << (sparse ? "SPARSE_ENCAPSULATED" : "UNIFORM_TERNARY")
-              << " h=" << o.h_weight << " (OpenFHE accounts UNIFORM_TERNARY)"
+              << "  secret=" << (sparse ? "SPARSE_ENCAPSULATED (uniform ternary main key; raise under an h=32 key "
+                                          "switched in at q_0..q_{d-1}*P)" : "UNIFORM_TERNARY")
               << "  dnum=" << o.num_large_digits
               << "  complex_payload=" << o.ckks_complex_payload << "\n"
               << "  security: " << sec << "\n"

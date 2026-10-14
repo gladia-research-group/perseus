@@ -29,6 +29,22 @@ using CKKSRNSParams = lbcrypto::CryptoParametersCKKSRNS;
 using RelinKey = std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>;
 using SKImpl = std::shared_ptr<lbcrypto::PrivateKeyImpl<lbcrypto::DCRTPoly>>;
 
+// ParameterSwitch.cuh KeepBottomLimbs: the dense->sparse key is applied only at the bottom level (keepQ towers),
+// where digit 0's q_0..q_{keepQ-1} and the special primes are read. Every other B limb is zeroed so the key is not
+// a clean sample of the sparse secret modulo QP/Q_j.
+void keep_bottom_limbs(const RelinKey& ek, uint32_t numQ, uint32_t keepQ) {
+    std::vector<lbcrypto::DCRTPoly> b = ek->GetBVector();
+    for (size_t j = 0; j < b.size(); ++j) {
+        for (uint32_t i = 0; i < b[j].GetNumOfElements(); ++i) {
+            if (j == 0 && (i < keepQ || i >= numQ)) continue;
+            auto t = b[j].GetElementAtIndex(i);
+            t.SetValuesToZero();
+            b[j].SetElementAtIndex(i, std::move(t));
+        }
+    }
+    ek->SetBVector(std::move(b));
+}
+
 std::shared_ptr<lbcrypto::FHECKKSRNS> fhe_of(const LbCC& cc) {
     auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE);
     if (!fhe) throw fhe::FHEError("bootstrap keys: the context has no FHE scheme (Enable(FHE) first)");
@@ -104,6 +120,7 @@ create_context_switching_keys(LbCC& cca, LbCC& ccb, const LbSK& a, int hamming_w
         skNewMain->SetKeyTag(a->GetKeyTag());
         atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
             cca->GetScheme()->KeySwitchGen(a, skNewMain));
+        keep_bottom_limbs(atob, cca->GetElementParams()->GetParams().size(), srcCompositeDegree);
     } else if (scaling != lbcrypto::FLEXIBLEAUTOEXT) {
         atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
             ccb->GetScheme()->KeySwitchGen(a, skNew));

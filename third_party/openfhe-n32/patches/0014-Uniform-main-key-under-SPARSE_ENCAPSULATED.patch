@@ -1,0 +1,49 @@
+From b7d50fc7cc71d4632894010dc375378b4f619f79 Mon Sep 17 00:00:00 2001
+From: Alex Zirilli <alexzirilli@gmail.com>
+Date: Wed, 14 Oct 2026 18:29:19 +0200
+Subject: [PATCH] Uniform main key under SPARSE_ENCAPSULATED
+
+---
+ src/pke/lib/schemebase/base-multiparty.cpp | 4 +++-
+ src/pke/lib/schemebase/base-pke.cpp        | 4 +++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/pke/lib/schemebase/base-multiparty.cpp b/src/pke/lib/schemebase/base-multiparty.cpp
+index 6b4e08bd..7d735ed2 100644
+--- a/src/pke/lib/schemebase/base-multiparty.cpp
++++ b/src/pke/lib/schemebase/base-multiparty.cpp
+@@ -98,10 +98,12 @@ KeyPair<Element> MultipartyBase<Element>::MultipartyKeyGen(CryptoContext<Element
+             s = Element(dgg, paramsPK, Format::EVALUATION);
+             break;
+         case UNIFORM_TERNARY:
++        // SPARSE_ENCAPSULATED raises under its own Hamming-weight-32 key, so the main key can stay uniform
++        // ternary: that is the distribution the HEStd_ternary table (the 128-bit check) is computed for.
++        case SPARSE_ENCAPSULATED:
+             s = Element(tug, paramsPK, Format::EVALUATION);
+             break;
+         case SPARSE_TERNARY:
+-        case SPARSE_ENCAPSULATED:
+             s = Element(tug, paramsPK, Format::EVALUATION, 192);
+             break;
+         default:
+diff --git a/src/pke/lib/schemebase/base-pke.cpp b/src/pke/lib/schemebase/base-pke.cpp
+index 8efa42fd..e9a45c39 100644
+--- a/src/pke/lib/schemebase/base-pke.cpp
++++ b/src/pke/lib/schemebase/base-pke.cpp
+@@ -62,10 +62,12 @@ KeyPair<Element> PKEBase<Element>::KeyGenInternal(CryptoContext<Element> cc, boo
+             s = Element(dgg, paramsPK, Format::EVALUATION);
+             break;
+         case UNIFORM_TERNARY:
++        // SPARSE_ENCAPSULATED raises under its own Hamming-weight-32 key, so the main key can stay uniform
++        // ternary: that is the distribution the HEStd_ternary table (the 128-bit check) is computed for.
++        case SPARSE_ENCAPSULATED:
+             s = Element(tug, paramsPK, Format::EVALUATION);
+             break;
+         case SPARSE_TERNARY:
+-        case SPARSE_ENCAPSULATED:
+             // https://github.com/openfheorg/openfhe-development/issues/311
+             s = Element(tug, paramsPK, Format::EVALUATION, 192);
+             break;
+-- 
+2.43.0
+

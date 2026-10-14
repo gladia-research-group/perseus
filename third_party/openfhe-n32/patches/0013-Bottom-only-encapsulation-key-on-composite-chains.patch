@@ -1,0 +1,54 @@
+From a9236b8713d9ef0654e2863bc94af01e5efb4a51 Mon Sep 17 00:00:00 2001
+From: Alex Zirilli <alexzirilli@gmail.com>
+Date: Wed, 14 Oct 2026 18:11:27 +0200
+Subject: [PATCH] Bottom-only encapsulation key on composite chains
+
+---
+ src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp | 23 +++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+index 0d595041..cd4975f1 100644
+--- a/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
++++ b/src/pke/lib/scheme/ckksrns/ckksrns-fhe.cpp
+@@ -74,6 +74,24 @@ double GetBigModulus(const std::shared_ptr<lbcrypto::CryptoParametersCKKSRNS> cr
+     return qDouble;
+ }
+ 
++// A composite chain applies the dense->sparse encapsulation key only at the bottom level (compositeDegree
++// towers), where the hybrid keyswitch reads digit 0 at q_0..q_{d-1} and the special primes. Zero every other
++// B limb: digit j of the full key is a clean RLWE sample of the sparse secret modulo QP/Q_j, far above what
++// a Hamming-weight-32 secret can afford; the bottom part alone lives modulo q_0...q_{d-1}*P.
++void KeepBottomLimbs(lbcrypto::EvalKey<lbcrypto::DCRTPoly>& ek, uint32_t numQ, uint32_t keepQ) {
++    std::vector<lbcrypto::DCRTPoly> b = ek->GetBVector();
++    for (size_t j = 0; j < b.size(); ++j) {
++        for (uint32_t i = 0; i < b[j].GetNumOfElements(); ++i) {
++            if (j == 0 && (i < keepQ || i >= numQ))
++                continue;
++            auto t = b[j].GetElementAtIndex(i);
++            t.SetValuesToZero();
++            b[j].SetElementAtIndex(i, std::move(t));
++        }
++    }
++    ek->SetBVector(std::move(b));
++}
++
+ }  // namespace
+ 
+ namespace lbcrypto {
+@@ -1367,8 +1385,11 @@ std::shared_ptr<std::map<uint32_t, EvalKey<DCRTPoly>>> FHECKKSRNS::EvalBootstrap
+         // that ExtendCiphertext then over-reads => segfault). Use the standard hybrid
+         // keyswitch machinery for the dense->sparse direction instead, exactly like the
+         // sparse->dense direction below always has; it works at any tower count.
+-        if (cryptoParams->GetCompositeDegree() > 1)
++        if (cryptoParams->GetCompositeDegree() > 1) {
+             (*evalKeys)[M - 4] = algo->KeySwitchGen(privateKey, skNew);
++            KeepBottomLimbs((*evalKeys)[M - 4], cryptoParams->GetElementParams()->GetParams().size(),
++                            cryptoParams->GetCompositeDegree());
++        }
+         else
+             (*evalKeys)[M - 4] = KeySwitchGenSparse(privateKey, skNew);
+         (*evalKeys)[M - 2] = algo->KeySwitchGen(skNew, privateKey);
+-- 
+2.43.0
+
