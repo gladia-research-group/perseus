@@ -2,6 +2,8 @@
 l + 16), normalised per (query, head) row with per-slot seeds, unpacked for the P.V CCMM."""
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from . import sinc as sc
@@ -11,6 +13,8 @@ from .poly import eval_chebyshev, im_cleanse
 from .prefill import _KcExtrapolated
 
 LO = (sc.slot_coords()[2] < 16).astype(float)
+# PF_SM_R_REFRESH=1 (with unpacked): one refresh of the last reciprocal R instead of P's 16 CCMM-entry refreshes
+R_REFRESH = os.environ.get("PF_SM_R_REFRESH", "0") not in ("", "0")
 
 
 def pack(rt, S):
@@ -55,9 +59,10 @@ def recip_slots(rt, D, av, bv, iters, key, cheb=None):
     return ops.mult_i(ops.sub(ops.conjugate(P), P))
 
 
-def softmax(rt, Spk, cfg, layer=0, T=127):
+def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
     """Spk: 16 packed real score ciphertexts in true units, the BOS key on key token sc.BOS_TOK.
-    Returns the packed probabilities."""
+    Returns the packed probabilities, or (`unpacked`) unpack's output with its masks on the Z side of the last
+    product: (Z LO) R + i (rot(Z, 16) LO) rot(R, 16), one level shallower when R is the deeper factor."""
     ops = rt.ops
     tq, tk = sc.packed_meta(T)
     qv = tq >= 0
@@ -94,5 +99,12 @@ def softmax(rt, Spk, cfg, layer=0, T=127):
         if cheb:
             cv = ([np.array([p[4][0][j] for p in per]) for j in range(iters - 1)], np.array([p[4][1] for p in per]))
         R = recip_slots(rt, D, av, bv, iters, ("sm", layer, r, T), cv)
+        if unpacked and r == n_rounds - 1:
+            if R_REFRESH:
+                ops.bootstrap_real(R)
+            Rh = ops.rotate(R, 16)
+            return [ops.add(ops.mult(rt.mult_mask(z, ("sm.unpack",), lambda: LO), R),
+                            ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), ("sm.unpack",), lambda: LO), Rh)))
+                    for z in Z]
         Y = [ops.mult(z, R) for z in Z]
     return Y

@@ -20,6 +20,8 @@ SHIFT_PV = int(os.environ.get("PF_CCMM_SHIFT_PV", "3"))
 QMAX = float(os.environ.get("PF_CCMM_QMAX", "4"))
 KMAX = float(os.environ.get("PF_CCMM_KMAX", "24"))
 VMAX = float(os.environ.get("PF_CCMM_VMAX", "8"))
+# PF_SM_UNPACK_FOLD=1: the unpack masks on the softmax's last Z (P one level shallower)
+UNPACK_FOLD = os.environ.get("PF_SM_UNPACK_FOLD", "0") not in ("", "0")
 
 
 def _halves(ops, X):
@@ -72,7 +74,10 @@ def attention_ccmm(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=
         S = eng.apply(Qs, Ks, b_transposed=True, amax=QMAX, bmax=KMAX, shift=SHIFT_QK, out_scale=0.5 * gscale,
                       site=f"qk{layer}")
     with rt.step("softmax"):
-        P = sm.unpack(rt, sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T))
+        if UNPACK_FOLD:
+            P = sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T, unpacked=True)
+        else:
+            P = sm.unpack(rt, sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T))
     with rt.step("softmax_v"):
         Vs = sc.to_sinc_kv(rt, Vr)
         vpat = sc.kv_row_pattern(vb)
