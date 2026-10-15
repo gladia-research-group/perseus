@@ -4123,19 +4123,28 @@ inline void log_ckks_params(const CC& cc, const CKKSContextOptions& o, uint32_t 
     const int num_limbs  = mult_depth + 1;
     const double logQ = o.first_mod_bits + static_cast<double>(mult_depth) * scale;   // uniform towers
 
+    // OpenFHE's HEStd_ternary table (stdlatticeparms.cpp), checked against the actual Q*P
     auto budget128 = [](int lN) -> double {
         switch (lN) { case 13: return 218; case 14: return 438; case 15: return 881;
-                      case 16: return 1761; case 17: return 3523; default: return -1.0; }
+                      case 16: return 1747; case 17: return 3523; default: return -1.0; }
     };
     const double b      = budget128(o.logN);
     const bool   sparse = (o.h_weight > 0);
+    double logQP = 0;
+    if (cc->cpu.has_value()) {
+        const auto& lcc = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(cc->cpu);
+        auto rns = std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(lcc->GetCryptoParameters());
+        for (const auto& m : rns->GetElementParams()->GetParams()) logQP += std::log2(m->GetModulus().ConvertToDouble());
+        if (rns->GetParamsP())
+            for (const auto& m : rns->GetParamsP()->GetParams()) logQP += std::log2(m->GetModulus().ConvertToDouble());
+    }
 
     std::string sec;
-    if (b < 0)
+    if (b < 0 || logQP == 0)
         sec = "HEStd_128_classic enforced (budget for this logN unknown)";
     else
-        sec = "HEStd_128_classic enforced & OK (logQ " + std::to_string((long)logQ)
-            + " <= uniform-ternary budget " + std::to_string((long)b) + ")";
+        sec = std::string("HEStd_128_classic ") + (logQP <= b ? "OK" : "VIOLATED") + " (logQP "
+            + std::to_string((long)std::ceil(logQP)) + " <= uniform-ternary budget " + std::to_string((long)b) + ")";
 
     std::cerr << "[ckks_params] ===== CKKS crypto context =====\n"
               << "  logN=" << o.logN << "  ringDim=" << ring_dim << "  slots=" << slots << "\n"
