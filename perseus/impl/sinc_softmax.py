@@ -16,6 +16,9 @@ LO = (sc.slot_coords()[2] < 16).astype(float)
 # PF_SM_R_REFRESH=1 (with unpacked): one refresh of the last reciprocal R instead of P's 16 CCMM-entry refreshes
 R_REFRESH = os.environ.get("PF_SM_R_REFRESH", "0") not in ("", "0")
 R_SCALE = float(os.environ.get("PF_SM_R_SCALE", "1"))   # refresh R / R_SCALE (|R| <= 32.5), R_SCALE rides the Z masks
+# PF_SM_R_ITER=1: the R refresh as two passes (the residual refreshed at 2^PF_SM_R_ITER_P, bts2's form from leaf ops)
+R_ITER = os.environ.get("PF_SM_R_ITER", "0") not in ("", "0")
+R_ITER_P = int(os.environ.get("PF_SM_R_ITER_P", "8"))
 
 
 def pack(rt, S):
@@ -105,7 +108,15 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
             if R_REFRESH:
                 if sc_r != 1.0:
                     R = ops.mult(R, 1.0 / sc_r)
-                ops.bootstrap_real(R)
+                if R_ITER:
+                    y = ops.copy(R)
+                    ops.bootstrap_real(y)
+                    # + 1/4: the residual is 0 on an exact backend, its refresh needs a captured magnitude
+                    e = ops.add(ops.mult(ops.sub(R, y), float(2 ** R_ITER_P)), 0.25)
+                    ops.bootstrap_real(e)
+                    R = ops.add(y, ops.mult(ops.add(e, -0.25), float(2.0 ** -R_ITER_P)))
+                else:
+                    ops.bootstrap_real(R)
             Rh = ops.rotate(R, 16)
             mk = ("sm.unpack",) if sc_r == 1.0 else ("sm.unpack", sc_r)
             return [ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * LO), R),
