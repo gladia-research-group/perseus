@@ -9,7 +9,7 @@ import time
 import numpy as np
 
 from . import sinc as sc
-from .pcmm import _N32_CAP, _ks_key, _twiddles, find_prime
+from .pcmm import _N32_CAP, KeyRng, _ks_key, _twiddles, find_prime
 
 NB, NS, KY, SW = 1 << 16, 1 << 13, 64, 8
 
@@ -29,10 +29,10 @@ def _negacyclic_square(s):
     return sq[:n] - sq[n:]
 
 
-def make_keys(sk, moduli, seed=None):
+def make_keys(sk, moduli):
     """bts.ccmm_keys dict: ring switch sk <-> s'(X^8) at 2^16, 128 automorphism keys and s'^2 -> s' at 2^13, over the
     four bottom moduli + one 31-bit special prime."""
-    rng = np.random.default_rng(seed)
+    rng = KeyRng()
     q = [int(m) for m in moduli[:4]]
     P = find_prime(31, 2 * NB, set(q))
     big = q + [P]
@@ -83,8 +83,8 @@ def exact(a_vecs, b_vecs, b_transposed):
 
 
 class Ccmm:
-    def __init__(self, ops, seed=None):
-        self.ops, self.seed = ops, seed
+    def __init__(self, ops):
+        self.ops = ops
         self.fhe = ops.fhe
         self.bts = getattr(ops.core, "bts", None)
         self.keys = None
@@ -107,7 +107,7 @@ class Ccmm:
         x = ops.encode_token(np.zeros(dim))
         d = bts.device(self.fhe, x)
         ex = bts.export_limbs(self.fhe, d)
-        self.keys = bts.ccmm_keys(make_keys(bts.secret_key_coeffs(self.fhe), ex["moduli"][:4], self.seed))
+        self.keys = bts.ccmm_keys(make_keys(bts.secret_key_coeffs(self.fhe), ex["moduli"][:4]))
         self.nf_ref = bts.noise_factor(d)
         y = ops.encode_token(np.zeros(dim))
         dy = bts.device(self.fhe, y)
@@ -226,7 +226,7 @@ class Ccmm:
 def engine(rt):
     e = rt.__dict__.get("_ccmm_engine")
     if e is None:
-        e = rt.__dict__["_ccmm_engine"] = Ccmm(rt.ops, seed=int(os.environ.get("PF_CCMM_SEED", "0")) or None)
+        e = rt.__dict__["_ccmm_engine"] = Ccmm(rt.ops)
         rt.ccmm = e
     return e
 

@@ -3,8 +3,10 @@ Sylph, arXiv 2601.18511): y = x W on the dense token layout via ring switch + in
 Needs FIDESLIB_BTS_STC_FIRST=2 and FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1."""
 from __future__ import annotations
 
+import hashlib
 import math
 import os
+import secrets
 import time
 from dataclasses import dataclass
 
@@ -151,6 +153,38 @@ def _twiddles(p, n):
     return pp[rev].astype(np.uint32), ip[rev].astype(np.uint32), ninv
 
 
+class KeyRng:
+    """Key-material sampler: SHAKE-256 in counter mode under a fresh 256-bit OS key (numpy's generators are not
+    cryptographic, and a seeded one publishes the keys)."""
+
+    def __init__(self):
+        self._key, self._ctr = secrets.token_bytes(32), 0
+
+    def _bytes(self, n):
+        self._ctr += 1
+        return hashlib.shake_256(self._key + self._ctr.to_bytes(8, "little")).digest(n)
+
+    def integers(self, lo, hi, size, dtype=np.int64):
+        """Uniform on [lo, hi), hi - lo <= 2^32, by rejection."""
+        m = hi - lo
+        lim = (1 << 32) // m * m
+        out, k = [], 0
+        while k < size:
+            u = np.frombuffer(self._bytes(4 * ((size - k) * (1 << 32) // lim + 64)), dtype=np.uint32).astype(np.int64)
+            u = u[u < lim][: size - k] % m
+            out.append(u)
+            k += u.size
+        return (np.concatenate(out) + lo).astype(dtype)
+
+    def normal(self, mu, sigma, size):
+        """Box-Muller on 53-bit uniforms."""
+        h = (size + 1) // 2
+        u = (np.frombuffer(self._bytes(16 * h), dtype=np.uint64) >> np.uint64(11)).astype(np.float64) / 2.0 ** 53
+        r = np.sqrt(-2.0 * np.log(1.0 - u[:h]))
+        z = np.concatenate([r * np.cos(2 * np.pi * u[h:]), r * np.sin(2 * np.pi * u[h:])])
+        return mu + sigma * z[:size]
+
+
 def _ks_key(s_from, s_to, q, P, rng):
     """[digit][prime][a, b][n] coefficient form: key_j = (a, -a s_to + e + P (Q / q_j) s_from) over q + [P]."""
     n = s_from.shape[-1]
@@ -167,10 +201,10 @@ def _ks_key(s_from, s_to, q, P, rng):
     return out
 
 
-def make_keys(sk, split_moduli, t, seed=None):
+def make_keys(sk, split_moduli, t):
     """Device key dict for bts.pcmm_keys: ring-switch keys to s'(X^16) and back, r pack keys, over {q0, q1, P}."""
     sh = Shape(t)
-    rng = np.random.default_rng(seed)
+    rng = KeyRng()
     q = [int(m) for m in split_moduli[:2]]
     P = find_prime(31, 2 * N, set(int(m) for m in split_moduli))
     sk = np.asarray(sk, dtype=np.int64)
@@ -299,7 +333,7 @@ def engine(rt, t=None):
     t = int(t or rt.dims.t)
     engines = rt.__dict__.setdefault("_pcmm_engines", {})
     if t not in engines:
-        engines[t] = Pcmm(rt.ops, t, seed=int(os.environ.get("PF_PCMM_SEED", "0")))
+        engines[t] = Pcmm(rt.ops, t)
     rt.pcmm = engines[t]
     return engines[t]
 
@@ -326,8 +360,8 @@ class Pcmm:
     """The session's PCMM engine, recorded as rotate(x, -1) + hint/level_hint(cap) per input, one external bootstrap
     per output, rotate(y, 1); the fake computes the exact integer products."""
 
-    def __init__(self, ops, t, seed=None):
-        self.ops, self.t, self.seed = ops, t, seed
+    def __init__(self, ops, t):
+        self.ops, self.t = ops, t
         self.core = ops.core
         self.fhe = ops.fhe
         self.bts = getattr(ops.core, "bts", None)
@@ -349,7 +383,7 @@ class Pcmm:
             ex = self.bts.export_limbs(self.fhe, dev)
             sk = self.bts.secret_key_coeffs(self.fhe)
             mod = ex["moduli"][:moduli_first] if moduli_first else ex["moduli"]
-            self.keys = self.bts.pcmm_keys(make_keys(sk, mod, self.t, self.seed))
+            self.keys = self.bts.pcmm_keys(make_keys(sk, mod, self.t))
             assert self.keys.channels == self.sh.nch
             self.keygen_s = time.perf_counter() - t0
 
