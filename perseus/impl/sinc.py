@@ -138,6 +138,8 @@ _MA = None
 def stage_a(rt, x, site="sinc.a"):
     """Swap slot fields [0, 6) <-> [6, 12) of x (BSGS: 12 hoisted baby rotations, 11 giant)."""
     global _MA
+    if A2:
+        return stage_a2(rt, x, site)
     if _MA is None:
         _MA = _stage_a_masks()
     ops = rt.ops
@@ -157,6 +159,59 @@ def stage_a(rt, x, site="sinc.a"):
             acc = ops.rotate(acc, -63 * A_BABY * g)
         out = acc if out is None else ops.add(out, acc)
     return out
+
+
+# PF_SINC_A2=1: stage A as two 3-bit field swaps ([0, 3) <-> [6, 9), then [3, 6) <-> [9, 12)): 2 x 15 diagonals and
+# one more level instead of 127 diagonals
+A2 = __import__("os").environ.get("PF_SINC_A2", "0") not in ("", "0")
+A2_BABY = 4
+A2_GIANT = range(-2, 2)
+
+
+def swap3(s, lo):
+    """Slot bit fields [lo, lo + 3) <-> [lo + 6, lo + 9)."""
+    s = np.asarray(s, dtype=np.int64)
+    a, b = (s >> lo) & 7, (s >> (lo + 6)) & 7
+    return (s & ~((7 << lo) | (7 << (lo + 6)))) | (b << lo) | (a << (lo + 6))
+
+
+_MA2 = {}
+
+
+def _swap3_masks(lo):
+    """mask_{g,b} = roll(m_d, u b) for d = 4 g + b, u = 63 2^lo, m_d[s] = [swap3(s) - s == u d]."""
+    if lo not in _MA2:
+        u = 63 << lo
+        s = np.arange(SLOTS)
+        dd = (swap3(s, lo) - s) // u
+        _MA2[lo] = {(g, b): np.roll((dd == A2_BABY * g + b).astype(float), u * b)
+                    for g in A2_GIANT for b in range(A2_BABY) if -7 <= A2_BABY * g + b <= 7}
+    return _MA2[lo]
+
+
+def _swap3(rt, x, lo, site):
+    ops, u = rt.ops, 63 << lo
+    ms = _swap3_masks(lo)
+    baby = [x] + ops.rotate_many(x, [-u * b for b in range(1, A2_BABY)])
+    out = None
+    for g in A2_GIANT:
+        acc = None
+        for b in range(A2_BABY):
+            m = ms.get((g, b))
+            if m is None:
+                continue
+            y = rt.mult_mask(baby[b], (site, lo, g, b), lambda m=m: m)
+            acc = y if acc is None else ops.add(acc, y)
+        if acc is None:
+            continue
+        if g:
+            acc = ops.rotate(acc, -u * A2_BABY * g)
+        out = acc if out is None else ops.add(out, acc)
+    return out
+
+
+def stage_a2(rt, x, site="sinc.a"):
+    return _swap3(rt, _swap3(rt, x, 0, site), 3, site)
 
 
 def _b_mask(o, v):
@@ -186,9 +241,23 @@ def _bi_mask(v):
     return (((s >> 2) & 15) == v).astype(float)
 
 
+# PF_SINC_BI_HOIST=1: stage_b_inv with the rotations hoisted to the 16 sources and the 8 sums (24 instead of 128)
+BI_HOIST = __import__("os").environ.get("PF_SINC_BI_HOIST", "0") not in ("", "0")
+
+
 def stage_b_inv(rt, ys, vs, site="sinc.bi"):
     """Inverse of stage_b: SinC ciphertexts ys (target o = index) -> one stage-A-layout ciphertext per v in vs."""
     ops = rt.ops
+    if BI_HOIST:
+        ws = [ops.rotate(y, (OFFSET - 4 * o) % SLOTS) for o, y in enumerate(ys)]
+        outs = []
+        for v in vs:
+            acc = None
+            for o, w in enumerate(ws):
+                t = rt.mult_mask(w, (site, "h", v, o), lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o))
+                acc = t if acc is None else ops.add(acc, t)
+            outs.append(ops.rotate(acc, 4 * v) if v else acc)
+        return outs
     zs = [ops.rotate(y, OFFSET) for y in ys]
     outs = []
     for v in vs:
@@ -230,6 +299,12 @@ def rot_steps() -> set[int]:
     st = {-63 * b for b in range(1, A_BABY)} | {-63 * A_BABY * g for g in A_GIANT if g}
     st |= {-4 * v for v in range(1, 16)} | {4 * v for v in range(1, 16)} | {4 * v - 4 * o for v in range(16) for o in range(16)}
     st |= {(4 * o - OFFSET) % SLOTS for o in range(16)} | {OFFSET}
+    if BI_HOIST:
+        st |= {(OFFSET - 4 * o) % SLOTS for o in range(16)} | {4 * v for v in range(1, 16)}
+    if A2:
+        for lo in (0, 3):
+            u = 63 << lo
+            st |= {-u * b for b in range(1, A2_BABY)} | {-u * A2_BABY * g for g in A2_GIANT if g}
     return {s for s in st if s % SLOTS}
 
 
