@@ -3831,6 +3831,151 @@ struct CKKSContext {
     }
     PackedCtx mult(const PackedCtx& a, double scalar) { return slotlayout::keep(a.ct, tagged(mult(a.ct, scalar), a.packing, packtag::t_mult_scalar(a.tag, scalar))); }
 
+    // A traced straight-line program (perseus.impl.poly cheb programs) on the API calls the per-op path makes, without
+    // its per-op bookkeeping. regs = inputs, then one register per instruction (realize: none). Instructions
+    // (opcode, args): 0 square a | 1 mult a b | 2 add a b | 3 sub a b | 4 add a c | 5 mult a c | 6 wsum k a_1..a_k
+    // c_1..c_k | 7 realize a. Var names: one per op, 2 k - 1 per wsum (the per-op path's); returns {} (caller runs
+    // the per-op path) when a graph is recorded or a plan entry names one of them.
+    std::vector<PackedCtx> run_program(const std::vector<PackedCtx>& in, const std::vector<std::vector<double>>& prog,
+                                       const std::vector<int>& outs) {
+        if (graph_enabled() || cc->devices.empty() || in.empty())
+            return {};
+        size_t names = 0, regs = in.size();
+        for (const auto& ins : prog) {
+            const int op = (int)ins.at(0);
+            if (op < 0 || op > 7)
+                throw std::invalid_argument("run_program: unknown opcode " + std::to_string(op));
+            names += op == 7 ? 0 : op == 6 ? 2 * (size_t)ins.at(1) - 1 : 1;
+            regs += op == 7 ? 0 : 1;
+        }
+        if (outs.size() != 1 || (size_t)outs[0] + 1 != regs || regs == in.size())
+            return {};          // one output, the last op's: the only register the per-op path names last
+        if (naming_active()) {
+            for (size_t k = 1; k <= names; ++k) {
+                const std::string nm = graph_var_scope.empty()
+                    ? "v_" + std::to_string(graph_ct_counter + k)
+                    : graph_var_scope + "_" + std::to_string(graph_var_scope_counter + k);
+                if (placement_after.count(nm) || plan_rescale_after.count(nm))
+                    return {};
+            }
+        }
+        std::vector<Ctx> r;
+        std::vector<packtag::PackTag> tg;
+        for (const auto& p : in) { r.push_back(p.ct); tg.push_back(p.tag); }
+        auto dev = [&](Ctx& c) {
+            cc->LoadCiphertext(c);
+            return std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(cc->GetDeviceCiphertext(c->gpu)).get();
+        };
+        for (const auto& ins : prog) {
+            const int op = (int)ins.at(0);
+            auto R = [&](size_t i) -> Ctx& { return r.at((size_t)ins.at(i)); };
+            auto T = [&](size_t i) { return tg.at((size_t)ins.at(i)); };
+            switch (op) {
+            case 0: r.push_back(cc->EvalSquare(R(1))); tg.push_back(packtag::t_square(T(1))); break;
+            case 1: { Ctx o = cc->EvalMult(R(1), R(2)); auto t = packtag::t_mult(T(1), T(2)); r.push_back(o); tg.push_back(t); break; }
+            case 2: case 3: {
+                Ctx o = op == 2 ? cc->EvalAdd(R(1), R(2)) : cc->EvalSub(R(1), R(2));
+                auto t = conj_pair(packtag::t_add(T(1), T(2)), R(1).get(), R(2).get(), T(1), T(2), op == 3);
+                r.push_back(o); tg.push_back(t); break;
+            }
+            case 4: { Ctx o = cc->EvalAdd(R(1), ins.at(2)); auto t = packtag::t_add_scalar(T(1), ins.at(2)); r.push_back(o); tg.push_back(t); break; }
+            case 5: { Ctx o = cc->EvalMult(R(1), ins.at(2)); auto t = packtag::t_mult_scalar(T(1), ins.at(2)); r.push_back(o); tg.push_back(t); break; }
+            case 6: {
+                const size_t k = (size_t)ins.at(1);
+                std::vector<FIDESlib::CKKS::Ciphertext*> ds;
+                std::vector<double> ws;
+                int lv = INT_MAX;
+                packtag::PackTag t = packtag::t_mult_scalar(T(2), ins.at(2 + k));
+                for (size_t j = 0; j < k; ++j) {
+                    Ctx& c = R(2 + j);
+                    cc->LoadCiphertext(c);
+                    if (c->GetNoiseScaleDeg() == 2) cc->RescaleInPlace(c);
+                    auto* d = dev(c);
+                    lv = std::min(lv, d->getLevel());
+                    ds.push_back(d);
+                    ws.push_back(ins.at(2 + k + j));
+                    if (j) t = packtag::t_add(t, packtag::t_mult_scalar(T(2 + j), ins.at(2 + k + j)));
+                }
+                Ctx o = R(2)->Clone();
+                auto* od = dev(o);
+                if (od->getLevel() > lv) od->dropToLevel(lv);
+                od->evalLinearWSumMutable((uint32_t)k, ds, ws);
+                r.push_back(o); tg.push_back(t); break;
+            }
+            case 7: { Ctx& c = R(1); cc->LoadCiphertext(c); if (c->GetNoiseScaleDeg() == 2) cc->RescaleInPlace(c); break; }
+            default: throw std::invalid_argument("run_program: unknown opcode " + std::to_string(op));
+            }
+            if (op != 7) tag_ct(r.back(), tg.back());
+        }
+        if (naming_active()) {
+            if (graph_var_scope.empty()) graph_ct_counter += names;
+            else graph_var_scope_counter += names;
+        }
+        std::vector<PackedCtx> res;
+        for (int i : outs) {
+            Ctx& c = r.at((size_t)i);
+            if (naming_active()) {   // the program's last name is the output's (one output per program)
+                const std::string nm = graph_var_scope.empty() ? "v_" + std::to_string(graph_ct_counter)
+                                                               : graph_var_scope + "_" + std::to_string(graph_var_scope_counter);
+                ct_vars[static_cast<const void*>(c.get())] = nm;
+                maybe_apply_planned_bootstrap_after(nm, c);
+                verify_expected_level(nm, "program", level_of(c));
+            }
+            res.push_back(slotlayout::keep(in.at(0).ct, tagged(c, in.at(0).packing, tg.at((size_t)i))));
+        }
+        return res;
+    }
+
+    // sum_i ts[i] cs[i]: the loop mult(t, c) + inplace_add, or (IMPL_WSUM=1, no graph recorded, no plan entry on the
+    // loop's intermediates) one FIDESlib evalLinearWSum. The fused path rescales deg-2 inputs in place (value-preserving,
+    // what multScalar does on a copy) and consumes the loop's 2n - 1 var names.
+    PackedCtx wsum_scalar(const std::vector<PackedCtx>& ts, const std::vector<double>& cs) {
+        const size_t n = ts.size();
+        auto loop = [&] {
+            PackedCtx r = mult(ts[0], cs[0]);
+            for (size_t i = 1; i < n; ++i) inplace_add(r, mult(ts[i], cs[i]));
+            return r;
+        };
+        static const bool on = [] { const char* e = std::getenv("IMPL_WSUM"); return e && std::atoi(e) > 0; }();
+        if (!on || n < 2 || graph_enabled() || cc->devices.empty())
+            return loop();
+        const size_t names = 2 * n - 1;
+        if (naming_active()) {
+            for (size_t k = 1; k <= names; ++k) {
+                const std::string nm = graph_var_scope.empty()
+                    ? "v_" + std::to_string(graph_ct_counter + k)
+                    : graph_var_scope + "_" + std::to_string(graph_var_scope_counter + k);
+                if (placement_after.count(nm) || plan_rescale_after.count(nm))
+                    return loop();
+            }
+        }
+        std::vector<FIDESlib::CKKS::Ciphertext*> dev;
+        int lv = INT_MAX;
+        for (const auto& t : ts) {
+            Ctx c = t.ct;
+            cc->LoadCiphertext(c);
+            if (c->GetNoiseScaleDeg() == 2) cc->RescaleInPlace(c);
+            auto* d = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(cc->GetDeviceCiphertext(c->gpu)).get();
+            lv = std::min(lv, d->getLevel());
+            dev.push_back(d);
+        }
+        Ctx o = ts[0].ct->Clone();
+        auto* od = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(cc->GetDeviceCiphertext(o->gpu)).get();
+        if (od->getLevel() > lv) od->dropToLevel(lv);
+        od->evalLinearWSumMutable((uint32_t)n, dev, cs);
+        packtag::PackTag tg = packtag::t_mult_scalar(ts[0].tag, cs[0]);
+        for (size_t i = 1; i < n; ++i) tg = packtag::t_add(tg, packtag::t_mult_scalar(ts[i].tag, cs[i]));
+        tag_ct(o, tg);
+        if (naming_active()) {
+            if (graph_var_scope.empty()) graph_ct_counter += names - 1;
+            else graph_var_scope_counter += names - 1;
+        }
+        const std::string out = set_new_var_for_ct(o);
+        maybe_apply_planned_bootstrap_after(out, o);
+        verify_expected_level(out, "add_inplace", level_of(o));
+        return slotlayout::keep(ts[0].ct, tagged(o, ts[0].packing, tg));
+    }
+
     // The raw inplace ops compute the proper transfer tag in the ct registry; sync the
     // PackedCtx FIELD from it afterwards so the two views never diverge. A stale field
     // here is a soundness hazard for any later reader of pc.tag.

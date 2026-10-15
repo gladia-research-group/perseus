@@ -10,12 +10,16 @@ pow_odd); im_cleanse is include/fideslib_wrapper.h and the 2-iteration bootstrap
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
 from .ops import FheOps, NumpyOps  # noqa: F401  (re-exported for the older import path)
 
 # ── ladders ──────────────────────────────────────────────────────────────────────────
+
+# PF_CHEB_LEAF_NATIVE=1: a Chebyshev leaf (sum c_i T_i) as one native call (same op stream)
+_LEAF_NATIVE = os.environ.get("PF_CHEB_LEAF_NATIVE", "0") not in ("", "0")
 
 def rotsum(ops, x, start: int, stop: int):
     """x += rotate(x, gap) for gap = start, 2 start, ... < stop (rotate_and_sum_all with
@@ -157,6 +161,72 @@ def _cheb_split(c, k):
     return q, r
 
 
+# IMPL_CHEB_PROG=1: on a runtime with run_program, a BSGS series as one traced program (the same API calls and var
+# names as the per-op path; leaves as one evalLinearWSum)
+_CHEB_PROG = os.environ.get("IMPL_CHEB_PROG", "0") not in ("", "0")
+_PROGS = {}
+
+
+class _Reg(int):
+    """A traced register (a scalar operand stays a float)."""
+
+
+class _TraceOps:
+    """Records eval_chebyshev_bsgs's ops on register numbers (run_program's instruction set)."""
+    trace = True
+
+    def __init__(self, base):
+        self.prog, self.n = [], 1
+        self.realize_shared = getattr(base, "realize_shared", False)
+        self.dead_ops = getattr(base, "dead_ops", False)
+        self.cheb_bsgs = True
+
+    def _new(self, ins):
+        self.prog.append([float(v) for v in ins])
+        self.n += 1
+        return _Reg(self.n - 1)
+
+    @staticmethod
+    def _sc(b):
+        return not isinstance(b, _Reg)
+
+    def square(self, a): return self._new([0, a])
+    def mult(self, a, b): return self._new([5, a, float(b)] if self._sc(b) else [1, a, b])
+    def add(self, a, b): return self._new([4, a, float(b)] if self._sc(b) else [2, a, b])
+
+    def sub(self, a, b):
+        if self._sc(b):
+            raise NotImplementedError
+        return self._new([3, a, b])
+
+    def realize(self, a):
+        self.prog.append([7.0, float(a)])
+        return a
+
+    def scalar_sum(self, ts, cs):
+        return self._new([6, len(ts)] + list(ts) + [float(c) for c in cs])
+
+    def inplace_add(self, a, b):
+        raise NotImplementedError
+
+
+def _cheb_program(ops, x, coeffs, a, b, eps):
+    """The series on run_program, or None (the per-op path)."""
+    run = getattr(getattr(ops, "fhe", None), "run_program", None)
+    if run is None or type(ops).__name__ != "FheOps" or getattr(ops, "cheb_align", False):
+        return None
+    key = (tuple(coeffs), float(a), float(b), eps, getattr(ops, "realize_shared", False), getattr(ops, "dead_ops", False))
+    prog = _PROGS.get(key)
+    if prog is None:
+        tr = _TraceOps(ops)
+        out = eval_chebyshev_bsgs(tr, _Reg(0), list(coeffs), a, b, eps)
+        prog = _PROGS[key] = (tr.prog, out) if out == tr.n - 1 else None
+    if prog is None:
+        return None
+    res = run([x], prog[0], [prog[1]])
+    return res[0] if res else None
+
+
 def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float, eps: float | None = None):
     """eval_chebyshev with a baby-step giant-step schedule (Bossuat et al.): babies T_1..T_{m-1} and giants
     T_m, T_2m, ..., the series split recursively as q(T) T_k + r(T) and recombined with k - 1 products per
@@ -166,6 +236,10 @@ def eval_chebyshev_bsgs(ops, x, coeffs, a: float, b: float, eps: float | None = 
     n = len(coeffs) - 1
     if n <= 3:
         return eval_chebyshev(_NoBsgs(ops), x, coeffs, a, b, eps)
+    if _CHEB_PROG and not getattr(ops, "trace", False):
+        r = _cheb_program(ops, x, coeffs, a, b, eps)
+        if r is not None:
+            return r
     alpha = 2.0 / (b - a)
     beta = (a + b) / (b - a)
     y = x if alpha == 1.0 else ops.mult(x, alpha)
@@ -281,6 +355,10 @@ def _cheb_leaf(ops, T, y, c):
     if isinstance(T, _AlignedBabies):
         T = T.terms([i for i in range(1, len(c)) if c[i] != 0.0])
     r = None
+    nz = [i for i in range(1, len(c)) if c[i] != 0.0]
+    if (_LEAF_NATIVE and nz and isinstance(ops, (FheOps, NumpyOps))) or (nz and getattr(ops, "trace", False)):
+        r = ops.scalar_sum([T[i] for i in nz], [c[i] for i in nz])
+        return ops.add(r, c[0]) if c[0] != 0.0 else r
     for i in range(1, len(c)):
         if c[i] == 0.0:
             continue

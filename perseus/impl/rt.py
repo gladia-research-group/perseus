@@ -29,6 +29,9 @@ import numpy as np
 from .layout import Dims
 
 
+# IMPL_MASK_SUM=1: masked inner sums (the SinC conversions) as one fused call (rt.mult_mask_sum)
+_MASK_SUM = os.environ.get("IMPL_MASK_SUM", "0") not in ("", "0")
+
 class Rt:
     def __init__(self, ops, dims: Dims):
         self.ops = ops
@@ -103,6 +106,22 @@ class Rt:
 
     def add_mask(self, ct, key, build):
         return self.ops.add_pt(ct, self.mask(key, build), key=self._use(key, ct), kind="mask")
+
+    def mult_mask_sum(self, cts, keys, builds):
+        """sum_i cts[i] * mask_i: one fused call when the runtime has mult_cached_sum and IMPL_MASK_SUM=1 (the loop's
+        op stream replayed), else mult_mask + add per term."""
+        if _MASK_SUM and len(cts) > 1 and hasattr(getattr(self.ops, "inf", None), "mult_cached_sum") \
+                and getattr(self.ops, "enc_cache", False):
+            vecs = [self.ops._vec(self.mask(k, b)) for k, b in zip(keys, builds)]
+            tags = [self._use(k, c) for k, c in zip(keys, cts)]
+            out = self.ops.inf.mult_cached_sum(list(cts), tags, vecs, True)
+            if out is not None:
+                return out
+        acc = None
+        for c, k, b in zip(cts, keys, builds):
+            t = self.mult_mask(c, k, b)
+            acc = t if acc is None else self.ops.add(acc, t)
+        return acc
 
     def mult_masks(self, ct, keys, builds):
         """ct * each mask, as one fused lane batch when the runtime allows."""
@@ -191,6 +210,12 @@ class Rt:
         return cls(FheOps(inf, core, unit, bts_precision), Dims.from_inf(inf))
 
 
+# PF_NVTX_STEPS=1 (diagnostic): an NVTX range per step (torch's NVTX binding), for nsys per-step GPU time
+_NVTX = None
+if os.environ.get("PF_NVTX_STEPS", "0") not in ("", "0"):
+    from torch.cuda import nvtx as _NVTX
+
+
 class _StepScope:
     def __init__(self, rt, label, shape=None):
         self.rt, self.label, self.shape = rt, label, shape
@@ -199,6 +224,8 @@ class _StepScope:
 
     def __enter__(self):
         self.inner.__enter__()
+        if _NVTX is not None:
+            _NVTX.range_push(str(self.label))
         rt, ops = self.rt, self.rt.ops
         self.prev = getattr(ops, "step_label", None)
         ops.step_label = self.label
@@ -219,4 +246,6 @@ class _StepScope:
         if self.saved is not None:
             rt._scope_path.pop()
             rt.ops.fhe.graph_scope, rt.ops.fhe.graph_scope_counter = self.saved
+        if _NVTX is not None:
+            _NVTX.range_pop()
         return self.inner.__exit__(*a)

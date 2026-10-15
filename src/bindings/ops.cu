@@ -337,6 +337,19 @@ void bind_ops(py::module_& m) {
              "acc += sum_j vs[j] * ss[j] with ONE relinearization when the runtime's fused lane "
              "accumulate applies (returns True), else the plain loop; the recorded op stream is "
              "the loop's either way.")
+        .def("mult_scalar_sum",
+             [](CKKSContext& c, const std::vector<PackedCtx>& ts, const std::vector<double>& cs) {
+                 if (ts.empty() || ts.size() != cs.size())
+                     throw std::invalid_argument("mult_scalar_sum: ts and cs must be non-empty and of equal length");
+                 py::gil_scoped_release nogil;
+                 return c.wsum_scalar(ts, cs);
+             },
+             py::arg("ts"), py::arg("cs"),
+             "sum_i ts[i] * cs[i]: the loop of mult(t, c) + inplace_add in one call (same op stream; IMPL_WSUM=1: one "
+             "evalLinearWSum kernel when nothing records the loop's intermediates).")
+        .def("run_program", &CKKSContext::run_program, py::arg("inputs"), py::arg("prog"), py::arg("outs"), kRelease,
+             "A traced straight-line program on the API calls without per-op bookkeeping (CKKSContext::run_program); "
+             "[] = run the per-op path instead.")
         .def("conjugate", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&)>(&CKKSContext::conjugate),
              py::arg("ct"), kRelease, "Complex conjugate of every slot (identity on real payloads).")
         .def("negate", static_cast<PackedCtx (CKKSContext::*)(const PackedCtx&)>(&CKKSContext::negate),
@@ -1048,6 +1061,34 @@ void bind_ops(py::module_& m) {
              py::arg("ct"), py::arg("tag"), py::arg("values"), py::arg("tagged") = true,
              "ct * the plaintext cached under `tag` at ct's level (encode_at_cached: encoded "
              "on a miss, uploaded on first use, shared by every later use at that level).")
+        .def("mult_cached_sum",
+             [](Inference& inf, std::vector<PackedCtx> cts, const std::vector<std::string>& tags,
+                const std::vector<py::array>& values, bool tagged) -> py::object {
+                 if (cts.empty() || tags.size() != cts.size() || values.size() != cts.size())
+                     throw std::invalid_argument("mult_cached_sum: cts, tags and values must have one entry each");
+                 std::vector<perseus_np::AnyVec> vs;
+                 for (const auto& v : values) vs.push_back(perseus_np::to_any(v));
+                 PackedCtx out;
+                 bool ok = false;
+                 {
+                     py::gil_scoped_release nogil;
+                     for (auto& c : cts) inf.fhe->realize_pending_rescale_raw(c.ct);
+                     std::vector<Ptx> pts;
+                     for (size_t i = 0; i < cts.size(); ++i) {
+                         vs[i].resize(static_cast<size_t>(inf.slots));
+                         pts.push_back(cached_any_at(inf, tags[i], vs[i], cts[i], tagged));
+                         inf.load_plaintext(pts.back());
+                     }
+                     ok = inf.fhe->mult_slot_pt_sum_usable(cts, pts);
+                     if (ok) out = inf.fhe->mult_slot_pt_sum(cts, pts);
+                 }
+                 if (!ok) return py::none();
+                 return py::cast(std::move(out));
+             },
+             py::arg("cts"), py::arg("tags"), py::arg("values"), py::arg("tagged") = true,
+             "sum_i cts[i] * the plaintext cached under tags[i] at cts[i]'s level, in one kernel (EvalMultPtSum, the "
+             "loop's node stream replayed); deg-2 inputs are realized in place first (what each product does on a "
+             "copy). None: not usable here (mixed levels, capture, a planned refresh inside), loop instead.")
         .def("add_cached",
              [](Inference& inf, const PackedCtx& ct, const std::string& tag,
                 const py::array& values, bool tagged) {

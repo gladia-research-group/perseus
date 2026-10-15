@@ -148,6 +148,16 @@ class FheOps:
     def conjugate(self, a): return self.fhe.conjugate(a)
     def inplace_add(self, a, b): self.fhe.inplace_add(a, b)
     def copy(self, a): return self.fhe.add(a, 0.0)
+
+    def scalar_sum(self, ts, cs):
+        """sum_i ts[i] * cs[i] as mult + inplace_add (one native call when the runtime has it; same op stream)."""
+        cs = [float(c) for c in cs]
+        if hasattr(self.fhe, "mult_scalar_sum"):
+            return self.fhe.mult_scalar_sum(list(ts), cs)
+        r = self.fhe.mult(ts[0], cs[0])
+        for t, c in zip(ts[1:], cs[1:]):
+            self.fhe.inplace_add(r, self.fhe.mult(t, c))
+        return r
     # Plaintext operands. Without a key the vector is encoded at every call (the leaf
     # primitive). With a key and a runtime that has `set_slot_pt` (the named-plaintext
     # extension), the vector is encoded ONCE at the level of its first use and reused —
@@ -418,6 +428,11 @@ class NumpyOps:
     def conjugate(self, a): return np.conj(a)
     def inplace_add(self, a, b): a += b
     def copy(self, a): return np.array(a)
+    def scalar_sum(self, ts, cs):
+        r = self.mult(ts[0], float(cs[0]))
+        for t, c in zip(ts[1:], cs[1:]):
+            self.inplace_add(r, self.mult(t, float(c)))
+        return r
     def mult_pt(self, a, v, key=None, kind="weight", tagged=True): return a * np.asarray(v)
     def mult_pt_sum(self, cts, vecs): return sum(c * np.asarray(v) for c, v in zip(cts, vecs))
     def add_pt(self, a, v, key=None, kind="weight", tagged=True): return a + np.asarray(v)
