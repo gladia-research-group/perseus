@@ -51,6 +51,7 @@ _PCMM = os.environ.get("PF_LINEAR", "") == "pcmm"
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 # PF_GLU_XU=1 (with the forced joint): x u before the refresh, the GLU output one level shallower
 _GLU_XU = os.environ.get("PF_GLU_XU", "0") not in ("", "0")
+_GLU_LEAN = os.environ.get("PF_GLU_LEAN", "0") not in ("", "0")
 
 
 def glu_pair(rt, G, U, cfg, dense=False):
@@ -63,6 +64,9 @@ def glu_pair(rt, G, U, cfg, dense=False):
     else:
         from perseus.impl.layout import active_expanded_lanes
         mask = ("pf.silu.lanes", lambda s: active_expanded_lanes(d, s, d.tp_E))
+    if _GELU_JOINT and dense and _GLU_XU and _GLU_LEAN:
+        a, b = gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB))      # 2 Re a + 2 i Re b with one conjugate
+        return ops.add(ops.add(a, ops.mult_i(b)), ops.conjugate(ops.sub(a, ops.mult_i(b))))
     if _GELU_JOINT and dense and _GLU_XU:
         hA, hB = (im_cleanse(ops, h) for h in gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB)))
     elif _GELU_JOINT:

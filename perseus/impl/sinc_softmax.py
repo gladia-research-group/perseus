@@ -10,7 +10,7 @@ from . import sinc as sc
 from . import smcheb
 from .attention import _recip_rounds
 from .poly import eval_chebyshev, im_cleanse
-from .prefill import _KcExtrapolated
+from .prefill import _KcExtrapolated, split
 
 LO = (sc.slot_coords()[2] < 16).astype(float)
 # PF_SM_R_REFRESH=1 (with unpacked): one refresh of the last reciprocal R instead of P's 16 CCMM-entry refreshes
@@ -18,6 +18,11 @@ R_REFRESH = os.environ.get("PF_SM_R_REFRESH", "0") not in ("", "0")
 R_SCALE = float(os.environ.get("PF_SM_R_SCALE", "1"))   # refresh R / R_SCALE (|R| <= 32.5), R_SCALE rides the Z masks
 # PF_SM_R_ITER=1: the R refresh as two passes (the residual refreshed at 2^PF_SM_R_ITER_P, bts2's form from leaf ops)
 R_ITER = os.environ.get("PF_SM_R_ITER", "0") not in ("", "0")
+# PF_SM_PAIR=1: the later rounds' Z refreshes as one complex bootstrap per score ciphertext pair (y_a + i y_b, split
+# after: 2 Re y_a, 2 Re y_b = the cleanses' values) instead of two real-route ones
+PAIR = os.environ.get("PF_SM_PAIR", "0") not in ("", "0")
+# PF_SM_PAIR_ROUNDS=1: pair only those rounds (the ones the plan refreshes); unset = every round >= 1
+PAIR_ROUNDS = {int(v) for v in os.environ.get("PF_SM_PAIR_ROUNDS", "").split(",") if v}
 R_ITER_P = int(os.environ.get("PF_SM_R_ITER_P", "8"))
 
 
@@ -63,7 +68,14 @@ def recip_slots(rt, D, av, bv, iters, key, cheb=None):
     return ops.mult_i(ops.sub(ops.conjugate(P), P))
 
 
-def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
+def score_affine(cfg):
+    """(alpha, beta) of the exp Chebyshev's domain map y = alpha s - beta."""
+    sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
+    a, b = cfg.cheb_a / sf, cfg.cheb_b / sf
+    return 2.0 / (b - a), (a + b) / (b - a)
+
+
+def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
     """Spk: 16 packed real score ciphertexts in true units, the BOS key on key token sc.BOS_TOK.
     Returns the packed probabilities, or (`unpacked`) unpack's output with its masks on the Z side of the last
     product: (Z LO) R + i (rot(Z, 16) LO) rot(R, 16), one level shallower when R is the deeper factor."""
@@ -75,9 +87,15 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
 
     def exp_part(s, valid, site):
-        s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T),
-                        lambda: np.where(valid, -mean, cfg.clip_lo - mean))
-        z = eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        if prescaled:       # Spk = alpha S: the domain map's product rode the caller's masks
+            al, be = score_affine(cfg)
+            s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T, "pre"),
+                            lambda: al * np.where(valid, -mean, cfg.clip_lo - mean) - be)
+            z = eval_chebyshev(ops, s, cfg.cheb_coeffs, -1.0, 1.0)
+        else:
+            s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T),
+                            lambda: np.where(valid, -mean, cfg.clip_lo - mean))
+            z = eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
         for _ in range(cfg.log2delta1):
             z = ops.square(z)
         z = im_cleanse(ops, z)
@@ -89,7 +107,13 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
     n_rounds = len(rnd[ks[0]])
     Y = Z
     for r in range(n_rounds):
-        if r:
+        if r and PAIR and len(Y) % 2 == 0 and (not PAIR_ROUNDS or r in PAIR_ROUNDS):
+            Z = []
+            for a, b in zip(Y[0::2], Y[1::2]):
+                X = ops.add(a, ops.mult_i(b))
+                ops.bootstrap(X)
+                Z += [ops.square(v) for v in split(ops, X)]
+        elif r:
             Z = [ops.square(im_cleanse(ops, y)) for y in Y]
         D = Z[0]
         for z in Z[1:]:

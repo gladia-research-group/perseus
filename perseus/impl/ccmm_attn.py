@@ -71,17 +71,23 @@ def attention_ccmm(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=
         Ks = sc.to_sinc_kv(rt, Kr)
         kpat = sc.kv_row_pattern(kb)
         Ks = [rt.add_mask(x, ("ccmm.kbos", layer, o), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
+        if cm.MERGE:
+            Qs, Ks = sc.dup(rt, Qs), sc.dup(rt, Ks)
         S = eng.apply(Qs, Ks, b_transposed=True, amax=QMAX, bmax=KMAX, shift=SHIFT_QK, out_scale=0.5 * gscale,
-                      site=f"qk{layer}")
+                      site=f"qk{layer}", merge=cm.MERGE)
+        if cm.MERGE:
+            S = cm.unmerge(rt, S, eng.w, scale=sm.score_affine(cfg)[0])
     with rt.step("softmax"):
         if UNPACK_FOLD:
-            P = sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T, unpacked=True)
+            P = sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T, unpacked=True, prescaled=cm.MERGE)
         else:
-            P = sm.unpack(rt, sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T))
+            P = sm.unpack(rt, sm.softmax(rt, sm.pack(rt, S), cfg, layer=layer, T=ch.T, prescaled=cm.MERGE))
     with rt.step("softmax_v"):
         Vs = sc.to_sinc_kv(rt, Vr)
         vpat = sc.kv_row_pattern(vb)
         Vs = [rt.add_mask(x, ("ccmm.vbos", layer, o), lambda o=o: vpat[o]) for o, x in enumerate(Vs)]
-        O = eng.apply(P, Vs, b_transposed=False, amax=1.5, bmax=VMAX, shift=SHIFT_PV, site=f"pv{layer}")
-        out = sc.from_sinc_q(rt, O)
+        if cm.MERGE:
+            P, Vs = sc.dup(rt, P), sc.dup(rt, Vs)
+        O = eng.apply(P, Vs, b_transposed=False, amax=1.5, bmax=VMAX, shift=SHIFT_PV, site=f"pv{layer}", merge=cm.MERGE)
+        out = sc.from_sinc_q_merged(rt, O, cm.w_slots(eng.w)) if cm.MERGE else sc.from_sinc_q(rt, O)
     return [out]

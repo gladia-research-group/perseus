@@ -1207,6 +1207,9 @@ _SILU_SINGLE_TOL = float(os.environ.get("PF_SILU_SINGLE_TOL", "2"))
 _SILU_SINGLE_EPS = float(os.environ.get("PF_SILU_SINGLE_EPS", "1e-8"))       # the series' coefficient trim
 _SILU_SINGLE_DEGS = [int(v) for v in os.environ.get("PF_SILU_SINGLE_DEGS", "63,95,127").split(",")]
 _SILU_SINGLE_ABS = float(os.environ.get("PF_SILU_SINGLE_ABS", "0"))   # else the last degree if within this abs error
+# PF_GLU_LEAN=1 (forced joint, single series): x u from the split halves as they are (no second cleanse; its 2 rides
+# the series' coefficients)
+_GLU_LEAN = os.environ.get("PF_GLU_LEAN", "0") not in ("", "0")
 _silu_single_cache = {}
 
 
@@ -1254,11 +1257,13 @@ def gelu_joint(rt, A, B, cfg, mask, us=None):
         c1 = [0.5 * al * float(c) for c in cfg.thor_p1_cheb]
         c1[0] -= 0.5 * be
         if us is not None:
-            xu = [ops.mult(im_cleanse(ops, x), u) for x, u in zip((A, B), us)]
             cs = silu_single_coeffs(cfg) if _SILU_SINGLE else None
+            lean = _GLU_LEAN and cs is not None
+            xu = [ops.mult(x if lean else im_cleanse(ops, x), u) for x, u in zip((A, B), us)]
             if cs is not None:
-                cs = [s_out * c for c in cs]
-                return [ops.mult(ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * s_out), w)
+                so = 2.0 * s_out if lean else s_out
+                cs = [so * c for c in cs]
+                return [ops.mult(ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * so), w)
                         for x, w in zip((A, B), xu)]
         p1 = [eval_chebyshev(ops, x, c1, cfg.thor_p1_a, cfg.thor_p1_b) for x in (A, B)]
         X = ops.add(p1[0], ops.mult_i(p1[1]))

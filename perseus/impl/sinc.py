@@ -146,15 +146,11 @@ def stage_a(rt, x, site="sinc.a"):
     baby = [x] + ops.rotate_many(x, [-63 * b for b in range(1, A_BABY)])
     out = None
     for g in A_GIANT:
-        acc = None
-        for b in range(A_BABY):
-            m = _MA.get((g, b))
-            if m is None:
-                continue
-            y = rt.mult_mask(baby[b], (site, g, b), lambda m=m: m)
-            acc = y if acc is None else ops.add(acc, y)
-        if acc is None:
+        bs = [b for b in range(A_BABY) if (g, b) in _MA]
+        if not bs:
             continue
+        acc = rt.mult_mask_sum([baby[b] for b in bs], [(site, g, b) for b in bs],
+                               [lambda m=_MA[(g, b)]: m for b in bs])
         if g:
             acc = ops.rotate(acc, -63 * A_BABY * g)
         out = acc if out is None else ops.add(out, acc)
@@ -195,15 +191,11 @@ def _swap3(rt, x, lo, site):
     baby = [x] + ops.rotate_many(x, [-u * b for b in range(1, A2_BABY)])
     out = None
     for g in A2_GIANT:
-        acc = None
-        for b in range(A2_BABY):
-            m = ms.get((g, b))
-            if m is None:
-                continue
-            y = rt.mult_mask(baby[b], (site, lo, g, b), lambda m=m: m)
-            acc = y if acc is None else ops.add(acc, y)
-        if acc is None:
+        bs = [b for b in range(A2_BABY) if (g, b) in ms]
+        if not bs:
             continue
+        acc = rt.mult_mask_sum([baby[b] for b in bs], [(site, lo, g, b) for b in bs],
+                               [lambda m=ms[(g, b)]: m for b in bs])
         if g:
             acc = ops.rotate(acc, -u * A2_BABY * g)
         out = acc if out is None else ops.add(out, acc)
@@ -226,10 +218,7 @@ def stage_b(rt, xs, vs, n_out=NCT, site="sinc.b"):
     ys = [x if v == 0 else ops.rotate(x, -4 * v) for x, v in zip(xs, vs)]
     outs = []
     for o in range(n_out):
-        acc = None
-        for y, v in zip(ys, vs):
-            t = rt.mult_mask(y, (site, o, v), lambda o=o, v=v: _b_mask(o, v))
-            acc = t if acc is None else ops.add(acc, t)
+        acc = rt.mult_mask_sum(ys, [(site, o, v) for v in vs], [lambda o=o, v=v: _b_mask(o, v) for v in vs])
         sh = (4 * o - OFFSET) % SLOTS
         outs.append(ops.rotate(acc, sh) if sh else acc)
     return outs
@@ -252,10 +241,8 @@ def stage_b_inv(rt, ys, vs, site="sinc.bi"):
         ws = [ops.rotate(y, (OFFSET - 4 * o) % SLOTS) for o, y in enumerate(ys)]
         outs = []
         for v in vs:
-            acc = None
-            for o, w in enumerate(ws):
-                t = rt.mult_mask(w, (site, "h", v, o), lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o))
-                acc = t if acc is None else ops.add(acc, t)
+            acc = rt.mult_mask_sum(ws, [(site, "h", v, o) for o in range(len(ws))],
+                                   [lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o) for o in range(len(ws))])
             outs.append(ops.rotate(acc, 4 * v) if v else acc)
         return outs
     zs = [ops.rotate(y, OFFSET) for y in ys]
@@ -288,6 +275,39 @@ def to_sinc_kv(rt, X):
     return stage_b(rt, xs, vs)
 
 
+def dup(rt, xs):
+    """Batch l < 16 copied onto l + 16 (the operands carry nothing on l >= 16): no level."""
+    ops = rt.ops
+    return [ops.add(x, ops.rotate(x, -16)) for x in xs]
+
+
+def stage_b_inv_merged(rt, Ms, wl, vs, site="sinc.bim"):
+    """stage_b_inv (hoisted) of the unmerged pairs of the merged CCMM outputs Ms ((e + w o) / 2, wl: w per SinC slot):
+    the unmerge's halves ride the stage's masks (no extra level)."""
+    ops = rt.ops
+    lo = (((np.arange(SLOTS) - OFFSET) % 32) < 16).astype(float)
+    us = []
+    for p, m in enumerate(Ms):
+        for o in (2 * p, 2 * p + 1):
+            sh = (OFFSET - 4 * o) % SLOTS
+            a, b = ops.rotate(m, sh), ops.rotate(m, (sh + 16) % SLOTS)
+            us.append(ops.add(a, b) if o % 2 == 0 else ops.sub(a, b))
+    um = [lo, lo / np.asarray(wl)]
+    outs = []
+    for v in vs:
+        acc = rt.mult_mask_sum(us, [(site, v, o) for o in range(len(us))],
+                               [lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o) * np.roll(um[o % 2], (4 * o - OFFSET) % SLOTS)
+                                for o in range(len(us))])
+        outs.append(ops.rotate(acc, 4 * v) if v else acc)
+    return outs
+
+
+def from_sinc_q_merged(rt, Ms, wl):
+    """from_sinc_q of the 16 unmerged outputs of the 8 merged CCMM outputs Ms."""
+    vs = [int(q_ct_bits(q)) for q in range(8)]
+    return [stage_a(rt, z, site="sinc.ai") for z in stage_b_inv_merged(rt, Ms, wl, vs)]
+
+
 def from_sinc_q(rt, Y):
     """Inverse of to_sinc_q (the attention output O, in Q's SinC layout) -> 8 blocked ciphertexts."""
     vs = [int(q_ct_bits(q)) for q in range(8)]
@@ -301,6 +321,9 @@ def rot_steps() -> set[int]:
     st |= {(4 * o - OFFSET) % SLOTS for o in range(16)} | {OFFSET}
     if BI_HOIST:
         st |= {(OFFSET - 4 * o) % SLOTS for o in range(16)} | {4 * v for v in range(1, 16)}
+    if __import__("os").environ.get("PF_CCMM_MERGE", "0") not in ("", "0"):
+        st |= {(OFFSET - 4 * o + 16) % SLOTS for o in range(16)} | {(OFFSET - 4 * o) % SLOTS for o in range(16)}
+        st |= {16, SLOTS - 16} | {4 * v for v in range(1, 16)}
     if A2:
         for lo in (0, 3):
             u = 63 << lo

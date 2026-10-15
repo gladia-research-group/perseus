@@ -12,6 +12,9 @@ from . import sinc as sc
 from .pcmm import _N32_CAP, KeyRng, _ks_key, _twiddles, find_prime
 
 NB, NS, KY, SW = 1 << 16, 1 << 13, 64, 8
+# PF_CCMM_MERGE=1: operands duplicated on batch l + 16 (sinc.dup) make every output even in Y = X^1024, so output pairs
+# merge at the split as e + X^1024 o (no key switch) and share one SinCBoot; unmerge() splits them in the slot domain
+MERGE = os.environ.get("PF_CCMM_MERGE", "0") not in ("", "0")
 
 
 def _auto_poly(s, h):
@@ -64,6 +67,21 @@ def _index():
     return _IDX
 
 
+def w_theory():
+    """Per batch slot l, the R_64 evaluation point of Y (slot l <-> zeta^(5^l), zeta = exp(i pi / 64))."""
+    return np.exp(1j * np.pi * np.array([pow(5, l, 128) for l in range(sc.BATCH)]) / 64)
+
+
+def w_slots(w):
+    """w per batch slot -> per SinC slot."""
+    return np.asarray(w)[(np.arange(sc.SLOTS) - sc.OFFSET) % 32]
+
+
+def merged(e, o, w):
+    """Slot vectors of the merged SinCBoot output (e + w o) / 2."""
+    return 0.5 * (np.asarray(e) + w_slots(w) * np.asarray(o))
+
+
 def to_mats(vecs):
     """16 SinC slot vectors -> (128 rows, 128 cols, 32 batch) complex."""
     ct, sl = _index()
@@ -94,6 +112,7 @@ class Ccmm:
             self.cap = self.cap or _N32_CAP
             self.land = self.land or int(os.environ.get("PF_CCMM_FAKE_LAND", "28"))
         self.c_unit = None
+        self.w = w_theory()
         self.nf_ref = self.nf_split = None
         self.times = np.zeros(5)
         self.t_in = self.t_mm = self.t_out = self.keygen_s = 0.0
@@ -136,6 +155,31 @@ class Ccmm:
         self.c_unit = float(np.real(np.vdot(want, got) / np.vdot(want, want))) / (f * f)
         if self.land is None:
             self.land = self.ops.level(ys[0])
+        if MERGE:
+            self._calibrate_w(dim, A, B, f)
+
+    def _calibrate_w(self, dim, A, B, f):
+        """Fit w (merged = (e + w o) / 2 per batch slot) on the device from duplicated probe operands."""
+        A2, B2 = A.copy(), B.copy()
+        A2[:, :, 16:], B2[:, :, 16:] = A[:, :, :16], B[:, :, :16]
+        enc = [self.ops.encode_token(np.zeros(dim)) for _ in range(2 * sc.NCT)]
+        xa = [self.ops.add_pt(e, v) for e, v in zip(enc[:sc.NCT], from_mats(A2))]
+        xb = [self.ops.add_pt(e, v) for e, v in zip(enc[sc.NCT:], from_mats(B2))]
+        g = f / math.sqrt(2.0)
+        ys = self._device(xa, xb, False, g, g, 0, True)
+        got = np.array([self.ops.decrypt_slots_complex(y) for y in ys]) / (self.c_unit * f * f)
+        P = from_mats(np.einsum("ijl,jkl->ikl", A2, B2))
+        e, o = P[0::2], P[1::2]
+        ls = (np.arange(sc.SLOTS) - sc.OFFSET) % 32
+        w = np.zeros(sc.BATCH, complex)
+        for l in range(sc.BATCH):
+            sel = ls == l
+            ov = o[:, sel].ravel()
+            w[l] = np.vdot(ov, (2 * got[:, sel] - e[:, sel]).ravel()) / np.vdot(ov, ov)
+        res = np.abs(2 * got - e - w_slots(w) * o).max() / np.abs(P).max()
+        print(f"[ccmm] merge w fit: |w|-1 max {np.abs(np.abs(w) - 1).max():.2e}, vs theory {np.abs(w - w_theory()).max():.2e}"
+              f", vs conj {np.abs(w - np.conj(w_theory())).max():.2e}, residual {res:.2e}", flush=True)
+        self.w = w
 
     def _measure_cap(self, x):
         ops, bts = self.ops, self.bts
@@ -143,9 +187,10 @@ class Ccmm:
         entry = bts.stc_first_entry(d, ops.inf.slots)
         return ops.level(x) + d.level - entry - ops.unit
 
-    def apply(self, xa, xb, b_transposed=False, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, site="ccmm"):
+    def apply(self, xa, xb, b_transposed=False, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, site="ccmm", merge=False):
         """out_scale M M' (M' = xb^T when b_transposed) for SinC slot ciphertexts; amax / bmax bound |entries|
-        (balance the operand factors), 2^shift bounds |output| (the refresh's range). Inputs are consumed."""
+        (balance the operand factors), 2^shift bounds |output| (the refresh's range). Inputs are consumed. With
+        `merge` (operands duplicated on l + 16) the 8 merged outputs (e + w o) / 2 of the pairs (2 p, 2 p + 1)."""
         ops = self.ops
         assert len(xa) == len(xb) == sc.NCT
         if self.cap is None:
@@ -159,12 +204,14 @@ class Ccmm:
         if self.bts is not None and os.environ.get("PF_CCMM_VERIFY"):
             want = out_scale * exact([ops.decrypt_slots_complex(x) for x in xa],
                                      [ops.decrypt_slots_complex(x) for x in xb], b_transposed)
+            if merge:
+                want = np.array([merged(want[2 * i], want[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
         if self.bts is None:
-            outs = self._fake(xa, xb, b_transposed, out_scale)
+            outs = self._fake(xa, xb, b_transposed, out_scale, merge)
         else:
-            p = out_scale * 2.0 ** -shift / self.c_unit
+            p = out_scale * 2.0 ** -shift / self.c_unit * (0.5 if merge else 1.0)
             fa, fb = math.sqrt(p * bmax / amax), math.sqrt(p * amax / bmax)
-            outs = self._device(xa, xb, b_transposed, fa, fb, shift)
+            outs = self._device(xa, xb, b_transposed, fa, fb, shift, merge)
         if want is not None:
             got = np.array([ops.decrypt_slots_complex(y) for y in outs])
             err = float(np.abs(got - want).max())
@@ -178,8 +225,10 @@ class Ccmm:
         self.calls += 1
         return outs
 
-    def _fake(self, xa, xb, b_transposed, out_scale):
+    def _fake(self, xa, xb, b_transposed, out_scale, merge=False):
         Y = out_scale * exact([x.vec for x in xa], [x.vec for x in xb], b_transposed)
+        if merge:
+            Y = np.array([merged(Y[2 * i], Y[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
         cls = type(xa[0])
         outs = []
         for m, y in enumerate(Y):
@@ -189,7 +238,7 @@ class Ccmm:
             outs.append(o)
         return outs
 
-    def _device(self, xa, xb, b_transposed, fa, fb, shift):
+    def _device(self, xa, xb, b_transposed, fa, fb, shift, merge=False):
         ops, bts, S = self.ops, self.bts, self.ops.inf.slots
         bts.sync()
         t0 = time.perf_counter()
@@ -207,6 +256,10 @@ class Ccmm:
         self.times += np.asarray(tm)
         t2 = time.perf_counter()
         self.t_mm += t2 - t1
+        if merge:
+            for i in range(sc.NCT // 2):
+                bts.merge_monomial(da[2 * i], da[2 * i + 1], NB // KY)
+            da, states, xa = da[0::2], states[0::2], xa[0::2]
         for d, st in zip(da, states):
             bts.set_scale(d, self.nf_split, 2)
             bts.mod_raise(d, st)
@@ -221,6 +274,18 @@ class Ccmm:
         bts.sync()
         self.t_out += time.perf_counter() - t2
         return list(xa)
+
+
+def unmerge(rt, Ms, w, scale=1.0, site="ccmm.um"):
+    """Merged outputs (e + w o) / 2 (duplicated on l + 16) -> scale [e, o, ...] on l < 16 (zero above), one level."""
+    ops = rt.ops
+    lo = scale * (((np.arange(sc.SLOTS) - sc.OFFSET) % 32) < 16)
+    out = []
+    for m in Ms:
+        r = ops.rotate(m, 16)
+        out.append(rt.mult_mask(ops.add(m, r), (site, "e", scale), lambda: lo))
+        out.append(rt.mult_mask(ops.sub(m, r), (site, "o", scale), lambda: lo / w_slots(w)))
+    return out
 
 
 def engine(rt):

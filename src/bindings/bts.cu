@@ -309,6 +309,47 @@ void bind_bts(py::module_& root) {
           py::arg("factor"), "NoiseFactor *= factor.");
     m.def("mult_int", [](DeviceCt& d, uint64_t k) { FC::multIntScalar(d.get(), k); }, py::arg("ct"), py::arg("k"),
           kRelease, "Exact product by a positive integer (no level).");
+    m.def("raise_scope",
+          [](CKKSContext& fhe, int drop) {
+              auto g = std::any_cast<FIDESlib::CKKS::Context&>(fhe.cc->gpu).get();
+              const int old = g->getBtsRaiseDrop();
+              g->setBtsRaiseDrop(drop);
+              FC::setStcFirstRaiseScope(drop > 0);
+              return old;
+          },
+          py::arg("fhe"), py::arg("drop"),
+          "Raise drop of the following bootstraps (StC-first finishes included: their route's raise variant); returns "
+          "the previous drop. 0 ends the scope.");
+    m.def("merge_monomial",
+          [](DeviceCt& d, DeviceCt& e, int power) {
+              auto& x = d.get();
+              FC::Ciphertext t(x.cc_);
+              t.copy(e.get());
+              t.multMonomial(power);
+              x.add(t);
+          },
+          py::arg("ct"), py::arg("other"), py::arg("power"), kRelease,
+          "ct += X^power other (no level, no key switch); other is left unchanged.");
+    m.def("wsum_raw",
+          [](DeviceCt& out, std::vector<DeviceCt> ts, std::vector<double> ws) {
+              if (ts.empty() || ts.size() != ws.size())
+                  throw std::invalid_argument("wsum_raw: ts and ws must be non-empty and of equal length");
+              std::vector<FC::Ciphertext*> v;
+              int lv = out.get().getLevel();
+              for (auto& t : ts) {
+                  auto& c = t.get();
+                  if (c.NoiseLevel == 2) c.rescale();
+                  lv = std::min(lv, c.getLevel());
+                  v.push_back(&c);
+              }
+              auto& o = out.get();
+              if (o.NoiseLevel == 2) o.rescale();
+              if (o.getLevel() > lv) o.dropToLevel(lv);
+              o.evalLinearWSumMutable((uint32_t)v.size(), v, ws);
+          },
+          py::arg("out"), py::arg("ts"), py::arg("ws"), kRelease,
+          "out = sum_i ws[i] ts[i] in one kernel (FIDESlib evalLinearWSum; deg-2 inputs are rescaled in place, "
+          "out's previous value is overwritten). Unrecorded: a benchmark / raw path.");
     m.def("secret_key_coeffs", [](CKKSContext& fhe) {
         const auto& lsk = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(fhe.keys.secretKey->pimpl);
         auto sk = lsk->GetPrivateElement();
