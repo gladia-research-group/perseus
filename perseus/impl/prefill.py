@@ -1199,14 +1199,53 @@ def norm_all(rt, Xs, cfg, ch: Chunks, rms: bool = False, max_period: int = 512):
 # PF_JOINT_FORCE=1: the joint GELU / softmax refresh is a deliberate bootstrap instead of a hint
 _JOINT_FORCE = os.environ.get("PF_JOINT_FORCE", "0") not in ("", "0")
 
-def gelu_joint(rt, A, B, cfg, mask):
+# PF_SILU_SINGLE=1 (with `us`): sigma(xmax t) - 1/2 as one odd Chebyshev series of degree 63 / 95 / 127, the smallest
+# within PF_SILU_SINGLE_TOL x the composite's error (both as evaluated, trimmed; floor 1e-7) on t in [-1, 1]:
+# no refresh in the GLU
+_SILU_SINGLE = os.environ.get("PF_SILU_SINGLE", "0") not in ("", "0")
+_SILU_SINGLE_TOL = float(os.environ.get("PF_SILU_SINGLE_TOL", "2"))
+_SILU_SINGLE_EPS = float(os.environ.get("PF_SILU_SINGLE_EPS", "1e-8"))       # the series' coefficient trim
+_SILU_SINGLE_DEGS = [int(v) for v in os.environ.get("PF_SILU_SINGLE_DEGS", "63,95,127").split(",")]
+_SILU_SINGLE_ABS = float(os.environ.get("PF_SILU_SINGLE_ABS", "0"))   # else the last degree if within this abs error
+_silu_single_cache = {}
+
+
+def silu_single_coeffs(cfg):
+    """The single-series coefficients of sigma(xmax t) - 1/2 on t in [-1, 1], or None (keep the composite)."""
+    from numpy.polynomial import chebyshev as C
+    from .poly import _cheb_trim
+    key = (float(cfg.xmax), tuple(cfg.thor_p1_cheb), tuple(cfg.thor_p2_cheb))
+    if key not in _silu_single_cache:
+        xm = float(cfg.xmax)
+        t = np.linspace(-1.0, 1.0, 40001)
+        f = 1.0 / (1.0 + np.exp(-xm * t)) - 0.5
+        a1, b1, a2, b2 = cfg.thor_p1_a, cfg.thor_p1_b, cfg.thor_p2_a, cfg.thor_p2_b
+        y1 = C.chebval((2 * t - (a1 + b1)) / (b1 - a1), _cheb_trim(cfg.thor_p1_cheb))
+        comp = C.chebval((2 * y1 - (a2 + b2)) / (b2 - a2), _cheb_trim(cfg.thor_p2_cheb))
+        tol = max(_SILU_SINGLE_TOL * float((np.abs(comp - f) * np.abs(t) * xm).max()), 1e-7)
+        best = None
+        for n in _SILU_SINGLE_DEGS:
+            c = C.chebinterpolate(lambda t: 1.0 / (1.0 + np.exp(-xm * t)) - 0.5, n)
+            c[0::2] = 0.0
+            c = np.array(_cheb_trim(c, _SILU_SINGLE_EPS))
+            err = float((np.abs(C.chebval(t, c) - f) * np.abs(t) * xm).max())
+            if err <= tol or (n == _SILU_SINGLE_DEGS[-1] and err <= _SILU_SINGLE_ABS):
+                best = [float(v) for v in c]
+                break
+        _silu_single_cache[key] = best
+    return _silu_single_cache[key]
+
+
+def gelu_joint(rt, A, B, cfg, mask, us=None):
     """Folded THOR GELU of real halves A, B (x / xmax) with one refresh of p1(A) + i p1(B) between P1 and P2.
-    Returns (g(A), g(B)) times the mask."""
+    Returns (g(A), g(B)) times the mask; with `us` (forced joint only), (g(A) uA, g(B) uB) without the final cleanse."""
     from .poly import eval_polynomial_ps
     ops = rt.ops
     if not (cfg.method == "thor_composite" and cfg.thor_p1_cheb and ops.gelu_fold):
         raise ValueError("gelu_joint: the folded THOR composite with Chebyshev P1 / P2 only")
     m = np.asarray(mask[1](1.0))
+    if us is not None and not (_JOINT_FORCE and np.all(m == m.flat[0])):
+        raise ValueError("gelu_joint: us needs the forced joint with a constant mask")
     if _JOINT_FORCE and np.all(m == m.flat[0]):
         # constant mask: P2's domain map and the split's 2 ride P1's coefficients, the mask P2's
         s_out = 0.5 * cfg.xmax * float(np.real(m.flat[0]))
@@ -1214,11 +1253,21 @@ def gelu_joint(rt, A, B, cfg, mask):
         al, be = 2.0 / (b2 - a2), (a2 + b2) / (b2 - a2)
         c1 = [0.5 * al * float(c) for c in cfg.thor_p1_cheb]
         c1[0] -= 0.5 * be
+        if us is not None:
+            xu = [ops.mult(im_cleanse(ops, x), u) for x, u in zip((A, B), us)]
+            cs = silu_single_coeffs(cfg) if _SILU_SINGLE else None
+            if cs is not None:
+                cs = [s_out * c for c in cs]
+                return [ops.mult(ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * s_out), w)
+                        for x, w in zip((A, B), xu)]
         p1 = [eval_chebyshev(ops, x, c1, cfg.thor_p1_a, cfg.thor_p1_b) for x in (A, B)]
         X = ops.add(p1[0], ops.mult_i(p1[1]))
         ops.bootstrap(X)
         ya, yb = split(ops, X)                                 # P2's domain variable
         c2 = [s_out * float(c) for c in cfg.thor_p2_cheb]
+        if us is not None:
+            return [ops.mult(ops.add(eval_chebyshev(ops, y, c2, -1.0, 1.0), 0.5 * s_out), w)
+                    for w, y in zip(xu, (ya, yb))]
         return [ops.mult(ops.add(eval_chebyshev(ops, y, c2, -1.0, 1.0), 0.5 * s_out), im_cleanse(ops, x))
                 for x, y in ((A, ya), (B, yb))]
     p1 = [eval_chebyshev(ops, x, cfg.thor_p1_cheb, cfg.thor_p1_a, cfg.thor_p1_b) for x in (A, B)]

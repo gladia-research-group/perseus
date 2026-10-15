@@ -49,6 +49,8 @@ _NORM_PERIOD = 256
 _PCMM = os.environ.get("PF_LINEAR", "") == "pcmm"
 # PF_GELU_JOINT=1: one refresh point for both halves between the SiLU's P1 and P2
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
+# PF_GLU_XU=1 (with the forced joint): x u before the refresh, the GLU output one level shallower
+_GLU_XU = os.environ.get("PF_GLU_XU", "0") not in ("", "0")
 
 
 def glu_pair(rt, G, U, cfg, dense=False):
@@ -61,7 +63,9 @@ def glu_pair(rt, G, U, cfg, dense=False):
     else:
         from perseus.impl.layout import active_expanded_lanes
         mask = ("pf.silu.lanes", lambda s: active_expanded_lanes(d, s, d.tp_E))
-    if _GELU_JOINT:
+    if _GELU_JOINT and dense and _GLU_XU:
+        hA, hB = (im_cleanse(ops, h) for h in gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB)))
+    elif _GELU_JOINT:
         aA, aB = gelu_joint(rt, gA, gB, cfg, mask)
         hA = im_cleanse(ops, ops.mult(aA, uA))
         hB = im_cleanse(ops, ops.mult(aB, uB))
