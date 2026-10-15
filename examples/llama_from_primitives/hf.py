@@ -23,7 +23,12 @@ def tokenizer():
 
 def text_windows(n, T, skip=0):
     """`n` windows of `T` tokens (BOS first) from the first openwebtext documents that are long
-    enough, after skipping `skip` such documents."""
+    enough, after skipping `skip` such documents. Cached on disk: the stream can stall for hours."""
+    path = os.path.join(os.path.dirname(__file__), "..", "..", ".cache", "windows", f"owt_{T}_{skip}.npy")
+    if os.path.exists(path):
+        cached = np.load(path)
+        if len(cached) >= n:
+            return cached[:n]
     from datasets import load_dataset
     tok = tokenizer()
     out = []
@@ -37,7 +42,11 @@ def text_windows(n, T, skip=0):
         out.append(ids[:T])
         if len(out) >= n:
             break
-    return np.asarray(out, dtype=np.int64)
+    out = np.asarray(out, dtype=np.int64)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.save(path + ".tmp.npy", out)
+    os.replace(path + ".tmp.npy", path)
+    return out
 
 
 def norm_sites(L):
