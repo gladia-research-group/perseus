@@ -15,6 +15,7 @@ from .prefill import _KcExtrapolated
 LO = (sc.slot_coords()[2] < 16).astype(float)
 # PF_SM_R_REFRESH=1 (with unpacked): one refresh of the last reciprocal R instead of P's 16 CCMM-entry refreshes
 R_REFRESH = os.environ.get("PF_SM_R_REFRESH", "0") not in ("", "0")
+R_SCALE = float(os.environ.get("PF_SM_R_SCALE", "1"))   # refresh R / R_SCALE (|R| <= 32.5), R_SCALE rides the Z masks
 
 
 def pack(rt, S):
@@ -100,11 +101,15 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False):
             cv = ([np.array([p[4][0][j] for p in per]) for j in range(iters - 1)], np.array([p[4][1] for p in per]))
         R = recip_slots(rt, D, av, bv, iters, ("sm", layer, r, T), cv)
         if unpacked and r == n_rounds - 1:
+            sc_r = R_SCALE if R_REFRESH else 1.0
             if R_REFRESH:
+                if sc_r != 1.0:
+                    R = ops.mult(R, 1.0 / sc_r)
                 ops.bootstrap_real(R)
             Rh = ops.rotate(R, 16)
-            return [ops.add(ops.mult(rt.mult_mask(z, ("sm.unpack",), lambda: LO), R),
-                            ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), ("sm.unpack",), lambda: LO), Rh)))
+            mk = ("sm.unpack",) if sc_r == 1.0 else ("sm.unpack", sc_r)
+            return [ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * LO), R),
+                            ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), mk, lambda: sc_r * LO), Rh)))
                     for z in Z]
         Y = [ops.mult(z, R) for z in Z]
     return Y
