@@ -18,6 +18,7 @@ option(CACHEMIR_CLIENT_ONLY "Build only perseus._client (OpenFHE, no CUDA toolch
 option(CACHEMIR_BUILD_CLIENT "Build the perseus._client pybind11 module" ${CACHEMIR_CLIENT_ONLY})
 if(NOT CACHEMIR_CLIENT_ONLY)
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)   # CUDA::cufft for the device magnitude probe
 endif()
 
 if(POLICY CMP0144)
@@ -126,6 +127,7 @@ add_library(cachemir_lib STATIC
     src/packing/cachemir_filling/cachemir_filling_complex_io.cu
     src/packing/cachemir_filling/cachemir_filling_complex_kv_cache.cu
     src/packing/cachemir_filling/cachemir_filling_rot_indices.cu
+    src/encode/gpu_mag_probe.cu
     src/encoded_block.cu
     src/block_artifact.cu
     src/residency_pipeline.cu
@@ -148,7 +150,7 @@ add_library(cachemir_lib STATIC
     src/app/pipeline.cu
 )
 target_include_directories(cachemir_lib PUBLIC include ${_openfhe_incdirs})
-target_link_libraries(cachemir_lib PUBLIC fideslib::fideslib OpenMP::OpenMP_CXX)
+target_link_libraries(cachemir_lib PUBLIC fideslib::fideslib OpenMP::OpenMP_CXX CUDA::cufft)   # cufft: the device magnitude probe (src/encode)
 if(LibArchive_FOUND)
     target_link_libraries(cachemir_lib PUBLIC LibArchive::LibArchive)
     # LibArchive::LibArchive marks its include dir SYSTEM; nvcc drops imported-target

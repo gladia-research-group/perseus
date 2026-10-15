@@ -10,7 +10,9 @@
 
 #include <CKKS/Ciphertext.cuh>
 #include <CKKS/Context.cuh>
+#include <CKKS/Plaintext.cuh>
 #include <CKKS/openfhe-interface/RawCiphertext.cuh>
+#include "gpu_mag_probe.h"   // the capture's magnitude probe on the device (FHE_MAG_GPU=1)
 
 // The exact Encode transform (slots -> plaintext coefficients), for the EvalMod-facing
 // magnitude the placer prices (output_max_coeff). core-only header: no lbcrypto
@@ -1573,6 +1575,8 @@ struct CKKSContext {
                 ++mag_stat_copies;
                 std::lock_guard<std::mutex> lk(mag_mtx);
                 mag_borrows.push_back(std::move(c));
+            } else if (mag_gpu_probe(output_ct, idx, magnitude_reuse_active ? ro_now : -1)) {
+                ++mag_stat_items;   // measured on the device; fetched at drain
             } else {
                 PendingMag it;
                 it.node_idx = idx;
@@ -1830,6 +1834,90 @@ struct CKKSContext {
             || op == "conjugate" || op == "negate" || op == "negate_inplace"
             || op == "level_reduce" || op == "drop_to_level" || op == "level_hint";
     }
+    // ── Device magnitude probe (FHE_MAG_GPU=1, default off) ─────────────────────────
+    // The same three statistics as the host path (max|z|, Re mean / max|z - mean|, the max
+    // coefficient with and without X^0) computed where the ciphertext is: c0 + c1*s per limb with
+    // the secret key resident on the device, the library's INTT, an exact mixed-radix
+    // reconstruction of the coefficients and one inverse cuFFT (include/gpu_mag_probe.h). Replaces
+    // the D2H snapshot + host decrypt per node; borrows and copy-inheritance resolve at drain
+    // exactly as before. A failure while issuing a probe switches the probe off and the node takes
+    // the host path (a CUDA error left pending by earlier work stops the capture instead: it is not
+    // the probe's); a failure at fetch (the device work itself) aborts the capture, since a graph
+    // with nodes that carry no magnitude would plan silently worse. The [mag_lanes] live/dead
+    // report of a lane-masked capture is a host-path diagnostic (lane_split reads decoded host
+    // values): nodes measured here do not feed it.
+    static bool mag_gpu_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("FHE_MAG_GPU");
+            return e && *e && std::atoi(e) != 0;
+        }();
+        return on;
+    }
+    std::unique_ptr<gpu_encode::GpuMagProbe> mag_gpu;
+    struct PendingGpuMag { std::size_t node_idx; long ordinal; };
+    std::vector<PendingGpuMag> mag_gpu_pending;
+    bool mag_gpu_failed = false;
+    // Zero a host buffer before it is freed; the volatile stores are not elided.
+    static void wipe_u64(std::vector<uint64_t>& v) {
+        volatile uint64_t* p = v.data();
+        for (std::size_t i = 0; i < v.size(); ++i) p[i] = 0;
+    }
+    void mag_gpu_init() {
+        if (!keys.secretKey) throw std::runtime_error("the session holds no secret key");
+        auto& occ = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(cc->cpu);
+        auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(keys.secretKey->pimpl);
+        const int slots = static_cast<int>(cc->GetRingDimension() / 2);
+        // the secret key polynomial travels like any plaintext: an OpenFHE plaintext at level 0
+        // (every limb) whose element is replaced by the key, imported in the library's EVAL layout
+        std::vector<double> zeros(static_cast<std::size_t>(slots), 0.0);
+        lbcrypto::Plaintext spt = occ->MakeCKKSPackedPlaintext(zeros, 1, 0);
+        spt->GetElement<lbcrypto::DCRTPoly>() = skImpl->GetPrivateElement();
+        FIDESlib::CKKS::RawPlainText raw = FIDESlib::CKKS::GetRawPlainText(occ, spt);
+        auto& fctx = std::any_cast<FIDESlib::CKKS::Context&>(cc->gpu);
+        auto gs = std::make_shared<FIDESlib::CKKS::Plaintext>(fctx, raw);   // uploaded synchronously
+        // the device copy is zeroed by whoever holds it last: the probe once it has taken it, this
+        // scope if the probe's construction fails before that
+        struct ZeroOnExit {
+            std::shared_ptr<FIDESlib::CKKS::Plaintext> p;
+            ~ZeroOnExit() {
+                if (p) gpu_encode::zero_plaintext_limbs(*p);
+            }
+        } key_guard{gs};
+        // the host copies of the key go: after a successful upload raw.sub_0 is wiped before it is
+        // freed (if the upload throws, it is freed as it is). Two more are freed unwiped: the
+        // OpenFHE plaintext's buffer (shared by raw.originalPlainText and spt; SetValuesToZero swaps
+        // in a zero buffer and frees the old one as it is) and, on a 32-bit chain, the staging copy
+        // FIDESlib's upload converts each limb through. The session's secret key stays on the host
+        // for the whole session regardless.
+        for (auto& limb : raw.sub_0) wipe_u64(limb);
+        raw.sub_0.clear();
+        raw.originalPlainText.reset();
+        spt->GetElement<lbcrypto::DCRTPoly>().SetValuesToZero();
+        spt.reset();
+        mag_gpu = std::make_unique<gpu_encode::GpuMagProbe>(fctx, slots, std::move(gs));
+        key_guard.p.reset();   // the probe owns the key from here on
+    }
+    bool mag_gpu_probe(const Ctx& ct, std::size_t node_idx, long ordinal) {
+        if (!mag_gpu_enabled() || mag_gpu_failed || !ct || !ct->loaded) return false;
+        // A CUDA error that the work before this node left pending (the library polls its own launches
+        // only under FIDESLIB_ERRCHECK=1) is no failure of the probe's: the ciphertexts it would measure
+        // are suspect, and the host path would measure them all the same, so the capture stops.
+        if (const std::string pending = gpu_encode::take_pending_cuda_error(); !pending.empty())
+            throw std::runtime_error("[mag_gpu] a CUDA error pending from earlier work, before node " +
+                                     std::to_string(node_idx) + ": " + pending +
+                                     " (FIDESLIB_ERRCHECK=1 names the launch); the capture stops");
+        try {
+            if (!mag_gpu) mag_gpu_init();
+            auto gct = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(cc->GetDeviceCiphertext(ct->gpu));
+            mag_gpu->probe(*gct);
+            mag_gpu_pending.push_back({node_idx, ordinal});
+            return true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[mag_gpu] disabled: %s\n", e.what());
+            mag_gpu_failed = true;
+            return false;
+        }
+    }
     std::unordered_map<std::string, std::size_t> mag_node_of;   // var -> node idx (capture)
     std::deque<PendingMag> mag_queue;
     std::vector<PendingMag> mag_borrows;   // resolved at drain, in order
@@ -1952,6 +2040,30 @@ struct CKKSContext {
             std::unique_lock<std::mutex> lk(mag_mtx);
             mag_cv_pop.notify_all();
             mag_cv_push.wait(lk, [&] { return mag_queue.empty() && mag_inflight.load() == 0; });
+            if (mag_gpu && !mag_gpu_pending.empty()) {
+                std::vector<gpu_encode::GpuMagProbe::Result> res;
+                try {
+                    res = mag_gpu->fetch();
+                } catch (const std::exception& e) {
+                    throw std::runtime_error("[mag_gpu] fetch failed, the capture has no magnitudes for " +
+                                             std::to_string(mag_gpu_pending.size()) + " node(s): " + e.what());
+                }
+                if (res.size() != mag_gpu_pending.size())
+                    throw std::runtime_error("[mag_gpu] " + std::to_string(res.size()) + " result(s) for " +
+                                             std::to_string(mag_gpu_pending.size()) + " pending node(s)");
+                for (std::size_t i = 0; i < mag_gpu_pending.size(); ++i) {
+                    MagStats m;
+                    m.max_abs = res[i].max_abs;
+                    m.has_stats = true; m.mean = res[i].mean; m.max_dev = res[i].max_dev;
+                    m.has_coeff = true; m.max_coeff = res[i].max_coeff; m.max_coeff_ac = res[i].max_coeff_ac;
+                    mag_results[mag_gpu_pending[i].node_idx] = m;
+                    if (mag_gpu_pending[i].ordinal >= 0) mag_ref_async[mag_gpu_pending[i].ordinal] = m;
+                }
+                const auto& st = mag_gpu->stats();
+                std::fprintf(stderr, "[mag_gpu] items=%zu enqueue_ms=%.0f fetch_ms=%.0f (cumulative)\n",
+                             mag_gpu_pending.size(), st.enqueue_ms, st.fetch_ms);
+                mag_gpu_pending.clear();
+            }
             auto g = graph_builder->graph();
             for (const auto& [idx, ms] : mag_results) apply_mag(g.get(), idx, ms);
             // Copy-inheritance (permutation-class ops) resolves transitively: chains of
