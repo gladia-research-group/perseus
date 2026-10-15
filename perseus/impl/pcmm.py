@@ -328,6 +328,31 @@ def _record_calib(name, ys):
         json.dump(_calib, f, indent=1, sort_keys=True)
 
 
+# PF_PCMM_PHASES=1 (diagnostic: syncs every phase): per-phase wall of the output finishes, printed at exit
+_PHASES = {} if os.environ.get("PF_PCMM_PHASES", "0") not in ("", "0") else None
+_INTERLEAVE = int(os.environ.get("PF_PCMM_INTERLEAVE", "0") or 0)
+# PF_PCMM_RAISE="gate_up:1,qkv:3": the finishes of those linears raise d composite levels below the top (the route's raise
+# variant; their outputs land 2 d level units deeper, where the consumer has the slack)
+_RAISE = {k: int(v) for k, v in (e.split(":") for e in os.environ.get("PF_PCMM_RAISE", "").split(",") if e)}
+
+
+def _raise_of(lin):
+    return _RAISE.get((lin.name or "").split(".")[-1], 0)
+
+
+def _phase(bts, name, t0=None):
+    bts.sync()
+    t = time.perf_counter()
+    if name is not None:
+        _PHASES[name] = _PHASES.get(name, 0.0) + t - t0
+    return t
+
+
+if _PHASES is not None:
+    import atexit
+    atexit.register(lambda: print("[pcmm_phases] " + " ".join(f"{k}={v:.2f}s" for k, v in _PHASES.items()), flush=True))
+
+
 def engine(rt, t=None):
     """The runtime's PCMM engine for t token lanes (made on first use)."""
     t = int(t or rt.dims.t)
@@ -423,7 +448,8 @@ class Pcmm:
             got = [ops.decrypt_slots_complex(y) for y in outs]
             err = max(float(np.abs(g - w).max()) for g, w in zip(got, want))
             print(f"[pcmm_verify] {lin.name} n_in={lin.n_in} n_out={lin.n_out} shift={lin.shift} "
-                  f"max|y|={max(float(np.abs(w).max()) for w in want):.3g} err={err:.3g}", flush=True)
+                  f"max|y|={max(float(np.abs(w).max()) for w in want):.3g} err={err:.3g} "
+                  f"level={ops.level(outs[0])} drop={_raise_of(lin)}", flush=True)
         for y in outs:
             self.fhe.record_external_bootstrap(y, names, levels)
         self.calls += 1
@@ -441,7 +467,7 @@ class Pcmm:
             for c in range(lin.n_in):
                 blk = Wi[m * nch:(m + 1) * nch, c * nch:(c + 1) * nch].astype(np.float64)[inv[:, None], inv[None, :]]
                 y += blk @ X[c]
-            o = FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land, 1, xr[0].packing)
+            o = FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land + 2 * _raise_of(lin), 1, xr[0].packing)
             if hasattr(xr[0], "ptag"):       # fakecap: outputs reuse the input handles (spares: input 0)
                 o.ptag = xr[m if m < lin.n_in else 0].ptag
             outs.append(o)
@@ -458,6 +484,9 @@ class Pcmm:
         finally:
             self.bts.set_correction_factor(self.fhe, -1)
 
+    def _finish_interleaved(self, ds, sts, shift):
+        _finish_interleaved_impl(self.bts, ds, sts, shift)
+
     def _device_cf(self, xr, lin):
         ops, bts, S = self.ops, self.bts, self.ops.inf.slots
         stamp = lin.w_scale * (1 << lin.shift)
@@ -465,11 +494,22 @@ class Pcmm:
         t0 = time.perf_counter()
         devs, outs, out_devs, states = [], [], [], []
         spare = []
+        drop = _raise_of(lin)
+
+        def fin_state(d):        # the finish's state, from the route's raise variant under a drop
+            if not drop:
+                return bts.begin(d, S, False, True)
+            old = bts.raise_scope(self.fhe, drop)
+            try:
+                return bts.begin(d, S, False, True)
+            finally:
+                bts.raise_scope(self.fhe, old)
         for x in xr:
             d = bts.device(self.fhe, x)
             st = bts.begin(d, S, False, True)
+            stf = fin_state(d) if drop else st
             if not spare and lin.n_out > lin.n_in:   # the spare outputs' states, taken at the input level
-                spare = [bts.begin(d, S, False, True) for _ in range(lin.n_out - lin.n_in)]
+                spare = [fin_state(d) for _ in range(lin.n_out - lin.n_in)]
             if not st.stc_first:
                 raise RuntimeError("pcmm: the dense route is not StC-first (FIDESLIB_BTS_STC_FIRST=2)")
             bts.scale_noise_factor(d, stamp)
@@ -478,7 +518,7 @@ class Pcmm:
             if len(outs) < lin.n_out:
                 outs.append(x)
                 out_devs.append(d)
-                states.append(st)
+                states.append(stf)
         bts.sync()
         t1 = time.perf_counter()
         self.t_in += t1 - t0
@@ -495,21 +535,59 @@ class Pcmm:
         self.times += np.asarray(tm)
         t2 = time.perf_counter()
         self.t_mm += t2 - t1
-        for m in range(lin.n_out):
-            d, st = out_devs[m], states[m]
-            bts.mod_raise(d, st)
-            bts.fold(d, st)
-            for k in range(st.n_cts):
-                bts.cts_stage(d, st, k)
-            bts.eval_mod(d, st)
-            bts.stc_first_output(d, st)
-            if lin.shift:
-                bts.mult_int(d, 1 << lin.shift)
+        ph = _PHASES is not None
+        old_drop = bts.raise_scope(self.fhe, drop) if drop else None
+        try:
+            self._finish_all(out_devs, states, lin, ph)
+        finally:
+            if drop:
+                bts.raise_scope(self.fhe, old_drop)
         bts.sync()
         self.t_out += time.perf_counter() - t2
-        if self.land is None:
+        if self.land is None and not drop:
             self.land = ops.level(outs[0])
         return outs[:lin.n_out]
+
+    def _finish_all(self, out_devs, states, lin, ph):
+        bts = self.bts
+        if _INTERLEAVE > 1 and not ph:
+            self._finish_interleaved(out_devs[:lin.n_out], states[:lin.n_out], lin.shift)
+        for m in (range(0) if _INTERLEAVE > 1 and not ph else range(lin.n_out)):
+            d, st = out_devs[m], states[m]
+            tp = _phase(bts, None) if ph else None
+            bts.mod_raise(d, st)
+            tp = _phase(bts, "raise", tp) if ph else None
+            bts.fold(d, st)
+            tp = _phase(bts, "fold", tp) if ph else None
+            for k in range(st.n_cts):
+                bts.cts_stage(d, st, k)
+                tp = _phase(bts, f"cts{k}", tp) if ph else None
+            bts.eval_mod(d, st)
+            tp = _phase(bts, "evalmod", tp) if ph else None
+            bts.stc_first_output(d, st)
+            tp = _phase(bts, "stc_out", tp) if ph else None
+            if lin.shift:
+                bts.mult_int(d, 1 << lin.shift)
+
+
+def _finish_interleaved_impl(bts, ds, sts, shift):
+    """The outputs' finishes stage-major in groups of PF_PCMM_INTERLEAVE: independent chains issued side by side."""
+    for g in range(0, len(ds), _INTERLEAVE):
+        grp = list(zip(ds[g:g + _INTERLEAVE], sts[g:g + _INTERLEAVE]))
+        for d, st in grp:
+            bts.mod_raise(d, st)
+        for d, st in grp:
+            bts.fold(d, st)
+        for k in range(max(st.n_cts for _, st in grp)):
+            for d, st in grp:
+                if k < st.n_cts:
+                    bts.cts_stage(d, st, k)
+        for d, st in grp:
+            bts.eval_mod(d, st)
+        for d, st in grp:
+            bts.stc_first_output(d, st)
+            if shift:
+                bts.mult_int(d, 1 << shift)
 
 
 def _exact(pc, xs, lin, m):
