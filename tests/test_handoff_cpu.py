@@ -27,9 +27,26 @@ def _rope_float(k, p, inv):
     return np.concatenate([a * c - b * s, b * c + a * s], axis=-1)
 
 
-@pytest.mark.parametrize("T", [1, 7, 8, 63, 64, 65, 120, 127])
+def _bases(T, paged):
+    """Chunk start positions: 64-token chunks from position 1, or the paged prefill's (page 0 = positions 1..127,
+    page p >= 1 = 128 p .. 128 p + 127, two chunks per page)."""
+    if not paged:
+        return [1 + 64 * c for c in range((T + 63) // 64)]
+    out, p = [], 0
+    while True:
+        b = 1 if p == 0 else 128 * p
+        if b > T:
+            return out
+        out.append(b)
+        if b + 64 <= T:
+            out.append(b + 64)
+        p += 1
+
+
+@pytest.mark.parametrize("T,paged", [(t, False) for t in (1, 7, 8, 63, 64, 65, 120, 127)]
+                         + [(t, True) for t in (128, 191, 200, 255)])
 @pytest.mark.parametrize("kv_lanes", [False, True])
-def test_handoff_matches_pushes(T, kv_lanes):
+def test_handoff_matches_pushes(T, paged, kv_lanes):
     d = Dims(32768, 4096, 4096, 32, 32, 16384, 14336)
     N = d.N
     inv = json.load(open(CFG))["model"]["rope_inv_freq"]
@@ -45,12 +62,15 @@ def test_handoff_matches_pushes(T, kv_lanes):
         k, v = (expanded_heads(F[p].ravel(), H, HKV, DH) for F in (Kf, Vf))
         cache_kv_push_packed_complex(rt, ref, lin(k) + 1j * lin(v), rope=rope, pos=p)
     Kr = np.stack([_rope_float(Kf[p], p, inv) for p in range(T + 1)])
-    t_src, nc = 64, (T + 63) // 64
+    t_src, bases = 64, _bases(T, paged)
+    nc = len(bases)
 
     def src(F, b, c):
         x = np.zeros(N)
         for lane in range(t_src):
-            p = 1 + t_src * c + lane
+            p = bases[c] + lane
+            if c + 1 < nc and p >= bases[c + 1]:
+                break
             if p > T:
                 break
             for m in range(4):
@@ -63,7 +83,7 @@ def test_handoff_matches_pushes(T, kv_lanes):
         return x
     K = [[src(Kr, b, c) for c in range(nc)] for b in range(2)]
     V = [[src(Vf, b, c) for c in range(nc)] for b in range(2)]
-    got = to_decode_cache(Rt(PlainOps(), d), K, V, T, bos(Kr), bos(Vf))
+    got = to_decode_cache(Rt(PlainOps(), d), K, V, T, bos(Kr), bos(Vf), bases=bases if paged else None)
     assert len(got.k_buckets) == len(ref.k_buckets) and len(got.k_pend) == len(ref.k_pend)
     for a, b in zip(got.k_buckets + got.k_pend, ref.k_buckets + ref.k_pend):
         assert np.allclose(a, b, atol=1e-9)

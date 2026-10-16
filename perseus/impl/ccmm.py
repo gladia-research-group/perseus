@@ -112,6 +112,7 @@ class Ccmm:
             self.cap = self.cap or _N32_CAP
             self.land = self.land or int(os.environ.get("PF_CCMM_FAKE_LAND", "28"))
         self.c_unit = None
+        self._carriers = None
         self.w = w_theory()
         self.nf_ref = self.nf_split = None
         self.times = np.zeros(5)
@@ -187,31 +188,72 @@ class Ccmm:
         entry = bts.stc_first_entry(d, ops.inf.slots)
         return ops.level(x) + d.level - entry - ops.unit
 
+    def _factors(self, amax, bmax, shift, out_scale, merge):
+        p = out_scale * 2.0 ** -shift / self.c_unit * (0.5 if merge else 1.0)
+        return math.sqrt(p * bmax / amax), math.sqrt(p * amax / bmax)
+
+    def prep_b(self, xb, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, merge=False):
+        """The right operands of later apply calls (same amax / bmax / shift / out_scale / merge), taken to the
+        CCMM's input form once (consumed): the paged prefill keeps every page's K / V this way (4 limbs)."""
+        ops = self.ops
+        if self.cap is None:
+            self.cap = self._measure_cap(xb[0])
+        for x in xb:
+            ops.bootstrap_hint(x, self.cap, True)
+            self.fhe.level_hint(x, self.cap)
+        prep = PreparedB(list(xb), [self.fhe.var_name(x) for x in xb], [ops.level(x) for x in xb])
+        if self.bts is None:
+            prep.vecs = [np.array(x.vec) for x in xb]
+            return prep
+        fb = self._factors(amax, bmax, shift, out_scale, merge)[1]
+        bts, S = self.bts, ops.inf.slots
+        bts.sync()
+        t0 = time.perf_counter()
+        # a dropped device ciphertext keeps its full allocation: host copies of the 4 live limbs, imported by
+        # apply into one shared set of carriers (the first operands prepared)
+        carry = self._carriers is None
+        if carry:
+            self._carriers = ([], [])
+        prep.cts = []
+        for x in xb:
+            d = bts.device(self.fhe, x)
+            bts.stc_high(d, S, 3, fb, 1, self.nf_ref)
+            ex = bts.export_limbs(self.fhe, d)
+            prep.host.append((ex["c0"].astype(np.uint32), ex["c1"].astype(np.uint32), float(ex["noise_factor"]),
+                              int(ex["noise_level"])))
+            if carry:
+                self._carriers[0].append(x)
+                self._carriers[1].append(d)
+        bts.sync()
+        self.t_in += time.perf_counter() - t0
+        return prep
+
     def apply(self, xa, xb, b_transposed=False, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, site="ccmm", merge=False):
         """out_scale M M' (M' = xb^T when b_transposed) for SinC slot ciphertexts; amax / bmax bound |entries|
         (balance the operand factors), 2^shift bounds |output| (the refresh's range). Inputs are consumed. With
         `merge` (operands duplicated on l + 16) the 8 merged outputs (e + w o) / 2 of the pairs (2 p, 2 p + 1)."""
         ops = self.ops
-        assert len(xa) == len(xb) == sc.NCT
+        prep = xb if isinstance(xb, PreparedB) else None
+        assert len(xa) == sc.NCT and (prep is not None or len(xb) == sc.NCT)
         if self.cap is None:
             self.cap = self._measure_cap(xa[0])
-        for x in list(xa) + list(xb):
+        mine = list(xa) if prep is not None else list(xa) + list(xb)
+        for x in mine:
             ops.bootstrap_hint(x, self.cap, True)
             self.fhe.level_hint(x, self.cap)
-        names = [self.fhe.var_name(x) for x in list(xa) + list(xb)]
-        levels = [ops.level(x) for x in list(xa) + list(xb)]
+        names = [self.fhe.var_name(x) for x in mine] + ([] if prep is None else prep.names)
+        levels = [ops.level(x) for x in mine] + ([] if prep is None else prep.levels)
         want = None
-        if self.bts is not None and os.environ.get("PF_CCMM_VERIFY"):
+        if self.bts is not None and os.environ.get("PF_CCMM_VERIFY") and prep is None:
             want = out_scale * exact([ops.decrypt_slots_complex(x) for x in xa],
                                      [ops.decrypt_slots_complex(x) for x in xb], b_transposed)
             if merge:
                 want = np.array([merged(want[2 * i], want[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
         if self.bts is None:
-            outs = self._fake(xa, xb, b_transposed, out_scale, merge)
+            outs = self._fake(xa, xb if prep is None else prep.vecs, b_transposed, out_scale, merge)
         else:
-            p = out_scale * 2.0 ** -shift / self.c_unit * (0.5 if merge else 1.0)
-            fa, fb = math.sqrt(p * bmax / amax), math.sqrt(p * amax / bmax)
-            outs = self._device(xa, xb, b_transposed, fa, fb, shift, merge)
+            fa, fb = self._factors(amax, bmax, shift, out_scale, merge)
+            outs = self._device(xa, xb if prep is None else prep, b_transposed, fa, fb, shift, merge)
         if want is not None:
             got = np.array([ops.decrypt_slots_complex(y) for y in outs])
             err = float(np.abs(got - want).max())
@@ -226,7 +268,7 @@ class Ccmm:
         return outs
 
     def _fake(self, xa, xb, b_transposed, out_scale, merge=False):
-        Y = out_scale * exact([x.vec for x in xa], [x.vec for x in xb], b_transposed)
+        Y = out_scale * exact([x.vec for x in xa], [getattr(x, "vec", x) for x in xb], b_transposed)
         if merge:
             Y = np.array([merged(Y[2 * i], Y[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
         cls = type(xa[0])
@@ -243,6 +285,11 @@ class Ccmm:
         bts.sync()
         t0 = time.perf_counter()
         da, db, states = [], [], []
+        if isinstance(xb, PreparedB):
+            db = self._carriers[1]
+            for d, (c0, c1, nf, nl) in zip(db, xb.host):
+                bts.import_limbs(self.fhe, d, c0.astype(np.uint64), c1.astype(np.uint64), nf, nl)
+            xb = []
         for xs, f, ds in ((xa, fa, da), (xb, fb, db)):
             for x in xs:
                 d = bts.device(self.fhe, x)
@@ -274,6 +321,14 @@ class Ccmm:
         bts.sync()
         self.t_out += time.perf_counter() - t2
         return list(xa)
+
+
+class PreparedB:
+    """Ccmm.prep_b's operands: host limbs (device) or slot vectors (fake), graph names / levels."""
+
+    def __init__(self, cts, names, levels):
+        self.cts, self.names, self.levels = cts, names, levels
+        self.host, self.vecs = [], None
 
 
 def unmerge(rt, Ms, w, scale=1.0, site="ccmm.um"):

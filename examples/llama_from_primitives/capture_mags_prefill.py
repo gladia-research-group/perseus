@@ -16,6 +16,7 @@ def main(argv=None):
     ap.add_argument("graph_dir")
     ap.add_argument("--tokens", type=int, default=16)
     ap.add_argument("--window", default="0")
+    ap.add_argument("--seq", type=int, default=128)
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--configs", default="configs/model/approximation/llama31_8b_n32/configs.json")
     ap.add_argument("--plan", default=None)
@@ -42,9 +43,12 @@ def main(argv=None):
                          n_layers=a.layers, packing="cachemir_complex")
     tape = magtape.attach(fhe, inf)
     tapes = magtape.tape_stages(model, tape, 1)
-    toks = hf.text_windows(int(a.window) + 1, 128)[int(a.window)][:a.tokens + 1]
+    toks = hf.text_windows(int(a.window) + 1, a.seq)[int(a.window)][:a.tokens + 1]
     t0 = time.time()
-    model.prefill(toks)
+    if os.environ.get("PF_PAGED", "0") not in ("", "0"):
+        model.prefill_paged(toks)
+    else:
+        model.prefill(toks)
     print(f"[mags] fake tape: {len(tapes)} stages, {sum(map(len, tapes.values()))} records, {time.time() - t0:.0f}s",
           flush=True)
     magtape.fill_dir(a.graph_dir, tapes)

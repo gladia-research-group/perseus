@@ -127,7 +127,7 @@ def main(argv=None):
         return x
     t_ho = [0.0]
 
-    def on_kv(b, K, V):
+    def on_kv(b, K, V, bases=None):
         t = time.time()
         with pre.rt.step("handoff"):
             if b == 0 and not a.fake:
@@ -136,7 +136,7 @@ def main(argv=None):
                     print(f"[handoff] layer 0 {nm}[0][0] max|re|={np.abs(z.real).max():.3g} "
                           f"max|im|={np.abs(z.imag).max():.3g}", flush=True)
             kv = to_decode_cache(pre.rt, K, V, a.tokens, bos_vec(bos[b][0]), bos_vec(bos[b][1]), keys=keys, layer=b,
-                                 cleanse=a.cleanse)
+                                 cleanse=a.cleanse, bases=bases)
             if a.launder:
                 ops = pre.rt.ops
 
@@ -161,13 +161,39 @@ def main(argv=None):
     def on_block(b, Xs, s):
         print(f"[handoff] prefill block {b} {s:.2f}s bts={int(inf.fhe.total_bootstraps)}", flush=True)
     t1 = time.time()
-    Xs, ch, _ = pre.prefill(toks[:a.tokens + 1], on_block=on_block,
-                            on_kv=None if (a.no_handoff or dec is None) else on_kv)
+    paged = os.environ.get("PF_PAGED", "0") not in ("", "0")
+    if paged:
+        # PF_PAGED=1: each layer's K / V chunks gathered over the pages, handed off after the last page
+        from perseus.impl.ccmm_paged import page_tokens
+        n_pages, cov = 0, 0
+        while cov < a.tokens:
+            cov += page_tokens(n_pages)
+            n_pages += 1
+        acc = {}
+
+        def on_kv_paged(p, b, K, V):
+            Ks, Vs, bs = acc.setdefault(b, ([[] for _ in K], [[] for _ in V], []))
+            for i in range(len(K)):
+                Ks[i] += K[i]
+                Vs[i] += V[i]
+            base = 1 if p == 0 else 128 * p
+            bs += [base, base + 64]
+            if p == n_pages - 1:
+                on_kv(b, Ks, Vs, bases=bs)
+                del acc[b]
+        pages, _ = pre.prefill_paged(toks[:a.tokens + 1], on_block=lambda p, b, X, c, s: on_block(b, X, s),
+                                     on_kv=None if (a.no_handoff or dec is None) else on_kv_paged)
+        hid = np.concatenate([pre.hidden_rows(X, c) for X, c in pages])[:a.tokens]
+        Xs = None
+    else:
+        Xs, ch, _ = pre.prefill(toks[:a.tokens + 1], on_block=on_block,
+                                on_kv=None if (a.no_handoff or dec is None) else on_kv)
+        hid = None
     ttft = time.time() - t1
     from .prefill import plain_logits
     from perseus.impl.prefill import Chunks
     if gt is not None and pre.n_layers == int(store.config["num_hidden_layers"]):
-        rows, out = report(plain_logits(pre, pre.hidden_rows(Xs, ch)), gt[1:a.tokens + 1])
+        rows, out = report(plain_logits(pre, pre.hidden_rows(Xs, ch) if hid is None else hid), gt[1:a.tokens + 1])
         print(f"[handoff] prefill top1={out.get('top1')}/{a.tokens} medianKL={out.get('medianKL', float('nan')):.4g}",
               flush=True)
     print(f"[handoff] prefill+handoff {ttft:.1f}s (handoff {t_ho[0]:.1f}s) bts={int(inf.fhe.total_bootstraps)}",
@@ -176,6 +202,8 @@ def main(argv=None):
         sess.close()
         return 0
     del Xs
+    if paged:
+        del pages
     pre.__dict__.pop("_pcmm_w", None)
     if hasattr(_core, "gpu_pool_trim") and not a.fake:
         _core.gpu_pool_trim()

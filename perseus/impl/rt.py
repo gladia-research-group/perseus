@@ -56,6 +56,7 @@ class Rt:
             ops.fhe.graph_scope_strict = True       # naming only: planned mode stays strict
         self._scope_path = []
         self._scope_visits = {}
+        self.rearm_plan = None    # hook: re-arm the plan's fire-once entries before a repeated step's next visit
 
     # ── mask vectors ──
     def mask(self, key, build):
@@ -198,11 +199,13 @@ class Rt:
             self.declare_step(step + 1, next_items)
         return self.stage_step(step + 1)
 
-    def step(self, label, shape=None):
+    def step(self, label, shape=None, repeat=False):
         """`with rt.step("label"):` scopes ops under a step label in the captured graph and,
         for the timing layer, attributes the time of the ops inside to `label`. `shape`: what
-        the step's op count depends on (e.g. the cache's group count), part of its name scope."""
-        return _StepScope(self, label, shape)
+        the step's op count depends on (e.g. the cache's group count), part of its name scope.
+        `repeat`: every visit takes the first visit's names (a loop body bound by one plan entry set), the plan's
+        fire-once entries re-armed (rearm_plan) before each later visit."""
+        return _StepScope(self, label, shape, repeat)
 
     @classmethod
     def from_inf(cls, inf, core, unit=2, bts_precision=12):
@@ -217,8 +220,8 @@ if os.environ.get("PF_NVTX_STEPS", "0") not in ("", "0"):
 
 
 class _StepScope:
-    def __init__(self, rt, label, shape=None):
-        self.rt, self.label, self.shape = rt, label, shape
+    def __init__(self, rt, label, shape=None, repeat=False):
+        self.rt, self.label, self.shape, self.repeat = rt, label, shape, repeat
         self.inner = rt.ops.inf.step(label)
         self.saved = None
 
@@ -236,6 +239,10 @@ class _StepScope:
             path = "_".join(re.sub(r"[^A-Za-z0-9~]+", "", p) for p in rt._scope_path)
             n = rt._scope_visits.get(path, 0)
             rt._scope_visits[path] = n + 1
+            if self.repeat:
+                if n and rt.rearm_plan is not None:
+                    rt.rearm_plan()
+                n = 0
             fhe.graph_scope = f"sc_{path}" + (f"~{n}" if n else "")
             fhe.graph_scope_counter = 0
         return self

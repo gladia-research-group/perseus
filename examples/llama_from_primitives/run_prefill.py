@@ -19,6 +19,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=16, help="prompt positions after the BOS prefix")
     ap.add_argument("--window", default="0")
+    ap.add_argument("--seq", type=int, default=128, help="window length (PF_PAGED=1 runs prompts past 128)")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=3)
     ap.add_argument("--configs", default=None)
@@ -50,7 +51,7 @@ def main(argv=None):
     from . import env, hf
     from . import weights as W
     from .config import load_configs
-    toks = hf.text_windows(int(a.window) + 1, 128)[int(a.window)][:a.tokens + 1]
+    toks = hf.text_windows(int(a.window) + 1, a.seq)[int(a.window)][:a.tokens + 1]
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
@@ -182,8 +183,27 @@ def main(argv=None):
         print(f"[llama-prefill] ccmm keys + calibration {time.time() - t_pre:.1f}s c_unit={ce.c_unit} land={ce.land}",
               flush=True)
     t1 = time.time()
-    Xs, ch, rec = model.prefill(toks, on_block=on_block)
-    wall = time.time() - t1
+    if os.environ.get("PF_PAGED", "0") not in ("", "0"):
+        def on_page_block(p, b, Xs, ch, s):
+            tb = int(inf.fhe.total_bootstraps)
+            line = f"[llama-prefill] page {p} block {b} {s:.2f}s bts={tb - b0[0]}"
+            if not a.fake and hasattr(_core, "device_free_gb"):
+                line += f" free={_core.device_free_gb():.1f}GB"
+            b0[0] = tb
+            if ref is not None:
+                h = model.hidden_rows(Xs, ch)
+                lo = ch.base - 1
+                n = min(ch.T, a.tokens - lo)
+                err = np.abs(h[:n] - ref[b][lo:lo + n]).max(1)
+                line += f" maxerr={err.max():.3g} (pos {int(err.argmax()) + 1 + lo}) |x|={np.abs(ref[b][lo:lo + n]).max():.3g}"
+            print(line, flush=True)
+        pages, rec = model.prefill_paged(toks, on_block=on_page_block)
+        wall = time.time() - t1
+        hid = np.concatenate([model.hidden_rows(X, c) for X, c in pages])[:a.tokens]
+    else:
+        Xs, ch, rec = model.prefill(toks, on_block=on_block)
+        wall = time.time() - t1
+        hid = None
     pc = getattr(model.rt, "pcmm", None)
     if pc is not None:
         print(f"[pcmm] calls={pc.calls} cap={pc.cap} land={pc.land} keygen={pc.keygen_s:.1f}s split->out ms: "
@@ -196,7 +216,7 @@ def main(argv=None):
               f"out={ce.t_out:.2f}s C++ ms " + " ".join(f"{v:.0f}" for v in ce.times), flush=True)
     out = {}
     if model.n_layers == int(store.config["num_hidden_layers"]) and gt is not None:
-        rows, out = report(plain_logits(model, model.hidden_rows(Xs, ch)), gt[1:a.tokens + 1])
+        rows, out = report(plain_logits(model, model.hidden_rows(Xs, ch) if hid is None else hid), gt[1:a.tokens + 1])
         print("[llama-prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows), flush=True)
     print(f"[llama-prefill] SUMMARY T={a.tokens} wall={wall:.1f}s per_token={wall / a.tokens:.3f}s "
           f"bts={int(inf.fhe.total_bootstraps)} top1={out.get('top1')}/{a.tokens} "

@@ -162,8 +162,9 @@ def _memdbg(rt, tag):
         print(f"[memdbg] {tag}: free={core.device_free_gb():.2f}GB pool={st.get('reserved_gb', 0):.2f}GB", flush=True)
 
 
-def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0):
-    """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block)."""
+def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0, paged=None):
+    """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block).
+    `paged` = (page, store): attention_paged on the K / V operands of the earlier pages in `store`."""
     ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
     _memdbg(rt, "in")
@@ -177,7 +178,12 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     _memdbg(rt, "qkv")
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
+        if paged is not None:
+            from perseus.impl.ccmm_paged import attention_paged
+            O = attention_paged(rt, Q, Kc, V, sm, ch, B, paged[0], paged[1], rope=rope, prefixes=prefixes,
+                                kv=kv if kv is not None else [dict() for _ in range(B.Kkv)], layer=layer)
+        else:
+            O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
     _memdbg(rt, "attn")
     with rt.step("out_proj"):
         A = [pcmm_run(rt, o, P["out"]) for o in O]
@@ -272,6 +278,49 @@ class LlamaPrefill(LlamaModel):
             if on_block is not None:
                 on_block(b, Xs, time.time() - t0)
         return Xs, ch, self.token_end(0)
+
+    def prefill_paged(self, tokens, on_block=None, on_kv=None):
+        """PF_PAGED=1: tokens[0] = BOS, the prompt in pages (ccmm_paged: page 0 = 127 tokens, then 128 each, the last
+        padded with copies of its last token), every page through all blocks with the same per-block plan. Returns
+        [(Xs, ch)] per page and the token record. `on_block(page, b, Xs, ch, seconds)`."""
+        from perseus.impl.ccmm_paged import page_tokens
+        B = self.blocks
+        prompt = list(tokens[1:])
+        pages, i, p = [], 0, 0
+        while i < len(prompt):
+            n = page_tokens(p)
+            chunk = prompt[i:i + n]
+            pages.append((chunk + [chunk[-1]] * (n - len(chunk)), 1 if p == 0 else i + 1))
+            i += n
+            p += 1
+        stores = [[] for _ in range(self.n_layers)]
+        self.token_begin(0)
+        out = []
+        for p, (toks, base) in enumerate(pages):
+            ch = Chunks(len(toks), B.t, base=base)
+            rows = np.stack([self.w.embedding(t) for t in toks])
+            Xs = BL.encode_blocked(self.rt, rows, ch, B)
+            for b in range(self.n_layers):
+                t0 = time.time()
+                self.rt._scope_visits.clear()
+                cap = self.enter_stage(b, 1)
+                plan = self._plan_for(b)
+                self.rt.rearm_plan = None if plan is None else (lambda plan=plan: self.core.install_plan_live(self.inf, plan))
+                BL.name_blocked(self.inf, Xs)
+                kvs = None if on_kv is None else [{} for _ in range(B.Kkv)]
+                with self.rt.step(f"blk{b}"):
+                    Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
+                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b,
+                                                     paged=(p, stores[b]))
+                self.rt.rearm_plan = None
+                self.exit_stage(b, cap)
+                if on_kv is not None:
+                    on_kv(p, b, [x["K"] for x in kvs], [x["V"] for x in kvs])
+                evict_block_masks(self.rt)
+                if on_block is not None:
+                    on_block(p, b, Xs, ch, time.time() - t0)
+            out.append((Xs, ch))
+        return out, self.token_end(0)
 
     def pcmm_weights(self, b):
         """Block b's PcmmLinears, scaled as the pair path's outputs (PF_PCMM_LLAMA_SCALES), cached next to the slots."""

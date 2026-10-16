@@ -34,10 +34,10 @@ def k_pairing(n: int, t: int):
 
 
 def to_decode_cache(rt, K, V, T: int, bos_k, bos_v, t_src: int = 64, hg: int = 4, G: int = 4, keys=None,
-                    tag: str = "ho", layer: int = 0, cleanse: bool = False):
+                    tag: str = "ho", layer: int = 0, cleanse: bool = False, bases=None):
     """K[b][c], V[b][c]: KV block b (KV heads hg b .. hg b + hg - 1 at local j hg + m), real chunk c (positions
-    1 + t_src c + lane); bos_k / bos_v: position 0's decode-layout group vectors. Decode geometry from rt.dims.
-    `cleanse`: keep only the real part of the sources (the pairing puts a group on the imaginary half)."""
+    bases[c] + lane, default 1 + t_src c); bos_k / bos_v: position 0's decode-layout group vectors. Decode geometry
+    from rt.dims. `cleanse`: keep only the real part of the sources (the pairing puts a group on the imaginary half)."""
     ops, d = rt.ops, rt.dims
     sc = 0.5 if cleanse else 1.0
     N, t, tH, dh = d.N, d.t, d.tH, d.d_head
@@ -54,16 +54,19 @@ def to_decode_cache(rt, K, V, T: int, bos_k, bos_v, t_src: int = 64, hg: int = 4
                     continue
                 if cleanse:
                     x = im_cleanse(ops, x)
-                last = min(t_src, T - t_src * c)
+                b0 = 1 + t_src * c if bases is None else bases[c]
+                last = min(t_src, T + 1 - b0)
+                if bases is not None and c + 1 < len(bases):
+                    last = min(last, bases[c + 1] - b0)       # page 0's last lane is empty
                 for g in range(ng):
-                    lo, hi = max(t * g - 1 - t_src * c, 0), min(t * g + t - 1 - t_src * c, last)
+                    lo, hi = max(t * g - b0, 0), min(t * g + t - b0, last)
                     if lo >= hi:
                         continue
                     for m in range(hg):
                         mk = (tag + ".grp", lo, hi, m, sc)
                         y = rt.mult_mask(x, mk, lambda lo=lo, hi=hi, m=m:
                                          sc * ((m_of == m) & (lane >= lo) & (lane < hi)).astype(float))
-                        s = t * g - 1 - t_src * c + m * (t_src - G * t) - b * hg * G * t
+                        s = t * g - b0 + m * (t_src - G * t) - b * hg * G * t
                         y = rot_any(ops, y, s, keys)
                         out[g] = y if out[g] is None else ops.add(out[g], y)
         for g in range(ng):
