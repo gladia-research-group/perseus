@@ -78,6 +78,10 @@ def main(argv=None):
     d0 = Dims.gpt2()
     extra = prefill_rot_steps(d0) | diag_rot_steps(d0) | (pcmm_rot_steps() if pcmm else set()) \
         | blocked_rot_steps(Blocks(d0, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
+    ccmm_on = os.environ.get("PF_ATTN", "") == "ccmm"
+    if ccmm_on:
+        from perseus.impl import sinc_mha
+        extra |= sinc_mha.rot_steps(2) | {16, -16}
     pruned = None
     if a.fake:
         from perseus.impl import fakecap
@@ -117,6 +121,11 @@ def main(argv=None):
     if pcmm:
         from perseus.impl.pcmm import engine
         engine(model.rt).prepare(d.dim)
+    if ccmm_on:
+        from perseus.impl.ccmm import engine as ccmm_engine
+        ce = ccmm_engine(model.rt)
+        ce.prepare(d.dim)
+        print(f"[vit] ccmm keys + calibration c_unit={ce.c_unit} land={ce.land}", flush=True)
     print(f"[vit] T={V.T} layers={model.n_layers} images={len(files)} weights ready {time.time() - t_pre:.1f}s "
           f"capture={a.capture} plan={a.plan}", flush=True)
     W1 = np.asarray(store.r("classifier.weight"))
@@ -133,7 +142,7 @@ def main(argv=None):
             line = f"[vit] block {b} {s:.2f}s bts={tb - b0[0]}"
             b0[0] = tb
             if a.check:
-                h = V.unscale(model.hidden(Xs, Chunks(V.T, model.blocks.t)))
+                h = V.unscale(model.hidden(Xs, model.last_ch))
                 err = np.abs(h - ref[b]).max(1)
                 line += f" maxerr={err.max():.3g} (tok {int(err.argmax())}) |x|={np.abs(ref[b]).max():.3g}"
             print(line, flush=True)
@@ -155,7 +164,7 @@ def main(argv=None):
                       f"median {np.median(e):.3g} |x| {np.abs(w_).max():.3g} (u_max {want['u_max']:.3g})", flush=True)
             if os.environ.get("VIT_TAPS"):
                 model.tap = tap
-            model.dbg_embed = lambda h, x0=x0: print(f"[vit] embed maxerr={np.abs(h - x0).max():.3g} "
+            model.dbg_embed = lambda h, x0=x0: print(f"[vit] embed maxerr={np.abs(h[:len(x0)] - x0).max():.3g} "
                                                      f"|x|={np.abs(x0).max():.3g}", flush=True)
         t0 = time.time()
         Xs, ch, rec = model.prefill(rows, on_block=on_block)
@@ -169,6 +178,10 @@ def main(argv=None):
             res.append(r)
             print(f"[vit] {r['file']}: ours={r['ours']} ref={r['ref']} top1={'OK' if r['hit'] else 'MISS'} "
                   f"in_top5={r['top5']} KL={r['kl']:.3g} wall={walls[-1]:.1f}s", flush=True)
+    ce = getattr(model.rt, "ccmm", None)
+    if ce is not None:
+        print(f"[ccmm] calls={ce.calls} cap={ce.cap} land={ce.land} in={ce.t_in:.2f}s mm={ce.t_mm:.2f}s "
+              f"out={ce.t_out:.2f}s", flush=True)
     pc = getattr(model.rt, "pcmm", None)
     if pc is not None:
         print(f"[pcmm] calls={pc.calls} cap={pc.cap} land={pc.land} | stc_in={pc.t_in:.2f}s pcmm={pc.t_mm:.2f}s "

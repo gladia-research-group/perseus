@@ -1,7 +1,9 @@
 """ViT on the GPT-2 blocked prefill (examples/gpt2_from_primitives/prefill.py, PF_LAYOUT=blocked, PF_LINEAR=pcmm,
-PF_NONCAUSAL=1): the client encrypts the patch pixels (CLS row zero); stage 0 opens with the patch embedding as a PCMM
+bidirectional Chunks): the client encrypts the patch pixels (CLS row zero); stage 0 opens with the patch embedding as a PCMM
 plus the per-token offsets (CLS, position embeddings, conv bias) as plaintext, then the 12 pre-LN blocks."""
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
@@ -23,6 +25,9 @@ def _pad(Wm, r, c):
 def add_rows(rt, Xg, rows, ch: Chunks, B, site):
     """Xg[g][k] + the plaintext (T, dim) rows in encode_blocked's layout."""
     ops, N, t = rt.ops, B.d.N, B.t
+    if rows.shape[0] < ch.T:                   # the padded rows repeat the last ones (VitPrefill.prefill)
+        n = rows.shape[0]
+        rows = np.vstack([rows, rows[n - (ch.T - n):]])
     full = np.zeros((rows.shape[0], B.d.hid))
     full[:, :rows.shape[1]] = rows
     idx = np.arange(B.nch) * t
@@ -52,7 +57,7 @@ def unscale_blocked(rt, Xg, B, site="vit.unscale"):
              for k, x in enumerate(row)] for row in Xg]
 
 
-def vit_block(rt, Xs, w, cfgs, ch: Chunks, B, tap=None):
+def vit_block(rt, Xs, w, cfgs, ch: Chunks, B, tap=None, layer=0):
     """prefill_block_blocked with the VIT_MASSIVE unscale at both LayerNorm inputs; tap(name, rows) at the
     hidden-width points (diagnostic)."""
     ops, K = rt.ops, B.K
@@ -71,7 +76,11 @@ def vit_block(rt, Xs, w, cfgs, ch: Chunks, B, tap=None):
             o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
             Kc.append(o[:K]); Vv.append(o[K:2 * K]); Q.append(o[2 * K:])
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, Vv, sm, ch, B)
+        if os.environ.get("PF_ATTN", "") == "ccmm":     # two-page bidirectional CCMM (ccmm_mha_paged.py)
+            from perseus.impl import ccmm_mha_paged
+            O = ccmm_mha_paged.attention(rt, Q, Kc, Vv, sm, ch, layer=layer, h_real=B.d.H_real)
+        else:
+            O = BL.attention_blocked(rt, Q, Kc, Vv, sm, ch, B)
     with rt.step("out_proj"):
         A = [_bias_blocks(rt, pcmm_run(rt, o, w["out"]), w["out"], ch, g, B) for g, o in enumerate(O)]
         if tap:
@@ -131,6 +140,29 @@ class VitPrefill(Gpt2Prefill):
             "shift1": self.block_weights(b).shift1, "shift2": self.block_weights(b).shift2}
         return cache[b]
 
+    def prefill(self, rows, on_block=None):
+        """Gpt2Prefill.prefill on a bidirectional prompt (every token attends the T real keys). VIT_PAD=1 (default):
+        the rows padded to whole 128-token pages with copies of the last ones, keys >= T masked, so no ciphertext
+        slice is identically zero (a zero-magnitude value is not refreshable by the planner)."""
+        from examples.gpt2_from_primitives.prefill import _tapped
+        n = len(rows)
+        if os.environ.get("VIT_PAD", "1") not in ("", "0"):
+            full = -(-n // 128) * 128
+            rows = np.vstack([rows, rows[n - (full - n):]]) if full > n else rows
+        ch = Chunks(len(rows), self.blocks.t, bidir=True, keys=n)
+        self.last_ch = ch
+        self.start()
+        self.token_begin(0)
+        Xs = [x for row in BL.encode_blocked(self.rt, rows, ch, self.blocks) for x in row]
+        stages = self.prefill_stages(ch)
+        if on_block is not None:
+            stages = [(lab, pre, _tapped(fn, b, on_block)) for b, (lab, pre, fn) in enumerate(stages)]
+        Xs = self.run_stages(Xs, 0, stages)
+        return Xs, ch, self.token_end(0)
+
+    def hidden(self, Xs, ch):
+        return super().hidden(Xs, ch)[:ch.n_keys]
+
     def preload_prefill(self):
         self.embed_weights()
         super().preload_prefill()
@@ -151,7 +183,7 @@ class VitPrefill(Gpt2Prefill):
                         if getattr(self, "dbg_embed", None) is not None:
                             self.dbg_embed(V.unscale(BL.decrypt_blocked(self.rt, Xg, ch, B, self.rt.dims.dim)))
                     tap = self.tap if b == getattr(self, "tap_block", 0) and getattr(self, "tap", None) else None
-                    Xg = vit_block(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B, tap)
+                    Xg = vit_block(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B, tap, layer=b)
                     Xs = [x for row in Xg for x in row]
                 self.exit_stage(b, cap)
                 evict_block_masks(self.rt)
