@@ -27,8 +27,10 @@ def inputs(a, T):
         ids, n = D.text128()
         out.append(("text128", ids, n, 1))
     if a.sst2:
-        sents = D.sentences(max(int(i) for i in a.sst2.split(",")) + 1)
-        for i in a.sst2.split(","):
+        idx = (list(range(*[int(v) for v in a.sst2.split(":")])) if ":" in a.sst2
+               else [int(i) for i in a.sst2.split(",")])
+        sents = D.sentences(max(idx) + 1)
+        for i in idx:
             s, lab = sents[int(i)]
             ids, n = D.encode(s, T)
             out.append((f"sst2[{i}]", ids, n, lab))
@@ -40,7 +42,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=128, help="T: rows padded to it")
     ap.add_argument("--text", default="128", help="'128': the 128-token text; '' for none")
-    ap.add_argument("--sst2", default="", help="comma-separated SST-2 validation indices")
+    ap.add_argument("--sst2", default="", help="SST-2 validation indices: comma-separated, or a range a:b")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=3)
     ap.add_argument("--configs", default=None)
@@ -93,6 +95,9 @@ def main(argv=None):
     d = Dims.gpt2()
     extra = prefill_rot_steps(d) | diag_rot_steps(d) | pcmm_rot_steps() | \
         blocked_rot_steps(Blocks(d, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())
+    if os.environ.get("PF_ATTN", "") == "ccmm":
+        from perseus.impl.sinc_mha import rot_steps as mha_rot_steps
+        extra |= mha_rot_steps() | {16, d.N - 16}
     pruned = None
     if a.fake:
         from perseus.impl import fakecap
@@ -127,6 +132,11 @@ def main(argv=None):
     model.preload()
     from perseus.impl.pcmm import engine
     engine(model.rt).prepare(d.dim)
+    if os.environ.get("PF_ATTN", "") == "ccmm":     # keys + calibration probes before the captured stages
+        from perseus.impl.ccmm import engine as ccmm_engine
+        ce = ccmm_engine(model.rt)
+        ce.prepare(d.dim)
+        print(f"[bert] ccmm c_unit={ce.c_unit} land={ce.land}", flush=True)
     print(f"[bert] configs={a.configs} weights+keys {time.time() - t_pre:.1f}s", flush=True)
     rows_out = []
     for name, ids, n, label in inputs(a, a.tokens):

@@ -51,7 +51,11 @@ def bert_block(rt, Xs, w, cfgs, ch: Chunks, B, b: int):
             o = _bias_blocks(rt, pcmm_run(rt, x, w["qkv"]), w["qkv"], ch, g, B)
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
+        if os.environ.get("PF_ATTN", "") == "ccmm":     # CCMM attention on the d_head-64 SinC packing (ccmm_mha.py)
+            from perseus.impl import ccmm_mha
+            O = ccmm_mha.attention(rt, Q, Kc, V, sm, ch, layer=b, h_real=B.d.H_real)
+        else:
+            O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
     with rt.step("out_proj"):
         A = [_bias_blocks(rt, pcmm_run(rt, o, w["out"]), w["out"], ch, g, B) for g, o in enumerate(O)]
     Y = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, Xs)]
