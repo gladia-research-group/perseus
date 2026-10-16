@@ -39,6 +39,17 @@ class Chunks:
     T: int
     t: int
     base: int = 0            # absolute position of token 0
+    bidir: bool = False      # every query sees every key (encoders), not only the earlier ones
+    keys: int = 0            # bidir: the first `keys` tokens are attended (0: all T; the rest is padding)
+
+    @property
+    def n_keys(self):
+        return self.keys or self.T
+
+    @property
+    def key_tag(self):
+        """The geometry part of a mask key: (T, base), plus (keys,) on a bidirectional prompt."""
+        return (self.T, self.base) + ((("bidir", self.n_keys),) if self.bidir else ())
 
     @property
     def n_chunks(self):
@@ -378,13 +389,21 @@ def lane_rotate_all(rt, x, site, batch: int):
 
 
 def _offsets(ch: Chunks, c: int):
-    """(u, c', e) of query chunk c: every earlier chunk at all t offsets, its own chunk at e < its lane count."""
+    """(u, c', e) of query chunk c: every earlier chunk at all t offsets, its own chunk at e < its lane count.
+    Bidirectional: every chunk c' at every cyclic lane offset e (key lane (lane - e) mod t), u = c' t + e."""
+    if ch.bidir:
+        return [(cp * ch.t + e, cp, e) for cp in range(ch.n_chunks) for e in range(ch.t)]
     out = []
     nq = len(ch.lanes(c))
     for cp in range(c, -1, -1):
         for e in range(nq if cp == c else ch.t):
             out.append(((c - cp) * ch.t + e, cp, e))
     return out
+
+
+def _kcs(ch: Chunks, pos):
+    """Keys each query lane attends: its position + 1 (causal), or every unpadded key (bidirectional)."""
+    return [ch.n_keys] * len(pos) if ch.bidir else [p + 1 for p in pos]
 
 
 def prefix_offset(ch: Chunks, c: int) -> int:
@@ -399,6 +418,9 @@ def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
     i = np.arange(d.N)
     blk, h, lane = i // d.tH, (i % d.tH) // d.t, i % d.t
     u = m * d.d_head + blk
+    if ch.bidir:
+        key = (u // ch.t) * ch.t + (lane - u % ch.t) % ch.t
+        return (h < d.H_real) & (lane < nq) & (u < ch.n_chunks * ch.t) & (key < ch.n_keys)
     same = u < ch.t
     reg = (u < c * ch.t + ch.t) & np.where(same, lane >= u, True)
     if prefix:
@@ -492,7 +514,7 @@ def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic
     for m, s in enumerate(S, m0):
         per = m == periodic
         valid = _periodic_valid(d, ch, c) if per else _score_valid(d, ch, c, m, prefix)
-        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean, ch.T, ch.base, prefix) + (("per",) if per else ()),
+        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean) + ch.key_tag + (prefix,) + (("per",) if per else ()),
                         lambda valid=valid: np.where(valid, -mean, cfg.clip_lo - mean))
         out.append((eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf), valid))
     return out
@@ -501,7 +523,7 @@ def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic
 def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int = 0, periodic=None):
     """Squarings, cleanse and active mask (0.5 / kc per lane, times factor[j]) of chunk c's exps."""
     ops, d = rt.ops, rt.dims
-    kcs = [p + 1 for p in ch.lanes(c)]
+    kcs = _kcs(ch, ch.lanes(c))
     Z = []
     for j, (z, valid) in enumerate(zs):
         m = m0 + j
@@ -510,7 +532,7 @@ def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int
         z = im_cleanse(ops, z)
         f = 1.0 if factor is None else factor[j]
         lane_scale = np.array([f * 0.5 / kcs[i] if i < len(kcs) else 0.0 for i in range(d.t)])
-        key = ("pf.sm.active", c, m, ch.T, ch.base, prefix) + ((f,) if f != 1.0 else ()) + \
+        key = ("pf.sm.active", c, m) + ch.key_tag + (prefix,) + ((f,) if f != 1.0 else ()) + \
             (("per",) if m == periodic else ())
         Z.append(rt.mult_mask(z, key,
                               lambda valid=valid, ls=lane_scale: np.where(valid, ls[np.arange(d.N) % d.t], 0.0)))
@@ -540,7 +562,7 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     `Z`: precomputed masked exps (the joint path)."""
     ops, d = rt.ops, rt.dims
     pos = ch.lanes(c)
-    kcs = [p + 1 for p in pos]
+    kcs = _kcs(ch, pos)
     if Z is None:     # cheb then tail per score ct: the captured op order
         Z = []
         for m in range(len(S)):
@@ -666,7 +688,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 valid = np.roll(_score_valid(d, ch, c, m, pre), -sh * d.tH)
                 return np.where(start & valid, coef, 0.0)
             for sh, coef in ((o, 0.5 * gscale), (o + 1, -0.5j * gscale)):
-                x = rt.mult_mask(w, ("pf.qpl", c, m, sh, W, complex(coef), ch.T, ch.base, pre),
+                x = rt.mult_mask(w, ("pf.qpl", c, m, sh, W, complex(coef)) + ch.key_tag + (pre,),
                                  lambda sh=sh, coef=coef: build(sh, coef))
                 if sh:
                     x = ops.rotate(x, d.N - sh * d.tH)
@@ -714,7 +736,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         offs = _offsets(ch, c)
         nq = len(ch.lanes(c))
         if c not in owns:
-            owns[c] = [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)])
+            owns[c] = ([K[c]] + [lane_rotate(rt, K[c], e, "pf.krot") for e in range(1, ch.t)] if ch.bidir
+                       else [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)]))
         own = owns[c]
         u_pre = prefix_offset(ch, c)                               # prefix key's offset
         M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
@@ -746,7 +769,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 by_m.setdefault(m, []).append((blk, coef))
             for m, lst in by_m.items():
                 builds = [smask(m, blk, coef) for blk, coef in lst]
-                key = (tag, c, m, tuple((blk, complex(coef)) for blk, coef in lst), ch.T, ch.base, pre)
+                key = (tag, c, m, tuple((blk, complex(coef)) for blk, coef in lst)) + ch.key_tag + (pre,)
                 v = rt.mult_mask(ct, key, lambda builds=builds: sum(b() for b in builds))
                 if dst[m] is None:
                     dst[m] = v
@@ -785,7 +808,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         offs, nq, u_pre, pre, groups = st["offs"], st["nq"], st["u_pre"], st["pre"], st["groups"]
         with rt.step("softmax_v"):
             if c not in vowns:
-                vowns[c] = [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)])
+                vowns[c] = ([V[c]] + [lane_rotate(rt, V[c], e, "pf.vrot") for e in range(1, ch.t)] if ch.bidir
+                            else [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)]))
             vown = vowns[c]
             accs = [None] * len(PL)
             if pre:

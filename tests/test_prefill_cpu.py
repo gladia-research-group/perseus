@@ -117,6 +117,45 @@ def test_attention_matches_softmax(T):
     assert err.max() < 3e-2 and np.median(err) < 1e-3
 
 
+@pytest.mark.parametrize("T,keys,pack", [(8, 0, 0), (40, 0, 0), (64, 50, 0), (100, 0, 0), (128, 97, 0), (128, 0, 3)])
+def test_attention_bidirectional(T, keys, pack, monkeypatch):
+    """Chunks(bidir=True): every query over the first `keys` keys (all T if 0), against float64 softmax attention
+    (SM_CHEB_GS reciprocal: the per-kc design holds at kc = keys for every row)."""
+    monkeypatch.setattr(prefill, "_PACK", pack)
+    rt, fhe, inf = _rt(N=4096, hid=128, dim=96, H=4, H_real=3)
+    rt.ops.sm_cheb_gs = True
+    d = rt.dims
+    rng = np.random.default_rng(T + keys + 7)
+    ch = prefill.Chunks(T, d.t, bidir=True, keys=keys)
+    sm = config.load_configs(str(CFG)).block(0)[2]
+    q, k, v = (0.5 * rng.standard_normal((T, d.hid)) for _ in range(3))
+    for M in (q, k, v):
+        for r in range(d.hid):
+            if r % d.H >= d.H_real:
+                M[:, r] = 0.0
+
+    def dense(M):
+        out = []
+        for c in range(ch.n_ct):
+            vec = np.zeros(d.N, dtype=np.complex128)
+            for half in (0, 1):
+                for lane, p in enumerate(ch.lanes(2 * c + half)):
+                    vec[np.arange(d.hid) * d.t + lane] += 0.5 * (1j if half else 1.0) * M[p]
+            out.append(fake.FakeCt(vec, 30))
+        return out
+    O = prefill.prefill_attention(rt, dense(q), dense(k), dense(v), sm, ch)
+    got = _dense_rows(rt, O, ch, d.t, d.hid)
+    n = ch.n_keys
+    want = np.zeros((T, d.hid))
+    for h in range(d.H_real):
+        cols = [j * d.H + h for j in range(d.d_head)]
+        s = q[:, cols] @ k[:n, cols].T / math.sqrt(d.d_head_real)
+        p = np.exp(s - s.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
+        want[:, cols] = p @ v[:n, cols]
+    err = np.abs(got - want)
+    assert err.max() < 3e-2 and np.median(err) < 1e-3, (err.max(), np.median(err))
+
+
 @pytest.mark.parametrize("T,pack", [(5, 1), (47, 2), (64, 3), (96, 2), (128, 3)])
 def test_attention_packed_matches_unpacked(T, pack, monkeypatch):
     rt, fhe, inf = _rt(N=4096, hid=128, dim=128, H=4, H_real=4)
