@@ -560,8 +560,16 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     count and a fold bootstrap finishes it (the denominator comes out refreshed);
     `s0_expected` sizes the fold's prescale. `periodic`: x is already tH-periodic (SM_PERIODIC), every lane copy
     holds the sum after the head ladder. `seed`: also return seed * the sum, from a second position mask on the same
-    head ladder (SM_FOLD: the reciprocal's seed slope rides the mask instead of a ciphertext x constant product)."""
+    head ladder (SM_FOLD: the reciprocal's seed slope rides the mask instead of a ciphertext x constant product).
+    SM_PERIODIC=2 past one group: the Gp groups' partial sums are added first (the rotations commute with the
+    tH-periodic mask and the replicate), so the head ladder's named ops, and the refreshes a token-0 plan pins on
+    them, hold the full tH-periodic sum at every cache length. Added after the ladder, those refreshes landed on the
+    partial sums, which repeat only every Gp tH slots: the sparse refresh returned them wrong (Llama past 256 keys)."""
     ops, d = rt.ops, rt.dims
+    if periodic and _general(rt):
+        with _gp_scope(rt, periodic):
+            if periodic > 1:
+                x = ops.tag_reduce(rotsum(ops, x, d.tH, int(periodic) * d.tH), d.tH)
     out = rotsum(ops, x, 1, d.t)
     if seed is not None and getattr(ops, "hrs_pack", False) and ops.complex_payload:
         if ops.fused_sm_den:
@@ -584,18 +592,12 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         if not periodic:
             h = rotsum(ops, h, d.tH, d.N)
         elif _general(rt):
-            with _gp_scope(rt, periodic):
-                if periodic > 1:
-                    h = rotsum(ops, h, d.tH, int(periodic) * d.tH)
             h = _gp_out(rt, h)
         h = ops.tag_reduce(h, getattr(rt, "gq_merge", 1) * d.tH)
     if periodic:
         if ops.fused_sm_den:
             raise ValueError("SM_PERIODIC=1 does not combine with FUSED_SM_DEN=1")
-        if _general(rt):     # the groups' partial sums sit in the Gp blocks of one period
-            with _gp_scope(rt, periodic):
-                if periodic > 1:
-                    out = rotsum(ops, out, d.tH, int(periodic) * d.tH)
+        if _general(rt):     # the groups' partial sums were added before the head ladder
             out = _gp_out(rt, out)
     elif ops.fused_sm_den:
         s_eff = ops.fold_slots_for(d.tH)
