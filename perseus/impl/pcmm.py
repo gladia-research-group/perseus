@@ -332,12 +332,22 @@ def _record_calib(name, ys):
 _PHASES = {} if os.environ.get("PF_PCMM_PHASES", "0") not in ("", "0") else None
 _INTERLEAVE = int(os.environ.get("PF_PCMM_INTERLEAVE", "0") or 0)
 # PF_PCMM_RAISE="gate_up:1,qkv:3": the finishes of those linears raise d composite levels below the top (the route's raise
-# variant; their outputs land 2 d level units deeper, where the consumer has the slack)
-_RAISE = {k: int(v) for k, v in (e.split(":") for e in os.environ.get("PF_PCMM_RAISE", "").split(",") if e)}
+# variant, their outputs land 2 d level units deeper, where the consumer has the slack); "gate_up:1:0-23" only on blocks 0..23
+_RAISE = [e.split(":") for e in os.environ.get("PF_PCMM_RAISE", "").split(",") if e]
 
 
 def _raise_of(lin):
-    return _RAISE.get((lin.name or "").split(".")[-1], 0)
+    parts = (lin.name or "").split(".")
+    blk = int(parts[0][1:]) if len(parts) > 1 and parts[0][1:].isdigit() else None
+    for e in _RAISE:
+        if e[0] != parts[-1]:
+            continue
+        if len(e) > 2:
+            lo, hi = (int(v) for v in e[2].split("-"))
+            if blk is None or not lo <= blk <= hi:
+                continue
+        return int(e[1])
+    return 0
 
 
 def _phase(bts, name, t0=None):

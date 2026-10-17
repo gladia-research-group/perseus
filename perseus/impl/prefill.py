@@ -1207,6 +1207,8 @@ _SILU_SINGLE_TOL = float(os.environ.get("PF_SILU_SINGLE_TOL", "2"))
 _SILU_SINGLE_EPS = float(os.environ.get("PF_SILU_SINGLE_EPS", "1e-8"))       # the series' coefficient trim
 _SILU_SINGLE_DEGS = [int(v) for v in os.environ.get("PF_SILU_SINGLE_DEGS", "63,95,127").split(",")]
 _SILU_SINGLE_ABS = float(os.environ.get("PF_SILU_SINGLE_ABS", "0"))   # else the last degree if within this abs error
+# PF_SILU_SINGLE_ERR=<abs>: instead, the smallest degree whose |x| |series - f| stays within <abs> (composite-free)
+_SILU_SINGLE_ERR = float(os.environ.get("PF_SILU_SINGLE_ERR", "0"))
 # PF_GLU_LEAN=1 (forced joint, single series): x u from the split halves as they are (no second cleanse; its 2 rides
 # the series' coefficients)
 _GLU_LEAN = os.environ.get("PF_GLU_LEAN", "0") not in ("", "0")
@@ -1225,7 +1227,7 @@ def silu_single_coeffs(cfg):
         a1, b1, a2, b2 = cfg.thor_p1_a, cfg.thor_p1_b, cfg.thor_p2_a, cfg.thor_p2_b
         y1 = C.chebval((2 * t - (a1 + b1)) / (b1 - a1), _cheb_trim(cfg.thor_p1_cheb))
         comp = C.chebval((2 * y1 - (a2 + b2)) / (b2 - a2), _cheb_trim(cfg.thor_p2_cheb))
-        tol = max(_SILU_SINGLE_TOL * float((np.abs(comp - f) * np.abs(t) * xm).max()), 1e-7)
+        tol = _SILU_SINGLE_ERR or max(_SILU_SINGLE_TOL * float((np.abs(comp - f) * np.abs(t) * xm).max()), 1e-7)
         best = None
         for n in _SILU_SINGLE_DEGS:
             c = C.chebinterpolate(lambda t: 1.0 / (1.0 + np.exp(-xm * t)) - 0.5, n)
