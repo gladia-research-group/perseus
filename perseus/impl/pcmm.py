@@ -278,7 +278,9 @@ class PcmmLinear:
         W = np.asarray(W, dtype=np.float64) * scale
         n_in, n_out = W.shape[0] // sh.nch, W.shape[1] // sh.nch
         assert W.shape == (n_in * sh.nch, n_out * sh.nch), "W must be whole nch blocks"
-        ws = 2.0 ** math.floor(math.log2((2 ** (wbits - 1) - 1) / np.abs(W).max()))
+        nb = (wbits + 7) // 8
+        top = min(2 ** (wbits - 1) - 1, 127 * (256 ** nb - 1) // 255)      # the balanced digits' reach
+        ws = 2.0 ** math.floor(math.log2(top / np.abs(W).max()))
         Wt = np.rint(W.T * ws).astype(np.int64)
         perm = sh.ch_of_row()
         Wi = np.empty_like(Wt)
