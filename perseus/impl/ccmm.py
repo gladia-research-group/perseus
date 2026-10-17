@@ -192,9 +192,10 @@ class Ccmm:
         p = out_scale * 2.0 ** -shift / self.c_unit * (0.5 if merge else 1.0)
         return math.sqrt(p * bmax / amax), math.sqrt(p * amax / bmax)
 
-    def prep_b(self, xb, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, merge=False):
+    def prep_b(self, xb, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, merge=False, keep=False, export=True):
         """The right operands of later apply calls (same amax / bmax / shift / out_scale / merge), taken to the
-        CCMM's input form once (consumed): the paged prefill keeps every page's K / V this way (4 limbs)."""
+        CCMM's input form once (consumed): the paged prefill keeps every page's K / V this way (4 limbs). `keep`:
+        the next apply reads the device copies as they are (no import); `export=False`: no host copy (last page)."""
         ops = self.ops
         if self.cap is None:
             self.cap = self._measure_cap(xb[0])
@@ -214,13 +215,17 @@ class Ccmm:
         carry = self._carriers is None
         if carry:
             self._carriers = ([], [])
-        prep.cts = []
+        if not keep:
+            prep.cts = []
         for x in xb:
             d = bts.device(self.fhe, x)
             bts.stc_high(d, S, 3, fb, 1, self.nf_ref)
-            ex = bts.export_limbs(self.fhe, d)
-            prep.host.append((ex["c0"].astype(np.uint32), ex["c1"].astype(np.uint32), float(ex["noise_factor"]),
-                              int(ex["noise_level"])))
+            if keep:
+                prep.dev.append(d)
+            if export:
+                ex = bts.export_limbs(self.fhe, d)
+                prep.host.append((ex["c0"].astype(np.uint32), ex["c1"].astype(np.uint32), float(ex["noise_factor"]),
+                                  int(ex["noise_level"])))
             if carry:
                 self._carriers[0].append(x)
                 self._carriers[1].append(d)
@@ -285,7 +290,9 @@ class Ccmm:
         bts.sync()
         t0 = time.perf_counter()
         da, db, states = [], [], []
-        if isinstance(xb, PreparedB):
+        if isinstance(xb, PreparedB) and xb.dev:
+            db, xb.dev, xb.cts, xb = list(xb.dev), [], [], []
+        elif isinstance(xb, PreparedB):
             db = self._carriers[1]
             for d, (c0, c1, nf, nl) in zip(db, xb.host):
                 bts.import_limbs(self.fhe, d, c0.astype(np.uint64), c1.astype(np.uint64), nf, nl)
@@ -328,7 +335,7 @@ class PreparedB:
 
     def __init__(self, cts, names, levels):
         self.cts, self.names, self.levels = cts, names, levels
-        self.host, self.vecs = [], None
+        self.host, self.vecs, self.dev = [], None, []
 
 
 def unmerge(rt, Ms, w, scale=1.0, site="ccmm.um"):

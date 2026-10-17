@@ -181,7 +181,7 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
         if paged is not None:
             from perseus.impl.ccmm_paged import attention_paged
             O = attention_paged(rt, Q, Kc, V, sm, ch, B, paged[0], paged[1], rope=rope, prefixes=prefixes,
-                                kv=kv if kv is not None else [dict() for _ in range(B.Kkv)], layer=layer)
+                                kv=kv if kv is not None else [dict() for _ in range(B.Kkv)], layer=layer, final=len(paged) > 2 and paged[2])
         else:
             O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
     _memdbg(rt, "attn")
@@ -311,7 +311,7 @@ class LlamaPrefill(LlamaModel):
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
                                                      self.rope, self.prefix_kv(b), B, kvs, layer=b,
-                                                     paged=(p, stores[b]))
+                                                     paged=(p, stores[b], p == len(pages) - 1))
                 self.rt.rearm_plan = None
                 self.exit_stage(b, cap)
                 if on_kv is not None:
@@ -388,7 +388,8 @@ def plain_logits(model, hidden):
         h = h @ R.T
     eps = float(st.config["rms_norm_eps"])
     n = h / np.sqrt((h * h).mean(axis=1, keepdims=True) + eps) * st.tensor("model.norm.weight").astype(np.float64)
-    return n @ st.tensor("lm_head.weight").astype(np.float32).T.astype(np.float64)
+    W = st.tensor("lm_head.weight")
+    return np.concatenate([n @ W[i:i + 8192].astype(np.float64).T for i in range(0, W.shape[0], 8192)], axis=1)
 
 
 def exact_hidden(model, tokens, n_layers):

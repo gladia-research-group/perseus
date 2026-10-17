@@ -50,6 +50,10 @@ def _valid(p: int, diag: bool, tq, tk, qv, o: int):
 
 _DBG_LAYER = int(__import__("os").environ.get("PF_PAGED_DBG", "-1"))
 _RSTAT = __import__("os").environ.get("PF_PAGED_RSTAT", "0") not in ("", "0")
+# PF_PAGED_STREAM=1: each block's P is built inside its P.V step and dropped after it (memory flat in the page count)
+_STREAM = __import__("os").environ.get("PF_PAGED_STREAM", "0") not in ("", "0")
+# PF_PAGED_DEVKV=1: a page's own K / V stay on the device for its diagonal block; host copies only for later pages
+_DEVKV = __import__("os").environ.get("PF_PAGED_DEVKV", "0") not in ("", "0")
 
 
 def _dbg_softmax(rt, Sd, Pd, p, al, tq, tk, qv):
@@ -82,7 +86,7 @@ def _acc(rt, acc, xs):
 
 
 def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: list, rope=None, prefixes=None,
-                    kv=None, layer=0):
+                    kv=None, layer=0, final=False):
     """`store`: this layer's [(K operands, V operands)] of the pages before `page`; this page's are appended."""
     ops, p = rt.ops, page
     if len(Q) != 1 or ch.n_chunks != 2 or B.Kkv != 2 or B.K != 8 or ch.T != page_tokens(p):
@@ -125,8 +129,9 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
         if merge:
             Qs, Ks, Vs = sc.dup(rt, Qs), sc.dup(rt, Ks), sc.dup(rt, Vs)
         # K / V in the CCMM's input form (4 limbs): every later page reads them as they are
-        store.append((eng.prep_b(Ks, amax=QMAX, bmax=KMAX, shift=SHIFT_QK, out_scale=0.5 * gscale, merge=merge),
-                      eng.prep_b(Vs, amax=1.5, bmax=VMAX, shift=SHIFT_PV, merge=merge)))
+        kw = dict(keep=True, export=not final) if _DEVKV else {}
+        store.append((eng.prep_b(Ks, amax=QMAX, bmax=KMAX, shift=SHIFT_QK, out_scale=0.5 * gscale, merge=merge, **kw),
+                      eng.prep_b(Vs, amax=1.5, bmax=VMAX, shift=SHIFT_PV, merge=merge, **kw)))
 
     tq, tk, qv, kc = page_meta(p)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
@@ -186,6 +191,7 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
                         zj = [ops.square(im_cleanse(ops, y)) for y in Y[j]]
                     else:
                         zj = Y[j]
+                    Y[j] = None
                     D = zj[0]
                     for z in zj[1:]:
                         D = ops.add(D, z)
@@ -219,20 +225,25 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
                         ops.bootstrap_real(R)
                 Rh = ops.rotate(R, 16)
                 mk = ("sm.unpack",) if sc_r == 1.0 else ("sm.unpack", sc_r)
+
+                def unpack_p(zs):
+                    return [ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * sm.LO), R),
+                                    ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), mk, lambda: sc_r * sm.LO), Rh)))
+                            for z in zs]
                 P = []
-                for j in range(p + 1):
-                    with rt.step(f"u{r}", repeat=True):
-                        P.append([ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * sm.LO), R),
-                                          ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), mk,
-                                                                           lambda: sc_r * sm.LO), Rh)))
-                                  for z in Zr[j]])
+                if not _STREAM:
+                    for j in range(p + 1):
+                        with rt.step(f"u{r}", repeat=True):
+                            P.append(unpack_p(Zr[j]))
+                        Zr[j] = None
             else:
                 Y = []
                 for j in range(p + 1):
                     with rt.step(f"y{r}", repeat=True):
                         Y.append([ops.mult(z, R) for z in Zr[j]])
+                    Zr[j] = None
 
-    if layer == _DBG_LAYER:
+    if layer == _DBG_LAYER and P:
         Pdbg = []
         for pj in P:
             blk = []
@@ -245,7 +256,11 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
         O = None
         for j in range(p + 1):
             with rt.step("pv", repeat=True):
+                if _STREAM:
+                    P.append(unpack_p(Zr[j]))
+                    Zr[j] = None
                 pj = sc.dup(rt, P[j]) if merge else P[j]
+                P[j] = None
                 Oj = eng.apply(pj, store[j][1], b_transposed=False, amax=1.5, bmax=VMAX, shift=SHIFT_PV, site=f"pv{layer}",
                                merge=merge)
                 O = _acc(rt, O, Oj)

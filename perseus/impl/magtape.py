@@ -231,6 +231,53 @@ def fill_graph(graph_path: str, records, start: int = 0, out_path: str | None = 
     return i
 
 
+def _stats(st):
+    return st.result() if hasattr(st, "result") else st
+
+
+def fold_visits(records, repeated, skip, visits: int):
+    """Records of a stage whose repeated steps (`repeated(path)`) ran `visits` times -> one visit's records, each
+    record's output_max_* the max over the visits; records under `skip(path)` (the visit accumulators) dropped."""
+    recs = [(o, p, _stats(st)) for o, p, st in records if not skip(p)]
+    out, i = [], 0
+    while i < len(recs):
+        if not repeated(recs[i][1]):
+            out.append(recs[i])
+            i += 1
+            continue
+        j = i
+        while j < len(recs) and recs[j][1] == recs[i][1]:
+            j += 1
+        run = recs[i:j]
+        n = len(run) // visits
+        if n * visits != len(run) or any(run[t][0] != run[t % n][0] for t in range(len(run))):
+            raise ValueError(f"fold_visits: {len(run)} records at {run[0][1]} are not {visits} equal visits")
+        for t in range(n):
+            st = dict(run[t][2])
+            for v in range(t + n, len(run), n):
+                for key, val in run[v][2].items():
+                    if key.startswith("output_max"):
+                        st[key] = max(st[key], val)
+            out.append((run[t][0], run[t][1], st))
+        i = j
+    return out
+
+
+def merge_max(tapes):
+    """Element-wise max of the output_max_* statistics of equally shaped record lists."""
+    out = []
+    for recs in zip(*tapes):
+        st = dict(_stats(recs[0][2]))
+        for r in recs[1:]:
+            if r[0] != recs[0][0] or r[1] != recs[0][1]:
+                raise ValueError(f"merge_max: {r[0]} @ {r[1]} vs {recs[0][0]} @ {recs[0][1]}")
+            for key, val in _stats(r[2]).items():
+                if key.startswith("output_max"):
+                    st[key] = max(st[key], val)
+        out.append((recs[0][0], recs[0][1], st))
+    return out
+
+
 def tape_stages(model, tape, pos: int):
     """Route `tape` per stage of position `pos`: wraps model.enter_stage / exit_stage (perseus.impl.driver
     ImplModel) so each stage's records land in their own list. Returns {stage: records}, filled as the model runs."""

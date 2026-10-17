@@ -46,7 +46,23 @@ def main(argv=None):
     toks = hf.text_windows(int(a.window) + 1, a.seq)[int(a.window)][:a.tokens + 1]
     t0 = time.time()
     if os.environ.get("PF_PAGED", "0") not in ("", "0"):
+        # every page's stage records folded onto one visit per repeated step, the max over pages: the plan of page 0's
+        # graph sees the magnitudes of every page of this window
+        import re
+        pages = {}
+        orig_exit = model.exit_stage
+
+        def exit_stage(b, cap):
+            r = orig_exit(b, cap)
+            pages.setdefault(b, []).append(list(tapes.pop(b, [])))
+            return r
+        model.exit_stage = exit_stage
         model.prefill_paged(toks)
+        rep = re.compile(r"\.(kb|pv|[ruy]\d+)$")
+        for b, lst in pages.items():
+            folded = [magtape.fold_visits(r, lambda p: bool(rep.search(p)), lambda p: p.endswith(".acc"), pg + 1)
+                      for pg, r in enumerate(lst)]
+            tapes[b] = magtape.merge_max(folded)
     else:
         model.prefill(toks)
     print(f"[mags] fake tape: {len(tapes)} stages, {sum(map(len, tapes.values()))} records, {time.time() - t0:.0f}s",
