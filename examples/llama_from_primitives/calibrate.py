@@ -211,6 +211,9 @@ def main(argv=None):
         print(f"[silu] {b:2d} xmax={s['xmax']:.3g} err max={s['fit_err_max']:.2e} med={s['fit_err_med']:.2e}", flush=True)
     knobs = softmax_knobs()
     knobs.range_margin = a.sm_margin
+    # every query of the window: gpt2.yaml's decode_window (160) would fit the clip range on queries < 160 only,
+    # so windows past 160 tokens left their later positions' scores outside it
+    knobs.decode_window = None
     for b in range(L):
         rows, row_q = st[f"layers.{b}.scores"]
         sm = fit_softmax_llama(rows, row_q, int(toks.shape[1]), knobs, a.sm_safety, a.sm_err, kc_max=a.sm_kc_max)
