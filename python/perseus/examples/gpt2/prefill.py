@@ -74,6 +74,27 @@ _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 _LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
 
 
+# PF_QKV_PACK=1: the last head group's K and V share one PCMM output when its real heads fill at most half of it
+# (GPT-2: heads 8-11 in a group of 8): V's heads ride K's padding heads, a rotation by half a group brings them home
+_QKV_PACK = os.environ.get("PF_QKV_PACK", "0") not in ("", "0")
+
+
+def _kv_packed(B):
+    return _QKV_PACK and 2 * B.group_dims(B.K - 1).H_real <= B.hg
+
+
+def _pack_kv(B, k_cols, v_cols, k_vec, v_vec):
+    """K's and V's last channel blocks as one: V's heads half a group up, on K's (zero) padding heads."""
+    n, h2 = B.nch, B.hg // 2
+    lo = (B.K - 1) * n
+    r = np.arange(n)
+    src = lo + r[r % B.hg < h2]
+    k_cols, k_vec = k_cols.copy(), k_vec.copy()
+    k_cols[:, src + h2] += v_cols[:, src]
+    k_vec[src + h2] += v_vec[src]
+    return k_cols, v_cols[:, :lo], k_vec, v_vec[:lo]
+
+
 # PF_PCMM_CALIB=<json>: record every block linear's max |output| (the PCMM band shifts)
 _CALIB_PATH = os.environ.get("PF_PCMM_CALIB", "")
 _calib: dict[str, float] = {}
@@ -186,6 +207,8 @@ def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B, last=None):
         Q, Kc, V = [], [], []
         for g, y in enumerate(Y):
             o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
+            if _kv_packed(B):          # V's last block rides K's, half a group up
+                o = o[:2 * K - 1] + [ops.rotate(o[K - 1], B.hg // 2 * B.t)] + o[2 * K - 1:]
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     with rt.step("attn"):
         O = (BL.attention_blocked(rt, Q, Kc, V, sm, ch, B) if last is None
@@ -280,9 +303,13 @@ class Gpt2Prefill(Gpt2Model):
                 B = self.blocks
                 enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                                    name=f"b{b}.{name}")
+                k_cols, v_cols = B.group_cols(m.K), B.group_cols(m.V)
+                k_vec, v_vec = B.group_vec(m.bk), B.group_vec(m.bv)
+                if _kv_packed(B):
+                    k_cols, v_cols, k_vec, v_vec = _pack_kv(B, k_cols, v_cols, k_vec, v_vec)
                 cache[b] = {
-                    "qkv": enc("qkv", np.hstack([B.group_cols(m.K), B.group_cols(m.V), B.group_cols(m.Q)]), 0.25,
-                               2.0 * np.concatenate([B.group_vec(m.bk), B.group_vec(m.bv), B.group_vec(m.bq)])),
+                    "qkv": enc("qkv", np.hstack([k_cols, v_cols, B.group_cols(m.Q)]), 0.25,
+                               2.0 * np.concatenate([k_vec, v_vec, B.group_vec(m.bq)])),
                     "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
                     "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
                     "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
