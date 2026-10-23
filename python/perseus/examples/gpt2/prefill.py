@@ -64,7 +64,8 @@ def prefill_block(rt, Xs, w, cfgs, ch: Chunks):
 _LOCKSTEP = os.environ.get("PF_LOCKSTEP", "0") not in ("", "0")
 # PF_NORM_SHARE=1: one LayerNorm inverse-sqrt chain for every chunk (prefill.norm_all)
 _NORM_SHARE = os.environ.get("PF_NORM_SHARE", "1") not in ("", "0")
-# PF_GELU_JOINT=1: one refresh point for both halves between the GELU's P1 and P2
+# PF_GELU_JOINT=1: one refresh point for both halves between the GELU's P1 and P2 (a THOR block; a Chebyshev
+# block's single series has none)
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 
 
@@ -130,7 +131,7 @@ def prefill_block_diag(rt, Xs, w, cfgs, ch: Chunks):
             mask = ("pf.gelu.dense", lambda s: np.full(d.N, s))
             for h in H:
                 a, b = split(ops, h)
-                if _GELU_JOINT:
+                if _GELU_JOINT and ge.method == "thor_composite":
                     ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
                 elif _LOCKSTEP:
                     g = gelu(lockstep_rt(rt), Pair(a, b), ge, mask=mask)
@@ -156,7 +157,7 @@ def _gelu_blocks(rt, H, ge):
     out = []
     for h in H:
         a, b = split(ops, h)
-        if _GELU_JOINT:
+        if _GELU_JOINT and ge.method == "thor_composite":
             ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
         else:
             ga = im_cleanse(ops, gelu(rt, a, ge, mask=mask))
@@ -249,7 +250,7 @@ class Gpt2Prefill(Gpt2Model):
         if b not in cache:
             d = self.rt.dims
             ge = self.cfgs.block(b)[3]
-            fold = self.rt.ops.gelu_fold and ge.method == "thor_composite"
+            fold = self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")
             us = 1.0 / ge.xmax if fold else 1.0
             m = W.block_matrices(self.store, self.cfgs, b, d, self.fold[0], self.fold[1])
             pinned = None if _use_pcmm(self) else getattr(self.core, "pinned_empty", None)
@@ -381,7 +382,7 @@ def _coeff_key(model, b):
     import hashlib
     st = model.store._zip.filename
     ge = model.cfgs.block(b)[3]
-    fold = model.rt.ops.gelu_fold and ge.method == "thor_composite"
+    fold = model.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")
     h = hashlib.sha256(f"{os.path.abspath(st)}|{os.path.getmtime(st)}|{model.cfgs.block(b)}|{model.fold}|"
                        f"{fold}|{model.complex_packing}|{model.rt.dims}".encode()).hexdigest()[:20]
     return f"{h}_b{b}"
