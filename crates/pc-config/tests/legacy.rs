@@ -39,8 +39,8 @@ fn field_table() {
     let pf = PlanConfig::fields();
     println!("[config] Config {} fields, PlanConfig {} fields", cf.len(), pf.len());
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
-    // bts.lt_tails
-    assert_eq!(cf.len(), 252);
+    // bts.lt_tails, model.prefill.last_query
+    assert_eq!(cf.len(), 253);
     // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
     // plan.fallback_cf
     assert_eq!(pf.len(), 90);
