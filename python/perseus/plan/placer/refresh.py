@@ -85,6 +85,8 @@ class RefreshPlanner:
     shadow: PlannerShadow | None = None
     #: dense refreshes of real-tagged slots take the real route (plan.real_route): priced on its real read
     real_route: bool = False
+    #: the drop each route runs at by default (PlanConfig.raise_drop_base): a site's emitted raise_drop is absolute
+    raise_drop_base: dict[int, int] = field(default_factory=dict)
     _cache: dict[str, RefreshSpec] = field(default_factory=dict)
     _warned_routes: set = field(default_factory=set)
 
@@ -180,6 +182,8 @@ class RefreshPlanner:
             # a landing deeper than the route's own is a level-aware (partial) ModRaise
             unit = float(self.graph.level_unit) or 1.0
             raise_drop = max(0, int(round((base - base_route) / unit)))
+            if raise_drop:
+                raise_drop += self.raise_drop_base.get(choice.route or 0, 0)
         else:
             base = base_route
         # plan.step_landing="softmax:32,...": refreshes in those steps are planned to land no shallower than that

@@ -48,10 +48,13 @@ if [[ -n "${PLAN_SHARED_REALIZE:-}" && "${PLAN_SHARED_REALIZE}" != 0 ]]; then ar
 if [[ -n "${PLAN_SITE_BTS_OUT_FILE:-}" ]]; then args+=(--site-bts-out-file "$PLAN_SITE_BTS_OUT_FILE"); fi
 if [[ -n "${PLAN_RAISE_DROP_MAX:-}" ]]; then args+=(--raise-drop-max "$PLAN_RAISE_DROP_MAX"); fi
 if [[ -n "${PLAN_RAISE_ENV_RULE:-}" ]]; then args+=(--raise-drop-env-rule "$PLAN_RAISE_ENV_RULE"); fi
+if [[ "${PLAN_RAISE_SEARCH:-0}" != 0 ]]; then args+=(--raise-drop-search); fi
 if [[ -n "${PLAN_RAISE_LANDING_MAX:-}" ]]; then args+=(--raise-drop-landing-max "$PLAN_RAISE_LANDING_MAX"); fi
 if [[ -n "${PLAN_HINT_VETO_STEPS:-}" ]]; then args+=(--hint-veto-steps "$PLAN_HINT_VETO_STEPS"); fi
 if [[ -n "${PLAN_RAISE_ROUTES:-}" ]]; then args+=(--raise-drop-routes "$PLAN_RAISE_ROUTES"); fi
 if [[ -n "${PLAN_RAISE_DROP_SET:-}" ]]; then args+=(--raise-drop-set "$PLAN_RAISE_DROP_SET"); fi
+if [[ -n "${PLAN_RAISE_DROP_BASE:-}" ]]; then args+=(--raise-drop-base "$PLAN_RAISE_DROP_BASE"); fi
+if [[ "${PLAN_RAISE_HINTS:-0}" != 0 ]]; then args+=(--raise-drop-hints); fi
 if [[ "${PLAN_REAL_ROUTE:-0}" != 0 ]]; then args+=(--real-route); fi
 if [[ -n "${PLAN_BOUNDARY_REALIZE:-}" ]]; then args+=(--boundary-realize);                    fi
 if [[ -n "${FORBID_STEPS+x}"        ]]; then args+=(--forbid-steps "$FORBID_STEPS");          fi
@@ -69,6 +72,8 @@ if [[ -n "${PLAN_ILP_TIME_LIMIT:-}" ]]; then args+=(--ilp-time-limit "$PLAN_ILP_
 if [[ -n "${PLAN_ILP_GAP:-}"        ]]; then args+=(--ilp-gap "$PLAN_ILP_GAP");               fi
 if [[ -n "${PLAN_ILP_OBJECTIVE:-}"  ]]; then args+=(--ilp-objective "$PLAN_ILP_OBJECTIVE");   fi
 if [[ -n "${PLAN_ILP_FREE_EXIT:-}"  ]]; then args+=(--ilp-free-exit);                         fi
+if [[ -n "${PLAN_ILP_FREE_HINTS:-}" ]]; then args+=(--ilp-free-hints);                        fi
+if [[ -n "${PLAN_ILP_TIEBREAK:-}"   ]]; then args+=(--ilp-tiebreak);                          fi
 if [[ -n "${PLAN_BASELINE_RESCUE:-}"   ]]; then args+=(--baseline-rescue);                          fi
 if [[ -n "${PLAN_BASELINE_DEPTH_CAP:-}" ]]; then args+=(--baseline-depth-cap "$PLAN_BASELINE_DEPTH_CAP"); fi
 if [[ -n "${PLAN_LATENCY_TABLE:-}"  ]]; then args+=(--latency-table "$PLAN_LATENCY_TABLE");   fi

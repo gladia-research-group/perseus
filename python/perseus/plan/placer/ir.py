@@ -82,6 +82,8 @@ class Node:
     # a code's own (deliberate) dense refresh captured on the StC-first route: it lands where that route lands only
     # while its input stays within the StC-first entry (past it the runtime takes the shipped order)
     stc_first: bool = False
+    # a deliberate refresh that finishes an external op (a PCMM / CCMM: args.external): its inputs are that op's
+    external: bool = False
 
     @property
     def is_deliberate_bts(self) -> bool:
@@ -162,6 +164,8 @@ class Graph:
                 stc_first=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
                                and ((n.get("args") or {}).get("route") or {}).get("stc_first")
                                and not ((n.get("args") or {}).get("route") or {}).get("slots")),
+                external=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
+                              and (n.get("args") or {}).get("external")),
             ))
 
         for d in drafts:
@@ -272,4 +276,5 @@ def _node_to_raw(n: Node) -> dict:
         "pack_period": n.pack_period,
         **({"pack_field": n.pack_field} if n.pack_field else {}),
         **({"args": {"route": {"slots": 0, "stc_first": True}}} if n.stc_first else {}),
+        **({"args": {"external": "finish"}} if n.external else {}),
     }

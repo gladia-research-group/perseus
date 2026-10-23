@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import json
 import logging
@@ -167,6 +168,11 @@ class PlanConfig:
     # levels and the P3/P3c checks see the deeper landings. Sites whose lineage reaches a
     # block output, a KV-cache write, or a hint (runtime-decided) are left at the full raise.
     raise_drop_max: int = 0
+    # Search the drops on the simulation instead (--raise-drop-search): site by site in program order, the largest
+    # drop whose re-simulation keeps every hint decision, every block output and cache write, every refresh input
+    # inside its envelope (or no deeper than before) and every level within max_level. A deeper landing absorbed by a
+    # max() downstream costs nothing there, which the walk cannot see.
+    raise_drop_search: bool = False
     # Envelope rule for the slack: "effective" (planner's P3c convention, refresh input + pending
     # rescale <= cap) or "nominal" (the runtime [bts_depth_error] guard: refresh input <= cap, the
     # level the shipped plans already run their deepest refreshes at).
@@ -175,13 +181,22 @@ class PlanConfig:
     # safety net fires at AUTO_BTS_LEVEL (46 on the n32 recipe) for any value it did not expect
     # there, so landings must stay strictly below it: default AUTO_BTS_LEVEL - level_unit = 44.
     raise_drop_landing_max: int = 44
-    # Routes (sparse slot counts, 0 = dense) a raise drop may be assigned to. The 1-slot route runs SPRU on the
-    # shipped n32 runtime, which has no raise variant, so it is excluded by default.
+    # Routes (sparse slot counts, 0 = dense) a raise drop may be assigned to. The 1-slot route (SPRU on n32) builds a
+    # variant for any drop; it is not in the default, which the shipped plans were made with.
     raise_drop_routes: tuple[int, ...] = (0, 512)
     # The drops the runtime builds plaintext variants for (FIDESLIB_BTS_RAISE_DROPS); a site's
     # drop is rounded down to the largest of them (None: any drop up to raise_drop_max). Each
-    # variant is a full CtS/StC plaintext set per route, so the runtime cannot afford them all.
+    # variant is a full CtS/StC plaintext set per route, so the runtime cannot afford them all; the 1-slot route has
+    # no plaintext set and takes any drop.
     raise_drop_set: tuple[int, ...] | None = None
+    # The drop each route already runs at by default (the runtime's FIDESLIB_BTS_RAISE_DROP, e.g. 512:1): its
+    # landing (PLAN_SPARSE_BTS_OUT) includes it, and the plan's raise_drop is absolute, so a site's assigned drop adds
+    # to it and rounds within raise_drop_set as that total (PLAN_RAISE_DROP_BASE).
+    raise_drop_base: tuple[tuple[int, int], ...] = ()
+    # The plan binds every hint decision (hint_fire), so a raise drop may look past a hint: an unfired one aliases its
+    # input, a fired one is a refresh whose input meets the envelope (PLAN_RAISE_HINTS; off: a hint downstream
+    # disqualifies the site, as every shipped plan was planned)
+    raise_drop_hints: bool = False
     # Dense refreshes whose slots the capture tagged real run one EvalMod chain (plan 'real_route'; the runtime
     # builds the real StC stage under FIDESLIB_BTS_REAL).
     real_route: bool = False
@@ -210,9 +225,13 @@ class PlanConfig:
     #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
     #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
     ilp_cap_exit: bool = True
+    #: placer "ilp": hints are decisions too (IlpPlacer.free_hints)
+    ilp_free_hints: bool = False
     #: a dense refresh whose input is past the StC-first entry runs the shipped order at the plan's CF: give it that
     #: order's CF (PLAN_FALLBACK_CF; off: the StC-first choice, sized on slot magnitudes, as every shipped plan has)
     fallback_cf: bool = False
+    #: placer "ilp": a deterministic choice among equal-cost optima (IlpPlacer.tiebreak, PLAN_ILP_TIEBREAK)
+    ilp_tiebreak: bool = False
     #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
     #: each placed refresh whose removal keeps the block within budget, lowers the bootstrap
     #: count and adds no refresh input past the envelope.
@@ -404,6 +423,7 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
             consumers[i].append(n)
     drops: dict[str, int] = {}
     skipped: dict[str, int] = collections.Counter()
+    base = dict(cfg.raise_drop_base)
     for p in sorted(placed):
         stack, seen, ends, sink, hint = [p], {p}, [], False, False
         while stack:
@@ -414,7 +434,13 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
                 continue
             for n in cs:
                 if n.hint_level is not None:
-                    hint = True
+                    if not cfg.raise_drop_hints:
+                        hint = True
+                    elif sim.hint_fired.get(n.idx):
+                        ends.append(x)      # the fired hint's INPUT meets the envelope
+                    elif n.output and n.output not in seen:
+                        seen.add(n.output)
+                        stack.append(n.output)
                     continue
                 if getattr(n, "is_deliberate_bts", False):
                     ends.append(x)          # the fold's INPUT is what meets the envelope
@@ -458,18 +484,133 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
         if refresh is not None and int(refresh.spec(p).route or 0) not in cfg.raise_drop_routes:
             skipped["route"] += 1
             continue
+        _fb = refresh.shadow.dense_fallback() if refresh is not None else None
+        if (_fb is not None and not refresh.spec(p).route
+                and cfg.bootstrap_level + sim.input_eff(g, p, g.level_unit) > _fb[0] + 1e-9):
+            skipped["shipped_order"] += 1       # past the StC-first entry: the shipped order runs it
+            continue
         if refresh is not None and cfg.raise_drop_landing_max is not None:
             s = refresh.spec(p)
             restore = float(g.level_unit) if s.prescale is not None else 0.0
             landing = cfg.bootstrap_level + s.out_consumed - restore
             k = min(k, int(math.floor((cfg.raise_drop_landing_max - landing) / unit + 1e-9)))
-        if cfg.raise_drop_set:
-            k = max((a for a in cfg.raise_drop_set if a <= k), default=0)
+        if cfg.raise_drop_set and (refresh is None or int(refresh.spec(p).route or 0) != 1):
+            b = base.get(int(refresh.spec(p).route or 0), 0) if refresh is not None else 0
+            k = max((a - b for a in cfg.raise_drop_set if b < a <= b + k), default=0)
         if k <= 0:
             skipped["no_slack"] += 1
             continue
         drops[p] = k
     return drops, dict(skipped)
+
+
+def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConfig
+                        ) -> tuple[dict[str, int], dict[str, int], SimResult]:
+    """`PlanConfig.raise_drop_search`: per refresh of a raise route (placed sites and fired hints), in program order,
+    the largest drop whose re-simulation leaves every hint decision, every block output and cache-write operand, and
+    every other refresh's landing as they were, keeps every refresh input inside its envelope (or no deeper than
+    before) and every level within max_level. The drops found are kept in `refresh.site_out_levels`. Returns (drops,
+    skipped, final sim)."""
+    import collections
+    from .place import refresh_env_cap as _refresh_env_cap
+    unit = int(cfg.level_unit) or 1
+    consumers: dict[str, int] = collections.Counter()
+    stores: set[str] = set()
+    for n in g.nodes:
+        for i in n.inputs:
+            consumers[i] += 1
+            if not n.output:
+                stores.add(i)
+    pinned = sorted(stores | {v for v in sim.consumed if not consumers[v]})
+
+    def inputs(s: SimResult) -> dict[str, tuple[float, float]]:
+        """(absolute effective input level, envelope) of every refresh: placed sites, fired hints and the code's
+        deliberate refreshes (dense: past the StC-first entry the runtime takes the shipped order, which lands
+        elsewhere)."""
+        out = {}
+        for v in placer.placed:
+            p = g.producer_of.get(v)
+            out[v] = (cfg.bootstrap_level + s.input_eff(g, v, unit),
+                      _refresh_env_cap(route=int(refresh.spec(v).route or 0), step=getattr(p, "step", None)))
+        for n in g.nodes:
+            if not n.cipher_inputs:
+                continue
+            if n.hint_level is not None and s.hint_fired.get(n.idx):
+                out[f"hint:{n.idx}"] = (cfg.bootstrap_level + s.effective(n.cipher_inputs[0], unit),
+                                        _refresh_env_cap(route=0, step=n.step))
+            elif n.is_deliberate_bts:
+                out[f"delib:{n.idx}"] = (cfg.bootstrap_level + max(s.effective(x, unit) for x in n.cipher_inputs),
+                                         _refresh_env_cap(route=0, step=n.step))
+        return out
+
+    def past_cap(s: SimResult) -> dict[str, float]:
+        """Effective level of every value past its step's envelope (P3c's reactive class: the runtime would refresh
+        it there)."""
+        out = {}
+        for v, c in s.consumed.items():
+            p = g.producer_of.get(v)
+            lv = cfg.bootstrap_level + s.effective(v, unit)
+            if lv > _refresh_env_cap(step=getattr(p, "step", None)) + 1e-9:
+                out[v] = lv
+        return out
+
+    fb = placer._dense_fallback()
+
+    def past_entry(s: SimResult, v: str) -> bool:
+        return fb is not None and cfg.bootstrap_level + s.input_eff(g, v, unit) > fb[0] + 1e-9
+
+    base_in, base_past = inputs(sim), past_cap(sim)
+    drops: dict[str, int] = {}
+    skipped: dict[str, int] = collections.Counter()
+    fired = {n.output for n in g.nodes if n.hint_level is not None and n.output and sim.hint_fired.get(n.idx)}
+    sites = set(placer.placed) | fired
+    order = sorted(sites, key=lambda v: g.producer_of[v].idx if v in g.producer_of else -1)
+    for p in order:
+        s = refresh.spec(p)
+        route = int(s.route or 0)
+        if route not in cfg.raise_drop_routes:
+            skipped["route"] += 1
+            continue
+        if not route and past_entry(sim, p):
+            # its input passed the StC-first entry: the shipped order runs it, at its own landing
+            skipped["shipped_order"] += 1
+            continue
+        restore = float(g.level_unit) if s.prescale is not None else 0.0
+        base_abs = cfg.bootstrap_level + s.out_consumed - restore
+        k_max = cfg.raise_drop_max
+        if cfg.raise_drop_landing_max is not None:
+            k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
+        # the plan's drop is absolute: the route's default (raise_drop_base) plus k must be a built variant
+        b = dict(cfg.raise_drop_base).get(route, 0)
+        ks = [k for k in range(k_max, 0, -1)
+              if route == 1 or not cfg.raise_drop_set or k + b in cfg.raise_drop_set]
+        saved = refresh.site_out_levels.get(p)
+        found = 0
+        for k in ks:
+            refresh.site_out_levels[p] = int(round(base_abs + k * unit))
+            refresh._cache.pop(p, None)
+            s2 = placer._sim()
+            in2 = inputs(s2)
+            ok = (s2.hint_fired == sim.hint_fired
+                  and all(s2.consumed.get(v) == sim.consumed.get(v) and s2.deg.get(v) == sim.deg.get(v) for v in pinned)
+                  and all(cfg.bootstrap_level + math.ceil(c) <= cfg.max_level for c in s2.consumed.values())
+                  and all(l <= max(c, base_in[key][0]) + 1e-9 for key, (l, c) in in2.items())
+                  and all(l <= base_past.get(v, 0.0) + 1e-9 for v, l in past_cap(s2).items() if v not in sites)
+                  and all(s2.consumed.get(v) == sim.consumed.get(v) for v in sites if v != p)
+                  and set(i for i, _ in s2.over_budget) <= set(i for i, _ in sim.over_budget))
+            if ok:
+                found, sim, base_in = k, s2, in2
+                break
+        if found:
+            drops[p] = found
+        else:
+            if saved is None:
+                refresh.site_out_levels.pop(p, None)
+            else:
+                refresh.site_out_levels[p] = saved
+            refresh._cache.pop(p, None)
+            skipped["no_slack"] += 1
+    return drops, dict(skipped), placer._sim()
 
 
 def recipe_plan_config(cfg: PlanConfig):
@@ -580,6 +721,17 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         prescale_bits_max=cfg.prescale_bits_max,
     )
     block_name = Path(graph_file).parent.name
+    shadow = PlannerShadow(cfg.bootstrap_level, g.level_unit, recipe_plan_config(cfg))
+    if shadow.dense_fallback() is not None:
+        # a v1 capture records no route: a code-owned refresh landing where the dense StC-first route lands before
+        # its realize is that route, and past the StC-first entry the compile runs it in the shipped order
+        # (`route_for_landing`), so the entry binds it as it binds a v2 StC-first refresh
+        raw = (float(cfg.bootstrap_level - g.level_unit), 2)
+        marked = [dataclasses.replace(n, stc_first=True) if (n.is_deliberate_bts and not n.stc_first and not n.external
+                                                             and (n.output_level, n.output_deg) == raw) else n
+                  for n in g.nodes]
+        if any(a is not b for a, b in zip(marked, g.nodes)):
+            g = g.replace_nodes(marked)
     refresh = RefreshPlanner(
         table=table if table is not None else _load_table(cfg),
         policy=policy,
@@ -590,8 +742,9 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         site_out_levels=dict((cfg.site_bts_out or {}).get(block_name, {})),
         bootstrap_level=cfg.bootstrap_level,
         step_bts_offset=step_bts_offsets(g, cfg.bootstrap_level),
-        shadow=PlannerShadow(cfg.bootstrap_level, g.level_unit, recipe_plan_config(cfg)),
+        shadow=shadow,
         real_route=cfg.real_route,
+        raise_drop_base=dict(cfg.raise_drop_base),
     )
 
     # compile the step substrings into per-var hint_force=False pins, so the pin
@@ -647,7 +800,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         from .ilp import IlpPlacer
         PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
                             objective=cfg.ilp_objective,
-                            cap_exit=bool(final_block and cfg.ilp_cap_exit))
+                            cap_exit=bool(final_block and cfg.ilp_cap_exit),
+                            free_hints=cfg.ilp_free_hints, tiebreak=cfg.ilp_tiebreak)
     if exact:
         # force_place: pre-seeded placements (the terminal-exit refresh retry in
         # plan_graph_dir, and the magnitude keep-anchors). The cut still adds
@@ -833,7 +987,15 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # ---- level-aware ModRaise post-pass (see PlanConfig.raise_drop_max) ----
     raise_hist: dict[int, int] = {}
     raise_skipped: dict[str, int] = {}
-    if cfg.raise_drop_max > 0 and exact:
+    if cfg.raise_drop_max > 0 and exact and cfg.raise_drop_search:
+        drops, raise_skipped, sim = _search_raise_drops(g, sim, placer, refresh, cfg)
+        for k in drops.values():
+            raise_hist[k] = raise_hist.get(k, 0) + 1
+        if cfg.verbose:
+            log.info(f"[plan] raise_drop (search): {len(drops)} refreshes (placed + fired hints) raise below the "
+                     f"chain top; " + " ".join(f"{v}:{k}" for v, k in drops.items())
+                     + (f"; skipped {raise_skipped}" if raise_skipped else ""))
+    elif cfg.raise_drop_max > 0 and exact:
         drops, raise_skipped = _assign_raise_drops(g, sim, set(placer.placed), cfg, refresh)
         if drops:
             saved_cache = dict(refresh._cache)

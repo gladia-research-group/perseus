@@ -273,8 +273,17 @@ class IlpPlacer(Placer):
     #: deeper exit there is a saving the planner books and the argmax pays back
     #: (measured: n32 block 12 exited 42 instead of 40, argmax +0.13 s/token)
     cap_exit: bool = False
+    #: a hint's firing is a decision too: the plan binds every hint (`hint_fire`), so the
+    #: model may veto one its threshold fires (as PLAN_HINT_ENV_VETO does past the envelope)
+    #: when a refresh elsewhere serves better. A vetoed hint is pinned off for the sim.
+    free_hints: bool = False
+    #: among the optima, take the one a fixed weight per decision (from the site's graph position) ranks first: a
+    #: second solve under the optimal cost, so the plan does not depend on the solver build's tie-breaking
+    tiebreak: bool = False
     meta: dict = field(default_factory=dict)
     _exit_cap: tuple[str, float] | None = None
+    #: the min-cut incumbent's hint pins (its envelope vetoes), restored with its plan
+    _mc_force: dict | None = None
 
     heuristic_config = "ilp"
 
@@ -287,6 +296,13 @@ class IlpPlacer(Placer):
         later refreshes it makes unnecessary."""
         route = self.refresh.spec(v).route or 0
         return self.bts_ms.get(route) or self.bts_ms.get(0, 1.0)
+
+    def _fallback_ms(self) -> float:
+        """Extra latency of a dense refresh that takes the shipped order (its input past the
+        StC-first entry) over the StC-first one, when the recipe prices the two (`bts_ms`
+        key -1); 0 otherwise."""
+        shipped = self.bts_ms.get(-1)
+        return max(0.0, shipped - self.bts_ms.get(0, shipped)) if shipped else 0.0
 
     def _site_cost(self, v: str) -> float:
         spec = self.refresh.spec(v)
@@ -367,6 +383,25 @@ class IlpPlacer(Placer):
             d = bit(s.out_deg)
             return Ladder.const(s.out_consumed + unit * d.const), d
 
+        sh = self.refresh.shadow
+        fb = self._dense_fallback()
+        fb_deep: dict[str, Expr] = {}           # [input past the StC-first entry] per dense site
+
+        def landing_from(v: str, pe: Ladder) -> tuple[Ladder, Expr]:
+            """`landing(v)` for a refresh whose input is `pe`: a dense site whose input passed
+            the StC-first entry runs the shipped order and lands where it lands (sim
+            `dense_fallback`)."""
+            le, ld = landing(v)
+            s = self.refresh.spec(v)
+            if fb is None or (s.route and not s.hopeless):
+                return le, ld
+            deep = pe.gt(fb[0] - bts)
+            if _is(deep, 0.0):
+                return le, ld
+            fb_deep[v] = deep
+            fd = bit(fb[2])
+            return lite(deep, Ladder.const(fb[1] + unit * fd.const), le), m.ITE(deep, fd, ld)
+
         def rungs(vals: list[float], bits: list[Expr]) -> Ladder:
             """A ladder, with its rungs stated to be monotone: [v >= k+1] implies [v >= k].
             Every integer solution satisfies this by construction, but saying it keeps the
@@ -406,17 +441,27 @@ class IlpPlacer(Placer):
         def dg(v: str) -> Expr:
             return D.get(v, ZERO)
 
-        def refresh(v: str, e: Ladder, d: Expr, xv: Expr) -> tuple[Ladder, Expr]:
+        fires: dict[str, Expr] = {}             # [the refresh at v runs], per site the model refreshes
+        hard = self._env_hard() if env_hard is None else env_hard
+
+        def env_rel(v: str) -> float:
+            return refresh_env_cap(self._step_of(v), route=self.refresh.spec(v).route or 0) - bts
+
+        def refresh(v: str, e: Ladder, d: Expr, xv: Expr, seed: bool = False) -> tuple[Ladder, Expr]:
             if _is(xv, 0.0):
                 return e, d
             pre[v] = e
-            le, ld = landing(v)
+            fires[v] = xv
+            # a refreshed graph input is seeded at its landing (the sim's StC-first test reads op outputs only);
+            # a hard envelope at or inside the StC-first entry leaves a placed refresh no input past it
+            inside = constrain and hard and fb is not None and env_rel(v) <= fb[0] - bts
+            le, ld = landing(v) if seed or inside else landing_from(v, e)
             return lite(xv, le, e), m.ITE(xv, ld, d)
 
         for v in g.inputs:
             d0 = bit(self.seed_deg(v))
             e0 = Ladder.const(self.seed_consumed(v) + unit * d0.const)
-            E[v], D[v] = refresh(v, e0, d0, x_of(v))
+            E[v], D[v] = refresh(v, e0, d0, x_of(v), seed=True)
 
         terminal = None
         for n in g.nodes:
@@ -452,6 +497,7 @@ class IlpPlacer(Placer):
             return c_e
 
         hints: dict[int, Expr] = {}
+        vetoes: dict[str, tuple[Expr, Expr]] = {}   # hint output -> (its threshold, its "keep" decision)
         for n in g.nodes:
             ins = n.cipher_inputs
             out = n.output
@@ -459,9 +505,25 @@ class IlpPlacer(Placer):
                 if out:
                     base = (n.output_level - bts if n.output_level is not None
                             else max(0.0, offs.get(n.step, 0.0)))
-                    if self.deliberate_clamp0:
-                        base = max(0.0, base)
-                    E[out], D[out] = Ladder.const(base + unit), ONE
+                    if self.deliberate_clamp0 and base + unit < 0:
+                        base = 0.0
+                    # the captured landing degree (a PCMM finish pends its rescale, a CCMM's ends
+                    # rescaled); StC-first runs push K/V in the shipped order (kv_landing)
+                    dd = bit(n.output_deg if n.output_deg is not None else 2)
+                    if sh.kv_landing is not None:
+                        base, dd = sh.kv_landing[0], bit(sh.kv_landing[1])
+                    E[out], D[out] = Ladder.const(base + unit * dd.const), dd
+                # a captured StC-first refresh past the entry takes the shipped order: re-routed to its raw
+                # landing (plan.stc_first_reroute), else a budget violation
+                if n.stc_first and fb is not None and ins:
+                    deep = lmax([eff(v) for v in ins]).gt(fb[0] - bts)
+                    if sh.stc_first_reroute and out:
+                        c_fb, d_fb = (fb[1] - unit, 2) if fb[2] == 1 else (fb[1], fb[2])
+                        rd = bit(d_fb)
+                        E[out] = lite(deep, Ladder.const(c_fb + unit * rd.const), E[out])
+                        D[out] = m.ITE(deep, rd, D[out])
+                    elif constrain:
+                        m.add(deep, hi=0.0, what=f"StC-first entry at node {n.idx} ({out})")
                 continue
 
             xo = ZERO
@@ -472,13 +534,18 @@ class IlpPlacer(Placer):
                     h = ONE if hint_force[out] else ZERO
                 else:
                     h = ie.gt(n.hint_level - bts)
+                    if self.free_hints and out and fixed is None and not _is(h, 0.0):
+                        keep = m.var(integer=True)
+                        vetoes[out] = (h, keep)
+                        h = m.AND(h, keep)
                 hints[n.idx] = h
                 if out:
                     xo = x_of(out)
                     y = m.OR([h, xo])           # fired, or placed: the refreshed value
-                    if not _is(xo, 0.0):
+                    if not _is(y, 0.0):
                         pre[out] = ie
-                    le, ld = landing(out)
+                        fires[out] = y
+                    le, ld = landing_from(out, ie)
                     e, d = lite(y, le, ie), m.ITE(y, ld, idg)
                 else:
                     e, d = ie, idg
@@ -487,7 +554,16 @@ class IlpPlacer(Placer):
                     E[out], D[out] = e, d
             else:
                 if not ins:
-                    e, d = Ladder.const(0.0), ZERO
+                    # Shadow.step on a node with no cipher input
+                    if n.op == "level_reduce":
+                        d = bit(n.output_deg if n.output_deg is not None else 1)
+                        c0 = n.output_level - bts if n.output_level is not None else 0.0
+                    elif n.op == "fold_bootstrap":
+                        d, c0 = ONE, (n.output_level - bts if n.output_level is not None else unit)
+                    else:
+                        raise PlanInfeasible(f"ilp: node {n.idx} ({n.op}) has no cipher input; "
+                                             "not modelled")
+                    e = Ladder.const(c0 + unit * d.const)
                 elif n.op in MULT_FAMILY:
                     e, d = lmax([eff(v) for v in ins]).shift(unit), ONE
                 elif n.op in ADD_FAMILY:
@@ -513,19 +589,12 @@ class IlpPlacer(Placer):
                 elif n.op in ("negate", "negate_inplace"):
                     e, d = eff(ins[0]).shift(unit), ONE
                 elif n.op == "level_reduce":
-                    if n.output_level is None and n.output_deg is None:
-                        e, d = eff(ins[0]), dg(ins[0])
-                    elif n.output_level is not None and n.output_deg is not None:
-                        d = bit(n.output_deg)
-                        e = Ladder.const(n.output_level - bts + unit * d.const)
-                    elif n.output_level is not None:
-                        d = dg(ins[0])
+                    # the wrapper's drop_to_level: max(cur, target), degree kept
+                    e, d = eff(ins[0]), dg(ins[0])
+                    if n.output_level is not None:
                         c0 = n.output_level - bts
-                        e = (Ladder.const(c0 + unit * d.const) if d.is_const
-                             else Ladder([c0, c0 + unit], [d]))
-                    else:
-                        raise PlanInfeasible(f"ilp: level_reduce {out} re-degrees an "
-                                             "unpinned level; not modelled")
+                        e = (lmax([e, Ladder.const(c0 + unit * d.const)]) if d.is_const
+                             else lite(d, lmax([e, Ladder.const(c0 + unit)]), lmax([e, Ladder.const(c0)])))
                 elif n.op == "fold_bootstrap":
                     c0 = n.output_level - bts if n.output_level is not None else unit
                     e, d = Ladder.const(c0 + unit), ONE
@@ -538,14 +607,17 @@ class IlpPlacer(Placer):
             if out and out in realized:
                 D[out] = ZERO                   # a deg-2 value rescales now; eff unchanged
 
-        # refresh envelope, on the input of every refresh a decision can place
+        # refresh envelope, on the input of every refresh a decision can place: the site's own
+        # (its step's and its route's, as the min-cut's _capacity reads it)
         env_pen: dict[int, float] = {}
-        hard = self._env_hard() if env_hard is None else env_hard
-        cap_rel = refresh_env_cap() - bts   # PLAN_REFRESH_ENV_CAP, as the min-cut's _capacity
+        hint_veto = os.environ.get("PLAN_HINT_ENV_VETO") == "1"
         for v, pe in (pre.items() if constrain else ()):
             xv = x.get(v, ZERO)
-            deep = pe.gt(cap_rel)
-            if hard:
+            deep = pe.gt(env_rel(v))
+            if v in vetoes and hint_veto:
+                # a hint the model may veto: vetoed when it would fire past the envelope
+                m.add(deep + fires[v], hi=1.0, what=f"hint envelope at {v}")
+            elif hard:
                 m.add(deep + xv, hi=1.0, what=f"refresh envelope at {v}")
             elif not xv.is_const and not _is(deep, 0.0):
                 p = m.AND(deep, xv)             # a refresh past the envelope: payable
@@ -554,13 +626,20 @@ class IlpPlacer(Placer):
                 env_pen[k] = env_pen.get(k, 0.0) + _ENV_PENALTY - cost[kx]
 
         obj_const = 0.0
+        terms: list[tuple[Expr, float]] = []
         for i, h in hints.items():
             out = g.nodes[i].output
             w = self._hint_cost(out) if out else 0.0
-            if not w:
-                continue
-            obj_const += w * h.const
-            for k, c in h.terms.items():
+            if w:
+                terms.append((h, w))
+        # "ms": a dense refresh past the StC-first entry pays the shipped order's latency
+        w_fb = self._fallback_ms() if self.objective == "ms" else 0.0
+        for v, deep in (fb_deep.items() if w_fb else ()):
+            if v in fires:
+                terms.append((m.AND(fires[v], deep), w_fb))
+        for e, w in terms:
+            obj_const += w * e.const
+            for k, c in e.terms.items():
                 cost[k] = cost.get(k, 0.0) + w * c
         for k, pen in env_pen.items():
             cost[k] = cost.get(k, 0.0) + pen
@@ -568,7 +647,7 @@ class IlpPlacer(Placer):
             term, cap = self._exit_cap
             if term in E:
                 m.add(E[term].gt(cap), hi=0.0, what=f"exit cap at {term}")
-        return m, x, E, D, hints, pre, cost, obj_const
+        return m, x, E, D, hints, pre, cost, obj_const, vetoes
 
     @staticmethod
     def _add_join(m: _Model, effs: list[Ladder], degs: list[Expr], lmax):
@@ -597,7 +676,9 @@ class IlpPlacer(Placer):
 
     # ── solve ──
     def _solve(self, m: _Model, cost: dict[int, float], cutoff: float | None,
-               obj_const: float, time_limit: float):
+               obj_const: float, time_limit: float, tie: dict[int, float] | None = None):
+        """min cost (or, with `tie`, min tie subject to cost <= cutoff); returns (x, status, cost objective,
+        bound)."""
         import numpy as np
         from scipy.optimize import Bounds, LinearConstraint, milp
         from scipy.sparse import csr_array
@@ -606,7 +687,7 @@ class IlpPlacer(Placer):
         if nv == 0:                                 # nothing left to decide
             return np.zeros(0), 0, obj_const, obj_const
         c = np.zeros(nv)
-        for k, w in cost.items():
+        for k, w in (tie if tie is not None else cost).items():
             c[k] = w
         rows = list(m.rows)
         if cutoff is not None and cost:
@@ -628,6 +709,9 @@ class IlpPlacer(Placer):
                    options={"time_limit": float(time_limit),
                             "mip_rel_gap": float(self.mip_gap), "disp": False})
         bound = getattr(res, "mip_dual_bound", None)
+        if tie is not None:
+            fun = None if res.x is None else obj_const + sum(w * res.x[k] for k, w in cost.items())
+            return res.x, res.status, fun, None
         return (res.x, res.status, (res.fun + obj_const if res.x is not None else None),
                 bound + obj_const if bound is not None and math.isfinite(bound) else None)
 
@@ -658,7 +742,7 @@ class IlpPlacer(Placer):
         disagreement on a level, degree or hint decision. Empty = the transcription
         holds on this placement. Over-budget ops are not a disagreement here."""
         forced = set(self.placed)
-        m, x, E, D, hints, pre, cost, oc = self._build(set(placed), set(placed),
+        m, x, E, D, hints, pre, cost, oc, vetoes = self._build(set(placed), set(placed),
                                                        constrain=False)
         sol, bad_row = m.propagate({})
         if bad_row is not None:
@@ -674,7 +758,7 @@ class IlpPlacer(Placer):
         """Pin x to `placed`, solve the (then fully determined) model and check it
         against the sim. Returns the plan's cost under the ILP objective."""
         forced = set(self.placed)
-        m, x, E, D, hints, pre, cost, oc = self._build(set(placed), set(placed))
+        m, x, E, D, hints, pre, cost, oc, vetoes = self._build(set(placed), set(placed))
         if m.infeasible:
             raise ModelMismatch(f"model rejects the min-cut plan: {m.infeasible}")
         sol, bad_row = m.propagate({})                  # pinned: no solver needed
@@ -698,6 +782,7 @@ class IlpPlacer(Placer):
                              f"not {self.objective!r}")
         t0 = time.monotonic()
         forced = set(self.placed)
+        caller_force = dict(self.hint_force or {})
 
         # 1. the incumbent: the min-cut, run as is
         mc_placed: set[str] | None = None
@@ -715,6 +800,7 @@ class IlpPlacer(Placer):
             log.info(f"[ilp] min-cut incumbent infeasible ({str(e).splitlines()[0]}); "
                      "solving without a cutoff")
         self.placed = set(forced)
+        self._mc_force = dict(self.hint_force or {})
         mc_cost = None
         if mc_placed is not None:
             try:
@@ -730,8 +816,11 @@ class IlpPlacer(Placer):
                  if v not in forced and self._candidate(v)}
         if mc_placed:
             cands |= mc_placed - forced         # dominance: the incumbent stays reachable
+        if self.free_hints:
+            # the min-cut's envelope vetoes are decisions of the model now (its own vetoes included)
+            self.hint_force = dict(caller_force)
         try:
-            m, x, E, D, hints, pre, cost, oc = self._build(
+            m, x, E, D, hints, pre, cost, oc, vetoes = self._build(
                 cands, None,
                 env_hard=True if mc_cost is not None and mc_cost < _ENV_PENALTY else None)
         except PlanInfeasible as e:
@@ -754,6 +843,16 @@ class IlpPlacer(Placer):
             # the cutoff priced the incumbent without its envelope penalties; retry bare
             left = max(1.0, self.time_limit - (time.monotonic() - t0))
             sol, status, obj, bound = self._solve(m, cost, None, oc, left)
+        if sol is not None and status == 0 and self.tiebreak:
+            # a weight per decision column fixed by its var's graph position (no solver state): the optimum is unique
+            idx = {next(iter(e.terms)): self.g.producer_of[v].idx if v in self.g.producer_of else 0
+                   for v, e in x.items() if not e.is_const}
+            idx.update({next(iter(keep.terms)): self.g.producer_of[v].idx for v, (_, keep) in vetoes.items()})
+            tie = {k: float(1 + (i * 2654435761 + k) % 1000003) for k, i in idx.items()}
+            left = max(1.0, self.time_limit - (time.monotonic() - t0))
+            sol2, status2, obj2, _ = self._solve(m, cost, obj, oc, left, tie=tie)
+            if sol2 is not None and status2 == 0:
+                sol, obj = sol2, obj2
         solve_s = time.monotonic() - t0
         if sol is None:
             what = {1: "time-limit-no-incumbent", 2: "infeasible"}.get(status, f"status-{status}")
@@ -766,6 +865,12 @@ class IlpPlacer(Placer):
 
         chosen = {v for v, e in x.items() if round(val(e)) == 1}
         self.placed = forced | chosen
+        if vetoes:
+            # every free hint is pinned to the model's decision, which the plan binds anyway
+            fired = {self.g.nodes[i].output: bool(round(val(h))) for i, h in hints.items()}
+            self.hint_force = {**caller_force, **{v: fired[v] for v in vetoes}}
+            self.meta["hints_vetoed"] = sorted(v for v, (thr, keep) in vetoes.items()
+                                               if round(val(thr)) == 1 and round(val(keep)) == 0)
         sim = self._sim()
         bad = self._check(sim, sol, E, D, hints)
         if bad:
@@ -794,5 +899,7 @@ class IlpPlacer(Placer):
     def _keep_mincut(self, placed, in_eff, why, t0) -> SimResult:
         self.placed = set(placed)
         self.placed_in_eff = dict(in_eff)
+        if self._mc_force is not None:
+            self.hint_force = dict(self._mc_force)
         self.meta.update(status=f"fallback:{why}", solve_s=round(time.monotonic() - t0, 2))
         return self._sim()
