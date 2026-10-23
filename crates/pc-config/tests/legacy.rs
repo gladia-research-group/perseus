@@ -54,8 +54,8 @@ fn field_table() {
         }
     }
     // 337 inventory names - 4 without a field (GPU guard, dropped _client, two upstream-driver inputs) + the two
-    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS) + PLAN_FALLBACK_CF
-    assert_eq!(envs.len(), 336);
+    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS) + PF_LAST_QUERY, PF_QKV_PACK, PLAN_FALLBACK_CF
+    assert_eq!(envs.len(), 338);
 }
 
 #[test]
