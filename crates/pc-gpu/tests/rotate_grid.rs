@@ -81,7 +81,7 @@ fn grid() -> Res<()> {
     let packed = KskLayout::packed_for::<W>(&chain)?;
     let shapes: Vec<_> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
     let n_cts = 2 * 4 * 63 + 16;
-    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: n_cts }, PoolClass { k: 4, count: 4 }], events: 16, scratch_cts: 2 };
+    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: n_cts }, PoolClass { k: 4, count: 8 }], events: 16, scratch_cts: 2 };
     let mut plan = MemPlan::build::<W, M>(&chain, cfg)?;
     let lay = plan.lay;
     plan.reserve("ks.plans", KsPlans::bytes::<W>(&chain, kmax)?);
@@ -386,6 +386,38 @@ fn grid() -> Res<()> {
             }
         }
         println!("[grid] level {level}: mult K = 4: {bad} of 4 products differ from single products");
+        assert_eq!(bad, 0);
+    }
+    // the replay's product unit: distinct operands gathered into K buffers (`bts::batch::put`), one K-batched
+    // product, the products scattered (`take`): each equal to its single product
+    {
+        let mut ga = pool.acquire(4, meta(level))?;
+        let mut gb = pool.acquire(4, meta(level))?;
+        let mut w = pool.acquire(1, meta(level))?;
+        for (c, (x, y)) in xs.iter().zip(xs.iter().rev()).enumerate() {
+            pc_gpu::bts::batch::put(&ctx, &ex.compute, ga.get_mut().ok_or("shared")?, c, x)?;
+            pc_gpu::bts::batch::put(&ctx, &ex.compute, gb.get_mut().ok_or("shared")?, c, y)?;
+        }
+        for g in [&mut ga, &mut gb] {
+            let g = g.get_mut().ok_or("shared")?;
+            g.buf.k = 4;
+            g.meta = meta(level);
+        }
+        let o = o4.get_mut().ok_or("shared")?;
+        relin::mult(&ctx, &mut ex, kc, &sh, &g_relin, &ga, &gb, o)?;
+        let mut bad = 0;
+        for (c, (x, y)) in xs.iter().zip(xs.iter().rev()).enumerate() {
+            let m = o4.meta;
+            let wm = w.get_mut().ok_or("shared")?;
+            relin::mult(&ctx, &mut ex, kc, &sh, &g_relin, x, y, wm)?;
+            let single = rows(&ex, wm, 0, top)?;
+            let wm = w.get_mut().ok_or("shared")?;
+            pc_gpu::bts::batch::take(&ctx, &ex.compute, wm, &o4, c, m)?;
+            if rows(&ex, wm, 0, top)? != single {
+                bad += 1;
+            }
+        }
+        println!("[grid] level {level}: gathered K = 4 product of distinct operands: {bad} of 4 differ from single products");
         assert_eq!(bad, 0);
     }
     Ok(())
