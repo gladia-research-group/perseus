@@ -508,7 +508,6 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         log.info(f"[plan] erased {erase.n_erased} reactive auto_bootstrap(s); "
               f"{erase.n_deliberate_kept} deliberate fixed point(s) kept")
 
-    kept_sites: set[str] = set()
     input_level_of: dict[str, float] = {}
     first_consumer_seed: dict[str, float] = {}
     for n in g.nodes:
@@ -645,11 +644,14 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
                             objective=cfg.ilp_objective,
                             cap_exit=bool(final_block and cfg.ilp_cap_exit))
+    # forced: sites refreshed whatever the levels say. force_place is the exit refresh
+    # of plan_graph_dir's terminal-exit retry; the exact path adds the keep_placements
+    # sites and the force_step_refresh keep-anchors below. The exact placers and the
+    # re-cut trials start from them, and the cut still adds whatever else it needs;
+    # every forced site goes through P2. The baseline placers take no seed: for them a
+    # forced site is only exempt from the prune.
+    forced = set(force_place or ())
     if exact:
-        # force_place: pre-seeded placements (the terminal-exit refresh retry in
-        # plan_graph_dir, and the magnitude keep-anchors). The cut still adds
-        # whatever else it needs; every forced site goes through P2.
-        forced = set(force_place or ())
         if cfg.keep_placements:
             # kept sites also survive the prune below
             kept = Path(cfg.keep_placements) / f"{block_name}_placement.json"
@@ -703,8 +705,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         sim = placer.run()
 
     rescale_anchors: set = set()
-    # the realize-anchor trials re-run the cut: kept sites stay placed in them too
-    _kept = {"placed": set(kept_sites)} if kept_sites else {}
+    # the realize-anchor trials re-run the cut and replace the incumbent when they need no more bootstraps: a
+    # trial that did not start from the forced sites (the retry's exit refresh, the keep-anchors, the kept
+    # placements) would drop every one the block's own levels do not need, and win for it
+    _seed = {"placed": set(forced)} if forced else {}
     if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
@@ -720,7 +724,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 break
             trial = rescale_anchors | cands
             p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_kept)
+                           hint_force=hint_force, **_seed)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -743,7 +747,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial), hint_force=hint_force, **_kept)
+            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial), hint_force=hint_force, **_seed)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -771,7 +775,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 break
             trial = rescale_anchors | cands
             p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_kept)
+                           hint_force=hint_force, **_seed)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -786,9 +790,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             log.info(f"[plan] ks_realize: {n_ks} key-switch realize anchor(s), bootstraps {base_ks} -> {best_ks}")
 
     if cfg.prune:
-        # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)
-        sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(force_place or ())
-                                         + tuple(sorted(kept_sites)))
+        # forced sites stay: the exit refresh of the terminal-exit retry is needed by the next block, and a
+        # keep-anchor or a kept placement is placed whether or not the levels need it, so the prune would remove
+        # it wherever they do not
+        sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(sorted(forced)))
         if hasattr(placer, "meta"):
             placer.meta["pruned"] = n_pruned
         if cfg.verbose:
