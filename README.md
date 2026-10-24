@@ -15,6 +15,7 @@
 <p align="center"><b>An open Python framework for encrypted inference of large language models</b></p>
 
 <p align="center">
+  <a href="https://github.com/gladia-research-group/perseus/tree/speedrun">🏁 <b>Encrypted GPT-2 Speedrun</b></a> ·
   <a href="#results">Results</a> ·
   <a href="#runtime">Runtime</a> ·
   <a href="#reproduce">Reproduce</a> ·
@@ -57,19 +58,11 @@ One NVIDIA RTX PRO 6000, 128-bit security. Prior results on their own hardware, 
 ours where the code is released.
 
 <p align="center">
-  <a href="assets/paper-tables-llama-prefill-light.png">
+  <a href="assets/paper-tables-llama-light.png">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-prefill-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-prefill-light.png">
-      <img src="assets/paper-tables-llama-prefill-light.png" alt="Encrypted Llama-3-8B prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 83.2 on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
-  <br>
-  <a href="assets/paper-tables-llama-decode-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-decode-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-decode-light.png">
-      <img src="assets/paper-tables-llama-decode-light.png" alt="Encrypted Llama-3-8B decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 16.2 at 512 on RTX PRO 6000, open source." width="707">
+      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-dark.png">
+      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-light.png">
+      <img src="assets/paper-tables-llama-light.png" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 83.2 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 16.2 at 512 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>

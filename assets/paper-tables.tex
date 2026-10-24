@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama-prefill llama-decode gpt2 vit bert core
+% pages: overview llama gpt2 vit bert core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -56,41 +56,32 @@ Llama-3-8B streams its weights from host memory one block at a time, while GPT-2
 the larger model can need less GPU memory.}
 \end{tbl}
 
+% Unlike the paper (two Llama tables, prefill and decode), the README shows one, in the GPT-2 table's layout.
 \begin{tbl}
-\begin{tabularx}{\linewidth}{L{1.2}rrL{0.8}c}
+\begin{tabularx}{\linewidth}{lXrrlc}
 \toprule
-\textbf{Llama-3-8B} & prompt & prefill (s) & GPU & open source \\
+ & \textbf{Llama-3-8B} & tokens & latency & GPU & open source \\
 \midrule
-MOAI (Zhang et al., 2026) & $8\!\to\!128$ & 3592.0\nt{\dagger *} & H200 & \semi \\
-NEXUS (Zhang et al., 2025) & $8\!\to\!128$ & 829.0\nt{\dagger *} & 4$\times$A100 & \semi \\
-Euston (Gao et al., 2026) & 128 & 484.0\nt{\dagger *} & RTX 6000 Ada & \semi \\
-STIP (Wang et al., 2026) & 128 & 406.6\nt{\dagger *} & A100 & \no \\
-Odin (Fan et al., 2026) & 128 & 366.4 & H100 & \no \\
-Cerium (Jayashankar et al., 2025) & 128 & 347.5\nt{\S} & RTX PRO 6000 & \yes \\
-Sylph (Park et al., 2026) & 128 & 116.0\nt{\dagger} & RTX PRO 6000 & \no \\
-\oursrow\textbf{Perseus (ours)} & 128 & \textbf{\llamapf} & RTX PRO 6000 & \yes \\
+prefill (s) & MOAI (Zhang et al., 2026) & $8\!\to\!128$ & 3592.0\nt{\dagger *} & H200 & \semi \\
+ & NEXUS (Zhang et al., 2025) & $8\!\to\!128$ & 829.0\nt{\dagger *} & 4$\times$A100 & \semi \\
+ & Euston (Gao et al., 2026) & 128 & 484.0\nt{\dagger *} & RTX 6000 Ada & \semi \\
+ & STIP (Wang et al., 2026) & 128 & 406.6\nt{\dagger *} & A100 & \no \\
+ & Odin (Fan et al., 2026) & 128 & 366.4 & H100 & \no \\
+ & Cerium (Jayashankar et al., 2025) & 128 & 347.5\nt{\S} & RTX PRO 6000 & \yes \\
+ & Sylph (Park et al., 2026) & 128 & 116.0\nt{\dagger} & RTX PRO 6000 & \no \\
+ & \oc\textbf{Perseus (ours)} & \oc 128 & \oc\textbf{\llamapf} & \oc RTX PRO 6000 & \oc\yes \\
+\cdashline{1-6}
+decode (s / token) & AR-HE (Kanpak and Unat, 2026) & 32 & 1569.0\nt{\dagger} & H100 & \no \\
+ & ROSETTA (Yu et al., 2026) & 512 & 311.0\nt{\dagger} & A100 & \no \\
+ & Cachemir (Yu et al., 2026) & 512 & 97.0\nt{\dagger} & A100 & \semi \\
+ & Sylph (Park et al., 2026) & 128 & 31.0\nt{\dagger} & RTX PRO 6000 & \no \\
+ & \oc\textbf{Perseus (ours)} & \oc 512 & \oc\textbf{\llamadec} & \oc RTX PRO 6000 & \oc\yes \\
 \bottomrule
 \end{tabularx}
-\tcap{Encrypted Llama-3-8B prefill, from the prompt to the first token. $^\dagger$Composed from per-block or per-operator
-timings, not run end to end; $^*$amortized over a batch; $^\S$replicated from the released code on our GPU. Perseus runs
-Llama-3.1-8B (the same architecture) end to end on one GPU; its wall excludes key generation, encryption and decryption.
-\legend}
-\end{tbl}
-
-\begin{tbl}
-\begin{tabularx}{\linewidth}{L{1.2}rrL{0.8}c}
-\toprule
-\textbf{Llama-3-8B} & context & s / token & GPU & open source \\
-\midrule
-AR-HE (Kanpak and Unat, 2026) & 32 & 1569.0\nt{\dagger} & H100 & \no \\
-ROSETTA (Yu et al., 2026) & 512 & 311.0\nt{\dagger} & A100 & \no \\
-Cachemir (Yu et al., 2026) & 512 & 97.0\nt{\dagger} & A100 & \semi \\
-Sylph (Park et al., 2026) & 128 & 31.0\nt{\dagger} & RTX PRO 6000 & \no \\
-\oursrow\textbf{Perseus (ours)} & 512 & \textbf{\llamadec} & RTX PRO 6000 & \yes \\
-\bottomrule
-\end{tabularx}
-\tcap{Encrypted Llama-3-8B decode of one token at the given context size. $^\dagger$Composed from per-block or per-operator
-timings, not run end to end. Perseus runs Llama-3.1-8B end to end on one GPU. \legend}
+\tcap{Encrypted Llama-3-8B: prefill of a prompt and decode of one token; \emph{tokens} is the prompt length (prefill) or
+the context (decode). $^\dagger$Composed from per-block or per-operator timings, not run end to end; $^*$amortized over a
+batch; $^\S$replicated from the released code on our GPU. Perseus runs Llama-3.1-8B (the same architecture) end to end on
+one GPU. \legend}
 \end{tbl}
 
 \begin{tbl}
