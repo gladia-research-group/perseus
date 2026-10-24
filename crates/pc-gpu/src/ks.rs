@@ -27,6 +27,9 @@ pub const KEY_KMAX: usize = 4;
 /// Extended rotations of one ciphertext batch `KsWork::ext` holds at once, for batches of up to `KEY_KMAX`: a radix-3
 /// rotate-and-sum group (7 keys) dotted in one go and summed inside the ModDown (`rotate::SumForm::InModDown`).
 pub const SUM_KEYS: usize = 7;
+/// Strides (in ciphertext layouts) of the k > 1 sources `modup_from` reads in place: 1, or 2 (the linear-transform
+/// results' stride, `bts::cts::LT_GMAX_LAUNCH`).
+pub const SRC_STRIDES: usize = 2;
 
 /// Seam `KeySwitch`: the decomposition / switching method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,8 +508,9 @@ struct LevelPlan<'a> {
     ndig: usize,
     /// INTT rows of the coefficient workspace: `(c * rows + t, t)`, t <= top, by ciphertext.
     intt: RowList<'a>,
-    /// The same rows in a ciphertext buffer, from one part of its first ciphertext: `c * 2 rows + t` (the ModUp's INTT
-    /// reads the input there, out of place).
+    /// The same rows in a ciphertext buffer, from one part of its first ciphertext, the ciphertexts m ciphertext
+    /// layouts apart (m = 1..=SRC_STRIDES, one table each): `c * m * 2 rows + t` (the ModUp's INTT reads the input
+    /// there, out of place).
     intt_src: ConstBuf<'a, u32>,
     /// ModUp conversions of every live digit, jobs `[c < k_max][digit]` (digit limbs -> the other live Q limbs and
     /// P): one launch for all digits of the first k ciphertexts (a job prefix).
@@ -544,7 +548,13 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
     for c in 0..k_max {
         for t in 0..=top {
             intt.push(((c * rows + t) as u32, t as i32));
-            intt_src.push((c * 2 * rows + t) as u32);
+        }
+    }
+    for m in 1..=SRC_STRIDES {
+        for c in 0..k_max {
+            for t in 0..=top {
+                intt_src.push((c * m * 2 * rows + t) as u32);
+            }
         }
     }
     // [c][digit] order: the first k ciphertexts' jobs (and NTT rows) are a prefix, so one launch serves any k
@@ -773,11 +783,14 @@ pub fn modup_from<W: DevWord, M: DevStrategy<W>>(
     if coef.len() < k * lay.poly_words() {
         return Err(shape("ks modup", format!("coefficient workspace holds {} words, {k} polys needed (MemPlan::bconv_work)", coef.len())));
     }
-    if k > 1 && src.ct_stride != lay.ct_words() as u64 {
-        return Err(shape("ks modup", "k > 1 sources must have the ciphertext layout"));
+    let cw = lay.ct_words() as u64;
+    let m = if k > 1 { (src.ct_stride / cw) as usize } else { 1 };
+    if k > 1 && (src.ct_stride % cw != 0 || m == 0 || m > SRC_STRIDES) {
+        return Err(shape("ks modup", format!("k > 1 sources must be 1..={SRC_STRIDES} ciphertext layouts apart")));
     }
     let lv = plans.level(top)?;
-    let src = ntt::Src { base: src.base, soff: lv.intt_src.dptr(), n: 1, stride: 0 };
+    let soff = lv.intt_src.dptr().wrapping_add((m - 1) * plans.k_max * (top + 1));
+    let src = ntt::Src { base: src.base, soff, n: 1, stride: 0 };
     ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, coef, &lv.intt, k * (top + 1), Some(src), None)?;
     modup_tail(ctx, s, lv, ks, coef, k)
 }
@@ -1083,6 +1096,8 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
                     part_stride: dst.part_stride,
                     dbl: 0,
                     pad: 0,
+                    alpha: std::ptr::null(),
+                    alphas: std::ptr::null(),
                 },
             ),
             None => (0, EpiArgs::default()),
@@ -1116,6 +1131,26 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// What a fused ModDown stores in its output view, md = (x - conv) P^-1 over Q rows 0..=top: `Set` out = md, `Add`
+/// out += md, `Onto(y)` out = y + md (y: k ciphertexts of the ciphertext layout, read at out's row offsets).
+#[derive(Clone, Copy, Debug)]
+pub enum MdOut {
+    Set,
+    Add,
+    Onto(View),
+}
+
+impl MdOut {
+    /// The accumulate source of `ntt::Epi::SubMulAcc*` (null: the output itself); None for `Set`.
+    fn onto(self) -> Option<*const c_void> {
+        match self {
+            MdOut::Set => None,
+            MdOut::Add => Some(std::ptr::null()),
+            MdOut::Onto(y) => Some(y.base as *const c_void),
+        }
+    }
+}
+
 /// Full ModDown in place on the first `k` ciphertexts of `x`: Q rows 0..=top = (x - conv) P^-1.
 pub fn moddown_inplace<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,
@@ -1127,12 +1162,12 @@ pub fn moddown_inplace<W: DevWord, M: DevStrategy<W>>(
     top: usize,
 ) -> Result<()> {
     let v = View::of(x, 0);
-    moddown_to(ctx, s, plans, x, conv, v, false, k, top)
+    moddown_to(ctx, s, plans, x, conv, v, MdOut::Set, k, top)
 }
 
-/// ModDown of the first `k` ciphertexts of `x` into `out` (k-ct view of the ciphertext layout; may be x itself):
-/// Q rows 0..=top of out = (x - conv) P^-1, or `acc`: out + (x - conv) P^-1. The last step rides the NTT of the
-/// conversion (its epilogue), so `conv` holds scratch afterwards; x's special rows are left in coefficient form.
+/// ModDown of the first `k` ciphertexts of `x` into `out` (k-ct view of the ciphertext layout; may be x itself), stored
+/// as `mode` says. The last step rides the NTT of the conversion (its epilogue), so `conv` holds scratch afterwards;
+/// x's special rows are left in coefficient form.
 #[allow(clippy::too_many_arguments)]
 pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,
@@ -1141,26 +1176,27 @@ pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
     x: &mut CtBuf<'_, Compute, W>,
     conv: &mut CtBuf<'_, Compute, W>,
     out: View,
-    acc: bool,
+    mode: MdOut,
     k: usize,
     top: usize,
 ) -> Result<()> {
     plans.check_k(k)?;
     check_cts(x, 0, k, "ks moddown")?;
     check_cts(conv, 0, k, "ks moddown")?;
-    let lay = ctx.lay;
-    if out.ct_stride != lay.ct_words() as u64 || out.part_stride != lay.poly_words() as u64 {
-        return Err(shape("ks moddown_to", "the output view must have the ciphertext layout"));
-    }
+    check_md_out(ctx, out, mode, "ks moddown_to")?;
     let lv = plans.level(top)?;
     ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let (o, xv, sc, scs) = (out.base, x.buf.vptr(), ctx.ks.p_inv_mod_q.v.vptr(), ctx.ks.p_inv_mod_q.s.vptr());
-    let epi = if acc { ntt::Epi::SubMulAcc { out: o, x: xv, s: sc, ss: scs } } else { ntt::Epi::SubMul { out: o, x: xv, s: sc, ss: scs } };
+    let epi = match mode.onto() {
+        Some(d) => ntt::Epi::SubMulAcc { out: o, x: xv, s: sc, ss: scs, d },
+        None => ntt::Epi::SubMul { out: o, x: xv, s: sc, ss: scs },
+    };
     ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
 }
 
-/// `out += x_0 + .. + x_(n-1)` ModDowned (the extended ciphertexts x_j of `x`, `stride` ciphertexts apart, k each):
+/// `out += x_0 + .. + x_(n-1)` ModDowned (the extended ciphertexts x_j of `x`, `stride` ciphertexts apart, k each;
+/// `mode` Add or Onto):
 /// the special rows' sum rides the INTT's first pass, the Q rows' sum the conversion NTT's epilogue, so the extended
 /// rotations of a hoisted sum are never added row by row. `x`'s special rows of its first k cts are left holding the
 /// sum (coefficient form), `conv` scratch.
@@ -1174,24 +1210,34 @@ pub fn moddown_sum_to<W: DevWord, M: DevStrategy<W>>(
     stride: usize,
     conv: &mut CtBuf<'_, Compute, W>,
     out: View,
+    mode: MdOut,
     k: usize,
     top: usize,
 ) -> Result<()> {
     plans.check_k(k)?;
     check_cts(x, 0, (n - 1) * stride + k, "ks moddown_sum")?;
     check_cts(conv, 0, k, "ks moddown_sum")?;
+    check_md_out(ctx, out, mode, "ks moddown_sum_to")?;
+    let d = mode.onto().ok_or_else(|| shape("ks moddown_sum_to", "the summed ModDown accumulates (Add or Onto)"))?;
     let lay = ctx.lay;
-    if out.ct_stride != lay.ct_words() as u64 || out.part_stride != lay.poly_words() as u64 {
-        return Err(shape("ks moddown_sum_to", "the output view must have the ciphertext layout"));
-    }
     let lv = plans.level(top)?;
     let words = stride * lay.ct_words();
     let xb = x.buf.vptr();
     let src = ntt::Src { base: xb, soff: std::ptr::null(), n, stride: words };
     ntt::transform_k_ex(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k, Some(src), None)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
-    let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: ctx.ks.p_inv_mod_q.v.vptr(), ss: ctx.ks.p_inv_mod_q.s.vptr() };
+    let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: ctx.ks.p_inv_mod_q.v.vptr(), ss: ctx.ks.p_inv_mod_q.s.vptr(), d };
     ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
+}
+
+/// The output view (and an `Onto` source) of a fused ModDown must have the ciphertext layout.
+fn check_md_out<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, out: View, mode: MdOut, what: &'static str) -> Result<()> {
+    let lay = ctx.lay;
+    let ok = |v: View| v.ct_stride == lay.ct_words() as u64 && v.part_stride == lay.poly_words() as u64;
+    if !ok(out) || matches!(mode, MdOut::Onto(y) if !ok(y)) {
+        return Err(shape(what, "the output view (and the Onto source) must have the ciphertext layout"));
+    }
+    Ok(())
 }
 
 /// `dst += (x - t) P^-1` over Q rows 0..=top, both parts, k ciphertexts (`md_epilogue`).

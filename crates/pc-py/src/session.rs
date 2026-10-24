@@ -639,6 +639,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
         let rn = route_needs(&ps.programs, n);
         // FIDESLIB_CTS_ALT_BUDGET: the dense routes' raise variants of drop >= 1 on a CtS one stage longer
         let cts_alt = knob(cfg.bts.cts_alt_budget, 0, "bts.cts_alt_budget")? as u32;
+        // PC_LT_TAILS (default on) / PC_EM_FUSE_RESCALE (default off): pc-gpu BtsSetup::lt_tails / em_fuse_rescale
+        let (lt_tails, em_fuse) = (cfg.bts.lt_tails.unwrap_or(true), cfg.bts.em_fuse_rescale.unwrap_or(false));
         for p in &ps.programs {
             steps.extend(prog_steps(p, half));
         }
@@ -650,6 +652,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             // batched PCMM finishes run K-member refreshes on this route (its work buffers)
             setup.k_max = pcmm.as_ref().map_or(1, |p| p.batch.max(1));
             setup.cts_alt_budget = cts_alt;
+            (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             let mut sfs = StcFirstSetup::n32_shipped();
             // FIDESLIB_BTS_STC_FIRST_CF: the route's default CF (a site's own Route::cf wins); 13 shipped
             if let Some(cf) = cfg.bts.stc_first_cf {
@@ -680,6 +683,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.raise_drops = rn.plain_drops.iter().copied().collect();
             setup.real = rn.plain_real;
             setup.cts_alt_budget = cts_alt;
+            (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             setup.k_max = 1;
             let dp = pc_gpu::bts::dense::DensePlan::new(chain, &setup).map_err(e)?;
             let geoms: Vec<_> = dp.variants.iter().flat_map(|v| v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter())).map(|h| h.geom).collect();
@@ -690,6 +694,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             for &d in drops {
                 let mut c = SparseBCfg::n32(sl, d);
                 c.k_max = 1;
+                (c.lt_tails, c.em_fuse_rescale) = (lt_tails, em_fuse);
                 full.extend(pc_gpu::bts::sparse_b::rot_steps(n, &c).map_err(e)?.into_iter().map(|k| k.rem_euclid(half)));
                 sb_cfgs.push(c);
             }

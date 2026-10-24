@@ -3,15 +3,17 @@
 //! metadata, device ops recorded with their integer constants), peephole-fused (`EmProgram::fused`); every op runs
 //! once for a batch of `kk` ciphertexts. Complex payload (dense route): Re and Im chains as ONE batch of 2K when it
 //! fits a launch; real payload (`Route::real`): one chain. Relinearizations use `KskSource::Regen` or `Cached`;
-//! rescales are composite one-pass kernels with a preceding MulConst folded in (exact).
-//! Details: docs/ARCHITECTURE.md "pc-gpu EvalMod".
+//! rescales are composite one-pass kernels with a preceding MulConst folded in (exact); a Regen relinearization the
+//! program rescales next has its ModDown fused with that rescale (`RelinRescale`). Details: docs/ARCHITECTURE.md
+//! "pc-gpu EvalMod".
+use super::cts::{md_plan, md_plan_bytes, MdPlan};
 use super::BtsCx;
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::error::{shape, Result};
 use crate::ks::{self, DotIo, DotRows, KeyGroup, KskSource, View};
 use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
-use pc_core::modmul::{mulmod, shoup};
+use pc_core::modmul::{invmod, mulmod, shoup};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, Lane, Stream};
 use pc_kernels::{AddConstArgs, EwArgs, MdEpiArgs, MulTableArgs, PolyRef, RescaleArgs, TensorArgs, WsumArgs, WsumKArgs, MdEpiToArgs};
 use pc_shadow::evalmod::{build_evalmod, EmOp, EmProgram, Epi, PsPlan};
@@ -82,6 +84,59 @@ struct RegenEpi<'a> {
     key: pc_kernels::KeyTab,
 }
 
+/// The ModDown of a Regen relinearization at `top` fused with the rescale the program runs right after it (`Mult;
+/// Rescale` of the product): the extended product is `V = P c + dot` (c the tensor, dot the key inner product), and
+/// rescale(ModDown(V)) = (V - conv) (P q_a q_b)^-1 with conv the exact conversion of V from P and the two tops (the
+/// CtS stages' fused end), i.e. `c (q_a q_b)^-1 + (dot - conv) (P q_a q_b)^-1` on rows 0..top-2. One NTT of the
+/// remaining rows instead of the ModDown's and the rescale's. The program's x2 / + constant land after the rescale
+/// (the constant rescaled exactly on the host): the same value up to the rescale's rounding of each term.
+struct RelinRescale<'a, W: DevWord> {
+    /// dot rows: top - 1, top, then the special rows
+    rows: ConstBuf<'a, u32>,
+    /// INTT of those rows of `ks.ext`, the exact conversion into rows 0..top-2 of `ks.conv`, their NTT
+    md: MdPlan<'a>,
+    /// (q_a q_b)^-1 and (P q_a q_b)^-1 by prime id
+    alpha: ScalarPair<'a, W>,
+    beta: ScalarPair<'a, W>,
+    /// wsum weights of `P c + dot` on the two tops: P mod q_(top-1), P mod q_top, 1, 1
+    wtop: ScalarPair<'a, W>,
+}
+
+/// Exact rescale by `q_top q_(top-1)` of the integer constant with residues `row` (by prime id): rows 0..top-2, the
+/// centred representative of the constant mod the two tops subtracted (raw residues, prime id order).
+fn rescaled_const(q: &[u64], row: &[u64], top: usize) -> Vec<u64> {
+    let (qa, qb) = (q[top], q[top - 1]);
+    let (ka, kb) = (row[top] % qa, row[top - 1] % qb);
+    let t = mulmod((ka + qa - kb % qa) % qa, invmod(qb % qa, qa), qa);
+    let m = qa as u128 * qb as u128;
+    let y = kb as u128 + qb as u128 * t as u128;
+    let mut out = vec![0u64; q.len()];
+    for i in 0..top - 1 {
+        let qi = q[i];
+        let mut yi = (y % qi as u128) as u64;
+        if y > m / 2 {
+            yi = (yi + qi - (m % qi as u128) as u64) % qi;
+        }
+        let ainv = invmod((m % qi as u128) as u64, qi);
+        out[i] = mulmod((row[i] % qi + qi - yi) % qi, ainv, qi);
+    }
+    out
+}
+
+/// The program's `Mult; Rescale` pairs `RelinRescale` serves: (top, the epilogue's constant index) per pair. Its
+/// conversion drops two primes (q_a q_b): chains with a level unit `d` other than 2 get none.
+fn relin_rescale_pairs(ops: &[EmOp], d: usize) -> Vec<(usize, Option<usize>)> {
+    if d != 2 {
+        return Vec::new();
+    }
+    ops.windows(2)
+        .filter_map(|w| match (&w[0], &w[1]) {
+            (EmOp::Mult { dst, n, epi, .. } | EmOp::MultAcc { dst, n, epi, .. }, EmOp::Rescale { x, n: n2, k: None }) if x == dst && n == n2 && *n >= 3 => Some((n - 1, epi.k)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// An EvalMod program with its device constants, rescale plans and keys.
 pub struct EvalModPlan<'a, W: DevWord> {
     pub mode: EmMode,
@@ -104,6 +159,11 @@ pub struct EvalModPlan<'a, W: DevWord> {
     pub kk_max: usize,
     pub relin_source: KskSource,
     regen_epi: Option<RegenEpi<'a>>,
+    /// Regen relinearizations fused with the rescale after them, by top (`RelinRescale`), and the epilogue constants
+    /// rescaled for them, by (constant index, top); off: relinearize then rescale.
+    rr: BTreeMap<usize, RelinRescale<'a, W>>,
+    rr_k: BTreeMap<(usize, usize), ConstBuf<'a, W>>,
+    pub fuse_rescale: bool,
     bytes: usize,
     nq: usize,
 }
@@ -357,6 +417,20 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             + Arena::bytes_for::<u32>(1)
             + Arena::bytes_for::<i32>(np);
         b += 2 * rows_b(nq * lay.n) + 2 * KeyGroup::bytes(1, true);
+        // the fused relinearization-rescale pairs: per top the dot rows, the conversion plan, alpha / beta / the top
+        // weights, the row table of rows 0..top-2; per (constant, top) the rescaled constant
+        let pairs = relin_rescale_pairs(&fused, st.d);
+        let primes = st.q.iter().chain(st.p.iter()).copied().collect::<Vec<u64>>();
+        let rr_tops: std::collections::BTreeSet<usize> = pairs.iter().map(|p| p.0).collect();
+        let rr_k: std::collections::BTreeSet<(usize, usize)> = pairs.iter().filter_map(|&(t, k)| k.map(|k| (k, t))).collect();
+        for &top in &rr_tops {
+            b += Arena::bytes_for::<u32>(2 + lay.kp) + md_plan_bytes::<W>(&primes, kk_max, 2, lay.kp + 2, top - 1, true)?;
+            b += 2 * 2 * rows_b(nq) + 2 * rows_b(4);
+        }
+        // row tables 0..=top-2 of the Q-row dots (where no Mult already has one: those are keyed by n - 1)
+        let mkeys: std::collections::BTreeSet<usize> = mtops.iter().map(|&n| n - 1).collect();
+        b += rr_tops.iter().map(|&t| t - 2).filter(|k| !mkeys.contains(k)).collect::<std::collections::BTreeSet<_>>().iter().map(|&k| Arena::bytes_for::<u32>(k + 1)).sum::<usize>();
+        b += rr_k.len() * rows_b(nq);
         Ok(b)
     }
 
@@ -409,6 +483,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let n = lay.n;
         let relin_group = KeyGroup::new(arena, s, n, &[relin], stage_ptrs)?;
         let in_place = relin_group.regen_tab(0)?;
+        let pairs = relin_rescale_pairs(&ops, ctx.chain.level_unit);
         let regen_epi = match (relin.staging(), relin.seed_ptr()) {
             (st, Some(seed)) if (st.is_none() && relin.digit_stride() == lay.poly_words()) || in_place.is_some() => {
                 let mut rows = BTreeMap::new();
@@ -419,6 +494,13 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                             let r: Vec<u32> = (0..=top as u32).collect();
                             e.insert(ConstBuf::new(arena, "bts.em", s, &r)?);
                         }
+                    }
+                }
+                // the fused relinearization-rescale's Q-row dots (rows 0..=top-2)
+                for &(top, _) in &pairs {
+                    if let std::collections::btree_map::Entry::Vacant(e) = rows.entry(top - 2) {
+                        let r: Vec<u32> = (0..=(top - 2) as u32).collect();
+                        e.insert(ConstBuf::new(arena, "bts.em", s, &r)?);
                     }
                 }
                 let digit_of: Vec<i32> = (0..lay.rows()).map(|t| ctx.chain.digit_of(t).map(|d| d as i32).unwrap_or(-1)).collect();
@@ -434,6 +516,32 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             }
             _ => None,
         };
+        let (mut rr, mut rr_k) = (BTreeMap::new(), BTreeMap::new());
+        let pmod: Vec<u64> = (0..nq).map(|i| ctx.chain.p.iter().fold(1u64, |a, &x| mulmod(a, x % primes[i], primes[i]))).collect();
+        for &(top, k) in &pairs {
+            if let std::collections::btree_map::Entry::Vacant(e) = rr.entry(top) {
+                let specials: Vec<usize> = (nq..lay.rows()).collect();
+                let mut src = specials.clone();
+                src.extend([top - 1, top]);
+                let r: Vec<u32> = [top - 1, top].into_iter().chain(specials).map(|t| t as u32).collect();
+                let qab = |i: usize| mulmod(primes[top] % primes[i], primes[top - 1] % primes[i], primes[i]);
+                let al: Vec<u64> = (0..nq).map(|i| if i + 2 <= top { invmod(qab(i), primes[i]) } else { 0 }).collect();
+                let be: Vec<u64> = (0..nq).map(|i| if i + 2 <= top { invmod(mulmod(qab(i), pmod[i], primes[i]), primes[i]) } else { 0 }).collect();
+                e.insert(RelinRescale {
+                    rows: ConstBuf::new(arena, "bts.em", s, &r)?,
+                    md: md_plan::<_, W>(arena, s, &lay, &primes, &(0..kk_max).collect::<Vec<_>>(), &[0, 1], &src, top - 1, true)?,
+                    alpha: ScalarPair::new(arena, s, &primes[..nq], &al)?,
+                    beta: ScalarPair::new(arena, s, &primes[..nq], &be)?,
+                    wtop: ScalarPair::new(arena, s, &[primes[top - 1], primes[top]], &[pmod[top - 1], pmod[top], 1, 1])?,
+                });
+            }
+            if let Some(ki) = k {
+                if let std::collections::btree_map::Entry::Vacant(e) = rr_k.entry((ki, top)) {
+                    let row: Vec<W> = rescaled_const(&primes[..nq], &prog.consts[ki], top).into_iter().map(W::from_u64).collect();
+                    e.insert(ConstBuf::new(arena, "bts.em", s, &row)?);
+                }
+            }
+        }
         let plan = EvalModPlan {
             mode,
             ops,
@@ -452,6 +560,9 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             kk_max,
             relin_source,
             regen_epi,
+            rr,
+            rr_k,
+            fuse_rescale: true,
             bytes: 0,
             nq,
         };
@@ -717,6 +828,19 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                 }
                 EmOp::Rescale { x, n, k } => self.rescale_from(cx, base + *x, None, *n, *k, kk)?,
                 EmOp::Mult { dst, n, .. } | EmOp::MultAcc { dst, n, .. } => {
+                    // the rescale right after the relin rides its ModDown (`RelinRescale`)
+                    let regen = self.regen_epi.is_some() && self.relin_source == KskSource::Regen && self.relin.seeded();
+                    if let Some(EmOp::Rescale { x, n: n2, k: None }) = next {
+                        if self.fuse_rescale && regen && x == dst && n2 == n && self.rr.contains_key(&(n - 1)) {
+                            i += 1;
+                            match op {
+                                EmOp::Mult { a, b, epi, .. } => self.relin_rescale(cx, base, *dst, &[(*a, *b)], *n, false, *epi, kk)?,
+                                EmOp::MultAcc { pairs, epi, .. } => self.relin_rescale(cx, base, *dst, pairs, *n, true, *epi, kk)?,
+                                _ => unreachable!(),
+                            }
+                            continue;
+                        }
+                    }
                     // `dst += b` right after the relin rides its fused epilogue (regen path; exact: one more add mod p)
                     let add = match next {
                         Some(EmOp::Add { dst: d, a, b, n: n2, sub: false }) if self.regen_epi.is_some() && self.relin_source == KskSource::Regen && d == dst && a == dst && b != dst && n2 == n => {
@@ -814,6 +938,113 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut cx.work.lt_tmp.buf, &rp.ntt, kk * 2 * keep, None, Some(epi))
     }
 
+    /// One `ks_dot_regen` launch per <= REGEN_KMAX cts of the relinearization key over `nrows` rows of `rows`: raw
+    /// into `ks.ext` (`epi` None) or through the epilogue.
+    #[allow(clippy::too_many_arguments)]
+    fn regen_dot<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, rows: *const u32, nrows: usize, top: usize, kk: usize, epi: Option<pc_kernels::EpiArgs>) -> Result<()> {
+        let ctx = cx.ctx;
+        let lay = ctx.lay;
+        let re = self.regen_epi.as_ref().ok_or_else(|| shape("evalmod relin", "no in-place relinearization key tables"))?;
+        let ex = &*cx.ex;
+        let (pw, cw) = (lay.poly_words() as u64, lay.ct_words() as u64);
+        let mu_ct = (cx.ks.dnum * lay.poly_words()) as u64;
+        let ndig = cx.ks.ndig(top)?;
+        let ext = View::of(&ex.ks.ext, 0);
+        let mut c = 0;
+        while c < kk {
+            let kc = (kk - c).min(ks::REGEN_KMAX);
+            let at = |p: *const c_void, stride: u64| (p as *const W).wrapping_add(c * stride as usize) as *const c_void;
+            let out = at(ext.base, cw);
+            let ka = pc_kernels::KsArgs {
+                c1: at(ext.part::<W>(1).base, cw),
+                modup: at(ex.ks.digits.vptr(), mu_ct),
+                c0: std::ptr::null(),
+                out0: out as *mut c_void,
+                out1: (out as *const W).wrapping_add(pw as usize) as *mut c_void,
+                kb: re.kb.dptr() as *const *const c_void,
+                ka: re.kb.dptr() as *const *const c_void,
+                autok: re.autok.dptr(),
+                rows,
+                digit_of: re.digit_of.dptr(),
+                pmod: ctx.ks.p_mod_q.v.vptr(),
+                pmods: ctx.ks.p_mod_q.s.vptr(),
+                pr: ctx.pr(),
+                ct_stride: cw,
+                mu_ct_stride: mu_ct,
+                mu_digit_stride: pw,
+                out_ct_stride: cw,
+                out_rot_stride: 0,
+                key_digit_stride: re.key_digit_stride,
+                k: kc as i32,
+                r: 1,
+                ndig: ndig as i32,
+                c0_mode: 0,
+                nq: lay.nq as i32,
+                nrows: nrows as i32,
+            };
+            let (use_epi, e) = match epi {
+                Some(e) => (1, pc_kernels::EpiArgs { dst: at(e.dst, cw) as *mut c_void, conv: at(e.conv, cw), ..e }),
+                None => (0, pc_kernels::EpiArgs::default()),
+            };
+            let a = pc_kernels::KsRegenArgs { ks: ka, seed: re.seed, epi: e, use_epi, pad: 0, key: re.key, add: std::ptr::null() };
+            // SAFETY: kc-ct views of the KS workspace and the program buffers (prefix of kk <= k_max), the key's seed
+            // and stored `b`, row tables built at setup over rows of the context layout
+            launch_result("ks_dot_regen", unsafe { (ctx.table.ks_dot_regen)(&a, ex.compute.raw()) })?;
+            c += kc;
+        }
+        Ok(())
+    }
+
+    /// `dst = rescale(relin(sum of pairs' tensors) [x2] [+ const])` with the ModDown fused into the rescale
+    /// (`RelinRescale`; Regen relinearization key): rows 0..top-2 of dst, degree 1.
+    #[allow(clippy::too_many_arguments)]
+    fn relin_rescale<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, base: usize, dst: usize, pairs: &[(usize, usize)], n: usize, acc: bool, epi: Epi, kk: usize) -> Result<()> {
+        let ctx = cx.ctx;
+        let lay = ctx.lay;
+        let top = n - 1;
+        let rr = self.rr.get(&top).ok_or_else(|| shape("evalmod relin-rescale", format!("no plan for top {top}")))?;
+        let re = self.regen_epi.as_ref().ok_or_else(|| shape("evalmod relin-rescale", "no in-place relinearization key tables"))?;
+        let qrows = re.rows.get(&(top - 2)).ok_or_else(|| shape("evalmod relin-rescale", format!("no row table for top {}", top - 2)))?;
+        let (pw, nn) = (lay.poly_words() as u64, lay.n);
+        let dstv = View::of(&cx.work.em[base + dst], 0);
+        {
+            let ex = &mut *cx.ex;
+            let v = |i: usize| View::of(&cx.work.em[base + i], 0).r();
+            let (a0, b0) = (v(pairs[0].0), v(pairs[0].1));
+            let (a1, b1) = if pairs.len() > 1 { (v(pairs[1].0), v(pairs[1].1)) } else { (a0, b0) };
+            let ext = View::of(&ex.ks.ext, 0);
+            let t = TensorArgs { out: dstv.r(), d2: ext.r(), a0, b0, a1, b1, coef: std::ptr::null_mut(), coef_ct_stride: pw, pr: ctx.pr(), npairs: pairs.len() as i32, acc: acc as i32, n: n as i32, k: kk as i32 };
+            // SAFETY: as in `relin`
+            launch_result("tensor", unsafe { (ctx.table.tensor)(&t, ex.compute.raw()) })?;
+            ks::modup_from(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, ext.part::<W>(1), kk, top)?;
+        }
+        // 1. the dot over the two tops and the special rows, raw into ks.ext
+        self.regen_dot(cx, rr.rows.dptr(), 2 + lay.kp, top, kk, None)?;
+        let ex = &mut *cx.ex;
+        let s = &ex.compute;
+        // 2. the tops of the extended product: P c + dot
+        let row = |v: View, r: usize| PolyRef { base: (v.base as *mut W).wrapping_add(r * nn) as *mut c_void, ct_stride: v.ct_stride, part_stride: v.part_stride };
+        let ext = View::of(&ex.ks.ext, 0);
+        let mut src = [PolyRef::default(); 8];
+        src[0] = row(dstv, top - 1);
+        src[1] = row(ext, top - 1);
+        let pr = ctx.pr().wrapping_add(top - 1);
+        let w = WsumArgs { out: row(ext, top - 1), src, w: rr.wtop.v.vptr(), ws: rr.wtop.s.vptr(), pr, nsrc: 2, rowstride: 2, n: 2, k: kk as i32 };
+        // SAFETY: rows top-1, top of kk cts of the program buffer and of ks.ext (the prime table offset to those
+        // rows); element-wise, out aliasing src[1] index by index
+        launch_result("wsum", unsafe { (ctx.table.wsum)(&w, s.raw()) })?;
+        // 3. coefficient form of the 11 source rows, the exact conversion to rows 0..top-2, their NTT
+        rr.md.run(ctx, s, &mut ex.ks.ext.buf, &mut ex.ks.conv.buf, kk)?;
+        // 4. the Q-row dot into dst = alpha c + beta (dot - conv) [x2] [+ the rescaled constant]
+        let conv = View::of(&ex.ks.conv, 0);
+        let k = match epi.k {
+            Some(ki) => self.rr_k.get(&(ki, top)).ok_or_else(|| shape("evalmod relin-rescale", format!("no rescaled constant {ki} at top {top}")))?.vptr(),
+            None => std::ptr::null(),
+        };
+        let e = pc_kernels::EpiArgs { dst: dstv.base, conv: conv.base, binv: rr.beta.v.vptr(), binvs: rr.beta.s.vptr(), k, part_stride: pw, dbl: epi.dbl as i32, pad: 0, alpha: rr.alpha.v.vptr(), alphas: rr.alpha.s.vptr() };
+        self.regen_dot(cx, qrows.dptr(), top - 1, top, kk, Some(e))
+    }
+
     /// dst = relin(sum of pairs' tensors) [x2] [+ const] [+ buffer `add`] (Mult: one pair; MultAcc: accumulate onto
     /// dst's tensor). `add` only on the fused regen epilogue path (the caller checks).
     #[allow(clippy::too_many_arguments)]
@@ -904,6 +1135,8 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                             part_stride: pw,
                             dbl: epi.dbl as i32,
                             pad: 0,
+                            alpha: std::ptr::null(),
+                            alphas: std::ptr::null(),
                         };
                         let addp = add.map(|b| at(View::of(&cx.work.em[base + b], 0).base, dstv.ct_stride)).unwrap_or(std::ptr::null());
                         let a = pc_kernels::KsRegenArgs { ks: ka, seed: re.seed, epi: e, use_epi: 1, pad: 0, key: re.key, add: addp };

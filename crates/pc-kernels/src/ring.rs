@@ -4,7 +4,7 @@ use crate::args::{BconvArgs, EwArgs, Launch, NttArgs, PrimeConst};
 use crate::table::TableError;
 use std::ffi::c_void;
 
-pub const RING_ABI: u32 = 6;
+pub const RING_ABI: u32 = 7;
 /// Ring sizes with a table when the feature is on.
 pub const RING_LOG_N: std::ops::RangeInclusive<u32> = 10..=17;
 

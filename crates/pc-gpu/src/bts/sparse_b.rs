@@ -36,11 +36,14 @@ pub struct SparseBCfg {
     pub b_step: u32,
     pub k_max: usize,
     pub ks_source: KskSource,
+    /// As `BtsSetup::lt_tails` / `em_fuse_rescale`.
+    pub lt_tails: bool,
+    pub em_fuse_rescale: bool,
 }
 
 impl SparseBCfg {
     pub fn n32(slots: u32, raise_drop: u32) -> Self {
-        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen }
+        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false }
     }
 }
 
@@ -160,7 +163,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let lt = |top: usize| -> Result<usize> {
             Ok(LtPts::<W>::coeffs_bytes(geo.npts, top + 1 + lay.kp, n, n) + LtStage::<W>::plan_bytes(&lay, &primes, &geo, top, LtEnd::ModDown, cfg.k_max)?)
         };
-        let tails = tail_steps(chain, &[(geo, tops.0)], LT_REGEN_DIGITS).len();
+        let tails = if cfg.lt_tails { tail_steps(chain, &[(geo, tops.0)], LT_REGEN_DIGITS).len() } else { 0 };
         Ok(vec![
             ("raise", RaisePlan::<W>::table_bytes()),
             ("fold", AccRounds::bytes(&rr[0])),
@@ -239,12 +242,14 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let geo = Self::lt_geom(&g);
         let sf_c = st.sf(top as i32)?;
         let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Slots { values: &p, scale: sf_c })?;
-        let tails = KeyTails::new(arena, s, ctx, keys, &tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS), LT_REGEN_DIGITS)?;
+        let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS) } else { Vec::new() };
+        let tails = KeyTails::new(arena, s, ctx, keys, &steps, LT_REGEN_DIGITS)?;
         let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring(keys, n)?, stage, cfg.k_max)?;
         mark("cts", &mut parts);
         let cts_acc = AccRounds::new(arena, s, n, keys, stage, r_cts)?;
         mark("cts_acc", &mut parts);
-        let em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &ps_k24()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
+        let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &ps_k24()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
+        em.fuse_rescale = cfg.em_fuse_rescale;
         mark("em", &mut parts);
         let sf_s = st.sf(stc_top as i32)?;
         let stc_pts = LtPts::new(arena, s, ctx, stc_top, PtSource::Slots { values: &q, scale: sf_s })?;

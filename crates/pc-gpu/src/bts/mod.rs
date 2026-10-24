@@ -135,6 +135,12 @@ pub struct BtsSetup {
     /// With `lt_baby` Regen: digits whose `a` is regenerated (the rest read the resident `a` when the keys have it;
     /// usize::MAX = all).
     pub lt_regen_digits: usize,
+    /// Resident `a` tails from digit `lt_regen_digits` on for the CtS baby keys of packed key sets (`cts::KeyTails`,
+    /// config `bts.lt_tails`); off: those stages regenerate every digit.
+    pub lt_tails: bool,
+    /// EvalMod: a Regen relinearization and the rescale after it as one exact conversion (`EvalModPlan::fuse_rescale`,
+    /// config `bts.em_fuse_rescale`); off: relinearize, then rescale.
+    pub em_fuse_rescale: bool,
 }
 
 impl BtsSetup {
@@ -159,6 +165,8 @@ impl BtsSetup {
             lt_group: 0,
             lt_baby: KskSource::Regen,
             lt_regen_digits: cts::LT_REGEN_DIGITS,
+            lt_tails: true,
+            em_fuse_rescale: false,
         }
     }
 

@@ -423,7 +423,7 @@ pub fn key_switch_inplace<W: DevWord, M: DevStrategy<W>>(
         ks::stage_key(ctx, &ex.compute, plans, &mut ex.ks, group, 0, ndig, true)?;
     }
     ks::dot(ctx, &ex.compute, plans, &ex.ks, group, 0, 1, k, top, DotRows::All, io, staged)?;
-    ks::moddown_to(ctx, &ex.compute, plans, &mut ex.ks.ext, &mut ex.ks.conv, View::of(x, 0), false, k, top)
+    ks::moddown_to(ctx, &ex.compute, plans, &mut ex.ks.ext, &mut ex.ks.conv, View::of(x, 0), ks::MdOut::Set, k, top)
 }
 
 /// The key tables of the two encapsulation keys (setup).

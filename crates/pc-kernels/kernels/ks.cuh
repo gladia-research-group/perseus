@@ -165,6 +165,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
                 const W bi = ((const W*)E.binv)[t], bis = ((const W*)E.binvs)[t];
                 const W* kp = (const W*)E.k;
                 const W kk = kp ? (kp[t] >= p ? (W)(kp[t] - p) : kp[t]) : (W)0;
+                const W* al = (const W*)E.alpha;
+                const W ai = al ? al[t] : (W)0, ais = al ? ((const W*)E.alphas)[t] : (W)0;
 #pragma unroll
                 for (int part = 0; part < 2; ++part) {
                     W* dp = (W*)E.dst + ob + part * E.part_stride;
@@ -175,7 +177,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
 #pragma unroll
                     for (int w = 0; w < 4; ++w) {
                         const W x = part ? r1[w] : r0[w];
-                        W r = add<W>(dv.v[w], mul_shoup<W>(sub<W>(x, cv.v[w], p), bi, bis, p), p);
+                        const W d = al ? mul_shoup<W>(dv.v[w], ai, ais, p) : dv.v[w];
+                        W r = add<W>(d, mul_shoup<W>(sub<W>(x, cv.v[w], p), bi, bis, p), p);
                         if (E.dbl) r = add<W>(r, r, p);
                         if (part == 0) r = add<W>(r, kk, p);
                         if (G.add) r = add<W>(r, av.v[w], p);

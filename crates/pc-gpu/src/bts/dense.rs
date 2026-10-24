@@ -178,6 +178,9 @@ impl DensePlan {
 
     /// The CtS baby steps whose keys get a resident `a` tail (`KeyTails`) from digit `lt_regen_digits` on.
     pub fn tail_steps(&self) -> Vec<i64> {
+        if !self.setup.lt_tails {
+            return Vec::new();
+        }
         let st: Vec<(LtGeom, usize)> = self.variants.iter().flat_map(|v| v.cts.iter().map(|h| (h.geom, h.top))).collect();
         tail_steps(&self.chain, &st, self.setup.lt_regen_digits)
     }
@@ -230,7 +233,11 @@ impl DensePlan {
             Ok(st)
         };
         for v in &self.variants {
-            let em_k = |mode| EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.ps, self.setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, self.setup.em_relin);
+            let em_k = |mode| {
+                let mut em = EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.ps, self.setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, self.setup.em_relin)?;
+                em.fuse_rescale = self.setup.em_fuse_rescale;
+                Ok::<_, crate::error::Error>(em)
+            };
             variants.push(BtsPrecomp {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
@@ -324,7 +331,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> DenseRoute<'a, W, M> {
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.conj, 0, ndig, true)?;
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, k, top, DotRows::All, io, staged)?;
-            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, true, k, top)?;
+            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, ks::MdOut::Add, k, top)?;
         }
         Ok(())
     }

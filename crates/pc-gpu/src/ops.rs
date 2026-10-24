@@ -818,6 +818,45 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Ok(())
     }
 
+    /// Whether `mult_pt_add_inplace` runs: `mult_pt_add_fusable` and no prelude on `a` either (it would run in `acc`).
+    pub fn mult_pt_add_inplace_fusable(sh: &Shadow, a: &CtMeta, pt: &PtMeta, acc: &CtMeta, sub: bool, product_first: bool) -> Result<bool> {
+        let (r1, _) = Self::mac_recipes(sh, a, pt, acc, sub, product_first)?;
+        Ok(r1.pre.is_empty() && Self::mult_pt_add_fusable(sh, a, pt, acc, sub, product_first)?)
+    }
+
+    /// In place: `acc = acc + a * pt` (`sub`: `acc - a * pt`, or `a * pt - acc` when `product_first`), `mult_pt_add`
+    /// with out = y = acc (an add landing in its other operand's slot); the same words and output meta. Needs
+    /// `mult_pt_add_inplace_fusable`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_pt_add_inplace<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        sh: &Shadow,
+        acc: &mut Ct<'_, W>,
+        a: &Ct<'_, W>,
+        pt: &Pt<'_>,
+        sub: bool,
+        product_first: bool,
+    ) -> Result<()> {
+        if !Self::mult_pt_add_inplace_fusable(sh, &a.meta, &pt.meta, &acc.meta, sub, product_first)? {
+            return Err(shape("mult_pt_add_inplace", "a prelude on a, the plaintext or the add: run mult_pt then add"));
+        }
+        let (r1, r2) = Self::mac_recipes(sh, &a.meta, &pt.meta, &acc.meta, sub, product_first)?;
+        Self::check_k("mult_pt_add_inplace", acc.k(), a.k())?;
+        if a.meta.level != r1.out.level {
+            return Err(shape("mult_pt_add_inplace", format!("a at level {} but the product is at {}", a.meta.level, r1.out.level)));
+        }
+        let top = self.top(ctx.shape, &a.meta)?;
+        let y = acc.buf.r();
+        let m = MulTableArgs { out: acc.buf.w(), inp: a.buf.r(), t: pt.poly().base, pr: ctx.pr(), n: (top + 1) as i32, k: acc.k() as i32 };
+        let args = MulAddArgs { m, y, sub: if !sub { 0 } else if product_first { 2 } else { 1 }, pad: 0 };
+        // SAFETY: as in mult_pt_add; out == y is the element-wise in-place form (each thread reads before it writes)
+        launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, ex.compute.raw()) })?;
+        acc.meta = r2.out;
+        Ok(())
+    }
+
     /// `out[j] = i * a[j]`: the monomial X^{N/2} (level and degree kept; exact).
     pub fn mult_i<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut [Ct<'_, W>], a: &[&Ct<'_, W>]) -> Result<()> {
         lens("mult_i", out.len(), &[a.len()])?;

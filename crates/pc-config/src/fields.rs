@@ -23,7 +23,7 @@ section! {
 }
 
 section! {
-    /// `bts` (27 legacy env names).
+    /// `bts` (29 legacy env names).
     BtsSection "bts" {
         #[doc = "`AUTO_BTS_LEVEL`. Default None. Read at impl/fakecap.py::make_session; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39; runtime= 6."]
@@ -43,12 +43,18 @@ section! {
         #[doc = "`FIDESLIB_CTS_ALT_BUDGET`. Default (unset). Read at RawCiphertext.cu: alternative CtS level budget (0 = off)."]
         #[doc = "Shipped plans: runtime= llama128."]
         cts_alt_budget: Int = "FIDESLIB_CTS_ALT_BUDGET", "(unset)";
+        #[doc = "EvalMod: a Regen relinearization and the rescale after it as one exact conversion (pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale)."]
+        #[doc = "Runtime switch `PC_EM_FUSE_RESCALE`."]
+        em_fuse_rescale: Flag = "PC_EM_FUSE_RESCALE", "(unset)";
         #[doc = "`FIDESLIB_GPU_ENCODE`. Default (unset). Read at examples/gpt2/env.py::ENV; examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: none."]
         gpu_encode: Flag = "FIDESLIB_GPU_ENCODE", "(unset)";
         #[doc = "Ciphertexts per batched bootstrap launch (PLAN.md Program: K-batching; 8)."]
         #[doc = "No legacy env name."]
         k_max: Int = "", "(unset)";
+        #[doc = "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu `BtsSetup::lt_tails`; default on, off = those stages regenerate every digit)."]
+        #[doc = "Runtime switch `PC_LT_TAILS`."]
+        lt_tails: Flag = "PC_LT_TAILS", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";
