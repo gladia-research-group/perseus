@@ -55,7 +55,7 @@ jobs:
             gh pr comment "$PR" --body-file "$RUNNER_TEMP/report.md"
           if [ "${{ steps.check.outputs.ok }}" = 1 ]; then
             gh pr edit "$PR" --add-label checked --remove-label check-failed
-            gh pr edit "$PR" --add-reviewer alexzilligmm || true
+            for r in alexzilligmm Davide-F5-Marincione; do gh pr edit "$PR" --add-reviewer "$r" || true; done
           else
             gh pr edit "$PR" --add-label check-failed --remove-label checked
             exit 1
