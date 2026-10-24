@@ -96,6 +96,7 @@ class Gpt2Handler:
         r = self.run_
         r.bundle = path
         r.setup(self.rows, argmax=self.argmax)
+        r.precompute(self.rows, argmax=self.argmax)
         assert not r.sess.has_secret and not r.fhe.has_secret_key
         s, k = r.sess.setup_seconds()
         return {"session_s": round(s, 2), "import_s": round(k, 2), "keys": r.sess.n_keys(), "has_secret": r.sess.has_secret}
