@@ -154,3 +154,25 @@ pub fn run_batch<'a, W: DevWord, M: DevStrategy<W>>(
     route.run(cx, std::slice::from_mut(&mut slots.x), &r)?;
     slots.scatter(cx, b)
 }
+
+/// Copy the live rows (Q `0..=top` at `src`'s metadata, both parts) of single ciphertext `src` into ciphertext `at` of
+/// the K-ciphertext buffer `dst` (a gather), on the compute lane.
+pub fn put<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, at: usize, src: &Ct<'_, W>) -> Result<()> {
+    let top = src.top(ctx.shape)?;
+    if src.k() != 1 || at >= dst.buf.buf.len() / ctx.lay.ct_words() || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay {
+        return Err(shape("batch put", format!("ciphertext {at} of a {}-ciphertext buffer", dst.buf.buf.len() / ctx.lay.ct_words())));
+    }
+    ks::ew(ctx, s, ks::Ew::Copy, View::of(&dst.buf, at), View::of(&src.buf, 0), None, ctx.lay.rs_q(top), 1, 2)
+}
+
+/// Copy ciphertext `at` of the K-ciphertext buffer `src` (its live rows at `meta`) into single ciphertext `dst`, which
+/// takes `meta` (a scatter), on the compute lane.
+pub fn take<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, src: &Ct<'_, W>, at: usize, meta: CtMeta) -> Result<()> {
+    let top = pc_shadow::meta::top_limb(ctx.shape, meta.level)? as usize;
+    if dst.k() != 1 || at >= src.k() || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay {
+        return Err(shape("batch take", format!("ciphertext {at} of a {}-ciphertext batch", src.k())));
+    }
+    ks::ew(ctx, s, ks::Ew::Copy, View::of(&dst.buf, 0), View::of(&src.buf, at), None, ctx.lay.rs_q(top), 1, 2)?;
+    dst.meta = meta;
+    Ok(())
+}

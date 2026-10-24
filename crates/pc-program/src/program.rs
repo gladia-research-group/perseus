@@ -308,7 +308,186 @@ pub struct Program {
     pub check: CheckReport,
 }
 
+/// Ciphertexts a rotation grid reads (pc-gpu `ks::KEY_KMAX`: one inner-product launch serves them all).
+pub const GRID_INPUTS: usize = 4;
+
+/// A run of consecutive rotation ops the replay executes as one grid (pc-gpu `rotate::rotate_grid`): ops
+/// `ops.0..ops.1`, the ciphertexts they rotate and their distinct steps (both in first-use order).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridSpec {
+    pub ops: (usize, usize),
+    pub ins: Vec<VarId>,
+    pub steps: Vec<i64>,
+}
+
+/// Rotation ops of the same inputs that share one ModUp (`Program::rotation_chains`): their op indices, the inputs
+/// and the distinct steps (first-use order); `held`: the ModUp lives in buffers of the chain's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChainSpec {
+    pub ops: Vec<usize>,
+    pub ins: Vec<VarId>,
+    pub steps: Vec<i64>,
+    pub held: bool,
+}
+
 impl Program {
+    /// The rotation grids: maximal runs of consecutive rotation ops (single or K-batched) reading at most
+    /// `GRID_INPUTS` ciphertexts of one level, none produced in the run, every output in a slot of its own that is no
+    /// input's (alloc may hand a slot freed inside the run to a later output: the run stops there). A run is a grid
+    /// when it rotates some input by two or more steps (a ModUp to share): the hoisted baby steps of a linear, or the
+    /// compiler's K-batches of one step over the same few inputs, step after step.
+    pub fn rotation_grids(&self) -> Vec<GridSpec> {
+        let rot = |op: &Op| op.members().iter().all(|m| matches!(m.kind, Kind::Rotate(k) if k != 0) && m.pre.is_empty() && m.ins.len() == 1 && m.outs.len() == 1);
+        let slot = |v: VarId| self.vars[v as usize].slot;
+        let mut out = vec![];
+        let mut i = 0;
+        while i < self.ops.len() {
+            if !rot(&self.ops[i]) {
+                i += 1;
+                continue;
+            }
+            let (mut ins, mut outs, mut made): (Vec<VarId>, Vec<Option<u32>>, Vec<VarId>) = (vec![], vec![], vec![]);
+            let mut j = i;
+            while j < self.ops.len() && rot(&self.ops[j]) {
+                let (mut ins2, mut outs2) = (ins.clone(), outs.clone());
+                let mut ok = true;
+                for m in self.ops[j].members() {
+                    let x = m.ins[0];
+                    ok &= !made.contains(&x) && ins2.first().is_none_or(|&f| self.vars[f as usize].meta.level == self.vars[x as usize].meta.level);
+                    if !ins2.contains(&x) {
+                        ins2.push(x);
+                    }
+                    outs2.push(slot(m.outs[0]));
+                }
+                let in_slots: Vec<Option<u32>> = ins2.iter().map(|&x| slot(x)).collect();
+                let mut seen = std::collections::BTreeSet::new();
+                ok &= ins2.len() <= GRID_INPUTS && outs2.iter().all(|s| s.is_some() && !in_slots.contains(s) && seen.insert(*s));
+                if !ok {
+                    break;
+                }
+                made.extend(self.ops[j].all_outs());
+                (ins, outs) = (ins2, outs2);
+                j += 1;
+            }
+            if j == i {
+                i += 1;
+                continue;
+            }
+            let mut pairs: Vec<(VarId, i64)> = vec![];
+            let mut steps: Vec<i64> = vec![];
+            for m in self.ops[i..j].iter().flat_map(|o| o.members()) {
+                if let Kind::Rotate(k) = m.kind {
+                    if !steps.contains(&k) {
+                        steps.push(k);
+                    }
+                    if !pairs.contains(&(m.ins[0], k)) {
+                        pairs.push((m.ins[0], k));
+                    }
+                }
+            }
+            if ins.iter().any(|&x| pairs.iter().filter(|q| q.0 == x).count() >= 2) {
+                out.push(GridSpec { ops: (i, j), ins, steps });
+            }
+            i = j;
+        }
+        out
+    }
+
+    /// The rotation chains: rotation ops outside the grids (single or K-batched, at most `GRID_INPUTS` ciphertexts of
+    /// one level, outputs in slots of their own that are no input's) that rotate the same inputs. The first link
+    /// gathers its inputs and runs their ModUp, the later links reuse both. A `held` chain keeps them in buffers of
+    /// its own (one set: held chains do not overlap; the first ones in op order are taken), so anything may run
+    /// between its links; any other chain keeps them in the key-switching workspaces and the gather buffer, so only
+    /// element-wise ops and rescales (which leave both alone) separate its links. `ChainSpec::ops` lists the links
+    /// (two or more); `ins` and `steps` are in first-use order, like a grid's.
+    pub fn rotation_chains(&self) -> Vec<ChainSpec> {
+        let grids = self.rotation_grids();
+        let in_grid = |i: usize| grids.iter().any(|g| i >= g.ops.0 && i < g.ops.1);
+        let slot = |v: VarId| self.vars[v as usize].slot;
+        let quiet = |op: &Op| {
+            op.members().iter().all(|m| {
+                matches!(m.kind, Kind::Add | Kind::Sub | Kind::AddPt(_) | Kind::MultPt(_) | Kind::AddConst(_) | Kind::MultConst(_) | Kind::Negate | Kind::MultI | Kind::Rescale | Kind::DropTo(_))
+            })
+        };
+        // a rotation op's inputs (first-use order), when it can be a chain link
+        let link = |op: &Op| -> Option<Vec<VarId>> {
+            let m = op.members();
+            if !m.iter().all(|x| matches!(x.kind, Kind::Rotate(k) if k != 0) && x.pre.is_empty() && x.ins.len() == 1 && x.outs.len() == 1) {
+                return None;
+            }
+            let mut ins: Vec<VarId> = vec![];
+            for x in m {
+                if !ins.contains(&x.ins[0]) {
+                    ins.push(x.ins[0]);
+                }
+            }
+            let level = self.vars[ins[0] as usize].meta.level;
+            let in_slots: Vec<Option<u32>> = ins.iter().map(|&x| slot(x)).collect();
+            let mut seen = std::collections::BTreeSet::new();
+            let ok = ins.len() <= GRID_INPUTS
+                && ins.iter().all(|&x| self.vars[x as usize].meta.level == level)
+                && m.iter().all(|x| slot(x.outs[0]).is_some_and(|s| !in_slots.contains(&Some(s)) && seen.insert(s)));
+            ok.then_some(ins)
+        };
+        let same = |a: &[VarId], b: &[VarId]| a.len() == b.len() && a.iter().all(|x| b.contains(x));
+        let add = |c: &mut ChainSpec, i: usize| {
+            c.ops.push(i);
+            for m in self.ops[i].members() {
+                if let Kind::Rotate(k) = m.kind {
+                    if !c.steps.contains(&k) {
+                        c.steps.push(k);
+                    }
+                }
+            }
+        };
+        let links: Vec<Option<Vec<VarId>>> = self.ops.iter().enumerate().map(|(i, op)| if in_grid(i) { None } else { link(op) }).collect();
+        // held chains: every link of one input set, spans [first, last] taken in order when they do not overlap
+        let mut by_set: Vec<ChainSpec> = vec![];
+        for (i, l) in links.iter().enumerate() {
+            if let Some(ins) = l {
+                match by_set.iter_mut().find(|c| same(&c.ins, ins)) {
+                    Some(c) => add(c, i),
+                    None => {
+                        let mut c = ChainSpec { ops: vec![], ins: ins.clone(), steps: vec![], held: true };
+                        add(&mut c, i);
+                        by_set.push(c);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<ChainSpec> = vec![];
+        let mut end = None;
+        for c in by_set.into_iter().filter(|c| c.ops.len() >= 2) {
+            if end.is_none_or(|e| c.ops[0] > e) {
+                end = c.ops.last().copied();
+                out.push(c);
+            }
+        }
+        let taken: std::collections::BTreeSet<usize> = out.iter().flat_map(|c| c.ops.iter().copied()).collect();
+        // the other links: chains of consecutive links of one input set, only quiet ops between them
+        let mut cur: Option<ChainSpec> = None;
+        let close = |cur: &mut Option<ChainSpec>, out: &mut Vec<ChainSpec>| {
+            if let Some(c) = cur.take().filter(|c| c.ops.len() >= 2) {
+                out.push(c);
+            }
+        };
+        for (i, op) in self.ops.iter().enumerate() {
+            match links[i].as_ref().filter(|_| !taken.contains(&i)) {
+                Some(ins) => {
+                    if !cur.as_ref().is_some_and(|c| same(&c.ins, ins)) {
+                        close(&mut cur, &mut out);
+                        cur = Some(ChainSpec { ops: vec![], ins: ins.clone(), steps: vec![], held: false });
+                    }
+                    add(cur.as_mut().expect("a chain is open"), i);
+                }
+                None if taken.contains(&i) || quiet(op) => {}
+                None => close(&mut cur, &mut out),
+            }
+        }
+        close(&mut cur, &mut out);
+        out
+    }
+
     /// The var a graph name is bound to at the end of the block.
     pub fn var(&self, name: &str) -> Option<VarId> {
         self.names.get(name).copied()

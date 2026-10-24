@@ -222,6 +222,101 @@ pub enum SumForm {
     InModDown,
 }
 
+/// A grid of rotations of up to `KEY_KMAX` ciphertexts: `outs[j].2 = rot(xs[outs[j].0], steps[outs[j].1])`. One ModUp
+/// per input (hoisted), each key's inner product over every input in one launch (K-batched: one read or regeneration
+/// of the key for all of them), one ModDown per (input, step) pair; every output is bit-identical to a plain rotation.
+/// Several inputs are first copied into `gather` (the inner product reads its inputs at one stride); outputs sharing
+/// an (input, step) pair are computed once. `group` holds the steps' keys in order; the outputs are distinct buffers,
+/// none of them an input. `fresh` false: `gather` and the ModUp workspace still hold these inputs' copies and ModUp
+/// from an earlier grid of the same inputs (nothing switched keys on this executor since), so both are reused.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    group: &KeyGroup<'_>,
+    xs: &[&Ct<'_, W>],
+    gather: Option<&mut Ct<'_, W>>,
+    fresh: bool,
+    steps: &[i64],
+    outs: &mut [(usize, usize, &mut Ct<'_, W>)],
+) -> Result<()> {
+    let k = xs.len();
+    let lay = ctx.lay;
+    let fits = |g: &Ct<'_, W>| g.buf.lay == lay && g.buf.buf.len() >= k * lay.ct_words();
+    if k == 0 || k > ks::KEY_KMAX || (k > 1 && !gather.as_deref().is_some_and(fits)) {
+        return Err(shape("rotate_grid", format!("{k} inputs (1..={}; several need a gather buffer of as many)", ks::KEY_KMAX)));
+    }
+    let top = top_of(ctx, xs[0])?;
+    for x in xs {
+        if x.k() != 1 || x.buf.lay != lay || top_of(ctx, x)? != top {
+            return Err(shape("rotate_grid", "inputs must be single ciphertexts of the context layout at one level"));
+        }
+    }
+    let mut key = Vec::with_capacity(steps.len());
+    for &st in steps {
+        let g = pc_core::galois::rotation_galois(st, lay.n)?;
+        key.push(if g == 1 { None } else { Some(key_index(group, g)?) });
+    }
+    for (c, s, o) in outs.iter_mut() {
+        if *c >= k || *s >= steps.len() || o.k() != 1 || o.buf.lay != lay {
+            return Err(shape("rotate_grid", format!("output of input {c}, step {s}: {k} inputs, {} steps, one ciphertext each", steps.len())));
+        }
+        o.meta = sh.rotate(&xs[*c].meta, steps[*s]).out;
+        if key[*s].is_none() {
+            ew(ctx, &ex.compute, Ew::Copy, View::of(&o.buf, 0), View::of(&xs[*c].buf, 0), None, lay.rs_q(top), 1, 2)?;
+        }
+    }
+    // (key index, step index) of the steps some output takes, in key order: a run of consecutive keys is one launch
+    // per stage
+    let mut live: Vec<(usize, usize)> = key.iter().enumerate().filter(|(s, _)| outs.iter().any(|o| o.1 == *s)).filter_map(|(s, r)| r.map(|r| (r, s))).collect();
+    live.sort_unstable();
+    live.dedup_by_key(|x| x.0);
+    if live.is_empty() {
+        return Ok(());
+    }
+    let x: &Ct<'_, W> = match gather {
+        Some(g) if k > 1 => {
+            if fresh {
+                g.buf.k = k;
+                g.meta = xs[0].meta;
+                for (c, x) in xs.iter().enumerate() {
+                    ew(ctx, &ex.compute, Ew::Copy, View::of(&g.buf, c), View::of(&x.buf, 0), None, lay.rs_q(top), 1, 2)?;
+                }
+            } else if g.buf.k != k {
+                return Err(shape("rotate_grid", format!("reused gather buffer holds {} inputs, the grid reads {k}", g.buf.k)));
+            }
+            &*g
+        }
+        _ => xs[0],
+    };
+    if fresh {
+        ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
+    }
+    let per = (kc.plans.k_max / k).max(1);
+    let mut j = 0;
+    while j < live.len() {
+        let mut m = 1;
+        while j + m < live.len() && m < per && live[j + m].0 == live[j].0 + m {
+            m += 1;
+        }
+        let io = io_of(x, View::of(&ex.ks.ext, 0), k);
+        dots(ctx, ex, kc, group, live[j].0, m, k, top, io)?;
+        ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top)?;
+        for (t, &(r, _)) in live[j..j + m].iter().enumerate() {
+            for (c, s, o) in outs.iter_mut() {
+                if key[*s] == Some(r) {
+                    let e = t * k + *c;
+                    ew(ctx, &ex.compute, Ew::SubMulPinv, View::of(&o.buf, 0), View::of(&ex.ks.ext, e), Some(View::of(&ex.ks.conv, e)), lay.rs_q(top), 1, 2)?;
+                }
+            }
+        }
+        j += m;
+    }
+    Ok(())
+}
+
 /// In place: `acc = acc + sum_k rot(acc, steps[k])`, the rotations summed in the extended basis, one ModDown.
 #[allow(clippy::too_many_arguments)]
 pub fn rotate_sum_inplace<W: DevWord, M: DevStrategy<W>>(
@@ -321,6 +416,45 @@ pub fn rotate_sum<W: DevWord, M: DevStrategy<W>>(
     copy_q(ctx, ex, x, out, top)?;
     out.meta = x.meta;
     rotate_sum_inplace(ctx, ex, kc, sh, group, out, steps)
+}
+
+/// K sibling rotate_sums of one step list: `outs[c] = xs[c] + sum_k rot(xs[c], steps[k])`, the inputs copied into
+/// `gather` (the launches read K ciphertexts at one stride) and summed as one K-batch, so each key is read or
+/// regenerated once for all of them; the sums are copied out. Bit-identical to `rotate_sum` of each input.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_sum_batch<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    group: &KeyGroup<'_>,
+    xs: &[&Ct<'_, W>],
+    gather: &mut Ct<'_, W>,
+    steps: &[i64],
+    outs: &mut [&mut Ct<'_, W>],
+) -> Result<()> {
+    let k = xs.len();
+    let lay = ctx.lay;
+    if k == 0 || k > ks::KEY_KMAX || outs.len() != k || gather.buf.lay != lay || gather.buf.buf.len() < k * lay.ct_words() {
+        return Err(shape("rotate_sum_batch", format!("{k} inputs, {} outputs (1..={} each, a gather buffer of as many)", outs.len(), ks::KEY_KMAX)));
+    }
+    let top = top_of(ctx, xs[0])?;
+    for (x, o) in xs.iter().zip(outs.iter()) {
+        if x.k() != 1 || o.k() != 1 || x.buf.lay != lay || o.buf.lay != lay || top_of(ctx, x)? != top {
+            return Err(shape("rotate_sum_batch", "inputs and outputs must be single ciphertexts of the context layout, inputs at one level"));
+        }
+    }
+    gather.buf.k = k;
+    gather.meta = xs[0].meta;
+    for (c, x) in xs.iter().enumerate() {
+        ew(ctx, &ex.compute, Ew::Copy, View::of(&gather.buf, c), View::of(&x.buf, 0), None, lay.rs_q(top), 1, 2)?;
+    }
+    rotate_sum_inplace(ctx, ex, kc, sh, group, gather, steps)?;
+    for (c, o) in outs.iter_mut().enumerate() {
+        ew(ctx, &ex.compute, Ew::Copy, View::of(&o.buf, 0), View::of(&gather.buf, c), None, lay.rs_q(top), 1, 2)?;
+        o.meta = sh.rotate_sum(&xs[c].meta, steps).out;
+    }
+    Ok(())
 }
 
 fn add_inplace<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, acc: &mut Ct<'_, W>, y: &Ct<'_, W>, top: usize) -> Result<()> {

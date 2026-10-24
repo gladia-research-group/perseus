@@ -1345,7 +1345,7 @@ class PlannedPrefill:
     `plan_dir`: the block plans; `config`: the session Config (plan_runtime over the prefill preset)."""
 
     def __init__(self, model, plan_dir, config, keys, *, work_dir, pt_rows=28, stc_cache=8, pool=16, pcmm_cf=6,
-                 check_meta=False, log=print, schedule="program"):
+                 check_meta=False, log=print, schedule="siblings"):
         self.model, self.plan_dir, self.cfg, self.keys = model, str(plan_dir), config, keys
         self.work_dir, self.pt_rows, self.stc_cache, self.pool = work_dir, pt_rows, stc_cache, pool
         self.pcmm_cf, self.check_meta, self.log = pcmm_cf, check_meta, log
@@ -1428,7 +1428,7 @@ class PlannedPrefill:
                 metas[lab] = {n: self.in_metas[b][names.index(n)] for n in ins}
             live[lab] = list(r.out_names)
         self.progs = _pc.Program.compile(self.work_dir, self.plan_dir, config=self.cfg, blocks=self.labels,
-                                         live_out=live, input_metas=metas)
+                                         live_out=live, input_metas=metas, schedule=self.schedule)
         # registers: every block's outputs (the stage order), kept to the end (the per-block check reads them)
         self.reg, n = {}, 0
         for b in range(self.n_stages):

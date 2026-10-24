@@ -2,8 +2,9 @@
 //! exist at the first sibling's position run as one `Kind::Batched` launch of up to `k_max` members. A later sibling
 //! is hoisted to the first one's position only when every input it reads is produced before that position (the
 //! dependency slack); that also makes the members mutually independent. Passes in order: bootstraps (same route),
-//! key-switching rotations (rotate of one step, rotate_sum of one step list, conjugate), products, rescales.
-//! Plaintext and scalar operands may differ between members (the "const shape" is what must agree).
+//! key-switching rotations (rotate of one step, rotate_sum of one step list, conjugate), relinearized products,
+//! rescales. Plaintext and scalar operands may differ between members (the "const shape" is what must agree).
+//! Products by a plaintext or a constant stay where the capture put them, next to the sum that reads them.
 use crate::program::{BatchReport, Kind, KindCount, Op, Program, VarId};
 use std::collections::{BTreeMap, HashMap};
 
@@ -13,7 +14,7 @@ fn key(p: &Program, op: &Op, pass: Option<usize>, cf_free: bool) -> Option<Strin
     let class = match k {
         Kind::Bootstrap(_) => 0,
         Kind::Rotate(_) | Kind::RotateSum(_) | Kind::Conjugate => 1,
-        Kind::Mult | Kind::Square | Kind::MultPt(_) | Kind::MultConst(_) => 2,
+        Kind::Mult | Kind::Square => 2,
         Kind::Rescale => 3,
         _ => return None,
     };
@@ -110,13 +111,28 @@ pub enum Schedule {
     /// List scheduling by (ASAP depth, capture index): independent chains of the same shape advance in lockstep, so
     /// their siblings are ready together (more batching, more live ciphertexts).
     Lockstep,
+    /// The capture's order, except that the siblings of a rotate_sum or a dense StC-first refresh (the launches a
+    /// K-batch makes cheaper per ciphertext: one read of each key, one pass over the route's tables) are pulled
+    /// forward together with the ops they wait for (`PULL_OPS` at most, from the next `PULL_WINDOW` ops): independent
+    /// chains of one shape meet at those launches, a few chain states live at once. Then the `Program` passes.
+    Siblings,
 }
+
+/// Ops a sibling may bring forward with it (its unissued ancestors), and how far ahead siblings are looked for.
+const PULL_OPS: usize = 256;
+const PULL_WINDOW: usize = 1024;
+/// Members of a pulled batch (pc-gpu `ks::KEY_KMAX`: one inner-product launch per key; the StC-first route's work
+/// buffers hold as many as the PCMM finish batch).
+pub const PULL_K: usize = 4;
 
 pub fn batch(p: &mut Program, k_max: u32, schedule: Schedule, cf_free: bool) {
     let k = k_max.max(1) as usize;
     if k > 1 {
         match schedule {
-            Schedule::Program => {
+            Schedule::Program | Schedule::Siblings => {
+                if schedule == Schedule::Siblings {
+                    pull(p, k.min(PULL_K), cf_free);
+                }
                 for pass in 0..4 {
                     one_pass(p, pass, k, cf_free);
                 }
@@ -125,6 +141,94 @@ pub fn batch(p: &mut Program, k_max: u32, schedule: Schedule, cf_free: bool) {
         }
     }
     p.batch_report = report(p, k_max);
+}
+
+/// `Schedule::Siblings`' grouping pass (see there).
+fn pull(p: &mut Program, k_max: usize, cf_free: bool) {
+    let ops = std::mem::take(&mut p.ops);
+    let n = ops.len();
+    let mut prod: HashMap<VarId, usize> = HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for v in op.all_outs() {
+            prod.insert(v, i);
+        }
+    }
+    let preds: Vec<Vec<usize>> = ops
+        .iter()
+        .map(|o| {
+            let mut d: Vec<usize> = o.all_ins().iter().filter_map(|v| prod.get(v).copied()).collect();
+            d.sort_unstable();
+            d.dedup();
+            d
+        })
+        .collect();
+    let keys: Vec<Option<String>> = ops
+        .iter()
+        .map(|o| match &o.kind {
+            Kind::RotateSum(_) | Kind::Mult | Kind::Square => key(p, o, None, cf_free),
+            Kind::Bootstrap(s) if p.bts_sites[*s as usize].route.slots == 0 && p.bts_sites[*s as usize].route.stc_first => key(p, o, None, cf_free),
+            _ => None,
+        })
+        .collect();
+    let mut bucket: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        if let Some(k) = k {
+            bucket.entry(k.as_str()).or_default().push(i);
+        }
+    }
+    let mut done = vec![false; n];
+    let mut ops: Vec<Option<Op>> = ops.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if done[i] {
+            continue;
+        }
+        done[i] = true;
+        let mut members = vec![i];
+        if let Some(k) = &keys[i] {
+            for &j in bucket[k.as_str()].iter().filter(|&&j| j > i && j <= i + PULL_WINDOW) {
+                if members.len() >= k_max {
+                    break;
+                }
+                if done[j] {
+                    continue;
+                }
+                // j's unissued ancestors: none of them a member (j independent of the batch), few enough to pull
+                let mut anc: Vec<usize> = vec![];
+                let mut stack: Vec<usize> = preds[j].clone();
+                let mut ok = true;
+                while let Some(a) = stack.pop() {
+                    if done[a] && !members.contains(&a) || anc.contains(&a) {
+                        continue;
+                    }
+                    if members.contains(&a) || anc.len() >= PULL_OPS {
+                        ok = false;
+                        break;
+                    }
+                    anc.push(a);
+                    stack.extend(preds[a].iter().copied());
+                }
+                if !ok {
+                    continue;
+                }
+                anc.sort_unstable();
+                for a in anc {
+                    done[a] = true;
+                    out.extend(ops[a].take());
+                }
+                done[j] = true;
+                members.push(j);
+            }
+        }
+        let mut m: Vec<Op> = members.iter().filter_map(|&j| ops[j].take()).collect();
+        if m.len() == 1 {
+            out.append(&mut m);
+        } else {
+            let origin = m[0].origin.clone();
+            out.push(Op { kind: Kind::Batched(m), ins: vec![], outs: vec![], pre: vec![], origin, inplace: false });
+        }
+    }
+    p.ops = out;
 }
 
 fn lockstep(p: &mut Program, k_max: usize, cf_free: bool) {

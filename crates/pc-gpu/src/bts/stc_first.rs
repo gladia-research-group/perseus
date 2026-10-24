@@ -248,6 +248,11 @@ impl<'a, W: DevWord> StageCache<'a, W> {
         self.state.borrow().stats
     }
 
+    /// Entries the cache holds.
+    pub fn slots(&self) -> usize {
+        self.state.borrow().slots.len()
+    }
+
     /// Keys held, most recently used first.
     pub fn keys(&self) -> Vec<CacheKey> {
         let st = self.state.borrow();
