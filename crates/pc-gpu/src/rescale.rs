@@ -322,6 +322,12 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&args, s.raw()) })?;
         match src {
             None => self.ntt_tmp_and_combine(ctx, s, x, top - 2, al, als),
+            Some(src) if src.ct_stride == self.lay.ct_words() as u64 && src.part_stride == self.lay.poly_words() as u64 => {
+                // x = alpha src + NTT(tmp), the combine in the transform's epilogue (src shares tmp's row offsets)
+                let new_top = top - 2;
+                let epi = ntt::Epi::MulAdd { out: x.buf.vptr_mut(), x: src.base, s: al, ss: als };
+                ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut self.tmp.buf, &self.fwd_tmp[new_top][k - 1], 2 * k * (new_top + 1), None, Some(epi))
+            }
             Some(src) => {
                 let new_top = top - 2;
                 ntt::transform_rows(ctx, s, Dir::Forward, &mut self.tmp.buf, &self.fwd_tmp[new_top][k - 1])?;
@@ -375,11 +381,10 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         als: *const c_void,
     ) -> Result<()> {
         let k = x.k;
-        ntt::transform_rows(ctx, s, Dir::Forward, &mut self.tmp.buf, &self.fwd_tmp[new_top][k - 1])?;
-        let args = RescaleCombineArgs { x: x.w(), tmp: self.tmp.r(), alpha: al, alphas: als, pr: ctx.pr(), n: (new_top + 1) as i32, k: k as i32 };
-        // SAFETY: rows 0..=new_top of k cts in both buffers; alpha is a context table or a constant-ring slot written
-        // earlier on this stream
-        launch_result("rescale_combine", unsafe { (ctx.table.rescale_combine)(&args, s.raw()) })?;
-        Ok(())
+        // x = alpha x + NTT(tmp): the combine rides the transform's epilogue (x shares tmp's row offsets); alpha is a
+        // context table or a constant-ring slot written earlier on this stream
+        let epi = ntt::Epi::MulAdd { out: x.buf.vptr_mut(), x: x.buf.vptr(), s: al, ss: als };
+        let list = &self.fwd_tmp[new_top][k - 1];
+        ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut self.tmp.buf, list, list.len(), None, Some(epi))
     }
 }

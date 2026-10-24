@@ -13,7 +13,7 @@ use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::modmul::{mulmod, shoup};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, Lane, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MdEpiArgs, MulTableArgs, PolyRef, RescaleArgs, RescaleCombineArgs, TensorArgs, WsumArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MdEpiArgs, MulTableArgs, PolyRef, RescaleArgs, TensorArgs, WsumArgs, WsumKArgs, MdEpiToArgs};
 use pc_shadow::evalmod::{build_evalmod, EmOp, EmProgram, Epi, PsPlan};
 use pc_shadow::fides::FMeta;
 use rayon::prelude::*;
@@ -804,22 +804,14 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         };
         // SAFETY: kk cts of a program buffer and of the LT workspace (>= kk_max cts), context-layout tables
         launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&ra, s.raw()) })?;
-        ntt::transform_rows_prefix(ctx, s, Dir::Forward, &mut tmp.buf, &rp.ntt, kk * 2 * keep)?;
-        let ca_ = RescaleCombineArgs { x: xb.w(), tmp: tmp.r(), alpha: al, alphas: als, pr: ctx.pr(), n: keep as i32, k: kk as i32 };
-        match src {
-            None => {
-                // SAFETY: as above
-                launch_result("rescale_combine", unsafe { (ctx.table.rescale_combine)(&ca_, s.raw()) })?;
-            }
-            Some(si) => {
-                // buf rows 0..top-2 = alpha * source + tmp (the source is left as it was)
-                let out = ca_.x;
-                let a = RescaleCombineToArgs { a: RescaleCombineArgs { x: View::of(&cx.work.em[si], 0).r(), ..ca_ }, out };
-                // SAFETY: as above; out is a program buffer distinct from the source (the executor checks dst != src)
-                launch_result("rescale_combine_to", unsafe { (ctx.table.rescale_combine_to)(&a, s.raw()) })?;
-            }
-        }
-        Ok(())
+        // buf rows 0..top-2 = alpha * (buf or the source, left as it was) + NTT(tmp): the combine rides the
+        // transform's epilogue (program buffers share tmp's row offsets)
+        let from = match src {
+            None => xb.buf.vptr(),
+            Some(si) => cx.work.em[si].buf.vptr(),
+        };
+        let epi = ntt::Epi::MulAdd { out: cx.work.em[buf].buf.vptr_mut(), x: from, s: al, ss: als };
+        ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut cx.work.lt_tmp.buf, &rp.ntt, kk * 2 * keep, None, Some(epi))
     }
 
     /// dst = relin(sum of pairs' tensors) [x2] [+ const] [+ buffer `add`] (Mult: one pair; MultAcc: accumulate onto
@@ -844,7 +836,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             b0,
             a1,
             b1,
-            coef: ex.bconv_work.vptr_mut(),
+            coef: std::ptr::null_mut(),
             coef_ct_stride: pw,
             pr: ctx.pr(),
             npairs: pairs.len() as i32,
@@ -853,9 +845,9 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             k: kk as i32,
         };
         // SAFETY: kk-ct views of the program buffers (out may be a source: element-wise, each thread reads its
-        // operands before writing), d2 into the key-switching workspace and its coefficient copy
+        // operands before writing), d2 into the key-switching workspace
         launch_result("tensor", unsafe { (ctx.table.tensor)(&t, ex.compute.raw()) })?;
-        ks::modup_coef_ready(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, kk, top)?;
+        ks::modup_from(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, ext.part::<W>(1), kk, top)?;
         let io = DotIo { c1: ext.part::<W>(1).base, c0: std::ptr::null(), ct_stride: cw, out: ext.base, part_stride: pw, out_ct_stride: cw, out_rot_stride: 0, c0_mode: 0 };
         let dstv = View::of(&cx.work.em[base + dst], 0);
         let kptr = epi.k.map(|ki| self.raw[ki].vptr()).unwrap_or(std::ptr::null());

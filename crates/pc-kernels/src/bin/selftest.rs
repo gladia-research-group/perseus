@@ -94,6 +94,7 @@ impl<'a> Setup<'a> {
             pr: self.pr(),
             nrows: nrows as i32,
             chunk: 128,
+            ..Default::default()
         }
     }
     /// rows of `nrows` limbs of prime ids pid(row) per slot of a buffer of 8-row slots
@@ -721,7 +722,7 @@ fn t_regen(st: &mut Setup) -> Vec<TestResult> {
     let ids: Vec<i32> = (0..nmod as i32).collect();
     let idsd = st.ctx.up_i32(&ids);
     let ka = st.ctx.zeros(g.ndig * kds);
-    let ea = KskExpandArgs { out: ka.p(), seed: seedd.c() as *const u32, prime_ids: idsd.c() as *const i32, pr: st.pr(), nmod: nmod as i32, dnum: g.ndig as i32 };
+    let ea = KskExpandArgs { out: ka.p(), seed: seedd.c() as *const u32, prime_ids: idsd.c() as *const i32, pr: st.pr(), nmod: nmod as i32, dnum: g.ndig as i32, d0: 0, pad: 0 };
     ck(unsafe { (st.t.ksk_expand)(&ea, st.s()) });
     let kah = ka.read(&st.ctx);
     let mut want = vec![0u64; g.ndig * kds];
@@ -1000,7 +1001,7 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
         .iter()
         .map(|sd| {
             let ka = st.ctx.zeros(g.ndig * kds);
-            let ea = KskExpandArgs { out: ka.p(), seed: sd.c() as *const u32, prime_ids: idsd.c() as *const i32, pr: st.pr(), nmod: nmod as i32, dnum: g.ndig as i32 };
+            let ea = KskExpandArgs { out: ka.p(), seed: sd.c() as *const u32, prime_ids: idsd.c() as *const i32, pr: st.pr(), nmod: nmod as i32, dnum: g.ndig as i32, d0: 0, pad: 0 };
             ck(unsafe { (st.t.ksk_expand)(&ea, st.s()) });
             ka
         })

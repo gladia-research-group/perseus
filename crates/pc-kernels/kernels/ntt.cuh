@@ -3,7 +3,8 @@
 //               registers, one shared-memory transpose (two halves for u64), 3 more stages in registers.
 //  row pass:    one warp per 256-element row, 8 elements per lane: 3 stages in registers, a warp-local transpose,
 //               2 stages across lane pairs (shuffles), 3 stages in registers (no block barrier).
-// Only Shoup products (twiddles are constants), so the kernels do not depend on the ModMul strategy.
+// Only Shoup products (twiddles are constants), so the kernels do not depend on the ModMul strategy. Out-of-place first
+// pass (`soff`) and the forward epilogues (`epi`): args.cuh NttArgs.
 #pragma once
 #include "arith.cuh"
 
@@ -43,12 +44,45 @@ __device__ __forceinline__ W mul_uv(W x, const W* w, const W* ws, int ui, int vi
     return mul_shoup<W>(mul_shoup<W>(x, __ldg(w + ui), __ldg(ws + ui), p), __ldg(w + vi), __ldg(ws + vi), p);
 }
 
+// NttArgs.epi on 4 consecutive transform values v of word r (prime p, scalar s with Shoup companion ss)
+// 4 consecutive words of the sum mod p of n rows `stride` words apart (n >= 1)
+template <class W>
+__device__ __forceinline__ V4<W> load4_sum(const W* a, int n, uint64_t stride, W p) {
+    V4<W> x = load4<W>(a);
+    for (int j = 1; j < n; ++j) {
+        const V4<W> y = load4<W>(a + j * stride);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) x.v[u] = add<W>(x.v[u], y.v[u], p);
+    }
+    return x;
+}
+
+template <class W>
+__device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s, W ss, W p) {
+    W* o = (W*)T.eout + r;
+    const V4<W> x = load4_sum<W>((const W*)T.ex + r, T.xnum, T.xstride, p);
+    V4<W> d{};
+    if (T.epi == 2) d = load4<W>(o);
+    W y[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        if (T.epi == 3) {
+            y[u] = add<W>(mul_shoup<W>(x.v[u], s, ss, p), v[u], p);
+        } else {
+            y[u] = mul_shoup<W>(sub<W>(x.v[u], v[u], p), s, ss, p);
+            if (T.epi == 2) y[u] = add<W>(d.v[u], y[u], p);
+        }
+    }
+    store4<W>(o, y[0], y[1], y[2], y[3]);
+}
+
 // ---------------------------------------------------------------- forward column pass
 template <class W>
 __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     __shared__ W s[256 * 32 / PH<W>];
     const int row = blockIdx.y;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 32 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
     const W* w = (const W*)T.fw + (size_t)pid * N;
@@ -56,7 +90,11 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     W x[32];
 #pragma unroll
-    for (int j = 0; j < 32; ++j) x[j] = a[(wp + 8 * j) * 256 + lane];
+    for (int j = 0; j < 32; ++j) x[j] = in[(wp + 8 * j) * 256 + lane];
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (wp + 8 * j) * 256 + lane], p);
+    }
     // stages tr = 128..8 (m = 1..16): pairs (j, j + tr/8), group i = j / (2 tr/8)
 #pragma unroll
     for (int st = 0; st < 5; ++st) {
@@ -213,6 +251,13 @@ __global__ void __launch_bounds__(256) ntt_fwd_rows(NttArgs T) {
         for (int qb = 0; qb < 4; ++qb) ct_uv(x[2 * qb], x[2 * qb + 1], 32768 + 128 * R, vidx(15, 4 * lane + qb));
     }
     // store: layout B is 8 consecutive elements per lane -> vectorized
+    if (T.epi) {
+        const size_t r = (size_t)T.roff[row] * N + R * 256 + 8 * lane;
+        const W s = ((const W*)T.es)[pid], ss = ((const W*)T.ess)[pid];
+        epi4<W>(T, r, x, s, ss, p);
+        epi4<W>(T, r + 4, x + 4, s, ss, p);
+        return;
+    }
     store4<W>(a + 8 * lane, x[0], x[1], x[2], x[3]);
     store4<W>(a + 8 * lane + 4, x[4], x[5], x[6], x[7]);
 }
@@ -225,13 +270,14 @@ __global__ void __launch_bounds__(256) ntt_inv_rows(NttArgs T) {
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     const int R = blockIdx.x * 8 + wp;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + R * 256 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
     const W* w = (const W*)T.iw + (size_t)pid * N;
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     W x[8];
     {
-        const V4<W> v0 = load4<W>(a + 8 * lane), v1 = load4<W>(a + 8 * lane + 4);
+        const V4<W> v0 = load4_sum<W>(in + 8 * lane, T.snum, T.sstride, p), v1 = load4_sum<W>(in + 8 * lane + 4, T.snum, T.sstride, p);
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             x[u] = v0.v[u];
@@ -387,12 +433,16 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
 
 template <class W>
 int fwd(const NttArgs* a, cudaStream_t s) {
+    if (a->epi < 0 || a->epi > 3 || (a->epi && (!a->eout || !a->ex || !a->es || !a->ess))) return -1;
     NttArgs b = *a;
+    b.snum = a->soff ? max(a->snum, 1) : 1;
+    b.xnum = max(a->xnum, 1);
     const int ch = a->chunk > 0 ? a->chunk : a->nrows;
     for (int i = 0; i < a->nrows; i += ch) {
         const int m = min(ch, a->nrows - i);
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
+        b.soff = a->soff ? a->soff + i : nullptr;
         ntt_fwd_cols<W><<<dim3(8, m), 256, 0, s>>>(b);
         ntt_fwd_rows<W><<<dim3(32, m), 256, 0, s>>>(b);
     }
@@ -400,12 +450,15 @@ int fwd(const NttArgs* a, cudaStream_t s) {
 }
 template <class W>
 int inv(const NttArgs* a, cudaStream_t s) {
+    if (a->epi) return -1;  // the epilogues are forward-only
     NttArgs b = *a;
+    b.snum = a->soff ? max(a->snum, 1) : 1;
     const int ch = a->chunk > 0 ? a->chunk : a->nrows;
     for (int i = 0; i < a->nrows; i += ch) {
         const int m = min(ch, a->nrows - i);
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
+        b.soff = a->soff ? a->soff + i : nullptr;
         ntt_inv_rows<W><<<dim3(32, m), 256, 0, s>>>(b);
         ntt_inv_cols<W><<<dim3(8, m), 256, 0, s>>>(b);
     }

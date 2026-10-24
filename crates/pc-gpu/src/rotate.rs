@@ -12,7 +12,7 @@ use crate::context::{Context, DevStrategy, DevWord};
 use crate::ct::Ct;
 use crate::error::{shape, Result};
 use crate::executor::Executor;
-use crate::ks::{self, ew, md_epilogue, DotIo, DotRows, Ew, KeyGroup, KsPlans, KskSource, View};
+use crate::ks::{self, ew, DotIo, DotRows, Ew, KeyGroup, KsPlans, KskSource, View};
 use pc_shadow::Shadow;
 
 /// Seam `Rotator`: how a set of rotations of one ciphertext is executed.
@@ -212,6 +212,16 @@ pub fn rotate_hoisted<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// How `rotate_sum_inplace_as` sums the extended rotations before the ModDown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SumForm {
+    /// Dot outputs chunk by chunk, added into `ks.conv` element-wise (any k, any number of keys).
+    Chunked,
+    /// Every dot output in `ks.ext` at once, added inside the ModDown (`ks::moddown_sum_to`) when the keys are
+    /// consecutive in the group and fit the extended workspace; Chunked otherwise. The same residues.
+    InModDown,
+}
+
 /// In place: `acc = acc + sum_k rot(acc, steps[k])`, the rotations summed in the extended basis, one ModDown.
 #[allow(clippy::too_many_arguments)]
 pub fn rotate_sum_inplace<W: DevWord, M: DevStrategy<W>>(
@@ -222,6 +232,21 @@ pub fn rotate_sum_inplace<W: DevWord, M: DevStrategy<W>>(
     group: &KeyGroup<'_>,
     acc: &mut Ct<'_, W>,
     steps: &[i64],
+) -> Result<()> {
+    rotate_sum_inplace_as(ctx, ex, kc, sh, group, acc, steps, SumForm::InModDown)
+}
+
+/// `rotate_sum_inplace` with the summation form chosen (`SumForm`; benches and checks compare the two).
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_sum_inplace_as<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    group: &KeyGroup<'_>,
+    acc: &mut Ct<'_, W>,
+    steps: &[i64],
+    form: SumForm,
 ) -> Result<()> {
     let (k, top) = (acc.k(), top_of(ctx, acc)?);
     let n = ctx.lay.n;
@@ -239,8 +264,17 @@ pub fn rotate_sum_inplace<W: DevWord, M: DevStrategy<W>>(
     let lay = ctx.lay;
     let rs = lay.rs_qp(top);
     ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &acc.buf, 0, k, 1, top)?;
+    let per = (ex.ks.ext.k / k).max(1);
+    let run = keys.iter().enumerate().all(|(j, &r)| r == keys[0] + j);
+    if form == SumForm::InModDown && run && keys.len() <= per {
+        // every extended rotation in ks.ext at once, summed inside the ModDown
+        let io = io_of(acc, View::of(&ex.ks.ext, 0), k);
+        dots(ctx, ex, kc, group, keys[0], keys.len(), k, top, io)?;
+        ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, keys.len(), k, &mut ex.ks.conv, View::of(&acc.buf, 0), k, top)?;
+        acc.meta = sh.rotate_sum(&acc.meta, steps).out;
+        return Ok(());
+    }
     // extended rotations, chunk by chunk, summed into ks.conv (Q rows 0..=top and P)
-    let per = (kc.plans.k_max / k).max(1);
     let mut j = 0;
     let mut first = true;
     while j < keys.len() {
@@ -265,8 +299,7 @@ pub fn rotate_sum_inplace<W: DevWord, M: DevStrategy<W>>(
         j += m;
     }
     // ModDown of the sum (conversion into ks.ext), fused with the accumulate: acc += (sum - conv) P^-1
-    ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.conv, &mut ex.ks.ext, k, top)?;
-    md_epilogue(ctx, &ex.compute, View::of(&acc.buf, 0), View::of(&ex.ks.conv, 0), View::of(&ex.ks.ext, 0), k, top)?;
+    ks::moddown_to(ctx, &ex.compute, kc.plans, &mut ex.ks.conv, &mut ex.ks.ext, View::of(&acc.buf, 0), true, k, top)?;
     acc.meta = sh.rotate_sum(&acc.meta, steps).out;
     Ok(())
 }

@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -762,6 +762,62 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Self::finish(out, &r, &t)
     }
 
+    /// The add / sub recipe of `mult_pt_add` (the product as operand A when `product_first`).
+    fn mac_recipes(sh: &Shadow, a: &CtMeta, pt: &PtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<(Recipe, Recipe)> {
+        let r1 = sh.mult_pt(a, pt)?;
+        let (x, z) = if product_first { (r1.out, *y) } else { (*y, r1.out) };
+        let r2 = if sub { sh.sub(&x, &z)? } else { sh.add(&x, &z)? };
+        Ok((r1, r2))
+    }
+
+    /// Whether `mult_pt_add` runs `y +- a * pt` as one pass (metadata only, a bind-time check): the add's recipe has
+    /// no prelude and the product's has none on the plaintext. With preludes on `a`, `out` must not alias `y`.
+    pub fn mult_pt_add_fusable(sh: &Shadow, a: &CtMeta, pt: &PtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<bool> {
+        let (r1, r2) = Self::mac_recipes(sh, a, pt, y, sub, product_first)?;
+        let on_pt = r1.pre.iter().any(|p| matches!(p, Prelude::Rescale(Operand::B) | Prelude::DropTo(Operand::B, _) | Prelude::ScalarAdjust(Operand::B, _)));
+        Ok(r2.pre.is_empty() && !on_pt)
+    }
+
+    /// `out = y + a * pt` (`sub`: `y - a * pt`, or `a * pt - y` when `product_first`): exactly `mult_pt` into a
+    /// temporary, then `add` / `sub` of it with `y` (the product as the add's operand A when `product_first`), as one
+    /// pass (the plaintext products of BSGS baby sums, consumed once by an add). Needs `mult_pt_add_fusable`; `a`'s
+    /// preludes run into `out` as in `mult_pt`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_pt_add<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        sh: &Shadow,
+        out: &mut Ct<'_, W>,
+        a: &Ct<'_, W>,
+        pt: &Pt<'_>,
+        y: &Ct<'_, W>,
+        sub: bool,
+        product_first: bool,
+    ) -> Result<()> {
+        if !Self::mult_pt_add_fusable(sh, &a.meta, &pt.meta, &y.meta, sub, product_first)? {
+            return Err(shape("mult_pt_add", "the add has preludes or the plaintext needs one: run mult_pt then add"));
+        }
+        let (r1, r2) = Self::mac_recipes(sh, &a.meta, &pt.meta, &y.meta, sub, product_first)?;
+        Self::check_k("mult_pt_add", out.k(), y.k())?;
+        if !r1.pre.is_empty() && out.buf.r().base == y.buf.r().base {
+            return Err(shape("mult_pt_add", "the product's preludes run in `out`, which must not alias y"));
+        }
+        let s = &ex.compute;
+        let (t, av) = self.prep_a_view(ctx, s, out, Some(a), &r1.pre)?;
+        if t.meta.level != r1.out.level {
+            return Err(shape("mult_pt_add", format!("preludes left level {} but the product is at {}", t.meta.level, r1.out.level)));
+        }
+        let top = self.top(ctx.shape, &t.meta)?;
+        let m = MulTableArgs { out: out.buf.w(), inp: av, t: pt.poly().base, pr: ctx.pr(), n: (top + 1) as i32, k: out.k() as i32 };
+        let args = MulAddArgs { m, y: y.buf.r(), sub: if !sub { 0 } else if product_first { 2 } else { 1 }, pad: 0 };
+        // SAFETY: k cts of the context layout over rows 0..=top (the plaintext broadcast); element-wise, so out may
+        // alias y or a's view (each thread reads its operands before writing the same index)
+        launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, s.raw()) })?;
+        out.meta = r2.out;
+        Ok(())
+    }
+
     /// `out[j] = i * a[j]`: the monomial X^{N/2} (level and degree kept; exact).
     pub fn mult_i<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut [Ct<'_, W>], a: &[&Ct<'_, W>]) -> Result<()> {
         lens("mult_i", out.len(), &[a.len()])?;
@@ -861,8 +917,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
 
     /// The tensor half of `a * b` (`b = None`: `a^2`) staged for relinearization: the recipe's preludes (A copied
     /// into `out` and adjusted there, B on a scratch copy), then `(c0, c1)` into `out` and d2 into `ex.ks.ext` part 1
-    /// plus its coefficient copy in `ex.bconv_work` (where `relin::relin_staged` expects it). Returns the live top
-    /// and the recipe; `out.meta` is left to the caller (the relinearized product takes `recipe.out`).
+    /// (where `relin::relin_staged` expects it). Returns the live top and the recipe; `out.meta` is left to the caller
+    /// (the relinearized product takes `recipe.out`).
     pub fn tensor_for_relin<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, a: &Ct<'_, W>, b: Option<&Ct<'_, W>>) -> Result<(usize, Recipe)> {
         let r = match b {
             Some(b) => sh.mult(&a.meta, &b.meta)?,
@@ -895,9 +951,6 @@ impl<'a, W: DevWord> Ops<'a, W> {
             (None, None) => x,
         };
         let lay = ctx.lay;
-        if ex.bconv_work.len() < k * lay.poly_words() {
-            return Err(shape("mult", "coefficient workspace too small (MemPlan::bconv_work)"));
-        }
         let args = TensorArgs {
             out: out.buf.w(),
             d2: crate::ks::View::of(&ex.ks.ext, 0).r(),
@@ -905,7 +958,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             b0: y,
             a1: x,
             b1: y,
-            coef: ex.bconv_work.vptr_mut(),
+            coef: std::ptr::null_mut(),
             coef_ct_stride: lay.poly_words() as u64,
             pr: ctx.pr(),
             npairs: 1,
@@ -914,8 +967,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
             k: k as i32,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1, so out aliasing the A
-        // operand (it holds A's adjusted copy) is element-wise safe; ext / the coefficient workspace are distinct from
-        // out and the scratch copy of B; rows 0..=top of k cts
+        // operand (it holds A's adjusted copy) is element-wise safe; ext is distinct from out and the scratch copy of
+        // B; rows 0..=top of k cts
         launch_result("tensor", unsafe { (ctx.table.tensor)(&args, ex.compute.raw()) })?;
         Ok((top, r))
     }

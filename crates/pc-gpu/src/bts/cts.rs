@@ -10,15 +10,16 @@ use super::{BtsCx, BtsKeyRing};
 use crate::bconv::{BconvPlan, JobSpec};
 use crate::context::{Context, DevStrategy, DevWord, ScalarTable};
 use crate::error::{shape, Result};
-use crate::ks::{self, DotIo, DotRows, KeyGroup, KeyTabs, KskSource, View};
+use crate::ks::{self, DotIo, DotRows, KeyGroup, KeyTabs, KsKeyRef, KskSource, Staging, View};
 use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::bts_setup::C64;
 use pc_core::encode::{Complex, Encoder, Payload};
 use pc_core::modmul::{invmod, mulmod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
-use pc_kernels::{CtsArgs, CtsRegenArgs, EwArgs};
+use pc_kernels::{CtsArgs, CtsRegenArgs, EwArgs, KskExpandArgs};
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 
 /// Digits of a baby key whose `a` `cts_fused_regen` regenerates by default when the rest can be read (one full
@@ -127,6 +128,8 @@ pub struct LtStage<'a, W: DevWord> {
     /// baby keys read in place (all seeded, one form), and whether the Cached kernel can read them
     tabs: Option<KeyTabs<'a>>,
     cached_ok: bool,
+    /// Every baby key has a resident tail from this digit on (`KeyTails`; `ka` points at it, shifted by `first` digits).
+    tail: Option<usize>,
     rows: ConstBuf<'a, u32>,
     digit_of: ConstBuf<'a, i32>,
     giant: Option<KeyGroup<'a>>,
@@ -154,9 +157,13 @@ struct MdPlan<'a> {
 
 impl MdPlan<'_> {
     fn run<W: DevWord, M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, src: &mut DBuf<'_, Compute, W>, dst: &mut DBuf<'_, Compute, W>, k: usize) -> Result<()> {
+        self.run_epi(ctx, s, src, dst, k, None)
+    }
+    /// `run` with the target NTT's epilogue (`ntt::Epi`, its buffers at the target rows' offsets).
+    fn run_epi<W: DevWord, M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, src: &mut DBuf<'_, Compute, W>, dst: &mut DBuf<'_, Compute, W>, k: usize, epi: Option<ntt::Epi>) -> Result<()> {
         ntt::transform_rows_prefix(ctx, s, Dir::Inverse, src, &self.intt, k * self.intt_per)?;
         self.conv.run_prefix(ctx, s, src, 0, dst, 0, k * self.jobs_per)?;
-        ntt::transform_rows_prefix(ctx, s, Dir::Forward, dst, &self.ntt, k * self.ntt_per)
+        ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, dst, &self.ntt, k * self.ntt_per, None, epi)
     }
 }
 
@@ -353,6 +360,143 @@ impl<'a, W: DevWord> LtPts<'a, W> {
     }
 }
 
+/// Resident `a` of the last digits of LT baby keys stored without one (packed, seeded): `cts_fused_regen` regenerates
+/// digits `0..first` and reads `first..` (`LT_REGEN_DIGITS`: the measured best mix at K = 1). Expanded at setup from
+/// each key's seed, one buffer per rotation step (`[digit - first][prime id][N]`, full keys only).
+pub struct KeyTails<'a, W: DevWord> {
+    first: usize,
+    tails: BTreeMap<i64, DBuf<'a, Compute, W>>,
+}
+
+/// One key with its resident tail (`KeyTails::ring`).
+struct TailKey<'r> {
+    key: &'r dyn KsKeyRef,
+    a: *const c_void,
+    first: usize,
+}
+
+impl KsKeyRef for TailKey<'_> {
+    fn b_ptr(&self) -> *const c_void {
+        self.key.b_ptr()
+    }
+    fn a_ptr(&self) -> Option<*const c_void> {
+        self.key.a_ptr()
+    }
+    fn seed_ptr(&self) -> Option<*const u32> {
+        self.key.seed_ptr()
+    }
+    fn galois(&self) -> u64 {
+        self.key.galois()
+    }
+    fn digit_stride(&self) -> usize {
+        self.key.digit_stride()
+    }
+    fn dnum(&self) -> usize {
+        self.key.dnum()
+    }
+    fn q_band(&self) -> usize {
+        self.key.q_band()
+    }
+    fn staging(&self) -> Option<Staging> {
+        self.key.staging()
+    }
+    fn a_tail(&self) -> Option<(*const c_void, usize)> {
+        Some((self.a, self.first))
+    }
+}
+
+/// A key ring whose rotation keys carry their tails (what `LtStage::new` reads); every other key as in `inner`.
+pub struct TailRing<'r> {
+    inner: &'r dyn BtsKeyRing,
+    keys: BTreeMap<i64, TailKey<'r>>,
+    half: i64,
+}
+
+impl BtsKeyRing for TailRing<'_> {
+    fn rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        match self.keys.get(&step.rem_euclid(self.half)) {
+            Some(k) => Ok(k),
+            None => self.inner.rot(step),
+        }
+    }
+    fn conj(&self) -> Result<&dyn KsKeyRef> {
+        self.inner.conj()
+    }
+    fn relin(&self) -> Result<&dyn KsKeyRef> {
+        self.inner.relin()
+    }
+    fn dense_to_sparse(&self) -> Result<&dyn KsKeyRef> {
+        self.inner.dense_to_sparse()
+    }
+    fn sparse_to_dense(&self) -> Result<&dyn KsKeyRef> {
+        self.inner.sparse_to_dense()
+    }
+}
+
+/// The baby steps of `stages` (geometry, input top) whose keys a tail from digit `first` serves: stages that regenerate
+/// more than `first` digits (`LtStage::regen_now`: K = 1 at >= 5 digits).
+pub fn tail_steps(chain: &pc_core::params::Chain, stages: &[(LtGeom, usize)], first: usize) -> Vec<i64> {
+    let nh = (chain.n / 2) as i64;
+    let ndig = |top: usize| chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= top)).count();
+    let mut v: Vec<i64> = stages
+        .iter()
+        .filter(|(_, top)| ndig(*top) >= 5 && ndig(*top) > first)
+        .flat_map(|(g, _)| (1..g.b).map(move |i| ((i * g.stride) as i64) % nh))
+        .filter(|&r| r != 0)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+impl<'a, W: DevWord> KeyTails<'a, W> {
+    /// Arena bytes of the tails of `nkeys` full keys of `dnum` digits.
+    pub fn bytes(lay: &Layout, dnum: usize, first: usize, nkeys: usize) -> usize {
+        if nkeys == 0 || first >= dnum {
+            return 0;
+        }
+        nkeys * Arena::bytes_for::<W>((dnum - first) * lay.poly_words()) + Arena::bytes_for::<i32>(lay.rows())
+    }
+    /// Expand digits `first..` of the rotation keys of `steps` (full seeded keys: what `bytes` sizes; a stage whose keys
+    /// have a resident dense `a` reads that one instead).
+    pub fn new<M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, keys: &dyn BtsKeyRing, steps: &[i64], first: usize) -> Result<Self> {
+        let lay = ctx.lay;
+        let nh = (lay.n / 2) as i64;
+        let mut tails = BTreeMap::new();
+        if steps.is_empty() {
+            return Ok(KeyTails { first, tails });
+        }
+        let ids: Vec<i32> = (0..lay.rows() as i32).collect();
+        let ids = ConstBuf::new(arena, "bts.tails", s, &ids)?;
+        for &st in steps {
+            let st = st.rem_euclid(nh);
+            if st == 0 || tails.contains_key(&st) {
+                continue;
+            }
+            let key = keys.rot(st)?;
+            let ndig = key.dnum();
+            let Some(seed) = key.seed_ptr() else { continue };
+            if key.q_band() + 1 < lay.nq || first >= ndig {
+                continue;
+            }
+            let mut buf = arena.alloc::<Compute, W>("bts.tails", (ndig - first) * lay.poly_words())?;
+            let a = KskExpandArgs { out: buf.vptr_mut(), seed, prime_ids: ids.dptr(), pr: ctx.pr(), nmod: lay.rows() as i32, dnum: ndig as i32, d0: first as i32, pad: 0 };
+            // SAFETY: buf holds (ndig - first) full-layout polys; the seed is the key's 8-word device buffer
+            launch_result("ksk_expand", unsafe { (ctx.table.ksk_expand)(&a, s.raw()) })?;
+            tails.insert(st, buf);
+        }
+        Ok(KeyTails { first, tails })
+    }
+    /// `keys` with these tails attached.
+    pub fn ring<'r>(&'r self, keys: &'r dyn BtsKeyRing, n: usize) -> Result<TailRing<'r>> {
+        let mut m = BTreeMap::new();
+        for (&st, buf) in &self.tails {
+            m.insert(st, TailKey { key: keys.rot(st)?, a: buf.vptr(), first: self.first });
+        }
+        Ok(TailRing { inner: keys, keys: m, half: (n / 2) as i64 })
+    }
+}
+
 impl<'a, W: DevWord> LtStage<'a, W> {
     /// Device bytes of a stage's tables besides its plaintexts (plans for k_max cts).
     pub fn plan_bytes(lay: &Layout, primes: &[u64], geom: &LtGeom, top: usize, end: LtEnd, k_max: usize) -> Result<usize> {
@@ -411,6 +555,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         let mut kinv = Vec::new();
         let mut babies: Vec<&dyn crate::ks::KsKeyRef> = Vec::new();
         let mut cached_ok = true;
+        let mut tails: Vec<Option<(*const c_void, usize)>> = Vec::new();
         for i in 1..geom.b {
             let r = (i * geom.stride) as i64 % nh;
             let key = keys.rot(r)?;
@@ -419,8 +564,21 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             kb.push(key.b_ptr() as u64);
             ka.push(a.map(|p| p as u64).unwrap_or(0));
             kinv.push(pc_core::galois::rotation_galois(r, n)? as u32);
+            tails.push(key.a_tail());
             babies.push(key);
         }
+        // every baby with a tail from the same digit: the kernel reads digit d >= first at ka + d * poly_words, so ka is
+        // the tail moved back by `first` digits (never dereferenced below the tail)
+        let tail = match tails.first().copied().flatten() {
+            Some((_, f)) if !cached_ok && tails.iter().all(|t| t.is_some_and(|t| t.1 == f)) => {
+                let back = (f * lay.poly_words() * std::mem::size_of::<W>()) as u64;
+                for (j, t) in tails.iter().enumerate() {
+                    ka[j] = (t.map(|t| t.0).unwrap_or(std::ptr::null()) as u64).wrapping_sub(back);
+                }
+                Some(f)
+            }
+            _ => None,
+        };
         let tabs = if babies.is_empty() { None } else { KeyTabs::new(arena, s, n, &babies)? };
         let tabs = tabs.filter(|t| t.run_len(0, babies.len()) == babies.len() && t.q_top() >= top);
         if kb.is_empty() {
@@ -500,6 +658,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             kinv: ConstBuf::new(arena, "bts.lt", s, &kinv)?,
             tabs,
             cached_ok,
+            tail,
             rows: ConstBuf::new(arena, "bts.lt", s, &rows)?,
             digit_of: ConstBuf::new(arena, "bts.lt", s, &digit_of)?,
             giant,
@@ -630,7 +789,12 @@ impl<'a, W: DevWord> LtStage<'a, W> {
                 match (self.regen_now(k, ndig), &self.tabs) {
                     (true, Some(t)) => {
                         let mut key = t.tab(0)?;
-                        key.nregen = if self.cached_ok { self.regen_digits.min(i32::MAX as usize) as i32 } else { i32::MAX };
+                        key.nregen = match self.tail {
+                            _ if self.cached_ok => self.regen_digits.min(i32::MAX as usize) as i32,
+                            // the digits below the tail regenerate (`regen_digits` above it: more regenerate)
+                            Some(f) => self.regen_digits.max(f).min(i32::MAX as usize) as i32,
+                            None => i32::MAX,
+                        };
                         let ra = CtsRegenArgs { cts: a, key };
                         // SAFETY: as below; the key tables (seeds, stored `b`) were built at setup from live keys
                         launch_result("cts_fused_regen", unsafe { (ctx.table.cts_fused_regen)(&ra, ex.compute.raw()) })?;
@@ -667,11 +831,18 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         }
         // 4. stage end into x
         let d = ctx.chain.level_unit;
+        // x = (sum - conv) B^-1 in the conversion's NTT when x's rows sit at the plan's offsets (the offset rotation's
+        // lt_rot: always; the results in lt_res: one ciphertext)
+        let into_x = |src: *const c_void, x: &mut CtBuf<'_, Compute, W>| ntt::Epi::SubMul { out: x.buf.vptr_mut(), x: src, s: self.binv.v.vptr(), ss: self.binv.s.vptr() };
         if self.geom.offset != 0 {
             self.rotate_ext(cx, 0, k, source, self.offset_key.as_ref())?;
             let ex = &*cx.ex;
-            self.md_end.run(ctx, &ex.compute, &mut cx.work.lt_rot.buf, &mut cx.work.lt_tmp.buf, k)?;
-            self.sub_mul(ctx, &ex.compute, x, View::of(&cx.work.lt_rot, 0), View::of(&cx.work.lt_tmp, 0), top, k)?;
+            let epi = into_x(cx.work.lt_rot.buf.vptr(), x);
+            self.md_end.run_epi(ctx, &ex.compute, &mut cx.work.lt_rot.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
+        } else if k == 1 {
+            let ex = &*cx.ex;
+            let epi = into_x(cx.work.lt_res.buf.vptr(), x);
+            self.md_end.run_epi(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
         } else {
             let ex = &*cx.ex;
             self.md_end.run(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k)?;
@@ -716,20 +887,26 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         let pw = lay.poly_words() as u64;
         let md = self.md_c1[j].as_ref().ok_or_else(|| shape("LtStage", format!("no ModDown plan for result {j}")))?;
         let ex = &mut *cx.ex;
-        md.run(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k)?;
+        // c1 = (c1 - conv) P^-1 on the Q rows, in the conversion's NTT (the plan's rows sit at the same offsets in
+        // lt_res and lt_tmp)
+        let res = cx.work.lt_res.buf.vptr_mut();
+        let epi = ntt::Epi::SubMul { out: res, x: res, s: ctx.ks.p_inv_mod_q.v.vptr(), ss: ctx.ks.p_inv_mod_q.s.vptr() };
+        md.run_epi(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
         let rv = View {
             base: (cx.work.lt_res.buf.vptr() as *mut W).wrapping_add(res_ct(self.k_max, g, 0, j) * cw) as *mut c_void,
             ct_stride: (res_stride(g, j) * cw) as u64,
             part_stride: pw,
         };
-        let tv = View { base: (cx.work.lt_tmp.buf.vptr() as *mut W).wrapping_add(res_ct(self.k_max, g, 0, j) * cw) as *mut c_void, ..rv };
-        // c1 = (c1 - conv) P^-1 on the Q rows
         let c1 = rv.part::<W>(1);
-        ks::ew(ctx, &ex.compute, ks::Ew::SubMulPinv, c1, c1, Some(tv.part::<W>(1)), lay.rs_q(top), k, 1)?;
-        // ModUp of c1 (copied into the coefficient workspace) and the dot with c0 extended
-        let dst = View { base: ex.bconv_work.vptr_mut(), ct_stride: pw, part_stride: 0 };
-        ks::ew(ctx, &ex.compute, ks::Ew::Copy, dst, View { part_stride: 0, ..c1 }, None, lay.rs_q(top), k, 1)?;
-        ks::modup_coef_ready(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, k, top)?;
+        // ModUp of c1 and the dot with c0 extended (one ciphertext: the INTT reads c1 in place; more: from a copy in
+        // the coefficient workspace, the results' stride is not the ciphertext layout's)
+        if k == 1 {
+            ks::modup_from(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, c1, k, top)?;
+        } else {
+            let dst = View { base: ex.bconv_work.vptr_mut(), ct_stride: pw, part_stride: 0 };
+            ks::ew(ctx, &ex.compute, ks::Ew::Copy, dst, View { part_stride: 0, ..c1 }, None, lay.rs_q(top), k, 1)?;
+            ks::modup_coef_ready(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, k, top)?;
+        }
         let staged = source == KskSource::Regen || key.needs_stage() || !key.has_a();
         if staged {
             let ndig = cx.ks.ndig(top)?;

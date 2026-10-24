@@ -24,6 +24,9 @@ pub const DOT_KMAX: usize = 8;
 pub const REGEN_KMAX: usize = 4;
 /// Ciphertexts per `ks_dot_key` launch (kernel bound).
 pub const KEY_KMAX: usize = 4;
+/// Extended rotations of one ciphertext batch `KsWork::ext` holds at once, for batches of up to `KEY_KMAX`: a radix-3
+/// rotate-and-sum group (7 keys) dotted in one go and summed inside the ModDown (`rotate::SumForm::InModDown`).
+pub const SUM_KEYS: usize = 7;
 
 /// Seam `KeySwitch`: the decomposition / switching method.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +70,11 @@ pub trait KsKeyRef {
     /// `b` is not dense rows indexed by prime id (28-bit packed rows, or a banded key's slots): the dot reads it after
     /// `stage_key` unpacks it into `KsWork::stage_b`.
     fn staging(&self) -> Option<Staging> {
+        None
+    }
+    /// Resident `a` of the digits from `first` on only (`bts::cts::KeyTails`), as (rows of digit `first`, `first`):
+    /// `[digit - first][prime id][N]`, every prime id; the regen kernels read those digits instead of regenerating them.
+    fn a_tail(&self) -> Option<(*const c_void, usize)> {
         None
     }
 }
@@ -308,7 +316,7 @@ pub fn expand_a<W: DevWord, M: DevStrategy<W>>(
     if ndig * rows * ctx.lay.n > out.len() {
         return Err(shape("expand_a", format!("{ndig} digits do not fit {} words", out.len())));
     }
-    let a = KskExpandArgs { out: out.vptr_mut(), seed, prime_ids: plans.ids.dptr(), pr: ctx.pr(), nmod: rows as i32, dnum: ndig as i32 };
+    let a = KskExpandArgs { out: out.vptr_mut(), seed, prime_ids: plans.ids.dptr(), pr: ctx.pr(), nmod: rows as i32, dnum: ndig as i32, d0: 0, pad: 0 };
     // SAFETY: table pointers are context constants; out range checked; seed is an 8-word device buffer
     launch_result("ksk_expand", unsafe { (ctx.table.ksk_expand)(&a, s.raw()) })?;
     Ok(())
@@ -439,7 +447,7 @@ impl<'a> KeyGroup<'a> {
 pub struct KsWork<'a, W: DevWord> {
     /// ModUp output: `[c < k_max][digit < dnum][row][N]`.
     pub digits: DBuf<'a, Compute, W>,
-    /// Extended-basis inner-product outputs (k_max ciphertexts).
+    /// Extended-basis inner-product outputs (`ext_cts(k_max)` ciphertexts).
     pub ext: CtBuf<'a, Compute, W>,
     /// ModDown conversions / extended accumulators (k_max ciphertexts).
     pub conv: CtBuf<'a, Compute, W>,
@@ -453,9 +461,13 @@ pub struct KsWork<'a, W: DevWord> {
 }
 
 impl<'a, W: DevWord> KsWork<'a, W> {
+    /// Ciphertexts of `ext`: k_max, or `SUM_KEYS` extended rotations of a batch of up to `KEY_KMAX` when more.
+    pub fn ext_cts(k_max: usize) -> usize {
+        k_max.max(SUM_KEYS * k_max.min(KEY_KMAX))
+    }
     /// Element counts (digits, ext, conv).
     pub fn words(lay: &Layout, k_max: usize, dnum: usize) -> [usize; 3] {
-        [k_max * dnum * lay.poly_words(), CtBuf::<Compute, W>::words(lay, k_max), CtBuf::<Compute, W>::words(lay, k_max)]
+        [k_max * dnum * lay.poly_words(), CtBuf::<Compute, W>::words(lay, Self::ext_cts(k_max)), CtBuf::<Compute, W>::words(lay, k_max)]
     }
     /// Arena bytes (MemPlan::ks_work).
     pub fn bytes(lay: &Layout, k_max: usize, dnum: usize) -> usize {
@@ -469,7 +481,7 @@ impl<'a, W: DevWord> KsWork<'a, W> {
         let [d, _, _] = Self::words(&lay, k_max, dnum);
         Ok(KsWork {
             digits: arena.alloc("ks_work.digits", d)?,
-            ext: CtBuf::new(arena, "ks_work.ext", lay, k_max)?,
+            ext: CtBuf::new(arena, "ks_work.ext", lay, Self::ext_cts(k_max))?,
             conv: CtBuf::new(arena, "ks_work.conv", lay, k_max)?,
             regen_a: None,
             stage_b: None,
@@ -493,6 +505,9 @@ struct LevelPlan<'a> {
     ndig: usize,
     /// INTT rows of the coefficient workspace: `(c * rows + t, t)`, t <= top, by ciphertext.
     intt: RowList<'a>,
+    /// The same rows in a ciphertext buffer, from one part of its first ciphertext: `c * 2 rows + t` (the ModUp's INTT
+    /// reads the input there, out of place).
+    intt_src: ConstBuf<'a, u32>,
     /// ModUp conversions of every live digit, jobs `[c < k_max][digit]` (digit limbs -> the other live Q limbs and
     /// P): one launch for all digits of the first k ciphertexts (a job prefix).
     modup: BconvPlan<'a>,
@@ -509,6 +524,7 @@ struct LevelPlan<'a> {
 /// Host specs of one level (shared by sizing and building).
 struct LevelSpecs {
     intt: Vec<(u32, i32)>,
+    intt_src: Vec<u32>,
     ndig: usize,
     modup: Vec<JobSpec>,
     modup_ntt: Vec<(u32, i32)>,
@@ -524,10 +540,11 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
     // live digits: digit d keeps its limbs <= top (FIDESlib DECOMPmeta sizes cut at the level's limb count)
     let digs: Vec<Vec<usize>> =
         chain.digits.iter().map(|d| d.iter().copied().filter(|&t| t <= top).collect::<Vec<_>>()).filter(|d| !d.is_empty()).collect();
-    let mut intt = Vec::new();
+    let (mut intt, mut intt_src) = (Vec::new(), Vec::new());
     for c in 0..k_max {
         for t in 0..=top {
             intt.push(((c * rows + t) as u32, t as i32));
+            intt_src.push((c * 2 * rows + t) as u32);
         }
     }
     // [c][digit] order: the first k ciphertexts' jobs (and NTT rows) are a prefix, so one launch serves any k
@@ -566,7 +583,7 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
             });
         }
     }
-    LevelSpecs { intt, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown }
+    LevelSpecs { intt, intt_src, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown }
 }
 
 fn rowlist_bytes(n: usize) -> usize {
@@ -594,7 +611,7 @@ impl<'a> KsPlans<'a> {
         let mut b = 2 * Arena::bytes_for::<i32>(lay.rows());
         for top in 0..lay.nq {
             let sp = level_specs(chain, &lay, top, k_max);
-            b += rowlist_bytes(sp.intt.len()) + Arena::bytes_for::<u32>(sp.ks_rows.len());
+            b += rowlist_bytes(sp.intt.len()) + Arena::bytes_for::<u32>(sp.intt_src.len()) + Arena::bytes_for::<u32>(sp.ks_rows.len());
             b += BconvPlan::bytes::<W>(&primes, &sp.modup)? + rowlist_bytes(sp.modup_ntt.len());
             b += BconvPlan::bytes::<W>(&primes, &sp.moddown)?;
         }
@@ -614,6 +631,7 @@ impl<'a> KsPlans<'a> {
             levels.push(LevelPlan {
                 ndig: sp.ndig,
                 intt: RowList::new(arena, s, &sp.intt)?,
+                intt_src: ConstBuf::new(arena, "ks.plans", s, &sp.intt_src)?,
                 modup: BconvPlan::new::<S, W>(arena, s, &primes, &sp.modup)?,
                 modup_ntt: RowList::new(arena, s, &sp.modup_ntt)?,
                 mu_rows: sp.mu_rows,
@@ -733,16 +751,35 @@ pub fn modup<W: DevWord, M: DevStrategy<W>>(
     part: usize,
     top: usize,
 ) -> Result<()> {
-    plans.check_k(k)?;
     check_cts(x, first, k, "ks modup")?;
+    modup_from(ctx, s, plans, ks, coef, View::of(x, first).part::<W>(part), k, top)
+}
+
+/// ModUp of the k polynomials of `src` (one part of k ciphertexts of the ciphertext layout, or of one ciphertext:
+/// rows 0..=top, evaluation form): the INTT reads them in place of a copy into `coef` (out-of-place first pass).
+#[allow(clippy::too_many_arguments)]
+pub fn modup_from<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    ks: &mut KsWork<'_, W>,
+    coef: &mut DBuf<'_, Compute, W>,
+    src: View,
+    k: usize,
+    top: usize,
+) -> Result<()> {
+    plans.check_k(k)?;
     let lay = ctx.lay;
     if coef.len() < k * lay.poly_words() {
         return Err(shape("ks modup", format!("coefficient workspace holds {} words, {k} polys needed (MemPlan::bconv_work)", coef.len())));
     }
-    let dst = View { base: coef.vptr_mut(), ct_stride: lay.poly_words() as u64, part_stride: 0 };
-    let src = View { part_stride: 0, ..View::of(x, first).part::<W>(part) };
-    ew(ctx, s, Ew::Copy, dst, src, None, lay.rs_q(top), k, 1)?;
-    modup_coef_ready(ctx, s, plans, ks, coef, k, top)
+    if k > 1 && src.ct_stride != lay.ct_words() as u64 {
+        return Err(shape("ks modup", "k > 1 sources must have the ciphertext layout"));
+    }
+    let lv = plans.level(top)?;
+    let src = ntt::Src { base: src.base, soff: lv.intt_src.dptr(), n: 1, stride: 0 };
+    ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, coef, &lv.intt, k * (top + 1), Some(src), None)?;
+    modup_tail(ctx, s, lv, ks, coef, k)
 }
 
 /// ModUp when rows 0..=top of the k polynomials already sit in `coef` (`[c][row][N]`, evaluation form).
@@ -758,9 +795,13 @@ pub fn modup_coef_ready<W: DevWord, M: DevStrategy<W>>(
     plans.check_k(k)?;
     let lv = plans.level(top)?;
     ntt::transform_rows_prefix(ctx, s, Dir::Inverse, coef, &lv.intt, k * (top + 1))?;
+    modup_tail(ctx, s, lv, ks, coef, k)
+}
+
+/// The ModUp after its INTT: conversion of every live digit, NTT of the targets.
+fn modup_tail<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, lv: &LevelPlan<'_>, ks: &mut KsWork<'_, W>, coef: &DBuf<'_, Compute, W>, k: usize) -> Result<()> {
     lv.modup.run_prefix(ctx, s, coef, 0, &mut ks.digits, 0, k * lv.ndig)?;
     ntt::transform_rows_prefix(ctx, s, Dir::Forward, &mut ks.digits, &lv.modup_ntt, k * lv.mu_rows)
-
 }
 
 /// Which rows a dot computes.
@@ -1085,9 +1126,72 @@ pub fn moddown_inplace<W: DevWord, M: DevStrategy<W>>(
     k: usize,
     top: usize,
 ) -> Result<()> {
-    moddown_conv(ctx, s, plans, x, conv, k, top)?;
     let v = View::of(x, 0);
-    ew(ctx, s, Ew::SubMulPinv, v, v, Some(View::of(conv, 0)), ctx.lay.rs_q(top), k, 2)
+    moddown_to(ctx, s, plans, x, conv, v, false, k, top)
+}
+
+/// ModDown of the first `k` ciphertexts of `x` into `out` (k-ct view of the ciphertext layout; may be x itself):
+/// Q rows 0..=top of out = (x - conv) P^-1, or `acc`: out + (x - conv) P^-1. The last step rides the NTT of the
+/// conversion (its epilogue), so `conv` holds scratch afterwards; x's special rows are left in coefficient form.
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    out: View,
+    acc: bool,
+    k: usize,
+    top: usize,
+) -> Result<()> {
+    plans.check_k(k)?;
+    check_cts(x, 0, k, "ks moddown")?;
+    check_cts(conv, 0, k, "ks moddown")?;
+    let lay = ctx.lay;
+    if out.ct_stride != lay.ct_words() as u64 || out.part_stride != lay.poly_words() as u64 {
+        return Err(shape("ks moddown_to", "the output view must have the ciphertext layout"));
+    }
+    let lv = plans.level(top)?;
+    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
+    lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
+    let (o, xv, sc, scs) = (out.base, x.buf.vptr(), ctx.ks.p_inv_mod_q.v.vptr(), ctx.ks.p_inv_mod_q.s.vptr());
+    let epi = if acc { ntt::Epi::SubMulAcc { out: o, x: xv, s: sc, ss: scs } } else { ntt::Epi::SubMul { out: o, x: xv, s: sc, ss: scs } };
+    ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
+}
+
+/// `out += x_0 + .. + x_(n-1)` ModDowned (the extended ciphertexts x_j of `x`, `stride` ciphertexts apart, k each):
+/// the special rows' sum rides the INTT's first pass, the Q rows' sum the conversion NTT's epilogue, so the extended
+/// rotations of a hoisted sum are never added row by row. `x`'s special rows of its first k cts are left holding the
+/// sum (coefficient form), `conv` scratch.
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_sum_to<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    n: usize,
+    stride: usize,
+    conv: &mut CtBuf<'_, Compute, W>,
+    out: View,
+    k: usize,
+    top: usize,
+) -> Result<()> {
+    plans.check_k(k)?;
+    check_cts(x, 0, (n - 1) * stride + k, "ks moddown_sum")?;
+    check_cts(conv, 0, k, "ks moddown_sum")?;
+    let lay = ctx.lay;
+    if out.ct_stride != lay.ct_words() as u64 || out.part_stride != lay.poly_words() as u64 {
+        return Err(shape("ks moddown_sum_to", "the output view must have the ciphertext layout"));
+    }
+    let lv = plans.level(top)?;
+    let words = stride * lay.ct_words();
+    let xb = x.buf.vptr();
+    let src = ntt::Src { base: xb, soff: std::ptr::null(), n, stride: words };
+    ntt::transform_k_ex(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k, Some(src), None)?;
+    lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
+    let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: ctx.ks.p_inv_mod_q.v.vptr(), ss: ctx.ks.p_inv_mod_q.s.vptr() };
+    ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
 }
 
 /// `dst += (x - t) P^-1` over Q rows 0..=top, both parts, k ciphertexts (`md_epilogue`).

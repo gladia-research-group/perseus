@@ -4,8 +4,8 @@
 //! c1 += ModDown(ks1). The degree stays 2 (rescale pending) until the next op pays it.
 //!
 //! The K-batched pipeline keeps d2 out of ciphertext slots: the tensor kernel writes d2 (evaluation form) into part 1
-//! of `KsWork::ext` and a copy into the ModUp coefficient workspace, so the ModUp starts with its INTT. The ModDown is
-//! fused with the accumulation (`dst += (dot - conv) P^-1`):
+//! of `KsWork::ext`, where the ModUp's INTT reads it (out of place). The ModDown is fused with the accumulation
+//! (`dst += (dot - conv) P^-1`):
 //! - `KskSource::Regen` (fused relin): `ks_dot_regen` over the special rows only, the conversion,
 //!   then `ks_dot_regen` over the Q rows straight into the epilogue (the Q-row inner product is never stored);
 //! - `KskSource::Cached`: one `ks_dot` over all rows into `ext`, the conversion, `md_epilogue`.
@@ -19,17 +19,14 @@ use pc_cuda::launch_result;
 use pc_kernels::TensorArgs;
 use pc_shadow::Shadow;
 
-/// (c0, c1) of `out` = the tensor's first two terms, d2 into `ex.ks.ext` part 1 and the ModUp workspace; Q rows
-/// 0..=top of k ciphertexts. `a` and `b` must already sit at the same top with degree 1 (the Recipe preludes ran).
+/// (c0, c1) of `out` = the tensor's first two terms, d2 into `ex.ks.ext` part 1; Q rows 0..=top of k ciphertexts. `a`
+/// and `b` must already sit at the same top with degree 1 (the Recipe preludes ran).
 pub fn tensor<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, a: &Ct<'_, W>, b: &Ct<'_, W>, out: &mut Ct<'_, W>, top: usize) -> Result<()> {
     let k = a.k();
     if b.k() != k || out.k() != k || k > ex.ks.k_max {
         return Err(shape("tensor", format!("k {} x {} -> {} (k_max {})", k, b.k(), out.k(), ex.ks.k_max)));
     }
     let lay = ctx.lay;
-    if ex.bconv_work.len() < k * lay.poly_words() {
-        return Err(shape("tensor", "coefficient workspace too small (MemPlan::bconv_work)"));
-    }
     let va = View::of(&a.buf, 0).r();
     let vb = View::of(&b.buf, 0).r();
     let args = TensorArgs {
@@ -39,7 +36,7 @@ pub fn tensor<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &mut E
         b0: vb,
         a1: va,
         b1: vb,
-        coef: ex.bconv_work.vptr_mut(),
+        coef: std::ptr::null_mut(),
         coef_ct_stride: lay.poly_words() as u64,
         pr: ctx.pr(),
         npairs: 1,
@@ -66,8 +63,8 @@ pub fn relin_staged<W: DevWord, M: DevStrategy<W>>(
         return Err(shape("relin", "key group 0 is not the relinearization key (galois 1)"));
     }
     let lay = ctx.lay;
-    ks::modup_coef_ready(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, k, top)?;
     let ext = View::of(&ex.ks.ext, 0);
+    ks::modup_from(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, ext.part::<W>(1), k, top)?;
     let io = DotIo {
         c1: ext.part::<W>(1).base,
         c0: std::ptr::null(),

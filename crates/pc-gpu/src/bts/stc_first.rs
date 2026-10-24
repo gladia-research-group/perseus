@@ -7,7 +7,7 @@
 //! scale, raise variant) and is re-levelled on the device per key into a bounded LRU `StageCache` (FIDESlib
 //! `relevelPlaintext`). Inputs deeper than the entry take the shipped order. Modes, the reference CF and the cache:
 //! docs/ARCHITECTURE.md "pc-gpu StC-first route".
-use super::cts::{diag_coeffs, stage_width, LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{diag_coeffs, stage_width, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::dense::{DensePlan, LtHost};
 use super::evalmod::{EmMode, EvalModPlan};
 use super::finish::{pow2_exp, Pow2};
@@ -481,9 +481,12 @@ impl StcFirstPlan {
         let setup = &self.dense.setup;
         let n = ctx.lay.n;
         let k_max = setup.k_max;
+        // resident `a` tails of the CtS baby keys (sized in `DensePlan::mem`)
+        let tails = KeyTails::new(arena, s, ctx, keys, &self.dense.tail_steps(), setup.lt_regen_digits)?;
+        let ring = tails.ring(keys, n)?;
         let lt = |h: &LtHost| -> Result<LtStage<'a, W>> {
             let pts = LtPts::new(arena, s, ctx, h.top, PtSource::Coeffs(&h.coeffs))?;
-            let mut st = LtStage::new(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, keys, stage_ptrs, k_max)?;
+            let mut st = LtStage::new(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, &ring, stage_ptrs, k_max)?;
             st.group = setup.lt_group;
             Ok(st)
         };
@@ -718,8 +721,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, conj, 0, ndig, true)?;
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, conj, 0, 1, k, top, DotRows::All, io, staged)?;
-            ks::moddown_inplace(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
-            ks::ew(ctx, &ex.compute, ks::Ew::Add, v, v, Some(View::of(&ex.ks.ext, 0)), lay.rs_q(top), k, 2)?;
+            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, true, k, top)?;
         }
         Ok(())
     }
