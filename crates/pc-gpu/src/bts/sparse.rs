@@ -264,9 +264,10 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for SpruRoute<'a, W> 
     fn kind(&self) -> RouteKind {
         RouteKind::Spru { slots: 1, h: self.spru.borrow().cfg.h as u32 }
     }
-    /// Raw output: depth_primes below the top, degree 2 (the recombination's two plaintext products, no rescale).
-    fn landing(&self, sh: &Shadow, meta: &CtMeta, _route: &Route) -> Result<CtMeta> {
-        let level = self.spru.borrow().out_level(sh.cfg.chain.unit);
+    /// Raw output: depth_primes below the variant's top, degree 2 (the recombination's two plaintext products, no
+    /// rescale).
+    fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
+        let level = self.spru.borrow().out_level(sh.cfg.chain.unit, route.raise_drop);
         let nq = sh.cfg.chain.n_q;
         let tables = sh.tables.as_deref().ok_or_else(|| shape("spru landing", "Shadow without scale tables"))?;
         let nf = tables.sf((nq - 1 - level) as i32)?.powi(2);
@@ -280,7 +281,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for SpruRoute<'a, W> 
         let mut s = self.spru.borrow_mut();
         for _ in 0..route.iterations.max(1) {
             for x in cts.iter_mut() {
-                s.run(cx, x, cf - self.deg)?;
+                s.run(cx, x, cf - self.deg, route.raise_drop)?;
             }
         }
         Ok(())

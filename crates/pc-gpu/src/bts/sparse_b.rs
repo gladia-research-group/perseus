@@ -223,14 +223,17 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let [r_fold, r_cts, r_stc, r_half] = rr;
         let fold = AccRounds::new(arena, s, n, keys, stage, r_fold)?;
         mark("fold", &mut parts);
-        // diagonals: gc = K_raise / 24 * 2^-t (the shifted raise carries 2^t), gd = q0 / sf(L)
+        // diagonals: gc = K_raise / 24 * 2^-t (the shifted raise carries 2^t), gd = q0 / sf(L) * fdrop: a raise to a
+        // lower top carries sf(L) / sf(raise top) (as the dense routes' last StC stage; 1 at drops 0 and 1, a 4-8 %
+        // output gain error at drops 2-5 without it)
         let shift_t = (-(cfg.cts0_t as f64)).exp2();
         let gc = cfg.raise_k / pc_core::bts_setup::SPARSE_B_K * shift_t;
         let mut q0 = ctx.chain.q[0] as f64;
         for j in 1..d {
             q0 *= ctx.chain.q[j] as f64;
         }
-        let gd = q0 / st.sf((lay.nq - 1) as i32)?;
+        let fdrop = st.sf((lay.nq - 1) as i32)? / st.sf(top as i32)?;
+        let gd = q0 / st.sf((lay.nq - 1) as i32)? * fdrop;
         let (p, q) = sparse_b_diagonals(n as u32, cfg.slots, &g, gc, gd);
         let geo = Self::lt_geom(&g);
         let sf_c = st.sf(top as i32)?;
