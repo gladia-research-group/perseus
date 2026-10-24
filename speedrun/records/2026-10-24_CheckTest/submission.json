@@ -1,1 +1,55 @@
-[]
+{
+  "name": "CheckTest",
+  "tracks": [
+    "prefill",
+    "decode"
+  ],
+  "authors": [
+    {
+      "name": "Test",
+      "github": "alexzilligmm"
+    }
+  ],
+  "summary": "One sentence: what changed.",
+  "ckks": {
+    "log_n": 16,
+    "log_qp": 1706,
+    "secret": "uniform-ternary",
+    "sparse_keys": [
+      {
+        "role": "encapsulation, dense to sparse",
+        "secret": "ternary, Hamming weight 32",
+        "modulus": "q_0 .. q_{d-1} and P"
+      },
+      {
+        "role": "SPRU block key",
+        "secret": "binary, one 1 in each of 64 blocks",
+        "modulus": "q_0 .. q_{d-1} and P"
+      },
+      {
+        "role": "PCMM ring switch (Prefill-128)",
+        "secret": "ternary on ring dimension 4096",
+        "modulus": "q_0 q_1 P"
+      }
+    ]
+  },
+  "systems_only": false,
+  "ai_assistance": {
+    "used": false,
+    "share_of_changed_lines": 0.0,
+    "tools": []
+  },
+  "dev_result": {
+    "gpu": "e.g. NVIDIA H100 80GB",
+    "prefill": {
+      "request_s": 0.0,
+      "record_request_s_same_gpu": 0.0,
+      "mean_kl": 0.0
+    },
+    "decode": {
+      "s_per_token": 0.0,
+      "record_s_per_token_same_gpu": 0.0,
+      "mean_kl": 0.0
+    }
+  }
+}
