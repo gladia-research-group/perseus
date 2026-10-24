@@ -611,7 +611,7 @@ class PlannedRun:
         self.debug = False
         self.records, self._next = {}, None
         self.stats = []
-        self._pre, self._staged = {}, None
+        self._pre, self._staged, self._keys, self._alias = {}, None, {}, {}
 
     # ── setup ──
     def _record(self, t, rows, argmax):
@@ -745,22 +745,24 @@ class PlannedRun:
         plaintexts whose values differ from the previous position's), so that a token's in-clock work is setting
         and staging them. The twin records structure only, on the session's public rows, so a position's patch
         depends on the position alone. Plaintexts that hold equal values at every position (the blocks' step masks)
-        share one slot (`alias_pts`), so a position stages each changed value once. Before the first run."""
+        share one slot (`alias_pts`), so a position stages each changed value once. Once, before the first run."""
         import hashlib
         if self.debug:
             return self
+        if self._alias:
+            raise RuntimeError("precompute: the plaintexts are already aliased")
         t0, n = time.time(), len(rows)
         self._keys = {lab: p.pt_keys() for lab, p in self.progs.items()}
         steps, pts = [], []
         for t in range(n):
             calls, zero, vals = self._steps(t, self.rec.token(t, rows[t], argmax))
             if pts:                        # equal values share the previous position's array
-                prev = dict(pts[-1])
-                vals = [(key, prev[key] if key in prev and np.array_equal(prev[key], v) else v) for key, v in vals]
+                last = dict(pts[-1])
+                vals = [(key, last[key] if key in last and np.array_equal(last[key], v) else v) for key, v in vals]
             steps.append((calls, zero))
             pts.append(vals)
-        # a plaintext's name in the store: the digest of its values at every position
-        digest, traj = {}, {}
+        # a plaintext's name in the store: the digest of its values at every position (checked equal within a name)
+        digest, traj, first = {}, {}, {}
         for i, (key, _v) in enumerate(pts[0]):
             h = hashlib.blake2b(digest_size=12)
             for t in range(n):
@@ -770,13 +772,17 @@ class PlannedRun:
                     digest[id(v)] = hashlib.blake2b(f"{a.dtype.str}{a.shape}".encode() + a.tobytes(),
                                                     digest_size=12).digest()
                 h.update(digest[id(v)])
-            traj[key] = "v/" + h.hexdigest()
+            name = traj[key] = "v/" + h.hexdigest()
+            j = first.setdefault(name, i)
+            if j != i and not all(np.array_equal(pts[t][j][1], pts[t][i][1]) for t in range(n)):
+                raise RuntimeError(f"precompute: digest collision between {pts[0][j][0]} and {key}")
         self._alias = {nm: name for (nm, _lv), name in traj.items()}
         for lab, p in self.progs.items():
             p.alias_pts({nm: self._alias[nm] for nm, _lv in self._keys[lab]})
         for t in range(n):
-            for prev in (None, (t - 1) % n) if t == 0 else ((t - 1) % n,):
-                staged, items = dict(pts[prev]) if prev is not None else {}, []
+            for prev in (None, n - 1) if t == 0 else (t - 1,):
+                staged = dict(pts[prev]) if prev is not None else {}
+                items = []
                 for key, v in pts[t]:
                     old = staged.get(key)
                     if old is None or (old is not v and not np.array_equal(old, v)):
@@ -790,12 +796,11 @@ class PlannedRun:
 
     def _shared(self, items):
         """Staged items [(name, level, values)] under their shared store names, one per name and level."""
-        alias = getattr(self, "_alias", None)
-        if not alias:
+        if not self._alias:
             return items
         out = {}
         for nm, lv, v in items:
-            out.setdefault((alias[nm], lv), v)
+            out.setdefault((self._alias[nm], lv), v)
         return [(nm, lv, v) for (nm, lv), v in out.items()]
 
     # ── per token ──
@@ -804,7 +809,7 @@ class PlannedRun:
         the K/V inputs read as an empty cache {block: positions}, and the plaintext values [((name, level), v)] by
         the programs' own plaintext names."""
         calls, zero, vals = [], {}, []
-        keys = getattr(self, "_keys", {})
+        keys = self._keys
         for b, r in recs.items():
             labs = [self.labels[b]] + [lab for lab, vb in self.variants.items() if vb == b]
             s, k, z = diff_block(self.ref[b], r)
