@@ -210,6 +210,9 @@ class PlanConfig:
     #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
     #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
     ilp_cap_exit: bool = True
+    #: a dense refresh whose input is past the StC-first entry runs the shipped order at the plan's CF: give it that
+    #: order's CF (PLAN_FALLBACK_CF; off: the StC-first choice, sized on slot magnitudes, as every shipped plan has)
+    fallback_cf: bool = False
     #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
     #: each placed refresh whose removal keeps the block within budget, lowers the bootstrap
     #: count and adds no refresh input past the envelope.
@@ -1014,6 +1017,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         boundary_realize=cfg.boundary_realize,
         realize_anchors=rescale_anchors,
         real_route=cfg.real_route,
+        fallback_cf=cfg.fallback_cf,
     )
     # Refresh-input absolute levels of the placed sites: what the pricing knobs move.
     # eff = nominal + pending rescale, as _capacity sees it.

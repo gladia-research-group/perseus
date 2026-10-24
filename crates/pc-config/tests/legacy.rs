@@ -41,7 +41,9 @@ fn field_table() {
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
     // bts.lt_tails
     assert_eq!(cf.len(), 252);
-    assert_eq!(pf.len(), 89); // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf
+    // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
+    // plan.fallback_cf
+    assert_eq!(pf.len(), 90);
     let mut envs = BTreeSet::new();
     let mut dotted = BTreeSet::new();
     for f in cf.iter().chain(pf.iter()) {
@@ -52,8 +54,8 @@ fn field_table() {
         }
     }
     // 337 inventory names - 4 without a field (GPU guard, dropped _client, two upstream-driver inputs) + the two
-    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS)
-    assert_eq!(envs.len(), 335);
+    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS) + PLAN_FALLBACK_CF
+    assert_eq!(envs.len(), 336);
 }
 
 #[test]
