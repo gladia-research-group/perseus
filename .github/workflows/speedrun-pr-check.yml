@@ -4,8 +4,9 @@
 # pull_request_target workflows from the default branch, so this file lives on main and checks out the PR's base on
 # speedrun, whose checker it runs; it reads the PR through git only, so no submitted code runs here, and the PR's
 # description reaches it as a file. A plain PR that passes gets no comment. An entry that passes is labelled `checked`
-# and its review requested; a failure is labelled `check-failed` and explained in a comment. A repository Actions
-# policy allows pull_request_target for this file (speedrun/MAINTAINING.md).
+# and its review requested; a failure is labelled `check-failed` and explained in a comment. A check that does not
+# run to the end fails, never passes. A repository Actions policy allows pull_request_target for this file
+# (speedrun/MAINTAINING.md); the action is pinned to a commit, since the job holds a write token.
 name: Speedrun PR check
 on:
   pull_request_target:
@@ -19,7 +20,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
@@ -32,9 +33,14 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
         run: |
           printf '%s' "$BODY" > "$RUNNER_TEMP/body.md"
-          if python3 speedrun/harness/check_pr.py --base "${{ github.event.pull_request.base.sha }}" --head pr-head \
-               --author "$AUTHOR" --body "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/report.md"
-          then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "ok=0" >> "$GITHUB_OUTPUT"; fi
+          ok=1
+          python3 speedrun/harness/check_pr.py --base "${{ github.event.pull_request.base.sha }}" --head pr-head \
+            --author "$AUTHOR" --body "$RUNNER_TEMP/body.md" > "$RUNNER_TEMP/report.md" || ok=0
+          if [ "$ok" = 0 ] && [ ! -s "$RUNNER_TEMP/report.md" ]; then
+            printf '%s\n' '<!-- speedrun-pr-check -->' \
+              '**PR check: failed.** The check did not run to the end; a maintainer looks at it.' > "$RUNNER_TEMP/report.md"
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/report.md"
       - name: Report and notify
         env:
