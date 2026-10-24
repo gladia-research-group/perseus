@@ -355,17 +355,7 @@ the rules, the harness that times entries and the records. Every entry is a pull
 
 ## Citation
 
-If you use Perseus, please cite the paper (GitHub's *Cite this repository* button reads
-[`CITATION.cff`](CITATION.cff)).
-
-```bibtex
-@misc{zirilli2026perseus,
-  title  = {Perseus: A Bootstrap Placer for Faster Encrypted Transformer Inference},
-  author = {Zirilli, Alessandro and Marincione, Davide and Kornaropoulos, Evgenios M. and Ateniese, Giuseppe and Rodol{\`a}, Emanuele},
-  year   = {2026},
-  url    = {https://github.com/gladia-research-group/perseus}
-}
-```
+The paper is coming soon.
 
 ## License
 
