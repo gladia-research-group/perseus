@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 13u
+#define PC_KERNELS_ABI 15u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -377,6 +377,17 @@ struct RescaleArgs {
     int32_t top, nrows, K, ndrop;
 };
 static_assert(sizeof(RescaleArgs) == 152, "RescaleArgs layout");
+
+// rescale_fwd (ABI 14, ndrop 2): rescale_coef and the forward NTT of its rows in one pipeline, the correction never
+// stored: rescale_prep writes the two sources of every coefficient into tmp rows top (y_a, scaled by ca) and top - 1
+// (y'); the NTT's column pass generates tmp_i = A_i lift(y_a) + B_i lift(y') in registers. `ntt` is the forward NTT
+// of the tmp rows (rprime = the row's prime id; the sources sit top - i and top - 1 - i rows above row i of the same
+// polynomial), its epilogue included (MUL_ADD: the combine).
+struct RescaleNttArgs {
+    RescaleArgs rs;
+    NttArgs ntt;
+};
+static_assert(sizeof(RescaleNttArgs) == 328, "RescaleNttArgs layout");
 
 struct RescaleCombineArgs {
     PolyRef x, tmp;
@@ -787,8 +798,9 @@ struct KernelTable {
     int (*small_int1)(const SmallInt1Args*, cudaStream_t);
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
     int (*mul_add)(const MulAddArgs*, cudaStream_t);
+    int (*rescale_fwd)(const RescaleNttArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 39 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 40 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

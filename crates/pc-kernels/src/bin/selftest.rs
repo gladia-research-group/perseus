@@ -1536,6 +1536,10 @@ fn t_rescale(st: &mut Setup) -> Vec<TestResult> {
             let (lr, lp) = st.rows(&lows);
             ck(unsafe { (st.t.ntt_fwd)(&st.ntt_args(x.p(), &ar, &ap, all.len()), st.s()) });
             ck(unsafe { (st.t.ntt_inv)(&st.ntt_args(x.p(), &tr, &tp, tops.len()), st.s()) });
+            // ABI 14 (drop 2): the same rescale as one rescale_fwd pipeline on a copy (correction generated in the
+            // column pass, combine in the row pass's epilogue)
+            let x2 = st.ctx.up(&x.read(&st.ctx));
+            let tmp2 = st.ctx.zeros(2 * k * 8 * N);
             ck(unsafe { (st.t.rescale_coef)(&ra, st.s()) });
             ck(unsafe { (st.t.ntt_fwd)(&st.ntt_args(tmp.p(), &lr, &lp, lows.len()), st.s()) });
             // ABI 7: the out-of-place combine first (x unchanged), then the in-place one; equal in the NTT domain
@@ -1544,6 +1548,12 @@ fn t_rescale(st: &mut Setup) -> Vec<TestResult> {
             ck(unsafe { (st.t.rescale_combine)(&ca, st.s()) });
             let mask = |v: &[u64]| -> Vec<u64> { lows.iter().flat_map(|&(o, _)| v[o as usize * N..(o as usize + 1) * N].to_vec()).collect() };
             out.push(cmp(&format!("rescale_combine_to == rescale_combine (drop {ndrop})"), &mask(&o3.read(&st.ctx)), &mask(&x.read(&st.ctx))));
+            if ndrop == 2 {
+                let ntt = NttArgs { eout: x2.p(), ex: x2.c(), es: ds[6].c(), ess: ds[7].c(), epi: ntt_epi::MUL_ADD, ..st.ntt_args(tmp2.p(), &lr, &lp, lows.len()) };
+                let rs = RescaleArgs { x: ctref(&x2), tmp: ctref(&tmp2), ..ra };
+                ck(unsafe { (st.t.rescale_fwd)(&RescaleNttArgs { rs, ntt }, st.s()) });
+                out.push(cmp(&format!("rescale_fwd == rescale_coef + NTT + combine (drop 2{})", if fold { ", folded" } else { "" }), &mask(&x2.read(&st.ctx)), &mask(&x.read(&st.ctx))));
+            }
             ck(unsafe { (st.t.ntt_inv)(&st.ntt_args(x.p(), &lr, &lp, lows.len()), st.s()) });
             let got = x.read(&st.ctx);
             out.push(cmp(&label, &mask(&got), &mask(&want)));

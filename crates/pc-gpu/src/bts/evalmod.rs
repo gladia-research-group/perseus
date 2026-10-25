@@ -872,8 +872,9 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         Ok(())
     }
 
-    /// Rescale buffer `buf` in place, or (`src = Some(s)`) buf = rescale(s) with s unchanged: only s's two top rows
-    /// are copied into buf (the conversion's input), the combine reads s and writes buf (the program's `Copy; Rescale`).
+    /// Rescale buffer `buf` in place, or (`src = Some(s)`) buf = rescale(s) with s unchanged: s's top rows reach buf
+    /// through their INTT (the conversion's input; copied first on a 1-prime unit), the combine reads s and writes buf
+    /// (the program's `Copy; Rescale`). On a 2-prime unit the conversion and the NTT of its rows run as `rescale_fwd`.
     fn rescale_from<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, buf: usize, src: Option<usize>, n: usize, k: Option<usize>, kk: usize) -> Result<()> {
         let ctx = cx.ctx;
         let top = n - 1;
@@ -881,13 +882,24 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let s = &cx.ex.compute;
         let d = rp.d;
         let keep = top + 1 - d; // rows left
-        if let Some(si) = src {
-            // the d tops of the source into buf (the conversion reads them there, in coefficient form)
-            let off = |v: View| View { base: (v.base as *mut W).wrapping_add(keep * ctx.lay.n) as *mut c_void, ..v };
-            ks::ew(ctx, s, ks::Ew::Copy, off(View::of(&cx.work.em[buf], 0)), off(View::of(&cx.work.em[si], 0)), None, ctx.lay.rs_q(d - 1), kk, 2)?;
+        let from = src.map(|si| cx.work.em[si].buf.vptr());
+        match from {
+            Some(f) if d == 2 => {
+                // the source's tops, inverse transformed into buf (programs buffers share their row offsets)
+                let xb = &mut cx.work.em[buf];
+                let sv = ntt::Src { base: f, soff: rp.intt.roff.dptr(), n: 1, stride: 0 };
+                ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, &mut xb.buf, &rp.intt, kk * 2 * d, Some(sv), None)?;
+            }
+            _ => {
+                if let Some(si) = src {
+                    // the d tops of the source into buf (the conversion reads them there, in coefficient form)
+                    let off = |v: View| View { base: (v.base as *mut W).wrapping_add(keep * ctx.lay.n) as *mut c_void, ..v };
+                    ks::ew(ctx, s, ks::Ew::Copy, off(View::of(&cx.work.em[buf], 0)), off(View::of(&cx.work.em[si], 0)), None, ctx.lay.rs_q(d - 1), kk, 2)?;
+                }
+                ntt::transform_rows_prefix(ctx, s, Dir::Inverse, &mut cx.work.em[buf].buf, &rp.intt, kk * 2 * d)?;
+            }
         }
         let xb = &mut cx.work.em[buf];
-        ntt::transform_rows_prefix(ctx, s, Dir::Inverse, &mut xb.buf, &rp.intt, kk * 2 * d)?;
         let (ca, cb, al, als) = match k {
             Some(ki) => {
                 let c = &self.consts_host[*&ki];
@@ -916,15 +928,19 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             k: kk as i32,
             ndrop: d as i32,
         };
-        // SAFETY: kk cts of a program buffer and of the LT workspace (>= kk_max cts), context-layout tables
-        launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&ra, s.raw()) })?;
         // buf rows 0..top-2 = alpha * (buf or the source, left as it was) + NTT(tmp): the combine rides the
         // transform's epilogue (program buffers share tmp's row offsets)
-        let from = match src {
-            None => xb.buf.vptr(),
-            Some(si) => cx.work.em[si].buf.vptr(),
-        };
+        let from = from.unwrap_or(xb.buf.vptr());
         let epi = ntt::Epi::MulAdd { out: cx.work.em[buf].buf.vptr_mut(), x: from, s: al, ss: als };
+        if d == 2 {
+            let ntt = ntt::forward_args(ctx, &mut cx.work.lt_tmp.buf, &rp.ntt, kk * 2 * keep, Some(epi))?;
+            // SAFETY: as rescale_coef and the transform below; the prep writes the LT workspace's rows top-1, top
+            // (scratch, past the kk * 2 * keep transform rows)
+            launch_result("rescale_fwd", unsafe { (ctx.table.rescale_fwd)(&pc_kernels::RescaleNttArgs { rs: ra, ntt }, s.raw()) })?;
+            return Ok(());
+        }
+        // SAFETY: kk cts of a program buffer and of the LT workspace (>= kk_max cts), context-layout tables
+        launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&ra, s.raw()) })?;
         ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut cx.work.lt_tmp.buf, &rp.ntt, kk * 2 * keep, None, Some(epi))
     }
 
