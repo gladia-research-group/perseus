@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 12u
+#define PC_KERNELS_ABI 13u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -279,15 +279,16 @@ static_assert(sizeof(CtsArgs) == 192, "CtsArgs layout");
 // ------------------------------------------------------------------------------------------------ EvalMod kernels
 // Q rows [0, n) of K ciphertexts (row index == prime id), PolyRef layout.
 // tensor: (c0, c1, d2) (= | +=) sum_{j < npairs} (a0 b0, a0 b1 + a1 b0, a1 b1); d2 written to part 1 of `d2`, and to
-// coef (when non-null) at coef + c*coef_ct_stride + row*N.
+// coef (when non-null) at coef + c*coef_ct_stride + row*N. ABI 13: dbl doubles all three (c0, c1 after the +=).
 struct TensorArgs {
     PolyRef out, d2, a0, b0, a1, b1;
     void* coef;
     uint64_t coef_ct_stride;
     const PrimeConst* pr;
     int32_t npairs, acc, n, K;
+    int32_t dbl, pad;
 };
-static_assert(sizeof(TensorArgs) == 184, "TensorArgs layout");
+static_assert(sizeof(TensorArgs) == 192, "TensorArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
 struct MdEpiArgs {

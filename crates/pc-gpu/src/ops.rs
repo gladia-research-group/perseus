@@ -947,6 +947,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
             acc: acc as i32,
             n: (top + 1) as i32,
             k: k as i32,
+            dbl: 0,
+            pad: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1 and d2[c] part 1, so
         // out aliasing an input is element-wise safe; rows 0..=top of k cts
@@ -1004,6 +1006,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
             acc: 0,
             n: (top + 1) as i32,
             k: k as i32,
+            dbl: 0,
+            pad: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1, so out aliasing the A
         // operand (it holds A's adjusted copy) is element-wise safe; ext is distinct from out and the scratch copy of

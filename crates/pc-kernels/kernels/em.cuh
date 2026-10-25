@@ -45,6 +45,14 @@ __global__ void tensor(TensorArgs A) {
             r1[w] = add<W>(r1[w], d1.v[w], p);
         }
     }
+    if (A.dbl) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            r0[w] = add<W>(r0[w], r0[w], p);
+            r1[w] = add<W>(r1[w], r1[w], p);
+            r2[w] = add<W>(r2[w], r2[w], p);
+        }
+    }
     store4<W>(o0, r0[0], r0[1], r0[2], r0[3]);
     store4<W>(o1, r1[0], r1[1], r1[2], r1[3]);
     store4<W>(at<W>(A.d2, c, 1, row) + i, r2[0], r2[1], r2[2], r2[3]);

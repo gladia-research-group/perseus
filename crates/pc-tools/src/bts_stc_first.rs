@@ -796,6 +796,8 @@ pub fn bench(args: &[String]) -> Res<bool> {
     setup.raise_drops = vec![0, 1];
     setup.k_max = kmax;
     setup.real = true;
+    // PC_EM_FUSE_RESCALE=1: the EvalMod relinearization-rescale fusion (stcf-prec compares the two forms' errors)
+    setup.em_fuse_rescale = std::env::var("PC_EM_FUSE_RESCALE").is_ok_and(|v| v == "1");
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     let high_shapes = vec![StcHighShape { out_level: 50, skip_mask: 1 }, StcHighShape { out_level: 30, skip_mask: 6 }, StcHighShape { out_level: 40, skip_mask: 0 }];
@@ -961,8 +963,10 @@ pub fn bench(args: &[String]) -> Res<bool> {
                             for (j, &amp) in chunk.1.iter().enumerate() {
                                 let e = got[j].iter().zip(&chunk.0[j]).map(|(g, v)| (g.re - v.re).abs()).fold(0f64, f64::max) / amp;
                                 let ec = got[j].iter().zip(&chunk.0[j]).map(|(g, v)| (*g - *v).abs()).fold(0f64, f64::max) / amp;
+                                // RMS of the complex error over the slots (the max moves ~5 % between noise draws)
+                                let rms = (got[j].iter().zip(&chunk.0[j]).map(|(g, v)| (*g - *v).abs().powi(2)).sum::<f64>() / got[j].len() as f64).sqrt() / amp;
                                 println!(
-                                    "[pc-bench] stcf-prec cf={cf} own_cf={own} real={real} cf_stage={} input level {} A={amp}: Re {e:.3e} ({:.2} bits), complex {ec:.3e} ({:.2} bits); landing {} deg {}",
+                                    "[pc-bench] stcf-prec cf={cf} own_cf={own} real={real} cf_stage={} input level {} A={amp}: Re {e:.3e} ({:.2} bits), complex {ec:.3e} ({:.2} bits), rms {rms:.4e}; landing {} deg {}",
                                     info.cf_stage,
                                     a.level,
                                     -e.log2(),
@@ -971,7 +975,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
                                     x.meta.deg
                                 );
                                 rows.push(serde_json::json!({"route": "stc_first", "real": real, "input_level": a.level, "iterations": 1, "cf": cf, "own_cf": own, "cf_stage": info.cf_stage, "period": 0, "amp": amp,
-                                    "rel_err": e, "bits": -e.log2(), "rel_err_complex": ec, "bits_complex": -ec.log2(), "landing_level": x.meta.level, "landing_deg": x.meta.deg}));
+                                    "rel_err": e, "bits": -e.log2(), "rel_err_complex": ec, "bits_complex": -ec.log2(), "rms": rms, "landing_level": x.meta.level, "landing_deg": x.meta.deg}));
                             }
                         }
                     }

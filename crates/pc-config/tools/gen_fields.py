@@ -97,7 +97,7 @@ def rows():
 
 def doc_lines(r):
     if r.get("extra"):
-        return [r["doc"].replace('"', "'"), f"Runtime switch `{r['name']}`." if r["name"] else "No legacy env name."]
+        return [r["doc"].replace('"', "'"), f"Runtime switch `{r['name']}` [kernel]: binds no plan and no key bundle." if r["name"] else "No legacy env name."]
     if not r["name"]:
         return [r["doc"].replace('"', "'"), "No legacy env name."]
     at = r["at"].replace("<br>", "; ")

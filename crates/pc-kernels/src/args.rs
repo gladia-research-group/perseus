@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 12;
+pub const ABI: u32 = 13;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -280,6 +280,9 @@ pub struct TensorArgs {
     pub acc: i32,
     pub n: i32,
     pub k: i32,
+    /// ABI 13: 1 doubles the three outputs.
+    pub dbl: i32,
+    pub pad: i32,
 }
 
 #[repr(C)]
@@ -810,7 +813,7 @@ const _: () = {
     assert!(size_of::<KsRegenArgs>() == 312);
     assert!(size_of::<KskExpandArgs>() == 48);
     assert!(size_of::<CtsArgs>() == 192);
-    assert!(size_of::<TensorArgs>() == 184);
+    assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
