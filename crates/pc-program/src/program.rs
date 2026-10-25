@@ -393,6 +393,29 @@ impl Program {
         out
     }
 
+    /// The plaintext products consumed once, by the add or sub right after them (a BSGS baby sum's terms): op
+    /// indices of the products. The pair can run as one pass (`Ops::mult_pt_add`), the product never written.
+    pub fn mult_pt_adds(&self) -> Vec<usize> {
+        let mut uses: BTreeMap<VarId, usize> = BTreeMap::new();
+        for op in &self.ops {
+            for v in op.all_ins() {
+                *uses.entry(v).or_default() += 1;
+            }
+        }
+        let mut out = vec![];
+        for i in 0..self.ops.len().saturating_sub(1) {
+            let (m, a) = (&self.ops[i], &self.ops[i + 1]);
+            if !matches!(m.kind, Kind::MultPt(_)) || !matches!(a.kind, Kind::Add | Kind::Sub) || m.outs.len() != 1 || a.ins.len() != 2 {
+                continue;
+            }
+            let v = m.outs[0];
+            if uses.get(&v) == Some(&1) && a.ins.contains(&v) && !self.outputs.contains(&v) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
     /// The rotation chains: rotation ops outside the grids (single or K-batched, at most `GRID_INPUTS` ciphertexts of
     /// one level, outputs in slots of their own that are no input's) that rotate the same inputs. The first link
     /// gathers its inputs and runs their ModUp, the later links reuse both. A `held` chain keeps them in buffers of

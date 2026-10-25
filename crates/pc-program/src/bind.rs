@@ -8,7 +8,7 @@
 //! * every streamed weight row (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
 //! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata;
 //! * the steps issued together (`Unit`): rotation grids and chains (`Program::rotation_grids` / `rotation_chains`),
-//!   K-batches of rotate_sums. Other batched ops are bound member by member (separate slots).
+//!   K-batches, plaintext products with their add (`mult_pt_adds`). Other batches: member by member.
 //! Details in docs/ARCHITECTURE.md "pc-program bind".
 use crate::error::{Error, Result};
 use crate::program::{Kind, Op, Origin, Program, Scalar, GRID_INPUTS};
@@ -144,6 +144,10 @@ pub enum UnitKind {
     Mult { b: Vec<u32> },
     /// A K-batch of refreshes on one route (`BtsRoute::run` of K ciphertexts): step `lo + c` refreshes `Unit::ins[c]`.
     Refresh { route: Route, kind: RouteKind },
+    /// A plaintext product and the add consuming it as one pass (`Ops::mult_pt_add`): step `lo` multiplies
+    /// `Unit::ins[0]` by plaintext `pt`, step `lo + 1` adds (`sub`: subtracts) it and `Unit::ins[1]`, the product
+    /// first when `product_first`.
+    MultPtAdd { pt: u32, sub: bool, product_first: bool },
 }
 
 /// Steps `lo..hi` issued together (their outputs at once), reading the slots `ins`. `chain`: the rotation chain the
@@ -665,6 +669,22 @@ impl<'a, W: DevWord> Bound<'a, W> {
             }
             unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
             units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind: UnitKind::RotateSum { l, g }, chain: NONE, off: false });
+        }
+        // plaintext products consumed by the next add (the product's input and the add's other operand stay live)
+        for oi in p.mult_pt_adds() {
+            let lo = first_step[oi];
+            let (StepOp::MultPt(pt), add) = (&steps[lo].op, &steps[lo + 1]) else { continue };
+            if !matches!(add.op, StepOp::Add | StepOp::Sub) || unit_of[lo] != NONE || unit_of[lo + 1] != NONE {
+                continue;
+            }
+            let sub = add.op == StepOp::Sub;
+            let product_first = p.ops[oi + 1].ins[0] == p.ops[oi].outs[0];
+            let y = if product_first { add.b } else { add.a };
+            if y == NONE {
+                continue;
+            }
+            unit_of[lo..lo + 2].iter_mut().for_each(|x| *x = units.len() as u32);
+            units.push(Unit { lo: lo as u32, hi: lo as u32 + 2, ins: vec![steps[lo].a, y], kind: UnitKind::MultPtAdd { pt: *pt, sub, product_first }, chain: NONE, off: false });
         }
         // K-batches of products and of refreshes (siblings of one recipe / route; outputs in slots of their own, the
         // refresh route built for K ciphertexts)

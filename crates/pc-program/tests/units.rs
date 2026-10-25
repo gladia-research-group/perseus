@@ -6,10 +6,12 @@
 //!     every output in a slot of its own that is no input's;
 //!   * rotation chains: every link rotates the chain's inputs; only element-wise ops and rescales between the links of
 //!     a chain kept in place; held chains do not overlap; no op between a chain's first and last link writes an
-//!     input's slot.
+//!     input's slot;
+//!   * plaintext products fused with their add (`Program::mult_pt_adds`): the product feeds only the add right after
+//!     it and is no output.
 use pc_program::compile::batch::Schedule;
 use pc_program::compile::{compile_dir, CompileOpts};
-use pc_program::program::{Kind, Op, Program, VarId, GRID_INPUTS};
+use pc_program::program::{Kind, Op, Origin, Program, VarId, GRID_INPUTS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -126,4 +128,49 @@ fn grid_and_chain_invariants() {
     grids_and_chains("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16", Schedule::Siblings);
     grids_and_chains("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16", Schedule::Program);
     grids_and_chains("gpt2_decode_python_n32_m16i", "gpt2_decode_python_n32_gcheb", Schedule::Program);
+}
+
+fn fused_pairs(plan: &str, graph: &str) {
+    let Some(progs) = compile(plan, graph, Schedule::Program) else { return };
+    let mut per: Vec<String> = vec![];
+    for (label, p) in &progs {
+        let mut uses: BTreeMap<VarId, usize> = BTreeMap::new();
+        for v in p.ops.iter().flat_map(|o| o.all_ins()) {
+            *uses.entry(v).or_default() += 1;
+        }
+        let pairs = p.mult_pt_adds();
+        for &i in &pairs {
+            let (m, a) = (&p.ops[i], &p.ops[i + 1]);
+            assert!(matches!(m.kind, Kind::MultPt(_)) && matches!(a.kind, Kind::Add | Kind::Sub), "{label}: op {i} is not a product and its add");
+            let v = m.outs[0];
+            assert_eq!(uses.get(&v), Some(&1), "{label}: a fused product read twice");
+            assert!(a.ins.contains(&v) && !p.outputs.contains(&v), "{label}: a fused product the add does not read, or an output");
+        }
+        per.push(format!("{label} {}", pairs.len()));
+    }
+    println!("{plan}: fused pairs {}", per.join(", "));
+}
+
+fn op(kind: Kind, ins: Vec<VarId>, out: VarId) -> Op {
+    Op { kind, ins, outs: vec![out], pre: vec![], origin: Origin::Node(out), inplace: false }
+}
+
+#[test]
+fn mult_pt_add_pairs() {
+    fused_pairs("gpt2_decode_python_n32_m16i_fcf", "gpt2_decode_python_n32_gcheb");
+    fused_pairs("gpt2_prefill128_pf", "gpt2_prefill128_pf");
+    // x = var 0, y = var 1: y + x pt and x pt - y fuse (the product first or second, add or sub); a product read
+    // twice, a product that is an output, a product the next op does not read, a batched product do not
+    let prog = |ops: Vec<Op>, outputs: Vec<VarId>| Program { ops, outputs, ..Default::default() };
+    let p = prog(vec![op(Kind::MultPt(0), vec![0], 2), op(Kind::Add, vec![1, 2], 3), op(Kind::MultPt(1), vec![0], 4), op(Kind::Sub, vec![4, 1], 5)], vec![3, 5]);
+    assert_eq!(p.mult_pt_adds(), vec![0, 2]);
+    let twice = prog(vec![op(Kind::MultPt(0), vec![0], 2), op(Kind::Add, vec![1, 2], 3), op(Kind::Add, vec![2, 3], 4)], vec![4]);
+    assert!(twice.mult_pt_adds().is_empty());
+    let output = prog(vec![op(Kind::MultPt(0), vec![0], 2), op(Kind::Add, vec![1, 2], 3)], vec![3, 2]);
+    assert!(output.mult_pt_adds().is_empty());
+    let other = prog(vec![op(Kind::MultPt(0), vec![0], 2), op(Kind::Add, vec![1, 1], 3), op(Kind::Add, vec![2, 3], 4)], vec![4]);
+    assert!(other.mult_pt_adds().is_empty());
+    let batched = Op { kind: Kind::Batched(vec![op(Kind::MultPt(0), vec![0], 2)]), ins: vec![], outs: vec![], pre: vec![], origin: Origin::Node(2), inplace: false };
+    let batch = prog(vec![batched, op(Kind::Add, vec![1, 2], 3)], vec![3]);
+    assert!(batch.mult_pt_adds().is_empty());
 }
