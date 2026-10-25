@@ -77,6 +77,9 @@ def main(argv=None):
                     help="with --argmax: logit rows [N, vocab] whose CutMax also runs; block 13 takes the per-node max")
     ap.add_argument("--blocks", default=None, help="comma-separated stages to write (default: every taped stage)")
     ap.add_argument("--procs", type=int, default=os.cpu_count())
+    ap.add_argument("--keep-differing", action="store_true",
+                    help="a step whose op list differs at this position keeps the capture's statistics (position 1's "
+                         "K / V push)")
     a = ap.parse_args(argv)
     from . import env
     over = {**env.plan_runtime(a.plan, "n32"), "GPT2_PACKING": a.packing,
@@ -123,7 +126,7 @@ def main(argv=None):
         tapes[b] = magtape.merge_max(recs)
     if a.blocks:
         tapes = {b: r for b, r in tapes.items() if b in {int(x) for x in a.blocks.split(",")}}
-    done = magtape.fill_dir(a.graph_dir, tapes, ".filled" if a.check else "")
+    done = magtape.fill_dir(a.graph_dir, tapes, ".filled" if a.check else "", keep_differing=a.keep_differing)
     if a.check:
         for b in done:
             print(f"[mags] block {b} vs {a.check} (median, p99, max rel diff):",

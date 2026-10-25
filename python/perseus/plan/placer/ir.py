@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# packtag::Field::Real (include/packing/pack_tag.h): the slots hold a real payload.
+# packtag::Field::Real / ::Complex (include/packing/pack_tag.h): the slots hold a real payload / a payload on each part.
 FIELD_REAL = 1
+FIELD_COMPLEX = 3
 
 # Table depth costs, in CKKS levels (x level_unit at use sites).
 DEPTH_COSTS: dict[str, int] = {

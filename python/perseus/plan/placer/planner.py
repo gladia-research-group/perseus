@@ -193,10 +193,6 @@ class PlanConfig:
     # landing (PLAN_SPARSE_BTS_OUT) includes it, and the plan's raise_drop is absolute, so a site's assigned drop adds
     # to it and rounds within raise_drop_set as that total (PLAN_RAISE_DROP_BASE).
     raise_drop_base: tuple[tuple[int, int], ...] = ()
-    # The plan binds every hint decision (hint_fire), so a raise drop may look past a hint: an unfired one aliases its
-    # input, a fired one is a refresh whose input meets the envelope (PLAN_RAISE_HINTS; off: a hint downstream
-    # disqualifies the site, as every shipped plan was planned)
-    raise_drop_hints: bool = False
     # Dense refreshes whose slots the capture tagged real run one EvalMod chain (plan 'real_route'; the runtime
     # builds the real StC stage under FIDESLIB_BTS_REAL).
     real_route: bool = False
@@ -209,6 +205,10 @@ class PlanConfig:
     #: a plan dir whose placements every block keeps (forced into the cut, which adds only what the new seeds
     #: still need): a plan re-derived for other entry levels with the refresh sites it was validated with
     keep_placements: str | None = None
+    #: with keep_placements: the plan must end with exactly the kept file's placements and fired hints (nothing added,
+    #: moved or pruned; every kept site present in the graph), else the block stops: a capture whose node names moved
+    #: can never re-place silently (PLAN_KEEP_PLACEMENTS_EXACT; a drops-only post-pass with PLAN_RAISE_SEARCH)
+    keep_placements_exact: bool = False
     verbose: bool = True
     placer: str = "min_cut"
     baseline_rescue: bool = False
@@ -225,12 +225,14 @@ class PlanConfig:
     #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
     #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
     ilp_cap_exit: bool = True
-    #: placer "ilp": hints are decisions too (IlpPlacer.free_hints)
-    ilp_free_hints: bool = False
     #: a dense refresh whose input is past the StC-first entry runs the shipped order at the plan's CF: give it that
     #: order's CF (PLAN_FALLBACK_CF; off: the StC-first choice, sized on slot magnitudes, as every shipped plan has)
     fallback_cf: bool = False
-    #: placer "ilp": a deterministic choice among equal-cost optima (IlpPlacer.tiebreak, PLAN_ILP_TIEBREAK)
+    #: a refresh of a complex pack whose small imaginary part a conjugation splits off downstream gets the lowest CF its
+    #: band allows, where its route's EvalMod sees the coefficients: its noise is absolute, the same on both parts
+    #: (PLAN_PACK_CF; emit.split_packs)
+    pack_cf: bool = False
+    #: placer "ilp": one optimum, the same on every machine and solver build (IlpPlacer.tiebreak, PLAN_ILP_TIEBREAK)
     ilp_tiebreak: bool = False
     #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
     #: each placed refresh whose removal keeps the block within budget, lowers the bootstrap
@@ -434,13 +436,7 @@ def _assign_raise_drops(g: Graph, sim: SimResult, placed: set, cfg: PlanConfig,
                 continue
             for n in cs:
                 if n.hint_level is not None:
-                    if not cfg.raise_drop_hints:
-                        hint = True
-                    elif sim.hint_fired.get(n.idx):
-                        ends.append(x)      # the fired hint's INPUT meets the envelope
-                    elif n.output and n.output not in seen:
-                        seen.add(n.output)
-                        stack.append(n.output)
+                    hint = True
                     continue
                 if getattr(n, "is_deliberate_bts", False):
                     ends.append(x)          # the fold's INPUT is what meets the envelope
@@ -653,6 +649,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
               f"{erase.n_deliberate_kept} deliberate fixed point(s) kept")
 
     kept_sites: set[str] = set()
+    kept_hints: set[str] | None = None        # PLAN_KEEP_PLACEMENTS_EXACT: the kept plan's fired hints
     input_level_of: dict[str, float] = {}
     first_consumer_seed: dict[str, float] = {}
     for n in g.nodes:
@@ -800,8 +797,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         from .ilp import IlpPlacer
         PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
                             objective=cfg.ilp_objective,
-                            cap_exit=bool(final_block and cfg.ilp_cap_exit),
-                            free_hints=cfg.ilp_free_hints, tiebreak=cfg.ilp_tiebreak)
+                            cap_exit=bool(final_block and cfg.ilp_cap_exit), tiebreak=cfg.ilp_tiebreak)
     if exact:
         # force_place: pre-seeded placements (the terminal-exit refresh retry in
         # plan_graph_dir, and the magnitude keep-anchors). The cut still adds
@@ -814,6 +810,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 raise FileNotFoundError(f"keep_placements: no {kept}")
             doc = json.loads(kept.read_text(encoding="utf-8"))
             kept_sites = {p["target_var"] for p in doc.get("placements", []) if p.get("target_var") in g.producer_of}
+            if cfg.keep_placements_exact:
+                kept_hints = set(doc.get("hint_fire", []))
+                absent = sorted({p["target_var"] for p in doc.get("placements", []) if p.get("target_var")} - kept_sites
+                                | {h for h in kept_hints if h not in g.producer_of})
+                if absent:
+                    raise RuntimeError(f"keep_placements_exact: {len(absent)} kept site(s) of {kept} are not in "
+                                       f"{graph_file}: {', '.join(map(str, absent[:6]))} (another capture?)")
             forced |= kept_sites
             if cfg.verbose:
                 log.info(f"[plan] keep_placements: {len(forced)} site(s) kept from {kept}")
@@ -1025,6 +1028,20 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                      + " ".join(f"{k}:{c}" for k, c in sorted(raise_hist.items()))
                      + (f"; skipped {raise_skipped}" if raise_skipped else ""))
 
+    if kept_hints is not None:
+        # PLAN_KEEP_PLACEMENTS_EXACT: the final plan (after the cut, the realize trials, the prune and the raise pass)
+        # refreshes exactly where the kept plan does
+        fired_now = {g.nodes[i].output for i, f in sim.hint_fired.items() if f and g.nodes[i].output}
+        diff = [(what, sorted(a - b)) for what, a, b in (
+            ("placements added", set(placer.placed), kept_sites),
+            ("placements dropped", kept_sites, set(placer.placed)),
+            ("hints fired", fired_now, kept_hints), ("hints no longer fired", kept_hints, fired_now)) if a - b]
+        if diff:
+            raise RuntimeError(f"keep_placements_exact: {block_name} differs from {cfg.keep_placements}: "
+                               + "; ".join(f"{what} {', '.join(vs[:6])}" for what, vs in diff))
+        if cfg.verbose:
+            log.info(f"[plan] keep_placements_exact: {len(kept_sites)} placement(s) and {len(kept_hints)} fired "
+                     f"hint(s) as kept")
     clamp = refresh.cf_clamp_report(sorted(set(placer.placed) | fired_hints))
     if diagnostics is not None:
         diagnostics.cf_clamp = clamp
@@ -1180,6 +1197,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         realize_anchors=rescale_anchors,
         real_route=cfg.real_route,
         fallback_cf=cfg.fallback_cf,
+        pack_cf=cfg.pack_cf,
     )
     # Refresh-input absolute levels of the placed sites: what the pricing knobs move.
     # eff = nominal + pending rescale, as _capacity sees it.

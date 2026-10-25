@@ -188,33 +188,69 @@ def attach(fhe, inf) -> Tape:
     return tape
 
 
-def fill_graph(graph_path: str, records, start: int = 0, out_path: str | None = None):
+def _runs(steps):
+    """[(step, first index, end index)] of the consecutive runs of equal steps."""
+    out = []
+    for i, st in enumerate(steps):
+        if out and out[-1][0] == st:
+            out[-1][2] = i + 1
+        else:
+            out.append([st, i, i + 1])
+    return out
+
+
+def fill_graph(graph_path: str, records, start: int = 0, out_path: str | None = None,
+               keep_differing: bool = False):
     """Write the tape's statistics, from records[start:], into the nodes of one capture graph.
-    Returns the index after the last record consumed (the next block's start)."""
+    Returns the index after the last record consumed (the next block's start).
+
+    `keep_differing`: a step whose op list differs from the tape's (a later decode position pushes its K / V through
+    another op sequence) keeps the capture's statistics instead of failing; every other step is filled. An in-place op
+    is the same kernel on the same operands as its out-of-place twin (a later position accumulates in place)."""
     with open(graph_path) as f:
         g = json.load(f)
     nodes = g["nodes"]
-    by_out = {}
+    kernel = [n for n in nodes if n["op_type"] not in _REFRESH]
+    recs = records[start:start + len(kernel)]
+    if len(recs) < len(kernel) and not keep_differing:
+        raise ValueError(f"{graph_path}: tape exhausted at node {kernel[len(recs)]['output']}")
+    stats: dict[str, dict] = {}
+    g_runs, r_runs = _runs([n.get("step") for n in kernel]), _runs([r[1] for r in records[start:]])
     i = start
+    for k, (st, a, b) in enumerate(g_runs):
+        if k >= len(r_runs) or r_runs[k][0] != st:
+            raise ValueError(f"{graph_path}: step {st} at node {kernel[a]['output']} has no tape run "
+                             f"(tape: {r_runs[k][0] if k < len(r_runs) else 'exhausted'})")
+        ra, rb = r_runs[k][1] + start, r_runs[k][2] + start
+        ops = [n["op_type"].removesuffix("_inplace") for n in kernel[a:b]]
+        r_ops = [records[j][0].removesuffix("_inplace") for j in range(ra, rb)]
+        if ops != r_ops:
+            if keep_differing:
+                print(f"[mags] {graph_path}: step {st} keeps the capture's statistics ({len(ops)} nodes, "
+                      f"{len(r_ops)} taped ops)", flush=True)
+            else:
+                j = next((j for j, (x, y) in enumerate(zip(ops, r_ops)) if x != y), min(len(ops), len(r_ops)))
+                raise ValueError(f"{graph_path}: step {st}: node {kernel[min(a + j, b - 1)]['output']} is "
+                                 f"{ops[j] if j < len(ops) else 'past the step'} but the tape has "
+                                 f"{r_ops[j] if j < len(r_ops) else 'nothing'}")
+            i = rb
+            continue
+        for n, j in zip(kernel[a:b], range(ra, rb)):
+            st_j = records[j][2]
+            stats[n["output"]] = st_j.result() if hasattr(st_j, "result") else st_j
+        i = rb
+    by_out = {}
     for n in nodes:
-        op = n["op_type"]
-        if op in _REFRESH:
+        if n["op_type"] in _REFRESH:
             src = by_out.get(n["inputs"][0]) if n["inputs"] else None
             if src:
                 n.update(src)
             by_out[n["output"]] = src
             continue
-        if i >= len(records):
-            raise ValueError(f"{graph_path}: tape exhausted at node {n['output']} ({op}, {n.get('step')})")
-        r_op, r_step, st = records[i]
-        if hasattr(st, "result"):
-            st = st.result()
-        if r_op != op or r_step != n.get("step", r_step):
-            raise ValueError(f"{graph_path}: node {n['output']} is {op} @ {n.get('step')} but tape[{i}] is "
-                             f"{r_op} @ {r_step}")
-        n.update(st)
-        by_out[n["output"]] = st
-        i += 1
+        src = stats.get(n["output"])
+        if src is not None:
+            n.update(src)
+        by_out[n["output"]] = src
     with open(out_path or graph_path, "w") as f:
         json.dump(g, f)
     return i
@@ -289,7 +325,7 @@ def tape_stages(model, tape, pos: int):
     return per_stage
 
 
-def fill_dir(graph_dir: str, tapes: dict, suffix: str = "", log=print):
+def fill_dir(graph_dir: str, tapes: dict, suffix: str = "", log=print, keep_differing: bool = False):
     """fill_graph for every captured block_<b>/graph.json with its stage's tape (suffix: write graph.json<suffix>
     instead of in place)."""
     import os
@@ -299,7 +335,7 @@ def fill_dir(graph_dir: str, tapes: dict, suffix: str = "", log=print):
         if not os.path.exists(g):
             log(f"[mags] block {b}: no graph, skipped")
             continue
-        used = fill_graph(g, rec, 0, g + suffix if suffix else None)
+        used = fill_graph(g, rec, 0, g + suffix if suffix else None, keep_differing)
         log(f"[mags] block {b}: {used}/{len(rec)} records merged")
         done.append(b)
     return done
