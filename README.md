@@ -15,7 +15,9 @@
 <p align="center"><b>An open Python framework for encrypted inference of large language models</b></p>
 
 <p align="center">
-  <a href="https://github.com/gladia-research-group/perseus/tree/speedrun">🏁 <b>Encrypted GPT-2 Speedrun</b></a> ·
+  <a href="https://github.com/gladia-research-group/perseus/tree/speedrun">🏁 <b>Encrypted GPT-2 Speedrun</b></a>
+</p>
+<p align="center">
   <a href="#results">Results</a> ·
   <a href="#runtime">Runtime</a> ·
   <a href="#reproduce">Reproduce</a> ·
