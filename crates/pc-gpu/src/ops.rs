@@ -56,9 +56,10 @@ pub const WSUM_MAX: usize = 8;
 /// enqueues the H2D copy on the compute lane and returns the device pointer; the kernels reading it are issued later
 /// on the same lane, and the next copy into the same device slot is ordered after them by the stream.
 ///
-/// Graph capture (`lease_begin` .. `lease_end`): a captured graph replays the pinned -> device copy, so the pinned
-/// slot must keep the captured value for the graph's lifetime. Pushes while leasing take slots out of the rotation
-/// (`leased`) until `release`; their copies record no event (the slot is never rewritten while leased).
+/// Graph capture (`lease_begin` .. `lease_end`): a captured graph reads the device slots its constants were pushed
+/// to. Pushes while leasing take slots out of the rotation (`leased`) until `release` and record no copy (it would be
+/// replayed at every launch); `lease_end`, after the capture, uploads them once (the slot is never rewritten while
+/// leased).
 pub struct ConstRing<'a, W: DevWord> {
     dev: DBuf<'a, Compute, W>,
     host: Vec<PinnedBuf<W>>,
@@ -105,13 +106,12 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
         }
         fill(self.host[i].as_mut_slice());
         let off = i * self.slot_words;
-        // SAFETY: the pinned slot is not rewritten before `ev[i]` (recorded after this copy) completes, or, leased,
-        // before `release` (after the graphs replaying the copy are gone)
-        unsafe { self.dev.upload_pinned_async(s, off, &self.host[i])? };
         if let Some(l) = self.lease.as_mut() {
             self.leased[i] = true;
             l.push(i);
         } else {
+            // SAFETY: the pinned slot is not rewritten before `ev[i]` (recorded after this copy) completes
+            unsafe { self.dev.upload_pinned_async(s, off, &self.host[i])? };
             self.ev[i].record(s)?;
             self.used[i] = true;
         }
@@ -129,12 +129,26 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
         self.lease = Some(Vec::new());
         Ok(())
     }
-    /// End the open lease: the slots pushed since `lease_begin` (they stay out of the rotation until `release`).
-    pub fn lease_end(&mut self) -> Vec<usize> {
-        self.lease.take().unwrap_or_default()
+    /// End the open lease (after the capture): upload the slots pushed since `lease_begin` and wait for the copies;
+    /// returns those slots (they stay out of the rotation until `release`). A failed upload releases them.
+    pub fn lease_end(&mut self, s: &Stream<Compute>) -> Result<Vec<usize>> {
+        let slots = self.lease.take().unwrap_or_default();
+        let mut up = Ok(());
+        for &i in &slots {
+            // SAFETY: a leased pinned slot is not rewritten before `release`; the copies are waited for below
+            up = unsafe { self.dev.upload_pinned_async(s, i * self.slot_words, &self.host[i]) };
+            if up.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = up.and_then(|()| s.sync()) {
+            self.release(&slots);
+            return Err(e.into());
+        }
+        Ok(slots)
     }
-    /// Return leased slots to the rotation (every graph replaying their copies has been dropped and its last
-    /// launch has completed).
+    /// Return leased slots to the rotation (every graph reading them has been dropped and its last launch has
+    /// completed).
     pub fn release(&mut self, slots: &[usize]) {
         for &i in slots {
             if let Some(l) = self.leased.get_mut(i) {

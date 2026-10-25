@@ -919,8 +919,23 @@ impl Replayer {
             }
         }
         rt.locks.iter().for_each(|l| l.set_locked(false));
-        let lease = rt.ops.ring.lease_end();
-        let side_lease = rt.side.as_deref_mut().map(|s| s.ops.ring.lease_end()).unwrap_or_default();
+        // both lanes end their leases before any error returns (a lease whose upload fails releases its slots)
+        let lease = rt.ops.ring.lease_end(&rt.ex.compute);
+        let side_lease = rt.side.as_deref_mut().map_or(Ok(vec![]), |s| s.ops.ring.lease_end(&s.ex.compute));
+        let (lease, side_lease) = match (lease, side_lease) {
+            (Ok(l), Ok(sl)) => (l, sl),
+            (l, sl) => {
+                if let Ok(l) = &l {
+                    rt.ops.ring.release(l);
+                }
+                if let (Ok(sl), Some(s)) = (&sl, rt.side.as_deref_mut()) {
+                    s.ops.ring.release(sl);
+                }
+                // the capture's own error first
+                let e = failed.or(l.err().map(Error::from)).or(sl.err().map(Error::from));
+                return Err(e.unwrap_or_else(|| rerr(&b.label, "constant ring lease")));
+            }
+        };
         let release_all = |rt: &mut Rt<'_, 'a, W, M>| {
             rt.ops.ring.release(&lease);
             if let Some(s) = rt.side.as_deref_mut() {
