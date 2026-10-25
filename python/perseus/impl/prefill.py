@@ -1337,8 +1337,8 @@ def gelu_joint(rt, A, B, cfg, mask, us=None):
 # the capture's `args.external` dict), and binds them on one planned Session that also holds the PCMM service: its
 # keys made at setup from the secret (dropped afterwards), every linear's digit planes resident (GPT-2: 48 linears,
 # ~250 MB at t = 32). The device run encrypts block 0's inputs at their compiled level and runs the blocks
-# (`Program.run`, GIL released, eager: a one-shot forward gains nothing from a CUDA-graph capture), carrying the
-# block outputs in registers.
+# (`Program.run`, GIL released; eager, or with `exec.use_graphs` captured on a block's first run and replayed after,
+# as the speedrun server does from its warm-up), carrying the block outputs in registers.
 
 class PlannedPrefill:
     """PLANNED prefill on the new runtime (see above). `model`: the prefill model on the CPU twin (fakecap session);
