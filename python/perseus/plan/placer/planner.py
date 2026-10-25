@@ -704,11 +704,15 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                              **placer_kwargs)
         sim = placer.run()
 
+    def trial_placer(realized: set) -> Placer:
+        """A re-cut trial (rescale_opt, shared_realize, ks_realize): the first placer's configuration, quiet, with
+        `realized` as its realize anchors, started from the same forced sites. A trial replaces the incumbent when
+        it needs no more bootstraps, so one that did not start from the forced sites (the retry's exit refresh, the
+        keep-anchors, the kept placements) would drop every one the block's own levels do not need, and win for it."""
+        return PlacerCls(**{**placer_kwargs, "verbose": False}, placed=set(forced), realized=set(realized),
+                         hint_force=hint_force)
+
     rescale_anchors: set = set()
-    # the realize-anchor trials re-run the cut and replace the incumbent when they need no more bootstraps: a
-    # trial that did not start from the forced sites (the retry's exit refresh, the keep-anchors, the kept
-    # placements) would drop every one the block's own levels do not need, and win for it
-    _seed = {"placed": set(forced)} if forced else {}
     if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
@@ -723,8 +727,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_seed)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -747,7 +750,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial), hint_force=hint_force, **_seed)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -774,8 +777,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_seed)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
