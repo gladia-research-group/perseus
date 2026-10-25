@@ -108,6 +108,10 @@ class CutMaxIter:
     ca: float = 0.0
     cb: float = 0.0
     casc_iters: int = 0
+    # the scaled normaliser (head.cutmax_argmax_packed): 1/sigma from x_scale * sum (x - mu)^2 in (0, 1] by the
+    # Newton steps (a, b) of poly.inv_sqrt_newton_scaled; empty = the cascade above
+    x_scale: float = 0.0
+    newton: tuple = ()
 
 
 @dataclasses.dataclass
@@ -119,6 +123,9 @@ class CutMaxCfg:
     sum_hi: float = 0.0
     gs_sum_iters: int = 4
     entry_scale: float = 1.0 / 256.0
+    # the final 1/S as (1/sqrt(sum_scale S))^2 by poly.inv_sqrt_newton_scaled; empty = Goldschmidt on [sum_lo, sum_hi]
+    sum_scale: float = 0.0
+    sum_newton: tuple = ()
 
 
 @dataclasses.dataclass
@@ -204,8 +211,20 @@ def parse_gelu(j: dict) -> GeluCfg:
     raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
 
 
+def _steps(v):
+    return tuple((float(a), float(b)) for a, b in v)
+
+
 def parse_cutmax(j: dict) -> CutMaxCfg:
     T = len(j["p"])
+    if "newton" in j:                     # the scaled normalisers (calibrate.approximations.cutmax.fit_scaled)
+        for k in ("c", "m", "x_scale", "newton"):
+            if len(j[k]) != T:
+                raise ValueError("cutmax calib: ragged/empty schedule arrays")
+        iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]), 0.0, 0, 0,
+                                 x_scale=float(j["x_scale"][i]), newton=_steps(j["newton"][i])) for i in range(T))
+        return CutMaxCfg(iters=iters, entry_scale=float(j["entry_scale"]), sum_scale=float(j["sum_scale"]),
+                         sum_newton=_steps(j["sum_newton"]))
     for k in ("c", "m", "s2_hi", "passes", "ex2", "chord_a", "chord_b", "cascade_iters"):
         if len(j[k]) != T:
             raise ValueError("cutmax calib: ragged/empty schedule arrays")

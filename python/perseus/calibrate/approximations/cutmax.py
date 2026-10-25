@@ -6,9 +6,10 @@ prescale per iteration (s2_hi := sqrt(lo * hi), consumed unchanged by the runtim
 iteration (from-below secant of x^-1/2 over the calibrated band, gamma-shrunk so Newton stays monotone), the const
 from-below init on later passes; and per-iteration pass counts (the smallest that converges the worst derivation token
 to 5 %). Validation replays the measured bootstrap envelopes at every noise site (`cutmax_sim.noisy`) plus a hard-wall
-breach check per row.
+breach check per row. `fit_scaled` fits the scaled normalisers (head.cutmax_argmax_packed) on such a schedule.
 """
 import logging
+import math
 
 import numpy as np
 
@@ -167,6 +168,69 @@ def fit_cutmax_section(rows, knobs):
         "oracle_rows": int(rows.shape[0]),
         "oracle_noise": knobs["noise"],
     }
+
+
+def _scaled_forward(x, sec, upto):
+    """The scaled CutMax (head.cutmax_argmax_packed, exact arithmetic) on rows x [B, n] times entry_scale, through
+    iteration upto - 1; returns iteration upto's sum (x - mu)^2, or the final sum S when upto is the last + 1."""
+    from perseus.impl.poly import NumpyOps, inv_sqrt_newton_scaled
+    n = x.shape[1]
+    for i in range(upto):
+        d = x - x.mean(axis=1, keepdims=True)
+        xs, c, m = sec["x_scale"][i], sec["c"][i], sec["m"][i]
+        f = inv_sqrt_newton_scaled(NumpyOps(), (d * d).sum(axis=1) * xs, sec["newton"][i],
+                                   0.5 * math.sqrt(n * xs) / (c * m))
+        x = (2.0 * (d * f[:, None] + 0.5 / m)) ** sec["p"][i]
+    if upto == len(sec["p"]):
+        return x.sum(axis=1)
+    d = x - x.mean(axis=1, keepdims=True)
+    return (d * d).sum(axis=1)
+
+
+def _steps_not_below(ratio, tol, zero):
+    """poly.scaled_newton_steps on [1 / ratio, 1] (from below, to tol), the last step scaled so the result is never
+    below the exact 1 / sqrt(x) on the band: within [1, 1 + tol] of it (a normaliser never softer than the exact
+    one)."""
+    from perseus.impl.poly import NumpyOps, inv_sqrt_newton_scaled, scaled_newton_steps
+    steps = scaled_newton_steps(ratio, tol, zero)
+    x = np.geomspace(1.0 / ratio, 1.0, 20001)
+    beta = 1.0 / float((inv_sqrt_newton_scaled(NumpyOps(), x, steps) * np.sqrt(x)).min())
+    return [list(s) for s in steps[:-1]] + [[steps[-1][0] * beta, steps[-1][1] * beta]]
+
+
+def fit_scaled(rows, section, tol=5e-3, sum_tol=1e-5, lo_margin=2.0, hi_margin=1.25, heavy_margin=4.0,
+               sum_margin=1.25, zero=3.0, batch=512):
+    """The scaled normalisers (configs.json "cutmax" with x_scale / newton / sum_scale / sum_newton) on the outer
+    schedule of `section` (its entry_scale, p, c, m kept). rows: a list of [N, vocab] logit arrays (memmaps are read
+    `batch` rows at a time; rows with a non-finite logit are skipped). Per iteration, in order, the band of
+    sum (x - mu)^2 over the rows (the earlier iterations run with their fitted steps) is widened by lo_margin below and
+    hi_margin above (heavy_margin after the schedule's largest power: there sum (x - mu)^2 goes as the top value to
+    twice that power, the heaviest tail), x_scale = 1 / its top, and the Newton steps reach a relative error tol on
+    it, never below the exact value; the final 1 / S the same with sum_tol and sum_margin."""
+    sec = {"entry_scale": section["entry_scale"], "p": list(section["p"]), "c": list(section["c"]),
+           "m": list(section["m"]), "x_scale": [], "newton": []}
+    heavy = 1 + int(np.argmax(sec["p"]))
+
+    def band(upto):
+        vals = []
+        for r in rows:
+            for s in range(0, len(r), batch):
+                x = np.asarray(r[s:s + batch], dtype=np.float64)
+                vals.append(_scaled_forward(x[np.isfinite(x).all(axis=1)] * sec["entry_scale"], sec, upto))
+        v = np.concatenate(vals)
+        return float(v.min()), float(v.max())
+
+    for i in range(len(sec["p"])):
+        lo, hi = band(i)
+        lo, hi = lo / lo_margin, hi * (heavy_margin if i == heavy else hi_margin)
+        sec["x_scale"].append(1.0 / hi)
+        sec["newton"].append(_steps_not_below(hi / lo, tol, zero))
+    lo, hi = band(len(sec["p"]))
+    lo, hi = lo / lo_margin, hi * sum_margin
+    sec["sum_scale"], sec["sum_newton"] = 1.0 / hi, _steps_not_below(hi / lo, sum_tol, zero)
+    log.info(f"[cutmax] scaled normalisers: {[len(s) for s in sec['newton']]} Newton steps per iteration, "
+             f"{len(sec['sum_newton'])} for the sum")
+    return sec
 
 
 class _CutmaxCollector:
