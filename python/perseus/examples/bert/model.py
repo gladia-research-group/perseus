@@ -22,6 +22,9 @@ from perseus.impl.prefill import Chunks, evict_block_masks, name_inputs
 from perseus.examples.gpt2 import weights as W
 from perseus.examples.gpt2.prefill import _bias_blocks, _gelu_blocks
 
+# PF_LAST_QUERY=1 (blocked attention): the last block computes [CLS] alone past its K / V (the head reads nothing else)
+_LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
+
 
 def affine_blocked(rt, Xs, gamma, beta, ch: Chunks, B, site):
     """LN output rows: gamma / 2 x (the norm's 2 n / descale, gamma descaled) + beta on the filled lanes."""
@@ -42,7 +45,8 @@ def affine_blocked(rt, Xs, gamma, beta, ch: Chunks, B, site):
     return out
 
 
-def bert_block(rt, Xs, w, cfgs, ch: Chunks, B, b: int):
+def bert_block(rt, Xs, w, cfgs, ch: Chunks, B, b: int, last=None):
+    """`last`: the only position the block's output must hold (blocked.attention_last)."""
     ops, K = rt.ops, B.K
     ln1, ln2, sm, ge = cfgs
     with rt.step("qkv"):
@@ -52,8 +56,13 @@ def bert_block(rt, Xs, w, cfgs, ch: Chunks, B, b: int):
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     with rt.step("attn"):
         if os.environ.get("PF_ATTN", "") == "ccmm":     # CCMM attention on the d_head-64 SinC packing (ccmm_mha.py)
+            if last is not None:
+                raise ValueError("PF_LAST_QUERY: blocked attention only")
             from perseus.impl import ccmm_mha
             O = ccmm_mha.attention(rt, Q, Kc, V, sm, ch, layer=b, h_real=B.d.H_real)
+        elif last is not None:
+            O = BL.attention_last(rt, Q, Kc, V, sm, ch, B, last)
+            Xs = [BL.token_bcast(rt, row, ch, B, last) for row in Xs]
         else:
             O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
     with rt.step("out_proj"):
@@ -117,7 +126,8 @@ class BertPrefill(ImplModel):
                 cap = self.enter_stage(b, 0)
                 name_inputs(self.inf, [x for row in Xs for x in row])
                 with self.rt.step(f"blk{b}"):
-                    Xs = bert_block(self.rt, Xs, self.weights(b), self.cfgs.block(b), ch, B, b)
+                    last = 0 if _LAST_QUERY and b == self.n_layers - 1 else None
+                    Xs = bert_block(self.rt, Xs, self.weights(b), self.cfgs.block(b), ch, B, b, last)
                 self.exit_stage(b, cap)
                 evict_block_masks(self.rt)
                 return Xs

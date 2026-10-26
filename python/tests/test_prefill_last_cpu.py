@@ -185,3 +185,28 @@ def test_padding_heads_do_not_leak(monkeypatch, layer):
         err = max(np.abs(got[g, j][slot_real[j]] - ref[g, j][slot_real[j]]).max()
                   for g in range(ref.shape[0]) for j in range(B.K))
         assert err < 1e-12 * max(1.0, np.abs(ref).max()), (bsgs, hpack, err)
+
+
+@pytest.mark.parametrize("keys", [T, 100])
+@pytest.mark.parametrize("layer", [0, 11])
+def test_attention_first_bidirectional(keys, layer):
+    """An encoder's [CLS] (position 0 of a bidirectional prompt, padding past `keys`) alone against attention_blocked."""
+    rt, d, B, _ = _setup(False)
+    ch = prefill.Chunks(T, B.t, bidir=True, keys=keys)
+    rng = np.random.default_rng(10 + layer)
+    q, k, v = _rows(rng, d, 1.2), _rows(rng, d, 1.2), _rows(rng, d, 1.0)
+
+    def enc(r):
+        return [[0.5 * x for x in row] for row in BL.blocked_slots(r, ch, B)]
+    sm = config.load_configs(str(CFG)).block(layer)[2]
+    ref = BL.decrypt_blocked(rt, BL.attention_blocked(rt, enc(q), enc(k), enc(v), sm, ch, B), ch, B, d.dim)
+    got = BL.decrypt_blocked(rt, BL.attention_last(rt, enc(q), enc(k), enc(v), sm, ch, B, 0), ch, B, d.dim)
+    assert np.abs(got - ref[0][None, :]).max() < 1e-12 * max(1.0, np.abs(ref).max())
+
+
+def test_token_bcast_first():
+    rt, d, B, ch = _setup(False)
+    X = [list(row) for row in BL.blocked_slots(_rows(np.random.default_rng(2), d, 3.0), ch, B)]
+    got = BL.decrypt_blocked(rt, [BL.token_bcast(rt, row, ch, B, 0) for row in X], ch, B, d.dim)
+    want = BL.decrypt_blocked(rt, X, ch, B, d.dim)[0]
+    assert np.abs(got - want[None, :]).max() == 0.0
