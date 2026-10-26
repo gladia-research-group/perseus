@@ -8,6 +8,7 @@ import numpy as np
 
 from .layout import Dims, lanes_mask, lanes_periodic, ladder_chunks
 from .poly import eval_chebyshev, im_cleanse, inv_sqrt_newton_d2, rotsum
+from . import prefill
 from .prefill import Chunks, join, prefill_attention
 
 
@@ -474,4 +475,10 @@ def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
             for grp in ladder_chunks(a, b, radix_bits):
                 if len(grp) > 1:
                     steps.update(grp)
+    if prefill._BSGS and prefill._PACK:     # PF_ATTN_BSGS: giant lane shifts riding the score block shifts, both ways
+        Bb = 2 << prefill._PACK
+        for g in range(1, gd.d_head // Bb):
+            for par in (0, 1):
+                s = (2 * g + par) * gd.tH + Bb * g
+                steps |= {s, -s, s - B.t, B.t - s}
     return steps

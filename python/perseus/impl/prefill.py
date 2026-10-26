@@ -26,6 +26,12 @@ _SM_JOINT = os.environ.get("PF_SM_JOINT", "0") not in ("", "0")
 _LANE_HOIST = int(os.environ.get("PF_LANE_HOIST", "0") or 0)
 # PF_ATTN_PACK=l: paired q.K^T / P.V reductions packed 2^l products per ciphertext over windows of d_head / 2^l blocks
 _PACK = int(os.environ.get("PF_ATTN_PACK", "0") or 0)
+# PF_ATTN_BSGS=1 (with PF_ATTN_PACK, causal): lane offsets b + 2^(l+1) g as baby rotations of K / V and giant ones of Q
+# and of the P.V sums, the giant lane shift riding the packed placing / unpacking rotations (_bsgs_block_offset)
+_BSGS = os.environ.get("PF_ATTN_BSGS", "0") not in ("", "0")
+# PF_SM_HPACK=1 (causal, two chunks): a head group whose real heads fill at most half of it runs one softmax for both
+# query chunks, chunk 1's scores moved onto the group's empty half of chunk 0's (one chain instead of two)
+_SM_HPACK = os.environ.get("PF_SM_HPACK", "0") not in ("", "0")
 # PF_KV_SHARE=1: GQA query sets walk each K / V pair together (one complex K / V combination per pair, not per set)
 _KV_SHARE = os.environ.get("PF_KV_SHARE", "0") not in ("", "0")
 # PF_PRE_PERIODIC=1: a prefix score alone in its score ciphertext stays tH-periodic (sparse refreshes, no block select);
@@ -427,12 +433,29 @@ def prefix_offset(ch: Chunks, c: int) -> int:
     return nq if nq < ch.t else c * ch.t + ch.t
 
 
+def _bsgs_on(ch: Chunks) -> bool:
+    return _BSGS and _ATTN_PAIR and _PACK > 0 and not ch.bidir
+
+
+def _bsgs_block_offset(blk, d_head: int):
+    """PF_ATTN_BSGS: the key offset (in its score ciphertext) of score block blk. Window a (W = d_head / 2^l blocks)
+    holds giant step g of the pair (2a, 2a + 1) at blocks a W + 2 g, a W + 2 g + 1: offsets 2a + 2^(l+1) g + (0, 1)."""
+    W = d_head >> _PACK
+    rem = blk % W
+    return 2 * (blk // W) + rem % 2 + (2 << _PACK) * (rem // 2)
+
+
+def _layout_tag(ch: Chunks) -> tuple:
+    """Mask-key part of the score block order."""
+    return ("bsgs", _PACK) if _bsgs_on(ch) else ()
+
+
 def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
     """(N,) bool: slots of score ciphertext m of query chunk c holding a real score (`prefix`: at prefix_offset)."""
     nq = len(ch.lanes(c))
     i = np.arange(d.N)
     blk, h, lane = i // d.tH, (i % d.tH) // d.t, i % d.t
-    u = m * d.d_head + blk
+    u = m * d.d_head + (_bsgs_block_offset(blk, d.d_head) if _bsgs_on(ch) else blk)
     if ch.bidir:
         key = (u // ch.t) * ch.t + (lane - u % ch.t) % ch.t
         return (h < d.H_real) & (lane < nq) & (u < ch.n_chunks * ch.t) & (key < ch.n_keys)
@@ -442,6 +465,24 @@ def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
         bos = u == prefix_offset(ch, c)
         reg = (reg & ~bos) | bos
     return (h < d.H_real) & (lane < nq) & reg
+
+
+def _hp_valid(d, ch: Chunks, m: int):
+    """PF_SM_HPACK: score ciphertext m of the head-packed softmax: chunk 0's on the first half of the heads, chunk 1's
+    moved half a group up."""
+    return _score_valid(d, ch, 0, m) | np.roll(_score_valid(d, ch, 1, m), d.tH // 2)
+
+
+def _valid_of(d, ch: Chunks, c, m: int, prefix: bool = False):
+    return _hp_valid(d, ch, m) if c == "hp" else _score_valid(d, ch, c, m, prefix)
+
+
+def _kcs_of(ch: Chunks, c):
+    """Keys per query lane of chunk c; "hp": chunk 0's lanes, then chunk 1's (t each)."""
+    if c == "hp":
+        k0 = _kcs(ch, ch.lanes(0))
+        return k0 + [1] * (ch.t - len(k0)) + _kcs(ch, ch.lanes(1))
+    return _kcs(ch, ch.lanes(c))
 
 
 def _periodic_valid(d, ch: Chunks, c: int):
@@ -473,8 +514,17 @@ def rope_lanes(rt, x, rope, positions, site):
 
 
 def _lane_vec(d, vals, fill=0.0):
-    """A per-query-lane value on every slot (t-periodic)."""
-    return lanes_periodic(d.N, d.t, vals, fill)
+    """A per-query-lane value on every slot (t-periodic); 2t values: the second t on the second half of the heads
+    (PF_SM_HPACK)."""
+    if len(vals) <= d.t:
+        return lanes_periodic(d.N, d.t, vals, fill)
+    lo, hi = lanes_periodic(d.N, d.t, vals[:d.t], fill), lanes_periodic(d.N, d.t, vals[d.t:], fill)
+    return np.where(_upper_heads(d), hi, lo)
+
+
+def _upper_heads(d):
+    """(N,) bool: the slots of the second half of a group's heads."""
+    return (np.arange(d.N) % d.tH) // d.t >= d.H // 2
 
 
 class _KcExtrapolated:
@@ -528,8 +578,9 @@ def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic
     out = []
     for m, s in enumerate(S, m0):
         per = m == periodic
-        valid = _periodic_valid(d, ch, c) if per else _score_valid(d, ch, c, m, prefix)
-        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean) + ch.key_tag + (prefix,) + (("per",) if per else ()),
+        valid = _periodic_valid(d, ch, c) if per else _valid_of(d, ch, c, m, prefix)
+        s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean) + ch.key_tag + (prefix,) + (("per",) if per else ())
+                        + _layout_tag(ch),
                         lambda valid=valid: np.where(valid, -mean, cfg.clip_lo - mean))
         out.append((eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf), valid))
     return out
@@ -538,7 +589,7 @@ def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic
 def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int = 0, periodic=None):
     """Squarings, cleanse and active mask (0.5 / kc per lane, times factor[j]) of chunk c's exps."""
     ops, d = rt.ops, rt.dims
-    kcs = _kcs(ch, ch.lanes(c))
+    kcs = _kcs_of(ch, c)
     Z = []
     for j, (z, valid) in enumerate(zs):
         m = m0 + j
@@ -546,11 +597,11 @@ def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int
             z = ops.square(z)
         z = im_cleanse(ops, z)
         f = 1.0 if factor is None else factor[j]
-        lane_scale = np.array([f * 0.5 / kcs[i] if i < len(kcs) else 0.0 for i in range(d.t)])
+        lane_scale = [f * 0.5 / kc for kc in kcs]
         key = ("pf.sm.active", c, m) + ch.key_tag + (prefix,) + ((f,) if f != 1.0 else ()) + \
-            (("per",) if m == periodic else ())
+            (("per",) if m == periodic else ()) + _layout_tag(ch)
         Z.append(rt.mult_mask(z, key,
-                              lambda valid=valid, ls=lane_scale: np.where(valid, ls[np.arange(d.N) % d.t], 0.0)))
+                              lambda valid=valid, ls=lane_scale: np.where(valid, _lane_vec(d, ls), 0.0)))
     return Z
 
 
@@ -576,8 +627,8 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     """softmax_thor over chunk c's packed scores S with per-lane (kc-dependent) reciprocal seeds.
     `Z`: precomputed masked exps (the joint path)."""
     ops, d = rt.ops, rt.dims
-    pos = ch.lanes(c)
-    kcs = _kcs(ch, pos)
+    pos = ch.lanes(0 if c == "hp" else c)
+    kcs = _kcs_of(ch, c)
     if Z is None:     # cheb then tail per score ct: the captured op order
         Z = []
         for m in range(len(S)):
@@ -672,6 +723,55 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
     nw = 1 << _PACK
     W = d.d_head // nw
     blk_of = np.arange(d.N) // d.tH
+    bsgs = _bsgs_on(ch)
+    if bsgs and (prefix is not None or ch.t != d.d_head):
+        raise ValueError("PF_ATTN_BSGS: needs t = d_head lanes and no prefix key")
+    Bb = 2 * nw                             # baby offsets b < Bb; a packed ciphertext holds one giant step
+    lane_of = np.arange(d.N) % d.t
+    start = blk_of % W == 0
+    rots, cycs = {}, {}
+
+    def prime(tag, x, steps):
+        """Plain rotations of x (one hoisted call for the new steps)."""
+        new = sorted({s % d.N for s in steps} - {0} - {s for t_, s in rots if t_ == tag})
+        for s, y in zip(new, ops.rotate_many(x, new) if new else []):
+            rots[(tag, s)] = y
+
+    def rot_of(tag, x, s):
+        s %= d.N
+        if s == 0:
+            return x
+        if (tag, s) not in rots:
+            prime(tag, x, [s])
+        return rots[(tag, s)]
+
+    def cyc(tag, x, e, site):
+        """lane_rotate(x, e) on the cached plain rotations of x."""
+        e %= d.t
+        if e == 0:
+            return x
+        if (tag, e) not in cycs:
+            hi = rt.mult_mask(rot_of(tag, x, -e), (site + ".hi", e),
+                              lambda: lanes_mask(d.N, d.N // d.t, d.t, [1.0 if j >= e else 0.0 for j in range(d.t)]))
+            lo = rt.mult_mask(rot_of(tag, x, d.t - e), (site + ".lo", e),
+                              lambda: lanes_mask(d.N, d.N // d.t, d.t, [1.0 if j < e else 0.0 for j in range(d.t)]))
+            cycs[(tag, e)] = ops.add(hi, lo)
+        return cycs[(tag, e)]
+
+    def lane_parts(shift, L, cyclic):
+        """(slot shift, lane select) of a lane shift by L riding a block shift: the lanes below t - L move L up in
+        their own lane group; cyclic: the others move L - t (wrap)."""
+        out = [(shift + L, lane_of < d.t - L)]
+        if cyclic and L:
+            out.append((shift + L - d.t, lane_of >= d.t - L))
+        return out
+
+    def baby(src, name, c, cp, b):
+        """src[cp] lane-rotated by baby offset b: plain within chunk c, cyclic across chunks."""
+        if cp == c:
+            return rot_of((name, cp), src[cp], -b)
+        prime((name, cp), src[cp], [d.t - j for j in range(1, Bb)])
+        return cyc((name, cp), src[cp], b, f"pf.{name.lower()}rot")
 
     def win_mask(a, lo=0):
         """Blocks [aW - lo, aW - lo + W): window a (pack), lo = W - 1: what the forward broadcast fills from aW."""
@@ -712,6 +812,85 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 else:
                     ops.inplace_add(S[m], x)
 
+    def qkt_bsgs(c, QL, SL, groups, pre):
+        """qkt_packed with offset e = b + Bb g as K rotated by b and Q by Bb g (cyclic across chunks): the nw pairs of a
+        giant step share a packed ciphertext, whose lane shift back by Bb g rides each window's placing rotation."""
+        by = {}
+        for grp in groups:
+            u, cp, _ = grp[0]
+            m, r = divmod(u, d.d_head)
+            g, b = divmod(r, Bb)
+            krs = [baby(K, "K", c, cp_, e % Bb) for _, cp_, e in grp]
+            kc = krs[0] if len(krs) == 1 else ops.add(krs[0], ops.mult_i(krs[1]))
+            for i, Q in enumerate(QL):
+                if cp == c:
+                    qg = rot_of(("Q", i, c), Q[c], Bb * g)
+                else:
+                    qg = cyc(("Q", i, c), Q[c], d.t - Bb * g, "pf.qrot")
+                p = rotsum(ops, ops.mult(qg, kc), W * d.tH, d.N)
+                v = rt.mult_mask(p, ("pf.qpk", b // 2, W), lambda a=b // 2: win_mask(a))
+                if (i, m, g) in by:
+                    ops.inplace_add(by[(i, m, g)], v)
+                else:
+                    by[(i, m, g)] = v
+        for (i, m, g), w in sorted(by.items()):
+            S = SL[i]
+            w = rotsum(ops, w, d.tH, W * d.tH)
+            valid = _score_valid(d, ch, c, m, pre)
+            for par, coef in ((0, 0.5 * gscale), (1, -0.5j * gscale)):
+                for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * g, m > 0)):
+                    x = rt.mult_mask(w, ("pf.qpl.b", c, m, sh, part, Bb * g, W, complex(coef)) + ch.key_tag,
+                                     lambda sh=sh, sel=sel, coef=coef, valid=valid:
+                                     np.where(start & sel & np.roll(valid, -sh), coef, 0.0))
+                    if sh % d.N:
+                        x = ops.rotate(x, -sh % d.N)
+                    if S[m] is None:
+                        S[m] = x
+                    else:
+                        ops.inplace_add(S[m], x)
+
+    def pv_bsgs(c, PL, groups):
+        """pv_packed with offset e = b + Bb g: each giant step's probabilities unpacked shifted by Bb g lanes, times V
+        rotated by b, summed per giant step and shifted back by Bb g (cyclic once chunk c attends an earlier chunk)."""
+        by = {}
+        for grp in groups:
+            u = grp[0][0]
+            m, r = divmod(u, d.d_head)
+            by.setdefault((m, r // Bb), []).append((r % Bb // 2, grp))
+        sums = {}
+        for (m, g), items in sorted(by.items()):
+            ys = []
+            for P in PL:
+                y = None
+                for par, coef in ((0, 0.5), (1, -0.5j)):
+                    for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * g, m > 0)):
+                        x = P[m] if sh % d.N == 0 else ops.rotate(P[m], sh % d.N)
+                        x = rt.mult_mask(x, ("pf.vpk.b", W, Bb * g, part, complex(coef)),
+                                         lambda sel=sel, coef=coef: np.where(start & sel, coef, 0.0))
+                        y = x if y is None else ops.add(y, x)
+                ys.append(rotsum(ops, y, d.tH, W * d.tH))
+            for a, grp in items:
+                pbs = [rotsum(ops, rt.mult_mask(y, ("pf.vup", a, W), lambda a=a: win_mask(a, W - 1)), W * d.tH, d.N)
+                       for y in ys]
+                vrs = [baby(V, "V", c, cp, e % Bb) for _, cp, e in grp]
+                vc = vrs[0] if len(vrs) == 1 else ops.add(vrs[0], ops.mult_i(vrs[1]))
+                for i, pb in enumerate(pbs):
+                    prod = ops.mult(pb, vc)
+                    if (i, g) in sums:
+                        ops.inplace_add(sums[(i, g)], prod)
+                    else:
+                        sums[(i, g)] = prod
+        cyclic = c > 0
+        accs = [None] * len(PL)
+        for (i, g), x in sorted(sums.items()):
+            for part, (sh, sel) in enumerate(lane_parts(0, Bb * g, cyclic) if g else [(0, None)]):
+                y = x if sel is None or not cyclic else rt.mult_mask(
+                    x, ("pf.vgb", Bb * g, part), lambda sel=sel: sel.astype(float))
+                if sh % d.N:
+                    y = ops.rotate(y, -sh % d.N)
+                accs[i] = y if accs[i] is None else ops.add(accs[i], y)
+        return accs
+
     def pv_packed(c, PL, groups, vown):
         """Inverse of qkt_packed: each pair's 0.5 p_u - 0.5i p_(u+1) moved to its window's first block, broadcast over
         the window, unpacked per window and broadcast over the nw windows (leaf ladder); per query set of PL
@@ -750,10 +929,12 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         """Chunk c's packed scores and what its P.V needs, per query set of QL (one K pass)."""
         offs = _offsets(ch, c)
         nq = len(ch.lanes(c))
-        if c not in owns:
+        if bsgs:
+            prime(("K", c), K[c], [-b for b in range(1, min(Bb, nq))])
+        elif c not in owns:
             owns[c] = ([K[c]] + [lane_rotate(rt, K[c], e, "pf.krot") for e in range(1, ch.t)] if ch.bidir
                        else [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)]))
-        own = owns[c]
+        own = owns.get(c)
         u_pre = prefix_offset(ch, c)                               # prefix key's offset
         M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
         SL = [[None] * M for _ in QL]
@@ -804,7 +985,11 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                         if _PRE_PERIODIC else ops.mult_pt(Q[c], prefix[0])
                     s = rotsum(ops, q0, d.tH, d.N)
                     place(S, s, [(m, blk, half * gscale)], "pf.qkt")
-            if packed:
+            if packed and bsgs:
+                for i, Q in enumerate(QL):
+                    prime(("Q", i, c), Q[c], [Bb * g for g in range(1, -(-nq // Bb))])
+                qkt_bsgs(c, QL, SL, groups, pre)
+            elif packed:
                 qkt_packed(c, QL, SL, groups, own, pre)
             else:
                 for grp in groups:
@@ -822,10 +1007,12 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         st = sts[0]
         offs, nq, u_pre, pre, groups = st["offs"], st["nq"], st["u_pre"], st["pre"], st["groups"]
         with rt.step("softmax_v"):
-            if c not in vowns:
+            if bsgs:
+                prime(("V", c), V[c], [-b for b in range(1, min(Bb, nq))])
+            elif c not in vowns:
                 vowns[c] = ([V[c]] + [lane_rotate(rt, V[c], e, "pf.vrot") for e in range(1, ch.t)] if ch.bidir
                             else [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)]))
-            vown = vowns[c]
+            vown = vowns.get(c)
             accs = [None] * len(PL)
             if pre:
                 m, blk = divmod(u_pre, d.d_head)
@@ -840,7 +1027,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                     accs[i] = rt.mult_mask(pb, ("pf.pre.v", _vkey(prefix[1])), lambda: np.asarray(prefix[1])) \
                         if _PRE_PERIODIC else ops.mult_pt(pb, prefix[1])
             if _ATTN_PAIR and _PACK > 0:
-                pas = pv_packed(c, PL, groups, vown)
+                pas = pv_bsgs(c, PL, groups) if bsgs else pv_packed(c, PL, groups, vown)
                 accs = [pa if acc is None else ops.add(acc, pa) for acc, pa in zip(accs, pas)]
                 groups = []
             for grp in groups:
@@ -871,6 +1058,9 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                         ops.inplace_add(accs[i], prod)
             return [im_cleanse(ops, acc) for acc in accs]
 
+    hpack = (_SM_HPACK and not _SM_JOINT and nc == 2 and not ch.bidir and prefix is None
+             and 2 * d.H_real <= d.H)
+
     def attend(QL):
         outs = [[None] * nc for _ in QL]
         if _SM_JOINT:
@@ -888,6 +1078,20 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                               for c in cs}
                     for c in cs:
                         outs[i][c] = pv_stage(c, [sts[c][i]], [Ps[c]])[0]
+        elif hpack:
+            sts = [qkt_stage(c, QL) for c in range(nc)]
+            h2 = d.tH // 2
+            PL = [[], []]
+            for s0, s1 in zip(*sts):
+                with rt.step("softmax"):
+                    S = [ops.add(s0["S"][0], ops.rotate(s1["S"][0], d.N - h2))] + \
+                        [ops.rotate(x, d.N - h2) for x in s1["S"][1:]]
+                    P = prefill_softmax(rt, S, cfg, ch, "hp")
+                PL[0].append(P[:len(s0["S"])])
+                PL[1].append([ops.rotate(x, h2) for x in P])
+            for c in range(nc):
+                for i, o in enumerate(pv_stage(c, sts[c], PL[c])):
+                    outs[i][c] = o
         else:
             for c in range(nc):
                 sts = qkt_stage(c, QL)
