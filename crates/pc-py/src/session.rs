@@ -1011,10 +1011,13 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             wshape = Some(wshape.map_or(w, |x| x.max(w)));
         }
         let st_tables = pc_core::scale::ScaleTables::precompute(&chain).map_err(|x| e(x.into()))?;
-        for c in &sb_cfgs {
+        for (i, c) in sb_cfgs.iter().enumerate() {
             let (b, w) = SparseBPrecomp::<W>::bytes(&chain, &st_tables, &lay, c).map_err(e)?;
             mp.reserve("bts.sparse", b);
-            mp.reserve("bts.route", pc_gpu::bts::raise::EncapsKeys::bytes() + pc_gpu::bts::finish::Pow2::<W>::bytes(lay.rows()));
+            // one route per slot count: its raise variants share the encapsulation keys and the post-factor table
+            if sb_cfgs[..i].iter().all(|x| x.slots != c.slots) {
+                mp.reserve("bts.route", pc_gpu::bts::raise::EncapsKeys::bytes() + pc_gpu::bts::finish::Pow2::<W>::bytes(lay.rows()));
+            }
             wshape = Some(wshape.map_or(w, |x| x.max(w)));
         }
         for cp in &cplans {
@@ -1170,12 +1173,17 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 Some(dp) => Some(dp.build(a, &ex.compute, &ctx, &keys, stage).map_err(e)?),
                 None => None,
             };
-            let mut sparse = vec![];
+            let mut sparse: Vec<SparseBRoute<'_, W>> = vec![];
             for c in &sb_cfgs {
                 let s = &ex.compute;
+                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, stage).map_err(e)?;
+                // the raise variants of one slot count are one route (`SparseBRoute::variant` picks by drop)
+                if let Some(r) = sparse.iter_mut().find(|r| r.slots == c.slots) {
+                    r.variants.push(pre);
+                    continue;
+                }
                 let encaps = pc_gpu::bts::raise::EncapsKeys::new(a, s, n, BtsKeyRing::dense_to_sparse(&keys).map_err(e)?, BtsKeyRing::sparse_to_dense(&keys).map_err(e)?, stage).map_err(e)?;
                 let pow2 = pc_gpu::bts::finish::Pow2::new(a, s, &ctx).map_err(e)?;
-                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, stage).map_err(e)?;
                 sparse.push(SparseBRoute { slots: c.slots, ring_n: n, variants: vec![pre], encaps, pow2, cf_default: 6, cf_window: (2, 20), deg: chain_deg(&ctx).map_err(e)?, ks_source: c.ks_source });
             }
             let mut classic = vec![];
