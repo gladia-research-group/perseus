@@ -4,7 +4,8 @@
 //!
 //! Per input: coefficient form, exact rescale by q3 then q2, key switch to s'(X^16), MLWE rows; Y = W X mod q_i as
 //! balanced base-256 digit planes (4 x nW int8 GEMMs, exact under `exact_k_limit`); per output: pack back into ring
-//! 2^12 ciphertexts, compose into ring 2^16, switch back to s, lift into limbs 0..3, eval form. Inputs are consumed
+//! 2^12 ciphertexts, compose into ring 2^16, switch back to s, lift into the split's limbs (0..3; 0..2 on a lean chain,
+//! whose split rescales by q2 alone), eval form. Inputs are consumed
 //! before any output is written (`product_inplace`). Scale: `nf_out = nf_split / w_scale`; the driver (`linear`)
 //! handles the 2^shift. Details: docs/ARCHITECTURE.md "pc-gpu PCMM".
 use super::gemm::{GemmBackend, GemmPlans};
@@ -296,7 +297,10 @@ pub struct Pcmm<'a, 'lt, W: DevWord> {
     work: Work<'a, W>,
     rows8: RowList<'a>,
     pow2: Pow2<'a, W>,
-    /// chain q0..q3, Barrett constants, rescale inverses (q3^-1 mod q0..q2, q2^-1 mod q0, q1), lift q2 q3 mod q0, q1
+    /// The split's limbs: 4 (q0..q3), or 3 on a lean chain (q0..q2: its StC-first split, `stc_first::split_top`).
+    nsplit: usize,
+    /// chain q0..q3, Barrett constants, rescale inverses (q3^-1 mod q0..q2, q2^-1 mod q0, q1), lift (the product of the
+    /// split's primes above q1) mod q0, q1
     chain4: [u32; 4],
     chain_mu: [u64; 4],
     inv_c: [u32; 8],
@@ -356,8 +360,12 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
             g: arena.alloc("pcmm.work", z.g.max(1))?,
             gws: arena.alloc("pcmm.gemm_ws", cfg.gemm_workspace)?,
         };
-        // staging rows: (part, limb) -> limb offset part*4 + i, prime id i
-        let rows: Vec<(u32, i32)> = (0..8).map(|r| (r as u32, (r % 4) as i32)).collect();
+        // staging rows: (part, limb) -> limb offset part*4 + i, prime id i (the split's limbs)
+        let nsplit = crate::bts::stc_first::split_top(&ctx.chain) + 1;
+        if !(3..=4).contains(&nsplit) {
+            return Err(shape("pcmm", format!("a split of {nsplit} limbs (3 or 4)")));
+        }
+        let rows: Vec<(u32, i32)> = (0..2).flat_map(|p| (0..nsplit).map(move |i| ((p * 4 + i) as u32, i as i32))).collect();
         let rows8 = RowList::new(arena, s, &rows)?;
         let pow2 = Pow2::new(arena, s, ctx)?;
         let q: Vec<u64> = split.clone();
@@ -370,7 +378,7 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
         for i in 0..2 {
             inv_c[3 + i] = invmod(q[2] % q[i], q[i]) as u32;
         }
-        let q23 = q[2] as u128 * q[3] as u128;
+        let q23 = q[2..nsplit].iter().fold(1u128, |a, &x| a * x as u128);
         let lift = [(q23 % q[0] as u128) as u32, (q23 % q[1] as u128) as u32];
         let mut plans = GemmPlans::default();
         for s_ in &cfg.shapes {
@@ -387,7 +395,7 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
                 }
             }
         }
-        let mut me = Pcmm { cfg, keys: dk, plans, work, rows8, pow2, chain4, chain_mu, inv_c, lift };
+        let mut me = Pcmm { cfg, keys: dk, plans, work, rows8, pow2, nsplit, chain4, chain_mu, inv_c, lift };
         if me.cfg.autotune {
             me.autotune(dev, s)?;
         }
@@ -576,8 +584,8 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
         let w = &mut self.work;
         let (stage, xr, res, scratch) = (w.stage.dptr_mut() as *mut c_void, w.xr.dptr_mut(), w.res.dptr_mut(), w.scratch.dptr_mut());
         let (pa, pbm, pap, pbp, pc, ppk, pra, prb) = (w.a.dptr_mut(), w.bm.dptr_mut(), w.ap.dptr_mut(), w.bp.dptr_mut(), w.c.dptr_mut(), w.pk.dptr_mut(), w.ra.dptr_mut(), w.rb.dptr_mut());
-        let (c4, cmu, inv_c, lift) = (self.chain4, self.chain_mu, self.inv_c, self.lift);
-        let chain = |opc: i32| PcmmArgs { op: opc, n: N as i32, p: c4, mu: cmu, ..PcmmArgs::default() };
+        let (c4, cmu, inv_c, lift, ns) = (self.chain4, self.chain_mu, self.inv_c, self.lift, self.nsplit as i32);
+        let chain = |opc: i32| PcmmArgs { op: opc, n: N as i32, p: c4, mu: cmu, i4: ns, ..PcmmArgs::default() };
         for (c, &(ct, m)) in ins.iter().enumerate() {
             let mut a = chain(op::GATHER);
             a.ct = ct;
@@ -673,8 +681,9 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
     }
 
     fn check_split<M: DevStrategy<W>>(ctx: &Context<'_, W, M>, x: &Ct<'_, W>) -> Result<()> {
-        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 {
-            return Err(shape("pcmm", format!("ciphertext at level {} (top {:?}): the split holds limbs 0..3", x.meta.level, ctx.top_of(x.meta.level).ok())));
+        let top = crate::bts::stc_first::split_top(&ctx.chain);
+        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != top {
+            return Err(shape("pcmm", format!("ciphertext at level {} (top {:?}): the split holds limbs 0..{top}", x.meta.level, ctx.top_of(x.meta.level).ok())));
         }
         Ok(())
     }

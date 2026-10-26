@@ -49,6 +49,12 @@ pub const THIN_SPLIT: [f64; 2] = [-6.0, -3.0];
 /// The reference CF of a lean chain's last stage (the factors above are set for it; lower CFs are pre-scaled to it).
 pub const THIN_CF_REF: u32 = 13;
 
+/// The top limb of the mode-2 split (degree 2 there, where a PCMM / CCMM consumes it): 2d - 1, or a lean chain's
+/// single prime above q0 (`StcFirstRoute::split_top` for the shipped StC budget).
+pub fn split_top(chain: &Chain) -> usize {
+    chain.lone_top().unwrap_or(2 * chain.level_unit - 1)
+}
+
 /// StC-first mode (FIDESLIB_BTS_STC_FIRST).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StcFirstMode {

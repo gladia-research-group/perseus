@@ -580,7 +580,8 @@ fn bench(args: &[String]) -> Res<bool> {
     }
     let kmax = 4usize;
     let t0 = Instant::now();
-    let chain = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (the lean n32a4's split has 3 limbs)
+    let chain = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     let n = chain.n;
     let slots = n / 2;
     let mut setup = BtsSetup::n32_shipped();
