@@ -145,6 +145,8 @@ pub struct RunInfo {
     pub launch_us: f64,
     pub meta_mismatches: usize,
     pub first_mismatches: Vec<String>,
+    /// Plaintext products and adds issued as one pass (`ReplayStats::fused`).
+    pub fused: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -155,6 +157,8 @@ pub struct ReplayStats {
     /// Graphs dropped because a plaintext address moved.
     pub invalidations: usize,
     pub capture_ms: f64,
+    /// Plaintext products and adds the eager runs issued as one pass (`UnitKind::MultPtAdd`).
+    pub fused: usize,
 }
 
 pub struct Replayer {
@@ -426,15 +430,18 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     // the rotation chain whose gathered inputs and ModUp the compute lane's workspaces (`ks_owner`) and the held
     // buffers (`held_owner`) hold: a later link of another state runs fresh (bind's chains never meet one, a guard)
     let (mut ks_owner, mut held_owner): (Option<u32>, Option<u32>) = (None, None);
+    // a fused product is never written: the metadata check and the step hooks see the pair step by step
+    let stepwise = check || hook.is_some();
     for i in lo..hi {
         let in_unit = i < unit_end;
         let unit = if in_unit {
             None
         } else {
             b.unit_at(i)
-                .filter(|u| unit_fits(u, &b.slots))
+                .filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. })))
+                .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
                 .map(|u| (b.unit_of[i], u.hi as usize))
-                .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == 0)))
+                .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == s.lane[i])))
         };
         let dynamic = b.dynamic.contains(&(i as u32));
         let lane = sched.map_or(0, |s| s.lane[i]);
@@ -493,9 +500,11 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                                 stale = *owner != Some(unit.chain);
                                 *owner = Some(unit.chain);
                             }
+                            // a fused plaintext product and add leaves the key-switching workspaces alone
+                            UnitKind::MultPtAdd { .. } => info.fused += 1,
                             _ => ks_owner = None,
                         }
-                        exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, stale)
+                        exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, pts, stale)
                     }
                     None => {
                         if lane == 0 && !quiet(&steps[i].op) {
@@ -586,7 +595,7 @@ fn quiet(op: &StepOp) -> bool {
 /// Whether unit `u` can issue as one batch on the operands its slots hold: a K-batched product or refresh runs one
 /// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
 /// rotations only need one level.
-fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>]) -> bool {
+fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow) -> bool {
     let meta = |s: &u32| slots.get(*s as usize).map(|c| c.meta);
     let one = |v: &[u32], scale: bool| {
         let m0 = v.first().and_then(meta);
@@ -596,6 +605,17 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>]) -> bool {
         UnitKind::Grid { .. } | UnitKind::RotateSum { .. } => one(&u.ins, false),
         UnitKind::Mult { b } => one(&u.ins, true) && one(b, true),
         UnitKind::Refresh { .. } => one(&u.ins, true),
+        // one pass when neither the add nor the plaintext needs a prelude; a sum landing on the add's other operand
+        // also takes none on the product, and one landing on the product's input is not fused
+        UnitKind::MultPtAdd { pt, sub, product_first } => {
+            let (Some(a), Some(y), Some(p)) = (meta(&u.ins[0]), meta(&u.ins[1]), pts.get(*pt as usize).and_then(|p| p.meta)) else { return false };
+            let out = steps[u.hi as usize - 1].out;
+            if out == u.ins[1] && u.ins[0] != u.ins[1] {
+                Ops::<W>::mult_pt_add_inplace_fusable(sh, &a, &p, &y, *sub, *product_first).unwrap_or(false)
+            } else {
+                out != u.ins[0] && Ops::<W>::mult_pt_add_fusable(sh, &a, &p, &y, *sub, *product_first).unwrap_or(false)
+            }
+        }
     }
 }
 
@@ -614,6 +634,7 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
     groups: &[KeyGroup<'a>],
     relin: u32,
     lists: &[Vec<i64>],
+    pts: &[BoundPt],
     stale: bool,
 ) -> Result<()> {
     let span = &steps[u.lo as usize..u.hi as usize];
@@ -684,6 +705,19 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                 batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, out, c, m)?;
             }
         }
+        UnitKind::MultPtAdd { pt: i, sub, product_first } => {
+            let p = pt(block, pts, *i)?;
+            if span[1].out == u.ins[1] {
+                // SAFETY: the sum lands on the add's other operand, the only mutable reference (`unit_fits`: not on the
+                // product's input, read through `xs[0]`)
+                let acc = unsafe { &mut *slots.add(u.ins[1] as usize) };
+                rt.ops.mult_pt_add_inplace(rt.ctx, rt.ex, rt.sh, acc, xs[0], &p, *sub, *product_first)?;
+            } else {
+                // SAFETY: `unit_fits` checked the sum's slot is neither operand's: the only mutable reference
+                let out = unsafe { &mut *slots.add(span[1].out as usize) };
+                rt.ops.mult_pt_add(rt.ctx, rt.ex, rt.sh, out, xs[0], &p, xs[1], *sub, *product_first)?;
+            }
+        }
         UnitKind::Refresh { route, kind } => {
             // the inputs gathered into one K-ciphertext buffer, refreshed in place as one K-batch, scattered back
             let r = rt.routes.get(*kind).ok_or_else(|| rerr(block, format!("route {kind:?} not held")))?;
@@ -718,7 +752,7 @@ fn issue_dynamic<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b
             }
         }
     }
-    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![] };
+    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
     issue_range(rt, b, i, i + 1, false, &mut scratch, None, None)
 }
 
@@ -779,7 +813,7 @@ impl Replayer {
 
     pub fn run<'a, W: DevWord, M: DevStrategy<W>>(&mut self, b: &mut Bound<'a, W>, rt: &mut Rt<'_, 'a, W, M>) -> Result<RunInfo> {
         let t0 = Instant::now();
-        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![] };
+        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
         if b.pts.iter().any(|p| !p.stream && p.meta.is_none()) {
             return Err(rerr(&b.label, "plaintexts not resolved (Bound::resolve_pts after staging)"));
         }
@@ -788,6 +822,7 @@ impl Replayer {
         if !self.cfg.use_graphs {
             issue(rt, b, self.cfg.check_meta, &mut info, None, sched)?;
             self.stats.eager += 1;
+            self.stats.fused += info.fused;
             info.host_us = t0.elapsed().as_secs_f64() * 1e6;
             return Ok(info);
         }
@@ -828,6 +863,7 @@ impl Replayer {
         // first run with these rows: eager (this token's result, warms the caches), then capture without executing
         let in_metas: Vec<CtMeta> = b.inputs.iter().map(|(_, s, _)| b.slots[*s as usize].meta).collect();
         issue(rt, b, self.cfg.check_meta, &mut info, None, sched)?;
+        self.stats.fused += info.fused;
         let out_metas: Vec<CtMeta> = b.outputs.iter().map(|(_, s, _)| b.slots[*s as usize].meta).collect();
         info.host_us = t0.elapsed().as_secs_f64() * 1e6;
         let tc = Instant::now();
@@ -851,7 +887,7 @@ impl Replayer {
             match seg {
                 Ok((lo, hi)) => {
                     let mut err: Option<Error> = None;
-                    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![] };
+                    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
                     let r = s.capture(|_| {
                         issue_range(rt, b, lo, hi, false, &mut scratch, None, sched).map_err(|e| {
                             err = Some(e);
@@ -912,7 +948,7 @@ impl Replayer {
     /// One eager run with `hook` called after every step (debugging: per-step decryptions, metadata traces).
     pub fn eager_with<'a, W: DevWord, M: DevStrategy<W>>(&mut self, b: &mut Bound<'a, W>, rt: &mut Rt<'_, 'a, W, M>, hook: &mut StepHook<'_, 'a, W, M>) -> Result<RunInfo> {
         let t0 = Instant::now();
-        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![] };
+        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
         issue(rt, b, true, &mut info, Some(hook), None)?;
         self.stats.eager += 1;
         info.host_us = t0.elapsed().as_secs_f64() * 1e6;

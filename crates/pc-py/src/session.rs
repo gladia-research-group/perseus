@@ -1760,6 +1760,7 @@ impl PySession {
         d.set_item("eager", pl.replayer.stats.eager)?;
         d.set_item("capture_ms", pl.replayer.stats.capture_ms)?;
         d.set_item("invalidations", pl.replayer.stats.invalidations)?;
+        d.set_item("fused", pl.replayer.stats.fused)?;
         d.set_item("stc_evictions", pl.locks().iter().map(|l| l.evictions()).sum::<u64>())?;
         let stc = pl.dense.as_ref().and_then(|r| r.last.as_ref());
         d.set_item("stc_misses", stc.map_or(0, |c| c.stats().misses))?;
