@@ -126,6 +126,7 @@ impl<'a> Setup<'a> {
 fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
     let mut out = Vec::new();
     let host_in = st.rand_slots(1);
+    let host16 = st.rand_slots(2);
     let mut buf = st.ctx.up(&host_in);
     let list: Vec<(u32, i32)> = (0..8).map(|i| (i, i as i32)).collect();
     let (ro, rp) = st.rows(&list);
@@ -143,6 +144,23 @@ fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
         out.push(cmp(&format!("ntt.fwd vs host (lazy {lazy})"), &buf.read(&st.ctx), &want));
         ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
         out.push(cmp(&format!("ntt.inv(fwd(x)) == x (lazy {lazy})"), &buf.read(&st.ctx), &host_in));
+    }
+    // 16 rows (two 8-row slots, primes repeating): chunks above COLS8_MAX run the 16-column passes
+    let mut buf16 = st.ctx.up(&host16);
+    let list16: Vec<(u32, i32)> = (0..16).map(|i| (i, (i % 8) as i32)).collect();
+    let (ro16, rp16) = st.rows(&list16);
+    let mut want16 = host16.clone();
+    for i in 0..16 {
+        ntt_ref(&mut want16[i * N..(i + 1) * N], &w[i % 8], st.primes[i % 8]);
+    }
+    let a16 = st.ntt_args(buf16.p(), &ro16, &rp16, 16);
+    for lazy in [a16.lazy, 0] {
+        let a = NttArgs { lazy, ..a16 };
+        buf16.write(&st.ctx, &host16);
+        ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.fwd vs host, 16 rows (lazy {lazy})"), &buf16.read(&st.ctx), &want16));
+        ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.inv(fwd(x)) == x, 16 rows (lazy {lazy})"), &buf16.read(&st.ctx), &host16));
     }
     out
 }
