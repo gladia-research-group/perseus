@@ -3,7 +3,8 @@
 //! adjust + drop to the bottom, dense -> block key switch, extraction of the 2n bootstrapping plaintexts, the
 //! key-ciphertext sum, trace, product over the h blocks, mask recombination (degree 2 output).
 //!
-//! The output is the slot mean (a 1-slot fold) in every slot, 2 * levels(product) + 2 levels below the top.
+//! The output is the slot mean (a 1-slot fold) in every slot, 2 * levels(product) + 2 levels below the top (a
+//! variant of drop d starts the key-ciphertext product d levels lower and lands that much deeper).
 //! All device state is carved at setup (`Spru::bytes` -> MemPlan). Steps: docs/ARCHITECTURE.md "pc-gpu SPRU".
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::ct::Ct;
@@ -35,11 +36,20 @@ pub struct SpruCfg {
     pub acc_bstep: usize,
     /// Ciphertexts per launch the route's buffers are carved for (K-batched SPRU).
     pub k_max: usize,
+    /// Raise drops the route holds a variant for, as a bit set: bit d = the key ciphertexts are read with their top d
+    /// CKKS levels dropped, so the extraction, product and recombination run d levels lower and the output lands d
+    /// levels deeper (`Route::raise_drop` of an s = 1 site). Bit 0 is the shipped route.
+    pub drops: u32,
 }
 
 impl SpruCfg {
     pub fn new(h: usize) -> Self {
-        SpruCfg { h, n: 2, acc_bstep: 4, k_max: 1 }
+        SpruCfg { h, n: 2, acc_bstep: 4, k_max: 1, drops: 1 }
+    }
+
+    /// The drops of `drops`, ascending.
+    pub fn drop_list(&self) -> Vec<u32> {
+        (0..u32::BITS).filter(|d| self.drops >> d & 1 == 1).collect()
     }
 
     pub fn check(&self, ring_n: usize) -> Result<()> {
@@ -50,7 +60,8 @@ impl SpruCfg {
             && (ring_n / self.h) % (2 * self.n) == 0
             && self.k_max >= 1
             && self.acc_bstep >= 2
-            && self.acc_bstep.is_power_of_two();
+            && self.acc_bstep.is_power_of_two()
+            && self.drops != 0;
         if !ok {
             return Err(Error::Mem { knob: "bts.spru", value: self.h, msg: format!("SPRU h must be a power of two dividing N/{} (got {self:?})", 2 * self.n) });
         }
@@ -91,6 +102,17 @@ impl SpruCfg {
     /// Levels (primes dropped) the route consumes from the top: the external product + the product tree.
     pub fn depth_primes(&self, unit: u32) -> u32 {
         unit * (1 + self.product_steps().len() as u32)
+    }
+
+    /// (top limb of the key-ciphertext product, top limb of the recombination) of the variant of drop `drop`, refused
+    /// when the recombination's degree-2 output would have no composite level left to realize into.
+    pub fn tops(&self, nq: usize, unit: u32, drop: u32) -> Result<(usize, usize)> {
+        let top = (nq - 1).checked_sub((unit * drop) as usize);
+        let mask_top = top.and_then(|t| t.checked_sub(self.depth_primes(unit) as usize)).filter(|&m| m + 1 >= 2 * unit as usize);
+        match (top, mask_top) {
+            (Some(t), Some(m)) => Ok((t, m)),
+            _ => Err(Error::Mem { knob: "bts.spru.drops", value: drop as usize, msg: format!("SPRU drop {drop}: the route needs {} primes below the top", self.depth_primes(unit) + 2 * unit) }),
+        }
     }
 }
 
@@ -174,21 +196,44 @@ pub struct Spru<'a, W: DevWord> {
     /// exp(-i pi m / (N/2)), m < N/2, and exp(-i pi k / N), k < N (twiddles and the coefficient rotation).
     tw: ConstBuf<'a, f64>,
     zt: ConstBuf<'a, f64>,
-    /// E_u rows `[u][0..=L][N]` and their NTT row list.
+    /// E_u rows `[u][0..=L][N]` (a variant fills rows 0..=its top).
     ept: DBuf<'a, Compute, W>,
-    ept_rows: RowList<'a>,
     /// INTT rows 0, 1 of both parts of a context-layout ciphertext.
     bottom_rows: RowList<'a>,
-    /// The recombination as one linear transform of the product's output a (step 7): masks over Q rows 0..=mask_top
-    /// and the P rows, full-row layout, for a, conj a, rot(a, 1), conj rot(a, 1): -i me, i me, -i mo, i mo
-    /// (me: even slots 1, odd i; mo swapped).
-    masks: DBuf<'a, Compute, W>,
-    mask_top: usize,
+    /// One per drop of `cfg.drops`, ascending.
+    variants: Vec<SpruVariant<'a, W>>,
     /// conj o rot(1) (Galois 2N - 5), route-owned: not a rotation step of the key set.
     conjrot: DevKsk<'a, W>,
     fin_group: Option<KeyGroup<'a>>,
     /// Working ciphertexts (k = 1).
     work: [Ct<'a, W>; 3],
+}
+
+/// The tables of one drop: the E_u row list at the variant's top and the recombination masks at its output top.
+struct SpruVariant<'a, W: DevWord> {
+    drop: u32,
+    /// Top limb of the key-ciphertext product (the E_u encodings) and of the recombination.
+    top: usize,
+    mask_top: usize,
+    /// NTT rows `[u][0..=top]` of `Spru::ept`.
+    ept_rows: RowList<'a>,
+    /// The recombination as one linear transform of the product's output a (step 7): masks for a, conj a, rot(a, 1),
+    /// conj rot(a, 1): -i me, i me, -i mo, i mo (me: even slots 1, odd i; mo swapped), at scale sf(mask_top); each
+    /// mask holds Q rows 0..=mask_top, then the special rows.
+    masks: DBuf<'a, Compute, W>,
+}
+
+impl<W: DevWord> SpruVariant<'_, W> {
+    /// Rows of one mask.
+    fn mask_rows(mask_top: usize, kp: usize) -> usize {
+        mask_top + 1 + kp
+    }
+
+    /// Mask `i` at Q row 0 and at its first special row.
+    fn mask(&self, i: usize, n: usize, kp: usize) -> (*const W, *const W) {
+        let base = (self.masks.vptr() as *const W).wrapping_add(i * Self::mask_rows(self.mask_top, kp) * n);
+        (base, base.wrapping_add((self.mask_top + 1) * n))
+    }
 }
 
 impl<'a, W: DevWord> Spru<'a, W> {
@@ -201,6 +246,12 @@ impl<'a, W: DevWord> Spru<'a, W> {
         let ct = Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, km));
         let ept_rows = km * nu * lay.nq;
         let rl = |k: usize| Arena::bytes_for::<u32>(k) + Arena::bytes_for::<i32>(k);
+        let mut variants = 0;
+        for d in cfg.drop_list() {
+            let (top, mask_top) = cfg.tops(lay.nq, chain.level_unit as u32, d)?;
+            let mr = SpruVariant::<W>::mask_rows(mask_top, lay.kp);
+            variants += rl(km * nu * (top + 1)) + Arena::bytes_for::<W>(4 * mr * n) + rl(4 * mr);
+        }
         Ok(KskShape::bottom(chain)?.bytes::<W>(n, KskLayout::Dense)
             + KeyGroup::bytes(1, true)
             + Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, nu))
@@ -209,10 +260,8 @@ impl<'a, W: DevWord> Spru<'a, W> {
             + f(n)
             + f(2 * n)
             + Arena::bytes_for::<W>(ept_rows * n)
-            + rl(ept_rows)
             + rl(4 * km)
-            + Arena::bytes_for::<W>(4 * lay.rows() * n)
-            + rl(4 * (lay.nq - cfg.depth_primes(chain.level_unit as u32) as usize + lay.kp))
+            + variants
             + KskShape::full(chain).bytes::<W>(n, KskLayout::Dense)
             + 3 * ct)
     }
@@ -285,7 +334,6 @@ impl<'a, W: DevWord> Spru<'a, W> {
         if cs.k() != nu {
             return Err(shape("Spru::from_material", format!("{} key ciphertexts, the route needs {nu}", cs.k())));
         }
-        let top = lay.nq - 1;
         let enc_host = Encoder::new(&ctx.chain);
         let km = cfg.k_max;
         let ev = arena.alloc("bts.spru.ev", 2 * km * nu * n)?;
@@ -295,42 +343,45 @@ impl<'a, W: DevWord> Spru<'a, W> {
         let ztv: Vec<f64> = (0..n).flat_map(|k| { let a = -pi * k as f64 / n as f64; [a.cos(), a.sin()] }).collect();
         let tw = ConstBuf::new(arena, "bts.spru.tw", s, &twv)?;
         let zt = ConstBuf::new(arena, "bts.spru.tw", s, &ztv)?;
-        // E rows `[c < k_max][u < 2n][0..=L][N]`; row lists ordered by ciphertext (prefixes serve every k)
+        // E rows `[c < k_max][u < 2n][0..=L][N]`; a variant's row list is ordered by ciphertext (prefixes serve every k)
         let ept = arena.alloc("bts.spru.ept", km * nu * lay.nq * n)?;
-        let er: Vec<(u32, i32)> = (0..km * nu).flat_map(|u| (0..lay.nq).map(move |l| ((u * lay.nq + l) as u32, l as i32))).collect();
-        let ept_rows = RowList::new(arena, s, &er)?;
         let ws = std::mem::size_of::<W>() as u64;
         let ept_ptrs = ConstBuf::new(arena, "bts.spru.ept", s, &(0..km * nu).map(|u| ept.dptr() as u64 + (u * lay.nq * n) as u64 * ws).collect::<Vec<u64>>())?;
         let rows = lay.rows();
         let bl: Vec<(u32, i32)> = (0..km as u32).flat_map(|c| { let b = c * 2 * rows as u32; [(b, 0), (b + 1, 1), (b + rows as u32, 0), (b + rows as u32 + 1, 1)] }).collect();
         let bottom_rows = RowList::new(arena, s, &bl)?;
-        // masks at the output top: trace and the product tree leave the ciphertext depth_primes below the top
-        let out_level = cfg.depth_primes(ctx.shape.unit);
-        let mask_top = top - out_level as usize;
-        let sf_m = ctx.scale.sf(mask_top as i32)?;
         let even: Vec<Complex> = (0..n / 2).map(|j| if j % 2 == 0 { Complex::new(1.0, 0.0) } else { Complex::new(0.0, 1.0) }).collect();
         let odd: Vec<Complex> = (0..n / 2).map(|j| if j % 2 == 1 { Complex::new(1.0, 0.0) } else { Complex::new(0.0, 1.0) }).collect();
         let times = |v: &[Complex], c: Complex| -> Vec<Complex> { v.iter().map(|z| Complex::new(z.re * c.re - z.im * c.im, z.re * c.im + z.im * c.re)).collect() };
         let (pi, mi) = (Complex::new(0.0, 1.0), Complex::new(0.0, -1.0));
         let mvals = [times(&even, mi), times(&even, pi), times(&odd, mi), times(&odd, pi)];
-        let rows_all = lay.rows();
-        let ids: Vec<usize> = (0..=mask_top).chain(lay.nq..rows_all).collect();
-        let mut masks = arena.alloc("bts.spru.masks", 4 * rows_all * n)?;
-        let mut host = vec![W::default(); 4 * rows_all * n];
-        for (i, m) in mvals.iter().enumerate() {
-            let c = enc_host.slot_coeffs(m, n / 2, Payload::Complex, sf_m)?;
-            for &id in &ids {
-                let p = ctx.prime(id) as i128;
-                let row = &mut host[(i * rows_all + id) * n..(i * rows_all + id + 1) * n];
-                for (o, &x) in row.iter_mut().zip(&c) {
-                    *o = W::from_u64(x.rem_euclid(p) as u64);
+        let mut variants = vec![];
+        for d in cfg.drop_list() {
+            // trace and the product tree leave the ciphertext depth_primes below the variant's top
+            let (vtop, mask_top) = cfg.tops(lay.nq, ctx.shape.unit, d)?;
+            let er: Vec<(u32, i32)> = (0..km * nu).flat_map(|u| (0..=vtop).map(move |l| ((u * lay.nq + l) as u32, l as i32))).collect();
+            let ept_rows = RowList::new(arena, s, &er)?;
+            let sf_m = ctx.scale.sf(mask_top as i32)?;
+            let ids: Vec<usize> = (0..=mask_top).chain(lay.nq..rows).collect();
+            let mr = ids.len();
+            let mut masks = arena.alloc("bts.spru.masks", 4 * mr * n)?;
+            let mut host = vec![W::default(); 4 * mr * n];
+            for (i, m) in mvals.iter().enumerate() {
+                let c = enc_host.slot_coeffs(m, n / 2, Payload::Complex, sf_m)?;
+                for (j, &id) in ids.iter().enumerate() {
+                    let p = ctx.prime(id) as i128;
+                    let row = &mut host[(i * mr + j) * n..(i * mr + j + 1) * n];
+                    for (o, &x) in row.iter_mut().zip(&c) {
+                        *o = W::from_u64(x.rem_euclid(p) as u64);
+                    }
                 }
             }
+            masks.upload(s, &host)?;
+            let ml: Vec<(u32, i32)> = (0..4).flat_map(|i| ids.iter().enumerate().map(move |(j, &id)| ((i * mr + j) as u32, id as i32))).collect();
+            let mrows = RowList::new(arena, s, &ml)?;
+            ntt::transform_rows(ctx, s, Dir::Forward, &mut masks, &mrows)?;
+            variants.push(SpruVariant { drop: d, top: vtop, mask_top, ept_rows, masks });
         }
-        masks.upload(s, &host)?;
-        let ml: Vec<(u32, i32)> = (0..4).flat_map(|i| ids.iter().map(move |&id| ((i * rows_all + id) as u32, id as i32))).collect();
-        let mrows = RowList::new(arena, s, &ml)?;
-        ntt::transform_rows(ctx, s, Dir::Forward, &mut masks, &mrows)?;
         let wk = || -> Result<Ct<'a, W>> { Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "bts.spru.work", lay, km)?)) };
         let work = [wk()?, wk()?, wk()?];
         s.sync()?;
@@ -350,10 +401,8 @@ impl<'a, W: DevWord> Spru<'a, W> {
             tw,
             zt,
             ept,
-            ept_rows,
             bottom_rows,
-            masks,
-            mask_top,
+            variants,
             conjrot,
             fin_group: None,
             work,
@@ -386,15 +435,16 @@ impl<'a, W: DevWord> Spru<'a, W> {
     }
 
     /// The output metadata the route produces for an input of any level (a function of the chain only).
-    pub fn out_level(&self, unit: u32) -> u32 {
-        self.cfg.depth_primes(unit)
+    pub fn out_level(&self, unit: u32, drop: u32) -> u32 {
+        self.cfg.depth_primes(unit) + unit * drop
     }
 
     /// Bootstrap the k <= `cfg.k_max` ciphertexts of `x` in place on the s = 1 route with correction `correction`
-    /// (= CF - deg): one set of launches for the batch (the extmult and the recombination loop over its members).
+    /// (= CF - deg), on the variant of drop `drop`: one set of launches for the batch (the extmult and the
+    /// recombination loop over its members).
     #[allow(clippy::too_many_arguments)]
-    pub fn run<M: DevStrategy<W>>(&mut self, cx: &mut BtsCx<'_, '_, W, M>, x: &mut Ct<'_, W>, correction: u32) -> Result<()> {
-        self.run_profiled(cx, x, correction, None)
+    pub fn run<M: DevStrategy<W>>(&mut self, cx: &mut BtsCx<'_, '_, W, M>, x: &mut Ct<'_, W>, correction: u32, drop: u32) -> Result<()> {
+        self.run_profiled(cx, x, correction, drop, None)
     }
 
     /// `run` with timing events recorded on the compute lane after each phase (`PHASES`: adjust, switch, encode,
@@ -405,9 +455,11 @@ impl<'a, W: DevWord> Spru<'a, W> {
         cx: &mut BtsCx<'_, '_, W, M>,
         x: &mut Ct<'_, W>,
         correction: u32,
+        drop: u32,
         prof: Option<&[pc_cuda::Event]>,
     ) -> Result<()> {
         let (ctx, sh) = (cx.ctx, cx.sh);
+        let v = self.variants.iter().find(|v| v.drop == drop).ok_or_else(|| shape("spru", format!("no variant for drop {drop} (built {:?})", self.cfg.drop_list())))?;
         let ex = &mut *cx.ex;
         let ops = &mut *cx.ops;
         let kc = rotate::KsCfg { plans: cx.ks, source: self.rot_source };
@@ -479,8 +531,11 @@ impl<'a, W: DevWord> Spru<'a, W> {
         };
         // SAFETY: rows 0, 1 of both parts of w2 (coefficient form) are live; ev holds 2n x N/2 complex
         launch_result("spru_extract", unsafe { (ctx.table.spru_extract)(&ea, ex.compute.raw()) })?;
-        let sf_top = ctx.scale.sf(top_l as i32)?;
-        // the 2n encodings at once: batched Stockham passes, then rounding into every limb of the top
+        // E_u at sf(top)^2 / cs.nf (= sf(top) on the shipped route): the key ciphertexts keep the chain top's scale
+        // with their top limbs dropped, so the product lands on the nominal scale of the level below the variant's top
+        let sf_v = ctx.scale.sf(v.top as i32)?;
+        let sf_e = sf_v * (sf_v / self.cs.meta.nf);
+        // the 2n encodings at once: batched Stockham passes, then rounding into every limb of the variant's top
         let (mut src, mut dst) = (self.ev.vptr_mut(), self.fb.vptr_mut());
         let mut ns = 1;
         while ns < n {
@@ -495,17 +550,18 @@ impl<'a, W: DevWord> Spru<'a, W> {
             out: self.ept.vptr_mut(),
             zt: self.zt.vptr(),
             pr: ctx.pr(),
-            scale: sf_top,
-            nl: lay.nq as i32,
+            scale: sf_e,
+            nl: (v.top + 1) as i32,
             batch: (kb * nu) as i32,
             out_stride: (lay.nq * n) as u64,
         };
-        // SAFETY: 2n FFT outputs of N complex; ept holds 2n x nq rows; prime table by id
+        // SAFETY: 2n FFT outputs of N complex; ept holds 2n x nq rows (v.top < nq); prime table by id
         launch_result("spru_scatter", unsafe { (ctx.table.spru_scatter)(&sa, ex.compute.raw()) })?;
-        ntt::transform_rows_prefix(ctx, &ex.compute, Dir::Forward, &mut self.ept, &self.ept_rows, kb * nu * lay.nq)?;
+        ntt::transform_rows_prefix(ctx, &ex.compute, Dir::Forward, &mut self.ept, &v.ept_rows, kb * nu * (v.top + 1))?;
         mark(ex, 3)?;
-        // 4. acc = sum_u cs_u E_u (one plaintext-dot launch over the 2n key ciphertexts), rescale
-        let pm = PtMeta { level: 0, deg: 1, nf: sf_top, tag: Default::default() };
+        // 4. acc = sum_u cs_u E_u (one plaintext-dot launch over the 2n key ciphertexts, rows 0..=v.top), rescale
+        let level = unit * drop;
+        let pm = PtMeta { level, deg: 1, nf: sf_e, tag: Default::default() };
         let (acc, tmp, acc2) = (w0, w1, w2);
         let cw = lay.ct_words() as u64;
         // the key ciphertexts are shared and the plaintexts are per member: one dot per member
@@ -517,7 +573,7 @@ impl<'a, W: DevWord> Spru<'a, W> {
                 res_stride: 0,
                 pts: self.ept_ptrs.dptr().wrapping_add(c * nu) as *const *const std::ffi::c_void,
                 pr: ctx.pr(),
-                rs: lay.rs_q(top_l),
+                rs: lay.rs_q(v.top),
                 npts: nu as i32,
                 bstep: nu as i32,
                 gstep: 1,
@@ -531,7 +587,7 @@ impl<'a, W: DevWord> Spru<'a, W> {
             // c 2n ..) and acc's ciphertext c are live context-layout buffers of rows 0..=L; acc is not an input
             launch_result("pt_dot", unsafe { (ctx.table.pt_dot)(&pd, ex.compute.raw()) })?;
         }
-        acc.meta = sh.mult_pt(&self.cs.meta, &pm)?.out;
+        acc.meta = sh.mult_pt(&CtMeta { level, ..self.cs.meta }, &pm)?.out;
         ops.rescale(ctx, ex, sh, std::slice::from_mut(acc))?;
         mark(ex, 4)?;
         // 5. trace over the h n period
@@ -556,13 +612,12 @@ impl<'a, W: DevWord> Spru<'a, W> {
         //    route's raw exit.
         let a = &*a;
         let top = a.top(ctx.shape)?;
-        if top != self.mask_top {
-            return Err(shape("spru", format!("recombination at top {top}, masks built at {}", self.mask_top)));
+        if top != v.mask_top {
+            return Err(shape("spru", format!("recombination at top {top}, masks built at {}", v.mask_top)));
         }
-        let rows_all = lay.rows();
         let cw = lay.ct_words();
         let pw = lay.poly_words() as u64;
-        let mask = |i: usize| (self.masks.vptr() as *const W).wrapping_add(i * rows_all * n);
+        let mask = |i: usize| v.mask(i, n, lay.kp);
         // per member: three rotations of one ciphertext fill three extended slots (k_max >= 3 is not assumed)
         for c in 0..kb {
             ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &a.buf, c, 1, 1, top)?;
@@ -572,19 +627,20 @@ impl<'a, W: DevWord> Spru<'a, W> {
             ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, fin_g, 0, 3, 1, top, DotRows::All, io, fin_g.reads_in_place(kc.source))?;
             for j in 0..3 {
                 let e = View::of(&ex.ks.ext, j);
-                mul_rows(ctx, &ex.compute, e, e, mask(j + 1), top + 1, 0)?;
-                mul_rows(ctx, &ex.compute, e, e, mask(j + 1), lay.kp, lay.nq)?;
+                let (mq, mp) = mask(j + 1);
+                mul_rows(ctx, &ex.compute, e, e, mq, top + 1, 0)?;
+                mul_rows(ctx, &ex.compute, e, e, mp, lay.kp, lay.nq)?;
             }
             for j in 1..3 {
                 ks::ew(ctx, &ex.compute, ks::Ew::Add, ext0, ext0, Some(View::of(&ex.ks.ext, j)), lay.rs_qp(top), 1, 2)?;
             }
             ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, 1, top)?;
             let vx = View::of(&x.buf, c);
-            mul_rows(ctx, &ex.compute, vx, va, mask(0), top + 1, 0)?;
+            mul_rows(ctx, &ex.compute, vx, va, mask(0).0, top + 1, 0)?;
             ks::ew(ctx, &ex.compute, ks::Ew::Add, vx, vx, Some(View::of(&ex.ks.ext, 0)), lay.rs_q(top), 1, 2)?;
         }
         let (slots, tag_in) = (x.meta.slots, x.meta.tag);
-        let mm = PtMeta { level: a.meta.level, deg: 1, nf: ctx.scale.sf(self.mask_top as i32)?, tag: Default::default() };
+        let mm = PtMeta { level: a.meta.level, deg: 1, nf: ctx.scale.sf(v.mask_top as i32)?, tag: Default::default() };
         x.meta = sh.mult_pt(&a.meta, &mm)?.out;
         x.meta.slots = slots;
         let total = if tag_in.slots > 0 { tag_in.slots } else if slots > 0 { slots as i64 } else { (n / 2) as i64 };
@@ -629,21 +685,21 @@ pub(crate) fn key_switch<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
-/// `out = inp * t` (prime-wise) on `nrows` rows starting at prime id `row0` of one ciphertext, both parts; `t` holds
-/// full-layout rows (prime id = row).
+/// `out = inp * t` (prime-wise) on `nrows` rows starting at prime id `row0` of one ciphertext, both parts; `t` points
+/// at the table's row of prime id `row0`, the next rows following it.
 fn mul_rows<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, out: View, inp: View, t: *const W, nrows: usize, row0: usize) -> Result<()> {
     let n = ctx.lay.n;
     let off = |v: View| View { base: (v.base as *mut W).wrapping_add(row0 * n) as *mut _, ..v };
     let a = pc_kernels::MulTableArgs {
         out: off(out).r(),
         inp: off(inp).r(),
-        t: t.wrapping_add(row0 * n) as *const _,
+        t: t as *const _,
         pr: ctx.pr().wrapping_add(row0),
         n: nrows as i32,
         k: 1,
     };
-    // SAFETY: rows [row0, row0 + nrows) of live context-layout buffers and of the mask table; element-wise (out may
-    // alias inp)
+    // SAFETY: rows [row0, row0 + nrows) of live context-layout buffers, nrows rows of the mask table at t;
+    // element-wise (out may alias inp)
     launch_result("mul_table", unsafe { (ctx.table.mul_table)(&a, s.raw()) })?;
     Ok(())
 }

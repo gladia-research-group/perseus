@@ -758,8 +758,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 }
                 info.pre_factor_log2 = e;
             }
-            let target_sf = ctx.scale.sf(self.variants[st.variant].raise.top as i32)?;
-            let factor = stc_first_mode2_factor(cf_stage as i32, target_sf, ctx.scale.sf((d - 1) as i32)?, ctx.scale.sf(self.entry_top as i32)?, nf_in);
+            let factor = self.mode2_factor(ctx, st, cf_stage, nf_in)?;
             let key = CacheKey([st.variant as i64, cf_stage as i64, (nf_in.log2() * 1e6).round() as i64]);
             for s in &self.input {
                 run_lt(cx, s, cts, src)?;
@@ -790,13 +789,22 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     /// state and an input scale `nf_in` at the entry.
     pub fn warm(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, st: &BtsState, nf_in: f64, own_cf: bool) -> Result<CacheKey> {
         let last = self.last.as_ref().ok_or_else(|| no_stage("stc_first", "warm (mode-2 cache not built)"))?;
-        let d = ctx.chain.level_unit;
         let cf_stage = if own_cf { st.cf } else { st.cf.max(self.sf.cf_ref) };
-        let target_sf = ctx.scale.sf(self.variants[st.variant].raise.top as i32)?;
-        let factor = stc_first_mode2_factor(cf_stage as i32, target_sf, ctx.scale.sf((d - 1) as i32)?, ctx.scale.sf(self.entry_top as i32)?, nf_in);
+        let factor = self.mode2_factor(ctx, st, cf_stage, nf_in)?;
         let key = CacheKey([st.variant as i64, cf_stage as i64, (nf_in.log2() * 1e6).round() as i64]);
         last.get(ctx, s, &self.srcs, key, factor)?;
         Ok(key)
+    }
+
+    /// The mode-2 last stage's factor for a call: the raise adjust to the variant's top times its `fdrop` =
+    /// sf(chain top) / sf(raise top) (the StC plaintexts' decoding constant is q0 / sf(chain top), as the shipped order's
+    /// last StC stage compensates in `DensePlan`): 1 at drops 0 and 1, a 4-8 % output gain error at drops 2-5 without
+    /// it. The product no longer depends on the variant, so a PCMM split serves a finish under any drop.
+    fn mode2_factor(&self, ctx: &Context<'_, W, M>, st: &BtsState, cf_stage: u32, nf_in: f64) -> Result<f64> {
+        let d = ctx.chain.level_unit;
+        let target_sf = ctx.scale.sf(self.variants[st.variant].raise.top as i32)?;
+        let fdrop = ctx.scale.sf((ctx.lay.nq - 1) as i32)? / target_sf;
+        Ok(stc_first_mode2_factor(cf_stage as i32, target_sf, ctx.scale.sf((d - 1) as i32)?, ctx.scale.sf(self.entry_top as i32)?, nf_in) * fdrop)
     }
 
     /// A state for the same input under another raise variant (the PCMM finish: input state at the route's drop, the

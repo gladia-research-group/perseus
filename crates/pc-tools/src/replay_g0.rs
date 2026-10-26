@@ -535,12 +535,16 @@ fn run(o: &Opts) -> Res<bool> {
     let mut dense_drops: BTreeSet<u32> = BTreeSet::new();
     let mut sparse: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     let mut spru_h: Option<u32> = None;
+    let mut spru_drops = 0u32;
     let mut real = false;
     let mut n_dense = 0usize;
     for s in &prog.bts_sites {
         let r = s.route;
         match pc_gpu::bts::RouteKind::of(&r, n) {
-            pc_gpu::bts::RouteKind::Spru { h, .. } => spru_h = Some(h),
+            pc_gpu::bts::RouteKind::Spru { h, .. } => {
+                spru_h = Some(h);
+                spru_drops |= 1 << r.raise_drop.min(31);
+            }
             pc_gpu::bts::RouteKind::Sparse(sl) => {
                 sparse.entry(sl).or_default().insert(r.raise_drop);
             }
@@ -575,7 +579,7 @@ fn run(o: &Opts) -> Res<bool> {
             })
         })
         .collect();
-    let spru_cfg = spru_h.map(|h| SpruCfg::new(h as usize));
+    let spru_cfg = spru_h.map(|h| SpruCfg { drops: spru_drops, ..SpruCfg::new(h as usize) });
     // every rotation key: the program's, the routes'
     let mut steps: BTreeSet<i64> = BTreeSet::new();
     let half = (n / 2) as i64;

@@ -442,12 +442,14 @@ struct RouteNeeds {
     /// classic sparse routes (`Route::sparse_b` off): slots -> raise drops
     classic: BTreeMap<u32, BTreeSet<u32>>,
     spru_h: Option<u32>,
+    /// raise drops of the SPRU sites (`SpruCfg::drops` bit set)
+    spru_drops: u32,
     /// (level, deg, raise drop) of the left operands of the programs' CCMM finishes (SinCBoot's stc_high shapes)
     ccmm_levels: BTreeSet<(u32, u8, u32)>,
 }
 
 fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
-    let mut r = RouteNeeds { dense_drops: BTreeSet::new(), real: false, n_dense: 0, plain_drops: BTreeSet::new(), plain_real: false, sparse: BTreeMap::new(), classic: BTreeMap::new(), spru_h: None, ccmm_levels: BTreeSet::new() };
+    let mut r = RouteNeeds { dense_drops: BTreeSet::new(), real: false, n_dense: 0, plain_drops: BTreeSet::new(), plain_real: false, sparse: BTreeMap::new(), classic: BTreeMap::new(), spru_h: None, spru_drops: 0, ccmm_levels: BTreeSet::new() };
     for p in progs {
         // a PCMM finish refreshes its outputs on the StC-first dense route (its raise drop's variant)
         for op in &p.ops {
@@ -472,7 +474,10 @@ fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
         }
         for s in &p.bts_sites {
             match RouteKind::of(&s.route, n) {
-                RouteKind::Spru { h, .. } => r.spru_h = Some(h),
+                RouteKind::Spru { h, .. } => {
+                    r.spru_h = Some(h);
+                    r.spru_drops |= 1 << s.route.raise_drop.min(31);
+                }
                 RouteKind::Sparse(sl) if !s.route.sparse_b => {
                     r.classic.entry(sl).or_default().insert(s.route.raise_drop);
                 }
@@ -627,7 +632,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             }
         }
         if let Some(h) = rn.spru_h {
-            let c = SpruCfg::new(h as usize);
+            let c = SpruCfg { drops: rn.spru_drops, ..SpruCfg::new(h as usize) };
             full.extend(c.rot_steps(n).into_iter().map(|k| k.rem_euclid(half)));
             spru_cfg = Some(c);
         }
