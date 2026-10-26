@@ -832,7 +832,7 @@ section! {
 }
 
 section! {
-    /// `plan` (90 legacy env names).
+    /// `plan` (96 legacy env names).
     PlanConfig "plan" {
         #[doc = "`PLAN_ACC_CHAIN`. Default (unset) / n32. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
@@ -840,6 +840,9 @@ section! {
         #[doc = "`PLAN_ACC_TABLE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         acc_table: Str = "PLAN_ACC_TABLE", "(unset)";
+        #[doc = "`PLAN_ARGMAX_MINCUT`. Default (unset). Read at examples/gpt2/make_plan.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        argmax_mincut: Flag = "PLAN_ARGMAX_MINCUT", "(unset)";
         #[doc = "`PLAN_BASELINE_DEPTH_CAP`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 1."]
         baseline_depth_cap: Str = "PLAN_BASELINE_DEPTH_CAP", "(unset)";
@@ -954,12 +957,18 @@ section! {
         #[doc = "`PLAN_ILP_OBJECTIVE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         ilp_objective: Str = "PLAN_ILP_OBJECTIVE", "(unset)";
+        #[doc = "`PLAN_ILP_TIEBREAK`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        ilp_tiebreak: Flag = "PLAN_ILP_TIEBREAK", "(unset)";
         #[doc = "`PLAN_ILP_TIME_LIMIT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 2."]
         ilp_time_limit: Str = "PLAN_ILP_TIME_LIMIT", "(unset)";
         #[doc = "`PLAN_KEEP_PLACEMENTS`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell); examples/llama/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: recipe= dsw48_ho36, dsw48_ho38."]
         keep_placements: Str = "PLAN_KEEP_PLACEMENTS", "(unset)";
+        #[doc = "`PLAN_KEEP_PLACEMENTS_EXACT`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: none."]
+        keep_placements_exact: Flag = "PLAN_KEEP_PLACEMENTS_EXACT", "'0'";
         #[doc = "`PLAN_KS_REALIZE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         ks_realize: Str = "PLAN_KS_REALIZE", "(unset)";
@@ -999,6 +1008,9 @@ section! {
         #[doc = "`OUT_NAME`. Default (required) / (unset). Read at examples/gpt2/make_plan.sh::(shell); examples/llama/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         out_dir: Str = "OUT_NAME", "(required) / (unset)";
+        #[doc = "`PLAN_PACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        pack_cf: Flag = "PLAN_PACK_CF", "'0'";
         #[doc = "`PLAN_PLACER`. Default / (unset). Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 4."]
         placer: Str = "PLAN_PLACER", " / (unset)";
@@ -1023,6 +1035,9 @@ section! {
         #[doc = "`PLAN_QUALITY_WEIGHT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         quality_weight: Str = "PLAN_QUALITY_WEIGHT", "(unset)";
+        #[doc = "`PLAN_RAISE_DROP_BASE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        raise_drop_base: Str = "PLAN_RAISE_DROP_BASE", "(unset)";
         #[doc = "`PLAN_RAISE_ENV_RULE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
         raise_drop_env_rule: Str = "PLAN_RAISE_ENV_RULE", "(unset)";
@@ -1035,6 +1050,9 @@ section! {
         #[doc = "`PLAN_RAISE_ROUTES`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 12."]
         raise_drop_routes: Str = "PLAN_RAISE_ROUTES", "(unset)";
+        #[doc = "`PLAN_RAISE_SEARCH`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        raise_drop_search: Flag = "PLAN_RAISE_SEARCH", "'0'";
         #[doc = "`PLAN_RAISE_DROP_SET`. Default (unset) / 1,3,5. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
         raise_drop_set: Str = "PLAN_RAISE_DROP_SET", "(unset) / 1,3,5";

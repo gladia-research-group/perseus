@@ -424,3 +424,119 @@ class CutPricingKnobs(unittest.TestCase):
             self.skipTest("real-graph fixture not present")
         self.assertLessEqual(dense_share(depth_weight=1.0, depth_form="ms"),
                              dense_share())
+
+
+class KeepPlacements(unittest.TestCase):
+    """PLAN_KEEP_PLACEMENTS + PLAN_RAISE_SEARCH as a drops-only post-pass over a finished plan, and
+    PLAN_KEEP_PLACEMENTS_EXACT, which stops a block that would not end with exactly the kept refreshes."""
+
+    GRAPH = REAL_GRAPH / "block_0" / "graph.json"
+    CFG = PlanConfig(bootstrap_level=34, max_level=46, source_level=34, cache_read_level=34, level_unit=2,
+                     acc_chain="n32", sparse_precomps=(512, 1), sparse_out_levels=((1, 16), (512, 26)), prune=True,
+                     verbose=False)
+    DROPS = dict(raise_drop_max=13, raise_drop_search=True, raise_drop_set=(1, 2, 3, 4, 5),
+                 raise_drop_routes=(0, 512, 1), raise_drop_base=((512, 1),))
+
+    def setUp(self):
+        if not self.GRAPH.is_file():
+            self.skipTest("real-graph fixture not present")
+        self.plan = plan_block(self.GRAPH, self.CFG)          # the finished plan, no drops
+        self.dir = Path(tempfile.mkdtemp(prefix="perseus_keep_"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _keep(self, doc, **kw):
+        (self.dir / "block_0_placement.json").write_text(json.dumps(doc))
+        cfg = dataclasses.replace(self.CFG, keep_placements=str(self.dir), **kw)
+        return plan_block(self.GRAPH, cfg)
+
+    def test_drops_only_post_pass(self):
+        out = self._keep(self.plan, keep_placements_exact=True, **self.DROPS)
+        for k in ("placements", "hint_fire", "sparse_slots", "correction_factor", "rescale_after"):
+            self.assertEqual(out.get(k), self.plan.get(k), k)
+        self.assertFalse(self.plan.get("raise_drop"))
+        self.assertTrue(out.get("raise_drop"), "the search assigns drops to the kept refreshes")
+        self.assertLessEqual(set(out["raise_drop"]), {p["target_var"] for p in self.plan["placements"]}
+                             | set(self.plan["hint_fire"]))
+
+    def test_exact_stops_a_re_placement(self):
+        # one kept refresh short: the cut adds one back, which the plain keep accepts and the exact keep refuses
+        doc = dict(self.plan, placements=self.plan["placements"][1:])
+        self.assertEqual(self._keep(doc)["summary"]["num_placements"], self.plan["summary"]["num_placements"])
+        with self.assertRaisesRegex(RuntimeError, "keep_placements_exact: .* placements added"):
+            self._keep(doc, keep_placements_exact=True)
+
+    def test_exact_stops_on_sites_the_graph_lacks(self):
+        doc = dict(self.plan, placements=self.plan["placements"]
+                   + [{"type": "bootstrap_after_node", "node_op": "mult", "target_var": "v_absent"}])
+        with self.assertRaisesRegex(RuntimeError, "not in .*v_absent"):
+            self._keep(doc, keep_placements_exact=True)
+
+    def test_exact_compares_the_fired_hints(self):
+        self.assertTrue(self.plan["hint_fire"])
+        doc = dict(self.plan, hint_fire=self.plan["hint_fire"][1:])
+        with self.assertRaisesRegex(RuntimeError, "hints fired " + self.plan["hint_fire"][0]):
+            self._keep(doc, keep_placements_exact=True)
+
+
+class SplitPacks(unittest.TestCase):
+    """emit.split_packs (PLAN_PACK_CF): the vars of a complex pack whose small imaginary part a conjugation splits off
+    downstream, back to the op that made the pack complex; a pack whose parts are alike, or no split, is not one."""
+
+    @staticmethod
+    def _graph(im_max):
+        def n(op, ins, out, mx, field):
+            return {**_node(op, ins, out, 20, max_abs=mx, step="blk.softmax", period=512), "pack_field": field}
+        return Graph.from_nodes([
+            n("mult", ["x0", "pt_s"], "v_s", 2.0, 1),           # the real sum
+            n("mult", ["v_s", "pt_pk"], "v_pk", 1.0, 3),        # (0.5 + 0.5i seed) x the sum: the pack
+            n("rotate_sum", ["v_pk", "rot(-1,-2)"], "v_z", 1.0, 3),
+            n("conjugate", ["v_z"], "v_cz", 1.0, 3),
+            n("sub_ct", ["v_cz", "v_z"], "v_im", 2 * im_max, 2),
+            n("add", ["v_z", "v_cz"], "v_re", 2.0, 1),
+            n("mult", ["v_re", "v_re"], "v_c", 1.0, 3),         # complex, never split
+            n("add", ["v_c", "v_im"], "v_out", 1.0, 3),
+        ], level_unit=1)
+
+    def test_small_imaginary_part(self):
+        from perseus.plan.placer.emit import split_packs
+        packs = split_packs(self._graph(1e-3))
+        self.assertEqual(sorted(packs), ["v_pk", "v_z"])
+        self.assertAlmostEqual(packs["v_z"], 1e-3)
+
+    def test_alike_parts_are_not_a_pack(self):
+        from perseus.plan.placer.emit import split_packs
+        self.assertEqual(split_packs(self._graph(0.5)), {})
+
+
+class ServedPackSites(unittest.TestCase):
+    """Decode-8's served plan (perseus/examples/defaults.py at 16 tokens) refreshes a split complex pack only on
+    SparseB-512, whose EvalMod sees the coefficients its PLAN_PACK_CF price is sized on, at the lowest CF whose band
+    holds 2 x (the recipe's PLAN_MAG_SAFETY) the site's coefficient max."""
+
+    def test_pack_sites(self):
+        from perseus._paths import resolve
+        from perseus.examples.defaults import default_plan
+        from perseus.plan import btserr
+        from perseus.plan.placer.emit import split_packs
+        plan = Path(resolve(default_plan("gpt2_decode", 16)))
+        graph = next((Path(resolve(line.split()[0][len("graph="):])) for line in (plan / "PLAN_CMD.txt").read_text()
+                      .splitlines() if line.startswith("graph=")), None)
+        if graph is None or not (graph / "block_0" / "graph.json").is_file():
+            self.skipTest("the served decode plan's capture is not present")
+        n = 0
+        for f in sorted(plan.glob("block_*_placement.json")):
+            b = f.name.split("_")[1]
+            doc = json.loads(f.read_text())
+            g, _ = erase_reactive_bootstraps(Graph.from_nodes(
+                json.loads((graph / f"block_{b}" / "graph.json").read_text())["nodes"], level_unit=2))
+            packs = split_packs(g)
+            for v in [x["target_var"] for x in doc["placements"]] + doc.get("hint_fire", []):
+                if v not in packs:
+                    continue
+                n += 1
+                cf, coeff = doc["correction_factor"][v], g.producer_of[v].max_coeff
+                with self.subTest(file=f.name, var=v):
+                    self.assertEqual((doc.get("sparse_slots") or {}).get(v), 512)
+                    self.assertEqual(cf, next(c for c in range(btserr.DEFAULT_CF_MIN, 21)
+                                              if btserr.band(c)[1] >= 2.0 * coeff))
+        print(f"[pack] {plan.name}: {n} refreshed pack sites")
