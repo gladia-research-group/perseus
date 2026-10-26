@@ -6,8 +6,8 @@
 //             FIDESlib's llrint, |m| reduced exactly, sign applied) -> scratch [term][limb][N];
 //   rows_mac: per limb the NTT row pass of every term's scratch row, multiplied by the term's ciphertext parts and
 //             summed in registers; one write of the output (or an add onto it: `accumulate`, chunks of a long sum).
-// The column / row passes are the ones of ntt.cuh (ntt_fwd_cols / ntt_fwd_rows) with another load / store; they are
-// repeated here rather than templated there so the NTT kernels stay untouched. Semantics in args.cuh CoeffArgs.
+// The column pass (on 32-column blocks) and the row pass follow ntt.cuh's with another load / store; they are repeated
+// here rather than templated there so the NTT kernels stay untouched. Semantics in args.cuh CoeffArgs.
 #pragma once
 #include "arith.cuh"
 #include "ntt.cuh"
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(256) cols_f32(CoeffArgs A) {
     W x[32];
 #pragma unroll
     for (int j = 0; j < 32; ++j) x[j] = residue<W>(src[(wp + 8 * j) * 256 + lane], A.scale, pk, A.overflow);
-    // from here: ntt_fwd_cols
+    // from here: the column pass on 32-column blocks
 #pragma unroll
     for (int st = 0; st < 5; ++st) {
         const int h = 16 >> st;
