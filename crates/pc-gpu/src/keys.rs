@@ -81,9 +81,10 @@ impl KskShape {
         let ndig = chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= q_top)).count();
         Ok(KskShape { q_top, ndig, nq: chain.q.len(), kp: chain.p.len() })
     }
-    /// The bottom composite level only (`level_unit` Q rows, digit 0): the dense->sparse encapsulation key.
+    /// The bottom composite level only (`level_unit` Q rows, digit 0) over P' (`Chain::p_sparse`): the keys to the
+    /// sparse secrets (dense->sparse encapsulation, SPRU atob), whose modulus is q0 x P'.
     pub fn bottom(chain: &Chain) -> Result<Self> {
-        Self::banded(chain, chain.level_unit - 1)
+        Ok(KskShape { kp: chain.p_sparse, ..Self::banded(chain, chain.level_unit - 1)? })
     }
     /// Slots per digit.
     pub fn rows(&self) -> usize {
