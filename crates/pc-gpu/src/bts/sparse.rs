@@ -358,8 +358,8 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RouteSet<'r, 'a, W, M> {
 
 /// One Accumulate round, `x += sum_j rot(x, steps[j])` (FIDESlib `Accumulate`: hoisted rotations summed in the
 /// extended basis, one ModDown fused with the add; = `rotate::rotate_sum_inplace`'s arithmetic, bit-identical). When
-/// every rotation of the batch fits the extended workspace the sums happen in place in the dot's output slots (no
-/// copy into the conversion buffer); otherwise `rotate_sum_inplace`.
+/// every rotation of the batch fits the extended workspace, the dot's outputs are summed inside the ModDown
+/// (`ks::moddown_sum_to`); otherwise `rotate_sum_inplace`.
 pub fn acc_round<W: DevWord, M: DevStrategy<W>>(
     ctx: &crate::Context<'_, W, M>,
     ex: &mut crate::Executor<'_, W>,
@@ -384,11 +384,8 @@ pub fn acc_round<W: DevWord, M: DevStrategy<W>>(
     let ext0 = View::of(&ex.ks.ext, 0);
     let io = DotIo { c1: va.part::<W>(1).base, c0: va.base, ct_stride: va.ct_stride, out: ext0.base, part_stride: lay.poly_words() as u64, out_ct_stride: cw, out_rot_stride: k as u64 * cw, c0_mode: 1 };
     ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, g, 0, m, k, top, DotRows::All, io, in_place)?;
-    for j in 1..m {
-        ks::ew(ctx, &ex.compute, ks::Ew::Add, ext0, ext0, Some(View::of(&ex.ks.ext, j * k)), lay.rs_qp(top), k, 2)?;
-    }
-    ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
-    ks::md_epilogue(ctx, &ex.compute, View::of(&x.buf, 0), View::of(&ex.ks.ext, 0), View::of(&ex.ks.conv, 0), k, top)?;
+    // the m extended rotations summed inside the ModDown (special rows in its INTT, Q rows in its epilogue)
+    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, m, k, &mut ex.ks.conv, View::of(&x.buf, 0), k, top)?;
     x.meta = sh.rotate_sum(&x.meta, steps).out;
     Ok(())
 }

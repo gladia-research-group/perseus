@@ -1,12 +1,13 @@
 //! Batched NTT over ciphertext rows (seam `Ntt<W, M>`: the 4-step register-pass kernel, one launch per row
 //! chunk of 128 rows inside the launcher). Rows are addressed by tables `(roff, rprime)` in device memory (limb
 //! offset in units of N from the buffer base, prime id), built at setup: `RowTables` for the spans every op needs,
-//! `RowList` for anything else (key-switching digit sets).
+//! `RowList` for anything else (key-switching digit sets). Optional: an out-of-place first pass (`Src`) and a forward
+//! epilogue stored in place of the transform (`Epi`: the ModDown and rescale last steps).
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::error::{shape, Result};
 use crate::poly::{CtBuf, Layout};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
-use pc_kernels::NttArgs;
+use pc_kernels::{ntt_epi, NttArgs};
 use std::ffi::c_void;
 
 /// Rows per launch chunk (both passes of a chunk run back to back, so the intermediate stays in L2).
@@ -149,6 +150,43 @@ impl<'a> RowList<'a> {
     }
 }
 
+/// The first pass reads row i at `base + soff[i] N` of another buffer (the transform lands in the row list's buffer):
+/// the sum mod p of `n` such rows `stride` words apart.
+#[derive(Clone, Copy, Debug)]
+pub struct Src {
+    pub base: *const c_void,
+    pub soff: *const u32,
+    pub n: usize,
+    pub stride: usize,
+}
+
+/// What the forward transform stores instead of v (rows at the row list's offsets from `out` / `x`; scalars by prime
+/// id with Shoup companions).
+#[derive(Clone, Copy, Debug)]
+pub enum Epi {
+    /// out = (x - v) s
+    SubMul { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
+    /// out = out + (x - v) s
+    SubMulAcc { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
+    /// out = x s + v
+    MulAdd { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
+    /// out = out + (x_0 + .. + x_(n-1) - v) s, the x_j `stride` words apart
+    SubMulAccSum { out: *mut c_void, x: *const c_void, n: usize, stride: usize, s: *const c_void, ss: *const c_void },
+}
+
+impl Epi {
+    /// (mode, out, x, x rows summed, their stride, s, ss)
+    #[allow(clippy::type_complexity)]
+    fn args(self) -> (i32, *mut c_void, *const c_void, usize, usize, *const c_void, *const c_void) {
+        match self {
+            Epi::SubMul { out, x, s, ss } => (ntt_epi::SUB_MUL, out, x, 1, 0, s, ss),
+            Epi::SubMulAcc { out, x, s, ss } => (ntt_epi::SUB_MUL_ACC, out, x, 1, 0, s, ss),
+            Epi::MulAdd { out, x, s, ss } => (ntt_epi::MUL_ADD, out, x, 1, 0, s, ss),
+            Epi::SubMulAccSum { out, x, n, stride, s, ss } => (ntt_epi::SUB_MUL_ACC, out, x, n, stride, s, ss),
+        }
+    }
+}
+
 fn launch<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,
     s: &Stream<Compute>,
@@ -158,9 +196,28 @@ fn launch<W: DevWord, M: DevStrategy<W>>(
     rprime: *const i32,
     nrows: usize,
 ) -> Result<()> {
+    launch_ex(ctx, s, dir, base, roff, rprime, nrows, None, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_ex<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    dir: Dir,
+    base: *mut c_void,
+    roff: *const u32,
+    rprime: *const i32,
+    nrows: usize,
+    src: Option<Src>,
+    epi: Option<Epi>,
+) -> Result<()> {
     if nrows == 0 {
         return Ok(());
     }
+    if epi.is_some() && dir == Dir::Inverse {
+        return Err(shape("ntt epilogue", "the epilogues are forward-only"));
+    }
+    let (mode, eout, ex, xn, xs, es, ess) = epi.map(Epi::args).unwrap_or((0, std::ptr::null_mut(), std::ptr::null(), 1, 0, std::ptr::null(), std::ptr::null()));
     let a = NttArgs {
         base,
         roff,
@@ -174,6 +231,18 @@ fn launch<W: DevWord, M: DevStrategy<W>>(
         pr: ctx.pr(),
         nrows: nrows as i32,
         chunk: NTT_CHUNK,
+        src: src.map(|x| x.base).unwrap_or(std::ptr::null()),
+        soff: src.map(|x| x.soff).unwrap_or(std::ptr::null()),
+        eout,
+        ex,
+        es,
+        ess,
+        epi: mode,
+        snum: src.map(|x| x.n.max(1)).unwrap_or(1) as i32,
+        sstride: src.map(|x| x.stride).unwrap_or(0) as u64,
+        xnum: xn.max(1) as i32,
+        pad: 0,
+        xstride: xs as u64,
     };
     let (f, name) = match dir {
         Dir::Forward => (ctx.table.ntt_fwd, "ntt_fwd"),
@@ -214,6 +283,53 @@ pub fn transform_k<W: DevWord, M: DevStrategy<W>>(
     let base = ct.buf.vptr_mut();
     for (start, n) in ctx.rows.launches(span, parts, k)? {
         launch(ctx, s, dir, base, ctx.rows.roff.dptr_at(start)?, ctx.rows.rprime.dptr_at(start)?, n)?;
+    }
+    Ok(())
+}
+
+/// Forward `transform_k` storing `epi` of the transform instead (`ct`'s rows hold the intermediate only); the
+/// epilogue's buffers share `ct`'s layout (row offsets).
+pub fn forward_k_epi<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    ct: &mut CtBuf<'_, Compute, W>,
+    span: Span,
+    parts: Parts,
+    k: usize,
+    epi: Epi,
+) -> Result<()> {
+    if ct.lay != ctx.lay || k > ct.k {
+        return Err(shape("ntt", format!("{k} of {} cts, buffer layout {:?}, context {:?}", ct.k, ct.lay, ctx.lay)));
+    }
+    let base = ct.buf.vptr_mut();
+    for (start, n) in ctx.rows.launches(span, parts, k)? {
+        launch_ex(ctx, s, Dir::Forward, base, ctx.rows.roff.dptr_at(start)?, ctx.rows.rprime.dptr_at(start)?, n, None, Some(epi))?;
+    }
+    Ok(())
+}
+
+/// `transform_k` with an out-of-place (summing) first pass from `src` at the row tables' offsets (`Src::soff` unused:
+/// the context's own row offsets are the source offsets) and an optional forward epilogue.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_k_ex<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    dir: Dir,
+    ct: &mut CtBuf<'_, Compute, W>,
+    span: Span,
+    parts: Parts,
+    k: usize,
+    src: Option<Src>,
+    epi: Option<Epi>,
+) -> Result<()> {
+    if ct.lay != ctx.lay || k > ct.k {
+        return Err(shape("ntt", format!("{k} of {} cts, buffer layout {:?}, context {:?}", ct.k, ct.lay, ctx.lay)));
+    }
+    let base = ct.buf.vptr_mut();
+    for (start, n) in ctx.rows.launches(span, parts, k)? {
+        let roff = ctx.rows.roff.dptr_at(start)?;
+        let src = src.map(|x| Src { soff: roff, ..x });
+        launch_ex(ctx, s, dir, base, roff, ctx.rows.rprime.dptr_at(start)?, n, src, epi)?;
     }
     Ok(())
 }
@@ -265,4 +381,23 @@ pub fn transform_rows_prefix<W: DevWord, M: DevStrategy<W>>(
         return Err(shape("ntt rows", format!("{nrows} of {} rows; list spans {} limbs, buffer holds {}", list.len(), list.span_limbs, buf.len() / ctx.lay.n)));
     }
     launch(ctx, s, dir, buf.vptr_mut(), list.roff.dptr(), list.rprime.dptr(), nrows)
+}
+
+/// `transform_rows_prefix` with an out-of-place first pass (`src`: one offset per entry of `list`, read before any
+/// row of `buf` is written) and an optional forward epilogue.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_rows_prefix_ex<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    dir: Dir,
+    buf: &mut DBuf<'_, Compute, W>,
+    list: &RowList<'_>,
+    nrows: usize,
+    src: Option<Src>,
+    epi: Option<Epi>,
+) -> Result<()> {
+    if nrows > list.len() || list.span_limbs * ctx.lay.n > buf.len() {
+        return Err(shape("ntt rows", format!("{nrows} of {} rows; list spans {} limbs, buffer holds {}", list.len(), list.span_limbs, buf.len() / ctx.lay.n)));
+    }
+    launch_ex(ctx, s, dir, buf.vptr_mut(), list.roff.dptr(), list.rprime.dptr(), nrows, src, epi)
 }

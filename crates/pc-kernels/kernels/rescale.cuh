@@ -63,14 +63,19 @@ __global__ void rescale_coef(RescaleArgs A) {
     }
 }
 
-// x_i = alpha_i x_i + w_i  (NTT domain)
+// x_i = alpha_i x_i + w_i  (NTT domain), 4 consecutive words per thread
 template <class W>
 __global__ void rescale_combine(RescaleCombineArgs A) {
     const int row = blockIdx.y, c = blockIdx.z >> 1, part = blockIdx.z & 1;
     const W p = (W)A.pr[row].p;
-    const int i = blockIdx.x * BX + threadIdx.x;
-    W* d = at<W>(A.x, c, part, row);
-    d[i] = add<W>(mul_shoup<W>(d[i], ((const W*)A.alpha)[row], ((const W*)A.alphas)[row], p), at<W>(A.tmp, c, part, row)[i], p);
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    W* d = at<W>(A.x, c, part, row) + i;
+    const W al = ((const W*)A.alpha)[row], als = ((const W*)A.alphas)[row];
+    const V4<W> x = load4<W>(d), t = load4<W>(at<W>(A.tmp, c, part, row) + i);
+    W r[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) r[w] = add<W>(mul_shoup<W>(x.v[w], al, als, p), t.v[w], p);
+    store4<W>(d, r[0], r[1], r[2], r[3]);
 }
 
 template <class W, class MM>
@@ -81,7 +86,7 @@ int coef_l(const RescaleArgs* a, cudaStream_t s) {
 }
 template <class W>
 int combine_l(const RescaleCombineArgs* a, cudaStream_t s) {
-    rescale_combine<W><<<dim3(N / BX, a->n, 2 * a->K), BX, 0, s>>>(*a);
+    rescale_combine<W><<<dim3(N / (4 * BX), a->n, 2 * a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 }  // namespace rescale

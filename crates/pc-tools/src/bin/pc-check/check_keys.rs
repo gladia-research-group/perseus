@@ -156,7 +156,7 @@ fn device_dense(
         }
         KskStore::Dense { b, .. } => wb.copy_from(s, b, nr * n)?,
     }
-    let e = KskExpandArgs { out: wa.vptr_mut(), seed: key.seed_dev.dptr(), prime_ids: ids.dptr(), pr: ctx.pr(), nmod: sh.rows() as i32, dnum: sh.ndig as i32 };
+    let e = KskExpandArgs { out: wa.vptr_mut(), seed: key.seed_dev.dptr(), prime_ids: ids.dptr(), pr: ctx.pr(), nmod: sh.rows() as i32, dnum: sh.ndig as i32, d0: 0, pad: 0 };
     // SAFETY: wa holds ndig * rows rows; ids holds rows prime ids
     launch_result("ksk_expand", unsafe { (ctx.table.ksk_expand)(&e, s.raw()) })?;
     Ok((wb.download_range(s, 0, nr * n)?, wa.download_range(s, 0, nr * n)?))

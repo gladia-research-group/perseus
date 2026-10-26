@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 10u
-#define PC_RING_ABI 5u
+#define PC_KERNELS_ABI 11u
+#define PC_RING_ABI 6u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
 #define PC_LOGN 16
@@ -68,6 +68,14 @@ static_assert(sizeof(PolyRef) == 24, "PolyRef layout");
 // bit-reversed output; GS inverse with N^-1 folded in). Twiddle tables: [prime id][N] words in bit-reversed index
 // order (fw[m + i] = psi^brev(m + i)), with Shoup companions; ninv/ninvs: [prime id]. `chunk` rows per launch pair
 // (both passes of a chunk run back to back so the intermediate stays in L2; 0 = all rows at once).
+// ABI 11 (the 2^16 kernels; the ring tables ignore both):
+//   soff non-null: the first pass reads row i from src + soff[i]*N instead (out of place: base gets the result), the
+//   sum mod p of snum (>= 1) such rows sstride words apart;
+//   epi != 0 (forward only): the last pass stores f(v) instead of the transform v of row i, at word r = roff[i]*N + e
+//   of eout, with x = the sum mod p of ex[r + j xstride] (j < xnum, >= 1), s = es[prime id] (Shoup companion ess):
+//     1: eout[r] = (x - v) s            (ModDown's last step: (x - conv) P^-1)
+//     2: eout[r] = eout[r] + (x - v) s  (the same, accumulated)
+//     3: eout[r] = x s + v              (the rescale's combine: alpha x + the correction)
 struct NttArgs {
     void* base;
     const uint32_t* roff;
@@ -80,8 +88,18 @@ struct NttArgs {
     const void* ninvs;
     const PrimeConst* pr;
     int32_t nrows, chunk;
+    const void* src;
+    const uint32_t* soff;
+    void* eout;
+    const void* ex;
+    const void* es;
+    const void* ess;
+    int32_t epi, snum;
+    uint64_t sstride;
+    int32_t xnum, pad;
+    uint64_t xstride;
 };
-static_assert(sizeof(NttArgs) == 88, "NttArgs layout");
+static_assert(sizeof(NttArgs) == 168, "NttArgs layout");
 
 // ------------------------------------------------------------------------------------------------ BConv
 // Batched fast base conversion (coefficient domain), one launch for many jobs (digits x ciphertexts):
@@ -221,8 +239,10 @@ struct KskExpandArgs {
     const int32_t* prime_ids;
     const PrimeConst* pr;
     int32_t nmod, dnum;
+    // ABI 11: digits d0..dnum only, digit d at out + (d - d0) * nmod * N
+    int32_t d0, pad;
 };
-static_assert(sizeof(KskExpandArgs) == 40, "KskExpandArgs layout");
+static_assert(sizeof(KskExpandArgs) == 48, "KskExpandArgs layout");
 
 // Fused CtS stage core: hoisted baby rotations + BSGS plaintext dot in the extended basis, gather form, K cts (groups
 // of kmax in {1, 2, 4, 8}), G <= 2 giant steps. See cts.cuh for the formula.
@@ -317,6 +337,15 @@ struct MulTableArgs {
     int32_t n, K;
 };
 static_assert(sizeof(MulTableArgs) == 72, "MulTableArgs layout");
+
+// mul_add (ABI 11): out = y + m (sub = 0), y - m (1), m - y (2), m = in * t as mul_table (rows [0, n), both parts):
+// a plaintext product and the add / sub that consumes it in one pass. out may alias y or in.
+struct MulAddArgs {
+    MulTableArgs m;
+    PolyRef y;
+    int32_t sub, pad;
+};
+static_assert(sizeof(MulAddArgs) == 104, "MulAddArgs layout");
 
 // ------------------------------------------------------------------------------------------------ rescale
 // Composite one-pass rescale by the top ndrop (1 or 2) primes:
@@ -750,8 +779,9 @@ struct KernelTable {
     int (*md_epilogue_to)(const MdEpiToArgs*, cudaStream_t);
     int (*small_int1)(const SmallInt1Args*, cudaStream_t);
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
+    int (*mul_add)(const MulAddArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 38 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 39 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

@@ -267,9 +267,9 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
 template <class W, class MM>
 __global__ void ksk_expand(KskExpandArgs A) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y, d = blockIdx.z;
+    const int m = blockIdx.y, d = A.d0 + (int)blockIdx.z;
     const PrimeConst& c = A.pr[A.prime_ids[m]];
-    ((W*)A.out)[((size_t)d * A.nmod + m) * N + slot] = chacha::expand_slot<W, MM>(A.seed, slot, (uint32_t)d, c, chacha::TAG_KSKA);
+    ((W*)A.out)[((size_t)blockIdx.z * A.nmod + m) * N + slot] = chacha::expand_slot<W, MM>(A.seed, slot, (uint32_t)d, c, chacha::TAG_KSKA);
 }
 
 template <class W, class MM>
@@ -323,7 +323,8 @@ int key_l(const KsKeyArgs* a, cudaStream_t s) {
 }
 template <class W, class MM>
 int expand_l(const KskExpandArgs* a, cudaStream_t s) {
-    ksk_expand<W, MM><<<dim3(N / 128, a->nmod, a->dnum), 128, 0, s>>>(*a);
+    if (a->d0 < 0 || a->d0 >= a->dnum) return -1;
+    ksk_expand<W, MM><<<dim3(N / 128, a->nmod, a->dnum - a->d0), 128, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 }  // namespace ks

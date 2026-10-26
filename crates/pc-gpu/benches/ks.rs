@@ -4,7 +4,9 @@
 //!   rotate K = 1 / 8 at levels 0, 20, 40 (6 / 4 / 2 live digits), Cached and Regen key sources on dense keys
 //!   (local `DevKey`), and Regen on PackedSeeded keys (28-bit packed `b`, `a` never stored);
 //!   24 hoisted rotations vs 24 plain rotations; the rotate-and-sum ladder 1 -> 32768 (radix 3 and rung by rung);
-//!   relin (tensor + relinearization) K = 1 / 8.
+//!   relin (tensor + relinearization) K = 1 / 8; rotate_sum (7 and 3 packed keys, K = 1 / 4, levels 0 / 20 / 34) with
+//!   the rotations added chunk by chunk vs inside the ModDown, outputs compared word for word; mult_pt + add vs the
+//!   fused mult_pt_add (K = 1, levels 20 / 34), compared word for word.
 //! usage (GPU only through tools/gpu.sh): the `ks` bench binary (`cargo bench -p pc-gpu --bench ks --no-run`).
 use pc_core::modmul::Barrett64;
 use pc_core::params::{Chain, ChainSpec};
@@ -15,8 +17,9 @@ use pc_gpu::keys::{DevSecret, KeySet, KeySetSpec, KskLayout, RotSpec};
 use pc_gpu::ks::{DevKey, KeyA, KeyGroup, KsKeyRef, KsPlans, KsWork, KskSource};
 use pc_gpu::relin;
 use pc_gpu::rotate::{self, KsCfg, RotKeys};
+use pc_gpu::ops::{Ops, OpsCfg, Pt};
 use pc_gpu::{Context, Ct, CtPool, Executor, MemCfg, MemPlan, PoolClass};
-use pc_shadow::{BtsConfig, CtMeta, Quirks, Shadow, ShadowConfig};
+use pc_shadow::{BtsConfig, CtMeta, PtMeta, Quirks, Shadow, ShadowConfig};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,7 +113,7 @@ fn main() -> Res<()> {
     }
     steps.sort();
     steps.dedup();
-    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: 30 }, PoolClass { k: kmax, count: 4 }], events: 16, scratch_cts: 2 };
+    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: 30 }, PoolClass { k: 4, count: 2 }, PoolClass { k: kmax, count: 4 }], events: 16, scratch_cts: 2 };
     let mut plan = MemPlan::build::<W, M>(&chain, cfg)?;
     let lay = plan.lay;
     plan.reserve("ks.plans", KsPlans::bytes::<W>(&chain, kmax)?);
@@ -126,6 +129,8 @@ fn main() -> Res<()> {
     plan.reserve("secret", DevSecret::<W>::bytes(&lay));
     plan.reserve("ks.groups.packed", (steps.len() + lg3.len() + 4) * KeyGroup::bytes(24, true));
     plan.reserve("ks.groups.hybrid", 2 * (steps.len() + lg3.len() + 4) * KeyGroup::bytes(24, true));
+    Ops::<W>::reserve(&mut plan, &OpsCfg::default());
+    plan.reserve("bench.pt", (chain.q.len() + chain.p.len()) * n * 4);
     println!("[bench] {} keys; MemPlan {}", steps.len() + 1, plan.report());
     let arena = plan.allocate(&dev)?;
     let mut ex = Executor::<W>::new(&dev, &arena, &plan)?;
@@ -196,7 +201,12 @@ fn main() -> Res<()> {
         }
     }
     pgroups.0.insert(h24.clone(), mkp(&h24)?);
+    let g3: Vec<i64> = vec![1, 2, 3];
+    pgroups.0.insert(g3.clone(), mkp(&g3)?);
     let prelin = KeyGroup::new(&arena, &ex.compute, n, &[pkeys.relin()? as &dyn KsKeyRef], regen)?;
+    let mut ops = Ops::<W>::new(&arena, &dev, &ex.compute, &ctx, OpsCfg::default())?;
+    let mut ptbuf = arena.alloc::<pc_cuda::Compute, W>("bench.pt", (chain.q.len() + chain.p.len()) * n)?;
+    ptbuf.upload(&ex.compute, &uniform(1, &primes, n, 0x9E7))?;
     ex.compute.sync()?;
     println!("[bench] setup done, arena used {} of {} B", arena.used_bytes(), arena.capacity());
     arena.freeze();
@@ -266,6 +276,87 @@ fn main() -> Res<()> {
                 let tm = tmp.get_mut().ok_or("shared")?;
                 let ms = time(&dev, &mut ex, 5, |ex| Ok(rotate::rotate_and_sum(&ctx, ex, kc, &sh, gr, &x, 1, 32768, rb, om, tm)?))?;
                 println!("| {name} | {level} ({}) | {sn} | {ms:.3} |", kp.ndig(top)?);
+            }
+        }
+    }
+    // rotate_sum: the dot outputs added chunk by chunk vs inside the ModDown, packed keys, Regen
+    println!("\n| rotate_sum | K | level (digits) | keys | chunked ms | in ModDown ms | equal |");
+    println!("|---|---|---|---|---|---|---|");
+    let kc = KsCfg { plans: &kp, source: KskSource::Regen };
+    for &k in &[1usize, 4] {
+        for &level in &[0u32, 20, 34] {
+            let top = nq - 1 - level as usize;
+            let mut a = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut b = pool.acquire(k, CtMeta::new(level, 1))?;
+            for st in [&lg3[0], &g3] {
+                let gr = &pgroups.0[st];
+                let (am, bm) = (a.get_mut().ok_or("shared")?, b.get_mut().ok_or("shared")?);
+                fill(am, level, &ex)?;
+                fill(bm, level, &ex)?;
+                rotate::rotate_sum_inplace_as(&ctx, &mut ex, kc, &sh, gr, am, st, rotate::SumForm::Chunked)?;
+                rotate::rotate_sum_inplace_as(&ctx, &mut ex, kc, &sh, gr, bm, st, rotate::SumForm::InModDown)?;
+                ex.compute.sync()?;
+                let (va, vb) = (am.buf.buf.download(&ex.compute)?, bm.buf.buf.download(&ex.compute)?);
+                let rows = lay.rows();
+                // Q rows 0..=top of both parts of every ciphertext
+                let live = |v: &[W]| -> Vec<W> { (0..2 * k).flat_map(|p| v[(p * rows) * n..(p * rows + top + 1) * n].to_vec()).collect() };
+                let eq = live(&va) == live(&vb);
+                let ms_s = time(&dev, &mut ex, 20, |ex| Ok(rotate::rotate_sum_inplace_as(&ctx, ex, kc, &sh, gr, am, st, rotate::SumForm::Chunked)?))?;
+                let ms_g = time(&dev, &mut ex, 20, |ex| Ok(rotate::rotate_sum_inplace_as(&ctx, ex, kc, &sh, gr, bm, st, rotate::SumForm::InModDown)?))?;
+                println!("| rotate_sum | {k} | {level} ({}) | {} | {ms_s:.3} | {ms_g:.3} | {eq} |", kp.ndig(top)?, st.len());
+                if !eq {
+                    return Err(format!("rotate_sum in-ModDown sum != chunked (K {k}, level {level}, {} keys)", st.len()).into());
+                }
+            }
+        }
+    }
+    // mult_pt + add / sub vs the fused mult_pt_add
+    println!("\n| mult_pt + add | K | level | sub | product first | two ops ms | fused ms | equal |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for &k in &[1usize] {
+        for &level in &[20u32, 34] {
+            let top = nq - 1 - level as usize;
+            let sf = ctx.scale.sf(top as i32)?;
+            let pm = PtMeta { level, deg: 1, nf: sf, tag: Default::default() };
+            let pt = Pt::of(pm, &ptbuf);
+            let mut x = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut y = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut t = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut o1 = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut o2 = pool.acquire(k, CtMeta::new(level, 1))?;
+            fill(x.get_mut().ok_or("shared")?, level, &ex)?;
+            fill(y.get_mut().ok_or("shared")?, level + 1, &ex)?;
+            let (xm, ym) = (x.get_mut().ok_or("shared")?, y.get_mut().ok_or("shared")?);
+            xm.meta = CtMeta { nf: sf, ..xm.meta };
+            ym.meta = sh.mult_pt(&xm.meta, &pm)?.out;
+            let (xr, yr) = (&*xm, &*ym);
+            for (sub, first) in [(false, false), (true, false), (true, true)] {
+                if !Ops::<W>::mult_pt_add_fusable(&sh, &xr.meta, &pm, &yr.meta, sub, first)? {
+                    return Err(format!("mult_pt_add not fusable at level {level}").into());
+                }
+                let (tm, a1, a2) = (t.get_mut().ok_or("shared")?, o1.get_mut().ok_or("shared")?, o2.get_mut().ok_or("shared")?);
+                let two = |ex: &mut Executor<'_, W>, ops: &mut Ops<'_, W>, tm: &mut Ct<'_, W>, a1: &mut Ct<'_, W>| -> Res<()> {
+                    ops.mult_pt(&ctx, ex, &sh, std::slice::from_mut(tm), &[xr], &[pt])?;
+                    let (l, r): (&Ct<'_, W>, &Ct<'_, W>) = if first { (&*tm, yr) } else { (yr, &*tm) };
+                    if sub {
+                        ops.sub(&ctx, ex, &sh, std::slice::from_mut(a1), &[l], &[r])?;
+                    } else {
+                        ops.add(&ctx, ex, &sh, std::slice::from_mut(a1), &[l], &[r])?;
+                    }
+                    Ok(())
+                };
+                two(&mut ex, &mut ops, tm, a1)?;
+                ops.mult_pt_add(&ctx, &mut ex, &sh, a2, xr, &pt, yr, sub, first)?;
+                ex.compute.sync()?;
+                let rows = lay.rows();
+                let live = |v: &[W]| -> Vec<W> { (0..2 * k).flat_map(|p| v[(p * rows) * n..(p * rows + top + 1) * n].to_vec()).collect() };
+                let eq = live(&a1.buf.buf.download(&ex.compute)?) == live(&a2.buf.buf.download(&ex.compute)?) && a1.meta == a2.meta;
+                let ms2 = time(&dev, &mut ex, 20, |ex| two(ex, &mut ops, tm, a1))?;
+                let ms1 = time(&dev, &mut ex, 20, |ex| Ok(ops.mult_pt_add(&ctx, ex, &sh, a2, xr, &pt, yr, sub, first)?))?;
+                println!("| mult_pt + add | {k} | {level} | {sub} | {first} | {ms2:.4} | {ms1:.4} | {eq} |");
+                if !eq {
+                    return Err(format!("mult_pt_add != mult_pt + add (K {k}, level {level}, sub {sub}, first {first})").into());
+                }
             }
         }
     }

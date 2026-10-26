@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 10;
+pub const ABI: u32 = 11;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -62,6 +62,31 @@ pub struct NttArgs {
     pub pr: *const PrimeConst,
     pub nrows: i32,
     pub chunk: i32,
+    /// ABI 11: out-of-place first pass (row i read at src + soff\[i\] N; null = in place).
+    pub src: *const c_void,
+    pub soff: *const u32,
+    /// ABI 11: forward epilogue (`ntt_epi`), 0 = store the transform.
+    pub eout: *mut c_void,
+    pub ex: *const c_void,
+    pub es: *const c_void,
+    pub ess: *const c_void,
+    pub epi: i32,
+    /// ABI 11: rows summed by the out-of-place first pass (`sstride` words apart) and by the epilogue's x (`xstride`).
+    pub snum: i32,
+    pub sstride: u64,
+    pub xnum: i32,
+    pub pad: i32,
+    pub xstride: u64,
+}
+
+/// Forward NTT epilogues (args.cuh NttArgs `epi`).
+pub mod ntt_epi {
+    /// eout = (ex - v) es
+    pub const SUB_MUL: i32 = 1;
+    /// eout += (ex - v) es
+    pub const SUB_MUL_ACC: i32 = 2;
+    /// eout = ex es + v
+    pub const MUL_ADD: i32 = 3;
 }
 
 #[repr(C)]
@@ -190,6 +215,9 @@ pub struct KskExpandArgs {
     pub pr: *const PrimeConst,
     pub nmod: i32,
     pub dnum: i32,
+    /// ABI 11: digits `d0..dnum` only, digit d at `out + (d - d0) nmod N`.
+    pub d0: i32,
+    pub pad: i32,
 }
 
 #[repr(C)]
@@ -314,6 +342,16 @@ pub struct MulTableArgs {
     pub pr: *const PrimeConst,
     pub n: i32,
     pub k: i32,
+}
+
+/// out = y + m (sub 0), y - m (1), m - y (2), m = inp * t as `mul_table` (args.cuh MulAddArgs, ABI 11).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MulAddArgs {
+    pub m: MulTableArgs,
+    pub y: PolyRef,
+    pub sub: i32,
+    pub pad: i32,
 }
 
 #[repr(C)]
@@ -695,7 +733,7 @@ pub struct CcmmArgs {
 zeroed_default!(
     SpruFftArgs, SpruScatterArgs, SpruExtractArgs, NttArgs, BconvArgs, EwArgs, PtDotArgs, KsArgs, EpiArgs, KsRegenArgs, KskExpandArgs, CtsArgs, TensorArgs, MdEpiArgs,
     WsumArgs, AddConstArgs, MulTableArgs, RescaleArgs, RescaleCombineArgs, AutomorphArgs, EncodeArgs, EncryptArgs, KskGenArgs, KskUnpackArgs, ModRaiseArgs, SmallIntTab, SmallIntArgs,
-    KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs
+    KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs, MulAddArgs
 );
 
 /// A launcher: (args, stream) -> cudaError_t of the launch (0 ok; negative = argument outside the kernel's range).
@@ -746,6 +784,7 @@ pub struct KernelTable {
     pub md_epilogue_to: Launch<MdEpiToArgs>,
     pub small_int1: Launch<SmallInt1Args>,
     pub coeff_sum: Launch<CoeffArgs>,
+    pub mul_add: Launch<MulAddArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -754,7 +793,7 @@ const _: () = {
     assert!(size_of::<PrimeConst>() == 64);
     assert!(size_of::<RowSet>() == 16);
     assert!(size_of::<PolyRef>() == 24);
-    assert!(size_of::<NttArgs>() == 88);
+    assert!(size_of::<NttArgs>() == 168);
     assert!(size_of::<BconvJob>() == 32);
     assert!(size_of::<BconvArgs>() == 48);
     assert!(size_of::<EwArgs>() == 128);
@@ -762,7 +801,7 @@ const _: () = {
     assert!(size_of::<KsArgs>() == 176);
     assert!(size_of::<EpiArgs>() == 56);
     assert!(size_of::<KsRegenArgs>() == 296);
-    assert!(size_of::<KskExpandArgs>() == 40);
+    assert!(size_of::<KskExpandArgs>() == 48);
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 184);
     assert!(size_of::<MdEpiArgs>() == 120);
@@ -789,7 +828,8 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 38 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 39 * 8);
+    assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);
     assert!(size_of::<MdEpiToArgs>() == 152);
     assert!(size_of::<RescaleCombineToArgs>() == 104);
