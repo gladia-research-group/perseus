@@ -61,7 +61,7 @@
       "objective": 1.0,
       "bound": 1.0,
       "gap": 0.0,
-      "solve_s": 36.29,
+      "solve_s": 30.47,
       "objective_kind": "total",
       "pruned": 0
     },

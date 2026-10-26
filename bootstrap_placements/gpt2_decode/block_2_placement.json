@@ -154,7 +154,7 @@
     "v_652": 10,
     "v_891": 6,
     "v_731": 10,
-    "v_1483": 13
+    "v_1483": 2
   },
   "real_route": [
     "v_652",
@@ -164,7 +164,7 @@
   "summary": {
     "placer_meta": {
       "status": "fallback:model-mismatch",
-      "solve_s": 0.46,
+      "solve_s": 0.57,
       "pruned": 0
     },
     "num_placements": 8,
@@ -3469,26 +3469,27 @@
       "table_measured": true,
       "num_sites": 10,
       "predicted_rel_err": {
-        "median": 9.760502295388554e-05,
+        "median": 1.1796347681151842e-05,
         "p90": 0.002012717976984125,
         "p99": 0.002012717976984125,
         "max": 0.002012717976984125
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
+        "2": 1,
         "5": 2,
         "6": 1,
         "7": 1,
         "8": 1,
         "10": 2,
         "11": 1,
-        "13": 1,
         "14": 1
       },
       "out_level_histogram": {
         "16": 2,
         "26": 5,
-        "28": 3
+        "28": 2,
+        "34": 1
       },
       "num_offset": 0,
       "num_prescale": 0,

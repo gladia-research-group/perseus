@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """GPT-2's logit rows for CutMax's stage-13 magnitudes (capture_mags --argmax --rows): the float64 reference model
-(speedrun/harness/gpt2_ref.py) at the last token of each window of a windows file (token ids per window).
+(scripts/utils/gpt2_ref.py) at the last token of each window of a windows file (token ids per window).
 
-    python scripts/utils/cutmax_rows.py graphs/gpt2_decode_python_n32_cm/cutmax_rows.json ROWS.npy \
+    python scripts/utils/cutmax_rows.py graphs/gpt2_decode/cutmax_rows.json ROWS.npy \
         [--weights model.safetensors]
 
 The weights default to GPT2_SAFETENSORS, else openai-community/gpt2 in the HF cache. Writes float32 rows
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "speedrun", "harness"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gpt2_ref import GPT2  # noqa: E402
 
 

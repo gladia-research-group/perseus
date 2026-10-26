@@ -170,7 +170,7 @@ def main(argv=None, results=None):
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture) and a.chain == "n32":
-        a.plan = default_plan("gpt2_decode")
+        a.plan = default_plan("gpt2_decode", a.tokens)
 
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:

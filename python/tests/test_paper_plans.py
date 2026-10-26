@@ -70,6 +70,11 @@ GATE: dict[str, tuple | None] = {
     # the decode cut for the prefill's K / V (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS, PLAN_SITE_CF in its recipe= line)
     "llama31_8b_handoff_decode": None,
 }
+# plans this planner does not regenerate, and why
+RETIRED = {
+    "gpt2_decode": "made by the ILP model before c064188 (14 of 15 blocks the min-cut's fallback)",
+    "gpt2_prefill128_tail": "speedrun record 3 (946694d), made by its make_prefill_plan.sh from an intermediate plan",
+}
 # the result plans: `python python/tests/test_paper_plans.py table` replans these
 TABLE = ("llama31_8b_prefill128", "gpt2_prefill128", "gpt2_decode", "bert_sst2_128", "vit_b16_224")
 # PLAN_KEEP_PLACEMENTS dirs that are not shipped: name -> the recipe changes that make them from the plan's own recipe
@@ -260,6 +265,8 @@ def _assert_identical(name: str, res: dict):
 
 
 def _run(name: str, tmp_path: Path):
+    if name in RETIRED:
+        pytest.skip(f"{name}: {RETIRED[name]}")
     try:
         regen, _ = replan(name, tmp_path / "plan.log")
         _assert_identical(name, compare(name, regen, tmp_path))
@@ -286,6 +293,9 @@ def main(names: list[str]) -> int:
     import tempfile
     failed = 0
     for name in names:
+        if name in RETIRED:
+            print(f"[gate] {name}: RETIRED ({RETIRED[name]})", flush=True)
+            continue
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             logdir = Path(os.environ.get("PLAN_GATE_LOGDIR", td))

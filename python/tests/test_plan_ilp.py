@@ -29,8 +29,8 @@ FIX = Path(__file__).resolve().parent / "fixtures"
 ASSETS = Path(__file__).resolve().parents[2]
 # the record decode plan's recipe (StC-first dense refreshes, the shipped-order fallback past the entry, per-route and
 # per-step envelopes) on its own graph, the blocks chained at the min-cut plan's exits
-DECODE_GRAPH = ASSETS / "graphs" / "gpt2_decode_python_n32_gcheb"
-DECODE_PLAN = ASSETS / "bootstrap_placements" / "gpt2_decode_python_n32"
+DECODE_GRAPH = ASSETS / "graphs" / "gpt2_decode"
+DECODE_PLAN = ASSETS / "bootstrap_placements" / "gpt2_decode"
 SYNTH = sorted((FIX / "placer_fidelity" / "graphs").glob("*/block_0/graph.json"))
 REAL = FIX / "real_graph" / "n32_gpt2_base" / "block_0" / "graph.json"
 

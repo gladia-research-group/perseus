@@ -160,20 +160,20 @@ fn grids_and_chains(plan: &str, graph: &str, schedule: Schedule) {
 
 #[test]
 fn siblings_only_reorders() {
-    siblings("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16");
-    siblings("gpt2_decode_python_n32_m16i", "gpt2_decode_python_n32_gcheb");
+    siblings("gpt2_prefill128_tail", "gpt2_prefill128_tail");
+    siblings("gpt2_decode", "gpt2_decode");
 }
 
 #[test]
 fn refresh_pairs_only_reorder() {
-    pairs("gpt2_prefill128_pf", "gpt2_prefill128_pf");
+    pairs("gpt2_prefill128_tail", "gpt2_prefill128_tail");
 }
 
 #[test]
 fn grid_and_chain_invariants() {
-    grids_and_chains("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16", Schedule::Siblings);
-    grids_and_chains("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16", Schedule::Program);
-    grids_and_chains("gpt2_decode_python_n32_m16i", "gpt2_decode_python_n32_gcheb", Schedule::Program);
+    grids_and_chains("gpt2_prefill128_tail", "gpt2_prefill128_tail", Schedule::Siblings);
+    grids_and_chains("gpt2_prefill128_tail", "gpt2_prefill128_tail", Schedule::Program);
+    grids_and_chains("gpt2_decode", "gpt2_decode", Schedule::Program);
 }
 
 fn fused_pairs(plan: &str, graph: &str) {
@@ -203,8 +203,8 @@ fn op(kind: Kind, ins: Vec<VarId>, out: VarId) -> Op {
 
 #[test]
 fn mult_pt_add_pairs() {
-    fused_pairs("gpt2_decode_python_n32_m16i_fcf", "gpt2_decode_python_n32_gcheb");
-    fused_pairs("gpt2_prefill128_pf", "gpt2_prefill128_pf");
+    fused_pairs("gpt2_decode", "gpt2_decode");
+    fused_pairs("gpt2_prefill128_tail", "gpt2_prefill128_tail");
     // x = var 0, y = var 1: y + x pt and x pt - y fuse (the product first or second, add or sub); a product read
     // twice, a product that is an output, a product the next op does not read, a batched product do not
     let prog = |ops: Vec<Op>, outputs: Vec<VarId>| Program { ops, outputs, ..Default::default() };

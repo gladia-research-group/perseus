@@ -166,7 +166,7 @@
       "mincut_cost": 9.0,
       "mincut_placed": 9,
       "status": "fallback:model-mismatch",
-      "solve_s": 6.4,
+      "solve_s": 7.89,
       "pruned": 0
     },
     "num_placements": 9,

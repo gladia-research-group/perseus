@@ -88,7 +88,7 @@ def _planned(a, model, store, rows, gt, ref, results=None):
     h = run.hidden()
     out = {"wall": wall}
     if model.n_layers == 12:
-        rows_, s = report(plain_logits(store, h), gt)
+        rows_, s = report(plain_logits(store, h[-1:]), gt[-1:]) if a.tail else report(plain_logits(store, h), gt)
         out.update(s)
         print("[prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows_), flush=True)
     st = run.sess.pcmm_stats() if n_fin[0] else {}

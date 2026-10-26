@@ -4,11 +4,7 @@ configs.json in, the same configs with its cutmax section's normalisers fitted (
 
     python scripts/utils/fit_cutmax_scaled.py BASE_CONFIGS OUT_CONFIGS ROWS.npy [ROWS.npy ...]
 
-gpt2_base_n32_cm is this on gpt2_base_n32 with six sets of calibration rows, 19,454 finite rows: GPT-2's logits (the
-CPU twin with gpt2_base_n32's decode approximations) at positions 8-15 of 16-token windows of OpenWebText (384 document
-starts, 384 random offsets) and of C4 validation shard 00001 (512 prompts), at positions 0-15 of 256 more document
-starts and 256 more shard-00001 prompts, and the exact logits at the last of 128 tokens of 1,024 shard-00001 prompts;
-never the dev prompts. gpt2_base_n32_pf_cm is this on gpt2_base_n32_pf with the same rows.
+gpt2_base_n32_cm is this on gpt2_base_n32, gpt2_base_n32_pf_cm on gpt2_base_n32_pf, never on the evaluation prompts.
 """
 import argparse
 import json

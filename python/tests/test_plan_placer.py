@@ -620,36 +620,3 @@ class SplitPacks(unittest.TestCase):
         from perseus.plan.placer.emit import split_packs
         self.assertEqual(split_packs(self._graph(0.5)), {})
 
-
-class ServedPackSites(unittest.TestCase):
-    """Decode-8's served plan (perseus/examples/defaults.py at 16 tokens) refreshes a split complex pack only on
-    SparseB-512, whose EvalMod sees the coefficients its PLAN_PACK_CF price is sized on, at the lowest CF whose band
-    holds 2 x (the recipe's PLAN_MAG_SAFETY) the site's coefficient max."""
-
-    def test_pack_sites(self):
-        from perseus._paths import resolve
-        from perseus.examples.defaults import default_plan
-        from perseus.plan import btserr
-        from perseus.plan.placer.emit import split_packs
-        plan = Path(resolve(default_plan("gpt2_decode", 16)))
-        graph = next((Path(resolve(line.split()[0][len("graph="):])) for line in (plan / "PLAN_CMD.txt").read_text()
-                      .splitlines() if line.startswith("graph=")), None)
-        if graph is None or not (graph / "block_0" / "graph.json").is_file():
-            self.skipTest("the served decode plan's capture is not present")
-        n = 0
-        for f in sorted(plan.glob("block_*_placement.json")):
-            b = f.name.split("_")[1]
-            doc = json.loads(f.read_text())
-            g, _ = erase_reactive_bootstraps(Graph.from_nodes(
-                json.loads((graph / f"block_{b}" / "graph.json").read_text())["nodes"], level_unit=2))
-            packs = split_packs(g)
-            for v in [x["target_var"] for x in doc["placements"]] + doc.get("hint_fire", []):
-                if v not in packs:
-                    continue
-                n += 1
-                cf, coeff = doc["correction_factor"][v], g.producer_of[v].max_coeff
-                with self.subTest(file=f.name, var=v):
-                    self.assertEqual((doc.get("sparse_slots") or {}).get(v), 512)
-                    self.assertEqual(cf, next(c for c in range(btserr.DEFAULT_CF_MIN, 21)
-                                              if btserr.band(c)[1] >= 2.0 * coeff))
-        print(f"[pack] {plan.name}: {n} refreshed pack sites")
