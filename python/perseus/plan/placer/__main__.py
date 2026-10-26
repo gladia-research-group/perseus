@@ -178,6 +178,8 @@ def main() -> None:
                    dest="ilp_cap_exit",
                    help="placer ilp: let the final block exit deeper than the min-cut's plan "
                         "(off by default: that exit feeds the unplanned encrypted argmax)")
+    p.add_argument("--fallback-cf", action="store_true", default=None, dest="fallback_cf",
+                   help="a dense refresh past the StC-first entry (the shipped order runs it) gets that order's CF")
     p.add_argument("--prune", action="store_true", default=None,
                    help="remove redundant refreshes from the final plan, any placer")
     p.add_argument("--baseline-depth-cap", type=float, dest="baseline_depth_cap",

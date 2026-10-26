@@ -73,4 +73,5 @@ if [[ -n "${PLAN_BASELINE_RESCUE:-}"   ]]; then args+=(--baseline-rescue);      
 if [[ -n "${PLAN_BASELINE_DEPTH_CAP:-}" ]]; then args+=(--baseline-depth-cap "$PLAN_BASELINE_DEPTH_CAP"); fi
 if [[ -n "${PLAN_LATENCY_TABLE:-}"  ]]; then args+=(--latency-table "$PLAN_LATENCY_TABLE");   fi
 if [[ "${PLAN_PRUNE:-}" == 1        ]]; then args+=(--prune);                                 fi
+if [[ "${PLAN_FALLBACK_CF:-0}" != 0 ]]; then args+=(--fallback-cf);                           fi
 exec "$PYTHON" -m perseus.plan.placer "${args[@]}"

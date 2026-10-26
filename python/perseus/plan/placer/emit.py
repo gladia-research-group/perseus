@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Callable
@@ -160,6 +161,7 @@ def assemble(
     boundary_realize: bool = False,
     realize_anchors: set | None = None,
     real_route: bool = False,
+    fallback_cf: bool = False,
 ) -> dict:
     unit = g.level_unit
 
@@ -227,14 +229,18 @@ def assemble(
     cf_hist: dict[int, int] = {}
     n_missed = 0
     out_level_hist: dict[int, int] = {}
-    # plan.stc_first_reroute: a dense site whose input passed the StC-first entry runs the shipped order: its CF is
-    # that order's choice and the compile routes it there (`shipped_order`)
-    _fb = refresh.shadow.dense_fallback() if refresh.shadow.stc_first_reroute else None
+    # a dense site whose input passed the StC-first entry runs the shipped order: with plan.stc_first_reroute its CF is
+    # that order's choice (priced on the coefficients, not on the slots the StC-first order meets) and the compile
+    # routes it to the plain dense route (`shipped_order`); with `fallback_cf` the CF only, the StC-first route running
+    # that order itself below its entry (btsBegin)
+    _fb = refresh.shadow.dense_fallback() if refresh.shadow.stc_first_reroute or fallback_cf else None
     for v in quality_sites:
         s = refresh.spec(v)
         if (_fb is not None and not s.route and not s.shipped
                 and bootstrap_level + sim.input_eff(g, v, unit) > _fb[0] + 1e-9 and refresh.spec_shipped(v).shipped):
             s = refresh.spec_shipped(v)
+            if not refresh.shadow.stc_first_reroute:
+                s = dataclasses.replace(s, shipped=False)
         cf = _site_cf(v, s.cf)
         if cf is not None:
             cf_map[v] = int(cf)

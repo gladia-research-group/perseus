@@ -826,7 +826,7 @@ section! {
 }
 
 section! {
-    /// `plan` (89 legacy env names).
+    /// `plan` (90 legacy env names).
     PlanConfig "plan" {
         #[doc = "`PLAN_ACC_CHAIN`. Default (unset) / n32. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
@@ -909,6 +909,9 @@ section! {
         #[doc = "`PLAN_ERR_TARGET`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         err_target: Str = "PLAN_ERR_TARGET", "(unset)";
+        #[doc = "`PLAN_FALLBACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_m16i_fcf."]
+        fallback_cf: Flag = "PLAN_FALLBACK_CF", "'0'";
         #[doc = "`FEEDBACK_ENTRY_DEG`. Default $ENTRY_DEG. Read at examples/gpt2/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         feedback_entry_deg: Str = "FEEDBACK_ENTRY_DEG", "$ENTRY_DEG";
