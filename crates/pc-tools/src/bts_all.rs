@@ -280,6 +280,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     pred.push(("dense+stcf".into(), "tables", sf_req.total()));
     pred.push(("dense+stcf".into(), "bts.work", BtsWork::<W>::bytes(&lay, sf_shape)));
     let mut sb_shapes = Vec::new();
+    pred.push(("sparse".into(), "tails", SparseBPrecomp::<W>::tails_bytes(&chain, &st_tab, &lay, &sb_cfgs)?));
     for c in &sb_cfgs {
         let (b, ws) = SparseBPrecomp::<W>::bytes(&chain, &st_tab, &lay, c)?;
         pred.push((c.slots.to_string(), "tables", b + EncapsKeys::bytes() + Pow2::<W>::bytes(lay.rows())));
@@ -349,9 +350,12 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     carved.push(mark(&arena) - u);
     let mut sb_routes = Vec::new();
     let mut sb_works = Vec::new();
+    let u = mark(&arena);
+    let sb_tails = SparseBPrecomp::<W>::tails(&arena, &ex.compute, &ctx, &keys, &sb_cfgs)?;
+    carved.push(mark(&arena) - u);
     for (c, ws) in sb_cfgs.iter().zip(&sb_shapes) {
         let u = mark(&arena);
-        let pre = SparseBPrecomp::new(&arena, &ex.compute, &ctx, c.clone(), &keys, stage)?;
+        let pre = SparseBPrecomp::new(&arena, &ex.compute, &ctx, c.clone(), &keys, &sb_tails, stage)?;
         let encaps = EncapsKeys::new(&arena, &ex.compute, n, keys.dense_to_sparse()?, keys.sparse_to_dense()?, stage)?;
         let pow2 = Pow2::new(&arena, &ex.compute, &ctx)?;
         carved.push(mark(&arena) - u);

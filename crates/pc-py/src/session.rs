@@ -1021,6 +1021,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             wshape = Some(wshape.map_or(w, |x| x.max(w)));
         }
         let st_tables = pc_core::scale::ScaleTables::precompute(&chain).map_err(|x| e(x.into()))?;
+        mp.reserve("bts.sparse", SparseBPrecomp::<W>::tails_bytes(&chain, &st_tables, &lay, &sb_cfgs).map_err(e)?);
         for (i, c) in sb_cfgs.iter().enumerate() {
             let (b, w) = SparseBPrecomp::<W>::bytes(&chain, &st_tables, &lay, c).map_err(e)?;
             mp.reserve("bts.sparse", b);
@@ -1184,9 +1185,10 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 None => None,
             };
             let mut sparse: Vec<SparseBRoute<'_, W>> = vec![];
+            let sb_tails = SparseBPrecomp::<W>::tails(a, &ex.compute, &ctx, &keys, &sb_cfgs).map_err(e)?;
             for c in &sb_cfgs {
                 let s = &ex.compute;
-                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, stage).map_err(e)?;
+                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, &sb_tails, stage).map_err(e)?;
                 // the raise variants of one slot count are one route (`SparseBRoute::variant` picks by drop)
                 if let Some(r) = sparse.iter_mut().find(|r| r.slots == c.slots) {
                     r.variants.push(pre);

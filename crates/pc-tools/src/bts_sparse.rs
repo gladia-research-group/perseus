@@ -562,7 +562,7 @@ fn run_sb(o: &Opts) -> Res<bool> {
     plan.reserve("decrypt", Decryptor::<W>::bytes(&lay, chain.level_unit, 1));
     Ops::<W>::reserve(&mut plan, &OpsCfg::default());
     let (sb_bytes, wshape) = SparseBPrecomp::<W>::bytes(&chain, &st, &lay, &scfg)?;
-    plan.reserve("bts.sparse", sb_bytes);
+    plan.reserve("bts.sparse", sb_bytes + SparseBPrecomp::<W>::tails_bytes(&chain, &st, &lay, std::slice::from_ref(&scfg))?);
     plan.reserve("bts.route", EncapsKeys::bytes() + pc_gpu::bts::finish::Pow2::<W>::bytes(lay.rows()));
     plan.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
     plan.reserve("bts.slack", 64 << 20); // the route assert reports any MemPlan misprediction instead of overflowing
@@ -600,7 +600,8 @@ fn run_sb(o: &Opts) -> Res<bool> {
     use pc_gpu::bts::BtsKeyRing;
     let encaps = EncapsKeys::new(&arena, s, n, ring.dense_to_sparse()?, ring.sparse_to_dense()?, stage)?;
     let pow2 = pc_gpu::bts::finish::Pow2::new(&arena, s, &ctx)?;
-    let pre = SparseBPrecomp::new(&arena, s, &ctx, scfg.clone(), &ring, stage)?;
+    let tails = SparseBPrecomp::<W>::tails(&arena, s, &ctx, &ring, std::slice::from_ref(&scfg))?;
+    let pre = SparseBPrecomp::new(&arena, s, &ctx, scfg.clone(), &ring, &tails, stage)?;
     println!(
         "[bts-sparse] SparseB geometry {:?}; CtS top {} StC top {}; EvalMod {:?} -> {:?}; carved {:.1} MB vs MemPlan bts.sparse {:.1} MB ({})",
         pre.geom,

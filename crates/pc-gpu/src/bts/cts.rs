@@ -491,11 +491,19 @@ impl<'a, W: DevWord> KeyTails<'a, W> {
     }
     /// `keys` with these tails attached.
     pub fn ring<'r>(&'r self, keys: &'r dyn BtsKeyRing, n: usize) -> Result<TailRing<'r>> {
+        let steps: Vec<i64> = self.tails.keys().copied().collect();
+        self.ring_of(keys, n, &steps)
+    }
+    /// `keys` with the tails of `steps` attached (tails shared by several stages: each attaches its own steps).
+    pub fn ring_of<'r>(&'r self, keys: &'r dyn BtsKeyRing, n: usize, steps: &[i64]) -> Result<TailRing<'r>> {
+        let nh = (n / 2) as i64;
         let mut m = BTreeMap::new();
-        for (&st, buf) in &self.tails {
-            m.insert(st, TailKey { key: keys.rot(st)?, a: buf.vptr(), first: self.first });
+        for st in steps {
+            if let Some(buf) = self.tails.get(&st.rem_euclid(nh)) {
+                m.insert(st.rem_euclid(nh), TailKey { key: keys.rot(*st)?, a: buf.vptr(), first: self.first });
+            }
         }
-        Ok(TailRing { inner: keys, keys: m, half: (n / 2) as i64 })
+        Ok(TailRing { inner: keys, keys: m, half: nh })
     }
 }
 
