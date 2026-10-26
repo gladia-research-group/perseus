@@ -5,7 +5,7 @@
 use crate::section;
 
 section! {
-    /// `chain` (4 legacy env names).
+    /// `chain` (5 legacy env names).
     ChainSection "chain" {
         #[doc = "`CHAIN`. Default None. Read at _env.py::current_chain; examples/gpt2/env.py::export_env; examples/gpt2/env.py::open_session; examples/gpt2/run_decode.py::main; examples/gpt2/run_generate.py::main; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
@@ -19,6 +19,9 @@ section! {
         #[doc = "`LOGN`. Default None. Read at plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
         logn: Int = "LOGN", "None";
+        #[doc = "The CKKS chain preset the runtime and the client build (pc-core `ChainSpec::preset`: n32, or the lean n32a4; default n32)."]
+        #[doc = "Runtime switch `CHAIN_PRESET`: binds the key bundle (params hash), not the plan."]
+        preset: Str = "CHAIN_PRESET", "(unset)";
     }
 }
 

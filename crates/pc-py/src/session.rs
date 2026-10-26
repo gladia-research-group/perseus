@@ -11,7 +11,7 @@ use crate::shadow::shadow_config;
 use crate::LevelError;
 use pc_core::keys::{Prng, SecretKey};
 use pc_core::modmul::Barrett64;
-use pc_core::params::{Chain, ChainSpec};
+use pc_core::params::Chain;
 use pc_cuda::{Arena, Device, Event, EventPool};
 use pc_gpu::decrypt::Decryptor;
 use pc_gpu::encrypt::Encryptor;
@@ -761,7 +761,7 @@ fn manifest(cfg: &pc_config::Config, chain: &Chain, nd: &Needs, pcmm: &Option<cr
         None => None,
     };
     Ok(pc_client::KeySpec {
-        chain: "n32".into(),
+        chain: cfg.chain.preset.clone().unwrap_or_else(|| "n32".into()),
         params_hash: pc_client::spec::params_hash(chain),
         contract: contract_hash(cfg)?,
         keys,
@@ -956,7 +956,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let complex = cfg.chain.ckks_complex.unwrap_or(false);
     let radix_bits = knob(cfg.model.ladder_radix_bits, 3, "model.ladder_radix_bits")? as u32;
     let device = Device::open().map_err(|x| e(x.into()))?;
-    let chain = Chain::generate(&ChainSpec::n32()).map_err(|x| e(x.into()))?;
+    let chain = crate::shadow::chain_of(cfg)?;
     let n = chain.n;
     let half = (n / 2) as i64;
     let k_max = 8;
@@ -1481,7 +1481,7 @@ impl PySession {
     #[allow(clippy::too_many_arguments)]
     fn key_manifest(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>) -> PyResult<String> {
         let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels)?;
-        let chain = Chain::generate(&ChainSpec::n32()).map_err(|e| gerr(e.into()))?;
+        let chain = crate::shadow::chain_of(&x.cfg)?;
         let nd = key_needs(&x.cfg, &x.ks, &chain, &x.plan, &x.pp, &x.cp)?;
         manifest(&x.cfg, &chain, &nd, &x.pp, x.cp.is_some())?.to_json().map_err(cerr)
     }
