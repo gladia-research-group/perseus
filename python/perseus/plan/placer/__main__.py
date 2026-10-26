@@ -128,8 +128,16 @@ def main() -> None:
                         "(plan 'real_route'; run with FIDESLIB_BTS_REAL=1)")
     p.add_argument("--raise-drop-set", dest="raise_drop_set", type=lambda s: tuple(int(x) for x in s.split(",") if x), default=None,
                    help="the drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS), e.g. 1,3,5: a site's drop is rounded down to one of them")
+    p.add_argument("--raise-drop-base", dest="raise_drop_base",
+                   type=lambda s: tuple((int(a), int(b)) for a, b in (x.split(":") for x in s.split(",") if x)),
+                   default=None, help="route:drop the runtime already runs each route at (FIDESLIB_BTS_RAISE_DROP)")
+    p.add_argument("--raise-drop-hints", dest="raise_drop_hints", action="store_true", default=None,
+                   help="raise drops look past the plan's (bound) hint decisions")
     p.add_argument("--raise-drop-env-rule", dest="raise_drop_env_rule", type=str, default=None,
                    choices=["effective", "nominal"], help="envelope rule for the raise-drop slack")
+    p.add_argument("--raise-drop-search", dest="raise_drop_search", action="store_true", default=None,
+                   help="search each site's raise drop on the re-simulation (hint decisions, block outputs and "
+                        "envelopes kept) instead of the forward walk")
     p.add_argument("--site-bts-out-file", dest="site_bts_out_file", type=str,
                    help="JSON {block_dir: {var: absolute_out_level}} of measured "
                         "per-site refresh landings (landing feedback)")
@@ -178,6 +186,12 @@ def main() -> None:
                    dest="ilp_cap_exit",
                    help="placer ilp: let the final block exit deeper than the min-cut's plan "
                         "(off by default: that exit feeds the unplanned encrypted argmax)")
+    p.add_argument("--ilp-tiebreak", action="store_true", default=None, dest="ilp_tiebreak",
+                   help="placer ilp: among equal-cost optima take the one fixed per-site weights rank first (a second "
+                        "solve), so the plan does not depend on the solver build")
+    p.add_argument("--ilp-free-hints", action="store_true", default=None,
+                   help="placer ilp: a hint's firing is a decision of the model too (it may veto a hint its "
+                        "threshold fires; the plan binds every hint)")
     p.add_argument("--fallback-cf", action="store_true", default=None, dest="fallback_cf",
                    help="a dense refresh past the StC-first entry (the shipped order runs it) gets that order's CF")
     p.add_argument("--prune", action="store_true", default=None,
