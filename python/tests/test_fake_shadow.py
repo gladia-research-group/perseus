@@ -24,8 +24,8 @@ D3 = Path("/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/d3")
 # ── Config ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def test_config_fields_and_presets():
-    # + bts.em_fuse_rescale, bts.lt_tails; plan.fallback_cf
-    assert len(_pc.Config.fields()) == 252 and len(_pc.PlanConfig.fields()) == 90
+    # + bts.em_fuse_rescale, bts.lt_tails, model.prefill.{last_query,qkv_pack}; plan.fallback_cf
+    assert len(_pc.Config.fields()) == 254 and len(_pc.PlanConfig.fields()) == 90
     assert all(f["env"] == "" or f"`{f['env']}`" in f["doc"] for f in _pc.Config.fields())
     assert set(config.PRESETS) == {"n32_gpt2_decode", "n32_gpt2_prefill", "n32_llama_decode", "n32_llama_prefill"}
     c = config.preset("n32_gpt2_decode")
