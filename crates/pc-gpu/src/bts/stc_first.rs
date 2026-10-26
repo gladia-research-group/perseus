@@ -497,7 +497,11 @@ impl StcFirstPlan {
         };
         let mut variants = Vec::new();
         for v in &self.dense.variants {
-            let em_k = |mode| EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.dense.ps, setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, setup.em_relin);
+            let em_k = |mode| {
+                let mut em = EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.dense.ps, setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, setup.em_relin)?;
+                em.fuse_rescale = setup.em_fuse_rescale;
+                Ok::<_, crate::error::Error>(em)
+            };
             variants.push(BtsPrecomp {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
@@ -726,7 +730,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, conj, 0, ndig, true)?;
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, conj, 0, 1, k, top, DotRows::All, io, staged)?;
-            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, true, k, top)?;
+            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, ks::MdOut::Add, k, top)?;
         }
         Ok(())
     }

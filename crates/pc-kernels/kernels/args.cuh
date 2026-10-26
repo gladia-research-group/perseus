@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 11u
-#define PC_RING_ABI 6u
+#define PC_KERNELS_ABI 12u
+#define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
 #define PC_LOGN 16
@@ -74,8 +74,9 @@ static_assert(sizeof(PolyRef) == 24, "PolyRef layout");
 //   epi != 0 (forward only): the last pass stores f(v) instead of the transform v of row i, at word r = roff[i]*N + e
 //   of eout, with x = the sum mod p of ex[r + j xstride] (j < xnum, >= 1), s = es[prime id] (Shoup companion ess):
 //     1: eout[r] = (x - v) s            (ModDown's last step: (x - conv) P^-1)
-//     2: eout[r] = eout[r] + (x - v) s  (the same, accumulated)
+//     2: eout[r] = d[r] + (x - v) s     (the same, accumulated: d = ed, or eout when ed is null; ABI 12)
 //     3: eout[r] = x s + v              (the rescale's combine: alpha x + the correction)
+//   lazy: 1 when every prime of the launch is below 2^30: lazy butterflies at u32 (same canonical result).
 struct NttArgs {
     void* base;
     const uint32_t* roff;
@@ -96,10 +97,11 @@ struct NttArgs {
     const void* ess;
     int32_t epi, snum;
     uint64_t sstride;
-    int32_t xnum, pad;
+    int32_t xnum, lazy;
     uint64_t xstride;
+    const void* ed;
 };
-static_assert(sizeof(NttArgs) == 168, "NttArgs layout");
+static_assert(sizeof(NttArgs) == 176, "NttArgs layout");
 
 // ------------------------------------------------------------------------------------------------ BConv
 // Batched fast base conversion (coefficient domain), one launch for many jobs (digits x ciphertexts):
@@ -195,8 +197,12 @@ struct EpiArgs {
     const void* k;  // per-row constant (nullptr: none)
     uint64_t part_stride;
     int32_t dbl, pad;
+    // ABI 11: dst's old value scaled by alpha[row] first (Shoup companion alphas; nullptr: 1): with binv = (B q)^-1 and
+    // alpha = q^-1 the epilogue is ModDown fused with the rescale by q (dst holds c, the conversion is from B and q)
+    const void* alpha;
+    const void* alphas;
 };
-static_assert(sizeof(EpiArgs) == 56, "EpiArgs layout");
+static_assert(sizeof(EpiArgs) == 72, "EpiArgs layout");
 
 // A set of switching keys read straight from their stored form (KeyTab, ABI 4; see the seeded keys section).
 struct KeyTab {
@@ -223,7 +229,7 @@ struct KsRegenArgs {
     KeyTab key;
     const void* add;
 };
-static_assert(sizeof(KsRegenArgs) == 296, "KsRegenArgs layout");
+static_assert(sizeof(KsRegenArgs) == 312, "KsRegenArgs layout");
 
 // Expander, ChaCha12 counter mode, state words 12..15 = (block counter, w13, w14, tag); FROZEN at u32 and u64.
 // u32 (FIDESlib KSKA lane): w13 = d, w14 = p, tag "KSKA"; slot s -> block s/16 word s%16; a value v is accepted when

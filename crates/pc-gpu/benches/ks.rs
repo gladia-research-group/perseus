@@ -5,8 +5,9 @@
 //!   (local `DevKey`), and Regen on PackedSeeded keys (28-bit packed `b`, `a` never stored);
 //!   24 hoisted rotations vs 24 plain rotations; the rotate-and-sum ladder 1 -> 32768 (radix 3 and rung by rung);
 //!   relin (tensor + relinearization) K = 1 / 8; rotate_sum (7 and 3 packed keys, K = 1 / 4, levels 0 / 20 / 34) with
-//!   the rotations added chunk by chunk vs inside the ModDown, outputs compared word for word; mult_pt + add vs the
-//!   fused mult_pt_add (K = 1, levels 20 / 34), compared word for word.
+//!   the rotations added chunk by chunk vs inside the ModDown, and out of place (the input as the ModDown's accumulate
+//!   source) vs the former copy + in place, outputs compared word for word; mult_pt + add vs the
+//!   fused mult_pt_add and its in-place form (K = 1, levels 20 / 34), compared word for word.
 //! usage (GPU only through tools/gpu.sh): the `ks` bench binary (`cargo bench -p pc-gpu --bench ks --no-run`).
 use pc_core::modmul::Barrett64;
 use pc_core::params::{Chain, ChainSpec};
@@ -113,7 +114,7 @@ fn main() -> Res<()> {
     }
     steps.sort();
     steps.dedup();
-    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: 30 }, PoolClass { k: 4, count: 2 }, PoolClass { k: kmax, count: 4 }], events: 16, scratch_cts: 2 };
+    let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: 30 }, PoolClass { k: 4, count: 4 }, PoolClass { k: kmax, count: 4 }], events: 16, scratch_cts: 2 };
     let mut plan = MemPlan::build::<W, M>(&chain, cfg)?;
     let lay = plan.lay;
     plan.reserve("ks.plans", KsPlans::bytes::<W>(&chain, kmax)?);
@@ -280,14 +281,16 @@ fn main() -> Res<()> {
         }
     }
     // rotate_sum: the dot outputs added chunk by chunk vs inside the ModDown, packed keys, Regen
-    println!("\n| rotate_sum | K | level (digits) | keys | chunked ms | in ModDown ms | equal |");
-    println!("|---|---|---|---|---|---|---|");
+    println!("\n| rotate_sum | K | level (digits) | keys | chunked ms | in ModDown ms | equal | copy + in place ms | out of place ms | equal |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     let kc = KsCfg { plans: &kp, source: KskSource::Regen };
     for &k in &[1usize, 4] {
         for &level in &[0u32, 20, 34] {
             let top = nq - 1 - level as usize;
             let mut a = pool.acquire(k, CtMeta::new(level, 1))?;
             let mut b = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut xi = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut xo = pool.acquire(k, CtMeta::new(level, 1))?;
             for st in [&lg3[0], &g3] {
                 let gr = &pgroups.0[st];
                 let (am, bm) = (a.get_mut().ok_or("shared")?, b.get_mut().ok_or("shared")?);
@@ -301,18 +304,29 @@ fn main() -> Res<()> {
                 // Q rows 0..=top of both parts of every ciphertext
                 let live = |v: &[W]| -> Vec<W> { (0..2 * k).flat_map(|p| v[(p * rows) * n..(p * rows + top + 1) * n].to_vec()).collect() };
                 let eq = live(&va) == live(&vb);
+                let (xm, om) = (xi.get_mut().ok_or("shared")?, xo.get_mut().ok_or("shared")?);
+                fill(xm, level, &ex)?;
+                rotate::rotate_sum(&ctx, &mut ex, kc, &sh, gr, xm, st, om)?;
+                ex.compute.sync()?;
+                let eq_o = live(&om.buf.buf.download(&ex.compute)?) == live(&vb);
                 let ms_s = time(&dev, &mut ex, 20, |ex| Ok(rotate::rotate_sum_inplace_as(&ctx, ex, kc, &sh, gr, am, st, rotate::SumForm::Chunked)?))?;
                 let ms_g = time(&dev, &mut ex, 20, |ex| Ok(rotate::rotate_sum_inplace_as(&ctx, ex, kc, &sh, gr, bm, st, rotate::SumForm::InModDown)?))?;
-                println!("| rotate_sum | {k} | {level} ({}) | {} | {ms_s:.3} | {ms_g:.3} | {eq} |", kp.ndig(top)?, st.len());
-                if !eq {
-                    return Err(format!("rotate_sum in-ModDown sum != chunked (K {k}, level {level}, {} keys)", st.len()).into());
+                // the former out-of-place form: copy (a step-0 rotation) then in place
+                let ms_c = time(&dev, &mut ex, 20, |ex| {
+                    rotate::rotate(&ctx, ex, kc, &sh, gr, xm, 0, om)?;
+                    Ok(rotate::rotate_sum_inplace_as(&ctx, ex, kc, &sh, gr, om, st, rotate::SumForm::InModDown)?)
+                })?;
+                let ms_o = time(&dev, &mut ex, 20, |ex| Ok(rotate::rotate_sum(&ctx, ex, kc, &sh, gr, xm, st, om)?))?;
+                println!("| rotate_sum | {k} | {level} ({}) | {} | {ms_s:.3} | {ms_g:.3} | {eq} | {ms_c:.3} | {ms_o:.3} | {eq_o} |", kp.ndig(top)?, st.len());
+                if !eq || !eq_o {
+                    return Err(format!("rotate_sum forms differ (K {k}, level {level}, {} keys): chunked {eq}, out of place {eq_o}", st.len()).into());
                 }
             }
         }
     }
     // mult_pt + add / sub vs the fused mult_pt_add
-    println!("\n| mult_pt + add | K | level | sub | product first | two ops ms | fused ms | equal |");
-    println!("|---|---|---|---|---|---|---|---|");
+    println!("\n| mult_pt + add | K | level | sub | product first | two ops ms | fused ms | equal | in place ms | equal |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     for &k in &[1usize] {
         for &level in &[20u32, 34] {
             let top = nq - 1 - level as usize;
@@ -324,6 +338,7 @@ fn main() -> Res<()> {
             let mut t = pool.acquire(k, CtMeta::new(level, 1))?;
             let mut o1 = pool.acquire(k, CtMeta::new(level, 1))?;
             let mut o2 = pool.acquire(k, CtMeta::new(level, 1))?;
+            let mut o3 = pool.acquire(k, CtMeta::new(level, 1))?;
             fill(x.get_mut().ok_or("shared")?, level, &ex)?;
             fill(y.get_mut().ok_or("shared")?, level + 1, &ex)?;
             let (xm, ym) = (x.get_mut().ok_or("shared")?, y.get_mut().ok_or("shared")?);
@@ -347,15 +362,29 @@ fn main() -> Res<()> {
                 };
                 two(&mut ex, &mut ops, tm, a1)?;
                 ops.mult_pt_add(&ctx, &mut ex, &sh, a2, xr, &pt, yr, sub, first)?;
+                // in place: acc = y's words (the same fill), then acc +-= x * pt
+                let a3 = o3.get_mut().ok_or("shared")?;
+                fill(a3, level + 1, &ex)?;
+                a3.meta = yr.meta;
+                if !Ops::<W>::mult_pt_add_inplace_fusable(&sh, &xr.meta, &pm, &a3.meta, sub, first)? {
+                    return Err(format!("mult_pt_add_inplace not fusable at level {level}").into());
+                }
+                ops.mult_pt_add_inplace(&ctx, &mut ex, &sh, a3, xr, &pt, sub, first)?;
                 ex.compute.sync()?;
                 let rows = lay.rows();
                 let live = |v: &[W]| -> Vec<W> { (0..2 * k).flat_map(|p| v[(p * rows) * n..(p * rows + top + 1) * n].to_vec()).collect() };
-                let eq = live(&a1.buf.buf.download(&ex.compute)?) == live(&a2.buf.buf.download(&ex.compute)?) && a1.meta == a2.meta;
+                let w1 = live(&a1.buf.buf.download(&ex.compute)?);
+                let eq = w1 == live(&a2.buf.buf.download(&ex.compute)?) && a1.meta == a2.meta;
+                let eq_i = w1 == live(&a3.buf.buf.download(&ex.compute)?) && a1.meta == a3.meta;
                 let ms2 = time(&dev, &mut ex, 20, |ex| two(ex, &mut ops, tm, a1))?;
                 let ms1 = time(&dev, &mut ex, 20, |ex| Ok(ops.mult_pt_add(&ctx, ex, &sh, a2, xr, &pt, yr, sub, first)?))?;
-                println!("| mult_pt + add | {k} | {level} | {sub} | {first} | {ms2:.4} | {ms1:.4} | {eq} |");
-                if !eq {
-                    return Err(format!("mult_pt_add != mult_pt + add (K {k}, level {level}, sub {sub}, first {first})").into());
+                let msi = time(&dev, &mut ex, 20, |ex| {
+                    a3.meta = yr.meta;
+                    Ok(ops.mult_pt_add_inplace(&ctx, ex, &sh, a3, xr, &pt, sub, first)?)
+                })?;
+                println!("| mult_pt + add | {k} | {level} | {sub} | {first} | {ms2:.4} | {ms1:.4} | {eq} | {msi:.4} | {eq_i} |");
+                if !eq || !eq_i {
+                    return Err(format!("mult_pt_add forms != mult_pt + add (K {k}, level {level}, sub {sub}, first {first}): {eq} {eq_i}").into());
                 }
             }
         }

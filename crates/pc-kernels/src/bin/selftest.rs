@@ -81,6 +81,7 @@ impl<'a> Setup<'a> {
     }
     fn ntt_args(&self, base: *mut c_void, roff: &Dev, rprime: &Dev, nrows: usize) -> NttArgs {
         let t = self.ntt.as_ref().expect("NTT tables");
+        let lazy = self.wbits == 32 && self.primes.iter().all(|&p| p < 1 << 30);
         NttArgs {
             base,
             roff: roff.c() as *const u32,
@@ -94,6 +95,7 @@ impl<'a> Setup<'a> {
             pr: self.pr(),
             nrows: nrows as i32,
             chunk: 128,
+            lazy: lazy as i32,
             ..Default::default()
         }
     }
@@ -124,20 +126,118 @@ impl<'a> Setup<'a> {
 fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
     let mut out = Vec::new();
     let host_in = st.rand_slots(1);
-    let buf = st.ctx.up(&host_in);
+    let mut buf = st.ctx.up(&host_in);
     let list: Vec<(u32, i32)> = (0..8).map(|i| (i, i as i32)).collect();
     let (ro, rp) = st.rows(&list);
-    let a = st.ntt_args(buf.p(), &ro, &rp, 8);
-    ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
-    let got = buf.read(&st.ctx);
     let w = &st.ntt.as_ref().unwrap().w;
     let mut want = host_in.clone();
     for i in 0..8 {
         ntt_ref(&mut want[i * N..(i + 1) * N], &w[i], st.primes[i]);
     }
-    out.push(cmp("ntt.fwd vs host", &got, &want));
-    ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
-    out.push(cmp("ntt.inv(fwd(x)) == x", &buf.read(&st.ctx), &host_in));
+    // the lazy butterflies (when the primes allow them) and the reduced ones
+    let a = st.ntt_args(buf.p(), &ro, &rp, 8);
+    for lazy in [a.lazy, 0] {
+        let a = NttArgs { lazy, ..a };
+        buf.write(&st.ctx, &host_in);
+        ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.fwd vs host (lazy {lazy})"), &buf.read(&st.ctx), &want));
+        ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.inv(fwd(x)) == x (lazy {lazy})"), &buf.read(&st.ctx), &host_in));
+    }
+    out
+}
+
+/// The lazy NTT at the edge of its range (u32): 8 primes just below 2^30 (words up to 4p - 1 < 2^32 between stages),
+/// edge inputs (p - 1, 0, 1) and uniform ones; in place lazy and reduced vs the host, the out-of-place first pass summing
+/// two sources (soff / snum), and epilogue 1 (eout = (ex - v) es) vs the host.
+fn t_ntt_wide(st: &mut Setup) -> Vec<TestResult> {
+    let primes = ntt_primes(30, 8);
+    let wbits = st.wbits;
+    let mut tabs = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut ws = Vec::new();
+    for &p in &primes {
+        let psi = psi_of(p, &mut st.rng);
+        let (w, i) = twiddles(p, psi);
+        tabs.1.extend(w.iter().map(|&x| shoup(x, p, wbits)));
+        tabs.3.extend(i.iter().map(|&x| shoup(x, p, wbits)));
+        tabs.0.extend(&w);
+        tabs.2.extend(&i);
+        let ni = invmod(N as u64 % p, p);
+        tabs.4.push(ni);
+        tabs.5.push(shoup(ni, p, wbits));
+        ws.push(w);
+    }
+    let ctx = &st.ctx;
+    let (fw, fws, iw, iws, ninv, ninvs) = (ctx.up(&tabs.0), ctx.up(&tabs.1), ctx.up(&tabs.2), ctx.up(&tabs.3), ctx.up(&tabs.4), ctx.up(&tabs.5));
+    let pr = ctx.up_wb(&prime_table(&primes, wbits), 8);
+    let rand = |rng: &mut Rng| -> Vec<u64> {
+        (0..8 * N)
+            .map(|i| {
+                let p = primes[i / N];
+                match i % N {
+                    0..=7 => p - 1,
+                    8..=11 => 0,
+                    12..=15 => 1,
+                    _ => rng.below(p),
+                }
+            })
+            .collect()
+    };
+    let (x0, x1, xe) = (rand(&mut st.rng), rand(&mut st.rng), rand(&mut st.rng));
+    let s: Vec<u64> = primes.iter().map(|&p| st.rng.below(p)).collect();
+    let ss: Vec<u64> = s.iter().zip(&primes).map(|(&v, &p)| shoup(v, p, wbits)).collect();
+    let ctx = &st.ctx;
+    let mut want = x0.clone();
+    for i in 0..8 {
+        ntt_ref(&mut want[i * N..(i + 1) * N], &ws[i], primes[i]);
+    }
+    let list: Vec<u32> = (0..8).collect();
+    let pid: Vec<i32> = (0..8).collect();
+    let (ro, rp) = (ctx.up32(&list), ctx.up_i32(&pid));
+    let mut buf = ctx.up(&x0);
+    let args = NttArgs {
+        base: buf.p(),
+        roff: ro.c() as *const u32,
+        rprime: rp.c() as *const i32,
+        fw: fw.c(),
+        fws: fws.c(),
+        iw: iw.c(),
+        iws: iws.c(),
+        ninv: ninv.c(),
+        ninvs: ninvs.c(),
+        pr: pr.c() as *const PrimeConst,
+        nrows: 8,
+        chunk: 128,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    for lazy in [1, 0] {
+        let a = NttArgs { lazy, ..args };
+        buf.write(ctx, &x0);
+        ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.fwd vs host, primes < 2^30 (lazy {lazy})"), &buf.read(ctx), &want));
+        ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.inv(fwd(x)) == x, primes < 2^30 (lazy {lazy})"), &buf.read(ctx), &x0));
+    }
+    // out of place: the first pass reads the sum of x0 and x1 (sources 8 rows apart), the transform lands in buf
+    let mut both = x0.clone();
+    both.extend(&x1);
+    let src = ctx.up(&both);
+    let mut want_s: Vec<u64> = (0..8 * N).map(|i| (x0[i] + x1[i]) % primes[i / N]).collect();
+    for i in 0..8 {
+        ntt_ref(&mut want_s[i * N..(i + 1) * N], &ws[i], primes[i]);
+    }
+    let a = NttArgs { lazy: 1, src: src.c(), soff: ro.c() as *const u32, snum: 2, sstride: (8 * N) as u64, ..args };
+    buf.write(ctx, &vec![0u64; 8 * N]);
+    ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+    out.push(cmp("ntt.fwd out of place, 2 sources summed (lazy 1)", &buf.read(ctx), &want_s));
+    // epilogue 1: eout = (ex - NTT(x0)) es
+    let (exd, eo, esd, essd) = (ctx.up(&xe), ctx.zeros(8 * N), ctx.up(&s), ctx.up(&ss));
+    let a = NttArgs { lazy: 1, eout: eo.p(), ex: exd.c(), es: esd.c(), ess: essd.c(), epi: ntt_epi::SUB_MUL, ..args };
+    buf.write(ctx, &x0);
+    ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+    let want_e: Vec<u64> = (0..8 * N).map(|i| mulmod((xe[i] + primes[i / N] - want[i]) % primes[i / N], s[i / N], primes[i / N])).collect();
+    out.push(cmp("ntt.fwd epilogue (ex - v) es (lazy 1)", &eo.read(ctx), &want_e));
     out
 }
 
@@ -797,7 +897,7 @@ fn t_regen(st: &mut Setup) -> Vec<TestResult> {
     re.ks.rows = qrows.c() as *const u32;
     re.ks.nrows = 4;
     re.use_epi = 1;
-    re.epi = EpiArgs { dst: dst.p(), conv: conv.c(), binv: bd.c(), binvs: bsd.c(), k: kd.c(), part_stride: (8 * N) as u64, dbl: 1, pad: 0 };
+    re.epi = EpiArgs { dst: dst.p(), conv: conv.c(), binv: bd.c(), binvs: bsd.c(), k: kd.c(), part_stride: (8 * N) as u64, dbl: 1, pad: 0, alpha: std::ptr::null(), alphas: std::ptr::null() };
     ck(unsafe { (st.t.ks_dot_regen)(&re, st.s()) });
     let mut w = dsth.clone();
     for c in 0..k {
@@ -1680,6 +1780,9 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
     let mut tests: Vec<Test> = Vec::new();
     if has_ntt {
         tests.push(t_ntt);
+        if wb == 4 {
+            tests.push(t_ntt_wide);
+        }
     }
     tests.extend([t_bconv as Test, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
     if has_ntt {

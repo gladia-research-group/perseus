@@ -29,6 +29,7 @@ pub const LT_REGEN_DIGITS: usize = 4;
 pub const LT_GMAX_LAUNCH: usize = 2;
 /// Giant steps per K=1 launch of the queued u32 regen kernel (two pairs).
 pub const LT_GMAX_LAUNCH_K1: usize = 4;
+const _: () = assert!(LT_GMAX_LAUNCH <= ks::SRC_STRIDES, "the k > 1 ModUp reads the LT results in place");
 /// Ciphertexts per `cts_fused` thread group by default (kernel KMAX 1/2/4/8; larger K runs several groups in one
 /// launch): 0 = 1 for a single ciphertext, else 2 (tuned).
 pub const LT_GROUP_AUTO: i32 = 0;
@@ -145,7 +146,7 @@ pub struct LtStage<'a, W: DevWord> {
 
 /// One ModDown-like conversion over k_max cts: INTT of the source rows (in the source buffer), bconv into the
 /// target buffer, NTT of the target rows there.
-struct MdPlan<'a> {
+pub(crate) struct MdPlan<'a> {
     intt: RowList<'a>,
     conv: BconvPlan<'a>,
     ntt: RowList<'a>,
@@ -156,7 +157,7 @@ struct MdPlan<'a> {
 }
 
 impl MdPlan<'_> {
-    fn run<W: DevWord, M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, src: &mut DBuf<'_, Compute, W>, dst: &mut DBuf<'_, Compute, W>, k: usize) -> Result<()> {
+    pub(crate) fn run<W: DevWord, M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, src: &mut DBuf<'_, Compute, W>, dst: &mut DBuf<'_, Compute, W>, k: usize) -> Result<()> {
         self.run_epi(ctx, s, src, dst, k, None)
     }
     /// `run` with the target NTT's epilogue (`ntt::Epi`, its buffers at the target rows' offsets).
@@ -182,7 +183,7 @@ fn res_stride(g: usize, j: usize) -> usize {
 
 /// The ModDown plan of `parts` of the cts at `cts[c]` (ciphertext indices in the source buffer, written at the same
 /// indices of the target buffer): sources `src_rows` -> targets `0..ntgt`.
-fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, lay: &Layout, primes: &[u64], cts: &[usize], parts: &[usize], src_rows: &[usize], ntgt: usize, exact: bool) -> Result<MdPlan<'a>> {
+pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, lay: &Layout, primes: &[u64], cts: &[usize], parts: &[usize], src_rows: &[usize], ntgt: usize, exact: bool) -> Result<MdPlan<'a>> {
     let rows = lay.rows();
     let (mut intt, mut specs, mut nttr) = (Vec::new(), Vec::new(), Vec::new());
     for &c in cts {
@@ -214,7 +215,7 @@ fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, lay: &Layou
     })
 }
 
-fn md_plan_bytes<W: DevWord>(primes: &[u64], ncts: usize, nparts: usize, nsrc: usize, ntgt: usize, exact: bool) -> Result<usize> {
+pub(crate) fn md_plan_bytes<W: DevWord>(primes: &[u64], ncts: usize, nparts: usize, nsrc: usize, ntgt: usize, exact: bool) -> Result<usize> {
     let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact };
     let specs = vec![spec; ncts * nparts];
     let rl = |n: usize| Arena::bytes_for::<u32>(n) + Arena::bytes_for::<i32>(n);
@@ -593,6 +594,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         } else {
             return Err(shape("LtStage", "baby keys: neither seeded in one stored form covering the stage (Regen) nor dense full-layout with a resident `a` (Cached)"));
         };
+        // the shifted tail pointers are read only above the regenerated digits (cts_fused_regen; tails need !cached_ok)
+        debug_assert!(tail.is_none() || baby == KskSource::Regen, "baby-key tails need the Regen kernel");
         let giant_r = (geom.b * geom.stride) as i64 % nh;
         let giant = if geom.g > 1 && giant_r != 0 { Some(KeyGroup::new(arena, s, n, &[keys.rot(giant_r)?], stage_ptrs)?) } else { None };
         let off = geom.offset.rem_euclid(nh);
@@ -898,9 +901,9 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             part_stride: pw,
         };
         let c1 = rv.part::<W>(1);
-        // ModUp of c1 and the dot with c0 extended (one ciphertext: the INTT reads c1 in place; more: from a copy in
-        // the coefficient workspace, the results' stride is not the ciphertext layout's)
-        if k == 1 {
+        // ModUp of c1 and the dot with c0 extended (the INTT reads c1 in place, the results 1..=SRC_STRIDES ciphertext
+        // layouts apart; another stride: from a copy in the coefficient workspace)
+        if k == 1 || rv.ct_stride as usize <= ks::SRC_STRIDES * cw {
             ks::modup_from(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, c1, k, top)?;
         } else {
             let dst = View { base: ex.bconv_work.vptr_mut(), ct_stride: pw, part_stride: 0 };

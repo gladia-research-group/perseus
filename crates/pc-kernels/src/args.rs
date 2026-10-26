@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 11;
+pub const ABI: u32 = 12;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -75,15 +75,19 @@ pub struct NttArgs {
     pub snum: i32,
     pub sstride: u64,
     pub xnum: i32,
-    pub pad: i32,
+    /// 1 when every prime of the launch is below 2^30 (u32 lazy butterflies), else 0 (the former pad word: 0 = the
+    /// reduced butterflies of ABI 11).
+    pub lazy: i32,
     pub xstride: u64,
+    /// ABI 12: the rows epilogue 2 accumulates onto (word offsets of eout; null = eout itself).
+    pub ed: *const c_void,
 }
 
 /// Forward NTT epilogues (args.cuh NttArgs `epi`).
 pub mod ntt_epi {
     /// eout = (ex - v) es
     pub const SUB_MUL: i32 = 1;
-    /// eout += (ex - v) es
+    /// eout = ed + (ex - v) es (ed null: eout += (ex - v) es)
     pub const SUB_MUL_ACC: i32 = 2;
     /// eout = ex es + v
     pub const MUL_ADD: i32 = 3;
@@ -190,6 +194,9 @@ pub struct EpiArgs {
     pub part_stride: u64,
     pub dbl: i32,
     pub pad: i32,
+    /// ABI 11: dst scaled by alpha\[row\] before the add (null: 1).
+    pub alpha: *const c_void,
+    pub alphas: *const c_void,
 }
 
 #[repr(C)]
@@ -793,14 +800,14 @@ const _: () = {
     assert!(size_of::<PrimeConst>() == 64);
     assert!(size_of::<RowSet>() == 16);
     assert!(size_of::<PolyRef>() == 24);
-    assert!(size_of::<NttArgs>() == 168);
+    assert!(size_of::<NttArgs>() == 176);
     assert!(size_of::<BconvJob>() == 32);
     assert!(size_of::<BconvArgs>() == 48);
     assert!(size_of::<EwArgs>() == 128);
     assert!(size_of::<PtDotArgs>() == 128);
     assert!(size_of::<KsArgs>() == 176);
-    assert!(size_of::<EpiArgs>() == 56);
-    assert!(size_of::<KsRegenArgs>() == 296);
+    assert!(size_of::<EpiArgs>() == 72);
+    assert!(size_of::<KsRegenArgs>() == 312);
     assert!(size_of::<KskExpandArgs>() == 48);
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 184);

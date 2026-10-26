@@ -343,7 +343,27 @@ pub fn rotate_sum_inplace_as<W: DevWord, M: DevStrategy<W>>(
     steps: &[i64],
     form: SumForm,
 ) -> Result<()> {
-    let (k, top) = (acc.k(), top_of(ctx, acc)?);
+    let out = View::of(&acc.buf, 0);
+    rotate_sum_core(ctx, ex, kc, group, acc, out, ks::MdOut::Add, steps, form)?;
+    acc.meta = sh.rotate_sum(&acc.meta, steps).out;
+    Ok(())
+}
+
+/// The sum of the rotations of `x` by `steps`, ModDowned into `out` as `mode` says (`Add` with out = x's view: in
+/// place; `Onto(x)`: out = x + the sum). The caller sets the output's meta.
+#[allow(clippy::too_many_arguments)]
+fn rotate_sum_core<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    group: &KeyGroup<'_>,
+    x: &Ct<'_, W>,
+    out: View,
+    mode: ks::MdOut,
+    steps: &[i64],
+    form: SumForm,
+) -> Result<()> {
+    let (k, top) = (x.k(), top_of(ctx, x)?);
     let n = ctx.lay.n;
     let mut keys = Vec::with_capacity(steps.len());
     for &st in steps {
@@ -358,16 +378,14 @@ pub fn rotate_sum_inplace_as<W: DevWord, M: DevStrategy<W>>(
     }
     let lay = ctx.lay;
     let rs = lay.rs_qp(top);
-    ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &acc.buf, 0, k, 1, top)?;
+    ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
     let per = (ex.ks.ext.k / k).max(1);
     let run = keys.iter().enumerate().all(|(j, &r)| r == keys[0] + j);
     if form == SumForm::InModDown && run && keys.len() <= per {
         // every extended rotation in ks.ext at once, summed inside the ModDown
-        let io = io_of(acc, View::of(&ex.ks.ext, 0), k);
+        let io = io_of(x, View::of(&ex.ks.ext, 0), k);
         dots(ctx, ex, kc, group, keys[0], keys.len(), k, top, io)?;
-        ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, keys.len(), k, &mut ex.ks.conv, View::of(&acc.buf, 0), k, top)?;
-        acc.meta = sh.rotate_sum(&acc.meta, steps).out;
-        return Ok(());
+        return ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, keys.len(), k, &mut ex.ks.conv, out, mode, k, top);
     }
     // extended rotations, chunk by chunk, summed into ks.conv (Q rows 0..=top and P)
     let mut j = 0;
@@ -378,7 +396,7 @@ pub fn rotate_sum_inplace_as<W: DevWord, M: DevStrategy<W>>(
             m += 1;
         }
         {
-            let io = io_of(acc, View::of(&ex.ks.ext, 0), k);
+            let io = io_of(x, View::of(&ex.ks.ext, 0), k);
             dots(ctx, ex, kc, group, keys[j], m, k, top, io)?;
         }
         let cv = View::of(&ex.ks.conv, 0);
@@ -393,13 +411,11 @@ pub fn rotate_sum_inplace_as<W: DevWord, M: DevStrategy<W>>(
         }
         j += m;
     }
-    // ModDown of the sum (conversion into ks.ext), fused with the accumulate: acc += (sum - conv) P^-1
-    ks::moddown_to(ctx, &ex.compute, kc.plans, &mut ex.ks.conv, &mut ex.ks.ext, View::of(&acc.buf, 0), true, k, top)?;
-    acc.meta = sh.rotate_sum(&acc.meta, steps).out;
-    Ok(())
+    // ModDown of the sum (conversion into ks.ext), fused with the accumulate: out = y + (sum - conv) P^-1
+    ks::moddown_to(ctx, &ex.compute, kc.plans, &mut ex.ks.conv, &mut ex.ks.ext, out, mode, k, top)
 }
 
-/// `out = x + sum_k rot(x, steps[k])` (see `rotate_sum_inplace`).
+/// `out = x + sum_k rot(x, steps[k])` (see `rotate_sum_inplace`; x is the ModDown's accumulate source, no copy).
 #[allow(clippy::too_many_arguments)]
 pub fn rotate_sum<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,
@@ -412,10 +428,10 @@ pub fn rotate_sum<W: DevWord, M: DevStrategy<W>>(
     out: &mut Ct<'_, W>,
 ) -> Result<()> {
     same_shape(x, out, "rotate_sum")?;
-    let top = top_of(ctx, x)?;
-    copy_q(ctx, ex, x, out, top)?;
-    out.meta = x.meta;
-    rotate_sum_inplace(ctx, ex, kc, sh, group, out, steps)
+    let o = View::of(&out.buf, 0);
+    rotate_sum_core(ctx, ex, kc, group, x, o, ks::MdOut::Onto(View::of(&x.buf, 0)), steps, SumForm::InModDown)?;
+    out.meta = sh.rotate_sum(&x.meta, steps).out;
+    Ok(())
 }
 
 /// K sibling rotate_sums of one step list: `outs[c] = xs[c] + sum_k rot(xs[c], steps[k])`, the inputs copied into

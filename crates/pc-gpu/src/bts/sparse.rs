@@ -385,7 +385,7 @@ pub fn acc_round<W: DevWord, M: DevStrategy<W>>(
     let io = DotIo { c1: va.part::<W>(1).base, c0: va.base, ct_stride: va.ct_stride, out: ext0.base, part_stride: lay.poly_words() as u64, out_ct_stride: cw, out_rot_stride: k as u64 * cw, c0_mode: 1 };
     ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, g, 0, m, k, top, DotRows::All, io, in_place)?;
     // the m extended rotations summed inside the ModDown (special rows in its INTT, Q rows in its epilogue)
-    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, m, k, &mut ex.ks.conv, View::of(&x.buf, 0), k, top)?;
+    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, m, k, &mut ex.ks.conv, View::of(&x.buf, 0), ks::MdOut::Add, k, top)?;
     x.meta = sh.rotate_sum(&x.meta, steps).out;
     Ok(())
 }

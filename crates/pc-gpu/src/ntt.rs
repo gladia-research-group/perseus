@@ -166,23 +166,24 @@ pub struct Src {
 pub enum Epi {
     /// out = (x - v) s
     SubMul { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
-    /// out = out + (x - v) s
-    SubMulAcc { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
+    /// out = d + (x - v) s (d at out's offsets; null: out itself)
+    SubMulAcc { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void, d: *const c_void },
     /// out = x s + v
     MulAdd { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
-    /// out = out + (x_0 + .. + x_(n-1) - v) s, the x_j `stride` words apart
-    SubMulAccSum { out: *mut c_void, x: *const c_void, n: usize, stride: usize, s: *const c_void, ss: *const c_void },
+    /// out = d + (x_0 + .. + x_(n-1) - v) s, the x_j `stride` words apart (d as in SubMulAcc)
+    SubMulAccSum { out: *mut c_void, x: *const c_void, n: usize, stride: usize, s: *const c_void, ss: *const c_void, d: *const c_void },
 }
 
 impl Epi {
-    /// (mode, out, x, x rows summed, their stride, s, ss)
+    /// (mode, out, x, x rows summed, their stride, s, ss, d)
     #[allow(clippy::type_complexity)]
-    fn args(self) -> (i32, *mut c_void, *const c_void, usize, usize, *const c_void, *const c_void) {
+    fn args(self) -> (i32, *mut c_void, *const c_void, usize, usize, *const c_void, *const c_void, *const c_void) {
+        let nul = std::ptr::null();
         match self {
-            Epi::SubMul { out, x, s, ss } => (ntt_epi::SUB_MUL, out, x, 1, 0, s, ss),
-            Epi::SubMulAcc { out, x, s, ss } => (ntt_epi::SUB_MUL_ACC, out, x, 1, 0, s, ss),
-            Epi::MulAdd { out, x, s, ss } => (ntt_epi::MUL_ADD, out, x, 1, 0, s, ss),
-            Epi::SubMulAccSum { out, x, n, stride, s, ss } => (ntt_epi::SUB_MUL_ACC, out, x, n, stride, s, ss),
+            Epi::SubMul { out, x, s, ss } => (ntt_epi::SUB_MUL, out, x, 1, 0, s, ss, nul),
+            Epi::SubMulAcc { out, x, s, ss, d } => (ntt_epi::SUB_MUL_ACC, out, x, 1, 0, s, ss, d),
+            Epi::MulAdd { out, x, s, ss } => (ntt_epi::MUL_ADD, out, x, 1, 0, s, ss, nul),
+            Epi::SubMulAccSum { out, x, n, stride, s, ss, d } => (ntt_epi::SUB_MUL_ACC, out, x, n, stride, s, ss, d),
         }
     }
 }
@@ -217,7 +218,8 @@ fn launch_ex<W: DevWord, M: DevStrategy<W>>(
     if epi.is_some() && dir == Dir::Inverse {
         return Err(shape("ntt epilogue", "the epilogues are forward-only"));
     }
-    let (mode, eout, ex, xn, xs, es, ess) = epi.map(Epi::args).unwrap_or((0, std::ptr::null_mut(), std::ptr::null(), 1, 0, std::ptr::null(), std::ptr::null()));
+    let (mode, eout, ex, xn, xs, es, ess, ed) =
+        epi.map(Epi::args).unwrap_or((0, std::ptr::null_mut(), std::ptr::null(), 1, 0, std::ptr::null(), std::ptr::null(), std::ptr::null()));
     let a = NttArgs {
         base,
         roff,
@@ -241,8 +243,9 @@ fn launch_ex<W: DevWord, M: DevStrategy<W>>(
         snum: src.map(|x| x.n.max(1)).unwrap_or(1) as i32,
         sstride: src.map(|x| x.stride).unwrap_or(0) as u64,
         xnum: xn.max(1) as i32,
-        pad: 0,
+        lazy: ctx.ntt.lazy as i32,
         xstride: xs as u64,
+        ed,
     };
     let (f, name) = match dir {
         Dir::Forward => (ctx.table.ntt_fwd, "ntt_fwd"),
