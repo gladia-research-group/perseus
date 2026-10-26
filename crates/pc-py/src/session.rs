@@ -668,7 +668,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             let mut sp = StcFirstPlan::new(chain, &setup, &sfs).map_err(e)?;
             // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for
             let keys = stc_first_keys(&ps.programs, n, (chain.q.len() - 1 - sp.entry_top) as u32, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
-            sp.sf.cache_slots = sp.sf.cache_slots.max(keys + 4);
+            sp.sf.cache_slots = sp.sf.cache_slots.max(keys);
             let mut geoms: Vec<_> = sp.dense.variants.iter().flat_map(|v| v.cts.iter().chain(&v.stc)).chain(&sp.input).map(|h| h.geom).collect();
             geoms.extend(sp.sources.iter().flatten().map(|s| s.geom));
             full.extend(lt_steps(&geoms, n));

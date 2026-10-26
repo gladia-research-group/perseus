@@ -1044,40 +1044,45 @@ pub fn bench(args: &[String]) -> Res<bool> {
                     println!("[pc-bench] contract cf={cf} input level {lvl} stc_first={stcf}: ran StC-first {order}, landing {} deg {}, {:.2} bits (gauss 0.1)", x.meta.level, x.meta.deg, (mx / e).log2());
                 }
             }
-            // K = 8 batch == 8 x K = 1 (same ciphertext replicated), and the PCMM finish pattern under raise drop 1
+            // K = 8 batch of distinct ciphertexts (the replay's refresh units) == each refreshed at K = 1, and the PCMM
+            // finish pattern under raise drop 1
             let cf = a.cfs[0];
             let r = Route { cf: Some(cf), stc_first: true, ..Route::dense() };
             let v1 = vec![rand_c(99, slots, 1.0, false)];
-            fresh(&mut y, &mut ex, &v1, a.level)?;
             let top_in = (nq - 1 - a.level) as usize;
             let ids: Vec<usize> = (0..=top_in).collect();
-            let rows0: Vec<Vec<u32>> = (0..2).map(|p| y.buf.download_rows(&ex.compute, 0, p, &ids)).collect::<std::result::Result<_, _>>()?;
-            x.buf.k = kmax;
+            let mut want: Vec<Vec<Vec<u32>>> = Vec::with_capacity(kmax);
             for c in 0..kmax {
-                for (p, rw) in rows0.iter().enumerate() {
-                    x.buf.upload_rows(&ex.compute, c, p, &ids, rw)?;
+                let vc = if c == 0 { v1.clone() } else { vec![rand_c(99 + c as u64, slots, 1.0, false)] };
+                fresh(&mut y, &mut ex, &vc, a.level)?;
+                x.buf.k = kmax;
+                for p in 0..2 {
+                    let rw = y.buf.download_rows(&ex.compute, 0, p, &ids)?;
+                    x.buf.upload_rows(&ex.compute, c, p, &ids, &rw)?;
                 }
+                x.meta = y.meta.clone();
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts::default())?;
+                call.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;
+                let ot: Vec<usize> = (0..=(nq - 1 - y.meta.level) as usize).collect();
+                want.push((0..2).map(|p| y.buf.download_rows(&ex.compute, 0, p, &ot)).collect::<std::result::Result<_, _>>()?);
             }
-            x.meta = y.meta.clone();
             {
                 let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
-                for z in [&mut x, &mut y] {
-                    let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(z), &r, CallOpts::default())?;
-                    call.run_to(&mut cx, std::slice::from_mut(z), Phase::Done)?;
-                }
+                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, CallOpts::default())?;
+                call.run_to(&mut cx, std::slice::from_mut(&mut x), Phase::Done)?;
             }
             let ot: Vec<usize> = (0..=(nq - 1 - y.meta.level) as usize).collect();
-            let want: Vec<Vec<u32>> = (0..2).map(|p| y.buf.download_rows(&ex.compute, 0, p, &ot)).collect::<std::result::Result<_, _>>()?;
-            let mut bad = 0;
-            let mut tot = 0;
-            for c in 0..kmax {
-                for (p, wnt) in want.iter().enumerate() {
+            let mut bad = (x.meta.level != y.meta.level || x.meta.deg != y.meta.deg) as usize;
+            let mut tot = 1;
+            for (c, wc) in want.iter().enumerate() {
+                for (p, wnt) in wc.iter().enumerate() {
                     let g = x.buf.download_rows(&ex.compute, c, p, &ot)?;
                     bad += g.iter().zip(wnt).filter(|(a, b)| a != b).count();
                     tot += g.len();
                 }
             }
-            t.add(&format!("K={kmax} StC-first batch (8 copies) == K=1, every word"), bad, tot);
+            t.add(&format!("K={kmax} StC-first batch of {kmax} distinct ciphertexts == each at K=1, every word"), bad, tot);
             // PCMM pattern: input state at drop 0, own CF, split, finish at drop 1 (the site's raise variant)
             fresh(&mut x, &mut ex, &v1, a.level)?;
             {

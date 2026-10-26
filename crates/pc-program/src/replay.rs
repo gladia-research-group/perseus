@@ -423,6 +423,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     let mut forked = false;
     // steps below `unit_end` were issued by the unit that holds them
     let mut unit_end = lo;
+    // the rotation chain whose gathered inputs and ModUp the compute lane's workspaces (`ks_owner`) and the held
+    // buffers (`held_owner`) hold: a later link of another state runs fresh (bind's chains never meet one, a guard)
+    let (mut ks_owner, mut held_owner): (Option<u32>, Option<u32>) = (None, None);
     for i in lo..hi {
         let in_unit = i < unit_end;
         let unit = if in_unit {
@@ -481,10 +484,23 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
                 let r = match unit {
                     Some((u, _)) => {
+                        let unit = &units[u as usize];
                         let gather = gather.as_mut().ok_or_else(|| rerr(label, "no gather buffer"))?;
-                        exec_unit(label, rt, &units[u as usize], steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists)
+                        let mut stale = false;
+                        match unit.kind {
+                            UnitKind::Grid { held: h, .. } if unit.chain != NONE => {
+                                let owner = if h { &mut held_owner } else { &mut ks_owner };
+                                stale = *owner != Some(unit.chain);
+                                *owner = Some(unit.chain);
+                            }
+                            _ => ks_owner = None,
+                        }
+                        exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, stale)
                     }
                     None => {
+                        if lane == 0 && !quiet(&steps[i].op) {
+                            ks_owner = None;
+                        }
                         let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, stream_base: *stream_base };
                         exec_step(label, rt, &steps[i], slots.as_mut_ptr(), slots.len(), tmp, &t)
                     }
@@ -561,6 +577,12 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     Ok(())
 }
 
+/// A step that leaves the key-switching workspaces and the gather buffers alone (element-wise ops and rescales).
+fn quiet(op: &StepOp) -> bool {
+    use StepOp::*;
+    matches!(op, Add | Sub | AddPt(_) | MultPt(_) | AddConst(_) | MultConst(_) | Negate | MultI | Rescale | DropTo(_))
+}
+
 /// Whether unit `u` can issue as one batch on the operands its slots hold: a K-batched product or refresh runs one
 /// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
 /// rotations only need one level.
@@ -578,8 +600,22 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>]) -> bool {
 }
 
 /// Issue unit `u` (all its steps' outputs at once).
+/// `stale`: a chain link whose gathered inputs and ModUp are not in the buffers it reads runs fresh.
 #[allow(clippy::too_many_arguments)]
-fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a, W, M>, u: &Unit, steps: &[Step], slots: *mut Ct<'a, W>, n_slots: usize, gather: &mut Gather<'a, W>, held: Option<&mut Held<'a, W>>, groups: &[KeyGroup<'a>], relin: u32, lists: &[Vec<i64>]) -> Result<()> {
+fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
+    block: &str,
+    rt: &mut Rt<'_, 'a, W, M>,
+    u: &Unit,
+    steps: &[Step],
+    slots: *mut Ct<'a, W>,
+    n_slots: usize,
+    gather: &mut Gather<'a, W>,
+    held: Option<&mut Held<'a, W>>,
+    groups: &[KeyGroup<'a>],
+    relin: u32,
+    lists: &[Vec<i64>],
+    stale: bool,
+) -> Result<()> {
     let span = &steps[u.lo as usize..u.hi as usize];
     if u.ins.iter().chain(span.iter().map(|st| &st.out)).any(|&s| s as usize >= n_slots) {
         return Err(rerr(block, format!("unit at step {}: slots outside the {n_slots} bound slots", u.lo)));
@@ -591,6 +627,7 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
     let kc = KsCfg { plans: rt.ks, source: rt.source };
     match &u.kind {
         UnitKind::Grid { steps: st, g, at, fresh, held: h } => {
+            let fresh = *fresh || stale;
             if span.len() != at.len() {
                 return Err(rerr(block, format!("grid at step {}: {} steps, {} members", u.lo, span.len(), at.len())));
             }
@@ -601,12 +638,12 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
                 let hd = held.ok_or_else(|| rerr(block, format!("held chain link at step {}: no held buffers", u.lo)))?;
                 std::mem::swap(&mut rt.ex.ks.digits, &mut hd.digits);
                 let gather = if xs.len() > 1 { Some(&mut hd.x) } else { None };
-                let r = rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, *fresh, st, &mut outs);
+                let r = rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, fresh, st, &mut outs);
                 std::mem::swap(&mut rt.ex.ks.digits, &mut hd.digits);
                 r?;
             } else {
                 let gather = if xs.len() > 1 { Some(&mut gather.a) } else { None };
-                rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, *fresh, st, &mut outs)?;
+                rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, fresh, st, &mut outs)?;
             }
         }
         UnitKind::RotateSum { l, g } => {

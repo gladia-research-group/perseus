@@ -224,7 +224,8 @@ pub enum SumForm {
 
 /// A grid of rotations of up to `KEY_KMAX` ciphertexts: `outs[j].2 = rot(xs[outs[j].0], steps[outs[j].1])`. One ModUp
 /// per input (hoisted), each key's inner product over every input in one launch (K-batched: one read or regeneration
-/// of the key for all of them), one ModDown per (input, step) pair; every output is bit-identical to a plain rotation.
+/// of the key for all of them), the ModDown of every input at every step an output takes; every output is
+/// bit-identical to a plain rotation.
 /// Several inputs are first copied into `gather` (the inner product reads its inputs at one stride); outputs sharing
 /// an (input, step) pair are computed once. `group` holds the steps' keys in order; the outputs are distinct buffers,
 /// none of them an input. `fresh` false: `gather` and the ModUp workspace still hold these inputs' copies and ModUp
