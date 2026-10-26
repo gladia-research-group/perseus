@@ -155,17 +155,20 @@ struct RouteCase {
     period: usize,
 }
 
-fn case(name: &str, n: usize, nq: usize) -> Res<RouteCase> {
+fn case(name: &str, n: usize, nq: usize, lean: bool) -> Res<RouteCase> {
     let n2 = (n / 2) as u32;
+    // input levels: the dense ones two levels above the StC-first entry, SparseB at its deepest (the g0 inputs' top 5
+    // on n32; the level above the single prime on a lean chain)
+    let (dense_lv, sparse_lv) = if lean { (44, 48) } else { (nq as u32 - 10, nq as u32 - 6) };
     Ok(match name {
         // shipped-order dense, real payload, CF 6 (the dense timing case), input at the reactive ceiling (44 on n32)
-        "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: (nq - 10) as u32, slots: n2, period: n / 2 },
+        "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: dense_lv, slots: n2, period: n / 2 },
         // StC-first, real payload, CF 13 (the shipped dense route and timing case)
-        "stcf" => RouteCase { route: Route { cf: Some(13), real: true, stc_first: true, ..Route::dense() }, level: (nq - 10) as u32, slots: n2, period: n / 2 },
+        "stcf" => RouteCase { route: Route { cf: Some(13), real: true, stc_first: true, ..Route::dense() }, level: dense_lv, slots: n2, period: n / 2 },
         // SparseB, raise drop 1, CF 6, input at top 5 (the g0 bootstrap inputs' top)
         "512" | "256" => {
             let s: u32 = name.parse()?;
-            RouteCase { route: Route { slots: s, raise_drop: 1, sparse_b: true, cf: Some(6), ..Route::dense() }, level: (nq - 6) as u32, slots: s, period: s as usize }
+            RouteCase { route: Route { slots: s, raise_drop: 1, sparse_b: true, cf: Some(6), ..Route::dense() }, level: sparse_lv, slots: s, period: s as usize }
         }
         // SPRU h = 64, CF 6, fresh level-26 input
         "1" => RouteCase { route: Route { slots: 1, spru_h: 64, cf: Some(6), ..Route::dense() }, level: 26, slots: 1, period: 1 },
@@ -173,10 +176,10 @@ fn case(name: &str, n: usize, nq: usize) -> Res<RouteCase> {
     })
 }
 
-/// The n32 chain, or a timing proxy of another shape: `PC_BENCH_LEVELS` (CKKS levels incl. q0) and `PC_BENCH_DNUM`
-/// (the HE-standard check off: timing only, never keys anyone uses).
-fn bench_spec() -> ChainSpec {
-    let mut spec = ChainSpec::n32();
+/// The chain: a preset (`PC_BENCH_CHAIN`, default n32), or a timing proxy of another shape: `PC_BENCH_LEVELS` (CKKS
+/// levels incl. q0) and `PC_BENCH_DNUM` (the HE-standard check off: timing only, never keys anyone uses).
+fn bench_spec() -> Res<ChainSpec> {
+    let mut spec = ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?;
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
     if let Some(l) = env("PC_BENCH_LEVELS") {
         spec.num_levels = l;
@@ -186,7 +189,7 @@ fn bench_spec() -> ChainSpec {
         spec.dnum = d;
         spec.security = pc_core::params::Security::NotSet;
     }
-    spec
+    Ok(spec)
 }
 
 /// One table row.
@@ -243,7 +246,7 @@ fn run(o: &Opts) -> Res<bool> {
 #[allow(clippy::too_many_lines)]
 fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(String, usize, &'static str, usize, usize)>) -> Res<()> {
     let t0 = Instant::now();
-    let chain = Chain::generate(&bench_spec())?;
+    let chain = Chain::generate(&bench_spec()?)?;
     let n = chain.n;
     let nq = chain.q.len();
     let st_tab = pc_core::scale::ScaleTables::precompute(&chain)?;
@@ -424,7 +427,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let (ev0, ev1) = (Event::timing(&dev)?, Event::timing(&dev)?);
     let ctw = lay.ct_words();
     for name in &o.routes {
-        let c = case(name, n, nq)?;
+        let c = case(name, n, nq, chain.lone_top().is_some())?;
         let (route, work, locks): (&dyn BtsRoute<'_, W, M>, &mut BtsWork<'_, W>, Vec<&dyn CaptureLock>) = match name.as_str() {
             "dense" | "stcf" => (&sfr, &mut sf_work, sfr.last.iter().map(|l| l as &dyn CaptureLock).collect()),
             "512" | "256" => {

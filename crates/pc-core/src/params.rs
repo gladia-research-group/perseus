@@ -71,11 +71,14 @@ pub struct ChainSpec {
 /// `thin` single primes kept above q0 in place of as many composite levels (the StC-first input stages run on them,
 /// one prime per stage: a ct x pt product keeps its scale), and `dnum` digits over the shorter chain. The base chain's
 /// special primes stay first in P (the bottom-shape keys of the sparse secrets use only them: their modulus q0 x P'
-/// is the base chain's); more are appended until P covers the largest digit.
+/// is the base chain's); more are appended until P exceeds the largest digit by `p_margin` bits (the key-switching
+/// noise after ModDown scales as digit / P: n32's P exceeds its digits by 8 bits, and the raise and CtS key switches sit
+/// at the refresh's precision floor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lean {
     pub thin: u32,
     pub dnum: u32,
+    pub p_margin: u32,
 }
 
 impl ChainSpec {
@@ -99,7 +102,7 @@ impl ChainSpec {
     /// n32 with its bottom StC levels on 3 single primes (n32's primes 2..=4; primes 5..=7 dropped) and dnum 4: 51
     /// limbs, the top 46 primes (every user, EvalMod and CtS level) n32's own.
     pub fn n32a4() -> Self {
-        ChainSpec { lean: Some(Lean { thin: 3, dnum: 4 }), ..Self::n32() }
+        ChainSpec { lean: Some(Lean { thin: 3, dnum: 4, p_margin: 8 }), ..Self::n32() }
     }
     /// The n64 chain (functional only): logN 16, 53-bit primes, 60-bit q0, depth 27, dnum 7, 60-bit specials.
     pub fn n64() -> Self {
@@ -426,7 +429,7 @@ impl Chain {
     /// The lean chain of `spec` from its base chain (`Lean`): Q = q0, the first `thin` primes above it, then the base
     /// chain minus the next `thin` primes; the composite grid runs from the top, so an odd count leaves one single
     /// level above q0. OpenFHE's partition into `lean.dnum` digits; P = the base P, then the largest NTT primes below
-    /// 2^b (b raised in 1/20-bit steps from the even split) until P covers the largest digit.
+    /// 2^b (b raised in 1/20-bit steps from the even split) until P exceeds the largest digit by `lean.p_margin` bits.
     fn lean(self, spec: &ChainSpec, lean: Lean) -> Result<Chain> {
         let d = self.level_unit;
         let t = lean.thin as usize;
@@ -451,7 +454,7 @@ impl Chain {
         let widest = digits.iter().map(|dg| lg(&dg.iter().map(|&i| q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
         let cycl_order = 2 * self.n as u64;
         let mut p = self.p.clone();
-        let need = widest - lg(&p);
+        let need = widest + lean.p_margin as f64 - lg(&p);
         if need > 0.0 {
             let k = (need / (spec.special_bits as f64 - 0.1)).ceil() as usize;
             let mut b = (need / k as f64 * 20.0).ceil() / 20.0;

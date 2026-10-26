@@ -58,7 +58,7 @@ fn n32a4_chain() {
     assert!(c.q.iter().chain(&c.p).all(|&p| p < 1 << 28));
     let lg = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
     let widest = c.digits.iter().map(|d| lg(&d.iter().map(|&i| c.q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
-    assert!(lg(&c.p) >= widest);
+    assert!(lg(&c.p) >= widest + 8.0);
     assert_eq!(c.groups[..3], [2, 1, 2]);
     assert_eq!(c.groups.len(), 26);
     assert_eq!((c.lone_top(), c.drop_at(2), c.drop_at(1), c.drop_at(4), c.drop_at(3)), (Some(2), Some(1), Some(2), Some(2), None));

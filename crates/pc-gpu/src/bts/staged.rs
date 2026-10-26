@@ -132,8 +132,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> BtsCall<'r, 'a, W, M> {
         }
         if let StagedRef::StcFirst(r) = self.route {
             let shp = cx.ctx.shape;
-            let d = cx.ctx.chain.level_unit;
-            let top = if self.st.stc_folded { 2 * d - 1 } else { 2 * d - 1 + d };
+            let top = if self.st.stc_folded { r.split_top() } else { r.split_top() + r.step };
             let want = (shp.n_q - 1 - top as u32, 2u8);
             if let Some(x) = cts.iter().find(|x| (x.meta.level, x.meta.deg) != want) {
                 return Err(shape("bts call", format!("at_split: ciphertext at level {} deg {}, the split is {want:?} (entry limb {})", x.meta.level, x.meta.deg, r.entry_top)));
