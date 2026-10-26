@@ -131,8 +131,7 @@ impl DensePlan {
                 if lv.top as usize != (shp.n_q - 1 - m.level) as usize || m.deg != 1 {
                     return Err(shape("dense plan", format!("CtS stage {e} plaintexts at top {} but the input is {m:?}", lv.top)));
                 }
-                let mut coeffs = diag_coeffs(chain, &fs.pts, lv.scale)?;
-                super::cts::emu_thin(&mut coeffs, "CTS", e, lv.scale, 0.0);
+                let coeffs = diag_coeffs(chain, &fs.pts, lv.scale)?;
                 cts.push(LtHost { geom: LtGeom::from_fides(fs), top: lv.top as usize, end: inner_end, nf: lv.scale, width: stage_width(n, &coeffs), coeffs });
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 m = sh.rescale(&m)?.out;

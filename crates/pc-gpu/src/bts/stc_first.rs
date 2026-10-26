@@ -108,9 +108,7 @@ pub struct SrcHost {
 
 impl SrcHost {
     pub fn new(chain: &Chain, geom: LtGeom, values: &[Vec<C64>]) -> Result<SrcHost> {
-        let mut coeffs = diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())?;
-        super::cts::emu_thin(&mut coeffs, "STCF", 2, (SRC_LOG2 as f64).exp2(), super::cts::emu_loss("STCF_LAST"));
-        Ok(SrcHost { geom, coeffs })
+        Ok(SrcHost { geom, coeffs: diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())? })
     }
     pub fn bytes<W: DevWord>(&self, n: usize) -> usize {
         Arena::bytes_for::<W>(self.coeffs.len() * SRC_LIMBS * n)
@@ -483,8 +481,7 @@ impl StcFirstPlan {
             let vals: Vec<Vec<C64>> = fs.pts.iter().map(|v| v.iter().map(|z| z.scale(fac)).collect()).collect();
             // a single-prime stage's plaintexts: the prime it drops times the stage's factor (the scale it keeps)
             let scale = if thin { chain.q[top] as f64 * THIN_SPLIT[si].exp2() } else { st.sf(top as i32)? };
-            let mut coeffs = diag_coeffs(chain, &vals, scale)?;
-            super::cts::emu_thin(&mut coeffs, "STCF", si, scale, 0.0);
+            let coeffs = diag_coeffs(chain, &vals, scale)?;
             input.push(LtHost { geom: LtGeom::from_fides(fs), top, end: LtEnd::ModDown, nf: scale, width: stage_width(n, &coeffs), coeffs });
         }
         let mut need = vec![false; ns];

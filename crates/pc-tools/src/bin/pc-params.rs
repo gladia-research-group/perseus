@@ -5,7 +5,7 @@ use pc_core::scale::ScaleTables;
 use std::process::ExitCode;
 
 fn usage() -> String {
-    "usage: pc-params [--preset n32|n64] [--check <params.json>]".to_string()
+    "usage: pc-params [--preset n32|n64|n32a4] [--check <params.json>]".to_string()
 }
 
 fn run() -> Result<usize, String> {
