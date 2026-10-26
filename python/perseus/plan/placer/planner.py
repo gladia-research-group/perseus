@@ -205,9 +205,11 @@ class PlanConfig:
     #: a plan dir whose placements every block keeps (forced into the cut, which adds only what the new seeds
     #: still need): a plan re-derived for other entry levels with the refresh sites it was validated with
     keep_placements: str | None = None
-    #: with keep_placements: the plan must end with exactly the kept file's placements and fired hints (nothing added,
-    #: moved or pruned; every kept site present in the graph), else the block stops: a capture whose node names moved
-    #: can never re-place silently (PLAN_KEEP_PLACEMENTS_EXACT; a drops-only post-pass with PLAN_RAISE_SEARCH)
+    #: with keep_placements: the kept file's decisions are the plan's (PLAN_KEEP_PLACEMENTS_EXACT): its placements, its
+    #: fired hints (every hint pinned as the file has it; no PLAN_HINT_ENV_VETO, no dissolution) and its realize anchors
+    #: (no realize-anchor trials, no prune); the cut may add nothing. The block stops when a kept site is not in the
+    #: graph or the plan does not end with exactly the kept refreshes and rescale_after (another capture or recipe).
+    #: With PLAN_RAISE_SEARCH it is a drops-only post-pass over a finished plan.
     keep_placements_exact: bool = False
     verbose: bool = True
     placer: str = "min_cut"
@@ -649,7 +651,6 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
               f"{erase.n_deliberate_kept} deliberate fixed point(s) kept")
 
     kept_sites: set[str] = set()
-    kept_hints: set[str] | None = None        # PLAN_KEEP_PLACEMENTS_EXACT: the kept plan's fired hints
     input_level_of: dict[str, float] = {}
     first_consumer_seed: dict[str, float] = {}
     for n in g.nodes:
@@ -767,7 +768,17 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # (`hint_aware`) with hints live; dissolving them there would change what the
     # benchmark measures.
     exact = cfg.placer in ("min_cut", "ilp")     # ours: the cut, or its exact twin
-    if cfg.dissolve_hints and exact:
+    keep_exact = bool(cfg.keep_placements and cfg.keep_placements_exact)
+    kept_doc: dict | None = None              # PLAN_KEEP_PLACEMENTS_EXACT: the kept plan
+    kept_hints: set[str] | None = None        # ... its fired hints
+    kept_anchors: set[str] = set()            # ... and its realize anchors
+    if keep_exact and not exact:
+        raise ValueError("keep_placements_exact needs placer min_cut or ilp")
+    if keep_exact:
+        # the kept plan's realize anchors and refreshes as they are: no realize-anchor trials (another trial path can
+        # end on other anchors at the same count), no prune
+        cfg = dataclasses.replace(cfg, rescale_opt=False, shared_realize=False, ks_realize=False, prune=False)
+    if cfg.dissolve_hints and exact and not keep_exact:
         dissolve_pins, hints_retained = _dissolve_hints(g, cfg, refresh)
 
     # stage 4 — ours, or a baseline placer (same seam, different site selection)
@@ -810,13 +821,20 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 raise FileNotFoundError(f"keep_placements: no {kept}")
             doc = json.loads(kept.read_text(encoding="utf-8"))
             kept_sites = {p["target_var"] for p in doc.get("placements", []) if p.get("target_var") in g.producer_of}
-            if cfg.keep_placements_exact:
-                kept_hints = set(doc.get("hint_fire", []))
-                absent = sorted({p["target_var"] for p in doc.get("placements", []) if p.get("target_var")} - kept_sites
-                                | {h for h in kept_hints if h not in g.producer_of})
+            if keep_exact:
+                kept_doc, kept_hints = doc, set(doc.get("hint_fire", []))
+                quality = (kept_sites | kept_hints) if refresh.out_deg == 1 else set()
+                exit_v = doc.get("summary", {}).get("exit_var")
+                kept_anchors = (set(doc.get("rescale_after", [])) - quality
+                                - ({exit_v} if cfg.boundary_realize and exit_v else set()))
+                absent = sorted(({p["target_var"] for p in doc.get("placements", []) if p.get("target_var")}
+                                 | kept_hints | kept_anchors) - set(g.producer_of))
                 if absent:
                     raise RuntimeError(f"keep_placements_exact: {len(absent)} kept site(s) of {kept} are not in "
                                        f"{graph_file}: {', '.join(map(str, absent[:6]))} (another capture?)")
+                # every hint as the kept plan has it, over any other pin (veto steps, a caller's)
+                hint_force = {n.output: n.output in kept_hints for n in g.nodes
+                              if n.hint_level is not None and n.output}
             forced |= kept_sites
             if cfg.verbose:
                 log.info(f"[plan] keep_placements: {len(forced)} site(s) kept from {kept}")
@@ -837,8 +855,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         caller_force = dict(hint_force or {})
         for _round in range(4):
             hint_force = {**dissolve_pins, **caller_force}
-            placer = PlacerCls(**placer_kwargs, placed=set(forced),
-                               hint_force=hint_force)
+            placer = PlacerCls(**placer_kwargs, placed=set(forced), hint_force=hint_force,
+                               **({"realized": set(kept_anchors), "hint_veto": False} if keep_exact else {}))
             try:
                 sim = placer.run()
                 break
@@ -1037,11 +1055,9 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             ("placements dropped", kept_sites, set(placer.placed)),
             ("hints fired", fired_now, kept_hints), ("hints no longer fired", kept_hints, fired_now)) if a - b]
         if diff:
-            raise RuntimeError(f"keep_placements_exact: {block_name} differs from {cfg.keep_placements}: "
+            raise RuntimeError(f"keep_placements_exact: {block_name} differs from {cfg.keep_placements} (the kept "
+                               f"decisions are infeasible here?): "
                                + "; ".join(f"{what} {', '.join(vs[:6])}" for what, vs in diff))
-        if cfg.verbose:
-            log.info(f"[plan] keep_placements_exact: {len(kept_sites)} placement(s) and {len(kept_hints)} fired "
-                     f"hint(s) as kept")
     clamp = refresh.cf_clamp_report(sorted(set(placer.placed) | fired_hints))
     if diagnostics is not None:
         diagnostics.cf_clamp = clamp
@@ -1194,11 +1210,19 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         heuristic_config=getattr(placer, "heuristic_config", "min_cut"),
         placer_meta=getattr(placer, "meta", None),
         boundary_realize=cfg.boundary_realize,
-        realize_anchors=rescale_anchors,
+        realize_anchors=kept_anchors if keep_exact else rescale_anchors,
         real_route=cfg.real_route,
         fallback_cf=cfg.fallback_cf,
         pack_cf=cfg.pack_cf,
     )
+    if kept_doc is not None:
+        if sorted(result["rescale_after"]) != sorted(kept_doc.get("rescale_after", [])):
+            a, b = set(result["rescale_after"]), set(kept_doc.get("rescale_after", []))
+            raise RuntimeError(f"keep_placements_exact: {block_name}'s rescale_after differs from the kept plan's: "
+                               f"+{sorted(a - b)[:6]} -{sorted(b - a)[:6]}")
+        if cfg.verbose:
+            log.info(f"[plan] keep_placements_exact: {len(kept_sites)} placement(s), {len(kept_hints or ())} fired "
+                     f"hint(s) and {len(kept_anchors)} realize anchor(s) as kept")
     # Refresh-input absolute levels of the placed sites: what the pricing knobs move.
     # eff = nominal + pending rescale, as _capacity sees it.
     _hist: dict[str, int] = {}
@@ -1303,6 +1327,24 @@ def _block_index(d: Path) -> int:
     return int(d.name.rsplit("_", 1)[1])
 
 
+def _write_whole(path: Path, doc: dict) -> None:
+    """Write a plan file under a temporary name and rename it: a file that exists is complete (PLAN_RESUME)."""
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _resumed(out_file: Path, block_dir: Path) -> dict | None:
+    """PLAN_RESUME: the block's plan file already in the out dir, when it parses and carries this capture's stamp."""
+    try:
+        doc = json.loads(out_file.read_text(encoding="utf-8"))
+        doc["summary"]["total_bootstraps"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    want = json.loads(json.dumps(contract.capture_stamp(block_dir)))
+    return doc if doc.get(contract.CONTRACT_KEY) == want else None
+
+
 def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                    cfg: PlanConfig) -> list[dict]:
     graph_dir, out_dir = Path(graph_dir), Path(out_dir)
@@ -1314,6 +1356,10 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
               f"table_measured={table.measured} err_target={cfg.err_target:g}")
 
     summaries: list[dict] = []
+    # PLAN_RESUME=1: a block whose plan file is already in out_dir (written whole, with this capture's stamp) is taken
+    # as planned and its exit enters the next block, so a preempted run restarts at the block it was planning; the
+    # plans are the chain's (each block's depends on its graph, the config and its entry alone)
+    resume = os.environ.get("PLAN_RESUME", "0") not in ("", "0")
     entry_level: int | None = cfg.first_entry_level
     entry_deg: int | None = cfg.first_entry_deg
     blocks = sorted((d for d in graph_dir.glob("block_*") if d.is_dir()),
@@ -1328,6 +1374,18 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
             entry_desc = (f"entry={entry_level}/d{entry_deg}"
                           if entry_level is not None else "capture-derived")
             log.info(f"[plan] [{bd.name}] ({entry_desc})")
+        out_file = out_dir / f"{bd.name}_placement.json"
+        done = _resumed(out_file, bd) if resume else None
+        if done is not None:
+            log.info(f"[plan] [{bd.name}] resumed: {out_file}")
+            s = done["summary"]
+            summaries.append({"block": bd.name, "output": str(out_file), **s, "cf_clamp": None})
+            prev = {"name": bd.name, "gf": gf, "out_file": out_file,
+                    "entry_level": entry_level, "entry_deg": entry_deg,
+                    "exit_var": s.get("exit_var"), "retried": False}
+            entry_level = s.get("exit_level")
+            entry_deg = (s.get("exit_deg") or 1) if entry_level is not None else None
+            continue
         # the in-memory diagnostics ride on `summaries` (never on the plan file)
         diag = PlanDiagnostics()
         try:
@@ -1344,7 +1402,7 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                               entry_deg=prev["entry_deg"], table=table,
                               force_place={prev["exit_var"]}, diagnostics=pdiag)
             emit.stamp(pres, contract.capture_stamp(Path(prev["gf"]).parent))
-            prev["out_file"].write_text(json.dumps(pres, indent=1), encoding="utf-8")
+            _write_whole(prev["out_file"], pres)
             ps = pres["summary"]
             summaries[-1] = {"block": prev["name"], "output": str(prev["out_file"]),
                              **ps, "cf_clamp": pdiag.cf_clamp}
@@ -1356,9 +1414,8 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
             diag = PlanDiagnostics()
             result = plan_block(gf, cfg, entry_level=entry_level, entry_deg=entry_deg,
                                 table=table, diagnostics=diag, final_block=bd == blocks[-1])
-        out_file = out_dir / f"{bd.name}_placement.json"
         emit.stamp(result, contract.capture_stamp(bd))   # the plan/config contract (perseus.plan.contract)
-        out_file.write_text(json.dumps(result, indent=1), encoding="utf-8")
+        _write_whole(out_file, result)
         s = result["summary"]
         summaries.append({"block": bd.name, "output": str(out_file), **s,
                           "cf_clamp": diag.cf_clamp})
