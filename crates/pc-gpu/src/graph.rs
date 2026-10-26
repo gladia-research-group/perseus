@@ -177,14 +177,17 @@ impl<'a, W: DevWord> BtsGraphs<'a, W> {
         let x = &mut self.slots.x;
         let r = capture(sp, || f(cx, x));
         locks.iter().for_each(|l| l.set_locked(false));
-        let lease = cx.ops.ring.lease_end();
+        let lease = cx.ops.ring.lease_end(&cx.ex.compute);
         let (exec, ()) = match r {
             Ok(v) => v,
             Err(e) => {
-                cx.ops.ring.release(&lease);
+                if let Ok(l) = &lease {
+                    cx.ops.ring.release(l);
+                }
                 return Err(e);
             }
         };
+        let lease = lease?;
         if self.slots.x.meta != out {
             cx.ops.ring.release(&lease);
             return Err(shape("bts graph", format!("captured refresh lands at {:?}, its eager run at {out:?} (non-deterministic program)", self.slots.x.meta)));
