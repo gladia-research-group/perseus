@@ -1,5 +1,7 @@
-"""The last-position prefill block (PF_LAST_QUERY) on the plaintext mirror: blocked.attention_last against
-blocked.attention_blocked at the last position, blocked.token_bcast against the row it broadcasts."""
+"""GPT-2's blocked prefill attention on the plaintext mirror: the last-position block (PF_LAST_QUERY:
+blocked.attention_last against blocked.attention_blocked at the last position, blocked.token_bcast against the row it
+broadcasts), the last head group's K and V in one PCMM output (PF_QKV_PACK) and the packed q.K^T / P.V reductions
+(PF_ATTN_PACK) against the plain attention."""
 import contextlib
 import sys
 from pathlib import Path
@@ -9,12 +11,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from perseus._paths import PKG  # noqa: E402
-
-from perseus.impl import blocked as BL  # noqa: E402
-from perseus.impl import config, layout, prefill  # noqa: E402
-from perseus.impl.ops import NumpyOps  # noqa: E402
-from perseus.impl.rt import Rt  # noqa: E402
+from perseus._paths import PKG
+from perseus.impl import blocked as BL
+from perseus.impl import config, layout, prefill
+from perseus.impl.ops import NumpyOps
+from perseus.impl.rt import Rt
 
 CFG = PKG / "configs/model/approximation/gpt2_base_n32_thor/configs.json"
 T = 128
@@ -94,3 +95,38 @@ def test_qkv_pack_columns():
     heads = (np.arange(d.N) % (B.hg * B.t)) // B.t < B.group_dims(1).H_real
     assert np.abs(Kp[0] - K[0]).max() < 1e-9 and np.abs((Kp[1] - K[1])[heads]).max() < 1e-9
     assert np.abs(V0 - V[0]).max() < 1e-9 and np.abs((V1 - V[1])[heads]).max() < 1e-9
+
+
+@pytest.mark.parametrize("layer", [0, 4, 11])
+def test_attn_pack_matches_plain(monkeypatch, layer):
+    """PF_ATTN_PACK=3 (8 products per ciphertext over windows of 8 blocks), with K / V plain and QKV-packed (K's last
+    block carries V's heads on its padding heads, V's last block is that block rotated by half a group): the real heads'
+    outputs equal the plain attention's (Chebyshev-scaled GS, the entry's softmax configs)."""
+    sm = config.load_configs(str(PKG / "configs/model/approximation/gpt2_base_n32_pf/configs.json")).block(layer)[2]
+    d = layout.Dims.gpt2()
+    B = BL.Blocks(d, 512)
+    ch = prefill.Chunks(T, B.t)
+    real = [np.ones(B.nch, bool), np.arange(B.nch) % B.hg < B.group_dims(1).H_real]
+    rng = np.random.default_rng(100 + layer)
+
+    def enc(scale):
+        r = scale * rng.standard_normal((T, d.hid))
+        for k in range(B.K):
+            r[:, k * B.nch:(k + 1) * B.nch] *= real[k]
+        return [[0.5 * x for x in row] for row in BL.blocked_slots(r, ch, B)]
+    Q, K, V = enc(1.2), enc(1.2), enc(1.0)
+    h2t = B.hg // 2 * B.t
+    Kp = [[K[g][0], K[g][1] + np.roll(V[g][1], h2t)] for g in range(len(K))]
+    Vp = [[V[g][0], np.roll(Kp[g][1], -h2t)] for g in range(len(K))]
+
+    def attend(pack, k, v):
+        monkeypatch.setattr(prefill, "_PACK", pack)
+        rt = Rt(_Ops(True), d)
+        return np.array([[np.asarray(x) for x in row] for row in BL.attention_blocked(rt, Q, k, v, sm, ch, B)])
+    ref = attend(0, K, V)
+    slot_real = [np.ones(d.N, bool), (np.arange(d.N) // B.t) % B.hg < B.group_dims(1).H_real]
+    for pack, k, v in ((3, K, V), (0, Kp, Vp), (3, Kp, Vp)):
+        got = attend(pack, k, v)
+        err = max(np.abs(got[g, j][slot_real[j]] - ref[g, j][slot_real[j]]).max()
+                  for g in range(ref.shape[0]) for j in range(B.K))
+        assert err < 1e-12 * max(1.0, np.abs(ref).max()), (pack, err)
