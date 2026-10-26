@@ -657,6 +657,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             let mut sfs = StcFirstSetup::n32_shipped();
             sfs.cache_slots = ps.stc_cache.max(1);
+            if pcmm.is_some() {
+                // a lean chain's PCMM inputs take their own fixed StC stages (no-op on a composite chain)
+                sfs.own_split = Some(pc_gpu::bts::stc_first::THIN_SPLIT_PCMM);
+            }
             if ccmm.is_some() {
                 // the CCMM operands' stc_high (50, skip 1) and SinCBoot's stage 0 for every left-operand state, plus
                 // the calibration probes' (fresh tokens at the bootstrap output level)

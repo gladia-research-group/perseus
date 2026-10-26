@@ -46,6 +46,10 @@ pub const SRC_LIMBS: usize = 4;
 pub const THIN_SPLIT: [f64; 2] = [-6.0, -3.0];
 /// The reference CF of a lean chain's last stage (the factors above are set for it; lower CFs are pre-scaled to it).
 pub const THIN_CF_REF: u32 = 13;
+/// The fixed factors of a lean chain's StC stages under a PCMM input (own CF, scaled by 1/(w_scale 2^shift), ~2^-20
+/// for 16-bit weights): with `THIN_SPLIT` that reduction lands in the last stage alone, the full-period one, whose
+/// 27-bit plaintexts then keep ~6 bits; spread over the three stages it costs each ~5 bits more than a refresh.
+pub const THIN_SPLIT_PCMM: [f64; 2] = [-10.0, -8.0];
 
 /// The top limb of the mode-2 split (degree 2 there, where a PCMM / CCMM consumes it): 2d - 1, or a lean chain's
 /// single prime above q0 (`StcFirstRoute::split_top` for the shipped StC budget).
@@ -77,12 +81,15 @@ pub struct StcFirstSetup {
     pub own_cf: bool,
     /// StC outside a bootstrap (`stc_high`): the shapes and cache it serves; None = no stc_high.
     pub high: Option<StcHighSetup>,
+    /// A lean chain's fixed input stages once more at these factors (log2), for calls at their own CF (the PCMM's
+    /// inputs, `THIN_SPLIT_PCMM`); None = every call takes `THIN_SPLIT`.
+    pub own_split: Option<[f64; 2]>,
 }
 
 impl StcFirstSetup {
     /// The shipped n32 StC-first configuration: mode 2, reference CF 20, route CF 13, 4 cache entries.
     pub fn n32_shipped() -> StcFirstSetup {
-        StcFirstSetup { mode: StcFirstMode::Folded, cf_ref: 20, cf_default: Some(13), cache_slots: 4, own_cf: false, high: None }
+        StcFirstSetup { mode: StcFirstMode::Folded, cf_ref: 20, cf_default: Some(13), cache_slots: 4, own_cf: false, high: None, own_split: None }
     }
 }
 
@@ -438,6 +445,8 @@ pub struct StcFirstPlan {
     pub step: usize,
     /// Fixed input-side stages in execution order (mode 2: StC stages 0..n-2; mode 1: all, the last x 2^-deg).
     pub input: Vec<LtHost>,
+    /// A lean chain's fixed stages at `StcFirstSetup::own_split` (calls at their own CF); empty otherwise.
+    pub input_own: Vec<LtHost>,
     /// Re-levelling sources by StC stage (Some for the mode-2 last stage and every stage stc_high keeps).
     pub sources: Vec<Option<SrcHost>>,
 }
@@ -472,16 +481,24 @@ impl StcFirstPlan {
         if thin {
             sf.cf_ref = sf.cf_ref.min(THIN_CF_REF);
         }
-        let mut input = Vec::new();
-        for (si, fs) in lay.stc.iter().enumerate().take(nfixed) {
-            let top = entry_top - si * step;
-            let fac = if si + 1 == ns { (-(dense.deg as f64)).exp2() } else { 1.0 };
-            let vals: Vec<Vec<C64>> = fs.pts.iter().map(|v| v.iter().map(|z| z.scale(fac)).collect()).collect();
-            // a single-prime stage's plaintexts: the prime it drops times the stage's factor (the scale it keeps)
-            let scale = if thin { chain.q[top] as f64 * THIN_SPLIT[si].exp2() } else { st.sf(top as i32)? };
-            let coeffs = diag_coeffs(chain, &vals, scale)?;
-            input.push(LtHost { geom: LtGeom::from_fides(fs), top, end: LtEnd::ModDown, nf: scale, width: stage_width(n, &coeffs), coeffs });
-        }
+        let stages = |split: &[f64]| -> Result<Vec<LtHost>> {
+            let mut input = Vec::new();
+            for (si, fs) in lay.stc.iter().enumerate().take(nfixed) {
+                let top = entry_top - si * step;
+                let fac = if si + 1 == ns { (-(dense.deg as f64)).exp2() } else { 1.0 };
+                let vals: Vec<Vec<C64>> = fs.pts.iter().map(|v| v.iter().map(|z| z.scale(fac)).collect()).collect();
+                // a single-prime stage's plaintexts: the prime it drops times the stage's factor (the scale it keeps)
+                let scale = if thin { chain.q[top] as f64 * split[si].exp2() } else { st.sf(top as i32)? };
+                let coeffs = diag_coeffs(chain, &vals, scale)?;
+                input.push(LtHost { geom: LtGeom::from_fides(fs), top, end: LtEnd::ModDown, nf: scale, width: stage_width(n, &coeffs), coeffs });
+            }
+            Ok(input)
+        };
+        let input = stages(&THIN_SPLIT)?;
+        let input_own = match sf.own_split {
+            Some(split) if thin => stages(&split)?,
+            _ => Vec::new(),
+        };
         let mut need = vec![false; ns];
         if sf.mode == StcFirstMode::Folded {
             need[ns - 1] = true;
@@ -496,7 +513,7 @@ impl StcFirstPlan {
             }
         }
         let sources = lay.stc.iter().zip(&need).map(|(fs, &nd)| if nd { SrcHost::new(chain, LtGeom::from_fides(fs), &fs.pts).map(Some) } else { Ok(None) }).collect::<Result<_>>()?;
-        Ok(StcFirstPlan { dense, sf, entry_top, step, input, sources })
+        Ok(StcFirstPlan { dense, sf, entry_top, step, input, input_own, sources })
     }
 
     fn src_geoms(&self) -> Vec<LtGeom> {
@@ -532,7 +549,7 @@ impl StcFirstPlan {
         let primes = self.dense.chain.primes();
         let k_max = self.dense.setup.k_max;
         let mut b = 0;
-        for h in &self.input {
+        for h in self.input.iter().chain(&self.input_own) {
             b += LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes(&lay, &primes, &h.geom, h.top, h.end, k_max)?;
         }
         for s in self.sources.iter().flatten() {
@@ -594,6 +611,7 @@ impl StcFirstPlan {
             });
         }
         let input = self.input.iter().map(lt).collect::<Result<Vec<_>>>()?;
+        let input_own = self.input_own.iter().map(lt).collect::<Result<Vec<_>>>()?;
         let srcs: Vec<Option<RelevelSrc<'a, W>>> = self.sources.iter().map(|o| o.as_ref().map(|h| RelevelSrc::new(arena, s, ctx, h)).transpose()).collect::<Result<_>>()?;
         let geoms = self.src_geoms();
         let last = match self.last_shape() {
@@ -621,6 +639,7 @@ impl StcFirstPlan {
             (mem, work_shape),
         );
         route.high = high;
+        route.input_own = input_own;
         route.step = self.step;
         route.thin = self.dense.chain.lone_top().is_some();
         Ok(route)
@@ -649,6 +668,8 @@ pub struct StcFirstRoute<'a, W: DevWord, M: DevStrategy<W>> {
     pub thin: bool,
     /// Fixed input-side stages.
     pub input: Vec<LtStage<'a, W>>,
+    /// A lean chain's fixed stages for calls at their own CF (`StcFirstSetup::own_split`); empty: `input`.
+    pub input_own: Vec<LtStage<'a, W>>,
     /// Re-levelling sources by StC stage.
     pub srcs: Vec<Option<RelevelSrc<'a, W>>>,
     /// Mode-2 last stage cache.
@@ -696,7 +717,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             [a, b, ..] => a.top - b.top,
             _ => entry_top.saturating_sub(input.first().map_or(entry_top, |s| s.top)).max(1),
         };
-        StcFirstRoute { setup, sf, variants, outs_shipped, encaps, conj, pow2, deg, entry_top, step, thin: false, input, srcs, last, high: None, mem, _m: PhantomData }
+        StcFirstRoute { setup, sf, variants, outs_shipped, encaps, conj, pow2, deg, entry_top, step, thin: false, input, input_own: Vec::new(), srcs, last, high: None, mem, _m: PhantomData }
     }
 
     /// Entry level (primes dropped): the deepest EFFECTIVE input level that runs StC-first (pc-shadow
@@ -866,10 +887,10 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 }
                 info.pre_factor_log2 = e;
             }
-            let factor = self.mode2_factor(ctx, st, cf_stage, nf_in)?;
-            let key = CacheKey([st.variant as i64, cf_stage as i64, nf_key(nf_in)]);
+            let factor = self.mode2_factor(ctx, st, cf_stage, nf_in, own_cf)?;
+            let key = self.cache_key(st, cf_stage, nf_in, own_cf);
             if self.thin() {
-                for s in &self.input {
+                for s in self.fixed_stages(own_cf).0 {
                     run_lt_thin(cx, s, s.pt_nf, cts, src, true)?;
                 }
             } else {
@@ -909,8 +930,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     pub fn warm(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, st: &BtsState, nf_in: f64, own_cf: bool) -> Result<CacheKey> {
         let last = self.last.as_ref().ok_or_else(|| no_stage("stc_first", "warm (mode-2 cache not built)"))?;
         let cf_stage = if own_cf { st.cf } else { st.cf.max(self.sf.cf_ref) };
-        let factor = self.mode2_factor(ctx, st, cf_stage, nf_in)?;
-        let key = CacheKey([st.variant as i64, cf_stage as i64, nf_key(nf_in)]);
+        let factor = self.mode2_factor(ctx, st, cf_stage, nf_in, own_cf)?;
+        let key = self.cache_key(st, cf_stage, nf_in, own_cf);
         last.get(ctx, s, &self.srcs, key, factor)?;
         Ok(key)
     }
@@ -919,7 +940,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     /// sf(chain top) / sf(raise top) (the StC plaintexts' decoding constant is q0 / sf(chain top), as the shipped order's
     /// last StC stage compensates in `DensePlan`): 1 at drops 0 and 1, a 4-8 % output gain error at drops 2-5 without
     /// it. The product no longer depends on the variant, so a PCMM split serves a finish under any drop.
-    fn mode2_factor(&self, ctx: &Context<'_, W, M>, st: &BtsState, cf_stage: u32, nf_in: f64) -> Result<f64> {
+    fn mode2_factor(&self, ctx: &Context<'_, W, M>, st: &BtsState, cf_stage: u32, nf_in: f64, own_cf: bool) -> Result<f64> {
         let d = ctx.chain.level_unit;
         let target_sf = ctx.scale.sf(self.variants[st.variant].raise.top as i32)?;
         let fdrop = ctx.scale.sf((ctx.lay.nq - 1) as i32)? / target_sf;
@@ -928,11 +949,28 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             // its prime dropped by the raise's rescale) end the input at 2^-cf_stage target fdrop; the cache scales
             // by factor x sf(top)
             let top = self.split_top();
-            let fixed: f64 = THIN_SPLIT[..self.input.len()].iter().sum::<f64>().exp2();
+            let fixed = self.fixed_stages(own_cf).1;
             let f = (-(cf_stage as f64)).exp2() * target_sf * fdrop / (nf_in * fixed);
             return Ok(f * ctx.chain.q[top] as f64 / ctx.scale.sf(top as i32)?);
         }
         Ok(stc_first_mode2_factor(cf_stage as i32, target_sf, ctx.scale.sf((d - 1) as i32)?, ctx.scale.sf(self.entry_top as i32)?, nf_in) * fdrop)
+    }
+
+    /// The fixed stages a call runs and the product of their factors: a lean chain's calls at their own CF take
+    /// `input_own` when it is built, every other call `input`.
+    fn fixed_stages(&self, own_cf: bool) -> (&[LtStage<'a, W>], f64) {
+        let (stages, split) = match self.sf.own_split {
+            Some(split) if own_cf && self.thin() && !self.input_own.is_empty() => (&self.input_own, split),
+            _ => (&self.input, THIN_SPLIT),
+        };
+        (stages, split[..stages.len()].iter().sum::<f64>().exp2())
+    }
+
+    /// The last-stage cache key of a call: the variant (marked when the call ran `input_own`, whose factor differs),
+    /// the CF the stage is built at and the input scale.
+    fn cache_key(&self, st: &BtsState, cf_stage: u32, nf_in: f64, own_cf: bool) -> CacheKey {
+        let own = own_cf && self.thin() && !self.input_own.is_empty();
+        CacheKey([st.variant as i64 + if own { 1 << 32 } else { 0 }, cf_stage as i64, nf_key(nf_in)])
     }
 
     /// A state for the same input under another raise variant (the PCMM finish: input state at the route's drop, the

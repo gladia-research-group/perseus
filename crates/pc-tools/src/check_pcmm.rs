@@ -589,6 +589,14 @@ fn bench(args: &[String]) -> Res<bool> {
     setup.k_max = kmax;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
+    // a lean chain's PCMM inputs: their own fixed StC stages (PC_BENCH_OWN_SPLIT "a,b" overrides THIN_SPLIT_PCMM)
+    sf.own_split = Some(match std::env::var("PC_BENCH_OWN_SPLIT") {
+        Ok(v) => {
+            let x: Vec<f64> = v.split(',').map(|t| t.trim().parse()).collect::<std::result::Result<_, _>>()?;
+            [*x.first().ok_or("PC_BENCH_OWN_SPLIT")?, *x.get(1).ok_or("PC_BENCH_OWN_SPLIT")?]
+        }
+        Err(_) => pc_gpu::bts::stc_first::THIN_SPLIT_PCMM,
+    });
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
     let mut geoms: Vec<LtGeom> = Vec::new();
     for v in &plan.dense.variants {
