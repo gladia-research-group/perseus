@@ -1,8 +1,8 @@
 //! `schedule`: which lane each step of a bound block runs on (1 compute + side lanes, events at joins). The
 //! compiler knows the DAG: steps off the block's critical path (under a static cost model: refreshes and key
 //! switches dominate) go to the side lane, everything on it stays on compute. Refreshes, finishes,
-//! streamed-weight sums, dynamic steps and steps using the block's scratch slot always run on compute (their
-//! workspaces are compute's).
+//! streamed-weight sums, units (grids, K-batches), dynamic steps and steps using the block's scratch slot always run on compute
+//! (their workspaces are compute's).
 //!
 //! Correctness does not depend on the heuristic: every slot hazard between the lanes (read after write, write after
 //! read, write after write) becomes one event wait on the latest conflicting step of the other lane (stream order
@@ -107,7 +107,9 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
         .map(|i| {
             let st = &b.steps[i];
             let on_cp = fin[i] + tail[i] >= total_cp - 1e-6;
-            if on_cp || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
+            // a unit issues all its steps at once, on compute (its gather buffer is compute's)
+            let unit = b.unit_of.get(i).is_some_and(|&u| u != NONE);
+            if on_cp || unit || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
                 0
             } else {
                 1

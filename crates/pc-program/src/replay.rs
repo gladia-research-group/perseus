@@ -8,12 +8,12 @@
 //! the same step sequence is captured into one `GraphExec` held by the `Bound`; later runs launch it. What a
 //! captured graph must not see change (slots, plaintext rows, weight frames, ring constants, stage caches) and how
 //! each is held: docs/ARCHITECTURE.md "pc-program replay". Inputs / outputs are written and read outside the graph.
-use crate::bind::{BoundPt, Bound, CoeffSumStep, FinishStep, Step, StepOp, NONE};
+use crate::bind::{BoundPt, Bound, CoeffSumStep, FinishStep, Gather, Held, Step, StepOp, Unit, UnitKind, NONE};
 use crate::schedule::{self, Sched};
 use crate::error::{Error, Result};
 use pc_core::encode::Complex;
 use pc_cuda::{launch_result, Compute, Event, GraphExec, Stream};
-use pc_gpu::bts::{BtsCx, BtsRoute, BtsWork, RouteKind};
+use pc_gpu::bts::{batch, BtsCx, BtsRoute, BtsWork, RouteKind};
 use pc_gpu::encode_dev::CoeffRowsDevice;
 use pc_gpu::ks::{KeyGroup, KsPlans, KskSource};
 use pc_gpu::ops::{Ops, Pt};
@@ -421,7 +421,18 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     }
     let sched = if rt.side.is_some() { sched.filter(|s| s.lane.len() == b.steps.len()) } else { None };
     let mut forked = false;
+    // steps below `unit_end` were issued by the unit that holds them
+    let mut unit_end = lo;
     for i in lo..hi {
+        let in_unit = i < unit_end;
+        let unit = if in_unit {
+            None
+        } else {
+            b.unit_at(i)
+                .filter(|u| unit_fits(u, &b.slots))
+                .map(|u| (b.unit_of[i], u.hi as usize))
+                .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == 0)))
+        };
         let dynamic = b.dynamic.contains(&(i as u32));
         let lane = sched.map_or(0, |s| s.lane[i]);
         if dynamic && forked {
@@ -436,45 +447,70 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 side.ex.compute.wait(&side.fork)?;
                 forked = true;
             }
-            let w = s.wait[i];
-            if w != NONE {
-                let ev = side.ev.get(w as usize).ok_or_else(|| rerr(&b.label, format!("step {w}: {} side events", side.ev.len())))?;
-                if lane == 1 {
-                    side.ex.compute.wait(ev)?;
-                } else {
-                    rt.ex.compute.wait(ev)?;
+            // a unit waits for what every one of its steps waits for
+            let waits = match unit {
+                Some((_, e)) => i..e,
+                None if in_unit => i..i,
+                None => i..i + 1,
+            };
+            for j in waits {
+                let w = s.wait[j];
+                if w != NONE {
+                    let ev = side.ev.get(w as usize).ok_or_else(|| rerr(&b.label, format!("step {w}: {} side events", side.ev.len())))?;
+                    if lane == 1 {
+                        side.ex.compute.wait(ev)?;
+                    } else {
+                        rt.ex.compute.wait(ev)?;
+                    }
                 }
             }
         }
-        if lane == 1 {
-            swap_lane(rt)?;
-        }
-        let pre_metas = if dynamic {
-            let st = &b.steps[i];
-            let m = |s: u32| if s != NONE { b.slots.get(s as usize).map(|c| c.meta) } else { None };
-            Some((m(st.a), m(st.b)))
-        } else {
-            None
-        };
-        {
-            let Bound { label, slots, tmp, steps, groups, relin, step_lists, pts, finishes, coeff_sums, stream_base, names, .. } = &mut *b;
-            let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
-            let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, stream_base: *stream_base };
-            let r = exec_step(label, rt, &steps[i], slots.as_mut_ptr(), slots.len(), tmp, &t);
+        if !in_unit {
             if lane == 1 {
                 swap_lane(rt)?;
             }
-            if let Err(e) = r {
-                // with the check on, the mismatches before the failing step say where the metadata left the compile's
-                if check {
-                    let st = &steps[i];
-                    let m = |s: u32| if s != NONE { slots.get(s as usize).map(|c| (c.meta.level, c.meta.deg)) } else { None };
-                    return Err(rerr(label, format!(
-                        "{e} (step {i} -> {} {}, operands at {:?} / {:?} (compiled {:?} / {:?}), compiled output {:?}; {} metadata mismatches before it, first: {})",
-                        names[st.var as usize], format!("{:?}", st.op).chars().take(160).collect::<String>(), m(st.a), m(st.b), st.a_meta.map(|x| (x.level, x.deg)), st.b_meta.map(|x| (x.level, x.deg)),
-                        (st.meta.level, st.meta.deg), info.meta_mismatches, info.first_mismatches.join("; "))));
+            let pre_metas = if dynamic {
+                let st = &b.steps[i];
+                let m = |s: u32| if s != NONE { b.slots.get(s as usize).map(|c| c.meta) } else { None };
+                Some((m(st.a), m(st.b)))
+            } else {
+                None
+            };
+            {
+                let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, stream_base, names, .. } = &mut *b;
+                let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
+                let r = match unit {
+                    Some((u, _)) => {
+                        let gather = gather.as_mut().ok_or_else(|| rerr(label, "no gather buffer"))?;
+                        exec_unit(label, rt, &units[u as usize], steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists)
+                    }
+                    None => {
+                        let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, stream_base: *stream_base };
+                        exec_step(label, rt, &steps[i], slots.as_mut_ptr(), slots.len(), tmp, &t)
+                    }
+                };
+                if lane == 1 {
+                    swap_lane(rt)?;
                 }
-                return Err(e);
+                if let Err(e) = r {
+                    // with the check on, the mismatches before the failing step say where the metadata left the compile's
+                    if check {
+                        let st = &steps[i];
+                        let m = |s: u32| if s != NONE { slots.get(s as usize).map(|c| (c.meta.level, c.meta.deg)) } else { None };
+                        return Err(rerr(label, format!(
+                            "{e} (step {i} -> {} {}, operands at {:?} / {:?} (compiled {:?} / {:?}), compiled output {:?}; {} metadata mismatches before it, first: {})",
+                            names[st.var as usize], format!("{:?}", st.op).chars().take(160).collect::<String>(), m(st.a), m(st.b), st.a_meta.map(|x| (x.level, x.deg)), st.b_meta.map(|x| (x.level, x.deg)),
+                            (st.meta.level, st.meta.deg), info.meta_mismatches, info.first_mismatches.join("; "))));
+                    }
+                    return Err(e);
+                }
+            }
+            if let Some((ma, mb)) = pre_metas {
+                let out = b.slots[b.steps[i].out as usize].meta;
+                b.dyn_metas.insert(i as u32, (ma, mb, out));
+            }
+            if let Some((_, e)) = unit {
+                unit_end = e;
             }
         }
         if let Some(s) = sched {
@@ -487,10 +523,6 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                     rt.ex.compute.record(ev)?;
                 }
             }
-        }
-        if let Some((ma, mb)) = pre_metas {
-            let out = b.slots[b.steps[i].out as usize].meta;
-            b.dyn_metas.insert(i as u32, (ma, mb, out));
         }
         let st = &b.steps[i];
         if check {
@@ -525,6 +557,113 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     }
     if forked {
         join_side(rt)?;
+    }
+    Ok(())
+}
+
+/// Whether unit `u` can issue as one batch on the operands its slots hold: a K-batched product or refresh runs one
+/// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
+/// rotations only need one level.
+fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>]) -> bool {
+    let meta = |s: &u32| slots.get(*s as usize).map(|c| c.meta);
+    let one = |v: &[u32], scale: bool| {
+        let m0 = v.first().and_then(meta);
+        v.iter().all(|s| meta(s).zip(m0).is_some_and(|(m, f)| m.level == f.level && (!scale || m.deg == f.deg && m.nf.to_bits() == f.nf.to_bits())))
+    };
+    match &u.kind {
+        UnitKind::Grid { .. } | UnitKind::RotateSum { .. } => one(&u.ins, false),
+        UnitKind::Mult { b } => one(&u.ins, true) && one(b, true),
+        UnitKind::Refresh { .. } => one(&u.ins, true),
+    }
+}
+
+/// Issue unit `u` (all its steps' outputs at once).
+#[allow(clippy::too_many_arguments)]
+fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a, W, M>, u: &Unit, steps: &[Step], slots: *mut Ct<'a, W>, n_slots: usize, gather: &mut Gather<'a, W>, held: Option<&mut Held<'a, W>>, groups: &[KeyGroup<'a>], relin: u32, lists: &[Vec<i64>]) -> Result<()> {
+    let span = &steps[u.lo as usize..u.hi as usize];
+    if u.ins.iter().chain(span.iter().map(|st| &st.out)).any(|&s| s as usize >= n_slots) {
+        return Err(rerr(block, format!("unit at step {}: slots outside the {n_slots} bound slots", u.lo)));
+    }
+    // SAFETY: bind formed the unit only over outputs in distinct slots none of which is an input's (a grid from
+    // `Program::rotation_grids`, a batch from alloc's slots checked there): the inputs are shared references, every
+    // output the only mutable one
+    let xs: Vec<&Ct<'a, W>> = u.ins.iter().map(|&s| unsafe { &*slots.add(s as usize) }).collect();
+    let kc = KsCfg { plans: rt.ks, source: rt.source };
+    match &u.kind {
+        UnitKind::Grid { steps: st, g, at, fresh, held: h } => {
+            if span.len() != at.len() {
+                return Err(rerr(block, format!("grid at step {}: {} steps, {} members", u.lo, span.len(), at.len())));
+            }
+            let mut outs: Vec<(usize, usize, &mut Ct<'a, W>)> = at.iter().zip(span).map(|(&(c, s), x)| (c as usize, s as usize, unsafe { &mut *slots.add(x.out as usize) })).collect();
+            let key = group(block, groups, *g)?;
+            if *h {
+                // a held chain's link: its own gather buffer, its ModUp in the workspace swapped in for the link
+                let hd = held.ok_or_else(|| rerr(block, format!("held chain link at step {}: no held buffers", u.lo)))?;
+                std::mem::swap(&mut rt.ex.ks.digits, &mut hd.digits);
+                let gather = if xs.len() > 1 { Some(&mut hd.x) } else { None };
+                let r = rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, *fresh, st, &mut outs);
+                std::mem::swap(&mut rt.ex.ks.digits, &mut hd.digits);
+                r?;
+            } else {
+                let gather = if xs.len() > 1 { Some(&mut gather.a) } else { None };
+                rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, *fresh, st, &mut outs)?;
+            }
+        }
+        UnitKind::RotateSum { l, g } => {
+            let st = lists.get(*l as usize).ok_or_else(|| rerr(block, format!("step list {l} out of range")))?;
+            let mut outs: Vec<&mut Ct<'a, W>> = span.iter().map(|x| unsafe { &mut *slots.add(x.out as usize) }).collect();
+            rotate::rotate_sum_batch(rt.ctx, rt.ex, kc, rt.sh, group(block, groups, *g)?, &xs, &mut gather.a, st, &mut outs)?;
+        }
+        UnitKind::Mult { b } => {
+            // the operands gathered into K-ciphertext buffers, one product of K ciphertexts (one relinearization key
+            // read for all of them), the products scattered with their own metadata
+            if b.iter().any(|&s| s as usize >= n_slots) {
+                return Err(rerr(block, format!("product unit at step {}: slots outside the {n_slots} bound slots", u.lo)));
+            }
+            let ys: Vec<&Ct<'a, W>> = b.iter().map(|&s| unsafe { &*slots.add(s as usize) }).collect();
+            let (k, s) = (xs.len(), &rt.ex.compute);
+            for (c, x) in xs.iter().enumerate() {
+                batch::put(rt.ctx, s, &mut gather.a, c, x)?;
+            }
+            for (c, y) in ys.iter().enumerate() {
+                batch::put(rt.ctx, s, &mut gather.b, c, y)?;
+            }
+            gather.a.buf.k = k;
+            gather.a.meta = xs[0].meta;
+            gather.out.buf.k = k;
+            let key = group(block, groups, relin)?;
+            let Gather { a, b: gb, out } = gather;
+            if ys.is_empty() {
+                rt.ops.square(rt.ctx, rt.ex, kc, rt.sh, key, out, a)?;
+            } else {
+                gb.buf.k = k;
+                gb.meta = ys[0].meta;
+                rt.ops.mult(rt.ctx, rt.ex, kc, rt.sh, key, out, a, gb)?;
+            }
+            for (c, st) in span.iter().enumerate() {
+                let r = if ys.is_empty() { rt.sh.square(&xs[c].meta) } else { rt.sh.mult(&xs[c].meta, &ys[c].meta) };
+                let m = r.map_err(|e| rerr(block, e.to_string()))?.out;
+                // SAFETY: as the unit's other outputs (distinct slots, none an operand's)
+                batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, out, c, m)?;
+            }
+        }
+        UnitKind::Refresh { route, kind } => {
+            // the inputs gathered into one K-ciphertext buffer, refreshed in place as one K-batch, scattered back
+            let r = rt.routes.get(*kind).ok_or_else(|| rerr(block, format!("route {kind:?} not held")))?;
+            for (c, x) in xs.iter().enumerate() {
+                batch::put(rt.ctx, &rt.ex.compute, &mut gather.a, c, x)?;
+            }
+            gather.a.buf.k = xs.len();
+            gather.a.meta = xs[0].meta;
+            let mut cx = BtsCx { ctx: rt.ctx, ex: &mut *rt.ex, sh: rt.sh, ks: rt.ks, ops: &mut *rt.ops, work: &mut *rt.work };
+            r.run(&mut cx, std::slice::from_mut(&mut gather.a), route)?;
+            let out = gather.a.meta;
+            for (c, st) in span.iter().enumerate() {
+                // each member's own landing (its tag), at the batch's level, degree and scale
+                let m = r.landing(rt.sh, &xs[c].meta, route).ok().filter(|m| m.level == out.level && m.deg == out.deg).map_or(out, |m| CtMeta { nf: out.nf, ..m });
+                batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, &gather.a, c, m)?;
+            }
+        }
     }
     Ok(())
 }

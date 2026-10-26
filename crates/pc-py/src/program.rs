@@ -66,8 +66,9 @@ impl PyProgram {
     /// `blocks`: labels to keep (None = all). A block whose compile check fails raises listing the errors, unless
     /// `keep_going`. `live_out` {label: [names]}: final states kept as outputs (K/V states); `input_metas` {label:
     /// {name: (level, deg)}}: the entry state of inputs the driver knows. `schedule`: "program" (the capture's order,
-    /// siblings hoisted) or "lockstep" (independent chains advance together: more K-batched refreshes, more live
-    /// ciphertexts).
+    /// siblings hoisted), "siblings" (the capture's order with the siblings of rotate_sums and dense refreshes pulled
+    /// forward with what they wait for: K-batched key switches and refreshes, a few more live ciphertexts) or
+    /// "lockstep" (independent chains advance together: more K-batched refreshes, many more live ciphertexts).
     #[staticmethod]
     /// `routes_built`: the sparse routes the runtime holds while these blocks run (SM_PERIODIC=2: a planned refresh
     /// of a value whose period outgrew its planned slot count takes the smallest built route its period allows).
@@ -78,7 +79,8 @@ impl PyProgram {
         let schedule = match schedule {
             "program" => pc_program::compile::batch::Schedule::Program,
             "lockstep" => pc_program::compile::batch::Schedule::Lockstep,
-            x => return Err(PyValueError::new_err(format!("Program.compile(schedule={x:?}): program | lockstep"))),
+            "siblings" => pc_program::compile::batch::Schedule::Siblings,
+            x => return Err(PyValueError::new_err(format!("Program.compile(schedule={x:?}): program | siblings | lockstep"))),
         };
         let opts = CompileOpts { keep_going, no_batch, live_out: live_out.unwrap_or_default(), input_metas: input_metas.unwrap_or_default(), schedule, batch_cf_free: cf_free, routes_built: routes_built.unwrap_or_default(), dense_fallback, ..CompileOpts::default() };
         let (gd, pd) = (graph_dir.to_string(), plan_dir.to_string());
