@@ -992,3 +992,53 @@ def test_ensure_routes_drops_before_it_builds(monkeypatch):
         m.ensure_routes(pos)
     assert log == [("add", 1024), ("drop", 1024), ("add", 2048), ("drop", 2048), ("add", 4096)]
     assert m.inf.sparse_routes == [1, 512, 4096]
+
+
+CFG_REF = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cm/configs.json"
+
+
+@pytest.mark.parametrize("kc", [1, 2, 7, 16])
+def test_softmax_centred_matches_ref(monkeypatch, kc):
+    """Reference-key centring: the keys pushed minus key 0 (KV_LANES), the self / prev heads' reference broadcast
+    after q.K^T and the exp on u - U give ref.softmax_ref's probabilities, zero past the keys, and the score slots
+    the broadcast reaches past a head's keys stay inside the exp's domain."""
+    import dataclasses
+    monkeypatch.setenv("SM_CHEB_GS", "1")
+    cfg = config.load_configs(str(CFG_REF)).softmax["transformer.h.0.attn"]
+    cfg = dataclasses.replace(cfg, ref_keys=(config.REF_SELF, config.REF_PREV, config.REF_SINK) + cfg.ref_keys[3:])
+    rt, fhe, inf = _rt(complex_payload=True)
+    ops = rt.ops
+    ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+    d = rt.dims
+    rng = np.random.default_rng(31)
+    kv = attention.ComplexKVCache(d.d_head, centre=True)
+    Ks = []
+    for tok in range(kc):
+        k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
+        for arr in (k, v):
+            arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        Ks.append(k)
+        attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(np.repeat(k, d.t) + 1j * np.repeat(v, d.t), 34))
+    q = rng.standard_normal(d.hid)
+    q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+    qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+    a = attention.sm_fold_affine(rt, cfg)[0]
+    scores = attention.complex_qkt(rt, kv, qct, a, cfg=cfg)
+    K = np.stack(Ks)
+    S = np.array([[K[j, h + d.H * np.arange(d.d_head)] @ q[h + d.H * np.arange(d.d_head)] for j in range(kc)]
+                  for h in range(d.H_real)]) / math.sqrt(d.d_head_real)
+    ref_idx = [config.ref_key(cfg.ref_keys[h], kc) for h in range(d.H_real)]
+    u = S - S[np.arange(d.H_real), ref_idx][:, None]
+    got = np.array([[scores.vec[h * d.t + j].real for j in range(kc)] for h in range(d.H_real)])
+    np.testing.assert_allclose(got, a * u, rtol=1e-9, atol=1e-9)
+    # every slot the exp reads, keys or not, maps inside its domain [-1, 1] (u inside the config's clip range)
+    assert cfg.clip_lo < u.min() and u.max() < cfg.clip_hi
+    y = scores.vec[:d.tH].real + attention._softmax_mask_items(d, cfg, kc, 1, attention.sm_fold_affine(rt, cfg))[0][1]()[:d.tH]
+    assert np.abs(y).max() <= 1 + 1e-9
+    probs = attention.softmax_thor(rt, scores, cfg, kc, folded=True)
+    got = np.array([[probs.vec[h * d.t + j].real for j in range(kc)] for h in range(d.H_real)])
+    want = np.array([ref.softmax_ref(S[h], cfg, kc, head=h) for h in range(d.H_real)])
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(got, ref.softmax_exact(S), rtol=1e-3, atol=1e-6)
+    off = (np.arange(d.tH) // d.t < d.H_real) & (np.arange(d.tH) % d.t >= kc)     # a real head's empty key slots
+    assert np.abs(probs.vec[:d.tH][off]).max() < 1e-12
