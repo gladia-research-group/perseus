@@ -1181,7 +1181,7 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
     let (pmd, pmsd) = (st.ctx.up(&pmod), st.ctx.up(&pmods));
     let (autod, dod) = (st.ctx.up32(&[1, 125]), st.ctx.up_i32(&g.digit_of));
     for (key, rowsd, nrows, name) in [(key_full, &rows_full, 6, "dense full".to_string()), (key_band, &rows_band, 5, band_name.clone())] {
-        for mode in [0, 1, 2, 2 | KS_ACC] {
+        for (kc, mode) in [k, 1].into_iter().flat_map(|kc| [0, 1, 2, 2 | KS_ACC].map(|m| (kc, m))) {
             // KS_ACC: every kernel's outputs start from the same random words
             let pre = if mode & KS_ACC != 0 { Some(st.rand_slots(k * r)) } else { None };
             let (o0, o1) = match &pre { Some(v) => (st.ctx.up(v), st.ctx.up(v)), None => (st.ctx.zeros(k * r * 8 * N), st.ctx.zeros(k * r * 8 * N)) };
@@ -1205,7 +1205,7 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
                 out_ct_stride: (r * 8 * N) as u64,
                 out_rot_stride: (8 * N) as u64,
                 key_digit_stride: kds as u64,
-                k: k as i32,
+                k: kc as i32,
                 r: r as i32,
                 ndig: g.ndig as i32,
                 c0_mode: mode,
@@ -1224,7 +1224,7 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
             ck(unsafe { (st.t.ks_dot_key)(&ka, st.s()) });
             let mut got = q0.read(&st.ctx);
             got.extend(q1.read(&st.ctx));
-            out.push(cmp(&format!("ks_dot_key ({name}, K=3, R=2, c0 mode {mode}) == ks_dot(expanded a)"), &got, &want));
+            out.push(cmp(&format!("ks_dot_key ({name}, K={kc}, R=2, c0 mode {mode}) == ks_dot(expanded a)"), &got, &want));
             if key.bits == 0 && key.q_top == 3 {
                 // hybrid: digit 0 regenerated, digit 1 read from the resident `a`
                 let (h0, h1) = match &pre { Some(v) => (st.ctx.up(v), st.ctx.up(v)), None => (st.ctx.zeros(k * r * 8 * N), st.ctx.zeros(k * r * 8 * N)) };
@@ -1237,7 +1237,7 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
                 ck(unsafe { (st.t.ks_dot_key)(&kh, st.s()) });
                 let mut gh = h0.read(&st.ctx);
                 gh.extend(h1.read(&st.ctx));
-                out.push(cmp(&format!("ks_dot_key (hybrid: 1 of 2 digits regenerated, c0 mode {mode}) == ks_dot"), &gh, &want));
+                out.push(cmp(&format!("ks_dot_key (hybrid: 1 of 2 digits regenerated, K={kc}, c0 mode {mode}) == ks_dot"), &gh, &want));
             }
         }
     }
