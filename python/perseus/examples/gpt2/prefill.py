@@ -69,6 +69,11 @@ _NORM_SHARE = os.environ.get("PF_NORM_SHARE", "1") not in ("", "0")
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 
 
+# PF_LAST_QUERY=1 (with the tail): the last block computes the last position alone past its K / V (the tail reads
+# nothing else)
+_LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
+
+
 # PF_PCMM_CALIB=<json>: record every block linear's max |output| (the PCMM band shifts)
 _CALIB_PATH = os.environ.get("PF_PCMM_CALIB", "")
 _calib: dict[str, float] = {}
@@ -166,8 +171,10 @@ def _gelu_blocks(rt, H, ge):
     return out
 
 
-def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B):
-    """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order)."""
+def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B, last=None):
+    """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order). `last`: the
+    only position the block's output must hold (every position's K / V is still computed): its attention alone
+    (blocked.attention_last), then it fills every lane of the residual stream."""
     ops, K = rt.ops, B.K
     ln1, ln2, sm, ge = cfgs
     skip = Xs
@@ -181,7 +188,10 @@ def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B):
             o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
+        O = (BL.attention_blocked(rt, Q, Kc, V, sm, ch, B) if last is None
+             else BL.attention_last(rt, Q, Kc, V, sm, ch, B, last))
+        if last is not None:
+            skip = [BL.token_bcast(rt, row, ch, B, last) for row in skip]
     with rt.step("out_proj"):
         A = [_bias_blocks(rt, pcmm_run(rt, o, w["out"]), w["out"], ch, g, B) for g, o in enumerate(O)]
     Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
@@ -297,7 +307,9 @@ class Gpt2Prefill(Gpt2Model):
                     if _layout_blocked():
                         B = self.blocks
                         Xg = [Xs[g * B.K:(g + 1) * B.K] for g in range(len(Xs) // B.K)]
-                        Xg = prefill_block_blocked(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B)
+                        tail = getattr(self, "with_tail", False)
+                        last = ch.T - 1 if _LAST_QUERY and tail and b == self.n_layers - 1 else None
+                        Xg = prefill_block_blocked(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B, last)
                         Xs = [x for row in Xg for x in row]
                     elif diag:
                         Xs = prefill_block_diag(self.rt, Xs, self.diag_weights(b), self.cfgs.block(b), ch)

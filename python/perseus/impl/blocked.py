@@ -371,6 +371,96 @@ def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefix
     return res
 
 
+# ── the last position alone: a block whose other positions feed nothing (Prefill-128's last block, before the tail) ──
+
+def _last_lane(ch: Chunks, B: Blocks, p: int):
+    """(half, lane) of position p, which must be the last lane of chunk pair 0."""
+    c = p // ch.t
+    if ch.n_ct != 1 or c // 2 or p - c * ch.t != B.t - 1:
+        raise ValueError(f"last-position block: position {p} must sit on the last lane of the first chunk pair")
+    return c % 2, B.t - 1
+
+
+def token_bcast(rt, row, ch: Chunks, B: Blocks, p: int):
+    """Position p of the blocked row (chunk pair 0) on every lane of both halves: one level."""
+    ops, N = rt.ops, B.d.N
+    half, lane = _last_lane(ch, B, p)
+    out = []
+    for k, x in enumerate(row):
+        sel = np.where(np.arange(N) % B.t == lane, -0.5j if half else 0.5, 0.0)
+        w = im_cleanse(ops, rt.mult_mask(x, ("bl.tok", B.nch, half, lane), lambda sel=sel: sel))
+        w = rotsum(ops, w, 1, B.t)                  # w[i] = sum_k w[i + k]: the last lane reaches its group's lanes
+        out.append(ops.add(w, ops.mult_i(w)))
+    return out
+
+
+def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
+    """attention_blocked for query position p = T - 1 alone (every key valid): O[0][k] holds p's output on every lane
+    of both halves. Per head group k, q_p on every lane times the complex K (keys of chunk 0 real, chunk 1 imaginary)
+    is summed over the head dimension; the groups' scores share one score ciphertext, keys of half h of group k on
+    the blocks of class h K + k (period 2 K tH), so one softmax serves every head; its key sums run over the lanes
+    (the halves first) and return to every lane from the first. P.V pairs the halves as P_0 - i P_1 against V."""
+    from . import smcheb
+    from .attention import _recip_rounds
+    from .prefill import _KcExtrapolated, recip_lanes
+    ops, N, t = rt.ops, B.d.N, B.t
+    half, lane = _last_lane(ch, B, p)
+    if ch.T != 2 * t or len(Q) != 1:
+        raise ValueError("attention_last: T must fill both halves of one chunk pair")
+    ks = [k for k in range(B.K) if B.group_dims(k).H_real]
+    gd = B.group_dims(0)
+    tH, R = gd.tH, 2 * B.K
+    cls = (np.arange(N) // tH) % R
+    head = (np.arange(N) % tH) // t
+    valid = head < np.array([B.group_dims(r % B.K).H_real for r in range(R)])[cls]
+    gscale = 1.0 / math.sqrt(gd.d_head_real)
+    T = None
+    for k in ks:
+        sel = np.where(np.arange(N) % t == lane, -1j if half else 1.0, 0.0)
+        q = im_cleanse(ops, rt.mult_mask(Q[0][k], ("bl.last.q", B.nch, half, lane), lambda sel=sel: sel))
+        q = rotsum(ops, q, 1, t)                                    # q_p on every lane: real, scale 1
+        s = rotsum(ops, ops.mult(q, K[0][k]), tH, N)                 # (s_0 + i s_1) / 2 on every block
+        m = np.where(cls == k, gscale, 0.0) + np.where(cls == B.K + k, -1j * gscale, 0.0)
+        s = rt.mult_mask(s, ("bl.last.s", B.nch, k, gscale), lambda m=m: m)
+        T = s if T is None else ops.add(T, s)
+    S = im_cleanse(ops, T)                                         # scores of half h of group k on class h K + k
+    kc = p + 1
+    mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+    sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
+    S = rt.add_mask(S, ("bl.last.score", B.nch, cfg.clip_lo, mean), lambda: np.where(valid, -mean, cfg.clip_lo - mean))
+    z = eval_chebyshev(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+    for _ in range(cfg.log2delta1):
+        z = ops.square(z)
+    Z = rt.mult_mask(im_cleanse(ops, z), ("bl.last.active", B.nch, kc), lambda: np.where(valid, 0.5 / kc, 0.0))
+    cheb = getattr(ops, "sm_cheb_gs", False)
+    rounds = smcheb.rounds(cfg, kc) if cheb else _recip_rounds(_KcExtrapolated(cfg), kc, ops.sm_gs_first)
+    first = np.arange(t) == 0
+    Y = Z
+    for i, r in enumerate(rounds):
+        if i:
+            Z = ops.square(im_cleanse(ops, Y))
+        D = ops.add(Z, ops.rotate(Z, B.K * tH))                     # both halves' keys
+        D = rotsum(ops, D, 1, t)                                   # the key sum on each group's first lane
+        a, b, iters = r[0] * r[3], r[1] * r[3] * r[3], r[2]
+        cv = None if not cheb else ([[r[4][0][j]] * t for j in range(iters - 1)], [r[4][1]] * t)
+        # seeds on the first lane only: the reciprocal is zero elsewhere, and the ladder spreads it to every lane
+        rc = recip_lanes(sub_rt(rt, B, 0), D, np.where(first, a, 0.0), np.where(first, b, 0.0), iters,
+                         ("last", round(a, 12), round(b, 15)), cv)
+        Y = ops.mult(Z, rotsum(ops, rc, -1, t))
+    outs = []
+    for k in range(B.K):
+        if k not in ks:
+            outs.append(ops.sub(Q[0][k], Q[0][k]))
+            continue
+        m = np.where(cls == k, 1.0, 0.0) + np.where(cls == B.K + k, -1j, 0.0)
+        pc = rotsum(ops, rt.mult_mask(Y, ("bl.last.pv", B.nch, k), lambda m=m: m), tH, R * tH)   # P_0 - i P_1
+        o = im_cleanse(ops, rotsum(ops, ops.mult(pc, V[0][k]), -1, t))      # sum over the lanes, on the last lane
+        o = rt.mult_mask(o, ("bl.last.o", B.nch, lane), lambda: (np.arange(N) % t == lane).astype(float))
+        o = rotsum(ops, o, 1, t)
+        outs.append(ops.add(o, ops.mult_i(o)))
+    return [outs]
+
+
 def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
     """Signed rotation steps (keys match exactly): lane moves, region spread (-r), radix ladder groups."""
     gd = B.group_dims(0)
