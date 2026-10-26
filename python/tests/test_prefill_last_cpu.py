@@ -72,3 +72,25 @@ def test_token_bcast():
     got = BL.decrypt_blocked(rt, [BL.token_bcast(rt, row, ch, B, T - 1) for row in X], ch, B, d.dim)
     want = BL.decrypt_blocked(rt, X, ch, B, d.dim)[T - 1]
     assert np.abs(got - want[None, :]).max() == 0.0
+
+
+def test_qkv_pack_columns():
+    """PF_QKV_PACK: V's last channel block, carried on K's padding heads, comes back by a rotation of half a group."""
+    pf = pytest.importorskip("perseus.examples.gpt2.prefill")
+    d = layout.Dims.gpt2()
+    B = BL.Blocks(d, 512)
+    ch = prefill.Chunks(T, B.t)
+    rng = np.random.default_rng(2)
+    real = np.arange(d.hid) % d.H < d.H_real            # interleaved features j H + h: padding heads are zero
+    Wk, Wv = rng.standard_normal((2, d.hid, d.hid)) * real
+    bk, bv = rng.standard_normal((2, d.hid)) * real
+    rows = _rows(rng, d, 1.0)
+    kc, vc, kv, vv = pf._pack_kv(B, B.group_cols(Wk), B.group_cols(Wv), B.group_vec(bk), B.group_vec(bv))
+    K = BL.blocked_slots(rows @ B.group_cols(Wk) + B.group_vec(bk), ch, B)[0]
+    V = BL.blocked_slots(rows @ B.group_cols(Wv) + B.group_vec(bv), ch, B)[0]
+    Kp = BL.blocked_slots(rows @ kc + kv, ch, B)[0]
+    V0 = BL.blocked_slots(np.hstack([rows @ vc + vv, np.zeros((T, B.nch))]), ch, B)[0][0]
+    V1 = np.roll(Kp[1], -(B.hg // 2) * B.t)
+    heads = (np.arange(d.N) % (B.hg * B.t)) // B.t < B.group_dims(1).H_real
+    assert np.abs(Kp[0] - K[0]).max() < 1e-9 and np.abs((Kp[1] - K[1])[heads]).max() < 1e-9
+    assert np.abs(V0 - V[0]).max() < 1e-9 and np.abs((V1 - V[1])[heads]).max() < 1e-9
