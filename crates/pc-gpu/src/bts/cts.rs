@@ -22,9 +22,10 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
-/// Digits of a baby key whose `a` `cts_fused_regen` regenerates by default when the rest can be read (one full
-/// 4-digit round of the warp's cooperative ChaCha; measured best of 2 / 4 / 6 at K = 1).
-pub const LT_REGEN_DIGITS: usize = 4;
+/// Digits of a baby key whose `a` `cts_fused_regen` regenerates by default when the rest can be read (packed keys:
+/// `KeyTails` from this digit on). Measured on GB202 and H100, every route at K = 1: 2 beats 3 and 4 on both; on
+/// GB202 2 also beats 1 and 0 (reading `a` then costs more than regenerating it), on H100 each digit read gains.
+pub const LT_REGEN_DIGITS: usize = 2;
 /// Giant steps per `cts_fused` launch (kernel bound GMAX).
 pub const LT_GMAX_LAUNCH: usize = 2;
 /// Giant steps per K=1 launch of the queued u32 regen kernel (two pairs).
@@ -362,7 +363,7 @@ impl<'a, W: DevWord> LtPts<'a, W> {
 }
 
 /// Resident `a` of the last digits of LT baby keys stored without one (packed, seeded): `cts_fused_regen` regenerates
-/// digits `0..first` and reads `first..` (`LT_REGEN_DIGITS`: the measured best mix at K = 1). Expanded at setup from
+/// digits `0..first` and reads `first..` (`LT_REGEN_DIGITS`: the measured best mix). Expanded at setup from
 /// each key's seed, one buffer per rotation step (`[digit - first][prime id][N]`, full keys only).
 pub struct KeyTails<'a, W: DevWord> {
     first: usize,
@@ -695,8 +696,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
     /// Whether a launch of `k` cts at `ndig` digits regenerates `a` (`cts_fused_regen`). Keys without a resident dense
     /// `a` always do. Otherwise Regen is a policy: the gather-form regeneration is ChaCha-bound (measured: all six
     /// digits regenerated is +0.4 ms on a K=1 CtS stage, +6 ms at K=8 where the cached kernel's groups share key reads
-    /// through L2), so it runs only for K = 1 at >= 5 digits with `regen_digits` (default 4: one full round of the warp)
-    /// regenerated and the rest read.
+    /// through L2), so it runs only for K = 1 at >= 5 digits with `regen_digits` (default `LT_REGEN_DIGITS`) regenerated
+    /// and the rest read.
     fn regen_now(&self, k: usize, ndig: usize) -> bool {
         match self.baby {
             _ if self.tabs.is_some() && !self.cached_ok => true,
