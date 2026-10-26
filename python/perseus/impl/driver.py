@@ -1383,8 +1383,9 @@ class StreamedPlannedRun:
         self._resident = need
         return len(items)
 
-    def token(self, t, rows):
-        """Issue token t's forward; returns (the tail's output registers, host times). Asynchronous."""
+    def token(self, t, rows, argmax=None):
+        """Issue token t's forward; returns (the tail's output registers, host times). Asynchronous. `argmax`: as
+        constructed (every record stages CutMax from setup)."""
         tt = time.time()
         if t not in self.records:
             self.records[t] = self.rec.token(t, rows[t], self.argmax_stage)
