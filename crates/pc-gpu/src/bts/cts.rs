@@ -17,7 +17,7 @@ use pc_core::bts_setup::C64;
 use pc_core::encode::{Complex, Encoder, Payload};
 use pc_core::modmul::{invmod, mulmod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
-use pc_kernels::{CtsArgs, CtsRegenArgs, EwArgs, KskExpandArgs};
+use pc_kernels::{CtsArgs, CtsRegenArgs, EwArgs, KskExpandArgs, KS_ACC};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -821,10 +821,9 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         for j in (0..g.saturating_sub(1)).rev() {
             let rv = res_view(j, &cx.work.lt_res);
             if self.giant.is_some() {
-                // acc = res_{j+1}: rotate it by b * stride (c1 down to Q, up again, dot with c0 extended)
-                self.rotate_ext(cx, j + 1, k, source, self.giant.as_ref())?;
-                let ex = &*cx.ex;
-                ks::ew(ctx, &ex.compute, ks::Ew::Add, rv, rv, Some(View::of(&cx.work.lt_rot, 0)), lay.rs_qp(top), k, 2)?;
+                // res_j += res_{j+1} rotated by b * stride (c1 down to Q, up again, dot with c0 extended, added onto
+                // res_j)
+                self.rotate_ext(cx, j + 1, k, source, self.giant.as_ref(), Some(rv))?;
             } else {
                 // b * stride = N/2: the giant rotation is the identity, the sums stay extended
                 let ex = &*cx.ex;
@@ -838,7 +837,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         // lt_rot: always; the results in lt_res: one ciphertext)
         let into_x = |src: *const c_void, x: &mut CtBuf<'_, Compute, W>| ntt::Epi::SubMul { out: x.buf.vptr_mut(), x: src, s: self.binv.v.vptr(), ss: self.binv.s.vptr() };
         if self.geom.offset != 0 {
-            self.rotate_ext(cx, 0, k, source, self.offset_key.as_ref())?;
+            self.rotate_ext(cx, 0, k, source, self.offset_key.as_ref(), None)?;
             let ex = &*cx.ex;
             let epi = into_x(cx.work.lt_rot.buf.vptr(), x);
             self.md_end.run_epi(ctx, &ex.compute, &mut cx.work.lt_rot.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
@@ -879,8 +878,9 @@ impl<'a, W: DevWord> LtStage<'a, W> {
     }
 
     /// `lt_rot` = rotation (key 0 of `key`) of result j in the extended basis: ModDown(c1 of res_j), ModUp(c1), dot
-    /// with c0 as stored (extended).
-    fn rotate_ext<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, j: usize, k: usize, source: KskSource, key: Option<&KeyGroup<'_>>) -> Result<()> {
+    /// with c0 as stored (extended); `acc`: added onto those ciphertexts instead.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_ext<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, j: usize, k: usize, source: KskSource, key: Option<&KeyGroup<'_>>, acc: Option<View>) -> Result<()> {
         let key = key.ok_or_else(|| shape("LtStage", "rotation key missing"))?;
         let ctx = cx.ctx;
         let lay = ctx.lay;
@@ -915,16 +915,11 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             let ndig = cx.ks.ndig(top)?;
             ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, key, 0, ndig, true)?;
         }
-        let io = DotIo {
-            c1: c1.base,
-            c0: rv.base,
-            ct_stride: rv.ct_stride,
-            out: cx.work.lt_rot.buf.vptr_mut(),
-            part_stride: pw,
-            out_ct_stride: cw as u64,
-            out_rot_stride: 0,
-            c0_mode: 2,
+        let (out, out_ct_stride, c0_mode) = match acc {
+            Some(v) => (v.base, v.ct_stride, 2 | KS_ACC),
+            None => (cx.work.lt_rot.buf.vptr_mut(), cw as u64, 2),
         };
+        let io = DotIo { c1: c1.base, c0: rv.base, ct_stride: rv.ct_stride, out, part_stride: pw, out_ct_stride, out_rot_stride: 0, c0_mode };
         ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, key, 0, 1, k, top, DotRows::All, io, staged)
     }
 }

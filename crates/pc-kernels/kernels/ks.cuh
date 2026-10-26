@@ -93,14 +93,18 @@ __global__ void __launch_bounds__(BX) ks_dot(KsArgs A) {
         for (int c = 0; c < KMAX; ++c) {
             if (c < A.K) {
                 W r0 = MM::reduce(s0[c], q);
-                const W r1 = MM::reduce(s1[c], q);
-                if (A.c0_mode == 1) {
+                W r1 = MM::reduce(s1[c], q);
+                if ((A.c0_mode & 3) == 1) {
                     if ((int)t < A.nq)
                         r0 = add<W>(r0, mul_shoup<W>(c0[c * A.ct_stride + roff], ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
-                } else if (A.c0_mode == 2) {
+                } else if ((A.c0_mode & 3) == 2) {
                     r0 = add<W>(r0, c0[c * A.ct_stride + roff], p);
                 }
                 const size_t ob = c * A.out_ct_stride + r * A.out_rot_stride + (size_t)t * N + o;
+                if (A.c0_mode & KS_ACC) {
+                    r0 = add<W>(r0, ((const W*)A.out0)[ob], p);
+                    r1 = add<W>(r1, ((const W*)A.out1)[ob], p);
+                }
                 ((W*)A.out0)[ob] = r0;
                 ((W*)A.out1)[ob] = r1;
             }
@@ -246,19 +250,23 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
         for (int c = 0; c < KMAX; ++c) {
             if (c < A.K) {
                 V4<W> c04{};
-                if (A.c0_mode != 0) c04 = load4<W>((const W*)A.c0 + c * A.ct_stride + roff);
+                if (A.c0_mode & 3) c04 = load4<W>((const W*)A.c0 + c * A.ct_stride + roff);
 #pragma unroll
                 for (int w = 0; w < 4; ++w) {
                     W r0 = MM::reduce(s0[c][w], q);
-                    const W r1 = MM::reduce(s1[c][w], q);
-                    if (A.c0_mode == 1) {
+                    W r1 = MM::reduce(s1[c][w], q);
+                    if ((A.c0_mode & 3) == 1) {
                         if ((int)t < A.nq) r0 = add<W>(r0, mul_shoup<W>(c04.v[w], ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
-                    } else if (A.c0_mode == 2) {
+                    } else if ((A.c0_mode & 3) == 2) {
                         r0 = add<W>(r0, c04.v[w], p);
                     }
                     const uint32_t i = (uint32_t)base + w;
                     const uint32_t o = k == 1 ? i : automorph_slot(k, i);
                     const size_t ob = c * A.out_ct_stride + r * A.out_rot_stride + (size_t)t * N + o;
+                    if (A.c0_mode & KS_ACC) {
+                        r0 = add<W>(r0, ((const W*)A.out0)[ob], p);
+                        r1 = add<W>(r1, ((const W*)A.out1)[ob], p);
+                    }
                     ((W*)A.out0)[ob] = r0;
                     ((W*)A.out1)[ob] = r1;
                 }

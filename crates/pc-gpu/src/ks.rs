@@ -842,7 +842,7 @@ pub struct DotIo {
     pub part_stride: u64,
     pub out_ct_stride: u64,
     pub out_rot_stride: u64,
-    /// 0 none, 1 P*c0 on Q rows, 2 c0 as stored (extended).
+    /// 0 none, 1 P*c0 on Q rows, 2 c0 as stored (extended); `| KS_ACC`: added onto out's words.
     pub c0_mode: i32,
 }
 

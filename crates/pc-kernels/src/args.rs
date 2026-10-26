@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 15;
+pub const ABI: u32 = 16;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -152,6 +152,9 @@ pub struct PtDotArgs {
     pub enc: u32,
     pub pad: i32,
 }
+
+/// `KsArgs::c0_mode` flag (ABI 16): the inner product is added onto the outputs' words.
+pub const KS_ACC: i32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

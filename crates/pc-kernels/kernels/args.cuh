@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 15u
+#define PC_KERNELS_ABI 16u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -168,7 +168,9 @@ static_assert(sizeof(PtDotArgs) == 128, "PtDotArgs layout");
 // Batched hybrid key-switch inner product, K ciphertexts x R keys per launch (each key element read once):
 //   s1 = sum_d D_d[t][i] a_{r,d}[t][i],  s0 = C0[t][i] + sum_d D_d[t][i] b_{r,d}[t][i]
 // D_d[t] = c1 itself when t is in digit d, else the NTT'd ModUp output; C0: c0_mode 0 none, 1 P*c0 on Q rows,
-// 2 c0 extended. Outputs written at automorph_slot(autok[r], i) (k = 1: identity). Grid row y -> prime id rows[y].
+// 2 c0 extended; c0_mode | KS_ACC (ABI 16): (s0, s1) added onto the outputs' words. Outputs written at
+// automorph_slot(autok[r], i) (k = 1: identity). Grid row y -> prime id rows[y].
+constexpr int32_t KS_ACC = 4;
 struct KsArgs {
     const void* c1;
     const void* modup;
