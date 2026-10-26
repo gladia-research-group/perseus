@@ -91,7 +91,9 @@ pub struct SrcHost {
 
 impl SrcHost {
     pub fn new(chain: &Chain, geom: LtGeom, values: &[Vec<C64>]) -> Result<SrcHost> {
-        Ok(SrcHost { geom, coeffs: diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())? })
+        let mut coeffs = diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())?;
+        super::cts::emu_thin(&mut coeffs, "STCF", 2, (SRC_LOG2 as f64).exp2(), super::cts::emu_loss("STCF_LAST"));
+        Ok(SrcHost { geom, coeffs })
     }
     pub fn bytes<W: DevWord>(&self, n: usize) -> usize {
         Arena::bytes_for::<W>(self.coeffs.len() * SRC_LIMBS * n)
@@ -429,7 +431,8 @@ impl StcFirstPlan {
             let fac = if si + 1 == ns { (-(dense.deg as f64)).exp2() } else { 1.0 };
             let vals: Vec<Vec<C64>> = fs.pts.iter().map(|v| v.iter().map(|z| z.scale(fac)).collect()).collect();
             let scale = st.sf(top as i32)?;
-            let coeffs = diag_coeffs(chain, &vals, scale)?;
+            let mut coeffs = diag_coeffs(chain, &vals, scale)?;
+            super::cts::emu_thin(&mut coeffs, "STCF", si, scale, 0.0);
             input.push(LtHost { geom: LtGeom::from_fides(fs), top, end: LtEnd::ModDown, nf: scale, width: stage_width(n, &coeffs), coeffs });
         }
         let mut need = vec![false; ns];

@@ -90,6 +90,34 @@ pub fn diag_coeffs(chain: &pc_core::params::Chain, values: &[Vec<C64>], scale: f
         .collect()
 }
 
+/// Thin-plaintext emulation (gate instrumentation): with `PC_EMU_<what>_BITS=b[,b1,...]` set, the stage's integer
+/// coefficients are moved to the grid of an encoding at 2^(b_k - loss) per unit of its natural values (`unit` =
+/// coefficients per unit value; `k` = the stage's index in execution order, the last entry repeats), so the stage
+/// carries the rounding error of a plaintext encoded at that scale on one thin prime. No-op when unset.
+pub fn emu_thin(coeffs: &mut [Vec<i128>], what: &str, k: usize, unit: f64, loss: f64) {
+    let Ok(v) = std::env::var(format!("PC_EMU_{what}_BITS")) else {
+        return;
+    };
+    let bits: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+    let Some(&b) = bits.get(k).or(bits.last()) else {
+        return;
+    };
+    let g = unit * (loss - b).exp2();
+    let mut nz = 0usize;
+    for c in coeffs.iter_mut() {
+        for x in c.iter_mut() {
+            *x = (((*x as f64) / g).round() * g).round() as i128;
+        }
+        nz = nz.max(c.iter().filter(|&&x| x != 0).count());
+    }
+    eprintln!("[emu] {what} stage {k}: {} plaintexts on a 2^{:.2} grid (unit {unit:.4e}, loss {loss}, nonzero coefficients <= {nz})", coeffs.len(), b - loss);
+}
+
+/// The env loss (bits) of `PC_EMU_<what>_LOSS`, 0 when unset.
+pub fn emu_loss(what: &str) -> f64 {
+    std::env::var(format!("PC_EMU_{what}_LOSS")).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
+}
+
 /// The stored width of a stage's plaintexts (every diagonal shares the stage's compaction).
 pub fn stage_width(n: usize, coeffs: &[Vec<i128>]) -> usize {
     n >> coeffs.iter().map(|c| compact_shift(c)).min().unwrap_or(0)

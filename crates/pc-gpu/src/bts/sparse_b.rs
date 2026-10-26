@@ -280,7 +280,9 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let (p, q) = sparse_b_diagonals(n as u32, cfg.slots, &g, gc, gd);
         let geo = Self::lt_geom(&g);
         let sf_c = st.sf(top as i32)?;
-        let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Slots { values: &p, scale: sf_c })?;
+        let mut cts_coeffs = super::cts::diag_coeffs(&ctx.chain, &p, sf_c)?;
+        super::cts::emu_thin(&mut cts_coeffs, "SBCTS", 0, sf_c * shift_t, 0.0);
+        let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Coeffs(&cts_coeffs))?;
         let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS) } else { Vec::new() };
         let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring_of(keys, n, &steps)?, stage, cfg.k_max)?;
         mark("cts", &mut parts);
@@ -290,7 +292,9 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         em.fuse_rescale = cfg.em_fuse_rescale;
         mark("em", &mut parts);
         let sf_s = st.sf(stc_top as i32)?;
-        let stc_pts = LtPts::new(arena, s, ctx, stc_top, PtSource::Slots { values: &q, scale: sf_s })?;
+        let mut stc_coeffs = super::cts::diag_coeffs(&ctx.chain, &q, sf_s)?;
+        super::cts::emu_thin(&mut stc_coeffs, "SBSTC", 0, sf_s, 0.0);
+        let stc_pts = LtPts::new(arena, s, ctx, stc_top, PtSource::Coeffs(&stc_coeffs))?;
         let stc = LtStage::new(arena, s, ctx, geo, stc_top, LtEnd::ModDown, sf_s, stc_pts, keys, stage, cfg.k_max)?;
         mark("stc", &mut parts);
         let stc_acc = AccRounds::new(arena, s, n, keys, stage, r_stc)?;

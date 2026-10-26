@@ -21,6 +21,7 @@ use pc_gpu::bts::sparse_b::{SparseBCfg, SparseBPrecomp};
 use pc_gpu::bts::spru::{Spru, SpruCfg, SpruKey};
 use pc_gpu::bts::stc_first::{StcFirstPlan, StcFirstSetup};
 use pc_gpu::bts::{BtsCx, BtsKeyRing, BtsRoute, BtsSetup, BtsWork, BtsWorkShape};
+use pc_gpu::decrypt::{Decryptor, Which};
 use pc_gpu::encrypt::Encryptor;
 use pc_gpu::graph::{BtsGraphs, CaptureLock, Served};
 use pc_gpu::keygen::{test_prng, KeyGen};
@@ -57,10 +58,13 @@ struct Opts {
     /// key storage (`--keys dense|packed`): sessions run packed keys (no resident `a`: every key switch and every
     /// CtS baby regenerates it); default dense
     packed: bool,
+    /// `--grid cfs:amps`: decrypted bits of one refresh per route x CF x amplitude (no timing), over `--seeds` inputs
+    grid: Option<(Vec<u32>, Vec<f64>)>,
+    seeds: usize,
 }
 
 fn parse(a: &[String]) -> Res<Opts> {
-    let mut o = Opts { ks: vec![1, 2, 4, 8], reps: 10, routes: ["dense", "stcf", "512", "256", "1"].iter().map(|s| s.to_string()).collect(), memdiag: false, packed: false };
+    let mut o = Opts { ks: vec![1, 2, 4, 8], reps: 10, routes: ["dense", "stcf", "512", "256", "1"].iter().map(|s| s.to_string()).collect(), memdiag: false, packed: false, grid: None, seeds: 1 };
     let mut i = 0;
     while i < a.len() {
         let v = a.get(i + 1).cloned().unwrap_or_default();
@@ -77,6 +81,13 @@ fn parse(a: &[String]) -> Res<Opts> {
             "--k" => o.ks = v.split(',').map(|x| x.parse()).collect::<std::result::Result<_, _>>()?,
             "--reps" => o.reps = v.parse()?,
             "--routes" => o.routes = v.split(',').map(|s| s.to_string()).collect(),
+            "--seeds" => o.seeds = v.parse()?,
+            "--grid" => {
+                let (c, a) = v.split_once(':').ok_or("--grid cfs:amps")?;
+                let cfs = c.split(',').map(|x| x.parse()).collect::<std::result::Result<_, _>>()?;
+                let amps = a.split(',').map(|x| x.parse()).collect::<std::result::Result<_, _>>()?;
+                o.grid = Some((cfs, amps));
+            }
             "--keys" => {
                 o.packed = match v.as_str() {
                     "packed" => true,
@@ -147,10 +158,10 @@ struct RouteCase {
 fn case(name: &str, n: usize, nq: usize) -> Res<RouteCase> {
     let n2 = (n / 2) as u32;
     Ok(match name {
-        // shipped-order dense, real payload, CF 6 (the dense timing case), input at the reactive ceiling 44
-        "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: 44, slots: n2, period: n / 2 },
+        // shipped-order dense, real payload, CF 6 (the dense timing case), input at the reactive ceiling (44 on n32)
+        "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: (nq - 10) as u32, slots: n2, period: n / 2 },
         // StC-first, real payload, CF 13 (the shipped dense route and timing case)
-        "stcf" => RouteCase { route: Route { cf: Some(13), real: true, stc_first: true, ..Route::dense() }, level: 44, slots: n2, period: n / 2 },
+        "stcf" => RouteCase { route: Route { cf: Some(13), real: true, stc_first: true, ..Route::dense() }, level: (nq - 10) as u32, slots: n2, period: n / 2 },
         // SparseB, raise drop 1, CF 6, input at top 5 (the g0 bootstrap inputs' top)
         "512" | "256" => {
             let s: u32 = name.parse()?;
@@ -160,6 +171,22 @@ fn case(name: &str, n: usize, nq: usize) -> Res<RouteCase> {
         "1" => RouteCase { route: Route { slots: 1, spru_h: 64, cf: Some(6), ..Route::dense() }, level: 26, slots: 1, period: 1 },
         o => return Err(format!("unknown route {o}").into()),
     })
+}
+
+/// The n32 chain, or a timing proxy of another shape: `PC_BENCH_LEVELS` (CKKS levels incl. q0) and `PC_BENCH_DNUM`
+/// (the HE-standard check off: timing only, never keys anyone uses).
+fn bench_spec() -> ChainSpec {
+    let mut spec = ChainSpec::n32();
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    if let Some(l) = env("PC_BENCH_LEVELS") {
+        spec.num_levels = l;
+        spec.security = pc_core::params::Security::NotSet;
+    }
+    if let Some(d) = env("PC_BENCH_DNUM") {
+        spec.dnum = d;
+        spec.security = pc_core::params::Security::NotSet;
+    }
+    spec
 }
 
 /// One table row.
@@ -216,7 +243,7 @@ fn run(o: &Opts) -> Res<bool> {
 #[allow(clippy::too_many_lines)]
 fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(String, usize, &'static str, usize, usize)>) -> Res<()> {
     let t0 = Instant::now();
-    let chain = Chain::generate(&ChainSpec::n32())?;
+    let chain = Chain::generate(&bench_spec())?;
     let n = chain.n;
     let nq = chain.q.len();
     let st_tab = pc_core::scale::ScaleTables::precompute(&chain)?;
@@ -270,6 +297,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     mp.reserve("secret", 2 * DevSecret::<W>::bytes(&lay));
     mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, false));
+    mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, chain.level_unit, 1));
     mp.reserve("ks.plans", KsPlans::bytes::<W>(&chain, mp.cfg.k_max)?);
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     let ocfg = OpsCfg::default();
@@ -298,7 +326,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     }
     // inputs: pristine (k = 1 each), separate working cts, one contiguous K-batch
     let ctb = Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(&lay, 1));
-    mp.reserve("bench.cts", (2 * kb) * ctb);
+    mp.reserve("bench.cts", (2 * kb + 1) * ctb);
     if o.memdiag {
         mp.reserve("bench.memdiag", 2 * sf_req.total());
     }
@@ -319,6 +347,8 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let tk = kg.generate_set(&ctx, &mut ex, &sec, &mut keys, &mut prng)?;
     println!("[bts-all] keygen {} keys in {:.1} s", tk.keys, tk.total);
     let mut encr = Encryptor::<W>::new(&arena, &ex.compute, lay, false, &mut prng)?;
+    let mut dec = Decryptor::<W>::new(&arena, &ex.compute, lay, chain.level_unit, 1)?;
+    dec.load_secret(&ex.compute, &sec)?;
     let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
     let align = Arena::bytes_for::<u8>(1);
     let mark = |a: &Arena| a.used_bytes().div_ceil(align) * align;
@@ -386,6 +416,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     }
     let mut src: Vec<Ct<'_, W>> = (0..kb).map(|_| CtBuf::new(&arena, "bench.cts", lay, 1).map(|b| Ct::new(CtMeta::new(0, 1), b))).collect::<pc_gpu::Result<_>>()?;
     let mut sep: Vec<Ct<'_, W>> = (0..kb).map(|_| CtBuf::new(&arena, "bench.cts", lay, 1).map(|b| Ct::new(CtMeta::new(0, 1), b))).collect::<pc_gpu::Result<_>>()?;
+    let mut probe = Ct::new(CtMeta::new(0, 1), CtBuf::new(&arena, "bench.cts", lay, 1)?);
     ex.compute.sync()?;
     println!("[bts-all] K={kb} setup {:.1} s; arena used {:.2} of {:.2} GB", t0.elapsed().as_secs_f64(), arena.used_bytes() as f64 / 1e9, arena.capacity() as f64 / 1e9);
     arena.freeze();
@@ -403,9 +434,45 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             "1" => (spru_route.as_ref().ok_or("spru not built")?, spru_work.as_mut().ok_or("spru work")?, vec![]),
             o => return Err(format!("route {o}").into()),
         };
-        // fresh inputs
         let top = nq - 1 - c.level as usize;
         let sf_ = ctx.scale.sf(top as i32)?;
+        if let Some((cfs, amps)) = &o.grid {
+            // precision grid: one refresh per amplitude, CF and seed; bits = -log2 of the worst real-part error
+            // relative to the input's max; rms: of the real-part error; min and mean over the seeds
+            for &amp in amps {
+                for &cf in cfs {
+                    let (mut bits, mut bits_r) = (vec![], vec![]);
+                    let mut lv = 0;
+                    for seed in 0..o.seeds {
+                        let mut meta = CtMeta::new(c.level, 1).with_nf(sf_);
+                        meta.slots = c.slots;
+                        let v: Vec<Complex> = rand_vals(31 + seed as u64, n / 2, c.period).into_iter().map(|z| Complex::new(amp * z.re, 0.0)).collect();
+                        let msg = enc.encode_slots(&v, n / 2, top, Payload::Complex, sf_)?;
+                        encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg], meta, &mut src[0], &mut prng)?;
+                        let a = v.iter().map(|z| z.re.abs()).fold(0.0, f64::max);
+                        let r = Route { cf: Some(cf), ..c.route };
+                        sep[0].buf.buf.copy_from(&ex.compute, &src[0].buf.buf, ctw)?;
+                        sep[0].meta = src[0].meta;
+                        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut *work };
+                        route.run(&mut cx, std::slice::from_mut(&mut sep[0]), &r)?;
+                        lv = sep[0].meta.level;
+                        probe.buf.buf.copy_from(&ex.compute, &sep[0].buf.buf, ctw)?;
+                        probe.meta = CtMeta { slots: 0, ..sep[0].meta };
+                        ops.realize(&ctx, &mut ex, &sh, std::slice::from_mut(&mut probe))?;
+                        let out = dec.decrypt_slots(&ctx, &ex.compute, &enc, &probe, Payload::Complex, Which::Dense)?.remove(0);
+                        let e = out.iter().zip(&v).map(|(x, y)| (x.re - y.re).abs()).fold(0.0, f64::max) / a;
+                        let er = (out.iter().zip(&v).map(|(x, y)| (x.re - y.re).powi(2)).sum::<f64>() / v.len() as f64).sqrt() / a;
+                        bits.push(-e.log2());
+                        bits_r.push(-er.log2());
+                    }
+                    let stat = |b: &[f64]| (b.iter().copied().fold(f64::INFINITY, f64::min), b.iter().sum::<f64>() / b.len() as f64);
+                    let ((mn, me), (_, mer)) = (stat(&bits), stat(&bits_r));
+                    println!("[bts-all] grid {name} cf {cf} A {amp}: bits min {mn:.2} mean {me:.2}; rms {mer:.2} ({} seeds), out level {lv}", o.seeds);
+                }
+            }
+            continue;
+        }
+        // fresh inputs
         for (i, x) in src.iter_mut().enumerate() {
             let mut meta = CtMeta::new(c.level, 1).with_nf(sf_);
             meta.slots = c.slots;
