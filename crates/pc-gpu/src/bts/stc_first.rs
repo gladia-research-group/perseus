@@ -6,11 +6,9 @@
 //! Mode 2 (shipped): the last StC stage carries ModRaise's FLEXIBLEAUTO adjust, so it depends on the call (CF, input
 //! scale, raise variant) and is re-levelled on the device per key into a bounded LRU `StageCache` (FIDESlib
 //! `relevelPlaintext`). Inputs deeper than the entry take the shipped order. Modes, the reference CF and the cache:
-//! docs/ARCHITECTURE.md "pc-gpu StC-first route".
-//!
-//! On a lean chain (`ChainSpec::lean`) the StC stages run on the single primes above q0, one prime each: a stage's
-//! plaintexts sit at that prime's scale times a factor (`THIN_SPLIT`; the last stage's per call), so the product keeps
-//! the input's scale but for the factor, and the 2^-CF reduction is spread over the stages.
+//! docs/ARCHITECTURE.md "pc-gpu StC-first route". On a lean chain (`ChainSpec::lean`) the StC stages run on the single
+//! primes above q0, one each, their plaintexts at the prime's scale times a factor (`THIN_SPLIT`; the last stage's per
+//! call): the product keeps the input's scale but for the factors, which spread the 2^-CF reduction over the stages.
 use super::cts::{diag_coeffs, stage_width, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::dense::{DensePlan, LtHost};
 use super::evalmod::{EmMode, EvalModPlan};
