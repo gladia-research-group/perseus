@@ -670,6 +670,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 sfs.high = Some(pc_gpu::bts::stc_high::StcHighSetup { shapes, slots: ps.stc_cache.max(4) });
             }
             let mut sp = StcFirstPlan::new(chain, &setup, &sfs).map_err(e)?;
+            // refresh pairs (bts.pair): the compile pairs CFs up to PAIR_CF_MAX, run_pair takes CFs below cf_ref
+            if ps.programs.iter().any(|p| p.batch_report.pairs > 0) && pc_program::program::PAIR_CF_MAX + 1 != sp.sf.cf_ref {
+                return Err(PyValueError::new_err(format!("refresh pairs up to CF {} on an StC-first route of reference CF {}", pc_program::program::PAIR_CF_MAX, sp.sf.cf_ref)));
+            }
             // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for
             let keys = stc_first_keys(&ps.programs, n, (chain.q.len() - 1 - sp.entry_top) as u32, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
             sp.sf.cache_slots = sp.sf.cache_slots.max(keys);
@@ -695,6 +699,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 let mut c = SparseBCfg::n32(sl, d);
                 c.k_max = 1;
                 (c.lt_tails, c.em_fuse_rescale) = (lt_tails, em_fuse);
+                c.evalmod_k = knob(cfg.bts.sparse_b_k, pc_core::bts_setup::SPARSE_B_K as i64, "bts.sparse_b_k")? as f64;
                 full.extend(pc_gpu::bts::sparse_b::rot_steps(n, &c).map_err(e)?.into_iter().map(|k| k.rem_euclid(half)));
                 sb_cfgs.push(c);
             }
@@ -1773,6 +1778,7 @@ impl PySession {
         d.set_item("eager", pl.replayer.stats.eager)?;
         d.set_item("capture_ms", pl.replayer.stats.capture_ms)?;
         d.set_item("invalidations", pl.replayer.stats.invalidations)?;
+        d.set_item("pairs", (pl.replayer.stats.pairs, pl.replayer.stats.pairs_split))?;
         d.set_item("fused", pl.replayer.stats.fused)?;
         d.set_item("stc_evictions", pl.locks().iter().map(|l| l.evictions()).sum::<u64>())?;
         let stc = pl.dense.as_ref().and_then(|r| r.last.as_ref());

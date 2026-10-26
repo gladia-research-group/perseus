@@ -3,7 +3,7 @@
 //!   pc-bench bts|bts-prec --route dense|1|256|512 [--classic --route 8192] [--k ..] [--cf ..] [--real]
 //!       device ms per call/ciphertext (CUDA events, median of `reps` after 2 warm-ups) | precision on random real
 //!       payloads: bits = -log2(max |out - in| / A) (the bts_accuracy_sweep methodology; `--old` adds the reference row)
-//!   pc-bench ccmm|pcmm|stcf|stcf-prec|stc-high|replay|modmul ...   (src/check_*.rs, bts_*.rs, replay_g0.rs, word_seam.rs)
+//!   pc-bench ccmm|pcmm|stcf|stcf-prec|stcf-pair|stc-high|replay|modmul ...   (src/check_*.rs, bts_*.rs, replay_g0.rs, word_seam.rs)
 //!
 //! Keys: a fresh secret (dense ternary + sparse h=32), every CtS/StC rotation, conjugation, relinearization and both
 //! encapsulation keys generated on the device (dense layout with resident `a`). Full usage: docs/ARCHITECTURE.md.
@@ -667,7 +667,7 @@ fn main() -> ExitCode {
         };
     }
     // the StC-first route, stc_high (src/bts_stc_first.rs)
-    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stc-high")) {
+    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stcf-pair" | "stc-high")) {
         return bts_stc_first::cmd(bts_stc_first::Mode::Bench, &args);
     }
     match parse(&args).and_then(run) {

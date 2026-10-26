@@ -5,6 +5,8 @@
 //!   pc-check stcf \<g0>        g0 bootstrap #2 (dense StC-first, CF 13): dumped split -> output bit-exact per stage;
 //!       our stc_first_input and whole refresh vs the dump; landing / entry vs pc-shadow
 //!   pc-bench stcf | stcf-prec | stc-high       device ms per call and stage | round-trip precision | stc_high vs host StC
+//!   pc-bench stcf-pair [--members cf:amp,...] [--seeds 4] [--dirty 4]   two real refreshes as one complex refresh:
+//!       each member vs its K = 1 real refresh, landings, graph == eager, K = 2 pair == two K = 1 pairs, timing
 use crate::check_bts::{load_key, ps_plan, OracleKeys, Tally};
 use pc_core::bts_setup::{cts_stc_factors, FidesStage, C64};
 use pc_core::encode::{Complex, Encoder, Payload};
@@ -16,7 +18,7 @@ use pc_gpu::bts::cts::{LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use pc_gpu::bts::evalmod::{em_work, EmMode, EvalModPlan};
 use pc_gpu::bts::finish::Pow2;
 use pc_gpu::bts::raise::RaisePlan;
-use pc_gpu::bts::stc_first::{StcFirstPlan, StcFirstRoute, StcFirstSetup};
+use pc_gpu::bts::stc_first::{nf_key, StcFirstPlan, StcFirstRoute, StcFirstSetup};
 use pc_gpu::bts::stc_high::{StcHighSetup, StcHighShape};
 use pc_gpu::bts::staged::{BtsCall, BtsLog, CallOpts, Phase, StagedRef};
 use pc_gpu::bts::{BtsCx, BtsKeyRing, BtsPrecomp, BtsRoute, BtsSetup, BtsWork, BtsWorkShape, MemReq, StcHigh};
@@ -691,10 +693,15 @@ struct BArgs {
     graph: bool,
     out: Option<String>,
     gauss: Option<f64>,
+    /// stcf-pair: the members (CF, amplitude), seeds per case, the dirty partner's imaginary lane (amplitude 2^-dirty)
+    members: Vec<(u32, f64)>,
+    seeds: usize,
+    dirty: u32,
 }
 
 fn bargs(a: &[String]) -> Res<BArgs> {
-    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None };
+    let members = vec![(13, 64.0), (10, 8.0), (6, 1.0), (2, 0.25)];
+    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None, members, seeds: 4, dirty: 4 };
     let list = |s: &str| -> Res<Vec<f64>> { s.split(',').map(|x| x.parse::<f64>().map_err(|e| e.into())).collect() };
     let mut i = 1;
     while i < a.len() {
@@ -707,6 +714,17 @@ fn bargs(a: &[String]) -> Res<BArgs> {
             "--level" => r.level = v.parse()?,
             "--out" => r.out = Some(v),
             "--gauss" => r.gauss = Some(v.parse()?),
+            "--members" => {
+                r.members = v
+                    .split(',')
+                    .map(|m| -> Res<(u32, f64)> {
+                        let (c, a) = m.split_once(':').ok_or("--members cf:amp,...")?;
+                        Ok((c.parse()?, a.parse()?))
+                    })
+                    .collect::<Res<_>>()?
+            }
+            "--seeds" => r.seeds = v.parse()?,
+            "--dirty" => r.dirty = v.parse()?,
             "--real" => {
                 r.real = true;
                 i += 1;
@@ -1111,6 +1129,307 @@ pub fn bench(args: &[String]) -> Res<bool> {
                 println!("[pc-bench] last-stage cache: {:?}", c.stats());
             }
         }
+        "stcf-pair" => {
+            // two real refreshes as one complex refresh (`run_pair`): each member against its own K = 1 real refresh
+            // (same CF, amplitude and payload), its landing, graph == eager, a K = 2 pair == two K = 1 pairs, timing
+            let rr = |cf: u32| Route { cf: Some(cf), stc_first: true, real: true, ..Route::dense() };
+            let vec_of = |m: usize, s: usize, role: u64, amp: f64| rand_c(1000 * m as u64 + 10 * s as u64 + role + 1, slots, amp, true);
+            let bits = |got: &[Complex], v: &[Complex], amp: f64| -> (f64, f64) {
+                let (mut mx, mut ss) = (0f64, 0f64);
+                for (g, w) in got.iter().zip(v) {
+                    let d = (g.re - w.re).abs();
+                    mx = mx.max(d);
+                    ss += d * d;
+                }
+                (-(mx / amp).log2(), -((ss / v.len() as f64).sqrt() / amp).log2())
+            };
+            let meq = |a: &CtMeta, b: &CtMeta| a.level == b.level && a.deg == b.deg && a.nf.to_bits() == b.nf.to_bits() && a.slots == b.slots;
+            let nm = a.members.len();
+            let mut single: BTreeMap<(usize, usize, u64), (f64, f64)> = BTreeMap::new();
+            for (m, &(cf, amp)) in a.members.iter().enumerate() {
+                for s in 0..a.seeds {
+                    for role in 0..2u64 {
+                        let v = vec![vec_of(m, s, role, amp)];
+                        fresh(&mut x, &mut ex, &v, a.level)?;
+                        {
+                            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                            route.run(&mut cx, std::slice::from_mut(&mut x), &rr(cf))?;
+                            cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                        }
+                        let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &x, Payload::Complex, Which::Dense)?;
+                        single.insert((m, s, role), bits(&got[0], &v[0], amp));
+                    }
+                }
+            }
+            // pair - single per member and role (max-error bits, rms bits); the dirty runs against the clean pair
+            let mut delta: BTreeMap<(usize, u64), Vec<(f64, f64)>> = BTreeMap::new();
+            for mi in 0..nm {
+                for mj in 0..nm {
+                    let ((cfx, ax), (cfy, ay)) = (a.members[mi], a.members[mj]);
+                    let (rx, ry) = (rr(cfx), rr(cfy));
+                    let mut clean0 = (0.0, 0.0);
+                    for s in 0..=a.seeds {
+                        // the last run: seed 0 with the partner's imaginary lane at amplitude A 2^-dirty
+                        let dirty = s == a.seeds;
+                        let s0 = if dirty { 0 } else { s };
+                        let vx = vec![vec_of(mi, s0, 0, ax)];
+                        let mut vy = vec![vec_of(mj, s0, 1, ay)];
+                        if dirty {
+                            let im = rand_c(77, slots, ay * (-(a.dirty as f64)).exp2(), false);
+                            for (z, w) in vy[0].iter_mut().zip(&im) {
+                                z.im = w.im;
+                            }
+                        }
+                        fresh(&mut x, &mut ex, &vx, a.level)?;
+                        fresh(&mut y, &mut ex, &vy, a.level)?;
+                        let (inx, iny) = (x.meta, y.meta);
+                        {
+                            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                            route.run_pair(&mut cx, &mut x, &mut y, &rx, &ry)?;
+                            if s == 0 {
+                                let (lx, ly) = (route.landing(&sh, &inx, &rx)?, route.landing(&sh, &iny, &ry)?);
+                                t.add(&format!("pair {cfx}:{ax} + {cfy}:{ay}: each output's metadata == its own landing"), (!meq(&x.meta, &lx)) as usize + (!meq(&y.meta, &ly)) as usize, 2);
+                            }
+                            cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                            cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+                        }
+                        if s == 0 {
+                            let want = BtsConfig::n32_shipped().landing(ctx.shape, &Quirks::none(), &rx, a.level, 1)?;
+                            t.add(&format!("pair {cfx}:{ax} + {cfy}:{ay}: realized landings == pc-shadow"), (x.meta.level != want.level) as usize + (y.meta.level != want.level) as usize, 2);
+                        }
+                        let gx = dec.decrypt_slots(&ctx, &ex.compute, &enc, &x, Payload::Complex, Which::Dense)?;
+                        let gy = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
+                        let (bx, by) = (bits(&gx[0], &vx[0], ax), bits(&gy[0], &vy[0], ay));
+                        let (sx, sy) = (single[&(mi, s0, 0)], single[&(mj, s0, 1)]);
+                        if dirty {
+                            println!(
+                                "[pc-bench] stcf-pair dirty partner (Im lane A 2^-{}): x {cfx}:{ax} {:.2} bits (clean pair {:.2}, single {:.2}), y {cfy}:{ay} {:.2} bits (single {:.2})",
+                                a.dirty, bx.0, clean0.0, sx.0, by.0, sy.0
+                            );
+                        } else {
+                            if s == 0 {
+                                clean0 = bx;
+                            }
+                            delta.entry((mi, 0)).or_default().push((bx.0 - sx.0, bx.1 - sx.1));
+                            delta.entry((mj, 1)).or_default().push((by.0 - sy.0, by.1 - sy.1));
+                            println!(
+                                "[pc-bench] stcf-pair seed {s} x {cfx}:{ax} y {cfy}:{ay}: x {:.2} bits (rms {:.2}) vs single {:.2} ({:.2}); y {:.2} ({:.2}) vs single {:.2} ({:.2})",
+                                bx.0, bx.1, sx.0, sx.1, by.0, by.1, sy.0, sy.1
+                            );
+                        }
+                        rows.push(serde_json::json!({"route": "stc_first_pair", "input_level": a.level, "seed": s0, "dirty": if dirty { Some(a.dirty) } else { None },
+                            "x": {"cf": cfx, "amp": ax, "bits": bx.0, "bits_rms": bx.1, "single_bits": sx.0, "single_bits_rms": sx.1},
+                            "y": {"cf": cfy, "amp": ay, "bits": by.0, "bits_rms": by.1, "single_bits": sy.0, "single_bits_rms": sy.1}}));
+                    }
+                }
+            }
+            for (&(m, role), d) in &delta {
+                let n = d.len() as f64;
+                let (dm, dr) = (d.iter().map(|v| v.0).sum::<f64>() / n, d.iter().map(|v| v.1).sum::<f64>() / n);
+                let worst = d.iter().map(|v| v.0).fold(f64::INFINITY, f64::min);
+                let (cf, amp) = a.members[m];
+                println!("[pc-bench] stcf-pair member cf {cf} A {amp} as {}: pair - single over {} runs: max-error bits {dm:+.3} (worst {worst:+.3}), rms bits {dr:+.3}", ["x", "y"][role as usize], d.len());
+                t.add(&format!("precision gate cf {cf} A {amp} as {}: mean pair - single >= -0.15 bits (max error) and >= -0.1 (rms)", ["x", "y"][role as usize]), (dm < -0.15 || dr < -0.1) as usize, 1);
+            }
+            // y's scale off x's by eps inside one cache key (siblings whose scales took different paths): the pair and y's
+            // single both go through the entry of that key (the factor of whichever input filled it); y against its single
+            for mi in 0..nm {
+                for mj in 0..nm {
+                    let ((cfx, ax), (cfy, ay)) = (a.members[mi], a.members[mj]);
+                    let (rx, ry) = (rr(cfx), rr(cfy));
+                    let (vx, vy) = (vec![vec_of(mi, 0, 0, ax)], vec![vec_of(mj, 0, 1, ay)]);
+                    fresh(&mut y, &mut ex, &vy, a.level)?;
+                    let nf0 = y.meta.nf;
+                    let eps = [3e-7, -3e-7].into_iter().find(|e| nf_key(nf0 * (1.0 + e)) == nf_key(nf0)).ok_or("no scale offset inside the key")?;
+                    let wy: Vec<Complex> = vy[0].iter().map(|z| *z / (1.0 + eps)).collect();
+                    y.meta.nf = nf0 * (1.0 + eps);
+                    {
+                        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                        route.run(&mut cx, std::slice::from_mut(&mut y), &ry)?;
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+                    }
+                    let gs = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
+                    let sy = bits(&gs[0], &wy, ay);
+                    fresh(&mut x, &mut ex, &vx, a.level)?;
+                    fresh(&mut y, &mut ex, &vy, a.level)?;
+                    y.meta.nf = nf0 * (1.0 + eps);
+                    {
+                        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                        route.run_pair(&mut cx, &mut x, &mut y, &rx, &ry)?;
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+                    }
+                    let gx = dec.decrypt_slots(&ctx, &ex.compute, &enc, &x, Payload::Complex, Which::Dense)?;
+                    let gy = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
+                    let (bx, by) = (bits(&gx[0], &vx[0], ax), bits(&gy[0], &wy, ay));
+                    println!(
+                        "[pc-bench] stcf-pair scales {eps:+.0e} apart: x {cfx}:{ax} {:.2} bits (single {:.2}), y {cfy}:{ay} {:.2} bits (rms {:.2}) vs its single {:.2} ({:.2})",
+                        bx.0, single[&(mi, 0, 0)].0, by.0, by.1, sy.0, sy.1
+                    );
+                    t.add(&format!("pair {cfx}:{ax} + {cfy}:{ay}, scales {eps:+.0e} apart: y within 0.15 bits of its single"), (by.0 < sy.0 - 0.15) as usize, 1);
+                    rows.push(serde_json::json!({"route": "stc_first_pair_scales", "eps": eps, "x": {"cf": cfx, "amp": ax, "bits": bx.0},
+                        "y": {"cf": cfy, "amp": ay, "bits": by.0, "bits_rms": by.1, "single_bits": sy.0, "single_bits_rms": sy.1}}));
+                }
+            }
+            // degree-2 inputs (a rescale pending, the pair's rescale at the entry): fresh at level - 2, times 1.0 (degree 2,
+            // level - 2, effective level `level`); each member against its single refresh of the same ciphertext
+            let lv2 = a.level - 2;
+            for mi in 0..nm {
+                for mj in 0..nm {
+                    let ((cfx, ax), (cfy, ay)) = (a.members[mi], a.members[mj]);
+                    let (rx, ry) = (rr(cfx), rr(cfy));
+                    let (vx, vy) = (vec![vec_of(mi, 1, 0, ax)], vec![vec_of(mj, 1, 1, ay)]);
+                    let mut sb = [0f64; 2];
+                    for (role, (v, r, amp)) in [(&vx, rx, ax), (&vy, ry, ay)].into_iter().enumerate() {
+                        fresh(&mut x, &mut ex, v, lv2)?;
+                        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                        cx.ops.mult_scalar_inplace(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x), &[Complex::new(1.0, 0.0)])?;
+                        route.run(&mut cx, std::slice::from_mut(&mut x), &r)?;
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                        drop(cx);
+                        let g = dec.decrypt_slots(&ctx, &ex.compute, &enc, &x, Payload::Complex, Which::Dense)?;
+                        sb[role] = bits(&g[0], &v[0], amp).0;
+                    }
+                    fresh(&mut x, &mut ex, &vx, lv2)?;
+                    fresh(&mut y, &mut ex, &vy, lv2)?;
+                    {
+                        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                        cx.ops.mult_scalar_inplace(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x), &[Complex::new(1.0, 0.0)])?;
+                        cx.ops.mult_scalar_inplace(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y), &[Complex::new(1.0, 0.0)])?;
+                        let (inx, iny) = (x.meta, y.meta);
+                        route.run_pair(&mut cx, &mut x, &mut y, &rx, &ry)?;
+                        let (lx, ly) = (route.landing(&sh, &inx, &rx)?, route.landing(&sh, &iny, &ry)?);
+                        t.add(&format!("pair {cfx}:{ax} + {cfy}:{ay}, degree-2 inputs at level {lv2}: each output's metadata == its own landing"), (!meq(&x.meta, &lx)) as usize + (!meq(&y.meta, &ly)) as usize, 2);
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+                    }
+                    let gx = dec.decrypt_slots(&ctx, &ex.compute, &enc, &x, Payload::Complex, Which::Dense)?;
+                    let gy = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
+                    let (bx, by) = (bits(&gx[0], &vx[0], ax).0, bits(&gy[0], &vy[0], ay).0);
+                    println!("[pc-bench] stcf-pair degree-2 inputs at level {lv2}: x {cfx}:{ax} {bx:.2} bits (single {:.2}), y {cfy}:{ay} {by:.2} bits (single {:.2})", sb[0], sb[1]);
+                    t.add(&format!("pair {cfx}:{ax} + {cfy}:{ay}, degree-2 inputs: both members within 0.15 bits of their singles"), (bx < sb[0] - 0.15) as usize + (by < sb[1] - 0.15) as usize, 2);
+                }
+            }
+            // graph replay == eager and a K = 2 pair == two K = 1 pairs, every word
+            let ((cfx, ax), (cfy, ay)) = (a.members[0], a.members[nm - 1]);
+            let (rx, ry) = (rr(cfx), rr(cfy));
+            let top_in = (nq - 1 - a.level) as usize;
+            let ids: Vec<usize> = (0..=top_in).collect();
+            let mut ins: Vec<[Vec<Vec<u32>>; 2]> = Vec::new();
+            for c in 0..2 {
+                fresh(&mut x, &mut ex, &[vec_of(0, c, 0, ax)], a.level)?;
+                fresh(&mut y, &mut ex, &[vec_of(nm - 1, c, 1, ay)], a.level)?;
+                let rx_: Vec<Vec<u32>> = (0..2).map(|p| x.buf.download_rows(&ex.compute, 0, p, &ids)).collect::<std::result::Result<_, _>>()?;
+                let ry_: Vec<Vec<u32>> = (0..2).map(|p| y.buf.download_rows(&ex.compute, 0, p, &ids)).collect::<std::result::Result<_, _>>()?;
+                ins.push([rx_, ry_]);
+            }
+            let min = x.meta;
+            let load = |z: &mut Ct<'_, W>, s: &Stream<Compute>, role: usize, cs: &[usize]| -> Res<()> {
+                z.buf.k = cs.len();
+                for (at, &c) in cs.iter().enumerate() {
+                    for p in 0..2 {
+                        z.buf.upload_rows(s, at, p, &ids, &ins[c][role][p])?;
+                    }
+                }
+                z.meta = min;
+                Ok(())
+            };
+            let mut want: Vec<[Vec<Vec<u32>>; 2]> = Vec::new();
+            let mut out_ids: Vec<usize> = Vec::new();
+            for c in 0..2 {
+                load(&mut x, &ex.compute, 0, &[c])?;
+                load(&mut y, &ex.compute, 1, &[c])?;
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                route.run_pair(&mut cx, &mut x, &mut y, &rx, &ry)?;
+                out_ids = (0..=(nq - 1 - x.meta.level) as usize).collect();
+                let wx: Vec<Vec<u32>> = (0..2).map(|p| x.buf.download_rows(&cx.ex.compute, 0, p, &out_ids)).collect::<std::result::Result<_, _>>()?;
+                let wy: Vec<Vec<u32>> = (0..2).map(|p| y.buf.download_rows(&cx.ex.compute, 0, p, &out_ids)).collect::<std::result::Result<_, _>>()?;
+                want.push([wx, wy]);
+            }
+            let cmp = |z: &Ct<'_, W>, s: &Stream<Compute>, at: usize, w: &[Vec<u32>]| -> Res<(usize, usize)> {
+                let mut bad = 0;
+                let mut tot = 0;
+                for (p, wp) in w.iter().enumerate() {
+                    let g = z.buf.download_rows(s, at, p, &out_ids)?;
+                    bad += g.iter().zip(wp).filter(|(a, b)| a != b).count();
+                    tot += g.len();
+                }
+                Ok((bad, tot))
+            };
+            {
+                load(&mut x, &ex.compute, 0, &[0, 1])?;
+                load(&mut y, &ex.compute, 1, &[0, 1])?;
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                route.run_pair(&mut cx, &mut x, &mut y, &rx, &ry)?;
+                let (mut bad, mut tot) = (0, 0);
+                for c in 0..2 {
+                    for (z, w) in [(&x, &want[c][0]), (&y, &want[c][1])] {
+                        let (b, n) = cmp(z, &cx.ex.compute, c, w)?;
+                        bad += b;
+                        tot += n;
+                    }
+                }
+                t.add("a K = 2 pair == two K = 1 pairs, every word", bad, tot);
+            }
+            if let Some(c) = &route.last {
+                c.set_locked(true);
+            }
+            let sp: *const Stream<Compute> = &ex.compute;
+            let (xp, yp): (*mut Ct<'_, W>, *mut Ct<'_, W>) = (&mut x, &mut y);
+            load(&mut x, &ex.compute, 0, &[0])?;
+            load(&mut y, &ex.compute, 1, &[0])?;
+            {
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                let rt = &route;
+                let (g, _) = capture(sp, || {
+                    // SAFETY: x and y are not otherwise borrowed while the closure runs
+                    let (x, y) = unsafe { (&mut *xp, &mut *yp) };
+                    rt.run_pair(&mut cx, x, y, &rx, &ry)
+                })?;
+                // SAFETY: the capture's borrows ended with the closure
+                let (x, y) = unsafe { (&mut *xp, &mut *yp) };
+                load(x, &cx.ex.compute, 0, &[0])?;
+                load(y, &cx.ex.compute, 1, &[0])?;
+                g.launch(&cx.ex.compute)?;
+                cx.ex.compute.sync()?;
+                let (b1, n1) = cmp(x, &cx.ex.compute, 0, &want[0][0])?;
+                let (b2, n2) = cmp(y, &cx.ex.compute, 0, &want[0][1])?;
+                t.add("pair graph replay == eager, every word", b1 + b2, n1 + n2);
+            }
+            if let Some(c) = &route.last {
+                c.set_locked(false);
+            }
+            // device ms: two real singles at K = 1, a real K = 2 batch, a complex single, the pair at K = 1 and 2
+            let ev: Vec<Event> = (0..2).map(|_| Event::timing(&dev)).collect::<std::result::Result<_, _>>()?;
+            let rc = Route { real: false, ..rr(cfx) };
+            for (name, k, pair, r) in [("real single", 1, false, rx), ("real K=2", 2, false, rx), ("complex single", 1, false, rc), ("pair", 1, true, rx), ("pair K=2", 2, true, rx)] {
+                let mut ms = Vec::new();
+                for rep in 0..a.reps + 2 {
+                    let vx: Vec<Vec<Complex>> = (0..k).map(|i| vec_of(0, i, 0, ax)).collect();
+                    fresh(&mut x, &mut ex, &vx, a.level)?;
+                    if pair {
+                        let vy: Vec<Vec<Complex>> = (0..k).map(|i| vec_of(0, i, 1, ax)).collect();
+                        fresh(&mut y, &mut ex, &vy, a.level)?;
+                    }
+                    let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                    ev[0].record(&cx.ex.compute)?;
+                    if pair {
+                        route.run_pair(&mut cx, &mut x, &mut y, &r, &r)?;
+                    } else {
+                        route.run(&mut cx, std::slice::from_mut(&mut x), &r)?;
+                    }
+                    ev[1].record(&cx.ex.compute)?;
+                    ev[1].sync()?;
+                    if rep >= 2 {
+                        ms.push(ev[0].elapsed_ms(&ev[1])? as f64);
+                    }
+                }
+                let d = median(ms);
+                let per = if pair { 2 * k } else { k };
+                println!("[pc-bench] stcf-pair timing {name} (cf {cfx}, input level {}): {d:.2} ms/call, {:.2} ms per refreshed ciphertext (median of {})", a.level, d / per as f64, a.reps);
+                rows.push(serde_json::json!({"route": "stc_first_pair_timing", "case": name, "k": k, "cf": cfx, "input_level": a.level, "ms_call": d, "ms_per_ct": d / per as f64}));
+            }
+        }
         "stc-high" => {
             let st = pc_core::scale::ScaleTables::precompute(&chain)?;
             let f = cts_stc_factors(n, slots as u32, setup.level_budget, setup.dim1, 1.0, pc_gpu::bts::stc::scale_dec(&st))?;
@@ -1147,7 +1466,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
                 }
             }
         }
-        c => return Err(format!("unknown command {c} (stcf | stcf-prec | stc-high)").into()),
+        c => return Err(format!("unknown command {c} (stcf | stcf-prec | stcf-pair | stc-high)").into()),
     }
     if let (Some(p), false) = (&a.out, rows.is_empty()) {
         let mut doc: serde_json::Value = std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::json!({"meta": {}, "rows": []}));
