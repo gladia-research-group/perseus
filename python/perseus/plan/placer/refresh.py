@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -9,6 +11,20 @@ from .ir import FIELD_REAL, Graph, is_kv_cache_read
 from .sim import PlannerShadow
 
 log = logging.getLogger(__name__)
+
+
+def mag_safety_of(step: str | None, base: float) -> float:
+    """The drift margin κ a site of `step` is sized with: `base` (PLAN_MAG_SAFETY), or the largest value of
+    PLAN_MAG_SAFETY_STEPS (`name:kappa,...`) whose `name` begins the full step name (`blk11.attn` covers blk11.attn and
+    blk11.attn.softmax; `tail` the tail), never below `base`. For the sites whose capture holds few independent values:
+    one position's (a prefill's last query and its tail) varies across prompts far more than a max over all of them."""
+    k = base
+    if step:
+        for kv in (os.environ.get("PLAN_MAG_SAFETY_STEPS") or "").split(","):
+            name, _, v = kv.partition(":")
+            if name.strip() and v.strip() and step.startswith(name.strip()):
+                k = max(k, float(v))
+    return k
 
 
 @dataclass(frozen=True)
@@ -130,6 +146,10 @@ class RefreshPlanner:
             return RefreshSpec(v, False, True, float("inf"),
                                reason="fresh graph input — never refreshable")
         route = self.route_for(v)
+        pol = self.policy
+        kappa = mag_safety_of(p.step if p is not None else None, pol.mag_safety)
+        if kappa != pol.mag_safety:
+            pol = dataclasses.replace(pol, mag_safety=kappa)
         site = dict(
             slot_mag=p.max_abs if p else None,
             period=p.pack_period if p else None,
@@ -138,10 +158,10 @@ class RefreshPlanner:
             mean=p.mean if p else None,
             residual_mag=p.max_dev if p else None,
             routes_avail=(route,) if route else (),
-            levels_free=1 if self.policy.allow_prescale else 0,
+            levels_free=1 if pol.allow_prescale else 0,
             real=bool(self.real_route and p is not None and p.pack_field == FIELD_REAL),
         )
-        choice = btserr.choose_site(self.table, self.policy, **site)
+        choice = btserr.choose_site(self.table, pol, **site)
         # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
         # shipped order's precision (plan.stc_first_mag_max, after the drift margin) bootstraps in the shipped order:
         # priced without the slim term, landed where that order lands (the Shadow's shipped-order dense landing,
@@ -155,14 +175,14 @@ class RefreshPlanner:
         _step_ok = True
         if _steps is not None and p is not None:
             _step_ok = (p.step or "").split(".")[-1] in {x.strip() for x in _steps.split(",") if x.strip()}
-        _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * self.policy.mag_safety > float(_mag_max)
-        if (self.policy.slim_cubic > 0 and not choice.route and sh.has_shipped and p is not None
+        _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * pol.mag_safety > float(_mag_max)
+        if (pol.slim_cubic > 0 and not choice.route and sh.has_shipped and p is not None
                 and (_too_big or not _step_ok or force_shipped)):
             import dataclasses as _dc
-            choice = btserr.choose_site(self.table, _dc.replace(self.policy, slim_cubic=0.0), **site)
+            choice = btserr.choose_site(self.table, _dc.replace(pol, slim_cubic=0.0), **site)
             shipped = not choice.route
         # one extra search, only for a site pinned at cf_max; the choice above is unchanged
-        clamped = btserr.ceiling_binds(self.table, self.policy, choice.cf, **site)
+        clamped = btserr.ceiling_binds(self.table, pol, choice.cf, **site)
 
         route_land = sh.landing(choice.route) if choice.route else None
         if route_land is not None:
