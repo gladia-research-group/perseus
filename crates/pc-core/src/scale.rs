@@ -16,6 +16,8 @@ pub struct ScaleTables {
     /// Top limb index `L` and primes per level.
     pub l: usize,
     pub d: usize,
+    /// Primes a rescale from limb top `t` drops (`Chain::drop_at`), 0 off the level grid.
+    pub drop: Vec<usize>,
     pub q: Vec<u64>,
     pub p: Vec<u64>,
 
@@ -135,6 +137,18 @@ impl ScaleTables {
                 }
             }
         }
+        if chain.spec.lean.is_some() {
+            // a lean chain's single-prime levels (the composite rule above leaves its sentinel there): walk the levels
+            // down from the top, sf' = sf^2 / (the prime dropped); the composite levels keep the rule's values
+            let mut k = 0;
+            for &g in chain.groups.iter().skip(1).rev() {
+                if g < d {
+                    let prev = sfr_o[k];
+                    sfr_o[k + g] = prev * prev / q[size_q - 1 - k] as f64;
+                }
+                k += g;
+            }
+        }
         let mut big_o = vec![0.0f64; size_q - 1];
         if !big_o.is_empty() {
             big_o[0] = sfr_o[0] * sfr_o[0];
@@ -222,9 +236,11 @@ impl ScaleTables {
             part_ql_hat_mod_p.push(hat_l);
         }
 
+        let drop: Vec<usize> = (0..size_q).map(|t| chain.drop_at(t).unwrap_or(0)).collect();
         Ok(ScaleTables {
             l,
             d,
+            drop,
             q,
             p,
             sf_real_openfhe: sfr_o,
@@ -248,7 +264,7 @@ impl ScaleTables {
 
     /// ContextData::sfAtLimb: the scaling factor of a ciphertext whose top limb is `limb_top` (must be on the grid).
     pub fn sf(&self, limb_top: i32) -> Result<f64> {
-        if limb_top < 0 || limb_top as usize > self.l || (self.l as i32 - limb_top) % self.d as i32 != 0 {
+        if limb_top < 0 || limb_top as usize > self.l || self.drop[limb_top as usize] == 0 {
             return Err(Error::Params(format!(
                 "sfAtLimb({limb_top}) is off the composite level grid (L={}, d={})",
                 self.l, self.d
@@ -257,10 +273,12 @@ impl ScaleTables {
         Ok(self.sfr[limb_top as usize])
     }
 
-    /// ContextData::modReduceProduct: the product of the `d` factors dropped by a rescale from `limb_top`.
+    /// ContextData::modReduceProduct: the product of the factors dropped by a rescale from `limb_top` (`d` of them
+    /// but at a lean chain's single-prime level).
     pub fn mod_reduce_product(&self, limb_top: i32) -> f64 {
         let mut f = 1.0f64;
-        for j in 0..self.d as i32 {
+        let g = self.drop.get(limb_top as usize).copied().filter(|&g| g > 0).unwrap_or(self.d);
+        for j in 0..g as i32 {
             f *= self.mrf[(limb_top - j) as usize];
         }
         f
@@ -270,7 +288,7 @@ impl ScaleTables {
     /// scaled so that a multiply-then-rescale lands a `level_in` ciphertext on the scale of `level - d`.
     pub fn elem_for_eval_mult(&self, level: i32, operand: f64, level_in: i32) -> Result<Vec<u64>> {
         let num = (level + 1) as usize;
-        let cd = self.d as i32;
+        let cd = self.drop.get(level as usize).copied().filter(|&g| g > 0).unwrap_or(self.d) as i32;
         let sc: f64 = if level_in == -1 || level_in == level {
             self.sf(level)?
         } else {

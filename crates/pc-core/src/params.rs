@@ -3,7 +3,9 @@
 //! `CryptoParametersRNS::PrecomputeCRTTables`, so the n32 preset reproduces OpenFHE's chain prime for prime.
 //!
 //! Level conventions: Q prime ids `0..q.len()`, special prime ids `q.len()..q.len()+p.len()` (FIDESlib's id space);
-//! one CKKS level is `level_unit = composite_degree` primes; "limb top" `l` means the primes `0..=l` are live.
+//! one CKKS level is `level_unit = composite_degree` primes; "limb top" `l` means the primes `0..=l` are live. A lean
+//! chain (`ChainSpec::lean`) keeps that grid from the top but has single-prime levels at the bottom: `Chain::groups`
+//! lists the primes of every level.
 pub mod check;
 pub mod nbtheory;
 pub mod primegen;
@@ -61,6 +63,19 @@ pub struct ChainSpec {
     /// Mixed-size chain (patch 0002, FLEXIBLEAUTO only): bit size per level above q0, bottom-up, `num_levels - 1`
     /// entries.
     pub sizes_per_level: Option<Vec<u32>>,
+    /// The lean bottom (composite chains): the base chain of the other fields with its bottom StC levels on single
+    /// primes and the key-switching digits re-partitioned.
+    pub lean: Option<Lean>,
+}
+
+/// `thin` single primes kept above q0 in place of as many composite levels (the StC-first input stages run on them,
+/// one prime per stage: a ct x pt product keeps its scale), and `dnum` digits over the shorter chain. The base chain's
+/// special primes stay first in P (the bottom-shape keys of the sparse secrets use only them: their modulus q0 x P'
+/// is the base chain's); more are appended until P covers the largest digit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lean {
+    pub thin: u32,
+    pub dnum: u32,
 }
 
 impl ChainSpec {
@@ -78,7 +93,13 @@ impl ChainSpec {
             secret: Secret::UniformTernary,
             word: WordId::U32,
             sizes_per_level: None,
+            lean: None,
         }
+    }
+    /// n32 with its bottom StC levels on 3 single primes (n32's primes 2..=4; primes 5..=7 dropped) and dnum 4: 51
+    /// limbs, the top 46 primes (every user, EvalMod and CtS level) n32's own.
+    pub fn n32a4() -> Self {
+        ChainSpec { lean: Some(Lean { thin: 3, dnum: 4 }), ..Self::n32() }
     }
     /// The n64 chain (functional only): logN 16, 53-bit primes, 60-bit q0, depth 27, dnum 7, 60-bit specials.
     pub fn n64() -> Self {
@@ -94,13 +115,15 @@ impl ChainSpec {
             secret: Secret::UniformTernary,
             word: WordId::U64,
             sizes_per_level: None,
+            lean: None,
         }
     }
     pub fn preset(name: &str) -> Result<Self> {
         match name {
             "n32" => Ok(Self::n32()),
             "n64" => Ok(Self::n64()),
-            _ => Err(Error::Params(format!("unknown chain preset '{name}' (known: n32, n64)"))),
+            "n32a4" => Ok(Self::n32a4()),
+            _ => Err(Error::Params(format!("unknown chain preset '{name}' (known: n32, n64, n32a4)"))),
         }
     }
     pub fn scaling(&self) -> Scaling {
@@ -131,6 +154,10 @@ pub struct Chain {
     pub scaling: Scaling,
     /// Bit length of Q*P (what the HE-standard check is run on).
     pub log_qp: u32,
+    /// Primes per CKKS level, bottom (q0) first: `level_unit` everywhere but at a lean chain's bottom.
+    pub groups: Vec<usize>,
+    /// Special primes the bottom-shape keys use (the first ones of P): all of P but on a lean chain.
+    pub p_sparse: usize,
 }
 
 /// OpenFHE AUXMODSIZE by native word.
@@ -213,6 +240,10 @@ fn estimate_log_p(
 impl Chain {
     /// ParamsGenCKKSRNSInternal (+ the HYBRID prime/partition part of PrecomputeCRTTables).
     pub fn generate(spec: &ChainSpec) -> Result<Chain> {
+        if let Some(lean) = spec.lean {
+            let base = Chain::generate(&ChainSpec { lean: None, ..spec.clone() })?;
+            return base.lean(spec, lean);
+        }
         let n = 1u64 << spec.logn;
         let cycl_order = 2 * n;
         let scaling = spec.scaling();
@@ -387,7 +418,75 @@ impl Chain {
             word_bits: rws,
             scaling,
             log_qp,
+            groups: vec![d as usize; spec.num_levels as usize],
+            p_sparse: size_p,
         })
+    }
+
+    /// The lean chain of `spec` from its base chain (`Lean`): Q = q0, the first `thin` primes above it, then the base
+    /// chain minus the next `thin` primes; the composite grid runs from the top, so an odd count leaves one single
+    /// level above q0. OpenFHE's partition into `lean.dnum` digits; P = the base P, then the largest NTT primes below
+    /// 2^b (b raised in 1/20-bit steps from the even split) until P covers the largest digit.
+    fn lean(self, spec: &ChainSpec, lean: Lean) -> Result<Chain> {
+        let d = self.level_unit;
+        let t = lean.thin as usize;
+        let levels = self.q.len() / d;
+        if self.scaling != Scaling::CompositeManual || t == 0 || t >= levels - 1 || lean.dnum < 1 {
+            return Err(Error::Params(format!("lean chain: thin {t} on a {levels}-level composite chain")));
+        }
+        let keep: Vec<usize> = (0..self.q.len()).filter(|&i| i < d + t || i >= d + d * t).collect();
+        let q: Vec<u64> = keep.iter().map(|&i| self.q[i]).collect();
+        let q_roots: Vec<u64> = keep.iter().map(|&i| self.q_roots[i]).collect();
+        let above = q.len() - d;
+        let mut groups = vec![d];
+        groups.extend(std::iter::repeat_n(1, above % d));
+        groups.extend(std::iter::repeat_n(d, above / d));
+        let dnum = lean.dnum as usize;
+        let a = q.len().div_ceil(dnum);
+        if q.len() <= a * (dnum - 1) {
+            return Err(Error::Params(format!("lean chain: can't distribute {} towers into {dnum} digits", q.len())));
+        }
+        let digits: Vec<Vec<usize>> = (0..dnum).map(|j| (j * a..((j + 1) * a).min(q.len())).collect()).collect();
+        let lg = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
+        let widest = digits.iter().map(|dg| lg(&dg.iter().map(|&i| q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
+        let cycl_order = 2 * self.n as u64;
+        let mut p = self.p.clone();
+        let need = widest - lg(&p);
+        if need > 0.0 {
+            let k = (need / (spec.special_bits as f64 - 0.1)).ceil() as usize;
+            let mut b = (need / k as f64 * 20.0).ceil() / 20.0;
+            loop {
+                if b > spec.special_bits as f64 {
+                    return Err(Error::Params(format!("lean chain: {k} special primes of <= {} bits cannot cover {need:.1} bits", spec.special_bits)));
+                }
+                let mut extra = Vec::with_capacity(k);
+                let mut cand = (b.exp2() as u64) / cycl_order * cycl_order + 1;
+                while extra.len() < k {
+                    cand = previous_prime(cand, cycl_order)?;
+                    if !q.contains(&cand) && !p.contains(&cand) {
+                        extra.push(cand);
+                    }
+                }
+                if lg(&extra) >= need {
+                    p.extend(extra);
+                    break;
+                }
+                b += 0.05;
+            }
+        }
+        let p_roots = p.iter().map(|&x| root_of_unity(cycl_order, x)).collect::<Result<Vec<_>>>()?;
+        let log_qp = product_bits(&q.iter().chain(p.iter()).copied().collect::<Vec<_>>());
+        if spec.security != Security::NotSet {
+            let n_actual = find_ring_dim(spec.security, log_qp);
+            if (self.n as u64) < n_actual as u64 {
+                return Err(Error::Params(format!(
+                    "the ring dimension [{}] does not meet security requirements (log QP {log_qp} needs {n_actual})",
+                    self.n
+                )));
+            }
+        }
+        let p_sparse = self.p.len();
+        Ok(Chain { spec: spec.clone(), q, p, q_roots, p_roots, digits, log_qp, groups, p_sparse, ..self })
     }
 
     /// Top limb index of the full chain (FIDESlib `L`).
@@ -431,6 +530,28 @@ impl Chain {
     }
     /// Is limb top `l` on the composite level grid (a ciphertext can sit there)?
     pub fn on_grid(&self, l: usize) -> bool {
-        (self.l() - l) % self.level_unit == 0
+        self.drop_at(l).is_some()
+    }
+    /// Primes of the level whose top limb is `l` (what a rescale from `l` drops); None off the level grid.
+    pub fn drop_at(&self, l: usize) -> Option<usize> {
+        let mut top = 0;
+        for &g in &self.groups {
+            top += g;
+            if top - 1 == l {
+                return Some(g);
+            }
+        }
+        None
+    }
+    /// Top limb of the lowest level above q0 that is narrower than `level_unit` (a lean chain's single-prime level).
+    pub fn lone_top(&self) -> Option<usize> {
+        let mut top = 0;
+        for &g in &self.groups {
+            top += g;
+            if g < self.level_unit {
+                return Some(top - 1);
+            }
+        }
+        None
     }
 }
