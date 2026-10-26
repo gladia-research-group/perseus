@@ -218,9 +218,31 @@ fn launch_ex<W: DevWord, M: DevStrategy<W>>(
     if epi.is_some() && dir == Dir::Inverse {
         return Err(shape("ntt epilogue", "the epilogues are forward-only"));
     }
+    let a = args_ex(ctx, base, roff, rprime, nrows, src, epi);
+    let (f, name) = match dir {
+        Dir::Forward => (ctx.table.ntt_fwd, "ntt_fwd"),
+        Dir::Inverse => (ctx.table.ntt_inv, "ntt_inv"),
+    };
+    // SAFETY: the tables are context constants of this chain; the row tables address rows inside `base`'s buffer
+    // (checked by the callers); `base` is exclusively borrowed by the caller for the launch's duration on `s`.
+    launch_result(name, unsafe { f(&a, s.raw()) })?;
+    Ok(())
+}
+
+/// The launch arguments of a transform of `nrows` rows (both directions; the epilogue is forward-only).
+#[allow(clippy::too_many_arguments)]
+fn args_ex<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    base: *mut c_void,
+    roff: *const u32,
+    rprime: *const i32,
+    nrows: usize,
+    src: Option<Src>,
+    epi: Option<Epi>,
+) -> NttArgs {
     let (mode, eout, ex, xn, xs, es, ess, ed) =
         epi.map(Epi::args).unwrap_or((0, std::ptr::null_mut(), std::ptr::null(), 1, 0, std::ptr::null(), std::ptr::null(), std::ptr::null()));
-    let a = NttArgs {
+    NttArgs {
         base,
         roff,
         rprime,
@@ -246,15 +268,22 @@ fn launch_ex<W: DevWord, M: DevStrategy<W>>(
         lazy: ctx.ntt.lazy as i32,
         xstride: xs as u64,
         ed,
-    };
-    let (f, name) = match dir {
-        Dir::Forward => (ctx.table.ntt_fwd, "ntt_fwd"),
-        Dir::Inverse => (ctx.table.ntt_inv, "ntt_inv"),
-    };
-    // SAFETY: the tables are context constants of this chain; the row tables address rows inside `base`'s buffer
-    // (checked by the callers); `base` is exclusively borrowed by the caller for the launch's duration on `s`.
-    launch_result(name, unsafe { f(&a, s.raw()) })?;
-    Ok(())
+    }
+}
+
+/// The forward arguments of entries `[0, nrows)` of `list` over `buf` with `epi`, for a pipeline that runs the
+/// transform itself (`rescale_fwd`).
+pub fn forward_args<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    buf: &mut DBuf<'_, Compute, W>,
+    list: &RowList<'_>,
+    nrows: usize,
+    epi: Option<Epi>,
+) -> Result<NttArgs> {
+    if nrows > list.len() || list.span_limbs * ctx.lay.n > buf.len() {
+        return Err(shape("ntt rows", format!("{nrows} of {} rows; list spans {} limbs, buffer holds {}", list.len(), list.span_limbs, buf.len() / ctx.lay.n)));
+    }
+    Ok(args_ex(ctx, buf.vptr_mut(), list.roff.dptr(), list.rprime.dptr(), nrows, None, epi))
 }
 
 /// In-place NTT of `parts` over `span` of every ciphertext in `ct` (one or two launches).

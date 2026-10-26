@@ -78,6 +78,81 @@ __global__ void rescale_combine(RescaleCombineArgs A) {
     store4<W>(d, r[0], r[1], r[2], r[3]);
 }
 
+// rescale_coef's two sources of every coefficient (ndrop 2), into tmp rows top (y_a, scaled by ca) and top - 1 (y')
+template <class W, class MM>
+__global__ void rescale_prep(RescaleArgs A) {
+    const int c = blockIdx.z >> 1, part = blockIdx.z & 1;
+    const int i = blockIdx.x * BX + threadIdx.x;
+    const int a = A.top, b = A.top - 1;
+    const PrimeConst& pa = A.pr[a];
+    const PrimeConst& pb = A.pr[b];
+    const W qb = (W)pb.p;
+    W ya = at<W>(A.x, c, part, a)[i];
+    W yb = at<W>(A.x, c, part, b)[i];
+    if (A.ca != 1) {
+        ya = MM::mul(ya, (W)A.ca, pa);
+        yb = MM::mul(yb, (W)A.cb, pb);
+    }
+    at<W>(A.tmp, c, part, a)[i] = ya;
+    at<W>(A.tmp, c, part, b)[i] = add<W>(MM::mul((W)A.qinv_ab, yb, pb), MM::mul((W)A.C_ab, lift<W, MM>(ya, (W)pa.p, pb), pb), qb);
+}
+
+// The forward NTT's column pass of rescale_coef's rows (ndrop 2), each row generated from rescale_prep's sources
+// (the same words rescale_coef stores, never stored here); row i of T is tmp row (c, part, r = rprime[i]).
+template <class W, class MM, bool L>
+__global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
+    __shared__ W s[256 * 32 / ntt::PH<W>];
+    const int row = blockIdx.y;
+    const int r = T.rprime[row];
+    W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
+    const W* ya = base + (size_t)(A.top - r) * N;
+    const W* yp = base + (size_t)(A.top - 1 - r) * N;
+    const PrimeConst& pq = A.pr[r];
+    const W q = (W)pq.p;
+    const W ha = (W)A.pr[A.top].p >> 1, hb = (W)A.pr[A.top - 1].p >> 1;
+    const W av = ((const W*)A.A)[r], as = ((const W*)A.As)[r], bv = ((const W*)A.B)[r], bs = ((const W*)A.Bs)[r];
+    const W qam = ((const W*)A.qam)[r], qbm = ((const W*)A.qbm)[r];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    W x[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int o = (wp + 8 * j) * 256 + lane;
+        const W u = ya[o], v = yp[o];
+        W la = reduce_small<W, MM>(u, pq);
+        if (u > ha) la = sub<W>(la, qam, q);
+        W lb = reduce_small<W, MM>(v, pq);
+        if (v > hb) lb = sub<W>(lb, qbm, q);
+        x[j] = add<W>(mul_shoup<W>(la, av, as, q), mul_shoup<W>(lb, bv, bs, q), q);
+    }
+    ntt::fwd_cols_core<W, L>(x, base, s, (const W*)T.fw + (size_t)r * N, (const W*)T.fws + (size_t)r * N, q, lane, wp);
+}
+
+template <class W, class MM>
+int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
+    const RescaleArgs& R = a->rs;
+    const NttArgs& T = a->ntt;
+    if (R.ndrop != 2 || T.soff || T.epi < 0 || T.epi > 3 || (T.epi && (!T.eout || !T.ex || !T.es || !T.ess))) return -1;
+    rescale_prep<W, MM><<<dim3(N / BX, 1, 2 * R.K), BX, 0, s>>>(R);
+    NttArgs b = T;
+    b.snum = 1;
+    b.xnum = max(T.xnum, 1);
+    const bool lz = ntt::LAZY<W, true> && T.lazy;
+    const int ch = T.chunk > 0 ? T.chunk : T.nrows;
+    for (int i = 0; i < T.nrows; i += ch) {
+        const int m = min(ch, T.nrows - i);
+        b.roff = T.roff + i;
+        b.rprime = T.rprime + i;
+        if (lz) {
+            cols_rs<W, MM, true><<<dim3(8, m), 256, 0, s>>>(b, R);
+            ntt::ntt_fwd_rows<W, true><<<dim3(32, m), 256, 0, s>>>(b);
+        } else {
+            cols_rs<W, MM, false><<<dim3(8, m), 256, 0, s>>>(b, R);
+            ntt::ntt_fwd_rows<W, false><<<dim3(32, m), 256, 0, s>>>(b);
+        }
+    }
+    return (int)cudaGetLastError();
+}
+
 template <class W, class MM>
 int coef_l(const RescaleArgs* a, cudaStream_t s) {
     if (a->ndrop != 1 && a->ndrop != 2) return -1;

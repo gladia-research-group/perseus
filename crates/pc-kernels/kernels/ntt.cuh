@@ -139,24 +139,10 @@ __device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s
 }
 
 // ---------------------------------------------------------------- forward column pass
+// The column pass of one 32-column block of a row (prime p, twiddles w / ws) on x = the block's words held as
+// x[j] = word (wp + 8 j) * 256 + lane (canonical), stored at a (the block's first word); s: the transpose buffer.
 template <class W, bool L>
-__global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
-    __shared__ W s[256 * 32 / PH<W>];
-    const int row = blockIdx.y;
-    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
-    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 32 : a;
-    const int pid = T.rprime[row];
-    const W p = (W)T.pr[pid].p;
-    const W* w = (const W*)T.fw + (size_t)pid * N;
-    const W* ws = (const W*)T.fws + (size_t)pid * N;
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    W x[32];
-#pragma unroll
-    for (int j = 0; j < 32; ++j) x[j] = in[(wp + 8 * j) * 256 + lane];
-    for (int m = 1; m < T.snum; ++m) {
-#pragma unroll
-        for (int j = 0; j < 32; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (wp + 8 * j) * 256 + lane], p);
-    }
+__device__ __forceinline__ void fwd_cols_core(W (&x)[32], W* a, W* s, const W* w, const W* ws, W p, int lane, int wp) {
     // stages tr = 128..8 (m = 1..16): pairs (j, j + tr/8), group i = j / (2 tr/8)
 #pragma unroll
     for (int st = 0; st < 5; ++st) {
@@ -212,6 +198,25 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     for (int q = 0; q < 4; ++q)
 #pragma unroll
         for (int u = 0; u < 8; ++u) a[(8 * (wp + 8 * q) + u) * 256 + lane] = x[8 * q + u];
+}
+
+template <class W, bool L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
+    __shared__ W s[256 * 32 / PH<W>];
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 32 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    W x[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) x[j] = in[(wp + 8 * j) * 256 + lane];
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (wp + 8 * j) * 256 + lane], p);
+    }
+    fwd_cols_core<W, L>(x, a, s, (const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, p, lane, wp);
 }
 
 // ---------------------------------------------------------------- forward row pass (warp per row, 8 rows per block)
