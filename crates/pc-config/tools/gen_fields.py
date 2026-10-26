@@ -64,6 +64,8 @@ EXTRA = [
      "(pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale).", "PC_EM_FUSE_RESCALE"),
     ("bts", "lt_tails", "Flag", "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu "
      "`BtsSetup::lt_tails`; default on, off = those stages regenerate every digit).", "PC_LT_TAILS"),
+    ("bts", "pair", "Flag", "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh "
+     "(pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own).", "PC_BTS_PAIR"),
     ("exec", "use_graphs", "Flag", "Replay a bound block program's static segments as captured CUDA graphs after its "
      "first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."),
     ("exec", "trace_alloc", "Flag", "Report device free memory and arena use around every planned token (the "

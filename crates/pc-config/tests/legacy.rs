@@ -39,12 +39,12 @@ fn field_table() {
     let pf = PlanConfig::fields();
     println!("[config] Config {} fields, PlanConfig {} fields", cf.len(), pf.len());
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
-    // bts.lt_tails, model.prefill.{last_query,qkv_pack}
-    assert_eq!(cf.len(), 254);
+    // bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack}
+    assert_eq!(cf.len(), 258);
     // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
     // plan.fallback_cf, plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
-    // plan.keep_placements_exact
-    assert_eq!(pf.len(), 96);
+    // plan.keep_placements_exact, plan.mag_safety_steps, plan.resume
+    assert_eq!(pf.len(), 98);
     let mut envs = BTreeSet::new();
     let mut dotted = BTreeSet::new();
     for f in cf.iter().chain(pf.iter()) {
@@ -54,11 +54,11 @@ fn field_table() {
             assert!(f.doc.contains(&format!("`{}`", f.env)), "{} not documented with its env name", f.dotted());
         }
     }
-    // 337 inventory names - 4 without a field (GPU guard, dropped _client, two upstream-driver inputs) + the two
-    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS) + PF_LAST_QUERY, PF_QKV_PACK, PLAN_FALLBACK_CF,
-    // PLAN_ARGMAX_MINCUT, PLAN_ILP_TIEBREAK, PLAN_RAISE_DROP_BASE, PLAN_RAISE_SEARCH, PLAN_PACK_CF,
-    // PLAN_KEEP_PLACEMENTS_EXACT
-    assert_eq!(envs.len(), 344);
+    // 337 inventory names - 4 without a field (GPU guard, dropped _client, two upstream-driver inputs) + the three
+    // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS, PC_BTS_PAIR) + PF_LAST_QUERY, PF_QKV_PACK, PF_ATTN_BSGS,
+    // PF_SM_HPACK, PLAN_FALLBACK_CF, PLAN_ARGMAX_MINCUT, PLAN_ILP_TIEBREAK, PLAN_RAISE_DROP_BASE, PLAN_RAISE_SEARCH,
+    // PLAN_PACK_CF, PLAN_KEEP_PLACEMENTS_EXACT, PLAN_MAG_SAFETY_STEPS, PLAN_RESUME, FIDESLIB_BTS_SPARSE_B_K
+    assert_eq!(envs.len(), 350);
 }
 
 #[test]

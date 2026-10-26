@@ -23,7 +23,7 @@ section! {
 }
 
 section! {
-    /// `bts` (29 legacy env names).
+    /// `bts` (31 legacy env names).
     BtsSection "bts" {
         #[doc = "`AUTO_BTS_LEVEL`. Default None. Read at impl/fakecap.py::make_session; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39; runtime= 6."]
@@ -55,6 +55,9 @@ section! {
         #[doc = "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu `BtsSetup::lt_tails`; default on, off = those stages regenerate every digit)."]
         #[doc = "Runtime switch `PC_LT_TAILS` [kernel]: binds no plan and no key bundle."]
         lt_tails: Flag = "PC_LT_TAILS", "(unset)";
+        #[doc = "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh (pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR`."]
+        pair: Flag = "PC_BTS_PAIR", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";
@@ -82,6 +85,9 @@ section! {
         #[doc = "`FIDESLIB_BTS_SPARSE_B_MAX`. Default (unset). Read at examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: runtime= 6."]
         sparse_b_max: Int = "FIDESLIB_BTS_SPARSE_B_MAX", "(unset)";
+        #[doc = "`FIDESLIB_BTS_SPARSE_B_K`. Default (unset) = 24. Read at pc-py session (the SparseB routes' EvalMod series: 24, FIDESlib's degree-20 table, or 16, the dense route's degree-14 table)."]
+        #[doc = "Shipped plans: none."]
+        sparse_b_k: Int = "FIDESLIB_BTS_SPARSE_B_K", "(unset)";
         #[doc = "`SPARSE_BTS_SLOTS`. Default '' / '512,1' / None. Read at impl/fakecap.py::CapFhe.__init__; impl/fakecap.py::make_session; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39; runtime= 6."]
         sparse_bts_slots: List = "SPARSE_BTS_SLOTS", "'' / '512,1' / None";
@@ -367,8 +373,11 @@ section! {
         #[doc = "`PF_ATTN`. Default ''. Read at examples/llama/run_prefill.py::main; impl/ccmm.py::enabled."]
         #[doc = "Shipped plans: runtime= 1."]
         attn: Str = "PF_ATTN", "''";
-        #[doc = "`PF_ATTN_PACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "`PF_ATTN_BSGS`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: runtime= 2."]
+        attn_bsgs: Flag = "PF_ATTN_BSGS", "'0'";
+        #[doc = "`PF_ATTN_PACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 9."]
         attn_pack: Int = "PF_ATTN_PACK", "'0'";
         #[doc = "`PF_ATTN_PAIR`. Default '1'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
@@ -574,6 +583,9 @@ section! {
         #[doc = "`PF_QKV_PACK`. Default '0'. Read at examples/gpt2/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         qkv_pack: Flag = "PF_QKV_PACK", "'0'";
+        #[doc = "`PF_SM_HPACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 2."]
+        sm_hpack: Flag = "PF_SM_HPACK", "'0'";
         #[doc = "`PF_SILU_SINGLE`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         silu_single: Flag = "PF_SILU_SINGLE", "'0'";
@@ -832,7 +844,7 @@ section! {
 }
 
 section! {
-    /// `plan` (96 legacy env names).
+    /// `plan` (98 legacy env names).
     PlanConfig "plan" {
         #[doc = "`PLAN_ACC_CHAIN`. Default (unset) / n32. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
@@ -958,7 +970,7 @@ section! {
         #[doc = "Shipped plans: none."]
         ilp_objective: Str = "PLAN_ILP_OBJECTIVE", "(unset)";
         #[doc = "`PLAN_ILP_TIEBREAK`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm, gpt2_prefill128_pfbh, gpt2_prefill128_pfbh_cm, gpt2_prefill128_pfbhrd, gpt2_prefill128_pfbhrd_cm."]
         ilp_tiebreak: Flag = "PLAN_ILP_TIEBREAK", "(unset)";
         #[doc = "`PLAN_ILP_TIME_LIMIT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 2."]
@@ -993,6 +1005,9 @@ section! {
         #[doc = "`PLAN_MAG_SAFETY`. Default (unset) / 2. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
         mag_safety: Str = "PLAN_MAG_SAFETY", "(unset) / 2";
+        #[doc = "`PLAN_MAG_SAFETY_STEPS`. Default None. Read at plan/placer/refresh.py::mag_safety_of."]
+        #[doc = "Shipped plans: none."]
+        mag_safety_steps: List = "PLAN_MAG_SAFETY_STEPS", "None";
         #[doc = "`MAX_LEVEL`. Default 24 / 50. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
         max_level: Str = "MAX_LEVEL", "24 / 50";
@@ -1036,7 +1051,7 @@ section! {
         #[doc = "Shipped plans: none."]
         quality_weight: Str = "PLAN_QUALITY_WEIGHT", "(unset)";
         #[doc = "`PLAN_RAISE_DROP_BASE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm, gpt2_prefill128_pfbhrd, gpt2_prefill128_pfbhrd_cm."]
         raise_drop_base: Str = "PLAN_RAISE_DROP_BASE", "(unset)";
         #[doc = "`PLAN_RAISE_ENV_RULE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
@@ -1051,7 +1066,7 @@ section! {
         #[doc = "Shipped plans: recipe= 12."]
         raise_drop_routes: Str = "PLAN_RAISE_ROUTES", "(unset)";
         #[doc = "`PLAN_RAISE_SEARCH`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm."]
+        #[doc = "Shipped plans: recipe= gpt2_decode_python_n32_kc16, gpt2_decode_python_n32_kc16_cm, gpt2_prefill128_pfbhrd, gpt2_prefill128_pfbhrd_cm."]
         raise_drop_search: Flag = "PLAN_RAISE_SEARCH", "'0'";
         #[doc = "`PLAN_RAISE_DROP_SET`. Default (unset) / 1,3,5. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
@@ -1074,6 +1089,9 @@ section! {
         #[doc = "`PLAN_RESCALE_OPT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         rescale_opt: Str = "PLAN_RESCALE_OPT", "(unset)";
+        #[doc = "`PLAN_RESUME`. Default '0'. Read at plan/placer/planner.py::plan_graph_dir."]
+        #[doc = "Shipped plans: none."]
+        resume: Flag = "PLAN_RESUME", "'0'";
         #[doc = "`RUNTIME_EXTRA`. Default . Read at examples/llama/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         runtime_extra: Str = "RUNTIME_EXTRA", "";
