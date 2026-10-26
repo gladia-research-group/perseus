@@ -751,6 +751,36 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
 
 // ── the linear: inputs -> StC -> product -> finishes ─────────────────────────────────────────────────────────────
 
+/// On a lean chain the StC-first input's factors sit in 27-bit single-prime plaintexts, set for a PCMM of band shift
+/// up to this (`stc_first::THIN_SPLIT_PCMM`); a linear of a larger shift first lowers its inputs' scale by
+/// 2^(shift - PREDIV_SHIFT), exactly, on the composite level above the StC-first entry (`prediv`).
+pub const PREDIV_SHIFT: u32 = 1;
+
+/// Lower `x`'s scale by 2^s at the cost of one level: x 2^k (an exact integer product) then the level's rescale, which
+/// divides by its primes (~2^(k + s)). The value is unchanged; its scale, which the StC-first input's factors divide,
+/// drops by the primes over 2^k. `x` must sit one level above the StC-first entry (after its pending rescale).
+fn prediv<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &Pcmm<'a, '_, W>, x: &mut Ct<'a, W>, s: u32, name: &str) -> Result<()> {
+    let ctx = cx.ctx;
+    if x.meta.deg == 2 {
+        cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
+    }
+    let entry = route.entry_level(ctx.shape.n_q);
+    if x.meta.level + ctx.shape.unit > entry {
+        return Err(shape("pcmm linear", format!("{name}: input at level {} has no level above the StC-first entry {entry} to divide its band shift on", x.meta.level)));
+    }
+    let top = ctx.top_of(x.meta.level)?;
+    let g = ctx.chain.drop_at(top).ok_or_else(|| shape("pcmm linear", format!("{name}: input top {top} off the level grid")))?;
+    let bits: f64 = (0..g).map(|j| (ctx.chain.q[top - j] as f64).log2()).sum();
+    let k = (bits.floor() as u32).checked_sub(s).ok_or_else(|| shape("pcmm linear", format!("{name}: band shift {s} past the level's {bits:.1} bits")))?;
+    pcmm.mult_pow2(ctx, &cx.ex.compute, x, k)?;
+    let nf = x.meta.nf * (k as f64).exp2();
+    x.meta.nf = nf;
+    x.meta.deg = 2;
+    cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
+    x.meta.nf = nf / ctx.scale.mod_reduce_product(top as i32);
+    Ok(())
+}
+
 /// How a linear's refreshes run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LinearOpts {
@@ -847,6 +877,11 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
         return Err(shape("pcmm linear", "every output must be in one group"));
     }
     let names: Vec<(String, u32)> = (0..ins.len()).map(|i| (format!("{}.in{i}", lin.name), ins[i].meta.level)).collect();
+    if route.thin() && lin.shift > PREDIV_SHIFT {
+        for x in ins.iter_mut() {
+            prediv(cx, route, pcmm, x, lin.shift - PREDIV_SHIFT, &lin.name)?;
+        }
+    }
     let stamp = lin.w_scale * (lin.shift as f64).exp2();
     for x in ins.iter_mut() {
         x.meta.nf *= stamp;

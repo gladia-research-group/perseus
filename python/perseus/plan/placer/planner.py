@@ -227,6 +227,9 @@ class PlanConfig:
     #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
     #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
     ilp_cap_exit: bool = True
+    #: a lean chain's PCMMs of band shift above PCMM_PREDIV_SHIFT: their inputs' caps (`hint_lev`, `lvl_cap`), one
+    #: level above the captured ones (PLAN_PCMM_PREDIV_CAP; the runtime spends that level dividing the shift)
+    pcmm_prediv_cap: int | None = None
     #: a dense refresh whose input is past the StC-first entry runs the shipped order at the plan's CF: give it that
     #: order's CF (PLAN_FALLBACK_CF; off: the StC-first choice, sized on slot magnitudes, as every shipped plan has)
     fallback_cf: bool = False
@@ -628,6 +631,45 @@ def recipe_plan_config(cfg: PlanConfig):
     return _pc.PlanConfig.from_legacy_env(env)
 
 
+#: pc-gpu `matmul::pcmm::PREDIV_SHIFT`: on a lean chain a PCMM of a larger band shift divides it on the level above
+#: the StC-first entry
+PCMM_PREDIV_SHIFT = 1
+
+
+def pcmm_prediv_caps(nodes: list[dict], cap: int) -> list[dict]:
+    """The captured nodes with the input caps (`hint_lev`, `lvl_cap`) of every PCMM whose band shift exceeds
+    PCMM_PREDIV_SHIFT lowered to `cap`: on a lean chain those inputs reach the PCMM one level above the StC-first entry,
+    which the runtime spends dividing their scale by 2^(shift - PCMM_PREDIV_SHIFT) (pc-gpu `matmul::pcmm::prediv`)."""
+    prod = {n["output"]: i for i, n in enumerate(nodes) if n.get("output")}
+    hit: set[int] = set()
+    for n in nodes:
+        ext = (n.get("args") or {}).get("external")
+        if not (isinstance(ext, dict) and ext.get("op") == "pcmm" and int(ext.get("shift", 0)) > PCMM_PREDIV_SHIFT):
+            continue
+        for v in n.get("inputs", []):
+            i = prod.get(v)
+            while i is not None and i not in hit and nodes[i].get("op_type") in ("level_hint", "hint"):
+                hit.add(i)
+                i = prod.get(nodes[i]["inputs"][0])
+
+    def lower(x: str) -> str:
+        for pre in ("lvl_cap(", "hint_lev("):
+            if x.startswith(pre) and x.endswith(")"):
+                return f"{pre}{min(cap, int(float(x[len(pre):-1])))})"
+        return x
+
+    out = []
+    for i, n in enumerate(nodes):
+        if i in hit:
+            args = dict(n.get("args") or {})
+            for k in ("thr", "cap"):
+                if k in args:
+                    args[k] = min(cap, int(args[k]))
+            n = dict(n, inputs=[lower(x) for x in n["inputs"]], args=args)
+        out.append(n)
+    return out
+
+
 def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                entry_level: int | None = None,
                entry_deg: int | None = None,
@@ -643,7 +685,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     """
     raw = json.loads(Path(graph_file).read_text(encoding="utf-8"))
     num_nodes_raw = len(raw.get("nodes", []))
-    g0 = Graph.from_nodes(raw.get("nodes", []), level_unit=cfg.level_unit)
+    nodes = raw.get("nodes", [])
+    if cfg.pcmm_prediv_cap is not None:
+        nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap)
+    g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
 
     g, erase = erase_reactive_bootstraps(g0)
     if cfg.verbose:
