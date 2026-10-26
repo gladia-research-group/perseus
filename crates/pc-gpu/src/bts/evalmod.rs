@@ -629,6 +629,21 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// rescale, which the caller decides) replaces them. `em`: the program buffers (BtsWork::em; joint runs use
     /// buffers 0..nslots, split runs 0..2 nslots); `tmp`: kk_max-ct rescale workspace.
     pub fn run<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, x: &mut CtBuf<'_, Compute, W>, k: usize) -> Result<()> {
+        self.run_into(cx, x, None, k)
+    }
+
+    /// Complex EvalMod whose Re and Im halves are two real payloads (a refresh pair, `StcFirstRoute::run_pair`): the
+    /// Re chain's result replaces the first k cts of `x`, the Im chain's those of `y`, both at `out_meta` (`run` would
+    /// return Re + i Im).
+    pub fn run_split<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, x: &mut CtBuf<'_, Compute, W>, y: &mut CtBuf<'_, Compute, W>, k: usize) -> Result<()> {
+        if self.mode != EmMode::Complex {
+            return Err(shape("evalmod", "a split EvalMod needs the Re / Im chains (EmMode::Complex)"));
+        }
+        ks::check_cts(y, 0, k, "evalmod split")?;
+        self.run_into(cx, x, Some(y), k)
+    }
+
+    fn run_into<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, x: &mut CtBuf<'_, Compute, W>, split: Option<&mut CtBuf<'_, Compute, W>>, k: usize) -> Result<()> {
         let ctx = cx.ctx;
         let lay = ctx.lay;
         let top_in = self.in_meta.top as usize;
@@ -710,12 +725,17 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let n_out = self.out_meta.top as usize + 1;
         let qo = lay.rs_q(n_out - 1);
         let re = View::of(&cx.work.em[0], 0);
-        match self.mode {
-            EmMode::Real => ks::ew(ctx, s, ks::Ew::Copy, View::of(x, 0), re, None, qo, k, 2)?,
-            EmMode::Complex => {
+        match (self.mode, split) {
+            (EmMode::Real, _) => ks::ew(ctx, s, ks::Ew::Copy, View::of(x, 0), re, None, qo, k, 2)?,
+            (EmMode::Complex, None) => {
                 let im = if joint { View::of(&cx.work.em[0], k) } else { View::of(&cx.work.em[self.nslots], 0) };
                 Self::mul_table(ctx, s, im, im, &self.mono_n2, n_out, k)?;
                 ks::ew(ctx, s, ks::Ew::Add, View::of(x, 0), re, Some(im), qo, k, 2)?;
+            }
+            (EmMode::Complex, Some(y)) => {
+                let im = if joint { View::of(&cx.work.em[0], k) } else { View::of(&cx.work.em[self.nslots], 0) };
+                ks::ew(ctx, s, ks::Ew::Copy, View::of(x, 0), re, None, qo, k, 2)?;
+                ks::ew(ctx, s, ks::Ew::Copy, View::of(y, 0), im, None, qo, k, 2)?;
             }
         }
         Ok(())

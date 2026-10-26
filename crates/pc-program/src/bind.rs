@@ -8,8 +8,9 @@
 //! * every streamed weight row (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
 //! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata;
 //! * the steps issued together (`Unit`): rotation grids and chains (`Program::rotation_grids` / `rotation_chains`),
-//!   K-batches, plaintext products with their add (`mult_pt_adds`). Other batches: member by member.
+//!   K-batches, refresh pairs, plaintext products with their add (`mult_pt_adds`); other batches member by member.
 //! Details in docs/ARCHITECTURE.md "pc-program bind".
+use crate::compile::batch::{paired, PAIR_K};
 use crate::error::{Error, Result};
 use crate::program::{Kind, Op, Origin, Program, Scalar, GRID_INPUTS};
 use crate::replay::Routes;
@@ -144,6 +145,9 @@ pub enum UnitKind {
     Mult { b: Vec<u32> },
     /// A K-batch of refreshes on one route (`BtsRoute::run` of K ciphertexts): step `lo + c` refreshes `Unit::ins[c]`.
     Refresh { route: Route, kind: RouteKind },
+    /// A refresh pair (`Pairing`): step `lo + c` refreshes `Unit::ins[c]` on `routes[c]`, both as one complex refresh
+    /// (`BtsRoute::run_pair`).
+    Pair { routes: [Route; 2], kind: RouteKind },
     /// A plaintext product and the add consuming it as one pass (`Ops::mult_pt_add`): step `lo` multiplies
     /// `Unit::ins[0]` by plaintext `pt`, step `lo + 1` adds (`sub`: subtracts) it and `Unit::ins[1]`, the product
     /// first when `product_first`.
@@ -703,6 +707,13 @@ impl<'a, W: DevWord> Bound<'a, W> {
             let kind = match (&m[0].kind, &steps[lo].op) {
                 (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs },
                 (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![] },
+                (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) if m.len() == PAIR_K && m.iter().all(|x| paired(p, x, p.batch_report.pair)) => {
+                    let StepOp::Bootstrap { route: ry, .. } = steps[lo + 1].op else { continue };
+                    if *kind != RouteKind::StcFirst || routes.get(*kind).is_none() {
+                        continue;
+                    }
+                    UnitKind::Pair { routes: [*route, ry], kind: *kind }
+                }
                 (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) => {
                     let same = steps[lo..hi].iter().all(|st| matches!(&st.op, StepOp::Bootstrap { route: r, .. } if r == route));
                     if !same || routes.get(*kind).is_none_or(|r| r.mem().1.k_max < m.len()) {

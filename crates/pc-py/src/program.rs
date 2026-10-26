@@ -192,6 +192,11 @@ impl PyProgram {
         }
         (r.k_max, r.bootstrap_launches, r.bootstrap_hist.clone(), per)
     }
+    /// Refresh pairs the batching formed (config `bts.pair`: two real refreshes as one complex refresh).
+    #[getter]
+    fn n_pairs(&self) -> usize {
+        self.prog.batch_report.pairs
+    }
     /// External finishes (PCMM / CCMM ops): (ops, refreshed outputs).
     #[getter]
     fn n_finishes(&self) -> (usize, usize) {

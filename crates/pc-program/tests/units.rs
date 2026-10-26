@@ -7,11 +7,11 @@
 //!   * rotation chains: every link rotates the chain's inputs; only element-wise ops and rescales between the links of
 //!     a chain kept in place; held chains do not overlap; no op between a chain's first and last link writes an
 //!     input's slot;
-//!   * plaintext products fused with their add (`Program::mult_pt_adds`): the product feeds only the add right after
-//!     it and is no output.
-use pc_program::compile::batch::Schedule;
+//!   * refresh pairs (`Pairing`) only reorder; a pair is two independent `Pairing::takes` refreshes of one level,
+//!     degree and drop; a fused product (`Program::mult_pt_adds`) feeds only the next add and is no output.
+use pc_program::compile::batch::{self, Schedule, PAIR_K};
 use pc_program::compile::{compile_dir, CompileOpts};
-use pc_program::program::{Kind, Op, Origin, Program, VarId, GRID_INPUTS};
+use pc_program::program::{Kind, Op, Origin, Pairing, Program, VarId, GRID_INPUTS};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,19 @@ fn member_set(p: &Program) -> BTreeMap<String, usize> {
     m
 }
 
+/// Every op after its inputs' producers; a batch's members independent.
+fn ordered(label: &str, p: &Program) {
+    let mut made: BTreeSet<VarId> = p.inputs.iter().copied().collect();
+    for op in &p.ops {
+        let outs: BTreeSet<VarId> = op.all_outs().into_iter().collect();
+        for v in op.all_ins() {
+            assert!(made.contains(&v), "{label}: {} reads var {v} before it is produced", op.members()[0].kind.name());
+            assert!(!outs.contains(&v), "{label}: a batch reads what one of its members writes");
+        }
+        made.extend(outs);
+    }
+}
+
 fn siblings(plan: &str, graph: &str) {
     let (Some(a), Some(b)) = (compile(plan, graph, Schedule::Program), compile(plan, graph, Schedule::Siblings)) else { return };
     assert_eq!(a.len(), b.len());
@@ -46,16 +59,44 @@ fn siblings(plan: &str, graph: &str) {
         assert_eq!(la, lb);
         assert!(pb.check.errors.is_empty(), "{lb}: {:?}", pb.check.errors.first());
         assert_eq!(member_set(pa), member_set(pb), "{lb}: the schedules run different ops");
-        let mut made: BTreeSet<VarId> = pb.inputs.iter().copied().collect();
-        for op in &pb.ops {
-            let outs: BTreeSet<VarId> = op.all_outs().into_iter().collect();
-            for v in op.all_ins() {
-                assert!(made.contains(&v), "{lb}: {} reads var {v} before it is produced", op.members()[0].kind.name());
-                assert!(!outs.contains(&v), "{lb}: a batch reads what one of its members writes");
-            }
-            made.extend(outs);
-        }
+        ordered(lb, pb);
     }
+}
+
+/// The unbatched programs (capture order) batched again with refresh pairs on (n32: StC-first entry 46, unit 2).
+fn pairs(plan: &str, graph: &str) {
+    let pd = assets().join("bootstrap_placements").join(plan);
+    let gd = assets().join("graphs").join(graph);
+    if !pd.join("block_0_placement.json").is_file() || !gd.join("block_0/graph.json").is_file() {
+        println!("SKIP {plan}: plan or graph not on disk");
+        return;
+    }
+    let dc = compile_dir(&pd, &gd, &CompileOpts { keep_going: true, no_batch: true, ..Default::default() }).expect("plan dir");
+    let pr = Pairing { entry: pc_shadow::BtsConfig::n32_shipped().stc_first_entry.expect("n32 StC-first entry"), unit: 2 };
+    let mut n_pairs = 0;
+    for (label, p) in dc.programs.iter().filter_map(|(l, r)| r.as_ref().ok().map(|p| (l, p))) {
+        let mut q = p.clone();
+        batch::batch(&mut q, 8, Schedule::Siblings, false, Some(pr));
+        assert_eq!(member_set(p), member_set(&q), "{label}: pairing runs different ops");
+        ordered(label, &q);
+        let mut formed = 0;
+        for op in &q.ops {
+            let m = op.members();
+            let takes = |x: &Op| batch::paired(&q, x, Some(pr));
+            if m.len() > 1 && m.iter().any(takes) {
+                assert!(m.len() == PAIR_K && m.iter().all(takes), "{label}: a pairable refresh in a batch that is not a pair");
+                let site = |x: &Op| match x.kind {
+                    Kind::Bootstrap(s) => (q.vars[x.ins[0] as usize].meta.level, q.vars[x.ins[0] as usize].meta.deg, q.bts_sites[s as usize].route.raise_drop),
+                    _ => unreachable!(),
+                };
+                assert_eq!(site(&m[0]), site(&m[1]), "{label}: a pair of two levels, degrees or raise drops");
+                formed += 1;
+            }
+        }
+        assert_eq!(formed, q.batch_report.pairs, "{label}: the batch report's pair count");
+        n_pairs += formed;
+    }
+    println!("{plan}: {n_pairs} refresh pairs checked");
 }
 
 fn rot(op: &Op) -> bool {
@@ -121,6 +162,11 @@ fn grids_and_chains(plan: &str, graph: &str, schedule: Schedule) {
 fn siblings_only_reorders() {
     siblings("gpt2_prefill128_m16s0_tail", "gpt2_prefill128_stcf_m16");
     siblings("gpt2_decode_python_n32_m16i", "gpt2_decode_python_n32_gcheb");
+}
+
+#[test]
+fn refresh_pairs_only_reorder() {
+    pairs("gpt2_prefill128_pf", "gpt2_prefill128_pf");
 }
 
 #[test]

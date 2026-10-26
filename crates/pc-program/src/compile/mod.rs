@@ -17,7 +17,7 @@ pub mod stream;
 use crate::error::{Error, Result};
 use crate::graph::BlockGraph;
 use crate::plan::{BlockPlan, PlanDir};
-use crate::program::{Program, VarId};
+use crate::program::{Pairing, Program, VarId};
 use pc_config::{Config, PlanConfig};
 use pc_shadow::graph::{parse_lvl_suffix, LoadOpts};
 use pc_shadow::route::Landing;
@@ -494,7 +494,9 @@ pub fn compile_block(
     p.check.ignored_anchors = lw.check.ignored_anchors.clone();
     p.check.inexact_scalars = res.inexact_scalars;
     let k_max = if opts.no_batch { 1 } else { sh.cfg.bts.k_max.max(1) };
-    batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free);
+    // PC_BTS_PAIR: sibling real refreshes in pairs, where the inputs enter StC-first
+    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit });
+    batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);
     let mut rep = check::verify(&sh, &p);

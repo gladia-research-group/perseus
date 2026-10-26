@@ -13,6 +13,7 @@ use crate::schedule::{self, Sched};
 use crate::error::{Error, Result};
 use pc_core::encode::Complex;
 use pc_cuda::{launch_result, Compute, Event, GraphExec, Stream};
+use pc_gpu::bts::stc_first::nf_key;
 use pc_gpu::bts::{batch, BtsCx, BtsRoute, BtsWork, RouteKind};
 use pc_gpu::encode_dev::CoeffRowsDevice;
 use pc_gpu::ks::{KeyGroup, KsPlans, KskSource};
@@ -145,6 +146,8 @@ pub struct RunInfo {
     pub launch_us: f64,
     pub meta_mismatches: usize,
     pub first_mismatches: Vec<String>,
+    /// Refresh pairs issued as one complex refresh and one by one (`ReplayStats::pairs`).
+    pub pairs: [usize; 2],
     /// Plaintext products and adds issued as one pass (`ReplayStats::fused`).
     pub fused: usize,
 }
@@ -157,6 +160,9 @@ pub struct ReplayStats {
     /// Graphs dropped because a plaintext address moved.
     pub invalidations: usize,
     pub capture_ms: f64,
+    /// Refresh pairs the eager runs issued as one complex refresh, and one by one (operand scales in two cache keys).
+    pub pairs: usize,
+    pub pairs_split: usize,
     /// Plaintext products and adds the eager runs issued as one pass (`UnitKind::MultPtAdd`).
     pub fused: usize,
 }
@@ -437,11 +443,16 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         let unit = if in_unit {
             None
         } else {
-            b.unit_at(i)
-                .filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. })))
+            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. })));
+            let unit = at
                 .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
                 .map(|u| (b.unit_of[i], u.hi as usize))
-                .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == s.lane[i])))
+                .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == s.lane[i])));
+            if at.is_some_and(|u| matches!(u.kind, UnitKind::Pair { .. })) {
+                // a pair whose scales fall in two cache keys (or that a segment end cuts) issues one by one
+                info.pairs[unit.is_none() as usize] += 1;
+            }
+            unit
         };
         let dynamic = b.dynamic.contains(&(i as u32));
         let lane = sched.map_or(0, |s| s.lane[i]);
@@ -594,7 +605,8 @@ fn quiet(op: &StepOp) -> bool {
 
 /// Whether unit `u` can issue as one batch on the operands its slots hold: a K-batched product or refresh runs one
 /// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
-/// rotations only need one level.
+/// rotations only need one level; a refresh pair's members share level, degree and the StC-first stage cache's scale
+/// key (`nf_key`: the pair's last stage is built for the first member's scale, as a single refresh takes its cached one).
 fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow) -> bool {
     let meta = |s: &u32| slots.get(*s as usize).map(|c| c.meta);
     let one = |v: &[u32], scale: bool| {
@@ -605,6 +617,10 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
         UnitKind::Grid { .. } | UnitKind::RotateSum { .. } => one(&u.ins, false),
         UnitKind::Mult { b } => one(&u.ins, true) && one(b, true),
         UnitKind::Refresh { .. } => one(&u.ins, true),
+        UnitKind::Pair { .. } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
+            (Some(x), Some(y)) => x.level == y.level && x.deg == y.deg && nf_key(x.nf) == nf_key(y.nf),
+            _ => false,
+        },
         // one pass when neither the add nor the plaintext needs a prelude; a sum landing on the add's other operand
         // also takes none on the product, and one landing on the product's input is not fused
         UnitKind::MultPtAdd { pt, sub, product_first } => {
@@ -735,6 +751,17 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                 batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, &gather.a, c, m)?;
             }
         }
+        UnitKind::Pair { routes, kind } => {
+            // each input copied into its output slot, the two refreshed there as one complex refresh, each landing where
+            // its single refresh would
+            let r = rt.routes.get(*kind).ok_or_else(|| rerr(block, format!("route {kind:?} not held")))?;
+            // SAFETY: as the unit's other outputs (two distinct slots, neither an input's)
+            let (x, y) = unsafe { (&mut *slots.add(span[0].out as usize), &mut *slots.add(span[1].out as usize)) };
+            copy_ct(rt.ctx, &rt.ex.compute, x, xs[0])?;
+            copy_ct(rt.ctx, &rt.ex.compute, y, xs[1])?;
+            let mut cx = BtsCx { ctx: rt.ctx, ex: &mut *rt.ex, sh: rt.sh, ks: rt.ks, ops: &mut *rt.ops, work: &mut *rt.work };
+            r.run_pair(&mut cx, x, y, &routes[0], &routes[1])?;
+        }
     }
     Ok(())
 }
@@ -752,7 +779,7 @@ fn issue_dynamic<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b
             }
         }
     }
-    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
+    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], pairs: [0; 2], fused: 0 };
     issue_range(rt, b, i, i + 1, false, &mut scratch, None, None)
 }
 
@@ -813,7 +840,7 @@ impl Replayer {
 
     pub fn run<'a, W: DevWord, M: DevStrategy<W>>(&mut self, b: &mut Bound<'a, W>, rt: &mut Rt<'_, 'a, W, M>) -> Result<RunInfo> {
         let t0 = Instant::now();
-        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
+        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], pairs: [0; 2], fused: 0 };
         if b.pts.iter().any(|p| !p.stream && p.meta.is_none()) {
             return Err(rerr(&b.label, "plaintexts not resolved (Bound::resolve_pts after staging)"));
         }
@@ -822,6 +849,8 @@ impl Replayer {
         if !self.cfg.use_graphs {
             issue(rt, b, self.cfg.check_meta, &mut info, None, sched)?;
             self.stats.eager += 1;
+            self.stats.pairs += info.pairs[0];
+            self.stats.pairs_split += info.pairs[1];
             self.stats.fused += info.fused;
             info.host_us = t0.elapsed().as_secs_f64() * 1e6;
             return Ok(info);
@@ -863,6 +892,8 @@ impl Replayer {
         // first run with these rows: eager (this token's result, warms the caches), then capture without executing
         let in_metas: Vec<CtMeta> = b.inputs.iter().map(|(_, s, _)| b.slots[*s as usize].meta).collect();
         issue(rt, b, self.cfg.check_meta, &mut info, None, sched)?;
+        self.stats.pairs += info.pairs[0];
+        self.stats.pairs_split += info.pairs[1];
         self.stats.fused += info.fused;
         let out_metas: Vec<CtMeta> = b.outputs.iter().map(|(_, s, _)| b.slots[*s as usize].meta).collect();
         info.host_us = t0.elapsed().as_secs_f64() * 1e6;
@@ -887,7 +918,7 @@ impl Replayer {
             match seg {
                 Ok((lo, hi)) => {
                     let mut err: Option<Error> = None;
-                    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
+                    let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], pairs: [0; 2], fused: 0 };
                     let r = s.capture(|_| {
                         issue_range(rt, b, lo, hi, false, &mut scratch, None, sched).map_err(|e| {
                             err = Some(e);
@@ -963,7 +994,7 @@ impl Replayer {
     /// One eager run with `hook` called after every step (debugging: per-step decryptions, metadata traces).
     pub fn eager_with<'a, W: DevWord, M: DevStrategy<W>>(&mut self, b: &mut Bound<'a, W>, rt: &mut Rt<'_, 'a, W, M>, hook: &mut StepHook<'_, 'a, W, M>) -> Result<RunInfo> {
         let t0 = Instant::now();
-        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], fused: 0 };
+        let mut info = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], pairs: [0; 2], fused: 0 };
         issue(rt, b, true, &mut info, Some(hook), None)?;
         self.stats.eager += 1;
         info.host_us = t0.elapsed().as_secs_f64() * 1e6;

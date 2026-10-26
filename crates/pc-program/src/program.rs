@@ -235,6 +235,38 @@ pub struct BatchReport {
     /// Batch size -> number of batches (bootstraps).
     pub bootstrap_hist: std::collections::BTreeMap<usize, usize>,
     pub per_kind: Vec<KindCount>,
+    /// The refresh pairing the batching ran with (config `bts.pair`; bind forms pair units only when it is set), and
+    /// the pairs formed (`Kind::Batched` of two refreshes `Pairing::takes`: one complex refresh at replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair: Option<Pairing>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pairs: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Refresh pairing (config `bts.pair`): two sibling refreshes of real payloads, x and y, run as one complex refresh of
+/// x + i y (pc-gpu `BtsRoute::run_pair`). `entry`: the deepest effective input level that runs StC-first (pc-shadow
+/// `BtsConfig::stc_first_entry`; deeper inputs take the shipped order, which has no pair form); `unit`: the chain's
+/// level unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pairing {
+    pub entry: u32,
+    pub unit: u32,
+}
+
+/// The largest correction factor of a pair member (the pair's 1/2 comes out of a member's pre-scale 2^(19 - CF)):
+/// pc-gpu's StC-first reference CF less one (the planned session checks the two agree).
+pub const PAIR_CF_MAX: u32 = 19;
+
+impl Pairing {
+    /// Whether a refresh on `r` of an input at `m` takes part in pairs: real payload, dense, StC-first with an input
+    /// that enters StC-first, one iteration, a CF of at most `PAIR_CF_MAX` (None: the route's default, below it).
+    pub fn takes(&self, r: &Route, m: &CtMeta) -> bool {
+        r.real && r.slots == 0 && r.stc_first && r.spru_h == 0 && r.iterations <= 1 && r.cf.is_none_or(|c| c <= PAIR_CF_MAX) && m.effective_level(self.unit) <= self.entry
+    }
 }
 
 /// Op accounting against the graph (the identity `tests/shipped_plans.rs` checks).
