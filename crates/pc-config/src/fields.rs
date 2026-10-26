@@ -44,7 +44,7 @@ section! {
         #[doc = "Shipped plans: runtime= llama128."]
         cts_alt_budget: Int = "FIDESLIB_CTS_ALT_BUDGET", "(unset)";
         #[doc = "EvalMod: a Regen relinearization and the rescale after it as one exact conversion (pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale)."]
-        #[doc = "Runtime switch `PC_EM_FUSE_RESCALE`."]
+        #[doc = "Runtime switch `PC_EM_FUSE_RESCALE` [kernel]: binds no plan and no key bundle."]
         em_fuse_rescale: Flag = "PC_EM_FUSE_RESCALE", "(unset)";
         #[doc = "`FIDESLIB_GPU_ENCODE`. Default (unset). Read at examples/gpt2/env.py::ENV; examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: none."]
@@ -53,7 +53,7 @@ section! {
         #[doc = "No legacy env name."]
         k_max: Int = "", "(unset)";
         #[doc = "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu `BtsSetup::lt_tails`; default on, off = those stages regenerate every digit)."]
-        #[doc = "Runtime switch `PC_LT_TAILS`."]
+        #[doc = "Runtime switch `PC_LT_TAILS` [kernel]: binds no plan and no key bundle."]
         lt_tails: Flag = "PC_LT_TAILS", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]

@@ -105,6 +105,9 @@ fn dotted_access_and_errors() {
     assert_eq!(lb.mem.fhe_pt_coeff_encode, Some(false));
     assert_eq!(lb.host, Default::default());
     assert_eq!(lb.model, c.model);
+    // the perseus-core kernel switches bind nothing
+    let (k, _) = Config::from_legacy_env([("PC_EM_FUSE_RESCALE", Some("1")), ("PC_LT_TAILS", Some("0"))]).unwrap();
+    assert_eq!(k.load_bearing(), Config::default().load_bearing());
 }
 
 fn walk(p: &Path, out: &mut Vec<PathBuf>) {

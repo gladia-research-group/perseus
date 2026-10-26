@@ -222,9 +222,12 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let st_tab = pc_core::scale::ScaleTables::precompute(&chain)?;
     let want = |r: &str| o.routes.iter().any(|x| x == r);
     // dense + StC-first: one StcFirstRoute (its shipped order == DenseRoute word for word)
+    // PC_EM_FUSE_RESCALE=1: the EvalMod relinearization-rescale fusion on every route (default off, as BtsSetup)
+    let em_fuse = std::env::var("PC_EM_FUSE_RESCALE").is_ok_and(|v| v == "1");
     let mut setup = BtsSetup::n32_shipped();
     setup.k_max = kb;
     setup.real = true;
+    setup.em_fuse_rescale = em_fuse;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
@@ -241,6 +244,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
         .map(|&s| {
             let mut c = SparseBCfg::n32(s, 1);
             c.k_max = kb;
+            c.em_fuse_rescale = em_fuse;
             c
         })
         .collect();
