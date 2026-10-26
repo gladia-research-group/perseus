@@ -93,7 +93,7 @@ pub fn rule(sh: &Shadow, kind: &Kind, ins: &[CtMeta], pts: &[PtRef], sites: &[Bt
             // the raise rescales a pending product, then rescales once more after its scale adjust (ModRaise's
             // non-prescaled path) before it drops to the composite bottom: both must stay on the chain
             let unit = sh.unit();
-            let room = sh.cfg.chain.n_q.saturating_sub(2 * unit);
+            let room = sh.cfg.bts.input_room.unwrap_or(sh.cfg.chain.n_q.saturating_sub(2 * unit));
             let eff = ins[0].effective_level(unit);
             if eff > room {
                 return Err(format!(

@@ -2,8 +2,8 @@
 //! plan decisions as ops, the Shadow alongside), `batch` (K sibling ops per launch), `alloc` (arena slots),
 //! `check::verify` (the Shadow re-run over the finished program: pins, ceilings, recorded preludes).
 //!
-//! The runtime truth the check runs on is `runtime_shadow`: the pc-shadow C++ rules (no quirks) on the real n32
-//! chain, with FIDESlib's realized route landings (dense StC-first 28 / shipped order 34 past the StC-first entry,
+//! The runtime truth the check runs on is `runtime_shadow`: the pc-shadow C++ rules (no quirks) on the real chain
+//! (`chain.preset`, n32 by default), with FIDESlib's realized route landings (dense StC-first 28 / shipped order 34 past the StC-first entry,
 //! 1024, 512 and 256 at 24, 1 at 16) and the per-route raise drops of the runtime line (`FIDESLIB_BTS_RAISE_DROP`): the
 //! planner's own landing table (`PLAN_SPARSE_BTS_OUT`, PLAN_STEP_LANDING floors) only sets the pins, which the check
 //! reads one-sided.
@@ -231,7 +231,12 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
         None | Some("n32") => {}
         Some(other) => return Err(cfg_err("chain.chain", format!("{other:?}: only the n32 chain shape is known"))),
     }
-    let chain = ChainShape { n_q: ChainShape::N32.n_q, unit };
+    // the limbs of the chain the Config names (`chain.preset`, default n32: 54; the lean n32a4: 51)
+    let preset = cfg.chain.preset.as_deref().unwrap_or("n32");
+    let spec = pc_core::params::ChainSpec::preset(preset).map_err(|e| cfg_err("chain.preset", e))?;
+    let real = pc_core::params::Chain::generate(&spec).map_err(|e| cfg_err("chain.preset", e))?;
+    let n_q = real.q.len() as u32;
+    let chain = ChainShape { n_q, unit };
     let mut quirks = Quirks::none();
     if let Some(names) = &cfg.quirks.shadow {
         for n in names {
@@ -284,6 +289,8 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     }
     // the shipped order (a dense refresh not run StC-first) lands where a too-deep StC-first input falls back to
     bts.dense_shipped = bts.stc_first_fallback;
+    // a refresh input's deepest effective level: the top of the level above q0's (n32: 50; n32a4's single s1: 48)
+    bts.input_room = Some(n_q - real.groups.iter().take(2).sum::<usize>() as u32);
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 

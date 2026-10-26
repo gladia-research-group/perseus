@@ -234,3 +234,35 @@ fn bootstrap_input_needs_raise_room() {
     assert!(rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(50, 1)], &[], &sites).is_ok());
     assert!(rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(48, 2)], &[], &sites).is_ok());
 }
+
+/// On a lean chain (CHAIN_PRESET=n32a4: 51 primes, a single s1 above the q0 pair) the runtime shadow takes the real
+/// limb count, and a refresh input may reach effective level 48 (s1's top), not n32's 50.
+#[test]
+fn runtime_shadow_on_the_lean_chain() {
+    use pc_program::compile::check::rule;
+    use pc_program::program::{BtsSite, SiteKind};
+    use pc_shadow::route::{Landing, Route};
+    use pc_shadow::CtMeta;
+    let mut c = cfg();
+    c.set_env("BTS_MAX_INPUT_LEVEL", Some("50")).unwrap();
+    let n32 = pc_program::compile::runtime_shadow(&c, &PlanConfig::default(), Some(34)).unwrap();
+    assert_eq!((n32.cfg.chain.n_q, n32.cfg.bts.input_room), (54, Some(50)));
+    c.set_env("CHAIN_PRESET", Some("n32a4")).unwrap();
+    let sh = pc_program::compile::runtime_shadow(&c, &PlanConfig::default(), Some(34)).unwrap();
+    assert_eq!((sh.cfg.chain.n_q, sh.cfg.bts.input_room), (51, Some(48)));
+    let site = BtsSite {
+        var: "x".into(),
+        kind: SiteKind::Placement,
+        route: Route::dense(),
+        input: CtMeta::new(48, 1),
+        landing: Landing { level: 34, deg: 1 },
+        realize: false,
+        prescale: None,
+        offset: None,
+    };
+    let sites = vec![site];
+    assert!(rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(48, 1)], &[], &sites).is_ok());
+    assert!(rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(46, 2)], &[], &sites).is_ok());
+    let err = rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(48, 2)], &[], &sites).unwrap_err();
+    assert!(err.starts_with("[bts_input_error]"), "{err}");
+}
