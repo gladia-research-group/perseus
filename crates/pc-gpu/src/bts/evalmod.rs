@@ -562,7 +562,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             regen_epi,
             rr,
             rr_k,
-            fuse_rescale: true,
+            fuse_rescale: false,
             bytes: 0,
             nq,
         };
