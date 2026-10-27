@@ -4,7 +4,7 @@ use pc_core::keys::{sample_ternary, DiscreteGaussian, Prng};
 use pc_tfhe::lwe::Lwe;
 use pc_tfhe::modq::prime_below;
 use pc_tfhe::params::Params;
-use pc_tfhe::pbs::{sign01, test_vector};
+use pc_tfhe::pbs::{sign01, test_vector, unwarp};
 use pc_tfhe::rlwe::RnsRlwe;
 use pc_tfhe::switch::Switcher;
 
@@ -35,20 +35,22 @@ fn pbs_sign_on_fresh_lwes() {
     let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, &dg, &mut prng);
     let delta = p.q_br >> p.out_cf;
     let (tv, off) = sign01(p.n_br, delta);
-    let ms: Vec<f64> = (0..24).map(|i| -0.95 + 1.9 * i as f64 / 23.0).collect();
+    let ms: Vec<f64> = (0..64).map(|i| -0.95 + 1.9 * i as f64 / 63.0).collect();
     let lwes: Vec<Lwe> = ms
         .iter()
         .map(|&m| Lwe::encrypt(((m * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64, &s_lwe, p0, &dg_lwe, &mut prng))
         .collect();
     let outs = bsk.bootstrap_many(&tv, off, &lwes, p0);
-    let mut worst = 0f64;
+    let (mut worst, mut ss) = (0f64, 0f64);
     for (m, o) in ms.iter().zip(outs) {
         let ph = pc_tfhe::modq::centered(o.phase(&s_br, p.q_br), p.q_br) as f64 / delta as f64;
         let want = if *m >= 0.0 { 1.0 } else { 0.0 };
         worst = worst.max((ph - want).abs());
+        ss += (ph - want).powi(2);
         assert!((ph - want).abs() < 1e-3, "m {m}: want {want} got {ph}");
     }
-    eprintln!("pbs_sign_on_fresh_lwes: max output error {worst:.3e} (units of delta)");
+    let rms = (ss / ms.len() as f64).sqrt() * delta as f64 / p.q_br as f64;
+    eprintln!("pbs_sign_on_fresh_lwes: max output error {worst:.3e} (units of delta), rms 2^{:.2} q_br", rms.log2());
 }
 
 #[test]
@@ -65,7 +67,6 @@ fn switch_sign_end_to_end() {
     let (tv, off) = sign01(sw.params.n_br, sw.delta_br());
     let out = sw.apply(&ct, &valid, &tv, off);
     let ph = out.phase(&s, &sw.ntt_p);
-    let unit = q0 as f64 / (1u64 << sw.params.out_cf) as f64;
     let mut worst = 0f64;
     for j in 0..N {
         // the input reaches the blind rotation with ~1% of its range in noise: no sign is promised inside that band
@@ -73,11 +74,11 @@ fn switch_sign_end_to_end() {
             continue;
         }
         let want = if valid.contains(&j) { if m[j] >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
-        let got = ph[j] as f64 / unit;
+        let got = unwarp(ph[j] as f64 / q0 as f64, sw.params.out_cf);
         worst = worst.max((got - want).abs());
         assert!((got - want).abs() < 1e-3, "coefficient {j}: m {} want {want} got {got}", m[j]);
     }
-    eprintln!("switch_sign_end_to_end: max |out - (1 + sign) / 2| = {worst:.3e} (units of q0 / 2^{})", sw.params.out_cf);
+    eprintln!("switch_sign_end_to_end: max |out - (1 + sign) / 2| = {worst:.3e} (as the finish reads it, x 2^{})", sw.params.out_cf);
 }
 
 #[test]
@@ -91,15 +92,13 @@ fn lut_general() {
     let msg: Vec<i128> = m.iter().map(|&v| (v * q0 as f64 / 4.0).round() as i128).collect();
     let ct = RnsRlwe::encrypt(&msg, &s, &sw.ntt_p, &dg, &mut prng);
     // f(m) = max(m, 0)^2 / 2 at the output scale (any function on [-1, 1))
-    let d = sw.delta_br() as f64;
-    let tv = test_vector(sw.params.n_br, sw.params.q_br, |x| ((x.max(0.0).powi(2) / 2.0) * d).round() as u64);
+    let tv = test_vector(sw.params.n_br, sw.params.q_br, |x| sw.lut_value(x.max(0.0).powi(2) / 2.0));
     let out = sw.apply(&ct, &valid, &tv, 0);
     let ph = out.phase(&s, &sw.ntt_p);
-    let unit = q0 as f64 / (1u64 << sw.params.out_cf) as f64;
     let mut worst = 0f64;
     for &j in &valid {
         let want = m[j].max(0.0).powi(2) / 2.0;
-        let got = ph[j] as f64 / unit;
+        let got = unwarp(ph[j] as f64 / q0 as f64, sw.params.out_cf);
         // f' <= 1 on [-1, 1): the output error is the input's (key switch + mod switch noise, ~1% of the range)
         worst = worst.max((got - want).abs());
         assert!((got - want).abs() < 0.03, "j {j} m {} want {want} got {got}", m[j]);

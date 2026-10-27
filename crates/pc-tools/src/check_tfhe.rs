@@ -71,9 +71,9 @@ fn run(args: &[String]) -> Res<bool> {
     let n_switch: usize = arg(args, "--switch").map(|s| s.parse()).transpose()?.unwrap_or(64);
     let level: u32 = arg(args, "--level").map(|s| s.parse()).transpose()?.unwrap_or(44);
     let cf: u32 = arg(args, "--cf").map(|s| s.parse()).transpose()?.unwrap_or(2);
-    // the LUT lands at v q0 / 2^out_cf: EvalMod's sine is m only while m << q0, so out_cf > cf; the finish's x 2^cf
-    // returns v / 2^(out_cf - cf)
-    let out_cf: u32 = arg(args, "--out-cf").map(|s| s.parse()).transpose()?.unwrap_or(8);
+    // the finish reads the LUT value v as v q0 / 2^out_cf (the LUT is arcsine-warped: pc_tfhe::pbs::warp) and, with its
+    // x 2^cf, returns v / 2^(out_cf - cf)
+    let out_cf: u32 = arg(args, "--out-cf").map(|s| s.parse()).transpose()?.unwrap_or(3);
     // --device: the same switch on the device too (pc_gpu::tfhe::TfheSwitch), on a second encryption of the values
     let device = args.iter().any(|a| a == "--device");
     let t0 = Instant::now();

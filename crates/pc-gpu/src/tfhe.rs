@@ -37,8 +37,8 @@ fn mu(p: u64) -> u64 {
 
 /// The device image of a host bootstrapping key (RNS, u32): the key [pair][m][e][h][thread][4] in Montgomery form
 /// (NTT form, times n^-1 2^32 per prime: the rotation's inverse NTT skips its scaling, its MAC reduces once per sum),
-/// where PBS_ROTATE's thread th of 1024 handles word k = th + 1024 e of [prime][n] and loads as uint4 h the values
-/// (c t = 2 h, part 0), (2 h, 1), (2 h + 1, 0), (2 h + 1, 1); the twiddles [prime][forward | inverse][n], then NTT(X^e - 1)'s
+/// where PBS_ROTATE's thread th of 1024 handles word k = th + 1024 e of [prime][n] and loads as uint4 h < levels the
+/// values (row r = 2 h, part 0), (2 h, 1), (2 h + 1, 0), (2 h + 1, 1), row r = c levels + t; the twiddles [prime][forward | inverse][n], then NTT(X^e - 1)'s
 /// tables (`Rns::monomial_tables`) pm1 [prime][2 n] (Montgomery form) and E [prime][n], and the twiddles' companions; and the PBS ops' constants (args.cuh:
 /// c[2..8) = n^-1 per prime with companions, q_a | q_b << 32, q_a^-1 mod q_b | its companion << 32; `m` the gadget's
 /// multiplier).
@@ -63,15 +63,15 @@ pub fn pbs_image(k: &pc_tfhe::pbs::BootstrapKey) -> PbsImage {
     let mut bsk = Vec::new();
     let mont = |v: u64, q: u64| ((v << 32) % q) as u32;
     let n = rns.n();
-    assert_eq!(lv, 2, "PBS_ROTATE's key layout is for two levels");
+    assert!(lv == 1 || lv == 2, "PBS_ROTATE takes one or two levels");
     for g in k.ggsw.iter().flatten() {
         for e in 0..4 {
-            for h in 0..2 {
+            for h in 0..lv {
                 for th in 0..n / 2 {
                     let (pr, j) = ((th + e * n / 2) / n, (th + e * n / 2) % n);
                     let q = [qa, qb][pr];
                     for ct in [2 * h, 2 * h + 1] {
-                        let r = &g.rows()[ct / 2][ct % 2][pr];
+                        let r = &g.rows()[ct / lv][ct % lv][pr];
                         for x in [r.0[j], r.1[j]] {
                             bsk.push(mont(pc_tfhe::modq::mulmod(x, ninv[pr], q), q));
                         }

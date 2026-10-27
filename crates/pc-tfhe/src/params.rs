@@ -5,8 +5,9 @@
 //! Security, against the HE-standard tables (128-bit classical, ternary secret, sigma 3.19) unless noted:
 //! - ring switch key / extracted LWE: secret s' of dimension 2048 (ring N, s'(X^S)), modulus p0 (31 bits): the table
 //!   allows 54 bits at 2048;
-//! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^50 (two 25-bit NTT primes, the device's u32
-//!   RNS): within the 54-bit bound;
+//! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
+//!   RNS): within the 54-bit bound. Output noise (unrolled pairs, one-level gadget 2^24): rms ~2^-15.4 q_br by the
+//!   model 6 (n/2) 2 l N (B^2 / 12) sigma^2 + n N (2/3) (q / B^l)^2 / 12, which matched 2^-20.2 measured at 2^50 / (18, 2);
 //! - repack columns: degree n_br = 2048 under a fresh ternary s_x at p0 P ~ 2^53 (P = rp_aux, 25 bits): within the
 //!   54-bit bound; repack ring key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
 //! - binary LWE key, n = 920, noise sigma = 2^-17 q: the regime of the TFHE-rs default sets (n 742-918 at relative
@@ -36,9 +37,9 @@ pub struct Params {
     pub rp_aux: u64,
     /// Ring-switch factor S: the extracted LWEs have dimension N / S.
     pub rs_factor: usize,
-    /// Output scale exponent: a LUT value v lands as v p0 / 2^out_cf. The finish's EvalMod returns m only while m << q0
-    /// (a sine): at q0 / 4 it reads 2 / pi; 2^-8 keeps it within ~1e-4. A finish at correction factor cf then returns
-    /// v / 2^(out_cf - cf) (folded into the consumer).
+    /// Output scale exponent: the finish reads a LUT value v as v / 2^out_cf of q0 (at correction factor cf it returns
+    /// v / 2^(out_cf - cf), folded into the consumer). Its EvalMod is a sine, so the LUT stores the arcsine-warped
+    /// phase (`pbs::warp`); |v| <= 1 needs out_cf >= 3.
     pub out_cf: u32,
 }
 
@@ -47,7 +48,7 @@ impl Params {
     pub fn new(n_ckks: usize) -> Result<Params> {
         let n_br = 2048;
         let m = 2 * n_br as u64;
-        let qa = prime_below(25, m)?;
+        let qa = prime_below(26, m)?;
         let mut qb = qa - m;
         while !crate::modq::is_prime(qb) {
             qb -= m;
@@ -59,13 +60,13 @@ impl Params {
             br_primes: (qa, qb),
             q_br: qa * qb,
             key_sigma: 3.19,
-            pbs: (18, 2),
+            pbs: (24, 1),
             ks: (2, 8),
             rs: (8, 3),
             rp: (16, 2),
-            rp_aux: qa,
+            rp_aux: prime_below(25, m)?,
             rs_factor: n_ckks / 2048,
-            out_cf: 8,
+            out_cf: 3,
         })
     }
 }

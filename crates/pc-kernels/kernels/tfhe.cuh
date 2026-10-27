@@ -83,7 +83,7 @@ __global__ void ms_k(TfheArgs A) {
     ((uint32_t*)A.x)[i] = (uint32_t)(scale_round(((const uint32_t*)A.y)[i], A.m) % two_n);
 }
 
-// ── the blind rotation in RNS: Q = q_a q_b (two ~25-bit primes, u32 residues, 32-bit Shoup products) ─────────────
+// ── the blind rotation in RNS: Q = q_a q_b (two ~26-bit primes, u32 residues, 32-bit Shoup products) ─────────────
 // c[0] base log, c[1] levels, c[2..6) n^-1 mod q_a and its companion, n^-1 mod q_b and its companion,
 // c[6] = q_a | q_b << 32, c[7] = q_a^-1 mod q_b | its Shoup companion mod q_b << 32; q = Q;
 // m = floor(2^(64 + levels base) / Q)
@@ -122,7 +122,7 @@ __device__ __forceinline__ uint32_t mono32(const uint32_t* a, int n, int kp, int
     return a[i + n];
 }
 // x mod Q from (r_a, r_b): r_a + q_a ((r_b - r_a) q_a^-1 mod q_b); invs = the Shoup companion of inv mod q_b.
-// q_a < 2 q_b (two 25-bit primes): r_a mod q_b is one conditional subtraction
+// q_a < 2 q_b (two primes of one size): r_a mod q_b is one conditional subtraction
 __device__ __forceinline__ uint64_t crt(uint32_t ra, uint32_t rb, uint32_t qa, uint32_t qb, uint32_t inv, uint32_t invs) {
     const uint32_t ram = ra >= qb ? ra - qb : ra;
     const uint32_t k = shoup32(sub32(rb, ram, qb), inv, invs, qb);
@@ -183,7 +183,7 @@ __device__ void nttp_inv(uint32_t* a, int P, int n, const uint32_t* tw, const ui
 // Register-blocked NTTs of P polynomials [P][2048] (poly k at prime k & 1): every phase loads groups of 2^S
 // coefficients into registers, runs S butterfly stages on them and writes back once (11 stages = 2 + 3 + 3 + 3:
 // four shared-memory round trips and barriers instead of eleven). Same butterflies and twiddles as nttp_fwd / nttp_inv,
-// reduced lazily (q < 2^25 leaves 7 bits of headroom): the forward takes [0, q) and adds < 2 q per stage (output
+// reduced lazily (q < 2^26 leaves 6 bits of headroom): the forward takes [0, q) and adds < 2 q per stage (output
 // < 23 q); the inverse keeps [0, 2 q). The rotation reduces exactly once, when it adds the product into acc.
 constexpr int RN = 2048, RLN = 11;
 // The shared polynomials (digits, products) are stored swizzled: word j at j ^ (bits 5-7 into 0-2) ^ (bits 6-7 into
@@ -324,15 +324,16 @@ __global__ void init_k(TfheArgs A) {
 
 // the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads), unrolled by key pairs (pc-tfhe pbs.rs):
 // per pair acc += sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j). Shared: acc [2 part][2 prime][n],
-// tb [c][level][2 prime][n] (the digits of both parts; the product o [2 part][2 prime][n] reuses its first 4 n): 12 n
-// words at two levels. bsk [pair][m][e][h][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
+// tb [c][level][2 prime][n] (the digits of both parts; the product o [2 part][2 prime][n] reuses its first 4 n):
+// 4 n (1 + LV) words at LV levels. bsk [pair][m][e][h < LV][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
 // inverse NTT then needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). tw carries after
 // the twiddles [prime][fwd | inv][n] the tables of NTT(X^e - 1): pm1 [prime][2 n] = g^x - 1 (Montgomery form) and
 // E [prime][n], NTT(X^e - 1)[j] = pm1[E[j] e mod 2 n]. Both products sum in 64 bits and reduce once (redc).
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
+template <int LV>
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
-    const int n = A.n, L = A.i1, bl = (int)A.c[0], lv = (int)A.c[1];
+    const int n = A.n, L = A.i1, bl = (int)A.c[0], lv = LV;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
     uint32_t *acc = sm32, *tb = sm32 + 4 * n, *o = tb;
     const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.x * (L + 1);
@@ -375,17 +376,17 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             const int k = threadIdx.x + e * blockDim.x, p = k >= n;
             const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
             const int ej = (int)ex[k];   // E [prime][n] at k = prime n + j
-            uint32_t d[4];   // [c][t]
+            uint32_t d[2 * LV];   // [c][t]
 #pragma unroll
-            for (int ct = 0; ct < 4; ct++) d[ct] = tb[ct * 2 * n + swz(k)];
+            for (int ct = 0; ct < 2 * LV; ct++) d[ct] = tb[ct * 2 * n + swz(k)];
             uint64_t y0 = 0, y1 = 0;   // 3 terms < 2 q q
 #pragma unroll
             for (int m = 0; m < 3; m++) {
                 if (!em[m]) continue;
-                uint64_t s0 = 0, s1 = 0;   // 4 terms < 23 q q: < q 2^32 at q < 2^25.5
+                uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
 #pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    const uint4 w = __ldg(bsk + ((m * RT_E + e) * 2 + h) * blockDim.x);
+                for (int h = 0; h < LV; h++) {
+                    const uint4 w = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
                     s0 += (uint64_t)d[2 * h] * w.x + (uint64_t)d[2 * h + 1] * w.z;
                     s1 += (uint64_t)d[2 * h] * w.y + (uint64_t)d[2 * h + 1] * w.w;
                 }
@@ -694,16 +695,20 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             init_k<<<dim3((A.n + 255) / 256, A.count), 256, 0, s>>>(A);
             break;
         case PC_TFHE_PBS_ROTATE: {
-            // the kernel is specialised to n = 2048 at two levels: 1024 threads, RT_E = 4 coefficients each
-            const int th = STEP_TH;
-            if (A.n != 2048 || A.c[1] != 2) return -1;
-            const int smem = 12 * A.n * (int)sizeof(uint32_t);
+            // the kernel is specialised to n = 2048 at one or two levels: 1024 threads, RT_E = 4 coefficients each; the
+            // lazy MAC needs 46 levels q < 2^32
+            const int th = STEP_TH, lv = (int)A.c[1];
+            const uint64_t qa = A.c[6] & 0xffffffffull, qb = A.c[6] >> 32, qmax = qa > qb ? qa : qb;
+            if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * lv * qmax >= (1ull << 32)) return -1;
+            const int smem = 4 * A.n * (1 + lv) * (int)sizeof(uint32_t);
             static bool attr_r = false;
-            if (!attr_r) {   // the opt-in for the largest ring (n = 2048: 96 KB), once
-                cudaFuncSetAttribute(rotate_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 12 * 2048 * (int)sizeof(uint32_t));
+            if (!attr_r) {   // the opt-in for n = 2048 (64 / 96 KB), once
+                cudaFuncSetAttribute(rotate_k<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                cudaFuncSetAttribute(rotate_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 12 * 2048 * (int)sizeof(uint32_t));
                 attr_r = true;
             }
-            rotate_k<<<A.count, th, smem, s>>>(A);
+            if (lv == 1) rotate_k<1><<<A.count, th, smem, s>>>(A);
+            else rotate_k<2><<<A.count, th, smem, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:
