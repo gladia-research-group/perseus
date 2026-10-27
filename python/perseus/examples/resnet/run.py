@@ -77,6 +77,7 @@ def _twin(a, net):
     from perseus.impl.layout import Dims
     from .impl import ResnetImpl
     over = dict(kv.split("=", 1) for kv in a.set)
+    over.setdefault("AUTO_BTS_LEVEL", str(a.twin_limit))     # the twin's ceiling, stamped in the capture's Config too
     env.export_env(None, chain="n32", CKKS_COMPLEX="1", **over)
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
     # the reactive ceiling at the planner's (make_plan.sh MAX_LEVEL): a stage output the twin refreshed reactively
