@@ -429,7 +429,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             // the group's key first (TFHE-rs's key bundle, in NTT form): G[ct][part] = sum_m f_m K_m[ct][part], f_m =
             // NTT(X^-e_m - 1) (KM <= 7 terms < q q: < q 2^32), then one product with the digits: 2 KM LV + 2 LV wide
             // products and 2 LV + 2 reductions per word instead of KM (2 LV + 2) and 2 KM + 2
-            uint64_t gk[NB][2 * LV][2];
+            uint64_t gk[NB][2 * LV][2];   // KM <= 15 terms < q q: < q 2^32 at q < 2^28
 #pragma unroll
             for (int b = 0; b < NB; b++)
 #pragma unroll
@@ -789,7 +789,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             const uint64_t qa = A.c[6] & 0xffffffffull, qb = A.c[6] >> 32, qmax = qa > qb ? qa : qb;
             if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * lv * qmax >= (1ull << 32)) return -1;
             const int grp = A.i2 ? A.i2 : 2;
-            if ((grp != 2 && grp != 3) || A.i1 % grp) return -1;
+            if (grp < 2 || grp > 4 || A.i1 % grp) return -1;
             static int sms = 0;
             static bool attr_r = false;
             if (!attr_r) {   // the shared-memory opt-ins (64 / 96 KB), once
@@ -803,6 +803,9 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 cudaFuncSetAttribute(rotate_k<1, 1, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
                 cudaFuncSetAttribute(rotate_k<1, 2, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
                 cudaFuncSetAttribute(rotate_k<2, 1, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
+                cudaFuncSetAttribute(rotate_k<1, 1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
+                cudaFuncSetAttribute(rotate_k<1, 2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
+                cudaFuncSetAttribute(rotate_k<2, 1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
                 attr_r = true;
             }
             // digits (4 / 8 n words) + pm1 (4 n)
@@ -813,10 +816,14 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 if (lv == 2) rotate_k<2, 1, 2><<<blocks, th, s8, s>>>(A);
                 else if (two) rotate_k<1, 2, 2><<<blocks, th, s8, s>>>(A);
                 else rotate_k<1, 1, 2><<<blocks, th, s4, s>>>(A);
-            } else {
+            } else if (grp == 3) {
                 if (lv == 2) rotate_k<2, 1, 3><<<blocks, th, s8, s>>>(A);
                 else if (two) rotate_k<1, 2, 3><<<blocks, th, s8, s>>>(A);
                 else rotate_k<1, 1, 3><<<blocks, th, s4, s>>>(A);
+            } else {
+                if (lv == 2) rotate_k<2, 1, 4><<<blocks, th, s8, s>>>(A);
+                else if (two) rotate_k<1, 2, 4><<<blocks, th, s8, s>>>(A);
+                else rotate_k<1, 1, 4><<<blocks, th, s4, s>>>(A);
             }
             break;
         }
