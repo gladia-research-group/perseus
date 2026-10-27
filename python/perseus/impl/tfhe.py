@@ -119,7 +119,11 @@ def tfhe_lut(ops, x, lut, slots):
     if hasattr(x, "ptag"):
         y = type(x)(y.vec, y.meta, packing=y.packing)     # the capture's own ciphertext type (CapCt)
         y.ptag = x.ptag
-    fhe.record_external_bootstrap(y, names, levels, desc={"op": "tfhe", "lut": str(lut), "slots": str(slots), "gain": GAIN})
+    # "range": the finish's output bound (|f| / GAIN): the capture's magnitude floor, so a pass whose values happen to
+    # be all zero (a sign LUT that read only negatives) is not a magnitude-free site the planner must refuse
+    rng = max(abs(v) for v in SIGNS[lut]) if lut in SIGNS else float(np.abs(grid(LUTS[lut])).max())
+    fhe.record_external_bootstrap(y, names, levels, desc={"op": "tfhe", "lut": str(lut), "slots": str(slots), "gain": GAIN,
+                                                          "range": rng / GAIN})
     return ops.add(y, y)
 
 
