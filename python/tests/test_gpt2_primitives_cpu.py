@@ -1042,3 +1042,30 @@ def test_softmax_centred_matches_ref(monkeypatch, kc):
     np.testing.assert_allclose(got, ref.softmax_exact(S), rtol=1e-3, atol=1e-6)
     off = (np.arange(d.tH) // d.t < d.H_real) & (np.arange(d.tH) % d.t >= kc)     # a real head's empty key slots
     assert np.abs(probs.vec[:d.tH][off]).max() < 1e-12
+
+
+def test_softmax_centred_refusals():
+    """A centred config holds for at most ref_window keys: complex_qkt refuses the 17th. The softmax paths that do
+    not centre refuse a centred config."""
+    import dataclasses
+    cfg = config.load_configs(str(CFG_REF)).softmax["transformer.h.0.attn"]
+    assert cfg.ref_keys and cfg.ref_window == 16
+    rt, fhe, inf = _rt(complex_payload=True)
+    ops = rt.ops
+    ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+    d = rt.dims
+    rng = np.random.default_rng(37)
+    kv = attention.ComplexKVCache(d.d_head, centre=True)
+    for tok in range(17):
+        k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
+        for arr in (k, v):
+            arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(np.repeat(k, d.t) + 1j * np.repeat(v, d.t), 34))
+    q = rng.standard_normal(d.hid)
+    q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+    qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+    with pytest.raises(ValueError, match="not 17"):
+        attention.complex_qkt(rt, kv, qct, attention.sm_fold_affine(rt, cfg)[0], cfg=cfg)
+    with pytest.raises(ValueError, match="complex-packed decode"):
+        attention.uncentred_only(cfg, "prefill_softmax")
+    attention.uncentred_only(dataclasses.replace(cfg, ref_keys=()), "prefill_softmax")
