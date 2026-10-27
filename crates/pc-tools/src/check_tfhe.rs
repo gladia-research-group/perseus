@@ -318,7 +318,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let dg = DiscreteGaussian::new(p.key_sigma)?;
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
     let t0 = Instant::now();
-    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, &dg, &mut prng);
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, p.pbs_group, &dg, &mut prng);
     println!("[pc-check] tfhe-pbs: host bootstrapping key {:.1} s (n_lwe {nl}, n_br {n}, Q {q} = {} x {}, gadget {:?})", t0.elapsed().as_secs_f64(), p.br_primes.0, p.br_primes.1, p.pbs);
     let (tv, off) = sign01(n, q >> p.out_cf);
     let lwes: Vec<Lwe> = (0..count)
@@ -360,7 +360,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, cx[6], cx[7]], ..base })?;
         Ok(())
     };

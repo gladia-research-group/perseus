@@ -35,7 +35,7 @@ fn mu(p: u64) -> u64 {
     ((1u128 << 64) / p as u128) as u64
 }
 
-/// The device image of a host bootstrapping key (RNS, u32): the key [pair][m][e][h][thread][4] in Montgomery form
+/// The device image of a host bootstrapping key (RNS, u32): the key [group][m][e][h][thread][4] in Montgomery form
 /// (NTT form, times n^-1 2^32 per prime: the rotation's inverse NTT skips its scaling, its MAC reduces once per sum),
 /// where PBS_ROTATE's thread th of 1024 handles word k = th + 1024 e of [prime][n] and loads as uint4 h < levels the
 /// values (row r = 2 h, part 0), (2 h, 1), (2 h + 1, 0), (2 h + 1, 1), row r = c levels + t; the twiddles [prime][forward | inverse][n], then NTT(X^e - 1)'s
@@ -272,7 +272,7 @@ impl<'a> TfheSwitch<'a> {
         let k = n_sub * p.ks.1;
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
             + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1)
-            + (nl / 2 * 3) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
+            + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
         4 * words32 + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
     }
@@ -453,6 +453,7 @@ impl<'a> TfheSwitch<'a> {
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: self.tv.vptr(), z: self.ms.vptr(), c: cx, ..pb })?;
         Self::go(ctx, s, &TfheArgs {
             op: tfhe_op::PBS_ROTATE,
+            i2: self.p.pbs_group as i32,
             x: self.acc.vptr_mut(),
             y: self.bsk.vptr(),
             z: self.ms.vptr(),

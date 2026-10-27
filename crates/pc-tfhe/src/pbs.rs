@@ -5,10 +5,11 @@
 //! input of phase m q / 4 (the forward switch's scale): phi = round(2 n_br phase / q) lies in [-n_br/2, n_br/2), and the
 //! negacyclic test vector holds f(2 phi / n_br) for phi >= 0 at index phi and -f(2 (j - n_br) / n_br) at index j in
 //! [n_br/2, n_br).
-//! The blind rotation is unrolled by two key bits (Bourse, Minelli, Minihold, Paillier 2018; Zhou et al. 2018): per pair
-//! (i, j) the key holds GGSW(s_i s_j), GGSW(s_i (1 - s_j)), GGSW((1 - s_i) s_j) and
-//! acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j): one decomposition and one set of NTTs per
-//! pair (half the transforms of the per-bit CMux) for three key MACs, at twice the key noise per term.
+//! The blind rotation is unrolled by groups of G key bits (Bourse, Minelli, Minihold, Paillier 2018; Zhou et al. 2018;
+//! the multi-bit PBS of TFHE-rs): per group the key holds, for every non-empty subset S (bit mask m = 1 .. 2^G - 1),
+//! K_m = GGSW(prod_{x in S} s_x prod_{x not in S} (1 - s_x)) (exactly one is GGSW(1) unless the group's bits are all 0)
+//! and acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc), e_m = sum_{x in S} a_x: one decomposition and one set of NTTs per
+//! group (1 / G of the transforms of the per-bit CMux) for 2^G - 1 key MACs, at twice the key noise per term.
 use pc_core::keys::{DiscreteGaussian, Prng};
 use rayon::prelude::*;
 
@@ -175,25 +176,33 @@ impl Ggsw {
     }
 }
 
-/// The bootstrapping key, unrolled by pairs of the binary LWE key (even dimension): per pair (s_i, s_j)
-/// GGSW(s_i s_j), GGSW(s_i (1 - s_j)), GGSW((1 - s_i) s_j), under the GLWE key s_br.
+/// The bootstrapping key, unrolled by groups of `group` bits of the binary LWE key (its dimension a multiple): per
+/// group [K_m for m = 1 .. 2^group - 1] (module doc), under the GLWE key s_br.
 pub struct BootstrapKey {
     pub gadget: Gadget,
     pub rns: Rns,
-    pub ggsw: Vec<[Ggsw; 3]>,
+    pub group: usize,
+    pub ggsw: Vec<Vec<Ggsw>>,
 }
 
 impl BootstrapKey {
-    pub fn generate(s_lwe: &[i64], s_br: &[i64], gadget: Gadget, rns: Rns, dg: &DiscreteGaussian, prng: &mut Prng) -> BootstrapKey {
-        assert!(s_lwe.len() % 2 == 0, "the unrolled bootstrapping key pairs the LWE key");
+    pub fn generate(s_lwe: &[i64], s_br: &[i64], gadget: Gadget, rns: Rns, group: usize, dg: &DiscreteGaussian, prng: &mut Prng) -> BootstrapKey {
+        assert!(group >= 1 && s_lwe.len() % group == 0, "the unrolled bootstrapping key groups the LWE key");
         let ggsw = s_lwe
-            .chunks(2)
-            .map(|p| [p[0] * p[1], p[0] * (1 - p[1]), (1 - p[0]) * p[1]].map(|mu| Ggsw::encrypt(mu, s_br, &gadget, &rns, dg, prng)))
+            .chunks(group)
+            .map(|g| {
+                (1..1usize << group)
+                    .map(|m| {
+                        let mu = g.iter().enumerate().map(|(x, &s)| if m >> x & 1 == 1 { s } else { 1 - s }).product();
+                        Ggsw::encrypt(mu, s_br, &gadget, &rns, dg, prng)
+                    })
+                    .collect()
+            })
             .collect();
-        BootstrapKey { gadget, rns, ggsw }
+        BootstrapKey { gadget, rns, group, ggsw }
     }
 
-    /// acc = (X^-b~ tv, 0), then per key pair acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc) (module doc): the phase
+    /// acc = (X^-b~ tv, 0), then per key group acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc) (module doc): the phase
     /// rotates by X^-phi.
     pub fn blind_rotate(&self, tv: &[u64], ct: &Lwe, q_in: u64) -> [Rlwe; 2] {
         let n = self.rns.n();
@@ -203,14 +212,15 @@ impl BootstrapKey {
         let neg = |k: usize| (2 * n - k) % (2 * n);
         let tvr = self.rns.residues(tv);
         let mut acc = [0, 1].map(|p| Rlwe { c0: monomial_mul(&tvr[p], neg(sw(ct.b)), self.rns.ntt[p].q), c1: vec![0; n] });
-        for (a, keys) in ct.a.chunks(2).zip(&self.ggsw) {
-            let (ki, kj) = (sw(a[0]), sw(a[1]));
-            if ki == 0 && kj == 0 {
+        for (a, keys) in ct.a.chunks(self.group).zip(&self.ggsw) {
+            let k: Vec<usize> = a.iter().map(|&x| sw(x)).collect();
+            if k.iter().all(|&x| x == 0) {
                 continue;
             }
             let digits = ntt_digits(&acc, &self.gadget, &self.rns);
             let mut out = [0, 1].map(|_| (vec![0u64; n], vec![0u64; n]));
-            for (key, e) in keys.iter().zip([neg((ki + kj) % (2 * n)), neg(ki), neg(kj)]) {
+            let exps = (1..1usize << self.group).map(|m| neg(k.iter().enumerate().filter(|(x, _)| m >> x & 1 == 1).map(|(_, &v)| v).sum::<usize>() % (2 * n)));
+            for (key, e) in keys.iter().zip(exps) {
                 if e == 0 {
                     continue;
                 }

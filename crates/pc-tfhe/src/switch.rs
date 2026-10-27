@@ -304,7 +304,7 @@ impl Switcher {
         let rs = RingSwitchKey::generate(s, &s_sub, params.rs_factor, Gadget::new(p0, params.rs, false), &ntt_p[0], &dg, prng);
         let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, prng);
         let rns = crate::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br)?;
-        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, &dg, prng);
+        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, params.pbs_group, &dg, prng);
         let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg, prng)?;
         Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, repack })
     }

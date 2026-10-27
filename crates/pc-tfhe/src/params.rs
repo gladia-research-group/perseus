@@ -19,7 +19,7 @@ use crate::Result;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Params {
-    /// Binary LWE key dimension (the blind rotation's length) and its noise (absolute, at p0).
+    /// Binary LWE key dimension (the blind rotation's length, a multiple of `pbs_group`) and its noise (relative to p0).
     pub n_lwe: usize,
     pub lwe_sigma_rel: f64,
     /// GLWE (k = 1) degree, the blind rotation's RNS primes and their product, and the bootstrapping key's noise.
@@ -30,6 +30,9 @@ pub struct Params {
     /// Gadgets as (base log, levels): blind rotation (approximate, over q_br), LWE key switch (approximate, over p0),
     /// ring switch (approximate, over p0), repack (exact, over p0).
     pub pbs: (u32, usize),
+    /// Key bits per blind-rotation step (the multi-bit unrolling: 2^group - 1 GGSWs per group). 2 on the device: 3
+    /// (n 921) measured 13% slower at 752 PBS (the 7 key MACs per 3 bits outweigh the third fewer NTTs).
+    pub pbs_group: usize,
     pub ks: (u32, usize),
     pub rs: (u32, usize),
     pub rp: (u32, usize),
@@ -61,6 +64,7 @@ impl Params {
             q_br: qa * qb,
             key_sigma: 3.19,
             pbs: (24, 1),
+            pbs_group: 2,
             ks: (2, 8),
             rs: (8, 3),
             rp: (16, 2),

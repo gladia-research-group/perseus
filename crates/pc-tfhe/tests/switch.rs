@@ -32,7 +32,7 @@ fn pbs_sign_on_fresh_lwes() {
     let dg = DiscreteGaussian::new(p.key_sigma).unwrap();
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64).unwrap();
     let rns = pc_tfhe::pbs::Rns::new(p.br_primes.0, p.br_primes.1, p.n_br).unwrap();
-    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, &dg, &mut prng);
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, p.pbs_group, &dg, &mut prng);
     let delta = p.q_br >> p.out_cf;
     let (tv, off) = sign01(p.n_br, delta);
     let ms: Vec<f64> = (0..64).map(|i| -0.95 + 1.9 * i as f64 / 63.0).collect();
