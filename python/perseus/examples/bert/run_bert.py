@@ -60,7 +60,7 @@ def _planned(a, model, groups, cl, st, results=None):
     rows_out = []
     for n, items in groups.items():
         model.rt.forget_masks()         # the previous token count's masks
-        cfg = plan_config(a.plan)
+        cfg = plan_config(a.plan, a.graphs)
         keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
         work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"m10_bert_{os.getpid()}_{n}")
         run = BertPlannedPrefill(model, resolve(a.plan), cfg, keys, n_keys=n, work_dir=work, pt_rows=a.pt_rows,
@@ -161,6 +161,7 @@ def main(argv=None, results=None):
     ap.add_argument("--stc-cache", type=int, default=16, help="planned: StC-first last-stage cache entries")
     ap.add_argument("--check-meta", action="store_true", help="planned: compare every step's metadata with the compile")
     ap.add_argument("--repeat", type=int, default=1, help="planned: timed forwards per input (wall = median)")
+    ap.add_argument("--graphs", action="store_true", help="planned: replay each block as CUDA graphs")
     ap.add_argument("--work-dir", default=None, help="planned: where the recorded stream is written")
     ap.add_argument("--compile-only", action="store_true", help="planned: record + compile on the CPU, then stop")
     ap.add_argument("--ccmm-kappa", default="256,16", help="planned: CCMM operating points QK,PV (SinCBoot input x kappa)")

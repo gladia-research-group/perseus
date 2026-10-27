@@ -17,10 +17,10 @@ import numpy as np
 from perseus.impl.prefill import PlannedPrefill
 
 
-def plan_config(plan):
+def plan_config(plan, graphs=False):
     """The session Config of a planned encoder run: the GPT-2 prefill preset (the encoder plans come from its planner
     path), the plan's capture env (the load-bearing fields its blocks were cut under, e.g. the reactive ceiling 46),
-    then its runtime switches."""
+    then its runtime switches. `graphs`: replay each block as CUDA graphs (exec.use_graphs; the first forward captures)."""
     import json
     from pathlib import Path
     from perseus import config as pcfg
@@ -30,8 +30,7 @@ def plan_config(plan):
         env = (json.loads(first[0].read_text()).get("capture_env") or {}).get("env") or {}
         cfg = cfg.with_env({k: str(v) for k, v in env.items() if v is not None})
     cfg = pcfg.plan_runtime(plan, "n32", base=cfg)
-    # one-shot forwards: eager replay (a graph capture costs a forward and leases a constant slot per scalar)
-    cfg["exec.use_graphs"] = False
+    cfg["exec.use_graphs"] = bool(graphs)
     return cfg
 
 
