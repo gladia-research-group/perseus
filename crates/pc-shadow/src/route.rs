@@ -69,6 +69,9 @@ pub enum Finish {
     /// A CCMM output (ccmm.py SinCBoot; drops PF_CCMM_RAISE): one StC stage past the route's landing, degree 1
     /// (pc-gpu `ccmm::stage0_level`).
     Ccmm,
+    /// A TFHE LUT's output (perseus impl/tfhe.py; pc-py tfhe.rs): the switch runs at the split, the route's finish
+    /// lands where a PCMM output does.
+    Tfhe,
 }
 
 impl Finish {
@@ -77,6 +80,7 @@ impl Finish {
         match op {
             "pcmm" => Some(Finish::Pcmm),
             "ccmm" => Some(Finish::Ccmm),
+            "tfhe" => Some(Finish::Tfhe),
             _ => None,
         }
     }
@@ -147,7 +151,7 @@ impl BtsConfig {
         let s = self.staged;
         let raw = if s.deg == 1 { Landing { level: s.level - u, deg: 2 } } else { s };
         let base = match finish {
-            Finish::Pcmm => raw,
+            Finish::Pcmm | Finish::Tfhe => raw,
             Finish::Ccmm => Landing { level: effective_level(raw.level, raw.deg, u) + u, deg: 1 },
         };
         Landing { level: base.level + raise_drop * u, deg: base.deg }

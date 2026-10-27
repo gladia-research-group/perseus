@@ -1,6 +1,7 @@
 """ResNet-20 from the conv primitive (impl/conv.py): stem, 9 residual blocks, pooled 1x1 head, one stage each. The
-activation is a hook `act(ops, cts, site, gain) -> gain * ReLU(cts)` (the exact max on the mirror, the composite-sign
-ReLU encrypted, the gain folded into its last series).
+activation is a hook `act(ops, cts, site, gain, geom=) -> gain * ReLU(cts)` (the exact max on the mirror, the
+composite-sign ReLU or the TFHE sign encrypted, the gain folded into its last series / its LUT; `geom` the activation's
+layout).
 
 With `scales` ({site: B}) every ReLU input arrives divided by its own B (the producing conv carries the 1 / B) and
 every activation is carried divided by a known scale (the consuming conv carries it back, the head the last one). An
@@ -16,7 +17,7 @@ from perseus.impl.conv import Geom, ConvSpec, conv2d, channel_sum, head_geoms
 from . import weights as R
 
 
-def relu_exact(ops, xs, site, gain=1.0):
+def relu_exact(ops, xs, site, gain=1.0, geom=None):
     return [gain * np.maximum(x.real, 0.0) for x in xs]
 
 
@@ -78,15 +79,15 @@ class ResNet20:
 
     # ── stages ──
     def stem_stage(self, ops, xs):
-        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"])
+        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"], geom=self.stem.go)
 
     def block_stage(self, ops, xs, b):
         name, s1, s2, sh = self.blocks[b]
         xs = self._in(ops, xs)
-        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1")
+        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1", geom=s1.go)
         y = conv2d(ops, h, s2)
         r = conv2d(ops, xs, sh) if sh is not None else xs
-        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"])
+        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"], geom=s2.go)
 
     def head_stage(self, ops, xs):
         return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)

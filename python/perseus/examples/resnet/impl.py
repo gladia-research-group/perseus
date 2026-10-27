@@ -48,9 +48,20 @@ class ResnetImpl(ImplModel):
 
 
 class ResnetPlanned(EncoderPlannedPrefill):
-    """Each stage compiled from the previous stage's compiled exit (EncoderPlannedPrefill.prepare)."""
+    """Each stage compiled from the previous stage's compiled exit (EncoderPlannedPrefill.prepare). `tfhe_chunk` > 0:
+    the session serves the TFHE ReLU's LUTs (impl/tfhe.py), `tfhe_chunk` values per switch pass."""
+    tfhe_chunk = 0
+
     def linears(self):
         return {}
+
+    def session_kw(self):
+        return {"tfhe": self.tfhe_chunk} if self.tfhe_chunk else {}
+
+    def after_setup(self):
+        if self.tfhe_chunk:
+            from perseus.impl import tfhe
+            tfhe.setup_session(self.sess)
 
     def input_values(self, img):
         return self.model.net.encode(img)

@@ -189,6 +189,8 @@ pub(crate) struct Planned {
     pub pcmm: Option<crate::pcmm::PcmmRt>,
     /// the CCMM service, likewise
     pub ccmm: Option<crate::matmul::CcmmRt>,
+    /// the TFHE service, likewise
+    pub tfhe: Option<crate::tfhe::TfheRt>,
     /// per bound block: its runtime Shadow (the plan's landings)
     pub shadows: Vec<Shadow>,
     pub replayer: Replayer,
@@ -456,6 +458,10 @@ fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
                     if let Some(d) = crate::pcmm::Desc::parse(d) {
                         r.dense_drops.insert(d.raise_drop);
                         r.dense_drops.extend(d.raise_drops.iter().flatten().copied());
+                        r.n_dense += 1;
+                    } else if crate::tfhe::Desc::parse(d).is_some() {
+                        // a TFHE LUT: the switch between the StC-first route's halves, no raise drop
+                        r.dense_drops.insert(0);
                         r.n_dense += 1;
                     } else if let Some(cd) = crate::matmul::CcmmDesc::parse(d) {
                         // a CCMM's SinCBoot: the StC-first route under its raise drop (PF_CCMM_RAISE)
@@ -865,7 +871,8 @@ fn reg_layouts(lay: pc_gpu::Layout, ps: &PlanSpec) -> PyResult<Vec<pc_gpu::Layou
         .collect()
 }
 
-fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Sizes, geometry: Geometry, debug_refresh: bool, plan: Option<PlanSpec>, pcmm: Option<crate::pcmm::PcmmPlan>, ccmm: Option<crate::matmul::CcmmPlan>) -> PyResult<Dev> {
+#[allow(clippy::too_many_arguments)]
+fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Sizes, geometry: Geometry, debug_refresh: bool, plan: Option<PlanSpec>, pcmm: Option<crate::pcmm::PcmmPlan>, ccmm: Option<crate::matmul::CcmmPlan>, tfhe: Option<crate::tfhe::TfhePlan>) -> PyResult<Dev> {
     let t0 = std::time::Instant::now();
     let e = gerr;
     let sc = shadow_config(cfg, None, "runtime", false)?;
@@ -964,6 +971,9 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("replay.groups", group_bytes);
         if let Some(pp) = &pcmm {
             pp.reserve(mp, lay.rows())?;
+        }
+        if let Some(tp) = &tfhe {
+            tp.reserve(mp, n)?;
         }
         // streamed weights: the expander's scratch at the deepest sum's limbs, the weight frames
         let (coeff_rows, frame_rows) = stream_needs(ps)?;
@@ -1172,6 +1182,17 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 }
                 None => None,
             };
+            // the TFHE switch keys, from the host secret (no client bundle carries them yet)
+            let tf = match tfhe {
+                Some(tp) => {
+                    if dense.is_none() {
+                        return Err(PyValueError::new_err("Session(tfhe=...): no program has a TFHE finish (no StC-first route)"));
+                    }
+                    let sk = sk.as_ref().ok_or_else(|| PyRuntimeError::new_err("Session(tfhe=...): TFHE keygen needs the host secret (no key bundle carries TFHE keys)"))?;
+                    Some(crate::tfhe::TfheRt::build(tp, a, &device, &ex.compute, &ctx, &sk.s, chain.q[0], chain.q[1], &mut prng)?)
+                }
+                None => None,
+            };
             let replayer = Replayer::new(ReplayCfg { use_graphs: ps.use_graphs, check_meta: ps.check_meta, graphs_per_block: 2 });
             let (coeff_rows, frame_rows) = stream_needs(&ps)?;
             let stream_events = Box::new(EventPool::new(&device, ps.stream_frames + ps.kv.map_or(0, |k| k.2) + 16).map_err(|x| e(x.into()))?);
@@ -1200,7 +1221,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 sx.compute.sync().map_err(|x| e(x.into()))?;
                 Some(SideLane { ex: sx, ops: sops, ev, fork, join })
             };
-            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
+            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, tfhe: tf, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
         }
     };
     ex.compute.sync().map_err(|x| e(x.into()))?;
@@ -1252,10 +1273,11 @@ pub(crate) struct Args {
     plan: Option<PlanSpec>,
     pp: Option<crate::pcmm::PcmmPlan>,
     cp: Option<crate::matmul::CcmmPlan>,
+    tp: Option<crate::tfhe::TfhePlan>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>) -> PyResult<Args> {
+fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, tfhe: Option<usize>) -> PyResult<Args> {
     let s = size.unwrap_or_default();
     let g = |k: &str, d: usize| s.get(k).copied().unwrap_or(d);
     let geometry = Geometry {
@@ -1313,7 +1335,16 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         return Err(PyValueError::new_err("Session(ccmm=True) serves planned programs: pass programs=[...]"));
     }
     let cp = ccmm.then(|| crate::matmul::CcmmPlan { cfg: pc_gpu::matmul::ccmm::CcmmCfg::default() });
-    Ok(Args { cfg, ks, sizes, geometry, plan, pp, cp })
+    let tp = match tfhe {
+        Some(max) if max > 0 => {
+            if plan.is_none() {
+                return Err(PyValueError::new_err("Session(tfhe=...) serves planned programs: pass programs=[...]"));
+            }
+            Some(crate::tfhe::TfhePlan { max })
+        }
+        _ => None,
+    };
+    Ok(Args { cfg, ks, sizes, geometry, plan, pp, cp, tp })
 }
 
 /// The device session. `Session(config, keys)` sizes and allocates the arena, generates the keys and carves every
@@ -1344,11 +1375,11 @@ impl PySession {
     /// (float32 coefficient rows, uploaded with `stream_weights`); `stream_frames` device weight frames rotate over
     /// the blocks in `stream_order`. `kv` (units, rows, device pages): the K/V states in pinned host pages
     /// (`Program.run(kv_in=, kv_out=)`), `pages` device pages (unit u in page u % pages).
-    #[pyo3(signature = (config, keys, size=None, pool=256, pt_slots=256, encode_threads=4, debug_refresh=false, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new()))]
+    #[pyo3(signature = (config, keys, size=None, pool=256, pt_slots=256, encode_threads=4, debug_refresh=false, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new(), tfhe=None))]
     #[allow(clippy::too_many_arguments)]
-    fn new(py: Python<'_>, config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, debug_refresh: bool, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>) -> PyResult<Self> {
-        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels)?;
-        let dev = nogil(py, || setup(&x.cfg, &x.ks, &Origin::Generate, x.sizes, x.geometry, debug_refresh, x.plan, x.pp, x.cp))?;
+    fn new(py: Python<'_>, config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, debug_refresh: bool, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, tfhe: Option<usize>) -> PyResult<Self> {
+        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels, tfhe)?;
+        let dev = nogil(py, || setup(&x.cfg, &x.ks, &Origin::Generate, x.sizes, x.geometry, debug_refresh, x.plan, x.pp, x.cp, x.tp))?;
         Ok(PySession { dev: Rc::new(dev), fhe: None })
     }
 
@@ -1358,15 +1389,15 @@ impl PySession {
     /// decryption raises. The bundle must answer this session's `key_manifest` (same keys, chain, plan contract).
     /// `debug_secret` (tests only): the client's secret, making a debug session that can also decrypt.
     #[staticmethod]
-    #[pyo3(signature = (config, keys, bundle, size=None, pool=256, pt_slots=256, encode_threads=4, debug_refresh=false, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new(), debug_secret=None))]
+    #[pyo3(signature = (config, keys, bundle, size=None, pool=256, pt_slots=256, encode_threads=4, debug_refresh=false, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new(), debug_secret=None, tfhe=None))]
     #[allow(clippy::too_many_arguments)]
-    fn from_bundle(py: Python<'_>, config: &PyConfig, keys: &PyKeySource, bundle: std::path::PathBuf, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, debug_refresh: bool, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, debug_secret: Option<Vec<u8>>) -> PyResult<Self> {
-        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels)?;
+    fn from_bundle(py: Python<'_>, config: &PyConfig, keys: &PyKeySource, bundle: std::path::PathBuf, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, debug_refresh: bool, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, debug_secret: Option<Vec<u8>>, tfhe: Option<usize>) -> PyResult<Self> {
+        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels, tfhe)?;
         let origin = match debug_secret {
             Some(sec) => Origin::DebugBundle(bundle, sec),
             None => Origin::Bundle(bundle),
         };
-        let dev = nogil(py, || setup(&x.cfg, &x.ks, &origin, x.sizes, x.geometry, debug_refresh, x.plan, x.pp, x.cp))?;
+        let dev = nogil(py, || setup(&x.cfg, &x.ks, &origin, x.sizes, x.geometry, debug_refresh, x.plan, x.pp, x.cp, x.tp))?;
         if matches!(origin, Origin::Bundle(_)) {
             let st = dev.st.borrow();
             if st.secret.is_some() || st.sk.is_some() {
@@ -1380,10 +1411,10 @@ impl PySession {
     /// switching key (role + rows), the SPRU material, the PCMM shapes, CCMM, a public key; the chain's params hash
     /// and the plan contract. No device.
     #[staticmethod]
-    #[pyo3(signature = (config, keys, size=None, pool=256, pt_slots=256, encode_threads=4, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new()))]
+    #[pyo3(signature = (config, keys, size=None, pool=256, pt_slots=256, encode_threads=4, programs=None, regs=0, pt_rows=0, dyn_rot=Vec::new(), stc_cache=8, pcmm=None, pcmm_cf=6, check_meta=false, ccmm=false, streams=None, stream_frames=2, kv=None, reg_levels=Vec::new(), pt_levels=Vec::new(), tfhe=None))]
     #[allow(clippy::too_many_arguments)]
-    fn key_manifest(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>) -> PyResult<String> {
-        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels)?;
+    fn key_manifest(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, tfhe: Option<usize>) -> PyResult<String> {
+        let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels, tfhe)?;
         let chain = Chain::generate(&ChainSpec::n32()).map_err(|e| gerr(e.into()))?;
         let nd = key_needs(&x.cfg, &x.ks, &chain, &x.plan, &x.pp, &x.cp)?;
         manifest(&x.cfg, &chain, &nd, &x.pp, x.cp.is_some())?.to_json().map_err(cerr)
@@ -1534,6 +1565,36 @@ impl PySession {
 
     /// PCMM service counters: {calls, batch (group size, per-drop batching), groups, outputs, keygen_s, linears,
     /// missing (declared, never uploaded)}.
+    /// Register TFHE LUT `name` (`Session(tfhe=...)`): `values` = f on the n_br-point grid of [-1, 1)
+    /// (perseus impl/tfhe.py `grid`), |f| <= 1. Synchronous; re-registering a name replaces it.
+    fn tfhe_lut(&self, py: Python<'_>, name: &str, values: Vec<f64>) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let State { planned, ex, .. } = &mut *st;
+        let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        nogil(py, || tf.lut(&ex.compute, name, &values))
+    }
+    /// Register TFHE slot set `name`: the slots (< N/2, a real payload) the LUTs run on. Synchronous.
+    fn tfhe_slots(&self, py: Python<'_>, name: &str, slots: Vec<usize>) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let State { planned, ex, .. } = &mut *st;
+        let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        nogil(py, || tf.slots(&ex.compute, name, &slots))
+    }
+    fn tfhe_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
+        let st = self.dev.st.borrow();
+        let tf = st.planned.as_ref().and_then(|p| p.tfhe.as_ref()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("calls", tf.calls)?;
+        d.set_item("values", tf.values)?;
+        d.set_item("keygen_s", tf.keygen_s)?;
+        let (luts, sets) = tf.names();
+        d.set_item("luts", luts)?;
+        d.set_item("slot_sets", sets)?;
+        d.set_item("per_pass", tf.sw.max())?;
+        d.set_item("out_cf", tf.params.out_cf)?;
+        d.set_item("cf", crate::tfhe::CF)?;
+        Ok(d.unbind())
+    }
     fn pcmm_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
         let st = self.dev.st.borrow();
         let pc = st.planned.as_ref().and_then(|p| p.pcmm.as_ref()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;

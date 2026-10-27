@@ -273,15 +273,23 @@ fn ferr(f: &FinishStep, msg: impl Into<String>) -> pc_program::Error {
     pc_program::Error::Replay { block: format!("finish {}", f.desc), msg: msg.into() }
 }
 
-/// The replay's finish service: PCMM and CCMM finishes on the session's StC-first route, by descriptor.
+/// The replay's finish service: PCMM, CCMM and TFHE finishes on the session's StC-first route, by descriptor.
 pub(crate) struct FinishSvc<'r> {
     pub pcmm: Option<&'r mut PcmmRt>,
     pub ccmm: Option<&'r mut CcmmRt>,
+    pub tfhe: Option<&'r mut crate::tfhe::TfheRt>,
     pub route: &'r StcFirstRoute<'static, W, M>,
 }
 
 impl<'r> FinishExec<'static, W, M> for FinishSvc<'r> {
     fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
+        if crate::tfhe::Desc::parse(&f.desc).is_some() {
+            let rt = self.tfhe.as_deref_mut().ok_or_else(|| ferr(f, "this session has no TFHE service (Session(tfhe=...))"))?;
+            return crate::tfhe::TfheExec { rt, route: self.route }.finish(cx, f, slots).map_err(|e| match e {
+                pc_program::Error::Replay { .. } => e,
+                e => ferr(f, e.to_string()),
+            });
+        }
         if let Some(d) = CcmmDesc::parse(&f.desc) {
             let rt = self.ccmm.as_deref_mut().ok_or_else(|| ferr(f, "this session has no CCMM service (Session(ccmm=True))"))?;
             let c_unit = rt.c_unit.ok_or_else(|| ferr(f, "CCMM not calibrated (Session.ccmm_set)"))?;

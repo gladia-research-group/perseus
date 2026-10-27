@@ -563,7 +563,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     let mut st = dev.st.borrow_mut();
     let State { planned, ex, ops, plans, pts, .. } = &mut *st;
     let pl = planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
-    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, side, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
+    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, tfhe, side, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
     // the block's weight frame: staged while the block before ran (else now), joined into compute
     let spos = match stream_tag.get(idx).copied().flatten() {
         Some(tag) => {
@@ -658,9 +658,9 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                 }
             }
             let info = {
-                // the PCMM / CCMM services run the program's finishes on the StC-first route
+                // the PCMM / CCMM / TFHE services run the program's finishes on the StC-first route
                 let mut fx = match dense.as_ref() {
-                    Some(route) if pcmm.is_some() || ccmm.is_some() => Some(crate::matmul::FinishSvc { pcmm: pcmm.as_mut(), ccmm: ccmm.as_mut(), route }),
+                    Some(route) if pcmm.is_some() || ccmm.is_some() || tfhe.is_some() => Some(crate::matmul::FinishSvc { pcmm: pcmm.as_mut(), ccmm: ccmm.as_mut(), tfhe: tfhe.as_mut(), route }),
                     _ => None,
                 };
                 let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);

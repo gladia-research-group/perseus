@@ -384,7 +384,7 @@ impl PyShadow {
     /// descriptor's `op`), under its raise drop: (level, deg).
     #[pyo3(signature = (op, raise_drop=0))]
     fn finish_landing(&self, op: &str, raise_drop: u32) -> PyResult<(u32, u8)> {
-        let f = pc_shadow::Finish::of_op(op).ok_or_else(|| cfg_err("finish_landing", format!("op {op:?} (pcmm | ccmm)")))?;
+        let f = pc_shadow::Finish::of_op(op).ok_or_else(|| cfg_err("finish_landing", format!("op {op:?} (pcmm | ccmm | tfhe)")))?;
         let l = self.s.cfg.bts.finish_landing(self.s.cfg.chain, f, raise_drop);
         Ok((l.level, l.deg))
     }

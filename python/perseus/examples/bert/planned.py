@@ -169,7 +169,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         self.sess = _pc.Session(self.cfg, self.keys, pool=self.pool, pt_slots=n_pts + 8, programs=progs,
                                 regs=self.n_regs, pt_rows=pt_rows, stc_cache=self.stc_cache,
                                 pcmm=specs or None, pcmm_cf=self.pcmm_cf, check_meta=self.check_meta, ccmm=self.ccmm,
-                                reg_levels=reg_levels, pt_levels=[lv for _k, lv in uniq])
+                                reg_levels=reg_levels, pt_levels=[lv for _k, lv in uniq], **self.session_kw())
         self.store = self.sess.pt_store
         for b, p in enumerate(progs):
             p.bind(self.sess, self.store)
@@ -180,6 +180,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
             self.sess.pcmm_upload(lin.name, np.ascontiguousarray(lin.Wd, dtype=np.int8).tobytes())
         if self.ccmm:
             self.calibrate_ccmm()
+        self.after_setup()
         self.sess.drop_secret()
         staged = self.store.stage([(key, lv, v) for (key, lv), v in uniq.items()])
         n_refs = sum(len({(nm, lv) for nm, lv, _d, _f in p.pt_refs}) for p in progs)
@@ -191,6 +192,13 @@ class EncoderPlannedPrefill(PlannedPrefill):
                  f"{self.setup_s:.1f} s")
         self.log("[planned] " + self.sess.mem_report.replace("\n", " | "))
         return self
+
+    def session_kw(self):
+        """Extra `Session` arguments of a subclass's services (e.g. `tfhe=`)."""
+        return {}
+
+    def after_setup(self):
+        """A subclass's service registration after `complete_setup` (the secret is still held)."""
 
     def calibrate_ccmm(self):
         """ccmm.py `prepare` + `_calibrate` on the session's CCMM service: nf_ref / nf_split from a token at the

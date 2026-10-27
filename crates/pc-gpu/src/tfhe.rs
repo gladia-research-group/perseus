@@ -416,6 +416,11 @@ impl<'a> TfheSwitch<'a> {
         self.apply_dev(ctx, s, lt_, x, pos, positions.len(), tvp, offset, true)
     }
 
+    /// Values per pass (`new`'s `max`).
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
     /// Prepare the key switch's GEMM plan for chunks of `b` values (setup: the replay builds none).
     pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
         let b = b.min(self.max);
