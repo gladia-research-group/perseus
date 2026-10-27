@@ -745,6 +745,11 @@ fn ks_geo() -> KsGeo {
     KsGeo { nq: 4, rows: vec![0, 1, 2, 3, 4, 5], digit_of: vec![0, 0, 1, 1, -1, -1, -1, -1], ndig: 2 }
 }
 
+/// ks_geo with three digits, the last a single prime.
+fn ks_geo3() -> KsGeo {
+    KsGeo { nq: 4, rows: vec![0, 1, 2, 3, 4, 5], digit_of: vec![0, 0, 1, 2, -1, -1, -1, -1], ndig: 3 }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ks_host(st: &Setup, g: &KsGeo, c1: &[u64], mu: &[u64], c0: &[u64], kb: &[Vec<u64>], ka: &[Vec<u64>], autok: &[u32],
            pmod: &[u64], c0_mode: i32, k: usize, kds: usize) -> (Vec<u64>, Vec<u64>) {
@@ -1133,8 +1138,15 @@ fn pack_rows(vals: &[u64], bits: usize) -> (Vec<u32>, usize) {
 /// ks_dot_key and cts_fused_regen (keys read through KeyTab: `a` from the seed, `b` dense / packed / banded) against
 /// ks_dot / cts_fused on the expanded keys (both host-checked above): bit-identical.
 fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
+    let mut out = keytab(st, &ks_geo(), true);
+    // three digits, the last one alone: ks_dot_seg's second expansion pass and an odd digit count
+    out.extend(keytab(st, &ks_geo3(), false));
+    out
+}
+
+/// t_keytab's cases on the digit geometry `g`; `all` adds the ks_dot_regen and fused CtS cases.
+fn keytab(st: &mut Setup, g: &KsGeo, all: bool) -> Vec<TestResult> {
     let mut out = Vec::new();
-    let g = ks_geo();
     let nmod = 6usize; // full key: slots = prime ids 0..5 (Q 0..3, P 4..5)
     let kds = nmod * N;
     let r = 2usize;
@@ -1198,11 +1210,16 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
     let pmods = st.shoup_row(&pmod);
     let (pmd, pmsd) = (st.ctx.up(&pmod), st.ctx.up(&pmods));
     let (autod, dod) = (st.ctx.up32(&[1, 125]), st.ctx.up_i32(&g.digit_of));
+    // the outputs of every case: ks_dot's, ks_dot_key's and the hybrid's (the arena never frees)
+    let zero = vec![0u64; k * r * 8 * N];
+    let (mut o0, mut o1, mut q0, mut q1, mut h0, mut h1) =
+        (st.ctx.zeros(zero.len()), st.ctx.zeros(zero.len()), st.ctx.zeros(zero.len()), st.ctx.zeros(zero.len()), st.ctx.zeros(zero.len()), st.ctx.zeros(zero.len()));
     for (key, rowsd, nrows, name) in [(key_full, &rows_full, 6, "dense full".to_string()), (key_band, &rows_band, 5, band_name.clone())] {
         for (kc, mode) in [k, 1].into_iter().flat_map(|kc| [0, 1, 2, 2 | KS_ACC].map(|m| (kc, m))) {
             // KS_ACC: every kernel's outputs start from the same random words
-            let pre = if mode & KS_ACC != 0 { Some(st.rand_slots(k * r)) } else { None };
-            let (o0, o1) = match &pre { Some(v) => (st.ctx.up(v), st.ctx.up(v)), None => (st.ctx.zeros(k * r * 8 * N), st.ctx.zeros(k * r * 8 * N)) };
+            let pre = if mode & KS_ACC != 0 { st.rand_slots(k * r) } else { zero.clone() };
+            o0.write(&st.ctx, &pre);
+            o1.write(&st.ctx, &pre);
             let mut a = KsArgs {
                 c1: c1.c(),
                 modup: mu.c(),
@@ -1233,7 +1250,8 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
             ck(unsafe { (st.t.ks_dot)(&a, st.s()) });
             let mut want = o0.read(&st.ctx);
             want.extend(o1.read(&st.ctx));
-            let (q0, q1) = match &pre { Some(v) => (st.ctx.up(v), st.ctx.up(v)), None => (st.ctx.zeros(k * r * 8 * N), st.ctx.zeros(k * r * 8 * N)) };
+            q0.write(&st.ctx, &pre);
+            q1.write(&st.ctx, &pre);
             a.out0 = q0.p();
             a.out1 = q1.p();
             a.kb = std::ptr::null();
@@ -1242,22 +1260,28 @@ fn t_keytab(st: &mut Setup) -> Vec<TestResult> {
             ck(unsafe { (st.t.ks_dot_key)(&ka, st.s()) });
             let mut got = q0.read(&st.ctx);
             got.extend(q1.read(&st.ctx));
-            out.push(cmp(&format!("ks_dot_key ({name}, K={kc}, R=2, c0 mode {mode}) == ks_dot(expanded a)"), &got, &want));
+            out.push(cmp(&format!("ks_dot_key ({name}, {} digits, K={kc}, R=2, c0 mode {mode}) == ks_dot(expanded a)", g.ndig), &got, &want));
             if key.bits == 0 && key.q_top == 3 {
-                // hybrid: digit 0 regenerated, digit 1 read from the resident `a`
-                let (h0, h1) = match &pre { Some(v) => (st.ctx.up(v), st.ctx.up(v)), None => (st.ctx.zeros(k * r * 8 * N), st.ctx.zeros(k * r * 8 * N)) };
-                let mut kh = ka;
-                kh.ks.out0 = h0.p();
-                kh.ks.out1 = h1.p();
-                kh.ks.ka = kap.c() as *const *const c_void;
-                kh.ks.key_digit_stride = kds as u64;
-                kh.key.nregen = 1;
-                ck(unsafe { (st.t.ks_dot_key)(&kh, st.s()) });
-                let mut gh = h0.read(&st.ctx);
-                gh.extend(h1.read(&st.ctx));
-                out.push(cmp(&format!("ks_dot_key (hybrid: 1 of 2 digits regenerated, K={kc}, c0 mode {mode}) == ks_dot"), &gh, &want));
+                // hybrid: the first `nregen` digits regenerated, the others read from the resident `a`
+                for nregen in 1..g.ndig {
+                    h0.write(&st.ctx, &pre);
+                    h1.write(&st.ctx, &pre);
+                    let mut kh = ka;
+                    kh.ks.out0 = h0.p();
+                    kh.ks.out1 = h1.p();
+                    kh.ks.ka = kap.c() as *const *const c_void;
+                    kh.ks.key_digit_stride = kds as u64;
+                    kh.key.nregen = nregen as i32;
+                    ck(unsafe { (st.t.ks_dot_key)(&kh, st.s()) });
+                    let mut gh = h0.read(&st.ctx);
+                    gh.extend(h1.read(&st.ctx));
+                    out.push(cmp(&format!("ks_dot_key (hybrid: {nregen} of {} digits regenerated, K={kc}, c0 mode {mode}) == ks_dot", g.ndig), &gh, &want));
+                }
             }
         }
+    }
+    if !all {
+        return out;
     }
     // ---- ABI 7: ks_dot_regen with key 0's `b` read through KeyTab (dense full / packed + banded) == ks_dot (R=1)
     {

@@ -199,7 +199,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
 }
 
 // ks_dot with the keys read through KeyTab: `a` regenerated (cooperative ChaCha over 4-lane groups at u32, each lane
-// 4 consecutive slots), `b` dense or packed in the key's slot order; outputs as ks_dot (automorphism, c0 modes).
+// 4 consecutive slots), `b` dense or packed in the key's slot order; outputs as ks_dot (automorphism, c0 modes). K = 1
+// at u32 runs ks_dot_seg instead (below).
 template <class W, class MM, int KMAX, bool PACKED>
 __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
     using Wd = WideOf<W>;

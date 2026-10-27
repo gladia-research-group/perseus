@@ -587,8 +587,9 @@ struct CtsRegenArgs {
 static_assert(sizeof(CtsRegenArgs) == 232, "CtsRegenArgs layout");
 
 // ks_dot (K <= 4 ciphertexts x R keys, automorphism, c0 modes) with the keys read through KeyTab (`ks.kb` unused;
-// `ks.ka` / `ks.key_digit_stride` only for digits >= key.nregen); 4 consecutive slots per thread (cooperative ChaCha
-// at u32).
+// `ks.ka` / `ks.key_digit_stride` only for digits >= key.nregen); at K = 1 (u32) on warp-sized row segments, 8 slots
+// per lane and one ChaCha block per thread (ks_dot_seg), else 4 consecutive slots per thread (cooperative ChaCha at
+// u32).
 struct KsKeyArgs {
     KsArgs ks;
     KeyTab key;
