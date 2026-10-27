@@ -677,9 +677,11 @@ __global__ void ks_recombine_k(TfheArgs A) {
     if (idx >= (size_t)A.count * cols) return;
     const size_t b = idx / cols, o = idx % cols;
     const int32_t* g = (const int32_t*)A.y;
-    const size_t plane = A.c[3] ? (size_t)A.c[3] : (size_t)cols * A.count;   // c[3]: a padded plane stride (words)
+    // c[4]: the GEMM's row count (>= count: padded rows), c[3]: a padded plane stride (words)
+    const size_t rows = A.c[4] ? (size_t)A.c[4] : (size_t)A.count;
+    const size_t plane = A.c[3] ? (size_t)A.c[3] : (size_t)cols * rows;
     int64_t v = 0;
-    for (int p = planes - 1; p >= 0; p--) v = v * 256 + g[p * plane + o * A.count + b];
+    for (int p = planes - 1; p >= 0; p--) v = v * 256 + g[p * plane + o * rows + b];
     const int64_t q = (int64_t)A.q;
     v %= q;
     if (v < 0) v += q;

@@ -306,9 +306,9 @@ impl<'a> TfheSwitch<'a> {
         let n_sub = n / p.rs_factor;
         let k = n_sub * p.ks.1;
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
-            + max * (n_sub + 1) + PLANES * ((nl + 1) * max + 64) + 2 * max * (nl + 1) + max * (nb + 1)
+            + max * (n_sub + 1) + PLANES * ((nl + 1) * (max + 16) + 64) + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
-        let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
+        let bytes8 = PLANES * (nl + 1) * k + (max + 16) * k + WS;
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
     }
 
@@ -379,8 +379,8 @@ impl<'a> TfheSwitch<'a> {
             rs: arena.alloc("tfhe.work", 2 * n)?,
             idx: arena.alloc("tfhe.work", max)?,
             ext: arena.alloc("tfhe.work", max * (n_sub + 1))?,
-            kdig: arena.alloc("tfhe.work", max * k)?,
-            g: arena.alloc("tfhe.work", PLANES * (cols * max).next_multiple_of(64))?,
+            kdig: arena.alloc("tfhe.work", max.next_multiple_of(16) * k)?,
+            g: arena.alloc("tfhe.work", PLANES * (cols * max.next_multiple_of(16)).next_multiple_of(64))?,
             lwe: arena.alloc("tfhe.work", max * cols)?,
             ms: arena.alloc("tfhe.work", max * cols)?,
             acc: arena.alloc("tfhe.work", max * 4 * nb)?,
@@ -426,9 +426,10 @@ impl<'a> TfheSwitch<'a> {
         self.max
     }
 
-    /// Prepare the key switch's GEMM plan for chunks of `b` values (setup: the replay builds none).
+    /// Prepare the key switch's GEMM plan for chunks of `b` values (setup: the replay builds none). The GEMM runs on
+    /// `b` rounded up to 16 rows (cuBLASLt's int8 kernels want aligned leading dimensions; the extra rows are unread).
     pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
-        let b = b.min(self.max);
+        let b = b.min(self.max).next_multiple_of(16);
         if b > 0 && !self.gemms.contains_key(&b) {
             let k = self.n_sub * self.p.ks.1;
             self.gemms.insert(b, I8Gemm::new(lt_, b as u64, (self.nl + 1) as u64, k as u64, 8, WS)?);
@@ -508,15 +509,16 @@ impl<'a> TfheSwitch<'a> {
             // LWE key switch
             Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: n_sub as i32, x: self.kdig.vptr_mut(), y: self.ext.vptr(), q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
             self.prepare(lt_, cb)?;
-            let gemm = &self.gemms[&cb];
+            let mp = cb.next_multiple_of(16);
+            let gemm = &self.gemms[&mp];
             // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
-            let ps = (cols * cb).next_multiple_of(64);
+            let ps = (cols * mp).next_multiple_of(64);
             let gp_ = self.g.dptr_mut();
             for u in 0..PLANES {
                 // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
                 unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
             }
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, 0, 0, 0, 0], ..Default::default() })?;
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
             lap(s, &mut t, &mut tm.key_switch)?;
 
             // bootstrap

@@ -1573,6 +1573,13 @@ impl PySession {
         let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
         nogil(py, || tf.lut(&ex.compute, name, &values))
     }
+    /// Register TFHE sign LUT `name`: `lo` for m < 0, `hi` for m >= 0, inputs m in (-2, 2) (pc-py tfhe.rs `lut_sign`).
+    fn tfhe_lut_sign(&self, py: Python<'_>, name: &str, lo: f64, hi: f64) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let State { planned, ex, .. } = &mut *st;
+        let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        nogil(py, || tf.lut_sign(&ex.compute, name, lo, hi))
+    }
     /// Register TFHE slot set `name`: the slots (< N/2, a real payload) the LUTs run on and `copies`, slot offsets
     /// every output is also written at (one bootstrap per value). Synchronous.
     #[pyo3(signature = (name, slots, copies=Vec::new()))]
