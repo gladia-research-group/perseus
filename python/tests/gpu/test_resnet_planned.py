@@ -26,3 +26,19 @@ def test_resnet_planned_cifar8(tmp_path):
     assert rc == 0
     assert got["agree"] == got["n"] == 8, got
     assert got["max_dlogit"] < 0.05, got
+
+
+STCF = ["--one-stage", "--twin-limit", "400", "--set", "FIDESLIB_BTS_STC_FIRST=2", "--set", "FIDESLIB_BTS_STC_FIRST_ROUTES=dense",
+        "--set", "FIDESLIB_BTS_STC_FIRST_CF=13", "--set", "FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=0"]
+
+
+@pytest.mark.skipif(not os.environ.get("HF_HOME"), reason="HF_HOME (CIFAR-10, the checkpoint) missing")
+def test_resnet_stc_first_planned_cifar8(tmp_path):
+    """The one-stage StC-first plan (CFs from the StC-first accuracy curves): 8/8, logits within 0.01."""
+    from perseus.examples.resnet import run
+    got = {}
+    rc = run.main(["--plan", "bootstrap_placements/resnet20_stcf2", *STCF, "--n", "8", "--work-dir", str(tmp_path / "w")],
+                  results=got.update)
+    assert rc == 0
+    assert got["agree"] == got["n"] == 8, got
+    assert got["max_dlogit"] < 0.01, got
