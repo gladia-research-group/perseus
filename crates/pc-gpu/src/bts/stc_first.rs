@@ -1294,4 +1294,27 @@ mod tests {
         // the entry level is pc-shadow's (FAKECAP_STC_ENTRY)
         assert_eq!(Some(53 - p.entry_top as u32), pc_shadow::BtsConfig::n32_shipped().stc_first_entry);
     }
+
+    /// A lean chain's PCMM inputs get their own fixed stages (`own_split`, THIN_SPLIT_PCMM): the same single-prime
+    /// stage tops as every other call's, each stage's plaintexts at its prime times 2^own_split (THIN_SPLIT's
+    /// elsewhere); a composite chain builds none.
+    #[test]
+    fn own_split_stages() {
+        let chain = Chain::generate(&ChainSpec::n32a4()).unwrap();
+        let mut setup = BtsSetup::n32_shipped();
+        setup.real = false;
+        let mut sf = StcFirstSetup::n32_shipped();
+        sf.own_split = Some(THIN_SPLIT_PCMM);
+        let p = StcFirstPlan::new(&chain, &setup, &sf).unwrap();
+        assert_eq!(p.step, 1);
+        assert_eq!(p.input.len(), THIN_SPLIT.len());
+        assert_eq!(p.input.iter().map(|h| h.top).collect::<Vec<_>>(), p.input_own.iter().map(|h| h.top).collect::<Vec<_>>());
+        for (si, (a, b)) in p.input.iter().zip(&p.input_own).enumerate() {
+            assert_eq!(a.nf.to_bits(), (chain.q[a.top] as f64 * THIN_SPLIT[si].exp2()).to_bits());
+            assert_eq!(b.nf.to_bits(), (chain.q[b.top] as f64 * THIN_SPLIT_PCMM[si].exp2()).to_bits());
+        }
+        assert!(StcFirstPlan::new(&chain, &setup, &StcFirstSetup::n32_shipped()).unwrap().input_own.is_empty());
+        let n32 = Chain::generate(&ChainSpec::n32()).unwrap();
+        assert!(StcFirstPlan::new(&n32, &setup, &sf).unwrap().input_own.is_empty());
+    }
 }
