@@ -84,7 +84,8 @@ impl BootstrapKey {
         let n = self.ntt.n;
         let q = self.ntt.q;
         let two_n = 2 * n as u64;
-        let sw = |x: u64| -> usize { ((x as u128 * two_n as u128 + q_in as u128 / 2) / q_in as u128 % two_n as u128) as usize };
+        let m = crate::gadget::fixed_ratio(two_n, q_in);
+        let sw = |x: u64| -> usize { (crate::gadget::scale_round(x, m) % two_n) as usize };
         let neg = |k: usize| (2 * n - k) % (2 * n);
         let mut acc = Rlwe { c0: crate::rlwe::monomial_mul(tv, neg(sw(ct.b)), q), c1: vec![0; n] };
         for (ai, key) in ct.a.iter().zip(&self.ggsw) {

@@ -2,8 +2,8 @@
 use pc_core::keys::{DiscreteGaussian, Prng};
 use rayon::prelude::*;
 
-use crate::gadget::Gadget;
-use crate::modq::{addmod, centered, from_signed, mulmod};
+use crate::gadget::{fixed_ratio, scale_round, Gadget};
+use crate::modq::{addmod, from_signed, mulmod};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lwe {
@@ -30,13 +30,10 @@ impl Lwe {
         ct
     }
 
-    /// Every word times round(to / from) as a real ratio: x -> round(x to / from) (centered), mod `to`.
+    /// Every word x -> round(x to / from) mod `to` (to < from), the device's fixed-point form (`gadget::scale_round`).
     pub fn mod_switch(&self, from: u64, to: u64) -> Lwe {
-        let sw = |x: u64| -> u64 {
-            let c = centered(x, from) as i128;
-            let v = (c * to as i128 * 2 + from as i128).div_euclid(2 * from as i128);
-            from_signed(v as i64, to)
-        };
+        let m = fixed_ratio(to, from);
+        let sw = |x: u64| -> u64 { scale_round(x, m) % to };
         Lwe { a: self.a.iter().map(|&x| sw(x)).collect(), b: sw(self.b) }
     }
 }
