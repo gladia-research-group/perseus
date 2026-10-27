@@ -33177,7 +33177,21 @@
    "delta1": 4,
    "delta2": 16,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.1.attn": {
    "mid_x": -3.417387008666992,
@@ -35282,7 +35296,17 @@
    "delta1": 8,
    "delta2": 4,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    5,
+    5,
+    8
+   ],
+   "recip_targets": [
+    0.01,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.10.attn": {
    "mid_x": -22.360966682434082,
@@ -38414,7 +38438,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.2,
+    0.2,
+    0.2,
+    0.001
+   ]
   },
   "transformer.h.11.attn": {
    "mid_x": -5.247037887573242,
@@ -41546,7 +41582,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    4,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.2.attn": {
    "mid_x": -41.25511169433593,
@@ -45705,7 +45753,21 @@
    "delta1": 8,
    "delta2": 16,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.01,
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.3.attn": {
    "mid_x": -47.92677688598633,
@@ -49864,7 +49926,21 @@
    "delta1": 8,
    "delta2": 16,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.4.attn": {
    "mid_x": -100.82367324829102,
@@ -55050,7 +55126,23 @@
    "delta1": 8,
    "delta2": 32,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.01,
+    0.3,
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.5.attn": {
    "mid_x": -23.572892665863037,
@@ -58182,7 +58274,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.6.attn": {
    "mid_x": -20.101624965667725,
@@ -61314,7 +61418,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.7.attn": {
    "mid_x": -18.93253135681152,
@@ -64446,7 +64562,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    5,
+    5,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.01,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.8.attn": {
    "mid_x": -19.439287662506107,
@@ -67578,7 +67706,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.3,
+    0.3,
+    0.3,
+    0.001
+   ]
   },
   "transformer.h.9.attn": {
    "mid_x": -23.968217849731445,
@@ -70710,7 +70850,19 @@
    "delta1": 8,
    "delta2": 8,
    "decode_window": 1024,
-   "calib_T": 1024
+   "calib_T": 1024,
+   "recip_iters_cheb": [
+    3,
+    6,
+    6,
+    8
+   ],
+   "recip_targets": [
+    0.2,
+    0.2,
+    0.2,
+    0.001
+   ]
   }
  },
  "cutmax": {
