@@ -578,15 +578,15 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
         k_max = cfg.raise_drop_max
         if cfg.raise_drop_landing_max is not None:
             k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
-        # the plan's drop is absolute: the route's default (raise_drop_base) plus k must be a built variant
-        b = dict(cfg.raise_drop_base).get(route, 0)
-        ks = [k for k in range(k_max, 0, -1)
-              if route == 1 or not cfg.raise_drop_set or k + b in cfg.raise_drop_set]
         saved = refresh.site_out_levels.get(p)
         found = 0
-        for k in ks:
+        for k in range(k_max, 0, -1):
             refresh.site_out_levels[p] = int(round(base_abs + k * unit))
             refresh._cache.pop(p, None)
+            # the plan's drop is absolute (the route's default and any step landing floor under base_abs included):
+            # it must be a built variant
+            if route != 1 and cfg.raise_drop_set and refresh.spec(p).raise_drop not in cfg.raise_drop_set:
+                continue
             s2 = placer._sim()
             in2 = inputs(s2)
             ok = (s2.hint_fired == sim.hint_fired
