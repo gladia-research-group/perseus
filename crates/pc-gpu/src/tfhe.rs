@@ -320,9 +320,7 @@ impl<'a> TfheSwitch<'a> {
             c: [self.p.pbs.0 as u64, self.p.pbs.1 as u64, self.bninv, shoup(self.bninv, qb), 0, 0, 0, 0],
             ..pb
         };
-        for key in 0..nl {
-            Self::go(ctx, s, &TfheArgs { i0: key as i32, ..step })?;
-        }
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_ROTATE, ..step })?;
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, 0, 0], ..pb })?;
         s.sync()?;
         tm.bootstrap = t2.elapsed().as_secs_f64() * 1e3;

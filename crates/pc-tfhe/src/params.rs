@@ -47,7 +47,7 @@ impl Params {
             n_br,
             q_br: prime_below(50, 2 * n_br as u64)?,
             key_sigma: 3.19,
-            pbs: (12, 3),
+            pbs: (18, 2),
             ks: (2, 8),
             rs: (8, 3),
             rp: (16, 2),

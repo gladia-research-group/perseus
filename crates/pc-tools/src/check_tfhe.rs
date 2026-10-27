@@ -287,7 +287,7 @@ fn run(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `pc-check tfhe-pbs [--count 256]`: the device's programmable bootstrap (PBS_MS -> PBS_INIT -> PBS_STEP x n_lwe ->
+/// `pc-check tfhe-pbs [--count 256] [--step]`: the device's programmable bootstrap (PBS_MS -> PBS_INIT -> PBS_STEP x n_lwe ->
 /// PBS_EXTRACT) on a batch of sign LUTs vs pc-tfhe's `bootstrap` + `mod_switch`, every output word; PBS/s.
 pub fn cmd_pbs(args: &[String]) -> ExitCode {
     match run_pbs(args) {
@@ -308,6 +308,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     use pc_tfhe::modq::shoup;
     use pc_tfhe::pbs::BootstrapKey;
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(256);
+    // --step: one PBS_STEP launch per key bit (the reference schedule) instead of the fused PBS_ROTATE
+    let step_ref = args.iter().any(|a| a == "--step");
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
@@ -388,8 +390,12 @@ fn run_pbs(args: &[String]) -> Res<bool> {
             c: [p.pbs.0 as u64, lv as u64, ninv, shoup(ninv, q), 0, 0, 0, 0],
             ..base
         };
-        for key in 0..nl {
-            go(&TfheArgs { i0: key as i32, ..step })?;
+        if step_ref {
+            for key in 0..nl {
+                go(&TfheArgs { i0: key as i32, ..step })?;
+            }
+        } else {
+            go(&TfheArgs { op: tfhe_op::PBS_ROTATE, ..step })?;
         }
         go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, 0, 0], ..base })?;
         Ok(())

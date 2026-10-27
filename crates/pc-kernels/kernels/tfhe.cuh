@@ -94,23 +94,15 @@ __global__ void init_k(TfheArgs A) {
     }
 }
 
-// one CMux of every LWE of the batch (a block each): acc += GGSW_key [x] (acc X^-a~ - acc)
-__global__ void __launch_bounds__(STEP_TH) step_k(TfheArgs A) {
-    extern __shared__ uint64_t sm[];
-    const int n = A.n, L = A.i1, key = A.i0, bl = (int)A.c[0], lv = (int)A.c[1];
+// acc (shared, both parts) += GGSW_key [x] (acc X^-ak - acc); dif, tb, o0, o1: shared scratch of n words each
+__device__ void cmux(const TfheArgs& A, int key, uint32_t ak, uint64_t* acc0, uint64_t* acc1, uint64_t* dif, uint64_t* tb, uint64_t* o0, uint64_t* o1) {
+    const int n = A.n, bl = (int)A.c[0], lv = (int)A.c[1];
     const uint64_t q = A.q;
-    const uint32_t ak = ((const uint32_t*)A.z)[(size_t)blockIdx.x * (L + 1) + key];
-    if (ak == 0) return;
     const int kp = (int)((2 * n - ak) % (2 * n));
-    uint64_t *acc0 = sm, *acc1 = sm + n, *dif = sm + 2 * n, *tb = sm + 3 * n, *o0 = sm + 4 * n, *o1 = sm + 5 * n;
-    uint64_t* g = (uint64_t*)A.x + (size_t)blockIdx.x * 2 * n;
     for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        acc0[o] = g[o];
-        acc1[o] = g[n + o];
         o0[o] = 0;
         o1[o] = 0;
     }
-    __syncthreads();
     const uint64_t* psi = (const uint64_t*)A.tw;
     const uint64_t* psis = (const uint64_t*)A.tws;
     const size_t kstride = (size_t)2 * lv * 2 * n;
@@ -139,8 +131,49 @@ __global__ void __launch_bounds__(STEP_TH) step_k(TfheArgs A) {
     ntt_inv(o0, n, psi + n, psis + n, A.c[2], A.c[3], q);
     ntt_inv(o1, n, psi + n, psis + n, A.c[2], A.c[3], q);
     for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        g[o] = addq(acc0[o], o0[o], q);
-        g[n + o] = addq(acc1[o], o1[o], q);
+        acc0[o] = addq(acc0[o], o0[o], q);
+        acc1[o] = addq(acc1[o], o1[o], q);
+    }
+    __syncthreads();
+}
+
+// one CMux of every LWE of the batch (a block each): acc += GGSW_key [x] (acc X^-a~ - acc)
+__global__ void __launch_bounds__(STEP_TH) step_k(TfheArgs A) {
+    extern __shared__ uint64_t sm[];
+    const int n = A.n, L = A.i1, key = A.i0;
+    const uint32_t ak = ((const uint32_t*)A.z)[(size_t)blockIdx.x * (L + 1) + key];
+    if (ak == 0) return;
+    uint64_t* g = (uint64_t*)A.x + (size_t)blockIdx.x * 2 * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        sm[o] = g[o];
+        sm[n + o] = g[n + o];
+    }
+    __syncthreads();
+    cmux(A, key, ak, sm, sm + n, sm + 2 * n, sm + 3 * n, sm + 4 * n, sm + 5 * n);
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        g[o] = sm[o];
+        g[n + o] = sm[n + o];
+    }
+}
+
+// the whole blind rotation of every LWE (a block each): the accumulator stays in shared memory across the i1 CMuxes
+__global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
+    extern __shared__ uint64_t sm[];
+    const int n = A.n, L = A.i1;
+    const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.x * (L + 1);
+    uint64_t* g = (uint64_t*)A.x + (size_t)blockIdx.x * 2 * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        sm[o] = g[o];
+        sm[n + o] = g[n + o];
+    }
+    __syncthreads();
+    for (int key = 0; key < L; key++) {
+        const uint32_t ak = at[key];
+        if (ak) cmux(A, key, ak, sm, sm + n, sm + 2 * n, sm + 3 * n, sm + 4 * n, sm + 5 * n);
+    }
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        g[o] = sm[o];
+        g[n + o] = sm[n + o];
     }
 }
 
@@ -324,7 +357,7 @@ __global__ void repack_b_k(TfheArgs A) {
 int launch(const TfheArgs* a, cudaStream_t s) {
     const TfheArgs A = *a;
     if (A.count < 1) return -1;
-    if (A.op <= PC_TFHE_PBS_EXTRACT && (A.n < 64 || A.n > 2048 || (A.n & (A.n - 1)))) return -1;
+    if ((A.op <= PC_TFHE_PBS_EXTRACT || A.op == PC_TFHE_PBS_ROTATE) && (A.n < 64 || A.n > 2048 || (A.n & (A.n - 1)))) return -1;
     switch (A.op) {
         case PC_TFHE_PBS_MS: {
             const size_t tot = (size_t)A.count * (A.i1 + 1);
@@ -343,6 +376,16 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 attr = true;
             }
             step_k<<<A.count, A.n / 2 < STEP_TH ? A.n / 2 : STEP_TH, smem, s>>>(A);
+            break;
+        }
+        case PC_TFHE_PBS_ROTATE: {
+            const int smem = 6 * A.n * (int)sizeof(uint64_t);
+            static bool attr_r = false;
+            if (!attr_r) {
+                cudaFuncSetAttribute(rotate_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 6 * 2048 * (int)sizeof(uint64_t));
+                attr_r = true;
+            }
+            rotate_k<<<A.count, A.n / 2 < STEP_TH ? A.n / 2 : STEP_TH, smem, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:
