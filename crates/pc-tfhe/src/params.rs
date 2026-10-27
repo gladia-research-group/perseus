@@ -10,7 +10,7 @@
 //!   model 6 (n/2) 2 l N (B^2 / 12) sigma^2 + n N (2/3) (q / B^l)^2 / 12, which matched 2^-20.2 measured at 2^50 / (18, 2);
 //! - repack columns: degree n_br = 2048 under a fresh ternary s_x at p0 P ~ 2^53 (P = rp_aux, 25 bits): within the
 //!   54-bit bound; repack ring key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
-//! - binary LWE key, n = 920, noise sigma = 2^-17 q: the regime of the TFHE-rs default sets (n 742-918 at relative
+//! - binary LWE key, n = 921 (a multiple of the PBS group), noise sigma = 2^-17 q: the regime of the TFHE-rs default sets (n 742-918 at relative
 //!   noise ~2^-17 for 128 bits). Not run through the lattice estimator here (no Sage on the box): re-check before
 //!   publication.
 //! Pegasus-style switching is not IND-CPA-D secure (ePrint 2026/285): decryptions must not go back to the server.
@@ -30,8 +30,9 @@ pub struct Params {
     /// Gadgets as (base log, levels): blind rotation (approximate, over q_br), LWE key switch (approximate, over p0),
     /// ring switch (approximate, over p0), repack (exact, over p0).
     pub pbs: (u32, usize),
-    /// Key bits per blind-rotation step (the multi-bit unrolling: 2^group - 1 GGSWs per group). 2 on the device: 3
-    /// (n 921) measured 13% slower at 752 PBS (the 7 key MACs per 3 bits outweigh the third fewer NTTs).
+    /// Key bits per blind-rotation step (the multi-bit unrolling: 2^group - 1 GGSWs per group): 3 (n_lwe 921) is 7%
+    /// faster than 2 on the device once NTT(X^e - 1)'s table sits in shared memory (from L2 its gathers made it 13%
+    /// slower).
     pub pbs_group: usize,
     pub ks: (u32, usize),
     pub rs: (u32, usize),
@@ -57,14 +58,14 @@ impl Params {
             qb -= m;
         }
         Ok(Params {
-            n_lwe: 920,
+            n_lwe: 921,
             lwe_sigma_rel: (-17f64).exp2(),
             n_br,
             br_primes: (qa, qb),
             q_br: qa * qb,
             key_sigma: 3.19,
             pbs: (24, 1),
-            pbs_group: 2,
+            pbs_group: 3,
             ks: (2, 8),
             rs: (8, 3),
             rp: (16, 2),
