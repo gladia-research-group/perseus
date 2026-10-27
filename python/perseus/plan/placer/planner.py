@@ -881,8 +881,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         sim = placer.run()
 
     rescale_anchors: set = set()
-    # the realize-anchor trials re-run the cut: kept sites stay placed in them too
-    _kept = {"placed": set(kept_sites)} if kept_sites else {}
+    # the realize-anchor trials re-run the cut: kept and forced sites stay placed in them too (the terminal-exit refresh
+    # of the block-loop retry was dropped by those trials, so the retry re-planned the same exit)
+    _kept_all = set(kept_sites) | (set(force_place or ()) if exact else set())
+    _kept = {"placed": _kept_all} if _kept_all else {}
     if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
@@ -1149,7 +1151,12 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 "[bts_depth_error] guard is the authority.")
     if _bad_cut and getattr(placer, "env_cap_relaxed", False):
         # the placer already proved no envelope-respecting placement exists (it tried that
-        # pass first and it could not be planned), so these sites are forced, not chosen
+        # pass first and it could not be planned), so these sites are forced, not chosen.
+        # PLAN_ENVELOPE_STRICT=1: refuse instead (the block loop then re-plans the block before with a refresh on its
+        # exit, the entry this block could not plan from: the tail after a deep last block)
+        if os.environ.get("PLAN_ENVELOPE_STRICT", "0") not in ("", "0"):
+            raise PlanInfeasible(f"P3c: {len(_bad_cut)} refresh(es) start past the measured envelope with no "
+                                 "envelope-respecting placement: " + ", ".join(f"{v}@{l:g}" for v, l in _bad_cut[:6]))
         log.warning(
             f"[plan] P3c: {len(_bad_cut)} refresh(es) start past the measured envelope "
             f"(abs level > {_ENV_CAP:g}) and NO placement avoids them -- a bootstrap there "
