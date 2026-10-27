@@ -5,13 +5,17 @@
 //! input of phase m q / 4 (the forward switch's scale): phi = round(2 n_br phase / q) lies in [-n_br/2, n_br/2), and the
 //! negacyclic test vector holds f(2 phi / n_br) for phi >= 0 at index phi and -f(2 (j - n_br) / n_br) at index j in
 //! [n_br/2, n_br).
+//! The blind rotation is unrolled by two key bits (Bourse, Minelli, Minihold, Paillier 2018; Zhou et al. 2018): per pair
+//! (i, j) the key holds GGSW(s_i s_j), GGSW(s_i (1 - s_j)), GGSW((1 - s_i) s_j) and
+//! acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j): one decomposition and one set of NTTs per
+//! pair (half the transforms of the per-bit CMux) for three key MACs, at twice the key noise per term.
 use pc_core::keys::{DiscreteGaussian, Prng};
 use rayon::prelude::*;
 
 use crate::gadget::Gadget;
 use crate::lwe::Lwe;
 use crate::modq::{addmod, from_signed, invmod, mulmod, submod, Ntt};
-use crate::rlwe::{add_into, monomial_mul, sub_into, Rlwe};
+use crate::rlwe::{add_into, monomial_mul, Rlwe};
 
 /// The RNS ring of the blind rotation: Q = q_a q_b.
 #[derive(Clone, Debug)]
@@ -41,6 +45,64 @@ impl Rns {
     pub fn residues(&self, v: &[u64]) -> [Vec<u64>; 2] {
         [0, 1].map(|l| v.iter().map(|&x| x % self.ntt[l].q).collect())
     }
+
+    /// NTT(X^e - 1) at prime p, e in [0, 2n).
+    pub fn monomial_m1(&self, p: usize, e: usize) -> Vec<u64> {
+        let (n, q) = (self.n(), self.ntt[p].q);
+        let mut f = vec![0u64; n];
+        f[e % n] = if e < n { 1 } else { q - 1 };
+        f[0] = submod(f[0], 1, q);
+        self.ntt[p].fwd(&mut f);
+        f
+    }
+
+    /// The device's tables for NTT(X^e - 1) at prime p: (g^x - 1 for x in [0, 2n), E [n]) with NTT(X)[j] = g^E[j]
+    /// (g = NTT(X)[0], a primitive 2n-th root): NTT(X^e - 1)[j] = (g^(E[j] e mod 2n)) - 1.
+    pub fn monomial_tables(&self, p: usize) -> (Vec<u64>, Vec<u32>) {
+        let (n, q) = (self.n(), self.ntt[p].q);
+        let x = {
+            let mut f = vec![0u64; n];
+            f[1] = 1;
+            self.ntt[p].fwd(&mut f);
+            f
+        };
+        let mut pw = Vec::with_capacity(2 * n);
+        let mut log = std::collections::HashMap::new();
+        let mut v = 1u64;
+        for k in 0..2 * n {
+            pw.push(v);
+            log.insert(v, k as u32);
+            v = mulmod(v, x[0], q);
+        }
+        let e = x.iter().map(|y| log[y]).collect();
+        (pw.into_iter().map(|v| submod(v, 1, q)).collect(), e)
+    }
+}
+
+/// The gadget digits of both components of ct (residues per prime) in NTT form: [c][t][prime].
+fn ntt_digits(ct: &[Rlwe; 2], gadget: &Gadget, rns: &Rns) -> Vec<Vec<[Vec<u64>; 2]>> {
+    let (n, l) = (rns.n(), gadget.levels);
+    let mut d = vec![0i64; l];
+    (0..2)
+        .map(|c| {
+            let (pa, pb) = if c == 0 { (&ct[0].c0, &ct[1].c0) } else { (&ct[0].c1, &ct[1].c1) };
+            let mut digits = vec![[vec![0u64; n], vec![0u64; n]]; l];
+            for i in 0..n {
+                gadget.decompose(rns.crt(pa[i], pb[i]), &mut d);
+                for t in 0..l {
+                    for p in 0..2 {
+                        digits[t][p][i] = from_signed(d[t], rns.ntt[p].q);
+                    }
+                }
+            }
+            for dt in digits.iter_mut() {
+                for (p, dp) in dt.iter_mut().enumerate() {
+                    rns.ntt[p].fwd(dp);
+                }
+            }
+            digits
+        })
+        .collect()
 }
 
 /// GGSW of a small integer mu: rows (Z + mu g_t (1, 0)) and (Z + mu g_t (0, 1)), per prime, stored in NTT form.
@@ -82,27 +144,14 @@ impl Ggsw {
         &self.rows
     }
 
-    /// GGSW(mu) [x] ct (residues per prime): phase mu (c0 + c1 s) + noise.
-    pub fn external_product(&self, ct: &[Rlwe; 2], gadget: &Gadget, rns: &Rns) -> [Rlwe; 2] {
-        let (n, l) = (rns.n(), gadget.levels);
+    /// sum_{c, t} digits[c][t] * rows[c][t]: per prime (part 0, part 1), NTT form.
+    fn mac(&self, digits: &[Vec<[Vec<u64>; 2]>], rns: &Rns) -> [(Vec<u64>, Vec<u64>); 2] {
+        let n = rns.n();
         let mut out = [0, 1].map(|_| (vec![0u64; n], vec![0u64; n]));
-        let mut d = vec![0i64; l];
-        for c in 0..2 {
-            let (pa, pb) = if c == 0 { (&ct[0].c0, &ct[1].c0) } else { (&ct[0].c1, &ct[1].c1) };
-            let mut digits = vec![[vec![0u64; n], vec![0u64; n]]; l];
-            for i in 0..n {
-                gadget.decompose(rns.crt(pa[i], pb[i]), &mut d);
-                for t in 0..l {
-                    for p in 0..2 {
-                        digits[t][p][i] = from_signed(d[t], rns.ntt[p].q);
-                    }
-                }
-            }
-            for (t, dt) in digits.into_iter().enumerate() {
-                for (p, mut dp) in dt.into_iter().enumerate() {
-                    let ntt = &rns.ntt[p];
-                    let q = ntt.q;
-                    ntt.fwd(&mut dp);
+        for (c, dc) in digits.iter().enumerate() {
+            for (t, dt) in dc.iter().enumerate() {
+                for (p, dp) in dt.iter().enumerate() {
+                    let q = rns.ntt[p].q;
                     let (r0, r1) = &self.rows[c][t][p];
                     for i in 0..n {
                         out[p].0[i] = addmod(out[p].0[i], mulmod(dp[i], r0[i], q), q);
@@ -111,6 +160,12 @@ impl Ggsw {
                 }
             }
         }
+        out
+    }
+
+    /// GGSW(mu) [x] ct (residues per prime): phase mu (c0 + c1 s) + noise.
+    pub fn external_product(&self, ct: &[Rlwe; 2], gadget: &Gadget, rns: &Rns) -> [Rlwe; 2] {
+        let mut out = self.mac(&ntt_digits(ct, gadget, rns), rns);
         [0, 1].map(|p| {
             let (mut o0, mut o1) = std::mem::take(&mut out[p]);
             rns.ntt[p].inv(&mut o0);
@@ -120,20 +175,26 @@ impl Ggsw {
     }
 }
 
-/// The bootstrapping key: GGSW(s_i) for the binary LWE key, under the GLWE key s_br.
+/// The bootstrapping key, unrolled by pairs of the binary LWE key (even dimension): per pair (s_i, s_j)
+/// GGSW(s_i s_j), GGSW(s_i (1 - s_j)), GGSW((1 - s_i) s_j), under the GLWE key s_br.
 pub struct BootstrapKey {
     pub gadget: Gadget,
     pub rns: Rns,
-    pub ggsw: Vec<Ggsw>,
+    pub ggsw: Vec<[Ggsw; 3]>,
 }
 
 impl BootstrapKey {
     pub fn generate(s_lwe: &[i64], s_br: &[i64], gadget: Gadget, rns: Rns, dg: &DiscreteGaussian, prng: &mut Prng) -> BootstrapKey {
-        let ggsw = s_lwe.iter().map(|&si| Ggsw::encrypt(si, s_br, &gadget, &rns, dg, prng)).collect();
+        assert!(s_lwe.len() % 2 == 0, "the unrolled bootstrapping key pairs the LWE key");
+        let ggsw = s_lwe
+            .chunks(2)
+            .map(|p| [p[0] * p[1], p[0] * (1 - p[1]), (1 - p[0]) * p[1]].map(|mu| Ggsw::encrypt(mu, s_br, &gadget, &rns, dg, prng)))
+            .collect();
         BootstrapKey { gadget, rns, ggsw }
     }
 
-    /// acc = (X^-b~ tv, 0), then acc <- acc + GGSW(s_i) [x] (acc X^-a~_i - acc): the phase rotates by X^-phi.
+    /// acc = (X^-b~ tv, 0), then per key pair acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc) (module doc): the phase
+    /// rotates by X^-phi.
     pub fn blind_rotate(&self, tv: &[u64], ct: &Lwe, q_in: u64) -> [Rlwe; 2] {
         let n = self.rns.n();
         let two_n = 2 * n as u64;
@@ -142,23 +203,34 @@ impl BootstrapKey {
         let neg = |k: usize| (2 * n - k) % (2 * n);
         let tvr = self.rns.residues(tv);
         let mut acc = [0, 1].map(|p| Rlwe { c0: monomial_mul(&tvr[p], neg(sw(ct.b)), self.rns.ntt[p].q), c1: vec![0; n] });
-        for (ai, key) in ct.a.iter().zip(&self.ggsw) {
-            let k = sw(*ai);
-            if k == 0 {
+        for (a, keys) in ct.a.chunks(2).zip(&self.ggsw) {
+            let (ki, kj) = (sw(a[0]), sw(a[1]));
+            if ki == 0 && kj == 0 {
                 continue;
             }
-            let diff = [0, 1].map(|p| {
-                let q = self.rns.ntt[p].q;
-                let mut d = acc[p].monomial_mul(neg(k), q);
-                sub_into(&mut d.c0, &acc[p].c0, q);
-                sub_into(&mut d.c1, &acc[p].c1, q);
-                d
-            });
-            let pr = key.external_product(&diff, &self.gadget, &self.rns);
+            let digits = ntt_digits(&acc, &self.gadget, &self.rns);
+            let mut out = [0, 1].map(|_| (vec![0u64; n], vec![0u64; n]));
+            for (key, e) in keys.iter().zip([neg((ki + kj) % (2 * n)), neg(ki), neg(kj)]) {
+                if e == 0 {
+                    continue;
+                }
+                let pr = key.mac(&digits, &self.rns);
+                for p in 0..2 {
+                    let q = self.rns.ntt[p].q;
+                    let f = self.rns.monomial_m1(p, e);
+                    for i in 0..n {
+                        out[p].0[i] = addmod(out[p].0[i], mulmod(f[i], pr[p].0[i], q), q);
+                        out[p].1[i] = addmod(out[p].1[i], mulmod(f[i], pr[p].1[i], q), q);
+                    }
+                }
+            }
             for p in 0..2 {
-                let q = self.rns.ntt[p].q;
-                add_into(&mut acc[p].c0, &pr[p].c0, q);
-                add_into(&mut acc[p].c1, &pr[p].c1, q);
+                let ntt = &self.rns.ntt[p];
+                let (o0, o1) = &mut out[p];
+                ntt.inv(o0);
+                ntt.inv(o1);
+                add_into(&mut acc[p].c0, o0, ntt.q);
+                add_into(&mut acc[p].c1, o1, ntt.q);
             }
         }
         acc
