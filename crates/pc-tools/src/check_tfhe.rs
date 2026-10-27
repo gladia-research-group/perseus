@@ -76,6 +76,8 @@ fn run(args: &[String]) -> Res<bool> {
     let out_cf: u32 = arg(args, "--out-cf").map(|s| s.parse()).transpose()?.unwrap_or(3);
     // --device: the same switch on the device too (pc_gpu::tfhe::TfheSwitch), on a second encryption of the values
     let device = args.iter().any(|a| a == "--device");
+    // --chunk C: the device switch holds C values per pass (several chunks per call: apply_dev on device arguments)
+    let chunk: Option<usize> = arg(args, "--chunk").map(|s| s.parse()).transpose()?;
     let t0 = Instant::now();
     let chain = Chain::generate(&ChainSpec::n32())?;
     let n = chain.n;
@@ -114,7 +116,8 @@ fn run(args: &[String]) -> Res<bool> {
     mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
     mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1)));
     if device {
-        mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &Params::new(n)?, n_switch));
+        mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &Params::new(n)?, chunk.unwrap_or(n_switch)));
+        mp.reserve("check.tfhe", 4 * (n_switch + 2 * 4096) + 512);
     }
     let arena = mp.allocate(&dev)?;
     let mut ex = Executor::<W>::new(&dev, &arena, &mp)?;
@@ -145,7 +148,9 @@ fn run(args: &[String]) -> Res<bool> {
     let tk = Instant::now();
     let sw = Switcher::generate(params, &s, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe: host switch keys {:.1} s (p0 {p0}, p1 {p1})", tk.elapsed().as_secs_f64());
-    let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &ex.compute, &sw, n_switch)?) } else { None };
+    let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &ex.compute, &sw, chunk.unwrap_or(n_switch))?) } else { None };
+    let mut d_pos = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", n_switch)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", 2 * sw.params.n_br)?;
     arena.freeze();
     let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
     let enc = Encoder::new(&chain);
@@ -263,8 +268,15 @@ fn run(args: &[String]) -> Res<bool> {
         let pos: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
         let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &tv);
         // a warm-up call on scratch (x: any content at the split's level) builds the GEMM plan; then the timed one
-        ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tvr, off)?;
-        let tm = ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tvr, off)?;
+        let tm = if chunk.is_some() {
+            d_pos.upload(&cx.ex.compute, &pos)?;
+            d_tv.upload(&cx.ex.compute, &tvr)?;
+            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut x, d_pos.vptr(), pos.len(), d_tv.vptr(), off, true)?;
+            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut y, d_pos.vptr(), pos.len(), d_tv.vptr(), off, true)?
+        } else {
+            ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tvr, off)?;
+            ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tvr, off)?
+        };
         let mut fin2 = inp2.finish_call(0)?;
         fin2.at_split(&cx, std::slice::from_ref(&y))?;
         fin2.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;

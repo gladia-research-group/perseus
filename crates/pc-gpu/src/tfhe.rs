@@ -173,13 +173,47 @@ impl<'a> DevRepack<'a> {
         })
     }
 
-    /// Repack the `b` LWEs `outs` ([b][n_br + 1] mod p0) to the coefficients `idx` ([b] u32). `pa`: the ring-N NTT
-    /// args (primes p0, p1 with their n^-1), `tw_f` / `tw_i` their twiddles.
-    #[allow(clippy::too_many_arguments)]
-    pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
-        let (n, nb, lv, p0, p1, aux) = (self.n, self.nb, self.rp.1, self.p0, self.p1, self.aux);
+    fn args(&self) -> TfheArgs {
+        let (p0, aux) = (self.p0, self.aux);
+        TfheArgs {
+            n: self.n as i32,
+            i1: self.nb as i32,
+            i2: self.sfac as i32,
+            q: p0,
+            c: [self.rp.0 as u64, self.rp.1 as u64, aux, invmod(aux % p0, p0), aux % p0, 0, 0, mu(p0)],
+            ..Default::default()
+        }
+    }
+
+    /// Add the `b` LWEs `outs` ([b][n_br + 1] mod p0) at the coefficients `idx` ([b] u32) into the packed sum
+    /// (`first`: start a new one).
+    pub fn accumulate(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, first: bool) -> Result<()> {
+        let nb = self.nb;
         let go = |a: &TfheArgs| -> Result<()> {
             // SAFETY: the pointers address this repack's buffers / the caller's LWEs and positions, sized for the op
+            launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?;
+            Ok(())
+        };
+        let rb = self.args();
+        for r0 in (0..b).step_by(RC) {
+            let rc = RC.min(b - r0);
+            let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
+            let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
+            let sums = self.sums.vptr_mut();
+            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (first && r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: sums, y: self.dig.vptr(), z: self.cols.vptr(), ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_FIN, count: rc as i32, x: self.pk.vptr_mut(), y: self.sums.vptr(), w: o, ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ix, ..rb })?;
+        }
+        Ok(())
+    }
+
+    /// The packed sum to `acc` [part][limb][n] mod p0 p1 under s (the ring key switch). `pa`: the ring-N NTT args
+    /// (primes p0, p1 with their n^-1), `tw_f` / `tw_i` their twiddles.
+    pub fn finish(&mut self, table: &KernelTable, s: &Stream<Compute>, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
+        let (n, lv, p0, p1) = (self.n, self.rp.1, self.p0, self.p1);
+        let go = |a: &TfheArgs| -> Result<()> {
+            // SAFETY: the pointers address this repack's buffers
             launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?;
             Ok(())
         };
@@ -188,28 +222,11 @@ impl<'a> DevRepack<'a> {
             launch_result("pcmm", unsafe { (table.pcmm)(a, s.raw()) })?;
             Ok(())
         };
-        let rb = TfheArgs {
-            n: n as i32,
-            i1: nb as i32,
-            i2: self.sfac as i32,
-            q: p0,
-            c: [self.rp.0 as u64, lv as u64, aux, invmod(aux % p0, p0), aux % p0, 0, 0, mu(p0)],
-            ..Default::default()
-        };
-        for r0 in (0..b).step_by(RC) {
-            let rc = RC.min(b - r0);
-            let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
-            let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
-            let sums = self.sums.vptr_mut();
-            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: sums, y: self.dig.vptr(), z: self.cols.vptr(), ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_FIN, count: rc as i32, x: self.pk.vptr_mut(), y: self.sums.vptr(), w: o, ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ix, ..rb })?;
-        }
+        let rb = self.args();
         let rr = TfheArgs { count: 1, c: [self.rp.0 as u64, lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..rb };
         go(&TfheArgs { op: tfhe_op::REPACK_RING, x: self.rdig.vptr_mut(), y: self.z.vptr(), w: self.c0.vptr_mut() as *const c_void, ..rr })?;
         gp(&PcmmArgs { op: pcmm_op::NTT, count: (2 * lv) as i32, i0: lv as i32, x: self.rdig.vptr_mut(), tw: tw_f, ..*pa })?;
-        self.acc.upload(s, &vec![0u32; 4 * n])?;
+        self.acc.zero(s)?;
         go(&TfheArgs { op: tfhe_op::REPACK_RMAC, x: self.acc.vptr_mut(), y: self.rdig.vptr(), z: self.ring.vptr(), ..rr })?;
         for part in 0..2 {
             let xp = (self.acc.vptr_mut() as *mut u32).wrapping_add(part * 2 * n) as *mut c_void;
@@ -217,6 +234,13 @@ impl<'a> DevRepack<'a> {
         }
         go(&TfheArgs { op: tfhe_op::REPACK_C0, x: self.acc.vptr_mut(), y: self.c0.vptr(), ..rr })?;
         Ok(())
+    }
+
+    /// `accumulate` then `finish`: the `b` LWEs `outs` at the coefficients `idx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
+        self.accumulate(table, s, outs, idx, b, true)?;
+        self.finish(table, s, pa, tw_f, tw_i)
     }
 }
 
@@ -380,15 +404,39 @@ impl<'a> TfheSwitch<'a> {
     /// The LUT (`tv` + `offset`, mod q_br; pc-tfhe pbs `test_vector` / `sign01`) on the split's coefficients
     /// `positions` (slot i of a real payload is coefficient brev((i - 1) mod N/2): pc-check tfhe). `x` is overwritten
     /// with the result in the split format (level, degree and scale unchanged). `lt_`: the cuBLASLt handle of the
-    /// key switch's GEMMs (a plan per batch size, built on first use).
+    /// key switch's GEMMs (a plan per batch size, built on first use). Uploads its arguments and syncs per stage
+    /// (the timings): the host API of the checks; the replay calls `apply_dev`.
     pub fn apply<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, positions: &[u32], tv: &[u32], offset: u64) -> Result<Timings> {
-        let (n, nb, nl, n_sub) = (self.n, self.nb, self.nl, self.n_sub);
-        let b = positions.len();
-        if b == 0 || b > self.max {
-            return Err(shape("tfhe switch", format!("{b} coefficients, the switch holds 1..={}", self.max)));
+        if positions.is_empty() || positions.len() > self.max || tv.len() != 2 * self.nb {
+            return Err(shape("tfhe switch", format!("{} coefficients (the switch holds 1..={}) / test vector of {}", positions.len(), self.max, tv.len())));
         }
-        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 || tv.len() != 2 * nb {
-            return Err(shape("tfhe switch", format!("ciphertext at level {} (the split holds limbs 0..3) / test vector of {}", x.meta.level, tv.len())));
+        self.idx.upload_at(s, 0, positions)?;
+        self.tv.upload(s, tv)?;
+        let (pos, tvp) = (self.idx.vptr(), self.tv.vptr());
+        self.apply_dev(ctx, s, lt_, x, pos, positions.len(), tvp, offset, true)
+    }
+
+    /// Prepare the key switch's GEMM plan for chunks of `b` values (setup: the replay builds none).
+    pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
+        let b = b.min(self.max);
+        if b > 0 && !self.gemms.contains_key(&b) {
+            let k = self.n_sub * self.p.ks.1;
+            self.gemms.insert(b, I8Gemm::new(lt_, b as u64, (self.nl + 1) as u64, k as u64, 8, WS)?);
+        }
+        Ok(())
+    }
+
+    /// `apply` on device arguments: `pos` [b] u32 coefficients (any count: chunks of the switch's capacity, the
+    /// repack accumulating across them), `tv` [2 prime][n_br] residues. `timed`: sync per stage for the timings
+    /// (else no host sync: the replay).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_dev<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, tv: *const c_void, offset: u64, timed: bool) -> Result<Timings> {
+        let (n, nb, nl, n_sub) = (self.n, self.nb, self.nl, self.n_sub);
+        if b == 0 {
+            return Err(shape("tfhe switch", "no coefficients"));
+        }
+        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 {
+            return Err(shape("tfhe switch", format!("ciphertext at level {} (the split holds limbs 0..3)", x.meta.level)));
         }
         let (p0, p1) = (self.p0, self.p1);
         let q = &ctx.chain.q;
@@ -406,9 +454,15 @@ impl<'a> TfheSwitch<'a> {
         let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, ..PcmmArgs::default() };
         let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [self.ninv[0], self.ninv[1], self.ninv[0], 0, 0, 0, 0, 0], ..Default::default() };
         let mut tm = Timings::default();
-        self.idx.upload_at(s, 0, positions)?;
-        self.tv.upload(s, tv)?;
-        let t0 = Instant::now();
+        let lap = |s: &Stream<Compute>, t: &mut Instant, acc: &mut f64| -> Result<()> {
+            if timed {
+                s.sync()?;
+                *acc += t.elapsed().as_secs_f64() * 1e3;
+                *t = Instant::now();
+            }
+            Ok(())
+        };
+        let mut t = Instant::now();
 
         // the split to LWEs: coefficient form, mod q0 (staging part 0 = c1, part 1 = c0)
         ntt::inverse(ctx, s, &mut x.buf, Span::Q { top: 3 }, Parts::Both)?;
@@ -427,69 +481,68 @@ impl<'a> TfheSwitch<'a> {
         Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 2, x: st, tw: self.tw_i.vptr(), ..pa })?;
         let c0 = (self.rs.vptr() as *const u32).wrapping_add(n) as *const c_void;
         Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::ADD, count: 1, i0: n as i32, x: st, y: c0, ..pa })?;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_EXTRACT, count: b as i32, i1: n_sub as i32, i2: self.sfac as i32, x: self.ext.vptr_mut(), y: self.stage.vptr(), z: self.idx.vptr(), ..tb })?;
-        s.sync()?;
-        tm.to_lwe = t0.elapsed().as_secs_f64() * 1e3;
+        lap(s, &mut t, &mut tm.to_lwe)?;
 
-        // LWE key switch
-        let t1 = Instant::now();
         let (ks_lv, cols) = (self.p.ks.1, nl + 1);
-        let k = n_sub * ks_lv;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: b as i32, i1: n_sub as i32, x: self.kdig.vptr_mut(), y: self.ext.vptr(), q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
-        if !self.gemms.contains_key(&b) {
-            self.gemms.insert(b, I8Gemm::new(lt_, b as u64, cols as u64, k as u64, 8, WS)?);
-        }
-        let gemm = &self.gemms[&b];
-        // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
-        let ps = (cols * b).next_multiple_of(64);
-        let gp_ = self.g.dptr_mut();
-        for u in 0..PLANES {
-            // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
-            unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
-        }
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: b as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, 0, 0, 0, 0], ..Default::default() })?;
-        s.sync()?;
-        tm.key_switch = t1.elapsed().as_secs_f64() * 1e3;
-
-        // bootstrap
-        let t2 = Instant::now();
         let qb = self.p.q_br;
-        let pb = TfheArgs { n: nb as i32, count: b as i32, i1: nl as i32, q: qb, ..Default::default() };
         let mut cx = [0u64; 8];
         cx[6] = self.pbs_c[6];
         cx[7] = self.pbs_c[7];
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nb as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..pb })?;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: self.tv.vptr(), z: self.ms.vptr(), c: cx, ..pb })?;
-        let rot = TfheArgs {
-            op: tfhe_op::PBS_ROTATE,
-            i2: self.p.pbs_group as i32,
-            x: self.acc.vptr_mut(),
-            y: self.bsk.vptr(),
-            z: self.ms.vptr(),
-            tw: self.btw.vptr(),
-            tws: self.btw_s.vptr(),
-            m: self.pbs_m,
-            c: self.pbs_c,
-            ..pb
-        };
-        if b <= KB_MAX && self.p.pbs.1 == 1 {
-            // the latency path: per window, the key bundles then the rotation on two-block clusters
-            let groups = nl / self.p.pbs_group;
-            for g0 in (0..groups).step_by(KB_WINDOW) {
-                let gw = KB_WINDOW.min(groups - g0);
-                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: self.kb.vptr_mut(), ..rot })?;
-                Self::go(ctx, s, &TfheArgs { w: self.kb.vptr(), i0: g0 as i32, i4: gw as i32, ..rot })?;
-            }
-        } else {
-            Self::go(ctx, s, &rot)?;
-        }
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
-        s.sync()?;
-        tm.bootstrap = t2.elapsed().as_secs_f64() * 1e3;
+        for c0 in (0..b).step_by(self.max) {
+            let cb = self.max.min(b - c0);
+            let pc = (pos as *const u32).wrapping_add(c0) as *const c_void;
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_EXTRACT, count: cb as i32, i1: n_sub as i32, i2: self.sfac as i32, x: self.ext.vptr_mut(), y: self.stage.vptr(), z: pc, ..tb })?;
+            lap(s, &mut t, &mut tm.to_lwe)?;
 
-        // repack into [part][limb][n] mod p0 p1, lift x p2 p3 into the staging, scatter, NTT
-        let t3 = Instant::now();
-        self.repack.run(ctx.table, s, self.outs.vptr(), self.idx.vptr(), b, &pa, self.tw_f.vptr(), self.tw_i.vptr())?;
+            // LWE key switch
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: n_sub as i32, x: self.kdig.vptr_mut(), y: self.ext.vptr(), q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+            self.prepare(lt_, cb)?;
+            let gemm = &self.gemms[&cb];
+            // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
+            let ps = (cols * cb).next_multiple_of(64);
+            let gp_ = self.g.dptr_mut();
+            for u in 0..PLANES {
+                // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
+                unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
+            }
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, 0, 0, 0, 0], ..Default::default() })?;
+            lap(s, &mut t, &mut tm.key_switch)?;
+
+            // bootstrap
+            let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nb as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..pb })?;
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: tv, z: self.ms.vptr(), c: cx, ..pb })?;
+            let rot = TfheArgs {
+                op: tfhe_op::PBS_ROTATE,
+                i2: self.p.pbs_group as i32,
+                x: self.acc.vptr_mut(),
+                y: self.bsk.vptr(),
+                z: self.ms.vptr(),
+                tw: self.btw.vptr(),
+                tws: self.btw_s.vptr(),
+                m: self.pbs_m,
+                c: self.pbs_c,
+                ..pb
+            };
+            if cb <= KB_MAX && self.p.pbs.1 == 1 {
+                // the latency path: per window, the key bundles then the rotation on two-block clusters
+                let groups = nl / self.p.pbs_group;
+                for g0 in (0..groups).step_by(KB_WINDOW) {
+                    let gw = KB_WINDOW.min(groups - g0);
+                    Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: self.kb.vptr_mut(), ..rot })?;
+                    Self::go(ctx, s, &TfheArgs { w: self.kb.vptr(), i0: g0 as i32, i4: gw as i32, ..rot })?;
+                }
+            } else {
+                Self::go(ctx, s, &rot)?;
+            }
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
+            lap(s, &mut t, &mut tm.bootstrap)?;
+            self.repack.accumulate(ctx.table, s, self.outs.vptr(), pc, cb, c0 == 0)?;
+            lap(s, &mut t, &mut tm.repack)?;
+        }
+
+        // the packed sum into [part][limb][n] mod p0 p1, lift x p2 p3 into the staging, scatter, NTT
+        self.repack.finish(ctx.table, s, &pa, self.tw_f.vptr(), self.tw_i.vptr())?;
         for sp in 0..2 {
             // staging part 0 = c1 (racc part 1), staging part 1 = c0 (racc part 0)
             let f = (self.repack.acc.vptr() as *const u32).wrapping_add((1 - sp) * 2 * n) as *const c_void;
@@ -498,8 +551,7 @@ impl<'a> TfheSwitch<'a> {
         }
         Self::gp(ctx, s, &PcmmArgs { ct: x.buf.r(), i0: 0, y: self.stage.vptr(), ..chain(pcmm_op::SCATTER) })?;
         ntt::forward(ctx, s, &mut x.buf, Span::Q { top: 3 }, Parts::Both)?;
-        s.sync()?;
-        tm.repack = t3.elapsed().as_secs_f64() * 1e3;
+        lap(s, &mut t, &mut tm.repack)?;
         Ok(tm)
     }
 }
