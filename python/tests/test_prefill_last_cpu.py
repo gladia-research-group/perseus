@@ -312,3 +312,42 @@ def test_attn_bsgs_llama_geometry(monkeypatch, share):
         got = attend(pack, bsgs)
         err = np.abs(got - ref).max()
         assert err < 1e-12 * max(1.0, np.abs(ref).max()), (pack, bsgs, err)
+
+
+def test_attention_last_llama_geometry():
+    """The last position alone on Llama's prefill geometry (127 prompt tokens: position 126 on lane 62 of chunk 1; GQA,
+    four query blocks per K / V block; RoPE; the BOS key / value on the first padding lane) against attention_blocked
+    at that position, with the post-RoPE K / V of every position handed over as prefill_attention's."""
+    from perseus.impl.attention import Rope
+    sm = config.load_configs(str(PKG / "configs/model/approximation/gpt2_base_n32_pf/configs.json")).block(4)[2]
+    d = layout.Dims(1 << 15, 4096, 4096, 32, 32, 16384, 14336)
+    B = BL.Blocks(d, 512, G=4)
+    Tq = 127
+    ch = prefill.Chunks(Tq, B.t, base=1)
+    gd = B.group_dims(0)
+    rng = np.random.default_rng(11)
+    rope = Rope(1.0 / 500000.0 ** (np.arange(0, gd.d_head, 2) / gd.d_head))
+
+    def enc(scale, width):
+        r = np.zeros((Tq, d.hid))
+        r[:, :width] = scale * rng.standard_normal((Tq, width))
+        return [[0.5 * x for x in row[:width // B.nch]] for row in BL.blocked_slots(r, ch, B)]
+    Q, K, V = enc(1.2, d.hid), enc(1.2, B.Kkv * B.nch), enc(1.0, B.Kkv * B.nch)
+
+    def pre_vec(scale):
+        v = scale * rng.standard_normal((gd.d_head, gd.H))
+        return np.repeat(v.reshape(-1), gd.t).astype(complex)
+    prefixes = [(pre_vec(1.2), pre_vec(1.0)) for _ in range(B.Kkv)]
+    rt = Rt(_Ops(True), d)
+    kv_ref = [dict() for _ in range(B.Kkv)]
+    ref = BL.decrypt_blocked(rt, BL.attention_blocked(rt, Q, K, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv_ref),
+                             ch, B, d.dim)
+    rt = Rt(_Ops(True), d)
+    kv = [dict() for _ in range(B.Kkv)]
+    got = BL.decrypt_blocked(rt, BL.attention_last(rt, Q, K, V, sm, ch, B, Tq - 1, rope=rope, prefixes=prefixes, kv=kv),
+                             ch, B, d.dim)
+    assert np.abs(got - ref[Tq - 1][None, :]).max() < 1e-12 * max(1.0, np.abs(ref).max())
+    for b in range(B.Kkv):
+        for name in ("K", "V"):
+            for x, y in zip(kv[b][name], kv_ref[b][name]):
+                assert np.abs(np.asarray(x) - np.asarray(y)).max() < 1e-12

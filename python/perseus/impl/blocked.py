@@ -376,17 +376,21 @@ def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefix
 # [CLS]) ──
 
 def _query_lane(ch: Chunks, B: Blocks, p: int):
-    """(half, lane) of position p, which must be the first or the last lane of a half of chunk pair 0 (the last
-    position of a causal prompt: its only chunk pair)."""
+    """(half, lane) of position p, which must sit in chunk pair 0 (the last position of a causal prompt: its only
+    chunk pair)."""
     c = p // ch.t
     lane = p - c * ch.t
-    if (ch.n_ct != 1 and not ch.bidir) or c // 2 or lane not in (0, B.t - 1):
-        raise ValueError(f"one-position block: position {p} must sit on the first or last lane of the first chunk pair")
+    if (ch.n_ct != 1 and not ch.bidir) or c // 2:
+        raise ValueError(f"one-position block: position {p} must sit in the first chunk pair")
     return c % 2, lane
 
 
 def _spread(ops, x, lane: int, t: int):
-    """Lane `lane` (the first or the last) of every t-lane group on all of the group's lanes."""
+    """Lane `lane` of every t-lane group on all of the group's lanes (another than the first or the last moves to the
+    last first: one rotation)."""
+    if lane not in (0, t - 1):
+        x = ops.rotate(x, lane - (t - 1))
+        lane = t - 1
     return rotsum(ops, x, -1 if lane == 0 else 1, t)
 
 
@@ -403,21 +407,62 @@ def token_bcast(rt, row, ch: Chunks, B: Blocks, p: int):
     return out
 
 
-def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
+def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, prefixes=None, kv=None):
     """attention_blocked for query position p alone (the last of a causal prompt, any of a bidirectional one: its keys
     are every unpadded token): O[0][k] holds p's output on every lane of both halves. Per head group k, q_p on every
     lane times the complex K of chunk pair g (keys of chunk 2g real, chunk 2g + 1 imaginary) is summed over the head
     dimension; the groups' scores share one score ciphertext, keys of chunk c of group k on the blocks of class c K + k
     (period 2 G K tH over the G chunk pairs), so one softmax serves every head; its key sums run over the chunks and the
-    lanes and return to every lane from the first. P.V pairs each chunk pair's halves as P_2g - i P_2g+1 against V."""
+    lanes and return to every lane from the first. P.V pairs each chunk pair's halves as P_2g - i P_2g+1 against V.
+    GQA (B.G > 1): query block k reads K / V block k % Kkv. `rope`: K's chunks and q_p take RoPE at their positions;
+    `prefixes`: per K / V block, the public (key, value) slot vectors before the prompt, put on the first padding lane;
+    `kv`: per K / V block, a dict receiving the per-chunk real K (post-RoPE) / V, as prefill_attention's."""
     from . import smcheb
     from .attention import _recip_rounds
-    from .prefill import _KcExtrapolated, recip_lanes
+    from .prefill import _KcExtrapolated, recip_lanes, rope_lanes, split
     ops, N, t = rt.ops, B.d.N, B.t
     half, lane = _query_lane(ch, B, p)
     G = len(Q)
-    if ch.T != 2 * t * G or G != ch.n_ct or (not ch.bidir and p != ch.T - 1):
-        raise ValueError("attention_last: T must fill both halves of its chunk pairs")
+    if G != ch.n_ct or (not ch.bidir and p != ch.T - 1):
+        raise ValueError("attention_last: one row per chunk pair, the last position of a causal prompt")
+    kvb = lambda k: k % B.Kkv                                       # noqa: E731  the K / V block of query block k
+    kscale = 1.0
+    if rope is not None or kv is not None:
+        # K's real chunks (post-RoPE) at scale 1, back to one complex ciphertext per chunk pair
+        Kr = [[None] * B.Kkv for _ in range(G)]
+        for b in range(B.Kkv):
+            sub = sub_rt(rt, B, b)
+            ks_, vs_ = [], []
+            for g in range(G):
+                A, Bh = split(ops, K[g][b])
+                if rope is not None:
+                    A = rope_lanes(sub, A, rope, ch.lanes(2 * g), "pf.rope.k")
+                    Bh = rope_lanes(sub, Bh, rope, ch.lanes(2 * g + 1), "pf.rope.k") if ch.has(2 * g + 1) else Bh
+                ks_ += [A, Bh] if ch.has(2 * g + 1) else [A]
+                Kr[g][b] = A if not ch.has(2 * g + 1) else ops.add(A, ops.mult_i(Bh))
+                if kv is not None:
+                    va, vb = split(ops, V[g][b])
+                    vs_ += [va, vb] if ch.has(2 * g + 1) else [va]
+            if kv is not None:
+                kv[b]["K"], kv[b]["V"] = ks_, vs_
+        K, kscale = Kr, 0.5
+    n_pre = 0
+    if prefixes is not None:
+        # the public key / value on key index T (the first padding lane), in its chunk's half
+        cp, lp = divmod(ch.T, t)
+        if cp >= 2 * G:
+            raise ValueError("attention_last: a prefix key needs a padding lane in the prompt's chunk pairs")
+        gp, ph = divmod(cp, 2)
+        at = np.arange(N) % t == lp
+        K, V = [list(r) for r in K], [list(r) for r in V]
+        for b in range(B.Kkv):
+            kvec, vvec = (np.asarray(x) for x in prefixes[b])
+            ck = (1j if ph else 1.0) * (1.0 if kscale == 0.5 else 0.5)
+            K[gp][b] = rt.add_mask(K[gp][b], ("bl.last.pre.k", B.nch, b, ch.T, kscale),
+                                   lambda kvec=kvec, ck=ck: np.where(at, ck * kvec, 0.0))
+            V[gp][b] = rt.add_mask(V[gp][b], ("bl.last.pre.v", B.nch, b, ch.T),
+                                   lambda vvec=vvec, ph=ph: np.where(at, (0.5j if ph else 0.5) * vvec, 0.0))
+        n_pre = 1
     ks = [k for k in range(B.K) if B.group_dims(k).H_real]
     gd = B.group_dims(0)
     tH, R = gd.tH, 2 * G * B.K
@@ -427,7 +472,7 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
     cls = (np.arange(N) // tH) % R
     head = (np.arange(N) % tH) // t
     valid = head < np.array([B.group_dims(r % B.K).H_real for r in range(R)])[cls]
-    kc = ch.n_keys if ch.bidir else p + 1
+    kc = (ch.n_keys if ch.bidir else p + 1) + n_pre
     valid &= (cls // B.K) * t + np.arange(N) % t < kc              # the key on each lane: chunk h, lane i
     gscale = 1.0 / math.sqrt(gd.d_head_real)
     T = None
@@ -435,11 +480,14 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
         sel = np.where(np.arange(N) % t == lane, -1j if half else 1.0, 0.0)
         q = im_cleanse(ops, rt.mult_mask(Q[0][k], ("bl.last.q", B.nch, half, lane), lambda sel=sel: sel))
         q = _spread(ops, q, lane, t)                                # q_p on every lane: real, scale 1
+        if rope is not None:
+            q = rope_lanes(sub_rt(rt, B, k), q, rope, [ch.base + p] * t, "bl.last.rope.q")
         for g in range(G):
-            s = rotsum(ops, ops.mult(q, K[g][k]), tH, N)             # (s_2g + i s_2g+1) / 2 on every block
+            s = rotsum(ops, ops.mult(q, K[g][kvb(k)]), tH, N)        # (s_2g + i s_2g+1) / 2 on every block
             c0, c1 = 2 * g * B.K + k, (2 * g + 1) * B.K + k
-            m = np.where(cls == c0, gscale, 0.0) + np.where(cls == c1, -1j * gscale, 0.0)
-            s = rt.mult_mask(s, ("bl.last.s", B.nch, k, gscale) + pair(g), lambda m=m: m)
+            gs = gscale * kscale
+            m = np.where(cls == c0, gs, 0.0) + np.where(cls == c1, -1j * gs, 0.0)
+            s = rt.mult_mask(s, ("bl.last.s", B.nch, k, gs) + pair(g), lambda m=m: m)
             T = s if T is None else ops.add(T, s)
     S = im_cleanse(ops, T)                                         # scores of chunk c of group k on class c K + k
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
@@ -475,7 +523,7 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
         for g in range(G):
             m = np.where(cls == 2 * g * B.K + k, 1.0, 0.0) + np.where(cls == (2 * g + 1) * B.K + k, -1j, 0.0)
             pc = rotsum(ops, rt.mult_mask(Y, ("bl.last.pv", B.nch, k) + pair(g), lambda m=m: m), tH, R * tH)
-            pv = ops.mult(pc, V[g][k])                                     # (P_2g - i P_2g+1) (V_2g + i V_2g+1)
+            pv = ops.mult(pc, V[g][kvb(k)])                                # (P_2g - i P_2g+1) (V_2g + i V_2g+1)
             acc = pv if acc is None else ops.add(acc, pv)
         o = im_cleanse(ops, rotsum(ops, acc, -1, t))                      # sum over the lanes, on the last lane
         o = rt.mult_mask(o, ("bl.last.o", B.nch, t - 1), lambda: (np.arange(N) % t == t - 1).astype(float))

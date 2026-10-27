@@ -47,6 +47,9 @@ _NORM_SHARE = os.environ.get("PF_NORM_SHARE", "1") not in ("", "0")
 _NORM_PERIOD = 256
 # PF_LINEAR=pcmm: every linear a PCMM inside a refresh
 _PCMM = os.environ.get("PF_LINEAR", "") == "pcmm"
+# PF_LAST_QUERY=1 (blocked layout, unpaged): the last block computes the last position alone past its K / V (the first
+# token reads nothing else)
+_LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
 # PF_GELU_JOINT=1: one refresh point for both halves between the SiLU's P1 and P2
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 # PF_GLU_XU=1 (with the forced joint): x u before the refresh, the GLU output one level shallower
@@ -162,9 +165,12 @@ def _memdbg(rt, tag):
         print(f"[memdbg] {tag}: free={core.device_free_gb():.2f}GB pool={st.get('reserved_gb', 0):.2f}GB", flush=True)
 
 
-def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0, paged=None):
+def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0, paged=None,
+                                last=None):
     """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block).
-    `paged` = (page, store): attention_paged on the K / V operands of the earlier pages in `store`."""
+    `paged` = (page, store): attention_paged on the K / V operands of the earlier pages in `store`. `last`: the only
+    position the block's output must hold (every position's K / V is still computed): its attention alone
+    (blocked.attention_last), then it fills every lane of the residual stream."""
     ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
     _memdbg(rt, "in")
@@ -178,7 +184,12 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
             Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
     _memdbg(rt, "qkv")
     with rt.step("attn"):
-        if paged is not None:
+        if last is not None:
+            if paged is not None or os.environ.get("PF_ATTN", "") == "ccmm":
+                raise ValueError("PF_LAST_QUERY: the unpaged blocked attention only")
+            O = BL.attention_last(rt, Q, Kc, V, sm, ch, B, last, rope=rope, prefixes=prefixes, kv=kv)
+            skip = [BL.token_bcast(rt, skip[0], ch, B, last)]
+        elif paged is not None:
             from perseus.impl.ccmm_paged import attention_paged
             O = attention_paged(rt, Q, Kc, V, sm, ch, B, paged[0], paged[1], rope=rope, prefixes=prefixes,
                                 kv=kv if kv is not None else [dict() for _ in range(B.Kkv)], layer=layer, final=len(paged) > 2 and paged[2])
@@ -231,6 +242,10 @@ class LlamaPrefill(LlamaModel):
                     for k in range(B.Kkv)]
         return np.repeat(kf, d.t), np.repeat(vf, d.t)
 
+    def last_position(self, ch: Chunks):
+        """PF_LAST_QUERY: the prompt position the last block computes alone (the last), else None."""
+        return ch.T - 1 if _LAST_QUERY and _layout_blocked() else None
+
     @property
     def blocks(self):
         G = self.H // self.H_kv if os.environ.get("PF_GQA", "") == "1" else 1
@@ -253,9 +268,10 @@ class LlamaPrefill(LlamaModel):
                 cap = self.enter_stage(b, 1)
                 BL.name_blocked(self.inf, Xs)
                 kvs = None if on_kv is None else [{} for _ in range(B.Kkv)]
+                last = self.last_position(ch) if b == self.n_layers - 1 else None
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
-                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b)
+                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b, last=last)
                 self.exit_stage(b, cap)
                 if on_kv is not None:
                     on_kv(b, [x["K"] for x in kvs], [x["V"] for x in kvs])
