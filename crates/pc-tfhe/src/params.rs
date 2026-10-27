@@ -5,7 +5,8 @@
 //! Security, against the HE-standard tables (128-bit classical, ternary secret, sigma 3.19) unless noted:
 //! - ring switch key / extracted LWE: secret s' of dimension 2048 (ring N, s'(X^S)), modulus p0 (31 bits): the table
 //!   allows 54 bits at 2048;
-//! - GLWE / bootstrapping key: degree 2048, k = 1, q_br ~ 2^50: within the 54-bit bound;
+//! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^50 (two 25-bit NTT primes, the device's u32
+//!   RNS): within the 54-bit bound;
 //! - repack key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
 //! - binary LWE key, n = 920, noise sigma = 2^-17 q: the regime of the TFHE-rs default sets (n 742-918 at relative
 //!   noise ~2^-17 for 128 bits). Not run through the lattice estimator here (no Sage on the box): re-check before
@@ -19,8 +20,9 @@ pub struct Params {
     /// Binary LWE key dimension (the blind rotation's length) and its noise (absolute, at p0).
     pub n_lwe: usize,
     pub lwe_sigma_rel: f64,
-    /// GLWE (k = 1) degree and prime of the blind rotation, and the bootstrapping key's noise.
+    /// GLWE (k = 1) degree, the blind rotation's RNS primes and their product, and the bootstrapping key's noise.
     pub n_br: usize,
+    pub br_primes: (u64, u64),
     pub q_br: u64,
     pub key_sigma: f64,
     /// Gadgets as (base log, levels): blind rotation (approximate, over q_br), LWE key switch (approximate, over p0),
@@ -41,11 +43,18 @@ impl Params {
     /// The default set for a CKKS ring of degree `n_ckks` (2^16 in production; tests use 4096 with S = 2).
     pub fn new(n_ckks: usize) -> Result<Params> {
         let n_br = 2048;
+        let m = 2 * n_br as u64;
+        let qa = prime_below(25, m)?;
+        let mut qb = qa - m;
+        while !crate::modq::is_prime(qb) {
+            qb -= m;
+        }
         Ok(Params {
             n_lwe: 920,
             lwe_sigma_rel: (-17f64).exp2(),
             n_br,
-            q_br: prime_below(50, 2 * n_br as u64)?,
+            br_primes: (qa, qb),
+            q_br: qa * qb,
             key_sigma: 3.19,
             pbs: (18, 2),
             ks: (2, 8),

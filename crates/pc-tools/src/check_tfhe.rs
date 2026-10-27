@@ -261,9 +261,10 @@ fn run(args: &[String]) -> Res<bool> {
         let mut inp2 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
         inp2.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
         let pos: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
+        let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &tv);
         // a warm-up call on scratch (x: any content at the split's level) builds the GEMM plan; then the timed one
-        ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tv, off)?;
-        let tm = ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tv, off)?;
+        ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tvr, off)?;
+        let tm = ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tvr, off)?;
         let mut fin2 = inp2.finish_call(0)?;
         fin2.at_split(&cx, std::slice::from_ref(&y))?;
         fin2.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;
@@ -287,7 +288,7 @@ fn run(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `pc-check tfhe-pbs [--count 256] [--step]`: the device's programmable bootstrap (PBS_MS -> PBS_INIT -> PBS_STEP x n_lwe ->
+/// `pc-check tfhe-pbs [--count 256]`: the device's programmable bootstrap (PBS_MS -> PBS_INIT -> PBS_ROTATE ->
 /// PBS_EXTRACT) on a batch of sign LUTs vs pc-tfhe's `bootstrap` + `mod_switch`, every output word; PBS/s.
 pub fn cmd_pbs(args: &[String]) -> ExitCode {
     match run_pbs(args) {
@@ -305,11 +306,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     use pc_kernels::args::{tfhe_op, TfheArgs};
     use pc_tfhe::gadget::{fixed_ratio, Gadget};
     use pc_tfhe::lwe::Lwe;
-    use pc_tfhe::modq::shoup;
-    use pc_tfhe::pbs::BootstrapKey;
+    use pc_tfhe::pbs::{BootstrapKey, Rns};
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(256);
-    // --step: one PBS_STEP launch per key bit (the reference schedule) instead of the fused PBS_ROTATE
-    let step_ref = args.iter().any(|a| a == "--step");
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
@@ -319,11 +317,9 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let s_br: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
     let dg = DiscreteGaussian::new(p.key_sigma)?;
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
-    let gad = Gadget::new(q, p.pbs, false);
-    let ntt = Ntt::new(q, n)?;
     let t0 = Instant::now();
-    let bsk = BootstrapKey::generate(&s_lwe, &s_br, gad.clone(), ntt.clone(), &dg, &mut prng);
-    println!("[pc-check] tfhe-pbs: host bootstrapping key {:.1} s (n_lwe {nl}, n_br {n}, q_br {q}, gadget {:?})", t0.elapsed().as_secs_f64(), p.pbs);
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, &dg, &mut prng);
+    println!("[pc-check] tfhe-pbs: host bootstrapping key {:.1} s (n_lwe {nl}, n_br {n}, Q {q} = {} x {}, gadget {:?})", t0.elapsed().as_secs_f64(), p.br_primes.0, p.br_primes.1, p.pbs);
     let (tv, off) = sign01(n, q >> p.out_cf);
     let lwes: Vec<Lwe> = (0..count)
         .map(|_| {
@@ -335,75 +331,44 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let want: Vec<Lwe> = bsk.bootstrap_many(&tv, off, &lwes, p0).iter().map(|o| o.mod_switch(q, p0)).collect();
     let host_s = th.elapsed().as_secs_f64();
 
-    // device buffers
-    let lv = p.pbs.1;
-    let mut bflat = Vec::with_capacity(nl * 2 * lv * 2 * n);
-    for g in &bsk.ggsw {
-        for c in 0..2 {
-            for t in 0..lv {
-                let (r0, r1) = &g.rows()[c][t];
-                bflat.extend_from_slice(r0);
-                bflat.extend_from_slice(r1);
-            }
-        }
-    }
-    let bsh: Vec<u64> = bflat.iter().map(|&w| shoup(w, q)).collect();
-    let (psi, ipsi, ninv) = ntt.tables();
-    let tw: Vec<u64> = psi.iter().chain(ipsi).copied().collect();
-    let tws: Vec<u64> = tw.iter().map(|&w| shoup(w, q)).collect();
+    let img = pc_gpu::tfhe::pbs_image(&bsk);
+    let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
-    let words = 2 * bflat.len() + 2 * tw.len() + n + count * 2 * n;
-    let bytes = 8 * words + 4 * (2 * lin.len() + count * (n + 1)) + (64 << 20);
-    let arena = pc_cuda::Arena::new(&dev, bytes)?;
+    let words = 2 * img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1);
+    let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
-    let mut d_bsk = arena.alloc::<pc_cuda::Compute, u64>("tfhe.bsk", bflat.len())?;
-    let mut d_bsh = arena.alloc::<pc_cuda::Compute, u64>("tfhe.bsk", bsh.len())?;
-    let mut d_tw = arena.alloc::<pc_cuda::Compute, u64>("tfhe.tw", tw.len())?;
-    let mut d_tws = arena.alloc::<pc_cuda::Compute, u64>("tfhe.tw", tws.len())?;
-    let mut d_tv = arena.alloc::<pc_cuda::Compute, u64>("tfhe.tv", n)?;
-    let mut d_acc = arena.alloc::<pc_cuda::Compute, u64>("tfhe.acc", count * 2 * n)?;
-    let mut d_in = arena.alloc::<pc_cuda::Compute, u32>("tfhe.in", lin.len())?;
+    let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
+        let mut b = arena.alloc::<pc_cuda::Compute, u32>(what, v.len())?;
+        b.upload(&s, v)?;
+        Ok(b)
+    };
+    let d_bsk = up("tfhe.bsk", &img.bsk)?;
+    let d_bsh = up("tfhe.bsk", &img.bsk_s)?;
+    let d_tw = up("tfhe.tw", &img.tw)?;
+    let d_tws = up("tfhe.tw", &img.tws)?;
+    let d_tv = up("tfhe.tv", &tvr)?;
+    let d_in = up("tfhe.in", &lin)?;
+    let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.acc", count * 4 * n)?;
     let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", lin.len())?;
     let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * (n + 1))?;
-    d_bsk.upload(&s, &bflat)?;
-    d_bsh.upload(&s, &bsh)?;
-    d_tw.upload(&s, &tw)?;
-    d_tws.upload(&s, &tws)?;
-    d_tv.upload(&s, &tv)?;
-    d_in.upload(&s, &lin)?;
     let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
     let base = TfheArgs { n: n as i32, count: count as i32, i1: nl as i32, q, ..Default::default() };
-    let mut run = |d_ms: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, d_acc: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u64>, d_out: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| -> Res<()> {
+    let mut cx = [0u64; 8];
+    cx[6] = img.c[6];
+    cx[7] = img.c[7];
+    let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), ..base })?;
-        let step = TfheArgs {
-            op: tfhe_op::PBS_STEP,
-            x: d_acc.vptr_mut(),
-            y: d_bsk.vptr(),
-            w: d_bsh.vptr(),
-            z: d_ms.vptr(),
-            tw: d_tw.vptr(),
-            tws: d_tws.vptr(),
-            m: gad.m,
-            c: [p.pbs.0 as u64, lv as u64, ninv, shoup(ninv, q), 0, 0, 0, 0],
-            ..base
-        };
-        if step_ref {
-            for key in 0..nl {
-                go(&TfheArgs { i0: key as i32, ..step })?;
-            }
-        } else {
-            go(&TfheArgs { op: tfhe_op::PBS_ROTATE, ..step })?;
-        }
-        go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, 0, 0], ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, x: d_acc.vptr_mut(), y: d_bsk.vptr(), w: d_bsh.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, cx[6], cx[7]], ..base })?;
         Ok(())
     };
-    run(&mut d_ms, &mut d_acc, &mut d_out)?;
+    run()?;
     s.sync()?;
     let td = Instant::now();
-    run(&mut d_ms, &mut d_acc, &mut d_out)?;
+    run()?;
     s.sync()?;
     let dev_s = td.elapsed().as_secs_f64();
     let got = d_out.download(&s)?;
@@ -580,7 +545,6 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-bridge: host pipeline {:.1} s (repack {:.1} s)", th.elapsed().as_secs_f64(), tr.elapsed().as_secs_f64());
 
     // device
-    let u32v = |v: &[u64]| -> Vec<u32> { v.iter().map(|&x| x as u32).collect() };
     let mu = |p: u64| -> u64 { ((1u128 << 64) / p as u128) as u64 };
     let (t0f, t0i, ni0) = sw.ntt_p[0].tables();
     let (t1f, t1i, ni1) = sw.ntt_p[1].tables();

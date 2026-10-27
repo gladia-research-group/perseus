@@ -233,8 +233,8 @@ impl Switcher {
         let s_br = to_i64(sample_ternary(prng, params.n_br));
         let rs = RingSwitchKey::generate(s, &s_sub, params.rs_factor, Gadget::new(p0, params.rs, false), &ntt_p[0], &dg, prng);
         let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, prng);
-        let ntt_br = Ntt::new(params.q_br, params.n_br)?;
-        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), ntt_br, &dg, prng);
+        let rns = crate::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br)?;
+        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, &dg, prng);
         let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), &ntt_p, &dg, prng);
         Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, repack })
     }
