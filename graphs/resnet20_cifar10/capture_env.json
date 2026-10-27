@@ -2,7 +2,7 @@
   "env": {
     "CHAIN": "n32",
     "LOGN": "16",
-    "AUTO_BTS_LEVEL": "46",
+    "AUTO_BTS_LEVEL": "50",
     "BTS_ITERATIONS": "1",
     "CKKS_COMPLEX": "1",
     "GPT2_PACKING": "cachemir",
