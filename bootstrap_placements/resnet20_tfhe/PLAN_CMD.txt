@@ -1,0 +1,4 @@
+graph=graphs/resnet20_tfhe
+tool=python -m perseus.examples.resnet.run --fake --tfhe --n 1 --capture graphs/resnet20_tfhe; PLAN_SPARSE_SLOTS= examples/gpt2/make_plan.sh
+configs=configs/model/approximation/resnet20_cifar10/configs.json (B: the sign LUT reads x / B)
+replanned=dense, the n32 blocks recipe; the ReLUs are TFHE finishes (impl/tfhe.py)

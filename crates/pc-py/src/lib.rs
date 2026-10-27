@@ -16,6 +16,7 @@ mod session;
 mod shadow;
 mod store;
 mod tag;
+mod tfhe;
 mod word64;
 
 pyo3::create_exception!(_pc, LevelError, pyo3::exceptions::PyRuntimeError, "A Shadow rule refused an op (level, degree, route or chain range).");

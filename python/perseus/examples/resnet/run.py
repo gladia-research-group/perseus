@@ -27,9 +27,25 @@ def relu_act(section):
     stages, B = relu_config(section)
     coefs = unit_stages(stages)
 
-    def act(ops, xs, site, gain=1.0):
+    def act(ops, xs, site, gain=1.0, geom=None):
         return [relu_unit(ops, x, coefs, gain) for x in xs]
     return act, stages, B
+
+
+def tfhe_act(ops, xs, site, gain=1.0, geom=None):
+    """gain * ReLU by scheme switching (impl/tfhe.py): x * (gain * step(x)) with the sign from a TFHE LUT on the
+    layout's valid slots (the gaps come back zero), one product. Reads x on [-1, 1) (x = input / B)."""
+    from perseus.impl import tfhe
+    masks = geom.pack(np.ones((geom.C, geom.H, geom.H)))
+    lut = tfhe.scaled_step(gain)
+    out = []
+    for j, x in enumerate(xs):
+        sl = tfhe.register_slots(f"g{geom.C}x{geom.H}/{geom.g}.{j}", np.nonzero(np.real(masks[j]))[0])
+        if isinstance(x, np.ndarray):
+            out.append(np.real(x) * tfhe.tfhe_lut(ops, x, lut, sl))
+        else:
+            out.append(ops.mult(x, tfhe.tfhe_lut(ops, x, lut, sl)))
+    return out
 
 
 def _mirror(a, sd, act, x, y, ref):
@@ -118,6 +134,7 @@ def _planned(a, sd, act, x, y, ref):
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
     run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=a.pt_rows, pool=a.pool,
                         log=lambda m: print(m, flush=True))
+    run.tfhe_chunk = a.tfhe_chunk if a.tfhe else 0
     t0 = time.time()
     run.prepare(x[0])
     progs = [run.progs[lab] for lab in run.labels]
@@ -163,6 +180,8 @@ def main(argv=None, results=None):
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--configs", default=None)
     ap.add_argument("--exact-relu", action="store_true", help="the exact max (mirror only)")
+    ap.add_argument("--tfhe", action="store_true", help="the ReLU's sign by CKKS -> TFHE -> CKKS (planned / twin / mirror)")
+    ap.add_argument("--tfhe-chunk", type=int, default=4096, help="--tfhe --plan: values per switch pass")
     ap.add_argument("--preset", default="n32_gpt2_decode")
     ap.add_argument("--debug-refresh", action="store_true",
                     help="eager: refresh by decrypt + re-encrypt (the eager session has no bootstrap; NOT encrypted end to end)")
@@ -185,6 +204,8 @@ def main(argv=None, results=None):
         act, stages, B = relu_act(section)
         a.scales = B
         ref_relu = lambda t, site: torch.from_numpy(relu_apply(t.numpy(), B[site], stages))
+        if a.tfhe:      # the exact sign (up to the switch's noise band): the reference is the exact model
+            act, ref_relu = tfhe_act, None
     exact = R.reference(sd, x)
     ref = R.reference(sd, x, ref_relu)          # what the encrypted run approximates
     if a.plan:
