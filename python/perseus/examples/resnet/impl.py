@@ -68,3 +68,6 @@ class ResnetPlanned(EncoderPlannedPrefill):
 
     def logits(self, regs):
         return self.model.net.logits([np.real(v) for v in self.decrypt(regs)])
+
+    def onehot(self, regs):
+        return self.model.net.onehot([np.real(v) for v in self.decrypt(regs)])

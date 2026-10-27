@@ -35,8 +35,8 @@ def relu_act(section):
 def tfhe_act(ops, xs, site, gain=1.0, geom=None):
     """gain * ReLU by scheme switching (impl/tfhe.py): x * (gain * step(x)) with the sign from a TFHE LUT on the
     layout's valid slots of the first channel copy, written to every copy by the switch's repack (impl/conv.py fills a
-    ciphertext with Q / cpc copies of its channels; the gaps come back zero), one product. Reads x on [-1, 1)
-    (x = input / B)."""
+    ciphertext with Q / cpc copies of its channels; the gaps come back zero), one product. The sign LUT reads 2 x on
+    (-2, 2) (x = input / B on [-1, 1)): twice a general LUT's resolution."""
     from perseus.impl import tfhe
     from perseus.impl.conv import S
     masks = geom.pack(np.ones((geom.C, geom.H, geom.H)))
@@ -47,17 +47,35 @@ def tfhe_act(ops, xs, site, gain=1.0, geom=None):
     for j, x in enumerate(xs):
         idx = np.nonzero(np.real(masks[j][:span]))[0]
         sl = tfhe.register_slots(f"g{geom.C}x{geom.H}/{geom.g}.{j}", idx, copies)
-        s = tfhe.tfhe_lut(ops, x, lut, sl)
+        # the sign reads (-2, 2): 2 x doubles the resolution (|x| <= 1 / margin)
+        x2 = 2.0 * np.real(x) if isinstance(x, np.ndarray) else ops.add(x, x)
+        s = tfhe.tfhe_lut(ops, x2, lut, sl)
         out.append(np.real(x) * s if isinstance(x, np.ndarray) else ops.mult(x, s))
     return out
+
+
+def _onehot_check(a, lg, oh):
+    """--tfhe-argmax: the encrypted one-hot against the argmax of the decrypted logits."""
+    if not a.tfhe_argmax:
+        return
+    oh = np.asarray(oh)
+    valid = (np.abs(oh - np.rint(oh)) < 0.1).all(1) & (np.rint(oh).sum(1) == 1)
+    agree = int((valid & (oh.argmax(1) == lg.argmax(1))).sum())
+    top2 = np.sort(lg, 1)[:, -2:]
+    print(f"[resnet] ARGMAX one-hot == argmax(decrypted logits): {agree}/{len(lg)} (valid one-hots {int(valid.sum())}; "
+          f"smallest top-2 gap {float((top2[:, 1] - top2[:, 0]).min()):.3g}; max |one-hot error| "
+          f"{float(np.abs(oh - np.rint(oh)).max()):.3g})", flush=True)
 
 
 def _mirror(a, sd, act, x, y, ref):
     from perseus.impl.ops import NumpyOps
     from .model import ResNet20
-    m = ResNet20(sd, act, scales=a.scales)
+    m = ResNet20(sd, act, scales=a.scales, argmax=a.tfhe_argmax)
     ops = NumpyOps()
-    lg = np.stack([m.logits(m.forward(ops, m.encode(xi))) for xi in x])
+    outs = [m.forward(ops, m.encode(xi)) for xi in x]
+    lg = np.stack([m.logits(o) for o in outs])
+    if a.tfhe_argmax:
+        _onehot_check(a, lg, [m.onehot(o) for o in outs])
     return lg
 
 
@@ -114,16 +132,20 @@ def _twin(a, net):
 
 def _fake(a, sd, act, x, y, ref):
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage))
-    lgs = []
+    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
+    lgs, ohs = [], []
     for i, xi in enumerate(x[:1] if a.capture else x):
         t0 = time.time()
         xs, _, _ = model.prefill(xi)
         lgs.append(model.logits(xs))
+        if a.tfhe_argmax:
+            ohs.append(model.net.onehot([np.real(model.rt.ops.decrypt_slots_complex(c)) for c in xs]))
         print(f"[resnet] twin image {i}: {time.time() - t0:.1f}s ours {lgs[-1].argmax()} ref {ref[i].argmax()} "
               f"max|dlogit| {np.abs(lgs[-1] - ref[i]).max():.3g}", flush=True)
     if a.capture:
         print(f"[resnet] captured {model.n_layers} stages -> {a.capture}", flush=True)
+    if ohs:
+        _onehot_check(a, np.stack(lgs), ohs)
     return np.stack(lgs + [ref[i] for i in range(len(lgs), len(x))])
 
 
@@ -132,13 +154,13 @@ def _planned(a, sd, act, x, y, ref):
     from perseus.examples.bert.planned import plan_config
     from .impl import ResnetPlanned
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage))
+    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
     cfg = plan_config(a.plan)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
     run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=a.pt_rows, pool=a.pool,
                         log=lambda m: print(m, flush=True))
-    run.tfhe_chunk = a.tfhe_chunk if a.tfhe else 0
+    run.tfhe_chunk = a.tfhe_chunk if (a.tfhe or a.tfhe_argmax) else 0
     t0 = time.time()
     run.prepare(x[0])
     progs = [run.progs[lab] for lab in run.labels]
@@ -149,7 +171,7 @@ def _planned(a, sd, act, x, y, ref):
     run.setup(x[0])
     print(f"[resnet] planned setup {time.time() - t0:.1f}s; device free {run.fhe.mem_info()[0] / 2 ** 30:.2f} GB",
           flush=True)
-    lgs, walls = [], []
+    lgs, walls, ohs = [], [], []
     for i, xi in enumerate(x):
         vals = run.input_values(xi)
         t0 = time.time()
@@ -157,9 +179,13 @@ def _planned(a, sd, act, x, y, ref):
         run.fhe.device_sync()
         walls.append(time.time() - t0)
         lgs.append(run.logits(regs))
+        if a.tfhe_argmax:
+            ohs.append(run.onehot(regs))
         print(f"[resnet] image {i}: wall {walls[-1]:.3f}s label {y[i]} ours {lgs[-1].argmax()} ref {ref[i].argmax()} "
               f"max|dlogit| {np.abs(lgs[-1] - ref[i]).max():.3g}", flush=True)
     print(f"[resnet] s/image median {np.median(walls):.3f} (walls {' '.join(f'{w:.3f}' for w in walls)})", flush=True)
+    if ohs:
+        _onehot_check(a, np.stack(lgs), ohs)
     run.close()
     return np.stack(lgs)
 
@@ -186,6 +212,7 @@ def main(argv=None, results=None):
     ap.add_argument("--exact-relu", action="store_true", help="the exact max (mirror only)")
     ap.add_argument("--tfhe", action="store_true", help="the ReLU's sign by CKKS -> TFHE -> CKKS (planned / twin / mirror)")
     ap.add_argument("--tfhe-chunk", type=int, default=4096, help="--tfhe --plan: values per switch pass")
+    ap.add_argument("--tfhe-argmax", action="store_true", help="a last stage: the encrypted one-hot of the argmax (TFHE)")
     ap.add_argument("--preset", default="n32_gpt2_decode")
     ap.add_argument("--debug-refresh", action="store_true",
                     help="eager: refresh by decrypt + re-encrypt (the eager session has no bootstrap; NOT encrypted end to end)")

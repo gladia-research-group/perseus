@@ -70,7 +70,8 @@ pub(crate) struct TfheRt {
     pub sw: TfheSwitch<'static>,
     pub params: Params,
     rns: pc_tfhe::pbs::Rns,
-    luts: BTreeMap<String, usize>,
+    /// name -> (table slot, output offset mod q_br)
+    luts: BTreeMap<String, (usize, u64)>,
     lut_buf: pc_cuda::DBuf<'static, pc_cuda::Compute, u32>,
     /// name -> (offset, values, copies): positions [copies][values] from `offset`
     sets: BTreeMap<String, (usize, usize, usize)>,
@@ -128,14 +129,34 @@ impl TfheRt {
             })
             .collect();
         let res: Vec<u32> = self.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect();
+        self.store(s, name, &res, 0)
+    }
+
+    /// Register sign LUT `name`: `lo` for m < 0, `hi` for m >= 0 on the whole torus, inputs m in (-2, 2) (a constant
+    /// test vector (hi - lo) / 2 and the offset (hi + lo) / 2, warped: the negacyclic sign needs no padding half, so
+    /// the input range and the resolution double). |lo|, |hi| <= `MAX_V`. Synchronous.
+    pub fn lut_sign(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, lo: f64, hi: f64) -> PyResult<()> {
+        if !(lo.is_finite() && hi.is_finite() && lo.abs() <= MAX_V && hi.abs() <= MAX_V) {
+            return Err(PyValueError::new_err(format!("tfhe sign lut {name}: ({lo}, {hi}) outside [-{MAX_V}, {MAX_V}]")));
+        }
+        let (nb, q) = (self.params.n_br, self.params.q_br);
+        let w = |v: f64| q as f64 * pc_tfhe::pbs::warp(v, self.params.out_cf);
+        let (c, off) = (((w(hi) - w(lo)) / 2.0).round() as i64, ((w(hi) + w(lo)) / 2.0).round() as i64);
+        let tv = vec![c.rem_euclid(q as i64) as u64; nb];
+        let res: Vec<u32> = self.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect();
+        self.store(s, name, &res, off.rem_euclid(q as i64) as u64)
+    }
+
+    fn store(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, res: &[u32], offset: u64) -> PyResult<()> {
+        let nb = self.params.n_br;
         let slot = match self.luts.get(name) {
-            Some(&k) => k,
+            Some(&(k, _)) => k,
             None if self.luts.len() < MAX_LUTS => self.luts.len(),
             None => return Err(PyValueError::new_err(format!("tfhe lut {name}: the session holds {MAX_LUTS} tables"))),
         };
-        self.lut_buf.upload_at(s, slot * 2 * nb, &res).map_err(|x| crate::session::gerr(x.into()))?;
+        self.lut_buf.upload_at(s, slot * 2 * nb, res).map_err(|x| crate::session::gerr(x.into()))?;
         s.sync().map_err(|x| crate::session::gerr(x.into()))?;
-        self.luts.insert(name.to_string(), slot);
+        self.luts.insert(name.to_string(), (slot, offset));
         Ok(())
     }
 
@@ -194,7 +215,7 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
     fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not a TFHE descriptor"))?;
         let rt = &mut *self.rt;
-        let &k = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
+        let &(k, offset) = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
         let &(off, cnt, reps) = rt.sets.get(&d.slots).ok_or_else(|| ferr(f, format!("slot set {} never registered (Session.tfhe_slots)", d.slots)))?;
         if f.ins.len() != 1 || f.outs.len() != 1 {
             return Err(ferr(f, format!("{} inputs / {} outputs (a TFHE finish has one of each)", f.ins.len(), f.outs.len())));
@@ -211,7 +232,7 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
         let nb = rt.params.n_br;
         let pos = (rt.pos_buf.vptr() as *const u32).wrapping_add(off) as *const std::ffi::c_void;
         let tv = (rt.lut_buf.vptr() as *const u32).wrapping_add(k * 2 * nb) as *const std::ffi::c_void;
-        rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, reps, tv, 0, false)?;
+        rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, reps, tv, offset, false)?;
         let mut fin = call.finish_call(0)?;
         fin.at_split(cx, x)?;
         fin.run_to(cx, x, Phase::Done)?;

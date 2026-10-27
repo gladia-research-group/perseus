@@ -4,7 +4,7 @@ ciphertext at the StC-first split of a dense refresh, turns the chosen slots int
 bootstrapping (exact for steps: no polynomial gap) and packs the outputs back for the refresh's finish.
 
 `tfhe_lut(ops, x, lut, slots)`: `lut` names a function registered with `register_lut` (|f| <= 1.25 on [-1, 1): the
-output warp's range at out_cf 3), `slots`
+output warp's range at out_cf 3) or a sign registered with `register_sign` (inputs on (-2, 2)), `slots`
 a slot set registered with `register_slots`; x must hold values in [-1, 1) on the set (they wrap beyond), and inputs
 within ~1-2 % of the range of a discontinuity may land on either side (the switch's input noise). The capture records
 one external refresh (`{op: "tfhe", lut, slots}`) landing where a PCMM output does; the planned driver registers the
@@ -23,12 +23,22 @@ _N32_CAP = 44        # the deepest input level that reaches the StC-first entry 
 _N32_LAND = 26       # the PCMM / TFHE finish's raw landing (pc-shadow Finish::Tfhe; the fake lands here)
 
 LUTS: dict = {}
+SIGNS: dict = {}     # name -> (lo, hi): sign LUTs on the whole torus (inputs in (-2, 2))
 SLOTS: dict = {}
 
 
 def register_lut(name, f):
     """`f`: numpy-vectorized on [-1, 1), |f| <= MAX_V. Re-registering a name replaces it."""
     LUTS[name] = f
+    return name
+
+
+def register_sign(name, lo, hi):
+    """A sign LUT: `lo` for m < 0, `hi` for m >= 0, read on (-2, 2): the negacyclic sign needs no padding half (a
+    constant test vector plus an offset), so its input range and resolution are twice a general LUT's."""
+    if max(abs(lo), abs(hi)) > MAX_V:
+        raise ValueError(f"tfhe sign {name}: |value| > {MAX_V}")
+    SIGNS[name] = (float(lo), float(hi))
     return name
 
 
@@ -61,13 +71,19 @@ def quantize(f, m):
     return np.asarray(f(2.0 * j / GRID), dtype=np.float64)
 
 
+def _sign_f(lo, hi):
+    # the switch rounds m to the grid of 2 / GRID: m >= -1 / GRID reads as non-negative
+    return lambda m: np.where(np.rint(np.asarray(m) * GRID / 2.0) >= 0, hi, lo)
+
+
 def _values(lut, slots, vec):
-    f, (idx, copies) = LUTS[lut], SLOTS[slots]
+    f = _sign_f(*SIGNS[lut]) if lut in SIGNS else LUTS[lut]
+    idx, copies = SLOTS[slots]
     vec = np.asarray(vec)
     n = vec.shape[0]
     out = np.zeros(n, dtype=np.float64)
     if n > 1:            # CapCt.novec keeps one slot: the recorder needs the op stream only
-        v = quantize(f, np.real(vec[idx]))
+        v = f(np.real(vec[idx])) if lut in SIGNS else quantize(f, np.real(vec[idx]))
         for c in (0,) + copies:
             out[(idx + c) % n] = v
     return out
@@ -75,7 +91,7 @@ def _values(lut, slots, vec):
 
 def tfhe_lut(ops, x, lut, slots):
     """f(x) on the slot set `slots`, zero elsewhere (module doc)."""
-    if lut not in LUTS or slots not in SLOTS:
+    if (lut not in LUTS and lut not in SIGNS) or slots not in SLOTS:
         raise KeyError(f"tfhe_lut: lut {lut!r} / slots {slots!r} not registered")
     from .ops import NumpyOps
     if isinstance(ops, NumpyOps):
@@ -99,6 +115,8 @@ def setup_session(sess):
     """Register every LUT and slot set the capture used with a planned session (`Session(tfhe=...)`)."""
     for name, f in LUTS.items():
         sess.tfhe_lut(name, [float(v) for v in grid(f)])
+    for name, (lo, hi) in SIGNS.items():
+        sess.tfhe_lut_sign(name, lo, hi)
     for name, (s, c) in SLOTS.items():
         sess.tfhe_slots(name, [int(i) for i in s], list(c))
 
@@ -115,11 +133,8 @@ def relu(m):
 
 
 def scaled_step(g):
-    """The LUT g * step (registered once per g; |g| <= MAX_V): a ReLU's gain folded into its sign."""
-    name = f"step*{float(g):.9g}"
-    if name not in LUTS:
-        register_lut(name, lambda m, g=float(g): g * step(m))
-    return name
+    """The sign LUT (0, g) (|g| <= MAX_V; inputs in (-2, 2)): a ReLU's gain folded into its sign."""
+    return register_sign(f"step*{float(g):.9g}", 0.0, float(g))
 
 
 register_lut("step", step)
