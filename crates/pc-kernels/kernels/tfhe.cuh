@@ -3,7 +3,7 @@
 // pc-core's order (psi powers bit-reversed, Cooley-Tukey forward / Gentleman-Sande inverse), the gadget digits and the
 // mod switches are the fixed-point roundings of pc-tfhe gadget.rs (`scale_round`). Products mod the bootstrapping
 // prime q < 2^62 are Shoup products against precomputed companions (twiddles, n^-1 and the bootstrapping key).
-#pragma once
+#pragma once   // needs <cooperative_groups.h> (instantiate.inc includes it at file scope)
 
 namespace pc {
 namespace tfhe {
@@ -180,7 +180,8 @@ __device__ void nttp_inv(uint32_t* a, int P, int n, const uint32_t* tw, const ui
         __syncthreads();
     }
 }
-// Register-blocked NTTs of P polynomials [P][2048] (poly k at prime k & 1): every phase loads groups of 2^S
+// Register-blocked NTTs of P polynomials [P][2048] (poly k at prime k & pm: pm = 0 puts every poly at the first,
+// with tw / tws / qa then that prime's): every phase loads groups of 2^S
 // coefficients into registers, runs S butterfly stages on them and writes back once (11 stages = 2 + 3 + 3 + 3:
 // four shared-memory round trips and barriers instead of eleven). Same butterflies and twiddles as nttp_fwd / nttp_inv,
 // reduced lazily (q < 2^26 leaves 6 bits of headroom): the forward takes [0, q) and adds < 2 q per stage (output
@@ -204,12 +205,12 @@ __device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int
 }
 // forward (Cooley-Tukey) phase: stages t = tt, tt / 2, .., tt >> (S - 1); a group = j0 + k tl (tl = tt >> (S - 1))
 template <int S>
-__device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+__device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int ltl = ltt - (S - 1), tl = 1 << ltl;
     const int lgpp = RLN - S;   // groups per polynomial = RN / G
     for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
-        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & 1;
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & pm;
         const uint32_t q = p ? qb : qa;
         uint32_t* x = a + k * RN;
         const int gi = g >> ltl;                         // the group's 2 tt block
@@ -238,20 +239,20 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
     }
     __syncthreads();
 }
-__device__ void nttr_fwd(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
-    fwd_phase<2>(a, P, 10, tw, tws, qa, qb);   // t = 1024, 512
-    fwd_phase<3>(a, P, 8, tw, tws, qa, qb);    // t = 256 .. 64
-    fwd_phase<3>(a, P, 5, tw, tws, qa, qb);    // t = 32 .. 8
-    fwd_phase<3>(a, P, 2, tw, tws, qa, qb);    // t = 4 .. 1
+__device__ void nttr_fwd(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
+    fwd_phase<2>(a, P, 10, tw, tws, qa, qb, pm);   // t = 1024, 512
+    fwd_phase<3>(a, P, 8, tw, tws, qa, qb, pm);    // t = 256 .. 64
+    fwd_phase<3>(a, P, 5, tw, tws, qa, qb, pm);    // t = 32 .. 8
+    fwd_phase<3>(a, P, 2, tw, tws, qa, qb, pm);    // t = 4 .. 1
 }
 // inverse (Gentleman-Sande) phase: stages t = tb, 2 tb, .., tb << (S - 1); a group = j0 + k tb, spanning G tb
 template <int S>
-__device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+__device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int tb = 1 << ltb;
     const int lgpp = RLN - S;
     for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
-        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & 1;
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & pm;
         const uint32_t q = p ? qb : qa;
         uint32_t* x = a + k * RN;
         const int gi = g >> ltb;                         // the group's G tb block
@@ -280,11 +281,11 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
     }
     __syncthreads();
 }
-__device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
-    inv_phase<3>(a, P, 0, tw, tws, qa, qb);    // t = 1 .. 4
-    inv_phase<3>(a, P, 3, tw, tws, qa, qb);    // t = 8 .. 32
-    inv_phase<3>(a, P, 6, tw, tws, qa, qb);    // t = 64 .. 256
-    inv_phase<2>(a, P, 9, tw, tws, qa, qb);    // t = 512, 1024
+__device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
+    inv_phase<3>(a, P, 0, tw, tws, qa, qb, pm);    // t = 1 .. 4
+    inv_phase<3>(a, P, 3, tw, tws, qa, qb, pm);    // t = 8 .. 32
+    inv_phase<3>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
+    inv_phase<2>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
 }
 __device__ void ntt2_inv(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, const TfheArgs& A, uint32_t qa, uint32_t qb) {
     for (int m = n / 2, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
@@ -504,6 +505,74 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
             for (int cp = 0; cp < 4; cp++) g[cp * n + threadIdx.x + jj * blockDim.x] = ar[b][jj][cp];
     }
+}
+
+// PBS_ROTATE's latency path on a cluster of two blocks per LWE, one per RNS prime (r = the block's rank, on the key
+// bundles of PBS_KEYBUNDLE, one level): each block keeps its prime's acc [2 part][n] in shared memory and reads the
+// partner's through distributed shared memory for the digits (the CRT of both residues). Per group: cluster sync (the
+// partner's acc is final), digits of both parts at its prime, cluster sync (both read: acc may change), forward NTT of
+// the two digit polys, the MAC on its half of the bundle words, inverse NTT, acc += o. Shared: acc 2 n, tb 2 n words.
+template <int G>
+__global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k(TfheArgs A) {
+    extern __shared__ uint32_t sm32[];
+    namespace cg = cooperative_groups;
+    cg::cluster_group cl = cg::this_cluster();
+    const int r = (int)cl.block_rank();
+    const int n = A.n, L = A.i1, bl = (int)A.c[0], lw = (int)blockIdx.x / 2;
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
+    const uint32_t q = r ? qb : qa, mi = mont_neg_inv(q);
+    uint32_t *acc = sm32, *tb = sm32 + 2 * n;
+    const uint32_t* pacc = cl.map_shared_rank(acc, r ^ 1);
+    uint32_t* g = (uint32_t*)A.x + (size_t)lw * 4 * n;   // [part][prime][n]
+    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) acc[x] = g[(2 * (x / n) + r) * n + x % n];
+    const uint32_t* at = (const uint32_t*)A.z + (size_t)lw * (L + 1);
+    const uint32_t* tw = (const uint32_t*)A.tw + (size_t)r * 2 * n;   // this prime's [fwd | inv][n]
+    const uint32_t* tws = (const uint32_t*)A.tws + (size_t)r * 2 * n;
+    const int64_t B = 1ll << bl;
+    for (int pr = 0; pr < L / G; pr++) {
+        bool nz = false;
+#pragma unroll
+        for (int x = 0; x < G; x++) nz |= at[G * pr + x] != 0;
+        if (!nz) continue;   // the same in both blocks
+        // the bundle words first: their L2 latency hides behind the digits and the forward NTT
+        uint4 w[2];
+#pragma unroll
+        for (int ee = 0; ee < 2; ee++)
+            w[ee] = __ldg((const uint4*)A.w + (((size_t)lw * (L / G) + pr) * RT_E + 2 * r + ee) * blockDim.x + threadIdx.x);
+        cl.sync();
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++) {
+            const int j = threadIdx.x + jj * blockDim.x;
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const uint32_t own = acc[c * n + j], oth = pacc[c * n + j];
+                int64_t v = (int64_t)scale_round(crt(r ? oth : own, r ? own : oth, qa, qb, inv, invs), A.m);
+                if (v >= B / 2) v -= B;   // one level: the digit is the centred value
+                tb[c * n + swz(j)] = v < 0 ? (uint32_t)((int64_t)q + v) : (uint32_t)v;
+            }
+        }
+        cl.sync();
+        nttr_fwd(tb, 2, tw, tws, q, q, 0);
+#pragma unroll
+        for (int ee = 0; ee < 2; ee++) {
+            const int j = threadIdx.x + ee * blockDim.x;
+            const uint64_t d0 = tb[swz(j)], d1 = tb[n + swz(j)];
+            // o aliases the digits: this thread alone reads and writes word j
+            tb[swz(j)] = redc(d0 * w[ee].x + d1 * w[ee].z, q, mi);   // < 2 q
+            tb[n + swz(j)] = redc(d0 * w[ee].y + d1 * w[ee].w, q, mi);
+        }
+        __syncthreads();
+        nttr_inv(tb, 2, tw, tws, q, q, 0);
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++)
+#pragma unroll
+            for (int c = 0; c < 2; c++) {
+                const int x = c * n + threadIdx.x + jj * blockDim.x;
+                acc[x] = add32(acc[x], fold32(tb[c * n + swz(threadIdx.x + jj * blockDim.x)], q), q);
+            }
+    }
+    cl.sync();   // the partner may still read this block's acc
+    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) g[(2 * (x / n) + r) * n + x % n] = acc[x];
 }
 
 // PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
@@ -878,6 +947,13 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                     attr_k = true;
                 }
                 if (lv != 1) return -1;
+                if (A.i3 != 1) {   // a cluster of two blocks per LWE (i3 = 1: one block, for comparison)
+                    const int sc = 4 * A.n * (int)sizeof(uint32_t);
+                    if (grp == 2) rotate_cl_k<2><<<2 * A.count, th, sc, s>>>(A);
+                    else if (grp == 3) rotate_cl_k<3><<<2 * A.count, th, sc, s>>>(A);
+                    else rotate_cl_k<4><<<2 * A.count, th, sc, s>>>(A);
+                    break;
+                }
                 if (grp == 2) rotate_k<1, 1, 2, true><<<A.count, th, s4, s>>>(A);
                 else if (grp == 3) rotate_k<1, 1, 3, true><<<A.count, th, s4, s>>>(A);
                 else rotate_k<1, 1, 4, true><<<A.count, th, s4, s>>>(A);

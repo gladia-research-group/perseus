@@ -2,6 +2,7 @@
 // instantiation after defining PC_W (word type), PC_MM (strategy template) and PC_TABLE (exported function name).
 // The kernels live in an anonymous namespace so the TUs' identical W-only templates never collide at link time.
 #include <cmath>
+#include <cooperative_groups.h>
 #include "../args.cuh"
 
 namespace {
