@@ -81,7 +81,7 @@ def _twin(a, net):
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
     # the reactive ceiling at the planner's (make_plan.sh MAX_LEVEL): a stage output the twin refreshed reactively
     # would carry that refresh's name, which the compiled program (reactive refreshes erased) does not produce
-    _, inf = fakecap.make_session(Dims.gpt2(), set(net.rotations()), limit=a.twin_limit)
+    _, inf = fakecap.make_session(Dims.gpt2(), set(net.rotations()), limit=a.twin_limit, bts_out=a.twin_bts_out)
     model = ResnetImpl(inf, net, core=fakecap.core)
     if a.capture:
         model.set_capture(a.capture)
@@ -93,7 +93,7 @@ def _twin(a, net):
 
 def _fake(a, sd, act, x, y, ref):
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=True))
+    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage))
     lgs = []
     for i, xi in enumerate(x[:1] if a.capture else x):
         t0 = time.time()
@@ -111,7 +111,7 @@ def _planned(a, sd, act, x, y, ref):
     from perseus.examples.bert.planned import plan_config
     from .impl import ResnetPlanned
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=True))
+    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage))
     cfg = plan_config(a.plan)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
@@ -150,7 +150,9 @@ def main(argv=None, results=None):
     mode.add_argument("--fake", action="store_true", help="the CPU twin (perseus.impl.fakecap)")
     mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir")
     ap.add_argument("--capture", default=None, help="--fake: write the stage graphs here")
+    ap.add_argument("--one-stage", action="store_true", help="twin / plan: the network as one stage")
     ap.add_argument("--twin-limit", type=int, default=50, help="the twin's reactive refresh ceiling")
+    ap.add_argument("--twin-bts-out", type=int, default=32, help="the twin's refresh landing (the route the run takes)")
     ap.add_argument("--structure-only", action="store_true", help="--capture without magnitudes")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--work-dir", default=None)
