@@ -335,7 +335,7 @@ __global__ void init_k(TfheArgs A) {
 #define RT_SKIP 0   // EXPERIMENT timing: 1 skip MAC, 2 skip NTTs
 #endif
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
-template <int LV, int NB, int G>
+template <int LV, int NB, int G, bool KB = false>
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     constexpr int KM = (1 << G) - 1;   // keys per group
     extern __shared__ uint32_t sm32[];
@@ -426,44 +426,54 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             for (int b = 0; b < NB; b++)
 #pragma unroll
                 for (int ct = 0; ct < 2 * LV; ct++) d[b][ct] = sm32[b * tbs + ct * 2 * n + swz(k)];
-            // the group's key first (TFHE-rs's key bundle, in NTT form): G[ct][part] = sum_m f_m K_m[ct][part], f_m =
-            // NTT(X^-e_m - 1) (KM <= 7 terms < q q: < q 2^32), then one product with the digits: 2 KM LV + 2 LV wide
-            // products and 2 LV + 2 reductions per word instead of KM (2 LV + 2) and 2 KM + 2
-            uint64_t gk[NB][2 * LV][2];   // KM <= 15 terms < q q: < q 2^32 at q < 2^28
-#pragma unroll
-            for (int b = 0; b < NB; b++)
-#pragma unroll
-                for (int ct = 0; ct < 2 * LV; ct++) gk[b][ct][0] = gk[b][ct][1] = 0;
-#pragma unroll
-            for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
-                uint4 w[LV];
-#pragma unroll
-                for (int h = 0; h < LV; h++) w[h] = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
-#pragma unroll
-                for (int b = 0; b < NB; b++) {
-                    if (!em[b][m]) continue;
-                    const uint64_t f = pm1[p * n2 + ((ej * em[b][m]) & (n2 - 1))];
-#pragma unroll
-                    for (int h = 0; h < LV; h++) {
-                        gk[b][2 * h][0] += w[h].x * f;
-                        gk[b][2 * h][1] += w[h].y * f;
-                        gk[b][2 * h + 1][0] += w[h].z * f;
-                        gk[b][2 * h + 1][1] += w[h].w * f;
+            if constexpr (KB) {
+                // the key bundle precomputed by PBS_KEYBUNDLE (w: [lwe][group][e][thread] uint4, NB = LV = 1)
+                const uint4 g = __ldg((const uint4*)A.w + (((size_t)blockIdx.x * (L / G) + pr) * RT_E + e) * blockDim.x + threadIdx.x);
+                const uint64_t s0 = (uint64_t)d[0][0] * g.x + (uint64_t)d[0][1] * g.z;
+                const uint64_t s1 = (uint64_t)d[0][0] * g.y + (uint64_t)d[0][1] * g.w;
+                sm32[swz(k)] = redc(s0, q, mi);   // < 2 q
+                sm32[2 * n + swz(k)] = redc(s1, q, mi);
+            } else {
+                // the group's key first (TFHE-rs's key bundle, in NTT form): G[ct][part] = sum_m f_m K_m[ct][part], f_m =
+                // NTT(X^-e_m - 1) (KM <= 7 terms < q q: < q 2^32), then one product with the digits: 2 KM LV + 2 LV wide
+                // products and 2 LV + 2 reductions per word instead of KM (2 LV + 2) and 2 KM + 2
+                uint64_t gk[NB][2 * LV][2];   // KM <= 15 terms < q q: < q 2^32 at q < 2^28
+    #pragma unroll
+                for (int b = 0; b < NB; b++)
+    #pragma unroll
+                    for (int ct = 0; ct < 2 * LV; ct++) gk[b][ct][0] = gk[b][ct][1] = 0;
+    #pragma unroll
+                for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
+                    uint4 w[LV];
+    #pragma unroll
+                    for (int h = 0; h < LV; h++) w[h] = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
+    #pragma unroll
+                    for (int b = 0; b < NB; b++) {
+                        if (!em[b][m]) continue;
+                        const uint64_t f = pm1[p * n2 + ((ej * em[b][m]) & (n2 - 1))];
+    #pragma unroll
+                        for (int h = 0; h < LV; h++) {
+                            gk[b][2 * h][0] += w[h].x * f;
+                            gk[b][2 * h][1] += w[h].y * f;
+                            gk[b][2 * h + 1][0] += w[h].z * f;
+                            gk[b][2 * h + 1][1] += w[h].w * f;
+                        }
                     }
                 }
+                // o aliases the digits: this thread alone reads and writes word k
+    #pragma unroll
+                for (int b = 0; b < NB; b++) {
+                    uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+    #pragma unroll
+                    for (int ct = 0; ct < 2 * LV; ct++) {
+                        s0 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][0], q, mi), q);
+                        s1 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][1], q, mi), q);
+                    }
+                    sm32[b * tbs + swz(k)] = redc(s0, q, mi);   // < 2 q
+                    sm32[b * tbs + 2 * n + swz(k)] = redc(s1, q, mi);
+    
             }
-            // o aliases the digits: this thread alone reads and writes word k
-#pragma unroll
-            for (int b = 0; b < NB; b++) {
-                uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
-#pragma unroll
-                for (int ct = 0; ct < 2 * LV; ct++) {
-                    s0 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][0], q, mi), q);
-                    s1 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][1], q, mi), q);
-                }
-                sm32[b * tbs + swz(k)] = redc(s0, q, mi);   // < 2 q
-                sm32[b * tbs + 2 * n + swz(k)] = redc(s1, q, mi);
-            }
+        }
         }
         __syncthreads();
         // o [lwe][part][prime][n]: poly k at prime k & 1 (the stride between LWEs is a whole number of polys)
@@ -493,6 +503,55 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
         for (int jj = 0; jj < 2; jj++)
 #pragma unroll
             for (int cp = 0; cp < 4; cp++) g[cp * n + threadIdx.x + jj * blockDim.x] = ar[b][jj][cp];
+    }
+}
+
+// PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
+// [count][group][e][thread] uint4 = (G[0][0], G[0][1], G[1][0], G[1][1]), G[c][part] = sum_m f_m K_m[c][part] (Montgomery
+// form, < q; one level), the MAC of rotate_k computed for all groups at once, off the rotation's sequential path. y =
+// bsk, z = the mod-switched LWEs, tw as PBS_ROTATE; grid (groups, count), 1024 threads.
+template <int G>
+__global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
+    extern __shared__ uint32_t sm32[];
+    constexpr int KM = (1 << G) - 1;
+    const int n = A.n, L = A.i1, n2 = 2 * n, pr = blockIdx.x;
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
+    const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
+    const uint32_t* tw = (const uint32_t*)A.tw;
+    const uint32_t* ex = tw + 8 * n;
+    uint32_t* pm1 = sm32;
+    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[x] = __ldg(tw + 4 * n + x);
+    const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.y * (L + 1);
+    int em[KM];
+#pragma unroll
+    for (int m = 1; m <= KM; m++) {
+        uint32_t e = 0;
+#pragma unroll
+        for (int x = 0; x < G; x++)
+            if (m >> x & 1) e += at[G * pr + x];
+        em[m - 1] = (int)((G * n2 - e) % n2);
+    }
+    __syncthreads();
+    const size_t kstride = (size_t)2 * 2 * 2 * n;   // one GGSW at one level
+    const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
+    uint4* out = (uint4*)A.x + ((size_t)blockIdx.y * (L / G) + pr) * RT_E * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int e = 0; e < RT_E; e++) {
+        const int k = threadIdx.x + e * blockDim.x, p = k >= n;
+        const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
+        const int ej = (int)ex[k];
+        uint64_t g00 = 0, g01 = 0, g10 = 0, g11 = 0;   // KM <= 15 terms < q q
+#pragma unroll
+        for (int m = 0; m < KM; m++) {
+            if (!em[m]) continue;
+            const uint4 w = __ldg(bsk + (m * RT_E + e) * blockDim.x);
+            const uint64_t f = pm1[p * n2 + ((ej * em[m]) & (n2 - 1))];
+            g00 += w.x * f;
+            g01 += w.y * f;
+            g10 += w.z * f;
+            g11 += w.w * f;
+        }
+        out[e * blockDim.x] = make_uint4(fold32(redc(g00, q, mi), q), fold32(redc(g01, q, mi), q), fold32(redc(g10, q, mi), q), fold32(redc(g11, q, mi), q));
     }
 }
 
@@ -810,6 +869,20 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             }
             // digits (4 / 8 n words) + pm1 (4 n)
             const int s4 = 8 * A.n * (int)sizeof(uint32_t), s8 = 12 * A.n * (int)sizeof(uint32_t);
+            if (A.w) {   // the latency path: the key bundles precomputed (PBS_KEYBUNDLE), one LWE per block, one level
+                static bool attr_k = false;
+                if (!attr_k) {
+                    cudaFuncSetAttribute(rotate_k<1, 1, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
+                    cudaFuncSetAttribute(rotate_k<1, 1, 3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
+                    cudaFuncSetAttribute(rotate_k<1, 1, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
+                    attr_k = true;
+                }
+                if (lv != 1) return -1;
+                if (grp == 2) rotate_k<1, 1, 2, true><<<A.count, th, s4, s>>>(A);
+                else if (grp == 3) rotate_k<1, 1, 3, true><<<A.count, th, s4, s>>>(A);
+                else rotate_k<1, 1, 4, true><<<A.count, th, s4, s>>>(A);
+                break;
+            }
             const bool two = lv == 1 && A.count >= 2 * sms;
             const unsigned blocks = two ? (A.count + 1) / 2 : A.count;
             if (grp == 2) {
@@ -825,6 +898,16 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 else if (two) rotate_k<1, 2, 4><<<blocks, th, s8, s>>>(A);
                 else rotate_k<1, 1, 4><<<blocks, th, s4, s>>>(A);
             }
+            break;
+        }
+        case PC_TFHE_PBS_KEYBUNDLE: {
+            const int grp = A.i2 ? A.i2 : 2;
+            if (A.n != 2048 || A.c[1] != 1 || grp < 2 || grp > 4 || A.i1 % grp || A.count > 65535) return -1;
+            const int sm = 4 * A.n * (int)sizeof(uint32_t);   // pm1
+            const dim3 grid(A.i1 / grp, A.count);
+            if (grp == 2) keybundle_k<2><<<grid, STEP_TH, sm, s>>>(A);
+            else if (grp == 3) keybundle_k<3><<<grid, STEP_TH, sm, s>>>(A);
+            else keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:
