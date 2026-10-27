@@ -1107,9 +1107,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 log.info(f"[plan]  CF {outside} lies OUTSIDE the measured table (cf {rng[0]}..{rng[1]}) "
                       f"— those sites are priced by the ANALYTIC fallback, not measurement. "
                       f"Extend the table with BTS_ACC_CFS before trusting them.")
+        err = bq['predicted_rel_err']       # median None: a block whose refreshes are all deliberate
         log.info(f"[plan] CF {bq['cf_histogram']}  out-levels {bq['out_level_histogram']}  "
-              f"pred rel_err median={bq['predicted_rel_err']['median']:.3g} "
-              f"p90={bq['predicted_rel_err']['p90']:.3g}"
+              + (f"pred rel_err median={err['median']:.3g} p90={err['p90']:.3g}" if err['median'] is not None
+                 else "pred rel_err n/a")
               + (f"   {bq['num_sites_missing_target']} MISS TARGET"
                  if bq['num_sites_missing_target'] else ""))
     return result
