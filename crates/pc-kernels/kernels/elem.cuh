@@ -1,5 +1,6 @@
 // Element-wise kernels over polynomial row sets, batched over ciphertexts x parts (blockIdx.z) and
-// rows (blockIdx.y). Semantics in args.cuh (EwArgs, PtDotArgs).
+// rows (blockIdx.y), 4 consecutive words per thread (vector loads; rows are N-word aligned). Semantics in args.cuh
+// (EwArgs, PtDotArgs).
 #pragma once
 #include "arith.cuh"
 
@@ -12,9 +13,12 @@ __global__ void ew_add(EwArgs A) {
     const int row = rs_row(A.rs, blockIdx.y);
     const int c = blockIdx.z / A.nparts, part = blockIdx.z % A.nparts;
     const W p = (W)A.pr[row].p;
-    const int i = blockIdx.x * BX + threadIdx.x;
-    const W x = at<W>(A.a, c, part, row)[i], y = at<W>(A.b, c, part, row)[i];
-    at<W>(A.out, c, part, row)[i] = A.sub ? sub<W>(x, y, p) : add<W>(x, y, p);
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    const V4<W> x = load4<W>(at<W>(A.a, c, part, row) + i), y = load4<W>(at<W>(A.b, c, part, row) + i);
+    W r[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) r[w] = A.sub ? sub<W>(x.v[w], y.v[w], p) : add<W>(x.v[w], y.v[w], p);
+    store4<W>(at<W>(A.out, c, part, row) + i, r[0], r[1], r[2], r[3]);
 }
 
 template <class W>
@@ -22,12 +26,15 @@ __global__ void ew_scale(EwArgs A) {
     const int row = rs_row(A.rs, blockIdx.y);
     const int c = blockIdx.z / A.nparts, part = blockIdx.z % A.nparts;
     const W p = (W)A.pr[row].p;
-    const int i = blockIdx.x * BX + threadIdx.x;
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    W* o = at<W>(A.out, c, part, row) + i;
     if (A.zero_p && (int)blockIdx.y >= A.rs.nq) {
-        at<W>(A.out, c, part, row)[i] = 0;
+        store4<W>(o, 0, 0, 0, 0);
         return;
     }
-    at<W>(A.out, c, part, row)[i] = mul_shoup<W>(at<W>(A.a, c, part, row)[i], ((const W*)A.sc)[row], ((const W*)A.scs)[row], p);
+    const W s = ((const W*)A.sc)[row], ss = ((const W*)A.scs)[row];
+    const V4<W> x = load4<W>(at<W>(A.a, c, part, row) + i);
+    store4<W>(o, mul_shoup<W>(x.v[0], s, ss, p), mul_shoup<W>(x.v[1], s, ss, p), mul_shoup<W>(x.v[2], s, ss, p), mul_shoup<W>(x.v[3], s, ss, p));
 }
 
 template <class W>
@@ -35,17 +42,22 @@ __global__ void ew_sub_mul(EwArgs A) {
     const int row = rs_row(A.rs, blockIdx.y);
     const int c = blockIdx.z / A.nparts, part = blockIdx.z % A.nparts;
     const W p = (W)A.pr[row].p;
-    const int i = blockIdx.x * BX + threadIdx.x;
-    const W v = sub<W>(at<W>(A.a, c, part, row)[i], at<W>(A.b, c, part, row)[i], p);
-    at<W>(A.out, c, part, row)[i] = mul_shoup<W>(v, ((const W*)A.sc)[row], ((const W*)A.scs)[row], p);
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    const W s = ((const W*)A.sc)[row], ss = ((const W*)A.scs)[row];
+    const V4<W> x = load4<W>(at<W>(A.a, c, part, row) + i), y = load4<W>(at<W>(A.b, c, part, row) + i);
+    W r[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) r[w] = mul_shoup<W>(sub<W>(x.v[w], y.v[w], p), s, ss, p);
+    store4<W>(at<W>(A.out, c, part, row) + i, r[0], r[1], r[2], r[3]);
 }
 
 template <class W>
 __global__ void ew_copy(EwArgs A) {
     const int row = rs_row(A.rs, blockIdx.y);
     const int c = blockIdx.z / A.nparts, part = blockIdx.z % A.nparts;
-    const int i = blockIdx.x * BX + threadIdx.x;
-    at<W>(A.out, c, part, row)[i] = at<W>(A.a, c, part, row)[i];
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    const V4<W> x = load4<W>(at<W>(A.a, c, part, row) + i);
+    store4<W>(at<W>(A.out, c, part, row) + i, x.v[0], x.v[1], x.v[2], x.v[3]);
 }
 
 template <class W, class MM, int KMAX>
@@ -85,7 +97,7 @@ __global__ void pt_dot(PtDotArgs A) {
     }
 }
 
-inline dim3 ew_grid(const EwArgs* a) { return dim3(N / BX, a->rs.nq + a->rs.np, a->K * a->nparts); }
+inline dim3 ew_grid(const EwArgs* a) { return dim3(N / (4 * BX), a->rs.nq + a->rs.np, a->K * a->nparts); }
 
 template <class W>
 int add_l(const EwArgs* a, cudaStream_t s) {

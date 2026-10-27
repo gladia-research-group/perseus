@@ -611,6 +611,7 @@ class PlannedRun:
         self.debug = False
         self.records, self._next = {}, None
         self.stats = []
+        self._pre, self._staged, self._keys, self._alias = {}, None, {}, {}
 
     # ── setup ──
     def _record(self, t, rows, argmax):
@@ -739,32 +740,109 @@ class PlannedRun:
         """Block 0's input of token t, encrypted at the program's input level."""
         return self.fhe.pack_tokens(np.asarray([rows[t]], dtype=np.float64), p.inputs[0][1])
 
+    def precompute(self, rows, argmax=False):
+        """Setup: every position's patch (its dynamic-step values, the K/V inputs it reads as an empty cache, the
+        plaintexts whose values differ from the previous position's), so that a token's in-clock work is setting
+        and staging them. The twin records structure only, on the session's public rows, so a position's patch
+        depends on the position alone. Plaintexts that hold equal values at every position (the blocks' step masks)
+        share one slot (`alias_pts`), so a position stages each changed value once. Once, before the first run."""
+        import hashlib
+        if self.debug:
+            return self
+        if self._alias:
+            raise RuntimeError("precompute: the plaintexts are already aliased")
+        t0, n = time.time(), len(rows)
+        self._keys = {lab: p.pt_keys() for lab, p in self.progs.items()}
+        steps, pts = [], []
+        for t in range(n):
+            calls, zero, vals = self._steps(t, self.rec.token(t, rows[t], argmax))
+            if pts:                        # equal values share the previous position's array
+                last = dict(pts[-1])
+                vals = [(key, last[key] if key in last and np.array_equal(last[key], v) else v) for key, v in vals]
+            steps.append((calls, zero))
+            pts.append(vals)
+        # a plaintext's name in the store: the digest of its values at every position (checked equal within a name)
+        digest, traj, first = {}, {}, {}
+        for i, (key, _v) in enumerate(pts[0]):
+            h = hashlib.blake2b(digest_size=12)
+            for t in range(n):
+                v = pts[t][i][1]
+                if id(v) not in digest:
+                    a = np.ascontiguousarray(v)
+                    digest[id(v)] = hashlib.blake2b(f"{a.dtype.str}{a.shape}".encode() + a.tobytes(),
+                                                    digest_size=12).digest()
+                h.update(digest[id(v)])
+            name = traj[key] = "v/" + h.hexdigest()
+            j = first.setdefault(name, i)
+            if j != i and not all(np.array_equal(pts[t][j][1], pts[t][i][1]) for t in range(n)):
+                raise RuntimeError(f"precompute: digest collision between {pts[0][j][0]} and {key}")
+        self._alias = {nm: name for (nm, _lv), name in traj.items()}
+        for lab, p in self.progs.items():
+            p.alias_pts({nm: self._alias[nm] for nm, _lv in self._keys[lab]})
+        for t in range(n):
+            for prev in (None, n - 1) if t == 0 else (t - 1,):
+                staged = dict(pts[prev]) if prev is not None else {}
+                items = []
+                for key, v in pts[t]:
+                    old = staged.get(key)
+                    if old is None or (old is not v and not np.array_equal(old, v)):
+                        items.append((*key, v))
+                        staged[key] = v
+                self._pre[(prev, t)] = {"calls": steps[t][0], "zero": steps[t][1], "items": self._shared(items)}
+        self.log(f"[planned] {n} positions precomputed in {time.time() - t0:.1f} s: {len(set(traj.values()))} "
+                 f"plaintext slots for {len(traj)} keys, {len(self._pre[(0, 1)]['items']) if n > 1 else 0} staged "
+                 f"per position")
+        return self
+
+    def _shared(self, items):
+        """Staged items [(name, level, values)] under their shared store names, one per name and level."""
+        if not self._alias:
+            return items
+        out = {}
+        for nm, lv, v in items:
+            out.setdefault((self._alias[nm], lv), v)
+        return [(nm, lv, v) for (nm, lv), v in out.items()]
+
     # ── per token ──
-    def _patch(self, t, recs):
-        """Check token t's streams, set the dynamic arguments, stage the plaintexts whose values changed."""
-        items, zero = [], {}
+    def _steps(self, t, recs):
+        """Token t's streams checked against the reference: the dynamic-step calls [(program, kind, name, value)],
+        the K/V inputs read as an empty cache {block: positions}, and the plaintext values [((name, level), v)] by
+        the programs' own plaintext names."""
+        calls, zero, vals = [], {}, []
+        keys = self._keys
         for b, r in recs.items():
-            ps = [self.progs[self.labels[b]]] + [self.progs[lab] for lab, vb in self.variants.items() if vb == b]
+            labs = [self.labels[b]] + [lab for lab, vb in self.variants.items() if vb == b]
             s, k, z = diff_block(self.ref[b], r)
             for nm, (kind, v0) in self.ref_dyn[b].items():
                 v = s.pop(nm, v0) if kind == "s" else k.pop(nm, v0)
-                for p in ps:
-                    if kind == "s":
-                        p.set_scalar(nm, v)
-                    else:
-                        p.set_rotation(nm, v)
+                calls += [(self.progs[lab], kind, nm, v) for lab in labs]
             if s or k:
                 raise RuntimeError(f"token {t} block {b}: steps the probe tokens kept constant change: {sorted(s) + sorted(k)}")
             zero[b] = z
-            for p in ps:
-                for nm, lv in p.pt_keys():
-                    v = r.pts[nm.split("/", 1)[1]]
-                    old = self._pt_vals.get((nm, lv))
-                    if old is None or (old is not v and not np.array_equal(old, v)):
-                        items.append((nm, lv, v))
-                        self._pt_vals[(nm, lv)] = v
+            vals += [((nm, lv), r.pts[nm.split("/", 1)[1]]) for lab in labs
+                     for nm, lv in keys.get(lab) or self.progs[lab].pt_keys()]
+        return calls, zero, vals
+
+    def _apply(self, calls, items):
+        for p, kind, nm, v in calls:
+            if kind == "s":
+                p.set_scalar(nm, v)
+            else:
+                p.set_rotation(nm, v)
         if items:
             self.store.stage(items)
+
+    def _patch(self, t, recs):
+        """Check token t's streams, set the dynamic arguments, stage the plaintexts whose values changed."""
+        calls, zero, vals = self._steps(t, recs)
+        items = []
+        for (nm, lv), v in vals:
+            old = self._pt_vals.get((nm, lv))
+            if old is None or (old is not v and not np.array_equal(old, v)):
+                items.append((nm, lv, v))
+                self._pt_vals[(nm, lv)] = v
+        items = self._shared(items)
+        self._apply(calls, items)
         return zero, len(items)
 
     def _run_block(self, b, t, zero, first_in, variant=None):
@@ -788,19 +866,27 @@ class PlannedRun:
         if self._next is not None:
             self._next.join()
             self._next = None
-        if t == 0:
-            # a new sequence: the twin replays it from its start, the reference token included (a stream cached from
-            # an earlier sequence would skip that position's K/V push, and every later position would be recorded
-            # against a cache one entry short); `self.ref` keeps the compiled reference
-            self.records.clear()
-        recs = self._record(t, rows, argmax)
-        t_rec = time.time() - tt
-        # the next token's stream is recorded on the CPU while this one is patched, issued and run (started before
-        # the issue, which the device paces: started after it, the record runs into the next token)
-        if t + 1 < len(rows) and (t + 1) not in self.records and not self.debug:
-            self._next = threading.Thread(target=self._record, args=(t + 1, rows, argmax))
-            self._next.start()
-        self._zero, n_staged = self._patch(t, recs)
+        pre = self._pre.get((self._staged, t))
+        if pre is not None and not self.debug:
+            t_rec = 0.0
+            self._apply(pre["calls"], pre["items"])
+            self._zero, n_staged = pre["zero"], len(pre["items"])
+            self._pt_vals.clear()          # the existing path, if ever taken next, restages every plaintext
+        else:
+            if t == 0:
+                # a new sequence: the twin replays it from its start, the reference token included (a stream cached
+                # from an earlier sequence would skip that position's K/V push, and every later position would be
+                # recorded against a cache one entry short); `self.ref` keeps the compiled reference
+                self.records.clear()
+            recs = self._record(t, rows, argmax)
+            t_rec = time.time() - tt
+            # the next token's stream is recorded on the CPU while this one is patched, issued and run (started
+            # before the issue, which the device paces: started after it, the record runs into the next token)
+            if t + 1 < len(rows) and (t + 1) not in self.records and (t, t + 1) not in self._pre and not self.debug:
+                self._next = threading.Thread(target=self._record, args=(t + 1, rows, argmax))
+                self._next.start()
+            self._zero, n_staged = self._patch(t, recs)
+        self._staged = t
         t_patch = time.time() - tt - t_rec
         info = []
         n_blocks = self.rec.n_layers + 1

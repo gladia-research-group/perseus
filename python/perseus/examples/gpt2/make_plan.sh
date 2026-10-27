@@ -124,6 +124,12 @@ if [ "$STAGE" = argmax ]; then
     read -r ENTRY_LEVEL ENTRY_DEG < <("$PYTHON" -c 'import json,sys; s=json.load(open(sys.argv[1]))["summary"]; print(s["exit_level"], s.get("exit_deg") or 1)' "$TAIL")
     TMP="$(mktemp -d "$GRAPH_DIR/../_argmax_XXXX")"; ln -s "$(cd "$GRAPH_DIR/block_13" && pwd)" "$TMP/block_13"
     cp "$GRAPH_DIR/capture_env.json" "$TMP/" 2>/dev/null || true
+    # PLAN_ARGMAX_MINCUT=1: the argmax on the min-cut placer without raise drops, whatever placer and raise drops the
+    # blocks take (no plan prices the one-hot's noise)
+    if [ "${PLAN_ARGMAX_MINCUT:-}" = 1 ]; then
+        unset PLAN_PLACER PLAN_QUALITY_WEIGHT PLAN_ILP_TIEBREAK PLAN_RAISE_SEARCH PLAN_RAISE_DROP_BASE PLAN_PACK_CF
+        export PLAN_RAISE_DROP_MAX=0 PLAN_RAISE_ROUTES=0
+    fi
     env GRAPH_DIR="$TMP" OUT_NAME="${OUT_NAME}_argmax" PLAN_DISSOLVE_HINTS=1 PLAN_HARD_ENV_CAP=1 \
         FIRST_ENTRY_LEVEL="${FIRST_ENTRY_LEVEL:-$ENTRY_LEVEL}" FIRST_ENTRY_DEG="${FIRST_ENTRY_DEG:-$ENTRY_DEG}" \
         MAX_LEVEL="${MAX_LEVEL:-50}" BTS_LEVEL="${BTS_LEVEL:-36}" SRC_LEVEL="${SRC_LEVEL:-36}" \

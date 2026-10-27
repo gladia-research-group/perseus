@@ -182,6 +182,8 @@ class Placer:
     placed_in_eff: dict[str, float] = field(default_factory=dict)
     realized: set[str] = field(default_factory=set)
     hint_force: dict[str, bool] | None = None
+    #: PLAN_HINT_ENV_VETO applies (off for a plan that keeps another plan's hint decisions: PLAN_KEEP_PLACEMENTS_EXACT)
+    hint_veto: bool = True
     deliberate_clamp0: bool = False
     _step_offsets: dict[str, float] | None = None
     ever_eligible: set[str] = field(default_factory=set)
@@ -389,7 +391,7 @@ class Placer:
         """
         res = self._run_once()
         import os as _os
-        if _os.environ.get("PLAN_HINT_ENV_VETO") != "1":
+        if _os.environ.get("PLAN_HINT_ENV_VETO") != "1" or not self.hint_veto:
             return res
         for _ in range(passes):
             deep = [v for v in self._deep_hints(res) if v not in self.vetoed_hints]

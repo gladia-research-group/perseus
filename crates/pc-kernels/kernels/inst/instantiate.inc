@@ -73,6 +73,8 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::em::md_epilogue_to_l<W>,
         &pc::bts::small_int1_l<W, MM>,
         &pc::coeffrows::launch<W, MM>,
+        &pc::em::mul_add_l<W, MM>,
+        &pc::rescale::fwd_l<W, MM>,
         &pc::tfhe::launch,
     };
     return &T;

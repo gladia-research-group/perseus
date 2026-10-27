@@ -556,6 +556,53 @@ def inv_sqrt_newton_safe(ops, x, y0, iters: int):
     return y
 
 
+def inv_sqrt_newton_scaled(ops, x, steps, scale: float = 1.0):
+    """scale / sqrt(x) for x in (0, 1] by from-below Newton steps y <- y (a - b x y^2) from the seed 1, one (a, b)
+    per step (`scaled_newton_steps`); the first step is closed form (a - b x, one level), the others take two (the
+    d2 product order), and `scale` rides the last step's constants."""
+    last = len(steps) - 1
+    a, b = steps[0]
+    k = scale if last == 0 else 1.0
+    y = ops.add(ops.mult(x, -b * k), a * k)
+    for i in range(1, last + 1):
+        a, b = steps[i]
+        k = scale if i == last else 1.0
+        c = ops.mult(x, -b * k)
+        y = ops.add(ops.mult(y, a * k), ops.mult(ops.mult(c, y), ops.square(y)))
+    return y
+
+
+def _newton_image(tl: float, a: float, b: float):
+    """[min, max] of q(t) = t (a - b t)^2 (t = x y^2 after the step) over t in [tl, 1]."""
+    ts = [tl, 1.0] + ([a / (3.0 * b)] if tl < a / (3.0 * b) < 1.0 else [])
+    qs = [t * (a - b * t) ** 2 for t in ts]
+    return min(qs), max(qs)
+
+
+def scaled_newton_steps(ratio: float, tol: float, zero: float = 3.0):
+    """The (a, b) of inv_sqrt_newton_scaled for x in [1 / ratio, 1], to a relative error <= tol from below.
+    The first step's zero a / b sits at `zero` times the band top (the result stays positive up to it: a value past
+    the band is under-normalised, never sign-flipped); every later step is the Chebyshev-scaled pair that maps the
+    band [tl, 1] of t = x y^2 onto the widest image under 1 (q peaks at 1 inside it and q(tl) = q(1)), or plain
+    Newton once that is wider. Each step covers ~6.7x more band ratio (plain Newton: 2.25x)."""
+    lo, hi = 1.0, 3.0
+    for _ in range(100):                      # the largest first step with q <= 1 on [0, 1] and its zero at `zero`
+        a = 0.5 * (lo + hi)
+        lo, hi = (a, hi) if _newton_image(0.0, a, a / zero)[1] <= 1.0 else (lo, a)
+    steps = [(lo, lo / zero)]
+    tl = _newton_image(1.0 / ratio, *steps[0])[0]
+    while 1.0 - math.sqrt(tl) > tol:
+        lo, hi = 1.5, math.sqrt(6.75)          # b = 4 a^3 / 27 puts the peak q(a / 3b) at 1
+        for _ in range(100):
+            a = 0.5 * (lo + hi)
+            lo, hi = (lo, a) if math.sqrt(tl) * (a - 4.0 * a ** 3 / 27.0 * tl) > a - 4.0 * a ** 3 / 27.0 else (a, hi)
+        cands = [(a, 4.0 * a ** 3 / 27.0), (1.5, 0.5)]
+        a, b = max(cands, key=lambda s: _newton_image(tl, *s)[0] if _newton_image(tl, *s)[1] <= 1.0 + 1e-12 else -1.0)
+        steps.append((a, b))
+        tl = _newton_image(tl, a, b)[0]
+    return steps
+
+
 def pow_odd(ops, y, p: int):
     """primitives.cu."""
     sq = ops.square

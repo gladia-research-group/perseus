@@ -316,7 +316,7 @@ pub fn run(o: &Opts) -> Res<bool> {
                 let mean = vin.iter().fold(Complex::default(), |a, b| Complex::new(a.re + b.re, a.im + b.im));
                 let mean = Complex::new(mean.re / vin.len() as f64, mean.im / vin.len() as f64);
                 let t = Instant::now();
-                spru.run(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, corr)?;
+                spru.run(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, corr, 0)?;
                 ex.compute.sync()?;
                 let wall = t.elapsed().as_secs_f64() * 1e3;
                 let ours = decrypt(&mut ex, &mut ops, xm)?;
@@ -367,7 +367,7 @@ pub fn run(o: &Opts) -> Res<bool> {
                         // the route consumes its input: restore it on the device first (one D2D copy, ~0.03 ms)
                         xm.buf.buf.copy_from(&ex.compute, &sv.buf.buf, words)?;
                         xm.meta = m0;
-                        spru.run(&mut BtsCx { ctx: &ctx, ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, 12 - deg)?;
+                        spru.run(&mut BtsCx { ctx: &ctx, ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, 12 - deg, 0)?;
                     }
                     Ok(())
                 })?;
@@ -382,7 +382,7 @@ pub fn run(o: &Opts) -> Res<bool> {
                 xm.meta = m0;
                 ex.compute.sync()?;
                 let th = Instant::now();
-                spru.run_profiled(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, 12 - deg, Some(&evs))?;
+                spru.run_profiled(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, 12 - deg, 0, Some(&evs))?;
                 hacc.push(th.elapsed().as_secs_f64() * 1e3);
                 ex.compute.sync()?;
                 for (i, a) in acc.iter_mut().enumerate() {
@@ -446,7 +446,7 @@ pub fn run(o: &Opts) -> Res<bool> {
                     let m0 = CtMeta { level: 0, deg: 1, nf: sf, slots: 0, tag: Default::default() };
                     let xm = x.get_mut().ok_or("shared")?;
                     enc.encrypt_sk(&ctx, &ex.compute, &secret, &[rows], m0, xm, &mut prng)?;
-                    spru.run(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, cf.saturating_sub(deg))?;
+                    spru.run(&mut BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work }, xm, cf.saturating_sub(deg), 0)?;
                     ops.realize(&ctx, &mut ex, &sh, std::slice::from_mut(xm))?;
                     let (lv, dg) = (xm.meta.level, xm.meta.deg);
                     // a constant puts all its energy in coefficient 0: |A| sf > q0 q1 / 2 for A > 2 would wrap the

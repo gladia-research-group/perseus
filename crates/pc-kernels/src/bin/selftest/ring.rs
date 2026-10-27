@@ -68,6 +68,7 @@ impl Tabs<'_> {
             pr: self.pr.c() as *const PrimeConst,
             nrows: nrows as i32,
             chunk,
+            ..Default::default()
         }
     }
 }

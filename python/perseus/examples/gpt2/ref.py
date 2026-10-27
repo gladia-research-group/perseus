@@ -17,8 +17,8 @@ from perseus.impl.attention import first_iters
 from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg
 from perseus.impl.poly import (NumpyOps, eval_chebyshev, eval_polynomial_ps, eval_remez_31,
                    eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0, goldschmidt_recip,
-                   inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, pow_odd,
-                   taylor_inv_sqrt_coeffs)
+                   inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, inv_sqrt_newton_scaled,
+                   pow_odd, taylor_inv_sqrt_coeffs)
 
 _ops = NumpyOps()
 
@@ -138,6 +138,13 @@ def cutmax_ref(logits, cfg: CutMaxCfg):
     x = np.asarray(logits, dtype=np.float64) * cfg.entry_scale
     n = x.shape[0]
     for it in cfg.iters:
+        if it.newton:                                   # the scaled normaliser
+            d = x - x.sum() / n
+            S2 = np.array([np.sum(d * d)])
+            f = inv_sqrt_newton_scaled(_ops, S2 * it.x_scale, it.newton,
+                                       0.5 * math.sqrt(n * it.x_scale) / (it.c * it.m))[0]
+            x = pow_odd(_ops, 2.0 * (d * f + 0.5 / it.m), it.p)
+            continue
         kf = 1.0 / math.sqrt(n * it.s2_hi)
         R = x.sum()
         cen = x * kf if it.ex2 else x * kf - R * kf / n
@@ -156,6 +163,9 @@ def cutmax_ref(logits, cfg: CutMaxCfg):
         y = 2.0 * (x * f - R * f / n + 0.5 / it.m)      # im_cleanse doubles
         x = pow_odd(_ops, y, it.p)
     S = np.array([x.sum()])
+    if cfg.sum_newton:
+        u = inv_sqrt_newton_scaled(_ops, S * cfg.sum_scale, cfg.sum_newton, math.sqrt(cfg.sum_scale))
+        return x * (u * u)[0]
     g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
     lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
     bsum = 8.0 / ((lo + hi) ** 2 + 4.0 * lo * hi)

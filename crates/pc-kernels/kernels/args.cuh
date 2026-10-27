@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 12u
-#define PC_RING_ABI 5u
+#define PC_KERNELS_ABI 16u
+#define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
 #define PC_LOGN 16
@@ -68,6 +68,15 @@ static_assert(sizeof(PolyRef) == 24, "PolyRef layout");
 // bit-reversed output; GS inverse with N^-1 folded in). Twiddle tables: [prime id][N] words in bit-reversed index
 // order (fw[m + i] = psi^brev(m + i)), with Shoup companions; ninv/ninvs: [prime id]. `chunk` rows per launch pair
 // (both passes of a chunk run back to back so the intermediate stays in L2; 0 = all rows at once).
+// ABI 11 (the 2^16 kernels; the ring tables ignore both):
+//   soff non-null: the first pass reads row i from src + soff[i]*N instead (out of place: base gets the result), the
+//   sum mod p of snum (>= 1) such rows sstride words apart;
+//   epi != 0 (forward only): the last pass stores f(v) instead of the transform v of row i, at word r = roff[i]*N + e
+//   of eout, with x = the sum mod p of ex[r + j xstride] (j < xnum, >= 1), s = es[prime id] (Shoup companion ess):
+//     1: eout[r] = (x - v) s            (ModDown's last step: (x - conv) P^-1)
+//     2: eout[r] = d[r] + (x - v) s     (the same, accumulated: d = ed, or eout when ed is null; ABI 12)
+//     3: eout[r] = x s + v              (the rescale's combine: alpha x + the correction)
+//   lazy: 1 when every prime of the launch is below 2^30: lazy butterflies at u32 (same canonical result).
 struct NttArgs {
     void* base;
     const uint32_t* roff;
@@ -80,8 +89,19 @@ struct NttArgs {
     const void* ninvs;
     const PrimeConst* pr;
     int32_t nrows, chunk;
+    const void* src;
+    const uint32_t* soff;
+    void* eout;
+    const void* ex;
+    const void* es;
+    const void* ess;
+    int32_t epi, snum;
+    uint64_t sstride;
+    int32_t xnum, lazy;
+    uint64_t xstride;
+    const void* ed;
 };
-static_assert(sizeof(NttArgs) == 88, "NttArgs layout");
+static_assert(sizeof(NttArgs) == 176, "NttArgs layout");
 
 // ------------------------------------------------------------------------------------------------ BConv
 // Batched fast base conversion (coefficient domain), one launch for many jobs (digits x ciphertexts):
@@ -177,8 +197,12 @@ struct EpiArgs {
     const void* k;  // per-row constant (nullptr: none)
     uint64_t part_stride;
     int32_t dbl, pad;
+    // ABI 11: dst's old value scaled by alpha[row] first (Shoup companion alphas; nullptr: 1): with binv = (B q)^-1 and
+    // alpha = q^-1 the epilogue is ModDown fused with the rescale by q (dst holds c, the conversion is from B and q)
+    const void* alpha;
+    const void* alphas;
 };
-static_assert(sizeof(EpiArgs) == 56, "EpiArgs layout");
+static_assert(sizeof(EpiArgs) == 72, "EpiArgs layout");
 
 // A set of switching keys read straight from their stored form (KeyTab, ABI 4; see the seeded keys section).
 struct KeyTab {
@@ -205,7 +229,7 @@ struct KsRegenArgs {
     KeyTab key;
     const void* add;
 };
-static_assert(sizeof(KsRegenArgs) == 296, "KsRegenArgs layout");
+static_assert(sizeof(KsRegenArgs) == 312, "KsRegenArgs layout");
 
 // Expander, ChaCha12 counter mode, state words 12..15 = (block counter, w13, w14, tag); FROZEN at u32 and u64.
 // u32 (FIDESlib KSKA lane): w13 = d, w14 = p, tag "KSKA"; slot s -> block s/16 word s%16; a value v is accepted when
@@ -221,8 +245,10 @@ struct KskExpandArgs {
     const int32_t* prime_ids;
     const PrimeConst* pr;
     int32_t nmod, dnum;
+    // ABI 11: digits d0..dnum only, digit d at out + (d - d0) * nmod * N
+    int32_t d0, pad;
 };
-static_assert(sizeof(KskExpandArgs) == 40, "KskExpandArgs layout");
+static_assert(sizeof(KskExpandArgs) == 48, "KskExpandArgs layout");
 
 // Fused CtS stage core: hoisted baby rotations + BSGS plaintext dot in the extended basis, gather form, K cts (groups
 // of kmax in {1, 2, 4, 8}), G <= 2 giant steps. See cts.cuh for the formula.
@@ -253,15 +279,16 @@ static_assert(sizeof(CtsArgs) == 192, "CtsArgs layout");
 // ------------------------------------------------------------------------------------------------ EvalMod kernels
 // Q rows [0, n) of K ciphertexts (row index == prime id), PolyRef layout.
 // tensor: (c0, c1, d2) (= | +=) sum_{j < npairs} (a0 b0, a0 b1 + a1 b0, a1 b1); d2 written to part 1 of `d2`, and to
-// coef (when non-null) at coef + c*coef_ct_stride + row*N.
+// coef (when non-null) at coef + c*coef_ct_stride + row*N. ABI 13: dbl doubles all three (c0, c1 after the +=).
 struct TensorArgs {
     PolyRef out, d2, a0, b0, a1, b1;
     void* coef;
     uint64_t coef_ct_stride;
     const PrimeConst* pr;
     int32_t npairs, acc, n, K;
+    int32_t dbl, pad;
 };
-static_assert(sizeof(TensorArgs) == 184, "TensorArgs layout");
+static_assert(sizeof(TensorArgs) == 192, "TensorArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
 struct MdEpiArgs {
@@ -318,6 +345,15 @@ struct MulTableArgs {
 };
 static_assert(sizeof(MulTableArgs) == 72, "MulTableArgs layout");
 
+// mul_add (ABI 11): out = y + m (sub = 0), y - m (1), m - y (2), m = in * t as mul_table (rows [0, n), both parts):
+// a plaintext product and the add / sub that consumes it in one pass. out may alias y or in.
+struct MulAddArgs {
+    MulTableArgs m;
+    PolyRef y;
+    int32_t sub, pad;
+};
+static_assert(sizeof(MulAddArgs) == 104, "MulAddArgs layout");
+
 // ------------------------------------------------------------------------------------------------ rescale
 // Composite one-pass rescale by the top ndrop (1 or 2) primes:
 //   host: INTT the dropped tops of x; rescale_coef -> tmp (coefficient form); NTT the nrows rows of tmp;
@@ -341,6 +377,17 @@ struct RescaleArgs {
     int32_t top, nrows, K, ndrop;
 };
 static_assert(sizeof(RescaleArgs) == 152, "RescaleArgs layout");
+
+// rescale_fwd (ABI 14, ndrop 2): rescale_coef and the forward NTT of its rows in one pipeline, the correction never
+// stored: rescale_prep writes the two sources of every coefficient into tmp rows top (y_a, scaled by ca) and top - 1
+// (y'); the NTT's column pass generates tmp_i = A_i lift(y_a) + B_i lift(y') in registers. `ntt` is the forward NTT
+// of the tmp rows (rprime = the row's prime id; the sources sit top - i and top - 1 - i rows above row i of the same
+// polynomial), its epilogue included (MUL_ADD: the combine).
+struct RescaleNttArgs {
+    RescaleArgs rs;
+    NttArgs ntt;
+};
+static_assert(sizeof(RescaleNttArgs) == 328, "RescaleNttArgs layout");
 
 struct RescaleCombineArgs {
     PolyRef x, tmp;
@@ -813,9 +860,11 @@ struct KernelTable {
     int (*md_epilogue_to)(const MdEpiToArgs*, cudaStream_t);
     int (*small_int1)(const SmallInt1Args*, cudaStream_t);
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
+    int (*mul_add)(const MulAddArgs*, cudaStream_t);
+    int (*rescale_fwd)(const RescaleNttArgs*, cudaStream_t);
     int (*tfhe)(const TfheArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 39 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 41 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Callable
 
-from .ir import FIELD_REAL, Graph, Node, is_literal_input, is_plaintext_name
+from .. import btserr
+from .ir import FIELD_COMPLEX, FIELD_REAL, Graph, Node, is_literal_input, is_plaintext_name
 from .refresh import RefreshPlanner
 from .sim import SimResult
 
@@ -136,6 +138,40 @@ def mask_levels(g: Graph, sim: SimResult, bootstrap_level: int,
     return {k: sorted(v) for k, v in sites.items()}
 
 
+# ops that carry a complex pack from their one ciphertext input to their output, both parts alike
+_PACK_LINEAR = frozenset({"rotate", "rotate_sum", "mult", "mult_inplace", "mult_scalar", "rescale", "level_reduce"})
+
+
+def split_packs(g: Graph) -> dict[str, float]:
+    """The vars holding a complex pack whose imaginary part a conjugation splits off downstream (conj(z) - z) and is
+    small next to the pack: the split value and its one-input ancestors back to the op that made the pack complex,
+    each with that ratio (the split's captured imaginary max over the pack's max). Small means below the band's own
+    range (BAND_LO_FRAC / BAND_HI_FRAC): with the pack at the top of a band, that payload sits under its bottom."""
+    prod = g.producer_of
+    out: dict[str, float] = {}
+    for n in g.nodes:
+        if n.op not in ("sub_ct", "sub") or len(n.cipher_inputs) != 2 or n.max_abs is None:
+            continue
+        a, b = n.cipher_inputs
+        pa, pb = prod.get(a), prod.get(b)
+        z = (b if pa is not None and pa.op == "conjugate" and pa.cipher_inputs == (b,) else
+             a if pb is not None and pb.op == "conjugate" and pb.cipher_inputs == (a,) else None)
+        pz = prod.get(z) if z is not None else None
+        if pz is None or not pz.max_abs:
+            continue
+        ratio = 0.5 * n.max_abs / pz.max_abs            # conj(z) - z = -2i Im z
+        if ratio >= btserr.BAND_LO_FRAC / btserr.BAND_HI_FRAC:
+            continue
+        while z is not None and z not in out:
+            p = prod.get(z)
+            if p is None or p.pack_field != FIELD_COMPLEX:
+                break
+            out[z] = ratio
+            ins = p.cipher_inputs
+            z = ins[0] if len(ins) == 1 and p.op in _PACK_LINEAR else None
+    return out
+
+
 def _placement_order(var: str) -> tuple:
     m = _VAR_INDEX_RE.match(var)
     return (0, int(m.group(1))) if m else (1, var)
@@ -160,6 +196,8 @@ def assemble(
     boundary_realize: bool = False,
     realize_anchors: set | None = None,
     real_route: bool = False,
+    fallback_cf: bool = False,
+    pack_cf: bool = False,
 ) -> dict:
     unit = g.level_unit
 
@@ -227,15 +265,33 @@ def assemble(
     cf_hist: dict[int, int] = {}
     n_missed = 0
     out_level_hist: dict[int, int] = {}
-    # plan.stc_first_reroute: a dense site whose input passed the StC-first entry runs the shipped order: its CF is
-    # that order's choice and the compile routes it there (`shipped_order`)
-    _fb = refresh.shadow.dense_fallback() if refresh.shadow.stc_first_reroute else None
+    # a dense site whose input passed the StC-first entry runs the shipped order: with plan.stc_first_reroute its CF is
+    # that order's choice (priced on the coefficients, not on the slots the StC-first order meets) and the compile
+    # routes it to the plain dense route (`shipped_order`); with `fallback_cf` the CF only, the StC-first route running
+    # that order itself below its entry (btsBegin)
+    _fb = refresh.shadow.dense_fallback() if refresh.shadow.stc_first_reroute or fallback_cf else None
+    # `pack_cf`: a refresh of a complex pack whose small imaginary part is split off downstream (`split_packs`) adds the
+    # same absolute noise to both parts, so that payload's error is the noise floor: the lowest CF whose band holds
+    # kappa x the site's coefficient max, not the choice sized on the pack. Only where the route's EvalMod sees the
+    # coefficients (a sparse route, or a dense refresh in the shipped order): the StC-first order's sees the slots
+    packs = split_packs(g) if pack_cf else {}
+    kappa = max(refresh.policy.mag_safety, 1.0)
+    _dfb = refresh.shadow.dense_fallback() if packs else None
     for v in quality_sites:
         s = refresh.spec(v)
         if (_fb is not None and not s.route and not s.shipped
                 and bootstrap_level + sim.input_eff(g, v, unit) > _fb[0] + 1e-9 and refresh.spec_shipped(v).shipped):
             s = refresh.spec_shipped(v)
+            if not refresh.shadow.stc_first_reroute:
+                s = dataclasses.replace(s, shipped=False)
         cf = _site_cf(v, s.cf)
+        p = g.producer_of.get(v)
+        coeffs = (bool(s.route) or s.shipped or _dfb is None
+                  or bootstrap_level + sim.input_eff(g, v, unit) > _dfb[0] + 1e-9)
+        if (cf is not None and v in packs and coeffs and p is not None and p.max_coeff and s.offset is None
+                and s.prescale is None):
+            cf = min(int(cf), next((c for c in range(refresh.policy.cf_min, int(cf))
+                                    if btserr.band(c)[1] >= kappa * p.max_coeff), int(cf)))
         if cf is not None:
             cf_map[v] = int(cf)
             cf_hist[int(cf)] = cf_hist.get(int(cf), 0) + 1

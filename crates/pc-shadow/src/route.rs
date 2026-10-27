@@ -108,7 +108,8 @@ pub struct BtsConfig {
     pub dense_shipped: Option<Landing>,
     /// Correction-factor window (min = the chain's deg floor FIRST_MOD_BITS - BTP_SCALE_BITS, max = PLAN_CF_MAX).
     pub cf_window: (u32, u32),
-    /// Raise drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS).
+    /// Raise drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS); a SPRU route (`Route::spru_h`) takes
+    /// any drop.
     #[serde(default)]
     pub raise_drops: Vec<u32>,
     /// Ciphertexts per batched bootstrap launch.
@@ -173,7 +174,8 @@ impl BtsConfig {
                 });
             }
         }
-        if route.raise_drop > 0 && !self.raise_drops.contains(&route.raise_drop) {
+        // SPRU has no plaintext set per drop: the runtime builds a variant for every drop a program uses
+        if route.raise_drop > 0 && route.spru_h == 0 && !self.raise_drops.contains(&route.raise_drop) {
             return Err(Error::Bts {
                 knob: "raise_drops",
                 msg: format!("raise drop {} has no variant (built: {:?})", route.raise_drop, self.raise_drops),

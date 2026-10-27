@@ -5,7 +5,7 @@
 //! StC + Accumulate + rotate-add -> x 2^correction. Plaintexts are encoded at setup straight at the level they are
 //! used (one rounding; FIDESlib re-levels from the top, two), so device words differ from FIDESlib's by that
 //! rounding. Details: docs/ARCHITECTURE.md "pc-gpu SparseB".
-use super::cts::{LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource, LT_REGEN_DIGITS};
 use super::evalmod::{em_work, EmMode, EvalModPlan};
 use super::raise::RaisePlan;
 use super::{BtsKeyRing, BtsWorkShape};
@@ -36,11 +36,28 @@ pub struct SparseBCfg {
     pub b_step: u32,
     pub k_max: usize,
     pub ks_source: KskSource,
+    /// As `BtsSetup::lt_tails` / `em_fuse_rescale`.
+    pub lt_tails: bool,
+    pub em_fuse_rescale: bool,
+    /// K of the EvalMod series: 24 (FIDESlib's degree-20 table) or 16 (the dense route's degree-14 table); the overflow
+    /// integer after the fold has the dense route's distribution.
+    pub evalmod_k: f64,
 }
 
 impl SparseBCfg {
     pub fn n32(slots: u32, raise_drop: u32) -> Self {
-        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen }
+        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K }
+    }
+
+    /// The EvalMod series' Paterson-Stockmeyer plan for `evalmod_k`.
+    pub fn em_series(&self) -> Result<PsPlan> {
+        if self.evalmod_k == pc_core::bts_setup::EVALMOD_K {
+            Ok(PsPlan::from_coeffs(pc_core::bts_setup::evalmod_coeffs())?)
+        } else if self.evalmod_k == pc_core::bts_setup::SPARSE_B_K {
+            ps_k24()
+        } else {
+            Err(shape("sparse_b", format!("no EvalMod series for K = {}", self.evalmod_k)))
+        }
     }
 }
 
@@ -143,7 +160,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let geo = Self::lt_geom(&g);
         let parts = Self::bytes_parts(chain, st, &lay, cfg)?;
         let b: usize = parts.iter().map(|p| p.1).sum();
-        let (_, _, nslots) = EvalModPlan::<W>::program(st, tops.1, &ps_k24()?, SPARSE_B_DA_ITS)?;
+        let (_, _, nslots) = EvalModPlan::<W>::program(st, tops.1, &cfg.em_series()?, SPARSE_B_DA_ITS)?;
         let (em_n, em_kk) = em_work(nslots, cfg.k_max, EmMode::Real);
         Ok((b, BtsWorkShape { k_max: cfg.k_max, g_max: geo.g, em_slots: em_n, em_kk, spare: 1 }))
     }
@@ -160,10 +177,11 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let lt = |top: usize| -> Result<usize> {
             Ok(LtPts::<W>::coeffs_bytes(geo.npts, top + 1 + lay.kp, n, n) + LtStage::<W>::plan_bytes(&lay, &primes, &geo, top, LtEnd::ModDown, cfg.k_max)?)
         };
+        let tails = if cfg.lt_tails { tail_steps(chain, &[(geo, tops.0)], LT_REGEN_DIGITS).len() } else { 0 };
         Ok(vec![
             ("raise", RaisePlan::<W>::table_bytes()),
             ("fold", AccRounds::bytes(&rr[0])),
-            ("cts", lt(tops.0)?),
+            ("cts", lt(tops.0)? + KeyTails::<W>::bytes(&lay, chain.dnum(), LT_REGEN_DIGITS, tails)),
             ("cts_acc", AccRounds::bytes(&rr[1])),
             ("em", Self::em_bytes(st, &lay, tops.1, cfg)?),
             ("stc", lt(tops.2)?),
@@ -173,7 +191,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
 
     /// The EvalMod plan's tables as `EvalModPlan::new` carves them.
     fn em_bytes(st: &ScaleTables, lay: &Layout, input: FMeta, cfg: &SparseBCfg) -> Result<usize> {
-        EvalModPlan::<W>::table_bytes(st, lay, input, &ps_k24()?, SPARSE_B_DA_ITS, cfg.k_max)
+        EvalModPlan::<W>::table_bytes(st, lay, input, &cfg.em_series()?, SPARSE_B_DA_ITS, cfg.k_max)
     }
 
     fn lt_geom(g: &SparseBGeom) -> LtGeom {
@@ -187,7 +205,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let raised_nf = st.sf(top as i32)? * (cfg.cts0_t as f64).exp2();
         let pt_nf = st.sf(top as i32)? * (-(cfg.cts0_t as f64)).exp2();
         let em_in = FMeta { top: top as i32, nl: 2, nf: raised_nf * pt_nf };
-        let (_, out, _) = EvalModPlan::<W>::program(st, em_in, &ps_k24()?, SPARSE_B_DA_ITS)?;
+        let (_, out, _) = EvalModPlan::<W>::program(st, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS)?;
         let stc_top = if out.nl == 2 { out.top as usize - d } else { out.top as usize };
         Ok((top, em_in, stc_top))
     }
@@ -223,23 +241,29 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let [r_fold, r_cts, r_stc, r_half] = rr;
         let fold = AccRounds::new(arena, s, n, keys, stage, r_fold)?;
         mark("fold", &mut parts);
-        // diagonals: gc = K_raise / 24 * 2^-t (the shifted raise carries 2^t), gd = q0 / sf(L)
+        // diagonals: gc = K_raise / K * 2^-t (the shifted raise carries 2^t), gd = q0 / sf(L) * fdrop: a raise to a
+        // lower top carries sf(L) / sf(raise top) (as the dense routes' last StC stage; 1 at drops 0 and 1, a 4-8 %
+        // output gain error at drops 2-5 without it)
         let shift_t = (-(cfg.cts0_t as f64)).exp2();
-        let gc = cfg.raise_k / pc_core::bts_setup::SPARSE_B_K * shift_t;
+        let gc = cfg.raise_k / cfg.evalmod_k * shift_t;
         let mut q0 = ctx.chain.q[0] as f64;
         for j in 1..d {
             q0 *= ctx.chain.q[j] as f64;
         }
-        let gd = q0 / st.sf((lay.nq - 1) as i32)?;
+        let fdrop = st.sf((lay.nq - 1) as i32)? / st.sf(top as i32)?;
+        let gd = q0 / st.sf((lay.nq - 1) as i32)? * fdrop;
         let (p, q) = sparse_b_diagonals(n as u32, cfg.slots, &g, gc, gd);
         let geo = Self::lt_geom(&g);
         let sf_c = st.sf(top as i32)?;
         let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Slots { values: &p, scale: sf_c })?;
-        let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, keys, stage, cfg.k_max)?;
+        let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS) } else { Vec::new() };
+        let tails = KeyTails::new(arena, s, ctx, keys, &steps, LT_REGEN_DIGITS)?;
+        let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring(keys, n)?, stage, cfg.k_max)?;
         mark("cts", &mut parts);
         let cts_acc = AccRounds::new(arena, s, n, keys, stage, r_cts)?;
         mark("cts_acc", &mut parts);
-        let em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &ps_k24()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
+        let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
+        em.fuse_rescale = cfg.em_fuse_rescale;
         mark("em", &mut parts);
         let sf_s = st.sf(stc_top as i32)?;
         let stc_pts = LtPts::new(arena, s, ctx, stc_top, PtSource::Slots { values: &q, scale: sf_s })?;

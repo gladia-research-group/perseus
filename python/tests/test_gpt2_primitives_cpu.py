@@ -474,12 +474,14 @@ def _logit_tiles(rng, d, vocab, boost=123):
     return logits, tiles
 
 
-def test_cutmax_packed_matches_real_path():
+@pytest.mark.parametrize("cfgs", ["gpt2_base_n32", "gpt2_base_n32_cm"])
+def test_cutmax_packed_matches_real_path(cfgs):
     """The packed two-tile CutMax (cutmax.cu) equals the real path on the same
-    logits, at the production geometry (the schedule needs vocab 50257 = 2 tiles of 32768)."""
+    logits, at the production geometry (the schedule needs vocab 50257 = 2 tiles of 32768); the record's
+    cascade and the scaled normalisers (gpt2_base_n32_cm) alike."""
     rt, fhe, inf = _rt(N=32768, hid=1024, dim=768, H=16, H_real=12, E=4096, E_real=3072,
                        complex_payload=True)
-    cfg = _cfgs().cutmax
+    cfg = config.load_configs(str(PKG / f"configs/model/approximation/{cfgs}/configs.json")).cutmax
     d = rt.dims
     logits, tiles = _logit_tiles(np.random.default_rng(7), d, 50257)
     pair = head.pack_tiles(rt, tiles)
@@ -493,6 +495,53 @@ def test_cutmax_packed_matches_real_path():
     n_real = fhe.n_bootstraps - n0 - n_packed
     np.testing.assert_allclose(head.decode_z(rt, z_real, 50257, d.N), zdec, rtol=1e-6, atol=1e-9)
     assert n_packed < n_real                            # one refresh for both tiles
+    assert int(np.argmax(zdec)) == 123 and zdec[123] > 0.99
+
+
+# the band ratios (top / bottom) gpt2_base_n32_cm's normalisers were fitted on: five iterations, then the sum
+CUTMAX_BANDS = (93.7, 3.13e4, 4.66e4, 4.64e4, 1.93e4, 7.11e3)
+
+
+@pytest.mark.parametrize("cfgs", ["gpt2_base_n32_cm", "gpt2_base_n32_pf_cm"])
+def test_cutmax_scaled_steps_on_their_bands(cfgs):
+    """The served scaled normalisers: on its band each gives 1 / sqrt(t) to within [1, 1 + tol] of the exact value,
+    never below, and past the band top it stays positive up to three times the top (the first step's zero)."""
+    import json
+    raw = json.load(open(PKG / f"configs/model/approximation/{cfgs}/configs.json"))["cutmax"]
+    sets = [(s, r, 5e-3) for s, r in zip(raw["newton"], CUTMAX_BANDS)] + [(raw["sum_newton"], CUTMAX_BANDS[-1], 1e-5)]
+    for steps, ratio, tol in sets:
+        t = np.geomspace(1.0 / ratio, 1.0, 4001)
+        r = poly.inv_sqrt_newton_scaled(poly.NumpyOps(), t, steps) * np.sqrt(t)
+        assert r.min() >= 1.0 - 1e-7 and r.max() <= 1.0 + 1.01 * tol
+        assert (poly.inv_sqrt_newton_scaled(poly.NumpyOps(), np.linspace(1.0, 2.99, 400), steps) > 0).all()
+
+
+def test_fit_scaled_round_trips_through_the_config():
+    """calibrate.approximations.cutmax.fit_scaled on a few logit rows: a cutmax section parse_cutmax takes, with the
+    base's outer schedule, whose CutMax picks each row's top logit."""
+    import json
+    from perseus.calibrate.approximations.cutmax import fit_scaled
+    rng = np.random.default_rng(3)
+    rows = rng.standard_normal((8, 50257)) * 3.0
+    top = rng.integers(0, 50257, 8)
+    rows[np.arange(8), top] = rows.max(axis=1) + 5.0
+    base = json.load(open(CFG))["cutmax"]
+    cfg = config.parse_cutmax(json.loads(json.dumps(fit_scaled([rows], base))))
+    assert [it.p for it in cfg.iters] == base["p"] and all(it.newton for it in cfg.iters) and cfg.sum_newton
+    for row, k in zip(rows, top):
+        z = ref.cutmax_ref(row, cfg)
+        assert int(np.argmax(z)) == k and z[k] > 0.99
+
+
+@pytest.mark.parametrize("ratio", [10.0, 1e3, 5e4])
+def test_scaled_newton_steps_from_below(ratio):
+    """poly.scaled_newton_steps: 1 / sqrt(x) from below to the tolerance on [1 / ratio, 1], the first step's zero at
+    three times the band top (past the band the result stays positive, never sign-flipped)."""
+    steps = poly.scaled_newton_steps(ratio, 5e-3)
+    x = np.geomspace(1.0 / ratio, 1.0, 4001)
+    r = poly.inv_sqrt_newton_scaled(poly.NumpyOps(), x, steps) * np.sqrt(x)
+    assert r.max() <= 1.0 + 1e-12 and r.min() >= 1.0 - 5e-3
+    assert steps[0][0] / steps[0][1] == pytest.approx(3.0)
 
 
 def test_feedback_packed_matches_real_tiles():

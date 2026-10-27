@@ -18,8 +18,10 @@ import logging
 import os
 import shutil
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from perseus.plan.placer.ir import Graph
 from perseus.plan.placer.place import PlanInfeasible, erase_reactive_bootstraps
@@ -366,6 +368,91 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class MagSafetySteps(unittest.TestCase):
+    """PLAN_MAG_SAFETY_STEPS sizes the sites of the steps it names with their own drift margin: a matching step's
+    placed site moves to a higher CF (its band holds the larger value), a name that matches no step and an unset
+    variable leave the plan as it was, and a value below PLAN_MAG_SAFETY never lowers the margin."""
+    _write = PlanBlockTest._write
+    CFG = PlanBlockTest.CFG
+
+    def _plan(self, steps):
+        old = os.environ.pop("PLAN_MAG_SAFETY_STEPS", None)
+        try:
+            if steps is not None:
+                os.environ["PLAN_MAG_SAFETY_STEPS"] = steps
+            return plan_block(self._write(_chain_graph(12, mag=1.0)), self.CFG)
+        finally:
+            os.environ.pop("PLAN_MAG_SAFETY_STEPS", None)
+            if old is not None:
+                os.environ["PLAN_MAG_SAFETY_STEPS"] = old
+
+    def test_a_named_step_takes_its_own_margin(self):
+        from perseus.plan.placer.refresh import mag_safety_of
+        base = self._plan(None)
+        cf = base["correction_factor"]
+        self.assertTrue(cf)
+        for steps in ("nothing:16", "chain.m:1", ""):
+            self.assertEqual(json.dumps(self._plan(steps), sort_keys=True), json.dumps(base, sort_keys=True), steps)
+        hot = self._plan("chain.m:16")
+        self.assertEqual(sorted(hot["correction_factor"]), sorted(cf))
+        for v, c in cf.items():
+            self.assertEqual(hot["correction_factor"][v], c + 3, v)       # x8 the margin: three CFs up
+        old = os.environ.pop("PLAN_MAG_SAFETY_STEPS", None)
+        try:
+            os.environ["PLAN_MAG_SAFETY_STEPS"] = "blk11.attn:8,tail:6"
+            self.assertEqual(mag_safety_of("blk11.attn", 2.0), 8.0)
+            self.assertEqual(mag_safety_of("blk11.attn.softmax", 2.0), 8.0)
+            self.assertEqual(mag_safety_of("blk1.attn", 2.0), 2.0)
+            self.assertEqual(mag_safety_of("tail", 2.0), 6.0)
+            self.assertEqual(mag_safety_of(None, 2.0), 2.0)
+            os.environ["PLAN_MAG_SAFETY_STEPS"] = "tail:1"
+            self.assertEqual(mag_safety_of("tail", 2.0), 2.0)
+        finally:
+            os.environ.pop("PLAN_MAG_SAFETY_STEPS", None)
+            if old is not None:
+                os.environ["PLAN_MAG_SAFETY_STEPS"] = old
+
+
+class PlanResume(unittest.TestCase):
+    """PLAN_RESUME=1 restarts a block chain at the first block without a complete plan file: a block whose file is
+    there is not planned again, a file a preemption cut short is, and every file ends byte for byte the uninterrupted
+    run's (no temporary file left behind)."""
+
+    def test_resume_reproduces_the_chain(self):
+        import perseus.plan.placer.planner as planner_mod
+        root = Path(tempfile.mkdtemp(prefix="perseus_resume_"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        g = root / "graphs"
+        for b in range(3):
+            (g / f"block_{b}").mkdir(parents=True)
+            (g / f"block_{b}" / "graph.json").write_text(json.dumps({"version": 1, "nodes": _chain_graph(12)}))
+        full, part = root / "full", root / "part"
+        planner_mod.plan_graph_dir(g, full, PlanBlockTest.CFG)
+        part.mkdir()
+        shutil.copy(full / "block_0_placement.json", part)
+        (part / "block_1_placement.json").write_text('{"summ')
+        calls, orig = [], planner_mod.plan_block
+
+        def spy(gf, *a, **k):
+            calls.append(Path(gf).parent.name)
+            return orig(gf, *a, **k)
+        old = os.environ.pop("PLAN_RESUME", None)
+        os.environ["PLAN_RESUME"] = "1"
+        planner_mod.plan_block = spy
+        try:
+            planner_mod.plan_graph_dir(g, part, PlanBlockTest.CFG)
+        finally:
+            planner_mod.plan_block = orig
+            os.environ.pop("PLAN_RESUME", None)
+            if old is not None:
+                os.environ["PLAN_RESUME"] = old
+        self.assertEqual(calls, ["block_1", "block_2"])
+        for b in range(3):
+            self.assertEqual((part / f"block_{b}_placement.json").read_bytes(),
+                             (full / f"block_{b}_placement.json").read_bytes(), b)
+        self.assertEqual(list(part.glob("*.part")), [])
+
+
 class CutPricingKnobs(unittest.TestCase):
     """depth_weight / level_weight: off by default, and each form moves the cut when on.
 
@@ -424,3 +511,111 @@ class CutPricingKnobs(unittest.TestCase):
             self.skipTest("real-graph fixture not present")
         self.assertLessEqual(dense_share(depth_weight=1.0, depth_form="ms"),
                              dense_share())
+
+
+class KeepPlacements(unittest.TestCase):
+    """PLAN_KEEP_PLACEMENTS_EXACT: a finished plan's decisions (placements, fired hints, realize anchors) kept as they
+    are, so PLAN_RAISE_SEARCH on top is a drops-only post-pass; a block that cannot keep them stops."""
+
+    GRAPH = REAL_GRAPH / "block_0" / "graph.json"
+    CFG = PlanConfig(bootstrap_level=34, max_level=46, source_level=34, cache_read_level=34, level_unit=2,
+                     acc_chain="n32", sparse_precomps=(512, 1), sparse_out_levels=((1, 16), (512, 26)), prune=True,
+                     rescale_opt=True, shared_realize=True, verbose=False)
+    DROPS = types.MappingProxyType({"raise_drop_max": 13, "raise_drop_search": True, "raise_drop_set": (1, 2, 3, 4, 5),
+                                    "raise_drop_routes": (0, 512, 1), "raise_drop_base": ((512, 1),)})
+    KEPT = ("placements", "hint_fire", "rescale_after", "sparse_slots", "correction_factor")
+
+    def setUp(self):
+        if not self.GRAPH.is_file():
+            self.skipTest("real-graph fixture not present")
+        self.plan = plan_block(self.GRAPH, self.CFG)          # the finished plan, no drops
+        self.dir = Path(tempfile.mkdtemp(prefix="perseus_keep_"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _keep(self, doc, **kw):
+        (self.dir / "block_0_placement.json").write_text(json.dumps(doc))
+        return plan_block(self.GRAPH, dataclasses.replace(self.CFG, keep_placements=str(self.dir), **kw))
+
+    def test_drops_only_post_pass(self):
+        out = self._keep(self.plan, keep_placements_exact=True, **self.DROPS)
+        for k in self.KEPT:
+            self.assertEqual(out.get(k), self.plan.get(k), k)
+        self.assertGreater(len(self.plan["rescale_after"]), len(self.plan["placements"]) + len(self.plan["hint_fire"]),
+                           "the fixture plan carries realize anchors")
+        self.assertFalse(self.plan.get("raise_drop"))
+        self.assertTrue(out.get("raise_drop"), "the search assigns drops to the kept refreshes")
+        self.assertLessEqual(set(out["raise_drop"]), {p["target_var"] for p in self.plan["placements"]}
+                             | set(self.plan["hint_fire"]))
+
+    def test_exact_keeps_hints_a_veto_would_turn_off(self):
+        # the kept plan fires the GELU hints; a run that vetoes them (as PLAN_HINT_ENV_VETO does for a hint it
+        # predicts deep) re-places around them under the plain keep, and keeps them under the exact keep
+        veto = {"hint_veto_steps": ("mlp.act.gelu_thor_composite",)}
+        self.assertTrue(any(h in self.plan["hint_fire"] for h in ("v_1467", "v_1622", "v_1758")))
+        plain = self._keep(self.plan, **veto)
+        self.assertNotEqual(plain["hint_fire"], self.plan["hint_fire"])
+        self.assertGreater(plain["summary"]["num_placements"], self.plan["summary"]["num_placements"])
+        out = self._keep(self.plan, keep_placements_exact=True, **veto)
+        for k in self.KEPT:
+            self.assertEqual(out.get(k), self.plan.get(k), k)
+
+    def test_exact_keeps_hints_the_envelope_veto_turns_off(self):
+        # on the 50-level chain two of the fixture plan's fired hints sit past the refresh envelope: under
+        # PLAN_HINT_ENV_VETO=1 (make_plan.sh's default) the plain keep vetoes them and re-places around them (pfbh's
+        # blocks 1, 6, 7, 9), the exact keep returns the plan
+        cfg = dataclasses.replace(self.CFG, bootstrap_level=36, source_level=36, cache_read_level=36, max_level=50,
+                                  cf_max=20, mag_safety=2.0, allow_prescale=False)
+        with mock.patch.dict(os.environ, {"PLAN_HINT_ENV_VETO": "0"}):
+            plan = plan_block(self.GRAPH, cfg)
+        (self.dir / "block_0_placement.json").write_text(json.dumps(plan))
+        with mock.patch.dict(os.environ, {"PLAN_HINT_ENV_VETO": "1"}):
+            plain = plan_block(self.GRAPH, dataclasses.replace(cfg, keep_placements=str(self.dir)))
+            out = plan_block(self.GRAPH, dataclasses.replace(cfg, keep_placements=str(self.dir),
+                                                             keep_placements_exact=True))
+        self.assertNotEqual(plain["hint_fire"], plan["hint_fire"])
+        self.assertGreater(plain["summary"]["num_placements"], plan["summary"]["num_placements"])
+        for k in self.KEPT:
+            self.assertEqual(out.get(k), plan.get(k), k)
+
+    def test_exact_stops_when_the_kept_decisions_do_not_fit(self):
+        # one kept refresh short: the plain keep re-places it, the exact keep refuses
+        doc = dict(self.plan, placements=self.plan["placements"][1:])
+        self.assertEqual(self._keep(doc)["summary"]["num_placements"], self.plan["summary"]["num_placements"])
+        with self.assertRaisesRegex(RuntimeError, "keep_placements_exact: .* placements added"):
+            self._keep(doc, keep_placements_exact=True)
+
+    def test_exact_stops_on_sites_the_graph_lacks(self):
+        doc = dict(self.plan, placements=self.plan["placements"]
+                   + [{"type": "bootstrap_after_node", "node_op": "mult", "target_var": "v_absent"}])
+        with self.assertRaisesRegex(RuntimeError, "not in .*v_absent"):
+            self._keep(doc, keep_placements_exact=True)
+
+
+class SplitPacks(unittest.TestCase):
+    """emit.split_packs (PLAN_PACK_CF): the vars of a complex pack whose small imaginary part a conjugation splits off
+    downstream, back to the op that made the pack complex; a pack whose parts are alike, or no split, is not one."""
+
+    @staticmethod
+    def _graph(im_max):
+        def n(op, ins, out, mx, field):
+            return {**_node(op, ins, out, 20, max_abs=mx, step="blk.softmax", period=512), "pack_field": field}
+        return Graph.from_nodes([
+            n("mult", ["x0", "pt_s"], "v_s", 2.0, 1),           # the real sum
+            n("mult", ["v_s", "pt_pk"], "v_pk", 1.0, 3),        # (0.5 + 0.5i seed) x the sum: the pack
+            n("rotate_sum", ["v_pk", "rot(-1,-2)"], "v_z", 1.0, 3),
+            n("conjugate", ["v_z"], "v_cz", 1.0, 3),
+            n("sub_ct", ["v_cz", "v_z"], "v_im", 2 * im_max, 2),
+            n("add", ["v_z", "v_cz"], "v_re", 2.0, 1),
+            n("mult", ["v_re", "v_re"], "v_c", 1.0, 3),         # complex, never split
+            n("add", ["v_c", "v_im"], "v_out", 1.0, 3),
+        ], level_unit=1)
+
+    def test_small_imaginary_part(self):
+        from perseus.plan.placer.emit import split_packs
+        packs = split_packs(self._graph(1e-3))
+        self.assertEqual(sorted(packs), ["v_pk", "v_z"])
+        self.assertAlmostEqual(packs["v_z"], 1e-3)
+
+    def test_alike_parts_are_not_a_pack(self):
+        from perseus.plan.placer.emit import split_packs
+        self.assertEqual(split_packs(self._graph(0.5)), {})

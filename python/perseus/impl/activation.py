@@ -94,6 +94,13 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         return rt.mult_mask(g, (mask[0], cfg.xmax), lambda: mask[1](0.5 * cfg.xmax))
     if _GELU_TFHE and cfg.method == "chebyshev" and ops.gelu_fold:
         return gelu_tfhe(rt, x, cfg, lanes)
+    if mask is not None and ops.gelu_fold and cfg.method == "chebyshev":
+        m = np.asarray(mask[1](1.0))
+        if _ACT_FOLD and np.all(m == m.flat[0]):          # constant mask: xmax and the mask ride the coefficients
+            s = cfg.xmax * float(np.real(m.flat[0]))
+            return eval_chebyshev(ops, x, [s * float(c) for c in cfg.cheb_coeffs], cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+        g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+        return rt.mult_mask(g, (mask[0], "cheb", cfg.xmax), lambda: mask[1](cfg.xmax))
     if cfg.method == "chebyshev":
         if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries 1/xmax): GELU(x) = xmax q(x / xmax),
             # q the Chebyshev series on [cheb_a, cheb_b]; xmax rides the lane mask, the refreshes are the plan's

@@ -135,6 +135,12 @@ pub struct BtsSetup {
     /// With `lt_baby` Regen: digits whose `a` is regenerated (the rest read the resident `a` when the keys have it;
     /// usize::MAX = all).
     pub lt_regen_digits: usize,
+    /// Resident `a` tails from digit `lt_regen_digits` on for the CtS baby keys of packed key sets (`cts::KeyTails`,
+    /// config `bts.lt_tails`); off: those stages regenerate every digit.
+    pub lt_tails: bool,
+    /// EvalMod: a Regen relinearization and the rescale after it as one exact conversion (`EvalModPlan::fuse_rescale`,
+    /// config `bts.em_fuse_rescale`); off: relinearize, then rescale.
+    pub em_fuse_rescale: bool,
 }
 
 impl BtsSetup {
@@ -159,6 +165,8 @@ impl BtsSetup {
             lt_group: 0,
             lt_baby: KskSource::Regen,
             lt_regen_digits: cts::LT_REGEN_DIGITS,
+            lt_tails: true,
+            em_fuse_rescale: false,
         }
     }
 
@@ -420,6 +428,12 @@ pub trait BtsRoute<'a, W: DevWord, M: DevStrategy<W>> {
     /// Refresh every batch of `cts` in place (`route.iterations` > 1: the residual iterations of perseus
     /// `eval_bootstrap_iter`).
     fn run(&self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], route: &Route) -> Result<()>;
+    /// Refresh two real payloads `x` on `rx` and `y` on `ry` (k ciphertexts each, one input metadata) as ONE complex
+    /// refresh, in place; each output lands as its own refresh would (`landing`). Only the StC-first route pairs
+    /// (`StcFirstRoute::pair_check`); the others refuse.
+    fn run_pair(&self, _cx: &mut BtsCx<'_, 'a, W, M>, _x: &mut Ct<'a, W>, _y: &mut Ct<'a, W>, _rx: &Route, _ry: &Route) -> Result<()> {
+        Err(shape("bts pair", format!("route {:?} has no paired refresh", self.kind())))
+    }
     fn staged(&self) -> Option<&dyn Staged<'a, W, M>>;
     /// Device bytes this route holds (precomputation tables) and the work shape it needs.
     fn mem(&self) -> (MemReq, BtsWorkShape);

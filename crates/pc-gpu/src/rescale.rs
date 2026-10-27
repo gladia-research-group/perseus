@@ -2,10 +2,10 @@
 //! product, in the NTT domain, with the centered lift of FIDESlib `Ciphertext::rescale`.
 //!
 //! Two implementations, bit-identical to each other and to FIDESlib (`pc-check leaf --ops rescale` runs both):
-//! * `CompositeOnePass` (EvalMod path): INTT the dropped tops, one `rescale_coef` pass computes the
-//!   combined correction for every target row in coefficient form, one NTT of the target rows, one
-//!   `rescale_combine` (`x_i = alpha_i x_i + tmp_i`). Optional scalar fold: a `ScalarAdjust` row vector `c` rides
-//!   the rescale (`ca`, `cb` scale the tops, `alpha_i c_i` the targets); exact, so it equals scale-then-rescale.
+//! * `CompositeOnePass`: INTT the dropped tops, the combined correction of every target row (`rescale_coef`), its
+//!   NTT, `x_i = alpha_i x_i + tmp_i`; at 2 primes one `rescale_fwd` pipeline generates the correction inside the NTT's
+//!   column pass (never stored) and combines in its epilogue. Optional scalar fold: a `ScalarAdjust` row vector `c`
+//!   rides the rescale (`ca`, `cb` scale the tops, `alpha_i c_i` the targets); exact, so it equals scale-then-rescale.
 //! * `Sequential`: OpenFHE order, one prime at a time (`d` passes of the same kernels with `ndrop = 1`).
 //!
 //! Level drops (`drop_to_level`) move no data: rows above the live top are dead in the full-row layout, so a drop
@@ -17,7 +17,7 @@ use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::modmul::{mulmod, shoup};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, Lane, Stream};
-use pc_kernels::{EwArgs, PolyRef, RescaleArgs, RescaleCombineArgs, RescaleCombineToArgs, RowSet};
+use pc_kernels::{EwArgs, PolyRef, RescaleArgs, RescaleCombineArgs, RescaleCombineToArgs, RescaleNttArgs, RowSet};
 use std::ffi::c_void;
 
 /// Which rescale algorithm (a config choice; both produce identical words).
@@ -240,9 +240,9 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
     }
 
     /// Out-of-place `rescale`: `dst` (k cts) = the rescale of `src` (live top limb `top`), `src` untouched (no
-    /// full copy before an operand's Rescale prelude). Only the two dropped tops are copied into `dst` (their
-    /// INTT and `rescale_coef` run there), then `rescale_combine_to` writes `dst = alpha src + tmp`: the same words
-    /// as copy + `rescale`. Composite one-pass on a 2-prime unit only (callers fall back to copy + `rescale`).
+    /// full copy before an operand's Rescale prelude). The two dropped tops' INTT reads them from `src` into `dst`
+    /// (copied there first when `src` lacks the ciphertext layout), then `dst = alpha src + tmp`: the same words as
+    /// copy + `rescale`. Composite one-pass on a 2-prime unit only (callers fall back to copy + `rescale`).
     pub fn rescale_to<M: DevStrategy<W>>(
         &mut self,
         ctx: &Context<'_, W, M>,
@@ -259,6 +259,10 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
             return Err(shape("rescale_to", format!("{} cts at top {top}", dst.k)));
         }
         let k = dst.k;
+        if self.ct_layout(src) {
+            // the tops' INTT reads them from src (out of place), so nothing is copied
+            return self.composite_from(ctx, s, dst, Some(src), top, fold);
+        }
         let n = self.lay.n;
         let off = |r: PolyRef| PolyRef { base: (r.base as *mut W).wrapping_add((top - 1) * n) as *mut c_void, ..r };
         let rs = RowSet { nq: 2, np: 0, qmax: self.lay.nq as i32, pad: 0 };
@@ -268,7 +272,13 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         self.composite_from(ctx, s, dst, Some(src), top, fold)
     }
 
-    /// `src` = Some: x holds only the tops (rows top-1, top); the targets come from `src` (`rescale_combine_to`).
+    /// `src` has the context's ciphertext layout (it shares tmp's and x's row offsets).
+    fn ct_layout(&self, src: PolyRef) -> bool {
+        src.ct_stride == self.lay.ct_words() as u64 && src.part_stride == self.lay.poly_words() as u64
+    }
+
+    /// `src` = Some: x holds only the tops (rows top-1, top; read from src by the INTT when src has the ciphertext
+    /// layout, else copied there); the targets come from `src`.
     fn composite_from<M: DevStrategy<W>>(
         &mut self,
         ctx: &Context<'_, W, M>,
@@ -282,7 +292,14 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         let np = self.lay.rows();
         let ct = self.comp.as_ref().ok_or_else(|| shape("rescale", "no composite tables (level unit != 2)"))?;
         let h = self.host[top].as_ref().ok_or_else(|| shape("rescale", format!("no composite drop from top {top}")))?;
-        ntt::transform_rows(ctx, s, Dir::Inverse, &mut x.buf, &self.intt2[top][k - 1])?;
+        let tops = &self.intt2[top][k - 1];
+        match src {
+            Some(src) if self.ct_layout(src) => {
+                let from = ntt::Src { base: src.base, soff: tops.roff.dptr(), n: 1, stride: 0 };
+                ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, &mut x.buf, tops, tops.len(), Some(from), None)?
+            }
+            _ => ntt::transform_rows(ctx, s, Dir::Inverse, &mut x.buf, tops)?,
+        }
         let (a, a_s) = ct.a.at(top)?;
         let (b, b_s) = ct.b.at(top)?;
         let (ca, cb, al, als) = match fold {
@@ -317,19 +334,31 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
             k: k as i32,
             ndrop: 2,
         };
-        // SAFETY: x (k cts) and tmp (k_max >= k cts) are distinct context-layout buffers, exclusively borrowed; the
-        // tables are context constants of this chain
-        launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&args, s.raw()) })?;
+        let new_top = top - 2;
         match src {
-            None => self.ntt_tmp_and_combine(ctx, s, x, top - 2, al, als),
-            Some(src) => {
-                let new_top = top - 2;
+            Some(src) if !self.ct_layout(src) => {
+                // SAFETY: x (k cts) and tmp (k_max >= k cts) are distinct context-layout buffers, exclusively borrowed;
+                // the tables are context constants of this chain
+                launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&args, s.raw()) })?;
                 ntt::transform_rows(ctx, s, Dir::Forward, &mut self.tmp.buf, &self.fwd_tmp[new_top][k - 1])?;
                 let a = RescaleCombineArgs { x: src, tmp: self.tmp.r(), alpha: al, alphas: als, pr: ctx.pr(), n: (new_top + 1) as i32, k: k as i32 };
                 let args = RescaleCombineToArgs { a, out: x.w() };
                 // SAFETY: rows 0..=new_top of k cts in src, tmp and x (x distinct from src: the caller's out-of-place
                 // destination); alpha as in `ntt_tmp_and_combine`
                 launch_result("rescale_combine_to", unsafe { (ctx.table.rescale_combine_to)(&args, s.raw()) })?;
+                Ok(())
+            }
+            _ => {
+                // x = alpha x (or alpha src, at tmp's row offsets) + NTT(tmp): the correction generated inside the
+                // transform, the combine in its epilogue
+                let from = src.map(|r| r.base as *const c_void).unwrap_or(x.buf.vptr());
+                let epi = ntt::Epi::MulAdd { out: x.buf.vptr_mut(), x: from, s: al, ss: als };
+                let list = &self.fwd_tmp[new_top][k - 1];
+                let ntt = ntt::forward_args(ctx, &mut self.tmp.buf, list, list.len(), Some(epi))?;
+                // SAFETY: x (k cts, its tops in coefficient form) and tmp (k_max >= k cts) are distinct context-layout
+                // buffers, exclusively borrowed; the prep writes tmp rows top-1, top, the transform rows 0..=new_top of
+                // k cts, the epilogue x rows 0..=new_top (from x itself or from src, read at the same offsets)
+                launch_result("rescale_fwd", unsafe { (ctx.table.rescale_fwd)(&RescaleNttArgs { rs: args, ntt }, s.raw()) })?;
                 Ok(())
             }
         }
@@ -375,11 +404,10 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         als: *const c_void,
     ) -> Result<()> {
         let k = x.k;
-        ntt::transform_rows(ctx, s, Dir::Forward, &mut self.tmp.buf, &self.fwd_tmp[new_top][k - 1])?;
-        let args = RescaleCombineArgs { x: x.w(), tmp: self.tmp.r(), alpha: al, alphas: als, pr: ctx.pr(), n: (new_top + 1) as i32, k: k as i32 };
-        // SAFETY: rows 0..=new_top of k cts in both buffers; alpha is a context table or a constant-ring slot written
-        // earlier on this stream
-        launch_result("rescale_combine", unsafe { (ctx.table.rescale_combine)(&args, s.raw()) })?;
-        Ok(())
+        // x = alpha x + NTT(tmp): the combine rides the transform's epilogue (x shares tmp's row offsets); alpha is a
+        // context table or a constant-ring slot written earlier on this stream
+        let epi = ntt::Epi::MulAdd { out: x.buf.vptr_mut(), x: x.buf.vptr(), s: al, ss: als };
+        let list = &self.fwd_tmp[new_top][k - 1];
+        ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut self.tmp.buf, list, list.len(), None, Some(epi))
     }
 }
