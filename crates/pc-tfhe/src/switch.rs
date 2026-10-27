@@ -324,8 +324,14 @@ impl Switcher {
         self.repack.repack(&slots, self.params.n_br, &self.ntt_p)
     }
 
-    /// The bootstrap's output scale for LUT values v: v q_br / 2^out_cf (it lands as v p0 / 2^out_cf).
+    /// The bootstrap's output phase for the LUT value 1 (`pbs::warp`: the finish reads it as 2^-out_cf); `sign01`'s delta.
     pub fn delta_br(&self) -> u64 {
-        self.params.q_br >> self.params.out_cf
+        self.lut_value(1.0)
+    }
+
+    /// The test-vector entry (mod q_br) of the LUT value v: q_br warp(v).
+    pub fn lut_value(&self, v: f64) -> u64 {
+        let x = (self.params.q_br as f64 * crate::pbs::warp(v, self.params.out_cf)).round() as i64;
+        x.rem_euclid(self.params.q_br as i64) as u64
     }
 }

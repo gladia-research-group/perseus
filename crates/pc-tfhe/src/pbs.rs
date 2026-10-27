@@ -1,5 +1,5 @@
 //! Programmable bootstrapping: GGSW bootstrapping keys over the GLWE (k = 1) of degree n_br at Q = q_a q_b (two
-//! ~25-bit NTT primes in RNS: the device's u32 butterflies), the external product, CMux blind rotation, sample
+//! ~26-bit NTT primes in RNS: the device's u32 butterflies), the external product, CMux blind rotation, sample
 //! extraction. Values crossing the interface (test vector, output LWE) are mod Q; inside, every polynomial is a pair
 //! of residue polynomials and a gadget digit is taken from the CRT of the pair (`crt`). A LUT f on [-1, 1) reads an
 //! input of phase m q / 4 (the forward switch's scale): phi = round(2 n_br phase / q) lies in [-n_br/2, n_br/2), and the
@@ -248,6 +248,21 @@ impl BootstrapKey {
     pub fn bootstrap_many(&self, tv: &[u64], offset: u64, cts: &[Lwe], q_in: u64) -> Vec<Lwe> {
         cts.par_iter().map(|c| self.bootstrap(tv, offset, c, q_in)).collect()
     }
+}
+
+/// The output phase x (a fraction of the modulus) of a LUT value v that the CKKS finish reads as v / 2^out_cf. The
+/// finish's EvalMod is a sine, sin(2 pi x) / (2 pi), so the LUT stores x = asin(2 pi v / 2^out_cf) / (2 pi) (needs
+/// |v| 2 pi <= 2^out_cf): the output may then sit at q / 8 instead of q / 2^8 (5 bits of the bootstrap's noise budget),
+/// and the sine's slope there (cos <= 1) only shrinks the noise.
+pub fn warp(v: f64, out_cf: u32) -> f64 {
+    let t = std::f64::consts::TAU;
+    (t * v / (1u64 << out_cf) as f64).asin() / t
+}
+
+/// v from the output phase x (`warp`'s inverse: what the finish returns, times 2^out_cf).
+pub fn unwarp(x: f64, out_cf: u32) -> f64 {
+    let t = std::f64::consts::TAU;
+    (t * x).sin() / t * (1u64 << out_cf) as f64
 }
 
 /// The test vector of f (values already scaled mod q) for inputs of phase m q / 4, m in [-1, 1).
