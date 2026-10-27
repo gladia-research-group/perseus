@@ -315,6 +315,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
     let (n, nl, q) = (p.n_br, p.n_lwe, p.q_br);
+    let groups = p.n_lwe / p.pbs_group;
+    let win: usize = arg(args, "--window").map(|s| s.parse()).transpose()?.unwrap_or(pc_gpu::tfhe::KB_WINDOW).min(groups);
     let mut prng = test_prng(0x51);
     let s_lwe: Vec<i64> = (0..nl).map(|_| (prng.next_u32() & 1) as i64).collect();
     let s_br: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
@@ -338,7 +340,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
-    let kb_words = if kb_path { count * nl / p.pbs_group * 4 * n * 2 } else { 0 };
+    let kb_words = if kb_path { count * win * 4 * n * 2 } else { 0 };
     let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1) + kb_words;
     let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
@@ -367,8 +369,11 @@ fn run_pbs(args: &[String]) -> Res<bool> {
         go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
         let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base };
         if kb_path {
-            go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, x: d_kb.vptr_mut(), ..rot })?;
-            go(&TfheArgs { w: d_kb.vptr(), i3: no_cl as i32, ..rot })?;
+            for g0 in (0..groups).step_by(win) {
+                let gw = win.min(groups - g0);
+                go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: d_kb.vptr_mut(), ..rot })?;
+                go(&TfheArgs { w: d_kb.vptr(), i3: no_cl as i32, i0: g0 as i32, i4: gw as i32, ..rot })?;
+            }
         } else {
             go(&rot)?;
         }
@@ -389,7 +394,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     }
     let mut t = Tally::default();
     t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs, every word"), bad, count * (n + 1));
-    println!("[pc-check] tfhe-pbs: {} path", if kb_path { "latency (key bundles)" } else { "batch" });
+    println!("[pc-check] tfhe-pbs: {} path", if kb_path { format!("latency (key bundles, windows of {win} groups)") } else { "batch".to_string() });
     println!("[pc-check] tfhe-pbs: device {:.2} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);
     println!("[pc-check] tfhe-pbs: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
