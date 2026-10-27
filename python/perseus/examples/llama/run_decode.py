@@ -138,6 +138,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=8, help="encrypted positions after the BOS prefix")
     ap.add_argument("--window", default="0", help="openwebtext window index (or a .npy of token ids)")
+    ap.add_argument("--window-tokens", type=int, default=128, help="the length of the indexed --window")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=None,
                     help="GPU index (default: the first of CUDA_VISIBLE_DEVICES)")
@@ -194,7 +195,7 @@ def main(argv=None):
         toks = np.load(a.window)
         toks = toks if toks.ndim == 1 else toks[0]
     else:
-        toks = hf.text_windows(int(a.window) + 1, 128)[int(a.window)]
+        toks = hf.text_windows(int(a.window) + 1, a.window_tokens)[int(a.window)]
     toks = toks[:a.tokens + 1]
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
