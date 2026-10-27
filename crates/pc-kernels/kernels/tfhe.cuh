@@ -91,6 +91,12 @@ __device__ __forceinline__ uint32_t shoup32(uint32_t a, uint32_t w, uint32_t ws,
     const uint32_t r = a * w - __umulhi(a, ws) * q;
     return r >= q ? r - q : r;
 }
+// lazy Shoup product: any a < 2^32, result in [0, 2 q)
+__device__ __forceinline__ uint32_t shoup32l(uint32_t a, uint32_t w, uint32_t ws, uint32_t q) {
+    return a * w - __umulhi(a, ws) * q;
+}
+// x in [0, 2 b) -> [0, b)
+__device__ __forceinline__ uint32_t fold32(uint32_t x, uint32_t b) { return min(x, x - b); }
 __device__ __forceinline__ uint32_t add32(uint32_t a, uint32_t b, uint32_t q) {
     const uint32_t s = a + b;
     return s >= q ? s - q : s;
@@ -166,8 +172,26 @@ __device__ void nttp_inv(uint32_t* a, int P, int n, const uint32_t* tw, const ui
 }
 // Register-blocked NTTs of P polynomials [P][2048] (poly k at prime k & 1): every phase loads groups of 2^S
 // coefficients into registers, runs S butterfly stages on them and writes back once (11 stages = 2 + 3 + 3 + 3:
-// four shared-memory round trips and barriers instead of eleven). Same butterflies and twiddles as nttp_fwd / nttp_inv.
+// four shared-memory round trips and barriers instead of eleven). Same butterflies and twiddles as nttp_fwd / nttp_inv,
+// reduced lazily (q < 2^25 leaves 7 bits of headroom): the forward takes [0, q) and adds < 2 q per stage (output
+// < 23 q); the inverse keeps [0, 2 q). The rotation reduces exactly once, when it adds the product into acc.
 constexpr int RN = 2048, RLN = 11;
+// The shared polynomials (digits, products) are stored swizzled: word j at j ^ (bits 5-7 into 0-2) ^ (bits 6-7 into
+// 3-4). The phases with groups of stride 1 and 8 then hit 32 distinct banks per warp (plain layout: 8- and 4-way
+// conflicts); stride >= 32 stays a permutation of one row.
+__device__ __forceinline__ int swz(int j) { return j ^ ((j >> 5) & 7) ^ (((j >> 6) & 3) << 3); }
+// c (1, 2 or 4) consecutive twiddles and companions from wi (a multiple of c) in one vector load each
+__device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int wi, int c, uint32_t* w, uint32_t* ws) {
+    if (c == 4) {
+        const uint4 a = __ldg((const uint4*)(tw + wi)), b = __ldg((const uint4*)(tws + wi));
+        w[0] = a.x, w[1] = a.y, w[2] = a.z, w[3] = a.w, ws[0] = b.x, ws[1] = b.y, ws[2] = b.z, ws[3] = b.w;
+    } else if (c == 2) {
+        const uint2 a = __ldg((const uint2*)(tw + wi)), b = __ldg((const uint2*)(tws + wi));
+        w[0] = a.x, w[1] = a.y, ws[0] = b.x, ws[1] = b.y;
+    } else {
+        w[0] = __ldg(tw + wi), ws[0] = __ldg(tws + wi);
+    }
+}
 // forward (Cooley-Tukey) phase: stages t = tt, tt / 2, .., tt >> (S - 1); a group = j0 + k tl (tl = tt >> (S - 1))
 template <int S>
 __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
@@ -182,24 +206,25 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
         const int j0 = (gi << (ltt + 1)) + (g & (tl - 1));
         uint32_t v[G];
 #pragma unroll
-        for (int e = 0; e < G; e++) v[e] = x[j0 + e * tl];
+        for (int e = 0; e < G; e++) v[e] = x[swz(j0 + e * tl)];
 #pragma unroll
         for (int st = 0; st < S; st++) {
             const int h = G >> (st + 1);                 // partner distance in the group
             const int lt = ltt - st;                     // log2 t of this stage
             const int m = RN >> (lt + 1);
+            uint32_t wt[4], wts[4];   // this stage's twiddles: i = (gi << st) + r, r < 2^st
+            twl(tw, tws, p * 2 * RN + m + (gi << st), 1 << st, wt, wts);
 #pragma unroll
             for (int e = 0; e < G; e++) {
                 if (e & h) continue;
-                const int i = (gi << st) + (e >> (S - st));
-                const int wi = p * 2 * RN + m + i;
-                const uint32_t u = v[e], w = shoup32(v[e + h], __ldg(tw + wi), __ldg(tws + wi), q);
-                v[e] = add32(u, w, q);
-                v[e + h] = sub32(u, w, q);
+                const int r = e >> (S - st);
+                const uint32_t u = v[e], w = shoup32l(v[e + h], wt[r], wts[r], q);
+                v[e] = u + w;
+                v[e + h] = u - w + 2 * q;
             }
         }
 #pragma unroll
-        for (int e = 0; e < G; e++) x[j0 + e * tl] = v[e];
+        for (int e = 0; e < G; e++) x[swz(j0 + e * tl)] = v[e];
     }
     __syncthreads();
 }
@@ -223,24 +248,25 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
         const int j0 = (gi << (ltb + S)) + (g & (tb - 1));
         uint32_t v[G];
 #pragma unroll
-        for (int e = 0; e < G; e++) v[e] = x[j0 + e * tb];
+        for (int e = 0; e < G; e++) v[e] = x[swz(j0 + e * tb)];
 #pragma unroll
         for (int st = 0; st < S; st++) {
             const int h = 1 << st;                       // partner distance
             const int lt = ltb + st;                     // log2 t of this stage
             const int m = RN >> (lt + 1);
+            uint32_t wt[4], wts[4];   // i = (gi << (S - 1 - st)) + r, r < 2^(S - 1 - st)
+            twl(tw, tws, p * 2 * RN + RN + m + (gi << (S - 1 - st)), 1 << (S - 1 - st), wt, wts);
 #pragma unroll
             for (int e = 0; e < G; e++) {
                 if (e & h) continue;
-                const int i = (gi << (S - 1 - st)) + (e >> (st + 1));
-                const int wi = p * 2 * RN + RN + m + i;
+                const int r = e >> (st + 1);
                 const uint32_t u = v[e], w = v[e + h];
-                v[e] = add32(u, w, q);
-                v[e + h] = shoup32(sub32(u, w, q), __ldg(tw + wi), __ldg(tws + wi), q);
+                v[e] = fold32(u + w, 2 * q);
+                v[e + h] = shoup32l(u - w + 2 * q, wt[r], wts[r], q);
             }
         }
 #pragma unroll
-        for (int e = 0; e < G; e++) x[j0 + e * tb] = v[e];
+        for (int e = 0; e < G; e++) x[swz(j0 + e * tb)] = v[e];
     }
     __syncthreads();
 }
@@ -328,8 +354,8 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                     if (r >= B / 2) r -= B;
                     v = (v - r) >> bl;
                     if (t == lv - 1) r += v << bl;
-                    tb[(2 * t) * n + j] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
-                    tb[(2 * t + 1) * n + j] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
+                    tb[(2 * t) * n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
+                    tb[(2 * t + 1) * n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
                 }
             }
             __syncthreads();
@@ -340,10 +366,10 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 const uint32_t q = k >= n ? qb : qa;
 #pragma unroll
                 for (int t = 0; t < 2; t++) {
-                    const uint32_t d = tb[t * 2 * n + k];
+                    const uint32_t d = tb[t * 2 * n + swz(k)];
                     const size_t off = (size_t)(c * lv + t) * 4 * n + k;
-                    a0[e] = add32(a0[e], shoup32(d, __ldg(bsk + off), __ldg(bsks + off), q), q);
-                    a1[e] = add32(a1[e], shoup32(d, __ldg(bsk + off + 2 * n), __ldg(bsks + off + 2 * n), q), q);
+                    a0[e] += shoup32l(d, __ldg(bsk + off), __ldg(bsks + off), q);   // 4 terms < 2 q
+                    a1[e] += shoup32l(d, __ldg(bsk + off + 2 * n), __ldg(bsks + off + 2 * n), q);
                 }
             }
             __syncthreads();   // tb is rewritten by the next part's digits
@@ -351,14 +377,15 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
         for (int e = 0; e < RT_E; e++) {
             const int k = threadIdx.x + e * blockDim.x;
-            o[k] = a0[e];
-            o[2 * n + k] = a1[e];
+            const uint32_t q = k >= n ? qb : qa;
+            o[swz(k)] = fold32(fold32(a0[e], 4 * q), 2 * q);
+            o[2 * n + swz(k)] = fold32(fold32(a1[e], 4 * q), 2 * q);
         }
         __syncthreads();
         nttr_inv(o, 4, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1
         for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) {
             const uint32_t q = (k >> (__ffs(n) - 1)) & 1 ? qb : qa;
-            acc[k] = add32(acc[k], o[k], q);
+            acc[k] = add32(acc[k], fold32(o[swz(k)], q), q);
         }
         __syncthreads();
     }
