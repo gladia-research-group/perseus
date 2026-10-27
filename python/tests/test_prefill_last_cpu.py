@@ -274,3 +274,41 @@ def test_attention_first_two_chunk_pairs(keys, layer):
     assert len(out) == 1
     got = BL.decrypt_blocked(rt, out, ch, B, d.dim)[:2 * B.t]
     assert np.abs(got - ref[0][None, :]).max() < 1e-12 * max(1.0, np.abs(ref).max())
+
+
+@pytest.mark.parametrize("share", [False, True])
+def test_attn_bsgs_llama_geometry(monkeypatch, share):
+    """PF_ATTN_BSGS on Llama's prefill geometry (d_head 128 over t = 64 lanes: a score ciphertext's giant steps span two
+    key chunks; GQA, four query blocks per K / V block, PF_KV_SHARE or not; the BOS prefix key; 127 prompt tokens)
+    against the plain attention, with and without the packed reductions."""
+    sm = config.load_configs(str(PKG / "configs/model/approximation/gpt2_base_n32_pf/configs.json")).block(4)[2]
+    d = layout.Dims(1 << 15, 4096, 4096, 32, 32, 16384, 14336)
+    B = BL.Blocks(d, 512, G=4)
+    Tq = 127
+    ch = prefill.Chunks(Tq, B.t)
+    gd = B.group_dims(0)
+    rng = np.random.default_rng(7)
+
+    def enc(scale, width):
+        r = np.zeros((Tq, d.hid))
+        r[:, :width] = scale * rng.standard_normal((Tq, width))
+        return [[0.5 * x for x in row[:width // B.nch]] for row in BL.blocked_slots(r, ch, B)]
+    Q, K, V = enc(1.2, d.hid), enc(1.2, B.Kkv * B.nch), enc(1.0, B.Kkv * B.nch)
+
+    def pre_vec(scale):
+        v = scale * rng.standard_normal((gd.d_head, gd.H))
+        return np.repeat(v.reshape(-1), gd.t).astype(complex)       # feature j of head h on every lane
+    prefixes = [(pre_vec(1.2), pre_vec(1.0)) for _ in range(B.Kkv)]
+    monkeypatch.setattr(prefill, "_KV_SHARE", share)
+
+    def attend(pack, bsgs):
+        monkeypatch.setattr(prefill, "_PACK", pack)
+        monkeypatch.setattr(prefill, "_BSGS", bsgs)
+        rt = Rt(_Ops(True), d)
+        return np.array([[np.asarray(x) for x in row]
+                         for row in BL.attention_blocked(rt, Q, K, V, sm, ch, B, prefixes=prefixes)])
+    ref = attend(0, False)
+    for pack, bsgs in ((3, False), (3, True), (2, True)):
+        got = attend(pack, bsgs)
+        err = np.abs(got - ref).max()
+        assert err < 1e-12 * max(1.0, np.abs(ref).max()), (pack, bsgs, err)

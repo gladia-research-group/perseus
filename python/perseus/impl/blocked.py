@@ -501,6 +501,6 @@ def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
         Bb = 2 << prefill._PACK
         for g in range(1, gd.d_head // Bb):
             for par in (0, 1):
-                s = (2 * g + par) * gd.tH + Bb * g
+                s = (2 * g + par) * gd.tH + Bb * (g % (B.t // Bb))     # lane step g mod t / Bb (d_head > t)
                 steps |= {s, -s, s - B.t, B.t - s}
     return steps

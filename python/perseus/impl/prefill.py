@@ -447,6 +447,11 @@ def _bsgs_block_offset(blk, d_head: int):
     return 2 * (blk // W) + rem % 2 + (2 << _PACK) * (rem // 2)
 
 
+def _bsgs_block_of(off: int, d_head: int) -> int:
+    """PF_ATTN_BSGS: the score block of key offset `off` (< d_head), the inverse of _bsgs_block_offset."""
+    return int(np.flatnonzero(_bsgs_block_offset(np.arange(d_head), d_head) == off)[0])
+
+
 def _layout_tag(ch: Chunks) -> tuple:
     """Mask-key part of the score block order."""
     return ("bsgs", _PACK) if _bsgs_on(ch) else ()
@@ -702,6 +707,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 dst[2 * c + 1] = B
         return dst
     Qs = [halves(q) for q in (Qd if shared else [Qd])]
+    qset = {id(Q): j for j, Q in enumerate(Qs)}      # a query set's key in the rotation caches
     K, V = halves(Kd), halves(Vd)
     if rope is not None:
         for k in range(nc):
@@ -741,9 +747,9 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
     W = d.d_head // nw
     blk_of = np.arange(d.N) // d.tH
     bsgs = _bsgs_on(ch)
-    if bsgs and (prefix is not None or ch.t != d.d_head):
-        raise ValueError("PF_ATTN_BSGS: needs t = d_head lanes and no prefix key")
     Bb = 2 * nw                             # baby offsets b < Bb; a packed ciphertext holds one giant step
+    if bsgs and (d.d_head % ch.t or ch.t % Bb):
+        raise ValueError("PF_ATTN_BSGS: needs d_head a multiple of t lanes, t a multiple of the baby range")
     lane_of = np.arange(d.N) % d.t
     start = blk_of % W == 0
     rots, cycs = {}, {}
@@ -832,19 +838,23 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
 
     def qkt_bsgs(c, QL, SL, groups, pre):
         """qkt_packed with offset e = b + Bb g as K rotated by b and Q by Bb g (cyclic across chunks): the nw pairs of a
-        giant step share a packed ciphertext, whose lane shift back by Bb g rides each window's placing rotation."""
-        by = {}
+        giant step share a packed ciphertext, whose lane shift back by Bb g rides each window's placing rotation. With
+        d_head > t a score ciphertext's giant steps span several key chunks: block step g, lane step g mod t / Bb."""
+        by, lanes = {}, {}
         for grp in groups:
             u, cp, _ = grp[0]
             m, r = divmod(u, d.d_head)
             g, b = divmod(r, Bb)
+            gl = (r % d.t) // Bb
+            cy = cp != c or ch.bidir
+            lanes[(m, g)] = (gl, cy)
             krs = [baby(K, "K", c, cp_, e % Bb) for _, cp_, e in grp]
             kc = krs[0] if len(krs) == 1 else ops.add(krs[0], ops.mult_i(krs[1]))
             for i, Q in enumerate(QL):
-                if cp == c and not ch.bidir:
-                    qg = rot_of(("Q", i, c), Q[c], Bb * g)
+                if not cy:
+                    qg = rot_of(("Q", qset[id(Q)], c), Q[c], Bb * gl)
                 else:
-                    qg = cyc(("Q", i, c), Q[c], d.t - Bb * g, "pf.qrot")
+                    qg = cyc(("Q", qset[id(Q)], c), Q[c], d.t - Bb * gl, "pf.qrot")
                 p = rotsum(ops, ops.mult(qg, kc), W * d.tH, d.N)
                 v = rt.mult_mask(p, ("pf.qpk", b // 2, W), lambda a=b // 2: win_mask(a))
                 if (i, m, g) in by:
@@ -853,11 +863,13 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                     by[(i, m, g)] = v
         for (i, m, g), w in sorted(by.items()):
             S = SL[i]
+            gl, cy = lanes[(m, g)]
             w = rotsum(ops, w, d.tH, W * d.tH)
             valid = _score_valid(d, ch, c, m, pre)
             for par, coef in ((0, 0.5 * gscale), (1, -0.5j * gscale)):
-                for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * g, m > 0 or ch.bidir)):
-                    x = rt.mult_mask(w, ("pf.qpl.b", c, m, sh, part, Bb * g, W, complex(coef)) + ch.key_tag,
+                for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * gl, cy)):
+                    x = rt.mult_mask(w, ("pf.qpl.b", c, m, sh, part, Bb * gl, W, complex(coef)) + ch.key_tag
+                                     + (("pre",) if pre else ()),
                                      lambda sh=sh, sel=sel, coef=coef, valid=valid:
                                      np.where(start & sel & np.roll(valid, -sh), coef, 0.0))
                     if sh % d.N:
@@ -870,20 +882,22 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
     def pv_bsgs(c, PL, groups):
         """pv_packed with offset e = b + Bb g: each giant step's probabilities unpacked shifted by Bb g lanes, times V
         rotated by b, summed per giant step and shifted back by Bb g (cyclic once chunk c attends an earlier chunk)."""
-        by = {}
+        by, lanes = {}, {}
         for grp in groups:
-            u = grp[0][0]
+            u, cp = grp[0][0], grp[0][1]
             m, r = divmod(u, d.d_head)
             by.setdefault((m, r // Bb), []).append((r % Bb // 2, grp))
+            lanes[(m, r // Bb)] = ((r % d.t) // Bb, cp != c or ch.bidir)
         sums = {}
         for (m, g), items in sorted(by.items()):
+            gl, cy = lanes[(m, g)]
             ys = []
             for P in PL:
                 y = None
                 for par, coef in ((0, 0.5), (1, -0.5j)):
-                    for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * g, m > 0 or ch.bidir)):
+                    for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * gl, cy)):
                         x = P[m] if sh % d.N == 0 else ops.rotate(P[m], sh % d.N)
-                        x = rt.mult_mask(x, ("pf.vpk.b", W, Bb * g, part, complex(coef)),
+                        x = rt.mult_mask(x, ("pf.vpk.b", W, Bb * gl, part, complex(coef)),
                                          lambda sel=sel, coef=coef: np.where(start & sel, coef, 0.0))
                         y = x if y is None else ops.add(y, x)
                 ys.append(rotsum(ops, y, d.tH, W * d.tH))
@@ -894,10 +908,10 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 vc = vrs[0] if len(vrs) == 1 else ops.add(vrs[0], ops.mult_i(vrs[1]))
                 for i, pb in enumerate(pbs):
                     prod = ops.mult(pb, vc)
-                    if (i, g) in sums:
-                        ops.inplace_add(sums[(i, g)], prod)
+                    if (i, gl) in sums:
+                        ops.inplace_add(sums[(i, gl)], prod)
                     else:
-                        sums[(i, g)] = prod
+                        sums[(i, gl)] = prod
         cyclic = c > 0 or ch.bidir
         accs = [None] * len(PL)
         for (i, g), x in sorted(sums.items()):
@@ -995,6 +1009,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             if pre:
                 for Q, S in zip(QL, SL):
                     m, blk = divmod(u_pre, d.d_head)
+                    if bsgs:
+                        blk = _bsgs_block_of(blk, d.d_head)
                     if per_m is not None:
                         k0 = np.asarray(prefix[0]) * (half * gscale)
                         S[m] = ops.tag_reduce(rotsum(ops, rt.mult_mask(Q[c], ("pf.pre.k", _vkey(k0)), lambda: k0),
@@ -1007,7 +1023,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             if packed and bsgs:
                 gs = range(1, d.t // Bb) if ch.bidir else range(1, -(-nq // Bb))
                 for i, Q in enumerate(QL):
-                    prime(("Q", i, c), Q[c], [Bb * g for g in gs] + ([Bb * g - d.t for g in gs] if ch.bidir else []))
+                    prime(("Q", qset[id(Q)], c), Q[c],
+                          [Bb * g for g in gs] + ([Bb * g - d.t for g in gs] if ch.bidir else []))
                 qkt_bsgs(c, QL, SL, groups, pre)
             elif packed:
                 qkt_packed(c, QL, SL, groups, own, pre)
@@ -1037,6 +1054,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             accs = [None] * len(PL)
             if pre:
                 m, blk = divmod(u_pre, d.d_head)
+                if bsgs:
+                    blk = _bsgs_block_of(blk, d.d_head)
                 for i, P in enumerate(PL):
                     if st["per"] is not None:
                         v0 = 0.5 * np.asarray(prefix[1])
