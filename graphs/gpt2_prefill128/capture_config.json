@@ -10,7 +10,7 @@
     "bts_iterations": 1,
     "bts_max_input_level": 50,
     "gpu_encode": true,
-    "raise_drop": "0",
+    "raise_drop": "512:1",
     "raise_drops": [
       "1",
       "3",
@@ -43,11 +43,8 @@
     "rot_key_band": 32
   },
   "host": {
-    "hf_home": "/data02/users/mithrillo/cache/huggingface",
     "malloc_arena_max": 2,
-    "omp_num_threads": 8,
-    "perseus_slotvec_cache": false,
-    "pythonpath": "python"
+    "omp_num_threads": 8
   },
   "model": {
     "cache_read_level_k": 34,
@@ -71,7 +68,7 @@
     "ladder_radix_bits": 3,
     "ln_cheb": true,
     "qkv_lanes": true,
-    "sm_cheb_gs": false,
+    "sm_cheb_gs": true,
     "sm_den_recip": true,
     "sm_fold": true,
     "sm_gs_first": true,
@@ -79,26 +76,26 @@
     "sm_periodic": 1,
     "prefill": {
       "act_fold": true,
+      "attn_bsgs": true,
+      "attn_pack": 3,
       "gelu_joint": true,
       "joint_force": true,
+      "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "/data02/users/mithrillo/projects/perseus/bootstrap_placements/gpt2_prefill_python_n32_blocked/pcmm_calib.json",
-      "pcmm_staged_only": "0"
+      "pcmm_calib_in": "graphs/_rows_3Ky5/pcmm_calib.json",
+      "pcmm_staged_only": "0",
+      "qkv_pack": true,
+      "sm_hpack": true
     }
   },
-  "quirks": {
-    "fakecap_landings": "0:32,1:14,256:22,512:22"
-  },
   "exec": {
-    "all_blocks_io_dir": "/data02/users/mithrillo/projects/perseus/.cache/oracle/gpt2/all_blocks_io",
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/M16/graphs/gpt2_prefill128_stcf_m16",
+    "fhe_graph_dir": "graphs/_rows_3Ky5/r4096",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
-    "steps_t": 128,
-    "weights_path": "/data02/users/mithrillo/projects/perseus/.cache/models/openai-community/gpt2/classic/weights.bin.zip"
+    "steps_t": 128
   }
 }

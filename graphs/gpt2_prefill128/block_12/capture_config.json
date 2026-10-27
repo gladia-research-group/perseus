@@ -44,7 +44,7 @@
   },
   "host": {
     "malloc_arena_max": 2,
-    "omp_num_threads": 4
+    "omp_num_threads": 8
   },
   "model": {
     "cache_read_level_k": 34,
@@ -83,7 +83,7 @@
       "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "graphs/gpt2_prefill128_pfbh/pcmm_calib.json",
+      "pcmm_calib_in": "graphs/_rows_3Ky5/pcmm_calib.json",
       "pcmm_staged_only": "0",
       "qkv_pack": true,
       "sm_hpack": true
@@ -92,7 +92,7 @@
   "exec": {
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "graphs/gpt2_prefill128_pfbh_cm.part",
+    "fhe_graph_dir": "graphs/_rows_3Ky5/r4096",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
