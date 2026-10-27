@@ -34,17 +34,21 @@ def relu_act(section):
 
 def tfhe_act(ops, xs, site, gain=1.0, geom=None):
     """gain * ReLU by scheme switching (impl/tfhe.py): x * (gain * step(x)) with the sign from a TFHE LUT on the
-    layout's valid slots (the gaps come back zero), one product. Reads x on [-1, 1) (x = input / B)."""
+    layout's valid slots of the first channel copy, written to every copy by the switch's repack (impl/conv.py fills a
+    ciphertext with Q / cpc copies of its channels; the gaps come back zero), one product. Reads x on [-1, 1)
+    (x = input / B)."""
     from perseus.impl import tfhe
+    from perseus.impl.conv import S
     masks = geom.pack(np.ones((geom.C, geom.H, geom.H)))
     lut = tfhe.scaled_step(gain)
+    span = geom.cpc * S            # one copy of the channels
+    copies = list(range(span, geom.slots, span))
     out = []
     for j, x in enumerate(xs):
-        sl = tfhe.register_slots(f"g{geom.C}x{geom.H}/{geom.g}.{j}", np.nonzero(np.real(masks[j]))[0])
-        if isinstance(x, np.ndarray):
-            out.append(np.real(x) * tfhe.tfhe_lut(ops, x, lut, sl))
-        else:
-            out.append(ops.mult(x, tfhe.tfhe_lut(ops, x, lut, sl)))
+        idx = np.nonzero(np.real(masks[j][:span]))[0]
+        sl = tfhe.register_slots(f"g{geom.C}x{geom.H}/{geom.g}.{j}", idx, copies)
+        s = tfhe.tfhe_lut(ops, x, lut, sl)
+        out.append(np.real(x) * s if isinstance(x, np.ndarray) else ops.mult(x, s))
     return out
 
 

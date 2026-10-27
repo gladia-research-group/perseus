@@ -186,8 +186,10 @@ impl<'a> DevRepack<'a> {
     }
 
     /// Add the `b` LWEs `outs` ([b][n_br + 1] mod p0) at the coefficients `idx` ([b] u32) into the packed sum
-    /// (`first`: start a new one).
-    pub fn accumulate(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, first: bool) -> Result<()> {
+    /// (`first`: start a new one); `reps` > 1: each also at `idx + r stride` (r < reps: copies of the value at other
+    /// coefficients, one packing each, `reps` scatters).
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, first: bool, reps: usize, stride: usize) -> Result<()> {
         let nb = self.nb;
         let go = |a: &TfheArgs| -> Result<()> {
             // SAFETY: the pointers address this repack's buffers / the caller's LWEs and positions, sized for the op
@@ -203,7 +205,10 @@ impl<'a> DevRepack<'a> {
             go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (first && r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rb })?;
             go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: sums, y: self.dig.vptr(), z: self.cols.vptr(), ..rb })?;
             go(&TfheArgs { op: tfhe_op::REPACK_FIN, count: rc as i32, x: self.pk.vptr_mut(), y: self.sums.vptr(), w: o, ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ix, ..rb })?;
+            for r in 0..reps.max(1) {
+                let ixr = (ix as *const u32).wrapping_add(r * stride) as *const c_void;
+                go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ixr, ..rb })?;
+            }
         }
         Ok(())
     }
@@ -239,7 +244,7 @@ impl<'a> DevRepack<'a> {
     /// `accumulate` then `finish`: the `b` LWEs `outs` at the coefficients `idx`.
     #[allow(clippy::too_many_arguments)]
     pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
-        self.accumulate(table, s, outs, idx, b, true)?;
+        self.accumulate(table, s, outs, idx, b, true, 1, 0)?;
         self.finish(table, s, pa, tw_f, tw_i)
     }
 }
@@ -413,7 +418,7 @@ impl<'a> TfheSwitch<'a> {
         self.idx.upload_at(s, 0, positions)?;
         self.tv.upload(s, tv)?;
         let (pos, tvp) = (self.idx.vptr(), self.tv.vptr());
-        self.apply_dev(ctx, s, lt_, x, pos, positions.len(), tvp, offset, true)
+        self.apply_dev(ctx, s, lt_, x, pos, positions.len(), 1, tvp, offset, true)
     }
 
     /// Values per pass (`new`'s `max`).
@@ -431,11 +436,12 @@ impl<'a> TfheSwitch<'a> {
         Ok(())
     }
 
-    /// `apply` on device arguments: `pos` [b] u32 coefficients (any count: chunks of the switch's capacity, the
-    /// repack accumulating across them), `tv` [2 prime][n_br] residues. `timed`: sync per stage for the timings
-    /// (else no host sync: the replay).
+    /// `apply` on device arguments: `pos` [reps][b] u32 coefficients (any b: chunks of the switch's capacity, the
+    /// repack accumulating across them; row 0 is read, rows 1.. are where the outputs are copied too: the repack
+    /// scatters each packed value `reps` times), `tv` [2 prime][n_br] residues. `timed`: sync per stage for the
+    /// timings (else no host sync: the replay).
     #[allow(clippy::too_many_arguments)]
-    pub fn apply_dev<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, tv: *const c_void, offset: u64, timed: bool) -> Result<Timings> {
+    pub fn apply_dev<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, reps: usize, tv: *const c_void, offset: u64, timed: bool) -> Result<Timings> {
         let (n, nb, nl, n_sub) = (self.n, self.nb, self.nl, self.n_sub);
         if b == 0 {
             return Err(shape("tfhe switch", "no coefficients"));
@@ -542,7 +548,7 @@ impl<'a> TfheSwitch<'a> {
             }
             Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
             lap(s, &mut t, &mut tm.bootstrap)?;
-            self.repack.accumulate(ctx.table, s, self.outs.vptr(), pc, cb, c0 == 0)?;
+            self.repack.accumulate(ctx.table, s, self.outs.vptr(), pc, cb, c0 == 0, reps, b)?;
             lap(s, &mut t, &mut tm.repack)?;
         }
 

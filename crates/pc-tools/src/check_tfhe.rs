@@ -271,8 +271,8 @@ fn run(args: &[String]) -> Res<bool> {
         let tm = if chunk.is_some() {
             d_pos.upload(&cx.ex.compute, &pos)?;
             d_tv.upload(&cx.ex.compute, &tvr)?;
-            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut x, d_pos.vptr(), pos.len(), d_tv.vptr(), off, true)?;
-            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut y, d_pos.vptr(), pos.len(), d_tv.vptr(), off, true)?
+            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut x, d_pos.vptr(), pos.len(), 1, d_tv.vptr(), off, true)?;
+            ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut y, d_pos.vptr(), pos.len(), 1, d_tv.vptr(), off, true)?
         } else {
             ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tvr, off)?;
             ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tvr, off)?
