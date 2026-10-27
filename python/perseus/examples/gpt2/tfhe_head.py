@@ -3,7 +3,7 @@ selection on the same logits: greedy argmax and top-k sampling; `--mode cutmax` 
 same inputs (the baseline).
 
     python -m perseus.examples.gpt2.tfhe_head --mirror --logits L.npy --mode argmax --n 256     # numpy mirror
-    PF_TFHE_NOISE=7.9e-3 python -m perseus.examples.gpt2.tfhe_head --mirror ...               # with the switch's noise
+    PF_TFHE_NOISE=5.3e-3 python -m perseus.examples.gpt2.tfhe_head --mirror ...               # with the switch's noise
     python -m perseus.examples.gpt2.tfhe_head --fake --logits L.npy --mode topk --capture graphs/<name>
     tools/gpu.sh <log> python -m perseus.examples.gpt2.tfhe_head --mode topk --logits L.npy --n 8 \
         --plan bootstrap_placements/gpt2_tfhe_topk_ship_hyb512L1k

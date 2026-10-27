@@ -5,7 +5,12 @@
 //! Security follows TFHE-rs's rule (its ci/lattice_estimator.sage): lattice-estimator, MATZOV cost model, the minimum
 //! of primal uSVP and dual hybrid >= 128 bits (132 to pass without a warning), every noise sigma >= 4. Each key's
 //! sigma is set by its LWE instance (lattice-estimator run 2026-10-26, bits):
-//! - binary LWE key (LWE key switch), n = 921 (a multiple of the PBS group), sigma 2^-17 p0: 154.1 bits;
+//! - binary LWE key (LWE key switch), n = 795 (a multiple of the PBS group), sigma 2^-17 p0: 133.2 bits (n 921:
+//!   154.1). The switch's input noise is the mod switch to 2 n_br (mean-compensated: `gadget::ms_body_mean`) plus the
+//!   LWE key switch's sum of 2048 x levels digit x key-noise terms: binary digits (16 levels, E d^2 = 1/2) carry 2/3 of
+//!   base 4's (8 levels, E d^2 = 3/2) variance. Model (torus rms): 1.93e-3 at n 921 / base 4 / plain rounding (7.9e-3
+//!   of a LUT's [-1, 1) measured), 1.40e-3 here (5.3e-3 of [-1, 1)
+//!   measured), and 14% fewer blind-rotation steps (37.4k PBS/s at 4096 from 31.6k);
 //! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 254.6;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
 //!   RNS), sigma 18.5 = TFHE-rs's q / sigma ~2^47.8: 138.6 (at sigma 3.19: 131.3, a warning). PBS output noise by
@@ -34,7 +39,7 @@ pub struct Params {
     /// Gadgets as (base log, levels): blind rotation (approximate, over q_br), LWE key switch (approximate, over p0),
     /// ring switch (approximate, over p0), repack (exact, over p0).
     pub pbs: (u32, usize),
-    /// Key bits per blind-rotation step (the multi-bit unrolling: 2^group - 1 GGSWs per group): 3 (n_lwe 921) is 7%
+    /// Key bits per blind-rotation step (the multi-bit unrolling: 2^group - 1 GGSWs per group): 3 (n_lwe 921) was 7%
     /// faster than 2 and 18% faster than 4 on the device (NTT(X^e - 1)'s table in shared memory; from L2 its gathers
     /// made 3 slower than 2).
     pub pbs_group: usize,
@@ -62,7 +67,7 @@ impl Params {
             qb -= m;
         }
         Ok(Params {
-            n_lwe: 921,
+            n_lwe: 795,
             lwe_sigma_rel: (-17f64).exp2(),
             n_br,
             br_primes: (qa, qb),
@@ -72,7 +77,7 @@ impl Params {
             rp_sigma: 1024.0,
             pbs: (23, 1),
             pbs_group: 3,
-            ks: (2, 8),
+            ks: (1, 16),
             rs: (8, 3),
             rp: (15, 2),
             rp_aux: prime_below(25, m)?,

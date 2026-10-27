@@ -12,6 +12,27 @@ pub fn fixed_ratio(num: u64, den: u64) -> u64 {
     (((num as u128) << 64) / den as u128) as u64
 }
 
+/// The mean-compensated mod switch of an LWE body (ePrint 2025/809): round(b M / 2^64 - sum_i delta_i / 2) mod `two_n`,
+/// delta_i = round(a_i M / 2^64) - a_i M / 2^64 the masks' rounding residuals. Under a binary key the switched phase's
+/// (b + <a, s>) error delta_b + sum_i s_i delta_i has the conditional mean delta_b + sum_i delta_i / 2: this body
+/// cancels it, the variance left is sum delta_i^2 / 4 (not / 2). The residuals are summed in 2^-32 units (floor), as
+/// the device does.
+pub fn ms_body_mean(a: &[u64], b: u64, m: u64, two_n: u64) -> u64 {
+    let s: i64 = a
+        .iter()
+        .map(|&x| {
+            let lo = (x as u128 * m as u128) as u64;
+            if lo >= 1 << 63 {
+                ((0u64.wrapping_sub(lo)) >> 32) as i64
+            } else {
+                (-(lo as i128) >> 32) as i64
+            }
+        })
+        .sum();
+    let v = (b as u128 * m as u128) as i128 - ((s as i128) << 31) + (1i128 << 63);
+    (v >> 64).rem_euclid(two_n as i128) as u64
+}
+
 /// round(x num / den) as (x M + 2^63) >> 64, M = `fixed_ratio(num, den)`: what the device computes with __umul64hi.
 #[inline]
 pub fn scale_round(x: u64, m: u64) -> u64 {
