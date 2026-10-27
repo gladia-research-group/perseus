@@ -34,6 +34,9 @@ pub const KB_MAX: usize = 94;
 pub const KB_WINDOW: usize = 32;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
 const RC: usize = 256;
+/// The repack columns' int8 planes (centred residues < 2^27) and the repack GEMMs' workspace.
+const KPL: usize = 4;
+const WSR: usize = 32 << 20;
 const WS: usize = 64 << 20;
 
 fn mu(p: u64) -> u64 {
@@ -121,9 +124,14 @@ pub struct DevRepack<'a> {
     p0: u64,
     p1: u64,
     aux: u64,
-    cols: DBuf<'a, Compute, u32>,
+    /// the columns as four balanced int8 planes [plane][4 n_br cols][n_br levels] (K-contiguous: the GEMM's B)
+    kpl: DBuf<'a, Compute, u8>,
     ring: DBuf<'a, Compute, u32>,
-    dig: DBuf<'a, Compute, i32>,
+    /// the digits' two planes [2][RC][n_br levels], one int8 GEMM output [4 n_br][RC] and its workspace
+    dpl: DBuf<'a, Compute, u8>,
+    gout: DBuf<'a, Compute, i32>,
+    ws: DBuf<'a, Compute, u8>,
+    gemms: HashMap<usize, I8Gemm<'a>>,
     pk: DBuf<'a, Compute, u32>,
     sums: DBuf<'a, Compute, u64>,
     z: DBuf<'a, Compute, u64>,
@@ -134,7 +142,7 @@ pub struct DevRepack<'a> {
 
 impl<'a> DevRepack<'a> {
     pub fn bytes(n: usize, nb: usize, lv: usize) -> usize {
-        4 * (nb * lv * 4 * nb + lv * 4 * n + RC * nb * lv + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * (RC * 4 * nb + 2 * n) + 9 * 256
+        KPL * 4 * nb * nb * lv + 2 * RC * nb * lv + 4 * (lv * 4 * n + 4 * nb * RC + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * (RC * 4 * nb + 2 * n) + WSR + 11 * 256
     }
 
     pub fn new(arena: &'a Arena, s: &Stream<Compute>, sw: &Switcher) -> Result<Self> {
@@ -144,14 +152,28 @@ impl<'a> DevRepack<'a> {
             b.upload(s, v)?;
             Ok(b)
         };
-        let mut cols = Vec::with_capacity(nb * lv * 4 * nb);
-        for k in sw.repack.cols() {
-            for t in k {
-                for (a, b) in t {
-                    cols.extend(a.iter().chain(b).map(|&x| x as u32));
+        // B of the int8 GEMMs: column (limb, part, i), K-contiguous over (k, t), centred residues in KPL planes
+        let kk = nb * lv;
+        let mut w = vec![0i64; 4 * nb * kk];
+        let primes = [sw.p0, sw.repack.aux];
+        for (k, kt) in sw.repack.cols().iter().enumerate() {
+            for (t, limbs) in kt.iter().enumerate() {
+                for (li, (a, b)) in limbs.iter().enumerate() {
+                    for (part, poly) in [a, b].into_iter().enumerate() {
+                        for (i, &x) in poly.iter().enumerate() {
+                            let col = (li * 2 + part) * nb + i;
+                            w[col * kk + k * lv + t] = pc_tfhe::modq::centered(x, primes[li]);
+                        }
+                    }
                 }
             }
         }
+        let planes = pc_core::pcmm_keys::digit_planes(&w, KPL)?;
+        drop(w);
+        let mut kpl = arena.alloc::<Compute, u8>("tfhe.rcols", planes.len())?;
+        let bytes: Vec<u8> = planes.iter().map(|&x| x as u8).collect();
+        kpl.upload(s, &bytes)?;
+        drop(planes);
         let ring: Vec<u32> = sw.repack.ring().iter().flatten().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
         Ok(DevRepack {
             n,
@@ -161,9 +183,12 @@ impl<'a> DevRepack<'a> {
             p0: sw.p0,
             p1: sw.p1,
             aux: sw.repack.aux,
-            cols: up("tfhe.rcols", &cols)?,
+            kpl,
             ring: up("tfhe.rring", &ring)?,
-            dig: arena.alloc("tfhe.work", RC * nb * lv)?,
+            dpl: arena.alloc("tfhe.work", 2 * RC * nb * lv)?,
+            gout: arena.alloc("tfhe.work", 4 * nb * RC)?,
+            ws: arena.alloc("tfhe.ws", WSR)?,
+            gemms: HashMap::new(),
             pk: arena.alloc("tfhe.work", RC * 2 * nb)?,
             sums: arena.alloc("tfhe.work", RC * 4 * nb)?,
             z: arena.alloc("tfhe.work", 2 * n)?,
@@ -185,12 +210,26 @@ impl<'a> DevRepack<'a> {
         }
     }
 
+    /// Prepare the int8 GEMM plans for passes of `b` values (setup: the replay builds none).
+    pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
+        let (nb, lv) = (self.nb, self.rp.1);
+        for m in [b.min(RC), b % RC] {
+            let mp = m.next_multiple_of(16);
+            if m > 0 && !self.gemms.contains_key(&mp) {
+                self.gemms.insert(mp, I8Gemm::new(lt_, mp as u64, (4 * nb) as u64, (nb * lv) as u64, 8, WSR)?);
+            }
+        }
+        Ok(())
+    }
+
     /// Add the `b` LWEs `outs` ([b][n_br + 1] mod p0) at the coefficients `idx` ([b] u32) into the packed sum
     /// (`first`: start a new one); `reps` > 1: each also at `idx + r stride` (r < reps: copies of the value at other
-    /// coefficients, one packing each, `reps` scatters).
+    /// coefficients, one packing each, `reps` scatters). The GEMM digits x columns runs on int8 tensor cores: 2 x KPL
+    /// plane products grouped by their power of 256 (int32 sums < 2^27), each group folded into the exact int64 sums.
     #[allow(clippy::too_many_arguments)]
-    pub fn accumulate(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, first: bool, reps: usize, stride: usize) -> Result<()> {
-        let nb = self.nb;
+    pub fn accumulate(&mut self, table: &KernelTable, s: &Stream<Compute>, lt_: &'a lt::Lt, outs: *const c_void, idx: *const c_void, b: usize, first: bool, reps: usize, stride: usize) -> Result<()> {
+        let (nb, kk) = (self.nb, self.nb * self.rp.1);
+        self.prepare(lt_, b)?;
         let go = |a: &TfheArgs| -> Result<()> {
             // SAFETY: the pointers address this repack's buffers / the caller's LWEs and positions, sized for the op
             launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?;
@@ -202,8 +241,28 @@ impl<'a> DevRepack<'a> {
             let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
             let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
             let sums = self.sums.vptr_mut();
-            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (first && r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: sums, y: self.dig.vptr(), z: self.cols.vptr(), ..rb })?;
+            let mp = rc.next_multiple_of(16);
+            let mut rd = rb;
+            rd.c[5] = mp as u64;
+            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (first && r0 == 0) as i32, x: self.dpl.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rd })?;
+            let gemm = &self.gemms[&mp];
+            for sh in 0..(KPL + 1) {
+                let mut acc = false;
+                for a in 0..2usize {
+                    if sh < a || sh - a >= KPL {
+                        continue;
+                    }
+                    let bk = sh - a;
+                    // SAFETY: the planes and the output are this repack's buffers of the plan's lengths, on `s`
+                    unsafe {
+                        gemm.run(s, (self.dpl.dptr() as *const i8).add(a * mp * kk), (self.kpl.dptr() as *const i8).add(bk * 4 * nb * kk), self.gout.dptr_mut(), acc, &mut self.ws)?;
+                    }
+                    acc = true;
+                }
+                let mut rcmb = rb;
+                rcmb.c[5] = sh as u64;
+                go(&TfheArgs { op: tfhe_op::REPACK_COMB, count: rc as i32, i3: mp as i32, x: sums, y: self.gout.vptr(), ..rcmb })?;
+            }
             go(&TfheArgs { op: tfhe_op::REPACK_FIN, count: rc as i32, x: self.pk.vptr_mut(), y: self.sums.vptr(), w: o, ..rb })?;
             for r in 0..reps.max(1) {
                 let ixr = (ix as *const u32).wrapping_add(r * stride) as *const c_void;
@@ -243,8 +302,8 @@ impl<'a> DevRepack<'a> {
 
     /// `accumulate` then `finish`: the `b` LWEs `outs` at the coefficients `idx`.
     #[allow(clippy::too_many_arguments)]
-    pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
-        self.accumulate(table, s, outs, idx, b, true, 1, 0)?;
+    pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, lt_: &'a lt::Lt, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
+        self.accumulate(table, s, lt_, outs, idx, b, true, 1, 0)?;
         self.finish(table, s, pa, tw_f, tw_i)
     }
 }
@@ -429,6 +488,7 @@ impl<'a> TfheSwitch<'a> {
     /// Prepare the key switch's GEMM plan for chunks of `b` values (setup: the replay builds none). The GEMM runs on
     /// `b` rounded up to 16 rows (cuBLASLt's int8 kernels want aligned leading dimensions; the extra rows are unread).
     pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
+        self.repack.prepare(lt_, b.min(self.max))?;
         let b = b.min(self.max).next_multiple_of(16);
         if b > 0 && !self.gemms.contains_key(&b) {
             let k = self.n_sub * self.p.ks.1;
@@ -550,7 +610,7 @@ impl<'a> TfheSwitch<'a> {
             }
             Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
             lap(s, &mut t, &mut tm.bootstrap)?;
-            self.repack.accumulate(ctx.table, s, self.outs.vptr(), pc, cb, c0 == 0, reps, b)?;
+            self.repack.accumulate(ctx.table, s, lt_, self.outs.vptr(), pc, cb, c0 == 0, reps, b)?;
             lap(s, &mut t, &mut tm.repack)?;
         }
 

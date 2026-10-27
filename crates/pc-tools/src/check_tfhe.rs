@@ -638,9 +638,10 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     // the repack from the host bootstrap's outputs
     let outv: Vec<u32> = outs.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let d_outs = up("tfhe.outs", &outv)?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
     let mut drep = pc_gpu::tfhe::DevRepack::new(&arena, &st, &sw)?;
     let tg = Instant::now();
-    drep.run(table, &st, d_outs.vptr(), d_idx.vptr(), n_valid, &pa, d_twf.vptr(), d_twi.vptr())?;
+    drep.run(table, &st, &blt.inner, d_outs.vptr(), d_idx.vptr(), n_valid, &pa, d_twf.vptr(), d_twi.vptr())?;
     st.sync()?;
     let t_rep = tg.elapsed().as_secs_f64();
     let d_acc = &drep.acc;
