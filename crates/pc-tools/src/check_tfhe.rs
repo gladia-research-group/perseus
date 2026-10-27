@@ -1,6 +1,6 @@
 //! CKKS -> TFHE -> CKKS through the device's StC-first route with the host switch (pc-tfhe) in between.
 //!
-//!   pc-check tfhe [--switch 64] [--level 44] [--cf 2] [--out-cf 8]
+//!   pc-check tfhe [--switch 64] [--level 44] [--cf 2] [--out-cf 8] [--device]
 //!
 //! A fresh ciphertext of random real values runs the route's input half at its own CF (values at the split's
 //! coefficients, phase m q0 / 2^cf), is brought to the host (inverse NTT, exact rescales by p3 and p2: mod q0), checked
@@ -74,6 +74,8 @@ fn run(args: &[String]) -> Res<bool> {
     // the LUT lands at v q0 / 2^out_cf: EvalMod's sine is m only while m << q0, so out_cf > cf; the finish's x 2^cf
     // returns v / 2^(out_cf - cf)
     let out_cf: u32 = arg(args, "--out-cf").map(|s| s.parse()).transpose()?.unwrap_or(8);
+    // --device: the same switch on the device too (pc_gpu::tfhe::TfheSwitch), on a second encryption of the values
+    let device = args.iter().any(|a| a == "--device");
     let t0 = Instant::now();
     let chain = Chain::generate(&ChainSpec::n32())?;
     let n = chain.n;
@@ -93,6 +95,7 @@ fn run(args: &[String]) -> Res<bool> {
     let steps: BTreeSet<i64> = crate::bts_stc_first::rot_steps(&geoms, n);
     let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
     let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
     let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
     let lay = mp.lay;
@@ -110,6 +113,9 @@ fn run(args: &[String]) -> Res<bool> {
     req.reserve(&mut mp);
     mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
     mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1)));
+    if device {
+        mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &Params::new(n)?, n_switch));
+    }
     let arena = mp.allocate(&dev)?;
     let mut ex = Executor::<W>::new(&dev, &arena, &mp)?;
     ex.ks.carve_regen(&arena, &lay)?;
@@ -130,13 +136,8 @@ fn run(args: &[String]) -> Res<bool> {
     let route = plan.build(&arena, &dev, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs())?;
     let mut x = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
     let mut y = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
-    arena.freeze();
-    let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
-    let enc = Encoder::new(&chain);
-    let nq = ctx.shape.n_q;
     println!("[pc-check] tfhe: device setup {:.1} s", t0.elapsed().as_secs_f64());
-
-    // the host switch, keyed by the same CKKS secret
+    // the host switch, keyed by the same CKKS secret (and its device copy)
     let s: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
     let (p0, p1) = (chain.q[0], chain.q[1]);
     let mut params = Params::new(n)?;
@@ -144,6 +145,11 @@ fn run(args: &[String]) -> Res<bool> {
     let tk = Instant::now();
     let sw = Switcher::generate(params, &s, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe: host switch keys {:.1} s (p0 {p0}, p1 {p1})", tk.elapsed().as_secs_f64());
+    let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &ex.compute, &sw, n_switch)?) } else { None };
+    arena.freeze();
+    let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
+    let enc = Encoder::new(&chain);
+    let nq = ctx.shape.n_q;
 
     // values: real, |v| < 0.9 (the forward phase m q0 / 4 must not wrap)
     let vals: Vec<Complex> = (0..slots).map(|_| Complex::new(prng.uniform_f64() * 1.8 - 0.9, 0.0)).collect();
@@ -247,6 +253,36 @@ fn run(args: &[String]) -> Res<bool> {
     }
     println!("[pc-check] tfhe: finished slots x 2^{} vs (1 + sign) / 2 (switched) and 0 (others): max err {worst:.3e}, output level {} deg {}", out_cf - cf, y.meta.level, y.meta.deg);
     t.add("tfhe: CKKS -> TFHE sign -> CKKS slots (err < 1e-2)", bad, slots);
+    if let Some(ts) = dsw.as_mut() {
+        // the device switch on a second encryption of the same values
+        let msg = enc.encode_slots(&vals, slots, top, Payload::Complex, sf_)?;
+        encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg], meta, &mut y, &mut prng)?;
+        let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+        let mut inp2 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
+        inp2.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
+        let pos: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
+        // a warm-up call on scratch (x: any content at the split's level) builds the GEMM plan; then the timed one
+        ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tv, off)?;
+        let tm = ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tv, off)?;
+        let mut fin2 = inp2.finish_call(0)?;
+        fin2.at_split(&cx, std::slice::from_ref(&y))?;
+        fin2.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;
+        cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+        let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
+        let (mut bad, mut worst) = (0, 0f64);
+        for i in 0..slots {
+            if vset.contains(&i) && vals[i].re.abs() < 0.02 {
+                continue;
+            }
+            let want = if vset.contains(&i) { if vals[i].re >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
+            let gain = (1u64 << (out_cf - cf)) as f64;
+            let e = (got[0][i].re * gain - want).abs().max(got[0][i].im.abs() * gain);
+            worst = worst.max(e);
+            bad += (e > 1e-2) as usize;
+        }
+        println!("[pc-check] tfhe: device switch of {n_switch} coefficients: max err {worst:.3e}; ms to LWE {:.2}, key switch {:.2}, bootstrap {:.2}, repack {:.2}", tm.to_lwe, tm.key_switch, tm.bootstrap, tm.repack);
+        t.add("tfhe: device CKKS -> TFHE sign -> CKKS slots (err < 1e-2)", bad, slots);
+    }
     println!("[pc-check] tfhe: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
@@ -632,12 +668,15 @@ fn run_bridge(args: &[String]) -> Res<bool> {
         let kz = unsafe { (d_rk.vptr() as *const u32).add(k0 * rp_lv * 2 * 2 * n) } as *const std::ffi::c_void;
         go(&TfheArgs { op: tfhe_op::REPACK_MAC, x: d_acc.vptr_mut(), y: d_rdig.vptr(), z: kz, ..rb })?;
     }
-    gp(&PcmmArgs { op: pcmm_op::INTT, count: 4, i0: 2, x: d_acc.vptr_mut(), tw: d_twi.vptr(), ..pa })?;
+    for part in 0..2 {   // [part][limb]: limb l at prime l
+        let xp = unsafe { (d_acc.vptr_mut() as *mut u32).add(part * 2 * n) } as *mut std::ffi::c_void;
+        gp(&PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 1, x: xp, tw: d_twi.vptr(), ..pa })?;
+    }
     go(&TfheArgs { op: tfhe_op::REPACK_B, x: d_acc.vptr_mut(), y: d_outs.vptr(), z: d_idx.vptr(), ..rb })?;
     st.sync()?;
     let t_rep = tg.elapsed().as_secs_f64();
     let got_acc = d_acc.download(&st)?;
-    let want: Vec<u64> = (0..2).flat_map(|l| rep.limbs[l].c0.iter().chain(&rep.limbs[l].c1).copied().collect::<Vec<_>>()).collect();
+    let want: Vec<u64> = [&rep.limbs[0].c0, &rep.limbs[1].c0, &rep.limbs[0].c1, &rep.limbs[1].c1].iter().flat_map(|v| v.iter().copied()).collect();
     let bad = got_acc.iter().zip(&want).filter(|(a, b)| **a as u64 != **b).count();
     t.add("tfhe-bridge: repack == pc-tfhe RepackKey::repack", bad, 4 * n);
     println!("[pc-check] tfhe-bridge: device ms: rescale {:.3}, ring switch {:.3}, extract {:.3} ({n_valid}), repack {:.3} (chunk {kc})", t_rescale * 1e3, t_rs * 1e3, t_ext * 1e3, t_rep * 1e3);
