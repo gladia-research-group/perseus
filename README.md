@@ -53,6 +53,9 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
 - **Complex Cachemir packing.** Two real vectors per ciphertext, in the complex slots of CKKS.
 - **Packing- and magnitude-aware bootstrap placement.** GPT-2 runs 416 bootstraps per token,
   against 584–894 for DaCapo, Orion and Fhelipe.
+- **CKKS -> TFHE -> CKKS lookup tables.** `perseus.impl.tfhe.tfhe_lut` evaluates a sign or any lookup table on
+  chosen slots by programmable bootstrapping (crates `pc-tfhe`, `pc-gpu` `tfhe`), as one planned refresh: exact
+  decisions where a polynomial needs high degree (ReLU's sign, argmax, thresholds).
 
 ## Results
 
@@ -199,6 +202,12 @@ y = fhe.rotate_and_sum(fhe.square(fhe.encrypt(x, 0)), 1, 16)   # sum of squares 
 print(np.real(fhe.decrypt_slots_complex(y)[0]), np.sum(x ** 2))
 sess.close()
 ```
+
+Branching on encrypted values goes through `perseus.impl.tfhe`: register a table (`register_sign`, `register_lut`)
+and the slots it reads (`register_slots`, with the copies a packing replicates), call `tfhe_lut(ops, x, table,
+slots)` in a stage, and give the planned session `tfhe=<values per pass>` (`setup_session` registers the tables).
+`python -m perseus.examples.resnet.run --plan bootstrap_placements/resnet20_tfhe_argmax --tfhe --tfhe-argmax` runs
+ResNet-20 with its ReLU signs and an encrypted argmax head that way.
 
 A new model subclasses `perseus.impl.driver.ImplModel` and lists its stages, the masks each
 step needs and its weights; `python/perseus/impl/__init__.py` describes the modules. The client
