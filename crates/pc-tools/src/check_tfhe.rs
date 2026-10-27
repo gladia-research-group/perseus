@@ -308,6 +308,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     use pc_tfhe::lwe::Lwe;
     use pc_tfhe::pbs::{BootstrapKey, Rns};
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(256);
+    // the latency path (PBS_KEYBUNDLE then PBS_ROTATE on the bundles) for small batches; --no-kb forces the batch path
+    let kb_path = count <= pc_gpu::tfhe::KB_MAX && !args.iter().any(|a| a == "--no-kb");
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
@@ -335,7 +337,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
-    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1);
+    let kb_words = if kb_path { count * nl / p.pbs_group * 4 * n * 2 } else { 0 };
+    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1) + kb_words;
     let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
@@ -351,6 +354,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.acc", count * 4 * n)?;
     let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", lin.len())?;
     let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * (n + 1))?;
+    let mut d_kb = arena.alloc::<pc_cuda::Compute, u32>("tfhe.kb", kb_words.max(1))?;
     let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
     let base = TfheArgs { n: n as i32, count: count as i32, i1: nl as i32, q, ..Default::default() };
@@ -360,7 +364,13 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
+        let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base };
+        if kb_path {
+            go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, x: d_kb.vptr_mut(), ..rot })?;
+            go(&TfheArgs { w: d_kb.vptr(), ..rot })?;
+        } else {
+            go(&rot)?;
+        }
         go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, cx[6], cx[7]], ..base })?;
         Ok(())
     };
@@ -378,7 +388,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     }
     let mut t = Tally::default();
     t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs, every word"), bad, count * (n + 1));
-    println!("[pc-check] tfhe-pbs: device {:.1} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);
+    println!("[pc-check] tfhe-pbs: {} path", if kb_path { "latency (key bundles)" } else { "batch" });
+    println!("[pc-check] tfhe-pbs: device {:.2} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);
     println!("[pc-check] tfhe-pbs: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }

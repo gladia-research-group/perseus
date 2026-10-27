@@ -752,6 +752,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_REPACK_RMAC 15
 #define PC_TFHE_REPACK_C0 16
 #define PC_TFHE_REPACK_FIN 17
+#define PC_TFHE_PBS_KEYBUNDLE 18
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

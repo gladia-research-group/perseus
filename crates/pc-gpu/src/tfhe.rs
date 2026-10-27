@@ -27,6 +27,9 @@ use crate::ntt::{self, Parts, Span};
 
 type W = u32;
 const PLANES: usize = 4;
+/// Batches up to this many LWEs take the bootstrap's latency path (PBS_KEYBUNDLE for every group at once, then
+/// PBS_ROTATE on the bundles: 20 MB of bundles per LWE).
+pub const KB_MAX: usize = 16;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
 const RC: usize = 256;
 const WS: usize = 64 << 20;
