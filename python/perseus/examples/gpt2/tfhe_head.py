@@ -5,19 +5,23 @@ same inputs (the baseline).
     python -m perseus.examples.gpt2.tfhe_head --mirror --logits L.npy --mode argmax --n 256     # numpy mirror
     PF_TFHE_NOISE=7.9e-3 python -m perseus.examples.gpt2.tfhe_head --mirror ...               # with the switch's noise
     python -m perseus.examples.gpt2.tfhe_head --fake --logits L.npy --mode topk --capture graphs/<name>
-    tools/gpu.sh <log> python -m perseus.examples.gpt2.tfhe_head --plan bootstrap_placements/gpt2_tfhe_topk_ship_hyb \
-        --mode topk --logits L.npy --n 8
+    tools/gpu.sh <log> python -m perseus.examples.gpt2.tfhe_head --mode topk --logits L.npy --n 8 \
+        --plan bootstrap_placements/gpt2_tfhe_topk_ship_hyb512L1k
 
 `--logits`: next-token logits (positions, 50257) of real text. The tiles are the LM head's layout (two tiles of N
 slots, column cutmax_tile_col_of_slot(m) of tile k at slot m). A plan's PLAN_CMD.txt carries what the run repeats
-(`runtime=`, `twin=`, `sign=`: PF_SELECT_SIGN). The plans: gpt2_tfhe_{argmax,topk}_ship (TFHE signs),
-gpt2_tfhe_{argmax,topk}_ship_hyb (the big early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_cutmax_ship (CutMax),
-all on the gpt2_decode recipe and runtime line.
+(`runtime=`, `twin=`, `sign=`, `env=`, the head's shape). The plans, all on the gpt2_decode recipe and runtime line:
+gpt2_tfhe_{argmax,topk}_ship (TFHE signs), gpt2_tfhe_argmax_ship_hyb512 / gpt2_tfhe_topk_ship_hyb512L1k (the big
+early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_cutmax_ship (CutMax).
 
-Measured (GPU 3, 8 positions, fresh inputs): argmax CutMax 0.45 s, TFHE 2.59 s, hybrid 1.29 s, the hybrid's all-CKKS
-control 1.42 s; top-40 sampling TFHE 4.39 s, hybrid 3.10 s, all-CKKS control 3.88 s, all-CKKS fine 3.94 s. CutMax
-wins greedy decoding; the tournament's edge is robustness (no calibration range: on 1792 positions CutMax's one-hot
-is smeared at 8% of them and wrong by 22-39 logits at 0.5%, the TFHE argmax misses only near-ties < 0.08 logits).
+Measured (GPU 3, 8 positions, fresh inputs, plans above): argmax CutMax 0.45 s, TFHE 2.59 s, hybrid 1.11 s;
+top-40 sampling TFHE 4.39 s, hybrid 2.35 s; the hybrids' all-CKKS controls (two-scale bound 2048, 2048 buckets) 1.42 s
+and 3.88 s against 1.29 s and 3.10 s for the hybrids at those settings. Two-scale signs on rounds of <= 512 heads
+and 1024 buckets cost no accuracy on the mirror (1792 / 400 positions); graph replay +1% (--graphs); no 0/1 cleanup
+-3%; the count comparisons as CKKS signs on a constant (PF_SELECT_COUNT=ckks) -7%.
+CutMax wins greedy decoding; the tournament's edge is robustness (no calibration range: on 1792 positions CutMax's
+one-hot is smeared at 8% of them and wrong by 22-39 logits at 0.5%, the TFHE argmax misses only near-ties < 0.08
+logits).
 """
 from __future__ import annotations
 
@@ -43,7 +47,7 @@ def tile_cols(k):
 class Head:
     """The selection stage on K = 2 logit tiles; `mode`: argmax | topk."""
 
-    def __init__(self, mode="argmax", k=40, L=2048, W=32.0, probes=8, R=128.0, fine=2048, temp=1.0):
+    def __init__(self, mode="argmax", k=40, L=1024, W=32.0, probes=8, R=128.0, fine=512, temp=1.0):
         self.mode, self.k, self.L, self.W, self.probes, self.R, self.fine, self.temp = mode, k, L, W, probes, R, fine, temp
         self.cols = [tile_cols(0), tile_cols(1)]
         self.valid = [c >= 0 for c in self.cols]
@@ -266,7 +270,8 @@ def planned(a, L):
     keys = _pc.KeySource.generate([], conj=True, layout="packed")
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"tfhe_head_{os.getpid()}")
     cfg = _config(a.plan, "n32_gpt2_decode") if a.mode == "cutmax" else plan_config(a.plan)
-    run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=28, pool=a.pool,
+    cfg["exec.use_graphs"] = bool(a.graphs)          # the head repeats per token: graph replay pays after the first
+    run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=28, pool=a.pool, stc_cache=a.stc_cache,
                         log=lambda m: print(m, flush=True))
     from perseus.impl.tfhe_select import ckks_res
     run.tfhe_chunk = 0 if (a.mode == "cutmax" or ckks_res() is not None) else a.tfhe_chunk
@@ -297,7 +302,8 @@ def planned(a, L):
 
 def _plan_settings(a):
     """The plan's PLAN_CMD.txt settings the run must repeat: `runtime=` (the twin's --set), `twin=` (the twin's
-    reactive ceiling) and `sign=` (PF_SELECT_SIGN)."""
+    reactive ceiling), `sign=` (PF_SELECT_SIGN), `env=` (other PF_SELECT_* switches) and the head's
+    shape (`fine=`, `L=`, `k=`, `W=`, `probes=`)."""
     path = os.path.join(a.plan, "PLAN_CMD.txt")
     lines = dict(ln.split("=", 1) for ln in open(path).read().splitlines() if "=" in ln) if os.path.exists(path) else {}
     a.set = lines.get("runtime", "").split() + a.set
@@ -305,6 +311,12 @@ def _plan_settings(a):
         a.twin_limit = int(lines["twin"].split()[-1])
     if "sign" in lines:
         os.environ.setdefault("PF_SELECT_SIGN", lines["sign"].strip())
+    for kv in lines.get("env", "").split():                  # selection switches (PF_SELECT_*)
+        k, v = kv.split("=", 1)
+        os.environ.setdefault(k, v)
+    for key, cast in (("fine", int), ("L", int), ("k", int), ("W", float), ("probes", int)):
+        if key in lines:
+            setattr(a, key, cast(lines[key]))
 
 
 def main(argv=None):
@@ -322,14 +334,16 @@ def main(argv=None):
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--tfhe-chunk", type=int, default=4096)
     ap.add_argument("--pool", type=int, default=256)
+    ap.add_argument("--stc-cache", type=int, default=64, help="StC-first last-stage cache entries (graphs keep theirs)")
+    ap.add_argument("--graphs", action="store_true", help="--plan: CUDA graph replay (exec.use_graphs)")
     ap.add_argument("--logits", required=True)
     ap.add_argument("--mode", choices=("argmax", "topk", "cutmax"), default="argmax")
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--k", type=int, default=40)
-    ap.add_argument("--L", type=int, default=2048)
+    ap.add_argument("--L", type=int, default=1024)
     ap.add_argument("--W", type=float, default=32.0)
     ap.add_argument("--probes", type=int, default=8)
-    ap.add_argument("--fine", type=int, default=2048)
+    ap.add_argument("--fine", type=int, default=512)
     a = ap.parse_args(argv)
     L = np.load(a.logits)
     if a.mirror:
