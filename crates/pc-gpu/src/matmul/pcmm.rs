@@ -759,6 +759,33 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
 pub const PREDIV_SHIFT: u32 = 1;
 pub const PREDIV_STAMP_LOG2: i32 = 20;
 
+/// The scale drop 2^s that P1 gives `lin`'s inputs on `route` (0: none): its stamp w_scale 2^shift over
+/// 2^PREDIV_STAMP_LOG2, on a lean chain for a band shift above PREDIV_SHIFT.
+pub fn prediv_shift<W: DevWord, M: DevStrategy<W>>(route: &StcFirstRoute<'_, W, M>, lin: &PcmmLinear) -> u32 {
+    prediv_log2(route.thin(), lin)
+}
+
+/// `prediv_shift` on a chain that is lean (`thin`) or not.
+pub fn prediv_log2(thin: bool, lin: &PcmmLinear) -> u32 {
+    if !thin || lin.shift <= PREDIV_SHIFT {
+        return 0;
+    }
+    let stamp = lin.w_scale * (lin.shift as f64).exp2();
+    (stamp.log2().round() as i32 - PREDIV_STAMP_LOG2).max(0) as u32
+}
+
+/// P1 on each of `lin`'s inputs (`prediv` by `prediv_shift`), before their stamp: `linear` and the per-input path of a
+/// linear whose inputs carry their own scales both run it.
+pub fn prediv_inputs<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &Pcmm<'a, '_, W>, lin: &PcmmLinear, ins: &mut [Ct<'a, W>]) -> Result<()> {
+    let s = prediv_shift(route, lin);
+    if s > 0 {
+        for x in ins.iter_mut() {
+            prediv(cx, route, pcmm, x, s, &lin.name)?;
+        }
+    }
+    Ok(())
+}
+
 /// Lower `x`'s scale by 2^s at the cost of one level: x 2^k (an exact integer product) then the level's rescale, which
 /// divides by its primes (~2^(k + s)). The value is unchanged; its scale, which the StC-first input's factors divide,
 /// drops by the primes over 2^k. `x` must sit one level above the StC-first entry (after its pending rescale).
@@ -781,6 +808,49 @@ fn prediv<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route
     x.meta.deg = 2;
     cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
     x.meta.nf = nf / ctx.scale.mod_reduce_product(top as i32);
+    Ok(())
+}
+
+/// `linear` for inputs whose metadata differ (the session's blocked layout: channel blocks carry their own scales): each
+/// input gets P1's pre-division (`prediv_inputs`, as `linear`) and its own StC-first input call (perseus pcmm.py
+/// `_device_cf`: `bts.begin` + `stc_first_input` per input, the mode-2 last stage built for that input's scale), the
+/// finishes run from input 0's call, as perseus does.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_per_input<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, planes: &DBuf<'_, Compute, u8>, ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts) -> Result<()> {
+    let sh = lin.shape;
+    let mut out_map = vec![(usize::MAX, 0); sh.n_out];
+    for (g, ms) in groups.iter().enumerate() {
+        for (j, &m) in ms.iter().enumerate() {
+            out_map[m] = (g, j);
+        }
+    }
+    let stamp = lin.w_scale * (lin.shift as f64).exp2();
+    let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
+    let co = CallOpts { prescaled: false, own_cf: true };
+    prediv_inputs(cx, route, pcmm, lin, ins)?;
+    let mut first: Option<BtsCall<'_, 'a, W, M>> = None;
+    for i in 0..ins.len() {
+        ins[i].meta.nf *= stamp;
+        let x = &mut ins[i..i + 1];
+        let mut call = BtsCall::begin(StagedRef::StcFirst(route), cx, x, &r, co)?;
+        if call.stc_first_input(cx, x)?.is_none() {
+            return Err(shape("pcmm linear", format!("{}: input {i} below the StC-first entry", lin.name)));
+        }
+        if first.is_none() {
+            first = Some(call);
+        }
+    }
+    let inp = first.ok_or_else(|| shape("pcmm linear", "no inputs"))?;
+    let nf_out = ins[0].meta.nf / lin.w_scale;
+    pcmm.product(cx.ctx, &cx.ex.compute, &sh, planes, ins, outs, &out_map, nf_out, None)?;
+    for (g, &dr) in drops.iter().enumerate() {
+        let mut fin = inp.finish_call(dr)?;
+        fin.at_split(cx, &outs[g..g + 1])?;
+        fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+        if lin.shift > 0 {
+            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
+        }
+    }
     Ok(())
 }
 
@@ -881,14 +951,7 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
     }
     let names: Vec<(String, u32)> = (0..ins.len()).map(|i| (format!("{}.in{i}", lin.name), ins[i].meta.level)).collect();
     let stamp = lin.w_scale * (lin.shift as f64).exp2();
-    if route.thin() && lin.shift > PREDIV_SHIFT {
-        let s = (stamp.log2().round() as i32 - PREDIV_STAMP_LOG2).max(0) as u32;
-        if s > 0 {
-            for x in ins.iter_mut() {
-                prediv(cx, route, pcmm, x, s, &lin.name)?;
-            }
-        }
-    }
+    prediv_inputs(cx, route, pcmm, lin, ins)?;
     for x in ins.iter_mut() {
         x.meta.nf *= stamp;
     }
@@ -997,6 +1060,20 @@ mod tests {
         assert_eq!(c.shift("b0.down", 1.5, 0.25).unwrap(), 12);
         assert!(c.shift("b1.qkv", 1.5, 0.25).is_err());
         assert_eq!(PcmmCalib::parse(&c.to_json()).unwrap(), c);
+    }
+
+    /// P1's scale drop: the stamp w_scale 2^shift over 2^20, on a lean chain only, for band shifts above 1 (the
+    /// served rule), never negative.
+    #[test]
+    fn prediv_scale() {
+        let lin = |w_log2: i32, shift: u32| PcmmLinear { name: "b.out".into(), shape: PcmmShape { t: 64, n_in: 6, n_out: 2, nw: 2 }, w_scale: 2f64.powi(w_log2), shift };
+        assert_eq!(prediv_log2(true, &lin(19, 5)), 4); // stamp 2^24
+        assert_eq!(prediv_log2(true, &lin(19, 2)), 1); // 2^21 (b5-b8, b10 .out)
+        assert_eq!(prediv_log2(true, &lin(19, 3)), 2); // 2^22 (b9.out)
+        assert_eq!(prediv_log2(true, &lin(14, 4)), 0); // 2^18: below the design stamp
+        assert_eq!(prediv_log2(true, &lin(21, 1)), 0); // band shift 1 (b1.up, 2^22): outside the rule
+        assert_eq!(prediv_log2(false, &lin(19, 5)), 0); // a composite chain
+        assert_eq!((PREDIV_SHIFT, PREDIV_STAMP_LOG2), (1, 20));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::session::{M, W};
 use pc_core::pcmm_keys::PcmmKeys;
 use pc_gpu::bts::stc_first::StcFirstRoute;
 use pc_gpu::bts::BtsCx;
-use pc_gpu::matmul::pcmm::{finish_groups, linear, LinearOpts, Pcmm, PcmmCalib, PcmmCfg, PcmmLinear, PcmmShape, WeightBuf};
+use pc_gpu::matmul::pcmm::{finish_groups, linear, linear_per_input, LinearOpts, Pcmm, PcmmCalib, PcmmCfg, PcmmLinear, PcmmShape, WeightBuf};
 use pc_gpu::{Ct, CtBuf, MemPlan};
 use pc_program::bind::FinishStep;
 use pc_program::replay::{copy_ct, FinishExec};
@@ -300,48 +300,6 @@ fn copy_member(ctx: &pc_gpu::Context<'static, W, M>, s: &pc_cuda::Stream<pc_cuda
     // SAFETY: dst is a one-member full-layout ciphertext; rows 0..=top of both parts of member j are read
     pc_cuda::launch_result("ew_copy", unsafe { (ctx.table.ew_copy)(&args, s.raw()) })?;
     dst.meta = src.meta;
-    Ok(())
-}
-
-/// `linear` for inputs whose metadata differ (the blocked layout's channel blocks carry their own scales): each
-/// input gets its own StC-first input call (perseus pcmm.py `_device_cf`: `bts.begin` + `stc_first_input` per input, the
-/// mode-2 last stage built for that input's scale), the finishes run from input 0's call, as perseus does.
-#[allow(clippy::too_many_arguments)]
-fn linear_per_input<'a>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, planes: &pc_cuda::DBuf<'_, pc_cuda::Compute, u8>, ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts) -> pc_gpu::Result<()> {
-    use pc_gpu::bts::staged::{BtsCall, CallOpts, Phase, StagedRef};
-    let sh = lin.shape;
-    let mut out_map = vec![(usize::MAX, 0); sh.n_out];
-    for (g, ms) in groups.iter().enumerate() {
-        for (j, &m) in ms.iter().enumerate() {
-            out_map[m] = (g, j);
-        }
-    }
-    let stamp = lin.w_scale * (lin.shift as f64).exp2();
-    let r = pc_shadow::Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..pc_shadow::Route::dense() };
-    let co = CallOpts { prescaled: false, own_cf: true };
-    let mut first: Option<BtsCall<'_, 'a, W, M>> = None;
-    for i in 0..ins.len() {
-        ins[i].meta.nf *= stamp;
-        let x = &mut ins[i..i + 1];
-        let mut call = BtsCall::begin(StagedRef::StcFirst(route), cx, x, &r, co)?;
-        if call.stc_first_input(cx, x)?.is_none() {
-            return Err(pc_gpu::Error::Shape { what: "pcmm linear", msg: format!("{}: input {i} below the StC-first entry", lin.name) });
-        }
-        if first.is_none() {
-            first = Some(call);
-        }
-    }
-    let inp = first.ok_or_else(|| pc_gpu::Error::Shape { what: "pcmm linear", msg: "no inputs".into() })?;
-    let nf_out = ins[0].meta.nf / lin.w_scale;
-    pcmm.product(cx.ctx, &cx.ex.compute, &sh, planes, ins, outs, &out_map, nf_out, None)?;
-    for (g, &dr) in drops.iter().enumerate() {
-        let mut fin = inp.finish_call(dr)?;
-        fin.at_split(cx, &outs[g..g + 1])?;
-        fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
-        if lin.shift > 0 {
-            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
-        }
-    }
     Ok(())
 }
 
