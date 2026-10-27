@@ -62,6 +62,11 @@ impl RingSwitchKey {
         RingSwitchKey { gadget, factor, keys }
     }
 
+    /// [t] -> (c0, c1) in NTT form: the device layout's source.
+    pub fn keys(&self) -> &[(Vec<u64>, Vec<u64>)] {
+        &self.keys
+    }
+
     /// ct under s -> ct under s'(X^S): (c0 + sum_t D_t(c1) k0_t, sum_t D_t(c1) k1_t).
     pub fn apply(&self, ct: &Rlwe, ntt: &Ntt) -> Rlwe {
         let (n, q, l) = (ntt.n, ntt.q, self.gadget.levels);
@@ -142,6 +147,11 @@ impl RepackKey {
             })
             .collect();
         RepackKey { gadget, keys }
+    }
+
+    /// [k][t][limb] -> (c0, c1) in NTT form: the device layout's source.
+    pub fn keys(&self) -> &[Vec<Vec<(Vec<u64>, Vec<u64>)>>] {
+        &self.keys
     }
 
     /// `lwes[j]` (mod p0, dimension n_br; None = an exact zero) into one RLWE of degree N mod p0 p1 under s.
