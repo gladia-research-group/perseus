@@ -124,7 +124,8 @@ class EncoderPlannedPrefill(PlannedPrefill):
                 self.in_metas[b] = [got[n] for n in self.recs[b - 1].out_names]
             metas = {lab: {n: self.in_metas[b][names.index(n)] for n in ins}}
             self.progs.update(_pc.Program.compile(self.work_dir, self.plan_dir, config=self.cfg, blocks=[lab],
-                                                  live_out={lab: list(r.out_names)}, input_metas=metas))
+                                                  live_out={lab: list(r.out_names)}, input_metas=metas,
+                                                  schedule=self.schedule))
             prev = b
         self.reg, n = {}, 0
         for b in range(self.n_layers):

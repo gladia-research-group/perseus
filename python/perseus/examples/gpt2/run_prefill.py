@@ -140,8 +140,9 @@ def main(argv=None, results=None):
     ap.add_argument("--repeat", type=int, default=1, help="planned: run the forward this many times (wall = median)")
     ap.add_argument("--work-dir", default=None, help="planned: where the recorded stream is written")
     ap.add_argument("--compile-only", action="store_true", help="planned: record + compile on the CPU, then stop")
-    ap.add_argument("--schedule", choices=("program", "lockstep"), default="program",
-                    help="planned: op order before K-batching (lockstep: more batched refreshes)")
+    ap.add_argument("--schedule", choices=("siblings", "program", "lockstep"), default="siblings",
+                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR) and pulled sibling "
+                         "batches; lockstep: more batched refreshes)")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
