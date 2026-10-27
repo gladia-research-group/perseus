@@ -315,7 +315,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut prng = test_prng(0x51);
     let s_lwe: Vec<i64> = (0..nl).map(|_| (prng.next_u32() & 1) as i64).collect();
     let s_br: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
-    let dg = DiscreteGaussian::new(p.key_sigma)?;
+    let dg = DiscreteGaussian::new(p.bsk_sigma)?;
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
     let t0 = Instant::now();
     let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, p.pbs_group, &dg, &mut prng);

@@ -132,7 +132,8 @@ pub struct RepackKey {
 }
 
 impl RepackKey {
-    pub fn generate(s: &[i64], s_br: &[i64], gadget: Gadget, aux: u64, ntts: &[Ntt], dg: &DiscreteGaussian, prng: &mut Prng) -> Result<RepackKey> {
+    /// `dg_cols`: the columns' noise (divided by P in the rescale: it can be large), `dg`: the ring key's.
+    pub fn generate(s: &[i64], s_br: &[i64], gadget: Gadget, aux: u64, ntts: &[Ntt], dg_cols: &DiscreteGaussian, dg: &DiscreteGaussian, prng: &mut Prng) -> Result<RepackKey> {
         let (n, nb) = (ntts[0].n, s_br.len());
         let p0 = gadget.q;
         if (p0 as u128) * (aux as u128) > 1 << 54 {
@@ -149,7 +150,7 @@ impl RepackKey {
                     .map(|t| {
                         let mut m = vec![0i128; nb];
                         m[0] = aux as i128 * g(t) * sk as i128;
-                        coef(RnsRlwe::encrypt(&m, &s_x, &small, dg, prng))
+                        coef(RnsRlwe::encrypt(&m, &s_x, &small, dg_cols, prng))
                     })
                     .collect()
             })
@@ -296,6 +297,7 @@ impl Switcher {
     pub fn generate(params: Params, s: &[i64], p0: u64, p1: u64, prng: &mut Prng) -> Result<Switcher> {
         let n = s.len();
         let dg = DiscreteGaussian::new(params.key_sigma)?;
+        let (dg_bsk, dg_rp) = (DiscreteGaussian::new(params.bsk_sigma)?, DiscreteGaussian::new(params.rp_sigma)?);
         let dg_lwe = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
         let ntt_p = vec![Ntt::new(p0, n)?, Ntt::new(p1, n)?];
         let s_sub = to_i64(sample_ternary(prng, n / params.rs_factor));
@@ -304,8 +306,8 @@ impl Switcher {
         let rs = RingSwitchKey::generate(s, &s_sub, params.rs_factor, Gadget::new(p0, params.rs, false), &ntt_p[0], &dg, prng);
         let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, prng);
         let rns = crate::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br)?;
-        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, params.pbs_group, &dg, prng);
-        let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg, prng)?;
+        let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, params.pbs_group, &dg_bsk, prng);
+        let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg_rp, &dg, prng)?;
         Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, repack })
     }
 

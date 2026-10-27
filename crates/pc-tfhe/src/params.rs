@@ -1,18 +1,19 @@
 //! The switch's parameters.
 //!
-//! The TFHE side runs at the CKKS chain's prime p0 (31 bits, NTT-friendly up to degree 2^16): the forward direction
+//! The TFHE side runs at the CKKS chain's prime p0 (28 bits, NTT-friendly up to degree 2^16): the forward direction
 //! is then one exact rescale by p1 and the return path is mod q0 = p0 p1 with the keys carrying the p1 (`switch`).
-//! Security, against the HE-standard tables (128-bit classical, ternary secret, sigma 3.19) unless noted:
-//! - ring switch key / extracted LWE: secret s' of dimension 2048 (ring N, s'(X^S)), modulus p0 (31 bits): the table
-//!   allows 54 bits at 2048;
+//! Security follows TFHE-rs's rule (its ci/lattice_estimator.sage): lattice-estimator, MATZOV cost model, the minimum
+//! of primal uSVP and dual hybrid >= 128 bits (132 to pass without a warning), every noise sigma >= 4. Each key's
+//! sigma is set by its LWE instance:
+//! - binary LWE key (LWE key switch), n = 921 (a multiple of the PBS group), sigma 2^-17 p0: 154 bits (measured);
+//! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 252 at 3.19;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
-//!   RNS): within the 54-bit bound. Output noise (unrolled pairs, one-level gadget 2^24): rms ~2^-15.4 q_br by the
-//!   model 6 (n/2) 2 l N (B^2 / 12) sigma^2 + n N (2/3) (q / B^l)^2 / 12, which matched 2^-20.2 measured at 2^50 / (18, 2);
-//! - repack columns: degree n_br = 2048 under a fresh ternary s_x at p0 P ~ 2^53 (P = rp_aux, 25 bits): within the
-//!   54-bit bound; repack ring key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
-//! - binary LWE key, n = 921 (a multiple of the PBS group), noise sigma = 2^-17 q: the regime of the TFHE-rs default
-//!   sets (n 742-918 at relative noise ~2^-17 for 128 bits). Not run through the lattice estimator here (no Sage on the box): re-check before
-//!   publication.
+//!   RNS), sigma 18.5 = TFHE-rs's q / sigma ~2^47.8 (at sigma 3.19 it measured 131: a warning). PBS output noise by
+//!   the model (n/G)(2^G - 1) 2 * 2 l N (B^2 / 12) sigma^2 + (n/G) 2 N (2/3) (q / B^l)^2 / 12 (it matched the measured
+//!   rms to 0.1 bit at sigma 3.19): ~2^-14.2 q_br at gadget 2^23;
+//! - repack columns: ternary s_x of degree 2048 mod p0 P ~ 2^53, sigma 1024 (the packing's noise is divided by P;
+//!   at 3.19 it measured 128.9);
+//! - repack ring key: ring 2^16 mod q0 ~ 2^56, secret s, sigma 4: the CKKS chain's own instance at a smaller modulus.
 //! Pegasus-style switching is not IND-CPA-D secure (ePrint 2026/285): decryptions must not go back to the server.
 use crate::modq::prime_below;
 use crate::Result;
@@ -22,11 +23,14 @@ pub struct Params {
     /// Binary LWE key dimension (the blind rotation's length, a multiple of `pbs_group`) and its noise (relative to p0).
     pub n_lwe: usize,
     pub lwe_sigma_rel: f64,
-    /// GLWE (k = 1) degree, the blind rotation's RNS primes and their product, and the bootstrapping key's noise.
+    /// GLWE (k = 1) degree, the blind rotation's RNS primes and their product.
     pub n_br: usize,
     pub br_primes: (u64, u64),
     pub q_br: u64,
+    /// Key noise: the ring-switch and repack ring keys, the bootstrapping key, the repack columns (module doc).
     pub key_sigma: f64,
+    pub bsk_sigma: f64,
+    pub rp_sigma: f64,
     /// Gadgets as (base log, levels): blind rotation (approximate, over q_br), LWE key switch (approximate, over p0),
     /// ring switch (approximate, over p0), repack (exact, over p0).
     pub pbs: (u32, usize),
@@ -63,8 +67,10 @@ impl Params {
             n_br,
             br_primes: (qa, qb),
             q_br: qa * qb,
-            key_sigma: 3.19,
-            pbs: (24, 1),
+            key_sigma: 4.0,
+            bsk_sigma: 18.5,
+            rp_sigma: 1024.0,
+            pbs: (23, 1),
             pbs_group: 3,
             ks: (2, 8),
             rs: (8, 3),

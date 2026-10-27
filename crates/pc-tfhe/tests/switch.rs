@@ -29,7 +29,7 @@ fn pbs_sign_on_fresh_lwes() {
     let p0 = prime_below(31, 1 << 17).unwrap();
     let s_lwe: Vec<i64> = (0..p.n_lwe).map(|_| (prng.next_u32() & 1) as i64).collect();
     let s_br: Vec<i64> = sample_ternary(&mut prng, p.n_br).into_iter().map(|x| x as i64).collect();
-    let dg = DiscreteGaussian::new(p.key_sigma).unwrap();
+    let dg = DiscreteGaussian::new(p.bsk_sigma).unwrap();
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64).unwrap();
     let rns = pc_tfhe::pbs::Rns::new(p.br_primes.0, p.br_primes.1, p.n_br).unwrap();
     let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, p.pbs_group, &dg, &mut prng);
@@ -47,7 +47,8 @@ fn pbs_sign_on_fresh_lwes() {
         let want = if *m >= 0.0 { 1.0 } else { 0.0 };
         worst = worst.max((ph - want).abs());
         ss += (ph - want).powi(2);
-        assert!((ph - want).abs() < 1e-3, "m {m}: want {want} got {ph}");
+        // ~8 sigma of the model's output noise (params.rs: ~2^-14.2 q_br = 4.4e-4 delta at delta = q_br / 8)
+        assert!((ph - want).abs() < 4e-3, "m {m}: want {want} got {ph}");
     }
     let rms = (ss / ms.len() as f64).sqrt() * delta as f64 / p.q_br as f64;
     eprintln!("pbs_sign_on_fresh_lwes: max output error {worst:.3e} (units of delta), rms 2^{:.2} q_br", rms.log2());
