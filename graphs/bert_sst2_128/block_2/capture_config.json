@@ -42,11 +42,8 @@
     "rot_key_band": 32
   },
   "host": {
-    "hf_home": "/data02/users/mithrillo/cache/huggingface",
     "malloc_arena_max": 2,
-    "omp_num_threads": 8,
-    "perseus_slotvec_cache": false,
-    "pythonpath": "python"
+    "omp_num_threads": 2
   },
   "model": {
     "cache_read_level_k": 34,
@@ -77,12 +74,13 @@
     "sm_hrs_pack": true,
     "sm_periodic": 1,
     "prefill": {
-      "attn": "ccmm",
-      "ccmm_fake_land": 30,
+      "attn": "",
+      "attn_pack": 3,
       "ccmm_merge": true,
+      "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/M7f/bootstrap_placements/bert_base_sst2_128/pcmm_calib.json",
+      "pcmm_calib_in": "/data02/users/azirilli/perseus-wt/main-replan/bootstrap_placements/bert_sst2_128/pcmm_calib.json",
       "pcmm_staged_only": "0",
       "sinc_a2": true,
       "sm_pair": true,
@@ -99,7 +97,7 @@
   "exec": {
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/M16/graphs/bert_sst2_128_stcf_m16",
+    "fhe_graph_dir": "graphs/_rp_bert_b",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
