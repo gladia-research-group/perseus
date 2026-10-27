@@ -759,7 +759,7 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
 pub const PREDIV_SHIFT: u32 = 1;
 pub const PREDIV_STAMP_LOG2: i32 = 20;
 
-/// The scale drop 2^s that P1 gives `lin`'s inputs on `route` (0: none): its stamp w_scale 2^shift over
+/// The scale drop 2^s that the pre-division gives `lin`'s inputs on `route` (0: none): its stamp w_scale 2^shift over
 /// 2^PREDIV_STAMP_LOG2, on a lean chain for a band shift above PREDIV_SHIFT.
 pub fn prediv_shift<W: DevWord, M: DevStrategy<W>>(route: &StcFirstRoute<'_, W, M>, lin: &PcmmLinear) -> u32 {
     prediv_log2(route.thin(), lin)
@@ -774,8 +774,8 @@ pub fn prediv_log2(thin: bool, lin: &PcmmLinear) -> u32 {
     (stamp.log2().round() as i32 - PREDIV_STAMP_LOG2).max(0) as u32
 }
 
-/// P1 on each of `lin`'s inputs (`prediv` by `prediv_shift`), before their stamp: `linear` and the per-input path of a
-/// linear whose inputs carry their own scales both run it.
+/// The pre-division of each of `lin`'s inputs (`prediv` by `prediv_shift`), before their stamp: `linear` and the
+/// per-input path of a linear whose inputs carry their own scales both run it.
 pub fn prediv_inputs<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &Pcmm<'a, '_, W>, lin: &PcmmLinear, ins: &mut [Ct<'a, W>]) -> Result<()> {
     let s = prediv_shift(route, lin);
     if s > 0 {
@@ -812,7 +812,7 @@ fn prediv<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route
 }
 
 /// `linear` for inputs whose metadata differ (the session's blocked layout: channel blocks carry their own scales): each
-/// input gets P1's pre-division (`prediv_inputs`, as `linear`) and its own StC-first input call (perseus pcmm.py
+/// input gets the pre-division (`prediv_inputs`, as `linear`) and its own StC-first input call (perseus pcmm.py
 /// `_device_cf`: `bts.begin` + `stc_first_input` per input, the mode-2 last stage built for that input's scale), the
 /// finishes run from input 0's call, as perseus does.
 #[allow(clippy::too_many_arguments)]
@@ -1062,8 +1062,8 @@ mod tests {
         assert_eq!(PcmmCalib::parse(&c.to_json()).unwrap(), c);
     }
 
-    /// P1's scale drop: the stamp w_scale 2^shift over 2^20, on a lean chain only, for band shifts above 1 (the
-    /// served rule), never negative.
+    /// The pre-division's scale drop: the stamp w_scale 2^shift over 2^20, on a lean chain only, for band shifts above
+    /// 1 (the served rule), never negative.
     #[test]
     fn prediv_scale() {
         let lin = |w_log2: i32, shift: u32| PcmmLinear { name: "b.out".into(), shape: PcmmShape { t: 64, n_in: 6, n_out: 2, nw: 2 }, w_scale: 2f64.powi(w_log2), shift };

@@ -7,7 +7,7 @@
 //!       product -> K-batched finishes vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits =
 //!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input; past band shift
 //!       DECODE_SHIFT the outputs' scale is lowered exactly before the decryption, whose decoder reads the bottom pair;
-//!       --per-input: each input at its own scale, the linear on `linear_per_input`; on a lean chain the P1
+//!       --per-input: each input at its own scale, the linear on `linear_per_input`; on a lean chain the
 //!       pre-division's exactness is gated too)
 //!   pc-bench pcmm [--shapes ..] [--k 1,2,4]      device ms per linear: product phases and output finishes per K
 use crate::check_bts::Tally;
@@ -710,7 +710,7 @@ fn bench(args: &[String]) -> Res<bool> {
         let shift = ((ymax * 1.5 / 0.25).log2().ceil()).max(0.0) as u32;
         let lin = PcmmLinear { name: name.to_string(), shape: sh, w_scale: ws, shift };
         if prec && route.thin() {
-            // P1's pre-division is exact: after `prediv_inputs` (a stamp 2^24: s = 4) one level down, the same values
+            // The pre-division is exact: after `prediv_inputs` (a stamp 2^24: s = 4) one level down, the same values
             let tl = PcmmLinear { w_scale: 2f64.powi(19), shift: 5, ..lin.clone() };
             let s = prediv_shift(&route, &tl);
             fresh(&mut ins[..sh.n_in], &mut ex, &xs)?;

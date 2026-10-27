@@ -454,9 +454,10 @@ class PlanResume(unittest.TestCase):
 
 
 class PcmmPredivCaps(unittest.TestCase):
-    """PLAN_PCMM_PREDIV_CAP (P1 on a lean chain): the hint and level-cap nodes feeding a PCMM of band shift above
-    PCMM_PREDIV_SHIFT are capped at the given level, in their inputs (`hint_lev(..)`, `lvl_cap(..)`) and their args
-    (`thr`, `cap`); a PCMM at band shift 1, a hint that feeds no PCMM and a cap already below are left as they are."""
+    """PLAN_PCMM_PREDIV_CAP (the PCMM pre-division on a lean chain): the hint and level-cap nodes feeding a PCMM of band
+    shift above PCMM_PREDIV_SHIFT are capped at the given level, in their inputs (`hint_lev(..)`, `lvl_cap(..)`) and
+    their args (`thr`, `cap`); a PCMM at band shift 1, a hint that feeds no PCMM and a cap already below are left as
+    they are."""
 
     @staticmethod
     def _pcmm(i: int, shift: int, lev: int = 44) -> list[dict]:
