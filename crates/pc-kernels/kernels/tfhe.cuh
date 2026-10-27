@@ -322,91 +322,148 @@ __global__ void init_k(TfheArgs A) {
     }
 }
 
-// the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads), unrolled by key pairs (pc-tfhe pbs.rs):
-// per pair acc += sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j). Shared: acc [2 part][2 prime][n],
-// tb [c][level][2 prime][n] (the digits of both parts; the product o [2 part][2 prime][n] reuses its first 4 n):
-// 4 n (1 + LV) words at LV levels. bsk [pair][m][e][h < LV][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
+// the whole blind rotation of NB LWEs per block (n / 2 = 1024 threads), unrolled by key pairs (pc-tfhe pbs.rs): per
+// pair acc += sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j). acc lives in registers (thread th owns
+// coefficients th and th + 1024 of [part][prime]); shared: tb [NB][c][level][2 prime][n] (the digits of both parts;
+// each LWE's product o [2 part][2 prime][n] reuses the first 4 n of its tb): 4 LV NB n words. The NB LWEs read each
+// key word once. bsk [pair][m][e][h < LV][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
 // inverse NTT then needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). tw carries after
 // the twiddles [prime][fwd | inv][n] the tables of NTT(X^e - 1): pm1 [prime][2 n] = g^x - 1 (Montgomery form) and
 // E [prime][n], NTT(X^e - 1)[j] = pm1[E[j] e mod 2 n]. Both products sum in 64 bits and reduce once (redc).
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
-template <int LV>
+template <int LV, int NB>
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
-    const int n = A.n, L = A.i1, bl = (int)A.c[0], lv = LV;
+    const int n = A.n, L = A.i1, bl = (int)A.c[0];
+    const int nbv = min(NB, A.count - (int)blockIdx.x * NB);   // LWEs of this block (the last may hold fewer)
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
-    uint32_t *acc = sm32, *tb = sm32 + 4 * n, *o = tb;
-    const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.x * (L + 1);
-    uint32_t* g = (uint32_t*)A.x + (size_t)blockIdx.x * 4 * n;
-    for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) acc[k] = g[k];
-    __syncthreads();
+    const size_t tbs = (size_t)4 * LV * n;
+    const uint32_t* at[NB];
+    uint32_t ar[NB][2][4];   // [lwe][jj][c prime]: coefficient th + 1024 jj
+#pragma unroll
+    for (int b = 0; b < NB; b++) {
+        const int lw = (int)blockIdx.x * NB + min(b, nbv - 1);
+        at[b] = (const uint32_t*)A.z + (size_t)lw * (L + 1);
+        const uint32_t* g = (const uint32_t*)A.x + (size_t)lw * 4 * n;
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++)
+#pragma unroll
+            for (int cp = 0; cp < 4; cp++) ar[b][jj][cp] = g[cp * n + threadIdx.x + jj * blockDim.x];
+    }
     const uint32_t* tw = (const uint32_t*)A.tw;
     const uint32_t* tws = (const uint32_t*)A.tws;
     const uint32_t *pm1 = tw + 4 * n, *ex = tw + 8 * n;
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
-    const size_t kstride = (size_t)2 * lv * 2 * 2 * n;   // one GGSW
-    const int bits = bl * lv, n2 = 2 * n;
+    const size_t kstride = (size_t)2 * LV * 2 * 2 * n;   // one GGSW
+    const int bits = bl * LV, n2 = 2 * n;
     const int64_t B = 1ll << bl;
     for (int pr = 0; pr < L / 2; pr++) {
-        const uint32_t ki = at[2 * pr], kj = at[2 * pr + 1];
-        if (!ki && !kj) continue;
-        const int em[3] = {(int)((2 * n2 - ki - kj) % n2), (int)((n2 - ki) % n2), (int)((n2 - kj) % n2)};
-        for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        int em[NB][3];
+        bool any = false;
 #pragma unroll
-            for (int c = 0; c < 2; c++) {
-                const uint32_t da = acc[(2 * c) * n + j], db = acc[(2 * c + 1) * n + j];
-                int64_t v = (int64_t)scale_round(crt(da, db, qa, qb, inv, invs), A.m);
-                if (v >= (1ll << (bits - 1))) v -= 1ll << bits;
-                for (int t = 0; t < lv; t++) {
-                    int64_t r = v & (B - 1);
-                    if (r >= B / 2) r -= B;
-                    v = (v - r) >> bl;
-                    if (t == lv - 1) r += v << bl;
-                    uint32_t* d = tb + (size_t)(c * lv + t) * 2 * n;
-                    d[swz(j)] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
-                    d[n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
+        for (int b = 0; b < NB; b++) {
+            const uint32_t ki = at[b][2 * pr], kj = at[b][2 * pr + 1];
+            const bool on = b < nbv;
+            em[b][0] = on ? (int)((2 * n2 - ki - kj) % n2) : 0;
+            em[b][1] = on ? (int)((n2 - ki) % n2) : 0;
+            em[b][2] = on ? (int)((n2 - kj) % n2) : 0;
+            any |= on && (ki || kj);
+        }
+        if (!any) continue;
+#pragma unroll
+        for (int b = 0; b < NB; b++) {
+            uint32_t* tbb = sm32 + b * tbs;
+#pragma unroll
+            for (int jj = 0; jj < 2; jj++) {
+                const int j = threadIdx.x + jj * blockDim.x;
+#pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    int64_t v = (int64_t)scale_round(crt(ar[b][jj][2 * c], ar[b][jj][2 * c + 1], qa, qb, inv, invs), A.m);
+                    if (v >= (1ll << (bits - 1))) v -= 1ll << bits;
+#pragma unroll
+                    for (int t = 0; t < LV; t++) {
+                        int64_t r = v & (B - 1);
+                        if (r >= B / 2) r -= B;
+                        v = (v - r) >> bl;
+                        if (t == LV - 1) r += v << bl;
+                        uint32_t* d = tbb + (size_t)(c * LV + t) * 2 * n;
+                        d[swz(j)] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
+                        d[n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
+                    }
                 }
             }
         }
         __syncthreads();
-        nttr_fwd(tb, 4 * lv, tw, tws, qa, qb);
+        nttr_fwd(sm32, 4 * LV * NB, tw, tws, qa, qb);
         const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * 3 * kstride) + threadIdx.x;
 #pragma unroll
         for (int e = 0; e < RT_E; e++) {
             const int k = threadIdx.x + e * blockDim.x, p = k >= n;
             const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
             const int ej = (int)ex[k];   // E [prime][n] at k = prime n + j
-            uint32_t d[2 * LV];   // [c][t]
+            uint32_t d[NB][2 * LV];   // [lwe][c][t]
 #pragma unroll
-            for (int ct = 0; ct < 2 * LV; ct++) d[ct] = tb[ct * 2 * n + swz(k)];
-            uint64_t y0 = 0, y1 = 0;   // 3 terms < 2 q q
+            for (int b = 0; b < NB; b++)
+#pragma unroll
+                for (int ct = 0; ct < 2 * LV; ct++) d[b][ct] = sm32[b * tbs + ct * 2 * n + swz(k)];
+            uint64_t y0[NB], y1[NB];   // 3 terms < 2 q q
+#pragma unroll
+            for (int b = 0; b < NB; b++) y0[b] = y1[b] = 0;
 #pragma unroll
             for (int m = 0; m < 3; m++) {
-                if (!em[m]) continue;
-                uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+                uint4 w[LV];
 #pragma unroll
-                for (int h = 0; h < LV; h++) {
-                    const uint4 w = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
-                    s0 += (uint64_t)d[2 * h] * w.x + (uint64_t)d[2 * h + 1] * w.z;
-                    s1 += (uint64_t)d[2 * h] * w.y + (uint64_t)d[2 * h + 1] * w.w;
+                for (int h = 0; h < LV; h++) w[h] = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
+#pragma unroll
+                for (int b = 0; b < NB; b++) {
+                    if (!em[b][m]) continue;
+                    uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+#pragma unroll
+                    for (int h = 0; h < LV; h++) {
+                        s0 += (uint64_t)d[b][2 * h] * w[h].x + (uint64_t)d[b][2 * h + 1] * w[h].z;
+                        s1 += (uint64_t)d[b][2 * h] * w[h].y + (uint64_t)d[b][2 * h + 1] * w[h].w;
+                    }
+                    const uint32_t f = __ldg(pm1 + p * n2 + ((ej * em[b][m]) & (n2 - 1)));
+                    y0[b] += (uint64_t)redc(s0, q, mi) * f;
+                    y1[b] += (uint64_t)redc(s1, q, mi) * f;
                 }
-                const uint32_t f = __ldg(pm1 + p * n2 + ((ej * em[m]) & (n2 - 1)));
-                y0 += (uint64_t)redc(s0, q, mi) * f;
-                y1 += (uint64_t)redc(s1, q, mi) * f;
             }
             // o aliases the digits: this thread alone reads and writes word k
-            o[swz(k)] = redc(y0, q, mi);   // < 2 q
-            o[2 * n + swz(k)] = redc(y1, q, mi);
+#pragma unroll
+            for (int b = 0; b < NB; b++) {
+                sm32[b * tbs + swz(k)] = redc(y0[b], q, mi);   // < 2 q
+                sm32[b * tbs + 2 * n + swz(k)] = redc(y1[b], q, mi);
+            }
         }
         __syncthreads();
-        nttr_inv(o, 4, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1
-        for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) {
-            const uint32_t q = (k >> (__ffs(n) - 1)) & 1 ? qb : qa;
-            acc[k] = add32(acc[k], fold32(o[swz(k)], q), q);
+        // o [lwe][part][prime][n]: poly k at prime k & 1 (the stride between LWEs is a whole number of polys)
+        if (LV == 1) {
+            nttr_inv(sm32, 4 * NB, tw, tws, qa, qb);
+        } else {
+#pragma unroll
+            for (int b = 0; b < NB; b++) nttr_inv(sm32 + b * tbs, 4, tw, tws, qa, qb);
         }
+#pragma unroll
+        for (int b = 0; b < NB; b++)
+#pragma unroll
+            for (int jj = 0; jj < 2; jj++)
+#pragma unroll
+                for (int cp = 0; cp < 4; cp++) {
+                    const uint32_t q = cp & 1 ? qb : qa;
+                    const int k = cp * n + threadIdx.x + jj * blockDim.x;
+                    ar[b][jj][cp] = add32(ar[b][jj][cp], fold32(sm32[b * tbs + swz(k)], q), q);
+                }
         __syncthreads();
     }
-    for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) g[k] = acc[k];
+#pragma unroll
+    for (int b = 0; b < NB; b++) {
+        if (b >= nbv) break;
+        uint32_t* g = (uint32_t*)A.x + ((size_t)blockIdx.x * NB + b) * 4 * n;
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++)
+#pragma unroll
+            for (int cp = 0; cp < 4; cp++) g[cp * n + threadIdx.x + jj * blockDim.x] = ar[b][jj][cp];
+    }
 }
 
 // sample extraction of coefficient 0 (CRT to mod Q), + offset c[0] (mod Q), then round(v c[1] / Q) mod c[1]
@@ -696,19 +753,29 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             break;
         case PC_TFHE_PBS_ROTATE: {
             // the kernel is specialised to n = 2048 at one or two levels: 1024 threads, RT_E = 4 coefficients each; the
-            // lazy MAC needs 46 levels q < 2^32
+            // lazy MAC needs 46 levels q < 2^32. Two LWEs per block (sharing the key reads) once the batch fills two
+            // blocks per SM (one level only: the digits of two LWEs then fit in 64 KB)
             const int th = STEP_TH, lv = (int)A.c[1];
             const uint64_t qa = A.c[6] & 0xffffffffull, qb = A.c[6] >> 32, qmax = qa > qb ? qa : qb;
             if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * lv * qmax >= (1ull << 32)) return -1;
-            const int smem = 4 * A.n * (1 + lv) * (int)sizeof(uint32_t);
+            static int sms = 0;
             static bool attr_r = false;
-            if (!attr_r) {   // the opt-in for n = 2048 (64 / 96 KB), once
-                cudaFuncSetAttribute(rotate_k<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
-                cudaFuncSetAttribute(rotate_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 12 * 2048 * (int)sizeof(uint32_t));
+            if (!attr_r) {   // the shared-memory opt-ins (32 / 64 KB), once
+                int dev = 0;
+                cudaGetDevice(&dev);
+                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+                cudaFuncSetAttribute(rotate_k<1, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 4 * 2048 * (int)sizeof(uint32_t));
+                cudaFuncSetAttribute(rotate_k<1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                cudaFuncSetAttribute(rotate_k<2, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
                 attr_r = true;
             }
-            if (lv == 1) rotate_k<1><<<A.count, th, smem, s>>>(A);
-            else rotate_k<2><<<A.count, th, smem, s>>>(A);
+            if (lv == 2) {
+                rotate_k<2, 1><<<A.count, th, 8 * A.n * (int)sizeof(uint32_t), s>>>(A);
+            } else if (A.count >= 2 * sms) {
+                rotate_k<1, 2><<<(A.count + 1) / 2, th, 8 * A.n * (int)sizeof(uint32_t), s>>>(A);
+            } else {
+                rotate_k<1, 1><<<A.count, th, 4 * A.n * (int)sizeof(uint32_t), s>>>(A);
+            }
             break;
         }
         case PC_TFHE_PBS_EXTRACT:
