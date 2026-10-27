@@ -20,7 +20,7 @@ from perseus.impl.pcmm import PcmmLinear, band_shift, run as pcmm_run
 from perseus.impl.prefill import Chunks, evict_block_masks, name_inputs
 
 from perseus.examples.gpt2 import weights as W
-from perseus.examples.gpt2.prefill import _bias_blocks, _gelu_blocks
+from perseus.examples.gpt2.prefill import _bias_blocks, _gelu_blocks, qkv_encode, qkv_split
 
 # PF_LAST_QUERY=1 (blocked attention): the last block computes [CLS] alone past its K / V (the head reads nothing else)
 _LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
@@ -47,13 +47,13 @@ def affine_blocked(rt, Xs, gamma, beta, ch: Chunks, B, site):
 
 def bert_block(rt, Xs, w, cfgs, ch: Chunks, B, b: int, last=None):
     """`last`: the only position the block's output must hold (blocked.attention_last)."""
-    ops, K = rt.ops, B.K
+    ops = rt.ops
     ln1, ln2, sm, ge = cfgs
     with rt.step("qkv"):
         Q, Kc, V = [], [], []
         for g, x in enumerate(Xs):
-            o = _bias_blocks(rt, pcmm_run(rt, x, w["qkv"]), w["qkv"], ch, g, B)
-            Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+            k, v, q = qkv_split(rt, _bias_blocks(rt, pcmm_run(rt, x, w["qkv"]), w["qkv"], ch, g, B), B)
+            Kc.append(k); V.append(v); Q.append(q)
     with rt.step("attn"):
         if os.environ.get("PF_ATTN", "") == "ccmm":     # CCMM attention on the d_head-64 SinC packing (ccmm_mha.py)
             if last is not None:
@@ -105,9 +105,9 @@ class BertPrefill(ImplModel):
 
             def enc(name, Wm, sc, bias):
                 return PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"), name=f"b{b}.{name}")
+            qkv_cols, qkv_bias = qkv_encode(B, m)
             self._w[b] = {
-                "qkv": enc("qkv", np.hstack([B.group_cols(m.K), B.group_cols(m.V), B.group_cols(m.Q)]), 0.5,
-                           np.concatenate([B.group_vec(m.bk), B.group_vec(m.bv), B.group_vec(m.bq)])),
+                "qkv": enc("qkv", qkv_cols, 0.5, qkv_bias),
                 "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
                 "up": enc("up", (m.Up * us)[:, :Er], 0.5, (m.bup * us)[:Er]),
                 "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
