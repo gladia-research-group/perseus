@@ -580,6 +580,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.k_max = pcmm.as_ref().map_or(1, |p| p.batch.max(1));
             setup.cts_alt_budget = cts_alt;
             let mut sfs = StcFirstSetup::n32_shipped();
+            // FIDESLIB_BTS_STC_FIRST_CF: the route's default CF (a site's own Route::cf wins); 13 shipped
+            if let Some(cf) = cfg.bts.stc_first_cf {
+                sfs.cf_default = Some(cf as u32);
+            }
             sfs.cache_slots = ps.stc_cache.max(1);
             if ccmm.is_some() {
                 // the CCMM operands' stc_high (50, skip 1) and SinCBoot's stage 0 for every left-operand state, plus

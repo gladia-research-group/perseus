@@ -94,7 +94,7 @@ section! {
         #[doc = "`FIDESLIB_BTS_STC_FIRST`. Default '0'. Read at impl/fakecap.py::CapFhe.stc_first."]
         #[doc = "Shipped plans: runtime= 7."]
         stc_first: Int = "FIDESLIB_BTS_STC_FIRST", "'0'";
-        #[doc = "`FIDESLIB_BTS_STC_FIRST_CF`. Default (unset). Read at —."]
+        #[doc = "`FIDESLIB_BTS_STC_FIRST_CF`. Default (unset). Read at pc-py session.rs key_needs (the StC-first route's default CF)."]
         #[doc = "Shipped plans: runtime= 6."]
         stc_first_cf: Int = "FIDESLIB_BTS_STC_FIRST_CF", "(unset)";
         #[doc = "`FIDESLIB_BTS_STC_FIRST_ROUTES`. Default 'dense'. Read at impl/fakecap.py::CapFhe.stc_first."]
