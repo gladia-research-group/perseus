@@ -185,8 +185,9 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
     _memdbg(rt, "qkv")
     with rt.step("attn"):
         if last is not None:
-            if paged is not None or os.environ.get("PF_ATTN", "") == "ccmm":
-                raise ValueError("PF_LAST_QUERY: the unpaged blocked attention only")
+            # the one-query attention whatever the other blocks run (CCMM included); paged, only the prompt's one page
+            if paged is not None and (paged[0] != 0 or kv is not None):
+                raise ValueError("PF_LAST_QUERY: paged, a one-page prompt without a K / V hand-off")
             O = BL.attention_last(rt, Q, Kc, V, sm, ch, B, last, rope=rope, prefixes=prefixes, kv=kv)
             skip = [BL.token_bcast(rt, skip[0], ch, B, last)]
         elif paged is not None:
@@ -310,6 +311,8 @@ class LlamaPrefill(LlamaModel):
             i += n
             p += 1
         stores = [[] for _ in range(self.n_layers)]
+        if _LAST_QUERY and len(pages) > 1:
+            raise ValueError("PF_LAST_QUERY: paged, a one-page prompt")
         self.token_begin(0)
         out = []
         for p, (toks, base) in enumerate(pages):
@@ -324,10 +327,11 @@ class LlamaPrefill(LlamaModel):
                 self.rt.rearm_plan = None if plan is None else (lambda plan=plan: self.core.install_plan_live(self.inf, plan))
                 BL.name_blocked(self.inf, Xs)
                 kvs = None if on_kv is None else [{} for _ in range(B.Kkv)]
+                last = self.last_position(ch) if b == self.n_layers - 1 else None
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
                                                      self.rope, self.prefix_kv(b), B, kvs, layer=b,
-                                                     paged=(p, stores[b], p == len(pages) - 1))
+                                                     paged=(p, stores[b], p == len(pages) - 1), last=last)
                 self.rt.rearm_plan = None
                 self.exit_stage(b, cap)
                 if on_kv is not None:

@@ -402,8 +402,9 @@ def main(argv=None, results=None):
     out = {}
     n_rep = a.tokens
     if model.n_layers == int(store.config["num_hidden_layers"]) and gt is not None:
+        from perseus.impl.prefill import Chunks
         h = model.hidden_rows(Xs, ch) if hid is None else hid
-        lo = a.tokens - 1 if hid is None and model.last_position(ch) is not None else 0   # PF_LAST_QUERY
+        lo = a.tokens - 1 if model.last_position(Chunks(a.tokens, model.blocks.t)) is not None else 0   # PF_LAST_QUERY
         n_rep = a.tokens - lo
         rows, out = report(plain_logits(model, h[lo:]), gt[1 + lo:a.tokens + 1])
         print("[llama-prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows), flush=True)
