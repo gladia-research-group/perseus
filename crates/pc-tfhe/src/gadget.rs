@@ -1,9 +1,22 @@
 //! Signed base-2^b gadget decomposition over a prime q.
 //!
-//! Approximate: x is rounded to `levels * b` bits of precision (x~ = round(x 2^(l b) / q)) and x~ is split into balanced
-//! digits; the gadget values are round(q B^t / 2^(l b)), so sum d_t g_t = x up to q / 2^(l b + 1). Exact: l b >=
-//! log2 q, x~ is x itself (centered) and g_t = B^t, so the recomposition is x as an integer in (-q/2, q/2].
+//! Approximate: x is rounded to `levels * b` bits of precision and split into balanced digits; the gadget values are
+//! round(q B^t / 2^(l b)), so sum d_t g_t = x up to ~q / 2^(l b). The rounding is the fixed-point product the device
+//! computes (`scale_round`: no 128-bit division): x~ = (x M + 2^63) >> 64 with M = floor(2^(64 + l b) / q), x in
+//! [0, q), then centered in 2^(l b). Exact: l b >= log2 q, x~ is x itself (centered) and g_t = B^t, so the
+//! recomposition is x as an integer in (-q/2, q/2].
 use crate::modq::{centered, from_signed};
+
+/// floor(2^64 num / den) for num < den (the multiplier of `scale_round`).
+pub fn fixed_ratio(num: u64, den: u64) -> u64 {
+    (((num as u128) << 64) / den as u128) as u64
+}
+
+/// round(x num / den) as (x M + 2^63) >> 64, M = `fixed_ratio(num, den)`: what the device computes with __umul64hi.
+#[inline]
+pub fn scale_round(x: u64, m: u64) -> u64 {
+    ((x as u128 * m as u128 + (1u128 << 63)) >> 64) as u64
+}
 
 #[derive(Clone, Debug)]
 pub struct Gadget {
@@ -12,6 +25,8 @@ pub struct Gadget {
     pub levels: usize,
     pub exact: bool,
     g: Vec<u64>,
+    /// fixed_ratio(2^(l b), q): the approximate decomposition's rounding multiplier
+    pub m: u64,
 }
 
 impl Gadget {
@@ -31,7 +46,8 @@ impl Gadget {
                 }
             })
             .collect();
-        Gadget { q, base_log, levels, exact, g }
+        let m = if exact { 0 } else { fixed_ratio(1u64 << bits, q) };
+        Gadget { q, base_log, levels, exact, g, m }
     }
 
     /// g_t mod q.
@@ -42,8 +58,16 @@ impl Gadget {
     /// Balanced digits d_t in [-B/2, B/2) of x (low digit first).
     pub fn decompose(&self, x: u64, out: &mut [i64]) {
         let bits = self.base_log as usize * self.levels;
-        let xc = centered(x, self.q) as i128;
-        let mut v: i128 = if self.exact { xc } else { (xc * (1i128 << bits) + (self.q as i128) / 2).div_euclid(self.q as i128) };
+        let mut v: i128 = if self.exact {
+            centered(x, self.q) as i128
+        } else {
+            let r = scale_round(x, self.m) as i128;
+            if r >= 1i128 << (bits - 1) {
+                r - (1i128 << bits)
+            } else {
+                r
+            }
+        };
         let b = 1i128 << self.base_log;
         for t in 0..self.levels {
             let mut r = v.rem_euclid(b);
