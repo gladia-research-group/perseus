@@ -21,11 +21,11 @@ def relu_exact(ops, xs, site, gain=1.0):
 
 
 class ResNet20:
-    def __init__(self, sd, act=relu_exact, slots=1 << 15, scales=None, refresh=False):
+    def __init__(self, sd, act=relu_exact, slots=1 << 15, scales=None, refresh=False, one_stage=False):
         """`refresh`: a deliberate bootstrap of every block / head stage's inputs on entry (the planner reads a stage's
         exit before a trailing refresh, so the refresh opens the next stage instead)."""
         stem, blks, (fw, fb) = R.blocks(sd)
-        self.act, self.refresh = act, refresh
+        self.act, self.refresh, self.one_stage = act, refresh, one_stage
         B = (lambda site: 1.0) if scales is None else (lambda site: float(scales[site]))
 
         def sc(Wb, s_in, s_out):
@@ -92,10 +92,19 @@ class ResNet20:
         return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
 
     def stages(self):
-        """[(label, fn(ops, cts) -> cts)]."""
+        """[(label, fn(ops, cts) -> cts)]; `one_stage`: the whole network as one (the planner places every refresh, no
+        stage entry to fix)."""
         out = [("stem", self.stem_stage)]
         out += [(name, lambda ops, xs, b=b: self.block_stage(ops, xs, b)) for b, (name, *_r) in enumerate(self.blocks)]
-        return out + [("head", self.head_stage)]
+        out += [("head", self.head_stage)]
+        if not self.one_stage:
+            return out
+
+        def net(ops, xs):
+            for _lab, fn in out:
+                xs = fn(ops, xs)
+            return xs
+        return [("net", net)]
 
     def forward(self, ops, xs):
         for _lab, fn in self.stages():
