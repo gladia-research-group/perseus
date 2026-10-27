@@ -326,11 +326,14 @@ __global__ void init_k(TfheArgs A) {
 // pbs.rs; i2 = G): per group acc += sum_m (X^-e_m - 1) (K_m [x] acc), m = 1 .. 2^G - 1, e_m = the sum of the a's in
 // the bit mask m. acc lives in registers (thread th owns
 // coefficients th and th + 1024 of [part][prime]); shared: tb [NB][c][level][2 prime][n] (the digits of both parts;
-// each LWE's product o [2 part][2 prime][n] reuses the first 4 n of its tb): 4 LV NB n words. The NB LWEs read each
+// each LWE's product o [2 part][2 prime][n] reuses the first 4 n of its tb): 4 LV NB n words, then pm1 (4 n). The NB LWEs read each
 // key word once. bsk [group][m][e][h < LV][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
 // inverse NTT then needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). tw carries after
 // the twiddles [prime][fwd | inv][n] the tables of NTT(X^e - 1): pm1 [prime][2 n] = g^x - 1 (Montgomery form) and
 // E [prime][n], NTT(X^e - 1)[j] = pm1[E[j] e mod 2 n]. Both products sum in 64 bits and reduce once (redc).
+#ifndef RT_SKIP
+#define RT_SKIP 0   // EXPERIMENT timing: 1 skip MAC, 2 skip NTTs
+#endif
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
 template <int LV, int NB, int G>
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
@@ -354,10 +357,14 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     }
     const uint32_t* tw = (const uint32_t*)A.tw;
     const uint32_t* tws = (const uint32_t*)A.tws;
-    const uint32_t *pm1 = tw + 4 * n, *ex = tw + 8 * n;
+    const uint32_t* ex = tw + 8 * n;
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
     const size_t kstride = (size_t)2 * LV * 2 * 2 * n;   // one GGSW
     const int bits = bl * LV, n2 = 2 * n;
+    // pm1 [prime][2 n] in shared memory after the digits: its gathers (data-dependent, 2^G - 1 per word) sat on the
+    // MAC's critical path from L2
+    uint32_t* pm1 = sm32 + NB * tbs;
+    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[x] = __ldg(tw + 4 * n + x);
     const int64_t B = 1ll << bl;
     for (int pr = 0; pr < L / G; pr++) {
         int em[NB][KM];
@@ -407,7 +414,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             }
         }
         __syncthreads();
-        nttr_fwd(sm32, 4 * LV * NB, tw, tws, qa, qb);
+        if (RT_SKIP != 2) nttr_fwd(sm32, 4 * LV * NB, tw, tws, qa, qb);
         const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
 #pragma unroll
         for (int e = 0; e < RT_E; e++) {
@@ -419,39 +426,49 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             for (int b = 0; b < NB; b++)
 #pragma unroll
                 for (int ct = 0; ct < 2 * LV; ct++) d[b][ct] = sm32[b * tbs + ct * 2 * n + swz(k)];
-            uint64_t y0[NB], y1[NB];   // KM <= 7 terms < 2 q q: < q 2^32 at q < 2^28
+            // the group's key first (TFHE-rs's key bundle, in NTT form): G[ct][part] = sum_m f_m K_m[ct][part], f_m =
+            // NTT(X^-e_m - 1) (KM <= 7 terms < q q: < q 2^32), then one product with the digits: 2 KM LV + 2 LV wide
+            // products and 2 LV + 2 reductions per word instead of KM (2 LV + 2) and 2 KM + 2
+            uint64_t gk[NB][2 * LV][2];
 #pragma unroll
-            for (int b = 0; b < NB; b++) y0[b] = y1[b] = 0;
+            for (int b = 0; b < NB; b++)
 #pragma unroll
-            for (int m = 0; m < KM; m++) {
+                for (int ct = 0; ct < 2 * LV; ct++) gk[b][ct][0] = gk[b][ct][1] = 0;
+#pragma unroll
+            for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
                 uint4 w[LV];
 #pragma unroll
                 for (int h = 0; h < LV; h++) w[h] = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
 #pragma unroll
                 for (int b = 0; b < NB; b++) {
                     if (!em[b][m]) continue;
-                    uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+                    const uint64_t f = pm1[p * n2 + ((ej * em[b][m]) & (n2 - 1))];
 #pragma unroll
                     for (int h = 0; h < LV; h++) {
-                        s0 += (uint64_t)d[b][2 * h] * w[h].x + (uint64_t)d[b][2 * h + 1] * w[h].z;
-                        s1 += (uint64_t)d[b][2 * h] * w[h].y + (uint64_t)d[b][2 * h + 1] * w[h].w;
+                        gk[b][2 * h][0] += w[h].x * f;
+                        gk[b][2 * h][1] += w[h].y * f;
+                        gk[b][2 * h + 1][0] += w[h].z * f;
+                        gk[b][2 * h + 1][1] += w[h].w * f;
                     }
-                    const uint32_t f = __ldg(pm1 + p * n2 + ((ej * em[b][m]) & (n2 - 1)));
-                    y0[b] += (uint64_t)redc(s0, q, mi) * f;
-                    y1[b] += (uint64_t)redc(s1, q, mi) * f;
                 }
             }
             // o aliases the digits: this thread alone reads and writes word k
 #pragma unroll
             for (int b = 0; b < NB; b++) {
-                sm32[b * tbs + swz(k)] = redc(y0[b], q, mi);   // < 2 q
-                sm32[b * tbs + 2 * n + swz(k)] = redc(y1[b], q, mi);
+                uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+#pragma unroll
+                for (int ct = 0; ct < 2 * LV; ct++) {
+                    s0 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][0], q, mi), q);
+                    s1 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][1], q, mi), q);
+                }
+                sm32[b * tbs + swz(k)] = redc(s0, q, mi);   // < 2 q
+                sm32[b * tbs + 2 * n + swz(k)] = redc(s1, q, mi);
             }
         }
         __syncthreads();
         // o [lwe][part][prime][n]: poly k at prime k & 1 (the stride between LWEs is a whole number of polys)
         if (LV == 1) {
-            nttr_inv(sm32, 4 * NB, tw, tws, qa, qb);
+            if (RT_SKIP != 2) nttr_inv(sm32, 4 * NB, tw, tws, qa, qb);
         } else {
 #pragma unroll
             for (int b = 0; b < NB; b++) nttr_inv(sm32 + b * tbs, 4, tw, tws, qa, qb);
@@ -775,11 +792,11 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if ((grp != 2 && grp != 3) || A.i1 % grp) return -1;
             static int sms = 0;
             static bool attr_r = false;
-            if (!attr_r) {   // the shared-memory opt-ins (32 / 64 KB), once
+            if (!attr_r) {   // the shared-memory opt-ins (64 / 96 KB), once
                 int dev = 0;
                 cudaGetDevice(&dev);
                 cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-                const int s4 = 4 * 2048 * (int)sizeof(uint32_t), s8 = 2 * s4;
+                const int s4 = 8 * 2048 * (int)sizeof(uint32_t), s8 = 12 * 2048 * (int)sizeof(uint32_t);
                 cudaFuncSetAttribute(rotate_k<1, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
                 cudaFuncSetAttribute(rotate_k<1, 2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
                 cudaFuncSetAttribute(rotate_k<2, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
@@ -788,7 +805,8 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 cudaFuncSetAttribute(rotate_k<2, 1, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
                 attr_r = true;
             }
-            const int s4 = 4 * A.n * (int)sizeof(uint32_t), s8 = 2 * s4;
+            // digits (4 / 8 n words) + pm1 (4 n)
+            const int s4 = 8 * A.n * (int)sizeof(uint32_t), s8 = 12 * A.n * (int)sizeof(uint32_t);
             const bool two = lv == 1 && A.count >= 2 * sms;
             const unsigned blocks = two ? (A.count + 1) / 2 : A.count;
             if (grp == 2) {
