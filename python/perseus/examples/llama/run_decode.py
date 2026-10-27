@@ -84,7 +84,7 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     run.debug = a.debug_blocks or a.tap_block is not None
     run.tail = n == n_total
     if a.tap_block is not None:
-        run.tap = (0, a.tap_block)
+        run.tap = (a.tap_token, a.tap_block)
         run.tap_steps = {x for x in a.tap_steps.split(",") if x}
     return run
 
@@ -170,6 +170,8 @@ def main(argv=None):
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output vs the twin")
     ap.add_argument("--tap-block", type=int, default=None, help="planned debug: block whose intermediates (token 0) are compared with the twin")
     ap.add_argument("--tap-steps", default="", help="with --tap-block: every output of these steps (comma list)")
+    ap.add_argument("--tap-token", type=int, default=0,
+                    help="with --tap-block: the token (position - 1) tapped; the first token of its program class")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
