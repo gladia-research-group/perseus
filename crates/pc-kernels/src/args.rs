@@ -717,6 +717,7 @@ pub mod tfhe_op {
     pub const REPACK_RING: i32 = 14;
     pub const REPACK_RMAC: i32 = 15;
     pub const REPACK_C0: i32 = 16;
+    pub const REPACK_FIN: i32 = 17;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

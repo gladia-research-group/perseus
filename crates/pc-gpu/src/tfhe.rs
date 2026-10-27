@@ -28,7 +28,7 @@ use crate::ntt::{self, Parts, Span};
 type W = u32;
 const PLANES: usize = 4;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
-const RC: usize = 1024;
+const RC: usize = 256;
 const WS: usize = 64 << 20;
 
 fn mu(p: u64) -> u64 {
@@ -106,7 +106,7 @@ pub fn tv_residues(k: &pc_tfhe::pbs::BootstrapKey, tv: &[u64]) -> Vec<u32> {
 }
 
 /// The device repack (pc-tfhe `RepackKey`, bit for bit): per RC LWEs REPACK_DIGITS -> REPACK_MAC (the GEMM in
-/// R_{n_br} mod p0 P, rescaled by P) -> REPACK_SCATTER (X^j P_j(X^S) into ring N), then REPACK_RING (c0, digits of
+/// R_{n_br} mod p0 P; split K into int64 sums) -> REPACK_FIN (rescaled by P) -> REPACK_SCATTER (X^j P_j(X^S) into ring N), then REPACK_RING (c0, digits of
 /// c1), NTT, REPACK_RMAC (the ring key), INTT, REPACK_C0: `acc` [part][limb][n] mod p0 p1 under s, coefficient form.
 pub struct DevRepack<'a> {
     n: usize,
@@ -120,6 +120,7 @@ pub struct DevRepack<'a> {
     ring: DBuf<'a, Compute, u32>,
     dig: DBuf<'a, Compute, i32>,
     pk: DBuf<'a, Compute, u32>,
+    sums: DBuf<'a, Compute, u64>,
     z: DBuf<'a, Compute, u64>,
     c0: DBuf<'a, Compute, u32>,
     rdig: DBuf<'a, Compute, u32>,
@@ -128,7 +129,7 @@ pub struct DevRepack<'a> {
 
 impl<'a> DevRepack<'a> {
     pub fn bytes(n: usize, nb: usize, lv: usize) -> usize {
-        4 * (nb * lv * 4 * nb + lv * 4 * n + RC * nb * lv + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * 2 * n + 8 * 256
+        4 * (nb * lv * 4 * nb + lv * 4 * n + RC * nb * lv + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * (RC * 4 * nb + 2 * n) + 9 * 256
     }
 
     pub fn new(arena: &'a Arena, s: &Stream<Compute>, sw: &Switcher) -> Result<Self> {
@@ -159,6 +160,7 @@ impl<'a> DevRepack<'a> {
             ring: up("tfhe.rring", &ring)?,
             dig: arena.alloc("tfhe.work", RC * nb * lv)?,
             pk: arena.alloc("tfhe.work", RC * 2 * nb)?,
+            sums: arena.alloc("tfhe.work", RC * 4 * nb)?,
             z: arena.alloc("tfhe.work", 2 * n)?,
             c0: arena.alloc("tfhe.work", n)?,
             rdig: arena.alloc("tfhe.work", 2 * lv * n)?,
@@ -193,8 +195,10 @@ impl<'a> DevRepack<'a> {
             let rc = RC.min(b - r0);
             let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
             let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
-            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, ..rb })?;
-            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: self.pk.vptr_mut(), y: self.dig.vptr(), z: self.cols.vptr(), w: o, ..rb })?;
+            let sums = self.sums.vptr_mut();
+            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, w: sums as *const c_void, ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: sums, y: self.dig.vptr(), z: self.cols.vptr(), ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_FIN, count: rc as i32, x: self.pk.vptr_mut(), y: self.sums.vptr(), w: o, ..rb })?;
             go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ix, ..rb })?;
         }
         let rr = TfheArgs { count: 1, c: [self.rp.0 as u64, lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..rb };
