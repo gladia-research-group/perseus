@@ -277,7 +277,7 @@ impl<'a> TfheSwitch<'a> {
         let n_sub = n / p.rs_factor;
         let k = n_sub * p.ks.1;
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
-            + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1)
+            + max * (n_sub + 1) + PLANES * ((nl + 1) * max + 64) + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
@@ -351,7 +351,7 @@ impl<'a> TfheSwitch<'a> {
             idx: arena.alloc("tfhe.work", max)?,
             ext: arena.alloc("tfhe.work", max * (n_sub + 1))?,
             kdig: arena.alloc("tfhe.work", max * k)?,
-            g: arena.alloc("tfhe.work", PLANES * cols * max)?,
+            g: arena.alloc("tfhe.work", PLANES * (cols * max).next_multiple_of(64))?,
             lwe: arena.alloc("tfhe.work", max * cols)?,
             ms: arena.alloc("tfhe.work", max * cols)?,
             acc: arena.alloc("tfhe.work", max * 4 * nb)?,
@@ -440,12 +440,14 @@ impl<'a> TfheSwitch<'a> {
             self.gemms.insert(b, I8Gemm::new(lt_, b as u64, cols as u64, k as u64, 8, WS)?);
         }
         let gemm = &self.gemms[&b];
+        // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
+        let ps = (cols * b).next_multiple_of(64);
         let gp_ = self.g.dptr_mut();
         for u in 0..PLANES {
             // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
-            unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * cols * b), false, &mut self.ws)? };
+            unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
         }
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: b as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, 0, 0, 0, 0, 0], ..Default::default() })?;
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: b as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, 0, 0, 0, 0], ..Default::default() })?;
         s.sync()?;
         tm.key_switch = t1.elapsed().as_secs_f64() * 1e3;
 
