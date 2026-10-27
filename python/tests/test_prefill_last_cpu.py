@@ -248,3 +248,29 @@ def test_attn_pack_bidirectional(monkeypatch, T, keys):
         err = max(np.abs(got[g, j][slot_real[j]] - ref[g, j][slot_real[j]]).max()
                   for g in range(ref.shape[0]) for j in range(B.K))
         assert err < 1e-12 * max(1.0, np.abs(ref).max()), (pack, bsgs, hpack, err)
+
+
+@pytest.mark.parametrize("keys", [256, 197])
+@pytest.mark.parametrize("layer", [0, 11])
+def test_attention_first_two_chunk_pairs(keys, layer):
+    """[CLS] alone on a bidirectional prompt over two chunk pairs (T = 256, ViT's: padding past `keys`) against
+    attention_blocked at position 0."""
+    T2 = 256
+    rt, d, B, _ = _setup(False)
+    ch = prefill.Chunks(T2, B.t, bidir=True, keys=keys)
+    rng = np.random.default_rng(20 + layer)
+
+    def rows(scale):
+        r = np.zeros((T2, d.hid))
+        r[:, :d.dim] = scale * rng.standard_normal((T2, d.dim))
+        return r
+
+    def enc(r):
+        return [[0.5 * x for x in row] for row in BL.blocked_slots(r, ch, B)]
+    q, k, v = rows(1.2), rows(1.2), rows(1.0)
+    sm = config.load_configs(str(CFG)).block(layer)[2]
+    ref = BL.decrypt_blocked(rt, BL.attention_blocked(rt, enc(q), enc(k), enc(v), sm, ch, B), ch, B, d.dim)
+    out = BL.attention_last(rt, enc(q), enc(k), enc(v), sm, ch, B, 0)
+    assert len(out) == 1
+    got = BL.decrypt_blocked(rt, out, ch, B, d.dim)[:2 * B.t]
+    assert np.abs(got - ref[0][None, :]).max() < 1e-12 * max(1.0, np.abs(ref).max())
