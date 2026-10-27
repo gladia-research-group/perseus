@@ -715,10 +715,16 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                gadget: c[0] = base log, c[1] = levels, m = floor(2^(64 + levels base) / q); c[2] = n^-1, c[3] its Shoup
 //   PBS_EXTRACT  y = acc -> x = u32 LWEs [count][n + 1] mod c[1]: sample extract of coefficient 0, b + c[0] (offset),
 //                then round(v c[1] / q) = (v m + 2^63) >> 64 mod c[1]  (m = floor(2^64 c[1] / q))
+//   KS_DIGITS    y = u32 LWEs [count][i1 + 1] mod q -> x = int8 [count][i1 levels]: the balanced digits (base 2^c[0],
+//                c[1] levels, approximate, m = floor(2^(64 + levels base) / q)) of a_i at i levels + t
+//   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
+//                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
 #define PC_TFHE_PBS_MS 0
 #define PC_TFHE_PBS_INIT 1
 #define PC_TFHE_PBS_STEP 2
 #define PC_TFHE_PBS_EXTRACT 3
+#define PC_TFHE_KS_DIGITS 4
+#define PC_TFHE_KS_RECOMBINE 5
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

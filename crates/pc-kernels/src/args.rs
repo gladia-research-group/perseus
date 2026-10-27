@@ -704,6 +704,8 @@ pub mod tfhe_op {
     pub const PBS_INIT: i32 = 1;
     pub const PBS_STEP: i32 = 2;
     pub const PBS_EXTRACT: i32 = 3;
+    pub const KS_DIGITS: i32 = 4;
+    pub const KS_RECOMBINE: i32 = 5;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).
