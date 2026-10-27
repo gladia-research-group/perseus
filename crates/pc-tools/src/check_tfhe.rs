@@ -310,6 +310,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(256);
     // the latency path (PBS_KEYBUNDLE then PBS_ROTATE on the bundles) for small batches; --no-kb forces the batch path
     let kb_path = count <= pc_gpu::tfhe::KB_MAX && !args.iter().any(|a| a == "--no-kb");
+    let no_cl = args.iter().any(|a| a == "--no-cluster");
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
@@ -367,7 +368,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
         let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base };
         if kb_path {
             go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, x: d_kb.vptr_mut(), ..rot })?;
-            go(&TfheArgs { w: d_kb.vptr(), ..rot })?;
+            go(&TfheArgs { w: d_kb.vptr(), i3: no_cl as i32, ..rot })?;
         } else {
             go(&rot)?;
         }
