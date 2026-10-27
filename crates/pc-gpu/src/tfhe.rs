@@ -30,7 +30,7 @@ const PLANES: usize = 4;
 /// Batches up to this many LWEs take the bootstrap's latency path (per window of KB_WINDOW groups: PBS_KEYBUNDLE,
 /// then PBS_ROTATE on a cluster of two blocks per LWE: 64 KB of bundles per LWE and group): up to half the SMs.
 pub const KB_MAX: usize = 94;
-/// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE (64 measured ~2% faster at twice the memory).
+/// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE.
 pub const KB_WINDOW: usize = 32;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
 const RC: usize = 256;

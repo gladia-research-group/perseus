@@ -13,15 +13,6 @@ slots, column cutmax_tile_col_of_slot(m) of tile k at slot m). A plan's PLAN_CMD
 (`runtime=`, `twin=`, `sign=`, `env=`, the head's shape). The plans, all on the gpt2_decode recipe and runtime line:
 gpt2_tfhe_{argmax,topk}_ship (TFHE signs), gpt2_tfhe_argmax_ship_hyb512 / gpt2_tfhe_topk_ship_hyb512L1k (the big
 early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_cutmax_ship (CutMax).
-
-Measured (GPU 3, 8 positions, fresh inputs, plans above): argmax CutMax 0.45 s, TFHE 2.59 s, hybrid 1.11 s;
-top-40 sampling TFHE 4.39 s, hybrid 2.35 s; the hybrids' all-CKKS controls (two-scale bound 2048, 2048 buckets) 1.42 s
-and 3.88 s against 1.29 s and 3.10 s for the hybrids at those settings. Two-scale signs on rounds of <= 512 heads
-and 1024 buckets cost no accuracy on the mirror (1792 / 400 positions); graph replay +1% (--graphs); no 0/1 cleanup
--3%; the count comparisons as CKKS signs on a constant (PF_SELECT_COUNT=ckks) -7%.
-CutMax wins greedy decoding; the tournament's edge is robustness (no calibration range: on 1792 positions CutMax's
-one-hot is smeared at 8% of them and wrong by 22-39 logits at 0.5%, the TFHE argmax misses only near-ties < 0.08
-logits).
 """
 from __future__ import annotations
 
