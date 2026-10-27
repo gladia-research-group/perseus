@@ -67,7 +67,7 @@ class SoftmaxCfg:
     # SM_CHEB_GS (impl smcheb): Chebyshev-scaled Goldschmidt counts per round and the mid-round residual targets
     recip_iters_cheb: tuple = ()
     recip_targets: tuple = ()
-    # reference-key centring (attention._thor_exp): per head the key whose score is subtracted before the exp
+    # reference-key centring (attention.complex_qkt): per head the key whose score is subtracted before the exp
     # (REF_SINK key 0, REF_SELF the query's own key, REF_PREV the one before it); empty = the mid-centred exp.
     # ref_window: the most keys the centred config covers (the broadcast ladder's length)
     ref_keys: tuple = ()

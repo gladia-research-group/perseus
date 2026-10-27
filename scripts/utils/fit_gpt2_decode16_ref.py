@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Decode-8's softmax centred on per-head reference keys, on gpt2_base_n32_kc16_cm (attention._thor_exp).
+"""Decode-8's softmax centred on per-head reference keys, on gpt2_base_n32_kc16_cm (attention.complex_qkt).
 
 Per layer and head the key whose score is subtracted before the exp: the first key (sink), the query's own (self) or the
 one before it (prev), so the exponentials are exp((u - U) / delta2) <= 1 with u = s - s_ref and the reference's own term
