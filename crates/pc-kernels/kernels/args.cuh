@@ -713,6 +713,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //   PBS_STEP     key i0 of i1: acc += GGSW_i0 [x] (acc X^-a~_i0 - acc); y = bsk u64 [i1][2 c][l][2 part][n] (NTT form),
 //                w = its Shoup companions, z = PBS_MS output, tw = [psi n | ipsi n], tws = their Shoup companions;
 //                gadget: c[0] = base log, c[1] = levels, m = floor(2^(64 + levels base) / q); c[2] = n^-1, c[3] its Shoup
+//   PBS_ROTATE   PBS_STEP for every key 0 .. i1 in one launch (the accumulator stays in shared memory)
 //   PBS_EXTRACT  y = acc -> x = u32 LWEs [count][n + 1] mod c[1]: sample extract of coefficient 0, b + c[0] (offset),
 //                then round(v c[1] / q) = (v m + 2^63) >> 64 mod c[1]  (m = floor(2^64 c[1] / q))
 //   KS_DIGITS    y = u32 LWEs [count][i1 + 1] mod q -> x = int8 [count][i1 levels]: the balanced digits (base 2^c[0],
@@ -746,6 +747,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_REPACK_DIGITS 10
 #define PC_TFHE_REPACK_MAC 11
 #define PC_TFHE_REPACK_B 12
+#define PC_TFHE_PBS_ROTATE 13
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

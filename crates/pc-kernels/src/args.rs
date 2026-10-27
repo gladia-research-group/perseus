@@ -713,6 +713,7 @@ pub mod tfhe_op {
     pub const REPACK_DIGITS: i32 = 10;
     pub const REPACK_MAC: i32 = 11;
     pub const REPACK_B: i32 = 12;
+    pub const PBS_ROTATE: i32 = 13;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).
