@@ -4,15 +4,15 @@
 //! is then one exact rescale by p1 and the return path is mod q0 = p0 p1 with the keys carrying the p1 (`switch`).
 //! Security follows TFHE-rs's rule (its ci/lattice_estimator.sage): lattice-estimator, MATZOV cost model, the minimum
 //! of primal uSVP and dual hybrid >= 128 bits (132 to pass without a warning), every noise sigma >= 4. Each key's
-//! sigma is set by its LWE instance:
-//! - binary LWE key (LWE key switch), n = 921 (a multiple of the PBS group), sigma 2^-17 p0: 154 bits (measured);
-//! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 252 at 3.19;
+//! sigma is set by its LWE instance (lattice-estimator run 2026-10-26, bits):
+//! - binary LWE key (LWE key switch), n = 921 (a multiple of the PBS group), sigma 2^-17 p0: 154.1 bits;
+//! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 254.6;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
-//!   RNS), sigma 18.5 = TFHE-rs's q / sigma ~2^47.8 (at sigma 3.19 it measured 131: a warning). PBS output noise by
+//!   RNS), sigma 18.5 = TFHE-rs's q / sigma ~2^47.8: 138.6 (at sigma 3.19: 131.3, a warning). PBS output noise by
 //!   the model (n/G)(2^G - 1) 2 * 2 l N (B^2 / 12) sigma^2 + (n/G) 2 N (2/3) (q / B^l)^2 / 12 (it matched the measured
 //!   rms to 0.1 bit at sigma 3.19): ~2^-14.2 q_br at gadget 2^23;
-//! - repack columns: ternary s_x of degree 2048 mod p0 P ~ 2^53, sigma 1024 (the packing's noise is divided by P;
-//!   at 3.19 it measured 128.9);
+//! - repack columns: ternary s_x of degree 2048 mod p0 P ~ 2^53, sigma 1024 (the packing's noise is divided by P):
+//!   154.2 (at 3.19: 128.9);
 //! - repack ring key: ring 2^16 mod q0 ~ 2^56, secret s, sigma 4: the CKKS chain's own instance at a smaller modulus.
 //! Pegasus-style switching is not IND-CPA-D secure (ePrint 2026/285): decryptions must not go back to the server.
 use crate::modq::prime_below;
