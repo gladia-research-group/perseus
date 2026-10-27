@@ -335,7 +335,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
-    let words = 2 * img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1);
+    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1);
     let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
@@ -344,7 +344,6 @@ fn run_pbs(args: &[String]) -> Res<bool> {
         Ok(b)
     };
     let d_bsk = up("tfhe.bsk", &img.bsk)?;
-    let d_bsh = up("tfhe.bsk", &img.bsk_s)?;
     let d_tw = up("tfhe.tw", &img.tw)?;
     let d_tws = up("tfhe.tw", &img.tws)?;
     let d_tv = up("tfhe.tv", &tvr)?;
@@ -361,7 +360,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, x: d_acc.vptr_mut(), y: d_bsk.vptr(), w: d_bsh.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, cx[6], cx[7]], ..base })?;
         Ok(())
     };

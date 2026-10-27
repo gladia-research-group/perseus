@@ -95,6 +95,16 @@ __device__ __forceinline__ uint32_t shoup32(uint32_t a, uint32_t w, uint32_t ws,
 __device__ __forceinline__ uint32_t shoup32l(uint32_t a, uint32_t w, uint32_t ws, uint32_t q) {
     return a * w - __umulhi(a, ws) * q;
 }
+// Montgomery (R = 2^32): -q^-1 mod 2^32 (Newton), and x R^-1 mod q in [0, 2 q) for x < q 2^32
+__device__ __forceinline__ uint32_t mont_neg_inv(uint32_t q) {
+    uint32_t v = q;   // q v = 1 mod 2^3 for odd q
+    for (int i = 0; i < 4; i++) v *= 2 - q * v;
+    return 0u - v;
+}
+__device__ __forceinline__ uint32_t redc(uint64_t x, uint32_t q, uint32_t mi) {
+    const uint32_t m = (uint32_t)x * mi;
+    return (uint32_t)((x + (uint64_t)m * q) >> 32);
+}
 // x in [0, 2 b) -> [0, b)
 __device__ __forceinline__ uint32_t fold32(uint32_t x, uint32_t b) { return min(x, x - b); }
 __device__ __forceinline__ uint32_t add32(uint32_t a, uint32_t b, uint32_t q) {
@@ -312,41 +322,38 @@ __global__ void init_k(TfheArgs A) {
     }
 }
 
-// the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads: two coefficients each); shared:
-// acc [2 part][2 prime][n], tb [level][2 prime][n], o [2 part][2 prime][n] (12 n words at two levels). Per key bit:
-// acc += GGSW [x] (acc X^-a~ - acc); bsk [key][c][t][part][prime][n], pre-multiplied by n^-1 (the inverse NTT then
-// needs no scaling pass: exact arithmetic, so the result is the host's bit for bit).
+// the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads), unrolled by key pairs (pc-tfhe pbs.rs):
+// per pair acc += sum_m (X^-e_m - 1) (K_m [x] acc), e = (a_i + a_j, a_i, a_j). Shared: acc [2 part][2 prime][n],
+// tb [c][level][2 prime][n] (the digits of both parts; the product o [2 part][2 prime][n] reuses its first 4 n): 12 n
+// words at two levels. bsk [pair][m][e][h][thread][4] (pbs_image), Montgomery form and pre-multiplied by n^-1 (the
+// inverse NTT then needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). tw carries after
+// the twiddles [prime][fwd | inv][n] the tables of NTT(X^e - 1): pm1 [prime][2 n] = g^x - 1 (Montgomery form) and
+// E [prime][n], NTT(X^e - 1)[j] = pm1[E[j] e mod 2 n]. Both products sum in 64 bits and reduce once (redc).
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
     const int n = A.n, L = A.i1, bl = (int)A.c[0], lv = (int)A.c[1];
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
-    uint32_t *acc = sm32, *tb = sm32 + 4 * n, *o = sm32 + 8 * n;
+    uint32_t *acc = sm32, *tb = sm32 + 4 * n, *o = tb;
     const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.x * (L + 1);
     uint32_t* g = (uint32_t*)A.x + (size_t)blockIdx.x * 4 * n;
     for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) acc[k] = g[k];
     __syncthreads();
     const uint32_t* tw = (const uint32_t*)A.tw;
     const uint32_t* tws = (const uint32_t*)A.tws;
-    const size_t kstride = (size_t)2 * lv * 2 * 2 * n;
-    const int bits = bl * lv;
+    const uint32_t *pm1 = tw + 4 * n, *ex = tw + 8 * n;
+    const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
+    const size_t kstride = (size_t)2 * lv * 2 * 2 * n;   // one GGSW
+    const int bits = bl * lv, n2 = 2 * n;
     const int64_t B = 1ll << bl;
-    for (int key = 0; key < L; key++) {
-        const uint32_t ak = at[key];
-        if (!ak) continue;
-        const int kp = (int)((2 * n - ak) % (2 * n));
-        const uint32_t* bsk = (const uint32_t*)A.y + key * kstride;
-        const uint32_t* bsks = (const uint32_t*)A.w + key * kstride;
-        uint32_t a0[RT_E], a1[RT_E];
+    for (int pr = 0; pr < L / 2; pr++) {
+        const uint32_t ki = at[2 * pr], kj = at[2 * pr + 1];
+        if (!ki && !kj) continue;
+        const int em[3] = {(int)((2 * n2 - ki - kj) % n2), (int)((n2 - ki) % n2), (int)((n2 - kj) % n2)};
+        for (int j = threadIdx.x; j < n; j += blockDim.x) {
 #pragma unroll
-        for (int e = 0; e < RT_E; e++) a0[e] = a1[e] = 0;
-#pragma unroll
-        for (int c = 0; c < 2; c++) {
-            const uint32_t* sa = acc + (2 * c) * n;       // part c, prime a
-            const uint32_t* sb = acc + (2 * c + 1) * n;   // part c, prime b
-            for (int j = threadIdx.x; j < n; j += blockDim.x) {
-                const uint32_t da = sub32(mono32(sa, n, kp, j, qa), sa[j], qa);
-                const uint32_t db = sub32(mono32(sb, n, kp, j, qb), sb[j], qb);
+            for (int c = 0; c < 2; c++) {
+                const uint32_t da = acc[(2 * c) * n + j], db = acc[(2 * c + 1) * n + j];
                 int64_t v = (int64_t)scale_round(crt(da, db, qa, qb, inv, invs), A.m);
                 if (v >= (1ll << (bits - 1))) v -= 1ll << bits;
                 for (int t = 0; t < lv; t++) {
@@ -354,32 +361,41 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                     if (r >= B / 2) r -= B;
                     v = (v - r) >> bl;
                     if (t == lv - 1) r += v << bl;
-                    tb[(2 * t) * n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
-                    tb[(2 * t + 1) * n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
+                    uint32_t* d = tb + (size_t)(c * lv + t) * 2 * n;
+                    d[swz(j)] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
+                    d[n + swz(j)] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
                 }
             }
-            __syncthreads();
-            nttr_fwd(tb, 2 * lv, tw, tws, qa, qb);
-#pragma unroll
-            for (int e = 0; e < RT_E; e++) {
-                const int k = threadIdx.x + e * blockDim.x;
-                const uint32_t q = k >= n ? qb : qa;
-#pragma unroll
-                for (int t = 0; t < 2; t++) {
-                    const uint32_t d = tb[t * 2 * n + swz(k)];
-                    const size_t off = (size_t)(c * lv + t) * 4 * n + k;
-                    a0[e] += shoup32l(d, __ldg(bsk + off), __ldg(bsks + off), q);   // 4 terms < 2 q
-                    a1[e] += shoup32l(d, __ldg(bsk + off + 2 * n), __ldg(bsks + off + 2 * n), q);
-                }
-            }
-            __syncthreads();   // tb is rewritten by the next part's digits
         }
+        __syncthreads();
+        nttr_fwd(tb, 4 * lv, tw, tws, qa, qb);
+        const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * 3 * kstride) + threadIdx.x;
 #pragma unroll
         for (int e = 0; e < RT_E; e++) {
-            const int k = threadIdx.x + e * blockDim.x;
-            const uint32_t q = k >= n ? qb : qa;
-            o[swz(k)] = fold32(fold32(a0[e], 4 * q), 2 * q);
-            o[2 * n + swz(k)] = fold32(fold32(a1[e], 4 * q), 2 * q);
+            const int k = threadIdx.x + e * blockDim.x, p = k >= n;
+            const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
+            const int ej = (int)ex[k];   // E [prime][n] at k = prime n + j
+            uint32_t d[4];   // [c][t]
+#pragma unroll
+            for (int ct = 0; ct < 4; ct++) d[ct] = tb[ct * 2 * n + swz(k)];
+            uint64_t y0 = 0, y1 = 0;   // 3 terms < 2 q q
+#pragma unroll
+            for (int m = 0; m < 3; m++) {
+                if (!em[m]) continue;
+                uint64_t s0 = 0, s1 = 0;   // 4 terms < 23 q q: < q 2^32 at q < 2^25.5
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const uint4 w = __ldg(bsk + ((m * RT_E + e) * 2 + h) * blockDim.x);
+                    s0 += (uint64_t)d[2 * h] * w.x + (uint64_t)d[2 * h + 1] * w.z;
+                    s1 += (uint64_t)d[2 * h] * w.y + (uint64_t)d[2 * h + 1] * w.w;
+                }
+                const uint32_t f = __ldg(pm1 + p * n2 + ((ej * em[m]) & (n2 - 1)));
+                y0 += (uint64_t)redc(s0, q, mi) * f;
+                y1 += (uint64_t)redc(s1, q, mi) * f;
+            }
+            // o aliases the digits: this thread alone reads and writes word k
+            o[swz(k)] = redc(y0, q, mi);   // < 2 q
+            o[2 * n + swz(k)] = redc(y1, q, mi);
         }
         __syncthreads();
         nttr_inv(o, 4, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1

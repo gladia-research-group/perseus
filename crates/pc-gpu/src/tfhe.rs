@@ -34,13 +34,15 @@ fn mu(p: u64) -> u64 {
     ((1u128 << 64) / p as u128) as u64
 }
 
-/// The device image of a host bootstrapping key (RNS, u32): the key [key][c][t][part][prime][n] (NTT form, times n^-1
-/// per prime: the rotation's inverse NTT skips its scaling) and its Shoup companions, the twiddles [prime][forward | inverse][n] and theirs, and the PBS ops' constants (args.cuh:
+/// The device image of a host bootstrapping key (RNS, u32): the key [pair][m][e][h][thread][4] in Montgomery form
+/// (NTT form, times n^-1 2^32 per prime: the rotation's inverse NTT skips its scaling, its MAC reduces once per sum),
+/// where PBS_ROTATE's thread th of 1024 handles word k = th + 1024 e of [prime][n] and loads as uint4 h the values
+/// (c t = 2 h, part 0), (2 h, 1), (2 h + 1, 0), (2 h + 1, 1); the twiddles [prime][forward | inverse][n], then NTT(X^e - 1)'s
+/// tables (`Rns::monomial_tables`) pm1 [prime][2 n] (Montgomery form) and E [prime][n], and the twiddles' companions; and the PBS ops' constants (args.cuh:
 /// c[2..8) = n^-1 per prime with companions, q_a | q_b << 32, q_a^-1 mod q_b | its companion << 32; `m` the gadget's
 /// multiplier).
 pub struct PbsImage {
     pub bsk: Vec<u32>,
-    pub bsk_s: Vec<u32>,
     pub tw: Vec<u32>,
     pub tws: Vec<u32>,
     pub c: [u64; 8],
@@ -58,18 +60,19 @@ pub fn pbs_image(k: &pc_tfhe::pbs::BootstrapKey) -> PbsImage {
     let lv = k.gadget.levels;
     let ninv = [rns.ntt[0].tables().2, rns.ntt[1].tables().2];
     let mut bsk = Vec::new();
-    let mut bsk_s = Vec::new();
-    for g in &k.ggsw {
-        for c in 0..2 {
-            for t in 0..lv {
-                let r = &g.rows()[c][t];
-                for part in 0..2 {
-                    for (pr, &q) in [qa, qb].iter().enumerate() {
-                        let poly = if part == 0 { &r[pr].0 } else { &r[pr].1 };
-                        for &x in poly {
-                            let v = pc_tfhe::modq::mulmod(x, ninv[pr], q);
-                            bsk.push(v as u32);
-                            bsk_s.push(shoup32(v, q));
+    let mont = |v: u64, q: u64| ((v << 32) % q) as u32;
+    let n = rns.n();
+    assert_eq!(lv, 2, "PBS_ROTATE's key layout is for two levels");
+    for g in k.ggsw.iter().flatten() {
+        for e in 0..4 {
+            for h in 0..2 {
+                for th in 0..n / 2 {
+                    let (pr, j) = ((th + e * n / 2) / n, (th + e * n / 2) % n);
+                    let q = [qa, qb][pr];
+                    for ct in [2 * h, 2 * h + 1] {
+                        let r = &g.rows()[ct / 2][ct % 2][pr];
+                        for x in [r.0[j], r.1[j]] {
+                            bsk.push(mont(pc_tfhe::modq::mulmod(x, ninv[pr], q), q));
                         }
                     }
                 }
@@ -85,8 +88,15 @@ pub fn pbs_image(k: &pc_tfhe::pbs::BootstrapKey) -> PbsImage {
             tws.push(shoup32(*v, q));
         }
     }
+    let mono = [0, 1].map(|p| rns.monomial_tables(p));
+    for (pr, &q) in [qa, qb].iter().enumerate() {
+        tw.extend(mono[pr].0.iter().map(|&v| mont(v, q)));
+    }
+    for m in &mono {
+        tw.extend(&m.1);
+    }
     let c = [k.gadget.base_log as u64, lv as u64, ninv[0], shoup32(ninv[0], qa) as u64, ninv[1], shoup32(ninv[1], qb) as u64, qa | qb << 32, rns.inv | (shoup32(rns.inv, qb) as u64) << 32];
-    PbsImage { bsk, bsk_s, tw, tws, c, m: k.gadget.m, q: rns.q }
+    PbsImage { bsk, tw, tws, c, m: k.gadget.m, q: rns.q }
 }
 
 /// A test vector (mod Q) as its residues [prime][n] (PBS_INIT's input).
@@ -123,7 +133,6 @@ pub struct TfheSwitch<'a> {
     rkey: DBuf<'a, Compute, u32>,
     ksk: Vec<DBuf<'a, Compute, u8>>,
     bsk: DBuf<'a, Compute, u32>,
-    bsk_s: DBuf<'a, Compute, u32>,
     btw: DBuf<'a, Compute, u32>,
     btw_s: DBuf<'a, Compute, u32>,
     rk: DBuf<'a, Compute, u32>,
@@ -155,7 +164,7 @@ impl<'a> TfheSwitch<'a> {
         let k = n_sub * p.ks.1;
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + nb * p.rp.1 * 4 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
             + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1) + 2 * CHUNK * p.rp.1 * n + 4 * n
-            + 2 * nl * 2 * p.pbs.1 * 4 * nb + 8 * nb + max * 4 * nb + 2 * nb;
+            + (nl / 2 * 3) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
         4 * words32 + bytes8 + 64 * 256
     }
@@ -227,7 +236,6 @@ impl<'a> TfheSwitch<'a> {
             rkey: up32("tfhe.rkey", &rkey)?,
             ksk,
             bsk: up32("tfhe.bsk", &img.bsk)?,
-            bsk_s: up32("tfhe.bsk", &img.bsk_s)?,
             btw: up32("tfhe.btw", &img.tw)?,
             btw_s: up32("tfhe.btw", &img.tws)?,
             rk: up32("tfhe.rk", &rk)?,
@@ -356,7 +364,6 @@ impl<'a> TfheSwitch<'a> {
             op: tfhe_op::PBS_ROTATE,
             x: self.acc.vptr_mut(),
             y: self.bsk.vptr(),
-            w: self.bsk_s.vptr(),
             z: self.ms.vptr(),
             tw: self.btw.vptr(),
             tws: self.btw_s.vptr(),
