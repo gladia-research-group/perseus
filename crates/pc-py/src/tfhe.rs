@@ -72,7 +72,8 @@ pub(crate) struct TfheRt {
     rns: pc_tfhe::pbs::Rns,
     luts: BTreeMap<String, usize>,
     lut_buf: pc_cuda::DBuf<'static, pc_cuda::Compute, u32>,
-    sets: BTreeMap<String, (usize, usize)>,
+    /// name -> (offset, values, copies): positions [copies][values] from `offset`
+    sets: BTreeMap<String, (usize, usize, usize)>,
     pos_buf: pc_cuda::DBuf<'static, pc_cuda::Compute, u32>,
     pos_used: usize,
     x: Ct<'static, W>,
@@ -139,20 +140,27 @@ impl TfheRt {
     }
 
     /// Register slot set `name`: the slots (of a real payload, < N/2) a LUT runs on, as split coefficients (slot i at
-    /// brev((i - 1) mod N/2): pc-check tfhe). Synchronous; builds the key switch's GEMM plans for the set's chunks.
-    pub fn slots(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, slots: &[usize]) -> PyResult<()> {
+    /// brev((i - 1) mod N/2): pc-check tfhe), and `copies`: slot offsets each output is also written at (a layout's
+    /// replicas: one bootstrap per value, the repack scatters it again). Synchronous; builds the key switch's GEMM
+    /// plans for the set's chunks.
+    pub fn slots(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, slots: &[usize], copies: &[usize]) -> PyResult<()> {
         let half = self.n / 2;
-        if slots.is_empty() || slots.iter().any(|&i| i >= half) {
-            return Err(PyValueError::new_err(format!("tfhe slots {name}: empty or a slot >= {half}")));
+        if slots.is_empty() || slots.iter().any(|&i| i >= half) || copies.iter().any(|&c| c == 0 || c >= half) {
+            return Err(PyValueError::new_err(format!("tfhe slots {name}: empty, a slot >= {half} or a copy offset outside 1..{half}")));
         }
         if self.sets.contains_key(name) {
             return Err(PyValueError::new_err(format!("tfhe slots {name} registered twice")));
         }
-        if self.pos_used + slots.len() > MAX_POS {
+        let reps = 1 + copies.len();
+        if self.pos_used + reps * slots.len() > MAX_POS {
             return Err(PyValueError::new_err(format!("tfhe slots {name}: the session holds {MAX_POS} positions")));
         }
         let bits = half.trailing_zeros();
-        let pos: Vec<u32> = slots.iter().map(|&i| (((i + half - 1) % half).reverse_bits() >> (usize::BITS - bits)) as u32).collect();
+        let coef = |i: usize| (((i + half - 1) % half).reverse_bits() >> (usize::BITS - bits)) as u32;
+        let mut pos: Vec<u32> = slots.iter().map(|&i| coef(i)).collect();
+        for &c in copies {
+            pos.extend(slots.iter().map(|&i| coef((i + c) % half)));
+        }
         self.pos_buf.upload_at(s, self.pos_used, &pos).map_err(|x| crate::session::gerr(x.into()))?;
         s.sync().map_err(|x| crate::session::gerr(x.into()))?;
         // SAFETY: the box is owned by self and outlives the switch's plans (declared after `sw`)
@@ -162,8 +170,8 @@ impl TfheRt {
         if slots.len() > max && slots.len() % max != 0 {
             self.sw.prepare(ltr, slots.len() % max).map_err(crate::session::gerr)?;
         }
-        self.sets.insert(name.to_string(), (self.pos_used, slots.len()));
-        self.pos_used += slots.len();
+        self.sets.insert(name.to_string(), (self.pos_used, slots.len(), reps));
+        self.pos_used += reps * slots.len();
         Ok(())
     }
 
@@ -187,7 +195,7 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not a TFHE descriptor"))?;
         let rt = &mut *self.rt;
         let &k = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
-        let &(off, cnt) = rt.sets.get(&d.slots).ok_or_else(|| ferr(f, format!("slot set {} never registered (Session.tfhe_slots)", d.slots)))?;
+        let &(off, cnt, reps) = rt.sets.get(&d.slots).ok_or_else(|| ferr(f, format!("slot set {} never registered (Session.tfhe_slots)", d.slots)))?;
         if f.ins.len() != 1 || f.outs.len() != 1 {
             return Err(ferr(f, format!("{} inputs / {} outputs (a TFHE finish has one of each)", f.ins.len(), f.outs.len())));
         }
@@ -203,7 +211,7 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
         let nb = rt.params.n_br;
         let pos = (rt.pos_buf.vptr() as *const u32).wrapping_add(off) as *const std::ffi::c_void;
         let tv = (rt.lut_buf.vptr() as *const u32).wrapping_add(k * 2 * nb) as *const std::ffi::c_void;
-        rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, tv, 0, false)?;
+        rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, reps, tv, 0, false)?;
         let mut fin = call.finish_call(0)?;
         fin.at_split(cx, x)?;
         fin.run_to(cx, x, Phase::Done)?;

@@ -32,12 +32,15 @@ def register_lut(name, f):
     return name
 
 
-def register_slots(name, slots):
-    """The slots (real payload, < N/2) a LUT reads and writes; the rest come back zero."""
+def register_slots(name, slots, copies=()):
+    """The slots (real payload, < N/2) a LUT reads and writes, and `copies`: slot offsets every output is also
+    written at (a layout's replicas: one bootstrap per value, the switch's repack scatters it again); the rest come
+    back zero."""
     s = np.unique(np.asarray(slots, dtype=np.int64))
-    if name in SLOTS and not np.array_equal(SLOTS[name], s):
+    c = tuple(int(k) for k in copies)
+    if name in SLOTS and not (np.array_equal(SLOTS[name][0], s) and SLOTS[name][1] == c):
         raise ValueError(f"tfhe slots {name}: registered with another set")
-    SLOTS[name] = s
+    SLOTS[name] = (s, c)
     return name
 
 
@@ -59,11 +62,14 @@ def quantize(f, m):
 
 
 def _values(lut, slots, vec):
-    f, idx = LUTS[lut], SLOTS[slots]
+    f, (idx, copies) = LUTS[lut], SLOTS[slots]
     vec = np.asarray(vec)
-    out = np.zeros(vec.shape[0], dtype=np.float64)
-    if vec.shape[0] > 1:            # CapCt.novec keeps one slot: the recorder needs the op stream only
-        out[idx] = quantize(f, np.real(vec[idx]))
+    n = vec.shape[0]
+    out = np.zeros(n, dtype=np.float64)
+    if n > 1:            # CapCt.novec keeps one slot: the recorder needs the op stream only
+        v = quantize(f, np.real(vec[idx]))
+        for c in (0,) + copies:
+            out[(idx + c) % n] = v
     return out
 
 
@@ -93,8 +99,8 @@ def setup_session(sess):
     """Register every LUT and slot set the capture used with a planned session (`Session(tfhe=...)`)."""
     for name, f in LUTS.items():
         sess.tfhe_lut(name, [float(v) for v in grid(f)])
-    for name, s in SLOTS.items():
-        sess.tfhe_slots(name, [int(i) for i in s])
+    for name, (s, c) in SLOTS.items():
+        sess.tfhe_slots(name, [int(i) for i in s], list(c))
 
 
 # ── common tables ─────────────────────────────────────────────────────────────────────────────────────────────────

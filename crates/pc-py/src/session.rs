@@ -1573,12 +1573,14 @@ impl PySession {
         let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
         nogil(py, || tf.lut(&ex.compute, name, &values))
     }
-    /// Register TFHE slot set `name`: the slots (< N/2, a real payload) the LUTs run on. Synchronous.
-    fn tfhe_slots(&self, py: Python<'_>, name: &str, slots: Vec<usize>) -> PyResult<()> {
+    /// Register TFHE slot set `name`: the slots (< N/2, a real payload) the LUTs run on and `copies`, slot offsets
+    /// every output is also written at (one bootstrap per value). Synchronous.
+    #[pyo3(signature = (name, slots, copies=Vec::new()))]
+    fn tfhe_slots(&self, py: Python<'_>, name: &str, slots: Vec<usize>, copies: Vec<usize>) -> PyResult<()> {
         let mut st = self.dev.st.borrow_mut();
         let State { planned, ex, .. } = &mut *st;
         let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
-        nogil(py, || tf.slots(&ex.compute, name, &slots))
+        nogil(py, || tf.slots(&ex.compute, name, &slots, &copies))
     }
     fn tfhe_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
         let st = self.dev.st.borrow();
