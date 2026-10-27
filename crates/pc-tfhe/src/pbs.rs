@@ -211,7 +211,8 @@ impl BootstrapKey {
         let sw = |x: u64| -> usize { (crate::gadget::scale_round(x, m) % two_n) as usize };
         let neg = |k: usize| (2 * n - k) % (2 * n);
         let tvr = self.rns.residues(tv);
-        let mut acc = [0, 1].map(|p| Rlwe { c0: monomial_mul(&tvr[p], neg(sw(ct.b)), self.rns.ntt[p].q), c1: vec![0; n] });
+        let bt = crate::gadget::ms_body_mean(&ct.a, ct.b, m, two_n) as usize;
+        let mut acc = [0, 1].map(|p| Rlwe { c0: monomial_mul(&tvr[p], neg(bt), self.rns.ntt[p].q), c1: vec![0; n] });
         for (a, keys) in ct.a.chunks(self.group).zip(&self.ggsw) {
             let k: Vec<usize> = a.iter().map(|&x| sw(x)).collect();
             if k.iter().all(|&x| x == 0) {

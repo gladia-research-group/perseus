@@ -32,7 +32,7 @@ import numpy as np
 from perseus.impl import tfhe
 
 SPAN = 1.9          # |d s_0| <= SPAN: the sign LUT's (-2, 2) with room for the noise
-TAU = 0.06          # a level's "sure" band (m units; the switch's input noise is ~7.9e-3 rms)
+TAU = 0.06          # a level's "sure" band (m units; the switch's input noise is ~5.3e-3 rms)
 RHO = SPAN / (2 * TAU)
 
 

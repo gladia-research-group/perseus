@@ -75,12 +75,39 @@ __device__ void ntt_inv(uint64_t* a, int n, const uint64_t* ipsi, const uint64_t
     __syncthreads();
 }
 
-__global__ void ms_k(TfheArgs A) {
-    const int len = A.i1 + 1;
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (size_t)A.count * len) return;
-    const uint64_t two_n = 2ull * A.n;
-    ((uint32_t*)A.x)[i] = (uint32_t)(scale_round(((const uint32_t*)A.y)[i], A.m) % two_n);
+// the mod switch to 2 n of one LWE per block (MS_TH threads): masks rounded, the body mean-compensated (pc-tfhe
+// gadget::ms_body_mean: round(b m / 2^64 - sum of the masks' rounding residuals / 2), the residuals in 2^-32 units)
+constexpr int MS_TH = 256;
+__global__ void __launch_bounds__(MS_TH) ms_k(TfheArgs A) {
+    const int n = A.i1;
+    const size_t base = (size_t)blockIdx.x * (n + 1);
+    const uint32_t* y = (const uint32_t*)A.y + base;
+    uint32_t* x = (uint32_t*)A.x + base;
+    const uint64_t two_n = 2ull * A.n, m = A.m;
+    long long s = 0;
+    for (int i = threadIdx.x; i < n; i += MS_TH) {
+        const uint64_t v = y[i], lo = v * m;
+        uint64_t hi = __umul64hi(v, m);
+        if (lo >= (1ull << 63)) {
+            hi += 1;
+            s += (long long)((0ull - lo) >> 32);
+        } else {
+            s -= (long long)((lo + 0xffffffffull) >> 32);
+        }
+        x[i] = (uint32_t)(hi % two_n);
+    }
+    __shared__ long long red[MS_TH];
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int k = MS_TH / 2; k > 0; k >>= 1) {
+        if (threadIdx.x < k) red[threadIdx.x] += red[threadIdx.x + k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const __int128 v = (__int128)((unsigned __int128)y[n] * m) - ((__int128)red[0] << 31) + ((__int128)1 << 63);
+        long long r = (long long)(v >> 64) % (long long)two_n;
+        x[n] = (uint32_t)(r < 0 ? r + (long long)two_n : r);
+    }
 }
 
 // ── the blind rotation in RNS: Q = q_a q_b (two ~26-bit primes, u32 residues, 32-bit Shoup products) ─────────────
@@ -934,8 +961,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
     if ((A.op <= PC_TFHE_PBS_EXTRACT || A.op == PC_TFHE_PBS_ROTATE) && (A.n < 64 || A.n > 2048 || (A.n & (A.n - 1)))) return -1;
     switch (A.op) {
         case PC_TFHE_PBS_MS: {
-            const size_t tot = (size_t)A.count * (A.i1 + 1);
-            ms_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            ms_k<<<(unsigned)A.count, MS_TH, 0, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_INIT:

@@ -15,7 +15,7 @@ from .poly import eval_chebyshev, eval_polynomial_ps, im_cleanse
 # PF_ACT_FOLD=1: fold a constant output mask into the THOR coefficients (changes the captured op stream)
 _ACT_FOLD = os.environ.get("PF_ACT_FOLD", "0") not in ("", "0")
 # PF_GELU_TFHE=1: the folded GELU as a TFHE LUT (impl/tfhe.py) on the active MLP lanes instead of its polynomial. An
-# experiment: at the switch's measured input noise (rms 7.9e-3 of the LUT's range: pc-check tfhe --identity) GPT-2's
+# experiment: at the switch's measured input noise (rms 7.9e-3 of the LUT's range then, 5.3e-3 now) GPT-2's
 # decode KL is ~0.4 (2: Phi) vs ~0.012 for the polynomial; it would take ~5x less noise (n_br ~16k) to match.
 _GELU_TFHE = os.environ.get("PF_GELU_TFHE", "0") not in ("", "0")
 # PF_GELU_TFHE=2: the LUT reads Phi (GELU = x Phi(x)) and one CKKS product makes GELU: the switch's input noise then
