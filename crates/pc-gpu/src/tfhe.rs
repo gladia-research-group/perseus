@@ -27,9 +27,11 @@ use crate::ntt::{self, Parts, Span};
 
 type W = u32;
 const PLANES: usize = 4;
-/// Batches up to this many LWEs take the bootstrap's latency path (PBS_KEYBUNDLE for every group at once, then
-/// PBS_ROTATE on the bundles: 20 MB of bundles per LWE).
-pub const KB_MAX: usize = 16;
+/// Batches up to this many LWEs take the bootstrap's latency path (per window of KB_WINDOW groups: PBS_KEYBUNDLE,
+/// then PBS_ROTATE on a cluster of two blocks per LWE: 64 KB of bundles per LWE and group): up to half the SMs.
+pub const KB_MAX: usize = 94;
+/// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE (64 measured ~2% faster at twice the memory).
+pub const KB_WINDOW: usize = 32;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
 const RC: usize = 256;
 const WS: usize = 64 << 20;
@@ -261,6 +263,7 @@ pub struct TfheSwitch<'a> {
     lwe: DBuf<'a, Compute, u32>,
     ms: DBuf<'a, Compute, u32>,
     acc: DBuf<'a, Compute, u32>,
+    kb: DBuf<'a, Compute, u32>,
     outs: DBuf<'a, Compute, u32>,
     tv: DBuf<'a, Compute, u32>,
     ws: DBuf<'a, Compute, u8>,
@@ -277,7 +280,7 @@ impl<'a> TfheSwitch<'a> {
             + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
-        4 * words32 + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
+        4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
     }
 
     /// Upload `sw`'s keys (host-generated: pc-tfhe `Switcher::generate`) and carve the work buffers.
@@ -352,6 +355,7 @@ impl<'a> TfheSwitch<'a> {
             lwe: arena.alloc("tfhe.work", max * cols)?,
             ms: arena.alloc("tfhe.work", max * cols)?,
             acc: arena.alloc("tfhe.work", max * 4 * nb)?,
+            kb: arena.alloc("tfhe.kb", max.min(KB_MAX) * KB_WINDOW * 8 * nb)?,
             outs: arena.alloc("tfhe.work", max * (nb + 1))?,
             tv: arena.alloc("tfhe.work", 2 * nb)?,
             ws: arena.alloc("tfhe.ws", WS)?,
@@ -454,7 +458,7 @@ impl<'a> TfheSwitch<'a> {
         cx[7] = self.pbs_c[7];
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nb as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..pb })?;
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: self.tv.vptr(), z: self.ms.vptr(), c: cx, ..pb })?;
-        Self::go(ctx, s, &TfheArgs {
+        let rot = TfheArgs {
             op: tfhe_op::PBS_ROTATE,
             i2: self.p.pbs_group as i32,
             x: self.acc.vptr_mut(),
@@ -465,7 +469,18 @@ impl<'a> TfheSwitch<'a> {
             m: self.pbs_m,
             c: self.pbs_c,
             ..pb
-        })?;
+        };
+        if b <= KB_MAX && self.p.pbs.1 == 1 {
+            // the latency path: per window, the key bundles then the rotation on two-block clusters
+            let groups = nl / self.p.pbs_group;
+            for g0 in (0..groups).step_by(KB_WINDOW) {
+                let gw = KB_WINDOW.min(groups - g0);
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: self.kb.vptr_mut(), ..rot })?;
+                Self::go(ctx, s, &TfheArgs { w: self.kb.vptr(), i0: g0 as i32, i4: gw as i32, ..rot })?;
+            }
+        } else {
+            Self::go(ctx, s, &rot)?;
+        }
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
         s.sync()?;
         tm.bootstrap = t2.elapsed().as_secs_f64() * 1e3;

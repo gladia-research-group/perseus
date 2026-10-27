@@ -367,12 +367,14 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
     const size_t kstride = (size_t)2 * LV * 2 * 2 * n;   // one GGSW
     const int bits = bl * LV, n2 = 2 * n;
+    // the groups [g0, g0 + gw) (i0, i4; i4 = 0: all): the latency path runs its windows of key bundles one at a time
+    const int g0 = A.i0, gw = A.i4 ? A.i4 : L / G - A.i0;
     // pm1 [prime][2 n] in shared memory after the digits: its gathers (data-dependent, 2^G - 1 per word) sat on the
     // MAC's critical path from L2
     uint32_t* pm1 = sm32 + NB * tbs;
     for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[x] = __ldg(tw + 4 * n + x);
     const int64_t B = 1ll << bl;
-    for (int pr = 0; pr < L / G; pr++) {
+    for (int pr = g0; pr < g0 + gw; pr++) {
         int em[NB][KM];
         bool any = false;
 #pragma unroll
@@ -433,8 +435,8 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
                 for (int ct = 0; ct < 2 * LV; ct++) d[b][ct] = sm32[b * tbs + ct * 2 * n + swz(k)];
             if constexpr (KB) {
-                // the key bundle precomputed by PBS_KEYBUNDLE (w: [lwe][group][e][thread] uint4, NB = LV = 1)
-                const uint4 g = __ldg((const uint4*)A.w + (((size_t)blockIdx.x * (L / G) + pr) * RT_E + e) * blockDim.x + threadIdx.x);
+                // the key bundle precomputed by PBS_KEYBUNDLE (w: [lwe][window group][e][thread] uint4, NB = LV = 1)
+                const uint4 g = __ldg((const uint4*)A.w + (((size_t)blockIdx.x * gw + pr - g0) * RT_E + e) * blockDim.x + threadIdx.x);
                 const uint64_t s0 = (uint64_t)d[0][0] * g.x + (uint64_t)d[0][1] * g.z;
                 const uint64_t s1 = (uint64_t)d[0][0] * g.y + (uint64_t)d[0][1] * g.w;
                 sm32[swz(k)] = redc(s0, q, mi);   // < 2 q
@@ -540,7 +542,8 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
     }
     const uint32_t *tw = twsm, *tws = twsm + 2 * n;
     const int64_t B = 1ll << bl;
-    for (int pr = 0; pr < L / G; pr++) {
+    const int g0 = A.i0, gw = A.i4 ? A.i4 : L / G - A.i0;   // the window of groups (as rotate_k)
+    for (int pr = g0; pr < g0 + gw; pr++) {
         bool nz = false;
 #pragma unroll
         for (int x = 0; x < G; x++) nz |= at[G * pr + x] != 0;
@@ -549,7 +552,7 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
         uint4 w[2];
 #pragma unroll
         for (int ee = 0; ee < 2; ee++)
-            w[ee] = __ldg((const uint4*)A.w + (((size_t)lw * (L / G) + pr) * RT_E + 2 * r + ee) * blockDim.x + threadIdx.x);
+            w[ee] = __ldg((const uint4*)A.w + (((size_t)lw * gw + pr - g0) * RT_E + 2 * r + ee) * blockDim.x + threadIdx.x);
         cl.sync();
 #pragma unroll
         for (int jj = 0; jj < 2; jj++) {
@@ -589,13 +592,14 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
 
 // PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
 // [count][group][e][thread] uint4 = (G[0][0], G[0][1], G[1][0], G[1][1]), G[c][part] = sum_m f_m K_m[c][part] (Montgomery
-// form, < q; one level), the MAC of rotate_k computed for all groups at once, off the rotation's sequential path. y =
-// bsk, z = the mod-switched LWEs, tw as PBS_ROTATE; grid (groups, count), 1024 threads.
+// form, < q; one level), the MAC of rotate_k computed for a window of groups at once (i0 = the first, i4 = how many),
+// off the rotation's sequential path. y = bsk, z = the mod-switched LWEs, tw as PBS_ROTATE; grid (window, count),
+// 1024 threads; x [count][window group][e][thread].
 template <int G>
 __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
     constexpr int KM = (1 << G) - 1;
-    const int n = A.n, L = A.i1, n2 = 2 * n, pr = blockIdx.x;
+    const int n = A.n, L = A.i1, n2 = 2 * n, pr = A.i0 + blockIdx.x;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
     const uint32_t* tw = (const uint32_t*)A.tw;
@@ -615,7 +619,7 @@ __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
     __syncthreads();
     const size_t kstride = (size_t)2 * 2 * 2 * n;   // one GGSW at one level
     const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
-    uint4* out = (uint4*)A.x + ((size_t)blockIdx.y * (L / G) + pr) * RT_E * blockDim.x + threadIdx.x;
+    uint4* out = (uint4*)A.x + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * RT_E * blockDim.x + threadIdx.x;
 #pragma unroll
     for (int e = 0; e < RT_E; e++) {
         const int k = threadIdx.x + e * blockDim.x, p = k >= n;
@@ -999,7 +1003,9 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             const int grp = A.i2 ? A.i2 : 2;
             if (A.n != 2048 || A.c[1] != 1 || grp < 2 || grp > 4 || A.i1 % grp || A.count > 65535) return -1;
             const int sm = 4 * A.n * (int)sizeof(uint32_t);   // pm1
-            const dim3 grid(A.i1 / grp, A.count);
+            const int gw = A.i4 ? A.i4 : A.i1 / grp - A.i0;
+            if (A.i0 < 0 || gw < 1 || A.i0 + gw > A.i1 / grp) return -1;
+            const dim3 grid(gw, A.count);
             if (grp == 2) keybundle_k<2><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 3) keybundle_k<3><<<grid, STEP_TH, sm, s>>>(A);
             else keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);
