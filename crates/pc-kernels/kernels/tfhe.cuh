@@ -513,11 +513,12 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 }
 
 // PBS_ROTATE's latency path on a cluster of two blocks per LWE, one per RNS prime (r = the block's rank, on the key
-// bundles of PBS_KEYBUNDLE, one level): each block keeps its prime's acc [2 part][n] in shared memory and reads the
-// partner's through distributed shared memory for the digits (the CRT of both residues). Per group: cluster sync (the
-// partner's acc is final), digits of both parts at its prime, cluster sync (both read: acc may change), forward NTT of
-// the two digit polys, the MAC on its half of the bundle words, inverse NTT, acc += o. Shared: acc 2 n, tb 2 n, this
-// prime's twiddles and companions 4 n words.
+// bundles of PBS_KEYBUNDLE, one level): each block keeps its prime's acc [2 part][n] in shared memory, double-buffered
+// by step parity, and reads the partner's through distributed shared memory for the digits (the CRT of both
+// residues). Per group: cluster sync (the partner's acc is final), digits of both parts at its prime, forward NTT of
+// the two digit polys, the MAC on its half of the bundle words, inverse NTT, acc' = acc + o into the other parity
+// (the partner may still read this one: no second sync). Shared: acc 2 x 2 n, tb 2 n, this prime's twiddles and
+// companions 4 n words.
 template <int G>
 __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
@@ -527,8 +528,9 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
     const int n = A.n, L = A.i1, bl = (int)A.c[0], lw = (int)blockIdx.x / 2;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
     const uint32_t q = r ? qb : qa, mi = mont_neg_inv(q);
-    uint32_t *acc = sm32, *tb = sm32 + 2 * n, *twsm = sm32 + 4 * n;   // twsm: this prime's [fwd | inv][n] and companions
+    uint32_t *acc = sm32, *tb = sm32 + 4 * n, *twsm = sm32 + 6 * n;   // acc [parity][2 part][n]; twsm: [fwd | inv][n] x 2
     const uint32_t* pacc = cl.map_shared_rank(acc, r ^ 1);
+    int st = 0;   // the parity of the current acc
     uint32_t* g = (uint32_t*)A.x + (size_t)lw * 4 * n;   // [part][prime][n]
     for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) acc[x] = g[(2 * (x / n) + r) * n + x % n];
     const uint32_t* at = (const uint32_t*)A.z + (size_t)lw * (L + 1);
@@ -554,13 +556,13 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
             const int j = threadIdx.x + jj * blockDim.x;
 #pragma unroll
             for (int c = 0; c < 2; c++) {
-                const uint32_t own = acc[c * n + j], oth = pacc[c * n + j];
+                const uint32_t own = acc[st * 2 * n + c * n + j], oth = pacc[st * 2 * n + c * n + j];
                 int64_t v = (int64_t)scale_round(crt(r ? oth : own, r ? own : oth, qa, qb, inv, invs), A.m);
                 if (v >= B / 2) v -= B;   // one level: the digit is the centred value
                 tb[c * n + swz(j)] = v < 0 ? (uint32_t)((int64_t)q + v) : (uint32_t)v;
             }
         }
-        cl.sync();
+        __syncthreads();
         nttr_fwd<true>(tb, 2, tw, tws, q, q, 0);
 #pragma unroll
         for (int ee = 0; ee < 2; ee++) {
@@ -577,11 +579,12 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
 #pragma unroll
             for (int c = 0; c < 2; c++) {
                 const int x = c * n + threadIdx.x + jj * blockDim.x;
-                acc[x] = add32(acc[x], fold32(tb[c * n + swz(threadIdx.x + jj * blockDim.x)], q), q);
+                acc[(st ^ 1) * 2 * n + x] = add32(acc[st * 2 * n + x], fold32(tb[c * n + swz(threadIdx.x + jj * blockDim.x)], q), q);
             }
+        st ^= 1;
     }
     cl.sync();   // the partner may still read this block's acc
-    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) g[(2 * (x / n) + r) * n + x % n] = acc[x];
+    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) g[(2 * (x / n) + r) * n + x % n] = acc[st * 2 * n + x];
 }
 
 // PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
@@ -957,12 +960,12 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 }
                 if (lv != 1) return -1;
                 if (A.i3 != 1) {   // a cluster of two blocks per LWE (i3 = 1: one block, for comparison)
-                    const int sc = 8 * A.n * (int)sizeof(uint32_t);
+                    const int sc = 10 * A.n * (int)sizeof(uint32_t);
                     static bool attr_c = false;
                     if (!attr_c) {
-                        cudaFuncSetAttribute(rotate_cl_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
-                        cudaFuncSetAttribute(rotate_cl_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
-                        cudaFuncSetAttribute(rotate_cl_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 10 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 10 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 10 * 2048 * (int)sizeof(uint32_t));
                         attr_c = true;
                     }
                     if (grp == 2) rotate_cl_k<2><<<2 * A.count, th, sc, s>>>(A);
