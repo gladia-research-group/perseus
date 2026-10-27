@@ -193,7 +193,7 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
                 if (e & h) continue;
                 const int i = (gi << st) + (e >> (S - st));
                 const int wi = p * 2 * RN + m + i;
-                const uint32_t u = v[e], w = shoup32(v[e + h], tw[wi], tws[wi], q);
+                const uint32_t u = v[e], w = shoup32(v[e + h], __ldg(tw + wi), __ldg(tws + wi), q);
                 v[e] = add32(u, w, q);
                 v[e + h] = sub32(u, w, q);
             }
@@ -236,7 +236,7 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
                 const int wi = p * 2 * RN + RN + m + i;
                 const uint32_t u = v[e], w = v[e + h];
                 v[e] = add32(u, w, q);
-                v[e + h] = shoup32(sub32(u, w, q), tw[wi], tws[wi], q);
+                v[e + h] = shoup32(sub32(u, w, q), __ldg(tw + wi), __ldg(tws + wi), q);
             }
         }
 #pragma unroll
@@ -289,8 +289,7 @@ __global__ void init_k(TfheArgs A) {
 // the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads: two coefficients each); shared:
 // acc [2 part][2 prime][n], tb [level][2 prime][n], o [2 part][2 prime][n] (12 n words at two levels). Per key bit:
 // acc += GGSW [x] (acc X^-a~ - acc); bsk [key][c][t][part][prime][n], pre-multiplied by n^-1 (the inverse NTT then
-// needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). The bit's key words a thread multiplies are
-// loaded into registers when the bit starts, so their L2 latency overlaps the digits and the forward NTTs.
+// needs no scaling pass: exact arithmetic, so the result is the host's bit for bit).
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
@@ -312,21 +311,6 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
         const int kp = (int)((2 * n - ak) % (2 * n));
         const uint32_t* bsk = (const uint32_t*)A.y + key * kstride;
         const uint32_t* bsks = (const uint32_t*)A.w + key * kstride;
-        // prefetch: [c][t][e] -> (k0, k0s, k1, k1s) for this thread's coefficients k = threadIdx.x + e blockDim.x
-        uint32_t kr[2][2][RT_E][4];
-#pragma unroll
-        for (int c = 0; c < 2; c++)
-#pragma unroll
-            for (int t = 0; t < 2; t++)
-#pragma unroll
-                for (int e = 0; e < RT_E; e++) {
-                    const int k = threadIdx.x + e * blockDim.x;
-                    const size_t off = (size_t)(c * lv + t) * 4 * n + k;
-                    kr[c][t][e][0] = bsk[off];
-                    kr[c][t][e][1] = bsks[off];
-                    kr[c][t][e][2] = bsk[off + 2 * n];
-                    kr[c][t][e][3] = bsks[off + 2 * n];
-                }
         uint32_t a0[RT_E], a1[RT_E];
 #pragma unroll
         for (int e = 0; e < RT_E; e++) a0[e] = a1[e] = 0;
@@ -357,8 +341,9 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
                 for (int t = 0; t < 2; t++) {
                     const uint32_t d = tb[t * 2 * n + k];
-                    a0[e] = add32(a0[e], shoup32(d, kr[c][t][e][0], kr[c][t][e][1], q), q);
-                    a1[e] = add32(a1[e], shoup32(d, kr[c][t][e][2], kr[c][t][e][3], q), q);
+                    const size_t off = (size_t)(c * lv + t) * 4 * n + k;
+                    a0[e] = add32(a0[e], shoup32(d, __ldg(bsk + off), __ldg(bsks + off), q), q);
+                    a1[e] = add32(a1[e], shoup32(d, __ldg(bsk + off + 2 * n), __ldg(bsks + off + 2 * n), q), q);
                 }
             }
             __syncthreads();   // tb is rewritten by the next part's digits
