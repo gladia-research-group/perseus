@@ -55,12 +55,13 @@ def tfhe_act(ops, xs, site, gain=1.0, geom=None):
 
 
 def _onehot_check(a, lg, oh):
-    """--tfhe-argmax: the encrypted one-hot against the argmax of the decrypted logits."""
+    """--tfhe-argmax: the encrypted one-hot against the argmax of the decrypted logits (also `a.onehot_agree`)."""
     if not a.tfhe_argmax:
         return
     oh = np.asarray(oh)
     valid = (np.abs(oh - np.rint(oh)) < 0.1).all(1) & (np.rint(oh).sum(1) == 1)
     agree = int((valid & (oh.argmax(1) == lg.argmax(1))).sum())
+    a.onehot_agree = agree
     top2 = np.sort(lg, 1)[:, -2:]
     print(f"[resnet] ARGMAX one-hot == argmax(decrypted logits): {agree}/{len(lg)} (valid one-hots {int(valid.sum())}; "
           f"smallest top-2 gap {float((top2[:, 1] - top2[:, 0]).min()):.3g}; max |one-hot error| "
@@ -251,7 +252,7 @@ def main(argv=None, results=None):
           f"{int((exact.argmax(1) == y).sum())}/{a.n}) agree-with-ref={agree}/{a.n} max|dlogit|={err:.3g}", flush=True)
     if results is not None:
         results({"n": a.n, "top1": int((lg.argmax(1) == y).sum()), "exact_top1": int((exact.argmax(1) == y).sum()),
-                 "agree": agree, "max_dlogit": float(err)})
+                 "agree": agree, "max_dlogit": float(err), "onehot_agree": getattr(a, "onehot_agree", None)})
     return 0
 
 

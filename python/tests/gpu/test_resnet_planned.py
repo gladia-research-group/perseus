@@ -42,3 +42,17 @@ def test_resnet_stc_first_planned_cifar8(tmp_path):
     assert rc == 0
     assert got["agree"] == got["n"] == 8, got
     assert got["max_dlogit"] < 0.01, got
+
+
+@pytest.mark.skipif(not os.environ.get("HF_HOME"), reason="HF_HOME (CIFAR-10, the checkpoint) missing")
+def test_resnet_tfhe_argmax_planned_cifar8(tmp_path):
+    """The ReLU's sign and an argmax head by CKKS -> TFHE -> CKKS (impl/tfhe.py): 8/8 against the exact model, the
+    encrypted one-hot right on all 8."""
+    from perseus.examples.resnet import run
+    got = {}
+    rc = run.main(["--plan", "bootstrap_placements/resnet20_tfhe_argmax", "--tfhe", "--tfhe-argmax", "--n", "8",
+                   "--work-dir", str(tmp_path / "w")], results=got.update)
+    assert rc == 0
+    assert got["agree"] == got["n"] == 8, got
+    assert got["max_dlogit"] < 1.0, got
+    assert got["onehot_agree"] == 8, got
