@@ -160,7 +160,15 @@ class RefreshPlanner:
             routes_avail=(route,) if route else (),
             levels_free=1 if pol.allow_prescale else 0,
             real=bool(self.real_route and p is not None and p.pack_field == FIELD_REAL),
+            slot_mag_lo=p.max_abs_lo if p else None,
+            coeff_mag_lo=p.max_coeff_lo if p else None,
         )
+        # PLAN_STEP_ROUTE_PRICING=1: a sparse site of a step whose route follows the cache length (a PLAN_STEP_LANDING
+        # step, SM_PERIODIC=2) runs on the bigger routes too once its value's period outgrows the planned one: its CF is
+        # priced on the worst of them the accuracy table measured
+        if route and p is not None and os.environ.get("PLAN_STEP_ROUTE_PRICING", "0") not in ("", "0") \
+                and _step_landing_floor(self.shadow.plan.get("plan.step_landing") or "", p.step) is not None:
+            site["price_routes"] = tuple(r for r in self.table.routes() if r > route)
         choice = btserr.choose_site(self.table, pol, **site)
         # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
         # shipped order's precision (plan.stc_first_mag_max, after the drift margin) bootstraps in the shipped order:

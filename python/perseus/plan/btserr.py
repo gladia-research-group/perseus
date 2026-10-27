@@ -227,6 +227,10 @@ class AccuracyTable:
     def routes_for(self, period: int) -> list[int]:
         return sorted({k[2] for k in self._curves if k[1] == period})
 
+    def routes(self) -> list[int]:
+        """Every route the table measured (0 = dense)."""
+        return sorted({k[2] for k in self._curves})
+
     # -- lookup ---------------------------------------------------------------------
     def _interp(self, key: tuple[int, int, int], mag: float) -> float | None:
         curve = self._curves.get(key)
@@ -401,6 +405,9 @@ def choose_site(
     routes_avail: Sequence[int] = (),
     levels_free: int = 0,
     real: bool = False,
+    price_routes: Sequence[int] = (),
+    slot_mag_lo: float | None = None,
+    coeff_mag_lo: float | None = None,
 ) -> SiteChoice:
     """Pick `(offset, CF, sparse route, prescale)` for one bootstrap site.
 
@@ -423,6 +430,11 @@ def choose_site(
     `levels_free`  spare levels at the bootstrap output; a prescale needs one.
     `real`      the site's slots hold a real payload (its dense refresh takes the real route): with a table that
                 measured the StC-first route, the dense StC-first candidate is priced on that route's real read.
+    `price_routes`  sparse routes a sparse candidate may run on at run time instead of its own (SM_PERIODIC=2: a
+                value whose period grows with the cache moves to a bigger route): its error is the largest over them.
+    `slot_mag_lo` / `coeff_mag_lo`  the smallest captured magnitude over several positions (a decode's values that
+                shrink as the cache grows): a candidate's error is also read there (no drift margin: the precision
+                floor, not the overflow, binds there), and the larger of the two counts.
     """
     # A node with no captured magnitude cannot be judged, so it must be UNCUTTABLE — which
     # means `hopeless`, not merely "misses the target". Returning a non-hopeless choice here
@@ -448,6 +460,13 @@ def choose_site(
         q_mag = slot_mag * kappa
         q_period = query_period(period)
         q_rescale = 1.0
+
+    # the low end of the captured magnitude range (several positions), on the same key as q_mag, without kappa
+    lo = None
+    if use_coeff and coeff_mag_lo is not None and 0.0 < coeff_mag_lo < coeff_mag:
+        lo = (coeff_mag_lo, min(1.0, coeff_mag_lo / (slot_mag_lo or slot_mag)))
+    elif not use_coeff and slot_mag_lo is not None and 0.0 < slot_mag_lo < slot_mag:
+        lo = (slot_mag_lo, 1.0)
 
     routes = [0]
     if policy.allow_sparse:
@@ -519,7 +538,12 @@ def choose_site(
         if stcf_measured and not route:
             # relative to the slot signal the site carries: an offset arm bootstraps only the residual
             return table.stcf_rel_err(slot_m * f, cf, real) * slot_m / (slot_mag * kappa)
-        return max(table.rel_err(mag * f, cf, per, route) * rescale, slim_err(slot_m * f, cf, route))
+        rts = [route] + ([int(r2) for r2 in price_routes if int(r2) > route] if route else [])
+        e = max(table.rel_err(mag * f, cf, per, r2) for r2 in rts) * rescale
+        if lo is not None and f == 1.0:
+            lo_mag, lo_rescale = lo
+            e = max(e, max(table.rel_err(lo_mag, cf, per, r2) for r2 in rts) * lo_rescale)
+        return max(e, slim_err(slot_m * f, cf, route))
 
     for off, mag, per, rescale, slot_m in offset_arms:
         for cf in range(policy.cf_min, policy.cf_max + 1):
