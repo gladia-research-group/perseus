@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 10u
+#define PC_KERNELS_ABI 11u
 #define PC_RING_ABI 5u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -704,6 +704,34 @@ struct CoeffArgs {
 };
 static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 
+// ------------------------------------------------------------------------------------------------ tfhe (ABI 11)
+// CKKS <-> TFHE scheme switching (pc-tfhe is the bit-exact host reference). One launcher, op-coded. Blind rotation
+// runs over the GLWE ring of degree n (power of two, <= 2048) at the bootstrapping prime q < 2^62 (u64, Shoup products):
+//   PBS_MS       y = u32 LWEs [count][i1 + 1] mod c[0] (a, then b) -> x = u32 [count][i1 + 1] in [0, 2n):
+//                round(v 2n / c[0]) = (v m + 2^63) >> 64 mod 2n  (m = floor(2^64 2n / c[0]))
+//   PBS_INIT     y = test vector u64 [n], z = PBS_MS output -> x = acc u64 [count][2][n]: X^-b~ tv, 0
+//   PBS_STEP     key i0 of i1: acc += GGSW_i0 [x] (acc X^-a~_i0 - acc); y = bsk u64 [i1][2 c][l][2 part][n] (NTT form),
+//                w = its Shoup companions, z = PBS_MS output, tw = [psi n | ipsi n], tws = their Shoup companions;
+//                gadget: c[0] = base log, c[1] = levels, m = floor(2^(64 + levels base) / q); c[2] = n^-1, c[3] its Shoup
+//   PBS_EXTRACT  y = acc -> x = u32 LWEs [count][n + 1] mod c[1]: sample extract of coefficient 0, b + c[0] (offset),
+//                then round(v c[1] / q) = (v m + 2^63) >> 64 mod c[1]  (m = floor(2^64 c[1] / q))
+#define PC_TFHE_PBS_MS 0
+#define PC_TFHE_PBS_INIT 1
+#define PC_TFHE_PBS_STEP 2
+#define PC_TFHE_PBS_EXTRACT 3
+struct TfheArgs {
+    int32_t op, n, count, i0, i1, i2, i3, i4;
+    void* x;
+    const void* y;
+    const void* z;
+    const void* w;
+    const void* tw;
+    const void* tws;
+    uint64_t q, m;
+    uint64_t c[8];
+};
+static_assert(sizeof(TfheArgs) == 32 + 6 * 8 + 16 + 64, "TfheArgs layout");
+
 // ------------------------------------------------------------------------------------------------ KernelTable
 // One table per (W, MM) instantiation, exported as `extern "C" const KernelTable* pc_table_<w>_<mm>()`.
 // Every launcher: (args, stream) -> cudaError_t of the launch (0 = ok; -1/-2 = argument out of the kernel's range).
@@ -750,8 +778,9 @@ struct KernelTable {
     int (*md_epilogue_to)(const MdEpiToArgs*, cudaStream_t);
     int (*small_int1)(const SmallInt1Args*, cudaStream_t);
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
+    int (*tfhe)(const TfheArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 38 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 39 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

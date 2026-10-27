@@ -37,6 +37,11 @@ impl Ggsw {
         Ggsw { rows }
     }
 
+    /// [component c][level t] -> (c0, c1), NTT form: the device layout's source.
+    pub fn rows(&self) -> &[Vec<(Vec<u64>, Vec<u64>)>] {
+        &self.rows
+    }
+
     /// GGSW(mu) [x] ct: phase mu (c0 + c1 s) + noise.
     pub fn external_product(&self, ct: &Rlwe, gadget: &Gadget, ntt: &Ntt) -> Rlwe {
         let (n, q, l) = (ntt.n, ntt.q, gadget.levels);

@@ -20,6 +20,7 @@ namespace {
 #include "../bts.cuh"
 #include "../spru.cuh"
 #include "../pcmm.cuh"
+#include "../tfhe.cuh"
 #include "../ccmm.cuh"
 #include "../coeffrows.cuh"
 
@@ -71,6 +72,7 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::em::md_epilogue_to_l<W>,
         &pc::bts::small_int1_l<W, MM>,
         &pc::coeffrows::launch<W, MM>,
+        &pc::tfhe::launch,
     };
     return &T;
 }

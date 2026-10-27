@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 10;
+pub const ABI: u32 = 11;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -695,8 +695,39 @@ pub struct CcmmArgs {
 zeroed_default!(
     SpruFftArgs, SpruScatterArgs, SpruExtractArgs, NttArgs, BconvArgs, EwArgs, PtDotArgs, KsArgs, EpiArgs, KsRegenArgs, KskExpandArgs, CtsArgs, TensorArgs, MdEpiArgs,
     WsumArgs, AddConstArgs, MulTableArgs, RescaleArgs, RescaleCombineArgs, AutomorphArgs, EncodeArgs, EncryptArgs, KskGenArgs, KskUnpackArgs, ModRaiseArgs, SmallIntTab, SmallIntArgs,
-    KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs
+    KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs, TfheArgs
 );
+
+/// TFHE op codes (args.cuh PC_TFHE_*, ABI 11).
+pub mod tfhe_op {
+    pub const PBS_MS: i32 = 0;
+    pub const PBS_INIT: i32 = 1;
+    pub const PBS_STEP: i32 = 2;
+    pub const PBS_EXTRACT: i32 = 3;
+}
+
+/// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TfheArgs {
+    pub op: i32,
+    pub n: i32,
+    pub count: i32,
+    pub i0: i32,
+    pub i1: i32,
+    pub i2: i32,
+    pub i3: i32,
+    pub i4: i32,
+    pub x: *mut c_void,
+    pub y: *const c_void,
+    pub z: *const c_void,
+    pub w: *const c_void,
+    pub tw: *const c_void,
+    pub tws: *const c_void,
+    pub q: u64,
+    pub m: u64,
+    pub c: [u64; 8],
+}
 
 /// A launcher: (args, stream) -> cudaError_t of the launch (0 ok; negative = argument outside the kernel's range).
 pub type Launch<A> = unsafe extern "C" fn(*const A, CudaStream) -> i32;
@@ -746,6 +777,7 @@ pub struct KernelTable {
     pub md_epilogue_to: Launch<MdEpiToArgs>,
     pub small_int1: Launch<SmallInt1Args>,
     pub coeff_sum: Launch<CoeffArgs>,
+    pub tfhe: Launch<TfheArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -789,7 +821,8 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 38 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 39 * 8);
+    assert!(size_of::<TfheArgs>() == 32 + 6 * 8 + 16 + 64);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);
     assert!(size_of::<MdEpiToArgs>() == 152);
     assert!(size_of::<RescaleCombineToArgs>() == 104);
