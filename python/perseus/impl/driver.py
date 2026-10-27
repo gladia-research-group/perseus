@@ -602,9 +602,10 @@ class PlannedRun:
     generation); they share the stage's registers, dynamic steps and plaintext values."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, ref_token=2, probe=4, work_dir, pt_rows=0,
-                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None):
+                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, schedule="program"):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
         self.variants = dict(variants or {})
+        self.schedule = schedule          # Program.compile's op order (siblings: refresh pairs)
         self.ref_token, self.probe, self.work_dir, self.pt_rows = ref_token, probe, work_dir, pt_rows
         self.dyn_rot = list(dyn_rot) if dyn_rot is not None else [-i for i in range(-1, 32)]
         self.stc_cache, self.pool, self.log = stc_cache, pool, log
@@ -653,7 +654,7 @@ class PlannedRun:
             live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
         self.progs = _pc.Program.compile(self.work_dir, str(self.plan_dir), config=self.cfg,
                                          blocks=[self.labels[b] for b in ref] + list(self.variants), live_out=live,
-                                         input_metas=metas)
+                                         input_metas=metas, schedule=self.schedule)
         # dynamic steps: everything a probe token changes
         dyn = {b: set() for b in ref}
         for t, rec in self.records.items():
@@ -978,8 +979,10 @@ class StreamedPlannedRun:
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, work_dir, streams, stream_rows, prefix=None,
                  kv_init=None, input_vec=None, routes_for=None, frames=None, stc_cache=8, pool=16, base_routes=(256, 1),
-                 size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print):
+                 size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print,
+                 schedule="program"):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
+        self.schedule = schedule          # Program.compile's op order (siblings: refresh pairs)
         self.work_dir, self.streams, self.stream_rows, self.prefix = work_dir, dict(streams), stream_rows, prefix
         self.input_vec = input_vec or (lambda row: row)
         self.size = size                   # the model geometry (Session size=: token packing, inf.size)
@@ -1200,7 +1203,7 @@ class StreamedPlannedRun:
             io[b] = kv_in
         progs = _pc.Program.compile(wd, str(self.plan_dir), config=self.cfg, blocks=[self.labels[b] for b in ref],
                                     live_out=live, input_metas=metas, routes_built=list(c["routes"]),
-                                    dense_fallback=self.dense_fallback)
+                                    dense_fallback=self.dense_fallback, schedule=self.schedule)
         c["progs"] = {}
         c["kv_in"], c["kv_out"], c["out"] = {}, {}, {}
         for b, r in ref.items():

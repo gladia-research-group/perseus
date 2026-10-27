@@ -79,7 +79,8 @@ def streamed_run(a, twin, lw, plan, *, log=print):
             "expanded": d.E_real, "seqLen": 1024}
     run = StreamedPlannedRun(rec, plan, cfg, labels, keys, work_dir=work, streams=streams, stream_rows=lw.coeff_rows,
                              prefix=prefix, input_vec=lw.embedding, routes_for=routes_for, stc_cache=a.stc_cache,
-                             size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log)
+                             size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log,
+                             schedule=getattr(a, "schedule", "program"))
     run.debug = a.debug_blocks or a.tap_block is not None
     run.tail = n == n_total
     if a.tap_block is not None:
@@ -163,6 +164,8 @@ def main(argv=None):
     ap.add_argument("--graphs", action="store_true", help="planned: CUDA graphs per block (default eager replay)")
     ap.add_argument("--key-layout", default="packed", choices=("dense", "packed"))
     ap.add_argument("--stc-cache", type=int, default=8)
+    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
+                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output vs the twin")
     ap.add_argument("--tap-block", type=int, default=None, help="planned debug: block whose intermediates (token 0) are compared with the twin")
