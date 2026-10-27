@@ -235,6 +235,7 @@ dependencies = [
  "pc-kernels",
  "pc-program",
  "pc-shadow",
+ "pc-tfhe",
  "rayon",
  "serde_json",
 ]
