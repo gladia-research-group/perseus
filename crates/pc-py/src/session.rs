@@ -637,7 +637,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
     steps.remove(&0);
     let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { ks.band } }).collect();
     let steps: BTreeSet<i64> = steps.union(&full).copied().collect();
-    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() };
+    // the StC-first route's raise needs the encapsulation keys too (a dense-only plan has no other route that does)
+    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
     let mut shapes: Vec<_> = spec.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     if spru_cfg.is_some() {
         shapes.push(KskShape::bottom(chain).map_err(e)?);
