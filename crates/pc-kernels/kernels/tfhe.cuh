@@ -192,8 +192,11 @@ constexpr int RN = 2048, RLN = 11;
 // conflicts); stride >= 32 stays a permutation of one row.
 __device__ __forceinline__ int swz(int j) { return j ^ ((j >> 5) & 7) ^ (((j >> 6) & 3) << 3); }
 // c (1, 2 or 4) consecutive twiddles and companions from wi (a multiple of c) in one vector load each
+template <bool TS = false>   // TS: the tables sit in shared memory (plain loads)
 __device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int wi, int c, uint32_t* w, uint32_t* ws) {
-    if (c == 4) {
+    if (TS) {
+        for (int i = 0; i < c; i++) w[i] = tw[wi + i], ws[i] = tws[wi + i];
+    } else if (c == 4) {
         const uint4 a = __ldg((const uint4*)(tw + wi)), b = __ldg((const uint4*)(tws + wi));
         w[0] = a.x, w[1] = a.y, w[2] = a.z, w[3] = a.w, ws[0] = b.x, ws[1] = b.y, ws[2] = b.z, ws[3] = b.w;
     } else if (c == 2) {
@@ -204,7 +207,7 @@ __device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int
     }
 }
 // forward (Cooley-Tukey) phase: stages t = tt, tt / 2, .., tt >> (S - 1); a group = j0 + k tl (tl = tt >> (S - 1))
-template <int S>
+template <int S, bool TS = false>
 __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int ltl = ltt - (S - 1), tl = 1 << ltl;
@@ -224,7 +227,7 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
             const int lt = ltt - st;                     // log2 t of this stage
             const int m = RN >> (lt + 1);
             uint32_t wt[4], wts[4];   // this stage's twiddles: i = (gi << st) + r, r < 2^st
-            twl(tw, tws, p * 2 * RN + m + (gi << st), 1 << st, wt, wts);
+            twl<TS>(tw, tws, p * 2 * RN + m + (gi << st), 1 << st, wt, wts);
 #pragma unroll
             for (int e = 0; e < G; e++) {
                 if (e & h) continue;
@@ -239,14 +242,15 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
     }
     __syncthreads();
 }
+template <bool TS = false>
 __device__ void nttr_fwd(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
-    fwd_phase<2>(a, P, 10, tw, tws, qa, qb, pm);   // t = 1024, 512
-    fwd_phase<3>(a, P, 8, tw, tws, qa, qb, pm);    // t = 256 .. 64
-    fwd_phase<3>(a, P, 5, tw, tws, qa, qb, pm);    // t = 32 .. 8
-    fwd_phase<3>(a, P, 2, tw, tws, qa, qb, pm);    // t = 4 .. 1
+    fwd_phase<2, TS>(a, P, 10, tw, tws, qa, qb, pm);   // t = 1024, 512
+    fwd_phase<3, TS>(a, P, 8, tw, tws, qa, qb, pm);    // t = 256 .. 64
+    fwd_phase<3, TS>(a, P, 5, tw, tws, qa, qb, pm);    // t = 32 .. 8
+    fwd_phase<3, TS>(a, P, 2, tw, tws, qa, qb, pm);    // t = 4 .. 1
 }
 // inverse (Gentleman-Sande) phase: stages t = tb, 2 tb, .., tb << (S - 1); a group = j0 + k tb, spanning G tb
-template <int S>
+template <int S, bool TS = false>
 __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int tb = 1 << ltb;
@@ -266,7 +270,7 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
             const int lt = ltb + st;                     // log2 t of this stage
             const int m = RN >> (lt + 1);
             uint32_t wt[4], wts[4];   // i = (gi << (S - 1 - st)) + r, r < 2^(S - 1 - st)
-            twl(tw, tws, p * 2 * RN + RN + m + (gi << (S - 1 - st)), 1 << (S - 1 - st), wt, wts);
+            twl<TS>(tw, tws, p * 2 * RN + RN + m + (gi << (S - 1 - st)), 1 << (S - 1 - st), wt, wts);
 #pragma unroll
             for (int e = 0; e < G; e++) {
                 if (e & h) continue;
@@ -281,11 +285,12 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
     }
     __syncthreads();
 }
+template <bool TS = false>
 __device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
-    inv_phase<3>(a, P, 0, tw, tws, qa, qb, pm);    // t = 1 .. 4
-    inv_phase<3>(a, P, 3, tw, tws, qa, qb, pm);    // t = 8 .. 32
-    inv_phase<3>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
-    inv_phase<2>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
+    inv_phase<3, TS>(a, P, 0, tw, tws, qa, qb, pm);    // t = 1 .. 4
+    inv_phase<3, TS>(a, P, 3, tw, tws, qa, qb, pm);    // t = 8 .. 32
+    inv_phase<3, TS>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
+    inv_phase<2, TS>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
 }
 __device__ void ntt2_inv(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, const TfheArgs& A, uint32_t qa, uint32_t qb) {
     for (int m = n / 2, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
@@ -511,7 +516,8 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 // bundles of PBS_KEYBUNDLE, one level): each block keeps its prime's acc [2 part][n] in shared memory and reads the
 // partner's through distributed shared memory for the digits (the CRT of both residues). Per group: cluster sync (the
 // partner's acc is final), digits of both parts at its prime, cluster sync (both read: acc may change), forward NTT of
-// the two digit polys, the MAC on its half of the bundle words, inverse NTT, acc += o. Shared: acc 2 n, tb 2 n words.
+// the two digit polys, the MAC on its half of the bundle words, inverse NTT, acc += o. Shared: acc 2 n, tb 2 n, this
+// prime's twiddles and companions 4 n words.
 template <int G>
 __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
@@ -521,13 +527,16 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
     const int n = A.n, L = A.i1, bl = (int)A.c[0], lw = (int)blockIdx.x / 2;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
     const uint32_t q = r ? qb : qa, mi = mont_neg_inv(q);
-    uint32_t *acc = sm32, *tb = sm32 + 2 * n;
+    uint32_t *acc = sm32, *tb = sm32 + 2 * n, *twsm = sm32 + 4 * n;   // twsm: this prime's [fwd | inv][n] and companions
     const uint32_t* pacc = cl.map_shared_rank(acc, r ^ 1);
     uint32_t* g = (uint32_t*)A.x + (size_t)lw * 4 * n;   // [part][prime][n]
     for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) acc[x] = g[(2 * (x / n) + r) * n + x % n];
     const uint32_t* at = (const uint32_t*)A.z + (size_t)lw * (L + 1);
-    const uint32_t* tw = (const uint32_t*)A.tw + (size_t)r * 2 * n;   // this prime's [fwd | inv][n]
-    const uint32_t* tws = (const uint32_t*)A.tws + (size_t)r * 2 * n;
+    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) {
+        twsm[x] = __ldg((const uint32_t*)A.tw + (size_t)r * 2 * n + x);
+        twsm[2 * n + x] = __ldg((const uint32_t*)A.tws + (size_t)r * 2 * n + x);
+    }
+    const uint32_t *tw = twsm, *tws = twsm + 2 * n;
     const int64_t B = 1ll << bl;
     for (int pr = 0; pr < L / G; pr++) {
         bool nz = false;
@@ -552,7 +561,7 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
             }
         }
         cl.sync();
-        nttr_fwd(tb, 2, tw, tws, q, q, 0);
+        nttr_fwd<true>(tb, 2, tw, tws, q, q, 0);
 #pragma unroll
         for (int ee = 0; ee < 2; ee++) {
             const int j = threadIdx.x + ee * blockDim.x;
@@ -562,7 +571,7 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
             tb[n + swz(j)] = redc(d0 * w[ee].y + d1 * w[ee].w, q, mi);
         }
         __syncthreads();
-        nttr_inv(tb, 2, tw, tws, q, q, 0);
+        nttr_inv<true>(tb, 2, tw, tws, q, q, 0);
 #pragma unroll
         for (int jj = 0; jj < 2; jj++)
 #pragma unroll
@@ -948,7 +957,14 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 }
                 if (lv != 1) return -1;
                 if (A.i3 != 1) {   // a cluster of two blocks per LWE (i3 = 1: one block, for comparison)
-                    const int sc = 4 * A.n * (int)sizeof(uint32_t);
+                    const int sc = 8 * A.n * (int)sizeof(uint32_t);
+                    static bool attr_c = false;
+                    if (!attr_c) {
+                        cudaFuncSetAttribute(rotate_cl_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        attr_c = true;
+                    }
                     if (grp == 2) rotate_cl_k<2><<<2 * A.count, th, sc, s>>>(A);
                     else if (grp == 3) rotate_cl_k<3><<<2 * A.count, th, sc, s>>>(A);
                     else rotate_cl_k<4><<<2 * A.count, th, sc, s>>>(A);
