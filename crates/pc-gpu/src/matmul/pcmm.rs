@@ -751,10 +751,13 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
 
 // ── the linear: inputs -> StC -> product -> finishes ─────────────────────────────────────────────────────────────
 
-/// On a lean chain the StC-first input's factors sit in 27-bit single-prime plaintexts, set for a PCMM of band shift
-/// up to this (`stc_first::THIN_SPLIT_PCMM`); a linear of a larger shift first lowers its inputs' scale by
-/// 2^(shift - PREDIV_SHIFT), exactly, on the composite level above the StC-first entry (`prediv`).
+/// On a lean chain the StC-first input's factors sit in 27-bit single-prime plaintexts, set for an input stamp
+/// w_scale 2^shift of 2^PREDIV_STAMP_LOG2 (`stc_first::THIN_SPLIT_PCMM`: 16-bit weights at band shift 1). A linear of
+/// band shift above PREDIV_SHIFT (whose inputs the plan keeps one level above the StC-first entry) first lowers its
+/// inputs' scale by its stamp over that, exactly, on that level (`prediv`): every PCMM input then reaches the stages at
+/// the same stamp (one factor, one cached last stage per input level).
 pub const PREDIV_SHIFT: u32 = 1;
+pub const PREDIV_STAMP_LOG2: i32 = 20;
 
 /// Lower `x`'s scale by 2^s at the cost of one level: x 2^k (an exact integer product) then the level's rescale, which
 /// divides by its primes (~2^(k + s)). The value is unchanged; its scale, which the StC-first input's factors divide,
@@ -877,12 +880,15 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
         return Err(shape("pcmm linear", "every output must be in one group"));
     }
     let names: Vec<(String, u32)> = (0..ins.len()).map(|i| (format!("{}.in{i}", lin.name), ins[i].meta.level)).collect();
+    let stamp = lin.w_scale * (lin.shift as f64).exp2();
     if route.thin() && lin.shift > PREDIV_SHIFT {
-        for x in ins.iter_mut() {
-            prediv(cx, route, pcmm, x, lin.shift - PREDIV_SHIFT, &lin.name)?;
+        let s = (stamp.log2().round() as i32 - PREDIV_STAMP_LOG2).max(0) as u32;
+        if s > 0 {
+            for x in ins.iter_mut() {
+                prediv(cx, route, pcmm, x, s, &lin.name)?;
+            }
         }
     }
-    let stamp = lin.w_scale * (lin.shift as f64).exp2();
     for x in ins.iter_mut() {
         x.meta.nf *= stamp;
     }
