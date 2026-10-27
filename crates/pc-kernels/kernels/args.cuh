@@ -719,12 +719,33 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                c[1] levels, approximate, m = floor(2^(64 + levels base) / q)) of a_i at i levels + t
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
 //                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
+// The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
+// floor(2^64 / q); NTTs run on the pcmm launcher's NTT op with pc-tfhe's tables):
+//   RESCALE_P1   y = [2 part][2 limb][n] mod (q, c[1]) -> x = [2 part][n] mod q: (x_0 - centered(x_1)) c[0] (c[0] = p1^-1)
+//   RS_DIGITS    y = c1 [n] -> x = [levels][n]: the approximate digits (base 2^c[0], c[1] levels, m) mod q
+//   MAC          y = [count][n], z = keys [count][i1][n] (NTT form) -> x = [i1][n] = sum_t y_t z_t,o mod q
+//   RS_EXTRACT   y = [2 part][n] (c0, c1 under s'(X^i2), coefficient form), z = int32 positions [count] ->
+//                x = u32 LWEs [count][i1 + 1]: a_k = +-c1[j - i2 k mod n], b = c0[j]
+//   REPACK_DIGITS y = PBS outputs [count][i1 + 1] mod q, w = int32 [n] position -> output row (-1: none), chunk
+//                k0 = i0, i3 keys -> x = [2 limb][i3][levels][n]: the exact digits (base 2^c[0], c[1] levels) of
+//                a_(row, k0 + kk) at their positions, mod the limb prime (q, c[4])
+//   REPACK_MAC   y = REPACK_DIGITS (NTT form), z = keys of the chunk [i3][levels][2 limb][2 part][n] -> x = acc
+//                [2 limb][2 part][n] += sum; c[4] = p1, c[6] = its mu
+//   REPACK_B     x = acc (coefficient form) part 0 += (c[1] mod p_l) centered(b_row) at the row's position
+//                (y = PBS outputs, z = int32 positions [count]); c[2] = p1 mod q
 #define PC_TFHE_PBS_MS 0
 #define PC_TFHE_PBS_INIT 1
 #define PC_TFHE_PBS_STEP 2
 #define PC_TFHE_PBS_EXTRACT 3
 #define PC_TFHE_KS_DIGITS 4
 #define PC_TFHE_KS_RECOMBINE 5
+#define PC_TFHE_RESCALE_P1 6
+#define PC_TFHE_RS_DIGITS 7
+#define PC_TFHE_MAC 8
+#define PC_TFHE_RS_EXTRACT 9
+#define PC_TFHE_REPACK_DIGITS 10
+#define PC_TFHE_REPACK_MAC 11
+#define PC_TFHE_REPACK_B 12
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

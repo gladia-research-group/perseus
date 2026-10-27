@@ -706,6 +706,13 @@ pub mod tfhe_op {
     pub const PBS_EXTRACT: i32 = 3;
     pub const KS_DIGITS: i32 = 4;
     pub const KS_RECOMBINE: i32 = 5;
+    pub const RESCALE_P1: i32 = 6;
+    pub const RS_DIGITS: i32 = 7;
+    pub const MAC: i32 = 8;
+    pub const RS_EXTRACT: i32 = 9;
+    pub const REPACK_DIGITS: i32 = 10;
+    pub const REPACK_MAC: i32 = 11;
+    pub const REPACK_B: i32 = 12;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

@@ -482,3 +482,165 @@ fn run_ks(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-ks: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
+
+/// `pc-check tfhe-bridge [--switch 256] [--chunk 64]`: the CKKS side of the switch on the device vs pc-tfhe, every
+/// word: RESCALE_P1, the ring switch (RS_DIGITS -> NTT -> MAC -> INTT -> + c0), RS_EXTRACT, and the repack
+/// (REPACK_DIGITS -> NTT -> REPACK_MAC per key chunk -> INTT -> REPACK_B) from the host bootstrap's outputs.
+pub fn cmd_bridge(args: &[String]) -> ExitCode {
+    match run_bridge(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-bridge: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_bridge(args: &[String]) -> Res<bool> {
+    use pc_core::keys::{sample_ternary, DiscreteGaussian};
+    use pc_kernels::args::{pcmm_op, tfhe_op, PcmmArgs, TfheArgs};
+    use pc_tfhe::lwe::Lwe;
+    use pc_tfhe::switch::rescale_p1;
+    use rayon::prelude::*;
+    let n_valid: usize = arg(args, "--switch").map(|s| s.parse()).transpose()?.unwrap_or(256);
+    let kc: usize = arg(args, "--chunk").map(|s| s.parse()).transpose()?.unwrap_or(64);
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let mut prng = test_prng(0x53);
+    let s: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
+    let tk = Instant::now();
+    let sw = Switcher::generate(Params::new(n)?, &s, p0, p1, &mut prng)?;
+    println!("[pc-check] tfhe-bridge: host switch keys {:.1} s", tk.elapsed().as_secs_f64());
+    let (nb, sfac) = (sw.params.n_br, sw.params.rs_factor);
+    let n_sub = n / sfac;
+    let (rs_lv, rp_lv) = (sw.params.rs.1, sw.params.rp.1);
+    let q0 = p0 as i128 * p1 as i128;
+    let dg = DiscreteGaussian::new(3.19)?;
+    let valid: Vec<usize> = (0..n_valid).map(|i| (i * (n / 2 / n_valid) + 7) % (n / 2)).collect();
+    let msg: Vec<i128> = (0..n).map(|_| ((prng.uniform_f64() * 1.8 - 0.9) * q0 as f64 / 4.0).round() as i128).collect();
+    let ct = RnsRlwe::encrypt(&msg, &s, &sw.ntt_p, &dg, &mut prng);
+    // the host's stages
+    let th = Instant::now();
+    let low = rescale_p1(&ct, p0, p1);
+    let rsw = sw.rs.apply(&low, &sw.ntt_p[0]);
+    let ext: Vec<Lwe> = valid.iter().map(|&j| sw.rs.extract(&rsw, j, p0)).collect();
+    let ksed: Vec<Lwe> = ext.par_iter().map(|l| sw.ksk.apply(l)).collect();
+    let (tv, off) = sign01(nb, sw.delta_br());
+    let outs: Vec<Lwe> = sw.bsk.bootstrap_many(&tv, off, &ksed, p0).iter().map(|o| o.mod_switch(sw.params.q_br, p0)).collect();
+    let mut slots: Vec<Option<Lwe>> = vec![None; n];
+    for (&j, o) in valid.iter().zip(&outs) {
+        slots[j] = Some(o.clone());
+    }
+    let tr = Instant::now();
+    let rep = sw.repack.repack(&slots, nb, &sw.ntt_p);
+    println!("[pc-check] tfhe-bridge: host pipeline {:.1} s (repack {:.1} s)", th.elapsed().as_secs_f64(), tr.elapsed().as_secs_f64());
+
+    // device
+    let u32v = |v: &[u64]| -> Vec<u32> { v.iter().map(|&x| x as u32).collect() };
+    let mu = |p: u64| -> u64 { ((1u128 << 64) / p as u128) as u64 };
+    let (t0f, t0i, ni0) = sw.ntt_p[0].tables();
+    let (t1f, t1i, ni1) = sw.ntt_p[1].tables();
+    let tw_f: Vec<u32> = [t0f, t1f, t0f].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
+    let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
+    let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [ni0 as u32, ni1 as u32, ni0 as u32, 0, 0, 0, 0, 0], ..Default::default() };
+    let dev = Device::open()?;
+    let rk_len = nb * rp_lv * 2 * 2 * n;
+    let bytes = 4 * (rk_len + 6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + 2 * kc * rp_lv * n + 4 * n + n + n_valid) + (64 << 20);
+    let arena = pc_cuda::Arena::new(&dev, bytes)?;
+    let st = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
+    let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
+    let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, st.raw()) })?) };
+    let gp = |a: &PcmmArgs| -> Res<()> { Ok(pc_cuda::launch_result("pcmm", unsafe { (table.pcmm)(a, st.raw()) })?) };
+    let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
+        let mut b = arena.alloc::<pc_cuda::Compute, u32>(what, v.len())?;
+        b.upload(&st, v)?;
+        Ok(b)
+    };
+    let mut d_twf = up("tfhe.tw", &tw_f)?;
+    let mut d_twi = up("tfhe.tw", &tw_i)?;
+    let _ = (&mut d_twf, &mut d_twi);
+    let ctv: Vec<u32> = [&ct.limbs[0].c0, &ct.limbs[1].c0, &ct.limbs[0].c1, &ct.limbs[1].c1].iter().flat_map(|v| v.iter().map(|&x| x as u32)).collect();
+    let d_ct = up("tfhe.ct", &ctv)?;
+    let mut d_low = up("tfhe.low", &vec![0; 2 * n])?;
+    let mut d_dig = up("tfhe.dig", &vec![0; rs_lv * n])?;
+    let rkey: Vec<u32> = sw.rs.keys().iter().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
+    let d_rkey = up("tfhe.rkey", &rkey)?;
+    let mut d_rs = up("tfhe.rs", &vec![0; 2 * n])?;
+    let idx: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
+    let d_idx = up("tfhe.idx", &idx)?;
+    let mut d_ext = up("tfhe.ext", &vec![0; n_valid * (n_sub + 1)])?;
+    let mut t = Tally::default();
+    let tg = Instant::now();
+    go(&TfheArgs { op: tfhe_op::RESCALE_P1, n: n as i32, count: 1, x: d_low.vptr_mut(), y: d_ct.vptr(), q: p0, c: [pc_tfhe::modq::invmod(p1 % p0, p0), p1, 0, 0, 0, 0, 0, mu(p0)], ..Default::default() })?;
+    st.sync()?;
+    let t_rescale = tg.elapsed().as_secs_f64();
+    let got_low = d_low.download(&st)?;
+    let bad = got_low.iter().zip(low.c0.iter().chain(&low.c1)).filter(|(a, b)| **a as u64 != **b).count();
+    t.add("tfhe-bridge: RESCALE_P1 == pc-tfhe rescale_p1", bad, 2 * n);
+    let tg = Instant::now();
+    let c1 = unsafe { (d_low.vptr() as *const u32).add(n) } as *const std::ffi::c_void;
+    go(&TfheArgs { op: tfhe_op::RS_DIGITS, n: n as i32, count: 1, x: d_dig.vptr_mut(), y: c1, q: p0, m: sw.rs.gadget.m, c: [sw.params.rs.0 as u64, rs_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+    gp(&PcmmArgs { op: pcmm_op::NTT, count: rs_lv as i32, i0: rs_lv as i32, x: d_dig.vptr_mut(), tw: d_twf.vptr(), ..pa })?;
+    go(&TfheArgs { op: tfhe_op::MAC, n: n as i32, count: rs_lv as i32, i1: 2, x: d_rs.vptr_mut(), y: d_dig.vptr(), z: d_rkey.vptr(), q: p0, c: [0, 0, 0, 0, 0, 0, 0, mu(p0)], ..Default::default() })?;
+    gp(&PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 2, x: d_rs.vptr_mut(), tw: d_twi.vptr(), ..pa })?;
+    gp(&PcmmArgs { op: pcmm_op::ADD, count: 1, i0: n as i32, x: d_rs.vptr_mut(), y: d_low.vptr(), ..pa })?;
+    st.sync()?;
+    let t_rs = tg.elapsed().as_secs_f64();
+    let got_rs = d_rs.download(&st)?;
+    let bad = got_rs.iter().zip(rsw.c0.iter().chain(&rsw.c1)).filter(|(a, b)| **a as u64 != **b).count();
+    t.add("tfhe-bridge: ring switch == pc-tfhe RingSwitchKey::apply", bad, 2 * n);
+    let tg = Instant::now();
+    go(&TfheArgs { op: tfhe_op::RS_EXTRACT, n: n as i32, count: n_valid as i32, i1: n_sub as i32, i2: sfac as i32, x: d_ext.vptr_mut(), y: d_rs.vptr(), z: d_idx.vptr(), q: p0, ..Default::default() })?;
+    st.sync()?;
+    let t_ext = tg.elapsed().as_secs_f64();
+    let got_ext = d_ext.download(&st)?;
+    let mut bad = 0;
+    for (i, w) in ext.iter().enumerate() {
+        let row = &got_ext[i * (n_sub + 1)..(i + 1) * (n_sub + 1)];
+        bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[n_sub] as u64) as usize;
+    }
+    t.add("tfhe-bridge: RS_EXTRACT == pc-tfhe extract", bad, n_valid * (n_sub + 1));
+
+    // the repack from the host bootstrap's outputs
+    let outv: Vec<u32> = outs.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
+    let d_outs = up("tfhe.outs", &outv)?;
+    let mut inv = vec![u32::MAX; n];
+    for (r, &j) in valid.iter().enumerate() {
+        inv[j] = r as u32;
+    }
+    let d_inv = up("tfhe.inv", &inv)?;
+    let mut rk = Vec::with_capacity(rk_len);
+    for k in 0..nb {
+        for tt in 0..rp_lv {
+            for l in 0..2 {
+                let (a, b) = &sw.repack.keys()[k][tt][l];
+                rk.extend(a.iter().chain(b).map(|&x| x as u32));
+            }
+        }
+    }
+    let d_rk = up("tfhe.rk", &rk)?;
+    drop(rk);
+    let mut d_rdig = up("tfhe.rdig", &vec![0; 2 * kc * rp_lv * n])?;
+    let mut d_acc = up("tfhe.acc", &vec![0; 4 * n])?;
+    let rb = TfheArgs { n: n as i32, count: n_valid as i32, i1: nb as i32, i3: kc as i32, q: p0, c: [sw.params.rp.0 as u64, rp_lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..Default::default() };
+    let tg = Instant::now();
+    for k0 in (0..nb).step_by(kc) {
+        go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, i0: k0 as i32, x: d_rdig.vptr_mut(), y: d_outs.vptr(), w: d_inv.vptr(), ..rb })?;
+        gp(&PcmmArgs { op: pcmm_op::NTT, count: (2 * kc * rp_lv) as i32, i0: (kc * rp_lv) as i32, x: d_rdig.vptr_mut(), tw: d_twf.vptr(), ..pa })?;
+        let kz = unsafe { (d_rk.vptr() as *const u32).add(k0 * rp_lv * 2 * 2 * n) } as *const std::ffi::c_void;
+        go(&TfheArgs { op: tfhe_op::REPACK_MAC, x: d_acc.vptr_mut(), y: d_rdig.vptr(), z: kz, ..rb })?;
+    }
+    gp(&PcmmArgs { op: pcmm_op::INTT, count: 4, i0: 2, x: d_acc.vptr_mut(), tw: d_twi.vptr(), ..pa })?;
+    go(&TfheArgs { op: tfhe_op::REPACK_B, x: d_acc.vptr_mut(), y: d_outs.vptr(), z: d_idx.vptr(), ..rb })?;
+    st.sync()?;
+    let t_rep = tg.elapsed().as_secs_f64();
+    let got_acc = d_acc.download(&st)?;
+    let want: Vec<u64> = (0..2).flat_map(|l| rep.limbs[l].c0.iter().chain(&rep.limbs[l].c1).copied().collect::<Vec<_>>()).collect();
+    let bad = got_acc.iter().zip(&want).filter(|(a, b)| **a as u64 != **b).count();
+    t.add("tfhe-bridge: repack == pc-tfhe RepackKey::repack", bad, 4 * n);
+    println!("[pc-check] tfhe-bridge: device ms: rescale {:.3}, ring switch {:.3}, extract {:.3} ({n_valid}), repack {:.3} (chunk {kc})", t_rescale * 1e3, t_rs * 1e3, t_ext * 1e3, t_rep * 1e3);
+    println!("[pc-check] tfhe-bridge: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
