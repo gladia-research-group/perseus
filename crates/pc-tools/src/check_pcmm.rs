@@ -6,7 +6,9 @@
 //!   pc-bench pcmm --prec [--cf 6] [--wbits 24] [--sigma 0.1] [--wamp 1]   a real input through StC-first stages ->
 //!       product -> K-batched finishes vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits =
 //!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input; past band shift
-//!       DECODE_SHIFT the outputs' scale is lowered exactly before the decryption, whose decoder reads the bottom pair)
+//!       DECODE_SHIFT the outputs' scale is lowered exactly before the decryption, whose decoder reads the bottom pair;
+//!       --per-input: each input at its own scale, the linear on `linear_per_input`; on a lean chain the P1
+//!       pre-division's exactness is gated too)
 //!   pc-bench pcmm [--shapes ..] [--k 1,2,4]      device ms per linear: product phases and output finishes per K
 use crate::check_bts::Tally;
 use pc_core::encode::{Complex, Encoder, Payload};
@@ -25,7 +27,7 @@ use pc_gpu::keygen::{test_prng, KeyGen};
 use pc_gpu::keys::hostref::HostNtt;
 use pc_gpu::keys::{DevSecret, KeySet, KeySetSpec, KskLayout, RotSpec};
 use pc_gpu::ks::KsPlans;
-use pc_gpu::matmul::pcmm::{finish_groups, linear, LinearHooks, LinearOpts, Pcmm, PcmmCfg, PcmmLinear, PcmmShape, PcmmTimes, WeightBuf};
+use pc_gpu::matmul::pcmm::{finish_groups, linear, linear_per_input, prediv_inputs, prediv_shift, LinearHooks, LinearOpts, Pcmm, PcmmCfg, PcmmLinear, PcmmShape, PcmmTimes, WeightBuf};
 use pc_gpu::ops::{Ops, OpsCfg};
 use pc_gpu::poly::CtBuf;
 use pc_gpu::{Context, Ct, Executor, MemCfg, MemPlan};
@@ -561,6 +563,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[allow(clippy::too_many_lines)]
 fn bench(args: &[String]) -> Res<bool> {
     let prec = args.iter().any(|a| a == "--prec");
+    // --per-input: input i at scale sf (1 + 1e-4 i), so the session's dispatch takes `linear_per_input`
+    let per_input = args.iter().any(|a| a == "--per-input");
     let shapes = pick(&arg(args, "--shapes").unwrap_or_else(|| {
         if prec {
             "gpt2.out".into()
@@ -679,11 +683,12 @@ fn bench(args: &[String]) -> Res<bool> {
     let mut fresh = |ins: &mut [Ct<'_, W>], ex: &mut Executor<'_, W>, vals: &[Vec<Complex>]| -> Res<()> {
         let top = (nq - 1 - level) as usize;
         let sf_ = ctx.scale.sf(top as i32)?;
-        for (x, v) in ins.iter_mut().zip(vals) {
-            let mut meta = CtMeta::new(level, 1).with_nf(sf_);
+        for (i, (x, v)) in ins.iter_mut().zip(vals).enumerate() {
+            let nf = if per_input { sf_ * (1.0 + 1e-4 * i as f64) } else { sf_ };
+            let mut meta = CtMeta::new(level, 1).with_nf(nf);
             meta.slots = slots as u32;
             x.buf.k = 1;
-            let msgs = vec![enc.encode_slots(v, slots, top, Payload::Complex, sf_)?];
+            let msgs = vec![enc.encode_slots(v, slots, top, Payload::Complex, nf)?];
             encr.encrypt_sk(&ctx, &ex.compute, &sec, &msgs, meta, x, &mut prng)?;
         }
         Ok(())
@@ -704,6 +709,24 @@ fn bench(args: &[String]) -> Res<bool> {
         let ymax = want.iter().flatten().fold(0f64, |m, z| m.max(z.re.abs()).max(z.im.abs()));
         let shift = ((ymax * 1.5 / 0.25).log2().ceil()).max(0.0) as u32;
         let lin = PcmmLinear { name: name.to_string(), shape: sh, w_scale: ws, shift };
+        if prec && route.thin() {
+            // P1's pre-division is exact: after `prediv_inputs` (a stamp 2^24: s = 4) one level down, the same values
+            let tl = PcmmLinear { w_scale: 2f64.powi(19), shift: 5, ..lin.clone() };
+            let s = prediv_shift(&route, &tl);
+            fresh(&mut ins[..sh.n_in], &mut ex, &xs)?;
+            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh_, ks: &kplans, ops: &mut ops, work: &mut work };
+            prediv_inputs(&mut cx, &route, &pc, &tl, &mut ins[..sh.n_in])?;
+            drop(cx);
+            let (mut e, mut lv) = (0f64, level);
+            for (x, v) in ins[..sh.n_in].iter().zip(&xs) {
+                let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, x, Payload::Complex, Which::Dense)?.remove(0);
+                e = got.iter().zip(v).fold(e, |a, (g, w)| a.max((g.re - w.re).abs()).max((g.im - w.im).abs()));
+                lv = lv.max(x.meta.level);
+            }
+            let xm = xs.iter().flatten().fold(0f64, |m, z| m.max(z.re.abs()).max(z.im.abs()));
+            println!("[pc-bench] prediv {name}: s {s}, level {level} -> {lv}, max err {e:.3e} of max |x| {xm:.3} -> {:.2} bits", (xm / e).log2());
+            t.add(&format!("prediv {name}: s 4 on one level, exact (>= 30 bits)"), (s != 4 || lv != level + ctx.shape.unit || !(xm / e >= 2f64.powi(30))) as usize, 1);
+        }
         let case_ks: Vec<usize> = if prec { vec![1, 2.min(sh.n_out), 4.min(sh.n_out)] } else { ks.clone() };
         let mut drops_cases: Vec<Vec<u32>> = vec![vec![0; sh.n_out]];
         if prec {
@@ -734,7 +757,14 @@ fn bench(args: &[String]) -> Res<bool> {
                     let e: Vec<Event> = (0..6).map(|_| Event::timing(&dev)).collect::<Result<_, _>>()?;
                     e[0].record(&cx.ex.compute)?;
                     // the linear end to end, with events around its two halves (product / finishes)
-                    linear_timed(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() }, &e, if rep == 0 { Some(&mut log) } else { None })?;
+                    if per_input {
+                        linear_per_input(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() })?;
+                        for ev in &e[1..] {
+                            ev.record(&cx.ex.compute)?;
+                        }
+                    } else {
+                        linear_timed(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() }, &e, if rep == 0 { Some(&mut log) } else { None })?;
+                    }
                     e[5].sync()?;
                     if rep > 0 || prec {
                         ms_prod.push(e[0].elapsed_ms(&e[4])? as f64);
@@ -766,9 +796,11 @@ fn bench(args: &[String]) -> Res<bool> {
                 }
                 if prec {
                     let bits = (ymax / errs).log2();
-                    println!("[pc-bench] pcmm-prec {name} {sh:?} wbits {wbits} cf {cf} shift {shift} w_scale 2^{} drops {drops:?} K={k}: max |Y| {ymax:.3}, max err {:.3e} -> {bits:.2} bits (old: PCMM finish 11.38, 1024->1536 11.49; plain StC-first 11.65)", ws.log2(), errs);
+                    println!("[pc-bench] pcmm-prec {name}{} {sh:?} wbits {wbits} cf {cf} shift {shift} w_scale 2^{} drops {drops:?} K={k}: max |Y| {ymax:.3}, max err {:.3e} -> {bits:.2} bits (old: PCMM finish 11.38, 1024->1536 11.49; plain StC-first 11.65)", if per_input { " per-input" } else { "" }, ws.log2(), errs);
                     t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: >= 11 bits"), (!(bits >= 11.0)) as usize, 1);
-                    t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: {} external refreshes recorded with descriptors", sh.n_out), (log.refreshes.len() != sh.n_out || !log.refreshes.iter().all(|r| r.desc.contains("\"op\": \"pcmm\""))) as usize, 1);
+                    if !per_input {
+                        t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: {} external refreshes recorded with descriptors", sh.n_out), (log.refreshes.len() != sh.n_out || !log.refreshes.iter().all(|r| r.desc.contains("\"op\": \"pcmm\""))) as usize, 1);
+                    }
                 } else {
                     let pm = median(ms_prod.clone());
                     let fm = median(ms_fin.clone());
@@ -793,9 +825,6 @@ fn bench(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `linear` with timing events: e\[0\] before the call (recorded by the caller), e\[1\] after the inputs' StC, e\[2\]
-/// after the product's input phase, e\[3\] after its GEMMs, e\[4\] after its outputs, e\[5\] after the finishes.
-#[allow(clippy::too_many_arguments)]
 /// The largest band shift whose outputs (|Y| up to 2^(shift - 2.6)) the decoder takes at their own scale: it reads the
 /// bottom composite pair only (`Encoder::decode_slots`), so |Y| nf stays below half that modulus.
 const DECODE_SHIFT: u32 = 11;
@@ -816,6 +845,9 @@ fn lower_scale<'a>(cx: &mut BtsCx<'_, 'a, W, M>, pc: &Pcmm<'a, '_, W>, x: &mut C
     Ok(())
 }
 
+/// `linear` with timing events: e\[0\] before the call (recorded by the caller), e\[1\] after the inputs' StC, e\[2\]
+/// after the product's input phase, e\[3\] after its GEMMs, e\[4\] after its outputs, e\[5\] after the finishes.
+#[allow(clippy::too_many_arguments)]
 fn linear_timed<'a>(
     cx: &mut BtsCx<'_, 'a, W, M>,
     route: &pc_gpu::bts::stc_first::StcFirstRoute<'a, W, M>,
