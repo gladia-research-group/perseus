@@ -1,0 +1,4 @@
+graph=graphs/resnet20_cifar10
+tool=python/perseus/examples/resnet/make_plan.sh
+configs=configs/model/approximation/resnet20_cifar10/configs.json
+replanned=dense (PLAN_SPARSE_SLOTS=), the n32 blocks recipe
