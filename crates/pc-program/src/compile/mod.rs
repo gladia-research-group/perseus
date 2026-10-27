@@ -225,6 +225,13 @@ fn planned_route_for(tag: &pc_shadow::tag::Tag, s: u32, built: &[u32], total: u3
 }
 
 /// The runtime Shadow a Config (+ the plan's PlanConfig and rules) means: C++ rules, real chain, FIDESlib landings.
+/// The chain a Config names (`chain.preset`, default n32).
+pub fn chain_of(cfg: &Config) -> Result<pc_core::params::Chain> {
+    let preset = cfg.chain.preset.as_deref().unwrap_or("n32");
+    let spec = pc_core::params::ChainSpec::preset(preset).map_err(|e| cfg_err("chain.preset", e))?;
+    pc_core::params::Chain::generate(&spec).map_err(|e| cfg_err("chain.preset", e))
+}
+
 pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Option<u32>) -> Result<Shadow> {
     let unit = u32_of("chain.composite_degree", cfg.chain.composite_degree, 2)?;
     match cfg.chain.chain.as_deref() {
@@ -232,9 +239,7 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
         Some(other) => return Err(cfg_err("chain.chain", format!("{other:?}: only the n32 chain shape is known"))),
     }
     // the limbs of the chain the Config names (`chain.preset`, default n32: 54; the lean n32a4: 51)
-    let preset = cfg.chain.preset.as_deref().unwrap_or("n32");
-    let spec = pc_core::params::ChainSpec::preset(preset).map_err(|e| cfg_err("chain.preset", e))?;
-    let real = pc_core::params::Chain::generate(&spec).map_err(|e| cfg_err("chain.preset", e))?;
+    let real = chain_of(cfg)?;
     let n_q = real.q.len() as u32;
     let chain = ChainShape { n_q, unit };
     let mut quirks = Quirks::none();
@@ -508,7 +513,10 @@ pub fn compile_block(
     p.check.inexact_scalars = res.inexact_scalars;
     let k_max = if opts.no_batch { 1 } else { sh.cfg.bts.k_max.max(1) };
     // PC_BTS_PAIR: sibling real refreshes in pairs, where the inputs enter StC-first
-    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit });
+    // (CFs up to the route's reference CF less one: 19, or 12 on a lean chain)
+    let cf_max = if chain_of(cfg)?.lone_top().is_some() { crate::program::PAIR_CF_MAX_LEAN } else { crate::program::PAIR_CF_MAX };
+    let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
+    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default });
     batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);

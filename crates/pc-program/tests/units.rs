@@ -72,7 +72,7 @@ fn pairs(plan: &str, graph: &str) {
         return;
     }
     let dc = compile_dir(&pd, &gd, &CompileOpts { keep_going: true, no_batch: true, ..Default::default() }).expect("plan dir");
-    let pr = Pairing { entry: pc_shadow::BtsConfig::n32_shipped().stc_first_entry.expect("n32 StC-first entry"), unit: 2 };
+    let pr = Pairing { entry: pc_shadow::BtsConfig::n32_shipped().stc_first_entry.expect("n32 StC-first entry"), unit: 2, cf_max: pc_program::program::PAIR_CF_MAX, cf_default: 13 };
     let mut n_pairs = 0;
     for (label, p) in dc.programs.iter().filter_map(|(l, r)| r.as_ref().ok().map(|p| (l, p))) {
         let mut q = p.clone();

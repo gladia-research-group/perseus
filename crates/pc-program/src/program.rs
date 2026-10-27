@@ -255,17 +255,22 @@ fn is_zero(n: &usize) -> bool {
 pub struct Pairing {
     pub entry: u32,
     pub unit: u32,
+    /// The largest member CF (`PAIR_CF_MAX`, or `PAIR_CF_MAX_LEAN` on a lean chain) and the CF of a route without one.
+    pub cf_max: u32,
+    pub cf_default: u32,
 }
 
 /// The largest correction factor of a pair member (the pair's 1/2 comes out of a member's pre-scale 2^(19 - CF)):
 /// pc-gpu's StC-first reference CF less one (the planned session checks the two agree).
 pub const PAIR_CF_MAX: u32 = 19;
+/// The same on a lean chain, whose StC-first reference CF is pc-gpu's `stc_first::THIN_CF_REF` (13).
+pub const PAIR_CF_MAX_LEAN: u32 = 12;
 
 impl Pairing {
     /// Whether a refresh on `r` of an input at `m` takes part in pairs: real payload, dense, StC-first with an input
-    /// that enters StC-first, one iteration, a CF of at most `PAIR_CF_MAX` (None: the route's default, below it).
+    /// that enters StC-first, one iteration, a CF of at most `cf_max` (None: the route's default, `cf_default`).
     pub fn takes(&self, r: &Route, m: &CtMeta) -> bool {
-        r.real && r.slots == 0 && r.stc_first && r.spru_h == 0 && r.iterations <= 1 && r.cf.is_none_or(|c| c <= PAIR_CF_MAX) && m.effective_level(self.unit) <= self.entry
+        r.real && r.slots == 0 && r.stc_first && r.spru_h == 0 && r.iterations <= 1 && r.cf.unwrap_or(self.cf_default) <= self.cf_max && m.effective_level(self.unit) <= self.entry
     }
 }
 
