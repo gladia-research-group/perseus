@@ -772,8 +772,9 @@ __global__ void rs_extract_k(TfheArgs A) {
 }
 
 // ── the repack (pc-tfhe switch.rs RepackKey): q = p0, n = N, i1 = n_br, c[0] base log, c[1] levels ─────────────
-// REPACK_DIGITS: D [count][n_br levels] (i32, k t) = exact digits of the LWEs' a (y = [count][n_br + 1] mod p0); also
-// zeroes the GEMM's accumulator w ([count][2 limb][2 n_br] i64) and, when i0 = 1, the scatter's z ([2 part][n] u64)
+// REPACK_DIGITS: the exact digits of the LWEs' a (y = [count][n_br + 1] mod p0) as two balanced int8 planes x [2][mp]
+// [n_br levels] (k t; mp = c[5] >= count rows, the GEMM's; digits |d| < 2^14: base 2^15); also zeroes the sums w
+// ([count][2 limb][2 n_br] i64) and, when i0 = 1, the scatter's z ([2 part][n] u64)
 __global__ void repack_digits_k(TfheArgs A) {
     const int nb = A.i1, lv = (int)A.c[1], bl = (int)A.c[0];
     const size_t tot = (size_t)A.count * nb, gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -782,10 +783,24 @@ __global__ void repack_digits_k(TfheArgs A) {
         for (size_t z = gid; z < 2 * (size_t)A.n; z += stride) ((uint64_t*)A.z)[z] = 0;
     for (size_t z = gid; z < tot * 4; z += stride) ((uint64_t*)A.w)[z] = 0;
     if (gid >= tot) return;
-    const size_t b = gid / nb, k = gid % nb;
+    const size_t b = gid / nb, k = gid % nb, K = (size_t)nb * lv, mp = A.c[5];
     const int64_t v = cent(((const uint32_t*)A.y)[b * (nb + 1) + k], A.q);
-    int32_t* out = (int32_t*)A.x + gid * lv;
-    for (int t = 0; t < lv; t++) out[t] = (int32_t)digit_exact(v, t, bl, lv);
+    int8_t* out = (int8_t*)A.x;
+    for (int t = 0; t < lv; t++) {
+        const int64_t d = digit_exact(v, t, bl, lv);
+        const int64_t lo = ((d + 128) % 256 + 256) % 256 - 128;
+        out[b * K + k * lv + t] = (int8_t)lo;
+        out[mp * K + b * K + k * lv + t] = (int8_t)((d - lo) / 256);
+    }
+}
+
+// REPACK_COMB: sums x [count][4 n_br] (i64) += G (y, [4 n_br][mp] i32: an int8 GEMM's output, i3 = mp) 2^(8 c[5])
+__global__ void repack_comb_k(TfheArgs A) {
+    const size_t cols = 4 * (size_t)A.i1, mp = A.i3;
+    const size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t)A.count * cols) return;
+    const size_t j = gid / cols, col = gid % cols;
+    ((int64_t*)A.x)[gid] += (int64_t)((const int32_t*)A.y)[col * mp + j] << (8 * A.c[5]);
 }
 
 // REPACK_MAC: x [count][2 limb][2 n_br] (i64) += sum_kt D[.][kt] cols[kt][limb][part][i], columns (part, i)
@@ -1049,6 +1064,11 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if ((2 * A.i1) % RG || (A.i1 * A.c[1]) % RKC) return -1;
             repack_gemm_k<<<dim3(2 * A.i1 / RG, (A.count + RJ - 1) / RJ, (unsigned)(A.i1 * A.c[1] / RKC)), RG, 0, s>>>(A);
             break;
+        case PC_TFHE_REPACK_COMB: {
+            const size_t tot = (size_t)A.count * 4 * A.i1;
+            repack_comb_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
         case PC_TFHE_REPACK_FIN: {
             const size_t tot = (size_t)A.count * 2 * A.i1;
             repack_fin_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);

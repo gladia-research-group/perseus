@@ -719,6 +719,7 @@ pub mod tfhe_op {
     pub const REPACK_C0: i32 = 16;
     pub const REPACK_FIN: i32 = 17;
     pub const PBS_KEYBUNDLE: i32 = 18;
+    pub const REPACK_COMB: i32 = 19;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

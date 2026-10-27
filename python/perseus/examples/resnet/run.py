@@ -18,6 +18,7 @@ import time
 import numpy as np
 
 DEFAULT_CONFIGS = "configs/model/approximation/resnet20_cifar10/configs.json"
+TFHE_SCALE = 0.5        # --tfhe: the ReLU inputs read x / (B TFHE_SCALE) (the sign LUT's (-2, 2))
 
 
 def relu_act(section):
@@ -35,8 +36,9 @@ def relu_act(section):
 def tfhe_act(ops, xs, site, gain=1.0, geom=None):
     """gain * ReLU by scheme switching (impl/tfhe.py): x * (gain * step(x)) with the sign from a TFHE LUT on the
     layout's valid slots of the first channel copy, written to every copy by the switch's repack (impl/conv.py fills a
-    ciphertext with Q / cpc copies of its channels; the gaps come back zero), one product. The sign LUT reads 2 x on
-    (-2, 2) (x = input / B on [-1, 1)): twice a general LUT's resolution."""
+    ciphertext with Q / cpc copies of its channels; the gaps come back zero), one product. The sign LUT reads x on
+    (-2, 2): with --tfhe the scales are B TFHE_SCALE, x = input / (B / 2) on (-1.33, 1.33), twice the resolution a
+    general LUT's [-1, 1) would allow (ReLU is positively homogeneous: the network is unchanged)."""
     from perseus.impl import tfhe
     from perseus.impl.conv import S
     masks = geom.pack(np.ones((geom.C, geom.H, geom.H)))
@@ -47,9 +49,7 @@ def tfhe_act(ops, xs, site, gain=1.0, geom=None):
     for j, x in enumerate(xs):
         idx = np.nonzero(np.real(masks[j][:span]))[0]
         sl = tfhe.register_slots(f"g{geom.C}x{geom.H}/{geom.g}.{j}", idx, copies)
-        # the sign reads (-2, 2): 2 x doubles the resolution (|x| <= 1 / margin)
-        x2 = 2.0 * np.real(x) if isinstance(x, np.ndarray) else ops.add(x, x)
-        s = tfhe.tfhe_lut(ops, x2, lut, sl)
+        s = tfhe.tfhe_lut(ops, x, lut, sl)
         out.append(np.real(x) * s if isinstance(x, np.ndarray) else ops.mult(x, s))
     return out
 
@@ -237,6 +237,7 @@ def main(argv=None, results=None):
         ref_relu = lambda t, site: torch.from_numpy(relu_apply(t.numpy(), B[site], stages))
         if a.tfhe:      # the exact sign (up to the switch's noise band): the reference is the exact model
             act, ref_relu = tfhe_act, None
+            a.scales = {k: v * TFHE_SCALE for k, v in B.items()}
     exact = R.reference(sd, x)
     ref = R.reference(sd, x, ref_relu)          # what the encrypted run approximates
     if a.plan:

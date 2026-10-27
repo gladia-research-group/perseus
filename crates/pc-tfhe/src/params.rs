@@ -74,7 +74,7 @@ impl Params {
             pbs_group: 3,
             ks: (2, 8),
             rs: (8, 3),
-            rp: (16, 2),
+            rp: (15, 2),
             rp_aux: prime_below(25, m)?,
             rs_factor: n_ckks / 2048,
             out_cf: 3,
