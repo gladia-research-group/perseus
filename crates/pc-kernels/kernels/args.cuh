@@ -730,7 +730,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                k0 = i0, i3 keys -> x = [2 limb][i3][levels][n]: the exact digits (base 2^c[0], c[1] levels) of
 //                a_(row, k0 + kk) at their positions, mod the limb prime (q, c[4])
 //   REPACK_MAC   y = REPACK_DIGITS (NTT form), z = keys of the chunk [i3][levels][2 limb][2 part][n] -> x = acc
-//                [2 limb][2 part][n] += sum; c[4] = p1, c[6] = its mu
+//                [2 part][2 limb][n] += sum; c[4] = p1, c[6] = its mu
 //   REPACK_B     x = acc (coefficient form) part 0 += (c[1] mod p_l) centered(b_row) at the row's position
 //                (y = PBS outputs, z = int32 positions [count]); c[2] = p1 mod q
 #define PC_TFHE_PBS_MS 0

@@ -27,6 +27,7 @@ pub mod relin;    // relinearization
 pub mod limbs;    // export/import limbs, merge_monomial
 pub mod bts;      // bootstrap routes (BtsRoute)
 pub mod matmul;   // PCMM / CCMM (cuBLASLt)
+pub mod tfhe;     // CKKS <-> TFHE scheme switch (LUTs by programmable bootstrapping at the StC-first split)
 pub mod graph;    // CUDA-graph capture / replay of bootstrap batches
 
 pub use context::{Context, DevStrategy, DevWord};

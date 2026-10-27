@@ -292,8 +292,9 @@ __global__ void repack_mac_k(TfheArgs A) {
     const uint64_t p = limb ? A.c[4] : A.q, mu = limb ? A.c[6] : A.c[7];
     const uint32_t* d = (const uint32_t*)A.y + (size_t)limb * kc * lv * n;
     const uint32_t* key = (const uint32_t*)A.z;
-    uint32_t* acc = (uint32_t*)A.x + (size_t)limb * 2 * n;
-    uint64_t a0 = acc[j], a1 = acc[n + j];
+    uint32_t* acc0 = (uint32_t*)A.x + (size_t)limb * n;            // [part][limb][n]: part 0
+    uint32_t* acc1 = (uint32_t*)A.x + (size_t)(2 + limb) * n;      // part 1
+    uint64_t a0 = acc0[j], a1 = acc1[j];
     for (int kk = 0; kk < kc; kk++) {
         for (int t = 0; t < lv; t++) {
             const uint32_t dv = d[((size_t)kk * lv + t) * n + j];
@@ -302,8 +303,8 @@ __global__ void repack_mac_k(TfheArgs A) {
             a1 = addq(a1, mulm32(dv, k0[n + j], p, mu), p);
         }
     }
-    acc[j] = (uint32_t)a0;
-    acc[n + j] = (uint32_t)a1;
+    acc0[j] = (uint32_t)a0;
+    acc1[j] = (uint32_t)a1;
 }
 
 __global__ void repack_b_k(TfheArgs A) {
@@ -315,7 +316,7 @@ __global__ void repack_b_k(TfheArgs A) {
     for (int limb = 0; limb < 2; limb++) {
         const uint64_t p = limb ? A.c[4] : A.q, mu = limb ? A.c[6] : A.c[7];
         const uint32_t p1 = limb ? 0 : (uint32_t)A.c[2];   // p1 mod p1 = 0
-        uint32_t* c0 = (uint32_t*)A.x + (size_t)limb * 2 * n;
+        uint32_t* c0 = (uint32_t*)A.x + (size_t)limb * n;   // part 0 of [part][limb][n]
         c0[j] = (uint32_t)addq(c0[j], mulm32(smod32(v, p), p1, p, mu), p);
     }
 }
