@@ -127,7 +127,7 @@ class VitPrefill(Gpt2Prefill):
         r[:d.dim] = V.residual_scale(d.dim)
         m = GW.block_matrices(self.store, self.cfgs, b, d, self.fold[0], self.fold[1])
         ge = self.cfgs.block(b)[3]
-        us = 1.0 / ge.xmax if (self.rt.ops.gelu_fold and ge.method == "thor_composite") else 1.0
+        us = 1.0 / ge.xmax if (self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")) else 1.0
         enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                            name=f"b{b}.{name}")
         Er = d.E_real

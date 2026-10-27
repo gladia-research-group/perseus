@@ -99,7 +99,7 @@ class BertPrefill(ImplModel):
         if b not in self._w:
             d, B = self.rt.dims, self.blocks
             ge = self.cfgs.block(b)[3]
-            us = 1.0 / ge.xmax if (self.rt.ops.gelu_fold and ge.method == "thor_composite") else 1.0
+            us = 1.0 / ge.xmax if (self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")) else 1.0
             m = W.block_matrices(self.store, self.cfgs, b, d, fold_ln1=False, fold_ln2=False)
             Er = d.E_real
 
