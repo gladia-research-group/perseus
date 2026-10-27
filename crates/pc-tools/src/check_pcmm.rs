@@ -3,8 +3,9 @@
 //!   pc-check pcmm [--shapes gpt2.qkv,..] [--twin gpt2.qkv,..] [--seed s]   the digit-plane GEMM vs the exact integer
 //!       product mod q, every element; the whole `Pcmm::product` on a random split ciphertext vs a host twin of the same
 //!       formulas (FIDESlib Pcmm.cu semantics), every output word
-//!   pc-bench pcmm --prec [--cf 6] [--wbits 24]   a real input through StC-first stages -> product -> K-batched finishes
-//!       vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits = log2(max |Y| / max err))
+//!   pc-bench pcmm --prec [--cf 6] [--wbits 24] [--sigma 0.1] [--wamp 1]   a real input through StC-first stages ->
+//!       product -> K-batched finishes vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits =
+//!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input)
 //!   pc-bench pcmm [--shapes ..] [--k 1,2,4]      device ms per linear: product phases and output finishes per K
 use crate::check_bts::Tally;
 use pc_core::encode::{Complex, Encoder, Payload};
@@ -571,6 +572,8 @@ fn bench(args: &[String]) -> Res<bool> {
     let cf: u32 = arg(args, "--cf").map(|s| s.parse()).transpose()?.unwrap_or(6);
     let wbits: u32 = arg(args, "--wbits").map(|s| s.parse()).transpose()?.unwrap_or(24);
     let sigma: f64 = arg(args, "--sigma").map(|s| s.parse()).transpose()?.unwrap_or(0.1);
+    // --wamp: the weights' amplitude (x 1/sqrt(rows_in)); larger outputs (band shifts) at a bounded input
+    let wamp: f64 = arg(args, "--wamp").map(|s| s.parse()).transpose()?.unwrap_or(1.0);
     let mut uniq: Vec<PcmmShape> = Vec::new();
     for (_, s) in &shapes {
         let s = if prec { PcmmShape { nw: wbits.div_ceil(8) as usize, ..*s } } else { *s };
@@ -691,7 +694,7 @@ fn bench(args: &[String]) -> Res<bool> {
         let nch = lay_s.nch();
         let (ri, ro) = (nch * sh.n_in, nch * sh.n_out);
         // weights ~ U(-1, 1) / sqrt(rows_in): |y| ~ |x|
-        let amp = 1.0 / (ri as f64).sqrt();
+        let amp = wamp / (ri as f64).sqrt();
         let w: Vec<f64> = (0..ri * ro).map(|_| (2.0 * g.uniform_f64() - 1.0) * amp).collect();
         let (planes, ws, wt) = encode_weights(&w, &sh, if prec { wbits } else { 8 * sh.nw as u32 })?;
         wb.upload(&ex.compute, &planes)?;
