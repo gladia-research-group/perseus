@@ -5,7 +5,7 @@
 //!
 //!   INTT, gather + exact rescale by p3, p2 (the PCMM's ops) -> RESCALE_P1 (mod p0) -> ring switch s -> s'(X^S)
 //!   (RS_DIGITS, NTT, MAC, INTT, + c0) -> RS_EXTRACT (LWEs of dimension N / S) -> LWE key switch (KS_DIGITS, four
-//!   int8 GEMMs, KS_RECOMBINE) -> bootstrap (PBS_MS, PBS_INIT, PBS_STEP per key bit, PBS_EXTRACT: mod p0) -> repack
+//!   int8 GEMMs, KS_RECOMBINE) -> bootstrap (PBS_MS, PBS_INIT, PBS_ROTATE, PBS_EXTRACT: mod p0) -> repack
 //!   (per key chunk REPACK_DIGITS, NTT, REPACK_MAC; INTT, REPACK_B) -> lift x p2 p3 into limbs 0..3, scatter, NTT.
 //!
 //! Ring-2^16 NTTs run on the PCMM launcher's NTT op with pc-tfhe's tables (the keys live in that NTT domain).
@@ -16,7 +16,7 @@ use std::time::Instant;
 use pc_cuda::blas::lt;
 use pc_cuda::{launch_result, Arena, Compute, DBuf, Stream};
 use pc_kernels::args::{pcmm_op, tfhe_op, PcmmArgs, TfheArgs};
-use pc_tfhe::modq::{invmod, shoup};
+use pc_tfhe::modq::invmod;
 use pc_tfhe::switch::Switcher;
 
 use crate::context::{Context, DevStrategy};
@@ -32,6 +32,66 @@ const WS: usize = 64 << 20;
 
 fn mu(p: u64) -> u64 {
     ((1u128 << 64) / p as u128) as u64
+}
+
+/// The device image of a host bootstrapping key (RNS, u32): the key [key][c][t][part][prime][n] (NTT form, times n^-1
+/// per prime: the rotation's inverse NTT skips its scaling) and its Shoup companions, the twiddles [prime][forward | inverse][n] and theirs, and the PBS ops' constants (args.cuh:
+/// c[2..8) = n^-1 per prime with companions, q_a | q_b << 32, q_a^-1 mod q_b | its companion << 32; `m` the gadget's
+/// multiplier).
+pub struct PbsImage {
+    pub bsk: Vec<u32>,
+    pub bsk_s: Vec<u32>,
+    pub tw: Vec<u32>,
+    pub tws: Vec<u32>,
+    pub c: [u64; 8],
+    pub m: u64,
+    pub q: u64,
+}
+
+fn shoup32(w: u64, q: u64) -> u32 {
+    ((w << 32) / q) as u32
+}
+
+pub fn pbs_image(k: &pc_tfhe::pbs::BootstrapKey) -> PbsImage {
+    let rns = &k.rns;
+    let (qa, qb) = (rns.ntt[0].q, rns.ntt[1].q);
+    let lv = k.gadget.levels;
+    let ninv = [rns.ntt[0].tables().2, rns.ntt[1].tables().2];
+    let mut bsk = Vec::new();
+    let mut bsk_s = Vec::new();
+    for g in &k.ggsw {
+        for c in 0..2 {
+            for t in 0..lv {
+                let r = &g.rows()[c][t];
+                for part in 0..2 {
+                    for (pr, &q) in [qa, qb].iter().enumerate() {
+                        let poly = if part == 0 { &r[pr].0 } else { &r[pr].1 };
+                        for &x in poly {
+                            let v = pc_tfhe::modq::mulmod(x, ninv[pr], q);
+                            bsk.push(v as u32);
+                            bsk_s.push(shoup32(v, q));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut tw = Vec::new();
+    let mut tws = Vec::new();
+    for (pr, &q) in [qa, qb].iter().enumerate() {
+        let (psi, ipsi, _) = rns.ntt[pr].tables();
+        for v in psi.iter().chain(ipsi) {
+            tw.push(*v as u32);
+            tws.push(shoup32(*v, q));
+        }
+    }
+    let c = [k.gadget.base_log as u64, lv as u64, ninv[0], shoup32(ninv[0], qa) as u64, ninv[1], shoup32(ninv[1], qb) as u64, qa | qb << 32, rns.inv | (shoup32(rns.inv, qb) as u64) << 32];
+    PbsImage { bsk, bsk_s, tw, tws, c, m: k.gadget.m, q: rns.q }
+}
+
+/// A test vector (mod Q) as its residues [prime][n] (PBS_INIT's input).
+pub fn tv_residues(k: &pc_tfhe::pbs::BootstrapKey, tv: &[u64]) -> Vec<u32> {
+    k.rns.residues(tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect()
 }
 
 /// Device milliseconds per stage of the last `apply` (host walls around synced stages: diagnostic).
@@ -55,17 +115,17 @@ pub struct TfheSwitch<'a> {
     p1: u64,
     rs_m: u64,
     ks_m: u64,
+    pbs_c: [u64; 8],
     pbs_m: u64,
     tw_f: DBuf<'a, Compute, u32>,
     tw_i: DBuf<'a, Compute, u32>,
     ninv: [u32; 2],
     rkey: DBuf<'a, Compute, u32>,
     ksk: Vec<DBuf<'a, Compute, u8>>,
-    bsk: DBuf<'a, Compute, u64>,
-    bsk_s: DBuf<'a, Compute, u64>,
-    btw: DBuf<'a, Compute, u64>,
-    btw_s: DBuf<'a, Compute, u64>,
-    bninv: u64,
+    bsk: DBuf<'a, Compute, u32>,
+    bsk_s: DBuf<'a, Compute, u32>,
+    btw: DBuf<'a, Compute, u32>,
+    btw_s: DBuf<'a, Compute, u32>,
     rk: DBuf<'a, Compute, u32>,
     stage: DBuf<'a, Compute, u32>,
     low: DBuf<'a, Compute, u32>,
@@ -78,9 +138,9 @@ pub struct TfheSwitch<'a> {
     g: DBuf<'a, Compute, i32>,
     lwe: DBuf<'a, Compute, u32>,
     ms: DBuf<'a, Compute, u32>,
-    acc: DBuf<'a, Compute, u64>,
+    acc: DBuf<'a, Compute, u32>,
     outs: DBuf<'a, Compute, u32>,
-    tv: DBuf<'a, Compute, u64>,
+    tv: DBuf<'a, Compute, u32>,
     rdig: DBuf<'a, Compute, u32>,
     racc: DBuf<'a, Compute, u32>,
     ws: DBuf<'a, Compute, u8>,
@@ -94,10 +154,10 @@ impl<'a> TfheSwitch<'a> {
         let n_sub = n / p.rs_factor;
         let k = n_sub * p.ks.1;
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + nb * p.rp.1 * 4 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
-            + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1) + 2 * CHUNK * p.rp.1 * n + 4 * n;
-        let words64 = 2 * nl * 2 * p.pbs.1 * 2 * nb + 4 * nb + max * 2 * nb + nb;
+            + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1) + 2 * CHUNK * p.rp.1 * n + 4 * n
+            + 2 * nl * 2 * p.pbs.1 * 4 * nb + 8 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
-        4 * words32 + 8 * words64 + bytes8 + 64 * 256
+        4 * words32 + bytes8 + 64 * 256
     }
 
     /// Upload `sw`'s keys (host-generated: pc-tfhe `Switcher::generate`) and carve the work buffers.
@@ -107,11 +167,6 @@ impl<'a> TfheSwitch<'a> {
         let n_sub = n / sfac;
         let up32 = |what: &'static str, v: &[u32]| -> Result<DBuf<'a, Compute, u32>> {
             let mut b = arena.alloc::<Compute, u32>(what, v.len())?;
-            b.upload(s, v)?;
-            Ok(b)
-        };
-        let up64 = |what: &'static str, v: &[u64]| -> Result<DBuf<'a, Compute, u64>> {
-            let mut b = arena.alloc::<Compute, u64>(what, v.len())?;
             b.upload(s, v)?;
             Ok(b)
         };
@@ -143,21 +198,7 @@ impl<'a> TfheSwitch<'a> {
             ksk.push(b);
         }
         drop(planes);
-        let q = p.q_br;
-        let mut bflat = Vec::with_capacity(nl * 2 * p.pbs.1 * 2 * nb);
-        for g in &sw.bsk.ggsw {
-            for c in 0..2 {
-                for t in 0..p.pbs.1 {
-                    let (r0, r1) = &g.rows()[c][t];
-                    bflat.extend_from_slice(r0);
-                    bflat.extend_from_slice(r1);
-                }
-            }
-        }
-        let bsh: Vec<u64> = bflat.iter().map(|&x| shoup(x, q)).collect();
-        let (bpsi, bipsi, bninv) = sw.bsk.ntt.tables();
-        let btw: Vec<u64> = bpsi.iter().chain(bipsi).copied().collect();
-        let btws: Vec<u64> = btw.iter().map(|&x| shoup(x, q)).collect();
+        let img = pbs_image(&sw.bsk);
         let mut rk = Vec::with_capacity(nb * p.rp.1 * 4 * n);
         for kk in 0..nb {
             for t in 0..p.rp.1 {
@@ -178,17 +219,17 @@ impl<'a> TfheSwitch<'a> {
             p1: sw.p1,
             rs_m: sw.rs.gadget.m,
             ks_m: sw.ksk.gadget.m,
-            pbs_m: sw.bsk.gadget.m,
+            pbs_c: img.c,
+            pbs_m: img.m,
             tw_f: up32("tfhe.tw", &tw_f)?,
             tw_i: up32("tfhe.tw", &tw_i)?,
             ninv: [ni0 as u32, ni1 as u32],
             rkey: up32("tfhe.rkey", &rkey)?,
             ksk,
-            bsk: up64("tfhe.bsk", &bflat)?,
-            bsk_s: up64("tfhe.bsk", &bsh)?,
-            btw: up64("tfhe.btw", &btw)?,
-            btw_s: up64("tfhe.btw", &btws)?,
-            bninv,
+            bsk: up32("tfhe.bsk", &img.bsk)?,
+            bsk_s: up32("tfhe.bsk", &img.bsk_s)?,
+            btw: up32("tfhe.btw", &img.tw)?,
+            btw_s: up32("tfhe.btw", &img.tws)?,
             rk: up32("tfhe.rk", &rk)?,
             stage: arena.alloc("tfhe.work", 8 * n)?,
             low: arena.alloc("tfhe.work", 2 * 2 * n)?,
@@ -201,9 +242,9 @@ impl<'a> TfheSwitch<'a> {
             g: arena.alloc("tfhe.work", PLANES * cols * max)?,
             lwe: arena.alloc("tfhe.work", max * cols)?,
             ms: arena.alloc("tfhe.work", max * cols)?,
-            acc: arena.alloc("tfhe.work", max * 2 * nb)?,
+            acc: arena.alloc("tfhe.work", max * 4 * nb)?,
             outs: arena.alloc("tfhe.work", max * (nb + 1))?,
-            tv: arena.alloc("tfhe.work", nb)?,
+            tv: arena.alloc("tfhe.work", 2 * nb)?,
             rdig: arena.alloc("tfhe.work", 2 * CHUNK * p.rp.1 * n)?,
             racc: arena.alloc("tfhe.work", 4 * n)?,
             ws: arena.alloc("tfhe.ws", WS)?,
@@ -229,13 +270,13 @@ impl<'a> TfheSwitch<'a> {
     /// `positions` (slot i of a real payload is coefficient brev((i - 1) mod N/2): pc-check tfhe). `x` is overwritten
     /// with the result in the split format (level, degree and scale unchanged). `lt_`: the cuBLASLt handle of the
     /// key switch's GEMMs (a plan per batch size, built on first use).
-    pub fn apply<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, positions: &[u32], tv: &[u64], offset: u64) -> Result<Timings> {
+    pub fn apply<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, positions: &[u32], tv: &[u32], offset: u64) -> Result<Timings> {
         let (n, nb, nl, n_sub) = (self.n, self.nb, self.nl, self.n_sub);
         let b = positions.len();
         if b == 0 || b > self.max {
             return Err(shape("tfhe switch", format!("{b} coefficients, the switch holds 1..={}", self.max)));
         }
-        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 || tv.len() != nb {
+        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 || tv.len() != 2 * nb {
             return Err(shape("tfhe switch", format!("ciphertext at level {} (the split holds limbs 0..3) / test vector of {}", x.meta.level, tv.len())));
         }
         let (p0, p1) = (self.p0, self.p1);
@@ -306,10 +347,13 @@ impl<'a> TfheSwitch<'a> {
         let t2 = Instant::now();
         let qb = self.p.q_br;
         let pb = TfheArgs { n: nb as i32, count: b as i32, i1: nl as i32, q: qb, ..Default::default() };
+        let mut cx = [0u64; 8];
+        cx[6] = self.pbs_c[6];
+        cx[7] = self.pbs_c[7];
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nb as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..pb })?;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: self.tv.vptr(), z: self.ms.vptr(), ..pb })?;
-        let step = TfheArgs {
-            op: tfhe_op::PBS_STEP,
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: self.tv.vptr(), z: self.ms.vptr(), c: cx, ..pb })?;
+        Self::go(ctx, s, &TfheArgs {
+            op: tfhe_op::PBS_ROTATE,
             x: self.acc.vptr_mut(),
             y: self.bsk.vptr(),
             w: self.bsk_s.vptr(),
@@ -317,11 +361,10 @@ impl<'a> TfheSwitch<'a> {
             tw: self.btw.vptr(),
             tws: self.btw_s.vptr(),
             m: self.pbs_m,
-            c: [self.p.pbs.0 as u64, self.p.pbs.1 as u64, self.bninv, shoup(self.bninv, qb), 0, 0, 0, 0],
+            c: self.pbs_c,
             ..pb
-        };
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_ROTATE, ..step })?;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, 0, 0], ..pb })?;
+        })?;
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offset, p0, 0, 0, 0, 0, cx[6], cx[7]], ..pb })?;
         s.sync()?;
         tm.bootstrap = t2.elapsed().as_secs_f64() * 1e3;
 

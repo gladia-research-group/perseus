@@ -2,7 +2,7 @@
 //! at phase m q0 / 4 go through the sign LUT and come back as (1 + sign m) / 2 at q0 / 2^out_cf, zeros elsewhere.
 use pc_core::keys::{sample_ternary, DiscreteGaussian, Prng};
 use pc_tfhe::lwe::Lwe;
-use pc_tfhe::modq::{prime_below, Ntt};
+use pc_tfhe::modq::prime_below;
 use pc_tfhe::params::Params;
 use pc_tfhe::pbs::{sign01, test_vector};
 use pc_tfhe::rlwe::RnsRlwe;
@@ -30,7 +30,8 @@ fn pbs_sign_on_fresh_lwes() {
     let s_br: Vec<i64> = sample_ternary(&mut prng, p.n_br).into_iter().map(|x| x as i64).collect();
     let dg = DiscreteGaussian::new(p.key_sigma).unwrap();
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64).unwrap();
-    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), Ntt::new(p.q_br, p.n_br).unwrap(), &dg, &mut prng);
+    let rns = pc_tfhe::pbs::Rns::new(p.br_primes.0, p.br_primes.1, p.n_br).unwrap();
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, &dg, &mut prng);
     let delta = p.q_br >> p.out_cf;
     let (tv, off) = sign01(p.n_br, delta);
     let ms: Vec<f64> = (0..24).map(|i| -0.95 + 1.9 * i as f64 / 23.0).collect();

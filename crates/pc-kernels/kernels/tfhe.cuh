@@ -83,114 +83,233 @@ __global__ void ms_k(TfheArgs A) {
     ((uint32_t*)A.x)[i] = (uint32_t)(scale_round(((const uint32_t*)A.y)[i], A.m) % two_n);
 }
 
+// ── the blind rotation in RNS: Q = q_a q_b (two ~25-bit primes, u32 residues, 32-bit Shoup products) ─────────────
+// c[0] base log, c[1] levels, c[2..6) n^-1 mod q_a and its companion, n^-1 mod q_b and its companion,
+// c[6] = q_a | q_b << 32, c[7] = q_a^-1 mod q_b | its Shoup companion mod q_b << 32; q = Q;
+// m = floor(2^(64 + levels base) / Q)
+__device__ __forceinline__ uint32_t shoup32(uint32_t a, uint32_t w, uint32_t ws, uint32_t q) {
+    const uint32_t r = a * w - __umulhi(a, ws) * q;
+    return r >= q ? r - q : r;
+}
+__device__ __forceinline__ uint32_t add32(uint32_t a, uint32_t b, uint32_t q) {
+    const uint32_t s = a + b;
+    return s >= q ? s - q : s;
+}
+__device__ __forceinline__ uint32_t sub32(uint32_t a, uint32_t b, uint32_t q) {
+    return a >= b ? a - b : a + q - b;
+}
+__device__ __forceinline__ uint32_t mono32(const uint32_t* a, int n, int kp, int o, uint32_t q) {
+    int i = o - kp;
+    if (i >= 0) return a[i];
+    i += n;
+    if (i >= 0) return a[i] ? q - a[i] : 0;
+    return a[i + n];
+}
+// x mod Q from (r_a, r_b): r_a + q_a ((r_b - r_a) q_a^-1 mod q_b); invs = the Shoup companion of inv mod q_b.
+// q_a < 2 q_b (two 25-bit primes): r_a mod q_b is one conditional subtraction
+__device__ __forceinline__ uint64_t crt(uint32_t ra, uint32_t rb, uint32_t qa, uint32_t qb, uint32_t inv, uint32_t invs) {
+    const uint32_t ram = ra >= qb ? ra - qb : ra;
+    const uint32_t k = shoup32(sub32(rb, ram, qb), inv, invs, qb);
+    return ra + (uint64_t)qa * k;
+}
+// both primes' polynomials [2][n] in place: forward (natural -> bit-reversed) / inverse (with n^-1)
+__device__ void ntt2_fwd(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    for (int m = 1, t = n / 2; m < n; m *= 2, t /= 2) {
+        for (int bb = threadIdx.x; bb < n; bb += blockDim.x) {
+            const int p = bb >= n / 2, b = bb - p * (n / 2);
+            const uint32_t q = p ? qb : qa;
+            uint32_t* x = a + p * n;
+            const int i = b / t, j = 2 * i * t + b % t;
+            const int wi = p * 2 * n + m + i;
+            const uint32_t u = x[j], v = shoup32(x[j + t], tw[wi], tws[wi], q);
+            x[j] = add32(u, v, q);
+            x[j + t] = sub32(u, v, q);
+        }
+        __syncthreads();
+    }
+}
+// P polynomials [P][n] in place, poly k at prime k & 1 (forward, natural -> bit-reversed)
+__device__ void nttp_fwd(uint32_t* a, int P, int n, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    // every divisor is a power of two: shifts and masks (a variable integer division costs more than the product)
+    const int half = n / 2, lh = __ffs(half) - 1;
+    for (int m = 1, t = half, lt = lh; m < n; m *= 2, t /= 2, lt--) {
+        for (int bb = threadIdx.x; bb < P * half; bb += blockDim.x) {
+            const int k = bb >> lh, b = bb & (half - 1), p = k & 1;
+            const uint32_t q = p ? qb : qa;
+            uint32_t* x = a + k * n;
+            const int i = b >> lt, j = (i << (lt + 1)) + (b & (t - 1));
+            const int wi = p * 2 * n + m + i;
+            const uint32_t u = x[j], v = shoup32(x[j + t], tw[wi], tws[wi], q);
+            x[j] = add32(u, v, q);
+            x[j + t] = sub32(u, v, q);
+        }
+        __syncthreads();
+    }
+}
+// P polynomials [P][n] in place, poly k at prime k & 1 (inverse, bit-reversed -> natural, WITHOUT the n^-1: the
+// rotation's key carries it)
+__device__ void nttp_inv(uint32_t* a, int P, int n, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    const int half = n / 2, lh = __ffs(half) - 1;
+    for (int m = half, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
+        for (int bb = threadIdx.x; bb < P * half; bb += blockDim.x) {
+            const int k = bb >> lh, b = bb & (half - 1), p = k & 1;
+            const uint32_t q = p ? qb : qa;
+            uint32_t* x = a + k * n;
+            const int i = b >> lt, j = (i << (lt + 1)) + (b & (t - 1));
+            const int wi = p * 2 * n + n + m + i;
+            const uint32_t u = x[j], v = x[j + t];
+            x[j] = add32(u, v, q);
+            x[j + t] = shoup32(sub32(u, v, q), tw[wi], tws[wi], q);
+        }
+        __syncthreads();
+    }
+}
+__device__ void ntt2_inv(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, const TfheArgs& A, uint32_t qa, uint32_t qb) {
+    for (int m = n / 2, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
+        for (int bb = threadIdx.x; bb < n; bb += blockDim.x) {
+            const int p = bb >= n / 2, b = bb - p * (n / 2);
+            const uint32_t q = p ? qb : qa;
+            uint32_t* x = a + p * n;
+            const int i = b >> lt, j = (i << (lt + 1)) + (b & (t - 1));
+            const int wi = p * 2 * n + n + m + i;
+            const uint32_t u = x[j], v = x[j + t];
+            x[j] = add32(u, v, q);
+            x[j + t] = shoup32(sub32(u, v, q), tw[wi], tws[wi], q);
+        }
+        __syncthreads();
+    }
+    for (int k = threadIdx.x; k < 2 * n; k += blockDim.x) {
+        const int p = k >= n;
+        a[k] = shoup32(a[k], (uint32_t)A.c[p ? 4 : 2], (uint32_t)A.c[p ? 5 : 3], p ? qb : qa);
+    }
+    __syncthreads();
+}
+
+// acc [count][2 part][2 prime][n]: part 0 = X^-b~ tv (y = tv residues [2 prime][n]), part 1 = 0
 __global__ void init_k(TfheArgs A) {
     const int n = A.n;
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
     const uint32_t bt = ((const uint32_t*)A.z)[(size_t)blockIdx.y * (A.i1 + 1) + A.i1];
     const int kp = (int)((2 * n - bt) % (2 * n));
-    uint64_t* acc = (uint64_t*)A.x + (size_t)blockIdx.y * 2 * n;
+    uint32_t* acc = (uint32_t*)A.x + (size_t)blockIdx.y * 4 * n;
     for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n; o += gridDim.x * blockDim.x) {
-        acc[o] = mono((const uint64_t*)A.y, n, kp, o, A.q);
-        acc[n + o] = 0;
-    }
-}
-
-// acc (shared, both parts) += GGSW_key [x] (acc X^-ak - acc); dif, tb, o0, o1: shared scratch of n words each
-__device__ void cmux(const TfheArgs& A, int key, uint32_t ak, uint64_t* acc0, uint64_t* acc1, uint64_t* dif, uint64_t* tb, uint64_t* o0, uint64_t* o1) {
-    const int n = A.n, bl = (int)A.c[0], lv = (int)A.c[1];
-    const uint64_t q = A.q;
-    const int kp = (int)((2 * n - ak) % (2 * n));
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        o0[o] = 0;
-        o1[o] = 0;
-    }
-    const uint64_t* psi = (const uint64_t*)A.tw;
-    const uint64_t* psis = (const uint64_t*)A.tws;
-    const size_t kstride = (size_t)2 * lv * 2 * n;
-    const uint64_t* bsk = (const uint64_t*)A.y + key * kstride;
-    const uint64_t* bsks = (const uint64_t*)A.w + key * kstride;
-    for (int c = 0; c < 2; c++) {
-        const uint64_t* src = c ? acc1 : acc0;
-        for (int o = threadIdx.x; o < n; o += blockDim.x) dif[o] = subq(mono(src, n, kp, o, q), src[o], q);
-        __syncthreads();
-        for (int t = 0; t < lv; t++) {
-            for (int o = threadIdx.x; o < n; o += blockDim.x) {
-                const int64_t d = digit(dif[o], t, bl, lv, A.m);
-                tb[o] = d < 0 ? (uint64_t)((int64_t)q + d) : (uint64_t)d;
-            }
-            __syncthreads();
-            ntt_fwd(tb, n, psi, psis, q);
-            const uint64_t* r0 = bsk + ((size_t)(c * lv + t) * 2) * n;
-            const uint64_t* r0s = bsks + ((size_t)(c * lv + t) * 2) * n;
-            for (int o = threadIdx.x; o < n; o += blockDim.x) {
-                o0[o] = addq(o0[o], shoup(tb[o], r0[o], r0s[o], q), q);
-                o1[o] = addq(o1[o], shoup(tb[o], r0[n + o], r0s[n + o], q), q);
-            }
-            __syncthreads();
+        for (int p = 0; p < 2; p++) {
+            acc[p * n + o] = mono32((const uint32_t*)A.y + p * n, n, kp, o, p ? qb : qa);
+            acc[(2 + p) * n + o] = 0;
         }
     }
-    ntt_inv(o0, n, psi + n, psis + n, A.c[2], A.c[3], q);
-    ntt_inv(o1, n, psi + n, psis + n, A.c[2], A.c[3], q);
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        acc0[o] = addq(acc0[o], o0[o], q);
-        acc1[o] = addq(acc1[o], o1[o], q);
-    }
-    __syncthreads();
 }
 
-// one CMux of every LWE of the batch (a block each): acc += GGSW_key [x] (acc X^-a~ - acc)
-__global__ void __launch_bounds__(STEP_TH) step_k(TfheArgs A) {
-    extern __shared__ uint64_t sm[];
-    const int n = A.n, L = A.i1, key = A.i0;
-    const uint32_t ak = ((const uint32_t*)A.z)[(size_t)blockIdx.x * (L + 1) + key];
-    if (ak == 0) return;
-    uint64_t* g = (uint64_t*)A.x + (size_t)blockIdx.x * 2 * n;
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        sm[o] = g[o];
-        sm[n + o] = g[n + o];
-    }
-    __syncthreads();
-    cmux(A, key, ak, sm, sm + n, sm + 2 * n, sm + 3 * n, sm + 4 * n, sm + 5 * n);
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        g[o] = sm[o];
-        g[n + o] = sm[n + o];
-    }
-}
-
-// the whole blind rotation of every LWE (a block each): the accumulator stays in shared memory across the i1 CMuxes
+// the whole blind rotation of every LWE (a block each, n / 2 = 1024 threads: two coefficients each); shared:
+// acc [2 part][2 prime][n], tb [level][2 prime][n], o [2 part][2 prime][n] (12 n words at two levels). Per key bit:
+// acc += GGSW [x] (acc X^-a~ - acc); bsk [key][c][t][part][prime][n], pre-multiplied by n^-1 (the inverse NTT then
+// needs no scaling pass: exact arithmetic, so the result is the host's bit for bit). The bit's key words a thread multiplies are
+// loaded into registers when the bit starts, so their L2 latency overlaps the digits and the forward NTTs.
+constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
-    extern __shared__ uint64_t sm[];
-    const int n = A.n, L = A.i1;
+    extern __shared__ uint32_t sm32[];
+    const int n = A.n, L = A.i1, bl = (int)A.c[0], lv = (int)A.c[1];
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
+    uint32_t *acc = sm32, *tb = sm32 + 4 * n, *o = sm32 + 8 * n;
     const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.x * (L + 1);
-    uint64_t* g = (uint64_t*)A.x + (size_t)blockIdx.x * 2 * n;
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        sm[o] = g[o];
-        sm[n + o] = g[n + o];
-    }
+    uint32_t* g = (uint32_t*)A.x + (size_t)blockIdx.x * 4 * n;
+    for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) acc[k] = g[k];
     __syncthreads();
+    const uint32_t* tw = (const uint32_t*)A.tw;
+    const uint32_t* tws = (const uint32_t*)A.tws;
+    const size_t kstride = (size_t)2 * lv * 2 * 2 * n;
+    const int bits = bl * lv;
+    const int64_t B = 1ll << bl;
     for (int key = 0; key < L; key++) {
         const uint32_t ak = at[key];
-        if (ak) cmux(A, key, ak, sm, sm + n, sm + 2 * n, sm + 3 * n, sm + 4 * n, sm + 5 * n);
+        if (!ak) continue;
+        const int kp = (int)((2 * n - ak) % (2 * n));
+        const uint32_t* bsk = (const uint32_t*)A.y + key * kstride;
+        const uint32_t* bsks = (const uint32_t*)A.w + key * kstride;
+        // prefetch: [c][t][e] -> (k0, k0s, k1, k1s) for this thread's coefficients k = threadIdx.x + e blockDim.x
+        uint32_t kr[2][2][RT_E][4];
+#pragma unroll
+        for (int c = 0; c < 2; c++)
+#pragma unroll
+            for (int t = 0; t < 2; t++)
+#pragma unroll
+                for (int e = 0; e < RT_E; e++) {
+                    const int k = threadIdx.x + e * blockDim.x;
+                    const size_t off = (size_t)(c * lv + t) * 4 * n + k;
+                    kr[c][t][e][0] = bsk[off];
+                    kr[c][t][e][1] = bsks[off];
+                    kr[c][t][e][2] = bsk[off + 2 * n];
+                    kr[c][t][e][3] = bsks[off + 2 * n];
+                }
+        uint32_t a0[RT_E], a1[RT_E];
+#pragma unroll
+        for (int e = 0; e < RT_E; e++) a0[e] = a1[e] = 0;
+#pragma unroll
+        for (int c = 0; c < 2; c++) {
+            const uint32_t* sa = acc + (2 * c) * n;       // part c, prime a
+            const uint32_t* sb = acc + (2 * c + 1) * n;   // part c, prime b
+            for (int j = threadIdx.x; j < n; j += blockDim.x) {
+                const uint32_t da = sub32(mono32(sa, n, kp, j, qa), sa[j], qa);
+                const uint32_t db = sub32(mono32(sb, n, kp, j, qb), sb[j], qb);
+                int64_t v = (int64_t)scale_round(crt(da, db, qa, qb, inv, invs), A.m);
+                if (v >= (1ll << (bits - 1))) v -= 1ll << bits;
+                for (int t = 0; t < lv; t++) {
+                    int64_t r = v & (B - 1);
+                    if (r >= B / 2) r -= B;
+                    v = (v - r) >> bl;
+                    if (t == lv - 1) r += v << bl;
+                    tb[(2 * t) * n + j] = r < 0 ? (uint32_t)((int64_t)qa + r) : (uint32_t)r;
+                    tb[(2 * t + 1) * n + j] = r < 0 ? (uint32_t)((int64_t)qb + r) : (uint32_t)r;
+                }
+            }
+            __syncthreads();
+            nttp_fwd(tb, 2 * lv, n, tw, tws, qa, qb);
+#pragma unroll
+            for (int e = 0; e < RT_E; e++) {
+                const int k = threadIdx.x + e * blockDim.x;
+                const uint32_t q = k >= n ? qb : qa;
+#pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    const uint32_t d = tb[t * 2 * n + k];
+                    a0[e] = add32(a0[e], shoup32(d, kr[c][t][e][0], kr[c][t][e][1], q), q);
+                    a1[e] = add32(a1[e], shoup32(d, kr[c][t][e][2], kr[c][t][e][3], q), q);
+                }
+            }
+            __syncthreads();   // tb is rewritten by the next part's digits
+        }
+#pragma unroll
+        for (int e = 0; e < RT_E; e++) {
+            const int k = threadIdx.x + e * blockDim.x;
+            o[k] = a0[e];
+            o[2 * n + k] = a1[e];
+        }
+        __syncthreads();
+        nttp_inv(o, 4, n, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1
+        for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) {
+            const uint32_t q = (k >> (__ffs(n) - 1)) & 1 ? qb : qa;
+            acc[k] = add32(acc[k], o[k], q);
+        }
+        __syncthreads();
     }
-    for (int o = threadIdx.x; o < n; o += blockDim.x) {
-        g[o] = sm[o];
-        g[n + o] = sm[n + o];
-    }
+    for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) g[k] = acc[k];
 }
 
+// sample extraction of coefficient 0 (CRT to mod Q), + offset c[0] (mod Q), then round(v c[1] / Q) mod c[1]
 __global__ void extract_k(TfheArgs A) {
     const int n = A.n;
-    const uint64_t q = A.q, to = A.c[1];
-    const uint64_t* acc = (const uint64_t*)A.y + (size_t)blockIdx.y * 2 * n;
+    const uint64_t Q = A.q, to = A.c[1];
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
+    const uint32_t* acc = (const uint32_t*)A.y + (size_t)blockIdx.y * 4 * n;
     uint32_t* out = (uint32_t*)A.x + (size_t)blockIdx.y * (n + 1);
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k <= n; k += gridDim.x * blockDim.x) {
         uint64_t v;
         if (k == n) {
-            v = addq(acc[0], A.c[0], q);
+            v = addq(crt(acc[0], acc[n], qa, qb, inv, invs), A.c[0], Q);
         } else if (k == 0) {
-            v = acc[n];
+            v = crt(acc[2 * n], acc[3 * n], qa, qb, inv, invs);
         } else {
-            const uint64_t c1 = acc[n + n - k];
-            v = c1 ? q - c1 : 0;
+            const uint64_t c1 = crt(acc[2 * n + n - k], acc[3 * n + n - k], qa, qb, inv, invs);
+            v = c1 ? Q - c1 : 0;
         }
         out[k] = (uint32_t)(scale_round(v, A.m) % to);
     }
@@ -368,24 +487,17 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if (A.count > 65535) return -1;
             init_k<<<dim3((A.n + 255) / 256, A.count), 256, 0, s>>>(A);
             break;
-        case PC_TFHE_PBS_STEP: {
-            const int smem = 6 * A.n * (int)sizeof(uint64_t);
-            static bool attr = false;
-            if (!attr) {   // the opt-in for the largest ring (n = 2048: 96 KB), once
-                cudaFuncSetAttribute(step_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 6 * 2048 * (int)sizeof(uint64_t));
-                attr = true;
-            }
-            step_k<<<A.count, A.n / 2 < STEP_TH ? A.n / 2 : STEP_TH, smem, s>>>(A);
-            break;
-        }
         case PC_TFHE_PBS_ROTATE: {
-            const int smem = 6 * A.n * (int)sizeof(uint64_t);
+            // the kernel is specialised to n = 2048 at two levels: 1024 threads, RT_E = 4 coefficients each
+            const int th = STEP_TH;
+            if (A.n != 2048 || A.c[1] != 2) return -1;
+            const int smem = 12 * A.n * (int)sizeof(uint32_t);
             static bool attr_r = false;
-            if (!attr_r) {
-                cudaFuncSetAttribute(rotate_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 6 * 2048 * (int)sizeof(uint64_t));
+            if (!attr_r) {   // the opt-in for the largest ring (n = 2048: 96 KB), once
+                cudaFuncSetAttribute(rotate_k, cudaFuncAttributeMaxDynamicSharedMemorySize, 12 * 2048 * (int)sizeof(uint32_t));
                 attr_r = true;
             }
-            rotate_k<<<A.count, A.n / 2 < STEP_TH ? A.n / 2 : STEP_TH, smem, s>>>(A);
+            rotate_k<<<A.count, th, smem, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:
