@@ -5,9 +5,8 @@ here holds one plan file per model stage, `block_N_placement.json`, and a `PLAN_
 recipe that regenerates it: the recorded forward pass it was computed from (`graph=`, under
 `graphs/`, same name as the plan), the planner settings (`recipe=`), the runtime switches the plan
 was cut for (`runtime=`, applied by `--plan`) and the approximation configs (`configs=`).
-`replanned=` notes the planner settings a replan adds on top of `recipe=`; `python/tests/test_paper_plans.py`
-replans every directory below (its `GATE` spells those settings out) and checks that the result is
-identical to the committed files. The Llama recordings ship as a release artifact
+`python/tests/test_paper_plans.py` replans every directory below from those lines and checks that the
+result is identical to the committed files. The Llama recordings ship as a release artifact
 (`graphs/RELEASE.txt`).
 
 ## Result plans
@@ -17,13 +16,12 @@ Each runs with `--plan` alone, and each is its model's default plan
 
 | directory | model and task |
 |---|---|
-| `gpt2_decode` | GPT-2, decode with the encrypted argmax (ILP placement); block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back) |
-| `gpt2_decode_ctx512` | GPT-2, decode up to a 512-token context (below) |
-| `gpt2_prefill128` | GPT-2, 128-token prefill, StC-first dense refreshes |
-| `gpt2_prefill128_tail` | `gpt2_prefill128` + the encrypted tail (stage 12: last position, final LayerNorm and LM head; stage 13: encrypted argmax), planned by `speedrun/make_tail_plan.sh` from `graphs/gpt2_prefill128_tail` |
-| `bert_sst2_128` | BERT-base, SST-2 classification of a 128-token input |
+| `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys; block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back) |
+| `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context (below) |
+| `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `speedrun/make_prefill_plan.sh` on the min-cut placer (its `tool=` line) |
+| `bert_sst2_128` | BERT-base, SST-2 classification of a 128-token input (blocked attention, the last block on [CLS] alone) |
 | `vit_b16_224` | ViT-B/16, one 224 x 224 image |
-| `llama31_8b_decode` | Llama-3.1-8B, decode |
+| `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context (below) |
 | `llama31_8b_prefill128` | Llama-3.1-8B, 128-token prefill: one planner run (python/perseus/examples/llama/make_plan.sh, `prefill` stage) on the fake recording made under its runtime= line |
 | `llama31_8b_handoff_decode` | Llama-3.1-8B, decode on the K / V handed over by `llama31_8b_prefill128` (`run_handoff`): cut for the hand-off's cache level (`KV_ENTRY_LEVEL=38`), on the refresh sites of the same recipe's plain decode plan (`PLAN_KEEP_PLACEMENTS`, see its `sites=` line), every softmax refresh one scaling step lower (`PLAN_SITE_CF=softmax:-1`) |
 
@@ -114,18 +112,24 @@ The solver iterates over Python sets of node names, so its choices depend on Pyt
 the recipe fixes `PYTHONHASHSEED=0`. Both scripts remove redundant bootstraps unless
 `PLAN_PRUNE=0`; the shipped DaCapo and Orion plans are the ones without that removal.
 
-## 512-context decode plan (32-bit)
+## Long-context decode plans (32-bit)
 
-`gpt2_decode_ctx512` decodes up to a 512-token context (the main plan binds up to 32 cached keys). It is
+`gpt2_decode_ctx1024` decodes up to GPT-2's 1,024-token context (the main plan binds up to 32 cached keys). It is
 captured at position 0 with step-scoped names and the general softmax period, so one plan binds at every cache
 length; past 32 keys the softmax refreshes on a sparse route of Gp x 512 slots that the runtime builds as the cache
-grows (1024 from 33 keys, up to 8192 from 257), multi-stage past 1024 slots, which is why its softmax refreshes are
-planned to land at 32. The magnitudes are the larger of position 0's and position 511's (`scripts/utils/merge_mags.py`):
-the softmax refresh inputs grow up to ~800x with the cache, and factors sized at position 0 wrap. The configs
-(`gpt2_base_n32_ctx512`) refit the softmax on every query position up to 520 keys, without the per-cache-length
+grows (1024 from 33 keys, up to 16384 from 513), multi-stage past 1024 slots, which is why its softmax refreshes are
+planned to land at 32. The magnitudes are the largest of positions 0, 511 and 1023 (`scripts/utils/merge_mags.py`):
+the softmax refresh inputs grow with the cache, and factors sized at position 0 wrap. The configs
+(`gpt2_base_n32_ctx1024`) refit the softmax on every query position up to 1,024 keys, without the per-cache-length
 refine rescale. The runtime records every position on the CPU twin at setup and compiles one program per structure
-class (56 for 512 positions: the score period, the K bucket and the routes change with the cache), with the K/V
-states in pinned host memory and every route resident; `IMPL_RESIDENT_BLOCKS` is a switch of the C++ runtime and is
-not read. 512 positions (`scripts/repro/gpt2_decode_ctx512.sh`, RTX PRO 6000): top-1 506/512 against the plaintext
-model (the six others at rank 1), the encrypted argmax 512/512, median KL 4.0e-4, 4.10 s per token at 500-511 keys
-(3.83 s within 32), peak 66 GB on the GPU; setup 17 min (recording 512 positions).
+class (112 for 1,024 positions: the score period, the K bucket and the routes change with the cache), with the K/V
+states in pinned host memory and every route resident. 1,024 positions (`CTX=1024 scripts/repro/gpt2_decode_ctx.sh`,
+RTX PRO 6000): top-1 994/1024 against the plaintext model, the encrypted argmax 1024/1024, median KL 8.9e-4, 3.25 s
+per token at 120-127 keys, 3.49 at 480-511, 3.63 at 992-1023; setup 34 min (recording 1,024 positions).
+
+`llama31_8b_decode` decodes up to a 512-token context on `llama31_8b_n32_ctx512` (the softmax fitted on every query
+position up to 512 keys), captured at position 1 the same way (its recording ships in the release artifact); its
+runtime adds only switches that move no level (the fused EvalMod conversion, SparseB K = 16, refresh pairs): the
+raise-drop search, checked on the position-1 recording, leaves sites without headroom once the softmax routes turn
+multi-stage. 511 positions of a 512-token window (`scripts/repro/llama_decode.sh`, RTX PRO 6000): top-1 488/511,
+median KL 7.4e-4, 14.93 s per token at 500-511 keys; setup 2.5 h (recording 511 positions).

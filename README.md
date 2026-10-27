@@ -124,10 +124,9 @@ float64 model (`NODE`/`MEMS` bind it to the GPU's NUMA node); each runs the mode
 
 ```bash
 GPU=0 NODE=1 MEMS=1,2 bash scripts/repro/llama_prefill128.sh   # Llama-3-8B, 128-token prefill
-GPU=0 bash scripts/repro/llama_decode.sh                        # Llama-3-8B, decode
-GPU=0 bash scripts/repro/gpt2_decode.sh                         # GPT-2, steady-token decode
-GPU=0 bash scripts/repro/gpt2_decode_ctx512.sh                  # GPT-2, decode up to a 512-token context
-GPU=0 bash scripts/repro/gpt2_prefill128.sh                     # GPT-2, 128-token prefill
+GPU=0 bash scripts/repro/llama_decode.sh                        # Llama-3-8B, decode up to a 512-token context
+GPU=0 bash scripts/repro/gpt2_decode_ctx.sh                     # GPT-2, decode up to a 128-token context
+GPU=0 bash scripts/repro/gpt2_prefill128.sh                     # GPT-2, 128-token prefill to the first token
 GPU=0 bash scripts/repro/bert_base.sh                           # BERT-base, 128 tokens (SST-2)
 GPU=0 bash scripts/repro/vit_base.sh                            # ViT-B/16, four EuroSAT images
 ```
@@ -319,7 +318,7 @@ bash scripts/make_plans.sh python/dacapo python/orion python/fhelipe
 source scripts/local_env.sh
 DECODE=".venv/bin/python -m perseus.examples.gpt2.run_decode --tokens 16 --argmax"
 $DECODE                                                        # the default plan
-bash scripts/repro/gpt2_decode_ctx512.sh                       # up to a 512-token context (its reference: the script)
+CTX=1024 bash scripts/repro/gpt2_decode_ctx.sh                 # up to GPT-2's 1024-token context (its reference: the script)
 ```
 
 Generation feeds each token back without decrypting it. The encrypted argmax picks the token, its
@@ -334,7 +333,7 @@ The runtime runs planned only. Every block is a program compiled from its record
 plan, and a plan that does not bind fails at compile time. The decode runs are teacher-forced
 (each position's input is the reference token's embedding); the encrypted argmax runs on every
 position. A plan that binds at every cache length (`SM_PERIODIC=2` in its `runtime=` line, the
-512-context plan) records every position at setup and compiles one program per structure class.
+1024-context plan) records every position at setup and compiles one program per structure class.
 
 A run passes when it prints `[decode] PASS`, which means that at every position the reference token
 stays among the top few of the encrypted output, and the divergence from the plaintext output stays

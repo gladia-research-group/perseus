@@ -970,7 +970,7 @@ section! {
         #[doc = "Shipped plans: none."]
         ilp_objective: Str = "PLAN_ILP_OBJECTIVE", "(unset)";
         #[doc = "`PLAN_ILP_TIEBREAK`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_prefill128."]
+        #[doc = "Shipped plans: none."]
         ilp_tiebreak: Flag = "PLAN_ILP_TIEBREAK", "(unset)";
         #[doc = "`PLAN_ILP_TIME_LIMIT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 2."]
@@ -1051,7 +1051,7 @@ section! {
         #[doc = "Shipped plans: none."]
         quality_weight: Str = "PLAN_QUALITY_WEIGHT", "(unset)";
         #[doc = "`PLAN_RAISE_DROP_BASE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_prefill128."]
+        #[doc = "Shipped plans: recipe= 6."]
         raise_drop_base: Str = "PLAN_RAISE_DROP_BASE", "(unset)";
         #[doc = "`PLAN_RAISE_ENV_RULE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
@@ -1066,7 +1066,7 @@ section! {
         #[doc = "Shipped plans: recipe= 12."]
         raise_drop_routes: Str = "PLAN_RAISE_ROUTES", "(unset)";
         #[doc = "`PLAN_RAISE_SEARCH`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= gpt2_prefill128."]
+        #[doc = "Shipped plans: recipe= 6."]
         raise_drop_search: Flag = "PLAN_RAISE_SEARCH", "'0'";
         #[doc = "`PLAN_RAISE_DROP_SET`. Default (unset) / 1,3,5. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
