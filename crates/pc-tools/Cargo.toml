@@ -13,6 +13,7 @@ pc-cuda = { path = "../pc-cuda" }
 pc-gpu = { path = "../pc-gpu" }
 pc-kernels = { path = "../pc-kernels" }
 pc-shadow = { path = "../pc-shadow" }
+pc-tfhe = { path = "../pc-tfhe" }
 rayon = { workspace = true }
 # pc-bench replay
 pc-program = { path = "../pc-program", features = ["gpu"] }

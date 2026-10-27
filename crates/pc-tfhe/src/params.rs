@@ -31,7 +31,9 @@ pub struct Params {
     pub rp: (u32, usize),
     /// Ring-switch factor S: the extracted LWEs have dimension N / S.
     pub rs_factor: usize,
-    /// Output scale exponent: a LUT value v lands as v p0 / 2^out_cf (the finish's correction factor).
+    /// Output scale exponent: a LUT value v lands as v p0 / 2^out_cf. The finish's EvalMod returns m only while m << q0
+    /// (a sine): at q0 / 4 it reads 2 / pi; 2^-8 keeps it within ~1e-4. A finish at correction factor cf then returns
+    /// v / 2^(out_cf - cf) (folded into the consumer).
     pub out_cf: u32,
 }
 
@@ -50,7 +52,7 @@ impl Params {
             rs: (8, 3),
             rp: (16, 2),
             rs_factor: n_ckks / 2048,
-            out_cf: 6,
+            out_cf: 8,
         })
     }
 }

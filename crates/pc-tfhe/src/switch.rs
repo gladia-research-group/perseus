@@ -1,7 +1,8 @@
 //! The CKKS side of the switch and the keys tying the two schemes together.
 //!
 //! Forward: a split ciphertext (RLWE of degree N mod q0 = p0 p1 under the CKKS secret s, phase m q0 / 4 at the
-//! coefficients that carry values) is rescaled by p1 (mod p0, phase m p0 / 4), key-switched from s to s''(X) =
+//! coefficients that carry values; at the device's StC-first split slot i sits at coefficient brev((i - 1) mod N/2),
+//! its imaginary part N/2 further: `pc-check tfhe`) is rescaled by p1 (mod p0, phase m p0 / 4), key-switched from s to s''(X) =
 //! s'(X^S) (s' ternary of dimension N / S), and its coefficient j read as an LWE of dimension N / S under s':
 //! b = c0[j], a_k = +-c1[j - S k mod N]. Then the LWE key switch to the binary key and the bootstrap (pbs.rs).
 //!

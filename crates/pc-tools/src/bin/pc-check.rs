@@ -39,6 +39,8 @@ mod check_ccmm;
 mod check_pcmm;
 #[path = "../word_seam.rs"]
 mod word_seam;
+#[path = "../check_tfhe.rs"]
+mod check_tfhe;
 
 fn cmd_bts(args: &[String]) -> ExitCode {
     let dir = match args.first() {
@@ -189,6 +191,7 @@ fn main() -> ExitCode {
         Some("stcf") => bts_stc_first::cmd(bts_stc_first::Mode::Check, &args[1..]),
         Some("pcmm") => check_pcmm::cmd(check_pcmm::Mode::Check, &args[1..]),
         Some("ccmm") => check_ccmm::cmd(check_ccmm::Mode::Check, &args[1..]),
+        Some("tfhe") => check_tfhe::cmd(&args[1..]),
         Some("n64") => cmd_word_seam(&args[1..]),
         _ => usage(),
     }

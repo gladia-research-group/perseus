@@ -94,7 +94,7 @@ fn dumped_stage(d: &Dump, st: &Value, prefix: &str, k: usize) -> Res<(LtGeom, Ve
     Ok((geom, rows, ptw, enc, nf, nqpt))
 }
 
-fn rot_steps(geoms: &[LtGeom], n: usize) -> BTreeSet<i64> {
+pub(crate) fn rot_steps(geoms: &[LtGeom], n: usize) -> BTreeSet<i64> {
     let mut steps = BTreeSet::new();
     for g in geoms {
         for i in 1..g.b {
