@@ -164,6 +164,92 @@ __device__ void nttp_inv(uint32_t* a, int P, int n, const uint32_t* tw, const ui
         __syncthreads();
     }
 }
+// Register-blocked NTTs of P polynomials [P][2048] (poly k at prime k & 1): every phase loads groups of 2^S
+// coefficients into registers, runs S butterfly stages on them and writes back once (11 stages = 2 + 3 + 3 + 3:
+// four shared-memory round trips and barriers instead of eleven). Same butterflies and twiddles as nttp_fwd / nttp_inv.
+constexpr int RN = 2048, RLN = 11;
+// forward (Cooley-Tukey) phase: stages t = tt, tt / 2, .., tt >> (S - 1); a group = j0 + k tl (tl = tt >> (S - 1))
+template <int S>
+__device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    constexpr int G = 1 << S;
+    const int ltl = ltt - (S - 1), tl = 1 << ltl;
+    const int lgpp = RLN - S;   // groups per polynomial = RN / G
+    for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & 1;
+        const uint32_t q = p ? qb : qa;
+        uint32_t* x = a + k * RN;
+        const int gi = g >> ltl;                         // the group's 2 tt block
+        const int j0 = (gi << (ltt + 1)) + (g & (tl - 1));
+        uint32_t v[G];
+#pragma unroll
+        for (int e = 0; e < G; e++) v[e] = x[j0 + e * tl];
+#pragma unroll
+        for (int st = 0; st < S; st++) {
+            const int h = G >> (st + 1);                 // partner distance in the group
+            const int lt = ltt - st;                     // log2 t of this stage
+            const int m = RN >> (lt + 1);
+#pragma unroll
+            for (int e = 0; e < G; e++) {
+                if (e & h) continue;
+                const int i = (gi << st) + (e >> (S - st));
+                const int wi = p * 2 * RN + m + i;
+                const uint32_t u = v[e], w = shoup32(v[e + h], tw[wi], tws[wi], q);
+                v[e] = add32(u, w, q);
+                v[e + h] = sub32(u, w, q);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < G; e++) x[j0 + e * tl] = v[e];
+    }
+    __syncthreads();
+}
+__device__ void nttr_fwd(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    fwd_phase<2>(a, P, 10, tw, tws, qa, qb);   // t = 1024, 512
+    fwd_phase<3>(a, P, 8, tw, tws, qa, qb);    // t = 256 .. 64
+    fwd_phase<3>(a, P, 5, tw, tws, qa, qb);    // t = 32 .. 8
+    fwd_phase<3>(a, P, 2, tw, tws, qa, qb);    // t = 4 .. 1
+}
+// inverse (Gentleman-Sande) phase: stages t = tb, 2 tb, .., tb << (S - 1); a group = j0 + k tb, spanning G tb
+template <int S>
+__device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    constexpr int G = 1 << S;
+    const int tb = 1 << ltb;
+    const int lgpp = RLN - S;
+    for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & 1;
+        const uint32_t q = p ? qb : qa;
+        uint32_t* x = a + k * RN;
+        const int gi = g >> ltb;                         // the group's G tb block
+        const int j0 = (gi << (ltb + S)) + (g & (tb - 1));
+        uint32_t v[G];
+#pragma unroll
+        for (int e = 0; e < G; e++) v[e] = x[j0 + e * tb];
+#pragma unroll
+        for (int st = 0; st < S; st++) {
+            const int h = 1 << st;                       // partner distance
+            const int lt = ltb + st;                     // log2 t of this stage
+            const int m = RN >> (lt + 1);
+#pragma unroll
+            for (int e = 0; e < G; e++) {
+                if (e & h) continue;
+                const int i = (gi << (S - 1 - st)) + (e >> (st + 1));
+                const int wi = p * 2 * RN + RN + m + i;
+                const uint32_t u = v[e], w = v[e + h];
+                v[e] = add32(u, w, q);
+                v[e + h] = shoup32(sub32(u, w, q), tw[wi], tws[wi], q);
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < G; e++) x[j0 + e * tb] = v[e];
+    }
+    __syncthreads();
+}
+__device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb) {
+    inv_phase<3>(a, P, 0, tw, tws, qa, qb);    // t = 1 .. 4
+    inv_phase<3>(a, P, 3, tw, tws, qa, qb);    // t = 8 .. 32
+    inv_phase<3>(a, P, 6, tw, tws, qa, qb);    // t = 64 .. 256
+    inv_phase<2>(a, P, 9, tw, tws, qa, qb);    // t = 512, 1024
+}
 __device__ void ntt2_inv(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, const TfheArgs& A, uint32_t qa, uint32_t qb) {
     for (int m = n / 2, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
         for (int bb = threadIdx.x; bb < n; bb += blockDim.x) {
@@ -263,7 +349,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 }
             }
             __syncthreads();
-            nttp_fwd(tb, 2 * lv, n, tw, tws, qa, qb);
+            nttr_fwd(tb, 2 * lv, tw, tws, qa, qb);
 #pragma unroll
             for (int e = 0; e < RT_E; e++) {
                 const int k = threadIdx.x + e * blockDim.x;
@@ -284,7 +370,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             o[2 * n + k] = a1[e];
         }
         __syncthreads();
-        nttp_inv(o, 4, n, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1
+        nttr_inv(o, 4, tw, tws, qa, qb);   // o [part][prime][n]: poly k at prime k & 1
         for (int k = threadIdx.x; k < 4 * n; k += blockDim.x) {
             const uint32_t q = (k >> (__ffs(n) - 1)) & 1 ? qb : qa;
             acc[k] = add32(acc[k], o[k], q);
