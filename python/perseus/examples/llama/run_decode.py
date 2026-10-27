@@ -141,7 +141,7 @@ def main(argv=None):
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=None,
                     help="GPU index (default: the first of CUDA_VISIBLE_DEVICES)")
-    ap.add_argument("--configs", default=DEFAULT_CONFIGS)
+    ap.add_argument("--configs", default=None, help="default: the plan's configs= line, else llama31_8b_n32")
     ap.add_argument("--capture", default=None, help="graph dir: capture block graphs at the first position")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts; fill them with capture_mags.py")
@@ -170,6 +170,14 @@ def main(argv=None):
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
         a.plan = default_plan("llama_decode")
+    if not a.configs:
+        a.configs = DEFAULT_CONFIGS
+        from perseus._paths import resolve
+        cmd = os.path.join(resolve(a.plan), "PLAN_CMD.txt") if a.plan else ""
+        if cmd and os.path.exists(cmd):
+            for line in open(cmd).read().splitlines():
+                if line.startswith("configs="):
+                    a.configs = line[len("configs="):].split()[0]
     import faulthandler
     import signal
     faulthandler.register(signal.SIGUSR1, all_threads=True)    # kill -USR1 <pid>: a stack dump
