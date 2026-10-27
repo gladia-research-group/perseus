@@ -216,6 +216,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pc-tfhe"
+version = "0.1.0"
+dependencies = [
+ "pc-core",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
 name = "pc-tools"
 version = "0.1.0"
 dependencies = [
