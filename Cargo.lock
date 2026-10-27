@@ -160,6 +160,7 @@ dependencies = [
  "pc-cuda",
  "pc-kernels",
  "pc-shadow",
+ "pc-tfhe",
  "rayon",
  "thiserror",
 ]
@@ -201,6 +202,7 @@ dependencies = [
  "pc-kernels",
  "pc-program",
  "pc-shadow",
+ "pc-tfhe",
  "pyo3",
  "serde_json",
 ]
