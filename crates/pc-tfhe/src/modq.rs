@@ -39,6 +39,11 @@ pub fn powmod(mut b: u64, mut e: u64, q: u64) -> u64 {
     r
 }
 
+/// The Shoup companion floor(w 2^64 / q) of w < q.
+pub fn shoup(w: u64, q: u64) -> u64 {
+    (((w as u128) << 64) / q as u128) as u64
+}
+
 pub fn invmod(a: u64, q: u64) -> u64 {
     powmod(a, q - 2, q)
 }
@@ -156,6 +161,11 @@ impl Ntt {
             b = mulmod(b, ipsi, q);
         }
         Ok(Ntt { q, n, psi: pw, ipsi: ipw, ninv: invmod(n as u64 % q, q) })
+    }
+
+    /// (psi powers, inverse psi powers, n^-1) in the transform's order: what the device kernels upload.
+    pub fn tables(&self) -> (&[u64], &[u64], u64) {
+        (&self.psi, &self.ipsi, self.ninv)
     }
 
     /// Forward, in place (natural -> bit-reversed).
