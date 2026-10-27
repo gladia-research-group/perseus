@@ -218,7 +218,9 @@ fn run(args: &[String]) -> Res<bool> {
     // the switch on spread coefficients
     let chosen: Vec<usize> = (0..n_switch).map(|i| (i * (slots / n_switch) + 7) % slots).collect();
     let valid: Vec<usize> = chosen.iter().map(|&i| coef_of(i)).collect();
-    let (tv, off) = sign01(sw.params.n_br, sw.delta_br());
+    // --identity: the LUT f(m) = m, its finished output against the input measures the switch's input noise
+    let identity = args.iter().any(|a| a == "--identity");
+    let (tv, off) = if identity { (pc_tfhe::pbs::test_vector(sw.params.n_br, sw.params.q_br, |m| sw.lut_value(m)), 0) } else { sign01(sw.params.n_br, sw.delta_br()) };
     let ts = Instant::now();
     let out = sw.apply(&ct, &valid, &tv, off);
     println!("[pc-check] tfhe: host switch of {n_switch} coefficients {:.1} s", ts.elapsed().as_secs_f64());
@@ -247,10 +249,10 @@ fn run(args: &[String]) -> Res<bool> {
     let mut worst = 0f64;
     let vset: BTreeSet<usize> = chosen.iter().copied().collect();
     for i in 0..slots {
-        if vset.contains(&i) && vals[i].re.abs() < 0.02 {
+        if !identity && vset.contains(&i) && vals[i].re.abs() < 0.02 {
             continue;
         }
-        let want = if vset.contains(&i) { if vals[i].re >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
+        let want = if vset.contains(&i) { if identity { vals[i].re } else if vals[i].re >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
         let gain = (1u64 << (out_cf - cf)) as f64;
         let e = (got[0][i].re * gain - want).abs().max(got[0][i].im.abs() * gain);
         worst = worst.max(e);
@@ -283,16 +285,22 @@ fn run(args: &[String]) -> Res<bool> {
         cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
         let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
         let (mut bad, mut worst) = (0, 0f64);
+        let (mut ss, mut ns) = (0f64, 0usize);
         for i in 0..slots {
-            if vset.contains(&i) && vals[i].re.abs() < 0.02 {
+            if !identity && vset.contains(&i) && vals[i].re.abs() < 0.02 {
                 continue;
             }
-            let want = if vset.contains(&i) { if vals[i].re >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
+            let want = if vset.contains(&i) { if identity { vals[i].re } else if vals[i].re >= 0.0 { 1.0 } else { 0.0 } } else { 0.0 };
             let gain = (1u64 << (out_cf - cf)) as f64;
             let e = (got[0][i].re * gain - want).abs().max(got[0][i].im.abs() * gain);
             worst = worst.max(e);
             bad += (e > 1e-2) as usize;
+            if vset.contains(&i) {
+                ss += (got[0][i].re * gain - want).powi(2);
+                ns += 1;
+            }
         }
+        println!("[pc-check] tfhe: device switched slots: rms error {:.3e} over {ns} (the LUT's input noise when --identity)", (ss / ns.max(1) as f64).sqrt());
         println!("[pc-check] tfhe: device switch of {n_switch} coefficients: max err {worst:.3e}; ms to LWE {:.2}, key switch {:.2}, bootstrap {:.2}, repack {:.2}", tm.to_lwe, tm.key_switch, tm.bootstrap, tm.repack);
         t.add("tfhe: device CKKS -> TFHE sign -> CKKS slots (err < 1e-2)", bad, slots);
     }

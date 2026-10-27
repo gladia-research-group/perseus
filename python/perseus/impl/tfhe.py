@@ -14,6 +14,8 @@ plan it.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 GRID = 2048          # n_br: the test vector's points over [-1, 1)
@@ -76,6 +78,13 @@ def _sign_f(lo, hi):
     return lambda m: np.where(np.rint(np.asarray(m) * GRID / 2.0) >= 0, hi, lo)
 
 
+# PF_TFHE_NOISE: sigma (in units of the LUT's input) of Gaussian noise the fakes add to the switched inputs, a model of
+# the switch's input noise (dominated by the mod switch to 2 n_br: rms 7.9e-3 of [-1, 1) on the device, pc-check
+# tfhe --identity; half that in a sign LUT's (-2, 2) units)
+_NOISE = float(os.environ.get("PF_TFHE_NOISE", "0") or 0)
+_RNG = np.random.default_rng(int(os.environ.get("PF_TFHE_NOISE_SEED", "0") or 0))
+
+
 def _values(lut, slots, vec):
     f = _sign_f(*SIGNS[lut]) if lut in SIGNS else LUTS[lut]
     idx, copies = SLOTS[slots]
@@ -83,7 +92,10 @@ def _values(lut, slots, vec):
     n = vec.shape[0]
     out = np.zeros(n, dtype=np.float64)
     if n > 1:            # CapCt.novec keeps one slot: the recorder needs the op stream only
-        v = f(np.real(vec[idx])) if lut in SIGNS else quantize(f, np.real(vec[idx]))
+        m = np.real(vec[idx])
+        if _NOISE:
+            m = m + _RNG.normal(0.0, _NOISE, m.shape)
+        v = f(m) if lut in SIGNS else quantize(f, m)
         for c in (0,) + copies:
             out[(idx + c) % n] = v
     return out
