@@ -5,7 +5,8 @@
 //!       formulas (FIDESlib Pcmm.cu semantics), every output word
 //!   pc-bench pcmm --prec [--cf 6] [--wbits 24] [--sigma 0.1] [--wamp 1]   a real input through StC-first stages ->
 //!       product -> K-batched finishes vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits =
-//!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input)
+//!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input; past band shift
+//!       DECODE_SHIFT the outputs' scale is lowered exactly before the decryption, whose decoder reads the bottom pair)
 //!   pc-bench pcmm [--shapes ..] [--k 1,2,4]      device ms per linear: product phases and output finishes per K
 use crate::check_bts::Tally;
 use pc_core::encode::{Complex, Encoder, Payload};
@@ -744,6 +745,12 @@ fn bench(args: &[String]) -> Res<bool> {
                         for gi in 0..groups.len() {
                             cx.ops.realize(&ctx, cx.ex, &sh_, std::slice::from_mut(&mut outs[gi]))?;
                         }
+                        let lvs: Vec<u32> = outs[..groups.len()].iter().map(|o| o.meta.level).collect();
+                        if shift > DECODE_SHIFT {
+                            for o in outs[..groups.len()].iter_mut() {
+                                lower_scale(&mut cx, &pc, o, shift - DECODE_SHIFT)?;
+                            }
+                        }
                         drop(cx);
                         for (gi, gr) in groups.iter().enumerate() {
                             let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &outs[gi], Payload::Complex, Which::Dense)?;
@@ -751,7 +758,7 @@ fn bench(args: &[String]) -> Res<bool> {
                                 let e = got[j].iter().zip(&want[m]).fold(0f64, |a, (g, w)| a.max((g.re - w.re).abs()).max((g.im - w.im).abs()));
                                 errs = errs.max(e);
                             }
-                            let lv = outs[gi].meta.level;
+                            let lv = lvs[gi];
                             let want_l = BtsConfig::n32_shipped().landing(ctx.shape, &Quirks::none(), &pc_shadow::Route { raise_drop: gd[gi], cf: Some(cf), stc_first: true, ..pc_shadow::Route::dense() }, level, 1)?;
                             t.add(&format!("pcmm {name} drops {drops:?} K={k} group {gi}: realized landing == pc-shadow (drop {})", gd[gi]), (lv != want_l.level) as usize, 1);
                         }
@@ -789,6 +796,26 @@ fn bench(args: &[String]) -> Res<bool> {
 /// `linear` with timing events: e\[0\] before the call (recorded by the caller), e\[1\] after the inputs' StC, e\[2\]
 /// after the product's input phase, e\[3\] after its GEMMs, e\[4\] after its outputs, e\[5\] after the finishes.
 #[allow(clippy::too_many_arguments)]
+/// The largest band shift whose outputs (|Y| up to 2^(shift - 2.6)) the decoder takes at their own scale: it reads the
+/// bottom composite pair only (`Encoder::decode_slots`), so |Y| nf stays below half that modulus.
+const DECODE_SHIFT: u32 = 11;
+
+/// `x`'s scale lowered by 2^s on its top level, exactly: x 2^k (k = that level's bits less s), then its rescale.
+fn lower_scale<'a>(cx: &mut BtsCx<'_, 'a, W, M>, pc: &Pcmm<'a, '_, W>, x: &mut Ct<'a, W>, s: u32) -> Res<()> {
+    let ctx = cx.ctx;
+    let top = ctx.top_of(x.meta.level)?;
+    let g = ctx.chain.drop_at(top).ok_or_else(|| format!("output top {top} off the level grid"))?;
+    let bits: f64 = (0..g).map(|j| (ctx.chain.q[top - j] as f64).log2()).sum();
+    let k = (bits.floor() as u32).checked_sub(s).ok_or_else(|| format!("scale 2^-{s} past the level's {bits:.1} bits"))?;
+    pc.mult_pow2(ctx, &cx.ex.compute, x, k)?;
+    let nf = x.meta.nf * (k as f64).exp2();
+    x.meta.nf = nf;
+    x.meta.deg = 2;
+    cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
+    x.meta.nf = nf / ctx.scale.mod_reduce_product(top as i32);
+    Ok(())
+}
+
 fn linear_timed<'a>(
     cx: &mut BtsCx<'_, 'a, W, M>,
     route: &pc_gpu::bts::stc_first::StcFirstRoute<'a, W, M>,
