@@ -6,7 +6,7 @@
 //!   INTT, gather + exact rescale by p3, p2 (the PCMM's ops) -> RESCALE_P1 (mod p0) -> ring switch s -> s'(X^S)
 //!   (RS_DIGITS, NTT, MAC, INTT, + c0) -> RS_EXTRACT (LWEs of dimension N / S) -> LWE key switch (KS_DIGITS, four
 //!   int8 GEMMs, KS_RECOMBINE) -> bootstrap (PBS_MS, PBS_INIT, PBS_ROTATE, PBS_EXTRACT: mod p0) -> repack
-//!   (per key chunk REPACK_DIGITS, NTT, REPACK_MAC; INTT, REPACK_B) -> lift x p2 p3 into limbs 0..3, scatter, NTT.
+//!   (`DevRepack`) -> lift x p2 p3 into limbs 0..3, scatter, NTT.
 //!
 //! Ring-2^16 NTTs run on the PCMM launcher's NTT op with pc-tfhe's tables (the keys live in that NTT domain).
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use pc_cuda::blas::lt;
 use pc_cuda::{launch_result, Arena, Compute, DBuf, Stream};
-use pc_kernels::args::{pcmm_op, tfhe_op, PcmmArgs, TfheArgs};
+use pc_kernels::args::{pcmm_op, tfhe_op, KernelTable, PcmmArgs, TfheArgs};
 use pc_tfhe::modq::invmod;
 use pc_tfhe::switch::Switcher;
 
@@ -27,7 +27,8 @@ use crate::ntt::{self, Parts, Span};
 
 type W = u32;
 const PLANES: usize = 4;
-const CHUNK: usize = 64;
+/// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
+const RC: usize = 1024;
 const WS: usize = 64 << 20;
 
 fn mu(p: u64) -> u64 {
@@ -104,6 +105,112 @@ pub fn tv_residues(k: &pc_tfhe::pbs::BootstrapKey, tv: &[u64]) -> Vec<u32> {
     k.rns.residues(tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect()
 }
 
+/// The device repack (pc-tfhe `RepackKey`, bit for bit): per RC LWEs REPACK_DIGITS -> REPACK_MAC (the GEMM in
+/// R_{n_br} mod p0 P, rescaled by P) -> REPACK_SCATTER (X^j P_j(X^S) into ring N), then REPACK_RING (c0, digits of
+/// c1), NTT, REPACK_RMAC (the ring key), INTT, REPACK_C0: `acc` [part][limb][n] mod p0 p1 under s, coefficient form.
+pub struct DevRepack<'a> {
+    n: usize,
+    nb: usize,
+    sfac: usize,
+    rp: (u32, usize),
+    p0: u64,
+    p1: u64,
+    aux: u64,
+    cols: DBuf<'a, Compute, u32>,
+    ring: DBuf<'a, Compute, u32>,
+    dig: DBuf<'a, Compute, i32>,
+    pk: DBuf<'a, Compute, u32>,
+    z: DBuf<'a, Compute, u64>,
+    c0: DBuf<'a, Compute, u32>,
+    rdig: DBuf<'a, Compute, u32>,
+    pub acc: DBuf<'a, Compute, u32>,
+}
+
+impl<'a> DevRepack<'a> {
+    pub fn bytes(n: usize, nb: usize, lv: usize) -> usize {
+        4 * (nb * lv * 4 * nb + lv * 4 * n + RC * nb * lv + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * 2 * n + 8 * 256
+    }
+
+    pub fn new(arena: &'a Arena, s: &Stream<Compute>, sw: &Switcher) -> Result<Self> {
+        let (n, nb, lv) = (sw.n, sw.params.n_br, sw.params.rp.1);
+        let up = |what: &'static str, v: &[u32]| -> Result<DBuf<'a, Compute, u32>> {
+            let mut b = arena.alloc::<Compute, u32>(what, v.len())?;
+            b.upload(s, v)?;
+            Ok(b)
+        };
+        let mut cols = Vec::with_capacity(nb * lv * 4 * nb);
+        for k in sw.repack.cols() {
+            for t in k {
+                for (a, b) in t {
+                    cols.extend(a.iter().chain(b).map(|&x| x as u32));
+                }
+            }
+        }
+        let ring: Vec<u32> = sw.repack.ring().iter().flatten().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
+        Ok(DevRepack {
+            n,
+            nb,
+            sfac: sw.params.rs_factor,
+            rp: sw.params.rp,
+            p0: sw.p0,
+            p1: sw.p1,
+            aux: sw.repack.aux,
+            cols: up("tfhe.rcols", &cols)?,
+            ring: up("tfhe.rring", &ring)?,
+            dig: arena.alloc("tfhe.work", RC * nb * lv)?,
+            pk: arena.alloc("tfhe.work", RC * 2 * nb)?,
+            z: arena.alloc("tfhe.work", 2 * n)?,
+            c0: arena.alloc("tfhe.work", n)?,
+            rdig: arena.alloc("tfhe.work", 2 * lv * n)?,
+            acc: arena.alloc("tfhe.work", 4 * n)?,
+        })
+    }
+
+    /// Repack the `b` LWEs `outs` ([b][n_br + 1] mod p0) to the coefficients `idx` ([b] u32). `pa`: the ring-N NTT
+    /// args (primes p0, p1 with their n^-1), `tw_f` / `tw_i` their twiddles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(&mut self, table: &KernelTable, s: &Stream<Compute>, outs: *const c_void, idx: *const c_void, b: usize, pa: &PcmmArgs, tw_f: *const c_void, tw_i: *const c_void) -> Result<()> {
+        let (n, nb, lv, p0, p1, aux) = (self.n, self.nb, self.rp.1, self.p0, self.p1, self.aux);
+        let go = |a: &TfheArgs| -> Result<()> {
+            // SAFETY: the pointers address this repack's buffers / the caller's LWEs and positions, sized for the op
+            launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?;
+            Ok(())
+        };
+        let gp = |a: &PcmmArgs| -> Result<()> {
+            // SAFETY: as `go` (the PCMM launcher's NTT ops on this repack's buffers)
+            launch_result("pcmm", unsafe { (table.pcmm)(a, s.raw()) })?;
+            Ok(())
+        };
+        let rb = TfheArgs {
+            n: n as i32,
+            i1: nb as i32,
+            i2: self.sfac as i32,
+            q: p0,
+            c: [self.rp.0 as u64, lv as u64, aux, invmod(aux % p0, p0), aux % p0, 0, 0, mu(p0)],
+            ..Default::default()
+        };
+        for r0 in (0..b).step_by(RC) {
+            let rc = RC.min(b - r0);
+            let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
+            let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
+            go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, count: rc as i32, i0: (r0 == 0) as i32, x: self.dig.vptr_mut(), y: o, z: self.z.vptr_mut() as *const c_void, ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_MAC, count: rc as i32, x: self.pk.vptr_mut(), y: self.dig.vptr(), z: self.cols.vptr(), w: o, ..rb })?;
+            go(&TfheArgs { op: tfhe_op::REPACK_SCATTER, count: rc as i32, y: self.pk.vptr(), z: self.z.vptr_mut() as *const c_void, w: ix, ..rb })?;
+        }
+        let rr = TfheArgs { count: 1, c: [self.rp.0 as u64, lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..rb };
+        go(&TfheArgs { op: tfhe_op::REPACK_RING, x: self.rdig.vptr_mut(), y: self.z.vptr(), w: self.c0.vptr_mut() as *const c_void, ..rr })?;
+        gp(&PcmmArgs { op: pcmm_op::NTT, count: (2 * lv) as i32, i0: lv as i32, x: self.rdig.vptr_mut(), tw: tw_f, ..*pa })?;
+        self.acc.upload(s, &vec![0u32; 4 * n])?;
+        go(&TfheArgs { op: tfhe_op::REPACK_RMAC, x: self.acc.vptr_mut(), y: self.rdig.vptr(), z: self.ring.vptr(), ..rr })?;
+        for part in 0..2 {
+            let xp = (self.acc.vptr_mut() as *mut u32).wrapping_add(part * 2 * n) as *mut c_void;
+            gp(&PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 1, x: xp, tw: tw_i, ..*pa })?;
+        }
+        go(&TfheArgs { op: tfhe_op::REPACK_C0, x: self.acc.vptr_mut(), y: self.c0.vptr(), ..rr })?;
+        Ok(())
+    }
+}
+
 /// Device milliseconds per stage of the last `apply` (host walls around synced stages: diagnostic).
 #[derive(Clone, Debug, Default)]
 pub struct Timings {
@@ -135,13 +242,12 @@ pub struct TfheSwitch<'a> {
     bsk: DBuf<'a, Compute, u32>,
     btw: DBuf<'a, Compute, u32>,
     btw_s: DBuf<'a, Compute, u32>,
-    rk: DBuf<'a, Compute, u32>,
+    repack: DevRepack<'a>,
     stage: DBuf<'a, Compute, u32>,
     low: DBuf<'a, Compute, u32>,
     dig: DBuf<'a, Compute, u32>,
     rs: DBuf<'a, Compute, u32>,
     idx: DBuf<'a, Compute, u32>,
-    inv: DBuf<'a, Compute, u32>,
     ext: DBuf<'a, Compute, u32>,
     kdig: DBuf<'a, Compute, u8>,
     g: DBuf<'a, Compute, i32>,
@@ -150,8 +256,6 @@ pub struct TfheSwitch<'a> {
     acc: DBuf<'a, Compute, u32>,
     outs: DBuf<'a, Compute, u32>,
     tv: DBuf<'a, Compute, u32>,
-    rdig: DBuf<'a, Compute, u32>,
-    racc: DBuf<'a, Compute, u32>,
     ws: DBuf<'a, Compute, u8>,
     gemms: HashMap<usize, I8Gemm<'a>>,
 }
@@ -162,11 +266,11 @@ impl<'a> TfheSwitch<'a> {
         let (nb, nl) = (p.n_br, p.n_lwe);
         let n_sub = n / p.rs_factor;
         let k = n_sub * p.ks.1;
-        let words32 = 2 * 3 * n + p.rs.1 * 2 * n + nb * p.rp.1 * 4 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
-            + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1) + 2 * CHUNK * p.rp.1 * n + 4 * n
+        let words32 = 2 * 3 * n + p.rs.1 * 2 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
+            + max * (n_sub + 1) + PLANES * (nl + 1) * max + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / 2 * 3) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb + 2 * nb;
         let bytes8 = PLANES * (nl + 1) * k + max * k + WS;
-        4 * words32 + bytes8 + 64 * 256
+        4 * words32 + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + 64 * 256
     }
 
     /// Upload `sw`'s keys (host-generated: pc-tfhe `Switcher::generate`) and carve the work buffers.
@@ -208,15 +312,6 @@ impl<'a> TfheSwitch<'a> {
         }
         drop(planes);
         let img = pbs_image(&sw.bsk);
-        let mut rk = Vec::with_capacity(nb * p.rp.1 * 4 * n);
-        for kk in 0..nb {
-            for t in 0..p.rp.1 {
-                for l in 0..2 {
-                    let (a, b) = &sw.repack.keys()[kk][t][l];
-                    rk.extend(a.iter().chain(b).map(|&x| x as u32));
-                }
-            }
-        }
         let me = TfheSwitch {
             n,
             nb,
@@ -238,13 +333,12 @@ impl<'a> TfheSwitch<'a> {
             bsk: up32("tfhe.bsk", &img.bsk)?,
             btw: up32("tfhe.btw", &img.tw)?,
             btw_s: up32("tfhe.btw", &img.tws)?,
-            rk: up32("tfhe.rk", &rk)?,
+            repack: DevRepack::new(arena, s, sw)?,
             stage: arena.alloc("tfhe.work", 8 * n)?,
             low: arena.alloc("tfhe.work", 2 * 2 * n)?,
             dig: arena.alloc("tfhe.work", p.rs.1 * n)?,
             rs: arena.alloc("tfhe.work", 2 * n)?,
             idx: arena.alloc("tfhe.work", max)?,
-            inv: arena.alloc("tfhe.work", n)?,
             ext: arena.alloc("tfhe.work", max * (n_sub + 1))?,
             kdig: arena.alloc("tfhe.work", max * k)?,
             g: arena.alloc("tfhe.work", PLANES * cols * max)?,
@@ -253,8 +347,6 @@ impl<'a> TfheSwitch<'a> {
             acc: arena.alloc("tfhe.work", max * 4 * nb)?,
             outs: arena.alloc("tfhe.work", max * (nb + 1))?,
             tv: arena.alloc("tfhe.work", 2 * nb)?,
-            rdig: arena.alloc("tfhe.work", 2 * CHUNK * p.rp.1 * n)?,
-            racc: arena.alloc("tfhe.work", 4 * n)?,
             ws: arena.alloc("tfhe.ws", WS)?,
             gemms: HashMap::new(),
             p,
@@ -303,12 +395,7 @@ impl<'a> TfheSwitch<'a> {
         let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, ..PcmmArgs::default() };
         let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [self.ninv[0], self.ninv[1], self.ninv[0], 0, 0, 0, 0, 0], ..Default::default() };
         let mut tm = Timings::default();
-        let mut inv = vec![u32::MAX; n];
-        for (r, &j) in positions.iter().enumerate() {
-            inv[j as usize] = r as u32;
-        }
         self.idx.upload_at(s, 0, positions)?;
-        self.inv.upload(s, &inv)?;
         self.tv.upload(s, tv)?;
         let t0 = Instant::now();
 
@@ -377,24 +464,10 @@ impl<'a> TfheSwitch<'a> {
 
         // repack into [part][limb][n] mod p0 p1, lift x p2 p3 into the staging, scatter, NTT
         let t3 = Instant::now();
-        let rp_lv = self.p.rp.1;
-        let zero = vec![0u32; 4 * n];
-        self.racc.upload(s, &zero)?;
-        let rb = TfheArgs { n: n as i32, count: b as i32, i1: nb as i32, i3: CHUNK as i32, q: p0, c: [self.p.rp.0 as u64, rp_lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..Default::default() };
-        for k0 in (0..nb).step_by(CHUNK) {
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::REPACK_DIGITS, i0: k0 as i32, x: self.rdig.vptr_mut(), y: self.outs.vptr(), w: self.inv.vptr(), ..rb })?;
-            Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::NTT, count: (2 * CHUNK * rp_lv) as i32, i0: (CHUNK * rp_lv) as i32, x: self.rdig.vptr_mut(), tw: self.tw_f.vptr(), ..pa })?;
-            let kz = (self.rk.vptr() as *const u32).wrapping_add(k0 * rp_lv * 4 * n) as *const c_void;
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::REPACK_MAC, x: self.racc.vptr_mut(), y: self.rdig.vptr(), z: kz, ..rb })?;
-        }
-        for part in 0..2 {
-            let xp = (self.racc.vptr_mut() as *mut u32).wrapping_add(part * 2 * n) as *mut c_void;
-            Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 1, x: xp, tw: self.tw_i.vptr(), ..pa })?;
-        }
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::REPACK_B, x: self.racc.vptr_mut(), y: self.outs.vptr(), z: self.idx.vptr(), ..rb })?;
+        self.repack.run(ctx.table, s, self.outs.vptr(), self.idx.vptr(), b, &pa, self.tw_f.vptr(), self.tw_i.vptr())?;
         for sp in 0..2 {
             // staging part 0 = c1 (racc part 1), staging part 1 = c0 (racc part 0)
-            let f = (self.racc.vptr() as *const u32).wrapping_add((1 - sp) * 2 * n) as *const c_void;
+            let f = (self.repack.acc.vptr() as *const u32).wrapping_add((1 - sp) * 2 * n) as *const c_void;
             let dst = (self.stage.vptr_mut() as *mut W).wrapping_add(sp * 4 * n) as *mut c_void;
             Self::gp(ctx, s, &PcmmArgs { y: f, x: dst, c: [lift[0], lift[1], 0, 0, 0, 0, 0, 0], ..chain(pcmm_op::LIFT) })?;
         }

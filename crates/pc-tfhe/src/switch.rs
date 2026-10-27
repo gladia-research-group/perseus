@@ -7,10 +7,8 @@
 //! b = c0[j], a_k = +-c1[j - S k mod N]. Then the LWE key switch to the binary key and the bootstrap (pbs.rs).
 //!
 //! Return: the bootstrap's outputs (dimension n_br under s_br, mod q_br) are mod-switched to p0, b_j + <a_j, s_br> =
-//! v_j + e_j + p0 I_j. With A_k(X) = sum_j a_jk X^j and B(X) = sum_j b_j X^j, the repack key K_kt = RLWE_s(p1 g_t
-//! s_br[k]) mod q0 (exact gadget over p0) gives p1 B + sum_kt D_kt(A_k) K_kt with phase p1 (B + A s_br) = p1 (v + e) +
-//! q0 I = p1 (v + e) mod q0: the p0 wraparound cancels and the key noise is not multiplied by p1. The result is the
-//! split format again (phase v q0 / 2^out_cf), what the finish takes.
+//! v_j + e_j + p0 I_j, and repacked (`RepackKey`: a GEMM in R_{n_br} mod p0 P, a rescale by P, X^j P_j(X^S) into R_N,
+//! one ring key switch to s mod q0) into the split format again (phase v q0 / 2^out_cf), what the finish takes.
 use pc_core::keys::{sample_ternary, DiscreteGaussian, Prng};
 use rayon::prelude::*;
 
@@ -114,93 +112,165 @@ impl RingSwitchKey {
     }
 }
 
-/// K_kt = RLWE_s(p1 g_t s_br[k]) mod p0 p1 (exact gadget over p0), NTT form per limb.
+/// The return path's keys, around an auxiliary prime P (p0 P <= 2^54: the HE-standard bound at degree n_br):
+/// - columns K_kt = RLWE_{s_x}(P g_t s_br[k]) mod p0 P in R_{n_br} under a fresh ternary s_x, coefficient form;
+/// - the ring key R_t = RLWE_s(p1 g_t s_x(X^S)) mod q0 = p0 p1 in R_N, NTT form per limb.
+/// An LWE (a, b) mod p0 under s_br packs into P_j = (P b, 0) + sum_kt d_t(a_k) K_kt (exact gadget over p0): phase
+/// P (b + <a, s_br>) + small = P (v + e) mod p0 P at coefficient 0 and only noise elsewhere (no junk: every column
+/// encrypts a scalar), the p0 wraparound cancels against P. A rescale by P leaves v + e mod p0 under s_x; X^j P_j(X^S)
+/// puts it at coefficient j (S = N / n_br), the values sum into one RLWE mod p0 under s_x(X^S), and the ring key
+/// switches that to s mod q0: p1 c0 + sum_t d_t(c1) R_t, phase p1 (v + e) (the wraparound cancels again, the key
+/// noise is not multiplied by p1). The packing is a GEMM of the digits [value][k t] by the columns [k t][part][limb][i]
+/// (no NTT), the ring switch one key switch at N.
 pub struct RepackKey {
     pub gadget: Gadget,
-    /// [k][t][limb] -> (c0, c1)
-    keys: Vec<Vec<Vec<(Vec<u64>, Vec<u64>)>>>,
+    pub aux: u64,
+    /// [k][t][limb p0 | P] -> (c0, c1), coefficient form, degree n_br
+    cols: Vec<Vec<Vec<(Vec<u64>, Vec<u64>)>>>,
+    /// [t][limb p0 | p1] -> (c0, c1), NTT form, degree N
+    ring: Vec<Vec<(Vec<u64>, Vec<u64>)>>,
 }
 
 impl RepackKey {
-    pub fn generate(s: &[i64], s_br: &[i64], gadget: Gadget, ntts: &[Ntt], dg: &DiscreteGaussian, prng: &mut Prng) -> RepackKey {
-        let n = ntts[0].n;
-        let p1 = ntts[1].q as i128;
-        let keys = s_br
+    pub fn generate(s: &[i64], s_br: &[i64], gadget: Gadget, aux: u64, ntts: &[Ntt], dg: &DiscreteGaussian, prng: &mut Prng) -> Result<RepackKey> {
+        let (n, nb) = (ntts[0].n, s_br.len());
+        let p0 = gadget.q;
+        if (p0 as u128) * (aux as u128) > 1 << 54 {
+            return Err(crate::Error::Params(format!("repack: p0 P = {p0} x {aux} exceeds 2^54 (degree {nb} security)")));
+        }
+        let small = [Ntt::new(p0, nb)?, Ntt::new(aux, nb)?];
+        let s_x = to_i64(sample_ternary(prng, nb));
+        let g = |t: usize| centered(gadget.g(t), p0) as i128;
+        let coef = |ct: RnsRlwe| ct.limbs.into_iter().map(|r| (r.c0, r.c1)).collect::<Vec<_>>();
+        let cols = s_br
             .iter()
             .map(|&sk| {
                 (0..gadget.levels)
                     .map(|t| {
-                        let mut m = vec![0i128; n];
-                        m[0] = p1 * centered(gadget.g(t), gadget.q) as i128 * sk as i128;
-                        let ct = RnsRlwe::encrypt(&m, s, ntts, dg, prng);
-                        ct.limbs
-                            .into_iter()
-                            .zip(ntts)
-                            .map(|(mut r, t)| {
-                                t.fwd(&mut r.c0);
-                                t.fwd(&mut r.c1);
-                                (r.c0, r.c1)
-                            })
-                            .collect()
+                        let mut m = vec![0i128; nb];
+                        m[0] = aux as i128 * g(t) * sk as i128;
+                        coef(RnsRlwe::encrypt(&m, &s_x, &small, dg, prng))
                     })
                     .collect()
             })
             .collect();
-        RepackKey { gadget, keys }
+        let p1 = ntts[1].q as i128;
+        let ring = (0..gadget.levels)
+            .map(|t| {
+                let mut m = vec![0i128; n];
+                for (k, &v) in s_x.iter().enumerate() {
+                    m[k * (n / nb)] = p1 * g(t) * v as i128;
+                }
+                let ct = RnsRlwe::encrypt(&m, s, ntts, dg, prng);
+                ct.limbs
+                    .into_iter()
+                    .zip(ntts)
+                    .map(|(mut r, t)| {
+                        t.fwd(&mut r.c0);
+                        t.fwd(&mut r.c1);
+                        (r.c0, r.c1)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(RepackKey { gadget, aux, cols, ring })
     }
 
-    /// [k][t][limb] -> (c0, c1) in NTT form: the device layout's source.
-    pub fn keys(&self) -> &[Vec<Vec<(Vec<u64>, Vec<u64>)>>] {
-        &self.keys
+    /// [k][t][limb p0 | P] -> (c0, c1), coefficient form: the device layout's source.
+    pub fn cols(&self) -> &[Vec<Vec<(Vec<u64>, Vec<u64>)>>] {
+        &self.cols
+    }
+
+    /// [t][limb p0 | p1] -> (c0, c1), NTT form.
+    pub fn ring(&self) -> &[Vec<(Vec<u64>, Vec<u64>)>] {
+        &self.ring
+    }
+
+    /// One LWE (mod p0, dimension n_br) packed and rescaled: (c0, c1) mod p0 in R_{n_br} under s_x.
+    pub fn pack(&self, c: &Lwe) -> (Vec<u64>, Vec<u64>) {
+        let (p0, aux, l) = (self.gadget.q, self.aux, self.gadget.levels);
+        let nb = c.a.len();
+        let mut digits = vec![0i64; nb * l];
+        for (k, &a) in c.a.iter().enumerate() {
+            self.gadget.decompose(a, &mut digits[k * l..(k + 1) * l]);
+        }
+        // [limb][part] sums < 4096 2^15 2^28 = 2^55: exact in i64
+        let mut acc = vec![vec![vec![0i64; nb]; 2]; 2];
+        for k in 0..nb {
+            for t in 0..l {
+                let d = digits[k * l + t];
+                if d == 0 {
+                    continue;
+                }
+                for (li, (k0, k1)) in self.cols[k][t].iter().enumerate() {
+                    for i in 0..nb {
+                        acc[li][0][i] += d * k0[i] as i64;
+                        acc[li][1][i] += d * k1[i] as i64;
+                    }
+                }
+            }
+        }
+        let b = centered(c.b, p0) as i128;
+        acc[0][0][0] += (aux as i128 * b).rem_euclid(p0 as i128) as i64;
+        let inv = invmod(aux % p0, p0);
+        let resc = |x0: i64, x1: i64| -> u64 {
+            let r0 = x0.rem_euclid(p0 as i64) as u64;
+            let r1 = centered(x1.rem_euclid(aux as i64) as u64, aux);
+            mulmod(submod(r0, from_signed(r1, p0), p0), inv, p0)
+        };
+        let part = |pt: usize| (0..nb).map(|i| resc(acc[0][pt][i], acc[1][pt][i])).collect();
+        (part(0), part(1))
     }
 
     /// `lwes[j]` (mod p0, dimension n_br; None = an exact zero) into one RLWE of degree N mod p0 p1 under s.
     pub fn repack(&self, lwes: &[Option<Lwe>], n_br: usize, ntts: &[Ntt]) -> RnsRlwe {
-        let n = ntts[0].n;
-        let p0 = self.gadget.q;
+        let (n, p0, l) = (ntts[0].n, self.gadget.q, self.gadget.levels);
+        let sf = n / n_br;
+        let packed: Vec<(usize, (Vec<u64>, Vec<u64>))> =
+            lwes.par_iter().enumerate().filter_map(|(j, c)| c.as_ref().map(|c| (j, self.pack(c)))).collect();
+        // X^j P_j(X^S), summed: under s_x(X^S), mod p0
+        let (mut c0, mut c1) = (vec![0u64; n], vec![0u64; n]);
+        for (j, (x0, x1)) in &packed {
+            for i in 0..n_br {
+                let y = j + sf * i;
+                if y < n {
+                    c0[y] = crate::modq::addmod(c0[y], x0[i], p0);
+                    c1[y] = crate::modq::addmod(c1[y], x1[i], p0);
+                } else {
+                    c0[y - n] = submod(c0[y - n], x0[i], p0);
+                    c1[y - n] = submod(c1[y - n], x1[i], p0);
+                }
+            }
+        }
+        // ring switch s_x(X^S) -> s mod q0: p1 c0 + sum_t d_t(c1) R_t
+        let mut d = vec![0i64; l];
+        let mut digits = vec![vec![0i64; n]; l];
+        for (i, &x) in c1.iter().enumerate() {
+            self.gadget.decompose(x, &mut d);
+            for t in 0..l {
+                digits[t][i] = d[t];
+            }
+        }
         let p1 = ntts[1].q;
-        let l = self.gadget.levels;
-        // B(X) and the digit polynomials D_kt(X) of A_k(X) = sum_j a_jk X^j
-        let bpoly: Vec<i64> = (0..n).map(|j| lwes[j].as_ref().map_or(0, |c| centered(c.b, p0))).collect();
-        let limbs: Vec<Rlwe> = ntts
+        let limbs = ntts
             .iter()
             .enumerate()
             .map(|(li, t)| {
                 let q = t.q;
-                let parts: Vec<(Vec<u64>, Vec<u64>)> = (0..n_br)
-                    .into_par_iter()
-                    .map(|k| {
-                        let mut d = vec![0i64; l];
-                        let mut digits = vec![vec![0u64; n]; l];
-                        for j in 0..n {
-                            if let Some(c) = &lwes[j] {
-                                self.gadget.decompose(c.a[k], &mut d);
-                                for tt in 0..l {
-                                    digits[tt][j] = from_signed(d[tt], q);
-                                }
-                            }
-                        }
-                        let (mut o0, mut o1) = (vec![0u64; n], vec![0u64; n]);
-                        for (tt, mut dt) in digits.into_iter().enumerate() {
-                            t.fwd(&mut dt);
-                            let (k0, k1) = &self.keys[k][tt][li];
-                            for i in 0..n {
-                                o0[i] = (o0[i] + mulmod(dt[i], k0[i], q)) % q;
-                                o1[i] = (o1[i] + mulmod(dt[i], k1[i], q)) % q;
-                            }
-                        }
-                        (o0, o1)
-                    })
-                    .collect();
                 let (mut o0, mut o1) = (vec![0u64; n], vec![0u64; n]);
-                for (a, b) in parts {
-                    add_into(&mut o0, &a, q);
-                    add_into(&mut o1, &b, q);
+                for (tt, dt) in digits.iter().enumerate() {
+                    let mut dq: Vec<u64> = dt.iter().map(|&v| from_signed(v, q)).collect();
+                    t.fwd(&mut dq);
+                    let (k0, k1) = &self.ring[tt][li];
+                    for i in 0..n {
+                        o0[i] = (o0[i] + mulmod(dq[i], k0[i], q)) % q;
+                        o1[i] = (o1[i] + mulmod(dq[i], k1[i], q)) % q;
+                    }
                 }
                 t.inv(&mut o0);
                 t.inv(&mut o1);
                 let p1q = p1 % q;
-                let pb: Vec<u64> = bpoly.iter().map(|&b| mulmod(from_signed(b, q), p1q, q)).collect();
+                let pb: Vec<u64> = c0.iter().map(|&b| mulmod(from_signed(centered(b, p0), q), p1q, q)).collect();
                 add_into(&mut o0, &pb, q);
                 Rlwe { c0: o0, c1: o1 }
             })
@@ -235,7 +305,7 @@ impl Switcher {
         let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, prng);
         let rns = crate::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br)?;
         let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, &dg, prng);
-        let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), &ntt_p, &dg, prng);
+        let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg, prng)?;
         Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, repack })
     }
 

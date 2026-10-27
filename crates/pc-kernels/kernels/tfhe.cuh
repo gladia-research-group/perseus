@@ -537,52 +537,129 @@ __global__ void rs_extract_k(TfheArgs A) {
     }
 }
 
+// ── the repack (pc-tfhe switch.rs RepackKey): q = p0, n = N, i1 = n_br, c[0] base log, c[1] levels ─────────────
+// REPACK_DIGITS: D [count][n_br levels] (i32, k t) = exact digits of the LWEs' a (y = [count][n_br + 1] mod p0); also
+// zeroes the scatter's accumulator z ([2 part][n] u64) when i0 = 1
 __global__ void repack_digits_k(TfheArgs A) {
-    const int n = A.n, dim = A.i1, lv = (int)A.c[1], bl = (int)A.c[0], kc = A.i3;
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
-    const int kk = blockIdx.y, limb = blockIdx.z;
-    const uint64_t p = limb ? A.c[2 + 2] : A.q;   // c[4] = p1
-    const int row = ((const int32_t*)A.w)[j];
-    int64_t v = 0;
-    if (row >= 0) v = cent(((const uint32_t*)A.y)[(size_t)row * (dim + 1) + A.i0 + kk], A.q);
-    uint32_t* out = (uint32_t*)A.x + ((size_t)(limb * kc + kk) * lv) * n;
-    for (int t = 0; t < lv; t++) out[(size_t)t * n + j] = row >= 0 ? smod32(digit_exact(v, t, bl, lv), p) : 0;
+    const int nb = A.i1, lv = (int)A.c[1], bl = (int)A.c[0];
+    const size_t tot = (size_t)A.count * nb, gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (A.i0)
+        for (size_t z = gid; z < 2 * (size_t)A.n; z += (size_t)gridDim.x * blockDim.x) ((uint64_t*)A.z)[z] = 0;
+    if (gid >= tot) return;
+    const size_t b = gid / nb, k = gid % nb;
+    const int64_t v = cent(((const uint32_t*)A.y)[b * (nb + 1) + k], A.q);
+    int32_t* out = (int32_t*)A.x + gid * lv;
+    for (int t = 0; t < lv; t++) out[t] = (int32_t)digit_exact(v, t, bl, lv);
 }
 
-__global__ void repack_mac_k(TfheArgs A) {
-    const int n = A.n, lv = (int)A.c[1], kc = A.i3;
+// REPACK_MAC: PK [count][2 part][n_br] mod p0 = the rescale by P of (P b, 0) + sum_kt D[.][kt] cols[kt][limb][part][i]
+// (limbs p0, P; sums < 2^55 exact in int64). z = cols [n_br levels][2 limb][2 part][n_br], y = D, w = the LWEs (b);
+// c[2] = P, c[3] = P^-1 mod p0, c[4] = P mod p0, c[7] = mu(p0). A block: RG columns (part, i) x RJ LWEs, the digits
+// staged in shared memory RKC at a time.
+constexpr int RJ = 16, RKC = 256, RG = 256;
+__global__ void __launch_bounds__(RG) repack_gemm_k(TfheArgs A) {
+    __shared__ int32_t ds[RJ][RKC];
+    const int nb = A.i1, K = nb * (int)A.c[1], b = A.count;
+    const int col = blockIdx.x * RG + threadIdx.x, j0 = blockIdx.y * RJ;
+    const uint64_t p0 = A.q, P = A.c[2];
+    const uint32_t* key = (const uint32_t*)A.z + col;
+    const int32_t* D = (const int32_t*)A.y;
+    int64_t a0[RJ], a1[RJ];
+#pragma unroll
+    for (int jj = 0; jj < RJ; jj++) a0[jj] = a1[jj] = 0;
+    for (int kc = 0; kc < K; kc += RKC) {
+        for (int e = threadIdx.x; e < RJ * RKC; e += RG) {
+            const int jj = e / RKC, kk = e % RKC;
+            ds[jj][kk] = j0 + jj < b ? D[(size_t)(j0 + jj) * K + kc + kk] : 0;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < RKC; kk++) {
+            const uint32_t* kp = key + (size_t)(kc + kk) * 4 * nb;
+            const int64_t k0 = __ldg(kp), k1 = __ldg(kp + 2 * nb);
+#pragma unroll
+            for (int jj = 0; jj < RJ; jj++) {
+                a0[jj] += ds[jj][kk] * k0;
+                a1[jj] += ds[jj][kk] * k1;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int jj = 0; jj < RJ; jj++) {
+        const int j = j0 + jj;
+        if (j >= b) break;
+        uint64_t x0 = smod32(a0[jj], p0);
+        if (col == 0) x0 = addq(x0, mulm32(smod32(cent(((const uint32_t*)A.w)[(size_t)j * (nb + 1) + nb], p0), p0), (uint32_t)A.c[4], p0, A.c[7]), p0);
+        const uint32_t x1 = smod32(cent(smod32(a1[jj], P), P), p0);
+        ((uint32_t*)A.x)[(size_t)j * 2 * nb + col] = mulm32((uint32_t)subq(x0, x1, p0), (uint32_t)A.c[3], p0, A.c[7]);
+    }
+}
+
+// REPACK_SCATTER: X^j PK_j(X^S) summed into z [2 part][n] (u64 atomics, reduced by REPACK_RING); y = PK, w = the
+// positions j, i2 = S
+__global__ void repack_scatter_k(TfheArgs A) {
+    const int n = A.n, nb = A.i1, S = A.i2;
+    const size_t gid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t)A.count * 2 * nb) return;
+    const size_t b = gid / (2 * nb);
+    const int part = (int)(gid / nb) & 1, i = (int)(gid % nb);
+    int y = ((const int32_t*)A.w)[b] + S * i;
+    uint64_t v = ((const uint32_t*)A.y)[gid];
+    if (y >= n) {
+        y -= n;
+        v = v ? A.q - v : 0;
+    }
+    atomicAdd((unsigned long long*)A.z + (size_t)part * n + y, (unsigned long long)v);
+}
+
+// REPACK_RING: (c0, c1) = z mod p0; c0 into w [n]; the exact digits of c1 into x [2 limb][levels][n] mod (p0, p1 = c[4])
+__global__ void repack_ring_k(TfheArgs A) {
+    const int n = A.n, lv = (int)A.c[1], bl = (int)A.c[0];
+    const int y = blockIdx.x * blockDim.x + threadIdx.x;
+    if (y >= n) return;
+    const uint64_t* z = (const uint64_t*)A.y;
+    ((uint32_t*)A.w)[y] = (uint32_t)(z[y] % A.q);
+    const int64_t v = cent(z[n + y] % A.q, A.q);
+    for (int t = 0; t < lv; t++) {
+        const int64_t d = digit_exact(v, t, bl, lv);
+        ((uint32_t*)A.x)[(size_t)t * n + y] = smod32(d, A.q);
+        ((uint32_t*)A.x)[(size_t)(lv + t) * n + y] = smod32(d, A.c[4]);
+    }
+}
+
+// REPACK_RMAC: acc [2 part][2 limb][n] += sum_t D[limb][t] R[t][limb][part] (NTT form; the ring key); c[4] = p1,
+// c[6] = mu(p1), c[7] = mu(p0)
+__global__ void repack_rmac_k(TfheArgs A) {
+    const int n = A.n, lv = (int)A.c[1];
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
     const int limb = blockIdx.y;
     const uint64_t p = limb ? A.c[4] : A.q, mu = limb ? A.c[6] : A.c[7];
-    const uint32_t* d = (const uint32_t*)A.y + (size_t)limb * kc * lv * n;
+    const uint32_t* d = (const uint32_t*)A.y + (size_t)limb * lv * n;
     const uint32_t* key = (const uint32_t*)A.z;
     uint32_t* acc0 = (uint32_t*)A.x + (size_t)limb * n;            // [part][limb][n]: part 0
     uint32_t* acc1 = (uint32_t*)A.x + (size_t)(2 + limb) * n;      // part 1
     uint64_t a0 = acc0[j], a1 = acc1[j];
-    for (int kk = 0; kk < kc; kk++) {
-        for (int t = 0; t < lv; t++) {
-            const uint32_t dv = d[((size_t)kk * lv + t) * n + j];
-            const uint32_t* k0 = key + ((((size_t)kk * lv + t) * 2 + limb) * 2) * n;
-            a0 = addq(a0, mulm32(dv, k0[j], p, mu), p);
-            a1 = addq(a1, mulm32(dv, k0[n + j], p, mu), p);
-        }
+    for (int t = 0; t < lv; t++) {
+        const uint32_t dv = d[(size_t)t * n + j];
+        const uint32_t* k0 = key + (((size_t)t * 2 + limb) * 2) * n;
+        a0 = addq(a0, mulm32(dv, k0[j], p, mu), p);
+        a1 = addq(a1, mulm32(dv, k0[n + j], p, mu), p);
     }
     acc0[j] = (uint32_t)a0;
     acc1[j] = (uint32_t)a1;
 }
 
-__global__ void repack_b_k(TfheArgs A) {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= A.count) return;
-    const int n = A.n, dim = A.i1;
-    const int j = ((const int32_t*)A.z)[b];
-    const int64_t v = cent(((const uint32_t*)A.y)[(size_t)b * (dim + 1) + dim], A.q);
+// REPACK_C0: acc part 0 [limb][n] += p1 c0 (y = c0 mod p0, centred; c[2] = p1 mod p0)
+__global__ void repack_c0_k(TfheArgs A) {
+    const int n = A.n;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int64_t v = cent(((const uint32_t*)A.y)[j], A.q);
     for (int limb = 0; limb < 2; limb++) {
         const uint64_t p = limb ? A.c[4] : A.q, mu = limb ? A.c[6] : A.c[7];
         const uint32_t p1 = limb ? 0 : (uint32_t)A.c[2];   // p1 mod p1 = 0
-        uint32_t* c0 = (uint32_t*)A.x + (size_t)limb * n;   // part 0 of [part][limb][n]
+        uint32_t* c0 = (uint32_t*)A.x + (size_t)limb * n;
         c0[j] = (uint32_t)addq(c0[j], mulm32(smod32(v, p), p1, p, mu), p);
     }
 }
@@ -641,14 +718,28 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if (A.count > 65535) return -1;
             rs_extract_k<<<dim3((A.i1 + 256) / 256, A.count), 256, 0, s>>>(A);
             break;
-        case PC_TFHE_REPACK_DIGITS:
-            repack_digits_k<<<dim3((A.n + 255) / 256, A.i3, 2), 256, 0, s>>>(A);
+        case PC_TFHE_REPACK_DIGITS: {
+            const size_t tot = (size_t)A.count * A.i1;
+            repack_digits_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
             break;
+        }
         case PC_TFHE_REPACK_MAC:
-            repack_mac_k<<<dim3((A.n + 255) / 256, 2), 256, 0, s>>>(A);
+            if ((2 * A.i1) % RG || (A.i1 * A.c[1]) % RKC) return -1;
+            repack_gemm_k<<<dim3(2 * A.i1 / RG, (A.count + RJ - 1) / RJ), RG, 0, s>>>(A);
             break;
-        case PC_TFHE_REPACK_B:
-            repack_b_k<<<(A.count + 255) / 256, 256, 0, s>>>(A);
+        case PC_TFHE_REPACK_SCATTER: {
+            const size_t tot = (size_t)A.count * 2 * A.i1;
+            repack_scatter_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
+        case PC_TFHE_REPACK_RING:
+            repack_ring_k<<<(A.n + 255) / 256, 256, 0, s>>>(A);
+            break;
+        case PC_TFHE_REPACK_RMAC:
+            repack_rmac_k<<<dim3((A.n + 255) / 256, 2), 256, 0, s>>>(A);
+            break;
+        case PC_TFHE_REPACK_C0:
+            repack_c0_k<<<(A.n + 255) / 256, 256, 0, s>>>(A);
             break;
         default:
             return -2;

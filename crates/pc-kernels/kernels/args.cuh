@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 11u
+#define PC_KERNELS_ABI 12u
 #define PC_RING_ABI 5u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -746,8 +746,11 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_RS_EXTRACT 9
 #define PC_TFHE_REPACK_DIGITS 10
 #define PC_TFHE_REPACK_MAC 11
-#define PC_TFHE_REPACK_B 12
+#define PC_TFHE_REPACK_SCATTER 12
 #define PC_TFHE_PBS_ROTATE 13
+#define PC_TFHE_REPACK_RING 14
+#define PC_TFHE_REPACK_RMAC 15
+#define PC_TFHE_REPACK_C0 16
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

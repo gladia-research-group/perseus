@@ -489,9 +489,9 @@ fn run_ks(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `pc-check tfhe-bridge [--switch 256] [--chunk 64]`: the CKKS side of the switch on the device vs pc-tfhe, every
+/// `pc-check tfhe-bridge [--switch 256]`: the CKKS side of the switch on the device vs pc-tfhe, every
 /// word: RESCALE_P1, the ring switch (RS_DIGITS -> NTT -> MAC -> INTT -> + c0), RS_EXTRACT, and the repack
-/// (REPACK_DIGITS -> NTT -> REPACK_MAC per key chunk -> INTT -> REPACK_B) from the host bootstrap's outputs.
+/// (pc-gpu `DevRepack`) from the host bootstrap's outputs.
 pub fn cmd_bridge(args: &[String]) -> ExitCode {
     match run_bridge(args) {
         Ok(true) => ExitCode::SUCCESS,
@@ -510,7 +510,6 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     use pc_tfhe::switch::rescale_p1;
     use rayon::prelude::*;
     let n_valid: usize = arg(args, "--switch").map(|s| s.parse()).transpose()?.unwrap_or(256);
-    let kc: usize = arg(args, "--chunk").map(|s| s.parse()).transpose()?.unwrap_or(64);
     let chain = Chain::generate(&ChainSpec::n32())?;
     let n = chain.n;
     let (p0, p1) = (chain.q[0], chain.q[1]);
@@ -551,8 +550,7 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
     let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [ni0 as u32, ni1 as u32, ni0 as u32, 0, 0, 0, 0, 0], ..Default::default() };
     let dev = Device::open()?;
-    let rk_len = nb * rp_lv * 2 * 2 * n;
-    let bytes = 4 * (rk_len + 6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + 2 * kc * rp_lv * n + 4 * n + n + n_valid) + (64 << 20);
+    let bytes = 4 * (6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + n_valid * (nb + 1) + n_valid) + pc_gpu::tfhe::DevRepack::bytes(n, nb, rp_lv) + (64 << 20);
     let arena = pc_cuda::Arena::new(&dev, bytes)?;
     let st = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
@@ -611,44 +609,17 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     // the repack from the host bootstrap's outputs
     let outv: Vec<u32> = outs.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let d_outs = up("tfhe.outs", &outv)?;
-    let mut inv = vec![u32::MAX; n];
-    for (r, &j) in valid.iter().enumerate() {
-        inv[j] = r as u32;
-    }
-    let d_inv = up("tfhe.inv", &inv)?;
-    let mut rk = Vec::with_capacity(rk_len);
-    for k in 0..nb {
-        for tt in 0..rp_lv {
-            for l in 0..2 {
-                let (a, b) = &sw.repack.keys()[k][tt][l];
-                rk.extend(a.iter().chain(b).map(|&x| x as u32));
-            }
-        }
-    }
-    let d_rk = up("tfhe.rk", &rk)?;
-    drop(rk);
-    let mut d_rdig = up("tfhe.rdig", &vec![0; 2 * kc * rp_lv * n])?;
-    let mut d_acc = up("tfhe.acc", &vec![0; 4 * n])?;
-    let rb = TfheArgs { n: n as i32, count: n_valid as i32, i1: nb as i32, i3: kc as i32, q: p0, c: [sw.params.rp.0 as u64, rp_lv as u64, p1 % p0, 0, p1, 0, mu(p1), mu(p0)], ..Default::default() };
+    let mut drep = pc_gpu::tfhe::DevRepack::new(&arena, &st, &sw)?;
     let tg = Instant::now();
-    for k0 in (0..nb).step_by(kc) {
-        go(&TfheArgs { op: tfhe_op::REPACK_DIGITS, i0: k0 as i32, x: d_rdig.vptr_mut(), y: d_outs.vptr(), w: d_inv.vptr(), ..rb })?;
-        gp(&PcmmArgs { op: pcmm_op::NTT, count: (2 * kc * rp_lv) as i32, i0: (kc * rp_lv) as i32, x: d_rdig.vptr_mut(), tw: d_twf.vptr(), ..pa })?;
-        let kz = unsafe { (d_rk.vptr() as *const u32).add(k0 * rp_lv * 2 * 2 * n) } as *const std::ffi::c_void;
-        go(&TfheArgs { op: tfhe_op::REPACK_MAC, x: d_acc.vptr_mut(), y: d_rdig.vptr(), z: kz, ..rb })?;
-    }
-    for part in 0..2 {   // [part][limb]: limb l at prime l
-        let xp = unsafe { (d_acc.vptr_mut() as *mut u32).add(part * 2 * n) } as *mut std::ffi::c_void;
-        gp(&PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 1, x: xp, tw: d_twi.vptr(), ..pa })?;
-    }
-    go(&TfheArgs { op: tfhe_op::REPACK_B, x: d_acc.vptr_mut(), y: d_outs.vptr(), z: d_idx.vptr(), ..rb })?;
+    drep.run(table, &st, d_outs.vptr(), d_idx.vptr(), n_valid, &pa, d_twf.vptr(), d_twi.vptr())?;
     st.sync()?;
     let t_rep = tg.elapsed().as_secs_f64();
+    let d_acc = &drep.acc;
     let got_acc = d_acc.download(&st)?;
     let want: Vec<u64> = [&rep.limbs[0].c0, &rep.limbs[1].c0, &rep.limbs[0].c1, &rep.limbs[1].c1].iter().flat_map(|v| v.iter().copied()).collect();
     let bad = got_acc.iter().zip(&want).filter(|(a, b)| **a as u64 != **b).count();
     t.add("tfhe-bridge: repack == pc-tfhe RepackKey::repack", bad, 4 * n);
-    println!("[pc-check] tfhe-bridge: device ms: rescale {:.3}, ring switch {:.3}, extract {:.3} ({n_valid}), repack {:.3} (chunk {kc})", t_rescale * 1e3, t_rs * 1e3, t_ext * 1e3, t_rep * 1e3);
+    println!("[pc-check] tfhe-bridge: device ms: rescale {:.3}, ring switch {:.3}, extract {:.3} ({n_valid}), repack {:.3}", t_rescale * 1e3, t_rs * 1e3, t_ext * 1e3, t_rep * 1e3);
     println!("[pc-check] tfhe-bridge: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }

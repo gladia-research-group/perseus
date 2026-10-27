@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 11;
+pub const ABI: u32 = 12;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -698,7 +698,7 @@ zeroed_default!(
     KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs, TfheArgs
 );
 
-/// TFHE op codes (args.cuh PC_TFHE_*, ABI 11).
+/// TFHE op codes (args.cuh PC_TFHE_*, ABI 12).
 pub mod tfhe_op {
     pub const PBS_MS: i32 = 0;
     pub const PBS_INIT: i32 = 1;
@@ -712,8 +712,11 @@ pub mod tfhe_op {
     pub const RS_EXTRACT: i32 = 9;
     pub const REPACK_DIGITS: i32 = 10;
     pub const REPACK_MAC: i32 = 11;
-    pub const REPACK_B: i32 = 12;
+    pub const REPACK_SCATTER: i32 = 12;
     pub const PBS_ROTATE: i32 = 13;
+    pub const REPACK_RING: i32 = 14;
+    pub const REPACK_RMAC: i32 = 15;
+    pub const REPACK_C0: i32 = 16;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

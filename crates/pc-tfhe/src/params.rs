@@ -7,7 +7,8 @@
 //!   allows 54 bits at 2048;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^50 (two 25-bit NTT primes, the device's u32
 //!   RNS): within the 54-bit bound;
-//! - repack key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
+//! - repack columns: degree n_br = 2048 under a fresh ternary s_x at p0 P ~ 2^53 (P = rp_aux, 25 bits): within the
+//!   54-bit bound; repack ring key: ring 2^16, q0 ~ 2^56, secret s: the CKKS chain's own instance at a smaller modulus;
 //! - binary LWE key, n = 920, noise sigma = 2^-17 q: the regime of the TFHE-rs default sets (n 742-918 at relative
 //!   noise ~2^-17 for 128 bits). Not run through the lattice estimator here (no Sage on the box): re-check before
 //!   publication.
@@ -31,6 +32,8 @@ pub struct Params {
     pub ks: (u32, usize),
     pub rs: (u32, usize),
     pub rp: (u32, usize),
+    /// The repack's auxiliary prime P (p0 P <= 2^54; NTT-friendly at n_br for the host's key generation).
+    pub rp_aux: u64,
     /// Ring-switch factor S: the extracted LWEs have dimension N / S.
     pub rs_factor: usize,
     /// Output scale exponent: a LUT value v lands as v p0 / 2^out_cf. The finish's EvalMod returns m only while m << q0
@@ -60,6 +63,7 @@ impl Params {
             ks: (2, 8),
             rs: (8, 3),
             rp: (16, 2),
+            rp_aux: qa,
             rs_factor: n_ckks / 2048,
             out_cf: 8,
         })
