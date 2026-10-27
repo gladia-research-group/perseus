@@ -47,7 +47,10 @@ def _mask(n, idx, v=1.0):
 
 
 def _clean(ops, s, n, heads):
-    """3 s^2 - 2 s^3 on the heads (0 and 1 are fixed points; the error e -> 3 e^2)."""
+    """3 s^2 - 2 s^3 on the heads (0 and 1 are fixed points; the error e -> 3 e^2). PF_SELECT_CLEAN=0: skipped."""
+    import os
+    if os.environ.get("PF_SELECT_CLEAN", "1") in ("0", ""):
+        return s
     s2 = ops.square(s)
     return ops.mult(s2, ops.add_pt(ops.mult_pt(s, _mask(n, heads, -2.0), kind="mask"), _mask(n, heads, 3.0), kind="mask"))
 
@@ -113,6 +116,25 @@ def _ckks_sign01(ops, d, n, heads, R, res):
     return ops.add_pt(ops.mult_pt(x, _mask(n, heads, 0.5), kind="mask"), _mask(n, heads, 0.5), kind="mask")
 
 
+def _ckks_sign01_const(ops, e, R, res):
+    """[e >= 0] of an all-slot constant (the reduction stamp kept: its refreshes take the 1-slot route), by the
+    composite: scalar products only."""
+    from perseus.impl.poly import eval_chebyshev
+    cheb = np.polynomial.chebyshev.poly2cheb
+    a, b = _composite(min(res / R, 0.5))
+    x = ops.mult(e, 1.0 / R)
+    for c in [_G3] * a + [_F3] * b:
+        x = eval_chebyshev(ops, x, list(cheb(c)), -1.0, 1.0)
+    return ops.add(ops.mult(x, 0.5), 0.5)
+
+
+def count_ckks():
+    """PF_SELECT_COUNT=ckks: top-k's count comparisons as CKKS signs on an all-slot constant (1-slot refreshes)
+    instead of a switch each (whose finish is a dense refresh)."""
+    import os
+    return os.environ.get("PF_SELECT_COUNT", "") == "ckks"
+
+
 def msign(ops, d, n, heads, R, levels, tag, res=None):
     """[d >= 0] on the slots `heads` (0 elsewhere) for |d| < R: `levels` scales in one switch (module doc). Under
     PF_SELECT_SIGN=ckks:<r> a composite polynomial at resolution max(r, `res`) instead (the baseline)."""
@@ -166,7 +188,7 @@ def msign(ops, d, n, heads, R, levels, tag, res=None):
     return _clean(ops, acc, n, heads)
 
 
-def tournament(ops, xs, valid, *, first=1, upto=None, R=128.0, fine=2048, dec=None, tag="t"):
+def tournament(ops, xs, valid, *, first=1, upto=None, R=128.0, fine=512, dec=None, tag="t"):
     """Rounds at strides first, 2 first, ... < upto (default n): the maxima of the slot blocks of size `upto` at their
     first slots, and the decisions (module doc). `first` > 1: continue a vector already folded to blocks of `first`
     (no tile round)."""
@@ -211,7 +233,7 @@ def _root(ops, ref, n, idx):
     return ops.add_pt(ops.mult_pt(ref, np.zeros(n), kind="mask"), _mask(n, idx), kind="mask")
 
 
-def argmax(ops, xs, valid, *, R=128.0, fine=2048):
+def argmax(ops, xs, valid, *, R=128.0, fine=512):
     """The one-hot (K tiles) of the argmax of the valid slots."""
     n = len(valid[0])
     x, dec = tournament(ops, xs, valid, R=R, fine=fine, tag="am")
@@ -223,7 +245,7 @@ def _bcast(ops, x, B, n):
     return ops.rotate_and_sum(x, -B, n)
 
 
-def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=2048, C=4.0):
+def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=512, C=4.0):
     """The one-hot (K tiles) of a top-k sample: Gumbel-max over the top-k maxima of the L slot blocks of size B = n / L
     (module doc). `g`: Gumbel noise at the slots j B (a ciphertext, or a slot vector used as a plaintext). Returns
     (one-hot tiles, mask over the block heads j B)."""
@@ -236,19 +258,30 @@ def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=2048
     hm = _mask(n, heads)
     y = ops.add_pt(ops.mult_pt(ops.sub(m, M), hm, kind="mask"), _mask(n, heads, W), kind="mask")
     y = ops.mult(y, msign(ops, y, n, heads, R, 1, "tk.clip"))
-    lo = None                        # the threshold's lower end (slot 0); public start 0, width W / 2^j
+    # the threshold's lower end: public start 0, width W / 2^j; at slot 0 (a switch per count), or in every slot
+    # (PF_SELECT_COUNT=ckks: an all-slot constant, no broadcast)
+    const = count_ckks()
+    lo = None
+    lo_at = (lambda v: v) if const else (lambda v: _bcast(ops, v, B, n))
     w = W
     for j in range(probes):
         w /= 2
         t = _mask(n, heads, w)
-        dt = ops.add_pt(y, -t, kind="mask") if lo is None else ops.sub(ops.add_pt(y, -t, kind="mask"), _bcast(ops, lo, B, n))
+        dt = ops.add_pt(y, -t, kind="mask") if lo is None else ops.sub(ops.add_pt(y, -t, kind="mask"), lo_at(lo))
         s = msign(ops, dt, n, heads, W + 1.0, 1, f"tk.p{j}")
-        cnt = ops.rotate_and_sum(s, B, n)                         # slot 0: count(y >= lo + w)
-        e = ops.add_pt(ops.mult_pt(cnt, e0, kind="mask"), _mask(n, [0], 0.5 - k), kind="mask")
-        b = msign(ops, e, n, [0], 2.0 * L, 3, f"tk.c{j}", res=0.25)   # [count >= k]: raise lo by w
-        step = ops.mult_pt(b, _mask(n, [0], w), kind="mask")
+        if const:
+            cnt = ops.rotate_and_sum(s, 1, n)                         # every slot: count(y >= lo + w)
+            if hasattr(ops, "tag_reduce"):                            # the stamp (the mirror has none)
+                cnt = ops.tag_reduce(cnt, 1)
+            b = _ckks_sign01_const(ops, ops.add(cnt, 0.5 - k), 2.0 * L, 0.25)
+            step = ops.mult(b, w)
+        else:
+            cnt = ops.rotate_and_sum(s, B, n)                         # slot 0: count(y >= lo + w)
+            e = ops.add_pt(ops.mult_pt(cnt, e0, kind="mask"), _mask(n, [0], 0.5 - k), kind="mask")
+            b = msign(ops, e, n, [0], 2.0 * L, 3, f"tk.c{j}", res=0.25)   # [count >= k]: raise lo by w
+            step = ops.mult_pt(b, _mask(n, [0], w), kind="mask")
         lo = step if lo is None else ops.add(lo, step)
-    mask = msign(ops, ops.sub(y, _bcast(ops, lo, B, n)), n, heads, W + 1.0, 1, "tk.mask")
+    mask = msign(ops, ops.sub(y, lo_at(lo)), n, heads, W + 1.0, 1, "tk.mask")
     if isinstance(g, np.ndarray):        # the noise as a plaintext (public server randomness, encoded per token)
         z = ops.mult(mask, ops.add_pt(y, np.where(hm > 0, g + C, 0.0), kind="mask"))
     else:                                # g masked first: product + product (a product plus a fresh input is a degree
