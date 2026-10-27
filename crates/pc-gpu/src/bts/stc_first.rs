@@ -41,7 +41,7 @@ pub const SRC_LOG2: i32 = 60;
 pub const SRC_LIMBS: usize = 4;
 /// A lean chain's single-prime StC stages: log2 of the fixed factors of the stages before the re-levelled last one.
 /// The stages' diagonals have 64, 2048 and 65,536 nonzero coefficients (rounding 2^0.45 / 2^3.7 / 2^6.2 per unit of
-/// scale), so the early stages take most of the reduction (measured on the 5090 against [-7, -3.5], [-8, -4], [-5, -3],
+/// scale), so the early stages take most of the reduction (measured against [-7, -3.5], [-8, -4], [-5, -3],
 /// [-4, -2]: this split loses the least refresh precision against n32's paired stages, 0.2-0.4 bits at CF 8-13).
 pub const THIN_SPLIT: [f64; 2] = [-6.0, -3.0];
 /// The reference CF of a lean chain's last stage (the factors above are set for it; lower CFs are pre-scaled to it).
