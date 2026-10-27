@@ -831,8 +831,11 @@ pub mod tfhe_op {
     pub const RS_EXTRACT: i32 = 9;
     pub const REPACK_DIGITS: i32 = 10;
     pub const REPACK_MAC: i32 = 11;
-    pub const REPACK_B: i32 = 12;
+    pub const REPACK_SCATTER: i32 = 12;
     pub const PBS_ROTATE: i32 = 13;
+    pub const REPACK_RING: i32 = 14;
+    pub const REPACK_RMAC: i32 = 15;
+    pub const REPACK_C0: i32 = 16;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

@@ -12,8 +12,9 @@ const N: usize = 4096;
 
 fn setup(seed: u32) -> (Switcher, Vec<i64>, Prng) {
     let mut prng = Prng::from_seed([seed, 1, 2, 3, 4, 5, 6, 7], 0);
-    let p0 = prime_below(31, 1 << 17).unwrap();
-    let p1 = prime_below(28, 1 << 17).unwrap();
+    // the production chain's primes are ~28 bits (the repack needs p0 P <= 2^54)
+    let p0 = prime_below(28, 1 << 17).unwrap();
+    let p1 = prime_below(28, 1 << 18).unwrap();
     let s: Vec<i64> = sample_ternary(&mut prng, N).into_iter().map(|x| x as i64).collect();
     let sw = Switcher::generate(Params::new(N).unwrap(), &s, p0, p1, &mut prng).unwrap();
     (sw, s, prng)
