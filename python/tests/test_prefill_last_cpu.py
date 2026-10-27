@@ -210,3 +210,41 @@ def test_token_bcast_first():
     got = BL.decrypt_blocked(rt, [BL.token_bcast(rt, row, ch, B, 0) for row in X], ch, B, d.dim)
     want = BL.decrypt_blocked(rt, X, ch, B, d.dim)[0]
     assert np.abs(got - want[None, :]).max() == 0.0
+
+
+@pytest.mark.parametrize("T,keys", [(128, 128), (128, 100), (256, 197)])
+def test_attn_pack_bidirectional(monkeypatch, T, keys):
+    """An encoder's attention (bidirectional, padding past `keys`; T = 256: two chunk pairs, ViT's): PF_ATTN_PACK with
+    PF_ATTN_BSGS (every chunk rotated cyclically) and PF_SM_HPACK (one softmax per query chunk pair on the half-empty
+    group), K / V plain and QKV-packed, against the plain attention on the real heads."""
+    sm = config.load_configs(str(PKG / "configs/model/approximation/gpt2_base_n32_pf/configs.json")).block(4)[2]
+    d = layout.Dims.gpt2()
+    B = BL.Blocks(d, 512)
+    ch = prefill.Chunks(T, B.t, bidir=True, keys=keys)
+    real = [np.ones(B.nch, bool), np.arange(B.nch) % B.hg < B.group_dims(1).H_real]
+    rng = np.random.default_rng(T + keys)
+
+    def enc(scale):
+        r = scale * rng.standard_normal((T, d.hid))
+        for k in range(B.K):
+            r[:, k * B.nch:(k + 1) * B.nch] *= real[k]
+        return [[0.5 * x for x in row] for row in BL.blocked_slots(r, ch, B)]
+    Q, K, V = enc(1.2), enc(1.2), enc(1.0)
+    h2t = B.hg // 2 * B.t
+    Kp = [[K[g][0], K[g][1] + np.roll(V[g][1], h2t)] for g in range(len(K))]
+    Vp = [[V[g][0], np.roll(Kp[g][1], -h2t)] for g in range(len(K))]
+
+    def attend(pack, k, v, bsgs=False, hpack=False):
+        monkeypatch.setattr(prefill, "_PACK", pack)
+        monkeypatch.setattr(prefill, "_BSGS", bsgs)
+        monkeypatch.setattr(prefill, "_SM_HPACK", hpack)
+        rt = Rt(_Ops(True), d)
+        return np.array([[np.asarray(x) for x in row] for row in BL.attention_blocked(rt, Q, k, v, sm, ch, B)])
+    ref = attend(0, K, V)
+    slot_real = [np.ones(d.N, bool), (np.arange(d.N) // B.t) % B.hg < B.group_dims(1).H_real]
+    for pack, k, v, bsgs, hpack in ((3, K, V, True, False), (2, K, V, True, False), (3, Kp, Vp, True, False),
+                                    (0, K, V, False, True), (3, Kp, Vp, False, True), (3, Kp, Vp, True, True)):
+        got = attend(pack, k, v, bsgs, hpack)
+        err = max(np.abs(got[g, j][slot_real[j]] - ref[g, j][slot_real[j]]).max()
+                  for g in range(ref.shape[0]) for j in range(B.K))
+        assert err < 1e-12 * max(1.0, np.abs(ref).max()), (pack, bsgs, hpack, err)
