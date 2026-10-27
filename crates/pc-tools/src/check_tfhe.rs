@@ -376,3 +376,109 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-pbs: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
+
+/// `pc-check tfhe-ks [--count 4096]`: the device LWE key switch (KS_DIGITS -> four int8 GEMMs against the key's
+/// balanced base-256 planes -> KS_RECOMBINE) vs pc-tfhe `LweKsk::apply`, every output word; LWEs/s.
+pub fn cmd_ks(args: &[String]) -> ExitCode {
+    match run_ks(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-ks: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_ks(args: &[String]) -> Res<bool> {
+    use pc_core::keys::{sample_ternary, DiscreteGaussian};
+    use pc_core::pcmm_keys::digit_planes;
+    use pc_kernels::args::{tfhe_op, TfheArgs};
+    use pc_tfhe::gadget::Gadget;
+    use pc_tfhe::lwe::{Lwe, LweKsk};
+    let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(4096);
+    const PLANES: usize = 4;
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let p0 = chain.q[0];
+    let p = Params::new(chain.n)?;
+    let n_in = chain.n / p.rs_factor;
+    let (nl, lv) = (p.n_lwe, p.ks.1);
+    let mut prng = test_prng(0x52);
+    let s_sub: Vec<i64> = sample_ternary(&mut prng, n_in).into_iter().map(|x| x as i64).collect();
+    let s_lwe: Vec<i64> = (0..nl).map(|_| (prng.next_u32() & 1) as i64).collect();
+    let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
+    let gad = Gadget::new(p0, p.ks, false);
+    let t0 = Instant::now();
+    let ksk = LweKsk::generate(&s_sub, &s_lwe, gad.clone(), &dg_lwe, &mut prng);
+    println!("[pc-check] tfhe-ks: host key switching key {:.1} s ({n_in} -> {nl}, gadget {:?})", t0.elapsed().as_secs_f64(), p.ks);
+    let lwes: Vec<Lwe> = (0..count).map(|_| Lwe { a: (0..n_in).map(|_| prng.uniform_below(p0)).collect(), b: prng.uniform_below(p0) }).collect();
+    let th = Instant::now();
+    let want: Vec<Lwe> = lwes.iter().map(|l| ksk.apply(l)).collect();
+    let host_s = th.elapsed().as_secs_f64();
+
+    // the key as K-contiguous columns: W[o][i levels + t], o < nl the a entries, o = nl the b entry
+    let k = n_in * lv;
+    let cols = nl + 1;
+    let mut w = vec![0i64; cols * k];
+    for i in 0..n_in {
+        for t in 0..lv {
+            let key = &ksk.keys[i][t];
+            for o in 0..cols {
+                let v = if o < nl { key.a[o] } else { key.b };
+                w[o * k + i * lv + t] = pc_tfhe::modq::centered(v, p0);
+            }
+        }
+    }
+    let planes = digit_planes(&w, PLANES)?;
+    let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
+    let dev = Device::open()?;
+    let ws_bytes = 64 << 20;
+    let bytes = planes.len() + count * k + 4 * (PLANES * cols * count + lin.len() + count * cols) + ws_bytes + (64 << 20);
+    let arena = pc_cuda::Arena::new(&dev, bytes)?;
+    let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
+    let lt = pc_cuda::blas::Lt::new(&dev)?;
+    // int8 operands live in byte buffers (the PCMM's weight planes do the same)
+    let mut d_planes: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u8>> = Vec::new();
+    for u in 0..PLANES {
+        let mut b = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ksk", cols * k)?;
+        let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
+        b.upload(&s, &bytes)?;
+        d_planes.push(b);
+    }
+    let mut d_in = arena.alloc::<pc_cuda::Compute, u32>("tfhe.in", lin.len())?;
+    d_in.upload(&s, &lin)?;
+    let mut d_dig = arena.alloc::<pc_cuda::Compute, u8>("tfhe.dig", count * k)?;
+    let mut d_g = arena.alloc::<pc_cuda::Compute, i32>("tfhe.g", PLANES * cols * count)?;
+    let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * cols)?;
+    let mut d_ws = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ws", ws_bytes)?;
+    let gemm = pc_gpu::matmul::gemm::I8Gemm::new(&lt.inner, count as u64, cols as u64, k as u64, 8, ws_bytes)?;
+    let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
+    let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
+    let mut run = || -> Res<()> {
+        go(&TfheArgs { op: tfhe_op::KS_DIGITS, count: count as i32, i1: n_in as i32, x: d_dig.vptr_mut(), y: d_in.vptr(), q: p0, m: gad.m, c: [p.ks.0 as u64, lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+        let gp = d_g.dptr_mut();
+        for u in 0..PLANES {
+            // SAFETY: the operands are live arena buffers of the plan's lengths, owned by `s`
+            unsafe { gemm.run(&s, d_dig.dptr() as *const i8, d_planes[u].dptr() as *const i8, gp.add(u * cols * count), false, &mut d_ws)? };
+        }
+        go(&TfheArgs { op: tfhe_op::KS_RECOMBINE, count: count as i32, i1: n_in as i32, i2: nl as i32, x: d_out.vptr_mut(), y: d_g.vptr(), z: d_in.vptr(), q: p0, c: [0, 0, PLANES as u64, 0, 0, 0, 0, 0], ..Default::default() })?;
+        Ok(())
+    };
+    run()?;
+    s.sync()?;
+    let td = Instant::now();
+    run()?;
+    s.sync()?;
+    let dev_s = td.elapsed().as_secs_f64();
+    let got = d_out.download(&s)?;
+    let mut bad = 0;
+    for (i, w) in want.iter().enumerate() {
+        let row = &got[i * cols..(i + 1) * cols];
+        bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[nl] as u64) as usize;
+    }
+    let mut t = Tally::default();
+    t.add(&format!("tfhe-ks: device key switch == pc-tfhe LweKsk::apply, {count} LWEs, every word"), bad, count * cols);
+    println!("[pc-check] tfhe-ks: device {:.2} ms for {count} = {:.0} LWE/s ({}); host {:.1} s", dev_s * 1e3, count as f64 / dev_s, gemm.label(), host_s);
+    println!("[pc-check] tfhe-ks: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}

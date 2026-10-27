@@ -163,9 +163,37 @@ __global__ void extract_k(TfheArgs A) {
     }
 }
 
+__global__ void ks_digits_k(TfheArgs A) {
+    const int len = A.i1, lv = (int)A.c[1];
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)A.count * len) return;
+    const size_t b = idx / len, i = idx % len;
+    const uint64_t x = ((const uint32_t*)A.y)[b * (len + 1) + i];
+    int8_t* out = (int8_t*)A.x + (b * len + i) * lv;
+    for (int t = 0; t < lv; t++) out[t] = (int8_t)digit(x, t, (int)A.c[0], lv, A.m);
+}
+
+__global__ void ks_recombine_k(TfheArgs A) {
+    const int cols = A.i2 + 1, planes = (int)A.c[2];
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)A.count * cols) return;
+    const size_t b = idx / cols, o = idx % cols;
+    const int32_t* g = (const int32_t*)A.y;
+    const size_t plane = (size_t)cols * A.count;
+    int64_t v = 0;
+    for (int p = planes - 1; p >= 0; p--) v = v * 256 + g[p * plane + o * A.count + b];
+    const int64_t q = (int64_t)A.q;
+    v %= q;
+    if (v < 0) v += q;
+    uint64_t r = (uint64_t)v;
+    if ((int)o == A.i2) r = addq(r, ((const uint32_t*)A.z)[b * (A.i1 + 1) + A.i1], A.q);
+    ((uint32_t*)A.x)[b * cols + o] = (uint32_t)r;
+}
+
 int launch(const TfheArgs* a, cudaStream_t s) {
     const TfheArgs A = *a;
-    if (A.n < 64 || A.n > 2048 || (A.n & (A.n - 1)) || A.count < 1) return -1;
+    if (A.count < 1) return -1;
+    if (A.op <= PC_TFHE_PBS_EXTRACT && (A.n < 64 || A.n > 2048 || (A.n & (A.n - 1)))) return -1;
     switch (A.op) {
         case PC_TFHE_PBS_MS: {
             const size_t tot = (size_t)A.count * (A.i1 + 1);
@@ -190,6 +218,16 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if (A.count > 65535) return -1;
             extract_k<<<dim3((A.n + 256) / 256, A.count), 256, 0, s>>>(A);
             break;
+        case PC_TFHE_KS_DIGITS: {
+            const size_t tot = (size_t)A.count * A.i1;
+            ks_digits_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
+        case PC_TFHE_KS_RECOMBINE: {
+            const size_t tot = (size_t)A.count * (A.i2 + 1);
+            ks_recombine_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
         default:
             return -2;
     }
