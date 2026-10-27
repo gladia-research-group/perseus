@@ -13,7 +13,7 @@ from . import sinc as sc
 from . import sinc_mha as smh
 from . import sinc_softmax as ss
 from . import smcheb
-from .attention import _recip_rounds
+from .attention import _recip_rounds, uncentred_only
 from .ccmm_mha import KMAX, QMAX, SHIFT_PV, SHIFT_QK, UNPACK_FOLD, VMAX, _halves
 from .poly import eval_chebyshev, im_cleanse
 from .prefill import Chunks, _KcExtrapolated, split
@@ -30,6 +30,7 @@ def _acc(rt, acc, xs):
 def softmax_pages(rt, Spks, cfg, valids, kc, tag, layer=0, prescaled=False):
     """ccmm_mha.softmax over key blocks Spks[j] (16 packed score ciphertexts each, validity valids[j][o]): the
     denominator sums every block; returns the unpacked P per block (PF_SM_UNPACK_FOLD form) or the packed Y."""
+    uncentred_only(cfg, "softmax_pages")
     ops = rt.ops
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)

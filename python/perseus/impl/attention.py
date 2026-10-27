@@ -131,6 +131,13 @@ def _ref_check(d, cfg: SoftmaxCfg, kc: int):
         raise ValueError(f"reference-key centring covers 1..{min(cfg.ref_window, d.t)} keys, not {kc}")
 
 
+def uncentred_only(cfg, where: str):
+    """The softmax paths that do not centre (all but the complex-packed decode's complex_qkt) refuse a centred config:
+    its exp domain and bands are in centred units."""
+    if getattr(cfg, "ref_keys", ()):
+        raise ValueError(f"{where}: reference-key centring needs the complex-packed decode (complex_qkt)")
+
+
 def _ref_heads(d, cfg: SoftmaxCfg, kind: int):
     return [h for h in range(d.H_real) if cfg.ref_keys[h] == kind]
 
@@ -892,6 +899,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     ops = rt.ops
     tap = getattr(rt, "tap", None) or (lambda name, ct: None)     # debug hook (the model's taps)
     cplx = isinstance(kv, ComplexKVCache)
+    if not cplx:
+        uncentred_only(sm_cfg, "mha on the real packing")
     qkvl = cplx and getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
     with rt.step("qkv"):
         # QKV_LANES: the hint fires only past the session limit; at or under it the linear runs on the LayerNorm
@@ -949,6 +958,7 @@ def gqa_dims(d: Dims, G: int) -> Dims:
 def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
             pre_linear=None, pre_out=None):
     """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims)."""
+    uncentred_only(sm_cfg, "mha_gqa")
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)

@@ -418,8 +418,9 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
     `prefixes`: per K / V block, the public (key, value) slot vectors before the prompt, put on the first padding lane;
     `kv`: per K / V block, a dict receiving the per-chunk real K (post-RoPE) / V, as prefill_attention's."""
     from . import smcheb
-    from .attention import _recip_rounds
+    from .attention import _recip_rounds, uncentred_only
     from .prefill import _KcExtrapolated, recip_lanes, rope_lanes, split
+    uncentred_only(cfg, "attention_last")
     ops, N, t = rt.ops, B.d.N, B.t
     half, lane = _query_lane(ch, B, p)
     G = len(Q)

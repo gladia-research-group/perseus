@@ -11,7 +11,7 @@ import math
 import numpy as np
 
 from . import smcheb
-from .attention import _recip_rounds, first_iters
+from .attention import _recip_rounds, first_iters, uncentred_only
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
 from .linear import _baby_sum, linear_multi, prepare_linear_input
@@ -648,6 +648,7 @@ def _sm_joint(rt, za, zb, cfg):
 def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None, periodic=None):
     """softmax_thor over chunk c's packed scores S with per-lane (kc-dependent) reciprocal seeds.
     `Z`: precomputed masked exps (the joint path)."""
+    uncentred_only(cfg, "prefill_softmax")
     ops, d = rt.ops, rt.dims
     c0 = _hp_pair(c)
     pos = ch.lanes(c if c0 is None else c0)

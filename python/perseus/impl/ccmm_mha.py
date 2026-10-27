@@ -15,7 +15,7 @@ from . import sinc as sc
 from . import sinc_mha as smh
 from . import sinc_softmax as ss
 from . import smcheb
-from .attention import _recip_rounds
+from .attention import _recip_rounds, uncentred_only
 from .poly import eval_chebyshev, im_cleanse
 from .prefill import Chunks, _KcExtrapolated, split
 
@@ -44,6 +44,7 @@ def _halves(ops, X):
 def softmax(rt, Spk, cfg, valid, kc, tag, layer=0, unpacked=False, prescaled=False):
     """sinc_softmax.softmax with the validity per (ciphertext, slot) `valid[o]` and the key count per slot `kc`
     given; `tag` names the masks of this geometry."""
+    uncentred_only(cfg, "ccmm_mha.softmax")
     ops = rt.ops
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
