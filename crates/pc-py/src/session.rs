@@ -430,9 +430,10 @@ fn lt_steps(geoms: &[pc_gpu::bts::cts::LtGeom], n: usize) -> BTreeSet<i64> {
     steps
 }
 
-/// Constant-ring slots of a planned session: 8192, or with CUDA graphs room for every constant the captured
-/// programs push at once (a scalar op or a scalar prelude one row table, a refresh or an external finish a few;
-/// counted twice over).
+/// Constant-ring size of a planned session, in pushes of the largest kind (`ConstRing::slot_words`): 8192, or with
+/// CUDA graphs room for every constant the captured programs push at once (a scalar op or a scalar prelude one row
+/// table, a refresh or an external finish a few), each counted constant as a two-table push (a quarter of the
+/// largest), counted twice over.
 fn const_slots(ps: &PlanSpec) -> usize {
     if !ps.use_graphs {
         return 8192;
@@ -449,10 +450,8 @@ fn const_slots(ps: &PlanSpec) -> usize {
             n += m.pre.iter().filter(|x| matches!(x, pc_shadow::Prelude::ScalarAdjust(..))).count();
         }
     }
-    // PC_GRAPH_CONST_X: the safety factor over the counted constants (default 2); a capture that runs the ring dry
-    // falls back to eager for its block
-    let x: f64 = std::env::var("PC_GRAPH_CONST_X").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-    ((x * n as f64) as usize).max(8192)
+    // twice over, 4 units each (a two-table push), in units of the largest push
+    (2 * n * 4).div_ceil(2 * pc_gpu::ops::WSUM_MAX).max(8192)
 }
 
 /// The mode-2 last-stage keys (`stc_first` `CacheKey`: raise variant, the stage's CF, the input scale) the programs'

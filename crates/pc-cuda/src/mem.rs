@@ -235,6 +235,25 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         )
     }
 
+    /// Asynchronous H2D of the pinned words `src[src_off..src_off + n]` into `[off, off + n)`.
+    ///
+    /// # Safety
+    /// As `upload_pinned_async`, for that range of `src`.
+    pub unsafe fn upload_pinned_range_async(&mut self, s: &Stream<S>, off: usize, src: &PinnedBuf<T>, src_off: usize, n: usize) -> Result<()> {
+        bounds("upload_pinned_range_async", off + n, self.len)?;
+        bounds("upload_pinned_range_async (source)", src_off + n, src.len())?;
+        check(
+            ffi::cudaMemcpyAsync(
+                self.ptr.add(off) as *mut c_void,
+                src.as_ptr().add(src_off) as *const c_void,
+                n * std::mem::size_of::<T>(),
+                MEMCPY_H2D,
+                s.raw(),
+            ),
+            "cudaMemcpyAsync H2D (pinned range)",
+        )
+    }
+
     /// Asynchronous D2H of `[off, off + dst.len())` into pinned memory.
     ///
     /// # Safety

@@ -1052,9 +1052,10 @@ impl Replayer {
         let capture_ms = tc.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("PC_GRAPH_LOG").is_some() {
             let free = pc_cuda::device::mem_info_current().map(|m| m.0 as f64 / 1e9).unwrap_or(-1.0);
-            eprintln!("[replay] {}: captured {} graphs, {:.0} ms, const slots {} + {} side (leased {} / {}), device free {free:.2} GB",
-                b.label, items.iter().filter(|i| matches!(i, Item::Graph(_))).count(), capture_ms, lease.len(), side_lease.len(),
-                rt.ops.ring.leased(), rt.side.as_deref().map_or(0, |s| s.ops.ring.leased()));
+            let (cu, ct) = rt.ops.ring.leased_units();
+            let (su, stt) = rt.side.as_deref().map_or((0, 0), |s| s.ops.ring.leased_units());
+            eprintln!("[replay] {}: captured {} graphs, {:.0} ms, constants {} + {} side (leased units {cu} / {ct}, side {su} / {stt}), device free {free:.2} GB",
+                b.label, items.iter().filter(|i| matches!(i, Item::Graph(_))).count(), capture_ms, lease.len(), side_lease.len());
         }
         self.stats.captures += 1;
         self.stats.capture_ms += capture_ms;
