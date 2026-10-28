@@ -96,6 +96,13 @@ def levers(f: dict) -> dict[str, str]:
         "SparseB landings": rc("PLAN_SPARSE_BTS_OUT") or "-",
         "SparseB EvalMod K": rt("FIDESLIB_BTS_SPARSE_B_K") or "default",
         "CtS alternative budget": rt("FIDESLIB_CTS_ALT_BUDGET") or "off",
+        "Dense refresh cap past the StC-first entry": rc("PLAN_REFRESH_ENV_CAP_ROUTES") or "off",
+        "Re-route past the StC-first entry": on(rc("PLAN_STC_FIRST_REROUTE") == "1"),
+        "Strict envelope": on(rc("PLAN_ENVELOPE_STRICT") == "1"),
+        "StC-first error model (slim cubic)": (on(True, "per site: staged finishes"
+                                                  if rc("PLAN_STC_FIRST_STAGED_ONLY") == "1" else "")
+                                               if rc("PLAN_SLIM_CUBIC") == "1" else "off"),
+        "PCMM finish raise drops": (rt("PF_PCMM_RAISE") or "off") if pre else "-",
         "Pack CF": on(rc("PLAN_PACK_CF") == "1"),
         "Fallback CF": on(rc("PLAN_FALLBACK_CF") == "1"),
         "Attention": att,
