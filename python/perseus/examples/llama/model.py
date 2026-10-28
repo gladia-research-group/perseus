@@ -107,6 +107,7 @@ class LlamaModel(ImplModel):
             from perseus.impl.blocked import SubRt
             self.sub = SubRt(self.rt, gqa_dims(self.rt.dims, self.G), f"gqa{self.G}")
         self._prefix = None
+        self.plain_prompt = None    # (k, v) (layers, n, H_kv d_head): the plain prefix of n positions
         self.taps = None                # {(pos, block): decrypted block output} when a dict
         self._bw = {}
         self._lm = None
@@ -165,6 +166,15 @@ class LlamaModel(ImplModel):
             out = []
             Hc = self.H_kv if self.G > 1 else self.H
             dc = self.sub.dims if self.G > 1 else d
+            if self.plain_prompt is not None:
+                # the plain prefix: positions 0 .. n-1 pushed from the exact model's K / V (prefix.plain_cache_n)
+                Ks, Vs = self.plain_prompt
+                for b in range(self.n_layers):
+                    kfs = [P.expanded_heads(k, Hc, self.H_kv, dh) for k in Ks[b]]
+                    vfs = [P.expanded_heads(v, Hc, self.H_kv, dh) for v in Vs[b]]
+                    out.append(P.plain_cache_n(dc, kfs, vfs, self.packing, self.rope))
+                self._prefix = out
+                return out
             for k, v in self.w.bos_kv(self.n_layers):
                 kf = P.expanded_heads(k, Hc, self.H_kv, dh)
                 vf = P.expanded_heads(v, Hc, self.H_kv, dh)

@@ -99,8 +99,18 @@ def _planned(a, toks, gt, lw, cfgs, dims, store):
     _, tinf = fakecap.make_session(dims, set(env.rot_steps(dims)))
     twin = LlamaModel(tinf, lw, cfgs, core=fakecap.core, n_layers=a.layers, packing=a.packing, kv_offload=False)
     twin.stream_twin()
+    first = 1
+    if a.plain_prefix:
+        # the plain prefix: positions 0 .. N-1 from the exact model (K / V encrypted as public values), the encrypted
+        # decode from N; only the program classes of positions >= N are recorded
+        first = a.plain_prefix
+        twin.plain_prompt = a.plain_kv
+        print(f"[llama] plain prefix: positions 0..{first - 1} computed in plaintext (exact fp32 model, pre-RoPE "
+              f"K / V pushed into the caches and encrypted as public values); encrypted decode from position {first}",
+              flush=True)
     run = streamed_run(a, twin, lw, plan, log=lambda m: print(m, flush=True))
-    rows = [int(x) for x in toks[1:]]
+    run.rec.first = first
+    rows = [int(x) for x in toks[first:]]
     t0 = time.time()
     run.setup(rows)
     print(f"[llama] planned setup {time.time() - t0:.0f}s", flush=True)
@@ -109,7 +119,7 @@ def _planned(a, toks, gt, lw, cfgs, dims, store):
     res = []
     b0 = run.sess.stream_stats()["bytes"]
     for t in range(len(rows)):
-        pos = t + 1
+        pos = t + first
         tt = time.time()
         regs, info = run.token(t, rows)
         lg = logits_of(run.fhe, [run.ct(r) for r in regs], dims, vocab) if run.tail else np.zeros(vocab)
@@ -138,6 +148,9 @@ def main(argv=None):
     from perseus.examples.gpt2.run_decode import gpu_busy
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=8, help="encrypted positions after the BOS prefix")
+    ap.add_argument("--plain-prefix", type=int, default=0, metavar="N",
+                    help="planned: positions 0..N-1 computed in plaintext (exact fp32 model), their K / V pushed into "
+                         "the caches and encrypted as public values; the encrypted decode runs positions N..--tokens")
     ap.add_argument("--window", default="0", help="openwebtext window index (or a .npy of token ids)")
     ap.add_argument("--window-tokens", type=int, default=128, help="the length of the indexed --window")
     ap.add_argument("--layers", type=int, default=None)
@@ -207,6 +220,12 @@ def main(argv=None):
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
     os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else env.gpt2_env.physical_device(a.device)
     gt = None if a.fake else hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
+    a.plain_kv = None
+    if a.plain_prefix:
+        if a.fake or not a.plan:
+            print("--plain-prefix: planned device runs only", file=sys.stderr)
+            return 2
+        a.plain_kv = hf.prompt_kv(toks, a.plain_prefix, cache[:-4] + f"_pkv{a.plain_prefix}.npz")
 
     over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": a.packing,
             **dict(kv.split("=", 1) for kv in a.set)}

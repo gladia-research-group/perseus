@@ -82,17 +82,63 @@ def _planned_classed(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     def routes_for(pos):
         r = rmodel.routes_for(pos)
         return set() if r is None else set(r[1])
+    first, prefix = 0, None
+    if a.plain_prefix:
+        # the plain prefix: positions 0 .. N-1 run on the numpy twin of the algorithm (float64, CPU), their K / V
+        # pushes replayed into the recording twin's caches from payloads encrypted as public values; the device's
+        # caches start from those states (each encrypted at the twin's entry metadata); only positions >= N are
+        # recorded and decoded encrypted
+        import numpy as np
+        first = a.plain_prefix
+        from .capture_mags import fake_model
+        t0 = time.time()
+        import hashlib
+        key = hashlib.sha256(repr((a.configs, open(resolve(a.configs), "rb").read(), open(os.path.join(resolve(a.plan), "PLAN_CMD.txt")).read(), a.packing, first,
+                                   np.asarray(a.all_inputs[:first]).tobytes())).encode()).hexdigest()[:16]
+        cpath = os.path.join(os.environ.get("PC_PREFIX_CACHE", os.path.expanduser("~/.cache/perseus_plain_prefix")),
+                             f"gpt2_{key}.npz")
+        if os.path.exists(cpath):
+            z = np.load(cpath)
+            logs = [[z[f"b{b}_{p}"] for p in range(first)] for b in range(n)]
+            src = f"cached {cpath}"
+        else:
+            fmodel, _ffhe, _finf = fake_model(a.weights, a.configs, a.packing)
+            for kv in fmodel.kv:
+                kv.payload_log = []
+            fmodel.run_decode(a.all_inputs[:first])
+            logs = [kv.payload_log for kv in fmodel.kv]
+            del fmodel
+            os.makedirs(os.path.dirname(cpath), exist_ok=True)
+            np.savez(cpath + ".tmp.npz", **{f"b{b}_{p}": logs[b][p] for b in range(n) for p in range(first)})
+            os.replace(cpath + ".tmp.npz", cpath)
+            src = f"computed, cached at {cpath}"
+        if os.environ.get("PC_PREFIX_ONLY", "0") not in ("", "0"):
+            print(f"[impl] plain prefix {src}; PC_PREFIX_ONLY: exit", flush=True)
+            sys.exit(0)
+        rmodel.start()
+        rmodel.replay_kv_pushes(logs, a.prefix_level)
+        snap = []
+        for b in range(n):
+            cts, ks = rmodel.kv[b].cts("")
+            snap.append({k: np.array(getattr(c, "vec", c)) for k, c in zip(ks, cts)})
+        prefix = lambda b: snap[b]
+        print(f"[impl] plain prefix: positions 0..{first - 1} computed in plaintext on the CPU (numpy twin, float64; "
+              f"{src}), K / V pushes encrypted as public values at level {a.prefix_level}; encrypted decode from "
+              f"position {first} ({time.time() - t0:.0f}s)", flush=True)
     run = StreamedPlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, streams={},
                              stream_rows=None, routes_for=routes_for, base_routes=base, stc_cache=a.stc_cache,
-                             argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True), schedule=a.schedule)
+                             argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True), schedule=a.schedule,
+                             prefix=prefix)
     run.debug = a.debug_blocks
+    if first:
+        run.rec.first, run.rec.restart = first, False
     run.prepare(inputs)
     # a token evicts the values it no longer reads before staging its new ones: one token's values + a margin
     run.pt_slots = run.n_pts + 64
     run.setup(inputs)
     dmodel = Gpt2Model(run.fhe, store, cfgs, core=_pc, n_layers=n, packing=a.packing, kv_offload=False)
     t0 = time.time()
-    res = dmodel.run_decode_planned(run, inputs, gt_logits, on_token=on_token, argmax=a.argmax)
+    res = dmodel.run_decode_planned(run, inputs, gt_logits, on_token=on_token, argmax=a.argmax, first=first)
     print(f"[planned] decode {time.time() - t0:.1f} s; {run.sess.planned_stats()}", flush=True)
     run.progs = {lab: run.classes[run.class_of[len(inputs) - 1]]["progs"][b] for b, lab in enumerate(labels)
                  if b in run.classes[run.class_of[len(inputs) - 1]]["progs"]}
@@ -132,6 +178,9 @@ def main(argv=None, results=None):
                          "(their K/V pushes replayed from payloads encrypted as public values at --prefix-level): a capture of position N without "
                          "decoding the positions before it")
     ap.add_argument("--prefix-level", type=int, default=36, help="the level of the replayed push payloads")
+    ap.add_argument("--plain-prefix", type=int, default=0, metavar="N",
+                    help="planned: positions 0..N-1 computed in plaintext on the CPU (the numpy twin), their K / V "
+                         "pushes replayed into the caches as public values; the encrypted decode runs N..--tokens-1")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts (fast); fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
@@ -244,6 +293,12 @@ def main(argv=None, results=None):
     os.environ["MULTI_T"] = str(a.tokens)
     cfg = oracle_io.RunConfig.from_env()
     inputs = oracle_io.read_teacher_forced_inputs(cfg)[:a.tokens]
+    a.all_inputs = inputs
+    if a.plain_prefix:
+        if a.fake or not a.plan:
+            print("--plain-prefix: planned device runs only", file=sys.stderr)
+            return 2
+        inputs = inputs[a.plain_prefix:]
     gt = oracle_io.read_lm_head_steps(cfg)
     gt_logits = gt.logits if gt.T else None
     print(f"[impl] decode {len(inputs)} tokens, layers={model.n_layers}, "
