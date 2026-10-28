@@ -48,9 +48,11 @@ PLAN_FIELDS = ("placements", "rescale_after", "sparse_slots", "correction_factor
 GATE: dict[str, tuple | None] = {
     "gpt2_decode": None,
     "gpt2_decode_ctx1024": None,
-    # the encoders: the gpt2 make_plan.sh blocks stage
+    # the encoders and the GPT-2 prefill (the tail and CutMax are its recording's blocks 12 and 13): the gpt2
+    # make_plan.sh blocks stage
     "bert_sst2_128": (None, "", GPT2_TOOL, ("blocks",)),
     "vit_b16_224": (None, "", GPT2_TOOL, ("blocks",)),
+    "gpt2_prefill128": (None, "", GPT2_TOOL, ("blocks",)),
     "llama31_8b_decode": None,
     # one planner run on the fake recording: the llama make_plan.sh prefill stage (its recipe= line)
     "llama31_8b_prefill128": (None, "", None, ("prefill",)),
@@ -58,9 +60,7 @@ GATE: dict[str, tuple | None] = {
     "llama31_8b_handoff_decode": None,
 }
 # plans this planner does not regenerate, and why
-RETIRED = {
-    "gpt2_prefill128": "speedrun/make_prefill_plan.sh (a3dff85) on the min-cut placer, through an intermediate plan",
-}
+RETIRED: dict[str, str] = {}
 # the result plans: `python python/tests/test_paper_plans.py table` replans these
 TABLE = ("llama31_8b_prefill128", "llama31_8b_decode", "gpt2_prefill128", "gpt2_decode_ctx1024", "gpt2_decode",
          "bert_sst2_128", "vit_b16_224")

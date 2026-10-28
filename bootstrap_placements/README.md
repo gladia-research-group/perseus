@@ -18,7 +18,7 @@ Each runs with `--plan` alone, and each is its model's default plan
 |---|---|
 | `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys; block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back) |
 | `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context (below) |
-| `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `speedrun/make_prefill_plan.sh` on the min-cut placer (its `tool=` line) |
+| `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `python/perseus/examples/gpt2/make_plan.sh` (`blocks` stage) on the min-cut placer |
 | `bert_sst2_128` | BERT-base, SST-2 classification of a 128-token input (blocked attention, the last block on [CLS] alone) |
 | `vit_b16_224` | ViT-B/16, one 224 x 224 image |
 | `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context (below) |

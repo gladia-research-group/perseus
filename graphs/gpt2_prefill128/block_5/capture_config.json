@@ -9,17 +9,26 @@
     "auto_bts_level": 46,
     "bts_iterations": 1,
     "bts_max_input_level": 50,
+    "cts_alt_budget": 5,
+    "em_fuse_rescale": true,
     "gpu_encode": true,
+    "pair": true,
     "raise_drop": "512:1",
     "raise_drops": [
       "1",
+      "2",
       "3",
-      "5"
+      "4",
+      "5",
+      "6",
+      "7",
+      "8"
     ],
     "real": true,
     "shift": true,
     "sparse_auto": 2,
     "sparse_b": true,
+    "sparse_b_k": 16,
     "sparse_bts_slots": [
       "512",
       "1"
@@ -43,8 +52,11 @@
     "rot_key_band": 32
   },
   "host": {
+    "hf_home": "/data02/users/azirilli/scratch/.cache",
     "malloc_arena_max": 2,
-    "omp_num_threads": 8
+    "omp_num_threads": 6,
+    "python": "/data02/users/azirilli/perseus-wt/main-port/.venv/bin/python",
+    "pythonpath": "/data02/users/azirilli/perseus-wt/main-replan/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -83,19 +95,25 @@
       "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "graphs/_rows_3Ky5/pcmm_calib.json",
+      "pcmm_calib_in": "/data02/users/azirilli/perseus-wt/main-replan/bootstrap_placements/_rp_gpt2_pf_d8a/pcmm_calib.json",
+      "pcmm_raise": [
+        "out:2",
+        "down:2"
+      ],
       "pcmm_staged_only": "0",
       "qkv_pack": true,
       "sm_hpack": true
     }
   },
   "exec": {
+    "all_blocks_io_dir": "/data02/users/azirilli/perseus-wt/main-replan/.cache/oracle/gpt2/all_blocks_io",
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "graphs/_rows_3Ky5/r4096",
+    "fhe_graph_dir": "/data02/users/azirilli/perseus-wt/main-replan/graphs/_gp_od2t",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
-    "steps_t": 128
+    "steps_t": 128,
+    "weights_path": "/data02/users/azirilli/perseus-wt/main-replan/.cache/models/openai-community/gpt2/classic/weights.bin.zip"
   }
 }

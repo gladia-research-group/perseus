@@ -771,10 +771,10 @@
     "sc_blk30_ln2_98": 256
   },
   "correction_factor": {
-    "sc_blk30_attn_softmax_3": 2,
-    "sc_blk30_attn_softmax_51": 10,
-    "sc_blk30_attn_softmax_7": 2,
-    "sc_blk30_attn_softmax_70": 8,
+    "sc_blk30_attn_softmax_3": 3,
+    "sc_blk30_attn_softmax_51": 11,
+    "sc_blk30_attn_softmax_7": 3,
+    "sc_blk30_attn_softmax_70": 9,
     "sc_blk30_ln1_98": 10,
     "sc_blk30_ln2_98": 10
   },
@@ -785,6 +785,12 @@
   },
   "real_route": [
     "sc_blk30_attn_softmax_3"
+  ],
+  "shipped_order": [
+    "sc_blk30_attn_softmax_3",
+    "sc_blk30_attn_softmax_51",
+    "sc_blk30_attn_softmax_7",
+    "sc_blk30_attn_softmax_70"
   ],
   "summary": {
     "num_placements": 6,
@@ -22643,16 +22649,17 @@
       "table_measured": true,
       "num_sites": 6,
       "predicted_rel_err": {
-        "median": 0.0009969525945709799,
-        "p90": 0.0022565217273924905,
-        "p99": 0.0022565217273924905,
-        "max": 0.0022565217273924905
+        "median": 0.0013722927935305403,
+        "p90": 0.002218203727182455,
+        "p99": 0.002218203727182455,
+        "max": 0.002218203727182455
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
-        "2": 2,
-        "8": 1,
-        "10": 3
+        "3": 2,
+        "9": 1,
+        "10": 2,
+        "11": 1
       },
       "out_level_histogram": {
         "26": 1,
@@ -22669,28 +22676,28 @@
       "worst_sites": [
         {
           "var": "sc_blk30_attn_softmax_3",
-          "rel_err": 0.0022565217273924905,
+          "rel_err": 0.002218203727182455,
           "max_abs": 0.02738597048527652,
           "pack_period": 32768,
           "step": "blk30.attn.softmax"
         },
         {
           "var": "sc_blk30_attn_softmax_70",
-          "rel_err": 0.0015282191867721849,
-          "max_abs": 3.5427414974436857,
+          "rel_err": 0.0016615971749731194,
+          "max_abs": 3.563454299909899,
           "pack_period": 32768,
           "step": "blk30.attn.softmax"
         },
         {
           "var": "sc_blk30_attn_softmax_51",
-          "rel_err": 0.0009969525945709799,
-          "max_abs": 14.551593702760204,
+          "rel_err": 0.0013722927935305403,
+          "max_abs": 14.734549404417606,
           "pack_period": 32768,
           "step": "blk30.attn.softmax"
         },
         {
           "var": "sc_blk30_attn_softmax_7",
-          "rel_err": 0.0004936847429766428,
+          "rel_err": 0.0004853014813153736,
           "max_abs": 0.12517510071944762,
           "pack_period": 32768,
           "step": "blk30.attn.softmax"
@@ -22704,7 +22711,7 @@
         },
         {
           "var": "sc_blk30_ln2_98",
-          "rel_err": 1.0420985548450402e-05,
+          "rel_err": 1.0421418192300908e-05,
           "max_abs": 0.9012036158294608,
           "pack_period": 128,
           "step": "blk30.ln_2"

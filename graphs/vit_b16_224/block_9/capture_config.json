@@ -9,16 +9,25 @@
     "auto_bts_level": 46,
     "bts_iterations": 1,
     "bts_max_input_level": 50,
+    "em_fuse_rescale": true,
     "gpu_encode": true,
+    "pair": true,
+    "raise_drop": "512:1",
     "raise_drops": [
       "1",
+      "2",
       "3",
-      "5"
+      "4",
+      "5",
+      "6",
+      "7",
+      "8"
     ],
     "real": true,
     "shift": true,
     "sparse_auto": 2,
     "sparse_b": true,
+    "sparse_b_k": 16,
     "sparse_bts_slots": [
       "512",
       "1"
@@ -42,11 +51,11 @@
     "rot_key_band": 32
   },
   "host": {
-    "hf_home": "/data02/users/mithrillo/cache/huggingface",
+    "hf_home": "/data02/users/azirilli/cache/huggingface",
     "malloc_arena_max": 2,
-    "omp_num_threads": 8,
-    "perseus_slotvec_cache": false,
-    "pythonpath": "python"
+    "omp_num_threads": 4,
+    "python": "/data02/users/azirilli/perseus-wt/main-port/.venv/bin/python",
+    "pythonpath": "/data02/users/azirilli/perseus-wt/main-replan/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -78,15 +87,23 @@
     "sm_periodic": 1,
     "prefill": {
       "act_fold": true,
-      "attn": "ccmm",
-      "ccmm_fake_land": 30,
+      "attn": "",
+      "attn_bsgs": true,
+      "attn_pack": 3,
       "ccmm_merge": true,
       "gelu_joint": true,
       "joint_force": true,
+      "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/M7f/bootstrap_placements/vit_b16_224/pcmm_calib.json",
+      "pcmm_calib_in": "/data02/users/azirilli/perseus-wt/main-replan/bootstrap_placements/_rp_vit_d8/pcmm_calib.json",
+      "pcmm_raise": [
+        "out:2",
+        "down:2"
+      ],
       "pcmm_staged_only": "0",
+      "qkv_pack": true,
+      "sm_hpack": true,
       "sinc_a2": true,
       "sm_pair": true,
       "sm_pair_rounds": [
@@ -102,7 +119,7 @@
   "exec": {
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/M16/graphs/vit_b16_224_stcf_m16",
+    "fhe_graph_dir": "graphs/_rp_vit_pr_od2",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,

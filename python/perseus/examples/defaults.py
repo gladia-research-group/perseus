@@ -11,7 +11,7 @@ PLANS: dict[str, dict[int | None, str]] = {
     # to the first token: the blocks, the last position's LM head and the encrypted argmax
     "gpt2_prefill": {128: "bootstrap_placements/gpt2_prefill128"},
     "bert": {128: "bootstrap_placements/bert_sst2_128"},
-    # StC-first dense refreshes where the input fits the entry, the shipped order past it (code-owned refreshes too)
+    # StC-first dense refreshes, their inputs capped at its entry level (46)
     "vit": {None: "bootstrap_placements/vit_b16_224"},
     # up to a 512-token context
     "llama_decode": {None: "bootstrap_placements/llama31_8b_decode"},
