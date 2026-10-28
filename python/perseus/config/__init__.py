@@ -83,8 +83,15 @@ def plan_runtime(plan=None, chain: str = "n32", base: _pc.Config | None = None) 
     if stamp is not None:
         cfg = cfg.overlay(stamp)
         line = _plan_cmd(plan).get("runtime")
-        return cfg.with_env(_runtime_line(line)) if line else cfg
-    return cfg.with_env(runtime_env(plan, chain))
+        return cfg.overlay(_config_switches(_runtime_line(line))) if line else cfg
+    return cfg.overlay(_config_switches(runtime_env(plan, chain)))
+
+
+def _config_switches(env: dict[str, str]) -> _pc.Config:
+    """The switches of a runtime line the Config has fields for; the others (model switches such as SM_HRS_CLEANSE,
+    which the CPU twin reads) reach the run through the example drivers' process environment (examples.*.env)."""
+    c, _pl, _rest = _pc.Config.split_legacy_env(env)
+    return c
 
 
 def _plan_stamp(plan):
