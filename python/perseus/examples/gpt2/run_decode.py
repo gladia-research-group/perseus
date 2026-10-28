@@ -223,10 +223,10 @@ def main(argv=None, results=None):
     ap.add_argument("--work-dir", default=None, help="planned: where the reference token's stream is written")
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output / K/V state vs the CPU twin (synchronous)")
     a = ap.parse_args(argv)
-    from perseus.examples.defaults import default_plan
+    from perseus._paths import resolve
+    from perseus.examples.defaults import default_plan, default_windows
     a.windows = None
     if a.plan_windows:
-        from perseus._paths import resolve
         from perseus.impl.driver import parse_plan_windows
         if a.fake or a.capture:
             print("--plan-windows: planned device runs only", file=sys.stderr)
@@ -235,7 +235,15 @@ def main(argv=None, results=None):
         if a.plan is None:
             a.plan = a.windows[0][1]
     if a.plan is None and not (a.fake or a.capture) and a.chain == "n32":
-        a.plan = default_plan("gpt2_decode", a.tokens)
+        # up to 32 cached keys the main plan; past them a plan per position window up to 512, then the 1,024-context
+        # plan
+        if a.tokens <= 32:
+            a.plan = default_plan("gpt2_decode", a.tokens)
+        elif default_windows("gpt2_decode", a.tokens):
+            a.windows = [(b, resolve(d)) for b, d in default_windows("gpt2_decode", a.tokens)]
+            a.plan = a.windows[0][1]
+        else:
+            a.plan = default_plan("gpt2_decode_ctx1024")
 
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:

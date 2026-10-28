@@ -24,9 +24,10 @@ FINALS = [
      "flags": "--tokens 128 --tail --graphs"},
     {"name": "Llama prefill", "kind": "prefill", "plans": ["bootstrap_placements/llama31_8b_prefill128"],
      "flags": "--tokens 128 --graphs --stc-cache 4"},
-    {"name": "GPT-2 decode", "kind": "decode", "plans": ["bootstrap_placements/gpt2_decode_ctx1024"],
-     "flags": "--argmax"},
-    {"name": "Llama decode", "kind": "decode", "plans": ["bootstrap_placements/llama31_8b_decode"], "flags": ""},
+    {"name": "GPT-2 decode", "kind": "decode",
+     "plans": [f"bootstrap_placements/gpt2_decode_ctx512_w{b}" for b in (128, 256, 384, 512)], "flags": "--argmax"},
+    {"name": "Llama decode", "kind": "decode",
+     "plans": [f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}" for b in (128, 256, 384, 512)], "flags": ""},
 ]
 
 
@@ -83,7 +84,9 @@ def levers(f: dict) -> dict[str, str]:
         stcf = "off"
     att = "CCMM" if rt("PF_ATTN") == "ccmm" else ("rotation + BSGS" if rt("PF_ATTN_BSGS") == "1" else
                                                 ("rotation" if pre else "-"))
-    windows = next((flags[i + 1] for i, x in enumerate(flags[:-1]) if x == "--plan-windows"), None)
+    # a window-plan set: --plan-windows, or the default windows (several plans)
+    windows = next((flags[i + 1] for i, x in enumerate(flags[:-1]) if x == "--plan-windows"),
+                   f"{len(cmds)} windows" if len(cmds) > 1 else None)
     prefix = next((flags[i + 1] for i, x in enumerate(flags[:-1]) if x == "--plain-prefix"), None)
     merged = bool(rc("PLAN_MAG_SAFETY_STEPS")) or any("merged" in c["note"] for c in cmds)
     return {

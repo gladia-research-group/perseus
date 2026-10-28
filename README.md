@@ -125,7 +125,7 @@ float64 model (`NODE`/`MEMS` bind it to the GPU's NUMA node); each runs the mode
 ```bash
 GPU=0 NODE=1 MEMS=1,2 bash scripts/repro/llama_prefill128.sh   # Llama-3-8B, 128-token prefill
 GPU=0 bash scripts/repro/llama_decode.sh                        # Llama-3-8B, decode up to a 512-token context
-GPU=0 bash scripts/repro/gpt2_decode_ctx.sh                     # GPT-2, decode up to a 128-token context
+GPU=0 bash scripts/repro/gpt2_decode_ctx.sh                     # GPT-2, decode up to a 512-token context
 GPU=0 bash scripts/repro/gpt2_prefill128.sh                     # GPT-2, 128-token prefill to the first token
 GPU=0 bash scripts/repro/bert_base.sh                           # BERT-base, 128 tokens (SST-2)
 GPU=0 bash scripts/repro/vit_base.sh                            # ViT-B/16, four EuroSAT images

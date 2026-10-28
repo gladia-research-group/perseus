@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from perseus._paths import ASSETS, PKG
+from perseus.examples.defaults import WINDOWS
 from perseus.plan import contract as _contract
 from perseus.plan import equiv as _equiv
 
@@ -44,16 +45,22 @@ STAMPS = ("capture_env", "config")
 PLAN_FIELDS = ("placements", "rescale_after", "sparse_slots", "correction_factor", "real_route", "raise_drop",
                "hint_fire", "summary.final_named_levels", "summary.final_named_degs")
 
+# the window plans of the 512-token decodes (perseus.examples.defaults.WINDOWS)
+GPT2_WINDOWS = tuple(Path(d).name for _b, d in WINDOWS["gpt2_decode"])
+LLAMA_WINDOWS = tuple(Path(d).name for _b, d in WINDOWS["llama_decode"])
+
 # name -> (graph override, recipe beyond PLAN_CMD.txt's recipe= line, tool override, stages); None = as shipped
 GATE: dict[str, tuple | None] = {
     "gpt2_decode": None,
     "gpt2_decode_ctx1024": None,
+    **dict.fromkeys(GPT2_WINDOWS),
     # the encoders and the GPT-2 prefill (the tail and CutMax are its recording's blocks 12 and 13): the gpt2
     # make_plan.sh blocks stage
     "bert_sst2_128": (None, "", GPT2_TOOL, ("blocks",)),
     "vit_b16_224": (None, "", GPT2_TOOL, ("blocks",)),
     "gpt2_prefill128": (None, "", GPT2_TOOL, ("blocks",)),
     "llama31_8b_decode": None,
+    **dict.fromkeys(LLAMA_WINDOWS),
     # one planner run on the fake recording: the llama make_plan.sh prefill stage (its recipe= line)
     "llama31_8b_prefill128": (None, "", None, ("prefill",)),
     # the decode cut for the prefill's K / V (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS, PLAN_SITE_CF in its recipe= line)
@@ -62,8 +69,8 @@ GATE: dict[str, tuple | None] = {
 # plans this planner does not regenerate, and why
 RETIRED: dict[str, str] = {}
 # the result plans: `python python/tests/test_paper_plans.py table` replans these
-TABLE = ("llama31_8b_prefill128", "llama31_8b_decode", "gpt2_prefill128", "gpt2_decode_ctx1024", "gpt2_decode",
-         "bert_sst2_128", "vit_b16_224")
+TABLE = ("llama31_8b_prefill128", *LLAMA_WINDOWS, "gpt2_prefill128", *GPT2_WINDOWS, "gpt2_decode_ctx1024",
+         "gpt2_decode", "bert_sst2_128", "vit_b16_224")
 # PLAN_KEEP_PLACEMENTS dirs that are not shipped: name -> the recipe changes that make them from the plan's own recipe
 # (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS and PLAN_SITE_CF dropped; PLAN_CMD.txt `sites=`), replanned first
 KEEP_SITES = {"llama31_8b_handoff_decode": "PLAN_REFRESH_ENV_CAP=48"}

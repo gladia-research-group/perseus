@@ -11,17 +11,19 @@ result is identical to the committed files. The Llama recordings ship as a relea
 
 ## Result plans
 
-Each runs with `--plan` alone, and each is its model's default plan
-(`python/perseus/examples/defaults.py`); `scripts/repro/` has one script per result.
+Each runs with `--plan` alone (a window set with `--plan-windows`), and each but `llama31_8b_decode` is its model's
+default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one script per result.
 
 | directory | model and task |
 |---|---|
 | `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys; block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back) |
-| `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context (below) |
+| `gpt2_decode_ctx512_w128` ... `_w512` | GPT-2, decode with the encrypted argmax past 32 cached keys up to a 512-token context, one plan per 128-position window (below) |
+| `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context, the default past 512 (below) |
 | `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `python/perseus/examples/gpt2/make_plan.sh` (`blocks` stage) on the min-cut placer |
 | `bert_sst2_128` | BERT-base, SST-2 classification of a 128-token input (blocked attention, the last block on [CLS] alone) |
 | `vit_b16_224` | ViT-B/16, one 224 x 224 image |
-| `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context (below) |
+| `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context in one plan (below) |
+| `llama31_8b_decode_ctx512_w128` ... `_w512` | Llama-3.1-8B, decode up to a 512-token context, one plan per 128-position window (below) |
 | `llama31_8b_prefill128` | Llama-3.1-8B, 128-token prefill: one planner run (python/perseus/examples/llama/make_plan.sh, `prefill` stage) on the fake recording made under its runtime= line |
 | `llama31_8b_handoff_decode` | Llama-3.1-8B, decode on the K / V handed over by `llama31_8b_prefill128` (`run_handoff`): cut for the hand-off's cache level (`KV_ENTRY_LEVEL=38`), on the refresh sites of the same recipe's plain decode plan (`PLAN_KEEP_PLACEMENTS`, see its `sites=` line), every softmax refresh one scaling step lower (`PLAN_SITE_CF=softmax:-1`) |
 
@@ -131,5 +133,14 @@ per token at 120-127 keys, 3.49 at 480-511, 3.63 at 992-1023; setup 34 min (reco
 position up to 512 keys), captured at position 1 the same way (its recording ships in the release artifact); its
 runtime adds only switches that move no level (the fused EvalMod conversion, SparseB K = 16, refresh pairs): the
 raise-drop search, checked on the position-1 recording, leaves sites without headroom once the softmax routes turn
-multi-stage. 511 positions of a 512-token window (`scripts/repro/llama_decode.sh`, RTX PRO 6000): top-1 488/511,
-median KL 7.4e-4, 14.93 s per token at 500-511 keys; setup 2.5 h (recording 511 positions).
+multi-stage. 511 positions of a 512-token window (`scripts/repro/llama_decode.sh --plan
+bootstrap_placements/llama31_8b_decode`, RTX PRO 6000): top-1 488/511, median KL 7.4e-4, 14.93 s per token at 500-511
+keys; setup 2.5 h (recording 511 positions).
+
+`gpt2_decode_ctx512_w<B>` and `llama31_8b_decode_ctx512_w<B>` are the default decodes up to a 512-token context (GPT-2
+past its main plan's 32 keys): one plan per 128-position window, `_w<B>` serving the positions below B
+(`--plan-windows`), each planned on the magnitudes of its window's positions only. A model's four plans share one
+runtime= line, configs (`gpt2_base_n32_ctx1024_g3`, `llama31_8b_n32_ctx512_silu`) and recipe (the dense refreshes
+capped at the StC-first entry, `PLAN_REFRESH_ENV_CAP_ROUTES=0:46`, and the strict envelope), so one session serves
+them: 160 refreshes per GPT-2 token (12 of them in the encrypted argmax), 349 per Llama token. `PP=500` runs either
+repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.

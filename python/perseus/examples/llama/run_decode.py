@@ -190,16 +190,17 @@ def main(argv=None):
     ap.add_argument("--tap-token", type=int, default=0,
                     help="with --tap-block: the token (position - 1) tapped; the first token of its program class")
     a = ap.parse_args(argv)
-    from perseus.examples.defaults import default_plan
+    from perseus._paths import resolve
+    from perseus.examples.defaults import default_windows
     a.windows = None
     if a.plan_windows:
-        from perseus._paths import resolve
         from perseus.impl.driver import parse_plan_windows
         a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
-        if a.plan is None:
-            a.plan = a.windows[0][1]
-    if a.plan is None and not (a.fake or a.capture):
-        a.plan = default_plan("llama_decode")
+    elif a.plan is None and not (a.fake or a.capture):
+        # up to a 512-token context: a plan per 128-position window
+        a.windows = [(b, resolve(d)) for b, d in default_windows("llama_decode")]
+    if a.windows and a.plan is None:
+        a.plan = a.windows[0][1]
     if not a.configs:
         a.configs = DEFAULT_CONFIGS
         from perseus._paths import resolve
