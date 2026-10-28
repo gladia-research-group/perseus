@@ -78,6 +78,9 @@ class Node:
     # a CF sized on the largest loses precision there); None = one position captured
     max_abs_lo: float | None = None
     max_coeff_lo: float | None = None
+    # the largest slot period over the captured positions (SM_PERIODIC=2: a per-key value's period grows with the cache,
+    # and its refresh moves to the route that period fills); None = one position captured
+    pack_period_max: int | None = None
     # derived, precomputed once
     cipher_inputs: tuple[str, ...] = ()
     hint_level: float | None = None
@@ -170,6 +173,8 @@ class Graph:
                             if isinstance(n.get("output_max_abs_lo"), (int, float)) else None),
                 max_coeff_lo=(float(n["output_max_coeff_lo"])
                               if isinstance(n.get("output_max_coeff_lo"), (int, float)) else None),
+                pack_period_max=(int(n["pack_period_max"])
+                                 if isinstance(n.get("pack_period_max"), (int, float)) else None),
                 stc_first=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
                                and ((n.get("args") or {}).get("route") or {}).get("stc_first")
                                and not ((n.get("args") or {}).get("route") or {}).get("slots")),
@@ -286,6 +291,7 @@ def _node_to_raw(n: Node) -> dict:
         **({"pack_field": n.pack_field} if n.pack_field else {}),
         **({"output_max_abs_lo": n.max_abs_lo} if n.max_abs_lo is not None else {}),
         **({"output_max_coeff_lo": n.max_coeff_lo} if n.max_coeff_lo is not None else {}),
+        **({"pack_period_max": n.pack_period_max} if n.pack_period_max is not None else {}),
         **({"args": {"route": {"slots": 0, "stc_first": True}}} if n.stc_first else {}),
         **({"args": {"external": "finish"}} if n.external else {}),
     }

@@ -539,10 +539,11 @@ def choose_site(
             # relative to the slot signal the site carries: an offset arm bootstraps only the residual
             return table.stcf_rel_err(slot_m * f, cf, real) * slot_m / (slot_mag * kappa)
         rts = [route] + ([int(r2) for r2 in price_routes if int(r2) > route] if route else [])
-        e = max(table.rel_err(mag * f, cf, per, r2) for r2 in rts) * rescale
+        # on a bigger route the value fills it: its period there is the route's
+        e = max(table.rel_err(mag * f, cf, per if r2 == route else r2, r2) for r2 in rts) * rescale
         if lo is not None and f == 1.0:
             lo_mag, lo_rescale = lo
-            e = max(e, max(table.rel_err(lo_mag, cf, per, r2) for r2 in rts) * lo_rescale)
+            e = max(e, max(table.rel_err(lo_mag, cf, per if r2 == route else r2, r2) for r2 in rts) * lo_rescale)
         return max(e, slim_err(slot_m * f, cf, route))
 
     for off, mag, per, rescale, slot_m in offset_arms:

@@ -168,7 +168,10 @@ class RefreshPlanner:
         # priced on the worst of them the accuracy table measured
         if route and p is not None and os.environ.get("PLAN_STEP_ROUTE_PRICING", "0") not in ("", "0") \
                 and _step_landing_floor(self.shadow.plan.get("plan.step_landing") or "", p.step) is not None:
-            site["price_routes"] = tuple(r for r in self.table.routes() if r > route)
+            # with the period range captured over several positions, only a value whose period outgrows the planned
+            # route moves, and only up to the route its largest period fills
+            pmax = p.pack_period_max
+            site["price_routes"] = tuple(r for r in self.table.routes() if r > route and (pmax is None or r <= pmax))
         choice = btserr.choose_site(self.table, pol, **site)
         # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
         # shipped order's precision (plan.stc_first_mag_max, after the drift margin) bootstraps in the shipped order:
