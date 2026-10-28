@@ -35,8 +35,11 @@ def rms_norm_ref(x, cfg, gamma):
 
 
 def silu_ref(x, cfg):
-    """activation.gelu's THOR composite with the SiLU coefficients: x (p2(p1(x/xmax)) + 1/2)."""
+    """activation.gelu's THOR composite with the SiLU coefficients: x (p2(p1(x/xmax)) + 1/2); or its one Chebyshev
+    series (method chebyshev, the gate's 1/xmax folded): xmax q(x/xmax)."""
     t = x / cfg.xmax
+    if cfg.method == "chebyshev":
+        return cfg.xmax * eval_chebyshev(_ops, t, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
     if cfg.thor_p1_cheb:            # the Chebyshev basis the kernel evaluates when present
         p1 = eval_chebyshev(_ops, t, cfg.thor_p1_cheb, cfg.thor_p1_a, cfg.thor_p1_b)
         g = eval_chebyshev(_ops, p1, cfg.thor_p2_cheb, cfg.thor_p2_a, cfg.thor_p2_b)
