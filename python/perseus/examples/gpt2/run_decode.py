@@ -128,7 +128,7 @@ def _planned_classed(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     run = StreamedPlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, streams={},
                              stream_rows=None, routes_for=routes_for, base_routes=base, stc_cache=a.stc_cache,
                              argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True), schedule=a.schedule,
-                             prefix=prefix)
+                             prefix=prefix, plan_windows=a.windows)
     run.debug = a.debug_blocks
     if first:
         run.rec.first, run.rec.restart = first, False
@@ -184,6 +184,10 @@ def main(argv=None, results=None):
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts (fast); fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
+    ap.add_argument("--plan-windows", default=None, metavar="B1:DIR1,B2:DIR2,...",
+                    help="planned, SM_PERIODIC=2 plans: a plan per position window (DIRi serves the positions below "
+                         "Bi), the plans sharing one runtime (only their magnitudes differ); --plan defaults to the "
+                         "first window's")
     ap.add_argument("--no-plan-argmax", action="store_true", help="run CutMax / feedback eager even if planned")
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS_PATH"))
     ap.add_argument("--configs", default=os.environ.get("CONFIGS_PATH"))
@@ -220,6 +224,16 @@ def main(argv=None, results=None):
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output / K/V state vs the CPU twin (synchronous)")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
+    a.windows = None
+    if a.plan_windows:
+        from perseus._paths import resolve
+        from perseus.impl.driver import parse_plan_windows
+        if a.fake or a.capture:
+            print("--plan-windows: planned device runs only", file=sys.stderr)
+            return 2
+        a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
+        if a.plan is None:
+            a.plan = a.windows[0][1]
     if a.plan is None and not (a.fake or a.capture) and a.chain == "n32":
         a.plan = default_plan("gpt2_decode", a.tokens)
 
@@ -357,6 +371,9 @@ def main(argv=None, results=None):
     if not a.fake:
         from perseus import config as pcfg
         classed = pcfg.plan_runtime(a.plan, a.chain, base=pcfg.preset("n32_gpt2_decode"))["model.sm_periodic"] == 2
+        if a.windows and not classed:
+            print("--plan-windows: the classed (SM_PERIODIC=2) planned run only", file=sys.stderr)
+            return 2
         res, inf, model = (_planned_classed if classed else _planned)(a, model, cfgs, store, inputs, gt_logits,
                                                                       on_token)
         sess = _Closer(inf)
