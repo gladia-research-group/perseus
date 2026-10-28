@@ -77,10 +77,11 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     d = twin.rt.dims
     size = {"hidDim": d.hid, "dim": d.dim, "numHeads": d.H, "numHeadsReal": d.H_real, "expDim": d.E,
             "expanded": d.E_real, "seqLen": 1024}
+    windows = getattr(a, "windows", None)
     run = StreamedPlannedRun(rec, plan, cfg, labels, keys, work_dir=work, streams=streams, stream_rows=lw.coeff_rows,
                              prefix=prefix, input_vec=lw.embedding, routes_for=routes_for, stc_cache=a.stc_cache,
                              size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log,
-                             schedule=getattr(a, "schedule", "program"))
+                             schedule=getattr(a, "schedule", "program"), plan_windows=windows)
     run.debug = a.debug_blocks or a.tap_block is not None
     run.tail = n == n_total
     if a.tap_block is not None:
@@ -161,6 +162,9 @@ def main(argv=None):
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts; fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
+    ap.add_argument("--plan-windows", default=None, metavar="B1:DIR1,B2:DIR2,...",
+                    help="planned: a plan per position window (DIRi serves the positions below Bi), the plans sharing "
+                         "one runtime (only their magnitudes differ); --plan defaults to the first window's")
     ap.add_argument("--packing", choices=("cachemir", "cachemir_complex"), default="cachemir_complex")
     ap.add_argument("--cpp-bootstrap", action="store_true")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
@@ -187,6 +191,13 @@ def main(argv=None):
                     help="with --tap-block: the token (position - 1) tapped; the first token of its program class")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
+    a.windows = None
+    if a.plan_windows:
+        from perseus._paths import resolve
+        from perseus.impl.driver import parse_plan_windows
+        a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
+        if a.plan is None:
+            a.plan = a.windows[0][1]
     if a.plan is None and not (a.fake or a.capture):
         a.plan = default_plan("llama_decode")
     if not a.configs:
