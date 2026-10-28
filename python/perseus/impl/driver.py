@@ -974,7 +974,7 @@ class StreamedPlannedRun:
     `routes_for(pos)`: the extra sparse routes position `pos` holds (SM_PERIODIC=2), or None; `prefix(b)`: {cache
     key suffix: slot vector} of block b's caches before the first token (the BOS prefix; None: the caches start
     empty, token 0 pushes into them). `argmax`: the stages include CutMax after the tail (`argmax(t)` runs it);
-    `pt_slots`: the plaintext slots (default: twice the distinct values a token reads); `slim`: keep only the
+    `pt_slots`: the plaintext slots (default: the distinct values a token reads, + 64); `slim`: keep only the
     plaintext values of the non-reference tokens' records once their diffs are taken (512-position runs)."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, work_dir, streams, stream_rows, prefix=None,
@@ -1267,8 +1267,10 @@ class StreamedPlannedRun:
                 lv += [p.outputs[j][1] for j, _u in c["kv_out"][b]] + [p.inputs[i][1] for i, _u in c["kv_in"][b]]
         kv_rows = 54 - min(lv) if lv else 1
         pages = 2 * self.U
-        # plaintext slots: the distinct values a token reads (+ the next token's new ones before the evictions)
-        n_slots = self.pt_slots if self.pt_slots is not None else 2 * self.n_pts + 64
+        # plaintext slots: the distinct values a token reads. `_patch` evicts the values a token no longer reads before it
+        # stages the new ones, so the store never holds more than one token reads; a staged upload waits on the compute
+        # lane's hand-off either way, so reusing an evicted slot costs nothing (2 x: ~17 GB at 511 Llama positions)
+        n_slots = self.pt_slots if self.pt_slots is not None else self.n_pts + 64
         pt_level = min(lev for c in self.classes for p in c["progs"].values() for _nm, lev, _d, f in p.pt_refs if f != "stream")
         # weight frames: the Config's host.n_in_flight (default 2), raised until the last block and the next token's
         # first one sit in different frames
