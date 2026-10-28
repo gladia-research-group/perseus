@@ -1267,10 +1267,19 @@ class StreamedPlannedRun:
                 lv += [p.outputs[j][1] for j, _u in c["kv_out"][b]] + [p.inputs[i][1] for i, _u in c["kv_in"][b]]
         kv_rows = 54 - min(lv) if lv else 1
         pages = 2 * self.U
-        # plaintext slots: the distinct values a token reads. `_patch` evicts the values a token no longer reads before it
-        # stages the new ones, so the store never holds more than one token reads; a staged upload waits on the compute
-        # lane's hand-off either way, so reusing an evicted slot costs nothing (2 x: ~17 GB at 511 Llama positions)
-        n_slots = self.pt_slots if self.pt_slots is not None else self.n_pts + 64
+        # plaintext slots: the most (value, level) pairs one token's class programs read (`_patch`'s keys). `_patch`
+        # evicts the values a token no longer reads before it stages the new ones, so the store never holds more than
+        # one token reads; a staged upload waits on the compute lane's hand-off either way, so reusing an evicted slot
+        # costs nothing (2 x the values: ~17 GB at 511 Llama positions)
+        peak, at = 0, 0
+        for t in sorted(self.records):
+            r, progs_t = self.records[t], self.classes[self.class_of[t]]["progs"]
+            k = len({(id(r[b].pts[nm]), lv_) for b in r for nm, lv_, _d, f in progs_t[b].pt_refs if f != "stream"})
+            if k > peak:
+                peak, at = k, t
+        n_slots = self.pt_slots if self.pt_slots is not None else peak + 64
+        self.log(f"[planned] plaintext slots {n_slots + self.extra_pt_slots}: the most one token reads {peak} (position "
+                 f"{at + self.rec.first}; recorded {self.n_pts})")
         pt_level = min(lev for c in self.classes for p in c["progs"].values() for _nm, lev, _d, f in p.pt_refs if f != "stream")
         # weight frames: the Config's host.n_in_flight (default 2), raised until the last block and the next token's
         # first one sit in different frames
