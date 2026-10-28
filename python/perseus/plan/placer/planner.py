@@ -1353,6 +1353,38 @@ def _resumed(out_file: Path, block_dir: Path) -> dict | None:
     return doc if doc.get(contract.CONTRACT_KEY) == want else None
 
 
+def _stage_outputs(gf: Path, level_unit: int) -> list[str]:
+    """The block's stage outputs as the compile takes them (every final state nothing reads): named, not a deliberate
+    refresh or a hint pass-through, read by no other node once the reactive refreshes are erased. One for a decode
+    block; several for a packed prefill stage (BERT's LN2 halves)."""
+    raw = json.loads(Path(gf).read_text(encoding="utf-8"))
+    g, _ = erase_reactive_bootstraps(Graph.from_nodes(raw.get("nodes", []), level_unit=level_unit))
+    read: set[str] = set()
+    for n in g.nodes:
+        read.update(n.cipher_inputs)
+    return [n.output for n in g.nodes
+            if n.output and not n.is_deliberate_bts and n.hint_level is None and n.output not in read]
+
+
+def _next_entry(s: dict, gf: Path, cfg: PlanConfig, strict: bool) -> tuple[int | None, int | None]:
+    """(level, deg) the next block enters at: the plan's exit, or under PLAN_ENVELOPE_STRICT the deepest of the block's
+    stage outputs (the next block reads all of them; the exit var is only the last one)."""
+    lvl = s.get("exit_level")
+    if lvl is None:
+        return None, None
+    deg = s.get("exit_deg") or 1
+    if not strict:
+        return lvl, deg
+    unit = cfg.level_unit
+    levels, degs = s.get("final_named_levels") or {}, s.get("final_named_degs") or {}
+    for v in _stage_outputs(gf, unit):
+        if v in levels:
+            lv, dv = int(levels[v]), int(degs.get(v, 1))
+            if lv + (unit if dv == 2 else 0) > lvl + (unit if deg == 2 else 0):
+                lvl, deg = lv, dv
+    return lvl, deg
+
+
 def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                    cfg: PlanConfig) -> list[dict]:
     graph_dir, out_dir = Path(graph_dir), Path(out_dir)
@@ -1368,6 +1400,9 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
     # as planned and its exit enters the next block, so a preempted run restarts at the block it was planning; the
     # plans are the chain's (each block's depends on its graph, the config and its entry alone)
     resume = os.environ.get("PLAN_RESUME", "0") not in ("", "0")
+    # PLAN_ENVELOPE_STRICT=1: a block enters at the deepest of the previous block's stage outputs, and the terminal-exit
+    # retry refreshes every stage output (a packed stage hands several to the next block, not only its exit var)
+    strict = os.environ.get("PLAN_ENVELOPE_STRICT", "0") not in ("", "0")
     entry_level: int | None = cfg.first_entry_level
     entry_deg: int | None = cfg.first_entry_deg
     blocks = sorted((d for d in graph_dir.glob("block_*") if d.is_dir()),
@@ -1391,8 +1426,7 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
             prev = {"name": bd.name, "gf": gf, "out_file": out_file,
                     "entry_level": entry_level, "entry_deg": entry_deg,
                     "exit_var": s.get("exit_var"), "retried": False}
-            entry_level = s.get("exit_level")
-            entry_deg = (s.get("exit_deg") or 1) if entry_level is not None else None
+            entry_level, entry_deg = _next_entry(s, gf, cfg, strict)
             continue
         # the in-memory diagnostics ride on `summaries` (never on the plan file)
         diag = PlanDiagnostics()
@@ -1406,17 +1440,22 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                   f"retrying {prev['name']} with a terminal-exit refresh on "
                   f"{prev['exit_var']}")
             pdiag = PlanDiagnostics()
+            exits = {prev["exit_var"]}
+            if strict:
+                exits |= set(_stage_outputs(prev["gf"], cfg.level_unit))
+                if cfg.verbose and len(exits) > 1:
+                    log.info(f"[plan] [{prev['name']}] terminal-exit refreshes on its {len(exits)} stage outputs: "
+                             + ", ".join(sorted(exits)))
             pres = plan_block(prev["gf"], cfg, entry_level=prev["entry_level"],
                               entry_deg=prev["entry_deg"], table=table,
-                              force_place={prev["exit_var"]}, diagnostics=pdiag)
+                              force_place=exits, diagnostics=pdiag)
             emit.stamp(pres, contract.capture_stamp(Path(prev["gf"]).parent))
             _write_whole(prev["out_file"], pres)
             ps = pres["summary"]
             summaries[-1] = {"block": prev["name"], "output": str(prev["out_file"]),
                              **ps, "cf_clamp": pdiag.cf_clamp}
             prev["retried"] = True
-            entry_level = ps.get("exit_level")
-            entry_deg = (ps.get("exit_deg") or 1) if entry_level is not None else None
+            entry_level, entry_deg = _next_entry(ps, prev["gf"], cfg, strict)
             if cfg.verbose:
                 log.info(f"[plan] [{bd.name}] (retry entry={entry_level}/d{entry_deg})")
             diag = PlanDiagnostics()
@@ -1430,6 +1469,5 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
         prev = {"name": bd.name, "gf": gf, "out_file": out_file,
                 "entry_level": entry_level, "entry_deg": entry_deg,
                 "exit_var": s.get("exit_var"), "retried": False}
-        entry_level = s.get("exit_level")
-        entry_deg = (s.get("exit_deg") or 1) if entry_level is not None else None
+        entry_level, entry_deg = _next_entry(s, gf, cfg, strict)
     return summaries
