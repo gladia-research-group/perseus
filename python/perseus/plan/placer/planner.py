@@ -784,7 +784,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # stage 4 — ours, or a baseline placer (same seam, different site selection)
     _fb = refresh.shadow.dense_fallback()
     budget = Budget(L=float(cfg.max_level - cfg.bootstrap_level), unit=g.level_unit,
-                    stc_first_entry=_fb[0] if _fb is not None and not refresh.shadow.stc_first_reroute else None)
+                    stc_first_entry=_fb[0] if _fb is not None else None,
+                    stc_first_reroute=bool(refresh.shadow.stc_first_reroute))
     placer_kwargs = dict(
         g=g, refresh=refresh, budget=budget,
         bootstrap_level=float(cfg.bootstrap_level),

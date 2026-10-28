@@ -55,11 +55,14 @@ class Budget:
     #: the StC-first entry (absolute effective level) when the recipe sets one: a deliberate StC-first refresh's input
     #: budget (`node_budget` of such a node bounds its input's consumed depth, one unit kept for a pending rescale)
     stc_first_entry: float | None = None
+    #: plan.stc_first_reroute: past the entry the refresh runs the shipped order, so the entry bounds only a K/V push's
+    stc_first_reroute: bool = False
 
     def node_budget(self, n: Node, *, is_terminal: bool, output_refreshed: bool,
                     bootstrap_level: float) -> float:
         if n.is_deliberate_bts:
-            if n.stc_first and self.stc_first_entry is not None:
+            if (n.stc_first and self.stc_first_entry is not None
+                    and (not self.stc_first_reroute or is_kv_push(n.step))):
                 return self.stc_first_entry - bootstrap_level - self.unit
             return float("inf")
         b = self.L
@@ -174,6 +177,11 @@ class PlannerShadow:
         return self.consumed(out.level), out.deg
 
 
+def is_kv_push(step: str) -> bool:
+    """A step that writes the K/V cache (the decode's `blk<b>.kv_push`)."""
+    return step.endswith(".kv_push") or ".kv_push." in step
+
+
 def simulate(
     g: Graph,
     *,
@@ -243,10 +251,12 @@ def simulate(
             # a captured StC-first refresh keeps its landing only within the entry; past it the runtime takes the
             # shipped order: a budget violation the cut repairs upstream, or (plan.stc_first_reroute) that order's
             # raw landing
+            # (plan.stc_first_reroute) never a K/V push's: that refresh lands the cache state every later position
+            # reads at the captured landing, and the shipped order lands it deeper
             if n.stc_first and dense_fallback is not None and ins:
                 in_eff = max(lc.get(v, 0.0) + (unit if dg.get(v, 1) == 2 else 0) for v in ins)
                 if bootstrap_level + in_eff > dense_fallback[0] + 1e-9:
-                    if sh.stc_first_reroute and n.output:
+                    if sh.stc_first_reroute and n.output and not is_kv_push(n.step):
                         c_fb, d_fb = dense_fallback[1], dense_fallback[2]
                         lc[n.output], dg[n.output] = (c_fb - unit, 2) if d_fb == 1 else (c_fb, d_fb)
                     else:
