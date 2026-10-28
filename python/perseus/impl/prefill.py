@@ -1803,6 +1803,47 @@ class PlannedPrefill:
                 on_block(b, info[-1])
         return [reg for _j, reg in self.reg[self.n_stages - 1]]
 
+    def verify_graphs(self, vals=None):
+        """Graph replay against eager issue on one set of ciphertexts (the runners' PF_GRAPH_VERIFY=1, after a forward
+        that captured the graphs): block 0's inputs encrypted once, the forward replayed from the graphs, then issued
+        eager (`Session.set_graphs(False)`), every stage's output decrypted after its issue and compared; then one
+        timed forward each way without decryptions. Returns {"worst", "exact", "stages": [(max|graph - eager|,
+        max|eager|)], "served": {mode: per-stage letters}, "eager_s", "graph_s"}; exact = worst 0, every stage
+        replayed."""
+        import time
+        vals = self.in_vals if vals is None else vals
+        x0 = [self.fhe.encrypt(v, lv, dg) for v, (lv, dg) in zip(vals, self.in_metas[0])]
+        outs, served, times = {}, {}, {}
+        try:
+            for mode in ("graph", "eager"):
+                self.sess.set_graphs(mode == "graph")
+                dumps, letters = [], []
+                t = time.time()
+                self.run(x0=x0, on_block=lambda b, i: (letters.append(i["served"][0]), dumps.append(
+                    np.stack(self.decrypt([r for _j, r in self.reg[b]])))))
+                self.fhe.device_sync()
+                outs[mode], served[mode] = dumps, "".join(letters)
+                self.log(f"[verify] {mode} forward {time.time() - t:.2f}s (with per-stage decryptions), "
+                         f"served {served[mode]}")
+            for mode in ("eager", "graph"):
+                self.sess.set_graphs(mode == "graph")
+                t = time.time()
+                self.run(x0=x0)
+                self.fhe.device_sync()
+                times[mode] = time.time() - t
+                self.log(f"[verify] timed {mode} forward {times[mode]:.2f}s")
+        finally:
+            self.sess.set_graphs(True)
+        stages = [(float(np.abs(g - e).max()), float(np.abs(e).max())) for g, e in zip(outs["graph"], outs["eager"])]
+        for b, (d, m) in enumerate(stages):
+            self.log(f"[verify] stage {b}: max|graph - eager| = {d:.3g} (max|eager| {m:.3g})")
+        worst = max(d for d, _m in stages)
+        exact = worst == 0.0 and set(served["graph"]) == {"r"}
+        self.log(f"[verify] {'BIT-EXACT' if exact else 'DIFFERS'}: worst {worst:.3g}, graph forward served "
+                 f"{served['graph']}; timed eager {times['eager']:.2f}s, graph {times['graph']:.2f}s")
+        return {"worst": worst, "exact": exact, "stages": stages, "served": served, "eager_s": times["eager"],
+                "graph_s": times["graph"]}
+
     def ct(self, reg):
         from perseus import _pc
         return _pc.Program.reg_ct(self.sess, reg)

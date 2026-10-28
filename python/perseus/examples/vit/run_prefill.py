@@ -72,6 +72,8 @@ def _planned(a, model, store, files, names, W1, results=None):
         frees.append(round(run.fhe.mem_info()[0] / 2 ** 30, 2))
         host = sum(i["host_us"] for i in info) / 1e6
         mm = sum(i["meta_mismatches"] for i in info)
+        if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+            run.verify_graphs(vals)     # graph replay vs eager on one encryption, every block's output compared
         if a.check:
             for b in range(model.n_layers):
                 h = V.unscale(run.hidden(b))

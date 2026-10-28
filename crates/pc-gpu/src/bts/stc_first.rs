@@ -154,13 +154,18 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    /// Distinct keys asked for so far (the entries a cache needs to never evict).
+    pub keys: u64,
 }
 
 struct CacheState<'a, W: DevWord> {
     slots: Vec<Slot<'a, W>>,
     clock: u64,
     locked: bool,
+    /// Every access refused (a capture must not bake an LRU entry that later calls evict: `ForbidLock`).
+    forbid: bool,
     stats: CacheStats,
+    seen: std::collections::HashSet<CacheKey>,
 }
 
 /// A bounded LRU cache of re-levelled LT stage sequences of one shape (every entry: the shape's stages at their
@@ -242,12 +247,17 @@ impl<'a, W: DevWord> StageCache<'a, W> {
             }
             sl.push(Slot { key: None, used: 0, stages, tabs, pinned, ntt: nttl, ev: Event::new(dev)? });
         }
-        Ok(StageCache { what, shape, prs, state: RefCell::new(CacheState { slots: sl, clock: 0, locked: false, stats: CacheStats::default() }) })
+        Ok(StageCache { what, shape, prs, state: RefCell::new(CacheState { slots: sl, clock: 0, locked: false, forbid: false, stats: CacheStats::default(), seen: Default::default() }) })
     }
 
     /// Refuse misses (e.g. while a CUDA graph is captured: a fill inside a capture would replay a later table).
     pub fn set_locked(&self, on: bool) {
         self.state.borrow_mut().locked = on;
+    }
+
+    /// Refuse every access (`ForbidLock`, while a capture runs).
+    pub fn set_forbidden(&self, on: bool) {
+        self.state.borrow_mut().forbid = on;
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -270,8 +280,14 @@ impl<'a, W: DevWord> StageCache<'a, W> {
     /// The entry for `key`, built with `factor` on the scaled stages when missing (LRU eviction). Returns its index.
     pub fn get<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, srcs: &[Option<RelevelSrc<'a, W>>], key: CacheKey, factor: f64) -> Result<usize> {
         let mut st = self.state.borrow_mut();
+        if st.forbid {
+            return Err(shape(self.what, format!("access to {key:?} while locked: a captured graph would bake an LRU entry (run the caller eager)")));
+        }
         st.clock += 1;
         let clock = st.clock;
+        if st.seen.insert(key) {
+            st.stats.keys += 1;
+        }
         if let Some(i) = st.slots.iter().position(|sl| sl.key == Some(key)) {
             st.slots[i].used = clock;
             st.stats.hits += 1;

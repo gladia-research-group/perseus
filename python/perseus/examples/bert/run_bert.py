@@ -110,6 +110,8 @@ def _planned(a, model, groups, cl, st, results=None):
                       + (f" metadata mismatches {mm}" if a.check_meta else "") + f", free {frees[-1]} GB{kl_k}",
                       flush=True)
             wall = sorted(walls)[len(walls) // 2]
+            if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+                run.verify_graphs(vals)     # graph replay vs eager on one encryption, every block's output compared
             if a.check:
                 for b in range(model.n_layers):
                     h = run.hidden(b)

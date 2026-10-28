@@ -33,6 +33,20 @@ impl<W: DevWord> CaptureLock for crate::bts::stc_first::StageCache<'_, W> {
     }
 }
 
+/// A cache a captured graph must not read at all (an LRU whose keys change per call, e.g. the CCMM's stc_high
+/// caches): any access while a capture runs is refused, so its callers run eager between the graph segments.
+/// Its evictions are not watched (no graph reads it).
+pub struct ForbidLock<'r, 'a, W: DevWord>(pub &'r crate::bts::stc_first::StageCache<'a, W>);
+
+impl<W: DevWord> CaptureLock for ForbidLock<'_, '_, W> {
+    fn set_locked(&self, on: bool) {
+        self.0.set_forbidden(on)
+    }
+    fn evictions(&self) -> u64 {
+        0
+    }
+}
+
 /// What one graph is specialized to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GraphKey {

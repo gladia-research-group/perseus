@@ -622,7 +622,15 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     if let Some(x) = spru.as_ref() {
         routes.add(x);
     }
-    let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense.iter().flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock)).collect();
+    // the CCMM's stc_high caches (keys change per call): no capture may read them (ForbidLock), their callers run
+    // eager between the graph segments; their evictions are not watched
+    let forbid: Vec<pc_gpu::graph::ForbidLock<'_, '_, W>> =
+        dense.iter().flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c)))).collect();
+    let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense
+        .iter()
+        .flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))
+        .chain(forbid.iter().map(|f| f as &dyn pc_program::replay::CaptureLock))
+        .collect();
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
     if ins.len() != b.inputs.len() {

@@ -116,6 +116,8 @@ def _planned(a, model, toks, gt, ref, results=None):
               f"{host:.2f}s, served {''.join(i['served'][0] for i in info)}, free {frees[-1]} GB"
               + (f", per block {min(fr)}..{max(fr)} GB" if fr else ""), flush=True)
     wall = sorted(walls)[len(walls) // 2]
+    if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+        run.verify_graphs()     # graph replay vs eager on one encryption, every block's output compared
     for b, (err, mx) in sorted(errs.items()):
         print(f"[llama-prefill] block {b} maxerr={err.max():.3g} (pos {int(err.argmax()) + 1}) |x|={mx:.3g}", flush=True)
     if a.tap_block is not None:

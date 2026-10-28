@@ -79,6 +79,8 @@ def _planned(a, model, store, rows, gt, ref, results=None):
         print(f"[prefill] forward {k}: wall {walls[-1]:.2f}s ({walls[-1] / a.tokens:.3f} s/tok), host issue {host:.2f}s, "
               f"served {''.join(i['served'][0] for i in info)}, free {frees[-1]} GB", flush=True)
     wall = sorted(walls)[len(walls) // 2]
+    if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+        run.verify_graphs()     # graph replay vs eager on one encryption, every stage's output compared
     if ref is not None:
         for b in range(model.n_layers):
             h = run.hidden(b)

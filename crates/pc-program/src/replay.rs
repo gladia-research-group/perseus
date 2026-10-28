@@ -8,7 +8,7 @@
 //! the same step sequence is captured into one `GraphExec` held by the `Bound`; later runs launch it. What a
 //! captured graph must not see change (slots, plaintext rows, weight frames, ring constants, stage caches) and how
 //! each is held: docs/ARCHITECTURE.md "pc-program replay". Inputs / outputs are written and read outside the graph.
-use crate::bind::{BoundPt, Bound, CoeffSumStep, FinishStep, Gather, Held, Step, StepOp, Unit, UnitKind, NONE};
+use crate::bind::{BoundPt, Bound, CoeffSumStep, DynMetas, FinishStep, Gather, Held, Step, StepOp, Unit, UnitKind, NONE};
 use crate::schedule::{self, Sched};
 use crate::error::{Error, Result};
 use pc_core::encode::Complex;
@@ -165,6 +165,8 @@ pub struct ReplayStats {
     pub pairs_split: usize,
     /// Plaintext products and adds the eager runs issued as one pass (`UnitKind::MultPtAdd`).
     pub fused: usize,
+    /// Blocks whose capture ran out of device memory: they run eager from then on (`Replayer::eager_only`).
+    pub graph_oom: usize,
 }
 
 pub struct Replayer {
@@ -174,6 +176,16 @@ pub struct Replayer {
     pub side_lane: bool,
     /// Lane schedules by block label, for the dynamic-step set they were made for.
     scheds: std::collections::HashMap<String, (Vec<u32>, Sched)>,
+    /// Labels of the blocks whose graph did not fit in device memory (instantiation out of memory): with graphs on,
+    /// they run eager, so a model whose graphs exceed the free memory replays the blocks that fit.
+    eager_only: std::collections::HashSet<String>,
+    /// Blocks whose PC_GRAPH_EAGER_FINISH steps were made dynamic (before their first capture).
+    eager_marked: std::collections::HashSet<String>,
+}
+
+/// A capture failed for lack of device memory (cudaErrorMemoryAllocation in the capture or the instantiation).
+fn is_oom(e: &pc_cuda::Error) -> bool {
+    matches!(e, pc_cuda::Error::Cuda { code: 2, .. })
 }
 
 fn rerr(block: &str, msg: impl Into<String>) -> Error {
@@ -476,7 +488,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             };
             for j in waits {
                 let w = s.wait[j];
-                if w != NONE {
+                // an event of a step before `lo` (an earlier graph segment, joined at its end, or a dynamic step on
+                // compute) is already ordered: a capture must not wait on work outside it
+                if w != NONE && (w as usize) >= lo {
                     let ev = side.ev.get(w as usize).ok_or_else(|| rerr(&b.label, format!("step {w}: {} side events", side.ev.len())))?;
                     if lane == 1 {
                         side.ex.compute.wait(ev)?;
@@ -490,13 +504,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             if lane == 1 {
                 swap_lane(rt)?;
             }
-            let pre_metas = if dynamic {
-                let st = &b.steps[i];
-                let m = |s: u32| if s != NONE { b.slots.get(s as usize).map(|c| c.meta) } else { None };
-                Some((m(st.a), m(st.b)))
-            } else {
-                None
-            };
+            // a dynamic step: every slot it reads, as it reads them (a finish reads several)
+            let pre_metas: Option<Vec<(u32, CtMeta)>> =
+                dynamic.then(|| schedule::rw(b, &b.steps[i]).0.into_iter().filter_map(|s| b.slots.get(s as usize).map(|c| (s, c.meta))).collect());
             {
                 let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, stream_base, names, .. } = &mut *b;
                 let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
@@ -541,9 +551,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                     return Err(e);
                 }
             }
-            if let Some((ma, mb)) = pre_metas {
-                let out = b.slots[b.steps[i].out as usize].meta;
-                b.dyn_metas.insert(i as u32, (ma, mb, out));
+            if let Some(ins) = pre_metas {
+                let outs = schedule::rw(b, &b.steps[i]).1.into_iter().filter_map(|s| b.slots.get(s as usize).map(|c| (s, c.meta))).collect();
+                b.dyn_metas.insert(i as u32, DynMetas { ins, outs });
             }
             if let Some((_, e)) = unit {
                 unit_end = e;
@@ -767,16 +777,13 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
 }
 
 /// A dynamic step between two graph launches: the launches did not move the host-side metadata of the slots they
-/// wrote, so its operands get their compiled metadata first.
+/// wrote, so every operand slot gets the metadata it had in the eager run the graphs were captured after (a finish
+/// reads all its inputs' levels and scales).
 fn issue_dynamic<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: &mut Bound<'a, W>, i: usize) -> Result<()> {
-    let st = b.steps[i].clone();
-    // the metadata the step's operands had in the eager run the graphs were captured after
-    let (ma, mb, _) = b.dyn_metas.get(&(i as u32)).copied().ok_or_else(|| rerr(&b.label, format!("dynamic step {i} never ran eagerly")))?;
-    for (s, m) in [(st.a, ma), (st.b, mb)] {
-        if let Some(m) = m {
-            if s != NONE && (s as usize) < b.slots.len() {
-                b.slots[s as usize].meta = m;
-            }
+    let ins = b.dyn_metas.get(&(i as u32)).map(|d| d.ins.clone()).ok_or_else(|| rerr(&b.label, format!("dynamic step {i} never ran eagerly")))?;
+    for (s, m) in ins {
+        if let Some(c) = b.slots.get_mut(s as usize) {
+            c.meta = m;
         }
     }
     let mut scratch = RunInfo { served: Served::Eager, host_us: 0.0, launch_us: 0.0, meta_mismatches: 0, first_mismatches: vec![], pairs: [0; 2], fused: 0 };
@@ -803,7 +810,7 @@ fn segments<W: DevWord>(b: &Bound<'_, W>) -> Vec<std::result::Result<(usize, usi
 
 impl Replayer {
     pub fn new(cfg: ReplayCfg) -> Self {
-        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default() }
+        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default(), eager_only: Default::default(), eager_marked: Default::default() }
     }
 
     /// Run `b` once on the inputs the driver wrote into its input slots: eager, or (graphs) the graph captured for
@@ -844,9 +851,30 @@ impl Replayer {
         if b.pts.iter().any(|p| !p.stream && p.meta.is_none()) {
             return Err(rerr(&b.label, "plaintexts not resolved (Bound::resolve_pts after staging)"));
         }
+        let graphs = self.cfg.use_graphs && !self.eager_only.contains(&b.label);
+        // PC_GRAPH_EAGER_FINISH (default "ccmm"): finish services run eager between the graph segments (the CCMM's
+        // stc_high caches are LRUs whose keys change per call: a capture cannot bake them, ForbidLock refuses it);
+        // marked before the lane schedule, whose regions end at the dynamic steps
+        if graphs && b.graphs.is_empty() && !self.eager_marked.contains(&b.label) {
+            self.eager_marked.insert(b.label.clone());
+            let ops = std::env::var("PC_GRAPH_EAGER_FINISH").unwrap_or_else(|_| "ccmm".into());
+            let ops: Vec<String> = ops.split(',').filter(|x| !x.is_empty()).map(|x| format!("\"op\": \"{x}\"")).collect();
+            let idx: Vec<usize> = (0..b.steps.len())
+                .filter(|&i| match &b.steps[i].op {
+                    StepOp::Finish { f } => b.finishes.get(*f as usize).is_some_and(|fs| {
+                        let d = fs.desc.replace("\":\"", "\": \"");
+                        ops.iter().any(|o| d.contains(o.as_str()))
+                    }),
+                    _ => false,
+                })
+                .collect();
+            for i in idx {
+                b.make_dynamic(i)?;
+            }
+        }
         let sched = self.schedule(b, rt);
         let sched = sched.as_ref();
-        if !self.cfg.use_graphs {
+        if !graphs {
             issue(rt, b, self.cfg.check_meta, &mut info, None, sched)?;
             self.stats.eager += 1;
             self.stats.pairs += info.pairs[0];
@@ -897,6 +925,16 @@ impl Replayer {
         self.stats.fused += info.fused;
         let out_metas: Vec<CtMeta> = b.outputs.iter().map(|(_, s, _)| b.slots[*s as usize].meta).collect();
         info.host_us = t0.elapsed().as_secs_f64() * 1e6;
+        // keep PC_GRAPH_RESERVE_GB (default 1) of device memory free for what the eager steps and lazily loaded
+        // kernels still allocate: below it, the block is not captured and runs eager from then on
+        let reserve = std::env::var("PC_GRAPH_RESERVE_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+        if pc_cuda::device::mem_info_current().is_ok_and(|(free, _)| (free as f64) < reserve * 1e9) {
+            self.eager_only.insert(b.label.clone());
+            self.stats.graph_oom += 1;
+            self.stats.eager += 1;
+            eprintln!("[replay] {}: under {reserve} GB of free device memory, the block runs eager", b.label);
+            return Ok(info);
+        }
         let tc = Instant::now();
         // the eager outputs must not be overwritten by anything the capture records (nothing executes in a capture,
         // but the lease starts with a lane sync, which also orders the outputs before the caller reads them)
@@ -914,6 +952,7 @@ impl Replayer {
         let s = unsafe { &*sp };
         let mut items: Vec<Item> = vec![];
         let mut failed: Option<Error> = None;
+        let mut oom = false;
         for seg in segments(b) {
             match seg {
                 Ok((lo, hi)) => {
@@ -926,8 +965,17 @@ impl Replayer {
                         })
                     });
                     match (r, err) {
-                        (_, Some(e)) => failed = Some(e),
-                        (Err(e), None) => failed = Some(e.into()),
+                        (_, Some(e)) => {
+                            // the constant ring ran out of free slots, or a locked route cache missed, under capture:
+                            // the block cannot be captured as it stands, it runs eager (as out of memory)
+                            let m = e.to_string();
+                            oom = m.contains("OpsCfg::const_slots") || m.contains("while locked");
+                            failed = Some(e)
+                        }
+                        (Err(e), None) => {
+                            oom = is_oom(&e);
+                            failed = Some(e.into())
+                        }
                         (Ok((exec, ())), None) => items.push(Item::Graph(exec)),
                     }
                     if failed.is_some() {
@@ -935,13 +983,18 @@ impl Replayer {
                     }
                 }
                 Err(d) => {
-                    // not issued under capture: its output takes the metadata the eager run produced
-                    let out = b.steps[d].out as usize;
-                    let m = b.dyn_metas.get(&(d as u32)).map(|x| x.2).ok_or_else(|| rerr(&b.label, format!("dynamic step {d} never ran eagerly")));
-                    match m {
-                        Ok(m) => b.slots[out].meta = m,
-                        Err(e) => {
-                            failed = Some(e);
+                    // not issued under capture: its outputs (a finish lands several) take the metadata the eager run
+                    // produced
+                    match b.dyn_metas.get(&(d as u32)) {
+                        Some(m) => {
+                            for &(o, mo) in &m.outs {
+                                if let Some(c) = b.slots.get_mut(o as usize) {
+                                    c.meta = mo;
+                                }
+                            }
+                        }
+                        None => {
+                            failed = Some(rerr(&b.label, format!("dynamic step {d} never ran eagerly")));
                             break;
                         }
                     }
@@ -975,6 +1028,19 @@ impl Replayer {
         };
         if let Some(e) = failed {
             release_all(rt);
+            if oom {
+                // the graph does not fit: free what this block captured, keep the eager run's outputs, run it eager
+                drop(items);
+                for (i, (_, s, _)) in b.outputs.iter().enumerate() {
+                    b.slots[*s as usize].meta = out_metas[i];
+                }
+                self.eager_only.insert(b.label.clone());
+                self.stats.graph_oom += 1;
+                self.stats.eager += 1;
+                eprintln!("[replay] {}: graph capture out of device memory, the block runs eager", b.label);
+                info.served = Served::Eager;
+                return Ok(info);
+            }
             return Err(e);
         }
         // the capture left the eager outputs' metadata on the slots again (same steps); keep the recorded ones
@@ -984,6 +1050,12 @@ impl Replayer {
             return Err(rerr(&b.label, "captured program lands its outputs at other metadata than its eager run (non-deterministic step)"));
         }
         let capture_ms = tc.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("PC_GRAPH_LOG").is_some() {
+            let free = pc_cuda::device::mem_info_current().map(|m| m.0 as f64 / 1e9).unwrap_or(-1.0);
+            eprintln!("[replay] {}: captured {} graphs, {:.0} ms, const slots {} + {} side (leased {} / {}), device free {free:.2} GB",
+                b.label, items.iter().filter(|i| matches!(i, Item::Graph(_))).count(), capture_ms, lease.len(), side_lease.len(),
+                rt.ops.ring.leased(), rt.side.as_deref().map_or(0, |s| s.ops.ring.leased()));
+        }
         self.stats.captures += 1;
         self.stats.capture_ms += capture_ms;
         b.graphs.push(Captured { items, dynamic, lease, side_lease, out_metas, pt_rows: b.pts.iter().map(|p| p.rows).collect(), stream_base: b.stream_base, capture_ms });

@@ -177,6 +177,15 @@ pub struct FinishStep {
     pub desc: String,
 }
 
+/// A dynamic step's slot metadata in its last eager issue: every slot it reads before it ran, every slot it writes
+/// after (a finish reads and lands several). A graph launch does not move the host-side metadata of the slots it
+/// wrote: the replay gives the step's operands these before issuing it, a capture its outputs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DynMetas {
+    pub ins: Vec<(u32, CtMeta)>,
+    pub outs: Vec<(u32, CtMeta)>,
+}
+
 /// One launch member: op, slots, the compiled output metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Step {
@@ -301,7 +310,7 @@ pub struct Bound<'a, W: DevWord> {
     pub dyn_steps: Vec<i64>,
     /// Per dynamic step: the operand and output metadata of its last eager issue (the compile leaves scales
     /// unknown; a capture and the replays between graph launches take these).
-    pub dyn_metas: BTreeMap<u32, (Option<CtMeta>, Option<CtMeta>, CtMeta)>,
+    pub dyn_metas: BTreeMap<u32, DynMetas>,
     pub steps: Vec<Step>,
     pub groups: Vec<KeyGroup<'a>>,
     /// Index of the relinearization group in `groups` (NONE when the block has no ct x ct product).
@@ -882,7 +891,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         (0..self.steps.len()).filter(|&i| self.names[self.steps[i].var as usize].split('~').next() == Some(name)).collect()
     }
 
-    fn make_dynamic(&mut self, i: usize) -> Result<()> {
+    pub(crate) fn make_dynamic(&mut self, i: usize) -> Result<()> {
         if !self.dynamic.contains(&(i as u32)) {
             if !self.graphs.is_empty() {
                 return Err(berr(&self.label, format!("step {i} made dynamic after a graph capture (declare dynamic steps before the first run)")));
