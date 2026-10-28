@@ -23,7 +23,7 @@ FINALS = [
     {"name": "GPT-2 prefill", "kind": "prefill", "plans": ["bootstrap_placements/gpt2_prefill128"],
      "flags": "--tokens 128 --tail --graphs"},
     {"name": "Llama prefill", "kind": "prefill", "plans": ["bootstrap_placements/llama31_8b_prefill128"],
-     "flags": "--tokens 128"},
+     "flags": "--tokens 128 --graphs --stc-cache 4"},
     {"name": "GPT-2 decode", "kind": "decode", "plans": ["bootstrap_placements/gpt2_decode_ctx1024"],
      "flags": "--argmax"},
     {"name": "Llama decode", "kind": "decode", "plans": ["bootstrap_placements/llama31_8b_decode"], "flags": ""},
