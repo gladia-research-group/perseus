@@ -16,13 +16,15 @@
 \pagecolor{bg}\color{fg}
 \arrayrulecolor{fg}
 \setlength{\dashlinedash}{3pt}\setlength{\dashlinegap}{3pt}
-% Perseus' numbers on the Rust + CUDA runtime (paper campaign 2026-10-22/23 and docs/REPORT.md: medians; default plan per model; decode at a 512-token context)
-\newcommand{\llamapf}{83.2}\newcommand{\llamadec}{16.2}\newcommand{\gptpf}{21.6}\newcommand{\gptdec}{4.10}
-\newcommand{\vitimg}{59.0}\newcommand{\bertin}{23.9}
-% peak GPU memory, GiB: total minus free after setup (the runtime allocates nothing after it); the decode rows at a
-% short context (the repro scripts' 16 tokens), the paper's "less than 48 GiB"
-\newcommand{\llamapfmem}{76.6}\newcommand{\llamadecmem}{46.0}\newcommand{\gptpfmem}{53.0}\newcommand{\gptdecmem}{47.9}
-\newcommand{\vitmem}{57.5}\newcommand{\bertmem}{53.5}
+% Perseus' numbers on the Rust + CUDA runtime (the shipped default plans, 2026-10-29: medians of 2 paired rounds on
+% one isolated GPU; decode at a 512-token context, positions 500-511 after a 500-position plaintext prefix)
+\newcommand{\llamapf}{74.0}\newcommand{\llamadec}{11.2}\newcommand{\gptpf}{11.7}\newcommand{\gptdec}{3.32}
+\newcommand{\vitimg}{36.6}\newcommand{\bertin}{14.4}
+% peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
+% the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), Llama's the
+% GPU's peak used memory over the run (its runner reports no free memory)
+\newcommand{\llamapfmem}{93.2}\newcommand{\llamadecmem}{59.7}\newcommand{\gptpfmem}{66.7}\newcommand{\gptdecmem}{55.9}
+\newcommand{\vitmem}{67.9}\newcommand{\bertmem}{65.4}
 \newcommand{\oursrow}{\rowcolor{ours}}
 \newcommand{\oc}{\cellcolor{ours}}
 \newcommand{\yes}{\textcolor{yescol}{\ding{51}}}
@@ -52,8 +54,7 @@ BERT-base & 128-token input & \bertmem\ GiB & \textbf{\bertin\ s} \\
 \bottomrule
 \end{tabularx}
 \tcap{End to end on one NVIDIA RTX PRO 6000 (96 GB), 128-bit security. $^\dagger$Peak memory when decoding 16 tokens.
-Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU, so
-the larger model can need less GPU memory.}
+Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU.}
 \end{tbl}
 
 % Unlike the paper (two Llama tables, prefill and decode), the README shows one, in the GPT-2 table's layout.
