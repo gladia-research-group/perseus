@@ -361,7 +361,8 @@ impl Client {
             return Err(Error::Wire(format!("ciphertext of {} rows at level {} (top {})", h.rows, h.meta.level, self.top_of(h.meta.level)?)));
         }
         let unit = self.chain.level_unit;
-        let d = if h.rows >= 4 { 4 } else { unit };
+        // a lean chain's level 48 holds q0 q1 q2: its 3 rows decode together (the bottom pair alone wraps above ~2^1.3)
+        let d = if h.rows >= 4 { 4 } else if h.rows == 3 && self.chain.lone_top().is_some() { 3 } else { unit };
         if h.rows < d {
             return Err(Error::Wire(format!("ciphertext of {} rows is below the bottom level ({d})", h.rows)));
         }
@@ -379,8 +380,8 @@ impl Client {
                         m.into_iter().map(|x| x as u64).collect()
                     })
                     .collect();
-                if d == 4 {
-                    Ok(decode4(&self.enc, &self.chain.q[..4], &rows, slots, payload, h.meta.nf, n))
+                if d >= 3 {
+                    Ok(decode4(&self.enc, &self.chain.q[..d], &rows, slots, payload, h.meta.nf, n))
                 } else {
                     Ok(self.enc.decode_slots(&rows, slots, payload, h.meta.nf)?)
                 }
