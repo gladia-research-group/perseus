@@ -105,7 +105,8 @@ fn parse(a: &[String]) -> Res<Args> {
         graph: false,
         level: 44,
         mean: 0.0,
-        chain: "n32".into(),
+        // PC_BENCH_CHAIN: the default chain preset (bts-prec --all runs this harness without --chain)
+        chain: std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()),
         cts_alt: 0,
     };
     let mut i = 1;
@@ -204,8 +205,9 @@ fn old_err(doc: &Option<serde_json::Value>, cf: u32, amp: f64) -> Option<f64> {
 fn run(a: Args) -> Res<()> {
     match a.chain.as_str() {
         "n32" => run_t::<W, M>(a, ChainSpec::n32(), BtsSetup::n32_shipped()),
+        "n32a4" => run_t::<W, M>(a, ChainSpec::n32a4(), BtsSetup::n32_shipped()),
         "n64" => run_t::<u64, Barrett64>(a, ChainSpec::n64(), BtsSetup::n64()),
-        c => Err(format!("--chain {c}: n32 | n64").into()),
+        c => Err(format!("--chain {c}: n32 | n32a4 | n64").into()),
     }
 }
 

@@ -806,7 +806,8 @@ fn host_stage(fs: &FidesStage, x: &[C64]) -> Vec<C64> {
 pub fn bench(args: &[String]) -> Res<bool> {
     let a = bargs(args)?;
     let t0 = Instant::now();
-    let chain = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (n32a4: the lean chain's single-prime StC stages)
+    let chain = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     let n = chain.n;
     let slots = n / 2;
     let kmax = (*a.ks.iter().max().unwrap_or(&1)).max(8);
