@@ -140,13 +140,16 @@ impl<'a, W: DevWord> RelevelSrc<'a, W> {
     }
 }
 
-/// One re-levelled stage of a cache shape: its source, its input top, how it ends, whether it carries the factor.
+/// One re-levelled stage of a cache shape: its source, its input top, how it ends, whether it carries the factor, and
+/// whether it drops the single prime q[top] (`thin`: its plaintexts at q[top] times the factor, `run_lt_thin`) instead
+/// of a level (at sf(top)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageShape {
     pub src: usize,
     pub top: usize,
     pub end: LtEnd,
     pub scaled: bool,
+    pub thin: bool,
 }
 
 /// What a cache entry was built for (opaque to the cache: the caller's rounding of its continuous parameters).
@@ -204,6 +207,15 @@ fn row_ids(lay: &Layout, top: usize) -> Vec<usize> {
     (0..=top).chain(lay.nq..lay.rows()).collect()
 }
 
+/// A cache stage's plaintext scale before its factor: sf(top), or the prime a thin stage drops.
+fn stage_scale<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, sh: &StageShape) -> Result<f64> {
+    if sh.thin {
+        Ok(ctx.chain.q[sh.top] as f64)
+    } else {
+        Ok(ctx.scale.sf(sh.top as i32)?)
+    }
+}
+
 impl<'a, W: DevWord> StageCache<'a, W> {
     /// Device bytes of a cache of `slots` entries of `shape` over the sources `srcs`.
     pub fn bytes(lay: &Layout, primes: &[u64], shape: &[StageShape], srcs: &[LtGeom], slots: usize, k_max: usize) -> Result<usize> {
@@ -258,7 +270,7 @@ impl<'a, W: DevWord> StageCache<'a, W> {
                 let nrows = ids.len();
                 let rows = vec![vec![0u32; nrows * n]; g.npts];
                 let pts = LtPts::new(arena, s, ctx, sh.top, PtSource::Rows { rows, ptw: n, enc: 0xFFFF_FFFF })?;
-                let pt_nf = ctx.scale.sf(sh.top as i32)?;
+                let pt_nf = stage_scale(ctx, sh)?;
                 let mut st = LtStage::new(arena, s, ctx, *g, sh.top, sh.end, pt_nf, pts, keys, stage_ptrs, k_max)?;
                 st.group = lt_group;
                 stages.push(st);
@@ -351,8 +363,8 @@ impl<'a, W: DevWord> StageCache<'a, W> {
             let primes: Vec<u64> = ids.iter().map(|&i| ctx.prime(i)).collect();
             let pos: Vec<usize> = (0..nrows).collect();
             let f = if sh.scaled { factor } else { 1.0 };
-            // integers x 2^SRC -> x f sf(top): scale by c = f sf(top) / 2^SRC
-            let c = f * ctx.scale.sf(sh.top as i32)? * (-(SRC_LOG2 as f64)).exp2();
+            // integers x 2^SRC -> x f sf(top) (a thin stage: f q[top]): scale by c = f sf(top) / 2^SRC
+            let c = f * stage_scale(ctx, sh)? * (-(SRC_LOG2 as f64)).exp2();
             let tab = small_int_tab(&q4, &pos, &primes, Some(c))?;
             slot.pinned[e].as_mut_slice().copy_from_slice(tab_words(&tab));
             // SAFETY: the pinned buffer is not written again before `ev` (recorded below) completes
@@ -412,7 +424,7 @@ pub fn run_lt<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, s
 /// One single-prime LT stage of a lean chain's StC-first input on every batch: the plaintexts' scale `pt_nf` is the
 /// prime the stage drops times its factor, so the product keeps the input's scale but for that factor. `rescale`: drop
 /// the stage's prime now (the last stage leaves it pending at the split, as the composite path leaves its pair).
-fn run_lt_thin<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, stage: &LtStage<'a, W>, pt_nf: f64, cts: &mut [Ct<'a, W>], source: KskSource, rescale: bool) -> Result<()> {
+pub(crate) fn run_lt_thin<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, stage: &LtStage<'a, W>, pt_nf: f64, cts: &mut [Ct<'a, W>], source: KskSource, rescale: bool) -> Result<()> {
     let ctx = cx.ctx;
     for x in cts.iter_mut() {
         let top = x.top(ctx.shape)?;
@@ -531,7 +543,7 @@ impl StcFirstPlan {
     /// The mode-2 last-stage cache shape.
     fn last_shape(&self) -> Option<Vec<StageShape>> {
         match self.sf.mode {
-            StcFirstMode::Folded => Some(vec![StageShape { src: self.sources.len() - 1, top: self.split_top(), end: LtEnd::ModDown, scaled: true }]),
+            StcFirstMode::Folded => Some(vec![StageShape { src: self.sources.len() - 1, top: self.split_top(), end: LtEnd::ModDown, scaled: true, thin: false }]),
             StcFirstMode::Plain => None,
         }
     }
@@ -560,7 +572,7 @@ impl StcFirstPlan {
             b += StageCache::<W>::bytes(&lay, &primes, &shp, &geoms, self.sf.cache_slots, k_max)?;
         }
         if let Some(h) = &self.sf.high {
-            b += StcHighPlan::<W>::bytes(&lay, &primes, h, &geoms, self.dense.setup.level_budget[1] as usize, self.dense.chain.level_unit, k_max)?;
+            b += StcHighPlan::<W>::bytes(&lay, &primes, h, &geoms, self.dense.setup.level_budget[1] as usize, self.dense.chain.level_unit, self.dense.chain.lone_top(), k_max)?;
         }
         r.add("bts.stc_first", b);
         Ok((r, ws))
@@ -1280,7 +1292,7 @@ mod tests {
         assert_eq!(p.input.iter().map(|h| h.top).collect::<Vec<_>>(), vec![7, 5]);
         assert!(p.input.iter().all(|h| h.end == LtEnd::ModDown));
         assert_eq!(p.sources.iter().map(|s| s.is_some()).collect::<Vec<_>>(), vec![false, false, true]);
-        assert_eq!(p.last_shape().unwrap(), vec![StageShape { src: 2, top: 3, end: LtEnd::ModDown, scaled: true }]);
+        assert_eq!(p.last_shape().unwrap(), vec![StageShape { src: 2, top: 3, end: LtEnd::ModDown, scaled: true, thin: false }]);
         let st = ScaleTables::precompute(&chain).unwrap();
         for h in &p.input {
             assert_eq!(h.nf.to_bits(), st.sf(h.top as i32).unwrap().to_bits());
