@@ -15,6 +15,7 @@ from .attention import _recip_rounds, first_iters
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
 from .linear import _baby_sum, linear_multi, prepare_linear_input
+from .pcmm import session_specs
 from .poly import eval_chebyshev, im_cleanse, rotsum
 import os
 _DBG = bool(os.environ.get("PF_DEBUG"))
@@ -1718,8 +1719,7 @@ class PlannedPrefill:
         # a compact plaintext slot holds the rows of its level (n32: 54 - level Q primes); the deepest plaintext sizes it
         pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
         t = self.model.rt.dims.t
-        specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
-                  int(lin.shift)) for lin in self.linears().values()]
+        specs = session_specs(self.linears().values(), t)
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_stages) for j, r in self.reg[b]])
         return dict(pool=self.pool, pt_slots=len(uniq) + 8, programs=progs, regs=self.n_regs, pt_rows=pt_rows,
                     stc_cache=self.stc_cache, pcmm=specs or None, pcmm_cf=self.pcmm_cf, check_meta=self.check_meta,

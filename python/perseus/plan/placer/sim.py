@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -228,6 +230,12 @@ def simulate(
     for n in g.nodes:
         if n.output and not n.is_deliberate_bts:
             terminal = n
+    # PLAN_ENV_EFFECTIVE=1: a refresh (placed, forced or a fired hint) whose effective input (a pending rescale
+    # counts) is past its step's envelope is over budget, which the cut repairs upstream: the compile check refuses
+    # such a refresh on every route (n32a4's input room)
+    env_cap = None
+    if os.environ.get("PLAN_ENV_EFFECTIVE") == "1":
+        from .place import refresh_env_cap as env_cap
 
     for n in g.nodes:
         ins = n.cipher_inputs
@@ -271,6 +279,8 @@ def simulate(
             if hint_force is not None and n.output in hint_force:
                 fired = hint_force[n.output]
             hint_fired[n.idx] = fired
+            if env_cap is not None and fired and ic_eff > env_cap(n.step) - bootstrap_level + 1e-9:
+                over.append((n.idx, ic_eff - (env_cap(n.step) - bootstrap_level)))
             if fired or n.output in placed_set:
                 if n.output in refreshed:
                     c, d = refreshed[n.output]
@@ -307,6 +317,9 @@ def simulate(
             bootstrap_level=bootstrap_level)
         if c > b:
             over.append((n.idx, c - b))
+        elif (env_cap is not None and n.hint_level is None and n.output and n.output in refreshed
+              and c + (unit if d == 2 else 0) > env_cap(n.step) - bootstrap_level + 1e-9):
+            over.append((n.idx, c + (unit if d == 2 else 0) - (env_cap(n.step) - bootstrap_level)))
 
     return SimResult(consumed=lc, deg=dg, node_out=node_out,
                      hint_fired=hint_fired, over_budget=over, node_deg=node_deg)

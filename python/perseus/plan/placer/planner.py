@@ -272,6 +272,8 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
         # a refresh's input level: its producer's output before the refresh, which for a
         # refresh on a hint's output is the hint's input (the sim records a placed hint's
         # output as already refreshed)
+        if eff_env:
+            return past_env_eff(s)
         k = 0
         for v in placer.placed:
             p = g.producer_of.get(v)
@@ -289,6 +291,28 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
                 if s.consumed.get(n.cipher_inputs[0], 0.0) > env_n + 1e-9:
                     k += 1
         return k
+
+    # PLAN_ENV_EFFECTIVE=1: the envelope the compile check enforces, the effective input (a pending rescale counts)
+    # of every refresh, every route, each against its step's and route's cap; a removal may not put any refresh
+    # past it that was not already
+    eff_env = os.environ.get("PLAN_ENV_EFFECTIVE") == "1"
+    unit = g.level_unit
+
+    def past_env_eff(s):
+        out = set()
+        for v in placer.placed:
+            p = g.producer_of.get(v)
+            if p is None:
+                continue
+            cap = refresh_env_cap(getattr(p, "step", None), route=placer.refresh.spec(v).route or 0)
+            if placer.bootstrap_level + s.input_eff(g, v, unit) > cap + 1e-9:
+                out.add(v)
+        for n in g.nodes:
+            if n.hint_level is not None and s.hint_fired.get(n.idx) and n.cipher_inputs:
+                cap = refresh_env_cap(n.step, route=placer.refresh.route_for(n.output) or 0)
+                if placer.bootstrap_level + s.effective(n.cipher_inputs[0], unit) > cap + 1e-9:
+                    out.add(f"hint:{n.idx}")
+        return out
 
     best, deep, removed = count(sim), past_env(sim), 0
     origin = getattr(placer, "_origin", None)
@@ -632,19 +656,45 @@ def recipe_plan_config(cfg: PlanConfig):
 
 
 #: pc-gpu `matmul::pcmm::PREDIV_SHIFT`: on a lean chain a PCMM of a larger band shift divides it on the level above
-#: the StC-first entry
+#: the StC-first entry, and only when its stamp w_scale 2^shift exceeds 2^PCMM_PREDIV_STAMP_LOG2 (`PREDIV_STAMP_LOG2`)
 PCMM_PREDIV_SHIFT = 1
+PCMM_PREDIV_STAMP_LOG2 = 20
 
 
-def pcmm_prediv_caps(nodes: list[dict], cap: int) -> list[dict]:
+def pcmm_stamps() -> dict[str, int] | None:
+    """PLAN_PCMM_STAMPS=<json>: each PCMM linear's stamp, round(log2(w_scale 2^shift)), as the runner declares it
+    (PF_PCMM_STAMPS_OUT, `perseus.impl.pcmm.session_specs`); None: unset."""
+    path = os.environ.get("PLAN_PCMM_STAMPS")
+    return {k: int(v) for k, v in json.loads(Path(path).read_text()).items()} if path else None
+
+
+def pcmm_prediv_caps(nodes: list[dict], cap: int, stamps: dict[str, int] | None = None) -> list[dict]:
     """The captured nodes with the input caps (`hint_lev`, `lvl_cap`) of every PCMM whose band shift exceeds
     PCMM_PREDIV_SHIFT lowered to `cap`: on a lean chain those inputs reach the PCMM one level above the StC-first entry,
-    which the runtime spends dividing their scale by 2^(shift - PCMM_PREDIV_SHIFT) (pc-gpu `matmul::pcmm::prediv`)."""
+    which the runtime spends dividing their scale by 2^(shift - PCMM_PREDIV_SHIFT) (pc-gpu `matmul::pcmm::prediv`).
+    With `stamps` (`pcmm_stamps`), only the linears the runtime pre-divides: a stamp above 2^PCMM_PREDIV_STAMP_LOG2
+    (a linear missing from them counts as one)."""
+    def pick(ext: dict) -> bool:
+        if ext.get("op") != "pcmm" or int(ext.get("shift", 0)) <= PCMM_PREDIV_SHIFT:
+            return False
+        return stamps is None or stamps.get(ext.get("linear"), PCMM_PREDIV_STAMP_LOG2 + 1) > PCMM_PREDIV_STAMP_LOG2
+    return lower_input_caps(nodes, pick, cap)
+
+
+def ccmm_operand_caps(nodes: list[dict], cap: int) -> list[dict]:
+    """The captured nodes with every CCMM operand's caps lowered to `cap` (PLAN_CCMM_OPERAND_CAP): a lean chain's
+    stc_high enters one level higher (pc-gpu `bts::stc_high::shape_stages`: limb 3 from the pair at limb 6)."""
+    return lower_input_caps(nodes, lambda ext: ext.get("op") == "ccmm", cap)
+
+
+def lower_input_caps(nodes: list[dict], pick, cap: int) -> list[dict]:
+    """The captured nodes with the input caps (`hint_lev`, `lvl_cap`: the hint / level-hint chain above each input) of
+    every external op `pick(args.external)` selects lowered to `cap`."""
     prod = {n["output"]: i for i, n in enumerate(nodes) if n.get("output")}
     hit: set[int] = set()
     for n in nodes:
         ext = (n.get("args") or {}).get("external")
-        if not (isinstance(ext, dict) and ext.get("op") == "pcmm" and int(ext.get("shift", 0)) > PCMM_PREDIV_SHIFT):
+        if not (isinstance(ext, dict) and pick(ext)):
             continue
         for v in n.get("inputs", []):
             i = prod.get(v)
@@ -687,7 +737,9 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     num_nodes_raw = len(raw.get("nodes", []))
     nodes = raw.get("nodes", [])
     if cfg.pcmm_prediv_cap is not None:
-        nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap)
+        nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap, pcmm_stamps())
+    if os.environ.get("PLAN_CCMM_OPERAND_CAP"):
+        nodes = ccmm_operand_caps(nodes, int(os.environ["PLAN_CCMM_OPERAND_CAP"]))
     g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
 
     g, erase = erase_reactive_bootstraps(g0)
@@ -1153,6 +1205,11 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     _bad_reactive = []
     _bad_nom: dict[str, float] = {}      # nominal input level of each entry in _bad_cut (eff = nominal + pending unit)
     _refresh_obj = getattr(placer, "refresh", None)
+    if os.environ.get("PLAN_DEBUG_SITES") == "1":
+        for _v in sorted(placer.placed):
+            _nom, _deg = sim.input_state(g, _v)
+            _r = _refresh_obj.spec(_v).route if _refresh_obj is not None else None
+            log.info(f"[plan] site {_v} route={_r} in=({cfg.bootstrap_level + _nom:g},{_deg}) cap={_cap_of(_v):g}")
     for _v, _c in sim.consumed.items():
         if _v in placer.placed:
             # a placed site's `consumed` is its LANDING; the envelope applies to the level its refresh STARTS
@@ -1160,7 +1217,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             # check below, and the envelope was measured on the dense route (a sparse route tolerates a
             # deeper input; its ceiling stays the runtime guard's, as before).
             _p = g.producer_of.get(_v)
-            _sparse = _refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+            _sparse = (_refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+                       and os.environ.get("PLAN_ENV_EFFECTIVE") != "1")      # PLAN_ENV_EFFECTIVE: every route
             if _p is None or _p.is_deliberate_bts or _p.hint_level is not None or _sparse:
                 continue
             _nom, _deg = sim.input_state(g, _v)

@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 
+from perseus.impl.pcmm import session_specs
 from perseus.impl.prefill import PlannedPrefill
 
 
@@ -161,8 +162,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
         lins = self.linears()
         t = self.model.rt.dims.t
-        specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
-                  int(lin.shift)) for lin in lins.values()]
+        specs = session_specs(lins.values(), t)
         self.rot_keys = plan_rot_scope(self.plan_dir, progs)
         from perseus.impl.driver import register_levels
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_layers) for j, r in self.reg[b]])
