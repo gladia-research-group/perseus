@@ -1702,6 +1702,7 @@ class PlannedPrefill:
         """The planned Session's arguments after (config, keys), which `Session.key_manifest` and `from_bundle` take
         too; records the plaintext aliases `setup` binds."""
         import hashlib
+        from perseus import _pc
         from .driver import register_levels
         progs = [self.progs[lab] for lab in self.labels]
         # plaintexts by value: the blocks' masks repeat (one resident slot per distinct (values, level))
@@ -1716,8 +1717,9 @@ class PlannedPrefill:
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), v)
         self.uniq = uniq
-        # a compact plaintext slot holds the rows of its level (n32: 54 - level Q primes); the deepest plaintext sizes it
-        pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
+        # a compact plaintext slot holds the rows of its level (the chain's Q primes less the level); the deepest
+        # plaintext sizes it
+        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
         t = self.model.rt.dims.t
         specs = session_specs(self.linears().values(), t)
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_stages) for j, r in self.reg[b]])

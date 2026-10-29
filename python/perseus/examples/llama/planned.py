@@ -243,6 +243,7 @@ class LlamaPlannedPrefill(PlannedPrefill):
     def session_kwargs(self):
         """The planned Session's arguments after (config, keys) (`Session.key_manifest` / `from_bundle` take the
         same); keeps the plaintext aliases and the distinct (value, level) plaintexts for `setup`."""
+        from perseus import _pc
         progs = [self.progs[lab] for lab in self.labels]
         self.alias, uniq = {}, {}
         for b, p in enumerate(progs):
@@ -252,7 +253,7 @@ class LlamaPlannedPrefill(PlannedPrefill):
                 store = f"{lab}/{nm}" if (form == "at_use" or nm.startswith("pt_")) else nm
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), self.uniq[key])
-        pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
+        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
         lins = self.linears()
         t = self.model.rt.dims.t
         specs = session_specs(lins.values(), t)
