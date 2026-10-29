@@ -674,27 +674,13 @@ def pcmm_prediv_caps(nodes: list[dict], cap: int, stamps: dict[str, int] | None 
     which the runtime spends dividing their scale by 2^(shift - PCMM_PREDIV_SHIFT) (pc-gpu `matmul::pcmm::prediv`).
     With `stamps` (`pcmm_stamps`), only the linears the runtime pre-divides: a stamp above 2^PCMM_PREDIV_STAMP_LOG2
     (a linear missing from them counts as one)."""
-    def pick(ext: dict) -> bool:
-        if ext.get("op") != "pcmm" or int(ext.get("shift", 0)) <= PCMM_PREDIV_SHIFT:
-            return False
-        return stamps is None or stamps.get(ext.get("linear"), PCMM_PREDIV_STAMP_LOG2 + 1) > PCMM_PREDIV_STAMP_LOG2
-    return lower_input_caps(nodes, pick, cap)
-
-
-def ccmm_operand_caps(nodes: list[dict], cap: int) -> list[dict]:
-    """The captured nodes with every CCMM operand's caps lowered to `cap` (PLAN_CCMM_OPERAND_CAP): a lean chain's
-    stc_high enters one level higher (pc-gpu `bts::stc_high::shape_stages`: limb 3 from the pair at limb 6)."""
-    return lower_input_caps(nodes, lambda ext: ext.get("op") == "ccmm", cap)
-
-
-def lower_input_caps(nodes: list[dict], pick, cap: int) -> list[dict]:
-    """The captured nodes with the input caps (`hint_lev`, `lvl_cap`: the hint / level-hint chain above each input) of
-    every external op `pick(args.external)` selects lowered to `cap`."""
     prod = {n["output"]: i for i, n in enumerate(nodes) if n.get("output")}
     hit: set[int] = set()
     for n in nodes:
         ext = (n.get("args") or {}).get("external")
-        if not (isinstance(ext, dict) and pick(ext)):
+        if not (isinstance(ext, dict) and ext.get("op") == "pcmm" and int(ext.get("shift", 0)) > PCMM_PREDIV_SHIFT):
+            continue
+        if stamps is not None and stamps.get(ext.get("linear"), PCMM_PREDIV_STAMP_LOG2 + 1) <= PCMM_PREDIV_STAMP_LOG2:
             continue
         for v in n.get("inputs", []):
             i = prod.get(v)
@@ -738,8 +724,6 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     nodes = raw.get("nodes", [])
     if cfg.pcmm_prediv_cap is not None:
         nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap, pcmm_stamps())
-    if os.environ.get("PLAN_CCMM_OPERAND_CAP"):
-        nodes = ccmm_operand_caps(nodes, int(os.environ["PLAN_CCMM_OPERAND_CAP"]))
     g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
 
     g, erase = erase_reactive_bootstraps(g0)
