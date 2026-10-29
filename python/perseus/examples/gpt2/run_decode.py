@@ -23,7 +23,8 @@ def gpu_busy(device=None):
                              capture_output=True, text=True, timeout=20).stdout.strip()
     except Exception:
         return None
-    return [l for l in out.splitlines() if l.strip()]
+    # this process's own context (an earlier run in the same process, e.g. a test session) is not another process
+    return [l for l in out.splitlines() if l.strip() and l.split(",")[0].strip() != str(os.getpid())]
 
 
 class _Closer:

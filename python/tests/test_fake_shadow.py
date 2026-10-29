@@ -67,7 +67,7 @@ def test_plan_runtime_matches_the_env_dicts():
         for k, v in want.items():
             assert got.get(k) == v or (got.get(k) is None and v == env.RUNTIME_LEGACY.get(k)), (plan, k)
     assert config.plan_configs("bootstrap_placements/gpt2_decode") == \
-        "configs/model/approximation/gpt2_base_n32/configs.json"
+        "configs/model/approximation/gpt2_base_n32_cm/configs.json"
 
 
 def test_capture_env_stamps_bridge():
@@ -143,7 +143,7 @@ def test_shadow_scale_tables_and_consts():
     assert s.add_scalar(a, -1.0).consts_kind == "add"
 
 
-@pytest.mark.skipif(not (D3 / "params.json").exists(), reason="d3 dump not readable")
+@pytest.mark.skipif(not os.access(D3 / "params.json", os.R_OK), reason="d3 dump not readable")
 def test_em_program_view():
     p = json.loads((D3 / "params.json").read_text())
     cts3 = json.loads((D3 / "it0.cts3.json").read_text())
