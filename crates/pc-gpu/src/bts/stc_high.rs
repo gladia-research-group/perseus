@@ -58,7 +58,10 @@ pub fn shape_stages(sh: StcHighShape, n_stc: usize, n_q: usize, d: usize, lone: 
     if top >= n_q {
         return Err(shape("stc_high", format!("entry limb {top} above the chain top (output level {}, {} stages)", sh.out_level, keep.len())));
     }
-    Ok(keep.iter().zip(&stages).enumerate().map(|(ki, (&s, &(top, thin)))| StageShape { src: s, top, end: LtEnd::ModDown, scaled: ki + 1 == keep.len(), thin }).collect())
+    // the factor on the last stage that drops a level: a single prime's plaintexts keep their 27 bits (the products
+    // are linear, so where the factor sits does not change the output)
+    let scaled = stages.iter().rposition(|s| !s.1).unwrap_or(keep.len() - 1);
+    Ok(keep.iter().zip(&stages).enumerate().map(|(ki, (&s, &(top, thin)))| StageShape { src: s, top, end: LtEnd::ModDown, scaled: ki == scaled, thin }).collect())
 }
 
 /// stc_high on the device: one cache per shape.
@@ -180,9 +183,9 @@ mod tests {
 
     #[test]
     fn lean_shapes_reach_limb_3() {
-        // n32a4 (51 primes, q2 single): limb 3 (level 47) from the pair q5 q6 at limb 6, then q4 alone
+        // n32a4 (51 primes, q2 single): limb 3 (level 47) from the pair q5 q6 at limb 6 (with the factor), then q4 alone
         let s = shape_stages(StcHighShape { out_level: 47, skip_mask: 1 }, 3, 51, 2, Some(2)).unwrap();
-        assert_eq!(s.iter().map(|x| (x.src, x.top, x.scaled, x.thin)).collect::<Vec<_>>(), vec![(1, 6, false, false), (2, 4, true, true)]);
+        assert_eq!(s.iter().map(|x| (x.src, x.top, x.scaled, x.thin)).collect::<Vec<_>>(), vec![(1, 6, true, false), (2, 4, false, true)]);
         // SinCBoot's stage 0 in the paired levels: a pair stage, as on n32 (level 28 = limb 22)
         let s = shape_stages(StcHighShape { out_level: 28, skip_mask: 6 }, 3, 51, 2, Some(2)).unwrap();
         assert_eq!(s.iter().map(|x| (x.src, x.top, x.scaled, x.thin)).collect::<Vec<_>>(), vec![(0, 24, true, false)]);
