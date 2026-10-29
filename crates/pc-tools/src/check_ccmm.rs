@@ -940,7 +940,10 @@ fn bench(args: &[String]) -> Res<bool> {
             tm.as_array().map(|x| (x * 100.0).round() / 100.0)
         );
         if bt {
-            t.add(&format!("ccmm {name} product >= 30 bits (Re {:.2}, Im {:.2})", bre.0, bim.0), (!(bre.0.min(bim.0) >= 30.0)) as usize, 1);
+            // a lean chain's last StC stage into the operands drops one 27-bit prime: its 65,536-coefficient diagonals
+            // keep ~21 bits, under SinCBoot's own ~15 (the outputs' gate below)
+            let need = if chain.lone_top().is_some() { 20.0 } else { 30.0 };
+            t.add(&format!("ccmm {name} product >= {need} bits (Re {:.2}, Im {:.2})", bre.0, bim.0), (!(bre.0.min(bim.0) >= need)) as usize, 1);
         }
         // SinCBoot: the scale the split asks for, set from the fitted product scale (ccmm.py c_unit's role)
         let nf_out = nf_split;

@@ -548,8 +548,8 @@ class Placer:
                 n, is_terminal=False, output_refreshed=(n.output in self.placed),
                 bootstrap_level=self.bootstrap_level)
             if env_eff:
-                # the sim's envelope class (a refresh or a fired hint past its effective envelope): the input's depth
-                # that keeps the refresh inside it, its pending rescale counted
+                # the sim's envelope class (a value or a fired hint's input past its effective envelope): the input's
+                # depth that keeps it inside, its pending rescale counted
                 cap_rel = refresh_env_cap(n.step) - self.bootstrap_level
                 if n.hint_level is not None and sim.hint_fired.get(n.idx, False) and n.cipher_inputs:
                     v = n.cipher_inputs[0]
@@ -557,7 +557,7 @@ class Placer:
                     if sim.consumed.get(v, 0.0) > t + 1e-9:
                         target[v] = min(target.get(v, float("inf")), t)
                     continue
-                if n.output and n.output in self.placed:
+                if n.output:
                     B = min(B, cap_rel - (unit if sim.node_deg.get(i, 1) == 2 else 0))
             for v in n.cipher_inputs:
                 if sim.consumed.get(v, 0.0) + n.cost > B:
