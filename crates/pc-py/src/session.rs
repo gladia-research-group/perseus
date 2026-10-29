@@ -290,8 +290,10 @@ pub(crate) struct State {
 /// What only a session holding the secret has.
 pub(crate) struct SecretSide {
     pub secret: DevSecret<'static, W>,
-    /// bottom-pair and 4-row decryptors (a value above q0 q1 / 2 at its scale decodes from 4 rows)
+    /// bottom-pair and 4-row decryptors (a value above q0 q1 / 2 at its scale decodes from 4 rows), and a 3-row one
+    /// for a lean chain's level 48 (q0 q1 q2: the deepest a value sits once realized, below its 4 rows)
     pub dec2: Decryptor<'static, W>,
+    pub dec3: Decryptor<'static, W>,
     pub dec4: Decryptor<'static, W>,
 }
 
@@ -1008,7 +1010,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let with_secret = !matches!(origin, Origin::Bundle(_));
     mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, !with_secret));
     if with_secret {
-        mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, 2, 1) + Decryptor::<W>::bytes(&lay, 4, 1));
+        mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, 2, 1) + Decryptor::<W>::bytes(&lay, 3, 1) + Decryptor::<W>::bytes(&lay, 4, 1));
         mp.reserve("keys.secret", DevSecret::<W>::bytes(&lay));
     }
     // planned: route tables + work, the shared slab, the registers, the programs' key groups
@@ -1167,10 +1169,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let secret_side = match secret.take() {
         Some(sec) => {
             let mut dec2 = Decryptor::new(a, &ex.compute, lay, 2, 1).map_err(e)?;
+            let mut dec3 = Decryptor::new(a, &ex.compute, lay, 3, 1).map_err(e)?;
             let mut dec4 = Decryptor::new(a, &ex.compute, lay, 4, 1).map_err(e)?;
             dec2.load_secret(&ex.compute, &sec).map_err(e)?;
+            dec3.load_secret(&ex.compute, &sec).map_err(e)?;
             dec4.load_secret(&ex.compute, &sec).map_err(e)?;
-            Some(SecretSide { secret: sec, dec2, dec4 })
+            Some(SecretSide { secret: sec, dec2, dec3, dec4 })
         }
         None => None,
     };
