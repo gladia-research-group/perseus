@@ -524,8 +524,8 @@
     "sc_blk5_ln2_141": 512
   },
   "correction_factor": {
-    "sc_blk5_1": 11,
-    "sc_blk5_2": 10,
+    "sc_blk5_1": 3,
+    "sc_blk5_2": 2,
     "sc_blk5_3": 15,
     "sc_blk5_4": 10,
     "sc_blk5_attn_softmax_116": 11,
@@ -554,16 +554,16 @@
     "sc_blk5_attn_softmax~2_78": 6,
     "sc_blk5_ln1_48": 9,
     "sc_blk5_ln2_48": 10,
-    "sc_blk5_qkv_3": 11,
-    "sc_blk5_qkv_5": 10,
+    "sc_blk5_qkv_3": 2,
+    "sc_blk5_qkv_5": 2,
     "sc_blk5_up_3": 14,
     "sc_blk5_up_5": 10,
-    "sc_blk5_down_7": 11,
-    "sc_blk5_down_9": 11,
-    "sc_blk5_down_11": 11,
-    "sc_blk5_down_13": 12,
-    "sc_blk5_down_15": 11,
-    "sc_blk5_down_17": 11,
+    "sc_blk5_down_7": 4,
+    "sc_blk5_down_9": 4,
+    "sc_blk5_down_11": 4,
+    "sc_blk5_down_13": 4,
+    "sc_blk5_down_15": 4,
+    "sc_blk5_down_17": 3,
     "sc_blk5_ln2_141": 9
   },
   "raise_drop": {
@@ -603,6 +603,18 @@
     "sc_blk5_attn_softmax~2_41",
     "sc_blk5_attn_softmax~2_73",
     "sc_blk5_attn_softmax~2_78"
+  ],
+  "shipped_order": [
+    "sc_blk5_1",
+    "sc_blk5_2",
+    "sc_blk5_down_11",
+    "sc_blk5_down_13",
+    "sc_blk5_down_15",
+    "sc_blk5_down_17",
+    "sc_blk5_down_7",
+    "sc_blk5_down_9",
+    "sc_blk5_qkv_3",
+    "sc_blk5_qkv_5"
   ],
   "summary": {
     "num_placements": 30,
@@ -18829,29 +18841,32 @@
       "table_measured": true,
       "num_sites": 41,
       "predicted_rel_err": {
-        "median": 0.0015762965259611733,
-        "p90": 0.0020329679690313063,
-        "p99": 0.0021175508020838925,
-        "max": 0.0021175508020838925
+        "median": 0.001043610377351806,
+        "p90": 0.001814171055466896,
+        "p99": 0.0020395577123498523,
+        "max": 0.0020395577123498523
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
+        "2": 3,
+        "3": 2,
+        "4": 5,
         "5": 1,
         "6": 5,
         "8": 1,
         "9": 11,
-        "10": 7,
-        "11": 10,
-        "12": 2,
+        "10": 5,
+        "11": 3,
+        "12": 1,
         "13": 2,
         "14": 1,
         "15": 1
       },
       "out_level_histogram": {
         "26": 1,
-        "28": 18,
-        "30": 8,
-        "34": 3,
+        "28": 14,
+        "30": 2,
+        "34": 13,
         "36": 3,
         "40": 6,
         "42": 2
