@@ -86,6 +86,8 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         ops.bootstrap_hint(x, ops.headroom(4))
         # unfolded: q on the interval stretched by xmax reads x / xmax; xmax and the lanes ride the mask as above
         g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.xmax * cfg.cheb_a, cfg.xmax * cfg.cheb_b, cfg.cheb_eps)
+        if getattr(ops, "gelu_out_hint", False):
+            ops.bootstrap_hint(g, ops.headroom(2), True)
         return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
     if cfg.method != "thor_composite":
         raise ValueError(f"gelu: method {cfg.method!r} not ported")
