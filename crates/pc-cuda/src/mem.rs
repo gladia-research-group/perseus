@@ -189,6 +189,24 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     pub fn upload(&mut self, s: &Stream<S>, data: &[T]) -> Result<()> {
         self.upload_at(s, 0, data)
     }
+    /// `upload_at` from the bytes of whole elements in device byte order (little endian), at any host alignment: a
+    /// wire frame's words uploaded where they lie, without a copy into a `Vec<T>`.
+    pub fn upload_bytes_at(&mut self, s: &Stream<S>, off: usize, bytes: &[u8]) -> Result<()> {
+        let sz = std::mem::size_of::<T>();
+        if bytes.len() % sz != 0 {
+            return Err(Error::Bounds { what: "upload_bytes_at (bytes of a partial element)", len: bytes.len(), cap: bytes.len() / sz * sz });
+        }
+        bounds("upload", off + bytes.len() / sz, self.len)?;
+        // SAFETY: range checked above (whole elements); host slice live for the call, and the stream is synced before
+        // returning; the copy is bytewise, so the host alignment does not matter
+        unsafe {
+            check(
+                ffi::cudaMemcpyAsync(self.ptr.add(off) as *mut c_void, bytes.as_ptr() as *const c_void, bytes.len(), MEMCPY_H2D, s.raw()),
+                "cudaMemcpyAsync H2D",
+            )?;
+        }
+        s.sync()
+    }
 
     /// Host copy of elements `[off, off + n)`, ordered after everything issued on the lane (syncs the lane).
     pub fn download_range(&self, s: &Stream<S>, off: usize, n: usize) -> Result<Vec<T>> {
@@ -214,6 +232,24 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     }
     pub fn download(&self, s: &Stream<S>) -> Result<Vec<T>> {
         self.download_range(s, 0, self.len)
+    }
+    /// `download_range` of the elements starting at `off` that fill `out` (whole elements, in device byte order),
+    /// written straight into `out` at any host alignment (syncs the lane).
+    pub fn download_bytes_into(&self, s: &Stream<S>, off: usize, out: &mut [u8]) -> Result<()> {
+        let sz = std::mem::size_of::<T>();
+        if out.len() % sz != 0 {
+            return Err(Error::Bounds { what: "download_bytes_into (bytes of a partial element)", len: out.len(), cap: out.len() / sz * sz });
+        }
+        bounds("download", off + out.len() / sz, self.len)?;
+        // SAFETY: range checked (whole elements); `out` is exclusively borrowed for the call and the copy completes
+        // at the sync before returning; the copy is bytewise, so the host alignment does not matter
+        unsafe {
+            check(
+                ffi::cudaMemcpyAsync(out.as_mut_ptr() as *mut c_void, self.ptr.add(off) as *const c_void, out.len(), MEMCPY_D2H, s.raw()),
+                "cudaMemcpyAsync D2H",
+            )?;
+        }
+        s.sync()
     }
 
     /// Asynchronous H2D from pinned memory into `[off, off + src.len())`.
