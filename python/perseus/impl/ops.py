@@ -132,6 +132,10 @@ class FheOps:
         # rides the imaginary part at seed / 1 of the sum, below the imaginary noise a refresh between the caller's
         # im_cleanse and the head sum leaves (the env switch: no Config field; the plan's runtime= line carries it)
         self.hrs_cleanse = os.environ.get("SM_HRS_CLEANSE", "0") not in ("", "0")
+        # GELU_OUT_HINT=1: the decode GELU's Chebyshev sum (bounded, before its xmax / layout mask) carries a refresh
+        # hint one unit below the down-projection's: a plan refreshes it there rather than after the mask, so the mask
+        # never takes a value past the chain's refresh room (the env switch, as SM_HRS_CLEANSE)
+        self.gelu_out_hint = os.environ.get("GELU_OUT_HINT", "0") not in ("", "0")
         # (SM_HRS_PACK and CUTMAX_PAIR need a complex payload; a real-slot session runs both unpacked)
         # CUTMAX_PAIR (default 1): two inverse-sigma cascade passes share one 1-slot refresh (examples/.../head.py)
         self.cutmax_pair = _on(cfg, "model.cutmax_pair", 1)
@@ -485,7 +489,7 @@ class NumpyOps:
     def bootstrap(self, a): return a
     def bootstrap_real(self, a): return a
     def bootstrap_hint(self, a, thr, acct=False): return a
-    folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = sm_periodic = sm_fold = kv_lanes = False
+    folds = fused_sm_den = fused_ln_var = sm_den_recip = gelu_fold = gelu_out_hint = sm_periodic = sm_fold = kv_lanes = False
     qkv_lanes = False
     realize_shared = False
     hrs_pack = False

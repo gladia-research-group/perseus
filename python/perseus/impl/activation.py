@@ -73,6 +73,10 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries 1/xmax): GELU(x) = xmax q(x / xmax),
             # q the Chebyshev series on [cheb_a, cheb_b]; xmax rides the lane mask, the refreshes are the plan's
             g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+            if getattr(ops, "gelu_out_hint", False):
+                # GELU_OUT_HINT: refresh the series' sum (|q| <= 1), not a term inside it, one unit before the
+                # down-projection's hint, so the mask below lands within the refresh room
+                ops.bootstrap_hint(g, ops.headroom(2), True)
             return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
         ops.bootstrap_hint(x, ops.headroom(4))
         # unfolded: q on the interval stretched by xmax reads x / xmax; xmax and the lanes ride the mask as above
