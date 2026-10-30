@@ -1567,8 +1567,13 @@ def gelu_joint(rt, A, B, cfg, mask, us=None):
             if cs is not None:
                 so = 2.0 * s_out if lean else s_out
                 cs = [so * c for c in cs]
-                return [ops.mult(ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * so), w)
-                        for x, w in zip((A, B), xu)]
+                out = []
+                for x, w in zip((A, B), xu):
+                    g = ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * so)
+                    if getattr(ops, "gelu_out_hint", False):   # GELU_OUT_HINT: the series' sum, before x u
+                        ops.bootstrap_hint(g, ops.headroom(2), True)
+                    out.append(ops.mult(g, w))
+                return out
         p1 = [eval_chebyshev(ops, x, c1, cfg.thor_p1_a, cfg.thor_p1_b) for x in (A, B)]
         X = ops.add(p1[0], ops.mult_i(p1[1]))
         ops.bootstrap(X)

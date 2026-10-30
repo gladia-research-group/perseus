@@ -66,8 +66,13 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         m = np.asarray(mask[1](1.0))
         if _ACT_FOLD and np.all(m == m.flat[0]):          # constant mask: xmax and the mask ride the coefficients
             s = cfg.xmax * float(np.real(m.flat[0]))
-            return eval_chebyshev(ops, x, [s * float(c) for c in cfg.cheb_coeffs], cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+            g = eval_chebyshev(ops, x, [s * float(c) for c in cfg.cheb_coeffs], cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+            if getattr(ops, "gelu_out_hint", False):      # GELU_OUT_HINT: the series' sum, as the decode's
+                ops.bootstrap_hint(g, ops.headroom(2), True)
+            return g
         g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+        if getattr(ops, "gelu_out_hint", False):
+            ops.bootstrap_hint(g, ops.headroom(2), True)
         return rt.mult_mask(g, (mask[0], "cheb", cfg.xmax), lambda: mask[1](cfg.xmax))
     if cfg.method == "chebyshev":
         if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries 1/xmax): GELU(x) = xmax q(x / xmax),
