@@ -58,6 +58,9 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     rec.first = 1
     labels = [f"block_{b}" for b in range(n)] + [f"block_{n_total}"]
     names = [x for x in lw.linear_names(n_total) if not x.startswith("b") or int(x[1:].split(".")[0]) < n]
+    for b in range(n):      # the slot cache entries the streams below mmap: built here on a fresh cache
+        lw.block(b)
+    lw.lm_tiles(paired=lw.packing == "cachemir_complex")
     streams = {x: int(np.load(lw.dir / f"{x}.npy", mmap_mode="r").shape[0]) for x in names}
 
     def prefix(b):
