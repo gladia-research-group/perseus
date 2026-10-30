@@ -254,9 +254,10 @@ typed configuration (`perseus._pc.Config`).
 
 The export packs the weights for the runtime. The calibration fits a polynomial approximation
 to every nonlinear function (LayerNorm, softmax, GELU and the encrypted argmax) on the value
-ranges it sees on OpenWebText; the shipped `gpt2_base_n32/configs.json` is the one the results
-use. The last command runs the plaintext model on a fixed piece of text and saves its inputs
-and output logits, the reference outputs that encrypted runs are compared against.
+ranges it sees on OpenWebText. The results use configs fitted the same way for their plans, each
+named in its plan's `PLAN_CMD.txt` (`gpt2_base_n32_ctx512s` for the 512-token decode). The last
+command runs the plaintext model on a fixed piece of text and saves its inputs and output logits,
+the reference outputs that encrypted runs are compared against.
 
 A model fine-tuned for encryption, such as the HEAT GPT-2, is exported on top of its base model
 with `--checkpoint` (a `model.pt` file or a HuggingFace repository id).
