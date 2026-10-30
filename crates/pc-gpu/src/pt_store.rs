@@ -430,6 +430,44 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
         self.view_slot(i)
     }
 
+    /// Words of one copy of a plaintext at `level` (rows `0..=top(level)`): what `copy_out` writes.
+    pub fn words_at(&self, sh: &Shadow, level: u32) -> Result<usize> {
+        Ok((self.top(sh, level)? + 1) * self.lay.n)
+    }
+
+    /// Copy resident `key`'s rows (`0..=top(level)`) into `dst` (device to device, on the compute lane after every
+    /// earlier writer): a snapshot of its encoding, which `copy_in` puts back. Returns its meta.
+    pub fn copy_out<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, sh: &Shadow, key: &PtKey, dst: &mut DBuf<'_, Compute, W>) -> Result<PtMeta> {
+        let words = self.words_at(sh, key.level)?;
+        let i = *self.index.get(key).ok_or_else(|| shape("copy_out", format!("'{}'@{} is not resident", key.name, key.level)))?;
+        self.join(ctx, &ex.compute, i)?;
+        match &self.slots[i].state {
+            State::Resident(b) => dst.copy_from(&ex.compute, b, words)?,
+            _ => return Err(shape("copy_out", "plaintext not resident")),
+        }
+        Ok(self.slots[i].meta)
+    }
+
+    /// Overwrite resident `key`'s slot IN PLACE with rows `copy_out` took (device to device, on the compute lane after
+    /// every earlier reader): the slot keeps its address, so a captured graph that reads it stays valid.
+    pub fn copy_in<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, sh: &Shadow, key: &PtKey, src: &DBuf<'_, Compute, W>, meta: PtMeta) -> Result<()> {
+        let words = self.words_at(sh, key.level)?;
+        if meta.level != key.level {
+            return Err(shape("copy_in", format!("a copy at level {} into '{}'@{}", meta.level, key.name, key.level)));
+        }
+        let i = *self.index.get(key).ok_or_else(|| shape("copy_in", format!("'{}'@{} is not resident", key.name, key.level)))?;
+        self.join(ctx, &ex.compute, i)?;
+        match &mut self.slots[i].state {
+            State::Resident(b) => b.copy_from(&ex.compute, src, words)?,
+            _ => return Err(shape("copy_in", "plaintext not resident")),
+        }
+        self.clock += 1;
+        let slot = &mut self.slots[i];
+        slot.meta = meta;
+        slot.last_use = self.clock;
+        Ok(())
+    }
+
     /// Encode `values` on the device (eager) into the slot of `key`.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_into<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, ops: &mut Ops<'_, W>, sh: &Shadow, key: PtKey, values: Payload2<'_>, deg: u8) -> Result<()> {

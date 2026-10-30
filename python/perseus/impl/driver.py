@@ -668,14 +668,18 @@ class PlannedRun:
     """PLANNED on the new runtime (see above). `recorder`: a Recorder on the model's CPU twin; `labels[i]`: the
     program label of stage i (+ CutMax after the stages). `variants` {label: stage}: more programs compiled from a
     stage's stream under the plan's `block_<b>_<variant>_placement.json` (e.g. block 0 for a token fed back by
-    generation); they share the stage's registers, dynamic steps and plaintext values."""
+    generation); they share the stage's registers, dynamic steps and plaintext values. `pt_cache`: `precompute`
+    encodes every position's plaintexts once into a device cache, and a token copies its position's into their
+    slots instead of encoding them (a few positions: GPT-2's 16 hold 1550 distinct values, 7.4 GB)."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, ref_token=2, probe=4, work_dir, pt_rows=0,
-                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, schedule="program"):
+                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, schedule="program",
+                 pt_cache=False):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
         self.variants = dict(variants or {})
         self.schedule = schedule          # Program.compile's op order (siblings: refresh pairs)
         self.ref_token, self.probe, self.work_dir, self.pt_rows = ref_token, probe, work_dir, pt_rows
+        self.pt_cache = pt_cache
         self.dyn_rot = list(dyn_rot) if dyn_rot is not None else [-i for i in range(-1, 32)]
         self.stc_cache, self.pool, self.log = stc_cache, pool, log
         self.debug = False
@@ -862,7 +866,38 @@ class PlannedRun:
         self.log(f"[planned] {n} positions precomputed in {time.time() - t0:.1f} s: {len(set(traj.values()))} "
                  f"plaintext slots for {len(traj)} keys, {len(self._pre[(0, 1)]['items']) if n > 1 else 0} staged "
                  f"per position")
+        if self.pt_cache:
+            self._cache_positions()
         return self
+
+    def _cache_positions(self):
+        """`pt_cache`: every staged value of every position encoded once into the session's position cache
+        (`PtStore.cache`, one copy per distinct value and level), each patch's items as the copies to restore
+        (`PtStore.restore`), and the first token's plaintexts staged whole now, so that no token encodes a plaintext.
+        The copies are the encoder's own output: a token's plaintexts are bit for bit those it would encode."""
+        import hashlib
+        t0, digest, ids, todo = time.time(), {}, {}, []
+        def key(nm, lv, v):
+            if id(v) not in digest:
+                a = np.ascontiguousarray(v)
+                digest[id(v)] = hashlib.blake2b(f"{a.dtype.str}{a.shape}".encode() + a.tobytes(), digest_size=16).digest()
+            return nm, lv, digest[id(v)]
+        first = self._pre.get((None, 0))
+        for k, pre in self._pre.items():
+            if pre is first:
+                continue
+            for nm, lv, v in pre["items"]:
+                c = key(nm, lv, v)
+                if c not in ids:
+                    ids[c] = len(todo)
+                    todo.append((nm, lv, v))
+        got = self.store.cache(todo)
+        for k, pre in self._pre.items():
+            pre["restore"] = [] if pre is first else [(nm, lv, got[ids[key(nm, lv, v)]]) for nm, lv, v in pre["items"]]
+        if first is not None:                    # the cache left each slot holding its last copy: position 0 now
+            self.store.stage(first["items"])
+        self.log(f"[planned] position cache: {len(todo)} plaintexts encoded in {time.time() - t0:.1f} s; "
+                 f"{max((len(p['restore']) for p in self._pre.values()), default=0)} copied per position")
 
     def _shared(self, items):
         """Staged items [(name, level, values)] under their shared store names, one per name and level."""
@@ -893,13 +928,16 @@ class PlannedRun:
                      for nm, lv in keys.get(lab) or self.progs[lab].pt_keys()]
         return calls, zero, vals
 
-    def _apply(self, calls, items):
+    def _apply(self, calls, items, restore=None):
         for p, kind, nm, v in calls:
             if kind == "s":
                 p.set_scalar(nm, v)
             else:
                 p.set_rotation(nm, v)
-        if items:
+        if restore is not None:
+            if restore:
+                self.store.restore(restore)
+        elif items:
             self.store.stage(items)
 
     def _patch(self, t, recs):
@@ -939,7 +977,7 @@ class PlannedRun:
         pre = self._pre.get((self._staged, t))
         if pre is not None and not self.debug:
             t_rec = 0.0
-            self._apply(pre["calls"], pre["items"])
+            self._apply(pre["calls"], pre["items"], pre.get("restore"))
             self._zero, n_staged = pre["zero"], len(pre["items"])
             self._pt_vals.clear()          # the existing path, if ever taken next, restages every plaintext
         else:
