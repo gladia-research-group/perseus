@@ -8,7 +8,7 @@ import numpy as np
 
 from . import sinc as sc
 from . import smcheb
-from .attention import _recip_rounds, uncentred_only
+from .attention import _recip_rounds, sink_only
 from .poly import eval_chebyshev, im_cleanse
 from .prefill import _KcExtrapolated, split
 
@@ -79,7 +79,7 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
     """Spk: 16 packed real score ciphertexts in true units, the BOS key on key token sc.BOS_TOK.
     Returns the packed probabilities, or (`unpacked`) unpack's output with its masks on the Z side of the last
     product: (Z LO) R + i (rot(Z, 16) LO) rot(R, 16), one level shallower when R is the deeper factor."""
-    uncentred_only(cfg, "sinc_softmax.softmax")
+    sink_only(cfg, "sinc_softmax.softmax")   # a key-0 config: the caller's K rows came off the BOS key (attention_ccmm)
     ops = rt.ops
     tq, tk = sc.packed_meta(T)
     qv = tq >= 0

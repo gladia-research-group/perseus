@@ -418,9 +418,10 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
     `prefixes`: per K / V block, the public (key, value) slot vectors before the prompt, put on the first padding lane;
     `kv`: per K / V block, a dict receiving the per-chunk real K (post-RoPE) / V, as prefill_attention's."""
     from . import smcheb
-    from .attention import _recip_rounds, uncentred_only
+    from .attention import _recip_rounds, sink_only
     from .prefill import _KcExtrapolated, recip_lanes, rope_lanes, split
-    uncentred_only(cfg, "attention_last")
+    sink_only(cfg, "attention_last")
+    centred = bool(cfg.ref_keys)
     ops, N, t = rt.ops, B.d.N, B.t
     half, lane = _query_lane(ch, B, p)
     G = len(Q)
@@ -447,6 +448,17 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
             if kv is not None:
                 kv[b]["K"], kv[b]["V"] = ks_, vs_
         K, kscale = Kr, 0.5
+    if centred and prefixes is None:
+        # key 0 encrypted (GPT-2, ViT): its K (chunk 0's lane 0, the real part of chunk pair 0) copied over every lane
+        # (replicate-right ladder) and taken off every chunk pair, real and imaginary: the scores come out as s - s_0
+        from .poly import rotsum_neg
+        K = [list(r) for r in K]
+        for b in range(B.Kkv):
+            k0 = rt.mult_mask(ops.add(K[0][b], ops.conjugate(K[0][b])), ("bl.last.kref0", B.nch, b, t),
+                              lambda: 0.5 * (np.arange(N) % t == 0))
+            k0 = rotsum_neg(ops, k0, t)
+            for g in range(G):
+                K[g][b] = ops.sub(K[g][b], ops.add(k0, ops.mult_i(k0)) if ch.has(2 * g + 1) else k0)
     n_pre = 0
     if prefixes is not None:
         # the public key / value on key index T (the first padding lane), in its chunk's half
@@ -458,9 +470,22 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
         K, V = [list(r) for r in K], [list(r) for r in V]
         for b in range(B.Kkv):
             kvec, vvec = (np.asarray(x) for x in prefixes[b])
-            ck = (1j if ph else 1.0) * (1.0 if kscale == 0.5 else 0.5)
-            K[gp][b] = rt.add_mask(K[gp][b], ("bl.last.pre.k", B.nch, b, ch.T, kscale),
-                                   lambda kvec=kvec, ck=ck: np.where(at, ck * kvec, 0.0))
+            sk = 1.0 if kscale == 0.5 else 0.5
+            if centred:
+                # a softmax centred on key 0: every prompt key minus the public key (chunk 2g real, 2g + 1 imaginary,
+                # on its token lanes), the prefix lane left 0, so the scores come out as s - s_pre (a plaintext sum)
+                for g in range(G):
+                    def build(g=g, kvec=kvec):
+                        out = np.zeros(N, dtype=complex)
+                        for unit, c in ((1.0, 2 * g), (1j, 2 * g + 1)):
+                            if ch.has(c):
+                                out += np.where(np.arange(N) % t < len(ch.lanes(c)), -unit * sk * kvec, 0.0)
+                        return out
+                    K[g][b] = rt.add_mask(K[g][b], ("bl.last.ref.k", B.nch, b, ch.T, kscale, g), build)
+            else:
+                ck = (1j if ph else 1.0) * sk
+                K[gp][b] = rt.add_mask(K[gp][b], ("bl.last.pre.k", B.nch, b, ch.T, kscale),
+                                       lambda kvec=kvec, ck=ck: np.where(at, ck * kvec, 0.0))
             V[gp][b] = rt.add_mask(V[gp][b], ("bl.last.pre.v", B.nch, b, ch.T),
                                    lambda vvec=vvec, ph=ph: np.where(at, (0.5j if ph else 0.5) * vvec, 0.0))
         n_pre = 1

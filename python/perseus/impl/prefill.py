@@ -11,12 +11,12 @@ import math
 import numpy as np
 
 from . import smcheb
-from .attention import _recip_rounds, first_iters, uncentred_only
+from .attention import _recip_rounds, first_iters, sink_only
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
 from .linear import _baby_sum, linear_multi, prepare_linear_input
 from .pcmm import session_specs
-from .poly import eval_chebyshev, im_cleanse, rotsum
+from .poly import eval_chebyshev, im_cleanse, rotsum, rotsum_neg
 import os
 _DBG = bool(os.environ.get("PF_DEBUG"))
 # PF_ATTN_PAIR=1: two offsets per q.K^T / P.V product on the complex axis
@@ -647,8 +647,9 @@ def _sm_joint(rt, za, zb, cfg):
 
 def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None, periodic=None):
     """softmax_thor over chunk c's packed scores S with per-lane (kc-dependent) reciprocal seeds.
-    `Z`: precomputed masked exps (the joint path)."""
-    uncentred_only(cfg, "prefill_softmax")
+    `Z`: precomputed masked exps (the joint path). A config centred on key 0 takes scores whose keys came off key 0
+    (prefill_attention's centre_keys)."""
+    sink_only(cfg, "prefill_softmax")
     ops, d = rt.ops, rt.dims
     c0 = _hp_pair(c)
     pos = ch.lanes(c if c0 is None else c0)
@@ -692,6 +693,16 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     return Y
 
 
+def centre_keys(rt, K, ch: Chunks):
+    """A softmax centred on key 0 (cfg.ref_keys): every chunk's keys minus key 0's (chunk 0, lane 0), so q.K^T returns
+    s - s_0. Key 0 is selected by one plaintext product and copied over the t lanes by the replicate-right ladder (no
+    level); the slots of no real score stay 0, since the score placing masks select the real ones."""
+    ops, d = rt.ops, rt.dims
+    k0 = rt.mult_mask(K[0], ("pf.kref0", ch.t), lambda: (np.arange(d.N) % ch.t == 0).astype(float))
+    k0 = rotsum_neg(ops, k0, ch.t)
+    return [None if k is None else ops.sub(k, k0) for k in K]
+
+
 def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False):
     """Causal attention on dense complex Q/K/V (scale 1/2); returns dense outputs (scale 1) as the decode's P.V.
     `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt.
@@ -718,6 +729,10 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             K[k] = rope_lanes(rt, K[k], rope, ch.lanes(k), "pf.rope.k")
     if kv is not None:
         kv["K"], kv["V"] = K, V
+    if getattr(cfg, "ref_keys", ()):
+        if prefix is not None:
+            raise ValueError("prefill_attention: a softmax centred on key 0 with a public prefix key runs on the CCMM")
+        K = centre_keys(rt, K, ch)
     gscale = 1.0 / math.sqrt(d.d_head_real)
     rotK, rotV = {}, {}
 

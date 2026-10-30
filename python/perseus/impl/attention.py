@@ -118,17 +118,33 @@ def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)
 # up, and a forward ladder copies it down over ref_window slots. Below the head's first key they land on key slots
 # kc + t - ref_window .. t - 1 of the head before, empty for every query of at most ref_window keys; the score mask
 # gives those the active constant, so they carry the head's (s_0 - s_r), a value of the u range, and the active mask
-# zeroes them after the exp.
+# zeroes them after the exp. A config whose every head is centred on key 0 needs no broadcast: the K side alone
+# centres every bucket and group, so it holds at any cache length up to its ref_window (the 512-key decodes).
+
+def _ref_sink_only(cfg: SoftmaxCfg) -> bool:
+    return all(r == REF_SINK for r in cfg.ref_keys)
+
+
+def _ref_limit(d, cfg: SoftmaxCfg) -> int:
+    return cfg.ref_window if _ref_sink_only(cfg) else min(cfg.ref_window, d.t)
+
 
 def _ref_covers(d, cfg: SoftmaxCfg, kc: int) -> bool:
-    return 0 < kc <= min(cfg.ref_window, d.t)
+    return 0 < kc <= _ref_limit(d, cfg)
 
 
 def _ref_check(d, cfg: SoftmaxCfg, kc: int):
     """A centred config holds for at most ref_window keys (its U and bands are fitted to them): a longer cache takes
     another plan. Only the computation checks; the masks staged one step ahead of the last token are never read."""
     if not _ref_covers(d, cfg, kc):
-        raise ValueError(f"reference-key centring covers 1..{min(cfg.ref_window, d.t)} keys, not {kc}")
+        raise ValueError(f"reference-key centring covers 1..{_ref_limit(d, cfg)} keys, not {kc}")
+
+
+def sink_only(cfg, where: str):
+    """A path whose keys come off key 0 on the K side (the CCMM prefill's BOS key) takes a config centred on key 0;
+    the self / previous-key references stay the complex-packed decode's."""
+    if getattr(cfg, "ref_keys", ()) and not _ref_sink_only(cfg):
+        raise ValueError(f"{where}: reference-key centring on the self / previous key needs the complex-packed decode")
 
 
 def uncentred_only(cfg, where: str):
@@ -159,11 +175,26 @@ def _ref_score_mask(d, cfg: SoftmaxCfg, kc: int, mean: float, per):
     return out
 
 
-def _ref_push_item(d, kc: int):
-    """The K push's copy of key 0 into k_ref: the push mask at the first token, zero after."""
+def _ref_push_item(d, kc: int, half: bool = False):
+    """The K push's copy of key 0 into k_ref: the push mask at the first token, zero after (`half`: the push without
+    KV_LANES, whose K arrives doubled)."""
     if kc == 1:
+        if half:
+            return ("kpush.ref0h", 1), lambda: real_head_half_mask(d)
         return ("kpush.ref0", 1), lambda: real_head_tok0_mask(d)
-    return ("kpush.ref0", 0), lambda: np.zeros(d.N)
+    return ("kpush.ref0" + ("h" if half else ""), 0), lambda: np.zeros(d.N)
+
+
+def _ref_push(rt, kv, raw, K, half: bool = False):
+    """K minus key 0 for a centred cache, kv.k_ref collecting key 0 from `raw` (the push's unmasked K) at the first
+    token."""
+    ops = rt.ops
+    r = rt.mult_mask(raw, *_ref_push_item(rt.dims, kv.k_count + 1, half))
+    if kv.k_count == 0:
+        kv.k_ref = ops.copy(r)
+    else:
+        ops.inplace_add(kv.k_ref, r)
+    return ops.sub(K, kv.k_ref)
 
 
 def _ref_sel_item(d, cfg: SoftmaxCfg, kc: int, kind: int, scale: float):
@@ -385,8 +416,6 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
     A centred cache (kv.centre) takes K minus key 0, held in kv.k_ref from the first token."""
     ops, d = rt.ops, rt.dims
     kvl = getattr(ops, "kv_lanes", False)
-    if kv.centre and not kvl:
-        raise ValueError("reference-key centring needs KV_LANES=1")
     q_out = None
     if kvl:
         # KV_LANES: realify first (both halves fill every token lane), keep K on lane 0 and V on lane 1, and refresh
@@ -413,20 +442,17 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
                 q_out = q_out[0]
         K = rope_mask(rt, X, "kpush.tok0", lambda: real_head_tok0_mask(d), rope, pos)
         if kv.centre:
-            r = rt.mult_mask(X, *_ref_push_item(d, kv.k_count + 1))
-            if kv.k_count == 0:
-                kv.k_ref = ops.copy(r)
-            else:
-                ops.inplace_add(kv.k_ref, r)
-            K = ops.sub(K, kv.k_ref)
+            K = _ref_push(rt, kv, X, K)
     else:
         P = ops.copy(P_in)
         with _kv_bts_scope():
             ops.bootstrap(P)
         conj = ops.conjugate(P)
-        K = ops.add(P, conj)                               # 2 K_raw
+        K2 = ops.add(P, conj)                              # 2 K_raw
         V = ops.sub(conj, P)                               # -2i V_raw, realified by the monomial i
-        K = rope_mask(rt, K, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
+        K = rope_mask(rt, K2, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
+        if kv.centre:
+            K = _ref_push(rt, kv, K2, K, half=True)
     K = ops.rotate(K, -(kv.k_count % d.t))
     # bucket_k_complex
     if kv.k_count % d.t == 0:
@@ -511,8 +537,9 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         raise ValueError("reference-key centring: the softmax config and the K cache disagree")
     if centred:
         _ref_check(d, cfg, kc)
-        if per != 1 or merge or kv.k_buckets:
-            raise ValueError("reference-key centring needs one pending K group of tH-periodic scores")
+        if not _ref_sink_only(cfg) and (per != 1 or merge or kv.k_buckets):
+            raise ValueError("reference-key centring on the self / previous key needs one pending K group of "
+                             "tH-periodic scores")
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
         result = ops.mult(q, pend)
@@ -957,8 +984,11 @@ def gqa_dims(d: Dims, G: int) -> Dims:
 
 def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
             pre_linear=None, pre_out=None):
-    """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims)."""
-    uncentred_only(sm_cfg, "mha_gqa")
+    """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims). A softmax centred on key 0
+    takes the K side's centring (each query head's scores minus its own key-0 score); the self / previous-key
+    references need the expanded cache."""
+    if getattr(sm_cfg, "ref_keys", ()) and not _ref_sink_only(sm_cfg):
+        raise ValueError("mha_gqa: reference-key centring on the self / previous key needs the expanded cache")
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)
@@ -985,7 +1015,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
         with rt.step("qkt", shape=shape):
             scores = None
             for g in range(G):
-                s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), **rp)
+                s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), cfg=sm_cfg, **rp)
                 scores = s_g if scores is None else ops.add(scores, s_g)
             scores = ops.tag_reduce(scores, G * sub.dims.tH)
         sub.gq_merge = G
@@ -1008,7 +1038,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
         with rt.step(f"g{g}"):
             shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
             with rt.step("qkt", shape=shape):
-                scores = complex_qkt(sub, kv, qs[g], a, **rp)
+                scores = complex_qkt(sub, kv, qs[g], a, cfg=sm_cfg, **rp)
             with rt.step("softmax"):
                 probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
             with rt.step("softmax_v"):

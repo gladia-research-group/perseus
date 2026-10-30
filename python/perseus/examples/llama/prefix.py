@@ -62,14 +62,14 @@ class PlainOps(NumpyOps):
         return a
 
 
-def plain_cache(dims, k_feat, v_feat, packing: str, rope=None):
+def plain_cache(dims, k_feat, v_feat, packing: str, rope=None, centre=False):
     """The cache structure one push of (k, v) at position 0 leaves, on plain slot vectors.
-    k_feat / v_feat: (hid,) in the head-interleaved order (GQA-expanded)."""
+    k_feat / v_feat: (hid,) in the head-interleaved order (GQA-expanded). `centre`: a cache centred on key 0."""
     rt = Rt(PlainOps(), dims)
     N, hid = dims.N, dims.hid
     lin = lambda f: encode_linear_input(f, N, hid, hid)      # a linear's output layout: f[r] at r t
     if packing == "cachemir_complex":
-        kv = ComplexKVCache(dims.d_head)
+        kv = ComplexKVCache(dims.d_head, centre=centre)
         cache_kv_push_packed_complex(rt, kv, lin(k_feat) + 1j * lin(v_feat), rope=rope, pos=0)
     else:
         kv = KVCache(dims.d_head)
@@ -81,7 +81,7 @@ def plain_cache(dims, k_feat, v_feat, packing: str, rope=None):
     return kv
 
 
-def plain_cache_n(dims, k_feats, v_feats, packing: str, rope=None):
+def plain_cache_n(dims, k_feats, v_feats, packing: str, rope=None, centre=False):
     """plain_cache over positions 0 .. n-1: the cache structure n pushes leave, on plain slot vectors (the plain
     prefix). k_feats[p] / v_feats[p]: position p's pre-RoPE K / V, (hid,) head-interleaved; RoPE at p is folded
     into the push masks as in the encrypted decode."""
@@ -90,7 +90,7 @@ def plain_cache_n(dims, k_feats, v_feats, packing: str, rope=None):
     lin = lambda f: encode_linear_input(f, N, hid, hid)
     if packing != "cachemir_complex":
         raise ValueError("plain_cache_n: cachemir_complex only")
-    kv = ComplexKVCache(dims.d_head)
+    kv = ComplexKVCache(dims.d_head, centre=centre)
     for p, (kf, vf) in enumerate(zip(k_feats, v_feats)):
         cache_kv_push_packed_complex(rt, kv, lin(kf) + 1j * lin(vf), rope=rope, pos=p)
     return kv
