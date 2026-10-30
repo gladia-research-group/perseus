@@ -106,14 +106,14 @@ primitives on one RTX PRO 6000, and the two commands under it reproduce the tabl
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-core-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-core-light.png">
-      <img src="assets/paper-tables-core-light.png" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.022 and 0.057, multiplication by a scalar 0.026 and 0.040, by a plaintext 0.019 and 0.038, relinearized multiplication 0.540 and 0.563, rescale 0.084 and 0.130, rotation 0.512 and 0.536, forward and inverse NTT 0.076 and 0.103. Bootstraps, dense 20.3 and 19.2, StC first 17.1 and 15.5, sparse 512 slots 17.4 and 19.0, sparse 256 slots 16.4 and 18.6, one slot 10.0 and 11.3. Ring 2^16, 54 + 9 primes in 32-bit words, log QP 1706, dnum 6, 128-bit security." width="707">
+      <img src="assets/paper-tables-core-light.png" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.015 and 0.054, multiplication by a scalar 0.016 and 0.037, by a plaintext 0.015 and 0.037, relinearized multiplication 0.413 and 0.439, rescale 0.057 and 0.072, rotation 0.360 and 0.378, forward and inverse NTT 0.070 and 0.098. Bootstraps, dense 15.2 and 14.0, StC first 13.0 and 11.7, sparse 512 slots 13.1 and 13.0, sparse 256 slots 12.2 and 12.6, one slot 7.3 and 7.7. Ring 2^16, 51 + 13 primes in 32-bit words, log QP 1734, dnum 4, 128-bit security." width="707">
     </picture>
   </a>
 </p>
 
 ```bash
-cargo run --release -p pc-tools -F pc-gpu/mont --bin pc-bench -- modmul --k 1,8 --reps 20   # leaf operations
-cargo run --release -p pc-tools --bin pc-bench -- bts --all --k 1,8 --reps 20 --keys packed  # bootstraps
+PC_BENCH_CHAIN=n32a4 cargo run --release -p pc-tools -F pc-gpu/mont --bin pc-bench -- modmul --k 1,8 --reps 20   # leaf operations
+PC_BENCH_CHAIN=n32a4 cargo run --release -p pc-tools --bin pc-bench -- bts --all --k 1,8 --reps 20 --keys packed  # bootstraps
 ```
 
 ## Reproduce

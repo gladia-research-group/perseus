@@ -133,31 +133,32 @@ Cerium (Jayashankar et al., 2025) & BERT-base & 128 & 43.6\nt{\S} & RTX PRO 6000
 our GPU. \legend}
 \end{tbl}
 
-% perseus-core primitives (2026-10-23, GPU 4 alone): pc-bench modmul --k 1,8 --reps 20 (the u32xBarrett64 column, rotation
-% KS Regen, rescale = its `rescale only` row, batch rows / 8) and pc-bench bts --all --k 1,8 --reps 20 --keys packed (eager)
+% perseus-core primitives (2026-10-30, GPU 4 alone, PC_BENCH_CHAIN=n32a4): pc-bench modmul --k 1,8 --reps 20 (the u32xBarrett64
+% column, rotation KS Regen, rescale = its `rescale only` row, batch rows / 8) and pc-bench bts --all --k 1,8 --reps 20
+% --keys packed (eager)
 \begin{tbl}
 \begin{tabularx}{\linewidth}{L{1}rr}
 \toprule
 \textbf{perseus-core} & one ciphertext (ms) & batch of 8 (ms per ciphertext) \\
 \midrule
-addition & 0.022 & 0.057 \\
-multiplication by a scalar & 0.026 & 0.040 \\
-multiplication by a plaintext & 0.019 & 0.038 \\
-multiplication, relinearized & 0.540 & 0.563 \\
-rescale & 0.084 & 0.130 \\
-rotation & 0.512 & 0.536 \\
-NTT, forward and inverse & 0.076 & 0.103 \\
+addition & 0.015 & 0.054 \\
+multiplication by a scalar & 0.016 & 0.037 \\
+multiplication by a plaintext & 0.015 & 0.037 \\
+multiplication, relinearized & 0.413 & 0.439 \\
+rescale & 0.057 & 0.072 \\
+rotation & 0.360 & 0.378 \\
+NTT, forward and inverse & 0.070 & 0.098 \\
 \cdashline{1-3}\noalign{\vskip 3pt}
-bootstrap, dense ($2^{15}$ slots) & 20.3 & 19.2 \\
-bootstrap, StC first ($2^{15}$ slots) & 17.1 & 15.5 \\
-bootstrap, sparse (512 slots) & 17.4 & 19.0 \\
-bootstrap, sparse (256 slots) & 16.4 & 18.6 \\
-bootstrap, one slot & 10.0 & 11.3 \\
+bootstrap, dense ($2^{15}$ slots) & 15.2 & 14.0 \\
+bootstrap, StC first ($2^{15}$ slots) & 13.0 & 11.7 \\
+bootstrap, sparse (512 slots) & 13.1 & 13.0 \\
+bootstrap, sparse (256 slots) & 12.2 & 12.6 \\
+bootstrap, one slot & 7.3 & 7.7 \\
 \bottomrule
 \end{tabularx}
 \tcap{\thickmuskip=5mu\medmuskip=4mu CKKS primitives on one NVIDIA RTX PRO 6000, device time per call (CUDA events), the
-median of 20 calls after 2 warm-ups and of 3 runs. Ring $N = 2^{16}$ with $54 + 9$ primes in 32-bit words
-($\log QP = 1706$), hybrid key switching with $d_{\mathrm{num}} = 6$, 128-bit security. Leaf operations run at the top
+median of 20 calls after 2 warm-ups and of 3 runs. Ring $N = 2^{16}$ with $51 + 13$ primes in 32-bit words
+($\log QP = 1734$), hybrid key switching with $d_{\mathrm{num}} = 4$, 128-bit security. Leaf operations run at the top
 of the chain, and every key switch regenerates half of its key from a seed. One ciphertext stays in the GPU's 128 MB L2
 cache between calls, a batch of 8 does not.}
 \end{tbl}
