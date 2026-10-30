@@ -1,9 +1,8 @@
 //! StC outside a bootstrap (FIDESlib `btsStcHigh`, perseus `bts.stc_high`): the dense route's shipped StC stages
 //! applied to an ordinary ciphertext, the kept stages (bit s of `skip_mask` skips stage s: the CCMM's SinC encoding
-//! runs stage 0 alone, or stages 1..2) re-levelled to `entry = out + n_kept d` .. `out + d` (a lean chain's output top
-//! inside a prime pair: the last stage drops one prime, `StageShape::thin`), the last kept stage
-//! scaled by `factor` (times `nf_ref / NoiseFactor` when `nf_ref > 0`: the output's integers then sit at the
-//! reference scale), unfused stage ends (EvalLTStages), a final rescale to the output level.
+//! runs stage 0 alone, or stages 1..2) re-levelled to `entry = out + n_kept d` .. `out + d` (on a lean chain the last
+//! stage drops one prime of a pair, `StageShape::thin`), the last kept stage scaled by `factor` (times `nf_ref /
+//! NoiseFactor` when `nf_ref > 0`, the output then at the reference scale), unfused stage ends, a rescale to `out`.
 //!
 //! The re-levelled stage sequences are cached per shape (out level, skip mask) in bounded LRU caches
 //! (`StageCache`, entries keyed by the factor; FIDESlib kept one process-wide map capped at 24 and synchronized the
