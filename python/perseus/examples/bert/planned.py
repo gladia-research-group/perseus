@@ -14,13 +14,14 @@ import time
 
 import numpy as np
 
+from perseus.impl.pcmm import session_specs
 from perseus.impl.prefill import PlannedPrefill
 
 
-def plan_config(plan):
+def plan_config(plan, graphs=False):
     """The session Config of a planned encoder run: the GPT-2 prefill preset (the encoder plans come from its planner
     path), the plan's capture env (the load-bearing fields its blocks were cut under, e.g. the reactive ceiling 46),
-    then its runtime switches."""
+    then its runtime switches. `graphs`: replay each block as CUDA graphs (exec.use_graphs; the first forward captures)."""
     import json
     from pathlib import Path
     from perseus import config as pcfg
@@ -30,8 +31,7 @@ def plan_config(plan):
         env = (json.loads(first[0].read_text()).get("capture_env") or {}).get("env") or {}
         cfg = cfg.with_env({k: str(v) for k, v in env.items() if v is not None})
     cfg = pcfg.plan_runtime(plan, "n32", base=cfg)
-    # one-shot forwards: eager replay (a graph capture costs a forward and leases a constant slot per scalar)
-    cfg["exec.use_graphs"] = False
+    cfg["exec.use_graphs"] = bool(graphs)
     return cfg
 
 
@@ -125,7 +125,8 @@ class EncoderPlannedPrefill(PlannedPrefill):
                 self.in_metas[b] = [got[n] for n in self.recs[b - 1].out_names]
             metas = {lab: {n: self.in_metas[b][names.index(n)] for n in ins}}
             self.progs.update(_pc.Program.compile(self.work_dir, self.plan_dir, config=self.cfg, blocks=[lab],
-                                                  live_out={lab: list(r.out_names)}, input_metas=metas))
+                                                  live_out={lab: list(r.out_names)}, input_metas=metas,
+                                                  schedule=self.schedule))
             prev = b
         self.reg, n = {}, 0
         for b in range(self.n_layers):
@@ -158,11 +159,10 @@ class EncoderPlannedPrefill(PlannedPrefill):
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), v)
         n_pts = len(uniq)
-        pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
+        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
         lins = self.linears()
         t = self.model.rt.dims.t
-        specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
-                  int(lin.shift)) for lin in lins.values()]
+        specs = session_specs(lins.values(), t)
         self.rot_keys = plan_rot_scope(self.plan_dir, progs)
         from perseus.impl.driver import register_levels
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_layers) for j, r in self.reg[b]])

@@ -10,7 +10,7 @@ import os
 
 import numpy as np
 
-from .config import SoftmaxCfg
+from .config import REF_PREV, REF_SELF, REF_SINK, SoftmaxCfg, ref_key
 from .layout import Dims
 from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_mask,
                      qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
@@ -96,12 +96,139 @@ def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sfx = (".p" if per == 1 else f".p{int(per)}") if per else ""
     al, be = affine
-    if (al, be) == (1.0, 0.0):
+    if cfg.ref_keys and _ref_covers(d, cfg, kc):
+        # the centred scores: the reference broadcast's spill slots take the active slots' constant too
+        refs = "".join(str(r) for r in cfg.ref_keys)
+        build = lambda: al * _ref_score_mask(d, cfg, kc, mean, per) - be
+        score = (("sm.score.ref" + sfx, cfg.clip_lo, mean, kc, refs, cfg.ref_window, "affine", al, be), build)
+    elif (al, be) == (1.0, 0.0):
         score = (("sm.score" + sfx, cfg.clip_lo, mean, kc), lambda: score_mask(d, cfg.clip_lo, mean, kc, periodic=per))
     else:
         score = (("sm.score" + sfx, cfg.clip_lo, mean, kc, "affine", al, be),
                  lambda: al * score_mask(d, cfg.clip_lo, mean, kc, periodic=per) - be)
     return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+
+
+# ── reference-key centring (cfg.ref_keys) ──
+# The exp runs on u - U, u = s - s_r(h): every head's scores minus its reference key's, so the exponentials stay <= 1
+# and the reference's own term keeps the head sum >= exp(-U / delta2) (the config's clip range is in u). Key 0 comes
+# off on the K side: every key is pushed minus key 0 (k_ref, held from the first token), so q.K^T returns s_j - s_0
+# and the empty key slots stay 0. The heads centred on their own key (REF_SELF) or the one before (REF_PREV) then
+# subtract (s_r - s_0): a selector at the group mask's level picks it (no level more), a prev head's moved one slot
+# up, and a forward ladder copies it down over ref_window slots. Below the head's first key they land on key slots
+# kc + t - ref_window .. t - 1 of the head before, empty for every query of at most ref_window keys; the score mask
+# gives those the active constant, so they carry the head's (s_0 - s_r), a value of the u range, and the active mask
+# zeroes them after the exp. A config whose every head is centred on key 0 needs no broadcast: the K side alone
+# centres every bucket and group, so it holds at any cache length up to its ref_window (the 512-key decodes).
+
+def _ref_sink_only(cfg: SoftmaxCfg) -> bool:
+    return all(r == REF_SINK for r in cfg.ref_keys)
+
+
+def _ref_limit(d, cfg: SoftmaxCfg) -> int:
+    return cfg.ref_window if _ref_sink_only(cfg) else min(cfg.ref_window, d.t)
+
+
+def _ref_covers(d, cfg: SoftmaxCfg, kc: int) -> bool:
+    return 0 < kc <= _ref_limit(d, cfg)
+
+
+def _ref_check(d, cfg: SoftmaxCfg, kc: int):
+    """A centred config holds for at most ref_window keys (its U and bands are fitted to them): a longer cache takes
+    another plan. Only the computation checks; the masks staged one step ahead of the last token are never read."""
+    if not _ref_covers(d, cfg, kc):
+        raise ValueError(f"reference-key centring covers 1..{_ref_limit(d, cfg)} keys, not {kc}")
+
+
+def sink_only(cfg, where: str):
+    """A path whose keys come off key 0 on the K side (the CCMM prefill's BOS key) takes a config centred on key 0;
+    the self / previous-key references stay the complex-packed decode's."""
+    if getattr(cfg, "ref_keys", ()) and not _ref_sink_only(cfg):
+        raise ValueError(f"{where}: reference-key centring on the self / previous key needs the complex-packed decode")
+
+
+def uncentred_only(cfg, where: str):
+    """The softmax paths that do not centre (all but the complex-packed decode's complex_qkt) refuse a centred config:
+    its exp domain and bands are in centred units."""
+    if getattr(cfg, "ref_keys", ()):
+        raise ValueError(f"{where}: reference-key centring needs the complex-packed decode (complex_qkt)")
+
+
+def _ref_heads(d, cfg: SoftmaxCfg, kind: int):
+    return [h for h in range(d.H_real) if cfg.ref_keys[h] == kind]
+
+
+def _ref_top(cfg: SoftmaxCfg, kind: int, kc: int) -> int:
+    """The key slot a self / prev head's reference sits at once the selectors are summed (prev: one slot up)."""
+    return ref_key(kind, kc) + (1 if kind == REF_PREV else 0)
+
+
+def _ref_score_mask(d, cfg: SoftmaxCfg, kc: int, mean: float, per):
+    _ref_check(d, cfg, kc)
+    out = score_mask(d, cfg.clip_lo, mean, kc, periodic=per)
+    blk = np.arange(0, d.N, d.tH)
+    for kind in (REF_SELF, REF_PREV):
+        for h in _ref_heads(d, cfg, kind):
+            top = h * d.t + _ref_top(cfg, kind, kc)
+            for j in range(cfg.ref_window):
+                out[(blk + (top - j) % d.tH)] = -mean
+    return out
+
+
+def _ref_push_item(d, kc: int, half: bool = False):
+    """The K push's copy of key 0 into k_ref: the push mask at the first token, zero after (`half`: the push without
+    KV_LANES, whose K arrives doubled)."""
+    if kc == 1:
+        if half:
+            return ("kpush.ref0h", 1), lambda: real_head_half_mask(d)
+        return ("kpush.ref0", 1), lambda: real_head_tok0_mask(d)
+    return ("kpush.ref0" + ("h" if half else ""), 0), lambda: np.zeros(d.N)
+
+
+def _ref_push(rt, kv, raw, K, half: bool = False):
+    """K minus key 0 for a centred cache, kv.k_ref collecting key 0 from `raw` (the push's unmasked K) at the first
+    token."""
+    ops = rt.ops
+    r = rt.mult_mask(raw, *_ref_push_item(rt.dims, kv.k_count + 1, half))
+    if kv.k_count == 0:
+        kv.k_ref = ops.copy(r)
+    else:
+        ops.inplace_add(kv.k_ref, r)
+    return ops.sub(K, kv.k_ref)
+
+
+def _ref_sel_item(d, cfg: SoftmaxCfg, kc: int, kind: int, scale: float):
+    """The selector of the `kind` heads' reference slot, at the group mask's value (periodic scores)."""
+    heads = tuple(_ref_heads(d, cfg, kind))
+    def build():
+        out = np.zeros(d.tH)
+        out[[h * d.t + ref_key(kind, kc) for h in heads]] = scale * 0.5 / math.sqrt(d.d_head_real)
+        return np.tile(out, d.N // d.tH)
+    return ("qkt.ref", kind, kc, heads, scale), build
+
+
+def _ref_broadcast(rt, result, cfg: SoftmaxCfg, kc: int, scale: float):
+    """(s_r - s_0) of the self / prev heads over their key slots (None when every head is centred on key 0)."""
+    ops, d = rt.ops, rt.dims
+    x = None
+    for kind in (REF_SELF, REF_PREV):
+        if not _ref_heads(d, cfg, kind):
+            continue
+        sel = rt.mult_mask(result, *_ref_sel_item(d, cfg, kc, kind, scale))
+        if kind == REF_PREV:
+            sel = ops.rotate(sel, -1)
+        x = sel if x is None else ops.add(x, sel)
+    return None if x is None else rotsum(ops, x, 1, cfg.ref_window)
+
+
+def _ref_step_items(d, cfg: SoftmaxCfg, kc: int, scale: float):
+    if not cfg.ref_keys or not _ref_covers(d, cfg, kc):
+        return []
+    items = [_ref_push_item(d, kc)]
+    for kind in (REF_SELF, REF_PREV):
+        if _ref_heads(d, cfg, kind):
+            items.append(_ref_sel_item(d, cfg, kc, kind, scale))
+    return items
 
 
 def _recip_rounds(cfg: SoftmaxCfg, kc: int, lean: bool):
@@ -193,10 +320,12 @@ def rope_step_masks(rt, rope, pos: int, packing: str = "cachemir"):
             + _rope_items(rt, rope, pos, *push))
 
 
-def _hrs_pack_item(d, seed: float, site: str):
+def _hrs_pack_item(d, seed: float, site: str, scale: float = 1.0):
     """SM_HRS_PACK: both head-sum masks on one ciphertext, the sum on the real part and seed * the sum on the
-    imaginary part, halved so that z + conj(z) and i (conj(z) - z) return them unscaled."""
-    return (site + ".pk", seed), lambda: (0.5 + 0.5j * seed) * hrs_pos0(d)
+    imaginary part, halved so that z + conj(z) and i (conj(z) - z) return them unscaled. `scale`: the mask times it
+    (0.5 on SM_HRS_CLEANSE's 2 Re input)."""
+    key = (site + ".pk", seed) if scale == 1.0 else (site + ".pk", seed, scale)
+    return key, lambda: scale * (0.5 + 0.5j * seed) * hrs_pos0(d)
 
 
 class KVCache:
@@ -231,16 +360,20 @@ class ComplexKVCache:
     complex buckets (group 2c on the real axis, 2c+1 on the imaginary axis; up to two real
     groups pending), V lanes paired into d_head/2 buckets (lane 2p real, 2p+1 imaginary)."""
 
-    def __init__(self, d_head: int):
+    def __init__(self, d_head: int, centre: bool = False):
         self.k_buckets = []
         self.k_pend = []
         self.v_buckets = [None] * (d_head // 2)
+        # reference-key centring: every key is pushed minus key 0, held in k_ref (token lane 0) from the first token
+        self.centre = centre
+        self.k_ref = None
         self.k_count = 0
         self.v_count = 0
 
     def reset(self):
         self.k_buckets.clear(); self.k_pend.clear()
         self.v_buckets = [None] * len(self.v_buckets)
+        self.k_ref = None
         self.k_count = self.v_count = 0
 
     def cts(self, prefix: str):
@@ -252,6 +385,8 @@ class ComplexKVCache:
         for i, v in enumerate(self.v_buckets):
             if v is not None:
                 cts.append(v); keys.append(f"{prefix}vb.{i}")
+        if self.k_ref is not None:
+            cts.append(self.k_ref); keys.append(f"{prefix}kref")
         return cts, keys
 
 
@@ -277,7 +412,8 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
     masked and bucketed (odd groups packed by the monomial i), V realified (times i, the
     monomial: no level) and scattered into the pair buckets.
     `q` (KV_LANES + QKV_LANES): the Q linear output rides the same real payload on token lane
-    2 and comes back refreshed, on lane 0 (the one refresh serves Q, K and V)."""
+    2 and comes back refreshed, on lane 0 (the one refresh serves Q, K and V).
+    A centred cache (kv.centre) takes K minus key 0, held in kv.k_ref from the first token."""
     ops, d = rt.ops, rt.dims
     kvl = getattr(ops, "kv_lanes", False)
     q_out = None
@@ -305,14 +441,18 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
             if not isinstance(q, list):
                 q_out = q_out[0]
         K = rope_mask(rt, X, "kpush.tok0", lambda: real_head_tok0_mask(d), rope, pos)
+        if kv.centre:
+            K = _ref_push(rt, kv, X, K)
     else:
         P = ops.copy(P_in)
         with _kv_bts_scope():
             ops.bootstrap(P)
         conj = ops.conjugate(P)
-        K = ops.add(P, conj)                               # 2 K_raw
+        K2 = ops.add(P, conj)                              # 2 K_raw
         V = ops.sub(conj, P)                               # -2i V_raw, realified by the monomial i
-        K = rope_mask(rt, K, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
+        K = rope_mask(rt, K2, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
+        if kv.centre:
+            K = _ref_push(rt, kv, K2, K, half=True)
     K = ops.rotate(K, -(kv.k_count % d.t))
     # bucket_k_complex
     if kv.k_count % d.t == 0:
@@ -359,10 +499,11 @@ def _pack_k_pair(ops, kv: ComplexKVCache, d):
         kv.k_pend.clear()
 
 
-def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None, merge=None):
+def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None, merge=None, cfg=None):
     """complex_qkt (cachemir_complex_attention.cu): one product per K bucket serves two
     token groups; the even group's scores come out of 2 Re, the odd group's out of the
-    imaginary axis through the odd mask; pending real groups run the real q.K^T."""
+    imaginary axis through the odd mask; pending real groups run the real q.K^T.
+    `cfg` with ref_keys: the scores come out centred on each head's reference key (_ref_broadcast)."""
     ops, d = rt.ops, rt.dims
     q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
     q = rotsum_neg(ops, q, d.t)
@@ -391,6 +532,14 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
             res_o = ops.sub(result, conj)
             n_odd = min(d.t, kc - g_odd * d.t)
             accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g0 + g_odd, scale, per_m)))
+    centred = cfg is not None and bool(cfg.ref_keys)
+    if centred != kv.centre:
+        raise ValueError("reference-key centring: the softmax config and the K cache disagree")
+    if centred:
+        _ref_check(d, cfg, kc)
+        if not _ref_sink_only(cfg) and (per != 1 or merge or kv.k_buckets):
+            raise ValueError("reference-key centring on the self / previous key needs one pending K group of "
+                             "tH-periodic scores")
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
         result = ops.mult(q, pend)
@@ -398,7 +547,12 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         if per:
             result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
         n = min(d.t, kc - g * d.t)
+        raw = result
         result = rt.mult_mask(result, *_group_mask_item(d, n, g0 + g, per_m, scale))
+        if centred:
+            ref = _ref_broadcast(rt, raw, cfg, kc, scale)
+            if ref is not None:
+                result = ops.sub(result, ref)
         accum(im_cleanse(ops, result))
     return attn
 
@@ -575,10 +729,22 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         if ops.fused_sm_den:
             raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
         # SM_HRS_PACK: one replicate ladder for both sums (the input is real), split by one conjugation
-        z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
-        cz = ops.conjugate(z)
-        h = ops.mult_i(ops.sub(cz, z))
-        out = ops.add(z, cz)
+        if getattr(ops, "hrs_cleanse", False):
+            # SM_HRS_CLEANSE: the seed lane holds seed * sum, ~1e-5 of the sum on the Llama decode's rounds; the
+            # imaginary noise of a refresh planned after the caller's im_cleanse (the exponentials' or a round's
+            # square, at the refresh's precision) swamps it (the Goldschmidt seed returns garbage). 2 Re of the input
+            # here, the mask halved; the sub-step `hrs` (FORBID_STEPS .hrs) keeps refreshes off the pack until the
+            # split (a refresh of either split output is relative to its own value)
+            with rt.step("hrs"):
+                z = rotsum_neg(ops, rt.mult_mask(im_cleanse(ops, out), *_hrs_pack_item(d, seed, seed_site, 0.5)), d.t)
+                cz = ops.conjugate(z)
+            h = ops.mult_i(ops.sub(cz, z))
+            out = ops.add(z, cz)
+        else:
+            z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
+            cz = ops.conjugate(z)
+            h = ops.mult_i(ops.sub(cz, z))
+            out = ops.add(z, cz)
     else:
         if seed is not None:
             tot = out
@@ -760,6 +926,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     ops = rt.ops
     tap = getattr(rt, "tap", None) or (lambda name, ct: None)     # debug hook (the model's taps)
     cplx = isinstance(kv, ComplexKVCache)
+    if not cplx:
+        uncentred_only(sm_cfg, "mha on the real packing")
     qkvl = cplx and getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
     with rt.step("qkv"):
         # QKV_LANES: the hint fires only past the session limit; at or under it the linear runs on the LayerNorm
@@ -784,7 +952,7 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
         if getattr(rt, "scoped_names", False) else None
     with rt.step("qkt", shape=shape):
         a = sm_fold_affine(rt, sm_cfg)[0]
-        scores = complex_qkt(rt, kv, q, a, **rp) if cplx else qkt(rt, kv, q, a, **rp)
+        scores = complex_qkt(rt, kv, q, a, cfg=sm_cfg, **rp) if cplx else qkt(rt, kv, q, a, **rp)
         folded = bool(getattr(ops, "sm_fold", False))
     tap("attn.q_pushed", q)
     tap("attn.scores", scores)
@@ -816,7 +984,11 @@ def gqa_dims(d: Dims, G: int) -> Dims:
 
 def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
             pre_linear=None, pre_out=None):
-    """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims)."""
+    """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims). A softmax centred on key 0
+    takes the K side's centring (each query head's scores minus its own key-0 score); the self / previous-key
+    references need the expanded cache."""
+    if getattr(sm_cfg, "ref_keys", ()) and not _ref_sink_only(sm_cfg):
+        raise ValueError("mha_gqa: reference-key centring on the self / previous key needs the expanded cache")
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)
@@ -843,7 +1015,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
         with rt.step("qkt", shape=shape):
             scores = None
             for g in range(G):
-                s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), **rp)
+                s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), cfg=sm_cfg, **rp)
                 scores = s_g if scores is None else ops.add(scores, s_g)
             scores = ops.tag_reduce(scores, G * sub.dims.tH)
         sub.gq_merge = G
@@ -866,7 +1038,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
         with rt.step(f"g{g}"):
             shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
             with rt.step("qkt", shape=shape):
-                scores = complex_qkt(sub, kv, qs[g], a, **rp)
+                scores = complex_qkt(sub, kv, qs[g], a, cfg=sm_cfg, **rp)
             with rt.step("softmax"):
                 probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
             with rt.step("softmax_v"):
@@ -889,7 +1061,8 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     d = rt.dims
     per = sm_periodic(rt, kc)
     affine = sm_fold_affine(rt, cfg)
-    items = _softmax_mask_items(d, cfg, kc, per, affine) + _fold_mask_items(rt, cfg, kc)
+    items = (_softmax_mask_items(d, cfg, kc, per, affine) + _fold_mask_items(rt, cfg, kc)
+             + _ref_step_items(d, cfg, kc, affine[0]))
     Nb = kc // (2 * d.t)
     G = (kc + d.t - 1) // d.t
     for gc in range(Nb):

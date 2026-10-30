@@ -14,11 +14,11 @@ import numpy as np
 
 from perseus.impl import smcheb
 from perseus.impl.attention import first_iters
-from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg
+from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg, ref_key
 from perseus.impl.poly import (NumpyOps, eval_chebyshev, eval_polynomial_ps, eval_remez_31,
                    eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0, goldschmidt_recip,
-                   inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, pow_odd,
-                   taylor_inv_sqrt_coeffs)
+                   inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, inv_sqrt_newton_scaled,
+                   pow_odd, taylor_inv_sqrt_coeffs)
 
 _ops = NumpyOps()
 
@@ -63,9 +63,9 @@ def layer_norm_ref(x, cfg, pos, gamma, beta):
 
 def gelu_ref(x, cfg: GeluCfg):
     x = np.asarray(x, dtype=np.float64)
-    if cfg.method == "chebyshev":
-        return eval_chebyshev(_ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b)
     t = x / cfg.xmax
+    if cfg.method == "chebyshev":       # the series is fitted on x / xmax: xmax q(x / xmax)
+        return cfg.xmax * eval_chebyshev(_ops, t, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
     if cfg.thor_p1_cheb:
         p1 = eval_chebyshev(_ops, t, cfg.thor_p1_cheb, cfg.thor_p1_a, cfg.thor_p1_b)
         g = eval_chebyshev(_ops, p1, cfg.thor_p2_cheb, cfg.thor_p2_a, cfg.thor_p2_b)
@@ -80,10 +80,18 @@ def gelu_exact(x):
     return 0.5 * x * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3)))
 
 
-def softmax_ref(scores, cfg: SoftmaxCfg, kc: int):
-    """THOR softmax over the LAST axis of scores[..., kc] (attention.softmax_thor)."""
+def softmax_ref(scores, cfg: SoftmaxCfg, kc: int, head=None):
+    """THOR softmax over the LAST axis of scores[..., kc] (attention.softmax_thor). With reference-key centring
+    (cfg.ref_keys) the scores are head `head`'s, or, when `head` is None, the second-to-last axis runs over the heads."""
     s = np.asarray(scores, dtype=np.float64)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+    if cfg.ref_keys:
+        if head is None:
+            idx = np.array([ref_key(r, kc) for r in cfg.ref_keys[:s.shape[-2]]])
+            ref = np.take_along_axis(s, np.broadcast_to(idx[:, None], s.shape[:-1] + (1,)), -1)
+        else:
+            ref = s[..., ref_key(cfg.ref_keys[head], kc), None]
+        s = s - ref
     ct = s - mean
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     z = eval_chebyshev(_ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
@@ -128,7 +136,7 @@ def attention_ref(q, K, V, cfg: SoftmaxCfg, H_real: int, d_head: int, softmax=so
     for h in range(H_real):
         idx = h + H * np.arange(d_head)
         sc = (K[:, idx] @ q[idx]) / math.sqrt(d_head)
-        p = softmax(sc, cfg, kc) if softmax is softmax_ref else softmax(sc)
+        p = softmax(sc, cfg, kc, head=h) if softmax is softmax_ref else softmax(sc)
         out[idx] = p @ V[:, idx]
     return out
 
@@ -138,6 +146,13 @@ def cutmax_ref(logits, cfg: CutMaxCfg):
     x = np.asarray(logits, dtype=np.float64) * cfg.entry_scale
     n = x.shape[0]
     for it in cfg.iters:
+        if it.newton:                                   # the scaled normaliser
+            d = x - x.sum() / n
+            S2 = np.array([np.sum(d * d)])
+            f = inv_sqrt_newton_scaled(_ops, S2 * it.x_scale, it.newton,
+                                       0.5 * math.sqrt(n * it.x_scale) / (it.c * it.m))[0]
+            x = pow_odd(_ops, 2.0 * (d * f + 0.5 / it.m), it.p)
+            continue
         kf = 1.0 / math.sqrt(n * it.s2_hi)
         R = x.sum()
         cen = x * kf if it.ex2 else x * kf - R * kf / n
@@ -156,6 +171,9 @@ def cutmax_ref(logits, cfg: CutMaxCfg):
         y = 2.0 * (x * f - R * f / n + 0.5 / it.m)      # im_cleanse doubles
         x = pow_odd(_ops, y, it.p)
     S = np.array([x.sum()])
+    if cfg.sum_newton:
+        u = inv_sqrt_newton_scaled(_ops, S * cfg.sum_scale, cfg.sum_newton, math.sqrt(cfg.sum_scale))
+        return x * (u * u)[0]
     g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
     lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
     bsum = 8.0 / ((lo + hi) ** 2 + 4.0 * lo * hi)

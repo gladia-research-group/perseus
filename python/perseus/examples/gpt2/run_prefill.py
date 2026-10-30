@@ -79,6 +79,8 @@ def _planned(a, model, store, rows, gt, ref, results=None):
         print(f"[prefill] forward {k}: wall {walls[-1]:.2f}s ({walls[-1] / a.tokens:.3f} s/tok), host issue {host:.2f}s, "
               f"served {''.join(i['served'][0] for i in info)}, free {frees[-1]} GB", flush=True)
     wall = sorted(walls)[len(walls) // 2]
+    if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+        run.verify_graphs()     # graph replay vs eager on one encryption, every stage's output compared
     if ref is not None:
         for b in range(model.n_layers):
             h = run.hidden(b)
@@ -88,7 +90,7 @@ def _planned(a, model, store, rows, gt, ref, results=None):
     h = run.hidden()
     out = {"wall": wall}
     if model.n_layers == 12:
-        rows_, s = report(plain_logits(store, h), gt)
+        rows_, s = report(plain_logits(store, h[-1:]), gt[-1:]) if a.tail else report(plain_logits(store, h), gt)
         out.update(s)
         print("[prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows_), flush=True)
     st = run.sess.pcmm_stats() if n_fin[0] else {}
@@ -140,8 +142,9 @@ def main(argv=None, results=None):
     ap.add_argument("--repeat", type=int, default=1, help="planned: run the forward this many times (wall = median)")
     ap.add_argument("--work-dir", default=None, help="planned: where the recorded stream is written")
     ap.add_argument("--compile-only", action="store_true", help="planned: record + compile on the CPU, then stop")
-    ap.add_argument("--schedule", choices=("program", "lockstep"), default="program",
-                    help="planned: op order before K-batching (lockstep: more batched refreshes)")
+    ap.add_argument("--schedule", choices=("siblings", "program", "lockstep"), default="siblings",
+                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR) and pulled sibling "
+                         "batches; lockstep: more batched refreshes)")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):

@@ -104,7 +104,8 @@ pub struct BtsConfig {
     pub dense_shipped: Option<Landing>,
     /// Correction-factor window (min = the chain's deg floor FIRST_MOD_BITS - BTP_SCALE_BITS, max = PLAN_CF_MAX).
     pub cf_window: (u32, u32),
-    /// Raise drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS).
+    /// Raise drops the runtime builds variants for (FIDESLIB_BTS_RAISE_DROPS); a SPRU route (`Route::spru_h`) takes
+    /// any drop.
     #[serde(default)]
     pub raise_drops: Vec<u32>,
     /// Ciphertexts per batched bootstrap launch.
@@ -114,6 +115,10 @@ pub struct BtsConfig {
     /// at (26, 2). Kept apart from `landings[0]`, which follows the order the plan's own dense sites run in.
     #[serde(default = "staged_n32")]
     pub staged: Landing,
+    /// The deepest effective level a refresh input may take with the raise's rescales still on the chain (the top of
+    /// the level above q0's); None = two composite levels above the bottom, `n_q - 2 unit`.
+    #[serde(default)]
+    pub input_room: Option<u32>,
 }
 
 impl BtsConfig {
@@ -134,6 +139,7 @@ impl BtsConfig {
             raise_drops: vec![1, 3, 5],
             k_max: 8,
             staged: staged_n32(),
+            input_room: None,
         }
     }
 
@@ -169,7 +175,8 @@ impl BtsConfig {
                 });
             }
         }
-        if route.raise_drop > 0 && !self.raise_drops.contains(&route.raise_drop) {
+        // SPRU has no plaintext set per drop: the runtime builds a variant for every drop a program uses
+        if route.raise_drop > 0 && route.spru_h == 0 && !self.raise_drops.contains(&route.raise_drop) {
             return Err(Error::Bts {
                 knob: "raise_drops",
                 msg: format!("raise drop {} has no variant (built: {:?})", route.raise_drop, self.raise_drops),

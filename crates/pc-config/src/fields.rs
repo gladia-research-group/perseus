@@ -5,7 +5,7 @@
 use crate::section;
 
 section! {
-    /// `chain` (4 legacy env names).
+    /// `chain` (5 legacy env names).
     ChainSection "chain" {
         #[doc = "`CHAIN`. Default None. Read at _env.py::current_chain; examples/gpt2/env.py::export_env; examples/gpt2/env.py::open_session; examples/gpt2/run_decode.py::main; examples/gpt2/run_generate.py::main; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
@@ -19,11 +19,14 @@ section! {
         #[doc = "`LOGN`. Default None. Read at plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
         logn: Int = "LOGN", "None";
+        #[doc = "The CKKS chain preset the runtime and the client build (pc-core `ChainSpec::preset`: n32, or the lean n32a4; default n32)."]
+        #[doc = "Runtime switch `CHAIN_PRESET`: binds the key bundle (params hash), not the plan."]
+        preset: Str = "CHAIN_PRESET", "(unset)";
     }
 }
 
 section! {
-    /// `bts` (27 legacy env names).
+    /// `bts` (31 legacy env names).
     BtsSection "bts" {
         #[doc = "`AUTO_BTS_LEVEL`. Default None. Read at impl/fakecap.py::make_session; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39; runtime= 6."]
@@ -43,12 +46,21 @@ section! {
         #[doc = "`FIDESLIB_CTS_ALT_BUDGET`. Default (unset). Read at RawCiphertext.cu: alternative CtS level budget (0 = off)."]
         #[doc = "Shipped plans: runtime= llama128."]
         cts_alt_budget: Int = "FIDESLIB_CTS_ALT_BUDGET", "(unset)";
+        #[doc = "EvalMod: a Regen relinearization and the rescale after it as one exact conversion (pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale)."]
+        #[doc = "Runtime switch `PC_EM_FUSE_RESCALE` [kernel]: binds no plan and no key bundle."]
+        em_fuse_rescale: Flag = "PC_EM_FUSE_RESCALE", "(unset)";
         #[doc = "`FIDESLIB_GPU_ENCODE`. Default (unset). Read at examples/gpt2/env.py::ENV; examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: none."]
         gpu_encode: Flag = "FIDESLIB_GPU_ENCODE", "(unset)";
         #[doc = "Ciphertexts per batched bootstrap launch (PLAN.md Program: K-batching; 8)."]
         #[doc = "No legacy env name."]
         k_max: Int = "", "(unset)";
+        #[doc = "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu `BtsSetup::lt_tails`; default on, off = those stages regenerate every digit)."]
+        #[doc = "Runtime switch `PC_LT_TAILS` [kernel]: binds no plan and no key bundle."]
+        lt_tails: Flag = "PC_LT_TAILS", "(unset)";
+        #[doc = "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh (pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR`."]
+        pair: Flag = "PC_BTS_PAIR", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";
@@ -76,6 +88,9 @@ section! {
         #[doc = "`FIDESLIB_BTS_SPARSE_B_MAX`. Default (unset). Read at examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: runtime= 6."]
         sparse_b_max: Int = "FIDESLIB_BTS_SPARSE_B_MAX", "(unset)";
+        #[doc = "`FIDESLIB_BTS_SPARSE_B_K`. Default (unset) = 24. Read at pc-py session (the SparseB routes' EvalMod series: 24, FIDESlib's degree-20 table, or 16, the dense route's degree-14 table)."]
+        #[doc = "Shipped plans: none."]
+        sparse_b_k: Int = "FIDESLIB_BTS_SPARSE_B_K", "(unset)";
         #[doc = "`SPARSE_BTS_SLOTS`. Default '' / '512,1' / None. Read at impl/fakecap.py::CapFhe.__init__; impl/fakecap.py::make_session; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39; runtime= 6."]
         sparse_bts_slots: List = "SPARSE_BTS_SLOTS", "'' / '512,1' / None";
@@ -238,6 +253,9 @@ section! {
         #[doc = "`GELU_FOLD`. Default '1' / None. Read at impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 15; runtime= 15."]
         gelu_fold: Flag = "GELU_FOLD", "'1' / None";
+        #[doc = "`GELU_OUT_HINT`. Default '0'. Read at impl/ops.py::FheOps.__init__."]
+        #[doc = "Shipped plans: runtime= 12."]
+        gelu_out_hint: Flag = "GELU_OUT_HINT", "'0'";
         #[doc = "`GPT2_FOLD_LN1`. Default None. Read at plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
         gpt2_fold_ln1: Flag = "GPT2_FOLD_LN1", "None";
@@ -337,6 +355,9 @@ section! {
         #[doc = "`SM_GS_FIRST`. Default '1' / None. Read at examples/gpt2/ref.py::softmax_ref [read via _on()]; impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 15; runtime= 15."]
         sm_gs_first: Flag = "SM_GS_FIRST", "'1' / None";
+        #[doc = "`SM_HRS_CLEANSE`. Default '0'. Read at impl/ops.py::FheOps.__init__."]
+        #[doc = "Shipped plans: runtime= 8."]
+        sm_hrs_cleanse: Flag = "SM_HRS_CLEANSE", "'0'";
         #[doc = "`SM_HRS_PACK`. Default '1' / None. Read at impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 13; runtime= 13."]
         sm_hrs_pack: Flag = "SM_HRS_PACK", "'1' / None";
@@ -353,7 +374,7 @@ section! {
 }
 
 section! {
-    /// `model.prefill` (90 legacy env names).
+    /// `model.prefill` (92 legacy env names).
     PrefillSection "model.prefill" {
         #[doc = "`PF_ACT_FOLD`. Default '0'. Read at impl/activation.py::<module>."]
         #[doc = "Shipped plans: runtime= 7."]
@@ -361,8 +382,11 @@ section! {
         #[doc = "`PF_ATTN`. Default ''. Read at examples/llama/run_prefill.py::main; impl/ccmm.py::enabled."]
         #[doc = "Shipped plans: runtime= 1."]
         attn: Str = "PF_ATTN", "''";
-        #[doc = "`PF_ATTN_PACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "`PF_ATTN_BSGS`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: runtime= 2."]
+        attn_bsgs: Flag = "PF_ATTN_BSGS", "'0'";
+        #[doc = "`PF_ATTN_PACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 9."]
         attn_pack: Int = "PF_ATTN_PACK", "'0'";
         #[doc = "`PF_ATTN_PAIR`. Default '1'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
@@ -454,6 +478,9 @@ section! {
         #[doc = "`PF_LANE_HOIST`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         lane_hoist: Int = "PF_LANE_HOIST", "'0'";
+        #[doc = "`PF_LAST_QUERY`. Default '0'. Read at examples/gpt2/prefill.py::<module>."]
+        #[doc = "Shipped plans: none."]
+        last_query: Flag = "PF_LAST_QUERY", "'0'";
         #[doc = "`PF_LAYOUT`. Default ''. Read at examples/gpt2/prefill.py::_layout_blocked; examples/gpt2/run_prefill.py::main; examples/llama/prefill.py::_layout_blocked; examples/llama/run_prefill.py::main; examples/llama/run_prefill.py::main.on_block."]
         #[doc = "Shipped plans: runtime= 5."]
         layout: Str = "PF_LAYOUT", "''";
@@ -562,6 +589,12 @@ section! {
         #[doc = "`PF_ROT_PRUNE`. Default '1'. Read at examples/gpt2/run_prefill.py::main; examples/llama/run_prefill.py::main."]
         #[doc = "Shipped plans: none."]
         rot_prune: Flag = "PF_ROT_PRUNE", "'1'";
+        #[doc = "`PF_QKV_PACK`. Default '0'. Read at examples/gpt2/prefill.py::<module>."]
+        #[doc = "Shipped plans: none."]
+        qkv_pack: Flag = "PF_QKV_PACK", "'0'";
+        #[doc = "`PF_SM_HPACK`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 2."]
+        sm_hpack: Flag = "PF_SM_HPACK", "'0'";
         #[doc = "`PF_SILU_SINGLE`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         silu_single: Flag = "PF_SILU_SINGLE", "'0'";
@@ -820,7 +853,7 @@ section! {
 }
 
 section! {
-    /// `plan` (89 legacy env names).
+    /// `plan` (98 legacy env names).
     PlanConfig "plan" {
         #[doc = "`PLAN_ACC_CHAIN`. Default (unset) / n32. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
@@ -828,6 +861,9 @@ section! {
         #[doc = "`PLAN_ACC_TABLE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         acc_table: Str = "PLAN_ACC_TABLE", "(unset)";
+        #[doc = "`PLAN_ARGMAX_MINCUT`. Default (unset). Read at examples/gpt2/make_plan.sh::(shell)."]
+        #[doc = "Shipped plans: none."]
+        argmax_mincut: Flag = "PLAN_ARGMAX_MINCUT", "(unset)";
         #[doc = "`PLAN_BASELINE_DEPTH_CAP`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 1."]
         baseline_depth_cap: Str = "PLAN_BASELINE_DEPTH_CAP", "(unset)";
@@ -897,12 +933,21 @@ section! {
         #[doc = "`PLAN_EMIT_OFFSET`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         emit_offset: Str = "PLAN_EMIT_OFFSET", "(unset)";
+        #[doc = "`PLAN_ENVELOPE_STRICT`. Default '0'. Read at plan/placer/planner.py::plan_graph."]
+        #[doc = "Shipped plans: recipe= 12."]
+        envelope_strict: Flag = "PLAN_ENVELOPE_STRICT", "'0'";
+        #[doc = "`PLAN_ENV_EFFECTIVE`. Default None. Read at plan/placer/sim.py; plan/placer/place.py::Placer._run_once."]
+        #[doc = "Shipped plans: recipe= 12."]
+        env_effective: Flag = "PLAN_ENV_EFFECTIVE", "None";
         #[doc = "`PLAN_ERR_HOPELESS`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         err_hopeless: Str = "PLAN_ERR_HOPELESS", "(unset)";
         #[doc = "`PLAN_ERR_TARGET`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         err_target: Str = "PLAN_ERR_TARGET", "(unset)";
+        #[doc = "`PLAN_FALLBACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= gpt2_decode."]
+        fallback_cf: Flag = "PLAN_FALLBACK_CF", "'0'";
         #[doc = "`FEEDBACK_ENTRY_DEG`. Default $ENTRY_DEG. Read at examples/gpt2/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         feedback_entry_deg: Str = "FEEDBACK_ENTRY_DEG", "$ENTRY_DEG";
@@ -939,12 +984,18 @@ section! {
         #[doc = "`PLAN_ILP_OBJECTIVE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         ilp_objective: Str = "PLAN_ILP_OBJECTIVE", "(unset)";
+        #[doc = "`PLAN_ILP_TIEBREAK`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: none."]
+        ilp_tiebreak: Flag = "PLAN_ILP_TIEBREAK", "(unset)";
         #[doc = "`PLAN_ILP_TIME_LIMIT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 2."]
         ilp_time_limit: Str = "PLAN_ILP_TIME_LIMIT", "(unset)";
         #[doc = "`PLAN_KEEP_PLACEMENTS`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell); examples/llama/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: recipe= dsw48_ho36, dsw48_ho38."]
         keep_placements: Str = "PLAN_KEEP_PLACEMENTS", "(unset)";
+        #[doc = "`PLAN_KEEP_PLACEMENTS_EXACT`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: none."]
+        keep_placements_exact: Flag = "PLAN_KEEP_PLACEMENTS_EXACT", "'0'";
         #[doc = "`PLAN_KS_REALIZE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         ks_realize: Str = "PLAN_KS_REALIZE", "(unset)";
@@ -969,6 +1020,9 @@ section! {
         #[doc = "`PLAN_MAG_SAFETY`. Default (unset) / 2. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
         mag_safety: Str = "PLAN_MAG_SAFETY", "(unset) / 2";
+        #[doc = "`PLAN_MAG_SAFETY_STEPS`. Default None. Read at plan/placer/refresh.py::mag_safety_of."]
+        #[doc = "Shipped plans: none."]
+        mag_safety_steps: List = "PLAN_MAG_SAFETY_STEPS", "None";
         #[doc = "`MAX_LEVEL`. Default 24 / 50. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 33."]
         max_level: Str = "MAX_LEVEL", "24 / 50";
@@ -984,6 +1038,15 @@ section! {
         #[doc = "`OUT_NAME`. Default (required) / (unset). Read at examples/gpt2/make_plan.sh::(shell); examples/llama/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         out_dir: Str = "OUT_NAME", "(required) / (unset)";
+        #[doc = "`PLAN_PACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: none."]
+        pack_cf: Flag = "PLAN_PACK_CF", "'0'";
+        #[doc = "`PLAN_PCMM_PREDIV_CAP`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= 12."]
+        pcmm_prediv_cap: Str = "PLAN_PCMM_PREDIV_CAP", "(unset)";
+        #[doc = "`PLAN_PCMM_STAMPS`. Default None. Read at plan/placer/planner.py::pcmm_stamps."]
+        #[doc = "Shipped plans: recipe= 4."]
+        pcmm_stamps: Str = "PLAN_PCMM_STAMPS", "None";
         #[doc = "`PLAN_PLACER`. Default / (unset). Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 4."]
         placer: Str = "PLAN_PLACER", " / (unset)";
@@ -1008,6 +1071,9 @@ section! {
         #[doc = "`PLAN_QUALITY_WEIGHT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         quality_weight: Str = "PLAN_QUALITY_WEIGHT", "(unset)";
+        #[doc = "`PLAN_RAISE_DROP_BASE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= 6."]
+        raise_drop_base: Str = "PLAN_RAISE_DROP_BASE", "(unset)";
         #[doc = "`PLAN_RAISE_ENV_RULE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
         raise_drop_env_rule: Str = "PLAN_RAISE_ENV_RULE", "(unset)";
@@ -1020,6 +1086,9 @@ section! {
         #[doc = "`PLAN_RAISE_ROUTES`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 12."]
         raise_drop_routes: Str = "PLAN_RAISE_ROUTES", "(unset)";
+        #[doc = "`PLAN_RAISE_SEARCH`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= 6."]
+        raise_drop_search: Flag = "PLAN_RAISE_SEARCH", "'0'";
         #[doc = "`PLAN_RAISE_DROP_SET`. Default (unset) / 1,3,5. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
         raise_drop_set: Str = "PLAN_RAISE_DROP_SET", "(unset) / 1,3,5";
@@ -1041,6 +1110,9 @@ section! {
         #[doc = "`PLAN_RESCALE_OPT`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         rescale_opt: Str = "PLAN_RESCALE_OPT", "(unset)";
+        #[doc = "`PLAN_RESUME`. Default '0'. Read at plan/placer/planner.py::plan_graph_dir."]
+        #[doc = "Shipped plans: none."]
+        resume: Flag = "PLAN_RESUME", "'0'";
         #[doc = "`RUNTIME_EXTRA`. Default . Read at examples/llama/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         runtime_extra: Str = "RUNTIME_EXTRA", "";
@@ -1083,12 +1155,18 @@ section! {
         #[doc = "`PLAN_STC_FIRST_REROUTE`. Default None. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: recipe= vit_b16_224."]
         stc_first_reroute: Flag = "PLAN_STC_FIRST_REROUTE", "None";
+        #[doc = "`PLAN_STC_FIRST_STAGED_ONLY`. Default '0'. Read at plan/placer/refresh.py::refresh_cost."]
+        #[doc = "Shipped plans: recipe= 1."]
+        stc_first_staged_only: Flag = "PLAN_STC_FIRST_STAGED_ONLY", "'0'";
         #[doc = "`PLAN_STC_FIRST_STEPS`. Default None. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: none."]
         stc_first_steps: Str = "PLAN_STC_FIRST_STEPS", "None";
         #[doc = "`PLAN_STEP_LANDING`. Default ''. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: recipe= 6."]
         step_landing: Str = "PLAN_STEP_LANDING", "''";
+        #[doc = "`PLAN_STEP_ROUTE_PRICING`. Default '0'. Read at plan/placer/refresh.py::refresh_cost."]
+        #[doc = "Shipped plans: recipe= 8."]
+        step_route_pricing: Flag = "PLAN_STEP_ROUTE_PRICING", "'0'";
     }
 }
 

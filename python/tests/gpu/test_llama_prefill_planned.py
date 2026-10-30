@@ -23,8 +23,10 @@ def test_llama_prefill_planned_two_blocks(tmp_path, monkeypatch, capsys):
     from perseus.examples.llama import run_prefill
     monkeypatch.setenv("PERSEUS_SLOTVEC_CACHE", "0")
     got = {}
+    # blocks 0-1 are full blocks in the plan: its PF_LAST_QUERY tail is block 31's, not the last of a --layers run
     rc = run_prefill.main(["--tokens", "127", "--plan", PLAN, "--layers", "2", "--check", "--check-meta",
-                           "--mem-per-block", "--work-dir", str(tmp_path / "w")], results=got.update)
+                           "--mem-per-block", "--set", "PF_LAST_QUERY=0", "--work-dir", str(tmp_path / "w")],
+                          results=got.update)
     assert rc == 0
     out = capsys.readouterr().out
     assert "metadata vs compile: 0 mismatches" in out

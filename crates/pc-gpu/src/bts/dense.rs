@@ -9,7 +9,7 @@
 //! `mem()`), then `DensePlan::build` (device tables after `MemPlan::allocate`). Every precomputation is encoded from
 //! `pc_core::bts_setup` at the levels of `pc_shadow::route`, one variant per raise drop of the setup.
 //! `iterations` > 1 runs perseus' `eval_bootstrap_iter` residual loop (y = bts(x); y += bts((x - y) 2^p) 2^-p).
-use super::cts::{diag_coeffs, stage_width, LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{diag_coeffs, stage_width, tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::evalmod::{em_work, EmMode, EvalModPlan};
 use super::finish::Pow2;
 use super::raise::{self, EncapsKeys, RaisePlan};
@@ -176,10 +176,20 @@ impl DensePlan {
         Ok(LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes(lay, &self.chain.primes(), &h.geom, h.top, h.end, self.setup.k_max)?)
     }
 
+    /// The CtS baby steps whose keys get a resident `a` tail (`KeyTails`) from digit `lt_regen_digits` on.
+    pub fn tail_steps(&self) -> Vec<i64> {
+        if !self.setup.lt_tails {
+            return Vec::new();
+        }
+        let st: Vec<(LtGeom, usize)> = self.variants.iter().flat_map(|v| v.cts.iter().map(|h| (h.geom, h.top))).collect();
+        tail_steps(&self.chain, &st, self.setup.lt_regen_digits)
+    }
+
     /// Device bytes of every table (MemPlan section "bts.dense") and the work shape.
     pub fn mem<W: DevWord>(&self) -> Result<(MemReq, BtsWorkShape)> {
         let lay = Layout::from_chain(&self.chain);
         let mut b = Pow2::<W>::bytes(lay.rows()) + EncapsKeys::bytes() + KeyGroup::bytes(1, true);
+        b += KeyTails::<W>::bytes(&lay, self.chain.dnum(), self.setup.lt_regen_digits, self.tail_steps().len());
         let mut em_slots = 0;
         let mut g_max = 1;
         for v in &self.variants {
@@ -212,16 +222,22 @@ impl DensePlan {
         let n = ctx.lay.n;
         let k_max = self.setup.k_max;
         let mut variants = Vec::new();
+        let tails = KeyTails::new(arena, s, ctx, keys, &self.tail_steps(), self.setup.lt_regen_digits)?;
+        let ring = tails.ring(keys, n)?;
         let lt = |h: &LtHost| -> Result<LtStage<'a, W>> {
             let pts = LtPts::new(arena, s, ctx, h.top, PtSource::Coeffs(&h.coeffs))?;
-            let mut st = LtStage::new(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, keys, stage_ptrs, k_max)?;
+            let mut st = LtStage::new(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, &ring, stage_ptrs, k_max)?;
             st.group = self.setup.lt_group;
             st.set_baby(self.setup.lt_baby)?;
             st.set_regen_digits(self.setup.lt_regen_digits)?;
             Ok(st)
         };
         for v in &self.variants {
-            let em_k = |mode| EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.ps, self.setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, self.setup.em_relin);
+            let em_k = |mode| {
+                let mut em = EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.ps, self.setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, self.setup.em_relin)?;
+                em.fuse_rescale = self.setup.em_fuse_rescale;
+                Ok::<_, crate::error::Error>(em)
+            };
             variants.push(BtsPrecomp {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
@@ -315,8 +331,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> DenseRoute<'a, W, M> {
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.conj, 0, ndig, true)?;
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, k, top, DotRows::All, io, staged)?;
-            ks::moddown_inplace(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
-            ks::ew(ctx, &ex.compute, ks::Ew::Add, v, v, Some(View::of(&ex.ks.ext, 0)), lay.rs_q(top), k, 2)?;
+            ks::moddown_to(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, v, ks::MdOut::Add, k, top)?;
         }
         Ok(())
     }

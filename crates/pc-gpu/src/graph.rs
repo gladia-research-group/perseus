@@ -33,6 +33,20 @@ impl<W: DevWord> CaptureLock for crate::bts::stc_first::StageCache<'_, W> {
     }
 }
 
+/// A cache a captured graph must not read at all (an LRU whose keys change per call, e.g. the CCMM's stc_high
+/// caches): any access while a capture runs is refused, so its callers run eager between the graph segments.
+/// Its evictions are not watched (no graph reads it).
+pub struct ForbidLock<'r, 'a, W: DevWord>(pub &'r crate::bts::stc_first::StageCache<'a, W>);
+
+impl<W: DevWord> CaptureLock for ForbidLock<'_, '_, W> {
+    fn set_locked(&self, on: bool) {
+        self.0.set_forbidden(on)
+    }
+    fn evictions(&self) -> u64 {
+        0
+    }
+}
+
 /// What one graph is specialized to.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GraphKey {
@@ -177,14 +191,17 @@ impl<'a, W: DevWord> BtsGraphs<'a, W> {
         let x = &mut self.slots.x;
         let r = capture(sp, || f(cx, x));
         locks.iter().for_each(|l| l.set_locked(false));
-        let lease = cx.ops.ring.lease_end();
+        let lease = cx.ops.ring.lease_end(&cx.ex.compute);
         let (exec, ()) = match r {
             Ok(v) => v,
             Err(e) => {
-                cx.ops.ring.release(&lease);
+                if let Ok(l) = &lease {
+                    cx.ops.ring.release(l);
+                }
                 return Err(e);
             }
         };
+        let lease = lease?;
         if self.slots.x.meta != out {
             cx.ops.ring.release(&lease);
             return Err(shape("bts graph", format!("captured refresh lands at {:?}, its eager run at {out:?} (non-deterministic program)", self.slots.x.meta)));

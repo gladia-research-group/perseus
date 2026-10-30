@@ -64,8 +64,52 @@ def prefill_block(rt, Xs, w, cfgs, ch: Chunks):
 _LOCKSTEP = os.environ.get("PF_LOCKSTEP", "0") not in ("", "0")
 # PF_NORM_SHARE=1: one LayerNorm inverse-sqrt chain for every chunk (prefill.norm_all)
 _NORM_SHARE = os.environ.get("PF_NORM_SHARE", "1") not in ("", "0")
-# PF_GELU_JOINT=1: one refresh point for both halves between the GELU's P1 and P2
+# PF_GELU_JOINT=1: one refresh point for both halves between the GELU's P1 and P2 (a THOR block; a Chebyshev
+# block's single series has none)
 _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
+
+
+# PF_LAST_QUERY=1 (with the tail): the last block computes the last position alone past its K / V (the tail reads
+# nothing else)
+_LAST_QUERY = os.environ.get("PF_LAST_QUERY", "0") not in ("", "0")
+
+
+# PF_QKV_PACK=1: the last head group's K and V share one PCMM output when its real heads fill at most half of it
+# (GPT-2: heads 8-11 in a group of 8): V's heads ride K's padding heads, a rotation by half a group brings them home
+_QKV_PACK = os.environ.get("PF_QKV_PACK", "0") not in ("", "0")
+
+
+def _kv_packed(B):
+    return _QKV_PACK and os.environ.get("PF_ATTN", "") != "ccmm" and 2 * B.group_dims(B.K - 1).H_real <= B.hg
+
+
+def _pack_kv(B, k_cols, v_cols, k_vec, v_vec):
+    """K's and V's last channel blocks as one: V's heads half a group up, on K's (zero) padding heads."""
+    n, h2 = B.nch, B.hg // 2
+    lo = (B.K - 1) * n
+    r = np.arange(n)
+    src = lo + r[r % B.hg < h2]
+    k_cols, k_vec = k_cols.copy(), k_vec.copy()
+    k_cols[:, src + h2] += v_cols[:, src]
+    k_vec[src + h2] += v_vec[src]
+    return k_cols, v_cols[:, :lo], k_vec, v_vec[:lo]
+
+
+def qkv_encode(B, m):
+    """The fused QKV linear's columns and bias in head-grouped order, K | V | Q (PF_QKV_PACK: V's last block on K's)."""
+    k_cols, v_cols = B.group_cols(m.K), B.group_cols(m.V)
+    k_vec, v_vec = B.group_vec(m.bk), B.group_vec(m.bv)
+    if _kv_packed(B):
+        k_cols, v_cols, k_vec, v_vec = _pack_kv(B, k_cols, v_cols, k_vec, v_vec)
+    return np.hstack([k_cols, v_cols, B.group_cols(m.Q)]), np.concatenate([k_vec, v_vec, B.group_vec(m.bq)])
+
+
+def qkv_split(rt, o, B):
+    """(K, V, Q) blocks of the fused QKV linear's output (PF_QKV_PACK: V's last block rides K's, half a group up)."""
+    K = B.K
+    if _kv_packed(B):
+        o = o[:2 * K - 1] + [rt.ops.rotate(o[K - 1], B.hg // 2 * B.t)] + o[2 * K - 1:]
+    return o[:K], o[K:2 * K], o[2 * K:]
 
 
 # PF_PCMM_CALIB=<json>: record every block linear's max |output| (the PCMM band shifts)
@@ -130,7 +174,7 @@ def prefill_block_diag(rt, Xs, w, cfgs, ch: Chunks):
             mask = ("pf.gelu.dense", lambda s: np.full(d.N, s))
             for h in H:
                 a, b = split(ops, h)
-                if _GELU_JOINT:
+                if _GELU_JOINT and ge.method == "thor_composite":
                     ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
                 elif _LOCKSTEP:
                     g = gelu(lockstep_rt(rt), Pair(a, b), ge, mask=mask)
@@ -156,7 +200,7 @@ def _gelu_blocks(rt, H, ge):
     out = []
     for h in H:
         a, b = split(ops, h)
-        if _GELU_JOINT:
+        if _GELU_JOINT and ge.method == "thor_composite":
             ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
         else:
             ga = im_cleanse(ops, gelu(rt, a, ge, mask=mask))
@@ -165,9 +209,11 @@ def _gelu_blocks(rt, H, ge):
     return out
 
 
-def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B):
-    """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order)."""
-    ops, K = rt.ops, B.K
+def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B, last=None):
+    """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order). `last`: the
+    only position the block's output must hold (every position's K / V is still computed): its attention alone
+    (blocked.attention_last), then it fills every lane of the residual stream."""
+    ops = rt.ops
     ln1, ln2, sm, ge = cfgs
     skip = Xs
     with rt.step("ln_1"):
@@ -177,10 +223,13 @@ def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B):
     with rt.step("qkv"):
         Q, Kc, V = [], [], []
         for g, y in enumerate(Y):
-            o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
-            Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+            k, v, q = qkv_split(rt, _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B), B)
+            Kc.append(k); V.append(v); Q.append(q)
     with rt.step("attn"):
-        O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B)
+        O = (BL.attention_blocked(rt, Q, Kc, V, sm, ch, B) if last is None
+             else BL.attention_last(rt, Q, Kc, V, sm, ch, B, last))
+        if last is not None:
+            skip = [BL.token_bcast(rt, row, ch, B, last) for row in skip]
     with rt.step("out_proj"):
         A = [_bias_blocks(rt, pcmm_run(rt, o, w["out"]), w["out"], ch, g, B) for g, o in enumerate(O)]
     Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
@@ -249,7 +298,7 @@ class Gpt2Prefill(Gpt2Model):
         if b not in cache:
             d = self.rt.dims
             ge = self.cfgs.block(b)[3]
-            fold = self.rt.ops.gelu_fold and ge.method == "thor_composite"
+            fold = self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")
             us = 1.0 / ge.xmax if fold else 1.0
             m = W.block_matrices(self.store, self.cfgs, b, d, self.fold[0], self.fold[1])
             pinned = None if _use_pcmm(self) else getattr(self.core, "pinned_empty", None)
@@ -269,9 +318,9 @@ class Gpt2Prefill(Gpt2Model):
                 B = self.blocks
                 enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                                    name=f"b{b}.{name}")
+                qkv_cols, qkv_bias = qkv_encode(B, m)
                 cache[b] = {
-                    "qkv": enc("qkv", np.hstack([B.group_cols(m.K), B.group_cols(m.V), B.group_cols(m.Q)]), 0.25,
-                               2.0 * np.concatenate([B.group_vec(m.bk), B.group_vec(m.bv), B.group_vec(m.bq)])),
+                    "qkv": enc("qkv", qkv_cols, 0.25, 2.0 * qkv_bias),
                     "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
                     "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
                     "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
@@ -296,7 +345,9 @@ class Gpt2Prefill(Gpt2Model):
                     if _layout_blocked():
                         B = self.blocks
                         Xg = [Xs[g * B.K:(g + 1) * B.K] for g in range(len(Xs) // B.K)]
-                        Xg = prefill_block_blocked(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B)
+                        tail = getattr(self, "with_tail", False)
+                        last = ch.T - 1 if _LAST_QUERY and tail and b == self.n_layers - 1 else None
+                        Xg = prefill_block_blocked(self.rt, Xg, self.diag_weights(b), self.cfgs.block(b), ch, B, last)
                         Xs = [x for row in Xg for x in row]
                     elif diag:
                         Xs = prefill_block_diag(self.rt, Xs, self.diag_weights(b), self.cfgs.block(b), ch)
@@ -381,7 +432,7 @@ def _coeff_key(model, b):
     import hashlib
     st = model.store._zip.filename
     ge = model.cfgs.block(b)[3]
-    fold = model.rt.ops.gelu_fold and ge.method == "thor_composite"
+    fold = model.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")
     h = hashlib.sha256(f"{os.path.abspath(st)}|{os.path.getmtime(st)}|{model.cfgs.block(b)}|{model.fold}|"
                        f"{fold}|{model.complex_packing}|{model.rt.dims}".encode()).hexdigest()[:20]
     return f"{h}_b{b}"

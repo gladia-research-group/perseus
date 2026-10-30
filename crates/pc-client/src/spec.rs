@@ -32,9 +32,10 @@ impl KeyShape {
         let ndig = chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= q_top)).count();
         Ok(KeyShape { q_top, ndig, nq: chain.q.len(), kp: chain.p.len() })
     }
-    /// The bottom composite level only (digit 0, `level_unit` Q rows).
+    /// The bottom composite level only (digit 0, `level_unit` Q rows) over P' (`Chain::p_sparse`): the keys to the
+    /// sparse secrets, whose modulus is q0 x P'.
     pub fn bottom(chain: &Chain) -> Result<Self> {
-        Self::banded(chain, chain.level_unit - 1)
+        Ok(KeyShape { kp: chain.p_sparse, ..Self::banded(chain, chain.level_unit - 1)? })
     }
     pub fn rows(&self) -> usize {
         self.q_top + 1 + self.kp
@@ -44,7 +45,8 @@ impl KeyShape {
     }
     /// Is this a shape the chain can have (full, banded or bottom with the matching digit count)?
     pub fn check(&self, chain: &Chain) -> Result<()> {
-        let want = Self::banded(chain, self.q_top)?;
+        let bottom = Self::bottom(chain)?;
+        let want = if self.q_top == bottom.q_top && self.kp == bottom.kp { bottom } else { Self::banded(chain, self.q_top)? };
         if *self != want {
             return Err(Error::Spec(format!("shape {self:?} does not match the chain's band at q_top {} ({want:?})", self.q_top)));
         }
@@ -146,6 +148,10 @@ impl KeySpec {
             let id = serde_json::to_string(&k.role)?;
             if !seen.insert(id.clone()) {
                 return Err(Error::Spec(format!("key {id} requested twice")));
+            }
+            // a sparse secret only at q0 x P' (the modulus its security verdict names)
+            if matches!(k.role, Role::EncDenseToSparse | Role::SpruAtob) && k.shape != KeyShape::bottom(chain)? {
+                return Err(Error::Spec(format!("{id}: a key to a sparse secret must have the bottom shape {:?}, not {:?}", KeyShape::bottom(chain)?, k.shape)));
             }
             if let Role::Rot { step, galois } = k.role {
                 if galois::rotation_galois(step, chain.n)? != galois {

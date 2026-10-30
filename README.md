@@ -15,6 +15,9 @@
 <p align="center"><b>An open Python framework for encrypted inference of large language models</b></p>
 
 <p align="center">
+  <a href="https://github.com/gladia-research-group/perseus/tree/speedrun">🏁 <b>Encrypted GPT-2 Speedrun</b></a>
+</p>
+<p align="center">
   <a href="#results">Results</a> ·
   <a href="#runtime">Runtime</a> ·
   <a href="#reproduce">Reproduce</a> ·
@@ -34,7 +37,7 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-overview-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-overview-light.png">
-      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 83.2 s (76.6 GiB), decode of one token at a 512-token context 16.2 s (46.0 GiB when decoding 16 tokens). GPT-2 small prefill 21.6 s (53.0 GiB), decode 4.10 s per token at a 512-token context (47.9 GiB when decoding 16 tokens). ViT-B/16 59.0 s per image (57.5 GiB). BERT-base 23.9 s for 128 tokens (53.5 GiB)." width="707">
+      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 71.0 s (86.3 GiB), decode of one token at a 512-token context 9.69 s (48.2 GiB when decoding 16 tokens). GPT-2 small prefill 9.62 s (58.8 GiB), decode 2.62 s per token at a 512-token context (59.1 GiB when decoding 16 tokens). ViT-B/16 31.2 s per image (60.6 GiB). BERT-base 12.2 s for 128 tokens (56.0 GiB)." width="707">
     </picture>
   </a>
 </p>
@@ -57,19 +60,11 @@ One NVIDIA RTX PRO 6000, 128-bit security. Prior results on their own hardware, 
 ours where the code is released.
 
 <p align="center">
-  <a href="assets/paper-tables-llama-prefill-light.png">
+  <a href="assets/paper-tables-llama-light.png">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-prefill-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-prefill-light.png">
-      <img src="assets/paper-tables-llama-prefill-light.png" alt="Encrypted Llama-3-8B prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 83.2 on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
-  <br>
-  <a href="assets/paper-tables-llama-decode-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-decode-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-decode-light.png">
-      <img src="assets/paper-tables-llama-decode-light.png" alt="Encrypted Llama-3-8B decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 16.2 at 512 on RTX PRO 6000, open source." width="707">
+      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-dark.png">
+      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-light.png">
+      <img src="assets/paper-tables-llama-light.png" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 71.0 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 9.69 at 512 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>
@@ -77,7 +72,7 @@ ours where the code is released.
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-gpt2-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-gpt2-light.png">
-      <img src="assets/paper-tables-gpt2-light.png" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 21.6 s, decode 4.10 s per token at context 512, on RTX PRO 6000, open source." width="707">
+      <img src="assets/paper-tables-gpt2-light.png" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 9.62 s, decode 2.62 s per token at context 512, on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>
@@ -85,7 +80,7 @@ ours where the code is released.
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-vit-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-vit-light.png">
-      <img src="assets/paper-tables-vit-light.png" alt="Encrypted ViT inference of one image, seconds. FIONA, ViT-S/16, 374.4 on a 48-core CPU (amortized over a batch of 32, retrained polynomial model); ATLAS, ViT-B/16, 2259.0 on RTX 4090; Perseus, ViT-B/16, 59.0 on RTX PRO 6000, open source." width="707">
+      <img src="assets/paper-tables-vit-light.png" alt="Encrypted ViT inference of one image, seconds. FIONA, ViT-S/16, 374.4 on a 48-core CPU (amortized over a batch of 32, retrained polynomial model); ATLAS, ViT-B/16, 2259.0 on RTX 4090; Perseus, ViT-B/16, 31.2 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>
@@ -93,7 +88,7 @@ ours where the code is released.
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-bert-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-bert-light.png">
-      <img src="assets/paper-tables-bert-light.png" alt="Encrypted BERT inference of one input, seconds. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 23.9 on RTX PRO 6000, open source." width="707">
+      <img src="assets/paper-tables-bert-light.png" alt="Encrypted BERT inference of one input, seconds. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 12.2 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
 </p>
@@ -111,14 +106,14 @@ primitives on one RTX PRO 6000, and the two commands under it reproduce the tabl
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-core-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-core-light.png">
-      <img src="assets/paper-tables-core-light.png" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.022 and 0.057, multiplication by a scalar 0.026 and 0.040, by a plaintext 0.019 and 0.038, relinearized multiplication 0.540 and 0.563, rescale 0.084 and 0.130, rotation 0.512 and 0.536, forward and inverse NTT 0.076 and 0.103. Bootstraps, dense 20.3 and 19.2, StC first 17.1 and 15.5, sparse 512 slots 17.4 and 19.0, sparse 256 slots 16.4 and 18.6, one slot 10.0 and 11.3. Ring 2^16, 54 + 9 primes in 32-bit words, log QP 1706, dnum 6, 128-bit security." width="707">
+      <img src="assets/paper-tables-core-light.png" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.015 and 0.054, multiplication by a scalar 0.016 and 0.037, by a plaintext 0.015 and 0.037, relinearized multiplication 0.413 and 0.439, rescale 0.057 and 0.072, rotation 0.360 and 0.378, forward and inverse NTT 0.070 and 0.098. Bootstraps, dense 15.2 and 14.0, StC first 13.0 and 11.7, sparse 512 slots 13.1 and 13.0, sparse 256 slots 12.2 and 12.6, one slot 7.3 and 7.7. Ring 2^16, 51 + 13 primes in 32-bit words, log QP 1734, dnum 4, 128-bit security." width="707">
     </picture>
   </a>
 </p>
 
 ```bash
-cargo run --release -p pc-tools -F pc-gpu/mont --bin pc-bench -- modmul --k 1,8 --reps 20   # leaf operations
-cargo run --release -p pc-tools --bin pc-bench -- bts --all --k 1,8 --reps 20 --keys packed  # bootstraps
+PC_BENCH_CHAIN=n32a4 cargo run --release -p pc-tools -F pc-gpu/mont --bin pc-bench -- modmul --k 1,8 --reps 20   # leaf operations
+PC_BENCH_CHAIN=n32a4 cargo run --release -p pc-tools --bin pc-bench -- bts --all --k 1,8 --reps 20 --keys packed  # bootstraps
 ```
 
 ## Reproduce
@@ -129,10 +124,9 @@ float64 model (`NODE`/`MEMS` bind it to the GPU's NUMA node); each runs the mode
 
 ```bash
 GPU=0 NODE=1 MEMS=1,2 bash scripts/repro/llama_prefill128.sh   # Llama-3-8B, 128-token prefill
-GPU=0 bash scripts/repro/llama_decode.sh                        # Llama-3-8B, decode
-GPU=0 bash scripts/repro/gpt2_decode.sh                         # GPT-2, steady-token decode
-GPU=0 bash scripts/repro/gpt2_decode_ctx512.sh                  # GPT-2, decode up to a 512-token context
-GPU=0 bash scripts/repro/gpt2_prefill128.sh                     # GPT-2, 128-token prefill
+GPU=0 bash scripts/repro/llama_decode.sh                        # Llama-3-8B, decode up to a 512-token context
+GPU=0 bash scripts/repro/gpt2_decode_ctx.sh                     # GPT-2, decode up to a 512-token context
+GPU=0 bash scripts/repro/gpt2_prefill128.sh                     # GPT-2, 128-token prefill to the first token
 GPU=0 bash scripts/repro/bert_base.sh                           # BERT-base, 128 tokens (SST-2)
 GPU=0 bash scripts/repro/vit_base.sh                            # ViT-B/16, four EuroSAT images
 ```
@@ -222,9 +216,9 @@ be skipped.
 You need the following.
 - Linux, an NVIDIA GPU of compute capability 12.0 (Blackwell; the kernels are built for `sm_120`)
   and CUDA 13.2 (`CUDA_HOME`, default `/usr/local/cuda-13.2`).
-- A GPU with enough memory for the run. Decoding peaks at 47.9 GiB with GPT-2 and 46.0 GiB with
-  Llama-3-8B, and the prefills, BERT and ViT need more (the first table lists every peak, measured on a
-  96 GB GPU).
+- A GPU with enough memory for the run. Decoding peaks at 59.1 GiB with GPT-2 and 48.2 GiB with
+  Llama-3-8B, and the Llama-3-8B prefill needs the most, 86.3 GiB (the first table lists every peak,
+  measured on a 96 GB GPU).
 - The Rust toolchain (`rustup`; `rust-toolchain.toml` pins the version) and Python 3.12.
 
 ```bash
@@ -260,9 +254,10 @@ typed configuration (`perseus._pc.Config`).
 
 The export packs the weights for the runtime. The calibration fits a polynomial approximation
 to every nonlinear function (LayerNorm, softmax, GELU and the encrypted argmax) on the value
-ranges it sees on OpenWebText; the shipped `gpt2_base_n32/configs.json` is the one the results
-use. The last command runs the plaintext model on a fixed piece of text and saves its inputs
-and output logits, the reference outputs that encrypted runs are compared against.
+ranges it sees on OpenWebText. The results use configs fitted the same way for their plans, each
+named in its plan's `PLAN_CMD.txt` (`gpt2_base_n32_ctx512s` for the 512-token decode). The last
+command runs the plaintext model on a fixed piece of text and saves its inputs and output logits,
+the reference outputs that encrypted runs are compared against.
 
 A model fine-tuned for encryption, such as the HEAT GPT-2, is exported on top of its base model
 with `--checkpoint` (a `model.pt` file or a HuggingFace repository id).
@@ -324,7 +319,7 @@ bash scripts/make_plans.sh python/dacapo python/orion python/fhelipe
 source scripts/local_env.sh
 DECODE=".venv/bin/python -m perseus.examples.gpt2.run_decode --tokens 16 --argmax"
 $DECODE                                                        # the default plan
-bash scripts/repro/gpt2_decode_ctx512.sh                       # up to a 512-token context (its reference: the script)
+CTX=1024 bash scripts/repro/gpt2_decode_ctx.sh                 # up to GPT-2's 1024-token context (its reference: the script)
 ```
 
 Generation feeds each token back without decrypting it. The encrypted argmax picks the token, its
@@ -339,7 +334,7 @@ The runtime runs planned only. Every block is a program compiled from its record
 plan, and a plan that does not bind fails at compile time. The decode runs are teacher-forced
 (each position's input is the reference token's embedding); the encrypted argmax runs on every
 position. A plan that binds at every cache length (`SM_PERIODIC=2` in its `runtime=` line, the
-512-context plan) records every position at setup and compiles one program per structure class.
+1024-context plan) records every position at setup and compiles one program per structure class.
 
 A run passes when it prints `[decode] PASS`, which means that at every position the reference token
 stays among the top few of the encrypted output, and the divergence from the plaintext output stays
@@ -355,17 +350,7 @@ the rules, the harness that times entries and the records. Every entry is a pull
 
 ## Citation
 
-If you use Perseus, please cite the paper (GitHub's *Cite this repository* button reads
-[`CITATION.cff`](CITATION.cff)).
-
-```bibtex
-@misc{zirilli2026perseus,
-  title  = {Perseus: A Bootstrap Placer for Faster Encrypted Transformer Inference},
-  author = {Zirilli, Alessandro and Marincione, Davide and Kornaropoulos, Evgenios M. and Ateniese, Giuseppe and Rodol{\`a}, Emanuele},
-  year   = {2026},
-  url    = {https://github.com/gladia-research-group/perseus}
-}
-```
+The paper is coming soon.
 
 ## License
 

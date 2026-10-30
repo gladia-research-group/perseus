@@ -13,7 +13,7 @@ from perseus.impl.layout import cutmax_tile_col_of_slot, cutmax_tile_mask, lane_
 from perseus.impl.linear import EncodedLinear, apply_linear, linear, prepare_linear_input
 from perseus.impl.norm import layer_norm
 from perseus.impl.poly import (bts2, goldschmidt_inv_x0, hint, im_cleanse, inv_sqrt_newton_safe,
-                   pow_odd, rotsum)
+                   inv_sqrt_newton_scaled, pow_odd, rotsum)
 
 
 def final_ln(rt, x, cfg: NormCfg, params: dict, pos: int, cap: int | None = 44):
@@ -150,16 +150,35 @@ def cutmax_argmax(rt, tiles_in, vocab: int, cfg: CutMaxCfg, ones=None, tap=None)
     tiles = []
     for k in range(K):
         x = mm(tiles_in[k], k, cfg.entry_scale, "entry")
-        x = hint(ops, x, 16, iters=vec_iters)
+        if not (cfg.iters and cfg.iters[0].newton):        # the scaled normalisers refresh the centred logits
+            x = hint(ops, x, 16, iters=vec_iters)
         if tap: tap(f"entry{k}", x)
         tiles.append(x)
 
     for ii, it in enumerate(cfg.iters):
-        kf = 1.0 / math.sqrt(vocab * it.s2_hi)
         R = None
         for k in range(K):
             r = rotsum_all(tiles[k])
             R = r if R is None else ops.add(R, r)
+        if it.newton:
+            # the scaled normaliser of cutmax_argmax_packed, per tile
+            kd = 0.5 * math.sqrt(vocab * it.x_scale) / (it.c * it.m)
+            D = [ops.sub(mm(tiles[k], k, kd, ("d", ii)), mm(R, k, kd / vocab, ("mu", ii))) for k in range(K)]
+            if ii == 0:
+                D = [hint(ops, x, 16, iters=vec_iters) for x in D]
+            S2 = None
+            for k in range(K):
+                sq = rotsum_all(ops.square(D[k]))
+                S2 = sq if S2 is None else ops.add(S2, sq)
+            t = ops.mult(S2, it.x_scale / (kd * kd))
+            ops.bootstrap(t)
+            u = inv_sqrt_newton_scaled(ops, t, it.newton)
+            if tap: tap(f"i{ii}.S2", S2); tap(f"i{ii}.f", u)
+            for k in range(K):
+                y = im_cleanse(ops, am(ops.mult(D[k], u), k, 0.5 / it.m, "shift"))
+                tiles[k] = pow_odd(ops, hint(ops, y, 16, iters=vec_iters), it.p)
+            continue
+        kf = 1.0 / math.sqrt(vocab * it.s2_hi)
         S2 = None
         for k in range(K):
             if it.ex2:
@@ -189,6 +208,12 @@ def cutmax_argmax(rt, tiles_in, vocab: int, cfg: CutMaxCfg, ones=None, tap=None)
     for k in range(K):
         s = rotsum_all(tiles[k])
         S = s if S is None else ops.add(S, s)
+    if cfg.sum_newton:
+        t = ops.mult(S, cfg.sum_scale)
+        ops.bootstrap(t)
+        r = ops.square(inv_sqrt_newton_scaled(ops, t, cfg.sum_newton, math.sqrt(cfg.sum_scale)))
+        if tap: tap("sum.S", S); tap("sum.r", r)
+        return [ops.mult(tiles[k], r) for k in range(K)]
     g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
     lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
     bsum = 8.0 / ((lo + hi) * (lo + hi) + 4.0 * lo * hi)
@@ -232,33 +257,72 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
     def am(ct, key, build, tagged=True):
         return ops.add_pt(ct, rt.mask(key, build), key=rt.mask_key(key), kind="mask", tagged=tagged)
 
-    pin = ops.mult(pair, cfg.entry_scale)
-    pin = hint(ops, pin, 16, iters=vec_iters)
-    A = ops.add(pin, ops.conjugate(pin))                  # 2 t0
-    B = ops.sub(pin, ops.conjugate(pin))                  # 2i t1
-    A = ops.mult(A, 0.5)
-    B = mm(B, ("cutmax.bmask",), lambda: 0.5 * masks[1])  # canonical, junk-free
-    if tap: tap("entry.A", A); tap("entry.B", B)
+    scaled = bool(cfg.iters) and bool(cfg.iters[0].newton)
+    if not scaled:
+        pin = ops.mult(pair, cfg.entry_scale)
+        pin = hint(ops, pin, 16, iters=vec_iters)
+        A = ops.add(pin, ops.conjugate(pin))                  # 2 t0
+        B = ops.sub(pin, ops.conjugate(pin))                  # 2i t1
+        A = ops.mult(A, 0.5)
+        B = mm(B, ("cutmax.bmask",), lambda: 0.5 * masks[1])  # canonical, junk-free
+        if tap: tap("entry.A", A); tap("entry.B", B)
+    # Re((1 - i sgn) (S0 + i sgn S1)) = S0 + S1: the cleanse of that Gaussian-integer product is 2 (S0 + S1), with
+    # no level and the reduction's stamp kept (its refreshes route sparse)
+    sum2 = lambda R_c, sgn: im_cleanse(ops, ops.sub(R_c, ops.mult_i(R_c)) if sgn > 0
+                                       else ops.add(R_c, ops.mult_i(R_c)))
     sgn = 1.0
     for ii, it in enumerate(cfg.iters):
-        kf = 1.0 / math.sqrt(n * it.s2_hi)
-        P = ops.add(A, B)                                 # free: B lives on the imaginary axis
-        R_c = rotsum_all(P)                               # S0 + i sgn S1
-        R = im_cleanse(ops, ops.mult_const(R_c, 0.5, -0.5 * sgn))   # S0 + S1
-        kA = ops.mult(A, kf)
-        kB = ops.mult(B, kf)
-        if not it.ex2:
-            kA = ops.sub(kA, mm(R, ("cutmax.m0", ii, kf), lambda: masks[0] * (kf / n)))
-            kB = ops.sub(kB, mm(R, ("cutmax.m1", ii, kf, sgn),
-                                lambda: 1j * sgn * masks[1] * (kf / n), tagged=False))
-        S2 = rotsum_all(ops.sub(ops.square(kA), ops.square(kB)))
-        if tap: tap(f"i{ii}.R", R); tap(f"i{ii}.S2", S2)
-        f = inv_sigma_cascade(ops, S2, cfg, it, ones, tap, casc_iters)
-        Rf = ops.mult(R, f)
-        a = ops.mult(P, f)
-        b = mm(Rf, ("cutmax.b", ii, sgn), lambda: (masks[0] + 1j * sgn * masks[1]) / n, tagged=False)
-        yP = am(ops.sub(a, b), ("cutmax.sh", ii, it.m, sgn),
-                lambda: (masks[0] + 1j * sgn * masks[1]) * (0.5 / it.m), tagged=False)
+        if it.newton:
+            # the scaled normaliser: D = k (x - mu) on both tiles, k = 0.5 sqrt(n x_scale) / (c m), so that
+            # y = 2 Re(D u) + 1 / m for u = 1 / sqrt(t), t = x_scale n sigma^2 = (x_scale / k^2) sum |D|^2 in (0, 1]
+            # (one product for both tiles' squares); D, t and u are all of order one wherever the plan refreshes them
+            k = 0.5 * math.sqrt(n * it.x_scale) / (it.c * it.m)
+            M = lambda: masks[0] + 1j * sgn * masks[1]
+            if ii == 0:
+                # the logits as the LM head leaves them: the tile split, entry_scale, k and the centring are one
+                # masked product per term, so the entry refresh sees the centred logits (their spread, not their
+                # common offset) one level below the head
+                ke = k * cfg.entry_scale
+                # the raw pair's sum: the LM head leaves tile 1's slots past the vocabulary at zero (zero weight
+                # columns, no refresh yet), so its imaginary part sums to S1 (the record masks B after its entry
+                # refresh, whose noise fills them)
+                R2 = sum2(rotsum_all(pair), sgn)
+                D = ops.sub(ops.add(mm(pair, ("cutmax.e1", ke), lambda: ke * 0.5 * (1.0 + masks[1])),
+                                    mm(ops.conjugate(pair), ("cutmax.e2", ke), lambda: ke * 0.5 * (1.0 - masks[1]))),
+                            mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * ke / n), tagged=False))
+                D = hint(ops, D, 16, iters=vec_iters)
+            else:
+                P = ops.add(A, B)                         # free: B lives on the imaginary axis
+                R2 = sum2(rotsum_all(P), sgn)
+                D = ops.sub(ops.mult(P, k), mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * k / n),
+                                              tagged=False))
+            S2 = rotsum_all(ops.mult(D, ops.conjugate(D)))
+            if tap: tap(f"i{ii}.S2", S2)
+            # t is refreshed where it is formed (one 1-slot refresh): every Newton step then reads it at the landing,
+            # and u ends early enough for D u to reach the vector's refresh inside its envelope
+            t = ops.mult(S2, it.x_scale / (k * k))
+            ops.bootstrap(t)
+            u = inv_sqrt_newton_scaled(ops, t, it.newton)
+            yP = am(ops.mult(D, u), ("cutmax.sh", ii, it.m, sgn), lambda: M() * (0.5 / it.m), tagged=False)
+        else:
+            P = ops.add(A, B)                             # free: B lives on the imaginary axis
+            R_c = rotsum_all(P)                           # S0 + i sgn S1
+            kf = 1.0 / math.sqrt(n * it.s2_hi)
+            R = im_cleanse(ops, ops.mult_const(R_c, 0.5, -0.5 * sgn))   # S0 + S1
+            kA = ops.mult(A, kf)
+            kB = ops.mult(B, kf)
+            if not it.ex2:
+                kA = ops.sub(kA, mm(R, ("cutmax.m0", ii, kf), lambda: masks[0] * (kf / n)))
+                kB = ops.sub(kB, mm(R, ("cutmax.m1", ii, kf, sgn),
+                                    lambda: 1j * sgn * masks[1] * (kf / n), tagged=False))
+            S2 = rotsum_all(ops.sub(ops.square(kA), ops.square(kB)))
+            if tap: tap(f"i{ii}.R", R); tap(f"i{ii}.S2", S2)
+            f = inv_sigma_cascade(ops, S2, cfg, it, ones, tap, casc_iters)
+            Rf = ops.mult(R, f)
+            a = ops.mult(P, f)
+            b = mm(Rf, ("cutmax.b", ii, sgn), lambda: (masks[0] + 1j * sgn * masks[1]) / n, tagged=False)
+            yP = am(ops.sub(a, b), ("cutmax.sh", ii, it.m, sgn),
+                    lambda: (masks[0] + 1j * sgn * masks[1]) * (0.5 / it.m), tagged=False)
         yP = hint(ops, yP, 16, iters=vec_iters)           # ONE packed vector refresh
         if tap: tap(f"i{ii}.yP", yP)
         A = pow_odd(ops, ops.add(yP, ops.conjugate(yP)), it.p)     # y0^p
@@ -267,15 +331,22 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
         if tap: tap(f"i{ii}.end", B)
     P = ops.add(A, B)
     S_c = rotsum_all(P)
-    S = im_cleanse(ops, ops.mult_const(S_c, 0.5, -0.5 * sgn))
-    g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
-    lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
-    bsum = 8.0 / ((lo + hi) * (lo + hi) + 4.0 * lo * hi)
-    alpha, beta = bsum * (lo + hi), bsum
-    Sn = ops.mult(S, g)
-    F_init = ops.add(ops.mult(Sn, -beta), alpha)
-    r = goldschmidt_inv_x0(ops, Sn, F_init, cfg.gs_sum_iters)
-    r = ops.mult(r, g)
+    if cfg.sum_newton:
+        # 1 / S = u^2, u = 1 / sqrt(S) from Newton steps on sum_scale S in (0, 1] (sum2 is 2 S)
+        S = sum2(S_c, sgn)
+        t = ops.mult(S, 0.5 * cfg.sum_scale)
+        ops.bootstrap(t)
+        r = ops.square(inv_sqrt_newton_scaled(ops, t, cfg.sum_newton, math.sqrt(cfg.sum_scale)))
+    else:
+        S = im_cleanse(ops, ops.mult_const(S_c, 0.5, -0.5 * sgn))
+        g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
+        lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
+        bsum = 8.0 / ((lo + hi) * (lo + hi) + 4.0 * lo * hi)
+        alpha, beta = bsum * (lo + hi), bsum
+        Sn = ops.mult(S, g)
+        F_init = ops.add(ops.mult(Sn, -beta), alpha)
+        r = goldschmidt_inv_x0(ops, Sn, F_init, cfg.gs_sum_iters)
+        r = ops.mult(r, g)
     Z = ops.mult(P, r)
     if sgn < 0:
         Z = ops.conjugate(Z)                              # realign: t0 - i t1 -> t0 + i t1

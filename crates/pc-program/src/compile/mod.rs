@@ -2,8 +2,8 @@
 //! plan decisions as ops, the Shadow alongside), `batch` (K sibling ops per launch), `alloc` (arena slots),
 //! `check::verify` (the Shadow re-run over the finished program: pins, ceilings, recorded preludes).
 //!
-//! The runtime truth the check runs on is `runtime_shadow`: the pc-shadow C++ rules (no quirks) on the real n32
-//! chain, with FIDESlib's realized route landings (dense StC-first 28 / shipped order 34 past the StC-first entry,
+//! The runtime truth the check runs on is `runtime_shadow`: the pc-shadow C++ rules (no quirks) on the real chain
+//! (`chain.preset`, n32 by default), with FIDESlib's realized route landings (dense StC-first 28 / shipped order 34 past the StC-first entry,
 //! 1024, 512 and 256 at 24, 1 at 16) and the per-route raise drops of the runtime line (`FIDESLIB_BTS_RAISE_DROP`): the
 //! planner's own landing table (`PLAN_SPARSE_BTS_OUT`, PLAN_STEP_LANDING floors) only sets the pins, which the check
 //! reads one-sided.
@@ -17,7 +17,7 @@ pub mod stream;
 use crate::error::{Error, Result};
 use crate::graph::BlockGraph;
 use crate::plan::{BlockPlan, PlanDir};
-use crate::program::{Program, VarId};
+use crate::program::{Pairing, Program, VarId};
 use pc_config::{Config, PlanConfig};
 use pc_shadow::graph::{parse_lvl_suffix, LoadOpts};
 use pc_shadow::route::Landing;
@@ -180,10 +180,16 @@ impl RouteEnv {
             if s > 1 && s < self.ring_dim / 2 && !r.sparse_b && !self.built.contains(&s) {
                 continue;
             }
-            let Ok(rec) = sh.bootstrap(input, &r) else { continue };
-            let got = if cap.deg == 2 { (rec.out.level.checked_sub(sh.unit())?, 2) } else { (rec.out.level, rec.out.deg) };
-            if got == (cap.level, cap.deg) {
-                return Some(r);
+            // the dense route: StC-first by default (its own shipped-order fallback past the entry); a capture at the
+            // shipped order's landing that route cannot give (IMPL_STC_FIRST_KV=0: the K/V push in the shipped order)
+            // takes the plain shipped-order route
+            let alts = if s == 0 && r.stc_first { vec![r, Route { stc_first: false, ..r }] } else { vec![r] };
+            for r in alts {
+                let Ok(rec) = sh.bootstrap(input, &r) else { continue };
+                let got = if cap.deg == 2 { (rec.out.level.checked_sub(sh.unit())?, 2) } else { (rec.out.level, rec.out.deg) };
+                if got == (cap.level, cap.deg) {
+                    return Some(r);
+                }
             }
         }
         None
@@ -219,13 +225,23 @@ fn planned_route_for(tag: &pc_shadow::tag::Tag, s: u32, built: &[u32], total: u3
 }
 
 /// The runtime Shadow a Config (+ the plan's PlanConfig and rules) means: C++ rules, real chain, FIDESlib landings.
+/// The chain a Config names (`chain.preset`, default n32).
+pub fn chain_of(cfg: &Config) -> Result<pc_core::params::Chain> {
+    let preset = cfg.chain.preset.as_deref().unwrap_or("n32");
+    let spec = pc_core::params::ChainSpec::preset(preset).map_err(|e| cfg_err("chain.preset", e))?;
+    pc_core::params::Chain::generate(&spec).map_err(|e| cfg_err("chain.preset", e))
+}
+
 pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Option<u32>) -> Result<Shadow> {
     let unit = u32_of("chain.composite_degree", cfg.chain.composite_degree, 2)?;
     match cfg.chain.chain.as_deref() {
         None | Some("n32") => {}
         Some(other) => return Err(cfg_err("chain.chain", format!("{other:?}: only the n32 chain shape is known"))),
     }
-    let chain = ChainShape { n_q: ChainShape::N32.n_q, unit };
+    // the limbs of the chain the Config names (`chain.preset`, default n32: 54; the lean n32a4: 51)
+    let real = chain_of(cfg)?;
+    let n_q = real.q.len() as u32;
+    let chain = ChainShape { n_q, unit };
     let mut quirks = Quirks::none();
     if let Some(names) = &cfg.quirks.shadow {
         for n in names {
@@ -278,6 +294,8 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     }
     // the shipped order (a dense refresh not run StC-first) lands where a too-deep StC-first input falls back to
     bts.dense_shipped = bts.stc_first_fallback;
+    // a refresh input's deepest effective level: the top of the level above q0's (n32: 50; n32a4's single s1: 48)
+    bts.input_room = Some(n_q - real.groups.iter().take(2).sum::<usize>() as u32);
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 
@@ -494,7 +512,12 @@ pub fn compile_block(
     p.check.ignored_anchors = lw.check.ignored_anchors.clone();
     p.check.inexact_scalars = res.inexact_scalars;
     let k_max = if opts.no_batch { 1 } else { sh.cfg.bts.k_max.max(1) };
-    batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free);
+    // PC_BTS_PAIR: sibling real refreshes in pairs, where the inputs enter StC-first
+    // (CFs up to the route's reference CF less one: 19, or 12 on a lean chain)
+    let cf_max = if chain_of(cfg)?.lone_top().is_some() { crate::program::PAIR_CF_MAX_LEAN } else { crate::program::PAIR_CF_MAX };
+    let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
+    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default });
+    batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);
     let mut rep = check::verify(&sh, &p);

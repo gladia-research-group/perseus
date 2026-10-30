@@ -24,7 +24,12 @@ D3 = Path("/data02/users/mithrillo/projects/perseus-oracle/fx/dumps/d3")
 # ── Config ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def test_config_fields_and_presets():
-    assert len(_pc.Config.fields()) == 250 and len(_pc.PlanConfig.fields()) == 89
+    # + bts.em_fuse_rescale, bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack},
+    # chain.preset;
+    # plan.fallback_cf,
+    # plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
+    # plan.keep_placements_exact, plan.mag_safety_steps, plan.resume; chain.preset
+    assert len(_pc.Config.fields()) == 261 and len(_pc.PlanConfig.fields()) == 104
     assert all(f["env"] == "" or f"`{f['env']}`" in f["doc"] for f in _pc.Config.fields())
     assert set(config.PRESETS) == {"n32_gpt2_decode", "n32_gpt2_prefill", "n32_llama_decode", "n32_llama_prefill"}
     c = config.preset("n32_gpt2_decode")
@@ -63,7 +68,7 @@ def test_plan_runtime_matches_the_env_dicts():
         for k, v in want.items():
             assert got.get(k) == v or (got.get(k) is None and v == env.RUNTIME_LEGACY.get(k)), (plan, k)
     assert config.plan_configs("bootstrap_placements/gpt2_decode") == \
-        "configs/model/approximation/gpt2_base_n32/configs.json"
+        "configs/model/approximation/gpt2_base_n32_cm/configs.json"
 
 
 def test_capture_env_stamps_bridge():
@@ -139,7 +144,7 @@ def test_shadow_scale_tables_and_consts():
     assert s.add_scalar(a, -1.0).consts_kind == "add"
 
 
-@pytest.mark.skipif(not (D3 / "params.json").exists(), reason="d3 dump not readable")
+@pytest.mark.skipif(not os.access(D3 / "params.json", os.R_OK), reason="d3 dump not readable")
 def test_em_program_view():
     p = json.loads((D3 / "params.json").read_text())
     cts3 = json.loads((D3 / "it0.cts3.json").read_text())

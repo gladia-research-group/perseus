@@ -37,6 +37,11 @@ impl FieldInfo {
     pub fn in_contract(&self) -> bool {
         self.doc.contains("[contract]")
     }
+    /// A perseus-core kernel switch: it changes neither the op stream, its levels nor the keys (`load_bearing` leaves
+    /// it out).
+    pub fn kernel_switch(&self) -> bool {
+        self.doc.contains("[kernel]")
+    }
 }
 
 /// A section struct per group: fields `Option<kind>`, the static field table, env and JSON accessors.
@@ -245,7 +250,8 @@ impl Config {
     }
 
     /// The subset a plan is bound to (chain / bts / model / quirks) plus every field the legacy contract
-    /// compared (`[contract]` readers, e.g. `exec.gpt2_cache`, `mem.fhe_pt_coeff_encode`).
+    /// compared (`[contract]` readers, e.g. `exec.gpt2_cache`, `mem.fhe_pt_coeff_encode`), without the kernel switches
+    /// (`[kernel]`): they bind no plan and no key bundle.
     pub fn load_bearing(&self) -> Config {
         let mut c = Config {
             chain: self.chain.clone(),
@@ -255,6 +261,10 @@ impl Config {
             ..Config::default()
         };
         for f in Config::fields() {
+            if f.kernel_switch() {
+                // a field of the copied sections; null unsets it
+                let _ = c.set(&f.dotted(), serde_json::Value::Null);
+            }
             if f.in_contract() && matches!(f.path.split('.').next(), Some("mem" | "host" | "exec")) {
                 if let Ok(v) = self.get(&f.dotted()) {
                     // the field exists by construction; set cannot fail on its own value

@@ -331,7 +331,7 @@ impl PyFhe {
         let c: &Ct<'static, W> = tmp.as_ref().map_or(x.ct(), |t| t.ct());
         let mut st = d.st.borrow_mut();
         let State { ex, secret, pts, .. } = &mut *st;
-        let crate::session::SecretSide { dec2, dec4, .. } = secret
+        let crate::session::SecretSide { dec2, dec3, dec4, .. } = secret
             .as_mut()
             .ok_or_else(|| rt_err("decrypt: this session holds no secret (built from a client's key bundle); decrypt on the client"))?;
         let payload = d.payload();
@@ -346,6 +346,10 @@ impl PyFhe {
             if top + 1 >= 4 {
                 let rows = dec4.decrypt_rows(&d.ctx, &ex.compute, c, pc_gpu::decrypt::Which::Dense)?;
                 Ok(decode4(enc, &d.ctx.chain.q[..4], &rows[0], slots, payload, c.meta.nf, n))
+            } else if top + 1 == 3 && d.ctx.chain.lone_top().is_some() {
+                // a lean chain's level 48: q0 q1 alone would wrap a value above ~2^1.3 at the 2^54 scale
+                let rows = dec3.decrypt_rows(&d.ctx, &ex.compute, c, pc_gpu::decrypt::Which::Dense)?;
+                Ok(decode4(enc, &d.ctx.chain.q[..3], &rows[0], slots, payload, c.meta.nf, n))
             } else {
                 let rows = dec2.decrypt_rows(&d.ctx, &ex.compute, c, pc_gpu::decrypt::Which::Dense)?;
                 Ok(enc.decode_slots(&rows[0], slots, payload, c.meta.nf)?)

@@ -32,7 +32,7 @@
     "IMPL_DEAD_OPS": "1",
     "LADDER_RADIX_BITS": "3",
     "CHEB_ALIGN": null,
-    "SM_CHEB_GS": "0",
+    "SM_CHEB_GS": "1",
     "LLAMA_GQA": null
   },
   "session": {

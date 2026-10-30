@@ -66,8 +66,9 @@ impl PyProgram {
     /// `blocks`: labels to keep (None = all). A block whose compile check fails raises listing the errors, unless
     /// `keep_going`. `live_out` {label: [names]}: final states kept as outputs (K/V states); `input_metas` {label:
     /// {name: (level, deg)}}: the entry state of inputs the driver knows. `schedule`: "program" (the capture's order,
-    /// siblings hoisted) or "lockstep" (independent chains advance together: more K-batched refreshes, more live
-    /// ciphertexts).
+    /// siblings hoisted), "siblings" (the capture's order with the siblings of rotate_sums and dense refreshes pulled
+    /// forward with what they wait for: K-batched key switches and refreshes, a few more live ciphertexts) or
+    /// "lockstep" (independent chains advance together: more K-batched refreshes, many more live ciphertexts).
     #[staticmethod]
     /// `routes_built`: the sparse routes the runtime holds while these blocks run (SM_PERIODIC=2: a planned refresh
     /// of a value whose period outgrew its planned slot count takes the smallest built route its period allows).
@@ -78,7 +79,8 @@ impl PyProgram {
         let schedule = match schedule {
             "program" => pc_program::compile::batch::Schedule::Program,
             "lockstep" => pc_program::compile::batch::Schedule::Lockstep,
-            x => return Err(PyValueError::new_err(format!("Program.compile(schedule={x:?}): program | lockstep"))),
+            "siblings" => pc_program::compile::batch::Schedule::Siblings,
+            x => return Err(PyValueError::new_err(format!("Program.compile(schedule={x:?}): program | siblings | lockstep"))),
         };
         let opts = CompileOpts { keep_going, no_batch, live_out: live_out.unwrap_or_default(), input_metas: input_metas.unwrap_or_default(), schedule, batch_cf_free: cf_free, routes_built: routes_built.unwrap_or_default(), dense_fallback, ..CompileOpts::default() };
         let (gd, pd) = (graph_dir.to_string(), plan_dir.to_string());
@@ -189,6 +191,11 @@ impl PyProgram {
             }
         }
         (r.k_max, r.bootstrap_launches, r.bootstrap_hist.clone(), per)
+    }
+    /// Refresh pairs the batching formed (config `bts.pair`: two real refreshes as one complex refresh).
+    #[getter]
+    fn n_pairs(&self) -> usize {
+        self.prog.batch_report.pairs
     }
     /// External finishes (PCMM / CCMM ops): (ops, refreshed outputs).
     #[getter]
@@ -615,7 +622,15 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     if let Some(x) = spru.as_ref() {
         routes.add(x);
     }
-    let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense.iter().flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock)).collect();
+    // the CCMM's stc_high caches (keys change per call): no capture may read them (ForbidLock), their callers run
+    // eager between the graph segments; their evictions are not watched
+    let forbid: Vec<pc_gpu::graph::ForbidLock<'_, '_, W>> =
+        dense.iter().flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c)))).collect();
+    let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense
+        .iter()
+        .flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))
+        .chain(forbid.iter().map(|f| f as &dyn pc_program::replay::CaptureLock))
+        .collect();
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
     if ins.len() != b.inputs.len() {

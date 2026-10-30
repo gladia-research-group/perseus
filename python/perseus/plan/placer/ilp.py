@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 
 from .ir import ADD_FAMILY, MULT_FAMILY, is_kv_cache_read, is_literal_input, is_plaintext_name
@@ -25,6 +26,11 @@ log = logging.getLogger(__name__)
 _INF = float("inf")
 _TOL = 1e-4           # agreement tolerance between the solved model and the sim
 _ENV_PENALTY = 1.0e4  # `_capacity`'s payable price for a site past the refresh envelope
+#: the tie-break prices the model in whole units of 2^-20: its optimum is then exact, and the tie-break's cutoff sits
+#: half a unit clear of it (with float costs, optima 1e-6 apart -- the solver's own tolerance -- trade places between
+#: solver builds). The quality term (PLAN_QUALITY_WEIGHT) then tells refresh errors apart only in steps of
+#: err_target / 256 (4e-5 at 1e-2), so most ties fall to the graph-position weights
+_UNIT = float(2 ** 20)
 
 
 class ModelMismatch(RuntimeError):
@@ -273,6 +279,10 @@ class IlpPlacer(Placer):
     #: deeper exit there is a saving the planner books and the argmax pays back
     #: (measured: n32 block 12 exited 42 instead of 40, argmax +0.13 s/token)
     cap_exit: bool = False
+    #: among the optima, take the one a fixed weight per decision (from the site's graph position) ranks first: the
+    #: model priced in whole `_UNIT`s (an exact optimum), then a second solve under that optimum, so the plan depends
+    #: on neither the solver build nor the machine's speed (both solves must be proven optimal)
+    tiebreak: bool = False
     meta: dict = field(default_factory=dict)
     _exit_cap: tuple[str, float] | None = None
 
@@ -367,6 +377,23 @@ class IlpPlacer(Placer):
             d = bit(s.out_deg)
             return Ladder.const(s.out_consumed + unit * d.const), d
 
+        sh = self.refresh.shadow
+        fb = self._dense_fallback()
+
+        def landing_from(v: str, pe: Ladder) -> tuple[Ladder, Expr]:
+            """`landing(v)` for a refresh whose input is `pe`: a dense site whose input passed
+            the StC-first entry runs the shipped order and lands where it lands (sim
+            `dense_fallback`)."""
+            le, ld = landing(v)
+            s = self.refresh.spec(v)
+            if fb is None or (s.route and not s.hopeless):
+                return le, ld
+            deep = pe.gt(fb[0] - bts)
+            if _is(deep, 0.0):
+                return le, ld
+            fd = bit(fb[2])
+            return lite(deep, Ladder.const(fb[1] + unit * fd.const), le), m.ITE(deep, fd, ld)
+
         def rungs(vals: list[float], bits: list[Expr]) -> Ladder:
             """A ladder, with its rungs stated to be monotone: [v >= k+1] implies [v >= k].
             Every integer solution satisfies this by construction, but saying it keeps the
@@ -406,17 +433,25 @@ class IlpPlacer(Placer):
         def dg(v: str) -> Expr:
             return D.get(v, ZERO)
 
-        def refresh(v: str, e: Ladder, d: Expr, xv: Expr) -> tuple[Ladder, Expr]:
+        hard = self._env_hard() if env_hard is None else env_hard
+
+        def env_rel(v: str) -> float:
+            return refresh_env_cap(self._step_of(v), route=self.refresh.spec(v).route or 0) - bts
+
+        def refresh(v: str, e: Ladder, d: Expr, xv: Expr, seed: bool = False) -> tuple[Ladder, Expr]:
             if _is(xv, 0.0):
                 return e, d
             pre[v] = e
-            le, ld = landing(v)
+            # a refreshed graph input is seeded at its landing (the sim's StC-first test reads op outputs only);
+            # a hard envelope at or inside the StC-first entry leaves a placed refresh no input past it
+            inside = constrain and hard and fb is not None and env_rel(v) <= fb[0] - bts
+            le, ld = landing(v) if seed or inside else landing_from(v, e)
             return lite(xv, le, e), m.ITE(xv, ld, d)
 
         for v in g.inputs:
             d0 = bit(self.seed_deg(v))
             e0 = Ladder.const(self.seed_consumed(v) + unit * d0.const)
-            E[v], D[v] = refresh(v, e0, d0, x_of(v))
+            E[v], D[v] = refresh(v, e0, d0, x_of(v), seed=True)
 
         terminal = None
         for n in g.nodes:
@@ -459,9 +494,25 @@ class IlpPlacer(Placer):
                 if out:
                     base = (n.output_level - bts if n.output_level is not None
                             else max(0.0, offs.get(n.step, 0.0)))
-                    if self.deliberate_clamp0:
-                        base = max(0.0, base)
-                    E[out], D[out] = Ladder.const(base + unit), ONE
+                    if self.deliberate_clamp0 and base + unit < 0:
+                        base = 0.0
+                    # the captured landing degree (a PCMM finish pends its rescale, a CCMM's ends
+                    # rescaled); StC-first runs push K/V in the shipped order (kv_landing)
+                    dd = bit(n.output_deg if n.output_deg is not None else 2)
+                    if sh.kv_landing is not None:
+                        base, dd = sh.kv_landing[0], bit(sh.kv_landing[1])
+                    E[out], D[out] = Ladder.const(base + unit * dd.const), dd
+                # a captured StC-first refresh past the entry takes the shipped order: re-routed to its raw
+                # landing (plan.stc_first_reroute), else a budget violation
+                if n.stc_first and fb is not None and ins:
+                    deep = lmax([eff(v) for v in ins]).gt(fb[0] - bts)
+                    if sh.stc_first_reroute and out:
+                        c_fb, d_fb = (fb[1] - unit, 2) if fb[2] == 1 else (fb[1], fb[2])
+                        rd = bit(d_fb)
+                        E[out] = lite(deep, Ladder.const(c_fb + unit * rd.const), E[out])
+                        D[out] = m.ITE(deep, rd, D[out])
+                    elif constrain:
+                        m.add(deep, hi=0.0, what=f"StC-first entry at node {n.idx} ({out})")
                 continue
 
             xo = ZERO
@@ -476,9 +527,9 @@ class IlpPlacer(Placer):
                 if out:
                     xo = x_of(out)
                     y = m.OR([h, xo])           # fired, or placed: the refreshed value
-                    if not _is(xo, 0.0):
+                    if not _is(y, 0.0):
                         pre[out] = ie
-                    le, ld = landing(out)
+                    le, ld = landing_from(out, ie)
                     e, d = lite(y, le, ie), m.ITE(y, ld, idg)
                 else:
                     e, d = ie, idg
@@ -487,7 +538,16 @@ class IlpPlacer(Placer):
                     E[out], D[out] = e, d
             else:
                 if not ins:
-                    e, d = Ladder.const(0.0), ZERO
+                    # Shadow.step on a node with no cipher input
+                    if n.op == "level_reduce":
+                        d = bit(n.output_deg if n.output_deg is not None else 1)
+                        c0 = n.output_level - bts if n.output_level is not None else 0.0
+                    elif n.op == "fold_bootstrap":
+                        d, c0 = ONE, (n.output_level - bts if n.output_level is not None else unit)
+                    else:
+                        raise PlanInfeasible(f"ilp: node {n.idx} ({n.op}) has no cipher input; "
+                                             "not modelled")
+                    e = Ladder.const(c0 + unit * d.const)
                 elif n.op in MULT_FAMILY:
                     e, d = lmax([eff(v) for v in ins]).shift(unit), ONE
                 elif n.op in ADD_FAMILY:
@@ -513,19 +573,12 @@ class IlpPlacer(Placer):
                 elif n.op in ("negate", "negate_inplace"):
                     e, d = eff(ins[0]).shift(unit), ONE
                 elif n.op == "level_reduce":
-                    if n.output_level is None and n.output_deg is None:
-                        e, d = eff(ins[0]), dg(ins[0])
-                    elif n.output_level is not None and n.output_deg is not None:
-                        d = bit(n.output_deg)
-                        e = Ladder.const(n.output_level - bts + unit * d.const)
-                    elif n.output_level is not None:
-                        d = dg(ins[0])
+                    # the wrapper's drop_to_level: max(cur, target), degree kept
+                    e, d = eff(ins[0]), dg(ins[0])
+                    if n.output_level is not None:
                         c0 = n.output_level - bts
-                        e = (Ladder.const(c0 + unit * d.const) if d.is_const
-                             else Ladder([c0, c0 + unit], [d]))
-                    else:
-                        raise PlanInfeasible(f"ilp: level_reduce {out} re-degrees an "
-                                             "unpinned level; not modelled")
+                        e = (lmax([e, Ladder.const(c0 + unit * d.const)]) if d.is_const
+                             else lite(d, lmax([e, Ladder.const(c0 + unit)]), lmax([e, Ladder.const(c0)])))
                 elif n.op == "fold_bootstrap":
                     c0 = n.output_level - bts if n.output_level is not None else unit
                     e, d = Ladder.const(c0 + unit), ONE
@@ -538,13 +591,12 @@ class IlpPlacer(Placer):
             if out and out in realized:
                 D[out] = ZERO                   # a deg-2 value rescales now; eff unchanged
 
-        # refresh envelope, on the input of every refresh a decision can place
+        # refresh envelope, on the input of every refresh a decision can place: the site's own
+        # (its step's and its route's, as the min-cut's _capacity reads it)
         env_pen: dict[int, float] = {}
-        hard = self._env_hard() if env_hard is None else env_hard
-        cap_rel = refresh_env_cap() - bts   # PLAN_REFRESH_ENV_CAP, as the min-cut's _capacity
         for v, pe in (pre.items() if constrain else ()):
             xv = x.get(v, ZERO)
-            deep = pe.gt(cap_rel)
+            deep = pe.gt(env_rel(v))
             if hard:
                 m.add(deep + xv, hi=1.0, what=f"refresh envelope at {v}")
             elif not xv.is_const and not _is(deep, 0.0):
@@ -596,8 +648,29 @@ class IlpPlacer(Placer):
         return Eo, z
 
     # ── solve ──
+    def _tie_weights(self, x: dict[str, Expr]) -> dict[str, float]:
+        """The tie-break's weight per decision var, fixed by its graph position (no solver state), so the lightest
+        optimum is unique: earliest first (an order the solver closes ~8x faster than hashed weights), hashed low
+        bits apart from it so that two sets of decisions rarely weigh the same; inputs (no producer) after the
+        nodes."""
+        n, prod = len(self.g.nodes), self.g.producer_of
+        free = sorted(v for v in x if v not in prod)
+        pos = {v: prod[v].idx for v in x if v in prod}
+        pos.update({v: n + j for j, v in enumerate(free)})
+        return {v: float(1 + 2048 * pos[v] + (2 * pos[v] * 2654435761) % 1021)
+                for v, e in x.items() if not e.is_const}
+
+    def _units(self, cost: dict[int, float]) -> dict[int, float]:
+        """The objective the solver sees: `cost`, or (tiebreak) `cost` in whole `_UNIT`s."""
+        if self.tiebreak:
+            return {k: float(round(w * _UNIT)) for k, w in cost.items()}
+        return cost
+
     def _solve(self, m: _Model, cost: dict[int, float], cutoff: float | None,
-               obj_const: float, time_limit: float):
+               obj_const: float, time_limit: float, tie: dict[int, float] | None = None,
+               at_most: float | None = None):
+        """min cost (or, with `tie`, min tie subject to the solver's objective <= `at_most`); returns (x, status,
+        cost objective, bound)."""
         import numpy as np
         from scipy.optimize import Bounds, LinearConstraint, milp
         from scipy.sparse import csr_array
@@ -605,12 +678,18 @@ class IlpPlacer(Placer):
         nv = len(m.lb)
         if nv == 0:                                 # nothing left to decide
             return np.zeros(0), 0, obj_const, obj_const
+        units = self._units(cost)
+        scale = _UNIT if units is not cost else 1.0
         c = np.zeros(nv)
-        for k, w in cost.items():
+        for k, w in (tie if tie is not None else units).items():
             c[k] = w
         rows = list(m.rows)
-        if cutoff is not None and cost:
-            rows.append((dict(cost), -_INF, cutoff - obj_const + 1e-6))
+        if at_most is not None:
+            rows.append((dict(units), -_INF, at_most))
+        elif cutoff is not None and cost:
+            # whole units: each rounded coefficient is off by up to half a unit, so the min-cut's bound is too
+            slack = 0.5 * len(units) + 1.0 if scale != 1.0 else 1e-6
+            rows.append((dict(units), -_INF, (cutoff - obj_const) * scale + slack))
         data, ri, ci, lo, hi = [], [], [], [], []
         for r, (terms, a, b) in enumerate(rows):
             for k, w in terms.items():
@@ -623,11 +702,22 @@ class IlpPlacer(Placer):
         if rows:
             A = csr_array((data, (ri, ci)), shape=(len(rows), nv))
             cons = [LinearConstraint(A, np.array(lo), np.array(hi))]
-        res = milp(c, constraints=cons, integrality=np.array(m.integer),
-                   bounds=Bounds(np.array(m.lb), np.array(m.ub)),
-                   options={"time_limit": float(time_limit),
-                            "mip_rel_gap": float(self.mip_gap), "disp": False})
+        with warnings.catch_warnings():
+            # HiGHS sizes its thread pool from the machine's cores, not the process's CPU share: in a job holding a
+            # few cores of a large node its workers contend for them (a 15 s solve took over 25 min). One thread; the
+            # tie-break's optimum is unique, so the plan does not depend on it
+            warnings.filterwarnings("ignore", "Unrecognized options detected", RuntimeWarning)
+            res = milp(c, constraints=cons, integrality=np.array(m.integer),
+                       bounds=Bounds(np.array(m.lb), np.array(m.ub)),
+                       options={"time_limit": float(time_limit),
+                                "mip_rel_gap": float(self.mip_gap), "disp": False, "threads": 1})
         bound = getattr(res, "mip_dual_bound", None)
+        if tie is not None or scale != 1.0:
+            fun = None if res.x is None else obj_const + sum(w * res.x[k] for k, w in cost.items())
+            if tie is not None:
+                return res.x, res.status, fun, None
+            return (res.x, res.status, fun,
+                    bound / scale + obj_const if bound is not None and math.isfinite(bound) else None)
         return (res.x, res.status, (res.fun + obj_const if res.x is not None else None),
                 bound + obj_const if bound is not None and math.isfinite(bound) else None)
 
@@ -754,6 +844,25 @@ class IlpPlacer(Placer):
             # the cutoff priced the incumbent without its envelope penalties; retry bare
             left = max(1.0, self.time_limit - (time.monotonic() - t0))
             sol, status, obj, bound = self._solve(m, cost, None, oc, left)
+        if sol is not None and status == 0 and self.tiebreak:
+            tie = {next(iter(x[v].terms)): w for v, w in self._tie_weights(x).items()}
+            # the optimum in whole units (its cost columns are integer), half a unit of room above it; the second
+            # solve has a budget of its own
+            assert all(m.integer[k] for k in cost), "a cost column is continuous"
+            at = sum(u * round(sol[k]) for k, u in self._units(cost).items()) + 0.5
+            t1 = time.monotonic()
+            sol2, status2, obj2, _ = self._solve(m, cost, None, oc, self.time_limit, tie=tie, at_most=at)
+            self.meta["tie"] = "optimal" if status2 == 0 else f"status-{status2}"
+            if self.verbose:
+                log.info(f"[ilp] optimum in {t1 - t0:.1f}s, tie-break {self.meta['tie']} in "
+                         f"{time.monotonic() - t1:.1f}s")
+            if sol2 is not None and status2 == 0:
+                sol, obj = sol2, obj2
+        if self.tiebreak and status != 2 and (status != 0 or self.meta.get("tie") != "optimal"):
+            # a plan from an unproven solve (or the min-cut it falls back to) depends on the machine's speed; an
+            # infeasible model keeps its min-cut fallback, which does not
+            raise RuntimeError(f"ilp: the exact tie-break needs both solves proven optimal (optimum status {status}, "
+                               f"tie-break {self.meta.get('tie')}): raise PLAN_ILP_TIME_LIMIT")
         solve_s = time.monotonic() - t0
         if sol is None:
             what = {1: "time-limit-no-incumbent", 2: "infeasible"}.get(status, f"status-{status}")

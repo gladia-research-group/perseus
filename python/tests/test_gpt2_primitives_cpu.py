@@ -20,6 +20,7 @@ from perseus.impl.ops import FheOps  # noqa: E402
 from perseus.examples.gpt2 import block, head, ref, weights  # noqa: E402
 
 CFG = PKG / "configs/model/approximation/gpt2_base_n32/configs.json"
+CFG_THOR = PKG / "configs/model/approximation/gpt2_base_n32_thor/configs.json"
 
 
 def _rt(strict=False, **kw):
@@ -163,8 +164,10 @@ def test_chebyshev_bsgs_matches_direct(deg):
 def test_chebyshev_bsgs_depth_matches_direct():
     """Same multiplicative depth on the fake's level accounting (the plan windows do not move)."""
     rt, fhe, inf = _rt()
-    g = next(v for v in _cfgs().gelu.values() if v.thor_p1_cheb)
-    for coeffs, a, b in ((g.thor_p1_cheb, g.thor_p1_a, g.thor_p1_b), (g.thor_p2_cheb, g.thor_p2_a, g.thor_p2_b)):
+    s = _cfgs().gelu["transformer.h.0.mlp.act"]
+    g = next(v for v in config.load_configs(str(CFG_THOR)).gelu.values() if v.thor_p1_cheb)
+    for coeffs, a, b in ((s.cheb_coeffs, s.cheb_a, s.cheb_b), (g.thor_p1_cheb, g.thor_p1_a, g.thor_p1_b),
+                         (g.thor_p2_cheb, g.thor_p2_a, g.thor_p2_b)):
         levels = []
         for flag in (False, True):
             rt.ops.cheb_bsgs = flag
@@ -189,7 +192,9 @@ def test_config_name_map():
     ln1, ln2, sm, ge = c.block(0)
     assert ln1.method == "remez" and ln1.epsilon == 1e-5 and len(ln1.center_scale_sq) == 1024
     assert sm.log2delta1 == 2 and sm.log2delta2 == 3 and len(sm.cheb_coeffs) == 9
-    assert ge.method == "thor_composite" and len(ge.thor_p1_cheb) == 32 and ge.thor_p1_a == -1.0
+    assert ge.method == "chebyshev" and len(ge.cheb_coeffs) == 93 and ge.xmax > 1.0
+    th = config.load_configs(str(CFG_THOR)).block(0)[3]
+    assert th.method == "thor_composite" and len(th.thor_p1_cheb) == 32 and th.thor_p1_a == -1.0
     assert c.cutmax.iters[0].p == 9 and c.cutmax.entry_scale == 1 / 256
     assert sm.kc_r(0, 1) == sm.sm_kc_r[0] and sm.kc_r(2, 10 ** 6) == sm.sm_kc_r[-1]
 
@@ -474,12 +479,14 @@ def _logit_tiles(rng, d, vocab, boost=123):
     return logits, tiles
 
 
-def test_cutmax_packed_matches_real_path():
+@pytest.mark.parametrize("cfgs", ["gpt2_base_n32", "gpt2_base_n32_cm"])
+def test_cutmax_packed_matches_real_path(cfgs):
     """The packed two-tile CutMax (cutmax.cu) equals the real path on the same
-    logits, at the production geometry (the schedule needs vocab 50257 = 2 tiles of 32768)."""
+    logits, at the production geometry (the schedule needs vocab 50257 = 2 tiles of 32768); the record's
+    cascade and the scaled normalisers (gpt2_base_n32_cm) alike."""
     rt, fhe, inf = _rt(N=32768, hid=1024, dim=768, H=16, H_real=12, E=4096, E_real=3072,
                        complex_payload=True)
-    cfg = _cfgs().cutmax
+    cfg = config.load_configs(str(PKG / f"configs/model/approximation/{cfgs}/configs.json")).cutmax
     d = rt.dims
     logits, tiles = _logit_tiles(np.random.default_rng(7), d, 50257)
     pair = head.pack_tiles(rt, tiles)
@@ -493,6 +500,53 @@ def test_cutmax_packed_matches_real_path():
     n_real = fhe.n_bootstraps - n0 - n_packed
     np.testing.assert_allclose(head.decode_z(rt, z_real, 50257, d.N), zdec, rtol=1e-6, atol=1e-9)
     assert n_packed < n_real                            # one refresh for both tiles
+    assert int(np.argmax(zdec)) == 123 and zdec[123] > 0.99
+
+
+# the band ratios (top / bottom) gpt2_base_n32_cm's normalisers were fitted on: five iterations, then the sum
+CUTMAX_BANDS = (93.7, 3.13e4, 4.66e4, 4.64e4, 1.93e4, 7.11e3)
+
+
+@pytest.mark.parametrize("cfgs", ["gpt2_base_n32_cm", "gpt2_base_n32_pf_cm"])
+def test_cutmax_scaled_steps_on_their_bands(cfgs):
+    """The served scaled normalisers: on its band each gives 1 / sqrt(t) to within [1, 1 + tol] of the exact value,
+    never below, and past the band top it stays positive up to three times the top (the first step's zero)."""
+    import json
+    raw = json.load(open(PKG / f"configs/model/approximation/{cfgs}/configs.json"))["cutmax"]
+    sets = [(s, r, 5e-3) for s, r in zip(raw["newton"], CUTMAX_BANDS)] + [(raw["sum_newton"], CUTMAX_BANDS[-1], 1e-5)]
+    for steps, ratio, tol in sets:
+        t = np.geomspace(1.0 / ratio, 1.0, 4001)
+        r = poly.inv_sqrt_newton_scaled(poly.NumpyOps(), t, steps) * np.sqrt(t)
+        assert r.min() >= 1.0 - 1e-7 and r.max() <= 1.0 + 1.01 * tol
+        assert (poly.inv_sqrt_newton_scaled(poly.NumpyOps(), np.linspace(1.0, 2.99, 400), steps) > 0).all()
+
+
+def test_fit_scaled_round_trips_through_the_config():
+    """calibrate.approximations.cutmax.fit_scaled on a few logit rows: a cutmax section parse_cutmax takes, with the
+    base's outer schedule, whose CutMax picks each row's top logit."""
+    import json
+    from perseus.calibrate.approximations.cutmax import fit_scaled
+    rng = np.random.default_rng(3)
+    rows = rng.standard_normal((8, 50257)) * 3.0
+    top = rng.integers(0, 50257, 8)
+    rows[np.arange(8), top] = rows.max(axis=1) + 5.0
+    base = json.load(open(CFG))["cutmax"]
+    cfg = config.parse_cutmax(json.loads(json.dumps(fit_scaled([rows], base))))
+    assert [it.p for it in cfg.iters] == base["p"] and all(it.newton for it in cfg.iters) and cfg.sum_newton
+    for row, k in zip(rows, top):
+        z = ref.cutmax_ref(row, cfg)
+        assert int(np.argmax(z)) == k and z[k] > 0.99
+
+
+@pytest.mark.parametrize("ratio", [10.0, 1e3, 5e4])
+def test_scaled_newton_steps_from_below(ratio):
+    """poly.scaled_newton_steps: 1 / sqrt(x) from below to the tolerance on [1 / ratio, 1], the first step's zero at
+    three times the band top (past the band the result stays positive, never sign-flipped)."""
+    steps = poly.scaled_newton_steps(ratio, 5e-3)
+    x = np.geomspace(1.0 / ratio, 1.0, 4001)
+    r = poly.inv_sqrt_newton_scaled(poly.NumpyOps(), x, steps) * np.sqrt(x)
+    assert r.max() <= 1.0 + 1e-12 and r.min() >= 1.0 - 5e-3
+    assert steps[0][0] / steps[0][1] == pytest.approx(3.0)
 
 
 def test_feedback_packed_matches_real_tiles():
@@ -938,3 +992,80 @@ def test_ensure_routes_drops_before_it_builds(monkeypatch):
         m.ensure_routes(pos)
     assert log == [("add", 1024), ("drop", 1024), ("add", 2048), ("drop", 2048), ("add", 4096)]
     assert m.inf.sparse_routes == [1, 512, 4096]
+
+
+CFG_REF = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cm/configs.json"
+
+
+@pytest.mark.parametrize("kc", [1, 2, 7, 16])
+def test_softmax_centred_matches_ref(monkeypatch, kc):
+    """Reference-key centring: the keys pushed minus key 0 (KV_LANES), the self / prev heads' reference broadcast
+    after q.K^T and the exp on u - U give ref.softmax_ref's probabilities, zero past the keys, and the score slots
+    the broadcast reaches past a head's keys stay inside the exp's domain."""
+    import dataclasses
+    monkeypatch.setenv("SM_CHEB_GS", "1")
+    cfg = config.load_configs(str(CFG_REF)).softmax["transformer.h.0.attn"]
+    cfg = dataclasses.replace(cfg, ref_keys=(config.REF_SELF, config.REF_PREV, config.REF_SINK) + cfg.ref_keys[3:])
+    rt, fhe, inf = _rt(complex_payload=True)
+    ops = rt.ops
+    ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+    d = rt.dims
+    rng = np.random.default_rng(31)
+    kv = attention.ComplexKVCache(d.d_head, centre=True)
+    Ks = []
+    for tok in range(kc):
+        k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
+        for arr in (k, v):
+            arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        Ks.append(k)
+        attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(np.repeat(k, d.t) + 1j * np.repeat(v, d.t), 34))
+    q = rng.standard_normal(d.hid)
+    q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+    qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+    a = attention.sm_fold_affine(rt, cfg)[0]
+    scores = attention.complex_qkt(rt, kv, qct, a, cfg=cfg)
+    K = np.stack(Ks)
+    S = np.array([[K[j, h + d.H * np.arange(d.d_head)] @ q[h + d.H * np.arange(d.d_head)] for j in range(kc)]
+                  for h in range(d.H_real)]) / math.sqrt(d.d_head_real)
+    ref_idx = [config.ref_key(cfg.ref_keys[h], kc) for h in range(d.H_real)]
+    u = S - S[np.arange(d.H_real), ref_idx][:, None]
+    got = np.array([[scores.vec[h * d.t + j].real for j in range(kc)] for h in range(d.H_real)])
+    np.testing.assert_allclose(got, a * u, rtol=1e-9, atol=1e-9)
+    # every slot the exp reads, keys or not, maps inside its domain [-1, 1] (u inside the config's clip range)
+    assert cfg.clip_lo < u.min() and u.max() < cfg.clip_hi
+    y = scores.vec[:d.tH].real + attention._softmax_mask_items(d, cfg, kc, 1, attention.sm_fold_affine(rt, cfg))[0][1]()[:d.tH]
+    assert np.abs(y).max() <= 1 + 1e-9
+    probs = attention.softmax_thor(rt, scores, cfg, kc, folded=True)
+    got = np.array([[probs.vec[h * d.t + j].real for j in range(kc)] for h in range(d.H_real)])
+    want = np.array([ref.softmax_ref(S[h], cfg, kc, head=h) for h in range(d.H_real)])
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(got, ref.softmax_exact(S), rtol=1e-3, atol=1e-6)
+    off = (np.arange(d.tH) // d.t < d.H_real) & (np.arange(d.tH) % d.t >= kc)     # a real head's empty key slots
+    assert np.abs(probs.vec[:d.tH][off]).max() < 1e-12
+
+
+def test_softmax_centred_refusals():
+    """A centred config holds for at most ref_window keys: complex_qkt refuses the 17th. The softmax paths that do
+    not centre refuse a centred config."""
+    import dataclasses
+    cfg = config.load_configs(str(CFG_REF)).softmax["transformer.h.0.attn"]
+    assert cfg.ref_keys and cfg.ref_window == 16
+    rt, fhe, inf = _rt(complex_payload=True)
+    ops = rt.ops
+    ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+    d = rt.dims
+    rng = np.random.default_rng(37)
+    kv = attention.ComplexKVCache(d.d_head, centre=True)
+    for tok in range(17):
+        k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
+        for arr in (k, v):
+            arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(np.repeat(k, d.t) + 1j * np.repeat(v, d.t), 34))
+    q = rng.standard_normal(d.hid)
+    q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+    qct = fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34)
+    with pytest.raises(ValueError, match="not 17"):
+        attention.complex_qkt(rt, kv, qct, attention.sm_fold_affine(rt, cfg)[0], cfg=cfg)
+    with pytest.raises(ValueError, match="complex-packed decode"):
+        attention.uncentred_only(cfg, "prefill_softmax")
+    attention.uncentred_only(dataclasses.replace(cfg, ref_keys=()), "prefill_softmax")

@@ -12,6 +12,9 @@ import sys
 
 # summary leaves that record wall time (the ILP's solve), never equal across two runs
 WALL_CLOCK = {"solve_s"}
+# the solver's float reports (placer_meta): the same optimum is summed in another order on another solver path, so they
+# compare to a relative 1e-9
+SOLVER_FLOATS = {"objective", "bound", "gap", "mincut_cost"}
 
 
 def _diff_subset(ref, new, path="summary"):
@@ -24,6 +27,9 @@ def _diff_subset(ref, new, path="summary"):
                 continue
             if k not in new:
                 return f"{path}.{k}", "missing"
+            if (k in SOLVER_FLOATS and isinstance(v, float) and isinstance(new[k], float)
+                    and abs(v - new[k]) <= 1e-9 * max(abs(v), abs(new[k]), 1.0)):
+                continue
             r = _diff_subset(v, new[k], f"{path}.{k}")
             if r:
                 return r

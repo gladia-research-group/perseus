@@ -121,6 +121,39 @@ def collect_sites(model, toks, rows_per_layer=8192, seed=0, rot=None):
     return out
 
 
+def prompt_kv(toks, n: int, path=None, device="cuda"):
+    """The plain prefix: exact fp32 pre-RoPE K / V of the first `n` positions of a teacher-forced window,
+    (k, v) each (layers, n, H_kv * d_head) float64 (the k_proj / v_proj outputs), cached at `path` (.npz)."""
+    if path and os.path.exists(path):
+        z = np.load(path)
+        return z["k"], z["v"]
+    import torch
+    m = load_model(device=device)
+    out = {}
+
+    def hook(b, kind):
+        def f(_mod, _inp, o):
+            out[(b, kind)] = o[0].double().cpu().numpy()
+        return f
+    hs = []
+    for b, layer in enumerate(m.model.layers):
+        hs.append(layer.self_attn.k_proj.register_forward_hook(hook(b, "k")))
+        hs.append(layer.self_attn.v_proj.register_forward_hook(hook(b, "v")))
+    with torch.no_grad():
+        m(torch.as_tensor(np.asarray(toks[:n])[None]).to(m.device))
+    for h in hs:
+        h.remove()
+    L = len(m.model.layers)
+    k = np.stack([out[(b, "k")] for b in range(L)])
+    v = np.stack([out[(b, "v")] for b in range(L)])
+    del m
+    torch.cuda.empty_cache()
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        np.savez(path, k=k, v=v)
+    return k, v
+
+
 def oracle_logits(toks, path=None):
     """Exact fp32 logits (T, vocab) of one teacher-forced window, cached at `path` (.npy)."""
     if path and os.path.exists(path):

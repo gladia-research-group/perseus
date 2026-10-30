@@ -307,6 +307,15 @@ fn level_from_planner(consumed: f64, bootstrap_level: u32) -> PyResult<u32> {
     m::level_from_planner_f64(consumed, bootstrap_level).map_err(level_err)
 }
 
+/// The Q limbs of the chain preset `preset` (`CHAIN_PRESET`; default n32: 54; n32a4: 51).
+#[pyfunction]
+#[pyo3(signature = (preset=None))]
+fn chain_limbs(preset: Option<&str>) -> PyResult<u32> {
+    let spec = pc_core::params::ChainSpec::preset(preset.unwrap_or("n32")).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let chain = pc_core::params::Chain::generate(&spec).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(chain.q.len() as u32)
+}
+
 pub fn register(mo: &Bound<'_, PyModule>) -> PyResult<()> {
     mo.add_class::<PyCtMeta>()?;
     mo.add_class::<PyPtMeta>()?;
@@ -317,5 +326,6 @@ pub fn register(mo: &Bound<'_, PyModule>) -> PyResult<()> {
     mo.add_function(wrap_pyfunction!(level_from_top_limb, mo)?)?;
     mo.add_function(wrap_pyfunction!(planner_consumed, mo)?)?;
     mo.add_function(wrap_pyfunction!(level_from_planner, mo)?)?;
+    mo.add_function(wrap_pyfunction!(chain_limbs, mo)?)?;
     Ok(())
 }

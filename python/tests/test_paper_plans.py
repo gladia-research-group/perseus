@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from perseus._paths import ASSETS, PKG
+from perseus.examples.defaults import WINDOWS
 from perseus.plan import contract as _contract
 from perseus.plan import equiv as _equiv
 
@@ -44,40 +45,38 @@ STAMPS = ("capture_env", "config")
 PLAN_FIELDS = ("placements", "rescale_after", "sparse_slots", "correction_factor", "real_route", "raise_drop",
                "hint_fire", "summary.final_named_levels", "summary.final_named_degs")
 
-# The StC-first prefill pipes' extra planner env: in no recipe= line (gpt2_prefill128's is PLAN_PRUNE=1 only, the
-# encoders' PLAN_CMD.txt has none), spelled out in each one's replanned= note.
-_STCF = ("BTS_LEVEL=28 PLAN_RAISE_DROP_MAX=0 PLAN_RAISE_LANDING_MAX=42 PLAN_RAISE_ROUTES=0 "
-         "PLAN_REFRESH_ENV_CAP_ROUTES=0:46 PLAN_SLIM_CUBIC=1 PLAN_STC_FIRST_ENTRY=46 PLAN_STC_FIRST_FALLBACK=34:1")
-# with the runtime's measured route landings (tools/route_table.py --recipe)
-_STCF_LANDED = "PLAN_SPARSE_BTS_OUT=1:16,512:24 " + _STCF
-# StC-first captures whose deliberate refreshes past the entry take the shipped order (no StC-first input cap)
-_STCF_REROUTE = _STCF_LANDED.replace("PLAN_REFRESH_ENV_CAP_ROUTES=0:46 ", "") + " PLAN_STC_FIRST_REROUTE=1"
+# the window plans of the 512-token decodes (perseus.examples.defaults.WINDOWS)
+GPT2_WINDOWS = tuple(Path(d).name for _b, d in WINDOWS["gpt2_decode"])
+LLAMA_WINDOWS = tuple(Path(d).name for _b, d in WINDOWS["llama_decode"])
+
 # name -> (graph override, recipe beyond PLAN_CMD.txt's recipe= line, tool override, stages); None = as shipped
 GATE: dict[str, tuple | None] = {
-    # the decode recipe (recipe= line) on the ILP placer (objective: total refresh count)
-    "gpt2_decode": (None, "PLAN_PLACER=ilp PLAN_ILP_TIME_LIMIT=600", GPT2_TOOL, None),
-    "gpt2_decode_ctx512": None,
-    "gpt2_prefill128": ("graphs/gpt2_prefill128", "PLAN_PRUNE=1 " + _STCF_LANDED, GPT2_TOOL, ("blocks",)),
-    # gpt2_prefill128's blocks + the encrypted tail (TAIL_STAGES)
-    "gpt2_prefill128_tail": ("graphs/gpt2_prefill128", "PLAN_PRUNE=1 " + _STCF_LANDED, GPT2_TOOL, ("blocks",)),
-    # the encoders: the gpt2 make_plan.sh blocks stage with PLAN_DELIB_DEG=captured
-    "bert_sst2_128": ("graphs/bert_sst2_128", "PLAN_DELIB_DEG=captured " + _STCF_LANDED, GPT2_TOOL, ("blocks",)),
-    "vit_b16_224": ("graphs/vit_b16_224", "PLAN_DELIB_DEG=captured " + _STCF_REROUTE, GPT2_TOOL, ("blocks",)),
-    # shipped before make_plan.sh defaulted shared realize anchors
-    "llama31_8b_decode": (None, "PLAN_SHARED_REALIZE=", None, None),
+    "gpt2_decode": None,
+    "gpt2_decode_ctx1024": None,
+    **dict.fromkeys(GPT2_WINDOWS),
+    # the encoders and the GPT-2 prefill (the tail and CutMax are its recording's blocks 12 and 13): the gpt2
+    # make_plan.sh blocks stage
+    "bert_sst2_128": (None, "", GPT2_TOOL, ("blocks",)),
+    "vit_b16_224": (None, "", GPT2_TOOL, ("blocks",)),
+    "gpt2_prefill128": (None, "", GPT2_TOOL, ("blocks",)),
+    "llama31_8b_decode": None,
+    **dict.fromkeys(LLAMA_WINDOWS),
     # one planner run on the fake recording: the llama make_plan.sh prefill stage (its recipe= line)
     "llama31_8b_prefill128": (None, "", None, ("prefill",)),
     # the decode cut for the prefill's K / V (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS, PLAN_SITE_CF in its recipe= line)
     "llama31_8b_handoff_decode": None,
 }
+# plans this planner does not regenerate, and why
+RETIRED: dict[str, str] = {}
 # the result plans: `python python/tests/test_paper_plans.py table` replans these
-TABLE = ("llama31_8b_prefill128", "gpt2_prefill128", "gpt2_decode", "bert_sst2_128", "vit_b16_224")
+TABLE = ("llama31_8b_prefill128", *LLAMA_WINDOWS, "gpt2_prefill128", *GPT2_WINDOWS, "gpt2_decode_ctx1024",
+         "gpt2_decode", "bert_sst2_128", "vit_b16_224")
 # PLAN_KEEP_PLACEMENTS dirs that are not shipped: name -> the recipe changes that make them from the plan's own recipe
 # (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS and PLAN_SITE_CF dropped; PLAN_CMD.txt `sites=`), replanned first
 KEEP_SITES = {"llama31_8b_handoff_decode": "PLAN_REFRESH_ENV_CAP=48"}
 _KEEP_DROP = ("KV_ENTRY_LEVEL", "PLAN_KEEP_PLACEMENTS", "PLAN_SITE_CF")
 # stages a separate tool plans from a graph that is not shipped (speedrun/make_tail_plan.sh): not regenerated here
-TAIL_STAGES = {"gpt2_prefill128_tail": ("block_12_placement.json", "block_13_placement.json")}
+TAIL_STAGES: dict[str, tuple[str, ...]] = {}
 
 
 # summary diagnostics a later planner computes differently than the shipped file recorded: left out of the body
@@ -260,6 +259,8 @@ def _assert_identical(name: str, res: dict):
 
 
 def _run(name: str, tmp_path: Path):
+    if name in RETIRED:
+        pytest.skip(f"{name}: {RETIRED[name]}")
     try:
         regen, _ = replan(name, tmp_path / "plan.log")
         _assert_identical(name, compare(name, regen, tmp_path))
@@ -286,6 +287,9 @@ def main(names: list[str]) -> int:
     import tempfile
     failed = 0
     for name in names:
+        if name in RETIRED:
+            print(f"[gate] {name}: RETIRED ({RETIRED[name]})", flush=True)
+            continue
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             logdir = Path(os.environ.get("PLAN_GATE_LOGDIR", td))

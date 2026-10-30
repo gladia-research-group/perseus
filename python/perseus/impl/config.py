@@ -67,6 +67,11 @@ class SoftmaxCfg:
     # SM_CHEB_GS (impl smcheb): Chebyshev-scaled Goldschmidt counts per round and the mid-round residual targets
     recip_iters_cheb: tuple = ()
     recip_targets: tuple = ()
+    # reference-key centring (attention.complex_qkt): per head the key whose score is subtracted before the exp
+    # (REF_SINK key 0, REF_SELF the query's own key, REF_PREV the one before it); empty = the mid-centred exp.
+    # ref_window: the most keys the centred config covers (the broadcast ladder's length)
+    ref_keys: tuple = ()
+    ref_window: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -77,6 +82,15 @@ class SoftmaxCfg:
         if kc > 0:
             return min(1.0, 4.0 / kc)
         return 1.0
+
+
+REF_SINK, REF_SELF, REF_PREV = 0, 1, 2
+_REF_NAMES = {"sink": REF_SINK, "self": REF_SELF, "prev": REF_PREV}
+
+
+def ref_key(kind: int, kc: int) -> int:
+    """The cache index of a reference key at cache count kc (the previous key of the first query is its own)."""
+    return 0 if kind == REF_SINK else kc - 1 if kind == REF_SELF else max(kc - 2, 0)
 
 
 @dataclasses.dataclass
@@ -108,6 +122,10 @@ class CutMaxIter:
     ca: float = 0.0
     cb: float = 0.0
     casc_iters: int = 0
+    # the scaled normaliser (head.cutmax_argmax_packed): 1/sigma from x_scale * sum (x - mu)^2 in (0, 1] by the
+    # Newton steps (a, b) of poly.inv_sqrt_newton_scaled; empty = the cascade above
+    x_scale: float = 0.0
+    newton: tuple = ()
 
 
 @dataclasses.dataclass
@@ -119,6 +137,9 @@ class CutMaxCfg:
     sum_hi: float = 0.0
     gs_sum_iters: int = 4
     entry_scale: float = 1.0 / 256.0
+    # the final 1/S as (1/sqrt(sum_scale S))^2 by poly.inv_sqrt_newton_scaled; empty = Goldschmidt on [sum_lo, sum_hi]
+    sum_scale: float = 0.0
+    sum_newton: tuple = ()
 
 
 @dataclasses.dataclass
@@ -185,7 +206,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         cheb_coeffs=_tup(j.get("cheb_coeffs")), cheb_a=float(j.get("cheb_a", -1.0)),
         cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")),
         gs_iters_first=int(j.get("gs_iters_first", 0)),
-        recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")))
+        recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
+        ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
@@ -204,8 +226,20 @@ def parse_gelu(j: dict) -> GeluCfg:
     raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
 
 
+def _steps(v):
+    return tuple((float(a), float(b)) for a, b in v)
+
+
 def parse_cutmax(j: dict) -> CutMaxCfg:
     T = len(j["p"])
+    if "newton" in j:                     # the scaled normalisers (calibrate.approximations.cutmax.fit_scaled)
+        for k in ("c", "m", "x_scale", "newton"):
+            if len(j[k]) != T:
+                raise ValueError("cutmax calib: ragged/empty schedule arrays")
+        iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]), 0.0, 0, 0,
+                                 x_scale=float(j["x_scale"][i]), newton=_steps(j["newton"][i])) for i in range(T))
+        return CutMaxCfg(iters=iters, entry_scale=float(j["entry_scale"]), sum_scale=float(j["sum_scale"]),
+                         sum_newton=_steps(j["sum_newton"]))
     for k in ("c", "m", "s2_hi", "passes", "ex2", "chord_a", "chord_b", "cascade_iters"):
         if len(j[k]) != T:
             raise ValueError("cutmax calib: ragged/empty schedule arrays")

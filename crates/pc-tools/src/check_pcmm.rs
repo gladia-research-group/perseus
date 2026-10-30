@@ -3,8 +3,12 @@
 //!   pc-check pcmm [--shapes gpt2.qkv,..] [--twin gpt2.qkv,..] [--seed s]   the digit-plane GEMM vs the exact integer
 //!       product mod q, every element; the whole `Pcmm::product` on a random split ciphertext vs a host twin of the same
 //!       formulas (FIDESlib Pcmm.cu semantics), every output word
-//!   pc-bench pcmm --prec [--cf 6] [--wbits 24]   a real input through StC-first stages -> product -> K-batched finishes
-//!       vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits = log2(max |Y| / max err))
+//!   pc-bench pcmm --prec [--cf 6] [--wbits 24] [--sigma 0.1] [--wamp 1]   a real input through StC-first stages ->
+//!       product -> K-batched finishes vs `_exact` (sylph methodology: complex Gaussian sigma 0.1, bits =
+//!       log2(max |Y| / max err); --wamp scales the weights, for large band shifts at a bounded input; past band shift
+//!       DECODE_SHIFT the outputs' scale is lowered exactly before the decryption, whose decoder reads the bottom pair;
+//!       --per-input: each input at its own scale, the linear on `linear_per_input`; on a lean chain the
+//!       pre-division's exactness is gated too)
 //!   pc-bench pcmm [--shapes ..] [--k 1,2,4]      device ms per linear: product phases and output finishes per K
 use crate::check_bts::Tally;
 use pc_core::encode::{Complex, Encoder, Payload};
@@ -23,7 +27,7 @@ use pc_gpu::keygen::{test_prng, KeyGen};
 use pc_gpu::keys::hostref::HostNtt;
 use pc_gpu::keys::{DevSecret, KeySet, KeySetSpec, KskLayout, RotSpec};
 use pc_gpu::ks::KsPlans;
-use pc_gpu::matmul::pcmm::{finish_groups, linear, LinearHooks, LinearOpts, Pcmm, PcmmCfg, PcmmLinear, PcmmShape, PcmmTimes, WeightBuf};
+use pc_gpu::matmul::pcmm::{finish_groups, linear, linear_per_input, prediv_inputs, prediv_shift, LinearHooks, LinearOpts, Pcmm, PcmmCfg, PcmmLinear, PcmmShape, PcmmTimes, WeightBuf};
 use pc_gpu::ops::{Ops, OpsCfg};
 use pc_gpu::poly::CtBuf;
 use pc_gpu::{Context, Ct, Executor, MemCfg, MemPlan};
@@ -559,6 +563,8 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[allow(clippy::too_many_lines)]
 fn bench(args: &[String]) -> Res<bool> {
     let prec = args.iter().any(|a| a == "--prec");
+    // --per-input: input i at scale sf (1 + 1e-4 i), so the session's dispatch takes `linear_per_input`
+    let per_input = args.iter().any(|a| a == "--per-input");
     let shapes = pick(&arg(args, "--shapes").unwrap_or_else(|| {
         if prec {
             "gpt2.out".into()
@@ -571,6 +577,8 @@ fn bench(args: &[String]) -> Res<bool> {
     let cf: u32 = arg(args, "--cf").map(|s| s.parse()).transpose()?.unwrap_or(6);
     let wbits: u32 = arg(args, "--wbits").map(|s| s.parse()).transpose()?.unwrap_or(24);
     let sigma: f64 = arg(args, "--sigma").map(|s| s.parse()).transpose()?.unwrap_or(0.1);
+    // --wamp: the weights' amplitude (x 1/sqrt(rows_in)); larger outputs (band shifts) at a bounded input
+    let wamp: f64 = arg(args, "--wamp").map(|s| s.parse()).transpose()?.unwrap_or(1.0);
     let mut uniq: Vec<PcmmShape> = Vec::new();
     for (_, s) in &shapes {
         let s = if prec { PcmmShape { nw: wbits.div_ceil(8) as usize, ..*s } } else { *s };
@@ -580,7 +588,8 @@ fn bench(args: &[String]) -> Res<bool> {
     }
     let kmax = 4usize;
     let t0 = Instant::now();
-    let chain = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (the lean n32a4's split has 3 limbs)
+    let chain = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     let n = chain.n;
     let slots = n / 2;
     let mut setup = BtsSetup::n32_shipped();
@@ -588,6 +597,14 @@ fn bench(args: &[String]) -> Res<bool> {
     setup.k_max = kmax;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
+    // a lean chain's PCMM inputs: their own fixed StC stages (PC_BENCH_OWN_SPLIT "a,b" overrides THIN_SPLIT_PCMM)
+    sf.own_split = Some(match std::env::var("PC_BENCH_OWN_SPLIT") {
+        Ok(v) => {
+            let x: Vec<f64> = v.split(',').map(|t| t.trim().parse()).collect::<std::result::Result<_, _>>()?;
+            [*x.first().ok_or("PC_BENCH_OWN_SPLIT")?, *x.get(1).ok_or("PC_BENCH_OWN_SPLIT")?]
+        }
+        Err(_) => pc_gpu::bts::stc_first::THIN_SPLIT_PCMM,
+    });
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
     let mut geoms: Vec<LtGeom> = Vec::new();
     for v in &plan.dense.variants {
@@ -666,11 +683,12 @@ fn bench(args: &[String]) -> Res<bool> {
     let mut fresh = |ins: &mut [Ct<'_, W>], ex: &mut Executor<'_, W>, vals: &[Vec<Complex>]| -> Res<()> {
         let top = (nq - 1 - level) as usize;
         let sf_ = ctx.scale.sf(top as i32)?;
-        for (x, v) in ins.iter_mut().zip(vals) {
-            let mut meta = CtMeta::new(level, 1).with_nf(sf_);
+        for (i, (x, v)) in ins.iter_mut().zip(vals).enumerate() {
+            let nf = if per_input { sf_ * (1.0 + 1e-4 * i as f64) } else { sf_ };
+            let mut meta = CtMeta::new(level, 1).with_nf(nf);
             meta.slots = slots as u32;
             x.buf.k = 1;
-            let msgs = vec![enc.encode_slots(v, slots, top, Payload::Complex, sf_)?];
+            let msgs = vec![enc.encode_slots(v, slots, top, Payload::Complex, nf)?];
             encr.encrypt_sk(&ctx, &ex.compute, &sec, &msgs, meta, x, &mut prng)?;
         }
         Ok(())
@@ -682,7 +700,7 @@ fn bench(args: &[String]) -> Res<bool> {
         let nch = lay_s.nch();
         let (ri, ro) = (nch * sh.n_in, nch * sh.n_out);
         // weights ~ U(-1, 1) / sqrt(rows_in): |y| ~ |x|
-        let amp = 1.0 / (ri as f64).sqrt();
+        let amp = wamp / (ri as f64).sqrt();
         let w: Vec<f64> = (0..ri * ro).map(|_| (2.0 * g.uniform_f64() - 1.0) * amp).collect();
         let (planes, ws, wt) = encode_weights(&w, &sh, if prec { wbits } else { 8 * sh.nw as u32 })?;
         wb.upload(&ex.compute, &planes)?;
@@ -691,6 +709,24 @@ fn bench(args: &[String]) -> Res<bool> {
         let ymax = want.iter().flatten().fold(0f64, |m, z| m.max(z.re.abs()).max(z.im.abs()));
         let shift = ((ymax * 1.5 / 0.25).log2().ceil()).max(0.0) as u32;
         let lin = PcmmLinear { name: name.to_string(), shape: sh, w_scale: ws, shift };
+        if prec && route.thin() {
+            // The pre-division is exact: after `prediv_inputs` (a stamp 2^24: s = 4) one level down, the same values
+            let tl = PcmmLinear { w_scale: 2f64.powi(19), shift: 5, ..lin.clone() };
+            let s = prediv_shift(&route, &tl);
+            fresh(&mut ins[..sh.n_in], &mut ex, &xs)?;
+            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh_, ks: &kplans, ops: &mut ops, work: &mut work };
+            prediv_inputs(&mut cx, &route, &pc, &tl, &mut ins[..sh.n_in])?;
+            drop(cx);
+            let (mut e, mut lv) = (0f64, level);
+            for (x, v) in ins[..sh.n_in].iter().zip(&xs) {
+                let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, x, Payload::Complex, Which::Dense)?.remove(0);
+                e = got.iter().zip(v).fold(e, |a, (g, w)| a.max((g.re - w.re).abs()).max((g.im - w.im).abs()));
+                lv = lv.max(x.meta.level);
+            }
+            let xm = xs.iter().flatten().fold(0f64, |m, z| m.max(z.re.abs()).max(z.im.abs()));
+            println!("[pc-bench] prediv {name}: s {s}, level {level} -> {lv}, max err {e:.3e} of max |x| {xm:.3} -> {:.2} bits", (xm / e).log2());
+            t.add(&format!("prediv {name}: s 4 on one level, exact (>= 30 bits)"), (s != 4 || lv != level + ctx.shape.unit || !(xm / e >= 2f64.powi(30))) as usize, 1);
+        }
         let case_ks: Vec<usize> = if prec { vec![1, 2.min(sh.n_out), 4.min(sh.n_out)] } else { ks.clone() };
         let mut drops_cases: Vec<Vec<u32>> = vec![vec![0; sh.n_out]];
         if prec {
@@ -721,7 +757,14 @@ fn bench(args: &[String]) -> Res<bool> {
                     let e: Vec<Event> = (0..6).map(|_| Event::timing(&dev)).collect::<Result<_, _>>()?;
                     e[0].record(&cx.ex.compute)?;
                     // the linear end to end, with events around its two halves (product / finishes)
-                    linear_timed(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() }, &e, if rep == 0 { Some(&mut log) } else { None })?;
+                    if per_input {
+                        linear_per_input(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() })?;
+                        for ev in &e[1..] {
+                            ev.record(&cx.ex.compute)?;
+                        }
+                    } else {
+                        linear_timed(&mut cx, &route, &mut pc, &lin, &wb.buf, &mut ins[..sh.n_in], &mut outs[..groups.len()], &groups, &gd, LinearOpts { cf, ..LinearOpts::default() }, &e, if rep == 0 { Some(&mut log) } else { None })?;
+                    }
                     e[5].sync()?;
                     if rep > 0 || prec {
                         ms_prod.push(e[0].elapsed_ms(&e[4])? as f64);
@@ -732,6 +775,12 @@ fn bench(args: &[String]) -> Res<bool> {
                         for gi in 0..groups.len() {
                             cx.ops.realize(&ctx, cx.ex, &sh_, std::slice::from_mut(&mut outs[gi]))?;
                         }
+                        let lvs: Vec<u32> = outs[..groups.len()].iter().map(|o| o.meta.level).collect();
+                        if shift > DECODE_SHIFT {
+                            for o in outs[..groups.len()].iter_mut() {
+                                lower_scale(&mut cx, &pc, o, shift - DECODE_SHIFT)?;
+                            }
+                        }
                         drop(cx);
                         for (gi, gr) in groups.iter().enumerate() {
                             let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &outs[gi], Payload::Complex, Which::Dense)?;
@@ -739,7 +788,7 @@ fn bench(args: &[String]) -> Res<bool> {
                                 let e = got[j].iter().zip(&want[m]).fold(0f64, |a, (g, w)| a.max((g.re - w.re).abs()).max((g.im - w.im).abs()));
                                 errs = errs.max(e);
                             }
-                            let lv = outs[gi].meta.level;
+                            let lv = lvs[gi];
                             let want_l = BtsConfig::n32_shipped().landing(ctx.shape, &Quirks::none(), &pc_shadow::Route { raise_drop: gd[gi], cf: Some(cf), stc_first: true, ..pc_shadow::Route::dense() }, level, 1)?;
                             t.add(&format!("pcmm {name} drops {drops:?} K={k} group {gi}: realized landing == pc-shadow (drop {})", gd[gi]), (lv != want_l.level) as usize, 1);
                         }
@@ -747,9 +796,11 @@ fn bench(args: &[String]) -> Res<bool> {
                 }
                 if prec {
                     let bits = (ymax / errs).log2();
-                    println!("[pc-bench] pcmm-prec {name} {sh:?} wbits {wbits} cf {cf} shift {shift} w_scale 2^{} drops {drops:?} K={k}: max |Y| {ymax:.3}, max err {:.3e} -> {bits:.2} bits (old: PCMM finish 11.38, 1024->1536 11.49; plain StC-first 11.65)", ws.log2(), errs);
+                    println!("[pc-bench] pcmm-prec {name}{} {sh:?} wbits {wbits} cf {cf} shift {shift} w_scale 2^{} drops {drops:?} K={k}: max |Y| {ymax:.3}, max err {:.3e} -> {bits:.2} bits (old: PCMM finish 11.38, 1024->1536 11.49; plain StC-first 11.65)", if per_input { " per-input" } else { "" }, ws.log2(), errs);
                     t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: >= 11 bits"), (!(bits >= 11.0)) as usize, 1);
-                    t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: {} external refreshes recorded with descriptors", sh.n_out), (log.refreshes.len() != sh.n_out || !log.refreshes.iter().all(|r| r.desc.contains("\"op\": \"pcmm\""))) as usize, 1);
+                    if !per_input {
+                        t.add(&format!("pcmm-prec {name} drops {drops:?} K={k}: {} external refreshes recorded with descriptors", sh.n_out), (log.refreshes.len() != sh.n_out || !log.refreshes.iter().all(|r| r.desc.contains("\"op\": \"pcmm\""))) as usize, 1);
+                    }
                 } else {
                     let pm = median(ms_prod.clone());
                     let fm = median(ms_fin.clone());
@@ -772,6 +823,26 @@ fn bench(args: &[String]) -> Res<bool> {
     }
     println!("[pc-bench] pcmm: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
+}
+
+/// The largest band shift whose outputs (|Y| up to 2^(shift - 2.6)) the decoder takes at their own scale: it reads the
+/// bottom composite pair only (`Encoder::decode_slots`), so |Y| nf stays below half that modulus.
+const DECODE_SHIFT: u32 = 11;
+
+/// `x`'s scale lowered by 2^s on its top level, exactly: x 2^k (k = that level's bits less s), then its rescale.
+fn lower_scale<'a>(cx: &mut BtsCx<'_, 'a, W, M>, pc: &Pcmm<'a, '_, W>, x: &mut Ct<'a, W>, s: u32) -> Res<()> {
+    let ctx = cx.ctx;
+    let top = ctx.top_of(x.meta.level)?;
+    let g = ctx.chain.drop_at(top).ok_or_else(|| format!("output top {top} off the level grid"))?;
+    let bits: f64 = (0..g).map(|j| (ctx.chain.q[top - j] as f64).log2()).sum();
+    let k = (bits.floor() as u32).checked_sub(s).ok_or_else(|| format!("scale 2^-{s} past the level's {bits:.1} bits"))?;
+    pc.mult_pow2(ctx, &cx.ex.compute, x, k)?;
+    let nf = x.meta.nf * (k as f64).exp2();
+    x.meta.nf = nf;
+    x.meta.deg = 2;
+    cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
+    x.meta.nf = nf / ctx.scale.mod_reduce_product(top as i32);
+    Ok(())
 }
 
 /// `linear` with timing events: e\[0\] before the call (recorded by the caller), e\[1\] after the inputs' StC, e\[2\]

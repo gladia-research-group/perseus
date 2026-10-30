@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import struct
 
-PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_tail"   # speedrun/make_tail_plan.sh
+PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128"        # the shipped prefill plan: stages 12-13 are the tail
 PROMPT = 128
 NCH = 512                                    # the prefill's channel blocks (PF_NCH)
 _COUNT, _LEN = struct.Struct("<I"), struct.Struct("<Q")

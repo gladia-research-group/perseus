@@ -58,6 +58,9 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     rec.first = 1
     labels = [f"block_{b}" for b in range(n)] + [f"block_{n_total}"]
     names = [x for x in lw.linear_names(n_total) if not x.startswith("b") or int(x[1:].split(".")[0]) < n]
+    for b in range(n):      # the slot cache entries the streams below mmap: built here on a fresh cache
+        lw.block(b)
+    lw.lm_tiles(paired=lw.packing == "cachemir_complex")
     streams = {x: int(np.load(lw.dir / f"{x}.npy", mmap_mode="r").shape[0]) for x in names}
 
     def prefix(b):
@@ -65,6 +68,8 @@ def streamed_run(a, twin, lw, plan, *, log=print):
         out = {f"kb.{j}": v for j, v in enumerate(pk.k_buckets)}
         out.update({f"kp.{j}": v for j, v in enumerate(pk.k_pend)})
         out.update({f"vb.{j}": v for j, v in enumerate(pk.v_buckets) if v is not None})
+        if pk.k_ref is not None:
+            out["kref"] = pk.k_ref
         return out
 
     def routes_for(pos):
@@ -77,13 +82,15 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     d = twin.rt.dims
     size = {"hidDim": d.hid, "dim": d.dim, "numHeads": d.H, "numHeadsReal": d.H_real, "expDim": d.E,
             "expanded": d.E_real, "seqLen": 1024}
+    windows = getattr(a, "windows", None)
     run = StreamedPlannedRun(rec, plan, cfg, labels, keys, work_dir=work, streams=streams, stream_rows=lw.coeff_rows,
                              prefix=prefix, input_vec=lw.embedding, routes_for=routes_for, stc_cache=a.stc_cache,
-                             size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log)
+                             size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log,
+                             schedule=getattr(a, "schedule", "program"), plan_windows=windows)
     run.debug = a.debug_blocks or a.tap_block is not None
     run.tail = n == n_total
     if a.tap_block is not None:
-        run.tap = (0, a.tap_block)
+        run.tap = (a.tap_token, a.tap_block)
         run.tap_steps = {x for x in a.tap_steps.split(",") if x}
     return run
 
@@ -98,8 +105,18 @@ def _planned(a, toks, gt, lw, cfgs, dims, store):
     _, tinf = fakecap.make_session(dims, set(env.rot_steps(dims)))
     twin = LlamaModel(tinf, lw, cfgs, core=fakecap.core, n_layers=a.layers, packing=a.packing, kv_offload=False)
     twin.stream_twin()
+    first = 1
+    if a.plain_prefix:
+        # the plain prefix: positions 0 .. N-1 from the exact model (K / V encrypted as public values), the encrypted
+        # decode from N; only the program classes of positions >= N are recorded
+        first = a.plain_prefix
+        twin.plain_prompt = a.plain_kv
+        print(f"[llama] plain prefix: positions 0..{first - 1} computed in plaintext (exact fp32 model, pre-RoPE "
+              f"K / V pushed into the caches and encrypted as public values); encrypted decode from position {first}",
+              flush=True)
     run = streamed_run(a, twin, lw, plan, log=lambda m: print(m, flush=True))
-    rows = [int(x) for x in toks[1:]]
+    run.rec.first = first
+    rows = [int(x) for x in toks[first:]]
     t0 = time.time()
     run.setup(rows)
     print(f"[llama] planned setup {time.time() - t0:.0f}s", flush=True)
@@ -108,7 +125,7 @@ def _planned(a, toks, gt, lw, cfgs, dims, store):
     res = []
     b0 = run.sess.stream_stats()["bytes"]
     for t in range(len(rows)):
-        pos = t + 1
+        pos = t + first
         tt = time.time()
         regs, info = run.token(t, rows)
         lg = logits_of(run.fhe, [run.ct(r) for r in regs], dims, vocab) if run.tail else np.zeros(vocab)
@@ -137,15 +154,22 @@ def main(argv=None):
     from perseus.examples.gpt2.run_decode import gpu_busy
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=8, help="encrypted positions after the BOS prefix")
+    ap.add_argument("--plain-prefix", type=int, default=0, metavar="N",
+                    help="planned: positions 0..N-1 computed in plaintext (exact fp32 model), their K / V pushed into "
+                         "the caches and encrypted as public values; the encrypted decode runs positions N..--tokens")
     ap.add_argument("--window", default="0", help="openwebtext window index (or a .npy of token ids)")
+    ap.add_argument("--window-tokens", type=int, default=128, help="the length of the indexed --window")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=None,
                     help="GPU index (default: the first of CUDA_VISIBLE_DEVICES)")
-    ap.add_argument("--configs", default=DEFAULT_CONFIGS)
+    ap.add_argument("--configs", default=None, help="default: the plan's configs= line, else llama31_8b_n32")
     ap.add_argument("--capture", default=None, help="graph dir: capture block graphs at the first position")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts; fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
+    ap.add_argument("--plan-windows", default=None, metavar="B1:DIR1,B2:DIR2,...",
+                    help="planned: a plan per position window (DIRi serves the positions below Bi), the plans sharing "
+                         "one runtime (only their magnitudes differ); --plan defaults to the first window's")
     ap.add_argument("--packing", choices=("cachemir", "cachemir_complex"), default="cachemir_complex")
     ap.add_argument("--cpp-bootstrap", action="store_true")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
@@ -162,14 +186,34 @@ def main(argv=None):
     ap.add_argument("--graphs", action="store_true", help="planned: CUDA graphs per block (default eager replay)")
     ap.add_argument("--key-layout", default="packed", choices=("dense", "packed"))
     ap.add_argument("--stc-cache", type=int, default=8)
+    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
+                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output vs the twin")
     ap.add_argument("--tap-block", type=int, default=None, help="planned debug: block whose intermediates (token 0) are compared with the twin")
     ap.add_argument("--tap-steps", default="", help="with --tap-block: every output of these steps (comma list)")
+    ap.add_argument("--tap-token", type=int, default=0,
+                    help="with --tap-block: the token (position - 1) tapped; the first token of its program class")
     a = ap.parse_args(argv)
-    from perseus.examples.defaults import default_plan
-    if a.plan is None and not (a.fake or a.capture):
-        a.plan = default_plan("llama_decode")
+    from perseus._paths import resolve
+    from perseus.examples.defaults import default_windows
+    a.windows = None
+    if a.plan_windows:
+        from perseus.impl.driver import parse_plan_windows
+        a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
+    elif a.plan is None and not (a.fake or a.capture):
+        # up to a 512-token context: a plan per 128-position window
+        a.windows = [(b, resolve(d)) for b, d in default_windows("llama_decode")]
+    if a.windows and a.plan is None:
+        a.plan = a.windows[0][1]
+    if not a.configs:
+        a.configs = DEFAULT_CONFIGS
+        from perseus._paths import resolve
+        cmd = os.path.join(resolve(a.plan), "PLAN_CMD.txt") if a.plan else ""
+        if cmd and os.path.exists(cmd):
+            for line in open(cmd).read().splitlines():
+                if line.startswith("configs="):
+                    a.configs = line[len("configs="):].split()[0]
     import faulthandler
     import signal
     faulthandler.register(signal.SIGUSR1, all_threads=True)    # kill -USR1 <pid>: a stack dump
@@ -186,13 +230,22 @@ def main(argv=None):
         toks = np.load(a.window)
         toks = toks if toks.ndim == 1 else toks[0]
     else:
-        toks = hf.text_windows(int(a.window) + 1, 128)[int(a.window)]
+        toks = hf.text_windows(int(a.window) + 1, a.window_tokens)[int(a.window)]
     toks = toks[:a.tokens + 1]
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
     os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else env.gpt2_env.physical_device(a.device)
     gt = None if a.fake else hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
+    a.plain_kv = None
+    if a.plain_prefix:
+        # a fake run from a plain prefix decodes (and captures) its first position alone: the magnitudes of a late
+        # position at the cost of one
+        if not (a.fake or a.plan):
+            print("--plain-prefix: planned device runs or fake runs only", file=sys.stderr)
+            return 2
+        a.plain_kv = hf.prompt_kv(toks, a.plain_prefix, cache[:-4] + f"_pkv{a.plain_prefix}.npz",
+                                  device="cpu" if a.fake else "cuda")
 
     over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": a.packing,
             **dict(kv.split("=", 1) for kv in a.set)}
@@ -200,8 +253,8 @@ def main(argv=None):
         over["KV_ARENA_GB"] = os.environ.get("LLAMA_KV_ARENA_GB", "56")     # the offloaded K/V of 32 layers
     if a.capture:
         os.environ["FHE_GRAPH_DIR"] = a.capture
-        # the first encrypted position is 1 (the BOS prefix is plaintext)
-        os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", "1")
+        # the first encrypted position is 1 (the BOS prefix is plaintext), or the plain prefix's length
+        os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", str(a.plain_prefix or 1))
     cfgs = load_configs(a.configs)
     dims = W.llama_dims(store.config)
     t0 = time.time()
@@ -299,8 +352,13 @@ def main(argv=None):
             model.rt.ops.reset()
 
     t1 = time.time()
+    start = None
+    if a.plain_kv is not None:
+        model.plain_prompt = a.plain_kv
+        model.start()
+        start = a.plain_prefix
     res = model.run_decode(toks, gt if model.n_layers == int(store.config["num_hidden_layers"]) else None,
-                           on_token=on_token)
+                           on_token=on_token, start=start)
     kls = sorted(r["kl"] for r in res if "kl" in r)
     hits = sum(1 for r in res if r.get("hit"))
     print(f"[llama] SUMMARY positions={len(res)} top1={hits}/{len(res)} "

@@ -182,6 +182,8 @@ class Placer:
     placed_in_eff: dict[str, float] = field(default_factory=dict)
     realized: set[str] = field(default_factory=set)
     hint_force: dict[str, bool] | None = None
+    #: PLAN_HINT_ENV_VETO applies (off for a plan that keeps another plan's hint decisions: PLAN_KEEP_PLACEMENTS_EXACT)
+    hint_veto: bool = True
     deliberate_clamp0: bool = False
     _step_offsets: dict[str, float] | None = None
     ever_eligible: set[str] = field(default_factory=set)
@@ -389,7 +391,7 @@ class Placer:
         """
         res = self._run_once()
         import os as _os
-        if _os.environ.get("PLAN_HINT_ENV_VETO") != "1":
+        if _os.environ.get("PLAN_HINT_ENV_VETO") != "1" or not self.hint_veto:
             return res
         for _ in range(passes):
             deep = [v for v in self._deep_hints(res) if v not in self.vetoed_hints]
@@ -407,13 +409,14 @@ class Placer:
             self.placed = set(getattr(self, "_forced", ()))
             try:
                 res = self._run_once()
-            except PlanInfeasible:
+            except PlanInfeasible as _e:
                 self.hint_force = saved_force
                 self.vetoed_hints.difference_update(deep)
                 (self.placed, self.realized,
                  self.ever_eligible, self.ever_pressured) = (set(saved_state[0]),
                     set(saved_state[1]), set(saved_state[2]), set(saved_state[3]))
                 if self.verbose:
+                    log.info(f"[plan] veto refusal: {str(_e)[:700]} | deep={deep}") if _os.environ.get("PLAN_DEBUG_SITES") == "1" else None
                     log.info(f"[plan] hint veto taken back for {len(deep)} hint(s): the cut "
                              "cannot cover the branch, so the deep hint stays")
                 return self._run_once()
@@ -501,14 +504,19 @@ class Placer:
 
         The measured envelope is the dense route's. A sparse route raises less and tolerates a deeper input
         (the shipped n32 plan runs 512-slot sites at 48 with a rescale pending), and its ceiling is not
-        measured, so those stay with the runtime guard.
+        measured, so those stay with the runtime guard. PLAN_ENV_EFFECTIVE=1 takes them too, each against its
+        own route's envelope: on a chain whose compile check bounds every refresh's effective input (n32a4's input
+        room), a sparse site past it is refused like a dense one.
         """
+        import os as _os
+        sparse = _os.environ.get("PLAN_ENV_EFFECTIVE") == "1"
         out = []
         for v in self.placed:
             p = self.g.producer_of.get(v)
-            if p is None or p.is_deliberate_bts or p.hint_level is not None or self.refresh.spec(v).route:
+            route = self.refresh.spec(v).route or 0
+            if p is None or p.is_deliberate_bts or p.hint_level is not None or (route and not sparse):
                 continue
-            if self.bootstrap_level + sim.input_eff(self.g, v, self.g.level_unit) > refresh_env_cap(self._step_of(v), route=0) + 1e-9:
+            if self.bootstrap_level + sim.input_eff(self.g, v, self.g.level_unit) > refresh_env_cap(self._step_of(v), route=route) + 1e-9:
                 out.append(v)
         return sorted(out)
 
@@ -532,11 +540,25 @@ class Placer:
 
         target: dict[str, float] = {}
         over_idx = {i for i, _ in sim.over_budget}
+        import os as _os
+        env_eff = _os.environ.get("PLAN_ENV_EFFECTIVE") == "1"
         for i, _ in sim.over_budget:
             n = g.nodes[i]
             B = self.budget.node_budget(
                 n, is_terminal=False, output_refreshed=(n.output in self.placed),
                 bootstrap_level=self.bootstrap_level)
+            if env_eff:
+                # the sim's envelope class (a value or a fired hint's input past its effective envelope): the input's
+                # depth that keeps it inside, its pending rescale counted
+                cap_rel = refresh_env_cap(n.step) - self.bootstrap_level
+                if n.hint_level is not None and sim.hint_fired.get(n.idx, False) and n.cipher_inputs:
+                    v = n.cipher_inputs[0]
+                    t = cap_rel - (unit if sim.deg.get(v, 1) == 2 else 0)
+                    if sim.consumed.get(v, 0.0) > t + 1e-9:
+                        target[v] = min(target.get(v, float("inf")), t)
+                    continue
+                if n.output:
+                    B = min(B, cap_rel - (unit if sim.node_deg.get(i, 1) == 2 else 0))
             for v in n.cipher_inputs:
                 if sim.consumed.get(v, 0.0) + n.cost > B:
                     target[v] = min(target.get(v, float("inf")), B - n.cost)
@@ -659,6 +681,20 @@ class Placer:
                     for i, _ in list(sim.over_budget)[:6]]
             finite = [v for v in sorted(in_net)
                       if not self.refresh.spec(v).hopeless and not self._forbidden(v)][:8]
+            if _os.environ.get("PLAN_DEBUG_SITES") == "1":
+                inf_g = nx.DiGraph([(a, b) for a, b, c in F.edges(data="capacity") if c == float("inf")])
+                try:
+                    path = nx.shortest_path(inf_g, "S", "T")
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    path = []
+                desc = []
+                for x in path:
+                    v = x[2:] if x[:2] in ("i_", "o_") else x
+                    why = ("hopeless" if v in in_net and self.refresh.spec(v).hopeless else
+                           "forbidden" if v in in_net and self._forbidden(v) else "")
+                    desc.append(f"{x}@{self.bootstrap_level + sim.consumed.get(v, 0.0):g}/d{sim.deg.get(v, 1)}"
+                                + (f"[{why}]" if why else ""))
+                log.info("[plan] infinite path: " + " -> ".join(desc))
             raise PlanInfeasible(
                 "every S->T path crosses only unrefreshable sites (infinite cut); "
                 f"over-budget ops: {over}; finite candidates in net: {finite}",

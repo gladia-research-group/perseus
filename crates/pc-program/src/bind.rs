@@ -6,11 +6,13 @@
 //! * every rotation step list / conjugation / relinearization -> a setup-built `KeyGroup`;
 //! * every refresh site -> its `Route`; every scalar -> an exact `f64`;
 //! * every streamed weight row (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
-//! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata.
-//!
-//! Batched ops are bound member by member (separate slots). Details in docs/ARCHITECTURE.md "pc-program bind".
+//! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata;
+//! * the steps issued together (`Unit`): rotation grids and chains (`Program::rotation_grids` / `rotation_chains`),
+//!   K-batches, refresh pairs, plaintext products with their add (`mult_pt_adds`); other batches member by member.
+//! Details in docs/ARCHITECTURE.md "pc-program bind".
+use crate::compile::batch::{paired, PAIR_K};
 use crate::error::{Error, Result};
-use crate::program::{Kind, Op, Origin, Program, Scalar};
+use crate::program::{Kind, Op, Origin, Program, Scalar, GRID_INPUTS};
 use crate::replay::Routes;
 use pc_cuda::{Arena, Compute, Stream};
 use pc_gpu::bts::{BtsKeyRing, RouteKind};
@@ -128,6 +130,43 @@ pub fn coeff_rows_needed(p: &Program, shape: pc_shadow::ChainShape) -> usize {
     r
 }
 
+/// What a unit runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UnitKind {
+    /// A rotation grid (`rotate::rotate_grid`): its distinct steps and their key group `g`, per step of the unit its
+    /// (input, step) indices into `Unit::ins` / `steps`. `fresh` false: a later link of a rotation chain, which reuses
+    /// the gather and ModUp of the chain's first; `held`: a held chain's link (`Held` buffers).
+    Grid { steps: Vec<i64>, g: u32, at: Vec<(u8, u16)>, fresh: bool, held: bool },
+    /// A K-batch of rotate_sums of step list `l` through key group `g` (`rotate::rotate_sum_batch`): step `lo + c`
+    /// reads `Unit::ins[c]`.
+    RotateSum { l: u32, g: u32 },
+    /// A K-batch of relinearized products (`Ops::mult`, `b` empty: `Ops::square`): step `lo + c` multiplies
+    /// `Unit::ins[c]` by `b[c]`.
+    Mult { b: Vec<u32> },
+    /// A K-batch of refreshes on one route (`BtsRoute::run` of K ciphertexts): step `lo + c` refreshes `Unit::ins[c]`.
+    Refresh { route: Route, kind: RouteKind },
+    /// A refresh pair (`Pairing`): step `lo + c` refreshes `Unit::ins[c]` on `routes[c]`, both as one complex refresh
+    /// (`BtsRoute::run_pair`).
+    Pair { routes: [Route; 2], kind: RouteKind },
+    /// A plaintext product and the add consuming it as one pass (`Ops::mult_pt_add`): step `lo` multiplies
+    /// `Unit::ins[0]` by plaintext `pt`, step `lo + 1` adds (`sub`: subtracts) it and `Unit::ins[1]`, the product
+    /// first when `product_first`.
+    MultPtAdd { pt: u32, sub: bool, product_first: bool },
+}
+
+/// Steps `lo..hi` issued together (their outputs at once), reading the slots `ins`. `chain`: the rotation chain the
+/// unit is a link of (NONE: none). `off`: a step of the unit (or of its chain) was made dynamic, so it issues step by
+/// step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unit {
+    pub lo: u32,
+    pub hi: u32,
+    pub ins: Vec<u32>,
+    pub kind: UnitKind,
+    pub chain: u32,
+    pub off: bool,
+}
+
 /// A `Kind::Finish` as bound: input and output slots (op order: output m = the descriptor's output m), the
 /// compiled landing of every output, the descriptor (v2 `args.external` JSON, or a calibration site name).
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +175,15 @@ pub struct FinishStep {
     pub outs: Vec<u32>,
     pub out_metas: Vec<CtMeta>,
     pub desc: String,
+}
+
+/// A dynamic step's slot metadata in its last eager issue: every slot it reads before it ran, every slot it writes
+/// after (a finish reads and lands several). A graph launch does not move the host-side metadata of the slots it
+/// wrote: the replay gives the step's operands these before issuing it, a capture its outputs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DynMetas {
+    pub ins: Vec<(u32, CtMeta)>,
+    pub outs: Vec<(u32, CtMeta)>,
 }
 
 /// One launch member: op, slots, the compiled output metadata.
@@ -162,15 +210,55 @@ pub struct Step {
 pub struct Slab<'a, W: DevWord> {
     pub slots: Vec<Ct<'a, W>>,
     pub tmp: Option<Ct<'a, W>>,
+    /// The units' gather buffers.
+    pub gather: Option<Gather<'a, W>>,
+    /// The held rotation chains' buffers (`Program::rotation_chains`), when some program has one.
+    pub held: Option<Held<'a, W>>,
+}
+
+/// Where a unit's members meet (`GRID_INPUTS` ciphertexts each): their first operands, their second operands, their
+/// outputs (a K-batched product's).
+pub struct Gather<'a, W: DevWord> {
+    pub a: Ct<'a, W>,
+    pub b: Ct<'a, W>,
+    pub out: Ct<'a, W>,
+}
+
+impl<'a, W: DevWord> Gather<'a, W> {
+    pub fn new(arena: &'a Arena, lay: Layout) -> Result<Self> {
+        let ct = || -> Result<Ct<'a, W>> { Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "replay.gather", lay, GRID_INPUTS)?)) };
+        Ok(Gather { a: ct()?, b: ct()?, out: ct()? })
+    }
+    pub fn bytes(lay: &Layout) -> usize {
+        3 * Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, GRID_INPUTS))
+    }
+}
+
+/// What a held rotation chain keeps between its links: its gathered inputs (`GRID_INPUTS` ciphertexts) and their
+/// ModUp (a key-switching ModUp workspace, `ks::KsWork::digits`, swapped in for the chain's links).
+pub struct Held<'a, W: DevWord> {
+    pub x: Ct<'a, W>,
+    pub digits: pc_cuda::DBuf<'a, Compute, W>,
 }
 
 impl<'a, W: DevWord> Slab<'a, W> {
-    pub fn bytes(lay: &Layout, n: usize) -> usize {
-        (n + 1) * Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, 1))
+    /// Bytes of a slab of `n` slots; `held_words`: the ModUp workspace's words (`ks::KsWork::words`) when a program
+    /// has a held rotation chain, else 0.
+    pub fn bytes(lay: &Layout, n: usize, held_words: usize) -> usize {
+        let ct = Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, 1));
+        let held = if held_words > 0 { Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, GRID_INPUTS)) + Arena::bytes_for::<W>(held_words) } else { 0 };
+        (n + 1) * ct + Gather::<W>::bytes(lay) + held
     }
-    pub fn new(arena: &'a Arena, lay: Layout, n: usize) -> Result<Self> {
+    pub fn new(arena: &'a Arena, lay: Layout, n: usize, held_words: usize) -> Result<Self> {
         let slots = (0..n).map(|_| Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "replay.slab", lay, 1)?))).collect::<Result<Vec<_>>>()?;
-        Ok(Slab { slots, tmp: Some(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "replay.slab", lay, 1)?)) })
+        let tmp = Some(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "replay.slab", lay, 1)?));
+        let gather = Some(Gather::new(arena, lay)?);
+        let held = if held_words > 0 {
+            Some(Held { x: Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "replay.slab", lay, GRID_INPUTS)?), digits: arena.alloc("replay.slab", held_words)? })
+        } else {
+            None
+        };
+        Ok(Slab { slots, tmp, gather, held })
     }
 }
 
@@ -208,6 +296,10 @@ pub struct Bound<'a, W: DevWord> {
     pub slots: Vec<Ct<'a, W>>,
     /// Scratch for in-place ops without an in-place kernel (copy, then out of place); the slab's while swapped in.
     pub tmp: Option<Ct<'a, W>>,
+    /// The units' gather buffers; the slab's while swapped in.
+    pub gather: Option<Gather<'a, W>>,
+    /// The held rotation chains' buffers; the slab's while swapped in (None: those chains issue step by step).
+    pub held: Option<Held<'a, W>>,
     /// Slots the program needs (`Program.mem`).
     pub n_slots: usize,
     /// Steps whose arguments the driver changes between runs (`set_scalar` / `set_rotation`): issued eagerly, the
@@ -218,12 +310,15 @@ pub struct Bound<'a, W: DevWord> {
     pub dyn_steps: Vec<i64>,
     /// Per dynamic step: the operand and output metadata of its last eager issue (the compile leaves scales
     /// unknown; a capture and the replays between graph launches take these).
-    pub dyn_metas: BTreeMap<u32, (Option<CtMeta>, Option<CtMeta>, CtMeta)>,
+    pub dyn_metas: BTreeMap<u32, DynMetas>,
     pub steps: Vec<Step>,
     pub groups: Vec<KeyGroup<'a>>,
     /// Index of the relinearization group in `groups` (NONE when the block has no ct x ct product).
     pub relin: u32,
     pub step_lists: Vec<Vec<i64>>,
+    /// Steps issued together, and per step the unit it belongs to (NONE: none).
+    pub units: Vec<Unit>,
+    pub unit_of: Vec<u32>,
     pub pts: Vec<BoundPt>,
     /// External finishes (`StepOp::Finish`).
     pub finishes: Vec<FinishStep>,
@@ -288,13 +383,14 @@ impl<'a, W: DevWord> Bound<'a, W> {
     /// Arena bytes `bind` carves for `p` (MemPlan section "replay"): its slots + scratch, its key groups.
     pub fn bytes(p: &Program, lay: &Layout) -> usize {
         let ct = Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, 1));
-        (p.mem.slot_bytes.len() + 1) * ct + Self::group_bytes(p, 0)
+        (p.mem.slot_bytes.len() + 1) * ct + Gather::<W>::bytes(lay) + Self::group_bytes(p, 0)
     }
 
     /// Arena bytes of `p`'s key groups (+ a dynamic-rotation group of `dyn_rot` steps): what `new_shared` carves.
     pub fn group_bytes(p: &Program, dyn_rot: usize) -> usize {
         let (relin, conj, lists) = key_needs(p);
-        lists.iter().map(|l| KeyGroup::bytes(l.len().max(1), true)).sum::<usize>() + (relin as usize + conj as usize) * KeyGroup::bytes(1, true) + if dyn_rot > 0 { KeyGroup::bytes(dyn_rot, true) } else { 0 }
+        let grids: usize = p.rotation_grids().iter().map(|g| KeyGroup::bytes(g.steps.len(), true)).sum::<usize>() + p.rotation_chains().iter().map(|c| KeyGroup::bytes(c.steps.len(), true)).sum::<usize>();
+        lists.iter().map(|l| KeyGroup::bytes(l.len().max(1), true)).sum::<usize>() + (relin as usize + conj as usize) * KeyGroup::bytes(1, true) + if dyn_rot > 0 { KeyGroup::bytes(dyn_rot, true) } else { 0 } + grids
     }
 
     /// `new` without slots: the block runs on a shared `Slab` (`with_slab`). `dyn_rot`: rotation steps a dynamic
@@ -422,7 +518,9 @@ impl<'a, W: DevWord> Bound<'a, W> {
             no_scalar.push(format!("{:?}: {}", m.origin, c.value));
             c.value
         };
+        let mut first_step: Vec<usize> = Vec::with_capacity(p.ops.len() + 1);
         for op in &p.ops {
+            first_step.push(steps.len());
             for m in op.members() {
                 let a = m.ins.first().map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
                 let b = m.ins.get(1).map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
@@ -510,6 +608,137 @@ impl<'a, W: DevWord> Bound<'a, W> {
                 steps.push(Step { op: sop, out, a, b, inplace, var, meta: p.vars[var as usize].meta, a_meta: vm(0), b_meta: vm(1) });
             }
         }
+        first_step.push(steps.len());
+        // rotation grids: their steps, input slots, a key group of their steps (a grid with a step that is the
+        // identity mod N/2 issues step by step)
+        let mut units: Vec<Unit> = vec![];
+        let mut unit_of = vec![NONE; steps.len()];
+        for gs in p.rotation_grids() {
+            if gs.steps.iter().any(|s| s.rem_euclid(half) == 0) {
+                continue;
+            }
+            let mut refs: Vec<&dyn KsKeyRef> = vec![];
+            for &s in &gs.steps {
+                match env.keys.rot(s) {
+                    Ok(k) => refs.push(k),
+                    Err(_) => missing.push(format!("rot {s}")),
+                }
+            }
+            if refs.len() != gs.steps.len() {
+                continue;
+            }
+            let (lo, hi) = (first_step[gs.ops.0], first_step[gs.ops.1]);
+            let mut at = Vec::with_capacity(hi - lo);
+            for m in p.ops[gs.ops.0..gs.ops.1].iter().flat_map(|o| o.members()) {
+                let Kind::Rotate(k) = m.kind else { return Err(berr(block, "rotation grid over a non-rotation op")) };
+                let c = gs.ins.iter().position(|&x| x == m.ins[0]).ok_or_else(|| berr(block, "rotation grid input missing"))?;
+                let s = gs.steps.iter().position(|&x| x == k).ok_or_else(|| berr(block, "rotation grid step missing"))?;
+                at.push((c as u8, s as u16));
+            }
+            unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+            let ins = gs.ins.iter().map(|&x| slot_of(x)).collect::<Result<Vec<_>>>()?;
+            units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind: UnitKind::Grid { steps: gs.steps.clone(), g: groups.len() as u32, at, fresh: true, held: false }, chain: NONE, off: false });
+            groups.push(KeyGroup::new(env.arena, env.stream, lay.n, &refs, env.stage)?);
+        }
+        // rotation chains: one key group of the chain's steps, one unit per link, the first one fresh
+        for (ci, cs) in p.rotation_chains().iter().enumerate() {
+            if cs.steps.iter().any(|s| s.rem_euclid(half) == 0) {
+                continue;
+            }
+            let refs: Vec<&dyn KsKeyRef> = cs.steps.iter().filter_map(|&s| env.keys.rot(s).ok().map(|k| k as &dyn KsKeyRef)).collect();
+            if refs.len() != cs.steps.len() {
+                continue;
+            }
+            let ins = cs.ins.iter().map(|&x| slot_of(x)).collect::<Result<Vec<_>>>()?;
+            let g = groups.len() as u32;
+            for (j, &oi) in cs.ops.iter().enumerate() {
+                let (lo, hi) = (first_step[oi], first_step[oi + 1]);
+                let mut at = Vec::with_capacity(hi - lo);
+                for m in p.ops[oi].members() {
+                    let Kind::Rotate(k) = m.kind else { return Err(berr(block, "rotation chain over a non-rotation op")) };
+                    let c = cs.ins.iter().position(|&x| x == m.ins[0]).ok_or_else(|| berr(block, "rotation chain input missing"))?;
+                    let s = cs.steps.iter().position(|&x| x == k).ok_or_else(|| berr(block, "rotation chain step missing"))?;
+                    at.push((c as u8, s as u16));
+                }
+                unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+                units.push(Unit { lo: lo as u32, hi: hi as u32, ins: ins.clone(), kind: UnitKind::Grid { steps: cs.steps.clone(), g, at, fresh: j == 0, held: cs.held }, chain: ci as u32, off: false });
+            }
+            groups.push(KeyGroup::new(env.arena, env.stream, lay.n, &refs, env.stage)?);
+        }
+        // K-batches of rotate_sums of one step list (inputs of one level, outputs in slots of their own)
+        for (oi, op) in p.ops.iter().enumerate() {
+            let m = op.members();
+            let Kind::RotateSum(list) = &m[0].kind else { continue };
+            let (lo, hi) = (first_step[oi], first_step[oi + 1]);
+            let level = |v: u32| p.vars[v as usize].meta.level;
+            if m.len() < 2 || m.len() > GRID_INPUTS || !m.iter().all(|x| matches!(&x.kind, Kind::RotateSum(l) if l == list) && x.pre.is_empty() && level(x.ins[0]) == level(m[0].ins[0])) {
+                continue;
+            }
+            let StepOp::RotateSum { l, g } = steps[lo].op else { continue };
+            let ins: Vec<u32> = steps[lo..hi].iter().map(|st| st.a).collect();
+            let outs: Vec<u32> = steps[lo..hi].iter().map(|st| st.out).collect();
+            if g == NONE || outs.iter().enumerate().any(|(c, o)| ins.contains(o) || outs[..c].contains(o)) {
+                continue;
+            }
+            unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+            units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind: UnitKind::RotateSum { l, g }, chain: NONE, off: false });
+        }
+        // plaintext products consumed by the next add (the product's input and the add's other operand stay live)
+        for oi in p.mult_pt_adds() {
+            let lo = first_step[oi];
+            let (StepOp::MultPt(pt), add) = (&steps[lo].op, &steps[lo + 1]) else { continue };
+            if !matches!(add.op, StepOp::Add | StepOp::Sub) || unit_of[lo] != NONE || unit_of[lo + 1] != NONE {
+                continue;
+            }
+            let sub = add.op == StepOp::Sub;
+            let product_first = p.ops[oi + 1].ins[0] == p.ops[oi].outs[0];
+            let y = if product_first { add.b } else { add.a };
+            if y == NONE {
+                continue;
+            }
+            unit_of[lo..lo + 2].iter_mut().for_each(|x| *x = units.len() as u32);
+            units.push(Unit { lo: lo as u32, hi: lo as u32 + 2, ins: vec![steps[lo].a, y], kind: UnitKind::MultPtAdd { pt: *pt, sub, product_first }, chain: NONE, off: false });
+        }
+        // K-batches of products and of refreshes (siblings of one recipe / route; outputs in slots of their own, the
+        // refresh route built for K ciphertexts)
+        for (oi, op) in p.ops.iter().enumerate() {
+            let m = op.members();
+            let (lo, hi) = (first_step[oi], first_step[oi + 1]);
+            if m.len() < 2 || m.len() > GRID_INPUTS || hi - lo != m.len() || steps[lo..hi].iter().any(|st| st.inplace) {
+                continue;
+            }
+            let ins: Vec<u32> = steps[lo..hi].iter().map(|st| st.a).collect();
+            let bs: Vec<u32> = steps[lo..hi].iter().map(|st| st.b).collect();
+            let outs: Vec<u32> = steps[lo..hi].iter().map(|st| st.out).collect();
+            if outs.iter().enumerate().any(|(c, o)| ins.contains(o) || bs.contains(o) || outs[..c].contains(o)) {
+                continue;
+            }
+            let kind = match (&m[0].kind, &steps[lo].op) {
+                (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs },
+                (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![] },
+                (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) if m.len() == PAIR_K && m.iter().all(|x| paired(p, x, p.batch_report.pair)) => {
+                    let StepOp::Bootstrap { route: ry, .. } = steps[lo + 1].op else { continue };
+                    if *kind != RouteKind::StcFirst || routes.get(*kind).is_none() {
+                        continue;
+                    }
+                    UnitKind::Pair { routes: [*route, ry], kind: *kind }
+                }
+                (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) => {
+                    let same = steps[lo..hi].iter().all(|st| matches!(&st.op, StepOp::Bootstrap { route: r, .. } if r == route));
+                    if !same || routes.get(*kind).is_none_or(|r| r.mem().1.k_max < m.len()) {
+                        continue;
+                    }
+                    UnitKind::Refresh { route: *route, kind: *kind }
+                }
+                _ => continue,
+            };
+            unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+            units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind, chain: NONE, off: false });
+        }
+        if !missing.is_empty() {
+            missing.dedup();
+            return Err(berr(block, format!("{} key(s) missing from the key ring: {}", missing.len(), list(&missing))));
+        }
         if !no_scalar.is_empty() {
             return Err(berr(block, format!("{} inexact v1 scalar(s) with no exact value in the driver's table: {}", no_scalar.len(), list(&no_scalar))));
         }
@@ -519,17 +748,21 @@ impl<'a, W: DevWord> Bound<'a, W> {
         if !alias.is_empty() {
             return Err(berr(block, format!("slot aliasing the replay cannot run: {}", list(&alias))));
         }
-        let (slots, tmp) = if carve {
+        let (slots, tmp, gather) = if carve {
             let slots = (0..n_slots).map(|_| Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(env.arena, "replay.slot", lay, 1)?))).collect::<Result<Vec<_>>>()?;
-            (slots, Some(Ct::new(CtMeta::new(0, 1), CtBuf::new(env.arena, "replay.slot", lay, 1)?)))
+            let tmp = Some(Ct::new(CtMeta::new(0, 1), CtBuf::new(env.arena, "replay.slot", lay, 1)?));
+            (slots, tmp, Some(Gather::new(env.arena, lay)?))
         } else {
-            (vec![], None)
+            (vec![], None, None)
         };
+        // a block on its own slots carves no held-chain buffers: those chains issue step by step
         let io = |vs: &[u32]| -> Result<Vec<(String, u32, CtMeta)>> { vs.iter().map(|&v| Ok((p.vars[v as usize].name.clone(), slot_of(v)?, p.vars[v as usize].meta))).collect() };
         Ok(Bound {
             label: block.to_string(),
             slots,
             tmp,
+            gather,
+            held: None,
             n_slots,
             dynamic: Default::default(),
             dyn_group: NONE,
@@ -539,6 +772,8 @@ impl<'a, W: DevWord> Bound<'a, W> {
             groups,
             relin,
             step_lists: lists,
+            units,
+            unit_of,
             pts,
             finishes,
             coeff_sums,
@@ -633,17 +868,21 @@ impl<'a, W: DevWord> Bound<'a, W> {
     /// Run `f` with `slab`'s slots as this block's slots (a block bound by `new_shared`); the slab gets them back
     /// whatever `f` returns.
     pub fn with_slab<T>(&mut self, slab: &mut Slab<'a, W>, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        if !self.slots.is_empty() || self.tmp.is_some() {
+        if !self.slots.is_empty() || self.tmp.is_some() || self.gather.is_some() {
             return Err(berr(&self.label, "with_slab on a block with its own slots"));
         }
-        if slab.slots.len() < self.n_slots || slab.tmp.is_none() {
+        if slab.slots.len() < self.n_slots || slab.tmp.is_none() || slab.gather.is_none() {
             return Err(berr(&self.label, format!("slab of {} slots, the block needs {}", slab.slots.len(), self.n_slots)));
         }
         std::mem::swap(&mut self.slots, &mut slab.slots);
         std::mem::swap(&mut self.tmp, &mut slab.tmp);
+        std::mem::swap(&mut self.gather, &mut slab.gather);
+        std::mem::swap(&mut self.held, &mut slab.held);
         let r = f(self);
         std::mem::swap(&mut self.slots, &mut slab.slots);
         std::mem::swap(&mut self.tmp, &mut slab.tmp);
+        std::mem::swap(&mut self.gather, &mut slab.gather);
+        std::mem::swap(&mut self.held, &mut slab.held);
         r
     }
 
@@ -652,14 +891,31 @@ impl<'a, W: DevWord> Bound<'a, W> {
         (0..self.steps.len()).filter(|&i| self.names[self.steps[i].var as usize].split('~').next() == Some(name)).collect()
     }
 
-    fn make_dynamic(&mut self, i: usize) -> Result<()> {
+    pub(crate) fn make_dynamic(&mut self, i: usize) -> Result<()> {
         if !self.dynamic.contains(&(i as u32)) {
             if !self.graphs.is_empty() {
                 return Err(berr(&self.label, format!("step {i} made dynamic after a graph capture (declare dynamic steps before the first run)")));
             }
             self.dynamic.insert(i as u32);
+            // a unit with a dynamic step issues step by step, and so does the rest of its rotation chain
+            if let Some(&u) = self.unit_of.get(i).filter(|&&u| u != NONE) {
+                let chain = self.units[u as usize].chain;
+                for (j, x) in self.units.iter_mut().enumerate() {
+                    if j == u as usize || chain != NONE && x.chain == chain {
+                        x.off = true;
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The unit step `i` heads (an enabled unit starting at step `i`; a held chain's link only with the held
+    /// buffers present).
+    pub fn unit_at(&self, i: usize) -> Option<&Unit> {
+        let u = self.units.get(*self.unit_of.get(i)? as usize)?;
+        let held = matches!(u.kind, UnitKind::Grid { held: true, .. });
+        (u.lo as usize == i && !u.off && (!held || self.held.is_some())).then_some(u)
     }
 
     /// Set the scalar of the constant op producing `name` (a per-position constant); the step becomes dynamic.

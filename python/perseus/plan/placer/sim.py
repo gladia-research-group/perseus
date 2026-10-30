@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -55,11 +57,14 @@ class Budget:
     #: the StC-first entry (absolute effective level) when the recipe sets one: a deliberate StC-first refresh's input
     #: budget (`node_budget` of such a node bounds its input's consumed depth, one unit kept for a pending rescale)
     stc_first_entry: float | None = None
+    #: plan.stc_first_reroute: past the entry the refresh runs the shipped order, so the entry bounds only a K/V push's
+    stc_first_reroute: bool = False
 
     def node_budget(self, n: Node, *, is_terminal: bool, output_refreshed: bool,
                     bootstrap_level: float) -> float:
         if n.is_deliberate_bts:
-            if n.stc_first and self.stc_first_entry is not None:
+            if (n.stc_first and self.stc_first_entry is not None
+                    and (not self.stc_first_reroute or is_kv_push(n.step))):
                 return self.stc_first_entry - bootstrap_level - self.unit
             return float("inf")
         b = self.L
@@ -174,6 +179,11 @@ class PlannerShadow:
         return self.consumed(out.level), out.deg
 
 
+def is_kv_push(step: str) -> bool:
+    """A step that writes the K/V cache (the decode's `blk<b>.kv_push`)."""
+    return step.endswith(".kv_push") or ".kv_push." in step
+
+
 def simulate(
     g: Graph,
     *,
@@ -220,6 +230,12 @@ def simulate(
     for n in g.nodes:
         if n.output and not n.is_deliberate_bts:
             terminal = n
+    # PLAN_ENV_EFFECTIVE=1: a value whose effective level (a pending rescale counts) is past its step's envelope is
+    # over budget, which the cut repairs upstream: on n32a4 the compile check refuses such a refresh on every route,
+    # and below level 48 only the single prime q2 is left, so a pending rescale there has no level to drop either
+    env_cap = None
+    if os.environ.get("PLAN_ENV_EFFECTIVE") == "1":
+        from .place import refresh_env_cap as env_cap
 
     for n in g.nodes:
         ins = n.cipher_inputs
@@ -243,10 +259,12 @@ def simulate(
             # a captured StC-first refresh keeps its landing only within the entry; past it the runtime takes the
             # shipped order: a budget violation the cut repairs upstream, or (plan.stc_first_reroute) that order's
             # raw landing
+            # (plan.stc_first_reroute) never a K/V push's: that refresh lands the cache state every later position
+            # reads at the captured landing, and the shipped order lands it deeper
             if n.stc_first and dense_fallback is not None and ins:
                 in_eff = max(lc.get(v, 0.0) + (unit if dg.get(v, 1) == 2 else 0) for v in ins)
                 if bootstrap_level + in_eff > dense_fallback[0] + 1e-9:
-                    if sh.stc_first_reroute and n.output:
+                    if sh.stc_first_reroute and n.output and not is_kv_push(n.step):
                         c_fb, d_fb = dense_fallback[1], dense_fallback[2]
                         lc[n.output], dg[n.output] = (c_fb - unit, 2) if d_fb == 1 else (c_fb, d_fb)
                     else:
@@ -261,6 +279,8 @@ def simulate(
             if hint_force is not None and n.output in hint_force:
                 fired = hint_force[n.output]
             hint_fired[n.idx] = fired
+            if env_cap is not None and fired and ic_eff > env_cap(n.step) - bootstrap_level + 1e-9:
+                over.append((n.idx, ic_eff - (env_cap(n.step) - bootstrap_level)))
             if fired or n.output in placed_set:
                 if n.output in refreshed:
                     c, d = refreshed[n.output]
@@ -297,6 +317,9 @@ def simulate(
             bootstrap_level=bootstrap_level)
         if c > b:
             over.append((n.idx, c - b))
+        elif (env_cap is not None and n.hint_level is None and n.output
+              and c + (unit if d == 2 else 0) > env_cap(n.step) - bootstrap_level + 1e-9):
+            over.append((n.idx, c + (unit if d == 2 else 0) - (env_cap(n.step) - bootstrap_level)))
 
     return SimResult(consumed=lc, deg=dg, node_out=node_out,
                      hint_fired=hint_fired, over_budget=over, node_deg=node_deg)

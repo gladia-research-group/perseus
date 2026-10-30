@@ -8,8 +8,8 @@
 //! batches, one launch each. A plaintext operand is broadcast over the `k` ciphertexts of its batch (stride 0).
 //!
 //! Per-call constants (`ElemForEvalMult` / `ElemForEvalAddOrSub` rows, wsum weights, folded alphas) go through the
-//! `ConstRing`: pinned host slots copied to device slots on the compute lane, in stream order with the kernels that
-//! read them (no host sync except when a pinned slot is reused before its copy ran).
+//! `ConstRing`: pinned host units copied to device units on the compute lane, in stream order with the kernels that
+//! read them (no host sync except when pinned units are reused before their copy a lap ago ran).
 /// ct x ct = tensor + relinearization; the Recipe preludes run in front of it.
 pub use crate::relin::mult;
 
@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -32,7 +32,8 @@ use std::ffi::c_void;
 /// Knobs of the op layer (the `exec` part of the typed Config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpsCfg {
-    /// Constant-ring slots (in flight per-call constant vectors before a pinned slot is reused).
+    /// Constant-ring size, in per-call constant vectors of the largest kind (a wsum of `WSUM_MAX` weights; a
+    /// one-table scalar row takes an eighth of one): what is in flight before pinned units are reused.
     pub const_slots: usize,
     pub rescale: RescaleKind,
     /// Fold a `ScalarAdjust` into the following `Rescale` (composite one-pass only; exact).
@@ -51,30 +52,51 @@ impl Default for OpsCfg {
 /// wsum takes at most this many sources per launch (`WsumArgs::src`).
 pub const WSUM_MAX: usize = 8;
 
-/// Per-call constant vectors: `slots` device slots of `slot_words` words, each with its own pinned host slot and an
-/// event recorded after its upload. A push writes the pinned slot (after syncing that event when the slot is reused),
-/// enqueues the H2D copy on the compute lane and returns the device pointer; the kernels reading it are issued later
-/// on the same lane, and the next copy into the same device slot is ordered after them by the stream.
+/// Per-call constant vectors on the device: a ring of `units` of `unit_words` words (one prime-row table, rounded up to
+/// 64 bytes), with its pinned host mirror. A push takes the next run of free units its words need (a one-table scalar
+/// row two, a wsum of 8 sources sixteen), writes them on the host, enqueues their H2D copy on the compute lane and
+/// returns the device pointer; the kernels reading it are issued later on the same lane, and the next copy into the
+/// same units is ordered after them by the stream. The ring is cut into chunks, each with an event recorded after its
+/// latest copy: the first push into a chunk on a new lap of the ring waits for that event (the copies a lap ago out of
+/// the pinned units it rewrites), so the host never waits on recent work.
 ///
-/// Graph capture (`lease_begin` .. `lease_end`): a captured graph replays the pinned -> device copy, so the pinned
-/// slot must keep the captured value for the graph's lifetime. Pushes while leasing take slots out of the rotation
-/// (`leased`) until `release`; their copies record no event (the slot is never rewritten while leased).
+/// Graph capture (`lease_begin` .. `lease_end`): a captured graph reads the device units its constants were pushed
+/// to. Pushes while leasing take their units out of the rotation (`leased`) until `release` and record no copy (it
+/// would be replayed at every launch); `lease_end`, after the capture, uploads them once (leased units are never
+/// rewritten). A lease is the list of its pushes' first units.
 pub struct ConstRing<'a, W: DevWord> {
     dev: DBuf<'a, Compute, W>,
-    host: Vec<PinnedBuf<W>>,
-    ev: Vec<Event>,
-    used: Vec<bool>,
+    host: PinnedBuf<W>,
+    unit_words: usize,
+    units: usize,
+    /// per unit: held by a captured graph
     leased: Vec<bool>,
-    /// Slots taken by the open lease (None: not leasing).
+    /// leased pushes: first unit -> units
+    held: std::collections::HashMap<usize, usize>,
+    /// Pushes of the open lease, by first unit (None: not leasing).
     lease: Option<Vec<usize>>,
     next: usize,
-    slot_words: usize,
+    lap: u64,
+    chunk_units: usize,
+    /// per chunk: the event recorded after its latest copy and that copy's lap (None: no copy in flight)
+    chunk_ev: Vec<Event>,
+    chunk_lap: Vec<Option<u64>>,
 }
 
+/// Chunks of a constant ring (events the host may wait on).
+const RING_CHUNKS: usize = 1024;
+
 impl<'a, W: DevWord> ConstRing<'a, W> {
+    /// Words of the largest push (`WSUM_MAX` tables and their Shoup companions): the size unit of `bytes` / `new`.
     pub fn slot_words(lay: &Layout) -> usize {
-        2 * WSUM_MAX * lay.rows()
+        2 * WSUM_MAX * Self::unit_words(lay)
     }
+    /// One prime-row table (`lay.rows()` words), rounded up to 64 bytes.
+    pub fn unit_words(lay: &Layout) -> usize {
+        let align = (64 / std::mem::size_of::<W>()).max(1);
+        lay.rows().div_ceil(align) * align
+    }
+    /// Device bytes of a ring with room for `slots` of the largest push (many more of the usual one-table rows).
     pub fn bytes(lay: &Layout, slots: usize) -> usize {
         Arena::bytes_for::<W>(slots * Self::slot_words(lay))
     }
@@ -82,69 +104,134 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
         if slots == 0 {
             return Err(Error::Mem { knob: "OpsCfg::const_slots", value: 0, msg: "must be >= 1".into() });
         }
-        let sw = Self::slot_words(lay);
-        let host = (0..slots).map(|_| PinnedBuf::new(dev, sw)).collect::<std::result::Result<Vec<_>, _>>()?;
-        let ev = (0..slots).map(|_| Event::new(dev)).collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ConstRing { dev: arena.alloc("ops.const_ring", slots * sw)?, host, ev, used: vec![false; slots], leased: vec![false; slots], lease: None, next: 0, slot_words: sw })
+        let uw = Self::unit_words(lay);
+        let units = slots * 2 * WSUM_MAX;
+        let nc = RING_CHUNKS.min(units);
+        let chunk_units = units.div_ceil(nc);
+        let chunk_ev = (0..units.div_ceil(chunk_units)).map(|_| Event::new(dev)).collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ConstRing {
+            dev: arena.alloc("ops.const_ring", units * uw)?,
+            host: PinnedBuf::new(dev, units * uw)?,
+            unit_words: uw,
+            units,
+            leased: vec![false; units],
+            held: Default::default(),
+            lease: None,
+            next: 0,
+            lap: 0,
+            chunk_units,
+            chunk_lap: vec![None; chunk_ev.len()],
+            chunk_ev,
+        })
     }
 
-    /// Upload `fill`'s words (it writes at most `slot_words`) and return the slot's device base pointer.
-    pub fn push(&mut self, s: &Stream<Compute>, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
-        let ns = self.host.len();
-        let i = (0..ns).map(|d| (self.next + d) % ns).find(|&j| !self.leased[j]).ok_or_else(|| Error::Mem {
+    /// The first unit of a free run of `n` units from `next` on (wrapping once), and whether it wrapped.
+    fn find(&self, n: usize) -> Option<(usize, bool)> {
+        let start = self.next;
+        let (mut p, mut wrapped) = (start, false);
+        loop {
+            if p + n > self.units {
+                if wrapped {
+                    return None;
+                }
+                (p, wrapped) = (0, true);
+            }
+            if wrapped && p >= start {
+                return None;
+            }
+            match (p..p + n).find(|&u| self.leased[u]) {
+                None => return Some((p, wrapped)),
+                Some(q) => p = q + 1,
+            }
+        }
+    }
+
+    /// Upload `words` words written by `fill` (it gets exactly that many) and return their device base pointer.
+    pub fn push(&mut self, s: &Stream<Compute>, words: usize, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
+        let n = words.div_ceil(self.unit_words).max(1);
+        let (u, wrapped) = self.find(n).ok_or_else(|| Error::Mem {
             knob: "OpsCfg::const_slots",
-            value: ns,
-            msg: "every constant slot is leased by a captured graph (release graphs or raise the knob)".into(),
+            value: self.units / (2 * WSUM_MAX),
+            msg: format!("no {n} free constant units: the ring is leased by captured graphs (release graphs or raise the knob)"),
         })?;
-        self.next = (i + 1) % ns;
-        if self.used[i] {
-            // the previous copy out of this pinned slot must have run before the host rewrites it (a lease begins
-            // with a stream sync, so this never waits inside a capture)
-            self.ev[i].sync()?;
-            self.used[i] = false;
+        if wrapped {
+            self.lap += 1;
         }
-        fill(self.host[i].as_mut_slice());
-        let off = i * self.slot_words;
-        // SAFETY: the pinned slot is not rewritten before `ev[i]` (recorded after this copy) completes, or, leased,
-        // before `release` (after the graphs replaying the copy are gone)
-        unsafe { self.dev.upload_pinned_async(s, off, &self.host[i])? };
+        self.next = u + n;
+        let (c0, c1) = (u / self.chunk_units, (u + n - 1) / self.chunk_units);
+        if self.lease.is_none() {
+            // the copies out of these pinned units a lap ago must have run before the host rewrites them (a lease
+            // begins with a stream sync, so this never waits inside a capture)
+            for c in c0..=c1 {
+                if self.chunk_lap[c].is_some_and(|l| l < self.lap) {
+                    self.chunk_ev[c].sync()?;
+                    self.chunk_lap[c] = None;
+                }
+            }
+        }
+        let off = u * self.unit_words;
+        fill(&mut self.host.as_mut_slice()[off..off + words]);
         if let Some(l) = self.lease.as_mut() {
-            self.leased[i] = true;
-            l.push(i);
+            self.leased[u..u + n].iter_mut().for_each(|x| *x = true);
+            self.held.insert(u, n);
+            l.push(u);
         } else {
-            self.ev[i].record(s)?;
-            self.used[i] = true;
+            // SAFETY: the pinned units are not rewritten before the chunk events recorded after this copy complete
+            unsafe { self.dev.upload_pinned_range_async(s, off, &self.host, off, words)? };
+            for c in c0..=c1 {
+                self.chunk_ev[c].record(s)?;
+                self.chunk_lap[c] = Some(self.lap);
+            }
         }
-        // SAFETY: off < slots * slot_words
+        // SAFETY: off + words <= units * unit_words
         Ok(unsafe { self.dev.dptr().add(off) })
     }
 
-    /// Start a lease (before a capture): waits for the lane, so no slot of the rotation has a copy in flight.
+    /// Start a lease (before a capture): waits for the lane, so no unit of the rotation has a copy in flight.
     pub fn lease_begin(&mut self, s: &Stream<Compute>) -> Result<()> {
         if self.lease.is_some() {
             return Err(shape("ConstRing::lease_begin", "a lease is already open"));
         }
         s.sync()?;
-        self.used.iter_mut().for_each(|u| *u = false);
+        self.chunk_lap.iter_mut().for_each(|l| *l = None);
         self.lease = Some(Vec::new());
         Ok(())
     }
-    /// End the open lease: the slots pushed since `lease_begin` (they stay out of the rotation until `release`).
-    pub fn lease_end(&mut self) -> Vec<usize> {
-        self.lease.take().unwrap_or_default()
+    /// End the open lease (after the capture): upload the pushes made since `lease_begin` and wait for the copies;
+    /// returns them (their units stay out of the rotation until `release`). A failed upload releases them.
+    pub fn lease_end(&mut self, s: &Stream<Compute>) -> Result<Vec<usize>> {
+        let pushes = self.lease.take().unwrap_or_default();
+        let mut up = Ok(());
+        for &u in &pushes {
+            let (off, words) = (u * self.unit_words, self.held.get(&u).copied().unwrap_or(0) * self.unit_words);
+            // SAFETY: leased pinned units are not rewritten before `release`; the copies are waited for below
+            up = unsafe { self.dev.upload_pinned_range_async(s, off, &self.host, off, words) };
+            if up.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = up.and_then(|()| s.sync()) {
+            self.release(&pushes);
+            return Err(e.into());
+        }
+        Ok(pushes)
     }
-    /// Return leased slots to the rotation (every graph replaying their copies has been dropped and its last
-    /// launch has completed).
-    pub fn release(&mut self, slots: &[usize]) {
-        for &i in slots {
-            if let Some(l) = self.leased.get_mut(i) {
-                *l = false;
+    /// Return leased pushes to the rotation (every graph reading them has been dropped and its last launch has
+    /// completed).
+    pub fn release(&mut self, pushes: &[usize]) {
+        for &u in pushes {
+            if let Some(n) = self.held.remove(&u) {
+                self.leased[u..u + n].iter_mut().for_each(|x| *x = false);
             }
         }
     }
-    /// Slots currently leased.
+    /// Pushes currently leased.
     pub fn leased(&self) -> usize {
-        self.leased.iter().filter(|&&l| l).count()
+        self.held.len()
+    }
+    /// Units currently leased, and the ring's units.
+    pub fn leased_units(&self) -> (usize, usize) {
+        (self.held.values().sum(), self.units)
     }
 
     /// `nt` tables of per-prime values (`vals[j]`, by prime id, rows `0..len`), laid out as `[j][rows]` values then
@@ -152,10 +239,10 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
     pub fn push_rows(&mut self, s: &Stream<Compute>, primes: &[u64], vals: &[&[u64]]) -> Result<(*const c_void, *const c_void)> {
         let rows = primes.len();
         let nt = vals.len();
-        if 2 * nt * rows > self.slot_words {
-            return Err(shape("ConstRing::push_rows", format!("{nt} tables of {rows} rows exceed a slot ({} words)", self.slot_words)));
+        if nt > WSUM_MAX || rows > self.unit_words {
+            return Err(shape("ConstRing::push_rows", format!("{nt} tables of {rows} rows: at most {WSUM_MAX} of {} rows", self.unit_words)));
         }
-        let base = self.push(s, |h| {
+        let base = self.push(s, 2 * nt * rows, |h| {
             for (j, v) in vals.iter().enumerate() {
                 for (i, &p) in primes.iter().enumerate() {
                     let c = shoup(W::from_u64(v.get(i).copied().unwrap_or(0) % p), W::from_u64(p));
@@ -164,16 +251,16 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
                 }
             }
         })?;
-        // SAFETY: inside the slot (checked above)
+        // SAFETY: inside the push's 2 nt rows words
         Ok((base as *const c_void, unsafe { base.add(nt * rows) } as *const c_void))
     }
 
     /// Raw per-prime words (no Shoup), e.g. add_const's `k` (values may equal `p`: the kernel reduces them).
     pub fn push_plain(&mut self, s: &Stream<Compute>, vals: &[u64]) -> Result<*const c_void> {
-        if vals.len() > self.slot_words {
-            return Err(shape("ConstRing::push_plain", format!("{} words exceed a slot", vals.len())));
+        if vals.len() > 2 * WSUM_MAX * self.unit_words {
+            return Err(shape("ConstRing::push_plain", format!("{} words exceed the largest push", vals.len())));
         }
-        Ok(self.push(s, |h| {
+        Ok(self.push(s, vals.len(), |h| {
             for (o, &v) in h.iter_mut().zip(vals) {
                 *o = W::from_u64(v);
             }
@@ -762,6 +849,101 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Self::finish(out, &r, &t)
     }
 
+    /// The add / sub recipe of `mult_pt_add` (the product as operand A when `product_first`).
+    fn mac_recipes(sh: &Shadow, a: &CtMeta, pt: &PtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<(Recipe, Recipe)> {
+        let r1 = sh.mult_pt(a, pt)?;
+        let (x, z) = if product_first { (r1.out, *y) } else { (*y, r1.out) };
+        let r2 = if sub { sh.sub(&x, &z)? } else { sh.add(&x, &z)? };
+        Ok((r1, r2))
+    }
+
+    /// Whether `mult_pt_add` runs `y +- a * pt` as one pass (metadata only, a bind-time check): the add's recipe has
+    /// no prelude and the product's has none on the plaintext. With preludes on `a`, `out` must not alias `y`.
+    pub fn mult_pt_add_fusable(sh: &Shadow, a: &CtMeta, pt: &PtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<bool> {
+        let (r1, r2) = Self::mac_recipes(sh, a, pt, y, sub, product_first)?;
+        let on_pt = r1.pre.iter().any(|p| matches!(p, Prelude::Rescale(Operand::B) | Prelude::DropTo(Operand::B, _) | Prelude::ScalarAdjust(Operand::B, _)));
+        Ok(r2.pre.is_empty() && !on_pt)
+    }
+
+    /// `out = y + a * pt` (`sub`: `y - a * pt`, or `a * pt - y` when `product_first`): exactly `mult_pt` into a
+    /// temporary, then `add` / `sub` of it with `y` (the product as the add's operand A when `product_first`), as one
+    /// pass (the plaintext products of BSGS baby sums, consumed once by an add). Needs `mult_pt_add_fusable`; `a`'s
+    /// preludes run into `out` as in `mult_pt`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_pt_add<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        sh: &Shadow,
+        out: &mut Ct<'_, W>,
+        a: &Ct<'_, W>,
+        pt: &Pt<'_>,
+        y: &Ct<'_, W>,
+        sub: bool,
+        product_first: bool,
+    ) -> Result<()> {
+        if !Self::mult_pt_add_fusable(sh, &a.meta, &pt.meta, &y.meta, sub, product_first)? {
+            return Err(shape("mult_pt_add", "the add has preludes or the plaintext needs one: run mult_pt then add"));
+        }
+        let (r1, r2) = Self::mac_recipes(sh, &a.meta, &pt.meta, &y.meta, sub, product_first)?;
+        Self::check_k("mult_pt_add", out.k(), y.k())?;
+        if !r1.pre.is_empty() && out.buf.r().base == y.buf.r().base {
+            return Err(shape("mult_pt_add", "the product's preludes run in `out`, which must not alias y"));
+        }
+        let s = &ex.compute;
+        let (t, av) = self.prep_a_view(ctx, s, out, Some(a), &r1.pre)?;
+        if t.meta.level != r1.out.level {
+            return Err(shape("mult_pt_add", format!("preludes left level {} but the product is at {}", t.meta.level, r1.out.level)));
+        }
+        let top = self.top(ctx.shape, &t.meta)?;
+        let m = MulTableArgs { out: out.buf.w(), inp: av, t: pt.poly().base, pr: ctx.pr(), n: (top + 1) as i32, k: out.k() as i32 };
+        let args = MulAddArgs { m, y: y.buf.r(), sub: if !sub { 0 } else if product_first { 2 } else { 1 }, pad: 0 };
+        // SAFETY: k cts of the context layout over rows 0..=top (the plaintext broadcast); element-wise, so out may
+        // alias y or a's view (each thread reads its operands before writing the same index)
+        launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, s.raw()) })?;
+        out.meta = r2.out;
+        Ok(())
+    }
+
+    /// Whether `mult_pt_add_inplace` runs: `mult_pt_add_fusable` and no prelude on `a` either (it would run in `acc`).
+    pub fn mult_pt_add_inplace_fusable(sh: &Shadow, a: &CtMeta, pt: &PtMeta, acc: &CtMeta, sub: bool, product_first: bool) -> Result<bool> {
+        let (r1, _) = Self::mac_recipes(sh, a, pt, acc, sub, product_first)?;
+        Ok(r1.pre.is_empty() && Self::mult_pt_add_fusable(sh, a, pt, acc, sub, product_first)?)
+    }
+
+    /// In place: `acc = acc + a * pt` (`sub`: `acc - a * pt`, or `a * pt - acc` when `product_first`), `mult_pt_add`
+    /// with out = y = acc (an add landing in its other operand's slot); the same words and output meta. Needs
+    /// `mult_pt_add_inplace_fusable`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_pt_add_inplace<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        sh: &Shadow,
+        acc: &mut Ct<'_, W>,
+        a: &Ct<'_, W>,
+        pt: &Pt<'_>,
+        sub: bool,
+        product_first: bool,
+    ) -> Result<()> {
+        if !Self::mult_pt_add_inplace_fusable(sh, &a.meta, &pt.meta, &acc.meta, sub, product_first)? {
+            return Err(shape("mult_pt_add_inplace", "a prelude on a, the plaintext or the add: run mult_pt then add"));
+        }
+        let (r1, r2) = Self::mac_recipes(sh, &a.meta, &pt.meta, &acc.meta, sub, product_first)?;
+        Self::check_k("mult_pt_add_inplace", acc.k(), a.k())?;
+        if a.meta.level != r1.out.level {
+            return Err(shape("mult_pt_add_inplace", format!("a at level {} but the product is at {}", a.meta.level, r1.out.level)));
+        }
+        let top = self.top(ctx.shape, &a.meta)?;
+        let y = acc.buf.r();
+        let m = MulTableArgs { out: acc.buf.w(), inp: a.buf.r(), t: pt.poly().base, pr: ctx.pr(), n: (top + 1) as i32, k: acc.k() as i32 };
+        let args = MulAddArgs { m, y, sub: if !sub { 0 } else if product_first { 2 } else { 1 }, pad: 0 };
+        // SAFETY: as in mult_pt_add; out == y is the element-wise in-place form (each thread reads before it writes)
+        launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, ex.compute.raw()) })?;
+        acc.meta = r2.out;
+        Ok(())
+    }
+
     /// `out[j] = i * a[j]`: the monomial X^{N/2} (level and degree kept; exact).
     pub fn mult_i<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut [Ct<'_, W>], a: &[&Ct<'_, W>]) -> Result<()> {
         lens("mult_i", out.len(), &[a.len()])?;
@@ -852,6 +1034,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
             acc: acc as i32,
             n: (top + 1) as i32,
             k: k as i32,
+            dbl: 0,
+            pad: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1 and d2[c] part 1, so
         // out aliasing an input is element-wise safe; rows 0..=top of k cts
@@ -861,8 +1045,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
 
     /// The tensor half of `a * b` (`b = None`: `a^2`) staged for relinearization: the recipe's preludes (A copied
     /// into `out` and adjusted there, B on a scratch copy), then `(c0, c1)` into `out` and d2 into `ex.ks.ext` part 1
-    /// plus its coefficient copy in `ex.bconv_work` (where `relin::relin_staged` expects it). Returns the live top
-    /// and the recipe; `out.meta` is left to the caller (the relinearized product takes `recipe.out`).
+    /// (where `relin::relin_staged` expects it). Returns the live top and the recipe; `out.meta` is left to the caller
+    /// (the relinearized product takes `recipe.out`).
     pub fn tensor_for_relin<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, a: &Ct<'_, W>, b: Option<&Ct<'_, W>>) -> Result<(usize, Recipe)> {
         let r = match b {
             Some(b) => sh.mult(&a.meta, &b.meta)?,
@@ -895,9 +1079,6 @@ impl<'a, W: DevWord> Ops<'a, W> {
             (None, None) => x,
         };
         let lay = ctx.lay;
-        if ex.bconv_work.len() < k * lay.poly_words() {
-            return Err(shape("mult", "coefficient workspace too small (MemPlan::bconv_work)"));
-        }
         let args = TensorArgs {
             out: out.buf.w(),
             d2: crate::ks::View::of(&ex.ks.ext, 0).r(),
@@ -905,17 +1086,19 @@ impl<'a, W: DevWord> Ops<'a, W> {
             b0: y,
             a1: x,
             b1: y,
-            coef: ex.bconv_work.vptr_mut(),
+            coef: std::ptr::null_mut(),
             coef_ct_stride: lay.poly_words() as u64,
             pr: ctx.pr(),
             npairs: 1,
             acc: 0,
             n: (top + 1) as i32,
             k: k as i32,
+            dbl: 0,
+            pad: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1, so out aliasing the A
-        // operand (it holds A's adjusted copy) is element-wise safe; ext / the coefficient workspace are distinct from
-        // out and the scratch copy of B; rows 0..=top of k cts
+        // operand (it holds A's adjusted copy) is element-wise safe; ext is distinct from out and the scratch copy of
+        // B; rows 0..=top of k cts
         launch_result("tensor", unsafe { (ctx.table.tensor)(&args, ex.compute.raw()) })?;
         Ok((top, r))
     }

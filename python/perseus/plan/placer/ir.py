@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# packtag::Field::Real (include/packing/pack_tag.h): the slots hold a real payload.
+# packtag::Field::Real / ::Complex (include/packing/pack_tag.h): the slots hold a real payload / a payload on each part.
 FIELD_REAL = 1
+FIELD_COMPLEX = 3
 
 # Table depth costs, in CKKS levels (x level_unit at use sites).
 DEPTH_COSTS: dict[str, int] = {
@@ -73,6 +74,13 @@ class Node:
     pack_period: int | None
     max_coeff_ac: float | None = None   # max_coeff with the DC (X^0) coefficient excluded
     pack_field: int = 0                 # packtag::Field of the slots (FIELD_REAL: a real payload)
+    # the smallest max_abs / max_coeff over the captured positions (a decode whose values shrink as the cache grows:
+    # a CF sized on the largest loses precision there); None = one position captured
+    max_abs_lo: float | None = None
+    max_coeff_lo: float | None = None
+    # the largest slot period over the captured positions (SM_PERIODIC=2: a per-key value's period grows with the cache,
+    # and its refresh moves to the route that period fills); None = one position captured
+    pack_period_max: int | None = None
     # derived, precomputed once
     cipher_inputs: tuple[str, ...] = ()
     hint_level: float | None = None
@@ -82,6 +90,8 @@ class Node:
     # a code's own (deliberate) dense refresh captured on the StC-first route: it lands where that route lands only
     # while its input stays within the StC-first entry (past it the runtime takes the shipped order)
     stc_first: bool = False
+    # a deliberate refresh that finishes an external op (a PCMM / CCMM: args.external): its inputs are that op's
+    external: bool = False
 
     @property
     def is_deliberate_bts(self) -> bool:
@@ -159,9 +169,17 @@ class Graph:
                 max_coeff_ac=(float(n["output_max_coeff_ac"])
                               if isinstance(n.get("output_max_coeff_ac"), (int, float)) else None),
                 pack_field=int(n.get("pack_field") or 0),
+                max_abs_lo=(float(n["output_max_abs_lo"])
+                            if isinstance(n.get("output_max_abs_lo"), (int, float)) else None),
+                max_coeff_lo=(float(n["output_max_coeff_lo"])
+                              if isinstance(n.get("output_max_coeff_lo"), (int, float)) else None),
+                pack_period_max=(int(n["pack_period_max"])
+                                 if isinstance(n.get("pack_period_max"), (int, float)) else None),
                 stc_first=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
                                and ((n.get("args") or {}).get("route") or {}).get("stc_first")
                                and not ((n.get("args") or {}).get("route") or {}).get("slots")),
+                external=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
+                              and (n.get("args") or {}).get("external")),
             ))
 
         for d in drafts:
@@ -271,5 +289,9 @@ def _node_to_raw(n: Node) -> dict:
         "output_max_coeff_ac": n.max_coeff_ac,
         "pack_period": n.pack_period,
         **({"pack_field": n.pack_field} if n.pack_field else {}),
+        **({"output_max_abs_lo": n.max_abs_lo} if n.max_abs_lo is not None else {}),
+        **({"output_max_coeff_lo": n.max_coeff_lo} if n.max_coeff_lo is not None else {}),
+        **({"pack_period_max": n.pack_period_max} if n.pack_period_max is not None else {}),
         **({"args": {"route": {"slots": 0, "stc_first": True}}} if n.stc_first else {}),
+        **({"args": {"external": "finish"}} if n.external else {}),
     }

@@ -690,7 +690,8 @@ fn bench(args: &[String]) -> Res<bool> {
     let level: u32 = arg(args, "--level").map(|s| s.parse()).transpose()?.unwrap_or(44);
     let kmax = 8usize;
     let t0 = Instant::now();
-    let chain = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (n32a4: the operands at limb 3 below the pair q3 q4, the split at limb 2)
+    let chain = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     let n = chain.n;
     let slots = n / 2;
     let mut setup = BtsSetup::n32_shipped();
@@ -704,7 +705,7 @@ fn bench(args: &[String]) -> Res<bool> {
     let cshape = pc_shadow::ChainShape { n_q: chain.q.len() as u32, unit: chain.level_unit as u32 };
     let land = BtsConfig::n32_shipped().landing(cshape, &Quirks::none(), &Route { cf: Some(cf.or(sf.cf_default).unwrap_or(13)), ..r }, level, 1)?;
     let s0 = ccmm::stage0_level(&CtMeta::new(land.level, land.deg), chain.level_unit as u32);
-    let high_shapes = vec![StcHighShape { out_level: 50, skip_mask: 1 }, StcHighShape { out_level: s0, skip_mask: 6 }];
+    let high_shapes = vec![StcHighShape { out_level: ccmm::operand_level(cshape.n_q), skip_mask: 1 }, StcHighShape { out_level: s0, skip_mask: 6 }];
     sf.high = Some(StcHighSetup { shapes: high_shapes.clone(), slots: 4 });
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
     let mut geoms: Vec<LtGeom> = Vec::new();
@@ -906,7 +907,7 @@ fn bench(args: &[String]) -> Res<bool> {
                     fresh(&mut qa[h], &mut ex, &va[8 * h..8 * h + 8], &mut prng)?;
                     fresh(&mut kb[h], &mut ex, &vb[8 * h..8 * h + 8], &mut prng)?;
                 }
-                let spec = StcHigh { slots: slots as u32, out_level: 50, factor: ($logf as f64).exp2(), skip_mask: 1, nf_ref: 0.0 };
+                let spec = StcHigh { slots: slots as u32, out_level: ccmm::operand_level(nq), factor: ($logf as f64).exp2(), skip_mask: 1, nf_ref: 0.0 };
                 let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
                 pc_gpu::bts::Staged::stc_high(&route, &mut cx, &mut qa, &spec)?;
                 pc_gpu::bts::Staged::stc_high(&route, &mut cx, &mut kb, &spec)?;
@@ -939,7 +940,10 @@ fn bench(args: &[String]) -> Res<bool> {
             tm.as_array().map(|x| (x * 100.0).round() / 100.0)
         );
         if bt {
-            t.add(&format!("ccmm {name} product >= 30 bits (Re {:.2}, Im {:.2})", bre.0, bim.0), (!(bre.0.min(bim.0) >= 30.0)) as usize, 1);
+            // a lean chain's last StC stage into the operands drops one 27-bit prime: its 65,536-coefficient diagonals
+            // keep ~21 bits, under SinCBoot's own ~15 (the outputs' gate below)
+            let need = if chain.lone_top().is_some() { 20.0 } else { 30.0 };
+            t.add(&format!("ccmm {name} product >= {need} bits (Re {:.2}, Im {:.2})", bre.0, bim.0), (!(bre.0.min(bim.0) >= need)) as usize, 1);
         }
         // SinCBoot: the scale the split asks for, set from the fitted product scale (ccmm.py c_unit's role)
         let nf_out = nf_split;
@@ -948,9 +952,7 @@ fn bench(args: &[String]) -> Res<bool> {
             // HalfBTS alone, its coefficient-domain output (4-limb CRT) vs the product, then stage 0
             {
                 let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
-                for x in qa.iter_mut() {
-                    leaf::set_scale(x, nf_out, 2);
-                }
+                ccmm::enter_split(&mut cx, &route, &mut qa, nf_out)?;
                 let mut call = pc_gpu::bts::staged::BtsCall::resume(pc_gpu::bts::staged::StagedRef::StcFirst(&route), st.clone(), pc_gpu::bts::staged::Phase::Split, Default::default());
                 call.at_split(&cx, &qa)?;
                 call.run_to(&mut cx, &mut qa, pc_gpu::bts::staged::Phase::Done)?;
@@ -1058,7 +1060,7 @@ fn bench(args: &[String]) -> Res<bool> {
                 fresh(&mut qa[h], &mut ex, &va[8 * h..8 * h + 8], &mut prng)?;
                 fresh(&mut kb[h], &mut ex, &vb[8 * h..8 * h + 8], &mut prng)?;
             }
-            let spec = StcHigh { slots: slots as u32, out_level: 50, factor: logf.exp2(), skip_mask: 1, nf_ref: 0.0 };
+            let spec = StcHigh { slots: slots as u32, out_level: ccmm::operand_level(nq), factor: logf.exp2(), skip_mask: 1, nf_ref: 0.0 };
             let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
             pc_gpu::bts::Staged::stc_high(&route, &mut cx, &mut qa, &spec)?;
             pc_gpu::bts::Staged::stc_high(&route, &mut cx, &mut kb, &spec)?;

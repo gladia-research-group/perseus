@@ -535,12 +535,16 @@ fn run(o: &Opts) -> Res<bool> {
     let mut dense_drops: BTreeSet<u32> = BTreeSet::new();
     let mut sparse: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     let mut spru_h: Option<u32> = None;
+    let mut spru_drops = 0u32;
     let mut real = false;
     let mut n_dense = 0usize;
     for s in &prog.bts_sites {
         let r = s.route;
         match pc_gpu::bts::RouteKind::of(&r, n) {
-            pc_gpu::bts::RouteKind::Spru { h, .. } => spru_h = Some(h),
+            pc_gpu::bts::RouteKind::Spru { h, .. } => {
+                spru_h = Some(h);
+                spru_drops |= 1 << r.raise_drop.min(31);
+            }
             pc_gpu::bts::RouteKind::Sparse(sl) => {
                 sparse.entry(sl).or_default().insert(r.raise_drop);
             }
@@ -575,7 +579,7 @@ fn run(o: &Opts) -> Res<bool> {
             })
         })
         .collect();
-    let spru_cfg = spru_h.map(|h| SpruCfg::new(h as usize));
+    let spru_cfg = spru_h.map(|h| SpruCfg { drops: spru_drops, ..SpruCfg::new(h as usize) });
     // every rotation key: the program's, the routes'
     let mut steps: BTreeSet<i64> = BTreeSet::new();
     let half = (n / 2) as i64;
@@ -623,6 +627,7 @@ fn run(o: &Opts) -> Res<bool> {
     PtStore::<W>::reserve(&mut mp, &pcfg);
     let (req, mut wshape) = splan.mem::<W>()?;
     req.reserve(&mut mp);
+    mp.reserve("bts.sparse", SparseBPrecomp::<W>::tails_bytes(&chain, &st_tables, &lay, &sb_cfgs)?);
     for c in &sb_cfgs {
         let (b, w) = SparseBPrecomp::<W>::bytes(&chain, &st_tables, &lay, c)?;
         mp.reserve("bts.sparse", b);
@@ -682,11 +687,12 @@ fn run(o: &Opts) -> Res<bool> {
     // routes
     let dense = splan.build(&arena, &dev, &ex.compute, &ctx, &keys, stage)?;
     let mut sbr: Vec<SparseBRoute<'_, W>> = vec![];
+    let sb_tails = SparseBPrecomp::<W>::tails(&arena, &ex.compute, &ctx, &keys, &sb_cfgs)?;
     for c in &sb_cfgs {
         let s = &ex.compute;
         let encaps = pc_gpu::bts::raise::EncapsKeys::new(&arena, s, n, keys.dense_to_sparse()?, keys.sparse_to_dense()?, stage)?;
         let pow2 = pc_gpu::bts::finish::Pow2::new(&arena, s, &ctx)?;
-        let pre = SparseBPrecomp::new(&arena, s, &ctx, c.clone(), &keys, stage)?;
+        let pre = SparseBPrecomp::new(&arena, s, &ctx, c.clone(), &keys, &sb_tails, stage)?;
         sbr.push(SparseBRoute { slots: c.slots, ring_n: n, variants: vec![pre], encaps, pow2, cf_default: 6, cf_window: (2, 20), deg: chain_deg(&ctx)?, ks_source: c.ks_source });
     }
     let mut prng = test_prng(0x7b);

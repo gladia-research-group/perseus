@@ -134,8 +134,8 @@ fn gpt2_prefill() {
 }
 
 #[test]
-fn gpt2_decode_ctx512() {
-    gate("gpt2_decode_ctx512", "gpt2_decode_ctx512");
+fn gpt2_decode_ctx1024() {
+    gate("gpt2_decode_ctx1024", "gpt2_decode_ctx1024");
 }
 
 #[test]

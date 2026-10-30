@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -9,6 +11,20 @@ from .ir import FIELD_REAL, Graph, is_kv_cache_read
 from .sim import PlannerShadow
 
 log = logging.getLogger(__name__)
+
+
+def mag_safety_of(step: str | None, base: float) -> float:
+    """The drift margin κ a site of `step` is sized with: `base` (PLAN_MAG_SAFETY), or the largest value of
+    PLAN_MAG_SAFETY_STEPS (`name:kappa,...`) whose `name` begins the full step name (`blk11.attn` covers blk11.attn and
+    blk11.attn.softmax; `tail` the tail), never below `base`. For the sites whose capture holds few independent values:
+    one position's (a prefill's last query and its tail) varies across prompts far more than a max over all of them."""
+    k = base
+    if step:
+        for kv in (os.environ.get("PLAN_MAG_SAFETY_STEPS") or "").split(","):
+            name, _, v = kv.partition(":")
+            if name.strip() and v.strip() and step.startswith(name.strip()):
+                k = max(k, float(v))
+    return k
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,8 @@ class RefreshPlanner:
     shadow: PlannerShadow | None = None
     #: dense refreshes of real-tagged slots take the real route (plan.real_route): priced on its real read
     real_route: bool = False
+    #: the drop each route runs at by default (PlanConfig.raise_drop_base): a site's emitted raise_drop is absolute
+    raise_drop_base: dict[int, int] = field(default_factory=dict)
     _cache: dict[str, RefreshSpec] = field(default_factory=dict)
     _warned_routes: set = field(default_factory=set)
 
@@ -128,6 +146,10 @@ class RefreshPlanner:
             return RefreshSpec(v, False, True, float("inf"),
                                reason="fresh graph input — never refreshable")
         route = self.route_for(v)
+        pol = self.policy
+        kappa = mag_safety_of(p.step if p is not None else None, pol.mag_safety)
+        if kappa != pol.mag_safety:
+            pol = dataclasses.replace(pol, mag_safety=kappa)
         site = dict(
             slot_mag=p.max_abs if p else None,
             period=p.pack_period if p else None,
@@ -136,10 +158,21 @@ class RefreshPlanner:
             mean=p.mean if p else None,
             residual_mag=p.max_dev if p else None,
             routes_avail=(route,) if route else (),
-            levels_free=1 if self.policy.allow_prescale else 0,
+            levels_free=1 if pol.allow_prescale else 0,
             real=bool(self.real_route and p is not None and p.pack_field == FIELD_REAL),
+            slot_mag_lo=p.max_abs_lo if p else None,
+            coeff_mag_lo=p.max_coeff_lo if p else None,
         )
-        choice = btserr.choose_site(self.table, self.policy, **site)
+        # PLAN_STEP_ROUTE_PRICING=1: a sparse site of a step whose route follows the cache length (a PLAN_STEP_LANDING
+        # step, SM_PERIODIC=2) runs on the bigger routes too once its value's period outgrows the planned one: its CF is
+        # priced on the worst of them the accuracy table measured
+        if route and p is not None and os.environ.get("PLAN_STEP_ROUTE_PRICING", "0") not in ("", "0") \
+                and _step_landing_floor(self.shadow.plan.get("plan.step_landing") or "", p.step) is not None:
+            # with the period range captured over several positions, only a value whose period outgrows the planned
+            # route moves, and only up to the route its largest period fills
+            pmax = p.pack_period_max
+            site["price_routes"] = tuple(r for r in self.table.routes() if r > route and (pmax is None or r <= pmax))
+        choice = btserr.choose_site(self.table, pol, **site)
         # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
         # shipped order's precision (plan.stc_first_mag_max, after the drift margin) bootstraps in the shipped order:
         # priced without the slim term, landed where that order lands (the Shadow's shipped-order dense landing,
@@ -153,14 +186,19 @@ class RefreshPlanner:
         _step_ok = True
         if _steps is not None and p is not None:
             _step_ok = (p.step or "").split(".")[-1] in {x.strip() for x in _steps.split(",") if x.strip()}
-        _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * self.policy.mag_safety > float(_mag_max)
-        if (self.policy.slim_cubic > 0 and not choice.route and sh.has_shipped and p is not None
-                and (_too_big or not _step_ok or force_shipped)):
+        _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * pol.mag_safety > float(_mag_max)
+        # PLAN_STC_FIRST_STAGED_ONLY=1: the runtime runs the StC-first order on the staged PCMM / CCMM finishes only
+        # (FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1, no FIDESLIB_BTS_STC_FIRST on the plan's runtime line): every refresh
+        # site of the plan bootstraps in the shipped order, so none takes the slim (slot) law; landed where that order
+        # lands when the recipe names it (plan.stc_first_fallback), else at the recipe's dense landing as before
+        _staged_only = os.environ.get("PLAN_STC_FIRST_STAGED_ONLY", "0") not in ("", "0")
+        if (pol.slim_cubic > 0 and not choice.route and p is not None
+                and (_staged_only or (sh.has_shipped and (_too_big or not _step_ok or force_shipped)))):
             import dataclasses as _dc
-            choice = btserr.choose_site(self.table, _dc.replace(self.policy, slim_cubic=0.0), **site)
+            choice = btserr.choose_site(self.table, _dc.replace(pol, slim_cubic=0.0), **site)
             shipped = not choice.route
         # one extra search, only for a site pinned at cf_max; the choice above is unchanged
-        clamped = btserr.ceiling_binds(self.table, self.policy, choice.cf, **site)
+        clamped = btserr.ceiling_binds(self.table, pol, choice.cf, **site)
 
         route_land = sh.landing(choice.route) if choice.route else None
         if route_land is not None:
@@ -180,6 +218,8 @@ class RefreshPlanner:
             # a landing deeper than the route's own is a level-aware (partial) ModRaise
             unit = float(self.graph.level_unit) or 1.0
             raise_drop = max(0, int(round((base - base_route) / unit)))
+            if raise_drop:
+                raise_drop += self.raise_drop_base.get(choice.route or 0, 0)
         else:
             base = base_route
         # plan.step_landing="softmax:32,...": refreshes in those steps are planned to land no shallower than that
@@ -188,7 +228,7 @@ class RefreshPlanner:
         if floor is not None:
             base = max(base, float(floor) - self.bootstrap_level)
         out_deg = self.out_deg
-        if shipped:
+        if shipped and sh.has_shipped:
             _lv, _dg = sh.shipped_landing()
             base, out_deg = float(_lv) - self.bootstrap_level, int(_dg)
         restore = float(self.graph.level_unit) if choice.prescale is not None else 0.0

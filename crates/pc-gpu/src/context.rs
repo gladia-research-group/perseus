@@ -43,7 +43,7 @@ impl DevStrategy<u16> for Barrett32 {
 }
 
 /// NTT tables by prime id (`NttArgs` layout): `fw[id*N + i] = psi^brev(i)`, `iw` the inverse powers, `*s` the
-/// Shoup companions at W, `ninv[id] = N^-1 mod p`.
+/// Shoup companions at W, `ninv[id] = N^-1 mod p`; `lazy`: u32 words and every prime below 2^30 (`NttArgs::lazy`).
 pub struct NttTables<'a, W: DevWord> {
     pub fw: ConstBuf<'a, W>,
     pub fws: ConstBuf<'a, W>,
@@ -51,6 +51,7 @@ pub struct NttTables<'a, W: DevWord> {
     pub iws: ConstBuf<'a, W>,
     pub ninv: ConstBuf<'a, W>,
     pub ninvs: ConstBuf<'a, W>,
+    pub lazy: bool,
 }
 
 /// Per-prime-id scalar table with its Shoup companion (`v[id]`, `s[id]`), the form `EwArgs::sc/scs`,
@@ -82,11 +83,14 @@ fn shoup_pairs<W: DevWord>(primes: &[u64], vals: &[u64]) -> (Vec<W>, Vec<W>) {
         .unzip()
 }
 
-/// ModDown / ModUp scalars by prime id (Q ids; special ids hold 0): `P mod q_i`, `P^-1 mod q_i`. The bconv job
-/// tables themselves depend on buffer offsets and are built by their users (`bconv::BconvPlan`).
+/// ModDown / ModUp scalars by prime id (Q ids; special ids hold 0): `P mod q_i`, `P^-1 mod q_i`, and the same for P'
+/// = the first `Chain::p_sparse` special primes (the bottom-shape keys' modulus; P itself but on a lean chain). The
+/// bconv job tables themselves depend on buffer offsets and are built by their users (`bconv::BconvPlan`).
 pub struct KsScalars<'a, W: DevWord> {
     pub p_mod_q: ScalarTable<'a, W>,
     pub p_inv_mod_q: ScalarTable<'a, W>,
+    pub ps_mod_q: ScalarTable<'a, W>,
+    pub ps_inv_mod_q: ScalarTable<'a, W>,
 }
 
 /// Device context of a chain for words `W` and ModMul strategy `M`.
@@ -120,7 +124,7 @@ impl ConstCounts {
         let np = lay.rows();
         let mut w_tables = vec![np * lay.n; 4]; // fw fws iw iws
         w_tables.extend([np, np]); // ninv ninvs
-        w_tables.extend([np; 4]); // ks scalars (2 tables x value/shoup)
+        w_tables.extend([np; 8]); // ks scalars (P and P': 2 tables x value/shoup each)
         ConstCounts { primes: np, w_tables, row_entries: RowTables::entries(lay, k_max) }
     }
     pub fn bytes<W>(&self) -> usize {
@@ -200,6 +204,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
             iws: ConstBuf::new(arena, "ctx.ntt.iws", s, &cat(|t| &t.3))?,
             ninv: ConstBuf::new(arena, "ctx.ntt.ninv", s, &ninv)?,
             ninvs: ConstBuf::new(arena, "ctx.ntt.ninvs", s, &ninvs)?,
+            lazy: W::BITS == 32 && primes_v.iter().all(|&p| p < 1 << 30),
         };
         drop(per_prime);
 
@@ -211,9 +216,16 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
         pmq.resize(lay.rows(), 0);
         pimq.resize(lay.rows(), 0);
         debug_assert!(nq <= pmq.len());
+        let ps = &chain.p[..chain.p_sparse];
+        let mut psmq: Vec<u64> = chain.q.iter().map(|&qi| ps.iter().fold(1u64 % qi, |a, &x| pc_core::modmul::mulmod(a, x % qi, qi))).collect();
+        let mut psimq: Vec<u64> = psmq.iter().zip(&chain.q).map(|(&x, &qi)| invmod(x, qi)).collect();
+        psmq.resize(lay.rows(), 0);
+        psimq.resize(lay.rows(), 0);
         let ks = KsScalars {
             p_mod_q: ScalarTable::new(arena, "ctx.ks.p_mod_q", s, &primes_v, &pmq)?,
             p_inv_mod_q: ScalarTable::new(arena, "ctx.ks.p_inv_mod_q", s, &primes_v, &pimq)?,
+            ps_mod_q: ScalarTable::new(arena, "ctx.ks.ps_mod_q", s, &primes_v, &psmq)?,
+            ps_inv_mod_q: ScalarTable::new(arena, "ctx.ks.ps_inv_mod_q", s, &primes_v, &psimq)?,
         };
         s.sync()?;
         Ok(Context { chain, scale, shape, lay, table, primes, ntt, rows, ks, k_max: plan.cfg.k_max, _m: PhantomData })

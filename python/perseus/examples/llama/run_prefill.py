@@ -116,6 +116,8 @@ def _planned(a, model, toks, gt, ref, results=None):
               f"{host:.2f}s, served {''.join(i['served'][0] for i in info)}, free {frees[-1]} GB"
               + (f", per block {min(fr)}..{max(fr)} GB" if fr else ""), flush=True)
     wall = sorted(walls)[len(walls) // 2]
+    if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+        run.verify_graphs()     # graph replay vs eager on one encryption, every block's output compared
     for b, (err, mx) in sorted(errs.items()):
         print(f"[llama-prefill] block {b} maxerr={err.max():.3g} (pos {int(err.argmax()) + 1}) |x|={mx:.3g}", flush=True)
     if a.tap_block is not None:
@@ -123,9 +125,14 @@ def _planned(a, model, toks, gt, ref, results=None):
             print(f"[tap] blk{a.tap_block} #{i} {nm}: rel err {rel:.3g} ({np.log2(1 / max(rel, 1e-300)):.1f} bits) "
                   f"max|x| {mx:.4g} device {mdev:.4g}", flush=True)
     out = {"wall": wall}
+    n_rep = a.tokens
     if gt is not None and model.n_layers == int(model.w.store.config["num_hidden_layers"]):
         hid = run.hidden()[:a.tokens]
-        rows_, s = report(plain_logits(model, hid), gt[1:a.tokens + 1])
+        # PF_LAST_QUERY: the last position alone is computed past the last block's K / V
+        from perseus.impl.prefill import Chunks
+        lo = len(hid) - 1 if model.last_position(Chunks(len(hid), model.blocks.t)) is not None else 0
+        n_rep = len(hid) - lo
+        rows_, s = report(plain_logits(model, hid[lo:]), gt[1 + lo:1 + len(hid)])
         out.update(s)
         print("[llama-prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows_), flush=True)
     st = run.sess.pcmm_stats()
@@ -134,7 +141,7 @@ def _planned(a, model, toks, gt, ref, results=None):
           f"missing={st.get('missing')}; [ccmm] calls={cst.get('calls')} keygen={cst.get('keygen_s', 0):.1f}s; "
           f"planned {run.sess.planned_stats()}", flush=True)
     print(f"[llama-prefill] SUMMARY T={a.tokens} wall={wall:.2f}s per_token={wall / a.tokens:.3f}s "
-          f"bts={n_bts + n_fin[1]} top1={out.get('top1')}/{a.tokens} medianKL={out.get('medianKL', float('nan')):.4g} "
+          f"bts={n_bts + n_fin[1]} top1={out.get('top1')}/{n_rep} medianKL={out.get('medianKL', float('nan')):.4g} "
           f"maxKL={out.get('maxKL', float('nan')):.4g} free={frees}GB (setup {free0:.2f}) "
           f"walls={[round(w, 2) for w in walls]}", flush=True)
     if results is not None:
@@ -395,11 +402,16 @@ def main(argv=None, results=None):
         print(f"[ccmm] calls={ce.calls} cap={ce.cap} land={ce.land} in={ce.t_in:.2f}s mm={ce.t_mm:.2f}s "
               f"out={ce.t_out:.2f}s C++ ms " + " ".join(f"{v:.0f}" for v in ce.times), flush=True)
     out = {}
+    n_rep = a.tokens
     if model.n_layers == int(store.config["num_hidden_layers"]) and gt is not None:
-        rows, out = report(plain_logits(model, model.hidden_rows(Xs, ch) if hid is None else hid), gt[1:a.tokens + 1])
+        from perseus.impl.prefill import Chunks
+        h = model.hidden_rows(Xs, ch) if hid is None else hid
+        lo = len(h) - 1 if model.last_position(Chunks(len(h), model.blocks.t)) is not None else 0   # PF_LAST_QUERY
+        n_rep = len(h) - lo
+        rows, out = report(plain_logits(model, h[lo:]), gt[1 + lo:1 + len(h)])
         print("[llama-prefill] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows), flush=True)
     print(f"[llama-prefill] SUMMARY T={a.tokens} wall={wall:.1f}s per_token={wall / a.tokens:.3f}s "
-          f"bts={int(inf.fhe.total_bootstraps)} top1={out.get('top1')}/{a.tokens} "
+          f"bts={int(inf.fhe.total_bootstraps)} top1={out.get('top1')}/{n_rep} "
           f"medianKL={out.get('medianKL', float('nan')):.4g} maxKL={out.get('maxKL', float('nan')):.4g} "
           f"free={rec.get('free_gb')}GB", flush=True)
     if a.profile and hasattr(model.rt.ops, "report"):

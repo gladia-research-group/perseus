@@ -3,7 +3,7 @@
 //!   pc-bench bts|bts-prec --route dense|1|256|512 [--classic --route 8192] [--k ..] [--cf ..] [--real]
 //!       device ms per call/ciphertext (CUDA events, median of `reps` after 2 warm-ups) | precision on random real
 //!       payloads: bits = -log2(max |out - in| / A) (the bts_accuracy_sweep methodology; `--old` adds the reference row)
-//!   pc-bench ccmm|pcmm|stcf|stcf-prec|stc-high|replay|modmul ...   (src/check_*.rs, bts_*.rs, replay_g0.rs, word_seam.rs)
+//!   pc-bench ccmm|pcmm|stcf|stcf-prec|stcf-pair|stc-high|replay|modmul ...   (src/check_*.rs, bts_*.rs, replay_g0.rs, word_seam.rs)
 //!
 //! Keys: a fresh secret (dense ternary + sparse h=32), every CtS/StC rotation, conjugation, relinearization and both
 //! encapsulation keys generated on the device (dense layout with resident `a`). Full usage: docs/ARCHITECTURE.md.
@@ -105,7 +105,8 @@ fn parse(a: &[String]) -> Res<Args> {
         graph: false,
         level: 44,
         mean: 0.0,
-        chain: "n32".into(),
+        // PC_BENCH_CHAIN: the default chain preset (bts-prec --all runs this harness without --chain)
+        chain: std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()),
         cts_alt: 0,
     };
     let mut i = 1;
@@ -204,8 +205,9 @@ fn old_err(doc: &Option<serde_json::Value>, cf: u32, amp: f64) -> Option<f64> {
 fn run(a: Args) -> Res<()> {
     match a.chain.as_str() {
         "n32" => run_t::<W, M>(a, ChainSpec::n32(), BtsSetup::n32_shipped()),
+        "n32a4" => run_t::<W, M>(a, ChainSpec::n32a4(), BtsSetup::n32_shipped()),
         "n64" => run_t::<u64, Barrett64>(a, ChainSpec::n64(), BtsSetup::n64()),
-        c => Err(format!("--chain {c}: n32 | n64").into()),
+        c => Err(format!("--chain {c}: n32 | n32a4 | n64").into()),
     }
 }
 
@@ -576,7 +578,8 @@ fn modmul(a: &[String]) -> Res<bool> {
         }
         i += 2;
     }
-    let n32 = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (n32a4, the shipped plans' lean chain)
+    let n32 = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     // interleaved twice (B64, B32, Mont, B64, B32, Mont): the box is noisy, the table keeps the per-op minimum
     let mut runs: Vec<(&str, word_seam::RigOut)> = Vec::new();
     for _round in 0..2 {
@@ -667,7 +670,7 @@ fn main() -> ExitCode {
         };
     }
     // the StC-first route, stc_high (src/bts_stc_first.rs)
-    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stc-high")) {
+    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stcf-pair" | "stc-high")) {
         return bts_stc_first::cmd(bts_stc_first::Mode::Bench, &args);
     }
     match parse(&args).and_then(run) {

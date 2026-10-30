@@ -213,7 +213,7 @@ fn run_dump_with(file: &str, quirks: &Quirks, verbose: bool) -> Option<(usize, u
 /// Plan-free runs of the dumped sim.py land a fired hint without a landing spec at (bootstrap level, deg 2); the
 /// rules realize it (deg 1, one level deeper). Nodes downstream of such a hint differ, per dump (planned runs pin
 /// every hint's landing: 0 there).
-const BARE_HINT_LANDINGS: (usize, usize, usize, usize) = (480, 12, 4, 4);
+const BARE_HINT_LANDINGS: (usize, usize, usize, usize) = (48, 56, 33, 32);
 
 #[test]
 fn gpt2_decode() {

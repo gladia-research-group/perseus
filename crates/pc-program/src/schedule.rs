@@ -1,15 +1,15 @@
 //! `schedule`: which lane each step of a bound block runs on (1 compute + side lanes, events at joins). The
 //! compiler knows the DAG: steps off the block's critical path (under a static cost model: refreshes and key
 //! switches dominate) go to the side lane, everything on it stays on compute. Refreshes, finishes,
-//! streamed-weight sums, dynamic steps and steps using the block's scratch slot always run on compute (their
-//! workspaces are compute's).
+//! streamed-weight sums, units (grids, K-batches), dynamic steps and steps using the block's scratch slot always run on compute
+//! (their workspaces are compute's); a fused plaintext product and add (no gather buffer) may run on the side lane.
 //!
 //! Correctness does not depend on the heuristic: every slot hazard between the lanes (read after write, write after
 //! read, write after write) becomes one event wait on the latest conflicting step of the other lane (stream order
 //! covers the earlier ones). Hazards are tracked per region (the steps between two dynamic steps): the replay forks
 //! the side lane from compute at a region's first side step and joins it back at the region's end, so a captured
 //! segment's graph holds the fork / join and never waits on an event of another capture.
-use crate::bind::{Bound, Step, StepOp, NONE};
+use crate::bind::{Bound, Step, StepOp, UnitKind, NONE};
 use pc_gpu::DevWord;
 use std::collections::BTreeSet;
 
@@ -42,7 +42,7 @@ fn cost(st: &Step, lists: &[Vec<i64>]) -> f64 {
 }
 
 /// Slots a step reads and writes (finishes: their own lists).
-fn rw<W: DevWord>(b: &Bound<'_, W>, st: &Step) -> (Vec<u32>, Vec<u32>) {
+pub(crate) fn rw<W: DevWord>(b: &Bound<'_, W>, st: &Step) -> (Vec<u32>, Vec<u32>) {
     if let StepOp::Finish { f } = &st.op {
         if let Some(fs) = b.finishes.get(*f as usize) {
             return (fs.ins.clone(), fs.outs.clone());
@@ -103,17 +103,26 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
             }
         }
     }
-    let lane: Vec<u8> = (0..n)
+    let mut lane: Vec<u8> = (0..n)
         .map(|i| {
             let st = &b.steps[i];
             let on_cp = fin[i] + tail[i] >= total_cp - 1e-6;
-            if on_cp || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
+            // a unit issues all its steps at once, on compute (its gather buffers are compute's); a product-add pair on
+            // one lane, compute when either step is held there
+            let unit = b.unit_of.get(i).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]);
+            let gathers = unit.is_some_and(|u| !matches!(u.kind, UnitKind::MultPtAdd { .. }));
+            if on_cp || gathers || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
                 0
             } else {
                 1
             }
         })
         .collect();
+    for u in b.units.iter().filter(|u| matches!(u.kind, UnitKind::MultPtAdd { .. })) {
+        let (lo, hi) = (u.lo as usize, u.hi as usize);
+        let l = lane[lo..hi].iter().copied().min().unwrap_or(0);
+        lane[lo..hi].iter_mut().for_each(|x| *x = l);
+    }
     // hazards per region: last writer and the latest reader per lane of every slot since its last write
     let mut wait = vec![NONE; n];
     let mut signal = vec![false; n];

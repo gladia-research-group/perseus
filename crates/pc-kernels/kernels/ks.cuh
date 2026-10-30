@@ -93,14 +93,18 @@ __global__ void __launch_bounds__(BX) ks_dot(KsArgs A) {
         for (int c = 0; c < KMAX; ++c) {
             if (c < A.K) {
                 W r0 = MM::reduce(s0[c], q);
-                const W r1 = MM::reduce(s1[c], q);
-                if (A.c0_mode == 1) {
+                W r1 = MM::reduce(s1[c], q);
+                if ((A.c0_mode & 3) == 1) {
                     if ((int)t < A.nq)
                         r0 = add<W>(r0, mul_shoup<W>(c0[c * A.ct_stride + roff], ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
-                } else if (A.c0_mode == 2) {
+                } else if ((A.c0_mode & 3) == 2) {
                     r0 = add<W>(r0, c0[c * A.ct_stride + roff], p);
                 }
                 const size_t ob = c * A.out_ct_stride + r * A.out_rot_stride + (size_t)t * N + o;
+                if (A.c0_mode & KS_ACC) {
+                    r0 = add<W>(r0, ((const W*)A.out0)[ob], p);
+                    r1 = add<W>(r1, ((const W*)A.out1)[ob], p);
+                }
                 ((W*)A.out0)[ob] = r0;
                 ((W*)A.out1)[ob] = r1;
             }
@@ -165,6 +169,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
                 const W bi = ((const W*)E.binv)[t], bis = ((const W*)E.binvs)[t];
                 const W* kp = (const W*)E.k;
                 const W kk = kp ? (kp[t] >= p ? (W)(kp[t] - p) : kp[t]) : (W)0;
+                const W* al = (const W*)E.alpha;
+                const W ai = al ? al[t] : (W)0, ais = al ? ((const W*)E.alphas)[t] : (W)0;
 #pragma unroll
                 for (int part = 0; part < 2; ++part) {
                     W* dp = (W*)E.dst + ob + part * E.part_stride;
@@ -175,7 +181,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
 #pragma unroll
                     for (int w = 0; w < 4; ++w) {
                         const W x = part ? r1[w] : r0[w];
-                        W r = add<W>(dv.v[w], mul_shoup<W>(sub<W>(x, cv.v[w], p), bi, bis, p), p);
+                        const W d = al ? mul_shoup<W>(dv.v[w], ai, ais, p) : dv.v[w];
+                        W r = add<W>(d, mul_shoup<W>(sub<W>(x, cv.v[w], p), bi, bis, p), p);
                         if (E.dbl) r = add<W>(r, r, p);
                         if (part == 0) r = add<W>(r, kk, p);
                         if (G.add) r = add<W>(r, av.v[w], p);
@@ -192,7 +199,8 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
 }
 
 // ks_dot with the keys read through KeyTab: `a` regenerated (cooperative ChaCha over 4-lane groups at u32, each lane
-// 4 consecutive slots), `b` dense or packed in the key's slot order; outputs as ks_dot (automorphism, c0 modes).
+// 4 consecutive slots), `b` dense or packed in the key's slot order; outputs as ks_dot (automorphism, c0 modes). K = 1
+// at u32 runs ks_dot_seg instead (below).
 template <class W, class MM, int KMAX, bool PACKED>
 __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
     using Wd = WideOf<W>;
@@ -243,19 +251,23 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
         for (int c = 0; c < KMAX; ++c) {
             if (c < A.K) {
                 V4<W> c04{};
-                if (A.c0_mode != 0) c04 = load4<W>((const W*)A.c0 + c * A.ct_stride + roff);
+                if (A.c0_mode & 3) c04 = load4<W>((const W*)A.c0 + c * A.ct_stride + roff);
 #pragma unroll
                 for (int w = 0; w < 4; ++w) {
                     W r0 = MM::reduce(s0[c][w], q);
-                    const W r1 = MM::reduce(s1[c][w], q);
-                    if (A.c0_mode == 1) {
+                    W r1 = MM::reduce(s1[c][w], q);
+                    if ((A.c0_mode & 3) == 1) {
                         if ((int)t < A.nq) r0 = add<W>(r0, mul_shoup<W>(c04.v[w], ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
-                    } else if (A.c0_mode == 2) {
+                    } else if ((A.c0_mode & 3) == 2) {
                         r0 = add<W>(r0, c04.v[w], p);
                     }
                     const uint32_t i = (uint32_t)base + w;
                     const uint32_t o = k == 1 ? i : automorph_slot(k, i);
                     const size_t ob = c * A.out_ct_stride + r * A.out_rot_stride + (size_t)t * N + o;
+                    if (A.c0_mode & KS_ACC) {
+                        r0 = add<W>(r0, ((const W*)A.out0)[ob], p);
+                        r1 = add<W>(r1, ((const W*)A.out1)[ob], p);
+                    }
                     ((W*)A.out0)[ob] = r0;
                     ((W*)A.out1)[ob] = r1;
                 }
@@ -264,12 +276,118 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
     }
 }
 
+// ks_dot_key at K = 1 (u32) on warp-sized row segments: a warp owns slots R * 256.. of row t, 8 consecutive per lane.
+// Its lanes expand `a` one 16-slot ChaCha block per thread (two digits per pass, through shared memory), and the
+// automorphism maps the segment onto one segment (in the bit-reversed order a slot's segment decides its image's), so
+// the outputs are permuted inside the warp.
+template <class MM, bool PACKED>
+__global__ void __launch_bounds__(256) ks_dot_seg(KsKeyArgs G) {
+    using W = uint32_t;
+    using Wd = WideOf<W>;
+    __shared__ W sa[8][2][264];
+    __shared__ W so[8][264];
+    const KsArgs& A = G.ks;
+    const KeyTab& T = G.key;
+    const uint32_t t = A.rows[blockIdx.y];
+    const PrimeConst& q = A.pr[t];
+    const W p = (W)q.p;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const uint32_t R = blockIdx.x * 8 + wp;
+    const uint32_t base = R * 256 + 8 * lane;
+    const int dt = (int)t < A.nq ? A.digit_of[t] : -1;
+    const size_t roff = (size_t)t * N + base;
+    const int slot = kskey::slot_of(T, (int)t, A.nq);
+    const int nreg = min(A.ndig, T.nregen);
+    auto pad = [](int e) { return e + (e >> 5); };
+    for (int r = 0; r < A.R; ++r) {
+        Wd s0[8], s1[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) s0[u] = s1[u] = 0;
+        const void* kb = T.kb[r];
+        uint32_t key[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) key[i] = __ldg(T.seed[r] + i);
+        for (int d = 0; d < A.ndig; ++d) {
+            if ((d & 1) == 0 && d < nreg) {
+                // digits d, d + 1: lanes 0-15 / 16-31 expand the segment's 16 blocks of one digit each
+                const int dd = d + (lane >> 4);
+                __syncwarp();
+                if (dd < nreg) {
+                    uint32_t v[16];
+                    chacha::regen_block16(key, R * 16 + (lane & 15), (uint32_t)dd, p, N >> 4, chacha::TAG_KSKA, v);
+#pragma unroll
+                    for (int k = 0; k < 16; ++k) sa[wp][lane >> 4][pad(16 * (lane & 15) + k)] = v[k];
+                }
+                __syncwarp();
+            }
+            W a[8];
+            if (d < nreg) {
+#pragma unroll
+                for (int u = 0; u < 8; ++u) a[u] = sa[wp][d & 1][pad(8 * lane + u)];
+            } else {  // resident dense `a` (full layout, prime-id rows)
+                const W* ka = (const W*)A.ka[r] + d * A.key_digit_stride + roff;
+                const V4<W> a0 = ldg4<W>(ka), a1 = ldg4<W>(ka + 4);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) a[u] = a0.v[u], a[4 + u] = a1.v[u];
+            }
+            const size_t brow = (size_t)d * T.srows + slot;
+            const V4<W> b0 = kskey::b_at4<W, PACKED>(T, kb, brow, base), b1 = kskey::b_at4<W, PACKED>(T, kb, brow, base + 4);
+            const W* xp = (d == dt) ? (const W*)A.c1 + roff : (const W*)A.modup + d * A.mu_digit_stride + roff;
+            const V4<W> x0 = load4<W>(xp), x1 = load4<W>(xp + 4);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                s0[u] += (Wd)x0.v[u] * b0.v[u];
+                s0[4 + u] += (Wd)x1.v[u] * b1.v[u];
+                s1[u] += (Wd)x0.v[u] * a[u];
+                s1[4 + u] += (Wd)x1.v[u] * a[4 + u];
+            }
+        }
+        W r0[8], r1[8];
+        V4<W> c0[2] = {};
+        if (A.c0_mode & 3) c0[0] = load4<W>((const W*)A.c0 + roff), c0[1] = load4<W>((const W*)A.c0 + roff + 4);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            r0[u] = MM::reduce(s0[u], q);
+            r1[u] = MM::reduce(s1[u], q);
+            const W cv = c0[u >> 2].v[u & 3];
+            if ((A.c0_mode & 3) == 1) {
+                if ((int)t < A.nq) r0[u] = add<W>(r0[u], mul_shoup<W>(cv, ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
+            } else if ((A.c0_mode & 3) == 2) {
+                r0[u] = add<W>(r0[u], cv, p);
+            }
+        }
+        const uint32_t k = A.autok[r];
+        uint32_t o[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) o[u] = k == 1 ? base + u : automorph_slot(k, base + u);
+        const uint32_t R2 = o[0] >> 8;
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            __syncwarp();
+#pragma unroll
+            for (int u = 0; u < 8; ++u) so[wp][pad(o[u] & 255)] = part ? r1[u] : r0[u];
+            __syncwarp();
+            W x[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) x[u] = so[wp][pad(8 * lane + u)];
+            W* g = (W*)(part ? A.out1 : A.out0) + r * A.out_rot_stride + (size_t)t * N + R2 * 256 + 8 * lane;
+            if (A.c0_mode & KS_ACC) {
+                const V4<W> y0 = load4<W>(g), y1 = load4<W>(g + 4);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) x[u] = add<W>(x[u], y0.v[u], p), x[4 + u] = add<W>(x[4 + u], y1.v[u], p);
+            }
+            store4<W>(g, x[0], x[1], x[2], x[3]);
+            store4<W>(g + 4, x[4], x[5], x[6], x[7]);
+        }
+    }
+}
+
 template <class W, class MM>
 __global__ void ksk_expand(KskExpandArgs A) {
     const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
-    const int m = blockIdx.y, d = blockIdx.z;
+    const int m = blockIdx.y, d = A.d0 + (int)blockIdx.z;
     const PrimeConst& c = A.pr[A.prime_ids[m]];
-    ((W*)A.out)[((size_t)d * A.nmod + m) * N + slot] = chacha::expand_slot<W, MM>(A.seed, slot, (uint32_t)d, c, chacha::TAG_KSKA);
+    ((W*)A.out)[((size_t)blockIdx.z * A.nmod + m) * N + slot] = chacha::expand_slot<W, MM>(A.seed, slot, (uint32_t)d, c, chacha::TAG_KSKA);
 }
 
 template <class W, class MM>
@@ -310,6 +428,12 @@ template <class W, class MM, bool PACKED>
 int key_k(const KsKeyArgs* a, cudaStream_t s) {
     dim3 grid(N / (BX * 4), a->ks.nrows);
     const int K = a->ks.K;
+    if constexpr (sizeof(W) == 4) {
+        if (K == 1) {
+            ks_dot_seg<MM, PACKED><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
+            return (int)cudaGetLastError();
+        }
+    }
     if (K <= 1) ks_dot_key<W, MM, 1, PACKED><<<grid, BX, 0, s>>>(*a);
     else if (K <= 2) ks_dot_key<W, MM, 2, PACKED><<<grid, BX, 0, s>>>(*a);
     else if (K <= 4) ks_dot_key<W, MM, 4, PACKED><<<grid, BX, 0, s>>>(*a);
@@ -323,7 +447,8 @@ int key_l(const KsKeyArgs* a, cudaStream_t s) {
 }
 template <class W, class MM>
 int expand_l(const KskExpandArgs* a, cudaStream_t s) {
-    ksk_expand<W, MM><<<dim3(N / 128, a->nmod, a->dnum), 128, 0, s>>>(*a);
+    if (a->d0 < 0 || a->d0 >= a->dnum) return -1;
+    ksk_expand<W, MM><<<dim3(N / 128, a->nmod, a->dnum - a->d0), 128, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 }  // namespace ks

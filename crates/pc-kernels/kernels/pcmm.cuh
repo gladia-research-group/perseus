@@ -40,41 +40,53 @@ __device__ __forceinline__ uint32_t smod(int64_t c, uint32_t p) {
 
 // ── ciphertext-facing ops (word W) ──────────────────────────────────────────────────────────────────────────────
 
+// The split's limbs (i4): 4 (q0..q3: the StC-first split of a composite chain) or 3 (q0..q2: a lean chain's); the
+// staging keeps 4 rows per part either way.
+__device__ __forceinline__ int split_limbs(const PcmmArgs& A) {
+    return A.i4 ? A.i4 : 4;
+}
 // staging [part][4][N] <- ct member c (staging part 0 = c1 = "a", part 1 = c0 = "b", FIDESlib's x order)
 template <class W>
 __global__ void gather_k(PcmmArgs A) {
     const int k = blockIdx.x * BX + threadIdx.x;
-    const int row = blockIdx.y;  // part * 4 + limb
+    const int ns = split_limbs(A);
+    const int row = blockIdx.y;  // part * ns + limb
     if (k >= N) return;
-    const int sp = row / 4, l = row % 4;
+    const int sp = row / ns, l = row % ns;
     const W* src = (const W*)A.ct.base + (size_t)A.i0 * A.ct.ct_stride + (size_t)(1 - sp) * A.ct.part_stride + (size_t)l * N;
-    ((W*)A.x)[(size_t)row * N + k] = src[k];
+    ((W*)A.x)[(size_t)(sp * 4 + l) * N + k] = src[k];
 }
 template <class W>
 __global__ void scatter_k(PcmmArgs A) {
     const int k = blockIdx.x * BX + threadIdx.x;
+    const int ns = split_limbs(A);
     const int row = blockIdx.y;
     if (k >= N) return;
-    const int sp = row / 4, l = row % 4;
+    const int sp = row / ns, l = row % ns;
     W* dst = (W*)A.ct.base + (size_t)A.i0 * A.ct.ct_stride + (size_t)(1 - sp) * A.ct.part_stride + (size_t)l * N;
-    dst[k] = ((const W*)A.y)[(size_t)row * N + k];
+    dst[k] = ((const W*)A.y)[(size_t)(sp * 4 + l) * N + k];
 }
-// exact rescale of the coefficient-form staging by q3 then q2 (FIDESlib Pcmm.cu rescaleTop twice): x[part][2][N] u32
+// exact rescale of the coefficient-form staging down to q0, q1 (FIDESlib Pcmm.cu rescaleTop: by q3 then q2 on 4 limbs,
+// by q2 on 3): x[part][2][N] u32
 template <class W>
 __global__ void in_rescale_k(PcmmArgs A) {
     const int k = blockIdx.x * BX + threadIdx.x;
     const int part = blockIdx.y;
     if (k >= N) return;
     const W* y = (const W*)A.y + (size_t)part * 4 * N;
+    const int ns = split_limbs(A);
     uint32_t v[4];
-    for (int i = 0; i < 4; ++i) v[i] = (uint32_t)y[(size_t)i * N + k];
-    const int64_t c3 = centered(v[3], A.p[3]);
-    for (int i = 0; i < 3; ++i) v[i] = mulm(subm(v[i], smod(c3, A.p[i]), A.p[i]), A.c[i], A.p[i], A.mu[i]);
+    for (int i = 0; i < ns; ++i) v[i] = (uint32_t)y[(size_t)i * N + k];
+    if (ns == 4) {
+        const int64_t c3 = centered(v[3], A.p[3]);
+        for (int i = 0; i < 3; ++i) v[i] = mulm(subm(v[i], smod(c3, A.p[i]), A.p[i]), A.c[i], A.p[i], A.mu[i]);
+    }
     const int64_t c2 = centered(v[2], A.p[2]);
     uint32_t* x = (uint32_t*)A.x + (size_t)part * 2 * N;
     for (int i = 0; i < 2; ++i) x[(size_t)i * N + k] = mulm(subm(v[i], smod(c2, A.p[i]), A.p[i]), A.c[3 + i], A.p[i], A.mu[i]);
 }
-// one part of the output: limb i < 2 = f[i] * lift[i] mod q_i, limbs 2, 3 = 0 (staging [4][N], coefficient form)
+// one part of the output: limb i < 2 = f[i] * lift[i] mod q_i, the split's other limbs 0 (staging [4][N], coefficient
+// form; grid rows = the split's limbs)
 template <class W>
 __global__ void lift_k(PcmmArgs A) {
     const int k = blockIdx.x * BX + threadIdx.x;
@@ -353,16 +365,20 @@ int launch(const PcmmArgs* a, cudaStream_t s) {
     const int n = A.n;
     switch (A.op) {
         case PCMM_GATHER:
-            gather_k<W><<<dim3(blocks(N), 8), BX, 0, s>>>(A);
+            if (A.i4 != 0 && A.i4 != 3 && A.i4 != 4) return -1;
+            gather_k<W><<<dim3(blocks(N), 2 * (A.i4 ? A.i4 : 4)), BX, 0, s>>>(A);
             break;
         case PCMM_SCATTER:
-            scatter_k<W><<<dim3(blocks(N), 8), BX, 0, s>>>(A);
+            if (A.i4 != 0 && A.i4 != 3 && A.i4 != 4) return -1;
+            scatter_k<W><<<dim3(blocks(N), 2 * (A.i4 ? A.i4 : 4)), BX, 0, s>>>(A);
             break;
         case PCMM_IN_RESCALE:
+            if (A.i4 != 0 && A.i4 != 3 && A.i4 != 4) return -1;
             in_rescale_k<W><<<dim3(blocks(N), 2), BX, 0, s>>>(A);
             break;
         case PCMM_LIFT:
-            lift_k<W><<<dim3(blocks(N), 4), BX, 0, s>>>(A);
+            if (A.i4 != 0 && A.i4 != 3 && A.i4 != 4) return -1;
+            lift_k<W><<<dim3(blocks(N), A.i4 ? A.i4 : 4), BX, 0, s>>>(A);
             break;
         case PCMM_KS_DIGITS:
             if (A.count < 1 || A.count > 65535) return -1;

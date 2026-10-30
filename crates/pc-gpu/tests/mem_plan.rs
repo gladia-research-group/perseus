@@ -14,8 +14,9 @@ fn n32_plan() {
     let ct = lay.ct_words() * 4;
     assert_eq!(plan.scratch, 8 * ct);
     assert_eq!(plan.ct_pool, 8 * ct + 2 * ct);
-    // ModUp digits (k_max x dnum polys) + extended dot outputs + ModDown conversions (k_max cts each)
-    assert_eq!(plan.ks_work, 8 * 6 * lay.poly_words() * 4 + 2 * 8 * ct);
+    // ModUp digits (k_max x dnum polys) + extended dot outputs (a 7-key sum of 4 cts: 28 cts) + ModDown conversions
+    // (k_max cts)
+    assert_eq!(plan.ks_work, 8 * 6 * lay.poly_words() * 4 + (28 + 8) * ct);
     assert_eq!(plan.bconv_work, 8 * lay.poly_words() * 4);
     // twiddles dominate the context: 4 tables x 63 primes x N words
     assert!(plan.context > 4 * 63 * (1 << 16) * 4 && plan.context < 4 * 63 * (1 << 16) * 4 + (1 << 20));
