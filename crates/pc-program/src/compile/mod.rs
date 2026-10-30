@@ -180,10 +180,16 @@ impl RouteEnv {
             if s > 1 && s < self.ring_dim / 2 && !r.sparse_b && !self.built.contains(&s) {
                 continue;
             }
-            let Ok(rec) = sh.bootstrap(input, &r) else { continue };
-            let got = if cap.deg == 2 { (rec.out.level.checked_sub(sh.unit())?, 2) } else { (rec.out.level, rec.out.deg) };
-            if got == (cap.level, cap.deg) {
-                return Some(r);
+            // the dense route: StC-first by default (its own shipped-order fallback past the entry); a capture at the
+            // shipped order's landing that route cannot give (IMPL_STC_FIRST_KV=0: the K/V push in the shipped order)
+            // takes the plain shipped-order route
+            let alts = if s == 0 && r.stc_first { vec![r, Route { stc_first: false, ..r }] } else { vec![r] };
+            for r in alts {
+                let Ok(rec) = sh.bootstrap(input, &r) else { continue };
+                let got = if cap.deg == 2 { (rec.out.level.checked_sub(sh.unit())?, 2) } else { (rec.out.level, rec.out.deg) };
+                if got == (cap.level, cap.deg) {
+                    return Some(r);
+                }
             }
         }
         None

@@ -1,0 +1,87 @@
+{
+  "chain": {
+    "chain": "n32",
+    "ckks_complex": true,
+    "composite_degree": 2,
+    "logn": 16
+  },
+  "bts": {
+    "auto_bts_level": 44,
+    "bts_iterations": 1,
+    "bts_max_input_level": 48,
+    "correction_factor": 6,
+    "gpu_encode": true,
+    "raise_drop": "512:1",
+    "raise_drops": [
+      "1",
+      "3",
+      "5"
+    ],
+    "real": true,
+    "shift": true,
+    "sparse_auto": 2,
+    "sparse_b": true,
+    "sparse_b_max": 1024,
+    "sparse_bts_slots": [
+      "512",
+      "1"
+    ],
+    "sparse_level_budget": [
+      "3",
+      "3"
+    ],
+    "sparse_ln_bts": false,
+    "sparse_sm_bts": false,
+    "spru": 64,
+    "stc_first": 2,
+    "stc_first_cf": 13,
+    "stc_first_routes": [
+      "dense"
+    ]
+  },
+  "mem": {
+    "fhe_pt_coeff_encode": false,
+    "fhe_stage_arena_gb": 24.0,
+    "kv_arena_gb": "24",
+    "rot_key_band": 32
+  },
+  "host": {
+    "malloc_arena_max": 2,
+    "omp_num_threads": 4
+  },
+  "model": {
+    "cache_read_level_k": 34,
+    "cache_read_level_v": 34,
+    "cheb_bsgs": true,
+    "cutmax_pair": true,
+    "cutmax_precise_scoped": true,
+    "cutmax_sparse_bts": false,
+    "cutmax_vec_bts_iters": 1,
+    "fhe_lmhead_cap": 44,
+    "fused_ln_var": false,
+    "fused_sm_den": false,
+    "gelu_fold": true,
+    "gpt2_fold_ln1": true,
+    "gpt2_fold_ln2": true,
+    "gpt2_fold_lnf": false,
+    "gpt2_packing": "cachemir_complex",
+    "impl_dead_ops": true,
+    "impl_scoped_names": true,
+    "kv_lanes": true,
+    "ladder_radix_bits": 3,
+    "ln_cheb": true,
+    "qkv_lanes": true,
+    "sm_cheb_gs": false,
+    "sm_den_recip": true,
+    "sm_fold": true,
+    "sm_gs_first": true,
+    "sm_hrs_pack": true,
+    "sm_periodic": 2
+  },
+  "exec": {
+    "fhe_graph_dir": "graphs/_rp_ctx1024_p0",
+    "gpt2_cache": true,
+    "gpt2_inference_mode": "sync",
+    "steps_t": 16
+  }
+}

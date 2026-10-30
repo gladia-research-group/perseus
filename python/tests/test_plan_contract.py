@@ -14,8 +14,6 @@ from perseus.plan.placer import emit
 
 BP = ASSETS / "bootstrap_placements"
 GRAPH = ASSETS / "graphs" / "gpt2_decode"
-# a plan with the legacy stamp (`capture_env`)
-LEGACY = BP / "gpt2_decode_ctx512"
 
 
 def _shipped_stamps():
@@ -47,7 +45,7 @@ def test_every_shipped_plan_validates_through_the_config():
 
 
 def test_mismatch_names_the_knob():
-    st = contract.read_stamp(LEGACY / "block_1_placement.json")
+    st = json.loads((GRAPH / "capture_env.json").read_text())        # the legacy stamp (`capture_env`)
     session = contract.config_of(st).with_env({"LN_CHEB": "0"})
     for stamp in (st, contract.stamp_of(st)):
         bad = contract.validate_contract(stamp, session=session, strict=False)

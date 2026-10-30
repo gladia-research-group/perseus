@@ -16,7 +16,7 @@ pytestmark = pytest.mark.gpu
 _pc = pytest.importorskip("perseus._pc")
 
 PLAN = "bootstrap_placements/vit_b16_224"
-IMAGES = "/data02/users/mithrillo/projects/perseus-oracle/wt_tip/scripts/repro/data/vit_eurosat"
+IMAGES = "scripts/repro/data/vit_eurosat"
 
 
 @pytest.mark.skipif(not (os.path.isdir(IMAGES) and os.environ.get("HF_HOME")), reason="repro images / HF_HOME missing")

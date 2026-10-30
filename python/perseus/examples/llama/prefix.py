@@ -81,6 +81,21 @@ def plain_cache(dims, k_feat, v_feat, packing: str, rope=None):
     return kv
 
 
+def plain_cache_n(dims, k_feats, v_feats, packing: str, rope=None):
+    """plain_cache over positions 0 .. n-1: the cache structure n pushes leave, on plain slot vectors (the plain
+    prefix). k_feats[p] / v_feats[p]: position p's pre-RoPE K / V, (hid,) head-interleaved; RoPE at p is folded
+    into the push masks as in the encrypted decode."""
+    rt = Rt(PlainOps(), dims)
+    N, hid = dims.N, dims.hid
+    lin = lambda f: encode_linear_input(f, N, hid, hid)
+    if packing != "cachemir_complex":
+        raise ValueError("plain_cache_n: cachemir_complex only")
+    kv = ComplexKVCache(dims.d_head)
+    for p, (kf, vf) in enumerate(zip(k_feats, v_feats)):
+        cache_kv_push_packed_complex(rt, kv, lin(kf) + 1j * lin(vf), rope=rope, pos=p)
+    return kv
+
+
 def expanded_heads(vec, H, H_kv, d_head):
     """(H_kv d_head,) -> head-interleaved (H d_head,) like the K/V linears' outputs."""
     full = np.repeat(np.asarray(vec).reshape(H_kv, d_head), H // H_kv, axis=0).ravel()

@@ -20,6 +20,7 @@ from perseus.impl.ops import FheOps  # noqa: E402
 from perseus.examples.gpt2 import block, head, ref, weights  # noqa: E402
 
 CFG = PKG / "configs/model/approximation/gpt2_base_n32/configs.json"
+CFG_THOR = PKG / "configs/model/approximation/gpt2_base_n32_thor/configs.json"
 
 
 def _rt(strict=False, **kw):
@@ -163,8 +164,10 @@ def test_chebyshev_bsgs_matches_direct(deg):
 def test_chebyshev_bsgs_depth_matches_direct():
     """Same multiplicative depth on the fake's level accounting (the plan windows do not move)."""
     rt, fhe, inf = _rt()
-    g = next(v for v in _cfgs().gelu.values() if v.thor_p1_cheb)
-    for coeffs, a, b in ((g.thor_p1_cheb, g.thor_p1_a, g.thor_p1_b), (g.thor_p2_cheb, g.thor_p2_a, g.thor_p2_b)):
+    s = _cfgs().gelu["transformer.h.0.mlp.act"]
+    g = next(v for v in config.load_configs(str(CFG_THOR)).gelu.values() if v.thor_p1_cheb)
+    for coeffs, a, b in ((s.cheb_coeffs, s.cheb_a, s.cheb_b), (g.thor_p1_cheb, g.thor_p1_a, g.thor_p1_b),
+                         (g.thor_p2_cheb, g.thor_p2_a, g.thor_p2_b)):
         levels = []
         for flag in (False, True):
             rt.ops.cheb_bsgs = flag
@@ -189,7 +192,9 @@ def test_config_name_map():
     ln1, ln2, sm, ge = c.block(0)
     assert ln1.method == "remez" and ln1.epsilon == 1e-5 and len(ln1.center_scale_sq) == 1024
     assert sm.log2delta1 == 2 and sm.log2delta2 == 3 and len(sm.cheb_coeffs) == 9
-    assert ge.method == "thor_composite" and len(ge.thor_p1_cheb) == 32 and ge.thor_p1_a == -1.0
+    assert ge.method == "chebyshev" and len(ge.cheb_coeffs) == 93 and ge.xmax > 1.0
+    th = config.load_configs(str(CFG_THOR)).block(0)[3]
+    assert th.method == "thor_composite" and len(th.thor_p1_cheb) == 32 and th.thor_p1_a == -1.0
     assert c.cutmax.iters[0].p == 9 and c.cutmax.entry_scale == 1 / 256
     assert sm.kc_r(0, 1) == sm.sm_kc_r[0] and sm.kc_r(2, 10 ** 6) == sm.sm_kc_r[-1]
 

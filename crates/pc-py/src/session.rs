@@ -432,9 +432,10 @@ fn lt_steps(geoms: &[pc_gpu::bts::cts::LtGeom], n: usize) -> BTreeSet<i64> {
     steps
 }
 
-/// Constant-ring slots of a planned session: 8192, or with CUDA graphs room for every constant the captured
-/// programs push at once (a scalar op or a scalar prelude one row table, a refresh or an external finish a few;
-/// counted twice over).
+/// Constant-ring size of a planned session, in pushes of the largest kind (`ConstRing::slot_words`): 8192, or with
+/// CUDA graphs room for every constant the captured programs push at once (a scalar op or a scalar prelude one row
+/// table, a refresh or an external finish a few), each counted constant as a two-table push (a quarter of the
+/// largest), counted twice over.
 fn const_slots(ps: &PlanSpec) -> usize {
     if !ps.use_graphs {
         return 8192;
@@ -451,7 +452,8 @@ fn const_slots(ps: &PlanSpec) -> usize {
             n += m.pre.iter().filter(|x| matches!(x, pc_shadow::Prelude::ScalarAdjust(..))).count();
         }
     }
-    (2 * n).max(8192)
+    // twice over, 4 units each (a two-table push), in units of the largest push
+    (2 * n * 4).div_ceil(2 * pc_gpu::ops::WSUM_MAX).max(8192)
 }
 
 /// The mode-2 last-stage keys (`stc_first` `CacheKey`: raise variant, the stage's CF, the input scale) the programs'
@@ -673,7 +675,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 let land = shc.bts.dense_shipped.or_else(|| shc.bts.landings.get(&0).copied()).map(|l| l.level).unwrap_or(shc.bts.bootstrap_level);
                 levels.insert((land, 1, 0));
                 let shapes = crate::matmul::high_shapes(shc.chain, sfs.cf_default.unwrap_or(13), &levels)?;
-                sfs.high = Some(pc_gpu::bts::stc_high::StcHighSetup { shapes, slots: ps.stc_cache.max(4) });
+                // PC_STC_HIGH_SLOTS: the entries of every stc_high shape's cache (default: the session's stc_cache, >= 4)
+                let hs = std::env::var("PC_STC_HIGH_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(ps.stc_cache.max(4));
+                eprintln!("[session] stc_high: {} shape(s) x {hs} entries", shapes.len());
+                sfs.high = Some(pc_gpu::bts::stc_high::StcHighSetup { shapes, slots: hs });
             }
             let mut sp = StcFirstPlan::new(chain, &setup, &sfs).map_err(e)?;
             // refresh pairs (bts.pair): the compile pairs CFs up to PAIR_CF_MAX, run_pair takes CFs below cf_ref
@@ -1658,8 +1663,6 @@ impl PySession {
         nogil(py, || pc.upload(&ex.compute, name, planes))
     }
 
-    /// PCMM service counters: {calls, batch (group size, per-drop batching), groups, outputs, keygen_s, linears,
-    /// missing (declared, never uploaded)}.
     /// Register TFHE LUT `name` (`Session(tfhe=...)`): `values` = f on the n_br-point grid of [-1, 1)
     /// (perseus impl/tfhe.py `grid`), |f| <= 1. Synchronous; re-registering a name replaces it.
     fn tfhe_lut(&self, py: Python<'_>, name: &str, values: Vec<f64>) -> PyResult<()> {
@@ -1699,6 +1702,8 @@ impl PySession {
         d.set_item("cf", crate::tfhe::CF)?;
         Ok(d.unbind())
     }
+    /// PCMM service counters: {calls, batch (group size, per-drop batching), groups, outputs, keygen_s, linears,
+    /// missing (declared, never uploaded)}.
     fn pcmm_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
         let st = self.dev.st.borrow();
         let pc = st.planned.as_ref().and_then(|p| p.pcmm.as_ref()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
@@ -1834,6 +1839,19 @@ impl PySession {
         .map_err(gerr)
     }
 
+    /// Planned runtime: replay the blocks from their CUDA graphs (`on`, the session's `exec.use_graphs`) or issue
+    /// every block eager, the captured graphs kept for the next `set_graphs(True)` (graph-vs-eager checks on one
+    /// set of ciphertexts). A session built without graphs cannot turn them on.
+    fn set_graphs(&self, on: bool) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let pl = st.planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
+        if on && !pl.spec.use_graphs {
+            return Err(PyValueError::new_err("set_graphs(True): the session was built without CUDA graphs (exec.use_graphs)"));
+        }
+        pl.replayer.cfg.use_graphs = on;
+        Ok(())
+    }
+
     /// Planned-runtime counters: runs, host us issuing them, cudaGraphLaunch us, replayer captures / replays /
     /// eager runs, capture ms, StC-first cache evictions.
     fn planned_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
@@ -1850,10 +1868,18 @@ impl PySession {
         d.set_item("invalidations", pl.replayer.stats.invalidations)?;
         d.set_item("pairs", (pl.replayer.stats.pairs, pl.replayer.stats.pairs_split))?;
         d.set_item("fused", pl.replayer.stats.fused)?;
+        d.set_item("graph_oom", pl.replayer.stats.graph_oom)?;
         d.set_item("stc_evictions", pl.locks().iter().map(|l| l.evictions()).sum::<u64>())?;
         let stc = pl.dense.as_ref().and_then(|r| r.last.as_ref());
         d.set_item("stc_misses", stc.map_or(0, |c| c.stats().misses))?;
         d.set_item("stc_slots", stc.map_or(0, |c| c.slots()))?;
+        d.set_item("stc_keys_seen", stc.map_or(0, |c| c.stats().keys))?;
+        // per stc_high shape: (out level, skip mask, entries, hits, misses, evictions, distinct keys asked for)
+        let high = pl.dense.as_ref().and_then(|r| r.high.as_ref());
+        d.set_item("stc_high", high.map_or(vec![], |h| h.caches.iter().map(|(sh, c)| {
+            let st = c.stats();
+            (sh.out_level, sh.skip_mask, c.slots(), st.hits, st.misses, st.evictions, st.keys)
+        }).collect::<Vec<_>>()))?;
         d.set_item("stc_keys", stc.map_or(vec![], |c| c.keys().into_iter().map(|k| k.0.to_vec()).collect::<Vec<_>>()))?;
         d.set_item("bound", pl.bounds.len())?;
         d.set_item("group_bytes", pl.group_bytes)?;

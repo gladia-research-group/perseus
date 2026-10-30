@@ -193,10 +193,12 @@ def rope_step_masks(rt, rope, pos: int, packing: str = "cachemir"):
             + _rope_items(rt, rope, pos, *push))
 
 
-def _hrs_pack_item(d, seed: float, site: str):
+def _hrs_pack_item(d, seed: float, site: str, scale: float = 1.0):
     """SM_HRS_PACK: both head-sum masks on one ciphertext, the sum on the real part and seed * the sum on the
-    imaginary part, halved so that z + conj(z) and i (conj(z) - z) return them unscaled."""
-    return (site + ".pk", seed), lambda: (0.5 + 0.5j * seed) * hrs_pos0(d)
+    imaginary part, halved so that z + conj(z) and i (conj(z) - z) return them unscaled. `scale`: the mask times it
+    (0.5 on SM_HRS_CLEANSE's 2 Re input)."""
+    key = (site + ".pk", seed) if scale == 1.0 else (site + ".pk", seed, scale)
+    return key, lambda: scale * (0.5 + 0.5j * seed) * hrs_pos0(d)
 
 
 class KVCache:
@@ -575,10 +577,22 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         if ops.fused_sm_den:
             raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
         # SM_HRS_PACK: one replicate ladder for both sums (the input is real), split by one conjugation
-        z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
-        cz = ops.conjugate(z)
-        h = ops.mult_i(ops.sub(cz, z))
-        out = ops.add(z, cz)
+        if getattr(ops, "hrs_cleanse", False):
+            # SM_HRS_CLEANSE: the seed lane holds seed * sum, ~1e-5 of the sum on the Llama decode's rounds; the
+            # imaginary noise of a refresh planned after the caller's im_cleanse (the exponentials' or a round's
+            # square, at the refresh's precision) swamps it (the Goldschmidt seed returns garbage). 2 Re of the input
+            # here, the mask halved; the sub-step `hrs` (FORBID_STEPS .hrs) keeps refreshes off the pack until the
+            # split (a refresh of either split output is relative to its own value)
+            with rt.step("hrs"):
+                z = rotsum_neg(ops, rt.mult_mask(im_cleanse(ops, out), *_hrs_pack_item(d, seed, seed_site, 0.5)), d.t)
+                cz = ops.conjugate(z)
+            h = ops.mult_i(ops.sub(cz, z))
+            out = ops.add(z, cz)
+        else:
+            z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
+            cz = ops.conjugate(z)
+            h = ops.mult_i(ops.sub(cz, z))
+            out = ops.add(z, cz)
     else:
         if seed is not None:
             tot = out

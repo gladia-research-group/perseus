@@ -10,6 +10,8 @@ import os
 import sys
 import time
 
+import numpy as np
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
@@ -38,7 +40,7 @@ def main(argv=None):
     os.environ["MULTI_T"] = str(V.T)
     t0 = time.time()
     model.preload_prefill()
-    model.prefill(V.patch_rows(V.pixels(a.image)))
+    model.prefill(V.patch_rows(np.load(a.image) if a.image.endswith(".npy") else V.pixels(a.image)))
     print(f"[mags] fake tape: {len(tapes)} stages, {sum(map(len, tapes.values()))} records, {time.time() - t0:.0f}s",
           flush=True)
     magtape.fill_dir(a.graph_dir, tapes)

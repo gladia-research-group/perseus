@@ -84,6 +84,9 @@ impl<'a> Lower<'a> {
         let in_meta = self.meta(input);
         let p = &self.plan.file;
         let mut route = self.env.route_tagged(site_var, self.plan, self.tags.get(name));
+        if captured.is_none() {
+            route = self.keep_planned_landing(name, site_var, &in_meta, route);
+        }
         let mut captured = captured;
         if let Some(cap) = captured {
             // a deliberate refresh: the route whose landing the capture recorded (the code's scope chose it)
@@ -140,6 +143,41 @@ impl<'a> Lower<'a> {
             self.vars[v as usize].name = name.to_string();
         }
         Ok(())
+    }
+
+    /// SM_PERIODIC=2: a planned refresh whose value outgrew its planned slot count runs on a bigger built route
+    /// (`RouteEnv::route_tagged`), which may land deeper (a classic multi-stage route at 32, SparseB at 24). The plan's
+    /// raise drop is absolute and was sized on the planned route: kept, it lands that much deeper than the plan pinned
+    /// the refresh (a step landing floor such as PLAN_STEP_LANDING softmax:32 absorbs part of it on the planned route
+    /// only). Returns the route with the largest built drop (FIDESLIB_BTS_RAISE_DROPS, 0, the route's default) whose
+    /// realized landing is no deeper than the plan's pin (else than the planned route's landing); the route unchanged
+    /// when none is (the check reports it).
+    fn keep_planned_landing(&self, name: &str, site_var: &str, input: &CtMeta, route: pc_shadow::Route) -> pc_shadow::Route {
+        let planned = self.env.route(site_var, self.plan);
+        if route.slots == planned.slots || route.raise_drop == 0 {
+            return route;
+        }
+        let level = |r: &pc_shadow::Route| self.sh.bootstrap(input, r).ok().map(|x| x.out.level);
+        let s = &self.plan.file.summary;
+        // a pinned raw (unrealized, degree-2) landing sits one unit above the realized level the Shadow reports
+        let want = match s.final_named_levels.get(name) {
+            Some(&l) => Some(l + if s.final_named_degs.get(name).copied().unwrap_or(1) == 2 { self.sh.unit() } else { 0 }),
+            None => level(&planned),
+        };
+        let (Some(want), Some(got)) = (want, level(&route)) else { return route };
+        if got <= want {
+            return route;
+        }
+        let mut drops: Vec<u32> = self.sh.cfg.bts.raise_drops.iter().copied().chain([0, self.env.base(route.slots).raise_drop]).filter(|&d| d < route.raise_drop).collect();
+        drops.sort_unstable_by(|a, b| b.cmp(a));
+        drops.dedup();
+        for d in drops {
+            let r = pc_shadow::Route { raise_drop: d, ..route };
+            if level(&r).is_some_and(|l| l <= want) {
+                return r;
+            }
+        }
+        route
     }
 
     /// The dense default route is StC-first and `input` is past its entry (the route lands at the shipped order's

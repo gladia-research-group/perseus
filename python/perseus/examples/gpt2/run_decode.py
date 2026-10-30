@@ -23,7 +23,8 @@ def gpu_busy(device=None):
                              capture_output=True, text=True, timeout=20).stdout.strip()
     except Exception:
         return None
-    return [l for l in out.splitlines() if l.strip()]
+    # this process's own context (an earlier run in the same process, e.g. a test session) is not another process
+    return [l for l in out.splitlines() if l.strip() and l.split(",")[0].strip() != str(os.getpid())]
 
 
 class _Closer:
@@ -49,7 +50,7 @@ def _planned(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"m7c_ref_{os.getpid()}")
     labels = [f"block_{b}" for b in range(n + 2)]
     run = PlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, pt_rows=a.pt_rows,
-                     stc_cache=a.stc_cache)
+                     stc_cache=a.stc_cache, schedule=a.schedule)
     run.debug = a.debug_blocks
     run.setup(inputs, argmax=a.argmax)
     dmodel = Gpt2Model(run.fhe, store, cfgs, core=_pc, n_layers=n, packing=a.packing, kv_offload=False)
@@ -82,17 +83,63 @@ def _planned_classed(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     def routes_for(pos):
         r = rmodel.routes_for(pos)
         return set() if r is None else set(r[1])
+    first, prefix = 0, None
+    if a.plain_prefix:
+        # the plain prefix: positions 0 .. N-1 run on the numpy twin of the algorithm (float64, CPU), their K / V
+        # pushes replayed into the recording twin's caches from payloads encrypted as public values; the device's
+        # caches start from those states (each encrypted at the twin's entry metadata); only positions >= N are
+        # recorded and decoded encrypted
+        import numpy as np
+        first = a.plain_prefix
+        from .capture_mags import fake_model
+        t0 = time.time()
+        import hashlib
+        key = hashlib.sha256(repr((a.configs, open(resolve(a.configs), "rb").read(), open(os.path.join(resolve(a.plan), "PLAN_CMD.txt")).read(), a.packing, first,
+                                   np.asarray(a.all_inputs[:first]).tobytes())).encode()).hexdigest()[:16]
+        cpath = os.path.join(os.environ.get("PC_PREFIX_CACHE", os.path.expanduser("~/.cache/perseus_plain_prefix")),
+                             f"gpt2_{key}.npz")
+        if os.path.exists(cpath):
+            z = np.load(cpath)
+            logs = [[z[f"b{b}_{p}"] for p in range(first)] for b in range(n)]
+            src = f"cached {cpath}"
+        else:
+            fmodel, _ffhe, _finf = fake_model(a.weights, a.configs, a.packing)
+            for kv in fmodel.kv:
+                kv.payload_log = []
+            fmodel.run_decode(a.all_inputs[:first])
+            logs = [kv.payload_log for kv in fmodel.kv]
+            del fmodel
+            os.makedirs(os.path.dirname(cpath), exist_ok=True)
+            np.savez(cpath + ".tmp.npz", **{f"b{b}_{p}": logs[b][p] for b in range(n) for p in range(first)})
+            os.replace(cpath + ".tmp.npz", cpath)
+            src = f"computed, cached at {cpath}"
+        if os.environ.get("PC_PREFIX_ONLY", "0") not in ("", "0"):
+            print(f"[impl] plain prefix {src}; PC_PREFIX_ONLY: exit", flush=True)
+            sys.exit(0)
+        rmodel.start()
+        rmodel.replay_kv_pushes(logs, a.prefix_level)
+        snap = []
+        for b in range(n):
+            cts, ks = rmodel.kv[b].cts("")
+            snap.append({k: np.array(getattr(c, "vec", c)) for k, c in zip(ks, cts)})
+        prefix = lambda b: snap[b]
+        print(f"[impl] plain prefix: positions 0..{first - 1} computed in plaintext on the CPU (numpy twin, float64; "
+              f"{src}), K / V pushes encrypted as public values at level {a.prefix_level}; encrypted decode from "
+              f"position {first} ({time.time() - t0:.0f}s)", flush=True)
     run = StreamedPlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, streams={},
                              stream_rows=None, routes_for=routes_for, base_routes=base, stc_cache=a.stc_cache,
-                             argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True))
+                             argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True), schedule=a.schedule,
+                             prefix=prefix, plan_windows=a.windows)
     run.debug = a.debug_blocks
+    if first:
+        run.rec.first, run.rec.restart = first, False
     run.prepare(inputs)
     # a token evicts the values it no longer reads before staging its new ones: one token's values + a margin
     run.pt_slots = run.n_pts + 64
     run.setup(inputs)
     dmodel = Gpt2Model(run.fhe, store, cfgs, core=_pc, n_layers=n, packing=a.packing, kv_offload=False)
     t0 = time.time()
-    res = dmodel.run_decode_planned(run, inputs, gt_logits, on_token=on_token, argmax=a.argmax)
+    res = dmodel.run_decode_planned(run, inputs, gt_logits, on_token=on_token, argmax=a.argmax, first=first)
     print(f"[planned] decode {time.time() - t0:.1f} s; {run.sess.planned_stats()}", flush=True)
     run.progs = {lab: run.classes[run.class_of[len(inputs) - 1]]["progs"][b] for b, lab in enumerate(labels)
                  if b in run.classes[run.class_of[len(inputs) - 1]]["progs"]}
@@ -132,9 +179,16 @@ def main(argv=None, results=None):
                          "(their K/V pushes replayed from payloads encrypted as public values at --prefix-level): a capture of position N without "
                          "decoding the positions before it")
     ap.add_argument("--prefix-level", type=int, default=36, help="the level of the replayed push payloads")
+    ap.add_argument("--plain-prefix", type=int, default=0, metavar="N",
+                    help="planned: positions 0..N-1 computed in plaintext on the CPU (the numpy twin), their K / V "
+                         "pushes replayed into the caches as public values; the encrypted decode runs N..--tokens-1")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts (fast); fill them with capture_mags.py")
     ap.add_argument("--plan", default=None, help="plan dir: run under block_<b>_placement.json")
+    ap.add_argument("--plan-windows", default=None, metavar="B1:DIR1,B2:DIR2,...",
+                    help="planned, SM_PERIODIC=2 plans: a plan per position window (DIRi serves the positions below "
+                         "Bi), the plans sharing one runtime (only their magnitudes differ); --plan defaults to the "
+                         "first window's")
     ap.add_argument("--no-plan-argmax", action="store_true", help="run CutMax / feedback eager even if planned")
     ap.add_argument("--weights", default=os.environ.get("WEIGHTS_PATH"))
     ap.add_argument("--configs", default=os.environ.get("CONFIGS_PATH"))
@@ -165,12 +219,32 @@ def main(argv=None, results=None):
                     help="planned: rotation keys resident (dense) or 28-bit b + seed regenerated per use (packed)")
     ap.add_argument("--pt-rows", type=int, default=28, help="planned: rows per plaintext slot (0 = every prime)")
     ap.add_argument("--stc-cache", type=int, default=8, help="planned: StC-first last-stage cache entries")
+    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
+                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
     ap.add_argument("--work-dir", default=None, help="planned: where the reference token's stream is written")
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output / K/V state vs the CPU twin (synchronous)")
     a = ap.parse_args(argv)
-    from perseus.examples.defaults import default_plan
+    from perseus._paths import resolve
+    from perseus.examples.defaults import default_plan, default_windows
+    a.windows = None
+    if a.plan_windows:
+        from perseus.impl.driver import parse_plan_windows
+        if a.fake or a.capture:
+            print("--plan-windows: planned device runs only", file=sys.stderr)
+            return 2
+        a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
+        if a.plan is None:
+            a.plan = a.windows[0][1]
     if a.plan is None and not (a.fake or a.capture) and a.chain == "n32":
-        a.plan = default_plan("gpt2_decode")
+        # up to 32 cached keys the main plan; past them a plan per position window up to 512, then the 1,024-context
+        # plan
+        if a.tokens <= 32:
+            a.plan = default_plan("gpt2_decode", a.tokens)
+        elif default_windows("gpt2_decode", a.tokens):
+            a.windows = [(b, resolve(d)) for b, d in default_windows("gpt2_decode", a.tokens)]
+            a.plan = a.windows[0][1]
+        else:
+            a.plan = default_plan("gpt2_decode_ctx1024")
 
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:
@@ -242,6 +316,12 @@ def main(argv=None, results=None):
     os.environ["MULTI_T"] = str(a.tokens)
     cfg = oracle_io.RunConfig.from_env()
     inputs = oracle_io.read_teacher_forced_inputs(cfg)[:a.tokens]
+    a.all_inputs = inputs
+    if a.plain_prefix:
+        if a.fake or not a.plan:
+            print("--plain-prefix: planned device runs only", file=sys.stderr)
+            return 2
+        inputs = inputs[a.plain_prefix:]
     gt = oracle_io.read_lm_head_steps(cfg)
     gt_logits = gt.logits if gt.T else None
     print(f"[impl] decode {len(inputs)} tokens, layers={model.n_layers}, "
@@ -300,6 +380,9 @@ def main(argv=None, results=None):
     if not a.fake:
         from perseus import config as pcfg
         classed = pcfg.plan_runtime(a.plan, a.chain, base=pcfg.preset("n32_gpt2_decode"))["model.sm_periodic"] == 2
+        if a.windows and not classed:
+            print("--plan-windows: the classed (SM_PERIODIC=2) planned run only", file=sys.stderr)
+            return 2
         res, inf, model = (_planned_classed if classed else _planned)(a, model, cfgs, store, inputs, gt_logits,
                                                                       on_token)
         sess = _Closer(inf)

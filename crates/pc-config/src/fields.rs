@@ -374,10 +374,10 @@ section! {
         #[doc = "Shipped plans: runtime= 1."]
         attn: Str = "PF_ATTN", "''";
         #[doc = "`PF_ATTN_BSGS`. Default '0'. Read at impl/prefill.py::<module>."]
-        #[doc = "Shipped plans: none."]
+        #[doc = "Shipped plans: runtime= 2."]
         attn_bsgs: Flag = "PF_ATTN_BSGS", "'0'";
         #[doc = "`PF_ATTN_PACK`. Default '0'. Read at impl/prefill.py::<module>."]
-        #[doc = "Shipped plans: runtime= 2."]
+        #[doc = "Shipped plans: runtime= 9."]
         attn_pack: Int = "PF_ATTN_PACK", "'0'";
         #[doc = "`PF_ATTN_PAIR`. Default '1'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
@@ -584,7 +584,7 @@ section! {
         #[doc = "Shipped plans: none."]
         qkv_pack: Flag = "PF_QKV_PACK", "'0'";
         #[doc = "`PF_SM_HPACK`. Default '0'. Read at impl/prefill.py::<module>."]
-        #[doc = "Shipped plans: none."]
+        #[doc = "Shipped plans: runtime= 2."]
         sm_hpack: Flag = "PF_SM_HPACK", "'0'";
         #[doc = "`PF_SILU_SINGLE`. Default '0'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
@@ -931,7 +931,7 @@ section! {
         #[doc = "Shipped plans: none."]
         err_target: Str = "PLAN_ERR_TARGET", "(unset)";
         #[doc = "`PLAN_FALLBACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: none."]
+        #[doc = "Shipped plans: recipe= gpt2_decode."]
         fallback_cf: Flag = "PLAN_FALLBACK_CF", "'0'";
         #[doc = "`FEEDBACK_ENTRY_DEG`. Default $ENTRY_DEG. Read at examples/gpt2/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
@@ -1051,7 +1051,7 @@ section! {
         #[doc = "Shipped plans: none."]
         quality_weight: Str = "PLAN_QUALITY_WEIGHT", "(unset)";
         #[doc = "`PLAN_RAISE_DROP_BASE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: none."]
+        #[doc = "Shipped plans: recipe= 6."]
         raise_drop_base: Str = "PLAN_RAISE_DROP_BASE", "(unset)";
         #[doc = "`PLAN_RAISE_ENV_RULE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]
@@ -1066,7 +1066,7 @@ section! {
         #[doc = "Shipped plans: recipe= 12."]
         raise_drop_routes: Str = "PLAN_RAISE_ROUTES", "(unset)";
         #[doc = "`PLAN_RAISE_SEARCH`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
-        #[doc = "Shipped plans: none."]
+        #[doc = "Shipped plans: recipe= 6."]
         raise_drop_search: Flag = "PLAN_RAISE_SEARCH", "'0'";
         #[doc = "`PLAN_RAISE_DROP_SET`. Default (unset) / 1,3,5. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 13."]

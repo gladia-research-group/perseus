@@ -160,7 +160,18 @@ class RefreshPlanner:
             routes_avail=(route,) if route else (),
             levels_free=1 if pol.allow_prescale else 0,
             real=bool(self.real_route and p is not None and p.pack_field == FIELD_REAL),
+            slot_mag_lo=p.max_abs_lo if p else None,
+            coeff_mag_lo=p.max_coeff_lo if p else None,
         )
+        # PLAN_STEP_ROUTE_PRICING=1: a sparse site of a step whose route follows the cache length (a PLAN_STEP_LANDING
+        # step, SM_PERIODIC=2) runs on the bigger routes too once its value's period outgrows the planned one: its CF is
+        # priced on the worst of them the accuracy table measured
+        if route and p is not None and os.environ.get("PLAN_STEP_ROUTE_PRICING", "0") not in ("", "0") \
+                and _step_landing_floor(self.shadow.plan.get("plan.step_landing") or "", p.step) is not None:
+            # with the period range captured over several positions, only a value whose period outgrows the planned
+            # route moves, and only up to the route its largest period fills
+            pmax = p.pack_period_max
+            site["price_routes"] = tuple(r for r in self.table.routes() if r > route and (pmax is None or r <= pmax))
         choice = btserr.choose_site(self.table, pol, **site)
         # StC-first (policy.slim_cubic > 0): a dense site whose slot magnitude the StC-first order cannot hold at the
         # shipped order's precision (plan.stc_first_mag_max, after the drift margin) bootstraps in the shipped order:
@@ -176,8 +187,13 @@ class RefreshPlanner:
         if _steps is not None and p is not None:
             _step_ok = (p.step or "").split(".")[-1] in {x.strip() for x in _steps.split(",") if x.strip()}
         _too_big = bool(_mag_max) and p is not None and (p.max_abs or 0.0) * pol.mag_safety > float(_mag_max)
-        if (pol.slim_cubic > 0 and not choice.route and sh.has_shipped and p is not None
-                and (_too_big or not _step_ok or force_shipped)):
+        # PLAN_STC_FIRST_STAGED_ONLY=1: the runtime runs the StC-first order on the staged PCMM / CCMM finishes only
+        # (FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1, no FIDESLIB_BTS_STC_FIRST on the plan's runtime line): every refresh
+        # site of the plan bootstraps in the shipped order, so none takes the slim (slot) law; landed where that order
+        # lands when the recipe names it (plan.stc_first_fallback), else at the recipe's dense landing as before
+        _staged_only = os.environ.get("PLAN_STC_FIRST_STAGED_ONLY", "0") not in ("", "0")
+        if (pol.slim_cubic > 0 and not choice.route and p is not None
+                and (_staged_only or (sh.has_shipped and (_too_big or not _step_ok or force_shipped)))):
             import dataclasses as _dc
             choice = btserr.choose_site(self.table, _dc.replace(pol, slim_cubic=0.0), **site)
             shipped = not choice.route
@@ -212,7 +228,7 @@ class RefreshPlanner:
         if floor is not None:
             base = max(base, float(floor) - self.bootstrap_level)
         out_deg = self.out_deg
-        if shipped:
+        if shipped and sh.has_shipped:
             _lv, _dg = sh.shipped_landing()
             base, out_deg = float(_lv) - self.bootstrap_level, int(_dg)
         restore = float(self.graph.level_unit) if choice.prescale is not None else 0.0

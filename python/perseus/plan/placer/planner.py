@@ -578,15 +578,15 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
         k_max = cfg.raise_drop_max
         if cfg.raise_drop_landing_max is not None:
             k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
-        # the plan's drop is absolute: the route's default (raise_drop_base) plus k must be a built variant
-        b = dict(cfg.raise_drop_base).get(route, 0)
-        ks = [k for k in range(k_max, 0, -1)
-              if route == 1 or not cfg.raise_drop_set or k + b in cfg.raise_drop_set]
         saved = refresh.site_out_levels.get(p)
         found = 0
-        for k in ks:
+        for k in range(k_max, 0, -1):
             refresh.site_out_levels[p] = int(round(base_abs + k * unit))
             refresh._cache.pop(p, None)
+            # the plan's drop is absolute (the route's default and any step landing floor under base_abs included):
+            # it must be a built variant
+            if route != 1 and cfg.raise_drop_set and refresh.spec(p).raise_drop not in cfg.raise_drop_set:
+                continue
             s2 = placer._sim()
             in2 = inputs(s2)
             ok = (s2.hint_fired == sim.hint_fired
@@ -784,7 +784,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # stage 4 — ours, or a baseline placer (same seam, different site selection)
     _fb = refresh.shadow.dense_fallback()
     budget = Budget(L=float(cfg.max_level - cfg.bootstrap_level), unit=g.level_unit,
-                    stc_first_entry=_fb[0] if _fb is not None and not refresh.shadow.stc_first_reroute else None)
+                    stc_first_entry=_fb[0] if _fb is not None else None,
+                    stc_first_reroute=bool(refresh.shadow.stc_first_reroute))
     placer_kwargs = dict(
         g=g, refresh=refresh, budget=budget,
         bootstrap_level=float(cfg.bootstrap_level),
@@ -881,8 +882,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         sim = placer.run()
 
     rescale_anchors: set = set()
-    # the realize-anchor trials re-run the cut: kept sites stay placed in them too
-    _kept = {"placed": set(kept_sites)} if kept_sites else {}
+    # the realize-anchor trials re-run the cut: kept and forced sites stay placed in them too (the terminal-exit refresh
+    # of the block-loop retry was dropped by those trials, so the retry re-planned the same exit)
+    _kept_all = set(kept_sites) | (set(force_place or ()) if exact else set())
+    _kept = {"placed": _kept_all} if _kept_all else {}
     if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
@@ -1149,7 +1152,12 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 "[bts_depth_error] guard is the authority.")
     if _bad_cut and getattr(placer, "env_cap_relaxed", False):
         # the placer already proved no envelope-respecting placement exists (it tried that
-        # pass first and it could not be planned), so these sites are forced, not chosen
+        # pass first and it could not be planned), so these sites are forced, not chosen.
+        # PLAN_ENVELOPE_STRICT=1: refuse instead (the block loop then re-plans the block before with a refresh on its
+        # exit, the entry this block could not plan from: the tail after a deep last block)
+        if os.environ.get("PLAN_ENVELOPE_STRICT", "0") not in ("", "0"):
+            raise PlanInfeasible(f"P3c: {len(_bad_cut)} refresh(es) start past the measured envelope with no "
+                                 "envelope-respecting placement: " + ", ".join(f"{v}@{l:g}" for v, l in _bad_cut[:6]))
         log.warning(
             f"[plan] P3c: {len(_bad_cut)} refresh(es) start past the measured envelope "
             f"(abs level > {_ENV_CAP:g}) and NO placement avoids them -- a bootstrap there "
@@ -1346,6 +1354,38 @@ def _resumed(out_file: Path, block_dir: Path) -> dict | None:
     return doc if doc.get(contract.CONTRACT_KEY) == want else None
 
 
+def _stage_outputs(gf: Path, level_unit: int) -> list[str]:
+    """The block's stage outputs as the compile takes them (every final state nothing reads): named, not a deliberate
+    refresh or a hint pass-through, read by no other node once the reactive refreshes are erased. One for a decode
+    block; several for a packed prefill stage (BERT's LN2 halves)."""
+    raw = json.loads(Path(gf).read_text(encoding="utf-8"))
+    g, _ = erase_reactive_bootstraps(Graph.from_nodes(raw.get("nodes", []), level_unit=level_unit))
+    read: set[str] = set()
+    for n in g.nodes:
+        read.update(n.cipher_inputs)
+    return [n.output for n in g.nodes
+            if n.output and not n.is_deliberate_bts and n.hint_level is None and n.output not in read]
+
+
+def _next_entry(s: dict, gf: Path, cfg: PlanConfig, strict: bool) -> tuple[int | None, int | None]:
+    """(level, deg) the next block enters at: the plan's exit, or under PLAN_ENVELOPE_STRICT the deepest of the block's
+    stage outputs (the next block reads all of them; the exit var is only the last one)."""
+    lvl = s.get("exit_level")
+    if lvl is None:
+        return None, None
+    deg = s.get("exit_deg") or 1
+    if not strict:
+        return lvl, deg
+    unit = cfg.level_unit
+    levels, degs = s.get("final_named_levels") or {}, s.get("final_named_degs") or {}
+    for v in _stage_outputs(gf, unit):
+        if v in levels:
+            lv, dv = int(levels[v]), int(degs.get(v, 1))
+            if lv + (unit if dv == 2 else 0) > lvl + (unit if deg == 2 else 0):
+                lvl, deg = lv, dv
+    return lvl, deg
+
+
 def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                    cfg: PlanConfig) -> list[dict]:
     graph_dir, out_dir = Path(graph_dir), Path(out_dir)
@@ -1361,6 +1401,9 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
     # as planned and its exit enters the next block, so a preempted run restarts at the block it was planning; the
     # plans are the chain's (each block's depends on its graph, the config and its entry alone)
     resume = os.environ.get("PLAN_RESUME", "0") not in ("", "0")
+    # PLAN_ENVELOPE_STRICT=1: a block enters at the deepest of the previous block's stage outputs, and the terminal-exit
+    # retry refreshes every stage output (a packed stage hands several to the next block, not only its exit var)
+    strict = os.environ.get("PLAN_ENVELOPE_STRICT", "0") not in ("", "0")
     entry_level: int | None = cfg.first_entry_level
     entry_deg: int | None = cfg.first_entry_deg
     blocks = sorted((d for d in graph_dir.glob("block_*") if d.is_dir()),
@@ -1384,8 +1427,7 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
             prev = {"name": bd.name, "gf": gf, "out_file": out_file,
                     "entry_level": entry_level, "entry_deg": entry_deg,
                     "exit_var": s.get("exit_var"), "retried": False}
-            entry_level = s.get("exit_level")
-            entry_deg = (s.get("exit_deg") or 1) if entry_level is not None else None
+            entry_level, entry_deg = _next_entry(s, gf, cfg, strict)
             continue
         # the in-memory diagnostics ride on `summaries` (never on the plan file)
         diag = PlanDiagnostics()
@@ -1399,17 +1441,22 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
                   f"retrying {prev['name']} with a terminal-exit refresh on "
                   f"{prev['exit_var']}")
             pdiag = PlanDiagnostics()
+            exits = {prev["exit_var"]}
+            if strict:
+                exits |= set(_stage_outputs(prev["gf"], cfg.level_unit))
+                if cfg.verbose and len(exits) > 1:
+                    log.info(f"[plan] [{prev['name']}] terminal-exit refreshes on its {len(exits)} stage outputs: "
+                             + ", ".join(sorted(exits)))
             pres = plan_block(prev["gf"], cfg, entry_level=prev["entry_level"],
                               entry_deg=prev["entry_deg"], table=table,
-                              force_place={prev["exit_var"]}, diagnostics=pdiag)
+                              force_place=exits, diagnostics=pdiag)
             emit.stamp(pres, contract.capture_stamp(Path(prev["gf"]).parent))
             _write_whole(prev["out_file"], pres)
             ps = pres["summary"]
             summaries[-1] = {"block": prev["name"], "output": str(prev["out_file"]),
                              **ps, "cf_clamp": pdiag.cf_clamp}
             prev["retried"] = True
-            entry_level = ps.get("exit_level")
-            entry_deg = (ps.get("exit_deg") or 1) if entry_level is not None else None
+            entry_level, entry_deg = _next_entry(ps, prev["gf"], cfg, strict)
             if cfg.verbose:
                 log.info(f"[plan] [{bd.name}] (retry entry={entry_level}/d{entry_deg})")
             diag = PlanDiagnostics()
@@ -1423,6 +1470,5 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
         prev = {"name": bd.name, "gf": gf, "out_file": out_file,
                 "entry_level": entry_level, "entry_deg": entry_deg,
                 "exit_var": s.get("exit_var"), "retried": False}
-        entry_level = s.get("exit_level")
-        entry_deg = (s.get("exit_deg") or 1) if entry_level is not None else None
+        entry_level, entry_deg = _next_entry(s, gf, cfg, strict)
     return summaries

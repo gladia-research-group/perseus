@@ -8,8 +8,8 @@
 //! batches, one launch each. A plaintext operand is broadcast over the `k` ciphertexts of its batch (stride 0).
 //!
 //! Per-call constants (`ElemForEvalMult` / `ElemForEvalAddOrSub` rows, wsum weights, folded alphas) go through the
-//! `ConstRing`: pinned host slots copied to device slots on the compute lane, in stream order with the kernels that
-//! read them (no host sync except when a pinned slot is reused before its copy ran).
+//! `ConstRing`: pinned host units copied to device units on the compute lane, in stream order with the kernels that
+//! read them (no host sync except when pinned units are reused before their copy a lap ago ran).
 /// ct x ct = tensor + relinearization; the Recipe preludes run in front of it.
 pub use crate::relin::mult;
 
@@ -32,7 +32,8 @@ use std::ffi::c_void;
 /// Knobs of the op layer (the `exec` part of the typed Config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpsCfg {
-    /// Constant-ring slots (in flight per-call constant vectors before a pinned slot is reused).
+    /// Constant-ring size, in per-call constant vectors of the largest kind (a wsum of `WSUM_MAX` weights; a
+    /// one-table scalar row takes an eighth of one): what is in flight before pinned units are reused.
     pub const_slots: usize,
     pub rescale: RescaleKind,
     /// Fold a `ScalarAdjust` into the following `Rescale` (composite one-pass only; exact).
@@ -51,31 +52,51 @@ impl Default for OpsCfg {
 /// wsum takes at most this many sources per launch (`WsumArgs::src`).
 pub const WSUM_MAX: usize = 8;
 
-/// Per-call constant vectors: `slots` device slots of `slot_words` words, each with its own pinned host slot and an
-/// event recorded after its upload. A push writes the pinned slot (after syncing that event when the slot is reused),
-/// enqueues the H2D copy on the compute lane and returns the device pointer; the kernels reading it are issued later
-/// on the same lane, and the next copy into the same device slot is ordered after them by the stream.
+/// Per-call constant vectors on the device: a ring of `units` of `unit_words` words (one prime-row table, rounded up to
+/// 64 bytes), with its pinned host mirror. A push takes the next run of free units its words need (a one-table scalar
+/// row two, a wsum of 8 sources sixteen), writes them on the host, enqueues their H2D copy on the compute lane and
+/// returns the device pointer; the kernels reading it are issued later on the same lane, and the next copy into the
+/// same units is ordered after them by the stream. The ring is cut into chunks, each with an event recorded after its
+/// latest copy: the first push into a chunk on a new lap of the ring waits for that event (the copies a lap ago out of
+/// the pinned units it rewrites), so the host never waits on recent work.
 ///
-/// Graph capture (`lease_begin` .. `lease_end`): a captured graph reads the device slots its constants were pushed
-/// to. Pushes while leasing take slots out of the rotation (`leased`) until `release` and record no copy (it would be
-/// replayed at every launch); `lease_end`, after the capture, uploads them once (the slot is never rewritten while
-/// leased).
+/// Graph capture (`lease_begin` .. `lease_end`): a captured graph reads the device units its constants were pushed
+/// to. Pushes while leasing take their units out of the rotation (`leased`) until `release` and record no copy (it
+/// would be replayed at every launch); `lease_end`, after the capture, uploads them once (leased units are never
+/// rewritten). A lease is the list of its pushes' first units.
 pub struct ConstRing<'a, W: DevWord> {
     dev: DBuf<'a, Compute, W>,
-    host: Vec<PinnedBuf<W>>,
-    ev: Vec<Event>,
-    used: Vec<bool>,
+    host: PinnedBuf<W>,
+    unit_words: usize,
+    units: usize,
+    /// per unit: held by a captured graph
     leased: Vec<bool>,
-    /// Slots taken by the open lease (None: not leasing).
+    /// leased pushes: first unit -> units
+    held: std::collections::HashMap<usize, usize>,
+    /// Pushes of the open lease, by first unit (None: not leasing).
     lease: Option<Vec<usize>>,
     next: usize,
-    slot_words: usize,
+    lap: u64,
+    chunk_units: usize,
+    /// per chunk: the event recorded after its latest copy and that copy's lap (None: no copy in flight)
+    chunk_ev: Vec<Event>,
+    chunk_lap: Vec<Option<u64>>,
 }
 
+/// Chunks of a constant ring (events the host may wait on).
+const RING_CHUNKS: usize = 1024;
+
 impl<'a, W: DevWord> ConstRing<'a, W> {
+    /// Words of the largest push (`WSUM_MAX` tables and their Shoup companions): the size unit of `bytes` / `new`.
     pub fn slot_words(lay: &Layout) -> usize {
-        2 * WSUM_MAX * lay.rows()
+        2 * WSUM_MAX * Self::unit_words(lay)
     }
+    /// One prime-row table (`lay.rows()` words), rounded up to 64 bytes.
+    pub fn unit_words(lay: &Layout) -> usize {
+        let align = (64 / std::mem::size_of::<W>()).max(1);
+        lay.rows().div_ceil(align) * align
+    }
+    /// Device bytes of a ring with room for `slots` of the largest push (many more of the usual one-table rows).
     pub fn bytes(lay: &Layout, slots: usize) -> usize {
         Arena::bytes_for::<W>(slots * Self::slot_words(lay))
     }
@@ -83,82 +104,134 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
         if slots == 0 {
             return Err(Error::Mem { knob: "OpsCfg::const_slots", value: 0, msg: "must be >= 1".into() });
         }
-        let sw = Self::slot_words(lay);
-        let host = (0..slots).map(|_| PinnedBuf::new(dev, sw)).collect::<std::result::Result<Vec<_>, _>>()?;
-        let ev = (0..slots).map(|_| Event::new(dev)).collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ConstRing { dev: arena.alloc("ops.const_ring", slots * sw)?, host, ev, used: vec![false; slots], leased: vec![false; slots], lease: None, next: 0, slot_words: sw })
+        let uw = Self::unit_words(lay);
+        let units = slots * 2 * WSUM_MAX;
+        let nc = RING_CHUNKS.min(units);
+        let chunk_units = units.div_ceil(nc);
+        let chunk_ev = (0..units.div_ceil(chunk_units)).map(|_| Event::new(dev)).collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ConstRing {
+            dev: arena.alloc("ops.const_ring", units * uw)?,
+            host: PinnedBuf::new(dev, units * uw)?,
+            unit_words: uw,
+            units,
+            leased: vec![false; units],
+            held: Default::default(),
+            lease: None,
+            next: 0,
+            lap: 0,
+            chunk_units,
+            chunk_lap: vec![None; chunk_ev.len()],
+            chunk_ev,
+        })
     }
 
-    /// Upload `fill`'s words (it writes at most `slot_words`) and return the slot's device base pointer.
-    pub fn push(&mut self, s: &Stream<Compute>, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
-        let ns = self.host.len();
-        let i = (0..ns).map(|d| (self.next + d) % ns).find(|&j| !self.leased[j]).ok_or_else(|| Error::Mem {
+    /// The first unit of a free run of `n` units from `next` on (wrapping once), and whether it wrapped.
+    fn find(&self, n: usize) -> Option<(usize, bool)> {
+        let start = self.next;
+        let (mut p, mut wrapped) = (start, false);
+        loop {
+            if p + n > self.units {
+                if wrapped {
+                    return None;
+                }
+                (p, wrapped) = (0, true);
+            }
+            if wrapped && p >= start {
+                return None;
+            }
+            match (p..p + n).find(|&u| self.leased[u]) {
+                None => return Some((p, wrapped)),
+                Some(q) => p = q + 1,
+            }
+        }
+    }
+
+    /// Upload `words` words written by `fill` (it gets exactly that many) and return their device base pointer.
+    pub fn push(&mut self, s: &Stream<Compute>, words: usize, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
+        let n = words.div_ceil(self.unit_words).max(1);
+        let (u, wrapped) = self.find(n).ok_or_else(|| Error::Mem {
             knob: "OpsCfg::const_slots",
-            value: ns,
-            msg: "every constant slot is leased by a captured graph (release graphs or raise the knob)".into(),
+            value: self.units / (2 * WSUM_MAX),
+            msg: format!("no {n} free constant units: the ring is leased by captured graphs (release graphs or raise the knob)"),
         })?;
-        self.next = (i + 1) % ns;
-        if self.used[i] {
-            // the previous copy out of this pinned slot must have run before the host rewrites it (a lease begins
-            // with a stream sync, so this never waits inside a capture)
-            self.ev[i].sync()?;
-            self.used[i] = false;
+        if wrapped {
+            self.lap += 1;
         }
-        fill(self.host[i].as_mut_slice());
-        let off = i * self.slot_words;
+        self.next = u + n;
+        let (c0, c1) = (u / self.chunk_units, (u + n - 1) / self.chunk_units);
+        if self.lease.is_none() {
+            // the copies out of these pinned units a lap ago must have run before the host rewrites them (a lease
+            // begins with a stream sync, so this never waits inside a capture)
+            for c in c0..=c1 {
+                if self.chunk_lap[c].is_some_and(|l| l < self.lap) {
+                    self.chunk_ev[c].sync()?;
+                    self.chunk_lap[c] = None;
+                }
+            }
+        }
+        let off = u * self.unit_words;
+        fill(&mut self.host.as_mut_slice()[off..off + words]);
         if let Some(l) = self.lease.as_mut() {
-            self.leased[i] = true;
-            l.push(i);
+            self.leased[u..u + n].iter_mut().for_each(|x| *x = true);
+            self.held.insert(u, n);
+            l.push(u);
         } else {
-            // SAFETY: the pinned slot is not rewritten before `ev[i]` (recorded after this copy) completes
-            unsafe { self.dev.upload_pinned_async(s, off, &self.host[i])? };
-            self.ev[i].record(s)?;
-            self.used[i] = true;
+            // SAFETY: the pinned units are not rewritten before the chunk events recorded after this copy complete
+            unsafe { self.dev.upload_pinned_range_async(s, off, &self.host, off, words)? };
+            for c in c0..=c1 {
+                self.chunk_ev[c].record(s)?;
+                self.chunk_lap[c] = Some(self.lap);
+            }
         }
-        // SAFETY: off < slots * slot_words
+        // SAFETY: off + words <= units * unit_words
         Ok(unsafe { self.dev.dptr().add(off) })
     }
 
-    /// Start a lease (before a capture): waits for the lane, so no slot of the rotation has a copy in flight.
+    /// Start a lease (before a capture): waits for the lane, so no unit of the rotation has a copy in flight.
     pub fn lease_begin(&mut self, s: &Stream<Compute>) -> Result<()> {
         if self.lease.is_some() {
             return Err(shape("ConstRing::lease_begin", "a lease is already open"));
         }
         s.sync()?;
-        self.used.iter_mut().for_each(|u| *u = false);
+        self.chunk_lap.iter_mut().for_each(|l| *l = None);
         self.lease = Some(Vec::new());
         Ok(())
     }
-    /// End the open lease (after the capture): upload the slots pushed since `lease_begin` and wait for the copies;
-    /// returns those slots (they stay out of the rotation until `release`). A failed upload releases them.
+    /// End the open lease (after the capture): upload the pushes made since `lease_begin` and wait for the copies;
+    /// returns them (their units stay out of the rotation until `release`). A failed upload releases them.
     pub fn lease_end(&mut self, s: &Stream<Compute>) -> Result<Vec<usize>> {
-        let slots = self.lease.take().unwrap_or_default();
+        let pushes = self.lease.take().unwrap_or_default();
         let mut up = Ok(());
-        for &i in &slots {
-            // SAFETY: a leased pinned slot is not rewritten before `release`; the copies are waited for below
-            up = unsafe { self.dev.upload_pinned_async(s, i * self.slot_words, &self.host[i]) };
+        for &u in &pushes {
+            let (off, words) = (u * self.unit_words, self.held.get(&u).copied().unwrap_or(0) * self.unit_words);
+            // SAFETY: leased pinned units are not rewritten before `release`; the copies are waited for below
+            up = unsafe { self.dev.upload_pinned_range_async(s, off, &self.host, off, words) };
             if up.is_err() {
                 break;
             }
         }
         if let Err(e) = up.and_then(|()| s.sync()) {
-            self.release(&slots);
+            self.release(&pushes);
             return Err(e.into());
         }
-        Ok(slots)
+        Ok(pushes)
     }
-    /// Return leased slots to the rotation (every graph reading them has been dropped and its last launch has
+    /// Return leased pushes to the rotation (every graph reading them has been dropped and its last launch has
     /// completed).
-    pub fn release(&mut self, slots: &[usize]) {
-        for &i in slots {
-            if let Some(l) = self.leased.get_mut(i) {
-                *l = false;
+    pub fn release(&mut self, pushes: &[usize]) {
+        for &u in pushes {
+            if let Some(n) = self.held.remove(&u) {
+                self.leased[u..u + n].iter_mut().for_each(|x| *x = false);
             }
         }
     }
-    /// Slots currently leased.
+    /// Pushes currently leased.
     pub fn leased(&self) -> usize {
-        self.leased.iter().filter(|&&l| l).count()
+        self.held.len()
+    }
+    /// Units currently leased, and the ring's units.
+    pub fn leased_units(&self) -> (usize, usize) {
+        (self.held.values().sum(), self.units)
     }
 
     /// `nt` tables of per-prime values (`vals[j]`, by prime id, rows `0..len`), laid out as `[j][rows]` values then
@@ -166,10 +239,10 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
     pub fn push_rows(&mut self, s: &Stream<Compute>, primes: &[u64], vals: &[&[u64]]) -> Result<(*const c_void, *const c_void)> {
         let rows = primes.len();
         let nt = vals.len();
-        if 2 * nt * rows > self.slot_words {
-            return Err(shape("ConstRing::push_rows", format!("{nt} tables of {rows} rows exceed a slot ({} words)", self.slot_words)));
+        if nt > WSUM_MAX || rows > self.unit_words {
+            return Err(shape("ConstRing::push_rows", format!("{nt} tables of {rows} rows: at most {WSUM_MAX} of {} rows", self.unit_words)));
         }
-        let base = self.push(s, |h| {
+        let base = self.push(s, 2 * nt * rows, |h| {
             for (j, v) in vals.iter().enumerate() {
                 for (i, &p) in primes.iter().enumerate() {
                     let c = shoup(W::from_u64(v.get(i).copied().unwrap_or(0) % p), W::from_u64(p));
@@ -178,16 +251,16 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
                 }
             }
         })?;
-        // SAFETY: inside the slot (checked above)
+        // SAFETY: inside the push's 2 nt rows words
         Ok((base as *const c_void, unsafe { base.add(nt * rows) } as *const c_void))
     }
 
     /// Raw per-prime words (no Shoup), e.g. add_const's `k` (values may equal `p`: the kernel reduces them).
     pub fn push_plain(&mut self, s: &Stream<Compute>, vals: &[u64]) -> Result<*const c_void> {
-        if vals.len() > self.slot_words {
-            return Err(shape("ConstRing::push_plain", format!("{} words exceed a slot", vals.len())));
+        if vals.len() > 2 * WSUM_MAX * self.unit_words {
+            return Err(shape("ConstRing::push_plain", format!("{} words exceed the largest push", vals.len())));
         }
-        Ok(self.push(s, |h| {
+        Ok(self.push(s, vals.len(), |h| {
             for (o, &v) in h.iter_mut().zip(vals) {
                 *o = W::from_u64(v);
             }

@@ -54,11 +54,11 @@ class LlamaPlannedPrefill(PlannedPrefill):
         io, kv_io = {}, {}
         self.uniq = {}
 
-        def block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None):
+        def block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None):
             flat = [x for blk in Xs for x in blk]
             metas = [(int(c.level), int(c.noise_deg)) for c in flat]
             vals = [np.array(c.vec) for c in flat] if layer == 0 else None
-            Y = orig(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged)
+            Y = orig(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last)
             # graph names as this block's capture wrote them (the next block renames what it reads)
             io[layer] = ([c.name for c in flat], [c.name for blk in Y for c in blk], metas, vals, ch, [len(b) for b in Y])
             return Y
@@ -85,10 +85,10 @@ class LlamaPlannedPrefill(PlannedPrefill):
                 self.snaps[nm] = np.array(ct.vec)
             return nm
 
-        def block_t(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None):
+        def block_t(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None):
             tapping[0] = layer == self.tap_block
             try:
-                return block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged)
+                return block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last)
             finally:
                 tapping[0] = False
 
@@ -96,7 +96,12 @@ class LlamaPlannedPrefill(PlannedPrefill):
         if self.tap_block is not None:
             fhe.new_var = snap_var
         try:
-            pages, _ = m.prefill_paged(toks, on_block=on_block, on_kv=on_kv if self.kv_out else None)
+            if os.environ.get("PF_PAGED", "0") not in ("", "0"):
+                pages, _ = m.prefill_paged(toks, on_block=on_block, on_kv=on_kv if self.kv_out else None)
+            else:           # the unpaged blocked prefill (one chunk-pair prompt)
+                Xs_, ch_, _ = m.prefill(toks, on_block=lambda b, Xs, s: on_block(0, b, Xs, None, s),
+                                        on_kv=(lambda b, K, V: on_kv(0, b, K, V)) if self.kv_out else None)
+                pages = [(Xs_, ch_)]
         finally:
             LP.llama_prefill_block_blocked = orig
             fhe.new_var = new_var

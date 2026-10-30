@@ -111,3 +111,11 @@ mod tests {
         assert!(guard_check(g, Some("1"), Some("2")).is_err());
     }
 }
+
+/// (free, total) memory of the calling thread's current device, in bytes (`Device::mem_info` without the handle).
+pub fn mem_info_current() -> Result<(usize, usize)> {
+    let (mut f, mut t) = (0usize, 0usize);
+    // SAFETY: out-pointers to locals
+    check(unsafe { ffi::cudaMemGetInfo(&mut f, &mut t) }, "cudaMemGetInfo")?;
+    Ok((f, t))
+}

@@ -22,18 +22,19 @@
 # recipe, same capture; the exit must equal block 0's, or block 1's plan would not bind.
 # Written as block_0_feedback_placement.json next to the plan.
 #
-# The 512-context plan (bootstrap_placements/gpt2_decode_ctx512) binds at every cache length: the capture
-# runs with step-scoped names and the general softmax period (IMPL_SCOPED_NAMES=1 SM_PERIODIC=2), the softmax
-# refreshes land at 32, where the multi-stage routes past 1024 slots arrive (PLAN_STEP_LANDING; the runtime caps
-# SparseB at 1024 slots, whose diagonals grow as n^2 / N), no refresh sits in a group ladder (.gp), and the
-# magnitudes are the larger of position 0's and position 511's (scripts/utils/merge_mags.py):
-#     python -m perseus.examples.gpt2.run_decode --tokens 1 --argmax --capture $GR --structure-only \
-#         --configs $CFG --set IMPL_SCOPED_NAMES=1 --set SM_PERIODIC=2 (+ the shipped plan's runtime as --set)
-#     python -m perseus.examples.gpt2.capture_mags $GR --argmax --configs $CFG --set IMPL_SCOPED_NAMES=1 ...
-#     FHE_GRAPH_CAPTURE_TOKEN=511 python -m perseus.examples.gpt2.run_decode --fake --tokens 512 \
-#         --capture $GR511 --configs $CFG --set IMPL_SCOPED_NAMES=1 ...   (STEPS_T=512 reference)
-#     python scripts/utils/merge_mags.py $GR graphs/gpt2_decode_ctx512 $GR511
-#     bash scripts/make_plans.sh gpt2_decode_ctx512
+# The 1024-context plan (bootstrap_placements/gpt2_decode_ctx1024) binds at every cache length: the capture runs
+# with step-scoped names and the general softmax period (IMPL_SCOPED_NAMES=1 SM_PERIODIC=2), the softmax refreshes
+# land at 32, where the multi-stage routes past 1024 slots arrive (PLAN_STEP_LANDING; the runtime caps SparseB at 1024
+# slots, whose diagonals grow as n^2 / N), no refresh sits in a group ladder (.gp), and the magnitudes are the largest
+# of positions 0, 511 and 1023 (scripts/utils/merge_mags.py). PLAN_FALLBACK_CF / PLAN_PACK_CF stay off: they size
+# factors for a fixed window, and the softmax refresh inputs grow with the cache (16x the KL, a wrap past 896 keys):
+#     python -m perseus.examples.gpt2.run_decode --fake --tokens 1 --argmax --capture $GR --structure-only \
+#         --configs $CFG --set CORRECTION_FACTOR=6 (+ the plan's runtime as --set)     (STEPS_T=16 reference)
+#     python -m perseus.examples.gpt2.capture_mags $GR --argmax --configs $CFG --set ...
+#     FHE_GRAPH_CAPTURE_TOKEN=1023 python -m perseus.examples.gpt2.run_decode --fake --tokens 1024 \
+#         --capture $GR1023 --configs $CFG --set ...   (STEPS_T=1024 reference; the same for 511)
+#     python scripts/utils/merge_mags.py $GR graphs/gpt2_decode_ctx1024 $GR511 $GR1023
+#     bash python/perseus/examples/gpt2/make_plan.sh graphs/gpt2_decode_ctx1024 gpt2_decode_ctx1024 (then argmax)
 set -euo pipefail
 # Runs from the repository root (graphs/, bootstrap_placements/); a GRAPH_DIR that exists from the caller's
 # directory is taken as given.

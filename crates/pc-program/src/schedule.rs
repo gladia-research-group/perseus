@@ -42,7 +42,7 @@ fn cost(st: &Step, lists: &[Vec<i64>]) -> f64 {
 }
 
 /// Slots a step reads and writes (finishes: their own lists).
-fn rw<W: DevWord>(b: &Bound<'_, W>, st: &Step) -> (Vec<u32>, Vec<u32>) {
+pub(crate) fn rw<W: DevWord>(b: &Bound<'_, W>, st: &Step) -> (Vec<u32>, Vec<u32>) {
     if let StepOp::Finish { f } = &st.op {
         if let Some(fs) = b.finishes.get(*f as usize) {
             return (fs.ins.clone(), fs.outs.clone());

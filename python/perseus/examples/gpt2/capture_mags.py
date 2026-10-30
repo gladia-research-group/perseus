@@ -1,25 +1,12 @@
 """Fill a magnitude-suppressed GPT-2 capture with the numpy fake's exact magnitudes (perseus/impl/magtape.py):
-the device capture records the structure only (no per-node decrypt), the fake runs the same kernels on the same
-oracle rows and writes each node's statistics.
+the device capture records the structure only, the fake runs the same kernels on the same oracle rows.
 
-    # 1. the device capture, structure only
     .venv/bin/python -m perseus.examples.gpt2.run_decode --tokens 1 --capture graphs/X --structure-only
-    # 2. the same token on the fake (CPU), merged into graphs/X/block_<b>/graph.json
     .venv/bin/python -m perseus.examples.gpt2.capture_mags graphs/X [--argmax]
 
-The switches that shape the op stream must be the device run's: the env is env.ENV plus the plan runtime and the
-same --set overrides. `--check REF_DIR` compares with a capture that carries the device's own magnitudes instead
-of writing.
-
-`--argmax --rows R.npy` sizes CutMax (block 13) on logit rows instead of the captured position: each row runs the
-CutMax code on the fake (entered as the captured position enters it), and the block takes the per-node max over the
-rows, its other statistics the first row's. `--blocks 13` writes that block only; the same op stream fills a prefill
-capture's CutMax stage. The rows of the served CutMax plans are the windows of graphs/gpt2_decode_python_n32_cm:
-    python scripts/utils/cutmax_rows.py graphs/gpt2_decode_python_n32_cm/cutmax_rows.json rows.npy
-    python -m perseus.examples.gpt2.capture_mags graphs/gpt2_decode_python_n32_cm --argmax --rows rows.npy --blocks 13 \
-        --plan bootstrap_placements/gpt2_decode_python_n32_m16i_fcf \
-        --configs configs/model/approximation/gpt2_base_n32_cm/configs.json
-(graphs/gpt2_prefill128_pf_cm: the same with its configs, gpt2_base_n32_pf_cm).
+The env is env.ENV plus the plan runtime and the same --set overrides. `--check REF_DIR` compares with a capture
+that carries the device's own magnitudes. `--argmax --rows R.npy` sizes CutMax (block 13) as the per-node max over
+logit rows (graphs/gpt2_decode/cutmax_rows.json, scripts/utils/cutmax_rows.py); `--blocks 13` writes that block.
 """
 from __future__ import annotations
 

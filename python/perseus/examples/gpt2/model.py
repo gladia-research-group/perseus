@@ -265,17 +265,19 @@ class Gpt2Model(ImplModel):
                 on_token(rec)
         return results
 
-    def run_decode_planned(self, run, inputs, gt_logits=None, on_token=None, argmax=False):
+    def run_decode_planned(self, run, inputs, gt_logits=None, on_token=None, argmax=False, first=0):
         """`run_decode` on the new runtime (impl.driver.PlannedRun: per stage Program.run). This model only decodes
-        (logits, CutMax z) from the run's registers; the run's recorder twin produces the per-position stream."""
+        (logits, CutMax z) from the run's registers; the run's recorder twin produces the per-position stream.
+        `first`: the position of inputs[0] (a plain prefix holds positions 0 .. first-1)."""
         results = []
         for t in range(len(inputs)):
             t0 = time.time()
             reg, hostrec = run.token(t, inputs, argmax=argmax)
             lg = self.logits([run.ct(r) for r in (reg if isinstance(reg, list) else [reg])])
-            rec = {"pos": t, "decode_s": time.time() - t0, "logits": lg, "top1": int(np.argmax(lg)), **hostrec}
-            if gt_logits is not None and t < len(gt_logits) and len(gt_logits[t]):
-                rec.update(dist_report(lg, np.asarray(gt_logits[t])))
+            p = t + first
+            rec = {"pos": p, "decode_s": time.time() - t0, "logits": lg, "top1": int(np.argmax(lg)), **hostrec}
+            if gt_logits is not None and p < len(gt_logits) and len(gt_logits[p]):
+                rec.update(dist_report(lg, np.asarray(gt_logits[p])))
             if argmax:
                 t1 = time.time()
                 z = run.argmax(t)

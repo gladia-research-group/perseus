@@ -585,6 +585,75 @@ def plan_rot_scope(plan_dir, progs, dyn_rot=(), half=1 << 15):
     return len(steps), len(scope)
 
 
+def parse_plan_windows(spec):
+    """`--plan-windows 128:dirA,256:dirB,...` as [(bound, plan dir)] by bound: a window's plan serves the positions
+    below its bound and at or above the bound before it."""
+    out = []
+    for item in str(spec).split(","):
+        bound, sep, d = item.strip().partition(":")
+        if not sep or not d.strip() or not bound.strip().isdigit():
+            raise ValueError(f"plan window {item!r}: expected <bound>:<plan dir>")
+        out.append((int(bound), d.strip()))
+    out.sort(key=lambda w: w[0])
+    bounds = [b for b, _d in out]
+    if bounds[0] <= 0 or len(set(bounds)) != len(bounds):
+        raise ValueError(f"plan windows {spec!r}: the bounds must be positive and distinct")
+    return out
+
+
+def window_index(windows, pos):
+    """The index of the window serving position `pos` (the first whose bound exceeds it)."""
+    for i, (bound, _d) in enumerate(windows):
+        if pos < bound:
+            return i
+    raise ValueError(f"position {pos} is past the last plan window (positions < {windows[-1][0]})")
+
+
+def check_plan_windows(dirs):
+    """The plans of one windowed run differ only in the magnitudes their refreshes were sized from, and one session
+    serves them all: their PLAN_CMD.txt `runtime=` switches and `configs=` line, their placements' Config stamp and
+    their block set must be equal (raises naming the first plan that differs). Returns the union of their
+    `plan_rot_steps.json` (None when none ships one). The session's rotation keys, refresh routes and bootstrap
+    variants are those of the compiled programs of every class, so they cover every window's plan."""
+    import shlex
+
+    def facts(d):
+        cmd = {}
+        p = os.path.join(d, "PLAN_CMD.txt")
+        if os.path.exists(p):
+            with open(p) as f:
+                for line in f.read().splitlines():
+                    k, sep, v = line.partition("=")
+                    if sep and k.isidentifier():
+                        cmd[k] = v
+        blocks = sorted(f for f in os.listdir(d) if f.startswith("block_") and f.endswith("_placement.json"))
+        if not blocks:
+            raise ValueError(f"plan window {d}: no block_*_placement.json")
+        with open(os.path.join(d, blocks[0])) as f:
+            stamp = json.load(f).get("config")
+        return {"runtime": dict(kv.split("=", 1) for kv in shlex.split(cmd.get("runtime", ""))),
+                "configs": cmd.get("configs", "").split()[:1], "stamp": stamp, "blocks": blocks}
+
+    dirs = [str(d) for d in dirs]
+    ref = facts(dirs[0])
+    for d in dirs[1:]:
+        f = facts(d)
+        for k in ("runtime", "configs", "stamp", "blocks"):
+            if f[k] != ref[k]:
+                what = k
+                if k == "runtime":
+                    what = "runtime switches " + ", ".join(sorted(x for x in set(f[k]) | set(ref[k])
+                                                                  if f[k].get(x) != ref[k].get(x))[:6])
+                raise ValueError(f"plan windows: {d} differs from {dirs[0]} in its {what}")
+    rot = None
+    for d in dirs:
+        p = os.path.join(d, "plan_rot_steps.json")
+        if os.path.exists(p):
+            with open(p) as f:
+                rot = (rot or set()) | {int(s) for s in json.load(f)}
+    return None if rot is None else sorted(rot)
+
+
 def register_levels(n_regs, writes):
     """`Session(reg_levels=)`: per register the richest level any program output written to it carries (a register
     is sized for the Q rows of that level); `writes` = (program, output index, register)."""
@@ -602,9 +671,10 @@ class PlannedRun:
     generation); they share the stage's registers, dynamic steps and plaintext values."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, ref_token=2, probe=4, work_dir, pt_rows=0,
-                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None):
+                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, schedule="program"):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
         self.variants = dict(variants or {})
+        self.schedule = schedule          # Program.compile's op order (siblings: refresh pairs)
         self.ref_token, self.probe, self.work_dir, self.pt_rows = ref_token, probe, work_dir, pt_rows
         self.dyn_rot = list(dyn_rot) if dyn_rot is not None else [-i for i in range(-1, 32)]
         self.stc_cache, self.pool, self.log = stc_cache, pool, log
@@ -653,7 +723,7 @@ class PlannedRun:
             live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
         self.progs = _pc.Program.compile(self.work_dir, str(self.plan_dir), config=self.cfg,
                                          blocks=[self.labels[b] for b in ref] + list(self.variants), live_out=live,
-                                         input_metas=metas)
+                                         input_metas=metas, schedule=self.schedule)
         # dynamic steps: everything a probe token changes
         dyn = {b: set() for b in ref}
         for t, rec in self.records.items():
@@ -973,13 +1043,21 @@ class StreamedPlannedRun:
     `routes_for(pos)`: the extra sparse routes position `pos` holds (SM_PERIODIC=2), or None; `prefix(b)`: {cache
     key suffix: slot vector} of block b's caches before the first token (the BOS prefix; None: the caches start
     empty, token 0 pushes into them). `argmax`: the stages include CutMax after the tail (`argmax(t)` runs it);
-    `pt_slots`: the plaintext slots (default: twice the distinct values a token reads); `slim`: keep only the
-    plaintext values of the non-reference tokens' records once their diffs are taken (512-position runs)."""
+    `pt_slots`: the plaintext slots (default: the distinct values a token reads, + 64); `slim`: keep only the
+    plaintext values of the non-reference tokens' records once their diffs are taken (512-position runs).
+    `plan_windows` [(bound, plan dir)] (`parse_plan_windows`): a plan per position window, the one whose bound first
+    exceeds a class's positions compiling it (classes never straddle a bound); `plan_dir` then only names the
+    run's runtime, which every window's plan shares (`check_plan_windows`)."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, work_dir, streams, stream_rows, prefix=None,
                  kv_init=None, input_vec=None, routes_for=None, frames=None, stc_cache=8, pool=16, base_routes=(256, 1),
-                 size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print):
+                 size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print,
+                 schedule="program", plan_windows=None):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
+        self.plan_windows = [(int(b), str(d)) for b, d in plan_windows] if plan_windows else None
+        if self.plan_windows:
+            self.window_rot = check_plan_windows([plan_dir] + [d for _b, d in self.plan_windows])
+        self.schedule = schedule          # Program.compile's op order (siblings: refresh pairs)
         self.work_dir, self.streams, self.stream_rows, self.prefix = work_dir, dict(streams), stream_rows, prefix
         self.input_vec = input_vec or (lambda row: row)
         self.size = size                   # the model geometry (Session size=: token packing, inf.size)
@@ -1003,6 +1081,13 @@ class StreamedPlannedRun:
         self.check_meta = False            # debug: every op's device metadata vs the compiled one (eager replay)
 
     # ── setup (CPU) ──
+    def plan_for(self, pos):
+        """(window index, plan dir) serving position `pos`: (None, plan_dir) without plan windows."""
+        if not self.plan_windows:
+            return None, self.plan_dir
+        w = window_index(self.plan_windows, pos)
+        return w, self.plan_windows[w][1]
+
     def _ukey(self, b, key):
         """A cache key `impl.b<b>.vb.3` as its suffix `vb.3`."""
         pre = f"impl.b{b}."
@@ -1033,14 +1118,15 @@ class StreamedPlannedRun:
             # classes: structure + K/V entry state + the class's routes
             pos = t + self.rec.first
             extra = tuple(sorted(self.routes_for(pos))) if self.routes_for else ()
-            key = (tuple((_sig(rec[b]), tuple(rec[b].metas.get(x) for x in rec[b].inputs())) for b in sorted(rec)), extra)
+            key = (tuple((_sig(rec[b]), tuple(rec[b].metas.get(x) for x in rec[b].inputs())) for b in sorted(rec)), extra,
+                   self.plan_for(pos)[0])
             if key not in keyidx:
                 if self.slim:          # a new structure: the classes before it take no more members (else reloaded)
                     for k0, c0 in enumerate(self.classes):
                         self._close_class(k0, c0)
                 keyidx[key] = len(self.classes)
                 self.classes.append({"ref": t, "members": [], "routes": sorted(set(self.base_routes) | set(extra)),
-                                     "diffs": {}})
+                                     "diffs": {}, "plan": self.plan_for(pos)[1]})
             c = self.classes[keyidx[key]]
             c["members"].append(t)
             self.class_of[t] = keyidx[key]
@@ -1079,6 +1165,14 @@ class StreamedPlannedRun:
         for k, c in enumerate(self.classes):
             self._compile_class(k, c)
         self.compile_s = time.time() - tc
+        if self.plan_windows:
+            used = {}
+            for c in self.classes:
+                used.setdefault(c["plan"], []).append(c["ref"] + self.rec.first)
+            rot = "none shipped" if self.window_rot is None else f"{len(self.window_rot)} steps"
+            self.log("[planned] plan windows: " + "; ".join(
+                f"< {b}: {os.path.basename(d.rstrip('/'))} ({len(used.get(d, []))} classes)" for b, d in self.plan_windows)
+                + f"; one runtime, rotation keys of every class's programs (plan_rot_steps.json union: {rot})")
         self.prepare_s = time.time() - t0
         return self
 
@@ -1198,9 +1292,9 @@ class StreamedPlannedRun:
                 live[lab] += self.taps
             metas[lab] = c["ref_info"][b][1] if closed else {ins[i]: r.metas[ins[i]] for i, _ in kv_in}
             io[b] = kv_in
-        progs = _pc.Program.compile(wd, str(self.plan_dir), config=self.cfg, blocks=[self.labels[b] for b in ref],
+        progs = _pc.Program.compile(wd, str(c["plan"]), config=self.cfg, blocks=[self.labels[b] for b in ref],
                                     live_out=live, input_metas=metas, routes_built=list(c["routes"]),
-                                    dense_fallback=self.dense_fallback)
+                                    dense_fallback=self.dense_fallback, schedule=self.schedule)
         c["progs"] = {}
         c["kv_in"], c["kv_out"], c["out"] = {}, {}, {}
         for b, r in ref.items():
@@ -1232,7 +1326,8 @@ class StreamedPlannedRun:
         ops = sum(p.n_ops for p in c["progs"].values())
         sums = sum(len(p.coeff_sums) for p in c["progs"].values())
         bts = sum(p.n_bootstraps for p in c["progs"].values())
-        self.log(f"[planned] class {k} (positions {[t + self.rec.first for t in c['members']]}, routes {c['routes']}): "
+        self.log(f"[planned] class {k} (positions {[t + self.rec.first for t in c['members']]}, routes {c['routes']}"
+                 + (f", plan {os.path.basename(str(c['plan']).rstrip('/'))}" if self.plan_windows else "") + "): "
                  f"{len(c['progs'])} programs, {ops} ops, {sums} streamed sums, {bts} refreshes, "
                  f"{sum(len(v) for v in dyn.values())} dynamic steps")
 
@@ -1264,8 +1359,19 @@ class StreamedPlannedRun:
                 lv += [p.outputs[j][1] for j, _u in c["kv_out"][b]] + [p.inputs[i][1] for i, _u in c["kv_in"][b]]
         kv_rows = 54 - min(lv) if lv else 1
         pages = 2 * self.U
-        # plaintext slots: the distinct values a token reads (+ the next token's new ones before the evictions)
-        n_slots = self.pt_slots if self.pt_slots is not None else 2 * self.n_pts + 64
+        # plaintext slots: the most (value, level) pairs one token's class programs read (`_patch`'s keys). `_patch`
+        # evicts the values a token no longer reads before it stages the new ones, so the store never holds more than
+        # one token reads; a staged upload waits on the compute lane's hand-off either way, so reusing an evicted slot
+        # costs nothing (2 x the values: ~17 GB at 511 Llama positions)
+        peak, at = 0, 0
+        for t in sorted(self.records):
+            r, progs_t = self.records[t], self.classes[self.class_of[t]]["progs"]
+            k = len({(id(r[b].pts[nm]), lv_) for b in r for nm, lv_, _d, f in progs_t[b].pt_refs if f != "stream"})
+            if k > peak:
+                peak, at = k, t
+        n_slots = self.pt_slots if self.pt_slots is not None else peak + 64
+        self.log(f"[planned] plaintext slots {n_slots + self.extra_pt_slots}: the most one token reads {peak} (position "
+                 f"{at + self.rec.first}; recorded {self.n_pts})")
         pt_level = min(lev for c in self.classes for p in c["progs"].values() for _nm, lev, _d, f in p.pt_refs if f != "stream")
         # weight frames: the Config's host.n_in_flight (default 2), raised until the last block and the next token's
         # first one sit in different frames
@@ -1383,8 +1489,9 @@ class StreamedPlannedRun:
         self._resident = need
         return len(items)
 
-    def token(self, t, rows):
-        """Issue token t's forward; returns (the tail's output registers, host times). Asynchronous."""
+    def token(self, t, rows, argmax=None):
+        """Issue token t's forward; returns (the tail's output registers, host times). Asynchronous. `argmax`: as
+        constructed (every record stages CutMax from setup)."""
         tt = time.time()
         if t not in self.records:
             self.records[t] = self.rec.token(t, rows[t], self.argmax_stage)

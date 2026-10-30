@@ -80,7 +80,7 @@ _QKV_PACK = os.environ.get("PF_QKV_PACK", "0") not in ("", "0")
 
 
 def _kv_packed(B):
-    return _QKV_PACK and 2 * B.group_dims(B.K - 1).H_real <= B.hg
+    return _QKV_PACK and os.environ.get("PF_ATTN", "") != "ccmm" and 2 * B.group_dims(B.K - 1).H_real <= B.hg
 
 
 def _pack_kv(B, k_cols, v_cols, k_vec, v_vec):
@@ -93,6 +93,23 @@ def _pack_kv(B, k_cols, v_cols, k_vec, v_vec):
     k_cols[:, src + h2] += v_cols[:, src]
     k_vec[src + h2] += v_vec[src]
     return k_cols, v_cols[:, :lo], k_vec, v_vec[:lo]
+
+
+def qkv_encode(B, m):
+    """The fused QKV linear's columns and bias in head-grouped order, K | V | Q (PF_QKV_PACK: V's last block on K's)."""
+    k_cols, v_cols = B.group_cols(m.K), B.group_cols(m.V)
+    k_vec, v_vec = B.group_vec(m.bk), B.group_vec(m.bv)
+    if _kv_packed(B):
+        k_cols, v_cols, k_vec, v_vec = _pack_kv(B, k_cols, v_cols, k_vec, v_vec)
+    return np.hstack([k_cols, v_cols, B.group_cols(m.Q)]), np.concatenate([k_vec, v_vec, B.group_vec(m.bq)])
+
+
+def qkv_split(rt, o, B):
+    """(K, V, Q) blocks of the fused QKV linear's output (PF_QKV_PACK: V's last block rides K's, half a group up)."""
+    K = B.K
+    if _kv_packed(B):
+        o = o[:2 * K - 1] + [rt.ops.rotate(o[K - 1], B.hg // 2 * B.t)] + o[2 * K - 1:]
+    return o[:K], o[K:2 * K], o[2 * K:]
 
 
 # PF_PCMM_CALIB=<json>: record every block linear's max |output| (the PCMM band shifts)
@@ -196,7 +213,7 @@ def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B, last=None):
     """prefill_block_diag on the channel-blocked layout (Xs[g][k]; PCMM linears in head-grouped order). `last`: the
     only position the block's output must hold (every position's K / V is still computed): its attention alone
     (blocked.attention_last), then it fills every lane of the residual stream."""
-    ops, K = rt.ops, B.K
+    ops = rt.ops
     ln1, ln2, sm, ge = cfgs
     skip = Xs
     with rt.step("ln_1"):
@@ -206,10 +223,8 @@ def prefill_block_blocked(rt, Xs, w, cfgs, ch: Chunks, B, last=None):
     with rt.step("qkv"):
         Q, Kc, V = [], [], []
         for g, y in enumerate(Y):
-            o = _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B)
-            if _kv_packed(B):          # V's last block rides K's, half a group up
-                o = o[:2 * K - 1] + [ops.rotate(o[K - 1], B.hg // 2 * B.t)] + o[2 * K - 1:]
-            Kc.append(o[:K]); V.append(o[K:2 * K]); Q.append(o[2 * K:])
+            k, v, q = qkv_split(rt, _bias_blocks(rt, pcmm_run(rt, y, w["qkv"]), w["qkv"], ch, g, B), B)
+            Kc.append(k); V.append(v); Q.append(q)
     with rt.step("attn"):
         O = (BL.attention_blocked(rt, Q, Kc, V, sm, ch, B) if last is None
              else BL.attention_last(rt, Q, Kc, V, sm, ch, B, last))
@@ -303,13 +318,9 @@ class Gpt2Prefill(Gpt2Model):
                 B = self.blocks
                 enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                                    name=f"b{b}.{name}")
-                k_cols, v_cols = B.group_cols(m.K), B.group_cols(m.V)
-                k_vec, v_vec = B.group_vec(m.bk), B.group_vec(m.bv)
-                if _kv_packed(B):
-                    k_cols, v_cols, k_vec, v_vec = _pack_kv(B, k_cols, v_cols, k_vec, v_vec)
+                qkv_cols, qkv_bias = qkv_encode(B, m)
                 cache[b] = {
-                    "qkv": enc("qkv", np.hstack([k_cols, v_cols, B.group_cols(m.Q)]), 0.25,
-                               2.0 * np.concatenate([k_vec, v_vec, B.group_vec(m.bq)])),
+                    "qkv": enc("qkv", qkv_cols, 0.25, 2.0 * qkv_bias),
                     "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
                     "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
                     "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),

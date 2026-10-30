@@ -37,7 +37,7 @@ def _planned(a, model, store, files, names, W1, results=None):
     from perseus.examples.gpt2.prefill import report
     from . import weights as V
     from .planned import VitPlannedPrefill
-    cfg = plan_config(a.plan)
+    cfg = plan_config(a.plan, a.graphs)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"m10_vit_{os.getpid()}")
     run = VitPlannedPrefill(model, resolve(a.plan), cfg, keys, work_dir=work, pt_rows=a.pt_rows,
@@ -72,6 +72,8 @@ def _planned(a, model, store, files, names, W1, results=None):
         frees.append(round(run.fhe.mem_info()[0] / 2 ** 30, 2))
         host = sum(i["host_us"] for i in info) / 1e6
         mm = sum(i["meta_mismatches"] for i in info)
+        if os.environ.get("PF_GRAPH_VERIFY") and a.graphs:
+            run.verify_graphs(vals)     # graph replay vs eager on one encryption, every block's output compared
         if a.check:
             for b in range(model.n_layers):
                 h = V.unscale(run.hidden(b))
@@ -118,6 +120,7 @@ def main(argv=None, results=None):
     ap.add_argument("--capture", default=None)
     ap.add_argument("--structure-only", action="store_true")
     ap.add_argument("--plan", default=None)
+    ap.add_argument("--graphs", action="store_true", help="planned: replay each block as CUDA graphs")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--profile", action="store_true")

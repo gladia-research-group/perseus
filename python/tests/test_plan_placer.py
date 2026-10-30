@@ -619,3 +619,4 @@ class SplitPacks(unittest.TestCase):
     def test_alike_parts_are_not_a_pack(self):
         from perseus.plan.placer.emit import split_packs
         self.assertEqual(split_packs(self._graph(0.5)), {})
+
