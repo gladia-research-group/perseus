@@ -75,7 +75,9 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
             g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
             return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
         ops.bootstrap_hint(x, ops.headroom(4))
-        return eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
+        # unfolded: q on the interval stretched by xmax reads x / xmax; xmax and the lanes ride the mask as above
+        g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.xmax * cfg.cheb_a, cfg.xmax * cfg.cheb_b, cfg.cheb_eps)
+        return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
     if cfg.method != "thor_composite":
         raise ValueError(f"gelu: method {cfg.method!r} not ported")
     if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries it): xmax rides the mask
