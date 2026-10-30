@@ -686,6 +686,7 @@ class PlannedRun:
         self.records, self._next = {}, None
         self.stats = []
         self._pre, self._staged, self._keys, self._alias = {}, None, {}, {}
+        self._ahead = None
 
     # ── setup ──
     def _record(self, t, rows, argmax):
@@ -975,9 +976,13 @@ class PlannedRun:
             self._next.join()
             self._next = None
         pre = self._pre.get((self._staged, t))
+        if self._ahead is not None and self._ahead != t:
+            raise RuntimeError(f"token {t} after position {self._ahead}'s patch (patch_ahead)")
         if pre is not None and not self.debug:
             t_rec = 0.0
-            self._apply(pre["calls"], pre["items"], pre.get("restore"))
+            if self._ahead is None:
+                self._apply(pre["calls"], pre["items"], pre.get("restore"))
+            self._ahead = None
             self._zero, n_staged = pre["zero"], len(pre["items"])
             self._pt_vals.clear()          # the existing path, if ever taken next, restages every plaintext
         else:
@@ -1012,6 +1017,17 @@ class PlannedRun:
         rec = {"record_s": round(t_rec, 3), "patch_s": round(t_patch, 3), "issue_s": round(t_issue, 3),
                "staged": n_staged, "served": "".join(i["served"][0] for i in info)}
         return self.reg[n_blocks - 1]["out"][0][1], rec
+
+    def patch_ahead(self, t):
+        """Apply position t's precomputed patch now (its dynamic steps, and its plaintexts, ordered on the device after
+        the work issued so far), so that `token(t)` issues its blocks at once: a server calls it once it has answered
+        the position before, while it waits for t's input. Returns whether a patch was applied."""
+        pre = self._pre.get((self._staged, t))
+        if pre is None or self.debug or self._ahead is not None:
+            return False
+        self._apply(pre["calls"], pre["items"], pre.get("restore"))
+        self._ahead = t
+        return True
 
     def _check(self, t, b, r):
         """Debug: the block's output and K/V states decrypted vs the recorder's float values (synchronous)."""
