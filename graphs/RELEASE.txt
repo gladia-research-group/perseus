@@ -2,9 +2,9 @@
 # repository: unpack it at the repository root (tar --zstd -xf perseus-graphs.tar.zst). Only replanning reads them;
 # the plans they made are in bootstrap_placements/ (same names).
 llama31_8b_decode              153 MB  the Llama decode plan's recording (position 1 on llama31_8b_n32_ctx512)
-llama31_8b_decode_ctx512_w128  266 MB  the Llama decode window plan's recording, positions 1-127
-llama31_8b_decode_ctx512_w256  266 MB  the same, positions 128-255
-llama31_8b_decode_ctx512_w384  266 MB  the same, positions 256-383
-llama31_8b_decode_ctx512_w512  266 MB  the same, positions 384-511
-llama31_8b_prefill128          185 MB  the 128-token Llama prefill plan's recording (fake capture under its runtime= line)
+llama31_8b_decode_ctx512_w128  265 MB  the Llama decode window plan's recording, positions 1-127
+llama31_8b_decode_ctx512_w256  265 MB  the same, positions 128-255
+llama31_8b_decode_ctx512_w384  265 MB  the same, positions 256-383
+llama31_8b_decode_ctx512_w512  265 MB  the same, positions 384-511
+llama31_8b_prefill128          186 MB  the 128-token Llama prefill plan's recording (fake capture under its runtime= line)
 llama31_8b_handoff_decode      174 MB  the hand-off decode plan's recording (decode cut for the prefill's K / V)
