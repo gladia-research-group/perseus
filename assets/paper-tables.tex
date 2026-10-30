@@ -16,15 +16,15 @@
 \pagecolor{bg}\color{fg}
 \arrayrulecolor{fg}
 \setlength{\dashlinedash}{3pt}\setlength{\dashlinegap}{3pt}
-% Perseus' numbers on the Rust + CUDA runtime (the shipped default plans, 2026-10-29: medians of 2 paired rounds on
+% Perseus' numbers on the Rust + CUDA runtime (the shipped default plans, 2026-10-30: medians of 2 paired rounds on
 % one isolated GPU; decode at a 512-token context, positions 500-511 after a 500-position plaintext prefix)
-\newcommand{\llamapf}{74.0}\newcommand{\llamadec}{11.2}\newcommand{\gptpf}{11.7}\newcommand{\gptdec}{3.32}
-\newcommand{\vitimg}{36.6}\newcommand{\bertin}{14.4}
+\newcommand{\llamapf}{71.0}\newcommand{\llamadec}{9.69}\newcommand{\gptpf}{9.62}\newcommand{\gptdec}{2.62}
+\newcommand{\vitimg}{31.2}\newcommand{\bertin}{12.2}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), Llama's the
 % GPU's peak used memory over the run (its runner reports no free memory)
-\newcommand{\llamapfmem}{93.2}\newcommand{\llamadecmem}{59.7}\newcommand{\gptpfmem}{66.7}\newcommand{\gptdecmem}{55.9}
-\newcommand{\vitmem}{67.9}\newcommand{\bertmem}{65.4}
+\newcommand{\llamapfmem}{86.3}\newcommand{\llamadecmem}{48.2}\newcommand{\gptpfmem}{58.8}\newcommand{\gptdecmem}{59.1}
+\newcommand{\vitmem}{60.6}\newcommand{\bertmem}{56.0}
 \newcommand{\oursrow}{\rowcolor{ours}}
 \newcommand{\oc}{\cellcolor{ours}}
 \newcommand{\yes}{\textcolor{yescol}{\ding{51}}}
