@@ -39,12 +39,15 @@ fn field_table() {
     let pf = PlanConfig::fields();
     println!("[config] Config {} fields, PlanConfig {} fields", cf.len(), pf.len());
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
-    // bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack}, chain.preset
-    assert_eq!(cf.len(), 259);
+    // bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack}, chain.preset,
+    // the GELU output hint, the head-sum cleanse
+    assert_eq!(cf.len(), 261);
     // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
     // plan.fallback_cf, plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
-    // plan.keep_placements_exact, plan.mag_safety_steps, plan.resume
-    assert_eq!(pf.len(), 98);
+    // plan.keep_placements_exact, plan.mag_safety_steps, plan.resume; the lean chain's plan.envelope_strict,
+    // plan.env_effective, plan.pcmm_prediv_cap, plan.pcmm_stamps, plan.stc_first_staged_only,
+    // plan.step_route_pricing
+    assert_eq!(pf.len(), 104);
     let mut envs = BTreeSet::new();
     let mut dotted = BTreeSet::new();
     for f in cf.iter().chain(pf.iter()) {
@@ -57,8 +60,10 @@ fn field_table() {
     // 337 inventory names - 4 without a field (GPU guard, dropped _client, two upstream-driver inputs) + the three
     // perseus-core runtime switches (PC_EM_FUSE_RESCALE, PC_LT_TAILS, PC_BTS_PAIR) + PF_LAST_QUERY, PF_QKV_PACK, PF_ATTN_BSGS,
     // PF_SM_HPACK, PLAN_FALLBACK_CF, PLAN_ARGMAX_MINCUT, PLAN_ILP_TIEBREAK, PLAN_RAISE_DROP_BASE, PLAN_RAISE_SEARCH,
-    // PLAN_PACK_CF, PLAN_KEEP_PLACEMENTS_EXACT, PLAN_MAG_SAFETY_STEPS, PLAN_RESUME, FIDESLIB_BTS_SPARSE_B_K, CHAIN_PRESET
-    assert_eq!(envs.len(), 351);
+    // PLAN_PACK_CF, PLAN_KEEP_PLACEMENTS_EXACT, PLAN_MAG_SAFETY_STEPS, PLAN_RESUME, FIDESLIB_BTS_SPARSE_B_K, CHAIN_PRESET,
+    // GELU_OUT_HINT, PLAN_ENVELOPE_STRICT, PLAN_ENV_EFFECTIVE, PLAN_PCMM_PREDIV_CAP, PLAN_PCMM_STAMPS,
+    // PLAN_STC_FIRST_STAGED_ONLY, PLAN_STEP_ROUTE_PRICING, SM_HRS_CLEANSE
+    assert_eq!(envs.len(), 359);
 }
 
 #[test]

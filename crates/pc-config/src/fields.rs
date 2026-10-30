@@ -253,6 +253,9 @@ section! {
         #[doc = "`GELU_FOLD`. Default '1' / None. Read at impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 15; runtime= 15."]
         gelu_fold: Flag = "GELU_FOLD", "'1' / None";
+        #[doc = "`GELU_OUT_HINT`. Default '0'. Read at impl/ops.py::FheOps.__init__."]
+        #[doc = "Shipped plans: runtime= 12."]
+        gelu_out_hint: Flag = "GELU_OUT_HINT", "'0'";
         #[doc = "`GPT2_FOLD_LN1`. Default None. Read at plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env all 39."]
         gpt2_fold_ln1: Flag = "GPT2_FOLD_LN1", "None";
@@ -352,6 +355,9 @@ section! {
         #[doc = "`SM_GS_FIRST`. Default '1' / None. Read at examples/gpt2/ref.py::softmax_ref [read via _on()]; impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 15; runtime= 15."]
         sm_gs_first: Flag = "SM_GS_FIRST", "'1' / None";
+        #[doc = "`SM_HRS_CLEANSE`. Default '0'. Read at impl/ops.py::FheOps.__init__."]
+        #[doc = "Shipped plans: runtime= 8."]
+        sm_hrs_cleanse: Flag = "SM_HRS_CLEANSE", "'0'";
         #[doc = "`SM_HRS_PACK`. Default '1' / None. Read at impl/ops.py::FheOps.__init__; plan/contract.py::current_contract/contract_mismatches [contract]."]
         #[doc = "Shipped plans: capture_env 13; runtime= 13."]
         sm_hrs_pack: Flag = "SM_HRS_PACK", "'1' / None";
@@ -927,6 +933,12 @@ section! {
         #[doc = "`PLAN_EMIT_OFFSET`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         emit_offset: Str = "PLAN_EMIT_OFFSET", "(unset)";
+        #[doc = "`PLAN_ENVELOPE_STRICT`. Default '0'. Read at plan/placer/planner.py::plan_graph."]
+        #[doc = "Shipped plans: recipe= 12."]
+        envelope_strict: Flag = "PLAN_ENVELOPE_STRICT", "'0'";
+        #[doc = "`PLAN_ENV_EFFECTIVE`. Default None. Read at plan/placer/sim.py; plan/placer/place.py::Placer._run_once."]
+        #[doc = "Shipped plans: recipe= 12."]
+        env_effective: Flag = "PLAN_ENV_EFFECTIVE", "None";
         #[doc = "`PLAN_ERR_HOPELESS`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         err_hopeless: Str = "PLAN_ERR_HOPELESS", "(unset)";
@@ -1029,6 +1041,12 @@ section! {
         #[doc = "`PLAN_PACK_CF`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         pack_cf: Flag = "PLAN_PACK_CF", "'0'";
+        #[doc = "`PLAN_PCMM_PREDIV_CAP`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
+        #[doc = "Shipped plans: recipe= 12."]
+        pcmm_prediv_cap: Str = "PLAN_PCMM_PREDIV_CAP", "(unset)";
+        #[doc = "`PLAN_PCMM_STAMPS`. Default None. Read at plan/placer/planner.py::pcmm_stamps."]
+        #[doc = "Shipped plans: recipe= 4."]
+        pcmm_stamps: Str = "PLAN_PCMM_STAMPS", "None";
         #[doc = "`PLAN_PLACER`. Default / (unset). Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 4."]
         placer: Str = "PLAN_PLACER", " / (unset)";
@@ -1137,12 +1155,18 @@ section! {
         #[doc = "`PLAN_STC_FIRST_REROUTE`. Default None. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: recipe= vit_b16_224."]
         stc_first_reroute: Flag = "PLAN_STC_FIRST_REROUTE", "None";
+        #[doc = "`PLAN_STC_FIRST_STAGED_ONLY`. Default '0'. Read at plan/placer/refresh.py::refresh_cost."]
+        #[doc = "Shipped plans: recipe= 1."]
+        stc_first_staged_only: Flag = "PLAN_STC_FIRST_STAGED_ONLY", "'0'";
         #[doc = "`PLAN_STC_FIRST_STEPS`. Default None. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: none."]
         stc_first_steps: Str = "PLAN_STC_FIRST_STEPS", "None";
         #[doc = "`PLAN_STEP_LANDING`. Default ''. Read at plan/placer/planner.py::recipe_plan_config -> `sim.PlannerShadow.plan`."]
         #[doc = "Shipped plans: recipe= 6."]
         step_landing: Str = "PLAN_STEP_LANDING", "''";
+        #[doc = "`PLAN_STEP_ROUTE_PRICING`. Default '0'. Read at plan/placer/refresh.py::refresh_cost."]
+        #[doc = "Shipped plans: recipe= 8."]
+        step_route_pricing: Flag = "PLAN_STEP_ROUTE_PRICING", "'0'";
     }
 }
 
