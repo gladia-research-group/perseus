@@ -578,7 +578,8 @@ fn modmul(a: &[String]) -> Res<bool> {
         }
         i += 2;
     }
-    let n32 = Chain::generate(&ChainSpec::n32())?;
+    // PC_BENCH_CHAIN: another chain preset (n32a4, the shipped plans' lean chain)
+    let n32 = Chain::generate(&ChainSpec::preset(&std::env::var("PC_BENCH_CHAIN").unwrap_or_else(|_| "n32".into()))?)?;
     // interleaved twice (B64, B32, Mont, B64, B32, Mont): the box is noisy, the table keeps the per-op minimum
     let mut runs: Vec<(&str, word_seam::RigOut)> = Vec::new();
     for _round in 0..2 {
