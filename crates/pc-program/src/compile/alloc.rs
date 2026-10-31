@@ -55,6 +55,34 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
         p.vars[v as usize].slot = Some(s);
         *live += need;
     };
+    // a batch's outputs in consecutive slots, member order (the lowest run of free slots that fit, else new slots
+    // after the free ones that end the list): a later batch over the same values reads them as one K-ciphertext
+    // buffer, and this batch writes them as one (the replay's gathers find nothing to copy)
+    let take_run = |p: &mut Program, vs: &[VarId], slot_bytes: &mut Vec<u64>, free: &mut BTreeSet<(u64, u32)>, live: &mut u64| {
+        let need = vs.iter().map(|&v| bytes_of(p, v)).max().unwrap_or(0);
+        let k = vs.len();
+        let fits = |s: usize, free: &BTreeSet<(u64, u32)>| s < slot_bytes.len() && slot_bytes[s] >= need && free.contains(&(slot_bytes[s], s as u32));
+        let mut slots: Vec<u32> = free.iter().map(|e| e.1).collect();
+        slots.sort_unstable();
+        let start = slots.iter().map(|&s| s as usize).find(|&s| (s..s + k).all(|t| fits(t, free))).unwrap_or_else(|| {
+            // new slots, after the free slots that fit at the end of the list
+            let mut s = slot_bytes.len();
+            while s > 0 && slot_bytes.len() - s + 1 < k && fits(s - 1, free) {
+                s -= 1;
+            }
+            s
+        });
+        for (j, &v) in vs.iter().enumerate() {
+            let t = start + j;
+            if t < slot_bytes.len() {
+                free.remove(&(slot_bytes[t], t as u32));
+            } else {
+                slot_bytes.push(if uniform { max_bytes } else { need });
+            }
+            p.vars[v as usize].slot = Some(t as u32);
+            *live += bytes_of(p, v);
+        }
+    };
     let inputs = p.inputs.clone();
     for v in inputs {
         take(p, v, &mut slot_bytes, &mut free, &mut live);
@@ -84,8 +112,12 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
             }
         }
         if freed_inplace.is_none() {
-            for &o in &outs {
-                take(p, o, &mut slot_bytes, &mut free, &mut live);
+            if !single && outs.len() > 1 {
+                take_run(p, &outs, &mut slot_bytes, &mut free, &mut live);
+            } else {
+                for &o in &outs {
+                    take(p, o, &mut slot_bytes, &mut free, &mut live);
+                }
             }
         }
         live_peak = live_peak.max(live);

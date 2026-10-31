@@ -752,28 +752,58 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                 return Err(rerr(block, format!("product unit at step {}: slots outside the {n_slots} bound slots", u.lo)));
             }
             let ys: Vec<&Ct<'a, W>> = b.iter().map(|&s| unsafe { &*slots.add(s as usize) }).collect();
-            let (k, s) = (xs.len(), &rt.ex.compute);
-            for (c, x) in xs.iter().enumerate() {
-                batch::put(rt.ctx, s, &mut gather.a, c, x)?;
+            let (k, s, lay) = (xs.len(), &rt.ex.compute, rt.ctx.lay);
+            // operands / outputs in consecutive slots are read / written where they lie (no gather copies)
+            // SAFETY: the operand views are only read; the output view is the only writer of the outputs (distinct
+            // slots, none an operand's) until it is dropped, before their metadata is set
+            let va = unsafe { pc_gpu::ct::run_view(lay, &xs) };
+            let vb = unsafe { pc_gpu::ct::run_view(lay, &ys) };
+            let mut vo = {
+                let os: Vec<&Ct<'a, W>> = span.iter().map(|st| unsafe { &*slots.add(st.out as usize) }).collect();
+                unsafe { pc_gpu::ct::run_view(lay, &os) }
+            };
+            if va.is_none() {
+                for (c, x) in xs.iter().enumerate() {
+                    batch::put(rt.ctx, s, &mut gather.a, c, x)?;
+                }
             }
-            for (c, y) in ys.iter().enumerate() {
-                batch::put(rt.ctx, s, &mut gather.b, c, y)?;
+            if vb.is_none() {
+                for (c, y) in ys.iter().enumerate() {
+                    batch::put(rt.ctx, s, &mut gather.b, c, y)?;
+                }
             }
             gather.a.buf.k = k;
             gather.a.meta = xs[0].meta;
             gather.out.buf.k = k;
             let key = group(block, groups, relin)?;
-            let Gather { a, b: gb, out } = gather;
+            let Gather { a: ga, b: gb, out: go } = gather;
+            let a: &Ct<'a, W> = match &va {
+                Some(v) => v,
+                None => &*ga,
+            };
+            let out: &mut Ct<'a, W> = match vo.as_mut() {
+                Some(v) => v,
+                None => &mut *go,
+            };
             if !ys.is_empty() {
                 gb.buf.k = k;
                 gb.meta = ys[0].meta;
             }
-            match (rs, ys.is_empty()) {
-                (Some(dbl), true) => rt.ops.mult_rescale(rt.ctx, rt.ex, kc, rt.sh, key, out, Some(a), None, *dbl)?,
-                (Some(dbl), false) => rt.ops.mult_rescale(rt.ctx, rt.ex, kc, rt.sh, key, out, Some(a), Some(gb), *dbl)?,
-                (None, true) => rt.ops.square(rt.ctx, rt.ex, kc, rt.sh, key, out, a)?,
-                (None, false) => rt.ops.mult(rt.ctx, rt.ex, kc, rt.sh, key, out, a, gb)?,
+            let b: Option<&Ct<'a, W>> = if ys.is_empty() {
+                None
+            } else {
+                Some(match &vb {
+                    Some(v) => v,
+                    None => &*gb,
+                })
+            };
+            match (rs, b) {
+                (Some(dbl), b) => rt.ops.mult_rescale(rt.ctx, rt.ex, kc, rt.sh, key, out, Some(a), b, *dbl)?,
+                (None, None) => rt.ops.square(rt.ctx, rt.ex, kc, rt.sh, key, out, a)?,
+                (None, Some(b)) => rt.ops.mult(rt.ctx, rt.ex, kc, rt.sh, key, out, a, b)?,
             }
+            let direct = vo.is_some();
+            drop(vo);
             for (c, st) in span.iter().enumerate() {
                 let r = if ys.is_empty() { rt.sh.square(&xs[c].meta) } else { rt.sh.mult(&xs[c].meta, &ys[c].meta) };
                 let mut m = r.map_err(|e| rerr(block, e.to_string()))?.out;
@@ -784,7 +814,12 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                     m = rt.sh.realize(&m).map_err(|e| rerr(block, e.to_string()))?.out;
                 }
                 // SAFETY: as the unit's other outputs (distinct slots, none an operand's)
-                batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, out, c, m)?;
+                let o = unsafe { &mut *slots.add(st.out as usize) };
+                if direct {
+                    o.meta = m;
+                } else {
+                    batch::take(rt.ctx, &rt.ex.compute, o, go, c, m)?;
+                }
             }
         }
         UnitKind::MultPtAdd { pt: i, sub, product_first } => {

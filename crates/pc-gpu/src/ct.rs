@@ -25,3 +25,21 @@ impl<'a, W: pc_cuda::Pod> Ct<'a, W> {
         Ok(pc_shadow::meta::top_limb(shape, self.meta.level)? as usize)
     }
 }
+
+/// Single ciphertexts of layout `lay` that lie back to back in memory, member c one ciphertext past member c - 1
+/// (consecutive slots of one slab), as one `cs.len()`-ciphertext buffer with the first member's metadata: a K-batch
+/// reads or writes them in place instead of through a gather buffer. None when they do not.
+///
+/// # Safety
+/// The view aliases the members' buffers: the caller does not use a member while it uses the view.
+pub unsafe fn run_view<'a, W: pc_cuda::Pod>(lay: crate::Layout, cs: &[&Ct<'a, W>]) -> Option<Ct<'a, W>> {
+    let first = cs.first()?;
+    let words = lay.ct_words();
+    let base = first.buf.buf.dptr() as *mut W;
+    let at = |c: usize| base.wrapping_add(c * words) as *const W;
+    if cs.len() < 2 || cs.iter().enumerate().any(|(c, x)| x.k() != 1 || x.buf.lay != lay || x.buf.buf.len() < words || x.buf.buf.dptr() != at(c)) {
+        return None;
+    }
+    let buf = pc_cuda::DBuf::from_raw(base, cs.len() * words);
+    Some(Ct::new(first.meta, CtBuf { buf, k: cs.len(), lay }))
+}

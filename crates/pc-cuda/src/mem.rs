@@ -145,6 +145,15 @@ fn bounds(what: &'static str, len: usize, cap: usize) -> Result<()> {
 }
 
 impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
+    /// A second handle on `len` elements at `ptr` (e.g. several adjacent allocations of one arena seen as one
+    /// buffer).
+    ///
+    /// # Safety
+    /// `ptr..ptr + len` lies inside allocations of an arena that outlives `'a`; the caller keeps the handles that
+    /// alias it from being used against each other (no concurrent writes through two of them).
+    pub unsafe fn from_raw(ptr: *mut T, len: usize) -> Self {
+        DBuf { ptr, len, _l: PhantomData }
+    }
     pub fn len(&self) -> usize {
         self.len
     }

@@ -277,7 +277,11 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
     if live.is_empty() {
         return Ok(());
     }
+    // inputs in consecutive slots are read where they lie (no gather copies)
+    // SAFETY: the view only feeds the ModUp below; the inputs are not written here
+    let view = if k > 1 { unsafe { crate::ct::run_view(lay, xs) } } else { None };
     let x: &Ct<'_, W> = match gather {
+        _ if view.is_some() => view.as_ref().expect("checked"),
         Some(g) if k > 1 => {
             if fresh {
                 g.buf.k = k;
@@ -479,14 +483,40 @@ pub fn rotate_sum_batch<W: DevWord, M: DevStrategy<W>>(
             return Err(shape("rotate_sum_batch", "inputs and outputs must be single ciphertexts of the context layout, inputs at one level"));
         }
     }
-    gather.buf.k = k;
-    gather.meta = xs[0].meta;
-    for (c, x) in xs.iter().enumerate() {
-        ew(ctx, &ex.compute, Ew::Copy, View::of(&gather.buf, c), View::of(&x.buf, 0), None, lay.rs_q(top), 1, 2)?;
+    // inputs / outputs in consecutive slots are read / written where they lie (no gather copies)
+    // SAFETY: the views alias the inputs (read only) and the outputs (written only through their view below; the
+    // output metadata is set after it is dropped); outputs are none of the inputs
+    let vx = unsafe { crate::ct::run_view(lay, xs) };
+    let vo = {
+        let os: Vec<&Ct<'_, W>> = outs.iter().map(|o| &**o).collect();
+        unsafe { crate::ct::run_view(lay, &os) }
+    };
+    match (vx, vo) {
+        (Some(x), Some(mut o)) => rotate_sum(ctx, ex, kc, sh, group, &x, steps, &mut o)?,
+        (x, mut o) => {
+            gather.buf.k = k;
+            match &x {
+                Some(x) => gather.meta = x.meta,
+                None => {
+                    gather.meta = xs[0].meta;
+                    for (c, x) in xs.iter().enumerate() {
+                        ew(ctx, &ex.compute, Ew::Copy, View::of(&gather.buf, c), View::of(&x.buf, 0), None, lay.rs_q(top), 1, 2)?;
+                    }
+                }
+            }
+            match (&x, &mut o) {
+                (Some(x), _) => rotate_sum(ctx, ex, kc, sh, group, x, steps, gather)?,
+                (None, Some(o)) => rotate_sum(ctx, ex, kc, sh, group, gather, steps, o)?,
+                (None, None) => rotate_sum_inplace(ctx, ex, kc, sh, group, gather, steps)?,
+            }
+            if o.is_none() {
+                for (c, o) in outs.iter_mut().enumerate() {
+                    ew(ctx, &ex.compute, Ew::Copy, View::of(&o.buf, 0), View::of(&gather.buf, c), None, lay.rs_q(top), 1, 2)?;
+                }
+            }
+        }
     }
-    rotate_sum_inplace(ctx, ex, kc, sh, group, gather, steps)?;
     for (c, o) in outs.iter_mut().enumerate() {
-        ew(ctx, &ex.compute, Ew::Copy, View::of(&o.buf, 0), View::of(&gather.buf, c), None, lay.rs_q(top), 1, 2)?;
         o.meta = sh.rotate_sum(&xs[c].meta, steps).out;
     }
     Ok(())
