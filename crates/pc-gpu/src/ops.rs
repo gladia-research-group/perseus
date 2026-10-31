@@ -668,6 +668,22 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Ok(())
     }
 
+    /// `x += x` (`sub`: `x -= x`) when its recipe has no prelude (both operands are one ciphertext): the kernel reads
+    /// `x` as both operands (element-wise in place), the add `add_inplace(x, &[copy of x])` makes; false (nothing
+    /// issued) when the recipe has preludes.
+    pub fn add_self_inplace<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, x: &mut Ct<'_, W>, sub: bool) -> Result<bool> {
+        let r = if sub { sh.sub(&x.meta, &x.meta)? } else { sh.add(&x.meta, &x.meta)? };
+        if !r.pre.is_empty() {
+            return Ok(false);
+        }
+        let t = Track { meta: x.meta };
+        let top = self.top(ctx.shape, &t.meta)?;
+        let o = x.buf.w();
+        Self::ew(ctx, &ex.compute, "ew_add", o, o, o, rows_q(&ctx.lay, top), x.k(), 2, sub, (std::ptr::null(), std::ptr::null()))?;
+        Self::finish(x, &r, &t)?;
+        Ok(true)
+    }
+
     /// `out[j] = a[j] + c[j]` (`addScalar`: the constant at the ciphertext's top and degree, no level change).
     pub fn add_scalar<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut [Ct<'_, W>], a: &[&Ct<'_, W>], c: &[f64]) -> Result<()> {
         lens("add_scalar", out.len(), &[a.len(), c.len()])?;

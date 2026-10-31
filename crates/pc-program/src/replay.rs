@@ -302,7 +302,9 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
     match &st.op {
         StepOp::Add | StepOp::Sub => {
             let sub = st.op == StepOp::Sub;
-            if st.inplace {
+            if st.inplace && st.b == st.out && rt.ops.add_self_inplace(ctx, rt.ex, sh, o, sub)? {
+                // x + x in one pass (no copy of x)
+            } else if st.inplace {
                 let b: &Ct<'a, W> = if st.b == st.out {
                     copy_ct(ctx, &rt.ex.compute, tmp, o)?;
                     &*tmp
