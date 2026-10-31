@@ -76,11 +76,16 @@ pub struct Builder<'s> {
     pub prog: EmProgram,
     pub metas: Vec<FMeta>,
     nq: usize,
+    /// Fewer level-alignment rescales than FIDESlib (same output level and scale, other roundings): T_1 for the
+    /// odd powers' subtraction from its first realized copy (a scalar and a drop, no rescale), and the series'
+    /// giant power realized before it joins the sum (its rescale can ride its relinearization). Off: FIDESlib's
+    /// program, request for request.
+    pub lean: bool,
 }
 
 impl<'s> Builder<'s> {
     pub fn new(st: &'s ScaleTables) -> Self {
-        Builder { st, prog: EmProgram::default(), metas: vec![], nq: st.q.len() }
+        Builder { st, prog: EmProgram::default(), metas: vec![], nq: st.q.len(), lean: false }
     }
     fn fx(&self) -> Fx<'s> {
         Fx { d: self.st.d as i32, st: Some(self.st) }
@@ -365,22 +370,37 @@ pub fn build_chebyshev(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
 fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
     let (k, m) = (ps.k, ps.m);
     let t: Vec<usize> = (0..k).map(|_| b.fresh()).collect();
-    let t2: Vec<usize> = (0..m).map(|_| b.fresh()).collect();
     b.copy(t[0], x);
     if b.metas[t[0]].nl == 2 {
         b.rescale(t[0])?;
     }
+    let x1 = if b.lean {
+        let x1 = b.fresh();
+        b.copy(x1, t[0]);
+        x1
+    } else {
+        x
+    };
     for i in 2..=k {
         if i % 2 == 1 {
             b.adjust_mult(t[i / 2], t[i / 2 - 1])?;
             b.adjust_mult(t[i / 2 - 1], t[i / 2])?;
             b.mult3(t[i - 1], t[i / 2 - 1], t[i / 2])?;
             b.add(t[i - 1], t[i - 1])?;
-            b.adjust_add(x, t[i - 1])?;
-            if b.metas[x].nl == 1 && b.metas[t[i - 1]].nl == 2 {
+            // lean: T_1 for the subtraction from its first realized copy, brought to T_(i-1)'s level and scale by a
+            // scalar and a drop (FIDESlib adjusts the input in place: a rescale from the second odd power on)
+            let xs = if b.lean {
+                let xs = b.fresh();
+                b.copy(xs, x1);
+                xs
+            } else {
+                x
+            };
+            b.adjust_add(xs, t[i - 1])?;
+            if b.metas[xs].nl == 1 && b.metas[t[i - 1]].nl == 2 {
                 b.rescale(t[i - 1])?;
             }
-            b.sub(t[i - 1], x)?;
+            b.sub(t[i - 1], xs)?;
         } else {
             b.adjust_mult(t[i / 2 - 1], t[i / 2 - 1])?;
             b.square2(t[i - 1], t[i / 2 - 1])?;
@@ -393,6 +413,7 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
             b.rescale(t[i - 1])?;
         }
     }
+    let t2: Vec<usize> = (0..m).map(|_| b.fresh()).collect();
     b.copy(t2[0], t[k - 1]);
     for i in 1..m {
         b.square2(t2[i], t2[i - 1])?;
@@ -494,7 +515,11 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
     if !flag_c {
         return Err(rule("evalmod", "addScalar(T2, c) branch not ported"));
     }
-    // max_m - m <= 1
+    // max_m - m <= 1; lean: the giant power realized before it joins cu (its rescale can ride its relinearization;
+    // FIDESlib rescales the sum, then a copy of the power for the lazy product)
+    if b.lean && b.metas[t2[m - 1]].nl == 2 {
+        b.rescale(t2[m - 1])?;
+    }
     b.adjust_add(t2[m - 1], cu)?;
     if b.metas[t2[m - 1]].nl == 1 && b.metas[cu].nl == 2 {
         b.rescale(cu)?;
@@ -538,17 +563,33 @@ fn cheb_powers(b: &mut Builder, x: usize, k: usize) -> Result<Vec<usize>> {
     if b.metas[t[0]].nl == 2 {
         b.rescale(t[0])?;
     }
+    let x1 = if b.lean {
+        let x1 = b.fresh();
+        b.copy(x1, t[0]);
+        x1
+    } else {
+        x
+    };
     for i in 2..=k {
         if i % 2 == 1 {
             b.adjust_mult(t[i / 2], t[i / 2 - 1])?;
             b.adjust_mult(t[i / 2 - 1], t[i / 2])?;
             b.mult3(t[i - 1], t[i / 2 - 1], t[i / 2])?;
             b.add(t[i - 1], t[i - 1])?;
-            b.adjust_add(x, t[i - 1])?;
-            if b.metas[x].nl == 1 && b.metas[t[i - 1]].nl == 2 {
+            // lean: T_1 for the subtraction from its first realized copy, brought to T_(i-1)'s level and scale by a
+            // scalar and a drop (FIDESlib adjusts the input in place: a rescale from the second odd power on)
+            let xs = if b.lean {
+                let xs = b.fresh();
+                b.copy(xs, x1);
+                xs
+            } else {
+                x
+            };
+            b.adjust_add(xs, t[i - 1])?;
+            if b.metas[xs].nl == 1 && b.metas[t[i - 1]].nl == 2 {
                 b.rescale(t[i - 1])?;
             }
-            b.sub(t[i - 1], x)?;
+            b.sub(t[i - 1], xs)?;
         } else {
             b.adjust_mult(t[i / 2 - 1], t[i / 2 - 1])?;
             b.square2(t[i - 1], t[i / 2 - 1])?;
@@ -774,6 +815,10 @@ fn inner_ps(
     if !flag_c {
         return Err(rule("evalmod", "addScalar(T2, c) branch not ported"));
     }
+    // lean, the lazy top call: the giant power realized before it joins cu (as `build_chebyshev_m2`)
+    if b.lean && lazy && level_offset == 0 && m == max_m && b.metas[t2[m - 1]].nl == 2 {
+        b.rescale(t2[m - 1])?;
+    }
     if max_m - m <= 1 {
         b.adjust_add(t2[m - 1], cu)?;
     }
@@ -803,7 +848,13 @@ pub fn build_double_angle(b: &mut Builder, x: usize, its: i32) -> Result<()> {
 
 /// The whole EvalMod chain of one input: the Chebyshev series, then `double_angle_its` double-angle steps.
 pub fn build_evalmod(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32) -> Result<(EmProgram, FMeta)> {
+    build_evalmod_opts(st, input, ps, double_angle_its, false)
+}
+
+/// `build_evalmod` with `Builder::lean`.
+pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32, lean: bool) -> Result<(EmProgram, FMeta)> {
     let mut b = Builder::new(st);
+    b.lean = lean;
     let x = b.input(input);
     build_chebyshev(&mut b, x, ps)?;
     build_double_angle(&mut b, x, double_angle_its)?;
@@ -889,6 +940,19 @@ mod general_ps_tests {
         assert_eq!(a.prog.consts, b.prog.consts);
         assert_eq!(a.metas[xa].top, b.metas[xb].top);
         assert_eq!(a.metas[xa].nf.to_bits(), b.metas[xb].nf.to_bits());
+        // the lean builders agree too, with FIDESlib's output level and scale and fewer rescales
+        let mut c = Builder::new(&st);
+        c.lean = true;
+        let xc = c.input(input);
+        build_chebyshev_m2(&mut c, xc, &ps).unwrap();
+        let mut e = Builder::new(&st);
+        e.lean = true;
+        let xe = e.input(input);
+        build_chebyshev_general(&mut e, xe, &ps.coeffs).unwrap();
+        assert_eq!(c.prog.ops, e.prog.ops);
+        assert_eq!((c.metas[xc].top, c.metas[xc].nl, c.metas[xc].nf.to_bits()), (a.metas[xa].top, a.metas[xa].nl, a.metas[xa].nf.to_bits()));
+        let rescales = |p: &EmProgram| p.ops.iter().filter(|o| matches!(o, EmOp::Rescale { .. })).count();
+        assert!(rescales(&c.prog) < rescales(&a.prog));
     }
 
     /// SparseB's K = 24 degree-20 series (m = 3, recursive PS) builds; depth as FIDESlib's.

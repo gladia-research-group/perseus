@@ -16,7 +16,7 @@ use crate::poly::{CtBuf, Layout};
 use pc_core::modmul::{invmod, mulmod, shoup};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, Lane, Stream};
 use pc_kernels::{AddConstArgs, EwArgs, MdEpiArgs, MulTableArgs, PolyRef, RescaleArgs, TensorArgs, WsumArgs, WsumKArgs, MdEpiToArgs};
-use pc_shadow::evalmod::{build_evalmod, EmOp, EmProgram, Epi, PsPlan};
+use pc_shadow::evalmod::{build_evalmod, build_evalmod_opts, EmOp, EmProgram, Epi, PsPlan};
 use pc_shadow::fides::FMeta;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -507,7 +507,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// The program of an input with metadata `input` (FIDESlib coordinates) and its buffer count (after the
     /// liveness assignment `new` runs). The returned program's ops are already fused and rewritten (`rewrite`).
     pub fn program(st: &pc_core::scale::ScaleTables, input: FMeta, ps: &PsPlan, da_its: u32) -> Result<(EmProgram, FMeta, usize)> {
-        let (mut prog, out) = build_evalmod(st, input, ps, da_its as i32)?;
+        let (mut prog, out) = build_evalmod_opts(st, input, ps, da_its as i32, true)?;
         let (ops, consts) = rewrite(prog.fused(), &prog.consts, &st.q);
         let ops = schedule_relin_rescales(ops, st.d);
         let (_, n) = assign_buffers(ops.clone());
@@ -1405,7 +1405,7 @@ mod tests {
         let st = pc_core::scale::ScaleTables::precompute(&chain).expect("tables");
         let v = &plan.variants[0];
         let ps = PsPlan::from_coeffs(&setup.evalmod_coeffs).expect("ps");
-        let (prog, _) = build_evalmod(&st, v.em_in, &ps, setup.evalmod_da_its as i32).expect("program");
+        let (prog, _) = build_evalmod_opts(&st, v.em_in, &ps, setup.evalmod_da_its as i32, true).expect("program");
         let fused = prog.fused();
         let before = slots_of(&fused);
         let (ops, after) = assign_buffers(fused.clone());
