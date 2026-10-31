@@ -90,6 +90,26 @@ pub fn diag_coeffs(chain: &pc_core::params::Chain, values: &[Vec<C64>], scale: f
         .collect()
 }
 
+/// A stage whose giant rotation is the identity (b stride = 0 mod N/2: CtS stage 0) as one giant step: the giant
+/// steps' diagonals summed per baby step (integer coefficients, so every prime's encoding is the sum of the
+/// unfolded encodings mod p). The sum over the giant steps then happens in the plaintexts instead of `g` products
+/// per baby step and an add of the extended results; the result is the same residues (bit-identical).
+pub fn fold_identity_giants(n: usize, geom: LtGeom, coeffs: Vec<Vec<i128>>) -> (LtGeom, Vec<Vec<i128>>) {
+    let nh = n / 2;
+    if geom.g <= 1 || (geom.b * geom.stride) % nh != 0 {
+        return (geom, coeffs);
+    }
+    let nb = geom.b.min(geom.npts);
+    let mut out: Vec<Vec<i128>> = Vec::with_capacity(nb);
+    for (dg, c) in coeffs.into_iter().enumerate() {
+        match out.get_mut(dg % geom.b) {
+            Some(acc) => acc.iter_mut().zip(&c).for_each(|(a, &x)| *a += x),
+            None => out.push(c),
+        }
+    }
+    (LtGeom { g: 1, npts: nb, ..geom }, out)
+}
+
 /// The stored width of a stage's plaintexts (every diagonal shares the stage's compaction).
 pub fn stage_width(n: usize, coeffs: &[Vec<i128>]) -> usize {
     n >> coeffs.iter().map(|c| compact_shift(c)).min().unwrap_or(0)

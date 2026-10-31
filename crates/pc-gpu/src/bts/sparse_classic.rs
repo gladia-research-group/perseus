@@ -8,7 +8,7 @@
 //! `ClassicPlan::new` is the host side (factors, stage levels, encodings, metadata, `mem`, `rot_steps`);
 //! `ClassicPlan::build` carves the device tables. One variant per raise drop. Plaintexts are encoded at their
 //! stage level from the slot values (one rounding).
-use super::cts::{diag_coeffs, stage_width, LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{diag_coeffs, fold_identity_giants, stage_width, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::dense::{shadow_of, LtHost};
 use super::evalmod::{em_work, EmMode, EvalModPlan};
 use super::finish::Pow2;
@@ -157,8 +157,8 @@ impl ClassicPlan {
                 if lv.top as usize != (shp.n_q - 1 - m.level) as usize || m.deg != 1 {
                     return Err(shape("classic plan", format!("CtS stage {e} plaintexts at top {} but the input is {m:?}", lv.top)));
                 }
-                let coeffs = diag_coeffs(chain, &fs.pts, lv.scale)?;
-                cts.push(LtHost { geom: LtGeom::from_fides(fs), top: lv.top as usize, end: inner_end, nf: lv.scale, width: stage_width(n, &coeffs), coeffs });
+                let (geom, coeffs) = fold_identity_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, lv.scale)?);
+                cts.push(LtHost { geom, top: lv.top as usize, end: inner_end, nf: lv.scale, width: stage_width(n, &coeffs), coeffs });
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 m = sh.rescale(&m)?.out;
             }
