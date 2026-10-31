@@ -437,9 +437,19 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
 #pragma unroll
         for (int qb = 0; qb < 4; ++qb) ct_uv(x[2 * qb], x[2 * qb + 1], u, us, v[qb], vs[qb], 16);
     }
-    // store: layout B is 8 consecutive elements per lane -> vectorized, canonical words
+    // store: layout B is 8 consecutive elements per lane -> vectorized, canonical words (at L = 2 a word below 16p by
+    // one quotient estimate q = floor(x floor(2^32 / p) / 2^32), x - q p in [0, 2p), and one conditional subtraction)
+    if constexpr (L == 2 && sizeof(W) == 4) {
+        const uint32_t m = (uint32_t)(T.pr[pid].mu_lo >> 32);
 #pragma unroll
-    for (int u = 0; u < 8; ++u) x[u] = canon<W, L>(x[u], p, p2, p4, p8);
+        for (int u = 0; u < 8; ++u) {
+            const W r = x[u] - __umulhi(x[u], m) * p;
+            x[u] = r >= p ? r - p : r;
+        }
+    } else {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) x[u] = canon<W, L>(x[u], p, p2, p4, p8);
+    }
     if (T.epi) {
         const size_t r = (size_t)T.roff[row] * N + R * 256 + 8 * lane;
         const W s = ((const W*)T.es)[pid], ss = ((const W*)T.ess)[pid];
