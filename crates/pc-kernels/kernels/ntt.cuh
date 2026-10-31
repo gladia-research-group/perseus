@@ -128,21 +128,31 @@ __device__ __forceinline__ void gs_pair(W (&x)[8], int d, bool lo, W tw, W tws, 
     }
 }
 
-// Row-pass twiddles of the last three stages (m = 2^s, s = 13..15) from two factors already in the table: for
-// i = R 2^(s-8) + c, psi^brev16(m + i) = U * V with U = w[m + (R << (s-8))] (uniform per warp) and V = psi^(2^(24-s)
-// brev_(s-8)(c)), the table entry vidx(s, c) < 128. The two Shoup products give the same residue as one product by
-// the full twiddle, while the row pass reads ~1/8 of the twiddle bytes.
-__device__ __forceinline__ int vidx(int s, uint32_t c) {
-    const uint32_t r = __brev(c) >> (32 - (s - 8));  // brev_(s-8)(c)
-    if (r == 0) return 0;                             // psi^0 = 1 (w[0])
-    const int j = __ffs(r) - 1;
-    const uint32_t o = r >> j;                        // odd: exponent 2^(24-s+j) o = 2^(15-s') (1 + 2 brev_s'(i'))
-    const int sp = s - 9 - j;
-    return (1 << sp) + (sp ? (int)(__brev((o - 1) >> 1) >> (32 - sp)) : 0);
-}
+// Row-pass twiddles of the last three stages (m = 2^s, s = 13..15) from two factors in the table: it holds
+// psi^brev16(k), so entries of disjoint index bits multiply, and for i = R 2^(s-8) + c (c < 2^(s-8)) w[m + i] = U V
+// with U = w[m + (R << (s-8))] (uniform per warp) and V = w[c] (the table's first 128 entries, L1-resident). The two
+// Shoup products give the same residue as one product by the full twiddle, while the row pass reads ~1/8 of the
+// twiddle bytes.
 template <class W, bool L>
-__device__ __forceinline__ W mul_uv(W x, const W* w, const W* ws, int ui, int vi, W p) {
-    return mul_lz<W, L>(mul_lz<W, L>(x, __ldg(w + ui), __ldg(ws + ui), p), __ldg(w + vi), __ldg(ws + vi), p);
+__device__ __forceinline__ W mul_uv(W x, W u, W us, W v, W vs, W p) {
+    return mul_lz<W, L>(mul_lz<W, L>(x, u, us, p), v, vs, p);
+}
+// n consecutive table entries at w (16-byte aligned for n = 4, 8-byte for n = 2: the tables are 256-byte aligned
+// and every run starts at a multiple of n)
+template <class W, int n>
+__device__ __forceinline__ void ldtw(const W* w, W (&v)[n]) {
+    if constexpr (n == 4) {
+        const V4<W> a = ldg4<W>(w);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = a.v[k];
+    } else if constexpr (n == 2 && sizeof(W) == 4) {
+        const uint2 a = __ldg((const uint2*)w);
+        v[0] = a.x;
+        v[1] = a.y;
+    } else {
+#pragma unroll
+        for (int k = 0; k < n; ++k) v[k] = __ldg(w + k);
+    }
 }
 
 // 4 consecutive words of the sum mod p of n rows `stride` words apart (n >= 1)
@@ -386,23 +396,30 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
         ct_pair<W, L>(x, 1, (lane & 1) == 0, tw, tws, p, p2);
     }
     // CT butterfly with the factored twiddle U V
-    auto ct_uv = [&](W& a, W& b, int ui, int vi) { ct_t<W, L>(a, b, mul_uv<W, L>(b, w, ws, ui, vi, p), p, p2); };
+    auto ct_uv = [&](W& a, W& b, W u, W us, W v, W vs) { ct_t<W, L>(a, b, mul_uv<W, L>(b, u, us, v, vs, p), p, p2); };
     {  // t = 4, m = 8192: i_local = e / 8 = lane
-        const int ui = 8192 + 32 * R, vi = vidx(13, lane);
+        const W u = __ldg(w + 8192 + 32 * R), us = __ldg(ws + 8192 + 32 * R), v = __ldg(w + lane), vs = __ldg(ws + lane);
 #pragma unroll
-        for (int u = 0; u < 4; ++u) ct_uv(x[u], x[u + 4], ui, vi);
+        for (int k = 0; k < 4; ++k) ct_uv(x[k], x[k + 4], u, us, v, vs);
     }
     {  // t = 2, m = 16384: i_local = e / 4 = 2 lane + u/4
+        const W u = __ldg(w + 16384 + 64 * R), us = __ldg(ws + 16384 + 64 * R);
+        W v[2], vs[2];
+        ldtw<W, 2>(w + 2 * lane, v);
+        ldtw<W, 2>(ws + 2 * lane, vs);
 #pragma unroll
         for (int hb = 0; hb < 2; ++hb) {
-            const int ui = 16384 + 64 * R, vi = vidx(14, 2 * lane + hb);
-            ct_uv(x[4 * hb], x[4 * hb + 2], ui, vi);
-            ct_uv(x[4 * hb + 1], x[4 * hb + 3], ui, vi);
+            ct_uv(x[4 * hb], x[4 * hb + 2], u, us, v[hb], vs[hb]);
+            ct_uv(x[4 * hb + 1], x[4 * hb + 3], u, us, v[hb], vs[hb]);
         }
     }
     {  // t = 1, m = 32768: i_local = e / 2 = 4 lane + u/2
+        const W u = __ldg(w + 32768 + 128 * R), us = __ldg(ws + 32768 + 128 * R);
+        W v[4], vs[4];
+        ldtw<W, 4>(w + 4 * lane, v);
+        ldtw<W, 4>(ws + 4 * lane, vs);
 #pragma unroll
-        for (int qb = 0; qb < 4; ++qb) ct_uv(x[2 * qb], x[2 * qb + 1], 32768 + 128 * R, vidx(15, 4 * lane + qb));
+        for (int qb = 0; qb < 4; ++qb) ct_uv(x[2 * qb], x[2 * qb + 1], u, us, v[qb], vs[qb]);
     }
     // store: layout B is 8 consecutive elements per lane -> vectorized, canonical words
 #pragma unroll
@@ -443,27 +460,34 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
         }
     }
     // GS butterfly with the factored twiddle U V (inverse table)
-    auto gs_uv = [&](W& a, W& b, int ui, int vi) {
-        const W u = a, v = b;
-        a = gs_sum<W, L>(u, v, p, p2);
-        b = mul_uv<W, L>(gs_dif<W, L>(u, v, p, p2), w, ws, ui, vi, p);
+    auto gs_uv = [&](W& a, W& b, W u, W us, W v, W vs) {
+        const W x0 = a, x1 = b;
+        a = gs_sum<W, L>(x0, x1, p, p2);
+        b = mul_uv<W, L>(gs_dif<W, L>(x0, x1, p, p2), u, us, v, vs, p);
     };
-    {  // t = 1, m = 32768
+    {  // t = 1, m = 32768: i_local = 4 lane + qb
+        const W u = __ldg(w + 32768 + 128 * R), us = __ldg(ws + 32768 + 128 * R);
+        W v[4], vs[4];
+        ldtw<W, 4>(w + 4 * lane, v);
+        ldtw<W, 4>(ws + 4 * lane, vs);
 #pragma unroll
-        for (int qb = 0; qb < 4; ++qb) gs_uv(x[2 * qb], x[2 * qb + 1], 32768 + 128 * R, vidx(15, 4 * lane + qb));
+        for (int qb = 0; qb < 4; ++qb) gs_uv(x[2 * qb], x[2 * qb + 1], u, us, v[qb], vs[qb]);
     }
-    {  // t = 2, m = 16384
+    {  // t = 2, m = 16384: i_local = 2 lane + hb
+        const W u = __ldg(w + 16384 + 64 * R), us = __ldg(ws + 16384 + 64 * R);
+        W v[2], vs[2];
+        ldtw<W, 2>(w + 2 * lane, v);
+        ldtw<W, 2>(ws + 2 * lane, vs);
 #pragma unroll
         for (int hb = 0; hb < 2; ++hb) {
-            const int ui = 16384 + 64 * R, vi = vidx(14, 2 * lane + hb);
-            gs_uv(x[4 * hb], x[4 * hb + 2], ui, vi);
-            gs_uv(x[4 * hb + 1], x[4 * hb + 3], ui, vi);
+            gs_uv(x[4 * hb], x[4 * hb + 2], u, us, v[hb], vs[hb]);
+            gs_uv(x[4 * hb + 1], x[4 * hb + 3], u, us, v[hb], vs[hb]);
         }
     }
-    {  // t = 4, m = 8192
-        const int ui = 8192 + 32 * R, vi = vidx(13, lane);
+    {  // t = 4, m = 8192: i_local = lane
+        const W u = __ldg(w + 8192 + 32 * R), us = __ldg(ws + 8192 + 32 * R), v = __ldg(w + lane), vs = __ldg(ws + lane);
 #pragma unroll
-        for (int u = 0; u < 4; ++u) gs_uv(x[u], x[u + 4], ui, vi);
+        for (int k = 0; k < 4; ++k) gs_uv(x[k], x[k + 4], u, us, v, vs);
     }
     {  // t = 8, m = 4096: lanes (l, l^1)
         const int ti = 4096 + 16 * R + (lane >> 1);
