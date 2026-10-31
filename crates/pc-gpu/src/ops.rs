@@ -471,8 +471,9 @@ impl<'a, W: DevWord> Ops<'a, W> {
         while i < mine.len() {
             let top = self.top(shape_, &t.meta)?;
             if let (Some(sv), false) = (src, matches!(mine[i], Prelude::DropTo(..))) {
-                // the first data prelude: it reads `src` (rescale) or `src` is copied into x now
-                if !(out_of_place && matches!(mine[i], Prelude::Rescale(_))) && !(out_of_place && matches!(mine[i], Prelude::ScalarAdjust(..)) && matches!(mine.get(i + 1), Some(Prelude::Rescale(_)))) {
+                // the first data prelude: it reads `src` (a rescale, or a scalar adjust: folded into the rescale after
+                // it, else the scaling reads `src`), or `src` is copied into x now
+                if !(out_of_place && matches!(mine[i], Prelude::Rescale(_) | Prelude::ScalarAdjust(..))) {
                     Self::copy_ct(ctx, s, x.w(), sv, x.k, top)?;
                     src = None;
                 }
@@ -508,13 +509,11 @@ impl<'a, W: DevWord> Ops<'a, W> {
                         i += 2;
                         continue;
                     }
-                    if let Some(sv) = src.take() {
-                        // not foldable after all: copy, then scale in place
-                        Self::copy_ct(ctx, s, x.w(), sv, x.k, top)?;
-                    }
+                    // not folded: x = c * (`src`, or x itself)
                     let sc = self.ring.push_rows(s, &self.primes, &[&rows])?;
                     let r = x.w();
-                    Self::ew(ctx, s, "ew_scale", r, r, r, ctx.lay.rs_q(top), x.k, 2, false, sc)?;
+                    let a = src.take().unwrap_or(r);
+                    Self::ew(ctx, s, "ew_scale", r, a, a, ctx.lay.rs_q(top), x.k, 2, false, sc)?;
                     t.meta.deg += 1;
                 }
             }
