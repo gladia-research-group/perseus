@@ -263,8 +263,9 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
 }
 
 // ---------------------------------------------------------------- forward row pass (warp per row, 8 rows per block)
+// Both row passes at 48 registers: 5 blocks per SM (their loads wait on L2; more warps hide it).
 template <class W, bool L>
-__global__ void __launch_bounds__(256) ntt_fwd_rows(NttArgs T) {
+__global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     __shared__ W s[8][256 + 8];
     const int row = blockIdx.y;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -371,7 +372,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_rows(NttArgs T) {
 
 // ---------------------------------------------------------------- inverse row pass (GS, t = 1 .. 128)
 template <class W, bool L>
-__global__ void __launch_bounds__(256) ntt_inv_rows(NttArgs T) {
+__global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     __shared__ W s[8][256 + 8];
     const int row = blockIdx.y;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
