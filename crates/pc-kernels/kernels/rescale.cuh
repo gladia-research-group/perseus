@@ -99,9 +99,10 @@ __global__ void rescale_prep(RescaleArgs A) {
 
 // The forward NTT's column pass of rescale_coef's rows (ndrop 2), each row generated from rescale_prep's sources
 // (the same words rescale_coef stores, never stored here); row i of T is tmp row (c, part, r = rprime[i]).
-template <class W, class MM, bool L>
+template <class W, class MM, int L>
 __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     __shared__ W s[256 * 16];
+    ntt::pdl_trigger();
     const int row = blockIdx.y;
     const int r = T.rprime[row];
     W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
@@ -136,18 +137,22 @@ int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
     NttArgs b = T;
     b.snum = 1;
     b.xnum = max(T.xnum, 1);
-    const bool lz = ntt::LAZY<W, true> && T.lazy;
+    // the transform's lazy level (ntt::fwd): 2 when every prime < 2^28; the row pass by programmatic dependent launch
+    const int lz = ntt::LAZY<W, 1> ? T.lazy : 0;
     const int ch = T.chunk > 0 ? T.chunk : T.nrows;
     for (int i = 0; i < T.nrows; i += ch) {
         const int m = min(ch, T.nrows - i);
         b.roff = T.roff + i;
         b.rprime = T.rprime + i;
-        if (lz) {
-            cols_rs<W, MM, true><<<dim3(16, m), 256, 0, s>>>(b, R);
-            ntt::ntt_fwd_rows<W, true><<<dim3(32, m), 256, 0, s>>>(b);
+        if (lz >= 2) {
+            cols_rs<W, MM, 2><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(ntt::ntt_fwd_rows<W, 2>, dim3(32, m), s, b);
+        } else if (lz) {
+            cols_rs<W, MM, 1><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(ntt::ntt_fwd_rows<W, 1>, dim3(32, m), s, b);
         } else {
-            cols_rs<W, MM, false><<<dim3(16, m), 256, 0, s>>>(b, R);
-            ntt::ntt_fwd_rows<W, false><<<dim3(32, m), 256, 0, s>>>(b);
+            cols_rs<W, MM, 0><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(ntt::ntt_fwd_rows<W, 0>, dim3(32, m), s, b);
         }
     }
     return (int)cudaGetLastError();
