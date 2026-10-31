@@ -241,7 +241,7 @@ impl DensePlan {
         keys: &dyn BtsKeyRing,
         stage_ptrs: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>,
     ) -> Result<DenseRoute<'a, W, M>> {
-        if self.setup.merge_s2d || self.setup.stc_ps {
+        if self.setup.merge_s2d || self.setup.stc_ps != 0 {
             return Err(shape("dense route", "merge_s2d / stc_ps are StC-first (StcFirstPlan) and SparseB options"));
         }
         let n = ctx.lay.n;

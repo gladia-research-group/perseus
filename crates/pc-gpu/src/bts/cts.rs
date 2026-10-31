@@ -172,6 +172,8 @@ pub struct LtStage<'a, W: DevWord> {
     /// Special primes of the stage's key switches: `lay.kp`, or P' (`Chain::p_sparse`) for a stage run with
     /// `KsPlans::new_ps` and `KskShape::stc_ps` keys.
     pub kp: usize,
+    /// (P_kp mod q, P_kp^-1 mod q) of a `kp` below P (P', `stc_ps_kp`; P takes the context's tables).
+    pk: Option<[ScalarTable<'a, W>; 2]>,
     /// The input is under the sparse secret (fresh from a raise): baby 0 is its switch to the dense secret by this key
     /// (sparse -> dense, inner product in the extended basis, no ModDown) and the baby keys are `SparseRot` keys.
     ident: Option<KeyGroup<'a>>,
@@ -575,6 +577,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
     #[allow(clippy::too_many_arguments)]
     pub fn plan_bytes_with(lay: &Layout, primes: &[u64], geom: &LtGeom, top: usize, end: LtEnd, k_max: usize, kp: usize, ident: bool) -> Result<usize> {
         let mut b = ident as usize * KeyGroup::bytes(1, true);
+        // own P_kp tables below P (two scalar tables)
+        b += (kp < lay.kp) as usize * 4 * Arena::bytes_for::<W>(lay.rows());
         b += 2 * Arena::bytes_for::<u64>(geom.b.max(2)) + Arena::bytes_for::<u32>(geom.b.max(2)) + KeyTabs::bytes(geom.b.max(2));
         b += Arena::bytes_for::<u32>(top + 1 + kp) + Arena::bytes_for::<i32>(lay.rows());
         // giant key only when the giant step is not the identity (b stride = N/2: CtS stage 0), offset key only when
@@ -637,7 +641,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         let nh = (n / 2) as i64;
         let primes = ctx.chain.primes();
         let d = ctx.chain.level_unit;
-        if kp == 0 || kp > lay.kp || (kp < lay.kp && kp != ctx.chain.p_sparse) {
+        if kp == 0 || kp > lay.kp || (kp < lay.kp && kp > ctx.chain.p_sparse) {
             return Err(shape("LtStage", format!("{kp} special primes (P has {}, P' {})", lay.kp, ctx.chain.p_sparse)));
         }
         if ident.is_some() && (geom.g != 1 || geom.offset.rem_euclid(nh) != 0) {
@@ -708,6 +712,13 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             Some(k) => Some(KeyGroup::new(arena, s, n, &[k], stage_ptrs)?),
             None => None,
         };
+        let pk = if kp < lay.kp {
+            let pm: Vec<u64> = (0..lay.rows()).map(|t| if t < lay.nq { specials.iter().fold(1u64 % primes[t], |a, &x| mulmod(a, primes[x] % primes[t], primes[t])) } else { 0 }).collect();
+            let pi: Vec<u64> = pm.iter().enumerate().map(|(t, &v)| if t < lay.nq { invmod(v, primes[t]) } else { 0 }).collect();
+            Some([ScalarTable::new(arena, "bts.lt", s, &primes, &pm)?, ScalarTable::new(arena, "bts.lt", s, &primes, &pi)?])
+        } else {
+            None
+        };
         let mut md_c1 = Vec::with_capacity(geom.g);
         for j in 0..geom.g {
             let need = (j > 0 && giant_r != 0) || (j == 0 && off != 0);
@@ -772,6 +783,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             giant,
             offset_key,
             kp,
+            pk,
             ident,
             md_c1,
             md_end,
@@ -866,7 +878,11 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             }
             None => std::ptr::null(),
         };
-        let (pmod, pmods) = if self.kp < lay.kp { (ctx.ks.ps_mod_q.v.vptr(), ctx.ks.ps_mod_q.s.vptr()) } else { (ctx.ks.p_mod_q.v.vptr(), ctx.ks.p_mod_q.s.vptr()) };
+        let pmt = match &self.pk {
+            Some([m, _]) => m,
+            None => &ctx.ks.p_mod_q,
+        };
+        let (pmod, pmods) = (pmt.v.vptr(), pmt.s.vptr());
         // 2. fused baby rotations x plaintexts, two giant steps per launch
         {
             let ex = &*cx.ex;
@@ -1019,7 +1035,10 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         // c1 = (c1 - conv) P^-1 on the Q rows, in the conversion's NTT (the plan's rows sit at the same offsets in
         // lt_res and lt_tmp)
         let res = cx.work.lt_res.buf.vptr_mut();
-        let pinv = if self.kp < lay.kp { &ctx.ks.ps_inv_mod_q } else { &ctx.ks.p_inv_mod_q };
+        let pinv = match &self.pk {
+            Some([_, i]) => i,
+            None => &ctx.ks.p_inv_mod_q,
+        };
         let epi = ntt::Epi::SubMul { out: res, x: res, s: pinv.v.vptr(), ss: pinv.s.vptr() };
         md.run_epi(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
         let rv = View {

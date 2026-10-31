@@ -636,6 +636,9 @@ mod tests {
         if chain.p_sparse < chain.p.len() {
             // a lean chain's StC-first input stages: a rotation key over P' at the single primes
             keys.push(KeyReq { role: Role::rot(1, chain.n).unwrap(), shape: KeyShape::stc_ps(&chain, chain.level_unit + 2).unwrap() });
+            // and over a shorter prefix of P (6 special primes still exceed the digit by 16 bits; 5 do not)
+            keys.push(KeyReq { role: Role::rot(2, chain.n).unwrap(), shape: KeyShape::stc_ps_kp(&chain, chain.level_unit + 2, 6).unwrap() });
+            assert!(KeyShape::stc_ps_kp(&chain, chain.level_unit + 2, 5).is_err());
         }
         let nkeys = keys.len();
         let spec = KeySpec {

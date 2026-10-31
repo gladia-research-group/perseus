@@ -656,7 +656,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
         // PC_LT_TAILS (default on) / PC_EM_FUSE_RESCALE (default off): pc-gpu BtsSetup::lt_tails / em_fuse_rescale
         let (lt_tails, em_fuse) = (cfg.bts.lt_tails.unwrap_or(true), cfg.bts.em_fuse_rescale.unwrap_or(false));
         // PC_BTS_MERGE_S2D / PC_BTS_STC_PS (default off): key-set switches (pc-gpu BtsSetup::merge_s2d / stc_ps)
-        let (merge_s2d, stc_ps) = (cfg.bts.merge_s2d.unwrap_or(false), cfg.bts.stc_ps.unwrap_or(false));
+        let (merge_s2d, stc_ps) = (cfg.bts.merge_s2d.unwrap_or(false), knob(cfg.bts.stc_ps, 0, "bts.stc_ps")? as usize);
         for p in &ps.programs {
             steps.extend(prog_steps(p, half));
         }
@@ -708,6 +708,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 extra.sparse_rots.extend(sp.dense.s0_steps().into_iter().map(|st| (st, KskShape::full(chain))));
             }
             if sp.input_kp() < chain.p.len() {
+                extra.ps_kp = sp.input_kp();
                 extra.rots_ps.extend(sp.input_steps().into_iter().map(|st| (st, sp.entry_top)));
             }
             splan = Some(sp);

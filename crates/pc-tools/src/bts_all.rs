@@ -257,7 +257,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     // PC_BENCH_MERGE=1: the raise's sparse -> dense switch folded into StC-first's CtS stage 0 and SparseB's first fold
     // round (`SparseRot` keys); PC_BENCH_STC_PS=1: the StC-first input stages over P' (`KskShape::stc_ps` keys)
     let merge = std::env::var("PC_BENCH_MERGE").is_ok_and(|v| v == "1");
-    let stc_ps = std::env::var("PC_BENCH_STC_PS").is_ok_and(|v| v == "1");
+    let stc_ps: usize = std::env::var("PC_BENCH_STC_PS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut setup = BtsSetup::n32_shipped();
     setup.k_max = kb;
     setup.real = true;
@@ -303,7 +303,8 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             extra.sparse_rots.extend(pc_gpu::bts::sparse_b::sparse_rot_steps(n, c)?.into_iter().map(|st| (st, full)));
         }
     }
-    if stc_ps {
+    extra.ps_kp = plan.input_kp();
+    if stc_ps != 0 {
         extra.rots_ps.extend(plan.input_steps().into_iter().map(|st| (st, plan.entry_top)));
     }
     let nextra = extra.keys(&chain)?.len();

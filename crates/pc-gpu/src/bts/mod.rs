@@ -144,8 +144,9 @@ pub struct BtsSetup {
     /// The raise's sparse -> dense switch folded into the first hoisted rotations after it (StC-first's CtS stage 0:
     /// its identity baby is the switch, its babies `SparseRot` keys): one ModUp and one ModDown fewer per refresh.
     pub merge_s2d: bool,
-    /// A lean chain's StC-first input stages switch over P' (`KsPlans::new_ps`, `KskShape::stc_ps` keys).
-    pub stc_ps: bool,
+    /// A lean chain's StC-first input stages switch over a prefix of P (`KsPlans::new_ps`, `KskShape::stc_ps_kp`
+    /// keys): 0 = off (P), 1 = P' (`Chain::p_sparse`), k > 1 = the first k special primes.
+    pub stc_ps: usize,
 }
 
 impl BtsSetup {
@@ -173,7 +174,7 @@ impl BtsSetup {
             lt_tails: true,
             em_fuse_rescale: false,
             merge_s2d: false,
-            stc_ps: false,
+            stc_ps: 0,
         }
     }
 

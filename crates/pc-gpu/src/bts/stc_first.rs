@@ -580,13 +580,15 @@ impl StcFirstPlan {
         self.entry_top - self.input.len() * self.step
     }
 
-    /// Special primes of the input stages' key switches: P' with `BtsSetup::stc_ps` (a lean chain), else P.
+    /// Special primes of the input stages' key switches: `BtsSetup::stc_ps`'s prefix of P on a lean chain (1 = P'),
+    /// else P.
     pub fn input_kp(&self) -> usize {
         let c = &self.dense.chain;
-        if self.dense.setup.stc_ps && c.lone_top().is_some() {
-            c.p_sparse
-        } else {
-            c.p.len()
+        match self.dense.setup.stc_ps {
+            0 => c.p.len(),
+            _ if c.lone_top().is_none() => c.p.len(),
+            1 => c.p_sparse,
+            k => k.min(c.p_sparse),
         }
     }
 
@@ -625,7 +627,7 @@ impl StcFirstPlan {
             b += LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes_with(&lay, &primes, &h.geom, h.top, h.end, k_max, kp, false)?;
         }
         if kp < lay.kp {
-            b += KsPlans::bytes_ps::<W>(&self.dense.chain, k_max, self.entry_top)?;
+            b += KsPlans::bytes_ps::<W>(&self.dense.chain, k_max, self.entry_top, kp)?;
         }
         for s in self.sources.iter().flatten() {
             b += s.bytes::<W>(lay.n);
@@ -681,7 +683,7 @@ impl StcFirstPlan {
         // stc_ps: the input stages (and the cached last one) over P', their own key-switch plans
         let kp_in = self.input_kp();
         let ps = PsRing(keys);
-        let ks_ps = if kp_in < ctx.lay.kp { Some(KsPlans::new_ps(arena, s, ctx, k_max, self.entry_top)?) } else { None };
+        let ks_ps = if kp_in < ctx.lay.kp { Some(KsPlans::new_ps(arena, s, ctx, k_max, self.entry_top, kp_in)?) } else { None };
         let lt_in = |h: &LtHost| -> Result<LtStage<'a, W>> {
             if kp_in == ctx.lay.kp {
                 return lt(h);

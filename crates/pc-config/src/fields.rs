@@ -78,9 +78,9 @@ section! {
         #[doc = "`FIDESLIB_BTS_RAISE_STC_ONUSE`. Default (unset). Read at Context.cu: a staged-only StC-first route builds a missing raise variant at first use."]
         #[doc = "Shipped plans: runtime= llama128."]
         raise_stc_onuse: Flag = "FIDESLIB_BTS_RAISE_STC_ONUSE", "(unset)";
-        #[doc = "A lean chain's StC-first input stages switch over P' (n32's 9 special primes; pc-gpu `BtsSetup::stc_ps`, `KskShape::stc_ps` rotation keys; default off)."]
+        #[doc = "A lean chain's StC-first input stages switch over a prefix of P (pc-gpu `BtsSetup::stc_ps`, `KskShape::stc_ps_kp` rotation keys): 0 = off, 1 = P' (n32's 9 special primes), k > 1 = the first k."]
         #[doc = "Runtime switch `PC_BTS_STC_PS`: binds the key bundle (P' rotation keys), not the plan."]
-        stc_ps: Flag = "PC_BTS_STC_PS", "(unset)";
+        stc_ps: Int = "PC_BTS_STC_PS", "(unset)";
         #[doc = "`FIDESLIB_BTS_REAL`. Default '0'. Read at impl/ops.py::FheOps.bootstrap_real."]
         #[doc = "Shipped plans: runtime= 15."]
         real: Flag = "FIDESLIB_BTS_REAL", "'0'";

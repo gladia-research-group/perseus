@@ -31,6 +31,8 @@ pub struct KeyGen<'a, W: DevWord> {
     digit_of: ConstBuf<'a, i32>,
     /// sigma_{g^-1}(s) of the rotation being generated (part 0).
     perm: CtBuf<'a, Compute, W>,
+    /// The gadget (first kp special primes mod q) of shapes over a prefix of P other than P and P' (`stc_ps_kp`).
+    gadgets: BTreeMap<usize, crate::context::ScalarTable<'a, W>>,
     gauss: DiscreteGaussian,
     /// Level relinearization keys (prototype): digit_of and (P' mod q, Shoup) by prime id, per limb top.
     levels: BTreeMap<usize, (ConstBuf<'a, i32>, ConstBuf<'a, W>, ConstBuf<'a, W>)>,
@@ -52,11 +54,20 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
         let mut sh: Vec<KskShape> = shapes.to_vec();
         sh.sort();
         sh.dedup();
+        let mut kps: Vec<usize> = sh.iter().map(|s| s.kp).filter(|&k| Self::own_gadget(lay, k)).collect();
+        kps.sort();
+        kps.dedup();
+        let gad = kps.len() * 2 * Arena::bytes_for::<W>(lay.rows());
         let tabs: usize = sh
             .iter()
             .map(|s| Arena::bytes_for::<i32>(s.rows()) + Arena::bytes_for::<u32>(s.ndig * s.rows()) + Arena::bytes_for::<i32>(s.ndig * s.rows()))
             .sum();
-        tabs + Arena::bytes_for::<i32>(lay.rows()) + Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, 1))
+        gad + tabs + Arena::bytes_for::<i32>(lay.rows()) + Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(lay, 1))
+    }
+
+    /// A shape over `kp` special primes (a prefix of P: P', `stc_ps_kp`) takes its own gadget table.
+    fn own_gadget(lay: &Layout, kp: usize) -> bool {
+        kp < lay.kp
     }
 
     /// Build the tables for every shape in `shapes` (setup only, uploads synced on `s`).
@@ -74,7 +85,17 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             e_rows.insert(*sh, RowList::new(arena, s, &rl)?);
         }
         let dof: Vec<i32> = (0..lay.rows()).map(|id| chain.digit_of(id).map_or(-1, |d| d as i32)).collect();
+        let primes = chain.primes();
+        let mut gadgets = BTreeMap::new();
+        for sh in shapes {
+            if Self::own_gadget(&lay, sh.kp) && !gadgets.contains_key(&sh.kp) {
+                let mut v: Vec<u64> = chain.q.iter().map(|&q| chain.p[..sh.kp].iter().fold(1u64 % q, |a, &x| pc_core::modmul::mulmod(a, x % q, q))).collect();
+                v.resize(lay.rows(), 0);
+                gadgets.insert(sh.kp, crate::context::ScalarTable::new(arena, "keygen.gadget", s, &primes, &v)?);
+            }
+        }
         Ok(KeyGen {
+            gadgets,
             ids,
             e_rows,
             digit_of: ConstBuf::new(arena, "keygen.digit_of", s, &dof)?,
@@ -214,6 +235,8 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
                 (self.perm.buf.vptr(), if matches!(key.role, KeyRole::SparseRot { .. }) { part(1) } else { part(0) }, 0)
             }
         };
+        // the key's own special set: P, or a prefix of it (P' for a bottom-shape key of a lean chain, `stc_ps_kp`)
+        let gadget = self.gadgets.get(&sh.kp).unwrap_or(&ctx.ks.p_mod_q);
         let (b, a, bits, row_words) = match &mut key.store {
             KskStore::PackedSeeded { b, bits, row_words } => (b.vptr_mut(), std::ptr::null_mut(), *bits as i32, *row_words as u64),
             KskStore::Dense { b, a } => (b.vptr_mut(), a.vptr_mut(), 0, 0),
@@ -227,9 +250,10 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             seed: key.seed_dev.dptr(),
             ids: ids.dptr(),
             digit_of: ov.map(|o| o.0).unwrap_or(self.digit_of.dptr()),
-            // the key's own special set: P, or P' for a bottom-shape key of a lean chain (or a level key's)
-            pmod: ov.map(|o| o.1).unwrap_or(if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.v.vptr() } else { ctx.ks.p_mod_q.v.vptr() }),
-            pmods: ov.map(|o| o.2).unwrap_or(if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.s.vptr() } else { ctx.ks.p_mod_q.s.vptr() }),
+            // the key's own special set: P, a prefix of it (P' for a bottom-shape key of a lean chain, `stc_ps_kp`), or a
+            // level key's
+            pmod: ov.map(|o| o.1).unwrap_or(gadget.v.vptr()),
+            pmods: ov.map(|o| o.2).unwrap_or(gadget.s.vptr()),
             pr: ctx.pr(),
             row_words,
             nrows: rows as i32,

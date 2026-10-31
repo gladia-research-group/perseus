@@ -114,6 +114,8 @@ pub struct Ring {
     pub p_mod_q: Vec<u32>,
     /// P' mod q_i (P' = the first `Chain::p_sparse` special primes: the bottom-shape keys' gadget).
     pub ps_mod_q: Vec<u32>,
+    /// (first k special primes) mod q_i for k = 1..=|P| (the StC-first input keys' gadget, `KeyShape::stc_ps`).
+    pub prefix_mod_q: Vec<Vec<u32>>,
     /// Special primes in P (a key over fewer uses P').
     pub kp: usize,
 }
@@ -125,15 +127,17 @@ impl Ring {
         let ntt = primes.par_iter().zip(roots.par_iter()).map(|(&p, &r)| Ntt::new(p, r, chain.n)).collect::<Result<Vec<_>>>()?;
         let prod = |ps: &[u64]| chain.q.iter().map(|&q| ps.iter().fold(1u64, |a, &pj| mulmod(a, pj % q, q)) as u32).collect();
         let (p_mod_q, ps_mod_q) = (prod(&chain.p), prod(&chain.p[..chain.p_sparse]));
-        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, kp: chain.p.len() })
+        let prefix_mod_q = (1..=chain.p.len()).map(|k| prod(&chain.p[..k])).collect();
+        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, prefix_mod_q, kp: chain.p.len() })
     }
 
-    /// The gadget factor (P or P' mod q) of a key over `kp` special primes.
+    /// The gadget factor (the product of the first `kp` special primes mod q: P, P' or a shorter prefix) of a key over
+    /// `kp` special primes.
     pub fn gadget(&self, kp: usize) -> &[u32] {
-        if kp < self.kp {
-            &self.ps_mod_q
-        } else {
+        if kp >= self.kp {
             &self.p_mod_q
+        } else {
+            &self.prefix_mod_q[kp.max(1) - 1]
         }
     }
 

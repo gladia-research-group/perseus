@@ -57,6 +57,9 @@ pub fn packed_row_words(n: usize, bits: u32) -> usize {
     (n * bits as usize / 32 + 1).div_ceil(4) * 4
 }
 
+/// Bits a `KskShape::stc_ps_kp` special modulus must exceed its digit by.
+pub const STC_PS_MARGIN: f64 = 16.0;
+
 /// Which rows a key stores (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KskShape {
@@ -90,9 +93,15 @@ impl KskShape {
     /// Rows for ciphertexts with top limb <= `q_top` over P' only (`Chain::p_sparse`): the StC-first input stages'
     /// keys on a lean chain (`KsPlans::new_ps`), one digit whose primes P' exceeds by > 100 bits.
     pub fn stc_ps(chain: &Chain, q_top: usize) -> Result<Self> {
-        let sh = KskShape { kp: chain.p_sparse, ..Self::banded(chain, q_top)? };
-        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() {
-            return Err(shape("KskShape::stc_ps", format!("top {q_top}: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
+        Self::stc_ps_kp(chain, q_top, chain.p_sparse)
+    }
+    /// `stc_ps` over the first `kp` (<= P') special primes, whose product exceeds the digit by `STC_PS_MARGIN` bits
+    /// (pc-client `KeyShape::stc_ps_kp`, the same rule).
+    pub fn stc_ps_kp(chain: &Chain, q_top: usize, kp: usize) -> Result<Self> {
+        let sh = KskShape { kp, ..Self::banded(chain, q_top)? };
+        let bits = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
+        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() || kp == 0 || kp > chain.p_sparse || bits(&chain.p[..kp]) < bits(&chain.q[..=q_top]) + STC_PS_MARGIN {
+            return Err(shape("KskShape::stc_ps", format!("top {q_top} over {kp} special primes: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
         }
         Ok(sh)
     }
@@ -446,6 +455,8 @@ pub struct KeySet<'a, W: DevWord> {
 pub struct ExtraKeySpec {
     pub rots_ps: Vec<(i64, usize)>,
     pub sparse_rots: Vec<(i64, KskShape)>,
+    /// Special primes of the `rots_ps` keys (0 = P', `Chain::p_sparse`).
+    pub ps_kp: usize,
 }
 
 impl ExtraKeySpec {
@@ -465,7 +476,8 @@ impl ExtraKeySpec {
         sp.remove(&0);
         let mut v = Vec::new();
         for (st, t) in ps {
-            v.push((KeyRole::rot(st, chain.n)?, KskShape::stc_ps(chain, t)?));
+            let kp = if self.ps_kp == 0 { chain.p_sparse } else { self.ps_kp };
+            v.push((KeyRole::rot(st, chain.n)?, KskShape::stc_ps_kp(chain, t, kp)?));
         }
         for (st, sh) in sp {
             v.push((KeyRole::SparseRot { step: st, galois: galois::rotation_galois(st, chain.n)? }, sh));

@@ -559,12 +559,15 @@ struct LevelSpecs {
     moddown: Vec<JobSpec>,
 }
 
-fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, ps: bool) -> LevelSpecs {
-    // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'; `ps`: every level over P'
-    // (`KsPlans::new_ps`, the StC-first input stages' keys `KskShape::stc_ps`)
+fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, ps: Option<usize>) -> LevelSpecs {
+    // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'; `ps` = Some(k): every
+    // other level over the first k special primes (`KsPlans::new_ps`, the StC-first input stages' keys
+    // `KskShape::stc_ps_kp`)
     let mut specials: Vec<usize> = chain.special_ids();
-    if top + 1 == chain.level_unit || ps {
+    if top + 1 == chain.level_unit {
         specials.truncate(chain.p_sparse);
+    } else if let Some(k) = ps {
+        specials.truncate(k);
     }
     // live digits: digit d keeps its limbs <= top (FIDESlib DECOMPmeta sizes cut at the level's limb count)
     let digs: Vec<Vec<usize>> =
@@ -681,13 +684,13 @@ pub struct KsPlans<'a> {
 impl<'a> KsPlans<'a> {
     /// Arena bytes of the plans of `chain` at words `W` for `k_max` ciphertexts.
     pub fn bytes<W: DevWord>(chain: &Chain, k_max: usize) -> Result<usize> {
-        Self::bytes_with::<W>(chain, k_max, Layout::from_chain(chain).nq, false)
+        Self::bytes_with::<W>(chain, k_max, Layout::from_chain(chain).nq, None)
     }
     /// Arena bytes of `new_ps`'s plans.
-    pub fn bytes_ps<W: DevWord>(chain: &Chain, k_max: usize, ps_top: usize) -> Result<usize> {
-        Self::bytes_with::<W>(chain, k_max, ps_top + 1, true)
+    pub fn bytes_ps<W: DevWord>(chain: &Chain, k_max: usize, ps_top: usize, kp: usize) -> Result<usize> {
+        Self::bytes_with::<W>(chain, k_max, ps_top + 1, Some(kp))
     }
-    fn bytes_with<W: DevWord>(chain: &Chain, k_max: usize, ntops: usize, ps: bool) -> Result<usize> {
+    fn bytes_with<W: DevWord>(chain: &Chain, k_max: usize, ntops: usize, ps: Option<usize>) -> Result<usize> {
         let lay = Layout::from_chain(chain);
         let primes = chain.primes();
         let mut b = 2 * Arena::bytes_for::<i32>(lay.rows());
@@ -703,17 +706,17 @@ impl<'a> KsPlans<'a> {
     }
 
     pub fn new<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize) -> Result<Self> {
-        Self::new_with(arena, s, ctx, k_max, ctx.lay.nq, false)
+        Self::new_with(arena, s, ctx, k_max, ctx.lay.nq, None)
     }
     /// Plans of the levels `0..=ps_top` with every key switch over P' (the first `Chain::p_sparse` special primes; keys
     /// of `KskShape::stc_ps`): a lean chain's StC-first input stages, whose single-prime levels P' covers by > 100 bits.
-    pub fn new_ps<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ps_top: usize) -> Result<Self> {
-        if ps_top >= ctx.lay.nq {
-            return Err(shape("KsPlans::new_ps", format!("top {ps_top} above the chain")));
+    pub fn new_ps<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ps_top: usize, kp: usize) -> Result<Self> {
+        if ps_top >= ctx.lay.nq || kp == 0 || kp > ctx.chain.p_sparse {
+            return Err(shape("KsPlans::new_ps", format!("top {ps_top} over {kp} special primes")));
         }
-        Self::new_with(arena, s, ctx, k_max, ps_top + 1, true)
+        Self::new_with(arena, s, ctx, k_max, ps_top + 1, Some(kp))
     }
-    fn new_with<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ntops: usize, ps: bool) -> Result<Self> {
+    fn new_with<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ntops: usize, ps: Option<usize>) -> Result<Self> {
         let chain = &ctx.chain;
         let lay = ctx.lay;
         if k_max == 0 || k_max > ctx.k_max {
@@ -752,7 +755,8 @@ impl<'a> KsPlans<'a> {
                 .unzip();
             v.iter().chain(&w).flat_map(|x| x.to_u64().to_le_bytes()[..std::mem::size_of::<W>()].to_vec()).collect()
         };
-        let md_scale = [ConstBuf::new(arena, "ks.plans", s, &md(lay.kp))?, ConstBuf::new(arena, "ks.plans", s, &md(chain.p_sparse.min(lay.kp)))?];
+        // [P, the plans' shorter set: P' (the bottom), or new_ps's prefix (its levels above the bottom)]
+        let md_scale = [ConstBuf::new(arena, "ks.plans", s, &md(lay.kp))?, ConstBuf::new(arena, "ks.plans", s, &md(ps.unwrap_or(chain.p_sparse).min(lay.kp)))?];
         Ok(KsPlans {
             levels,
             digit_of: ConstBuf::new(arena, "ks.plans", s, &digit_of)?,
@@ -1004,8 +1008,13 @@ fn dot_rows(lv: &LevelPlan<'_>, top: usize, rows: DotRows) -> Result<(*const u32
 }
 
 /// `P mod q` and `P^-1 mod q` (value, Shoup) of a level's special set: P, or P' at the bottom of a lean chain.
+/// (A `new_ps` level over a shorter prefix gets null pointers: its key switches take the extended c0 as stored and leave
+/// the ModDown to their caller's plans, `bts::cts::LtStage`.)
 fn level_scalars<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, lv: &LevelPlan<'_>) -> [*const c_void; 4] {
     let k = &ctx.ks;
+    if lv.kp < ctx.lay.kp && lv.kp != ctx.chain.p_sparse {
+        return [std::ptr::null(); 4];
+    }
     if lv.kp < ctx.lay.kp {
         [k.ps_mod_q.v.vptr(), k.ps_mod_q.s.vptr(), k.ps_inv_mod_q.v.vptr(), k.ps_inv_mod_q.s.vptr()]
     } else {

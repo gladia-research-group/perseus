@@ -11,6 +11,9 @@ use pc_core::galois;
 use pc_core::params::Chain;
 use serde::{Deserialize, Serialize};
 
+/// Bits a `KeyShape::stc_ps_kp` special modulus must exceed its digit by.
+pub const STC_PS_MARGIN: f64 = 16.0;
+
 /// Which rows a key stores: digits `0..ndig`, each the Q rows `0..=q_top` then the `kp` special rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct KeyShape {
@@ -40,9 +43,15 @@ impl KeyShape {
     /// Q rows `0..=q_top` (one digit) over P' (`Chain::p_sparse`): a lean chain's StC-first input stages' rotation
     /// keys, under the dense secret at q_0 .. q_{q_top} x P' (a few hundred bits).
     pub fn stc_ps(chain: &Chain, q_top: usize) -> Result<Self> {
-        let sh = KeyShape { kp: chain.p_sparse, ..Self::banded(chain, q_top)? };
-        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() {
-            return Err(Error::Spec(format!("P' shape at top {q_top}: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
+        Self::stc_ps_kp(chain, q_top, chain.p_sparse)
+    }
+    /// `stc_ps` over the first `kp` special primes (<= P'): their product must exceed the digit's (q_0 .. q_{q_top}) by
+    /// `STC_PS_MARGIN` bits (the key-switching noise after ModDown scales as digit / special modulus).
+    pub fn stc_ps_kp(chain: &Chain, q_top: usize, kp: usize) -> Result<Self> {
+        let sh = KeyShape { kp, ..Self::banded(chain, q_top)? };
+        let bits = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
+        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() || kp == 0 || kp > chain.p_sparse || bits(&chain.p[..kp]) < bits(&chain.q[..=q_top]) + STC_PS_MARGIN {
+            return Err(Error::Spec(format!("P' shape at top {q_top} over {kp} special primes: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
         }
         Ok(sh)
     }
@@ -57,8 +66,8 @@ impl KeyShape {
         let bottom = Self::bottom(chain)?;
         let want = if self.q_top == bottom.q_top && self.kp == bottom.kp {
             bottom
-        } else if self.kp == chain.p_sparse && self.kp < chain.p.len() {
-            Self::stc_ps(chain, self.q_top)?
+        } else if self.kp <= chain.p_sparse && self.kp < chain.p.len() {
+            Self::stc_ps_kp(chain, self.q_top, self.kp)?
         } else {
             Self::banded(chain, self.q_top)?
         };
