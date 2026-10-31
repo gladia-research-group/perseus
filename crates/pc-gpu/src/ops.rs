@@ -309,6 +309,8 @@ pub struct Ops<'a, W: DevWord> {
     pub rescaler: Rescaler<'a, W>,
     primes: Vec<u64>,
     lay: Layout,
+    /// The relinearization fused with its rescale (`mult_rescale`); None: not built (setup's choice).
+    pub rr: Option<crate::relin::RelinRescaler<'a, W>>,
 }
 
 /// OpenFHE ForwardTransformToBitReverse (`w[i] = psi^brev(i)`), for the setup-time monomial table.
@@ -373,7 +375,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             .collect();
         let mono = ConstBuf::new(arena, "ops.mono_i", s, &mono_v)?;
         let rescaler = Rescaler::new(arena, s, ctx, cfg.rescale)?;
-        Ok(Ops { cfg, ring, mono, rescaler, primes: ctx.chain.primes(), lay })
+        Ok(Ops { cfg, ring, mono, rescaler, primes: ctx.chain.primes(), lay, rr: None })
     }
 
     // ── launch helpers (raw PolyRefs: views into Ct batches, scratch, plaintext rows) ─────────────────────────────
@@ -1129,11 +1131,17 @@ impl<'a, W: DevWord> Ops<'a, W> {
     /// (where `relin::relin_staged` expects it). Returns the live top and the recipe; `out.meta` is left to the caller
     /// (the relinearized product takes `recipe.out`).
     pub fn tensor_for_relin<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, a: &Ct<'_, W>, b: Option<&Ct<'_, W>>) -> Result<(usize, Recipe)> {
+        self.tensor_for_relin_of(ctx, ex, sh, out, Some(a), b, false)
+    }
+
+    /// `tensor_for_relin` with `a = None`: A is `out` itself (its preludes run in place, no copy); `b` must not alias it.
+    fn tensor_for_relin_of<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, a: Option<&Ct<'_, W>>, b: Option<&Ct<'_, W>>, dbl: bool) -> Result<(usize, Recipe)> {
+        let am = a.map_or(out.meta, |a| a.meta);
         let r = match b {
-            Some(b) => sh.mult(&a.meta, &b.meta)?,
-            None => sh.square(&a.meta)?,
+            Some(b) => sh.mult(&am, &b.meta)?,
+            None => sh.square(&am)?,
         };
-        let k = a.k();
+        let k = a.map_or(out.k(), |a| a.k());
         if k > ex.ks.k_max {
             return Err(shape("mult", format!("batch of {k} > the key-switching k_max {}", ex.ks.k_max)));
         }
@@ -1144,7 +1152,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             }
             None => None,
         };
-        let (t, x) = self.prep_a_view(ctx, &ex.compute, out, Some(a), &r.pre)?;
+        let (t, x) = self.prep_a_view(ctx, &ex.compute, out, a, &r.pre)?;
         if t.meta.level != r.out.level {
             return Err(shape("mult", format!("preludes left level {} but the recipe's output is at {}", t.meta.level, r.out.level)));
         }
@@ -1174,7 +1182,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             acc: 0,
             n: (top + 1) as i32,
             k: k as i32,
-            dbl: 0,
+            dbl: dbl as i32,
             pad: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1, so out aliasing the A
@@ -1192,6 +1200,31 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let (top, r) = self.tensor_for_relin(ctx, ex, sh, out, a, Some(b))?;
         crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
         out.meta = r.out;
+        Ok(())
+    }
+
+    /// `rescale([2] a * b)` (`b = None`: a^2; `a = None`: `out` holds A), the relinearization's ModDown fused with the
+    /// rescale (`relin::RelinRescaler`): degree 1 out, one unit of levels down. The same value as `mult` [+ the
+    /// doubling add] + `Rescale` up to one rounding in place of two. Errs when the tables do not serve the top.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_rescale<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, out: &mut Ct<'_, W>, a: Option<&Ct<'_, W>>, b: Option<&Ct<'_, W>>, dbl: bool) -> Result<()> {
+        let am = a.map_or(out.meta, |a| a.meta);
+        let r0 = match b {
+            Some(b) => sh.mult(&am, &b.meta)?,
+            None => sh.square(&am)?,
+        };
+        let top = self.top(ctx.shape, &r0.out)?;
+        if !self.rr.as_ref().is_some_and(|rr| rr.serves(top, out.k())) {
+            return Err(shape("mult_rescale", format!("no fused relin-rescale tables for top {top}")));
+        }
+        let (top, r) = self.tensor_for_relin_of(ctx, ex, sh, out, a, b, dbl)?;
+        let rr = self.rr.as_ref().ok_or_else(|| shape("mult_rescale", "no tables"))?;
+        rr.relin_rescale(ctx, ex, kc, key, out, top)?;
+        let mut m = r.out;
+        if dbl {
+            m = sh.add(&m, &m)?.out;
+        }
+        out.meta = sh.realize(&m)?.out;
         Ok(())
     }
 

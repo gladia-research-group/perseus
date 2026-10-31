@@ -38,6 +38,8 @@ pub enum StepOp {
     MultConst(f64),
     Mult,
     Square,
+    /// `Kind::MultRescale` (`Ops::mult_rescale`); `b` NONE when `square`.
+    MultRescale { square: bool, dbl: bool },
     Negate,
     /// Rotation by `k` through key group `g`.
     Rotate { k: i64, g: u32 },
@@ -142,7 +144,7 @@ pub enum UnitKind {
     RotateSum { l: u32, g: u32 },
     /// A K-batch of relinearized products (`Ops::mult`, `b` empty: `Ops::square`): step `lo + c` multiplies
     /// `Unit::ins[c]` by `b[c]`.
-    Mult { b: Vec<u32> },
+    Mult { b: Vec<u32>, rs: Option<bool> },
     /// A K-batch of refreshes on one route (`BtsRoute::run` of K ciphertexts): step `lo + c` refreshes `Unit::ins[c]`.
     Refresh { route: Route, kind: RouteKind },
     /// A refresh pair (`Pairing`): step `lo + c` refreshes `Unit::ins[c]` on `routes[c]`, both as one complex refresh
@@ -158,6 +160,10 @@ pub enum UnitKind {
     /// it (`pf[j]`: the product as the add's operand A) onto the previous sum, every intermediate used only by the next
     /// add (never written).
     MultPtAddChain { head: Option<u32>, pts: Vec<u32>, pf: Vec<bool> },
+    /// A rotation accumulation (`Program::rot_acc_chains`, pc-gpu `rotate::rotate_acc`): steps `lo..hi` are
+    /// `[rot(t_1), add, rot(t_2), add, ...]`, `Unit::ins` = `[acc_0, t_1, t_2, ...]`, `gs[j]` the key group of
+    /// `steps[j]`; the rotations summed in the extended basis and ModDowned once onto `acc_0`.
+    RotAcc { gs: Vec<u32>, gal: Vec<u64>, steps: Vec<Option<i64>> },
 }
 
 /// Steps `lo..hi` issued together (their outputs at once), reading the slots `ins`. `chain`: the rotation chain the
@@ -366,7 +372,7 @@ fn key_needs(p: &Program) -> (bool, bool, Vec<Vec<i64>>) {
     for op in &p.ops {
         for m in op.members() {
             match &m.kind {
-                Kind::Mult | Kind::Square => relin = true,
+                Kind::Mult | Kind::Square | Kind::MultRescale { .. } => relin = true,
                 Kind::Conjugate => conj = true,
                 Kind::Rotate(k) => {
                     if !lists.contains(&vec![*k]) {
@@ -581,6 +587,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
                     Kind::MultConst(c) => StepOp::MultConst(scalar(m, c, &mut no_scalar)),
                     Kind::Mult => StepOp::Mult,
                     Kind::Square => StepOp::Square,
+                    Kind::MultRescale { square, dbl, .. } => StepOp::MultRescale { square: *square, dbl: *dbl },
                     Kind::Negate => StepOp::Negate,
                     Kind::Rotate(k) => StepOp::Rotate { k: *k, g: list_group[list_idx(&vec![*k]) as usize] },
                     Kind::RotateSum(s) => StepOp::RotateSum { l: list_idx(s), g: list_group[list_idx(s) as usize] },
@@ -689,6 +696,46 @@ impl<'a, W: DevWord> Bound<'a, W> {
             unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
             units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind: UnitKind::RotateSum { l, g }, chain: NONE, off: false });
         }
+        // rotation accumulations (`Program::rot_acc_chains`): each rotation's ModDown adds its output onto the
+        // accumulator (no add, the same residues), or with `rotacc_lazy` a chain's rotations summed in the extended
+        // basis with one ModDown
+        let lazy = crate::program::lever_on("rotacc_lazy");
+        for ((o0, o1), acc, ts, rsteps) in if crate::program::lever_on("rotacc_unit") { p.rot_acc_chains() } else { vec![] } {
+            let (lo, hi) = (first_step[o0], first_step[o1]);
+            if hi - lo != 2 * ts.len() || unit_of[lo..hi].iter().any(|&u| u != NONE) {
+                continue;
+            }
+            let mut gs = vec![];
+            let mut gal = vec![];
+            for (j, k) in rsteps.iter().enumerate() {
+                match (&steps[lo + 2 * j].op, k) {
+                    (StepOp::Rotate { g, .. }, Some(k)) if *g != NONE => {
+                        gs.push(*g);
+                        gal.push(pc_core::galois::rotation_galois(*k, lay.n).map_err(|e| berr(block, e.to_string()))?);
+                    }
+                    (StepOp::Conjugate { g }, None) if *g != NONE => {
+                        gs.push(*g);
+                        gal.push(pc_core::galois::conj_galois(lay.n).map_err(|e| berr(block, e.to_string()))?);
+                    }
+                    _ => break,
+                }
+            }
+            if gs.len() != ts.len() {
+                continue;
+            }
+            // links: one unit per chain (lazy), else one per link; link j reads the previous add's output slot
+            let groups_of: Vec<(usize, usize)> = if lazy { vec![(0, ts.len())] } else { (0..ts.len()).map(|j| (j, j + 1)).collect() };
+            for (a, b) in groups_of {
+                let acc_slot = if a == 0 { slot_of(acc)? } else { steps[lo + 2 * a - 1].out };
+                let mut ins = vec![acc_slot];
+                for &t in &ts[a..b] {
+                    ins.push(slot_of(t)?);
+                }
+                let (ulo, uhi) = (lo + 2 * a, lo + 2 * b);
+                unit_of[ulo..uhi].iter_mut().for_each(|x| *x = units.len() as u32);
+                units.push(Unit { lo: ulo as u32, hi: uhi as u32, ins, kind: UnitKind::RotAcc { gs: gs[a..b].to_vec(), gal: gal[a..b].to_vec(), steps: rsteps[a..b].to_vec() }, chain: NONE, off: false });
+            }
+        }
         // plaintext products consumed by the next add (the product's input and the add's other operand stay live)
         for oi in p.mult_pt_adds() {
             let lo = first_step[oi];
@@ -777,8 +824,9 @@ impl<'a, W: DevWord> Bound<'a, W> {
                 continue;
             }
             let kind = match (&m[0].kind, &steps[lo].op) {
-                (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs },
-                (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![] },
+                (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs, rs: None },
+                (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![], rs: None },
+                (Kind::MultRescale { square, dbl, .. }, StepOp::MultRescale { .. }) if steps[lo..hi].iter().all(|st| st.op == steps[lo].op) && relin != NONE => UnitKind::Mult { b: if *square { vec![] } else { bs }, rs: Some(*dbl) },
                 (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) if m.len() == PAIR_K && m.iter().all(|x| paired(p, x, p.batch_report.pair)) => {
                     let StepOp::Bootstrap { route: ry, .. } = steps[lo + 1].op else { continue };
                     if *kind != RouteKind::StcFirst || routes.get(*kind).is_none() {

@@ -12,6 +12,9 @@ pub mod apply_plan;
 pub mod batch;
 pub mod check;
 pub mod resolve;
+pub mod rotacc;
+pub mod rr;
+pub mod share;
 pub mod stream;
 
 use crate::error::{Error, Result};
@@ -517,6 +520,18 @@ pub fn compile_block(
     let cf_max = if chain_of(cfg)?.lone_top().is_some() { crate::program::PAIR_CF_MAX_LEAN } else { crate::program::PAIR_CF_MAX };
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default });
+    if crate::program::lever_on("rr") {
+        rr::fuse(&mut p, &sh);
+        if crate::program::lever_on("rr_pre") {
+            rr::fuse_preludes(&mut p, &sh);
+        }
+    }
+    if crate::program::lever_on("share") {
+        share::share_rescales(&mut p, &sh);
+    }
+    if crate::program::lever_on("rotacc") && crate::program::lever_on("rotacc_lazy") {
+        rotacc::sink(&mut p);
+    }
     batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);

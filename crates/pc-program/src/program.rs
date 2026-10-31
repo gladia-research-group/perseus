@@ -50,6 +50,15 @@ pub enum Kind {
     /// ct * ct, relinearized.
     Mult,
     Square,
+    /// `rescale([2] a * b)` (`square`: a^2), the relinearization's ModDown fused with the rescale (`compile::rr`:
+    /// a product, its doubling add, its rescale).
+    /// `fused`: the product's, the doubling's and the pre-rescale constant's vars, never materialized (as CoeffSum's).
+    MultRescale {
+        square: bool,
+        dbl: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fused: Vec<VarId>,
+    },
     Negate,
     Rotate(i64),
     /// a + sum rot(a, k) over the steps (one hoisted radix group).
@@ -95,6 +104,7 @@ impl Kind {
             Kind::MultConst(_) => "mult_const",
             Kind::Mult => "mult",
             Kind::Square => "square",
+            Kind::MultRescale { .. } => "mult_rescale",
             Kind::Negate => "negate",
             Kind::Rotate(_) => "rotate",
             Kind::RotateSum(_) => "rotate_sum",
@@ -430,6 +440,63 @@ impl Program {
         out
     }
 
+    /// The rotation accumulations (`compile::rotacc`): runs of ops `[rot(t_1), add, rot(t_2), add, ...]` (a rotation
+    /// or a conjugation, then the add of its output), each add reading the previous add's output (the first: `acc`)
+    /// and the rotation before it, the rotation's output read nowhere else, every operand at one level, degree and
+    /// scale. (op range, acc, the t_j, the steps: None = conjugation).
+    pub fn rot_acc_chains(&self) -> Vec<((usize, usize), VarId, Vec<VarId>, Vec<Option<i64>>)> {
+        let mut uses: BTreeMap<VarId, usize> = BTreeMap::new();
+        for op in &self.ops {
+            for v in op.all_ins() {
+                *uses.entry(v).or_default() += 1;
+            }
+        }
+        for &v in &self.outputs {
+            *uses.entry(v).or_default() += 1;
+        }
+        let one = |v: VarId| uses.get(&v) == Some(&1);
+        let same = |a: VarId, b: VarId| {
+            let (x, y) = (&self.vars[a as usize].meta, &self.vars[b as usize].meta);
+            x.level == y.level && x.deg == y.deg && x.nf.to_bits() == y.nf.to_bits()
+        };
+        // link at i: (step, t, acc, out)
+        let link = |i: usize| -> Option<(Option<i64>, VarId, VarId, VarId)> {
+            let (r, a) = (self.ops.get(i)?, self.ops.get(i + 1)?);
+            let k = match r.kind {
+                Kind::Rotate(k) if k != 0 => Some(k),
+                Kind::Conjugate => None,
+                _ => return None,
+            };
+            if !r.pre.is_empty() || r.ins.len() != 1 || r.outs.len() != 1 || !matches!(a.kind, Kind::Add) || !a.pre.is_empty() || a.ins.len() != 2 || a.outs.len() != 1 {
+                return None;
+            }
+            let rv = r.outs[0];
+            let acc = if a.ins[1] == rv { a.ins[0] } else if a.ins[0] == rv { a.ins[1] } else { return None };
+            (acc != rv && one(rv) && same(r.ins[0], acc)).then_some((k, r.ins[0], acc, a.outs[0]))
+        };
+        let mut out = vec![];
+        let mut i = 0;
+        while i + 1 < self.ops.len() {
+            let Some((k, t, acc, o)) = link(i) else {
+                i += 1;
+                continue;
+            };
+            let (mut ts, mut steps, mut cur, mut j) = (vec![t], vec![k], o, i + 2);
+            while let Some((k2, t2, a2, o2)) = link(j) {
+                if a2 != cur || !one(cur) || !same(t2, acc) {
+                    break;
+                }
+                ts.push(t2);
+                steps.push(k2);
+                cur = o2;
+                j += 2;
+            }
+            out.push(((i, j), acc, ts, steps));
+            i = j;
+        }
+        out
+    }
+
     /// The plaintext products consumed once, by the add or sub right after them (a BSGS baby sum's terms): op
     /// indices of the products. The pair can run as one pass (`Ops::mult_pt_add`), the product never written.
     pub fn mult_pt_adds(&self) -> Vec<usize> {
@@ -566,4 +633,11 @@ impl Program {
     pub fn from_json(s: &str) -> Result<Program> {
         serde_json::from_str(s).map_err(|err| Error::Json { path: "<str>".into(), err })
     }
+}
+
+/// Experiment switches (bn-linear A/B; read once): `PC_LIN_OFF` = comma list of levers to turn off
+/// (`inplace`, `rotacc`, `rotacc_unit`).
+pub fn lever_on(name: &str) -> bool {
+    static OFF: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    !OFF.get_or_init(|| std::env::var("PC_LIN_OFF").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).iter().any(|s| s == name)
 }

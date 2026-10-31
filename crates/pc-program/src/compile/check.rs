@@ -5,7 +5,7 @@
 //! pins: `final_named_levels` one-sided (a var may sit richer than planned, never deeper: the perseus runtime's
 //! `[plan_level_error]`) and `final_named_degs` exactly (`[plan_deg_error]`), (c) no var reaches the reactive
 //! ceiling the plan did not predict (`[plan_bts_error]`, an unplanned safety-net bootstrap).
-use crate::program::{BtsSite, CheckReport, Kind, Program, PtRef, SiteKind};
+use crate::program::{BtsSite, CheckReport, Kind, Program, PtRef, SiteKind, VarId};
 use pc_shadow::rules::PtMeta;
 use pc_shadow::{CtMeta, Prelude, Shadow};
 
@@ -55,6 +55,21 @@ pub fn rule(sh: &Shadow, kind: &Kind, ins: &[CtMeta], pts: &[PtRef], sites: &[Bt
         Kind::Square => {
             one(1)?;
             sh.square(&ins[0]).map_err(e)?
+        }
+        Kind::MultRescale { square, dbl, .. } => {
+            let r = if *square {
+                one(1)?;
+                sh.square(&ins[0]).map_err(e)?
+            } else {
+                one(2)?;
+                sh.mult(&ins[0], &ins[1]).map_err(e)?
+            };
+            let mut m = r.out;
+            if *dbl {
+                m = sh.add(&m, &m).map_err(e)?.out;
+            }
+            let out = sh.realize(&m).map_err(e)?.out;
+            return Ok((r.pre, vec![out]));
         }
         Kind::Negate => {
             one(1)?;
@@ -244,15 +259,20 @@ pub fn verify(sh: &Shadow, p: &Program) -> CheckReport {
                         }
                     }
                     // a fused sum's intermediates keep their lowered states (pins and the ceiling read them)
-                    if let Kind::CoeffSum { fused, .. } = &m.kind {
-                        for &f in fused {
+                    let fz: &[VarId] = match &m.kind {
+                        Kind::CoeffSum { fused, .. } | Kind::MultRescale { fused, .. } => fused,
+                        _ => &[],
+                    };
+                    {
+                        for &f in fz {
                             let var = &p.vars[f as usize];
                             if state[f as usize].is_some() {
                                 rep.errors.push(format!("op {oi}: {} produced twice", var.name));
                             }
                             state[f as usize] = Some(var.meta);
                             let m = var.meta;
-                            if m.level >= limit && !p.pins.get(&var.name).is_some_and(|&(el, _)| m.level <= el) {
+                            // a fused product's `~raw` state is before its realize, unchecked as above
+                            if !var.name.contains('~') && m.level >= limit && !p.pins.get(&var.name).is_some_and(|&(el, _)| m.level <= el) {
                                 rep.errors.push(format!("[plan_bts_error] {} at level {} reaches the reactive ceiling {limit} unplanned", var.name, m.level));
                             }
                         }

@@ -999,6 +999,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         None => OpsCfg::default(),
     };
     Ops::<W>::reserve(mp, &ocfg);
+    // the fused relinearization-rescales' tables (compute's op layer)
+    mp.reserve("relin.rr", pc_gpu::relin::RelinRescaler::<W>::bytes(&chain, &lay, k_max).map_err(e)?);
     let pcfg = PtStoreCfg {
         slots: sizes.pt_slots,
         ring: 4,
@@ -1157,7 +1159,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         };
         Groups { all, steps: steps.clone(), exact, relin, conj, half }
     };
-    let ops = Ops::new(a, &device, &ex.compute, &ctx, ocfg).map_err(e)?;
+    let mut ops = Ops::new(a, &device, &ex.compute, &ctx, ocfg).map_err(e)?;
+    ops.rr = Some(pc_gpu::relin::RelinRescaler::new(a, &ex.compute, &ctx, k_max).map_err(e)?);
     let pt_events = Box::new(EventPool::new(&device, 64).map_err(|x| e(x.into()))?);
     // SAFETY: `pt_events` is boxed and declared after `pts` in State, so it outlives the store's borrow
     let ev: &'static EventPool = unsafe { &*(pt_events.as_ref() as *const EventPool) };

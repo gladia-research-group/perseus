@@ -38,7 +38,7 @@ fn key(p: &Program, op: &Op, pass: Option<usize>, cf_free: bool, pair: Option<Pa
     let class = match k {
         Kind::Bootstrap(_) => 0,
         Kind::Rotate(_) | Kind::RotateSum(_) | Kind::Conjugate => 1,
-        Kind::Mult | Kind::Square => 2,
+        Kind::Mult | Kind::Square | Kind::MultRescale { .. } => 2,
         Kind::Rescale => 3,
         _ => return None,
     };
@@ -63,6 +63,7 @@ fn key(p: &Program, op: &Op, pass: Option<usize>, cf_free: bool, pair: Option<Pa
         }
         Kind::Rotate(r) => r.to_string(),
         Kind::RotateSum(st) => format!("{st:?}"),
+        Kind::MultRescale { square, dbl, .. } => format!("{square}{dbl}"),
         Kind::MultPt(id) => {
             let pt = &p.pt_refs[*id as usize];
             format!("pt@{}d{}", pt.level, pt.deg)

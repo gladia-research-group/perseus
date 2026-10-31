@@ -344,6 +344,16 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
             let key = group(block, t.groups, t.relin)?;
             rt.ops.mult(ctx, rt.ex, kc, sh, key, o, a, at(st.b))?
         }
+        StepOp::MultRescale { square, dbl } => {
+            let key = group(block, t.groups, t.relin)?;
+            let b = if *square { None } else { Some(at(st.b)) };
+            if st.inplace && (*square || st.b != st.out) {
+                rt.ops.mult_rescale(ctx, rt.ex, kc, sh, key, o, None, b, *dbl)?
+            } else {
+                let a = src_a!();
+                rt.ops.mult_rescale(ctx, rt.ex, kc, sh, key, o, Some(a), b, *dbl)?
+            }
+        }
         StepOp::Square => {
             let a = src_a!();
             let key = group(block, t.groups, t.relin)?;
@@ -455,7 +465,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         let unit = if in_unit {
             None
         } else {
-            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. })));
+            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. })));
             let unit = at
                 .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
                 .map(|u| (b.unit_of[i], u.hi as usize))
@@ -626,7 +636,9 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
     };
     match &u.kind {
         UnitKind::Grid { .. } | UnitKind::RotateSum { .. } => one(&u.ins, false),
-        UnitKind::Mult { b } => one(&u.ins, true) && one(b, true),
+        // the adds take no prelude: every operand at one level, degree and scale
+        UnitKind::RotAcc { .. } => one(&u.ins, true),
+        UnitKind::Mult { b, .. } => one(&u.ins, true) && one(b, true),
         UnitKind::Refresh { .. } => one(&u.ins, true),
         UnitKind::Pair { .. } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
             (Some(x), Some(y)) => x.level == y.level && x.deg == y.deg && nf_key(x.nf) == nf_key(y.nf),
@@ -710,12 +722,22 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                 rotate::rotate_grid(rt.ctx, rt.ex, kc, rt.sh, key, &xs, gather, fresh, st, &mut outs)?;
             }
         }
+        UnitKind::RotAcc { gs, gal, steps: st } => {
+            let o = span[span.len() - 1].out;
+            let keys: Vec<&KeyGroup<'a>> = gs.iter().map(|&g| group(block, groups, g)).collect::<Result<_>>()?;
+            // the sum may land on acc_0's slot (then read there, `xs[0]` unused) or on a rotated input's (each is read
+            // before the one write at the end)
+            let acc = if u.ins[0] == o { None } else { Some(xs[0]) };
+            // SAFETY: as the other units' outputs: the only mutable reference into the slots during the unit
+            let out = unsafe { &mut *slots.add(o as usize) };
+            rotate::rotate_acc(rt.ctx, rt.ex, kc, rt.sh, &keys, acc, &xs[1..], gal, st, out)?;
+        }
         UnitKind::RotateSum { l, g } => {
             let st = lists.get(*l as usize).ok_or_else(|| rerr(block, format!("step list {l} out of range")))?;
             let mut outs: Vec<&mut Ct<'a, W>> = span.iter().map(|x| unsafe { &mut *slots.add(x.out as usize) }).collect();
             rotate::rotate_sum_batch(rt.ctx, rt.ex, kc, rt.sh, group(block, groups, *g)?, &xs, &mut gather.a, st, &mut outs)?;
         }
-        UnitKind::Mult { b } => {
+        UnitKind::Mult { b, rs } => {
             // the operands gathered into K-ciphertext buffers, one product of K ciphertexts (one relinearization key
             // read for all of them), the products scattered with their own metadata
             if b.iter().any(|&s| s as usize >= n_slots) {
@@ -734,16 +756,25 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
             gather.out.buf.k = k;
             let key = group(block, groups, relin)?;
             let Gather { a, b: gb, out } = gather;
-            if ys.is_empty() {
-                rt.ops.square(rt.ctx, rt.ex, kc, rt.sh, key, out, a)?;
-            } else {
+            if !ys.is_empty() {
                 gb.buf.k = k;
                 gb.meta = ys[0].meta;
-                rt.ops.mult(rt.ctx, rt.ex, kc, rt.sh, key, out, a, gb)?;
+            }
+            match (rs, ys.is_empty()) {
+                (Some(dbl), true) => rt.ops.mult_rescale(rt.ctx, rt.ex, kc, rt.sh, key, out, Some(a), None, *dbl)?,
+                (Some(dbl), false) => rt.ops.mult_rescale(rt.ctx, rt.ex, kc, rt.sh, key, out, Some(a), Some(gb), *dbl)?,
+                (None, true) => rt.ops.square(rt.ctx, rt.ex, kc, rt.sh, key, out, a)?,
+                (None, false) => rt.ops.mult(rt.ctx, rt.ex, kc, rt.sh, key, out, a, gb)?,
             }
             for (c, st) in span.iter().enumerate() {
                 let r = if ys.is_empty() { rt.sh.square(&xs[c].meta) } else { rt.sh.mult(&xs[c].meta, &ys[c].meta) };
-                let m = r.map_err(|e| rerr(block, e.to_string()))?.out;
+                let mut m = r.map_err(|e| rerr(block, e.to_string()))?.out;
+                if let Some(dbl) = rs {
+                    if *dbl {
+                        m = rt.sh.add(&m, &m).map_err(|e| rerr(block, e.to_string()))?.out;
+                    }
+                    m = rt.sh.realize(&m).map_err(|e| rerr(block, e.to_string()))?.out;
+                }
                 // SAFETY: as the unit's other outputs (distinct slots, none an operand's)
                 batch::take(rt.ctx, &rt.ex.compute, unsafe { &mut *slots.add(st.out as usize) }, out, c, m)?;
             }

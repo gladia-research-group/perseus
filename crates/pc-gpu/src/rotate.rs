@@ -474,6 +474,58 @@ pub fn rotate_sum_batch<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// `out = acc + sum_j sigma_j(xs[j])` (`acc` None: `out` holds it; `gal[j]`: the automorphism, a rotation or the
+/// conjugation, `steps[j]` its step, None = conjugation), the key switches of different inputs summed in the extended
+/// basis (each input's ModUp and inner product, the later products added onto the first's) and ModDowned ONCE onto the
+/// accumulator by the ModDown's epilogue. One input: bit-identical to the key switch and then the add. Several: the
+/// same sum up to the ModDown's rounding (one ModDown and no adds in place of one of each per input). `keys[j]` holds
+/// automorphism j's key; every input single, at one level with `acc`; `out` may be the slot of `acc` or of any input
+/// (it is written last).
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_acc<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    keys: &[&KeyGroup<'_>],
+    acc: Option<&Ct<'_, W>>,
+    xs: &[&Ct<'_, W>],
+    gal: &[u64],
+    steps: &[Option<i64>],
+    out: &mut Ct<'_, W>,
+) -> Result<()> {
+    if xs.is_empty() || xs.len() != gal.len() || keys.len() != gal.len() || steps.len() != gal.len() {
+        return Err(shape("rotate_acc", format!("{} inputs, {} automorphisms, {} key groups", xs.len(), gal.len(), keys.len())));
+    }
+    let top = top_of(ctx, xs[0])?;
+    let mut meta = acc.map_or(out.meta, |a| a.meta);
+    for (j, x) in xs.iter().enumerate() {
+        if x.k() != 1 || out.k() != 1 || top_of(ctx, x)? != top || gal[j] == 1 {
+            return Err(shape("rotate_acc", "inputs must be single ciphertexts at one level, no identity"));
+        }
+        let r = key_index(keys[j], gal[j])?;
+        ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, 1, 1, top)?;
+        let mut io = io_of(x, View::of(&ex.ks.ext, 0), 1);
+        if j > 0 {
+            io.c0_mode |= pc_kernels::KS_ACC;
+        }
+        dots(ctx, ex, kc, keys[j], r, 1, 1, top, io)?;
+        let y = match steps[j] {
+            Some(k) => sh.rotate(&x.meta, k).out,
+            None => sh.conjugate(&x.meta).out,
+        };
+        meta = sh.add(&meta, &y)?.out;
+    }
+    let mode = match acc {
+        Some(a) => ks::MdOut::Onto(View::of(&a.buf, 0)),
+        None => ks::MdOut::Add,
+    };
+    let o = View::of(&out.buf, 0);
+    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, 1, &mut ex.ks.conv, o, mode, 1, top)?;
+    out.meta = meta;
+    Ok(())
+}
+
 fn add_inplace<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, acc: &mut Ct<'_, W>, y: &Ct<'_, W>, top: usize) -> Result<()> {
     let a = View::of(&acc.buf, 0);
     ew(ctx, &ex.compute, Ew::Add, a, a, Some(View::of(&y.buf, 0)), ctx.lay.rs_q(top), acc.k(), 2)

@@ -1124,6 +1124,38 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
     io: DotIo,
     epi: Option<(View, View)>,
 ) -> Result<()> {
+    let lv = plans.level(top)?;
+    let r = dot_rows(lv, top, rows)?;
+    let e = epi.map(|(dst, conv)| EpiArgs {
+        dst: dst.base,
+        conv: conv.base,
+        binv: ctx.ks.p_inv_mod_q.v.vptr(),
+        binvs: ctx.ks.p_inv_mod_q.s.vptr(),
+        k: std::ptr::null(),
+        part_stride: dst.part_stride,
+        dbl: 0,
+        pad: 0,
+        alpha: std::ptr::null(),
+        alphas: std::ptr::null(),
+    });
+    dot_regen_ex(ctx, s, plans, ks, group, k, top, r, io, e.map(|e| (e, epi.map_or(0, |x| x.0.ct_stride), epi.map_or(0, |x| x.1.ct_stride))))
+}
+
+/// `dot_regen` over an explicit row list (`rows`: device row ids, count) with the caller's epilogue (`epi`: its
+/// arguments for ciphertext 0, and the dst / conv ciphertext strides).
+#[allow(clippy::too_many_arguments)]
+pub fn dot_regen_ex<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    ks: &KsWork<'_, W>,
+    group: &KeyGroup<'_>,
+    k: usize,
+    top: usize,
+    rows: (*const u32, usize),
+    io: DotIo,
+    epi: Option<(EpiArgs, u64, u64)>,
+) -> Result<()> {
     plans.check_k(k)?;
     let seed = group.seed(0).ok_or_else(|| shape("ks dot_regen", "key without a seed (KskSource::Regen)"))?;
     if group.galois[0] != 1 {
@@ -1131,7 +1163,7 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
     }
     let lv = plans.level(top)?;
     let lay = ctx.lay;
-    let (rows_ptr, nrows) = dot_rows(lv, top, rows)?;
+    let (rows_ptr, nrows) = rows;
     let [pm, pms, _, _] = level_scalars(ctx, lv);
     // a packed / banded relin key: read in place through its KeyTab (ABI 7), else the `b` that `stage_key` left in
     // KsWork::stage_b (unseeded tables)
@@ -1179,21 +1211,7 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
             nrows: nrows as i32,
         };
         let (use_epi, e) = match epi {
-            Some((dst, conv)) => (
-                1,
-                EpiArgs {
-                    dst: at(dst.base, dst.ct_stride) as *mut c_void,
-                    conv: at(conv.base, conv.ct_stride),
-                    binv: ctx.ks.p_inv_mod_q.v.vptr(),
-                    binvs: ctx.ks.p_inv_mod_q.s.vptr(),
-                    k: std::ptr::null(),
-                    part_stride: dst.part_stride,
-                    dbl: 0,
-                    pad: 0,
-                    alpha: std::ptr::null(),
-                    alphas: std::ptr::null(),
-                },
-            ),
+            Some((e, ds, cs)) => (1, EpiArgs { dst: at(e.dst, ds) as *mut c_void, conv: at(e.conv, cs), ..e }),
             None => (0, EpiArgs::default()),
         };
         let a = KsRegenArgs { ks: ks_args, seed, epi: e, use_epi, pad: 0, key: tab.unwrap_or_default(), add: std::ptr::null() };
