@@ -99,6 +99,35 @@ __device__ __forceinline__ void gs_lz(W& a, W& b, W w, W ws, W p, W p2) {
     b = mul_lz<W, L>(gs_dif<W, L>(u, v, p, p2), w, ws, p);
 }
 
+// A row-pass stage across lane pairs (l, l ^ d) on 8 slots per lane (`lo`: the lane holding the pair's upper words):
+// each lane takes the butterflies of half the slots, the low lane slots k < 4 and the high lane slots k + 4 (one
+// exchange in, one out per slot pair), so every product is taken once instead of on both lanes.
+template <class W, bool L>
+__device__ __forceinline__ void ct_pair(W (&x)[8], int d, bool lo, W tw, W tws, W p, W p2) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const W r = shfl_xor<W>(0xffffffffu, lo ? x[k + 4] : x[k], d);
+        W U = lo ? x[k] : r, V = lo ? r : x[k + 4];  // slot k on the low lane, k + 4 on the high one
+        ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2);
+        const W b = shfl_xor<W>(0xffffffffu, lo ? V : U, d);
+        x[k] = lo ? U : b;
+        x[k + 4] = lo ? b : V;
+    }
+}
+// ct_pair's GS counterpart: the low lane keeps the sums, the high lane the products
+template <class W, bool L>
+__device__ __forceinline__ void gs_pair(W (&x)[8], int d, bool lo, W tw, W tws, W p, W p2) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const W r = shfl_xor<W>(0xffffffffu, lo ? x[k + 4] : x[k], d);
+        const W U = lo ? x[k] : r, V = lo ? r : x[k + 4];
+        const W sum = gs_sum<W, L>(U, V, p, p2), prod = mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
+        const W b = shfl_xor<W>(0xffffffffu, lo ? prod : sum, d);
+        x[k] = lo ? sum : b;
+        x[k + 4] = lo ? b : prod;
+    }
+}
+
 // Row-pass twiddles of the last three stages (m = 2^s, s = 13..15) from two factors already in the table: for
 // i = R 2^(s-8) + c, psi^brev16(m + i) = U * V with U = w[m + (R << (s-8))] (uniform per warp) and V = psi^(2^(24-s)
 // brev_(s-8)(c)), the table entry vidx(s, c) < 128. The two Shoup products give the same residue as one product by
@@ -348,28 +377,13 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     {
         const int ti = 2048 + 8 * R + (lane >> 2);
         const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-        const bool lo = (lane & 2) == 0;
-#pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const W o = shfl_xor<W>(0xffffffffu, x[u], 2);
-            // lo lane holds U (e), hi lane holds V (e+16)
-            W U = lo ? x[u] : o, V = lo ? o : x[u];
-            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2);
-            x[u] = lo ? U : V;
-        }
+        ct_pair<W, L>(x, 2, (lane & 2) == 0, tw, tws, p, p2);
     }
     // t = 8, m = 4096: pair (e, e+8) = lanes (l, l^1); i_local = e / 16 = lane / 2
     {
         const int ti = 4096 + 16 * R + (lane >> 1);
         const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-        const bool lo = (lane & 1) == 0;
-#pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const W o = shfl_xor<W>(0xffffffffu, x[u], 1);
-            W U = lo ? x[u] : o, V = lo ? o : x[u];
-            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2);
-            x[u] = lo ? U : V;
-        }
+        ct_pair<W, L>(x, 1, (lane & 1) == 0, tw, tws, p, p2);
     }
     // CT butterfly with the factored twiddle U V
     auto ct_uv = [&](W& a, W& b, int ui, int vi) { ct_t<W, L>(a, b, mul_uv<W, L>(b, w, ws, ui, vi, p), p, p2); };
@@ -454,24 +468,12 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     {  // t = 8, m = 4096: lanes (l, l^1)
         const int ti = 4096 + 16 * R + (lane >> 1);
         const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-        const bool lo = (lane & 1) == 0;
-#pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const W o = shfl_xor<W>(0xffffffffu, x[u], 1);
-            const W U = lo ? x[u] : o, V = lo ? o : x[u];
-            x[u] = lo ? gs_sum<W, L>(U, V, p, p2) : mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
-        }
+        gs_pair<W, L>(x, 1, (lane & 1) == 0, tw, tws, p, p2);
     }
     {  // t = 16, m = 2048: lanes (l, l^2)
         const int ti = 2048 + 8 * R + (lane >> 2);
         const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-        const bool lo = (lane & 2) == 0;
-#pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const W o = shfl_xor<W>(0xffffffffu, x[u], 2);
-            const W U = lo ? x[u] : o, V = lo ? o : x[u];
-            x[u] = lo ? gs_sum<W, L>(U, V, p, p2) : mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
-        }
+        gs_pair<W, L>(x, 2, (lane & 2) == 0, tw, tws, p, p2);
     }
     // transpose B -> A
 #pragma unroll
