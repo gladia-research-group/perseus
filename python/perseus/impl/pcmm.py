@@ -345,6 +345,10 @@ _RAISE = [e.split(":") for e in os.environ.get("PF_PCMM_RAISE", "").split(",") i
 # PF_PCMM_RAISE_HI: PF_PCMM_RAISE's syntax for the second half of a linear's outputs (gate_up: the up half, whose
 # refresh only feeds the GLU product, can land lower than the gate half that feeds the SiLU)
 _RAISE_HI = [e.split(":") for e in os.environ.get("PF_PCMM_RAISE_HI", "").split(",") if e]
+# PF_PCMM_RAISE_OUT="qkv:2:5,qkv:1:4:1-1": output m of those linears raises d levels below the top ("linear:m:d", on
+# blocks lo..hi when named), ahead of PF_PCMM_RAISE_HI / PF_PCMM_RAISE: the finishes whose consumers have the slack
+# (the planner's deliberate-drop probe, PLAN_RAISE_DELIB)
+_RAISE_OUT = [e.split(":") for e in os.environ.get("PF_PCMM_RAISE_OUT", "").split(",") if e]
 # PF_PCMM_RAISE_UP=d[:lo-hi] (pr9's spelling of the same lever): PF_PCMM_RAISE_HI=gate_up:d[:lo-hi]
 if os.environ.get("PF_PCMM_RAISE_UP"):
     _RAISE_HI.append(["gate_up"] + os.environ["PF_PCMM_RAISE_UP"].split(":"))
@@ -380,7 +384,12 @@ def _raise_of(lin, table=None):
 
 
 def _drop_of(lin, m):
-    """Output m's raise drop: PF_PCMM_RAISE_HI's for the second half when it names lin, else PF_PCMM_RAISE's."""
+    """Output m's raise drop: PF_PCMM_RAISE_OUT's when it names (lin, m), PF_PCMM_RAISE_HI's for the second half when it
+    names lin, else PF_PCMM_RAISE's."""
+    if _RAISE_OUT:
+        hit = _raise_of(lin, [[e[0], e[2], *e[3:]] for e in _RAISE_OUT if int(e[1]) == m])
+        if hit:
+            return hit
     if _RAISE_HI and m >= lin.n_out // 2:
         hi = _raise_of(lin, _RAISE_HI)
         if hi:

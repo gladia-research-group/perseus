@@ -562,6 +562,9 @@ section! {
         #[doc = "`PF_PCMM_RAISE_HI`. Default ''. Read at impl/pcmm.py::(module)."]
         #[doc = "Shipped plans: runtime= llama128."]
         pcmm_raise_hi: List = "PF_PCMM_RAISE_HI", "''";
+        #[doc = "`PF_PCMM_RAISE_OUT`. Default ''. Read at impl/pcmm.py::(module): linear:output:drop[:lo-hi]."]
+        #[doc = "Shipped plans: none."]
+        pcmm_raise_out: List = "PF_PCMM_RAISE_OUT", "''";
         #[doc = "`PF_PCMM_RAISE_UP`. Default '' / None. Read at impl/pcmm.py::(module)."]
         #[doc = "Shipped plans: runtime= pr9."]
         pcmm_raise_up: Str = "PF_PCMM_RAISE_UP", "'' / None";
