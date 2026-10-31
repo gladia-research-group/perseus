@@ -265,7 +265,7 @@ fn args_ex<W: DevWord, M: DevStrategy<W>>(
         snum: src.map(|x| x.n.max(1)).unwrap_or(1) as i32,
         sstride: src.map(|x| x.stride).unwrap_or(0) as u64,
         xnum: xn.max(1) as i32,
-        lazy: ctx.ntt.lazy as i32,
+        lazy: ctx.ntt.lazy,
         xstride: xs as u64,
         ed,
     }

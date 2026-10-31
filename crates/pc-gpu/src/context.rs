@@ -43,7 +43,8 @@ impl DevStrategy<u16> for Barrett32 {
 }
 
 /// NTT tables by prime id (`NttArgs` layout): `fw[id*N + i] = psi^brev(i)`, `iw` the inverse powers, `*s` the
-/// Shoup companions at W, `ninv[id] = N^-1 mod p`; `lazy`: u32 words and every prime below 2^30 (`NttArgs::lazy`).
+/// Shoup companions at W, `ninv[id] = N^-1 mod p`; `lazy` (`NttArgs::lazy`): u32 words and every prime below 2^30
+/// (1) or 2^28 (2), else 0.
 pub struct NttTables<'a, W: DevWord> {
     pub fw: ConstBuf<'a, W>,
     pub fws: ConstBuf<'a, W>,
@@ -51,7 +52,7 @@ pub struct NttTables<'a, W: DevWord> {
     pub iws: ConstBuf<'a, W>,
     pub ninv: ConstBuf<'a, W>,
     pub ninvs: ConstBuf<'a, W>,
-    pub lazy: bool,
+    pub lazy: i32,
 }
 
 /// Per-prime-id scalar table with its Shoup companion (`v[id]`, `s[id]`), the form `EwArgs::sc/scs`,
@@ -204,7 +205,11 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
             iws: ConstBuf::new(arena, "ctx.ntt.iws", s, &cat(|t| &t.3))?,
             ninv: ConstBuf::new(arena, "ctx.ntt.ninv", s, &ninv)?,
             ninvs: ConstBuf::new(arena, "ctx.ntt.ninvs", s, &ninvs)?,
-            lazy: W::BITS == 32 && primes_v.iter().all(|&p| p < 1 << 30),
+            lazy: match W::BITS == 32 {
+                true if primes_v.iter().all(|&p| p < 1 << 28) => 2,
+                true if primes_v.iter().all(|&p| p < 1 << 30) => 1,
+                _ => 0,
+            },
         };
         drop(per_prime);
 

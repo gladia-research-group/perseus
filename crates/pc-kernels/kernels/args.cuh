@@ -76,7 +76,8 @@ static_assert(sizeof(PolyRef) == 24, "PolyRef layout");
 //     1: eout[r] = (x - v) s            (ModDown's last step: (x - conv) P^-1)
 //     2: eout[r] = d[r] + (x - v) s     (the same, accumulated: d = ed, or eout when ed is null; ABI 12)
 //     3: eout[r] = x s + v              (the rescale's combine: alpha x + the correction)
-//   lazy: 1 when every prime of the launch is below 2^30: lazy butterflies at u32 (same canonical result).
+//   lazy: 1 when every prime of the launch is below 2^30: lazy butterflies at u32 (same canonical result); 2 when
+//   every prime is below 2^28: the forward transform's words grow to 16p between its few reductions.
 // ABI 17: an inverse transform with es non-null scales row i by es[i] (Shoup companion ess[i]) in place of N^-1 (a
 // per-row constant folded into the last pass: N^-1 times the base conversion's pre factor of the row).
 struct NttArgs {

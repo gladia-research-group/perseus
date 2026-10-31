@@ -81,7 +81,11 @@ impl<'a> Setup<'a> {
     }
     fn ntt_args(&self, base: *mut c_void, roff: &Dev, rprime: &Dev, nrows: usize) -> NttArgs {
         let t = self.ntt.as_ref().expect("NTT tables");
-        let lazy = self.wbits == 32 && self.primes.iter().all(|&p| p < 1 << 30);
+        let lazy = match self.wbits == 32 {
+            true if self.primes.iter().all(|&p| p < 1 << 28) => 2,
+            true if self.primes.iter().all(|&p| p < 1 << 30) => 1,
+            _ => 0,
+        };
         NttArgs {
             base,
             roff: roff.c() as *const u32,
@@ -95,7 +99,7 @@ impl<'a> Setup<'a> {
             pr: self.pr(),
             nrows: nrows as i32,
             chunk: 128,
-            lazy: lazy as i32,
+            lazy,
             ..Default::default()
         }
     }
@@ -137,7 +141,7 @@ fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
     }
     // the lazy butterflies (when the primes allow them) and the reduced ones
     let a = st.ntt_args(buf.p(), &ro, &rp, 8);
-    for lazy in [a.lazy, 0] {
+    for lazy in (0..=a.lazy).rev() {
         let a = NttArgs { lazy, ..a };
         buf.write(&st.ctx, &host_in);
         ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
@@ -154,7 +158,7 @@ fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
         ntt_ref(&mut want16[i * N..(i + 1) * N], &w[i % 8], st.primes[i % 8]);
     }
     let a16 = st.ntt_args(buf16.p(), &ro16, &rp16, 16);
-    for lazy in [a16.lazy, 0] {
+    for lazy in (0..=a16.lazy).rev() {
         let a = NttArgs { lazy, ..a16 };
         buf16.write(&st.ctx, &host16);
         ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
@@ -179,11 +183,18 @@ fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
     out
 }
 
-/// The lazy NTT at the edge of its range (u32): 8 primes just below 2^30 (words up to 4p - 1 < 2^32 between stages),
-/// edge inputs (p - 1, 0, 1) and uniform ones; in place lazy and reduced vs the host, the out-of-place first pass summing
-/// two sources (soff / snum), and epilogue 1 (eout = (ex - v) es) vs the host.
+/// The lazy NTT at the edge of its range (u32): 8 primes just below 2^30 (lazy 1: words up to 4p - 1 < 2^32 between
+/// stages), edge inputs (p - 1, 0, 1) and uniform ones; in place lazy and reduced vs the host, the out-of-place first
+/// pass summing two sources (soff / snum), and epilogue 1 (eout = (ex - v) es) vs the host.
 fn t_ntt_wide(st: &mut Setup) -> Vec<TestResult> {
-    let primes = ntt_primes(30, 8);
+    t_ntt_edge(st, 30, 1)
+}
+/// t_ntt_wide at lazy 2's edge: 8 primes just below 2^28 (forward words up to 16p - 1 < 2^32 between stages).
+fn t_ntt_wide28(st: &mut Setup) -> Vec<TestResult> {
+    t_ntt_edge(st, 28, 2)
+}
+fn t_ntt_edge(st: &mut Setup, bits: u32, lz: i32) -> Vec<TestResult> {
+    let primes = ntt_primes(bits, 8);
     let wbits = st.wbits;
     let mut tabs = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut ws = Vec::new();
@@ -243,13 +254,13 @@ fn t_ntt_wide(st: &mut Setup) -> Vec<TestResult> {
         ..Default::default()
     };
     let mut out = Vec::new();
-    for lazy in [1, 0] {
+    for lazy in (0..=lz).rev() {
         let a = NttArgs { lazy, ..args };
         buf.write(ctx, &x0);
         ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
-        out.push(cmp(&format!("ntt.fwd vs host, primes < 2^30 (lazy {lazy})"), &buf.read(ctx), &want));
+        out.push(cmp(&format!("ntt.fwd vs host, primes < 2^{bits} (lazy {lazy})"), &buf.read(ctx), &want));
         ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
-        out.push(cmp(&format!("ntt.inv(fwd(x)) == x, primes < 2^30 (lazy {lazy})"), &buf.read(ctx), &x0));
+        out.push(cmp(&format!("ntt.inv(fwd(x)) == x, primes < 2^{bits} (lazy {lazy})"), &buf.read(ctx), &x0));
     }
     // out of place: the first pass reads the sum of x0 and x1 (sources 8 rows apart), the transform lands in buf
     let mut both = x0.clone();
@@ -259,17 +270,17 @@ fn t_ntt_wide(st: &mut Setup) -> Vec<TestResult> {
     for i in 0..8 {
         ntt_ref(&mut want_s[i * N..(i + 1) * N], &ws[i], primes[i]);
     }
-    let a = NttArgs { lazy: 1, src: src.c(), soff: ro.c() as *const u32, snum: 2, sstride: (8 * N) as u64, ..args };
+    let a = NttArgs { lazy: lz, src: src.c(), soff: ro.c() as *const u32, snum: 2, sstride: (8 * N) as u64, ..args };
     buf.write(ctx, &vec![0u64; 8 * N]);
     ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
-    out.push(cmp("ntt.fwd out of place, 2 sources summed (lazy 1)", &buf.read(ctx), &want_s));
+    out.push(cmp(&format!("ntt.fwd out of place, 2 sources summed, primes < 2^{bits} (lazy {lz})"), &buf.read(ctx), &want_s));
     // epilogue 1: eout = (ex - NTT(x0)) es
     let (exd, eo, esd, essd) = (ctx.up(&xe), ctx.zeros(8 * N), ctx.up(&s), ctx.up(&ss));
-    let a = NttArgs { lazy: 1, eout: eo.p(), ex: exd.c(), es: esd.c(), ess: essd.c(), epi: ntt_epi::SUB_MUL, ..args };
+    let a = NttArgs { lazy: lz, eout: eo.p(), ex: exd.c(), es: esd.c(), ess: essd.c(), epi: ntt_epi::SUB_MUL, ..args };
     buf.write(ctx, &x0);
     ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
     let want_e: Vec<u64> = (0..8 * N).map(|i| mulmod((xe[i] + primes[i / N] - want[i]) % primes[i / N], s[i / N], primes[i / N])).collect();
-    out.push(cmp("ntt.fwd epilogue (ex - v) es (lazy 1)", &eo.read(ctx), &want_e));
+    out.push(cmp(&format!("ntt.fwd epilogue (ex - v) es, primes < 2^{bits} (lazy {lz})"), &eo.read(ctx), &want_e));
     out
 }
 
@@ -1893,6 +1904,7 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
         tests.push(t_ntt);
         if wb == 4 {
             tests.push(t_ntt_wide);
+            tests.push(t_ntt_wide28);
         }
     }
     tests.extend([t_bconv as Test, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
