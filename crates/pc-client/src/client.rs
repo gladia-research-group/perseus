@@ -118,6 +118,12 @@ impl Client {
     /// Packed `b` of one switching key (relation in `spec` module doc).
     #[allow(clippy::too_many_arguments)]
     fn ksk_packed(&self, shape: &KeyShape, s_new: &[Option<Vec<u32>>], s_old: &[Vec<u32>], sq: bool, seed: &KskSeed, err_key: [u32; 8], bits: u32, row_words: usize) -> Vec<u32> {
+        self.ksk_packed_with(shape, s_new, s_old, sq, seed, err_key, bits, row_words, None)
+    }
+
+    /// `ksk_packed` with the digit map and the gadget (P mod q_t by prime id) given (level relinearization keys).
+    #[allow(clippy::too_many_arguments)]
+    fn ksk_packed_with(&self, shape: &KeyShape, s_new: &[Option<Vec<u32>>], s_old: &[Vec<u32>], sq: bool, seed: &KskSeed, err_key: [u32; 8], bits: u32, row_words: usize, ov: Option<(&[i32], &[u32])>) -> Vec<u32> {
         let n = self.chain.n;
         let ids = shape.row_ids();
         let rows = ids.len();
@@ -132,8 +138,16 @@ impl Client {
             let mut a = vec![0u32; n];
             kska_expand_row(seed, d as u32, p as u32, &mut a);
             let sn = s_new[id].as_ref().expect("s_new row of every stored prime id");
-            let inq = id < nq && self.ring.digit_of(id) == Some(d);
-            let pm = if inq { self.ring.gadget(shape.kp)[id] } else { 0 };
+            let (inq, pm) = match ov {
+                Some((dof, g)) => {
+                    let inq = id < nq && dof[id] == d as i32;
+                    (inq, if inq { g[id] } else { 0 })
+                }
+                None => {
+                    let inq = id < nq && self.ring.digit_of(id) == Some(d);
+                    (inq, if inq { self.ring.gadget(shape.kp)[id] } else { 0 })
+                }
+            };
             let so = &s_old[id];
             for i in 0..n {
                 let mut v = b[i] as u64 + p - mm(a[i], sn[i], p);
@@ -146,6 +160,17 @@ impl Client {
             wire::pack_row(&b, bits, o);
         });
         out
+    }
+
+    /// A level relinearization key's digit map and gadget (P' mod q_t, Q ids <= top) by prime id.
+    fn level_tables(&self, top: usize) -> Result<(Vec<i32>, Vec<u32>)> {
+        let chain = &self.chain;
+        let (dg, sp, _) = chain.level_relin_layout(top, crate::spec::LEVEL_RELIN_CAP).ok_or_else(|| Error::Spec(format!("no level relinearization key at top {top}")))?;
+        let rows = chain.q.len() + chain.p.len();
+        let pr = &self.ring.primes;
+        let dof: Vec<i32> = (0..rows).map(|t| dg.iter().position(|g| g.contains(&t)).map_or(-1, |d| d as i32)).collect();
+        let g: Vec<u32> = (0..rows).map(|t| if t <= top { sp.iter().fold(1u64, |acc, &x| acc * (pr[x] % pr[t]) % pr[t]) as u32 } else { 0 }).collect();
+        Ok((dof, g))
     }
 
     /// Eval rows (every prime id; None outside `ids`) of a signed small polynomial.
@@ -247,6 +272,10 @@ impl Client {
             let ids = k.shape.row_ids();
             let packed = match k.role {
                 Role::Relin => self.ksk_packed(&k.shape, &s_all, &self.s_eval, true, seed, *ek, bits, row_words),
+                Role::RelinLevel { top } => {
+                    let (dof, g) = self.level_tables(top)?;
+                    self.ksk_packed_with(&k.shape, &s_all, &self.s_eval, true, seed, *ek, bits, row_words, Some((&dof, &g)))
+                }
                 Role::Rot { .. } | Role::Conj | Role::Auto { .. } => {
                     let g = k.role.galois(n).ok_or_else(|| Error::Spec(format!("{:?} without a Galois element", k.role)))?;
                     let ginv = galois::galois_inverse(g, n)?;
@@ -398,7 +427,7 @@ impl Client {
         let rows = ids.len();
         let s_all: Vec<Option<Vec<u32>>> = self.s_eval.iter().cloned().map(Some).collect();
         let (s_new, s_old, sq): (Vec<Option<Vec<u32>>>, Vec<Vec<u32>>, bool) = match key.role {
-            Role::Relin => (s_all, self.s_eval.clone(), true),
+            Role::Relin | Role::RelinLevel { .. } => (s_all, self.s_eval.clone(), true),
             Role::Rot { .. } | Role::Conj | Role::Auto { .. } => {
                 let g = key.role.galois(n).ok_or_else(|| Error::Spec("automorphism key without a Galois element".into()))?;
                 (Self::gathered(&self.s_eval, galois::galois_inverse(g, n)?, &ids, n)?, self.s_eval.clone(), false)
@@ -411,6 +440,10 @@ impl Client {
             }
         };
         let nq = self.ring.nq;
+        let lvl = match key.role {
+            Role::RelinLevel { top } => Some(self.level_tables(top)?),
+            _ => None,
+        };
         let mx = (0..key.shape.ndig * rows)
             .into_par_iter()
             .map(|r| {
@@ -421,14 +454,17 @@ impl Client {
                 let mut a = vec![0u32; n];
                 kska_expand_row(seed, d as u32, p as u32, &mut a);
                 let sn = s_new[id].as_ref().expect("row");
-                let inq = id < nq && self.ring.digit_of(id) == Some(d);
+                let (inq, gm) = match &lvl {
+                    Some((dof, g)) => (id < nq && dof[id] == d as i32, g[id]),
+                    None => (id < nq && self.ring.digit_of(id) == Some(d), self.ring.gadget(key.shape.kp)[id]),
+                };
                 let mut e: Vec<u32> = (0..n)
                     .map(|i| {
                         let mut v = b[i] as u64 + mm(a[i], sn[i], p);
                         if inq {
                             let so = s_old[id][i];
                             let x = if sq { mm(so, so, p) as u32 } else { so };
-                            v += p - mm(self.ring.gadget(key.shape.kp)[id], x, p);
+                            v += p - mm(gm, x, p);
                         }
                         (v % p) as u32
                     })
@@ -536,6 +572,43 @@ mod tests {
         for name in ["n32", "n32a4"] {
             keygen_relations_and_bundle_on(name);
         }
+    }
+
+    /// Level relinearization keys (n32a4: tops 30, 40, 42 = 1, 2, 3 digits over P' with idle Q primes): the relation
+    /// holds with the level's digits and gadget (small |e|), and a wrong shape is refused.
+    #[test]
+    fn level_relin_keys() {
+        let name = "n32a4";
+        let mut c = client_on(name, 3);
+        let chain = c.chain.clone();
+        let keys: Vec<KeyReq> = [30usize, 40, 42]
+            .iter()
+            .map(|&top| {
+                let (dg, _, q_top) = chain.level_relin_layout(top, crate::spec::LEVEL_RELIN_CAP).unwrap();
+                KeyReq { role: Role::RelinLevel { top }, shape: KeyShape { q_top, ndig: dg.len(), nq: chain.q.len(), kp: chain.p.len() } }
+            })
+            .collect();
+        let spec = KeySpec { chain: name.into(), params_hash: c.params_hash.clone(), contract: "test".into(), keys, spru: None, pcmm_t: vec![], ccmm: false, public_key: false };
+        spec.check(&chain).unwrap();
+        let mut bad = spec.clone();
+        bad.keys[0].shape = KeyShape::full(&chain);
+        assert!(bad.check(&chain).is_err());
+        let dir = std::env::temp_dir().join(format!("pc_client_level_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.pckb");
+        let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let st = c.keygen(&spec, f, &mut Prng::from_seed([7; 8], 0), 8).unwrap();
+        assert_eq!(st.keys, 3);
+        let mut r = wire::BundleReader::open(&path).unwrap();
+        let (bits, rw) = (r.header.bits, r.header.row_words);
+        for i in 0..r.header.entries.len() {
+            if let Entry::Ksk { key, seed, .. } = r.header.entries[i].clone() {
+                let v = r.read(i).unwrap();
+                let mx = c.ksk_relation_max_err(&key, &KskSeed(seed), &v, bits, rw).unwrap();
+                assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn keygen_relations_and_bundle_on(name: &str) {

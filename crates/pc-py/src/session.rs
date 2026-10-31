@@ -621,6 +621,8 @@ pub(crate) struct Needs {
     sb_cfgs: Vec<SparseBCfg>,
     spru_cfg: Option<SpruCfg>,
     cplans: Vec<pc_gpu::bts::sparse_classic::ClassicPlan>,
+    /// PC_EM_LEVEL_KEYS: the level relinearization keys (EvalMod relinearization tops 16..=46)
+    levels: Vec<pc_gpu::keys::LevelRelinSpec>,
 }
 
 fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Option<PlanSpec>, pcmm: &Option<crate::pcmm::PcmmPlan>, ccmm: &Option<crate::matmul::CcmmPlan>) -> PyResult<Needs> {
@@ -745,7 +747,13 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
         shapes.push(KskShape::bottom(chain).map_err(e)?);
         shapes.push(KskShape::full(chain));
     }
-    Ok(Needs { layout, steps, spec, shapes, needs, splan, dplan, sb_cfgs, spru_cfg, cplans })
+    let levels: Vec<pc_gpu::keys::LevelRelinSpec> = if cfg.bts.em_level_keys.unwrap_or(false) && (dplan.is_some() || splan.is_some() || !sb_cfgs.is_empty()) {
+        (16..=46).step_by(2).filter_map(|t| pc_gpu::keys::level_relin_spec(chain, t, pc_client::spec::LEVEL_RELIN_CAP)).collect()
+    } else {
+        Vec::new()
+    };
+    shapes.extend(levels.iter().map(|l| l.shape));
+    Ok(Needs { layout, steps, spec, shapes, needs, splan, dplan, sb_cfgs, spru_cfg, cplans, levels })
 }
 
 /// Where a session's keys come from.
@@ -763,6 +771,7 @@ pub(crate) enum Origin {
 fn manifest(cfg: &pc_config::Config, chain: &Chain, nd: &Needs, pcmm: &Option<crate::pcmm::PcmmPlan>, ccmm: bool) -> PyResult<pc_client::KeySpec> {
     let e = gerr;
     let mut keys: Vec<pc_client::KeyReq> = nd.spec.keys(chain).map_err(e)?.iter().map(|(r, s)| key_req(r, s)).collect();
+    keys.extend(nd.levels.iter().map(|l| pc_client::KeyReq { role: pc_client::Role::RelinLevel { top: l.top }, shape: shape_req(&l.shape) }));
     let spru = match &nd.spru_cfg {
         Some(c) => {
             keys.push(pc_client::KeyReq { role: pc_client::Role::SpruAtob, shape: shape_req(&KskShape::bottom(chain).map_err(e)?) });
@@ -869,6 +878,7 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
                         parts.spru_auto = Some((seed, words));
                         continue;
                     }
+                    R::RelinLevel { top } => keys.relin_levels.get_mut(&top).map(|x| &mut x.1),
                 };
                 let k = slot.ok_or_else(|| PyValueError::new_err(format!("key bundle: no carved key for {:?}", key.role)))?;
                 if shape_req(&k.shape) != key.shape {
@@ -981,12 +991,21 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         Origin::Generate => None,
         _ => Some(manifest(cfg, &chain, &nd, &pcmm, ccmm.is_some())?),
     };
-    let Needs { layout, steps, spec, shapes, needs, splan, dplan, sb_cfgs, spru_cfg, cplans } = nd;
+    let Needs { layout, steps, spec, shapes, needs, splan, dplan, sb_cfgs, spru_cfg, cplans, levels } = nd;
     let mp = &mut mplan;
     mp.reserve("ks.plans", KsPlans::bytes::<W>(&chain, k_max).map_err(e)?);
     mp.reserve("keys", spec.bytes::<W>(&chain, layout).map_err(e)?);
     if matches!(origin, Origin::Generate) {
         mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
+    }
+    if !levels.is_empty() {
+        // the level relinearization keys, their keygen tables and the EvalMod level plans (prototype: a fixed
+        // allowance per EvalMod plan for the latter)
+        mp.reserve("keys.level", KeySet::<W>::relin_levels_bytes(&levels, layout, n));
+        if matches!(origin, Origin::Generate) {
+            mp.reserve("keygen.level", KeyGen::<W>::levels_bytes(&lay, levels.len()));
+        }
+        mp.reserve("bts.levelks", 512 << 20);
     }
     let nrot = steps.len() + ks.conj as usize;
     let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + 2 * KeyGroup::bytes(1, true);
@@ -1099,6 +1118,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
     let plans = KsPlans::new(a, &ex.compute, &ctx, k_max).map_err(e)?;
     let mut keys = KeySet::carve(a, &chain, &spec, layout).map_err(e)?;
+    keys.carve_relin_levels(a, &levels).map_err(e)?;
     let mut prng = match ks.seed {
         Some(s) => Prng::from_seed([0x5e55_1013, s as u32, (s >> 32) as u32, 4, 5, 6, 7, 8], 0),
         None => Prng::from_os().map_err(|x| e(x.into()))?,
@@ -1127,6 +1147,14 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             let mut kg = KeyGen::new(a, &ex.compute, &chain, &shapes).map_err(e)?;
             let sec = secret.as_ref().ok_or_else(|| PyRuntimeError::new_err("device keygen without a secret"))?;
             kg.generate_set(&ctx, &mut ex, sec, &mut keys, &mut prng).map_err(e)?;
+            if !levels.is_empty() {
+                kg.add_levels(a, &ex.compute, &chain, &levels).map_err(e)?;
+                for l in &levels {
+                    let k = &mut keys.relin_levels.get_mut(&l.top).ok_or_else(|| PyRuntimeError::new_err("level key not carved"))?.1;
+                    kg.generate_level(&ctx, &mut ex, sec, k, l.top, &mut prng).map_err(e)?;
+                }
+                ex.sync_compute().map_err(e)?;
+            }
             (Some(kg), None)
         }
         (Origin::Bundle(path) | Origin::DebugBundle(path, _), Some(req)) => (None, Some(import_bundle(path, req, &chain, &ex.compute, &mut keys)?)),

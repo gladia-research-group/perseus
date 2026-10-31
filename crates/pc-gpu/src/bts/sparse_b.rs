@@ -42,16 +42,20 @@ pub struct SparseBCfg {
     /// K of the EvalMod series: 24 (FIDESlib's degree-20 table) or 16 (the dense route's degree-14 table); the overflow
     /// integer after the fold has the dense route's distribution.
     pub evalmod_k: f64,
+    /// An EvalMod series replacing the K = 16 table (same K, double angles and depth; empty = the frozen table).
+    pub em_coeffs: Vec<f64>,
 }
 
 impl SparseBCfg {
     pub fn n32(slots: u32, raise_drop: u32) -> Self {
-        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K }
+        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K, em_coeffs: Vec::new() }
     }
 
     /// The EvalMod series' Paterson-Stockmeyer plan for `evalmod_k`.
     pub fn em_series(&self) -> Result<PsPlan> {
-        if self.evalmod_k == pc_core::bts_setup::EVALMOD_K {
+        if self.evalmod_k == pc_core::bts_setup::EVALMOD_K && !self.em_coeffs.is_empty() {
+            Ok(PsPlan::from_coeffs(&self.em_coeffs)?)
+        } else if self.evalmod_k == pc_core::bts_setup::EVALMOD_K {
             Ok(PsPlan::from_coeffs(pc_core::bts_setup::evalmod_coeffs())?)
         } else if self.evalmod_k == pc_core::bts_setup::SPARSE_B_K {
             ps_k24()
@@ -288,6 +292,8 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         mark("cts_acc", &mut parts);
         let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
         em.fuse_rescale = cfg.em_fuse_rescale;
+        // level relinearization keys (prototype): only when the key ring carries them
+        em.attach_level_keys(arena, s, ctx, keys, stage)?;
         mark("em", &mut parts);
         let sf_s = st.sf(stc_top as i32)?;
         let stc_pts = LtPts::new(arena, s, ctx, stc_top, PtSource::Slots { values: &q, scale: sf_s })?;

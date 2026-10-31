@@ -607,6 +607,8 @@ impl StcFirstPlan {
             let em_k = |mode| {
                 let mut em = EvalModPlan::new(arena, s, ctx, mode, v.em_in, &self.dense.ps, setup.evalmod_da_its, keys.conj()?, keys.relin()?, stage_ptrs, k_max, setup.em_relin)?;
                 em.fuse_rescale = setup.em_fuse_rescale;
+                // level relinearization keys (prototype): only when the key ring carries them
+                em.attach_level_keys(arena, s, ctx, keys, stage_ptrs)?;
                 Ok::<_, crate::error::Error>(em)
             };
             variants.push(BtsPrecomp {

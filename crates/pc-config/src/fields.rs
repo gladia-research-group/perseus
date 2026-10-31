@@ -49,6 +49,8 @@ section! {
         #[doc = "EvalMod: a Regen relinearization and the rescale after it as one exact conversion (pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale)."]
         #[doc = "Runtime switch `PC_EM_FUSE_RESCALE` [kernel]: binds no plan and no key bundle."]
         em_fuse_rescale: Flag = "PC_EM_FUSE_RESCALE", "(unset)";
+        #[doc = "EvalMod (prototype, bn-evalmod): relinearization-rescales over level relinearization keys (P' = P x the Q primes idle above the level, fewer digits; pc-gpu `keys::LevelRelinSpec`). Binds the key bundle (the client generates them)."]
+        em_level_keys: Flag = "PC_EM_LEVEL_KEYS", "(unset)";
         #[doc = "`FIDESLIB_GPU_ENCODE`. Default (unset). Read at examples/gpt2/env.py::ENV; examples/llama/env.py::ENV."]
         #[doc = "Shipped plans: none."]
         gpu_encode: Flag = "FIDESLIB_GPU_ENCODE", "(unset)";

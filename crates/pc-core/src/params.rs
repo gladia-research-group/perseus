@@ -519,6 +519,28 @@ impl Chain {
         v.extend((0..self.q.len()).filter(|i| !self.digits[d].contains(i)));
         v
     }
+    /// A level relinearization key's layout (bn-evalmod prototype) for a ciphertext at limb top `top`: digits of Q
+    /// primes 0..=top, balanced, at most |P'| limbs each, P' = (the Q primes top + 1 .. top + e, idle at that level) x P,
+    /// |P'| <= `cap`: (digits, P' prime ids, the key's top stored Q id). None when the chain's partition has no more
+    /// digits there. The key's modulus is the chain's Q P.
+    pub fn level_relin_layout(&self, top: usize, cap: usize) -> Option<(Vec<Vec<usize>>, Vec<usize>, usize)> {
+        let (nq, kp) = (self.q.len(), self.p.len());
+        let n = top + 1;
+        if n >= nq || top < 2 || cap <= kp.min(1) {
+            return None;
+        }
+        let pmax = (kp + (nq - n)).min(cap);
+        let d = n.div_ceil(pmax);
+        let cur = self.digits.iter().filter(|g| g.first().is_some_and(|&f| f <= top)).count();
+        if d >= cur {
+            return None;
+        }
+        let a = n.div_ceil(d);
+        let e = a.saturating_sub(kp).min(nq - n);
+        let specials: Vec<usize> = (n..n + e).chain(nq..nq + kp).collect();
+        let digits: Vec<Vec<usize>> = (0..d).map(|j| (j * a..((j + 1) * a).min(n)).collect()).collect();
+        Some((digits, specials, top + e))
+    }
     /// The digit a Q prime belongs to.
     pub fn digit_of(&self, id: usize) -> Option<usize> {
         self.digits.iter().position(|dg| dg.contains(&id))

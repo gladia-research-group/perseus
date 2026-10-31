@@ -12,6 +12,7 @@ use crate::ntt::{self, Parts, Span};
 use crate::poly::{CtBuf, Layout};
 use pc_core::galois;
 use pc_core::keys::{KskMaterial, KskSeed, SecretKey};
+use pc_core::modmul::mulmod;
 use pc_core::params::Chain;
 use pc_cuda::{Arena, Compute, DBuf, Stream};
 use rayon::prelude::*;
@@ -375,6 +376,40 @@ impl KeySetSpec {
     }
 }
 
+/// A level relinearization key (PROTOTYPE, bn-evalmod): for a ciphertext at limb top `top`, the special modulus is
+/// P' = (Q primes top + 1 ..= q_top, idle at that level) x P and the digits partition Q primes 0..=top into `ndig`
+/// balanced runs of at most |P'| limbs (`level_relin_spec`). Relation, every slot t of the shape (Q ids 0..=q_top, P):
+///   b_d[t] = -a_d[t] s[t] + e_d[t] + (t <= top && t in digit d ? (P' mod q_t) s^2[t] : 0),  a_d = KSKA(seed, d)
+/// i.e. the relinearization key's relation with P' for P and the level's digits: modulus Q P (the chain's), dense
+/// ternary s, sigma 3.19 - the RLWE instance of every key of the set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelRelinSpec {
+    pub top: usize,
+    pub digits: Vec<Vec<usize>>,
+    /// P' prime ids: the idle Q ids, then P.
+    pub specials: Vec<usize>,
+    pub shape: KskShape,
+}
+
+/// The level relinearization key for limb top `top` with |P'| <= `cap` (the wide bconv: digits and P' + 2 <= 48), or
+/// None when it would not take fewer digits than the chain's partition.
+pub fn level_relin_spec(chain: &Chain, top: usize, cap: usize) -> Option<LevelRelinSpec> {
+    let (digits, specials, q_top) = chain.level_relin_layout(top, cap)?;
+    let shape = KskShape { q_top, ndig: digits.len(), nq: chain.q.len(), kp: chain.p.len() };
+    Some(LevelRelinSpec { top, digits, specials, shape })
+}
+
+impl LevelRelinSpec {
+    /// prime id -> digit (Q ids <= top), -1 otherwise (P' rows), over `rows` ids.
+    pub fn digit_of(&self, rows: usize) -> Vec<i32> {
+        (0..rows).map(|t| self.digits.iter().position(|g| g.contains(&t)).map_or(-1, |d| d as i32)).collect()
+    }
+    /// P' mod q_t by prime id (0 on P' rows), over `rows` ids.
+    pub fn pmod(&self, primes: &[u64], rows: usize) -> Vec<u64> {
+        (0..rows).map(|t| if t <= self.top { self.specials.iter().fold(1u64, |acc, &x| mulmod(acc, primes[x] % primes[t], primes[t])) } else { 0 }).collect()
+    }
+}
+
 /// The device key set .
 pub struct KeySet<'a, W: DevWord> {
     pub layout: KskLayout,
@@ -383,6 +418,8 @@ pub struct KeySet<'a, W: DevWord> {
     /// Rotation keys by step normalized to `[0, N/2)` (`rot` normalizes the lookup).
     pub rots: BTreeMap<i64, DevKsk<'a, W>>,
     pub bts: Option<BtsKeys<'a, W>>,
+    /// Level relinearization keys by limb top (`LevelRelinSpec`; prototype, empty unless carved).
+    pub relin_levels: BTreeMap<usize, (LevelRelinSpec, DevKsk<'a, W>)>,
     n: usize,
 }
 
@@ -396,7 +433,7 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             }
         }
         let n = chain.n;
-        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, n };
+        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, relin_levels: BTreeMap::new(), n };
         let (mut d2s, mut s2d) = (None, None);
         for (role, sh) in spec.keys(chain)? {
             let k = DevKsk::carve(arena, role, sh, layout, n)?;
@@ -424,6 +461,24 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             value: k as usize,
             msg: format!("no rotation key for step {step} (normalized {k}); add it to the model/bts rotation set"),
         })
+    }
+    /// Carve the level relinearization keys of `specs` (setup only, before `Arena::freeze`).
+    pub fn carve_relin_levels(&mut self, arena: &'a Arena, specs: &[LevelRelinSpec]) -> Result<()> {
+        for sp in specs {
+            let k = DevKsk::carve(arena, KeyRole::Relin, sp.shape, self.layout, self.n)?;
+            self.relin_levels.insert(sp.top, (sp.clone(), k));
+        }
+        Ok(())
+    }
+    /// Arena bytes of `carve_relin_levels`.
+    pub fn relin_levels_bytes(specs: &[LevelRelinSpec], layout: KskLayout, n: usize) -> usize {
+        specs
+            .iter()
+            .map(|sp| match layout {
+                KskLayout::PackedSeeded { .. } => Arena::bytes_for::<u32>(sp.shape.b_words(n, layout)),
+                KskLayout::Dense => Arena::bytes_for::<W>(sp.shape.b_words(n, layout)) + Arena::bytes_for::<W>(sp.shape.a_words(n, layout)),
+            } + Arena::bytes_for::<u32>(8))
+            .sum()
     }
     pub fn relin(&self) -> Result<&DevKsk<'a, W>> {
         self.relin.as_ref().ok_or_else(|| Error::Mem { knob: "KeySetSpec::relin", value: 0, msg: "no relinearization key".into() })

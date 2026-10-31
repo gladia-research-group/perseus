@@ -510,7 +510,7 @@ impl<'a, W: DevWord> KsWork<'a, W> {
     }
 }
 
-struct LevelPlan<'a> {
+pub struct LevelPlan<'a> {
     ndig: usize,
     /// Special rows of the level's keys: P, or P' at the bottom of a lean chain (the bottom-shape keys').
     kp: usize,
@@ -560,8 +560,6 @@ struct LevelSpecs {
 }
 
 fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSpecs {
-    let rows = lay.rows();
-    let dnum = chain.dnum();
     // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'
     let mut specials: Vec<usize> = chain.special_ids();
     if top + 1 == chain.level_unit {
@@ -570,6 +568,13 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
     // live digits: digit d keeps its limbs <= top (FIDESlib DECOMPmeta sizes cut at the level's limb count)
     let digs: Vec<Vec<usize>> =
         chain.digits.iter().map(|d| d.iter().copied().filter(|&t| t <= top).collect::<Vec<_>>()).filter(|d| !d.is_empty()).collect();
+    level_specs_with(chain, lay, top, k_max, digs, specials)
+}
+
+/// `level_specs` over a given digit partition of rows 0..=top and special set (prime ids; may include Q ids above top).
+fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs: Vec<Vec<usize>>, specials: Vec<usize>) -> LevelSpecs {
+    let rows = lay.rows();
+    let dnum = chain.dnum();
     let (mut intt, mut intt_src) = (Vec::new(), Vec::new());
     let primes = chain.primes();
     let mut pre_of = vec![0u64; top + 1];
@@ -895,6 +900,45 @@ pub fn modup_coef_ready<W: DevWord, M: DevStrategy<W>>(
     let lv = plans.level(top)?;
     ntt::inverse_rows_prefix_scaled(ctx, s, coef, &lv.intt, k * (top + 1), None, lv.scale_ptrs::<W>())?;
     modup_tail(ctx, s, lv, ks, coef, k)
+}
+
+/// A key-switching level plan over a custom digit partition of rows 0..=top and special set (TIMING PROTOTYPE: keys
+/// whose special modulus takes the Q primes idle above the level), for `k_max` ciphertexts.
+pub fn custom_level<'a, W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, top: usize, k_max: usize, digs: Vec<Vec<usize>>, specials: Vec<usize>) -> Result<LevelPlan<'a>> {
+    let chain = &ctx.chain;
+    let lay = ctx.lay;
+    let primes = chain.primes();
+    let sp = level_specs_with(chain, &lay, top, k_max, digs, specials);
+    Ok(LevelPlan {
+        ndig: sp.ndig,
+        kp: sp.kp,
+        intt: RowList::new(arena, s, &sp.intt)?,
+        intt_src: ConstBuf::new(arena, "ks.plans", s, &sp.intt_src)?,
+        intt_scale: ConstBuf::new(arena, "ks.plans", s, &intt_scale_bytes::<W>(&primes, lay.n, &sp))?,
+        modup: BconvPlan::new::<S, W>(arena, s, &primes, &sp.modup)?,
+        modup_ntt: RowList::new(arena, s, &sp.modup_ntt)?,
+        mu_rows: sp.mu_rows,
+        ks_rows: ConstBuf::new(arena, "ks.plans", s, &sp.ks_rows)?,
+        moddown: BconvPlan::new::<S, W>(arena, s, &primes, &sp.moddown)?,
+    })
+}
+
+/// `modup_from` with a given level plan (`custom_level`, built for `k_max` = `plans.k_max`).
+#[allow(clippy::too_many_arguments)]
+pub fn modup_from_level<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, plans: &KsPlans<'_>, lv: &LevelPlan<'_>, ks: &mut KsWork<'_, W>, coef: &mut DBuf<'_, Compute, W>, src: View, k: usize, top: usize) -> Result<()> {
+    plans.check_k(k)?;
+    let cw = ctx.lay.ct_words() as u64;
+    let m = if k > 1 { (src.ct_stride / cw) as usize } else { 1 };
+    let soff = lv.intt_src.dptr().wrapping_add((m - 1) * plans.k_max * (top + 1));
+    let src = ntt::Src { base: src.base, soff, n: 1, stride: 0 };
+    ntt::inverse_rows_prefix_scaled(ctx, s, coef, &lv.intt, k * (top + 1), Some(src), lv.scale_ptrs::<W>())?;
+    modup_tail(ctx, s, lv, ks, coef, k)
+}
+
+impl LevelPlan<'_> {
+    pub fn ndig(&self) -> usize {
+        self.ndig
+    }
 }
 
 /// The ModUp after its INTT: conversion of every live digit, NTT of the targets.

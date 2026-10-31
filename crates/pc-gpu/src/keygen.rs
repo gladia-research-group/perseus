@@ -9,7 +9,7 @@
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::error::{shape, Result};
 use crate::executor::Executor;
-use crate::keys::{DevKsk, DevSecret, KeyRole, KeySet, KskShape, KskStore};
+use crate::keys::{DevKsk, DevSecret, KeyRole, KeySet, KskShape, KskStore, LevelRelinSpec};
 use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::galois;
@@ -32,6 +32,8 @@ pub struct KeyGen<'a, W: DevWord> {
     /// sigma_{g^-1}(s) of the rotation being generated (part 0).
     perm: CtBuf<'a, Compute, W>,
     gauss: DiscreteGaussian,
+    /// Level relinearization keys (prototype): digit_of and (P' mod q, Shoup) by prime id, per limb top.
+    levels: BTreeMap<usize, (ConstBuf<'a, i32>, ConstBuf<'a, W>, ConstBuf<'a, W>)>,
 }
 
 /// Seconds spent per phase over a `generate_set` call.
@@ -78,7 +80,47 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             digit_of: ConstBuf::new(arena, "keygen.digit_of", s, &dof)?,
             perm: CtBuf::new(arena, "keygen.perm", lay, 1)?,
             gauss: DiscreteGaussian::new(DiscreteGaussian::SIGMA)?,
+            levels: BTreeMap::new(),
         })
+    }
+
+    /// Tables of the level relinearization keys `specs` (their shapes must be among `new`'s); setup only.
+    pub fn add_levels(&mut self, arena: &'a Arena, s: &Stream<Compute>, chain: &Chain, specs: &[LevelRelinSpec]) -> Result<()> {
+        let lay = Layout::from_chain(chain);
+        let primes = chain.primes();
+        for sp in specs {
+            let dof = sp.digit_of(lay.rows());
+            let pm = sp.pmod(&primes, lay.rows());
+            let (v, w): (Vec<W>, Vec<W>) = pm
+                .iter()
+                .enumerate()
+                .map(|(t, &x)| {
+                    let c = pc_core::modmul::shoup(W::from_u64(x % primes[t]), W::from_u64(primes[t]));
+                    (c.w, c.w_prime)
+                })
+                .unzip();
+            self.levels.insert(sp.top, (ConstBuf::new(arena, "keygen.levels", s, &dof)?, ConstBuf::new(arena, "keygen.levels", s, &v)?, ConstBuf::new(arena, "keygen.levels", s, &w)?));
+        }
+        Ok(())
+    }
+    /// Arena bytes of `add_levels`.
+    pub fn levels_bytes(lay: &Layout, nspecs: usize) -> usize {
+        nspecs * (Arena::bytes_for::<i32>(lay.rows()) + 2 * Arena::bytes_for::<W>(lay.rows()))
+    }
+
+    /// Generate the level relinearization key of limb top `top` (`add_levels` tables) into `key`.
+    pub fn generate_level<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        secret: &DevSecret<'_, W>,
+        key: &mut DevKsk<'_, W>,
+        top: usize,
+        prng: &mut Prng,
+    ) -> Result<(f64, f64)> {
+        let (d, v, w) = self.levels.get(&top).ok_or_else(|| shape("KeyGen::generate_level", format!("no level tables for top {top}")))?;
+        let ov = (d.dptr(), v.vptr(), w.vptr());
+        self.generate_with(ctx, ex, secret, key, prng, Some(ov))
     }
 
     /// Generate one key into `key` (its role, shape and layout) from `secret`; the seed and errors are drawn from
@@ -90,6 +132,20 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
         secret: &DevSecret<'_, W>,
         key: &mut DevKsk<'_, W>,
         prng: &mut Prng,
+    ) -> Result<(f64, f64)> {
+        self.generate_with(ctx, ex, secret, key, prng, None)
+    }
+
+    /// `generate` with the digit map and the gadget's (P mod q, Shoup) tables overridden (`ov`, level keys).
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        secret: &DevSecret<'_, W>,
+        key: &mut DevKsk<'_, W>,
+        prng: &mut Prng,
+        ov: Option<(*const i32, *const c_void, *const c_void)>,
     ) -> Result<(f64, f64)> {
         let n = ctx.lay.n;
         let sh = key.shape;
@@ -169,10 +225,10 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             s_old,
             seed: key.seed_dev.dptr(),
             ids: ids.dptr(),
-            digit_of: self.digit_of.dptr(),
-            // the key's own special set: P, or P' for a bottom-shape key of a lean chain
-            pmod: if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.v.vptr() } else { ctx.ks.p_mod_q.v.vptr() },
-            pmods: if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.s.vptr() } else { ctx.ks.p_mod_q.s.vptr() },
+            digit_of: ov.map(|o| o.0).unwrap_or(self.digit_of.dptr()),
+            // the key's own special set: P, or P' for a bottom-shape key of a lean chain (or a level key's)
+            pmod: ov.map(|o| o.1).unwrap_or(if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.v.vptr() } else { ctx.ks.p_mod_q.v.vptr() }),
+            pmods: ov.map(|o| o.2).unwrap_or(if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.s.vptr() } else { ctx.ks.p_mod_q.s.vptr() }),
             pr: ctx.pr(),
             row_words,
             nrows: rows as i32,

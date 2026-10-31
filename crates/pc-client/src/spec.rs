@@ -68,6 +68,9 @@ pub enum Role {
     SpruAtob,
     /// Any other automorphism key, by Galois element (the SPRU route's conj o rot(1), g = 2N - 5).
     Auto { galois: u64 },
+    /// A level relinearization key for ciphertexts at limb top `top` (`Chain::level_relin_layout`): the relin
+    /// relation with the level's digits and P' = (Q primes idle above `top`) x P for P; modulus Q P.
+    RelinLevel { top: usize },
 }
 
 impl Role {
@@ -83,6 +86,9 @@ impl Role {
         }
     }
 }
+
+/// |P'| bound of the level relinearization keys (the server's wide base conversion: P' + 2 tops <= 48 sources).
+pub const LEVEL_RELIN_CAP: usize = 46;
 
 /// One switching key to generate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +150,16 @@ impl KeySpec {
     pub fn check(&self, chain: &Chain) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for k in &self.keys {
-            k.shape.check(chain)?;
+            match k.role {
+                Role::RelinLevel { top } => {
+                    let (dg, _, q_top) = chain.level_relin_layout(top, LEVEL_RELIN_CAP).ok_or_else(|| Error::Spec(format!("no level relinearization key at top {top}")))?;
+                    let want = KeyShape { q_top, ndig: dg.len(), nq: chain.q.len(), kp: chain.p.len() };
+                    if k.shape != want {
+                        return Err(Error::Spec(format!("level relinearization key at top {top}: shape {:?}, the layout's is {want:?}", k.shape)));
+                    }
+                }
+                _ => k.shape.check(chain)?,
+            }
             let id = serde_json::to_string(&k.role)?;
             if !seen.insert(id.clone()) {
                 return Err(Error::Spec(format!("key {id} requested twice")));
