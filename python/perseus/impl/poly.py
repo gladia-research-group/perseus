@@ -572,6 +572,31 @@ def inv_sqrt_newton_scaled(ops, x, steps, scale: float = 1.0):
     return y
 
 
+def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0):
+    """inv_sqrt_newton_scaled from w = -b1 x instead of x (b1 = steps[0][1], applied before x's refresh): the
+    closed-form first step is w + a1, no product and no level; the second step's cubic term reads w itself (its
+    constant b2 / b1 carried into the next step's constants: y2 = (b2 / b1) (a2 b1 / b2 y1 + w y1^3)), so its
+    critical path is (w y1) y1^2 from the landing, two levels below inv_sqrt_newton_scaled's; every later step's -b x
+    is w b / b1, shallow beside y."""
+    last = len(steps) - 1
+    a1, b1 = steps[0]
+    if last == 0:
+        return ops.add(ops.mult(w, scale), a1 * scale)
+    y = ops.add(w, a1)
+    kappa = 1.0
+    for i in range(1, last + 1):
+        a, b = steps[i]
+        k = scale if i == last else 1.0
+        if i == 1 and last > 1:
+            kappa = b / b1
+            y = ops.add(ops.mult(y, a / kappa), ops.mult(ops.mult(w, y), ops.square(y)))
+            continue
+        c = ops.mult(w, b * k * kappa ** 3 / b1)
+        y = ops.add(ops.mult(y, a * k * kappa), ops.mult(ops.mult(c, y), ops.square(y)))
+        kappa = 1.0
+    return y
+
+
 def _newton_image(tl: float, a: float, b: float):
     """[min, max] of q(t) = t (a - b t)^2 (t = x y^2 after the step) over t in [tl, 1]."""
     ts = [tl, 1.0] + ([a / (3.0 * b)] if tl < a / (3.0 * b) < 1.0 else [])

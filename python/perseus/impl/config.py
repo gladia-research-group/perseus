@@ -140,6 +140,15 @@ class CutMaxCfg:
     # the final 1/S as (1/sqrt(sum_scale S))^2 by poly.inv_sqrt_newton_scaled; empty = Goldschmidt on [sum_lo, sum_hi]
     sum_scale: float = 0.0
     sum_newton: tuple = ()
+    # scaled normalisers only: the 1-slot refreshes take the sum's vector itself (the refresh returns its slot mean,
+    # no all-slot ladder first) / the first Newton step's -b rides the refreshed input (that step costs no level)
+    spru_mean: int = 0
+    newton_fold: int = 0
+    # the entry's 1-slot refresh reads D conj(E), E = D times its constant from the logits' own masked products (no
+    # product of D's square): with the logits a level earlier (lnf_fold), D needs no refresh of its own
+    entry_dd: int = 0
+    # the packed CutMax's pow_odd lanes share one conjugate of the refreshed vector
+    conj_once: int = 0
 
 
 @dataclasses.dataclass
@@ -157,6 +166,9 @@ class Configs:
     softmax: dict
     gelu: dict
     cutmax: Optional[CutMaxCfg]
+    # ln_f folded into the LM head (its gain into the weights, its bias as the normalised input's shift): one product
+    # fewer at the end of the tail, so the logits leave it a level earlier (examples/gpt2 weights.lm_head_matrix)
+    lnf_fold: int = 0
 
     def block(self, b: int):
         base = f"transformer.h.{b}"
@@ -239,7 +251,9 @@ def parse_cutmax(j: dict) -> CutMaxCfg:
         iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]), 0.0, 0, 0,
                                  x_scale=float(j["x_scale"][i]), newton=_steps(j["newton"][i])) for i in range(T))
         return CutMaxCfg(iters=iters, entry_scale=float(j["entry_scale"]), sum_scale=float(j["sum_scale"]),
-                         sum_newton=_steps(j["sum_newton"]))
+                         sum_newton=_steps(j["sum_newton"]), spru_mean=int(j.get("spru_mean", 0)),
+                         newton_fold=int(j.get("newton_fold", 0)), conj_once=int(j.get("conj_once", 0)),
+                         entry_dd=int(j.get("entry_dd", 0)))
     for k in ("c", "m", "s2_hi", "passes", "ex2", "chord_a", "chord_b", "cascade_iters"):
         if len(j[k]) != T:
             raise ValueError("cutmax calib: ragged/empty schedule arrays")
@@ -264,4 +278,5 @@ def load_configs(path: str) -> Configs:
                    norm={k: parse_norm(v) for k, v in j.get("norm", {}).items()},
                    softmax={k: parse_softmax(v) for k, v in j.get("softmax", {}).items()},
                    gelu={k: parse_gelu(v) for k, v in j.get("softgelu", {}).items()},
-                   cutmax=parse_cutmax(j["cutmax"]) if "cutmax" in j else None)
+                   cutmax=parse_cutmax(j["cutmax"]) if "cutmax" in j else None,
+                   lnf_fold=int(j.get("lnf_fold", 0)))

@@ -42,7 +42,7 @@ class Gpt2Model(ImplModel):
             raise ValueError("cachemir_complex needs a complex payload session (CKKS_COMPLEX=1)")
         self.store, self.cfgs = store, cfgs
         self.n_layers = int(n_layers if n_layers is not None else cfgs.model.n_layers)
-        self.fold = (fold_ln1, fold_ln2, fold_lnf)
+        self.fold = (fold_ln1, fold_ln2, fold_lnf or bool(getattr(cfgs, "lnf_fold", 0)))
         self.lmhead_cap = lmhead_cap
         self.vocab = W.vocab_size(store)
         self.W_tile = self.rt.dims.N

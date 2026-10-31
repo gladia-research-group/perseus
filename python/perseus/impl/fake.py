@@ -204,6 +204,10 @@ class FakeFhe:
     def bootstrap(self, a, route=None):
         self.n_bootstraps += 1
         self.calls.append("bootstrap")
+        if getattr(a, "period", 0) == 1:
+            # a value stamped as one slot refreshes on the 1-slot route, which returns its slot mean (bts/spru.rs: the
+            # mean in every slot; the identity on a constant)
+            a.vec = np.full_like(a.vec, a.vec.mean())
         a.meta = self.shadow.bootstrap(a.meta, route).out
 
     # folds (fideslib_wrapper.h fold_slots_for / fold_bootstrap)

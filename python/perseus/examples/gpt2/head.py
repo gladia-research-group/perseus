@@ -12,8 +12,8 @@ from perseus.impl.config import CutMaxCfg, CutMaxIter, NormCfg
 from perseus.impl.layout import cutmax_tile_col_of_slot, cutmax_tile_mask, lane_vec
 from perseus.impl.linear import EncodedLinear, apply_linear, linear, prepare_linear_input
 from perseus.impl.norm import layer_norm
-from perseus.impl.poly import (bts2, goldschmidt_inv_x0, hint, im_cleanse, inv_sqrt_newton_safe,
-                   inv_sqrt_newton_scaled, pow_odd, rotsum)
+from perseus.impl.poly import (bts2, goldschmidt_inv_x0, hint, im_cleanse, inv_sqrt_newton_folded,
+                   inv_sqrt_newton_safe, inv_sqrt_newton_scaled, pow_odd, rotsum)
 
 
 def final_ln(rt, x, cfg: NormCfg, params: dict, pos: int, cap: int | None = 44):
@@ -270,6 +270,24 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
     # no level and the reduction's stamp kept (its refreshes route sparse)
     sum2 = lambda R_c, sgn: im_cleanse(ops, ops.sub(R_c, ops.mult_i(R_c)) if sgn > 0
                                        else ops.add(R_c, ops.mult_i(R_c)))
+
+    def mean_refresh(v, scale, steps, summed=None):
+        """The 1-slot refresh of scale x (the sum of v over the slots; `summed`: that sum, already formed).
+        spru_mean: v itself times the slot count, stamped as a 1-slot value: that refresh (SPRU, bts/spru.rs) decrypts
+        only the coefficients X^0 and X^(N/2), Re and Im of the slot mean, so it returns the mean of ANY input in
+        every slot and no all-slot ladder is needed first. newton_fold: times the first Newton step's -b1
+        (inv_sqrt_newton_folded reads -b1 x, so that step costs no level)."""
+        c = scale * (-steps[0][1] if cfg.newton_fold else 1.0)
+        if cfg.spru_mean:
+            t = ops.tag_reduce(ops.mult(v, c * N), 1)
+        else:
+            t = ops.mult(summed if summed is not None else rotsum_all(v), c)
+        ops.bootstrap(t)
+        return t
+
+    def newton(t, steps, scale=1.0):
+        return (inv_sqrt_newton_folded if cfg.newton_fold else inv_sqrt_newton_scaled)(ops, t, steps, scale)
+
     sgn = 1.0
     for ii, it in enumerate(cfg.iters):
         if it.newton:
@@ -287,22 +305,34 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
                 # columns, no refresh yet), so its imaginary part sums to S1 (the record masks B after its entry
                 # refresh, whose noise fills them)
                 R2 = sum2(rotsum_all(pair), sgn)
-                D = ops.sub(ops.add(mm(pair, ("cutmax.e1", ke), lambda: ke * 0.5 * (1.0 + masks[1])),
-                                    mm(ops.conjugate(pair), ("cutmax.e2", ke), lambda: ke * 0.5 * (1.0 - masks[1]))),
-                            mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * ke / n), tagged=False))
+                cpair = []
+
+                def centred(c, mu, R2=R2, cpair=cpair, M=M):
+                    a = mm(pair, ("cutmax.e1", c), lambda: c * 0.5 * (1.0 + masks[1]))
+                    cpair or cpair.append(ops.conjugate(pair))
+                    b = mm(cpair[0], ("cutmax.e2", c), lambda: c * 0.5 * (1.0 - masks[1]))
+                    return ops.sub(ops.add(a, b), mm(R2, mu, lambda: M() * (0.5 * c / n), tagged=False))
+                D = centred(ke, ("cutmax.mu", ii, sgn))
+                t = None
+                if cfg.entry_dd and cfg.spru_mean:
+                    # the 1-slot refresh's input as D conj(E), E = D times that refresh's constant, both one masked
+                    # product off the logits: D's square costs no product of its own and D need not be refreshed first
+                    ce = ke * N * it.x_scale / (k * k) * (-it.newton[0][1] if cfg.newton_fold else 1.0)
+                    t = ops.tag_reduce(ops.mult(D, ops.conjugate(centred(ce, ("cutmax.mu.e", ii, sgn)))), 1)
+                    ops.bootstrap(t)
                 D = hint(ops, D, 16, iters=vec_iters)
             else:
+                t = None
                 P = ops.add(A, B)                         # free: B lives on the imaginary axis
                 R2 = sum2(rotsum_all(P), sgn)
                 D = ops.sub(ops.mult(P, k), mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * k / n),
                                               tagged=False))
-            S2 = rotsum_all(ops.mult(D, ops.conjugate(D)))
-            if tap: tap(f"i{ii}.S2", S2)
             # t is refreshed where it is formed (one 1-slot refresh): every Newton step then reads it at the landing,
             # and u ends early enough for D u to reach the vector's refresh inside its envelope
-            t = ops.mult(S2, it.x_scale / (k * k))
-            ops.bootstrap(t)
-            u = inv_sqrt_newton_scaled(ops, t, it.newton)
+            if t is None:
+                t = mean_refresh(ops.mult(D, ops.conjugate(D)), it.x_scale / (k * k), it.newton)
+            if tap: tap(f"i{ii}.S2", t)
+            u = newton(t, it.newton)
             yP = am(ops.mult(D, u), ("cutmax.sh", ii, it.m, sgn), lambda: M() * (0.5 / it.m), tagged=False)
         else:
             P = ops.add(A, B)                             # free: B lives on the imaginary axis
@@ -325,19 +355,22 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
                     lambda: (masks[0] + 1j * sgn * masks[1]) * (0.5 / it.m), tagged=False)
         yP = hint(ops, yP, 16, iters=vec_iters)           # ONE packed vector refresh
         if tap: tap(f"i{ii}.yP", yP)
-        A = pow_odd(ops, ops.add(yP, ops.conjugate(yP)), it.p)     # y0^p
-        B = pow_odd(ops, ops.sub(yP, ops.conjugate(yP)), it.p)     # i^p sgn y1^p
+        cj = ops.conjugate(yP)
+        A = pow_odd(ops, ops.add(yP, cj), it.p)                    # y0^p
+        B = pow_odd(ops, ops.sub(yP, cj if cfg.conj_once else ops.conjugate(yP)), it.p)   # i^p sgn y1^p
         sgn *= 1.0 if it.p % 4 == 1 else -1.0
         if tap: tap(f"i{ii}.end", B)
     P = ops.add(A, B)
-    S_c = rotsum_all(P)
     if cfg.sum_newton:
         # 1 / S = u^2, u = 1 / sqrt(S) from Newton steps on sum_scale S in (0, 1] (sum2 is 2 S)
-        S = sum2(S_c, sgn)
-        t = ops.mult(S, 0.5 * cfg.sum_scale)
-        ops.bootstrap(t)
-        r = ops.square(inv_sqrt_newton_scaled(ops, t, cfg.sum_newton, math.sqrt(cfg.sum_scale)))
+        if cfg.spru_mean:
+            # sum2 per slot, 2 Re((1 - i sgn) P): the sum of its slots is sum2's 2 S
+            t = mean_refresh(sum2(P, sgn), 0.5 * cfg.sum_scale, cfg.sum_newton)
+        else:
+            t = mean_refresh(None, 0.5 * cfg.sum_scale, cfg.sum_newton, summed=sum2(rotsum_all(P), sgn))
+        r = ops.square(newton(t, cfg.sum_newton, math.sqrt(cfg.sum_scale)))
     else:
+        S_c = rotsum_all(P)
         S = im_cleanse(ops, ops.mult_const(S_c, 0.5, -0.5 * sgn))
         g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
         lo, hi = cfg.sum_lo * g, cfg.sum_hi * g
