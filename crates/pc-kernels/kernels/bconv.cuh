@@ -9,14 +9,15 @@ constexpr int BX = 128;  // coefficients per block
 constexpr int TG = 32;   // targets per block (blockIdx.y)
 
 template <class W, class MM>
-__global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst,
-                                                   const BconvJob* __restrict__ jobs, const W* __restrict__ pool,
-                                                   const PrimeConst* __restrict__ pr) {
+__device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                           const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     using Wd = WideOf<W>;
     const BconvJob J = jobs[blockIdx.z];
-    const int t0 = blockIdx.y * TG;
+    // the job's targets split evenly over the gridDim.y blocks (a multiple of 4 each, at most TG): no light last block
+    const int per = (((int)J.ntgt + (int)gridDim.y - 1) / (int)gridDim.y + 3) & ~3;
+    const int t0 = blockIdx.y * per;
     if (t0 >= (int)J.ntgt) return;
-    const int nt = min(TG, (int)J.ntgt - t0);
+    const int nt = min(per, (int)J.ntgt - t0);
     const int ns = J.nsrc;
     const W* P = pool + J.pool_off;
     const W* srow = P;
@@ -118,11 +119,37 @@ __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W*
     }
 }
 
+// Two occupancies of one body: the compiler's registers (46: 10 blocks per SM, the shorter per-thread chains) for a
+// launch that fits in one wave there, 40 registers (12 blocks per SM) for a larger one, which then runs in fewer waves.
+template <class W, class MM>
+__global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                                   const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    bconv_body<W, MM>(src, dst, jobs, pool, pr);
+}
+template <class W, class MM>
+__global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                                         const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    bconv_body<W, MM>(src, dst, jobs, pool, pr);
+}
+
+// SMs of the current device (cached; a failed query selects the one-wave kernel everywhere)
+inline int num_sms() {
+    static int n = 0;
+    if (!n) {
+        int d = 0, v = 0;
+        n = cudaGetDevice(&d) == cudaSuccess && cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, d) == cudaSuccess && v > 0 ? v : 1 << 20;
+    }
+    return n;
+}
+
 template <class W, class MM>
 int launch(const BconvArgs* a, cudaStream_t s) {
     if (a->njobs == 0) return 0;
     dim3 grid(N / BX, (a->max_tgt + TG - 1) / TG, a->njobs);
-    bconv_kernel<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+    if ((long)grid.x * grid.y * grid.z > 10L * num_sms())
+        bconv_kernel12<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+    else
+        bconv_kernel<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
     return (int)cudaGetLastError();
 }
 }  // namespace bconv
