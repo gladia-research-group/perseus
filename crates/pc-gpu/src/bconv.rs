@@ -98,7 +98,9 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             }
         }
         max_tgt = max_tgt.max(j.tgt.len());
-                jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, j.prescaled as u32, 0]);
+                // u32 words, every target below 2^30: the sums reduced as hi 2^32 + lo in 32-bit products (`BconvJob::split`)
+        let split = wb == 4 && j.tgt.iter().all(|&(_, tp)| primes[tp as usize] < 1 << 30);
+        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, j.prescaled as u32, split as u32]);
     }
     Ok((pool, jobs, max_tgt))
 }

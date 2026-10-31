@@ -104,7 +104,9 @@ pub struct BconvJob {
     pub exact: u32,
     /// ABI 17: 1 = the source rows hold `x_i pre_i` already (folded into the INTT's last pass).
     pub prescaled: u32,
-    pub pad: u32,
+    /// ABI 17: 1 = u32 words, every target below 2^30: the sums reduced as `hi 2^32 + lo` in 32-bit products (plain
+    /// jobs; exact ones keep the double-word reduction).
+    pub split: u32,
 }
 
 #[repr(C)]

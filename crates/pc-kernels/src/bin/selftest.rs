@@ -43,7 +43,7 @@ fn prime_table(primes: &[u64], word_bits: u32) -> Vec<u64> {
         .iter()
         .flat_map(|&p| {
             let c = PrimeConst::new(p, word_bits);
-            [c.p, c.mu_lo, c.mu_hi, c.neal_mu, c.bits as u64 | ((c.word_bits as u64) << 32), c.mont_pinv, c.mont_r2, 0]
+            [c.p, c.mu_lo, c.mu_hi, c.neal_mu, c.bits as u64 | ((c.word_bits as u64) << 32), c.mont_pinv, c.mont_r2, c.split]
         })
         .collect()
 }
@@ -338,7 +338,7 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
             pool_off: off as u32,
             exact: j.exact as u32,
             prescaled: 0,
-            pad: 0,
+            split: 0,
         });
         for idx in 0..N {
             let y: Vec<u64> = (0..ns)
@@ -380,15 +380,15 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
     };
     ck(unsafe { (st.t.bconv)(&a, st.s()) });
     let got = dst.read(&st.ctx);
-    // the same jobs prescaled (the source rows hold x pre)
-    let flagged: Vec<u32> = jobs.iter().flat_map(|j| [j.src_off, j.dst_off, j.nsrc, j.ntgt, j.pool_off, j.exact, 1, 0]).collect();
+    // the same jobs prescaled (the source rows hold x pre) and with the split reduction (plain jobs only)
+    let flagged: Vec<u32> = jobs.iter().flat_map(|j| [j.src_off, j.dst_off, j.nsrc, j.ntgt, j.pool_off, j.exact, 1, 1]).collect();
     let jobs2 = st.ctx.up32(&flagged);
     let src2 = st.ctx.up(&src_pre);
     let dst2 = st.ctx.zeros(9 * N);
     let a2 = BconvArgs { src: src2.c(), dst: dst2.p(), jobs: jobs2.c() as *const BconvJob, ..a };
     ck(unsafe { (st.t.bconv)(&a2, st.s()) });
     let got2 = dst2.read(&st.ctx);
-    vec![cmp("bconv (plain + exact HPS) vs host", &got, &want), cmp("bconv prescaled vs host", &got2, &want)]
+    vec![cmp("bconv (plain + exact HPS) vs host", &got, &want), cmp("bconv prescaled + split reduction vs host", &got2, &want)]
 }
 
 // ================================================================================================ element-wise

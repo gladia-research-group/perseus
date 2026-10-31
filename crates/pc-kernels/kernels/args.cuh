@@ -34,7 +34,7 @@
 //   36   word_bits  BITS of the word this entry was built for (16, 32 or 64); kernels do not read it, checks do
 //   40   mont_pinv  -p^-1 mod 2^BITS                        (Montgomery)
 //   48   mont_r2    2^(2*BITS) mod p                         (Montgomery: R^2, converts a REDC result back)
-//   56   reserved   0
+//   56   split      u32: 2^32 mod p (low word), floor((2^32 mod p) 2^32 / p) (high word); other words 0
 struct PrimeConst {
     uint64_t p;
     uint64_t mu_lo;
@@ -44,7 +44,7 @@ struct PrimeConst {
     uint32_t word_bits;
     uint64_t mont_pinv;
     uint64_t mont_r2;
-    uint64_t reserved;
+    uint64_t split;
 };
 static_assert(sizeof(PrimeConst) == 64, "PrimeConst layout");
 
@@ -120,7 +120,7 @@ struct BconvJob {
     uint32_t pool_off;          // W words
     uint32_t exact;
     uint32_t prescaled;  // ABI 17: 1 = the source rows hold y_i = x_i pre_i already (folded into the INTT)
-    uint32_t pad;
+    uint32_t split;      // ABI 17: 1 = u32 words, every target < 2^30: the sums reduced as hi 2^32 + lo (plain jobs)
 };
 static_assert(sizeof(BconvJob) == 32, "BconvJob layout");
 

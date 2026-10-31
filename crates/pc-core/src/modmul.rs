@@ -329,7 +329,8 @@ pub fn mul_shoup<W: Word>(a: W, s: &ShoupConst<W>, p: W) -> W {
 /// | 36 | word_bits | 16 / 32 / 64 (the word the entry was built for; kernels do not read it, checks do) |
 /// | 40 | mont_pinv | -p^-1 mod 2^BITS |
 /// | 48 | mont_r2 | 2^(2 BITS) mod p |
-/// | 56 | reserved | 0 |
+/// | 56 | split | u32: `2^32 mod p` (low word) and its Shoup companion `floor((2^32 mod p) 2^32 / p)` (high word), the
+/// double-word reduction as `hi 2^32 + lo` in 32-bit products; other words 0 |
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DevPrimeConst {
@@ -341,7 +342,7 @@ pub struct DevPrimeConst {
     pub word_bits: u32,
     pub mont_pinv: u64,
     pub mont_r2: u64,
-    pub reserved: u64,
+    pub split: u64,
 }
 
 // Layout frozen against args.cuh (`static_assert(sizeof(PrimeConst) == 64)` there; offsets per the table above).
@@ -357,7 +358,7 @@ const _: () = {
     assert!(offset_of!(DevPrimeConst, word_bits) == 36);
     assert!(offset_of!(DevPrimeConst, mont_pinv) == 40);
     assert!(offset_of!(DevPrimeConst, mont_r2) == 48);
-    assert!(offset_of!(DevPrimeConst, reserved) == 56);
+    assert!(offset_of!(DevPrimeConst, split) == 56);
 };
 
 impl DevPrimeConst {
@@ -402,7 +403,13 @@ impl DevPrimeConst {
         } else {
             ((1u128 << (2 * word_bits)) % p as u128) as u64
         };
-        Ok(DevPrimeConst { p, mu_lo, mu_hi, neal_mu, bits, word_bits, mont_pinv, mont_r2, reserved: 0 })
+        let split = if word_bits == 32 {
+            let r = (1u64 << 32) % p;
+            r | ((r << 32) / p) << 32
+        } else {
+            0
+        };
+        Ok(DevPrimeConst { p, mu_lo, mu_hi, neal_mu, bits, word_bits, mont_pinv, mont_r2, split })
     }
 }
 
