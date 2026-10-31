@@ -639,62 +639,83 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     b.resolve_pts(pts).map_err(perr)?;
     let ctx = &dev.ctx;
     let sh = &shadows[idx];
+    let lent = lent_slots(ctx, b, ins, outputs, kvio, regs);
     let info = b
         .with_slab(slab, |b| {
-            for (i, x) in ins.iter().enumerate() {
+            // the registers lent to their slots for the run: the input read and the output left in place
+            for &(i, _, _, r) in &lent {
                 let want = b.inputs[i].2;
-                let label = b.label.clone();
-                let name = b.inputs[i].0.clone();
-                let kv_unit = kvio.inp.iter().find(|(p, _)| *p == i).map(|&(_, u)| u);
-                let dst = b.input_mut(i)?;
-                let src: Option<&Ct<'static, W>> = match (kv_unit, x) {
-                    (Some(u), _) => Some(&*kv.as_mut().ok_or_else(|| pc_program::Error::Replay { block: label.clone(), msg: "no pinned KV".into() })?.page(u)?),
-                    (None, In::Reg(r)) => Some(regs.get(*r).ok_or_else(|| pc_program::Error::Replay { block: label.clone(), msg: format!("register {r}") })?),
-                    (None, In::Ct(c)) => Some(*c),
-                    (None, In::Zero) => None,
-                };
-                match src {
-                    Some(c) => {
-                        copy_ct(ctx, &ex.compute, dst, c)?;
-                        if (c.meta.level, c.meta.deg) != (want.level, want.deg) {
-                            return Err(pc_program::Error::Replay { block: label, msg: format!("input {i} ({name}) at level {} deg {}, compiled level {} deg {}", c.meta.level, c.meta.deg, want.level, want.deg) });
-                        }
+                let c = &mut regs[r];
+                if matches!(ins[i], In::Zero) {
+                    c.buf.buf.zero(&ex.compute).map_err(pc_gpu::Error::from)?;
+                    c.meta = zero_meta(ctx, want).map_err(|x| pc_program::Error::Replay { block: b.label.clone(), msg: x })?;
+                } else if (c.meta.level, c.meta.deg) != (want.level, want.deg) {
+                    return Err(pc_program::Error::Replay { block: b.label.clone(), msg: format!("input {i} ({}) at level {} deg {}, compiled level {} deg {}", b.inputs[i].0, c.meta.level, c.meta.deg, want.level, want.deg) });
+                }
+            }
+            for &(_, _, s, r) in &lent {
+                std::mem::swap(&mut b.slots[s as usize], &mut regs[r]);
+            }
+            let res = (|| -> pc_program::Result<pc_program::replay::RunInfo> {
+                for (i, x) in ins.iter().enumerate() {
+                    if lent.iter().any(|l| l.0 == i) {
+                        continue;
                     }
-                    None => {
-                        dst.buf.buf.zero(&ex.compute).map_err(pc_gpu::Error::from)?;
-                        dst.meta = want;
-                        if want.nf == 0.0 {
-                            // the compile leaves block-input scales unknown: an encryption of 0 at the level's own
-                            // scaling factor (what a rescaled K/V state carries, so the add it meets adjusts nothing)
-                            let top = pc_shadow::meta::top_limb(ctx.shape, want.level).map_err(pc_gpu::Error::from)? as i32;
-                            dst.meta.nf = ctx.scale.sf(top).map_err(|x| pc_program::Error::Replay { block: label.clone(), msg: x.to_string() })?.powi(want.deg as i32);
+                    let want = b.inputs[i].2;
+                    let label = b.label.clone();
+                    let name = b.inputs[i].0.clone();
+                    let kv_unit = kvio.inp.iter().find(|(p, _)| *p == i).map(|&(_, u)| u);
+                    let dst = b.input_mut(i)?;
+                    let src: Option<&Ct<'static, W>> = match (kv_unit, x) {
+                        (Some(u), _) => Some(&*kv.as_mut().ok_or_else(|| pc_program::Error::Replay { block: label.clone(), msg: "no pinned KV".into() })?.page(u)?),
+                        (None, In::Reg(r)) => Some(regs.get(*r).ok_or_else(|| pc_program::Error::Replay { block: label.clone(), msg: format!("register {r}") })?),
+                        (None, In::Ct(c)) => Some(*c),
+                        (None, In::Zero) => None,
+                    };
+                    match src {
+                        Some(c) => {
+                            copy_ct(ctx, &ex.compute, dst, c)?;
+                            if (c.meta.level, c.meta.deg) != (want.level, want.deg) {
+                                return Err(pc_program::Error::Replay { block: label, msg: format!("input {i} ({name}) at level {} deg {}, compiled level {} deg {}", c.meta.level, c.meta.deg, want.level, want.deg) });
+                            }
+                        }
+                        None => {
+                            dst.buf.buf.zero(&ex.compute).map_err(pc_gpu::Error::from)?;
+                            dst.meta = zero_meta(ctx, want).map_err(|x| pc_program::Error::Replay { block: label.clone(), msg: x })?;
                         }
                     }
                 }
-            }
-            let info = {
-                // the PCMM / CCMM services run the program's finishes on the StC-first route
-                let mut fx = match dense.as_ref() {
-                    Some(route) if pcmm.is_some() || ccmm.is_some() => Some(crate::matmul::FinishSvc { pcmm: pcmm.as_mut(), ccmm: ccmm.as_mut(), route }),
-                    _ => None,
+                let info = {
+                    // the PCMM / CCMM services run the program's finishes on the StC-first route
+                    let mut fx = match dense.as_ref() {
+                        Some(route) if pcmm.is_some() || ccmm.is_some() => Some(crate::matmul::FinishSvc { pcmm: pcmm.as_mut(), ccmm: ccmm.as_mut(), route }),
+                        _ => None,
+                    };
+                    let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);
+                    let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut() };
+                    replayer.run(b, &mut rt)?
                 };
-                let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);
-                let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut() };
-                replayer.run(b, &mut rt)?
-            };
-            for &(j, r) in outputs {
-                let o = b.output(j)?;
-                let label = b.label.clone();
-                let dst = regs.get_mut(r).ok_or_else(|| pc_program::Error::Replay { block: label, msg: format!("register {r}") })?;
-                copy_ct(ctx, &ex.compute, dst, o)?;
+                for &(j, r) in outputs {
+                    if lent.iter().any(|l| l.1 == j && l.3 == r) {
+                        continue;
+                    }
+                    let o = b.output(j)?;
+                    let label = b.label.clone();
+                    let dst = regs.get_mut(r).ok_or_else(|| pc_program::Error::Replay { block: label, msg: format!("register {r}") })?;
+                    copy_ct(ctx, &ex.compute, dst, o)?;
+                }
+                for &(j, u) in kvio.out {
+                    let o = b.output(j)?;
+                    let k = kv.as_mut().ok_or_else(|| pc_program::Error::Replay { block: b.label.clone(), msg: "no pinned KV".into() })?;
+                    copy_ct(ctx, &ex.compute, k.page(u)?, o)?;
+                    k.store(ex, u)?;
+                }
+                Ok(info)
+            })();
+            for &(_, _, s, r) in &lent {
+                std::mem::swap(&mut b.slots[s as usize], &mut regs[r]);
             }
-            for &(j, u) in kvio.out {
-                let o = b.output(j)?;
-                let k = kv.as_mut().ok_or_else(|| pc_program::Error::Replay { block: b.label.clone(), msg: "no pinned KV".into() })?;
-                copy_ct(ctx, &ex.compute, k.page(u)?, o)?;
-                k.store(ex, u)?;
-            }
-            Ok(info)
+            res
         })
         .map_err(perr)?;
     if let Some(k) = kv.as_mut() {
@@ -721,6 +742,42 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     }
     let _ = gerr;
     Ok(info)
+}
+
+/// The block inputs whose register can stand in for their slot during the run, as (input, output, slot, register):
+/// output (j, r) lands in input i's slot, input i reads register r (or zero), no other input reads r and no other
+/// output writes it, and the slot is plain (`Bound::plain`) at levels within r's rows. Such a register is swapped
+/// into the slot for the run: no copy in, no copy out (the graphs bake the register's address: `Captured`).
+fn lent_slots(ctx: &pc_gpu::Context<'static, W, crate::session::M>, b: &pc_program::bind::Bound<'static, W>, ins: &[In<'_>], outputs: &[(usize, usize)], kvio: &KvIo<'_>, regs: &[Ct<'static, W>]) -> Vec<(usize, usize, u32, usize)> {
+    let mut out = vec![];
+    for (i, x) in ins.iter().enumerate() {
+        let s = b.inputs[i].1;
+        if kvio.inp.iter().any(|(p, _)| *p == i) {
+            continue;
+        }
+        let Some(&(j, r)) = outputs.iter().find(|(j, _)| b.outputs.get(*j).is_some_and(|o| o.1 == s)) else { continue };
+        let reads = |k: usize, y: &In<'_>| k != i && matches!(y, In::Reg(q) if *q == r);
+        if !(matches!(x, In::Zero) || matches!(x, In::Reg(q) if *q == r)) || ins.iter().enumerate().any(|(k, y)| reads(k, y)) || outputs.iter().filter(|o| o.1 == r).count() != 1 {
+            continue;
+        }
+        let (Some(Some(l)), Some(reg)) = (b.plain.get(s as usize), regs.get(r)) else { continue };
+        match pc_shadow::meta::top_limb(ctx.shape, (*l).min(b.inputs[i].2.level)) {
+            Ok(top) if reg.k() == 1 && (top as usize) < reg.buf.lay.nq => out.push((i, j, s, r)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A zero block input's metadata: the compiled one, whose unknown scale (the compile leaves block-input scales
+/// unknown) is the level's own scaling factor (what a rescaled K/V state carries, so the add it meets adjusts nothing).
+fn zero_meta(ctx: &pc_gpu::Context<'static, W, crate::session::M>, want: pc_shadow::CtMeta) -> std::result::Result<pc_shadow::CtMeta, String> {
+    let mut m = want;
+    if want.nf == 0.0 {
+        let top = pc_shadow::meta::top_limb(ctx.shape, want.level).map_err(|x| x.to_string())? as i32;
+        m.nf = ctx.scale.sf(top).map_err(|x| x.to_string())?.powi(want.deg as i32);
+    }
+    Ok(m)
 }
 
 fn json_diff(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String> {

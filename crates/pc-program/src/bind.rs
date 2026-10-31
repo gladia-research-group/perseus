@@ -20,6 +20,7 @@ use pc_gpu::encode_dev::PtForm as DevForm;
 use pc_gpu::ks::{KeyGroup, KsKeyRef};
 use pc_gpu::pt_store::{PtKey, PtStore};
 use pc_gpu::{Ct, CtBuf, DevStrategy, DevWord, Layout};
+use pc_shadow::rules::{Operand, Prelude};
 use pc_shadow::{CtMeta, PtMeta, Route};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -350,6 +351,10 @@ pub struct Bound<'a, W: DevWord> {
     /// Captured graphs of this block, one per plaintext-row layout it ran with (most recent last; a weight ring
     /// may place a block's rows in a few different slot sets over a token cycle).
     pub(crate) graphs: Vec<crate::replay::Captured>,
+    /// Per slot: the richest level written into it when only element-wise steps touch it (no unit but a plaintext
+    /// product-add, no key switch or refresh writing it, no prelude on it), else None: a compact buffer of those
+    /// rows can stand in for such a slot during a run (`plain_slots`).
+    pub plain: Vec<Option<u32>>,
 }
 
 fn berr(block: &str, msg: impl Into<String>) -> Error {
@@ -531,9 +536,13 @@ impl<'a, W: DevWord> Bound<'a, W> {
             c.value
         };
         let mut first_step: Vec<usize> = Vec::with_capacity(p.ops.len() + 1);
+        // per step: the compiled op's preludes on operands A and B
+        let mut pre: Vec<[bool; 2]> = vec![];
         for op in &p.ops {
             first_step.push(steps.len());
             for m in op.members() {
+                let on = |o: Operand| m.pre.iter().any(|x| matches!(x, Prelude::Rescale(w) | Prelude::DropTo(w, _) | Prelude::ScalarAdjust(w, _) if *w == o));
+                pre.push([on(Operand::A), on(Operand::B)]);
                 let a = m.ins.first().map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
                 let b = m.ins.get(1).map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
                 if let Kind::Finish { desc, .. } = &m.kind {
@@ -866,6 +875,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         } else {
             (vec![], None, None)
         };
+        let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, n_slots);
         // a block on its own slots carves no held-chain buffers: those chains issue step by step
         let io = |vs: &[u32]| -> Result<Vec<(String, u32, CtMeta)>> { vs.iter().map(|&v| Ok((p.vars[v as usize].name.clone(), slot_of(v)?, p.vars[v as usize].meta))).collect() };
         Ok(Bound {
@@ -895,6 +905,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
             names: p.vars.iter().map(|v| v.name.clone()).collect(),
             ring_n: lay.n,
             graphs: vec![],
+            plain,
         })
     }
 
@@ -1076,6 +1087,56 @@ impl<'a, W: DevWord> Bound<'a, W> {
         }
         Ok(())
     }
+}
+
+/// `Bound::plain`: per slot, the richest (lowest) level its writes land at when every step touching it is an
+/// element-wise op (add, sub, plaintext add / product, constants, negate, times i; a ct x ct product reading it),
+/// outside units other than plaintext product-adds, and no compiled prelude runs on it; else None.
+fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]], finishes: &[FinishStep], coeff_sums: &[CoeffSumStep], n: usize) -> Vec<Option<u32>> {
+    let mut lv: Vec<Option<u32>> = vec![Some(u32::MAX); n];
+    let bad = |lv: &mut Vec<Option<u32>>, s: u32| {
+        if let Some(x) = lv.get_mut(s as usize) {
+            *x = None;
+        }
+    };
+    for (i, st) in steps.iter().enumerate() {
+        let u = unit_of[i];
+        let unit_ok = u == NONE || matches!(units[u as usize].kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. });
+        let ew = matches!(st.op, StepOp::Add | StepOp::Sub | StepOp::AddPt(_) | StepOp::MultPt(_) | StepOp::AddConst(_) | StepOp::MultConst(_) | StepOp::Negate | StepOp::MultI);
+        let prod = matches!(st.op, StepOp::Mult | StepOp::Square);
+        match &st.op {
+            StepOp::Finish { f } => finishes[*f as usize].ins.iter().chain(&finishes[*f as usize].outs).for_each(|&s| bad(&mut lv, s)),
+            StepOp::CoeffSum { c } => coeff_sums[*c as usize].ins.iter().for_each(|&s| bad(&mut lv, s)),
+            _ => {}
+        }
+        if !unit_ok || !(ew || prod) {
+            for s in [st.out, st.a, st.b] {
+                bad(&mut lv, s);
+            }
+            continue;
+        }
+        if pre[i][0] {
+            // an operand-A prelude runs in place on `a` or into the output
+            bad(&mut lv, st.out);
+            bad(&mut lv, st.a);
+        }
+        if pre[i][1] {
+            // B's run on a scratch copy, read from `b` by layout-specific kernels
+            bad(&mut lv, st.b);
+        }
+        if prod {
+            // a product's output is relinearized (key switching): only its operands may be plain
+            bad(&mut lv, st.out);
+            if st.inplace {
+                bad(&mut lv, st.a);
+            }
+            continue;
+        }
+        if let Some(Some(l)) = lv.get_mut(st.out as usize) {
+            *l = (*l).min(st.meta.level);
+        }
+    }
+    lv
 }
 
 impl Program {

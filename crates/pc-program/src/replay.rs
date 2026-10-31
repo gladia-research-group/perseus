@@ -123,8 +123,14 @@ pub struct Captured {
     side_lease: Vec<usize>,
     out_metas: Vec<CtMeta>,
     pt_rows: Vec<*const c_void>,
+    /// The slots' buffers it baked (a driver may lend a slot another buffer for a run: pc-py `run_block`).
+    slot_rows: Vec<*const c_void>,
     stream_base: *const f32,
     pub capture_ms: f64,
+}
+
+fn slot_rows<W: DevWord>(b: &Bound<'_, W>) -> Vec<*const c_void> {
+    b.slots.iter().map(|c| c.buf.r().base as *const c_void).collect()
 }
 
 /// How a run was served.
@@ -948,7 +954,8 @@ impl Replayer {
             return Ok(info);
         }
         let dynamic: Vec<u32> = b.dynamic.iter().copied().collect();
-        let hit = b.graphs.iter().position(|g| g.dynamic == dynamic && g.stream_base == b.stream_base && g.pt_rows.len() == b.pts.len() && g.pt_rows.iter().zip(&b.pts).all(|(r, p)| *r == p.rows));
+        let rows = slot_rows(b);
+        let hit = b.graphs.iter().position(|g| g.dynamic == dynamic && g.stream_base == b.stream_base && g.slot_rows == rows && g.pt_rows.len() == b.pts.len() && g.pt_rows.iter().zip(&b.pts).all(|(r, p)| *r == p.rows));
         if let Some(gi) = hit {
             // the dynamic steps need the Bound mutably: take the captured block out while it replays
             let g = b.graphs.remove(gi);
@@ -1123,7 +1130,7 @@ impl Replayer {
         }
         self.stats.captures += 1;
         self.stats.capture_ms += capture_ms;
-        b.graphs.push(Captured { items, dynamic, lease, side_lease, out_metas, pt_rows: b.pts.iter().map(|p| p.rows).collect(), stream_base: b.stream_base, capture_ms });
+        b.graphs.push(Captured { items, dynamic, lease, side_lease, out_metas, pt_rows: b.pts.iter().map(|p| p.rows).collect(), slot_rows: rows, stream_base: b.stream_base, capture_ms });
         info.served = Served::Captured;
         Ok(info)
     }
