@@ -114,6 +114,8 @@ class PlannerShadow:
         # PLAN_STC_FIRST_REROUTE: a deliberate StC-first refresh whose input passed the entry lands where the shipped
         # order lands (the compile re-routes it) instead of being over budget
         self.stc_first_reroute = bool(self.plan.get("plan.stc_first_reroute"))
+        #: probe only (planner PLAN_RAISE_DELIB): deliberate refresh output -> units its landing sits deeper
+        self.delib_drops: dict[str, int] = {}
         entry, fallback = self.shadow.stc_first
         self.stc_first_entry = entry
         self.has_shipped = fallback is not None
@@ -249,7 +251,7 @@ def simulate(
                     # sparse one; a dense run lands it at the bts level. A dense landing
                     # (bts level - unit, degree 2: the K/V push) is left alone.
                     base = 0.0
-                lc[n.output] = base
+                lc[n.output] = base + sh.delib_drops.get(n.output, 0) * unit
                 # the captured landing degree (a CCMM's SinCBoot ends rescaled, a PCMM finish pends its rescale)
                 dg[n.output] = n.output_deg if n.output_deg is not None else 2
                 # StC-first runs with the K/V push in the shipped order (plan.stc_first_kv_landing): it lands where

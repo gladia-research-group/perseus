@@ -635,6 +635,40 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
                 refresh.site_out_levels[p] = saved
             refresh._cache.pop(p, None)
             skipped["no_slack"] += 1
+    # PLAN_RAISE_DELIB=1 (probe, reported only): after the planned sites, the code's own dense deliberate refreshes
+    # (a PCMM finish, a K/V push): the largest drop each could take under the same checks, landing k units below
+    # its captured landing
+    if os.environ.get("PLAN_RAISE_DELIB", "0") not in ("", "0"):
+        sh = refresh.shadow
+        found_d: dict[str, int] = {}
+        for n in g.nodes:
+            if not (n.is_deliberate_bts and n.output and n.output_level is not None):
+                continue
+            if fb is not None and cfg.bootstrap_level + max(sim.effective(x, unit) for x in n.cipher_inputs) > fb[0] + 1e-9:
+                continue
+            land = float(n.output_level) + (unit if (n.output_deg or 2) == 2 else 0)
+            k_max = min(5, int(math.floor((cfg.raise_drop_landing_max - land) / unit + 1e-9)))
+            for k in range(k_max, 0, -1):
+                sh.delib_drops[n.output] = k
+                s2 = placer._sim()
+                in2 = inputs(s2)
+                ok = (s2.hint_fired == sim.hint_fired
+                      and all(s2.consumed.get(v) == sim.consumed.get(v) and s2.deg.get(v) == sim.deg.get(v) for v in pinned)
+                      and all(cfg.bootstrap_level + math.ceil(c) <= cfg.max_level for c in s2.consumed.values())
+                      and all(l <= max(c, base_in[key][0]) + 1e-9 for key, (l, c) in in2.items())
+                      and all(l <= base_past.get(v, 0.0) + 1e-9 for v, l in past_cap(s2).items() if v not in sites)
+                      and all(s2.consumed.get(v) == sim.consumed.get(v) for v in sites)
+                      and set(i for i, _ in s2.over_budget) <= set(i for i, _ in sim.over_budget))
+                if ok:
+                    found_d[n.output] = k
+                    sim, base_in = s2, in2
+                    break
+                sh.delib_drops.pop(n.output, None)
+        hist = collections.Counter(found_d.values())
+        n_delib = sum(1 for n in g.nodes if n.is_deliberate_bts and n.output)
+        log.info(f"[plan] delib drop probe: {len(found_d)} of {n_delib} deliberate refreshes could drop "
+                 f"({dict(sorted(hist.items()))}): " + " ".join(f"{v}:{k}" for v, k in found_d.items()))
+        sh.delib_drops.clear()
     return drops, dict(skipped), placer._sim()
 
 
