@@ -172,17 +172,38 @@ impl DensePlan {
         Ok(DensePlan { setup: setup.clone(), chain: chain.clone(), variants, ps, deg })
     }
 
-    fn lt_bytes<W: DevWord>(&self, lay: &Layout, h: &LtHost) -> Result<usize> {
-        Ok(LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes(lay, &self.chain.primes(), &h.geom, h.top, h.end, self.setup.k_max)?)
+    /// Bytes of a stage's plaintexts and tables over `kp` special primes, with an identity key (`LtStage::new_with`).
+    pub(crate) fn lt_bytes_with<W: DevWord>(&self, lay: &Layout, h: &LtHost, kp: usize, ident: bool) -> Result<usize> {
+        Ok(LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes_with(lay, &self.chain.primes(), &h.geom, h.top, h.end, self.setup.k_max, kp, ident)?)
     }
 
-    /// The CtS baby steps whose keys get a resident `a` tail (`KeyTails`) from digit `lt_regen_digits` on.
+    /// The CtS baby steps whose keys get a resident `a` tail (`KeyTails`) from digit `lt_regen_digits` on (with
+    /// `merge_s2d`: of every stage but the first, whose keys are `tail_steps_s0`'s).
     pub fn tail_steps(&self) -> Vec<i64> {
         if !self.setup.lt_tails {
             return Vec::new();
         }
-        let st: Vec<(LtGeom, usize)> = self.variants.iter().flat_map(|v| v.cts.iter().map(|h| (h.geom, h.top))).collect();
+        let skip = self.setup.merge_s2d as usize;
+        let st: Vec<(LtGeom, usize)> = self.variants.iter().flat_map(|v| v.cts.iter().skip(skip).map(|h| (h.geom, h.top))).collect();
         tail_steps(&self.chain, &st, self.setup.lt_regen_digits, super::cts::TAIL_MIN_DIGITS_DENSE)
+    }
+
+    /// With `merge_s2d`: the first CtS stage's baby steps whose `SparseRot` keys get tails.
+    pub fn tail_steps_s0(&self) -> Vec<i64> {
+        if !self.setup.lt_tails || !self.setup.merge_s2d {
+            return Vec::new();
+        }
+        let st: Vec<(LtGeom, usize)> = self.variants.iter().filter_map(|v| v.cts.first().map(|h| (h.geom, h.top))).collect();
+        tail_steps(&self.chain, &st, self.setup.lt_regen_digits, super::cts::TAIL_MIN_DIGITS_DENSE)
+    }
+
+    /// The first CtS stages' baby steps (the `SparseRot` keys `merge_s2d` needs).
+    pub fn s0_steps(&self) -> Vec<i64> {
+        let nh = (self.chain.n / 2) as i64;
+        let mut v: Vec<i64> = self.variants.iter().filter_map(|v| v.cts.first()).flat_map(|h| (1..h.geom.b).map(move |i| ((i * h.geom.stride) as i64) % nh)).filter(|&r| r != 0).collect();
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// Device bytes of every table (MemPlan section "bts.dense") and the work shape.
@@ -190,12 +211,13 @@ impl DensePlan {
         let lay = Layout::from_chain(&self.chain);
         let mut b = Pow2::<W>::bytes(lay.rows()) + EncapsKeys::bytes() + KeyGroup::bytes(1, true);
         b += KeyTails::<W>::bytes(&lay, self.chain.dnum(), self.setup.lt_regen_digits, self.tail_steps().len());
+        b += KeyTails::<W>::bytes(&lay, self.chain.dnum(), self.setup.lt_regen_digits, self.tail_steps_s0().len());
         let mut em_slots = 0;
         let mut g_max = 1;
         for v in &self.variants {
             b += RaisePlan::<W>::table_bytes();
-            for h in v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter()) {
-                b += self.lt_bytes::<W>(&lay, h)?;
+            for (i, h) in v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter()).enumerate() {
+                b += self.lt_bytes_with::<W>(&lay, h, lay.kp, self.setup.merge_s2d && i == 0)?;
                 g_max = g_max.max(h.geom.g);
             }
             // EvalMod plans (complex + real share the program), exactly as `EvalModPlan::new` carves them
@@ -219,6 +241,9 @@ impl DensePlan {
         keys: &dyn BtsKeyRing,
         stage_ptrs: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>,
     ) -> Result<DenseRoute<'a, W, M>> {
+        if self.setup.merge_s2d || self.setup.stc_ps {
+            return Err(shape("dense route", "merge_s2d / stc_ps are StC-first (StcFirstPlan) and SparseB options"));
+        }
         let n = ctx.lay.n;
         let k_max = self.setup.k_max;
         let mut variants = Vec::new();

@@ -15,11 +15,11 @@ use super::evalmod::{EmMode, EvalModPlan};
 use super::finish::{pow2_exp, Pow2};
 use super::raise::{self, small_int_tab, EncapsKeys, RaisePlan};
 use super::stc_high::{StcHighPlan, StcHighSetup};
-use super::{common_meta, no_stage, BtsCx, BtsKeyRing, BtsPrecomp, BtsRoute, BtsSetup, BtsState, BtsWorkShape, MemReq, RouteKind, Staged, StcHigh};
+use super::{common_meta, no_stage, BtsCx, BtsKeyRing, BtsPrecomp, BtsRoute, BtsSetup, BtsState, BtsWorkShape, MemReq, PsRing, RouteKind, SparseRotRing, Staged, StcHigh};
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::ct::Ct;
 use crate::error::{shape, Error, Result};
-use crate::ks::{self, DotIo, DotRows, KeyGroup, KskSource, View};
+use crate::ks::{self, DotIo, DotRows, KeyGroup, KsPlans, KskSource, View};
 use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::bts_setup::{cts_stc_factors, stc_first_mode2_factor, C64};
@@ -220,12 +220,16 @@ fn stage_scale<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, sh: &Stag
 impl<'a, W: DevWord> StageCache<'a, W> {
     /// Device bytes of a cache of `slots` entries of `shape` over the sources `srcs`.
     pub fn bytes(lay: &Layout, primes: &[u64], shape: &[StageShape], srcs: &[LtGeom], slots: usize, k_max: usize) -> Result<usize> {
+        Self::bytes_kp(lay, primes, shape, srcs, slots, k_max, lay.kp)
+    }
+    /// `bytes` of stages switching over `kp` special primes (`new_kp`).
+    pub fn bytes_kp(lay: &Layout, primes: &[u64], shape: &[StageShape], srcs: &[LtGeom], slots: usize, k_max: usize, kp: usize) -> Result<usize> {
         let mut per = 0;
         let mut fixed = 0;
         for sh in shape {
             let g = srcs.get(sh.src).ok_or_else(|| shape_err(sh.src))?;
             let nrows = sh.top + 1 + lay.kp;
-            per += LtPts::<W>::bytes(g.npts, nrows, lay.n) + LtStage::<W>::plan_bytes(lay, primes, g, sh.top, sh.end, k_max)?;
+            per += LtPts::<W>::bytes(g.npts, nrows, lay.n) + LtStage::<W>::plan_bytes_with(lay, primes, g, sh.top, sh.end, k_max, kp, false)?;
             per += Arena::bytes_for::<u32>(TAB_WORDS);
             per += Arena::bytes_for::<u32>(g.npts * nrows) + Arena::bytes_for::<i32>(g.npts * nrows);
             fixed += Arena::bytes_for::<DevPrimeConst>(nrows);
@@ -248,6 +252,27 @@ impl<'a, W: DevWord> StageCache<'a, W> {
         stage_ptrs: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>,
         k_max: usize,
         lt_group: i32,
+    ) -> Result<Self> {
+        Self::new_kp(what, arena, dev, s, ctx, shape, srcs, slots, keys, stage_ptrs, k_max, lt_group, ctx.lay.kp)
+    }
+
+    /// `new` with stages switching over `kp` special primes (P': `keys.rot` gives `KskShape::stc_ps` keys; run them
+    /// with `KsPlans::new_ps`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_kp<M: DevStrategy<W>>(
+        what: &'static str,
+        arena: &'a Arena,
+        dev: &Device,
+        s: &Stream<Compute>,
+        ctx: &Context<'_, W, M>,
+        shape: Vec<StageShape>,
+        srcs: &[LtGeom],
+        slots: usize,
+        keys: &dyn BtsKeyRing,
+        stage_ptrs: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>,
+        k_max: usize,
+        lt_group: i32,
+        kp: usize,
     ) -> Result<Self> {
         let lay = ctx.lay;
         let n = lay.n;
@@ -272,7 +297,7 @@ impl<'a, W: DevWord> StageCache<'a, W> {
                 let rows = vec![vec![0u32; nrows * n]; g.npts];
                 let pts = LtPts::new(arena, s, ctx, sh.top, PtSource::Rows { rows, ptw: n, enc: 0xFFFF_FFFF })?;
                 let pt_nf = stage_scale(ctx, sh)?;
-                let mut st = LtStage::new(arena, s, ctx, *g, sh.top, sh.end, pt_nf, pts, keys, stage_ptrs, k_max)?;
+                let mut st = LtStage::new_with(arena, s, ctx, *g, sh.top, sh.end, pt_nf, pts, keys, stage_ptrs, k_max, kp, None)?;
                 st.group = lt_group;
                 stages.push(st);
                 tabs.push(arena.alloc::<Compute, u32>("bts.stc_first", TAB_WORDS)?);
@@ -555,22 +580,59 @@ impl StcFirstPlan {
         self.entry_top - self.input.len() * self.step
     }
 
+    /// Special primes of the input stages' key switches: P' with `BtsSetup::stc_ps` (a lean chain), else P.
+    pub fn input_kp(&self) -> usize {
+        let c = &self.dense.chain;
+        if self.dense.setup.stc_ps && c.lone_top().is_some() {
+            c.p_sparse
+        } else {
+            c.p.len()
+        }
+    }
+
+    /// The rotation steps of the input stages (fixed and the cached last one: babies, giants, offsets): the P' keys
+    /// `stc_ps` needs, at top `entry_top`.
+    pub fn input_steps(&self) -> Vec<i64> {
+        let nh = (self.dense.chain.n / 2) as i64;
+        let mut geoms: Vec<LtGeom> = self.input.iter().chain(&self.input_own).map(|h| h.geom).collect();
+        if let Some(shp) = self.last_shape() {
+            let g = self.src_geoms();
+            geoms.extend(shp.iter().filter_map(|s| g.get(s.src).copied()));
+        }
+        let mut v = Vec::new();
+        for g in geoms {
+            v.extend((1..g.b).map(|i| ((i * g.stride) as i64) % nh));
+            if g.g > 1 {
+                v.push(((g.b * g.stride) as i64) % nh);
+            }
+            v.push(g.offset.rem_euclid(nh));
+        }
+        v.retain(|&r| r != 0);
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// Device bytes (MemPlan sections "bts.dense" and "bts.stc_first") and the work shape.
     pub fn mem<W: DevWord>(&self) -> Result<(MemReq, BtsWorkShape)> {
         let (mut r, ws) = self.dense.mem::<W>()?;
         let lay = Layout::from_chain(&self.dense.chain);
         let primes = self.dense.chain.primes();
         let k_max = self.dense.setup.k_max;
+        let kp = self.input_kp();
         let mut b = 0;
         for h in self.input.iter().chain(&self.input_own) {
-            b += LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes(&lay, &primes, &h.geom, h.top, h.end, k_max)?;
+            b += LtPts::<W>::coeffs_bytes(h.coeffs.len(), h.top + 1 + lay.kp, h.width, lay.n) + LtStage::<W>::plan_bytes_with(&lay, &primes, &h.geom, h.top, h.end, k_max, kp, false)?;
+        }
+        if kp < lay.kp {
+            b += KsPlans::bytes_ps::<W>(&self.dense.chain, k_max, self.entry_top)?;
         }
         for s in self.sources.iter().flatten() {
             b += s.bytes::<W>(lay.n);
         }
         let geoms = self.src_geoms();
         if let Some(shp) = self.last_shape() {
-            b += StageCache::<W>::bytes(&lay, &primes, &shp, &geoms, self.sf.cache_slots, k_max)?;
+            b += StageCache::<W>::bytes_kp(&lay, &primes, &shp, &geoms, self.sf.cache_slots, k_max, kp)?;
         }
         if let Some(h) = &self.sf.high {
             b += StcHighPlan::<W>::bytes(&lay, &primes, h, &geoms, self.dense.setup.level_budget[1] as usize, self.dense.chain.level_unit, self.dense.chain.lone_top(), k_max)?;
@@ -602,6 +664,33 @@ impl StcFirstPlan {
             st.group = setup.lt_group;
             Ok(st)
         };
+        // merge_s2d: CtS stage 0 on the raised ciphertext under the sparse secret, its babies `SparseRot` keys with
+        // their own tails, its identity the sparse -> dense key
+        let sparse = SparseRotRing(keys);
+        let tails_s0 = KeyTails::new(arena, s, ctx, &sparse, &self.dense.tail_steps_s0(), setup.lt_regen_digits)?;
+        let ring_s0 = tails_s0.ring(&sparse, n)?;
+        let lt_s0 = |h: &LtHost| -> Result<LtStage<'a, W>> {
+            let pts = LtPts::new(arena, s, ctx, h.top, PtSource::Coeffs(&h.coeffs))?;
+            let mut st = LtStage::new_with(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, &ring_s0, stage_ptrs, k_max, ctx.lay.kp, Some(keys.sparse_to_dense()?))?;
+            st.group = setup.lt_group;
+            Ok(st)
+        };
+        let cts_of = |v: &super::dense::VariantHost| -> Result<Vec<LtStage<'a, W>>> {
+            v.cts.iter().enumerate().map(|(i, h)| if setup.merge_s2d && i == 0 { lt_s0(h) } else { lt(h) }).collect()
+        };
+        // stc_ps: the input stages (and the cached last one) over P', their own key-switch plans
+        let kp_in = self.input_kp();
+        let ps = PsRing(keys);
+        let ks_ps = if kp_in < ctx.lay.kp { Some(KsPlans::new_ps(arena, s, ctx, k_max, self.entry_top)?) } else { None };
+        let lt_in = |h: &LtHost| -> Result<LtStage<'a, W>> {
+            if kp_in == ctx.lay.kp {
+                return lt(h);
+            }
+            let pts = LtPts::new(arena, s, ctx, h.top, PtSource::Coeffs(&h.coeffs))?;
+            let mut st = LtStage::new_with(arena, s, ctx, h.geom, h.top, h.end, h.nf, pts, &ps, stage_ptrs, k_max, kp_in, None)?;
+            st.group = setup.lt_group;
+            Ok(st)
+        };
         let mut variants = Vec::new();
         for v in &self.dense.variants {
             let em_k = |mode| {
@@ -615,7 +704,7 @@ impl StcFirstPlan {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
                 raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, setup.cts0_t)?,
-                cts: v.cts.iter().map(lt).collect::<Result<_>>()?,
+                cts: cts_of(v)?,
                 stc: v.stc.iter().map(lt).collect::<Result<_>>()?,
                 stc_real0: v.stc_real0.as_ref().map(lt).transpose()?,
                 em: em_k(EmMode::Complex)?,
@@ -625,11 +714,12 @@ impl StcFirstPlan {
                 boot_k: setup.boot_k,
             });
         }
-        let input = self.input.iter().map(lt).collect::<Result<Vec<_>>>()?;
-        let input_own = self.input_own.iter().map(lt).collect::<Result<Vec<_>>>()?;
+        let input = self.input.iter().map(lt_in).collect::<Result<Vec<_>>>()?;
+        let input_own = self.input_own.iter().map(lt_in).collect::<Result<Vec<_>>>()?;
         let srcs: Vec<Option<RelevelSrc<'a, W>>> = self.sources.iter().map(|o| o.as_ref().map(|h| RelevelSrc::new(arena, s, ctx, h)).transpose()).collect::<Result<_>>()?;
         let geoms = self.src_geoms();
         let last = match self.last_shape() {
+            Some(shp) if kp_in < ctx.lay.kp => Some(StageCache::new_kp("stc_first last stage", arena, dev, s, ctx, shp, &geoms, self.sf.cache_slots, &ps, stage_ptrs, k_max, setup.lt_group, kp_in)?),
             Some(shp) => Some(StageCache::new("stc_first last stage", arena, dev, s, ctx, shp, &geoms, self.sf.cache_slots, keys, stage_ptrs, k_max, setup.lt_group)?),
             None => None,
         };
@@ -657,6 +747,7 @@ impl StcFirstPlan {
         route.input_own = input_own;
         route.step = self.step;
         route.thin = self.dense.chain.lone_top().is_some();
+        route.ks_ps = ks_ps;
         Ok(route)
     }
 }
@@ -691,6 +782,8 @@ pub struct StcFirstRoute<'a, W: DevWord, M: DevStrategy<W>> {
     pub last: Option<StageCache<'a, W>>,
     /// StC outside a bootstrap.
     pub high: Option<StcHighPlan<'a, W>>,
+    /// `BtsSetup::stc_ps`: the key-switch plans (P' at every level up to the entry) the input stages run with.
+    pub ks_ps: Option<KsPlans<'a>>,
     mem: (MemReq, BtsWorkShape),
     _m: PhantomData<M>,
 }
@@ -732,7 +825,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             [a, b, ..] => a.top - b.top,
             _ => entry_top.saturating_sub(input.first().map_or(entry_top, |s| s.top)).max(1),
         };
-        StcFirstRoute { setup, sf, variants, outs_shipped, encaps, conj, pow2, deg, entry_top, step, thin: false, input, input_own: Vec::new(), srcs, last, high: None, mem, _m: PhantomData }
+        StcFirstRoute { setup, sf, variants, outs_shipped, encaps, conj, pow2, deg, entry_top, step, thin: false, input, input_own: Vec::new(), srcs, last, high: None, ks_ps: None, mem, _m: PhantomData }
     }
 
     /// Entry level (primes dropped): the deepest EFFECTIVE input level that runs StC-first (pc-shadow
@@ -904,26 +997,32 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             }
             let factor = self.mode2_factor(ctx, st, cf_stage, nf_in, own_cf)?;
             let key = self.cache_key(st, cf_stage, nf_in, own_cf);
-            if self.thin() {
-                for s in self.fixed_stages(own_cf).0 {
-                    run_lt_thin(cx, s, s.pt_nf, cts, src, true)?;
-                }
-            } else {
-                for s in &self.input {
-                    run_lt(cx, s, cts, src)?;
-                }
-            }
-            let i = last.get(ctx, &cx.ex.compute, &self.srcs, key, factor)?;
-            last.with(i, |stages| {
-                for s in stages {
-                    if self.thin() {
-                        // the cache builds the plaintexts at factor x sf(top): the stage's scale; the prime stays pending
-                        run_lt_thin(cx, s, factor * ctx.scale.sf(s.top as i32)?, cts, src, false)?;
-                    } else {
+            self.with_ps(cx, |cx| {
+                if self.thin() {
+                    for s in self.fixed_stages(own_cf).0 {
+                        run_lt_thin(cx, s, s.pt_nf, cts, src, true)?;
+                    }
+                } else {
+                    for s in &self.input {
                         run_lt(cx, s, cts, src)?;
                     }
                 }
                 Ok(())
+            })?;
+            let i = last.get(ctx, &cx.ex.compute, &self.srcs, key, factor)?;
+            self.with_ps(cx, |cx| {
+                last.with(i, |stages| {
+                    for s in stages {
+                        if self.thin() {
+                            // the cache builds the plaintexts at factor x sf(top): the stage's scale; the prime stays
+                            // pending
+                            run_lt_thin(cx, s, factor * ctx.scale.sf(s.top as i32)?, cts, src, false)?;
+                        } else {
+                            run_lt(cx, s, cts, src)?;
+                        }
+                    }
+                    Ok(())
+                })
             })?;
             info.cf_stage = cf_stage;
             info.factor = factor;
@@ -933,11 +1032,25 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 return Err(shape("stc_first", format!("folded last stage left the ciphertext at level {} deg {}", x.meta.level, x.meta.deg)));
             }
         } else {
-            for s in &self.input {
-                run_lt(cx, s, cts, src)?;
-            }
+            self.with_ps(cx, |cx| {
+                for s in &self.input {
+                    run_lt(cx, s, cts, src)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(Some(info))
+    }
+
+    /// Run `f` with the input stages' key-switch plans (`ks_ps` when built, else the caller's).
+    fn with_ps<R>(&self, cx: &mut BtsCx<'_, 'a, W, M>, f: impl FnOnce(&mut BtsCx<'_, 'a, W, M>) -> Result<R>) -> Result<R> {
+        match &self.ks_ps {
+            Some(p) => {
+                let mut c2 = BtsCx { ctx: cx.ctx, ex: &mut *cx.ex, sh: cx.sh, ks: p, ops: &mut *cx.ops, work: &mut *cx.work };
+                f(&mut c2)
+            }
+            None => f(cx),
+        }
     }
 
     /// Warm the mode-2 last stage for a call (before a CUDA graph capture, or a PCMM's first use): the entry for the
@@ -1136,7 +1249,9 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for StcFirstRoute<'a, W
         let pre = &self.variants[st.variant];
         let prescaled = st.prescaled || (st.stc_first && st.stc_folded);
         let encaps = self.encaps.as_ref().ok_or_else(|| no_stage("stc_first", "mod_raise (built without encapsulation keys)"))?;
-        raise::raise(cx, &pre.raise, Some(encaps), self.setup.ks_source, cts, if prescaled { None } else { Some(st.correction) })?;
+        // merge_s2d: CtS stage 0 switches the raised ciphertexts out of the sparse secret
+        let stop = if self.setup.merge_s2d { raise::RaiseStop::Scaled } else { raise::RaiseStop::Done };
+        raise::raise_to(cx, &pre.raise, Some(encaps), self.setup.ks_source, cts, if prescaled { None } else { Some(st.correction) }, stop)?;
         st.shifted_flow = true;
         Ok(())
     }

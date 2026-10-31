@@ -470,13 +470,27 @@ pub fn raise<'a, W: DevWord, M: DevStrategy<W>>(
     cts: &mut [Ct<'a, W>],
     correction: Option<u32>,
 ) -> Result<()> {
+    raise_to(cx, plan, keys, source, cts, correction, RaiseStop::Done)
+}
+
+/// `raise` up to `stop`: `Scaled` leaves the raised ciphertexts under the sparse secret (the caller's first hoisted
+/// rotations switch them, `BtsSetup::merge_s2d`).
+pub fn raise_to<'a, W: DevWord, M: DevStrategy<W>>(
+    cx: &mut BtsCx<'_, 'a, W, M>,
+    plan: &RaisePlan<'_, W>,
+    keys: Option<&EncapsKeys<'_>>,
+    source: KskSource,
+    cts: &mut [Ct<'a, W>],
+    correction: Option<u32>,
+    stop: RaiseStop,
+) -> Result<()> {
     for x in cts.iter_mut() {
         to_bottom(cx, plan, x, correction)?;
         if let Some(kk) = keys {
             let k = x.k();
             key_switch_inplace(cx, &kk.dense_to_sparse, source, &mut x.buf, k, plan.d - 1)?;
         }
-        raise_from_bottom(cx, plan, keys, source, x, RaiseStop::Done)?;
+        raise_from_bottom(cx, plan, keys, source, x, stop)?;
     }
     Ok(())
 }

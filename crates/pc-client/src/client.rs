@@ -265,7 +265,7 @@ impl Client {
         }
         drop(small);
         let tks = Instant::now();
-        let needs_sparse = spec.keys.iter().any(|k| matches!(k.role, Role::EncDenseToSparse | Role::EncSparseToDense));
+        let needs_sparse = spec.keys.iter().any(|k| matches!(k.role, Role::EncDenseToSparse | Role::EncSparseToDense | Role::SparseRot { .. }));
         let s_sparse = if needs_sparse { Some(self.dense_rows(&self.secret.sk.s_sparse)) } else { None };
         let s_all: Vec<Option<Vec<u32>>> = self.s_eval.iter().cloned().map(Some).collect();
         for (k, (seed, ek)) in spec.keys.iter().zip(&seeds) {
@@ -290,6 +290,11 @@ impl Client {
                 Role::EncSparseToDense => {
                     let sp = s_sparse.as_ref().ok_or_else(|| Error::Spec("sparse secret rows".into()))?;
                     self.ksk_packed(&k.shape, &s_all, sp, false, seed, *ek, bits, row_words)
+                }
+                Role::SparseRot { galois, .. } => {
+                    let sp = s_sparse.as_ref().ok_or_else(|| Error::Spec("sparse secret rows".into()))?;
+                    let s_new = Self::gathered(&self.s_eval, galois::galois_inverse(galois, n)?, &ids, n)?;
+                    self.ksk_packed(&k.shape, &s_new, sp, false, seed, *ek, bits, row_words)
                 }
                 Role::SpruAtob => {
                     let block = self.spru_block.as_ref().ok_or_else(|| Error::Spec("SpruAtob key without a spru request".into()))?;
@@ -434,6 +439,7 @@ impl Client {
             }
             Role::EncDenseToSparse => (self.dense_rows(&self.secret.sk.s_sparse).into_iter().map(Some).collect(), self.s_eval.clone(), false),
             Role::EncSparseToDense => (s_all, self.dense_rows(&self.secret.sk.s_sparse), false),
+            Role::SparseRot { galois, .. } => (Self::gathered(&self.s_eval, galois::galois_inverse(galois, n)?, &ids, n)?, self.dense_rows(&self.secret.sk.s_sparse), false),
             Role::SpruAtob => {
                 let b = self.spru_block.as_ref().ok_or_else(|| Error::Spec("no SPRU block key in this client".into()))?;
                 (self.rows_of(b, &ids), self.s_eval.clone(), false)
@@ -624,7 +630,14 @@ mod tests {
             KeyReq { role: Role::EncSparseToDense, shape: full },
             KeyReq { role: Role::SpruAtob, shape: KeyShape::bottom(&chain).unwrap() },
             KeyReq { role: Role::Auto { galois: 2 * chain.n as u64 - 5 }, shape: full },
+            KeyReq { role: Role::SparseRot { step: 2048, galois: galois::rotation_galois(2048, chain.n).unwrap() }, shape: full },
         ];
+        let mut keys = keys;
+        if chain.p_sparse < chain.p.len() {
+            // a lean chain's StC-first input stages: a rotation key over P' at the single primes
+            keys.push(KeyReq { role: Role::rot(1, chain.n).unwrap(), shape: KeyShape::stc_ps(&chain, chain.level_unit + 2).unwrap() });
+        }
+        let nkeys = keys.len();
         let spec = KeySpec {
             chain: name.into(),
             params_hash: c.params_hash.clone(),
@@ -640,6 +653,10 @@ mod tests {
             let mut wide = spec.clone();
             wide.keys[4].shape = KeyShape::banded(&chain, 1).unwrap();
             assert!(wide.check(&chain).is_err());
+            // P' above the bottom only for rotation keys
+            let mut ps_relin = spec.clone();
+            ps_relin.keys[0].shape = KeyShape::stc_ps(&chain, chain.level_unit + 2).unwrap();
+            assert!(ps_relin.check(&chain).is_err());
         }
         let dir = std::env::temp_dir().join(format!("pc_client_test_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -647,7 +664,7 @@ mod tests {
         let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
         let mut g = Prng::from_seed([9; 8], 0);
         let st = c.keygen(&spec, f, &mut g, 8).unwrap();
-        assert_eq!(st.keys, 8);
+        assert_eq!(st.keys, nkeys);
         let mut r = wire::BundleReader::open(&path).unwrap();
         assert_eq!(r.bytes(), st.bytes);
         let (bits, rw) = (r.header.bits, r.header.row_words);

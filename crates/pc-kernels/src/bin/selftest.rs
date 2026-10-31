@@ -1298,6 +1298,7 @@ fn t_cts(st: &mut Setup) -> Vec<TestResult> {
         nrows: g.rows.len() as i32,
         kmax,
         pair_cts: 0,
+        x0: std::ptr::null(),
     };
     ck(unsafe { (st.t.cts_fused)(&a, st.s()) });
     let got = res.read(&st.ctx);
@@ -1628,6 +1629,7 @@ fn keytab(st: &mut Setup, g: &KsGeo, all: bool) -> Vec<TestResult> {
                 nrows,
                 kmax,
                 pair_cts: 0,
+                x0: std::ptr::null(),
             };
             ck(unsafe { (st.t.cts_fused)(&a, st.s()) });
             let want = res.read(&st.ctx);
@@ -1699,6 +1701,7 @@ fn keytab(st: &mut Setup, g: &KsGeo, all: bool) -> Vec<TestResult> {
             nrows: 6,
             kmax: 1,
             pair_cts: 0,
+            x0: std::ptr::null(),
         };
         // cached reference: giant steps 0, 1 at region 0, giant steps 2, 3 at region `pair`
         ck(unsafe { (st.t.cts_fused)(&base, st.s()) });

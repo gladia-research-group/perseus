@@ -282,8 +282,12 @@ struct CtsArgs {
     // > 0: giant steps j = 2l, 2l+1 of a launch sit at res + l * pair_cts cts (the LtStage result layout), so one
     // K=1 launch carries up to 4 giant steps and regenerates the baby keys once; 0: all at res + (c G + j) cts (G <= 2)
     int32_t pair_cts;
+    // ABI 20: non-null: baby 0 is x0 as stored (extended: Q rows 0..=top and the special rows, ct c at
+    // x0 + c*ct_stride), a key-switched identity (the sparse -> dense switch of a raise folded into its CtS stage 0);
+    // null: baby 0 = (P c0, P c1) of x
+    const void* x0;
 };
-static_assert(sizeof(CtsArgs) == 192, "CtsArgs layout");
+static_assert(sizeof(CtsArgs) == 200, "CtsArgs layout");
 
 // ------------------------------------------------------------------------------------------------ EvalMod kernels
 // Q rows [0, n) of K ciphertexts (row index == prime id), PolyRef layout.
@@ -630,7 +634,7 @@ struct CtsRegenArgs {
     CtsArgs cts;
     KeyTab key;
 };
-static_assert(sizeof(CtsRegenArgs) == 232, "CtsRegenArgs layout");
+static_assert(sizeof(CtsRegenArgs) == 240, "CtsRegenArgs layout");
 
 // ks_dot (K <= 4 ciphertexts x R keys, automorphism, c0 modes) with the keys read through KeyTab (`ks.kb` unused;
 // `ks.ka` / `ks.key_digit_stride` only for digits >= key.nregen); at K = 1 (u32) on warp-sized row segments, 8 slots

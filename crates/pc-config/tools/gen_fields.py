@@ -68,6 +68,11 @@ EXTRA = [
      "`BtsSetup::lt_tails`; default on, off = those stages regenerate every digit).", "PC_LT_TAILS"),
     ("bts", "pair", "Flag", "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh "
      "(pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own).", "PC_BTS_PAIR"),
+    ("bts", "merge_s2d", "Flag", "The raise's sparse -> dense switch folded into the first hoisted rotations after it: "
+     "StC-first's CtS stage 0 and SparseB's first fold round switch out of the sparse secret with `SparseRot` keys (pc-gpu "
+     "`BtsSetup::merge_s2d`; default off).", "PC_BTS_MERGE_S2D"),
+    ("bts", "stc_ps", "Flag", "A lean chain's StC-first input stages switch over P' (n32's 9 special primes; pc-gpu "
+     "`BtsSetup::stc_ps`, `KskShape::stc_ps` rotation keys; default off).", "PC_BTS_STC_PS"),
     ("exec", "use_graphs", "Flag", "Replay a bound block program's static segments as captured CUDA graphs after its "
      "first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."),
     ("exec", "trace_alloc", "Flag", "Report device free memory and arena use around every planned token (the "

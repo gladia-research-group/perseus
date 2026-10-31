@@ -64,8 +64,12 @@ impl<'a, W: DevWord> SparseBRoute<'a, W> {
 
     fn acc<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, 'a, W, M>, rounds: &AccRounds<'_>, x: &mut Ct<'a, W>) -> Result<()> {
         let kc = KsCfg { plans: cx.ks, source: self.ks_source };
-        for (steps, g) in &rounds.rounds {
-            acc_round(cx.ctx, cx.ex, kc, cx.sh, g, x, steps)?;
+        for (i, (steps, g)) in rounds.rounds.iter().enumerate() {
+            if i == 0 && rounds.merged {
+                acc_round_sparse(cx.ctx, cx.ex, kc, cx.sh, g, x, steps)?;
+            } else {
+                acc_round(cx.ctx, cx.ex, kc, cx.sh, g, x, steps)?;
+            }
         }
         Ok(())
     }
@@ -135,7 +139,9 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for SparseBRoute<'a, W>
     }
     fn mod_raise(&self, cx: &mut BtsCx<'_, 'a, W, M>, st: &mut BtsState, cts: &mut [Ct<'a, W>]) -> Result<()> {
         let pre = &self.variants[st.variant];
-        raise::raise(cx, &pre.raise, Some(&self.encaps), self.ks_source, cts, if st.prescaled { None } else { Some(st.correction) })?;
+        // merge_s2d: the fold's first round switches the raised ciphertexts out of the sparse secret
+        let stop = if pre.cfg.merge_s2d { raise::RaiseStop::Scaled } else { raise::RaiseStop::Done };
+        raise::raise_to(cx, &pre.raise, Some(&self.encaps), self.ks_source, cts, if st.prescaled { None } else { Some(st.correction) }, stop)?;
         st.shifted_flow = true;
         Ok(())
     }
@@ -390,6 +396,38 @@ pub fn acc_round<W: DevWord, M: DevStrategy<W>>(
     ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, g, 0, m, k, top, DotRows::All, io, in_place)?;
     let n = if sum { 1 } else { m };
     ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, n, k, &mut ex.ks.conv, View::of(&x.buf, 0), ks::MdOut::Add, k, top)?;
+    x.meta = sh.rotate_sum(&x.meta, steps).out;
+    Ok(())
+}
+
+/// `acc_round` on a raised ciphertext under the sparse secret: `x = s2d(x) + sum_j rot(x, steps[j])` switched to the
+/// dense secret, `g` = [sparse -> dense, SparseRot(steps[j])..] (`AccRounds::new_merged`): one ModUp, the m + 1 dots,
+/// one ModDown summing them (no add of x: its value is the identity term).
+pub fn acc_round_sparse<W: DevWord, M: DevStrategy<W>>(
+    ctx: &crate::Context<'_, W, M>,
+    ex: &mut crate::Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    g: &crate::ks::KeyGroup<'_>,
+    x: &mut Ct<'_, W>,
+    steps: &[i64],
+) -> Result<()> {
+    use crate::ks::{self, DotIo, DotRows};
+    let (k, m) = (x.k(), steps.len() + 1);
+    let in_place = g.reads_in_place(kc.source);
+    let staged = !in_place && (kc.source != KskSource::Cached || g.needs_stage() || !g.has_a());
+    if staged || k * m > ex.ks.ext.k || g.len() != m {
+        return Err(shape("acc_round_sparse", format!("{m} keys of {k} cts: the group must be read in place and fit the extended workspace ({} cts)", ex.ks.ext.k)));
+    }
+    let lay = ctx.lay;
+    let top = x.top(ctx.shape)?;
+    let cw = lay.ct_words() as u64;
+    ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
+    let va = View::of(&x.buf, 0);
+    let ext0 = View::of(&ex.ks.ext, 0);
+    let io = DotIo { c1: va.part::<W>(1).base, c0: va.base, ct_stride: va.ct_stride, out: ext0.base, part_stride: lay.poly_words() as u64, out_ct_stride: cw, out_rot_stride: k as u64 * cw, c0_mode: 1 };
+    ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, g, 0, m, k, top, DotRows::All, io, in_place)?;
+    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, m, k, &mut ex.ks.conv, View::of(&x.buf, 0), ks::MdOut::Set, k, top)?;
     x.meta = sh.rotate_sum(&x.meta, steps).out;
     Ok(())
 }

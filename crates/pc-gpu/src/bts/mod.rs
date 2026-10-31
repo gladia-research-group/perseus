@@ -141,6 +141,11 @@ pub struct BtsSetup {
     /// EvalMod: a Regen relinearization and the rescale after it as one exact conversion (`EvalModPlan::fuse_rescale`,
     /// config `bts.em_fuse_rescale`); off: relinearize, then rescale.
     pub em_fuse_rescale: bool,
+    /// The raise's sparse -> dense switch folded into the first hoisted rotations after it (StC-first's CtS stage 0:
+    /// its identity baby is the switch, its babies `SparseRot` keys): one ModUp and one ModDown fewer per refresh.
+    pub merge_s2d: bool,
+    /// A lean chain's StC-first input stages switch over P' (`KsPlans::new_ps`, `KskShape::stc_ps` keys).
+    pub stc_ps: bool,
 }
 
 impl BtsSetup {
@@ -167,6 +172,8 @@ impl BtsSetup {
             lt_regen_digits: cts::LT_REGEN_DIGITS,
             lt_tails: true,
             em_fuse_rescale: false,
+            merge_s2d: false,
+            stc_ps: false,
         }
     }
 
@@ -196,6 +203,56 @@ pub trait BtsKeyRing {
     fn relin_level(&self, _top: usize) -> Option<(&crate::keys::LevelRelinSpec, &dyn KsKeyRef)> {
         None
     }
+    /// Rotation by `step` over P' (`KskShape::stc_ps`: the StC-first input stages on a lean chain).
+    fn rot_ps(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        Err(crate::error::Error::Mem { knob: "ExtraKeySpec::rots_ps", value: step.unsigned_abs() as usize, msg: "this key ring holds no P' rotation keys".into() })
+    }
+    /// Sparse -> dense fused with a rotation by `step` (`KeyRole::SparseRot`).
+    fn sparse_rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        Err(crate::error::Error::Mem { knob: "ExtraKeySpec::sparse_rots", value: step.unsigned_abs() as usize, msg: "this key ring holds no sparse -> dense rotation keys".into() })
+    }
+}
+
+/// A key ring whose rotations are another ring's P' rotations (`BtsKeyRing::rot_ps`).
+pub struct PsRing<'r>(pub &'r dyn BtsKeyRing);
+
+impl BtsKeyRing for PsRing<'_> {
+    fn rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        self.0.rot_ps(step)
+    }
+    fn conj(&self) -> Result<&dyn KsKeyRef> {
+        self.0.conj()
+    }
+    fn relin(&self) -> Result<&dyn KsKeyRef> {
+        self.0.relin()
+    }
+    fn dense_to_sparse(&self) -> Result<&dyn KsKeyRef> {
+        self.0.dense_to_sparse()
+    }
+    fn sparse_to_dense(&self) -> Result<&dyn KsKeyRef> {
+        self.0.sparse_to_dense()
+    }
+}
+
+/// A key ring whose rotations are another ring's sparse -> dense rotations (`BtsKeyRing::sparse_rot`).
+pub struct SparseRotRing<'r>(pub &'r dyn BtsKeyRing);
+
+impl BtsKeyRing for SparseRotRing<'_> {
+    fn rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        self.0.sparse_rot(step)
+    }
+    fn conj(&self) -> Result<&dyn KsKeyRef> {
+        self.0.conj()
+    }
+    fn relin(&self) -> Result<&dyn KsKeyRef> {
+        self.0.relin()
+    }
+    fn dense_to_sparse(&self) -> Result<&dyn KsKeyRef> {
+        self.0.dense_to_sparse()
+    }
+    fn sparse_to_dense(&self) -> Result<&dyn KsKeyRef> {
+        self.0.sparse_to_dense()
+    }
 }
 
 impl<W: DevWord> BtsKeyRing for crate::keys::KeySet<'_, W> {
@@ -216,6 +273,12 @@ impl<W: DevWord> BtsKeyRing for crate::keys::KeySet<'_, W> {
     }
     fn relin_level(&self, top: usize) -> Option<(&crate::keys::LevelRelinSpec, &dyn KsKeyRef)> {
         self.relin_levels.get(&top).map(|(s, k)| (s, k as &dyn KsKeyRef))
+    }
+    fn rot_ps(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        Ok(crate::keys::KeySet::rot_ps(self, step)?)
+    }
+    fn sparse_rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        Ok(crate::keys::KeySet::sparse_rot(self, step)?)
     }
 }
 

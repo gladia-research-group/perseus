@@ -155,7 +155,7 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
         if ex.ks.digits.len() < nr * n {
             return Err(shape("KeyGen::generate", format!("ks_work holds {} words, the key's errors need {}", ex.ks.digits.len(), nr * n)));
         }
-        if matches!(key.role, KeyRole::EncDenseToSparse | KeyRole::EncSparseToDense) && !secret.has_sparse {
+        if matches!(key.role, KeyRole::EncDenseToSparse | KeyRole::EncSparseToDense | KeyRole::SparseRot { .. }) && !secret.has_sparse {
             return Err(shape("KeyGen::generate", "encapsulation key requested but the device secret has no sparse part"));
         }
         let t0 = std::time::Instant::now();
@@ -194,7 +194,7 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             KeyRole::Relin => (part(0), part(0), 1),
             KeyRole::EncDenseToSparse => (part(1), part(0), 0),
             KeyRole::EncSparseToDense => (part(0), part(1), 0),
-            KeyRole::Rot { .. } | KeyRole::Conj => {
+            KeyRole::Rot { .. } | KeyRole::Conj | KeyRole::SparseRot { .. } => {
                 let g = key.role.galois(n).ok_or_else(|| shape("KeyGen::generate", "rotation without a Galois element"))?;
                 let ginv = galois::galois_inverse(g, n)?;
                 let a = AutomorphArgs {
@@ -210,7 +210,8 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
                 };
                 // SAFETY: perm and the secret are distinct context-layout buffers; rows of rs exist in both
                 launch_result("automorph", unsafe { (ctx.table.automorph)(&a, s.raw()) })?;
-                (self.perm.buf.vptr(), part(0), 0)
+                // SparseRot: from the sparse secret (part 1) to sigma_{g^-1}(s)
+                (self.perm.buf.vptr(), if matches!(key.role, KeyRole::SparseRot { .. }) { part(1) } else { part(0) }, 0)
             }
         };
         let (b, a, bits, row_words) = match &mut key.store {

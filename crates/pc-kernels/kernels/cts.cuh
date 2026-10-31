@@ -21,7 +21,7 @@ constexpr int BX = 128;
 template <class W>
 constexpr int DMAX = sizeof(W) == 4 ? 6 : 8;
 
-template <class W, class MM, int KMAX, int GMAX, bool REGEN>
+template <class W, class MM, int KMAX, int GMAX, bool REGEN, bool X0 = false>
 __global__ void __launch_bounds__(BX) cts_fused(CtsRegenArgs R) {
     using Wd = WideOf<W>;
     const CtsArgs& A = R.cts;
@@ -53,7 +53,15 @@ __global__ void __launch_bounds__(BX) cts_fused(CtsRegenArgs R) {
         if (i == 0) {
 #pragma unroll
             for (int c = 0; c < KMAX; ++c) {
-                if (c < Kg && isq) {
+                if constexpr (X0) {  // a key-switched identity, extended (every row as stored)
+                    if (c < Kg) {
+                        const W* xc = (const W*)A.x0 + (c0 + c) * A.ct_stride + rowoff;
+                        v0[c] = xc[o];
+                        v1[c] = xc[A.part_stride + o];
+                    } else {
+                        v0[c] = v1[c] = 0;
+                    }
+                } else if (c < Kg && isq) {
                     const W* xc = X + c * A.ct_stride + rowoff;
                     v0[c] = mul_shoup<W>(xc[o], pm, pms, p);
                     v1[c] = mul_shoup<W>(xc[A.part_stride + o], pm, pms, p);
@@ -227,7 +235,7 @@ constexpr int rq_blocks() {
     return KMAX == 1 && GMAX == 4 ? 7 : 0;
 }
 
-template <class MM, int KMAX, int GMAX>
+template <class MM, int KMAX, int GMAX, bool X0 = false>
 __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsRegenArgs R) {
     using W = uint32_t;
     using Wd = WideOf<W>;
@@ -305,7 +313,15 @@ __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsR
         if (i == 0) {
 #pragma unroll
             for (int c = 0; c < KMAX; ++c) {
-                if (c < Kg && isq) {
+                if constexpr (X0) {  // a key-switched identity, extended (every row as stored)
+                    if (c < Kg) {
+                        const W* xc = (const W*)A.x0 + (c0 + c) * A.ct_stride + rowoff;
+                        v0[c] = xc[o];
+                        v1[c] = xc[A.part_stride + o];
+                    } else {
+                        v0[c] = v1[c] = 0;
+                    }
+                } else if (c < Kg && isq) {
                     const W* xc = X + c * A.ct_stride + rowoff;
                     v0[c] = mul_shoup<W>(xc[o], pm, pms, p);
                     v1[c] = mul_shoup<W>(xc[A.part_stride + o], pm, pms, p);
@@ -472,11 +488,20 @@ int launch_any(const CtsRegenArgs* a, cudaStream_t s) {
     dim3 grid((N / BX) * b.cts.ngrp, a->cts.nrows);
     if constexpr (REGEN && sizeof(W) == 4) {
         if (a->cts.B > 64) return -1;  // queue entries hold the baby index in 6 bits
-        if (g4) cts_fused_rq<MM, 1, 4><<<grid, BX, 0, s>>>(b);
+        if (a->cts.x0) {  // ABI 19: a sparse-input stage (one giant step)
+            if (g4) return -1;
+            if (km == 1) cts_fused_rq<MM, 1, 2, true><<<grid, BX, 0, s>>>(b);
+            else if (km == 2) cts_fused_rq<MM, 2, 2, true><<<grid, BX, 0, s>>>(b);
+            else if (km == 4) cts_fused_rq<MM, 4, 2, true><<<grid, BX, 0, s>>>(b);
+            else cts_fused_rq<MM, 8, 2, true><<<grid, BX, 0, s>>>(b);
+        } else if (g4) cts_fused_rq<MM, 1, 4><<<grid, BX, 0, s>>>(b);
         else if (km == 1) cts_fused_rq<MM, 1, 2><<<grid, BX, 0, s>>>(b);
         else if (km == 2) cts_fused_rq<MM, 2, 2><<<grid, BX, 0, s>>>(b);
         else if (km == 4) cts_fused_rq<MM, 4, 2><<<grid, BX, 0, s>>>(b);
         else cts_fused_rq<MM, 8, 2><<<grid, BX, 0, s>>>(b);
+    } else if (a->cts.x0) {
+        if (km != 1) return -1;  // sparse-input stages run one ciphertext per group off the u32 regen path
+        cts_fused<W, MM, 1, 2, REGEN, true><<<grid, BX, 0, s>>>(b);
     } else {
         if (km == 1) cts_fused<W, MM, 1, 2, REGEN><<<grid, BX, 0, s>>>(b);
         else if (km == 2) cts_fused<W, MM, 2, 2, REGEN><<<grid, BX, 0, s>>>(b);

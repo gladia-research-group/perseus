@@ -37,6 +37,15 @@ impl KeyShape {
     pub fn bottom(chain: &Chain) -> Result<Self> {
         Ok(KeyShape { kp: chain.p_sparse, ..Self::banded(chain, chain.level_unit - 1)? })
     }
+    /// Q rows `0..=q_top` (one digit) over P' (`Chain::p_sparse`): a lean chain's StC-first input stages' rotation
+    /// keys, under the dense secret at q_0 .. q_{q_top} x P' (a few hundred bits).
+    pub fn stc_ps(chain: &Chain, q_top: usize) -> Result<Self> {
+        let sh = KeyShape { kp: chain.p_sparse, ..Self::banded(chain, q_top)? };
+        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() {
+            return Err(Error::Spec(format!("P' shape at top {q_top}: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
+        }
+        Ok(sh)
+    }
     pub fn rows(&self) -> usize {
         self.q_top + 1 + self.kp
     }
@@ -46,7 +55,13 @@ impl KeyShape {
     /// Is this a shape the chain can have (full, banded or bottom with the matching digit count)?
     pub fn check(&self, chain: &Chain) -> Result<()> {
         let bottom = Self::bottom(chain)?;
-        let want = if self.q_top == bottom.q_top && self.kp == bottom.kp { bottom } else { Self::banded(chain, self.q_top)? };
+        let want = if self.q_top == bottom.q_top && self.kp == bottom.kp {
+            bottom
+        } else if self.kp == chain.p_sparse && self.kp < chain.p.len() {
+            Self::stc_ps(chain, self.q_top)?
+        } else {
+            Self::banded(chain, self.q_top)?
+        };
         if *self != want {
             return Err(Error::Spec(format!("shape {self:?} does not match the chain's band at q_top {} ({want:?})", self.q_top)));
         }
@@ -71,6 +86,10 @@ pub enum Role {
     /// A level relinearization key for ciphertexts at limb top `top` (`Chain::level_relin_layout`): the relin
     /// relation with the level's digits and P' = (Q primes idle above `top`) x P for P; modulus Q P.
     RelinLevel { top: usize },
+    /// Sparse -> dense fused with a left rotation by `step` (s_old = s_sparse, s_new = sigma_{g^-1}(s), g = 5^step):
+    /// the first hoisted rotations after a bootstrap's raise switch out of the sparse secret themselves. Under the
+    /// dense secret (an RLWE sample at the key's modulus <= Q P, as every rotation key).
+    SparseRot { step: i64, galois: u64 },
 }
 
 impl Role {
@@ -80,7 +99,7 @@ impl Role {
     /// The automorphism of an automorphism key (None for relin and the secret switches).
     pub fn galois(&self, n: usize) -> Option<u64> {
         match self {
-            Role::Rot { galois, .. } | Role::Auto { galois } => Some(*galois),
+            Role::Rot { galois, .. } | Role::Auto { galois } | Role::SparseRot { galois, .. } => Some(*galois),
             Role::Conj => Some(2 * n as u64 - 1),
             _ => None,
         }
@@ -161,7 +180,9 @@ impl KeySpec {
                 }
                 _ => k.shape.check(chain)?,
             }
-            let id = serde_json::to_string(&k.role)?;
+            // a rotation over P' (`stc_ps`) is another key than the same rotation over P
+            let ps = k.shape.kp < chain.p.len() && k.shape.q_top >= chain.level_unit;
+            let id = format!("{}{}", serde_json::to_string(&k.role)?, if ps { " over P'" } else { "" });
             if !seen.insert(id.clone()) {
                 return Err(Error::Spec(format!("key {id} requested twice")));
             }
@@ -169,7 +190,11 @@ impl KeySpec {
             if matches!(k.role, Role::EncDenseToSparse | Role::SpruAtob) && k.shape != KeyShape::bottom(chain)? {
                 return Err(Error::Spec(format!("{id}: a key to a sparse secret must have the bottom shape {:?}, not {:?}", KeyShape::bottom(chain)?, k.shape)));
             }
-            if let Role::Rot { step, galois } = k.role {
+            // P' (below the bottom: `stc_ps`) only for rotation keys
+            if k.shape.kp < chain.p.len() && k.shape.q_top >= chain.level_unit && !matches!(k.role, Role::Rot { .. }) {
+                return Err(Error::Spec(format!("{id}: only rotation keys may use the P' shape above the bottom")));
+            }
+            if let Role::Rot { step, galois } | Role::SparseRot { step, galois } = k.role {
                 if galois::rotation_galois(step, chain.n)? != galois {
                     return Err(Error::Spec(format!("rotation {step}: Galois element {galois} is not 5^{step} mod 2N")));
                 }

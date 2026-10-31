@@ -169,6 +169,12 @@ pub struct LtStage<'a, W: DevWord> {
     digit_of: ConstBuf<'a, i32>,
     giant: Option<KeyGroup<'a>>,
     offset_key: Option<KeyGroup<'a>>,
+    /// Special primes of the stage's key switches: `lay.kp`, or P' (`Chain::p_sparse`) for a stage run with
+    /// `KsPlans::new_ps` and `KskShape::stc_ps` keys.
+    pub kp: usize,
+    /// The input is under the sparse secret (fresh from a raise): baby 0 is its switch to the dense secret by this key
+    /// (sparse -> dense, inner product in the extended basis, no ModDown) and the baby keys are `SparseRot` keys.
+    ident: Option<KeyGroup<'a>>,
     /// ModDown of c1 of res_j (j = 1..g-1, and j = 0 when there is an offset rotation): per j
     md_c1: Vec<Option<MdPlan<'a>>>,
     /// stage end on res_0 (FusedRescale / ModDown without offset) or on lt_rot (offset)
@@ -475,6 +481,12 @@ impl BtsKeyRing for TailRing<'_> {
     fn sparse_to_dense(&self) -> Result<&dyn KsKeyRef> {
         self.inner.sparse_to_dense()
     }
+    fn rot_ps(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        self.inner.rot_ps(step)
+    }
+    fn sparse_rot(&self, step: i64) -> Result<&dyn KsKeyRef> {
+        self.inner.sparse_rot(step)
+    }
 }
 
 /// Fewest digits of a stage whose baby keys get tails: the dense routes' CtS from 4 (n32a4's top stages: 2 of their 4
@@ -557,8 +569,13 @@ impl<'a, W: DevWord> KeyTails<'a, W> {
 impl<'a, W: DevWord> LtStage<'a, W> {
     /// Device bytes of a stage's tables besides its plaintexts (plans for k_max cts).
     pub fn plan_bytes(lay: &Layout, primes: &[u64], geom: &LtGeom, top: usize, end: LtEnd, k_max: usize) -> Result<usize> {
-        let kp = lay.kp;
-        let mut b = 2 * Arena::bytes_for::<u64>(geom.b.max(2)) + Arena::bytes_for::<u32>(geom.b.max(2)) + KeyTabs::bytes(geom.b.max(2));
+        Self::plan_bytes_with(lay, primes, geom, top, end, k_max, lay.kp, false)
+    }
+    /// `plan_bytes` of a stage over `kp` special primes, with an identity key (`new_with`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_bytes_with(lay: &Layout, primes: &[u64], geom: &LtGeom, top: usize, end: LtEnd, k_max: usize, kp: usize, ident: bool) -> Result<usize> {
+        let mut b = ident as usize * KeyGroup::bytes(1, true);
+        b += 2 * Arena::bytes_for::<u64>(geom.b.max(2)) + Arena::bytes_for::<u32>(geom.b.max(2)) + KeyTabs::bytes(geom.b.max(2));
         b += Arena::bytes_for::<u32>(top + 1 + kp) + Arena::bytes_for::<i32>(lay.rows());
         // giant key only when the giant step is not the identity (b stride = N/2: CtS stage 0), offset key only when
         // there is an offset; one ModDown plan per non-identity giant step and one for the offset (as `new` builds)
@@ -593,11 +610,39 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         stage_ptrs: Option<(*const c_void, *const c_void)>,
         k_max: usize,
     ) -> Result<Self> {
+        Self::new_with(arena, s, ctx, geom, top, end, pt_nf, pts, keys, stage_ptrs, k_max, ctx.lay.kp, None)
+    }
+
+    /// `new` over `kp` special primes (P' = `Chain::p_sparse`: run with `KsPlans::new_ps`, keys of `KskShape::stc_ps`
+    /// from `keys.rot`), and with `ident` = Some(sparse -> dense key): a stage on a raised ciphertext still under the
+    /// sparse secret (`keys.rot` then gives `SparseRot` keys).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with<M: DevStrategy<W>>(
+        arena: &'a Arena,
+        s: &Stream<Compute>,
+        ctx: &Context<'_, W, M>,
+        geom: LtGeom,
+        top: usize,
+        end: LtEnd,
+        pt_nf: f64,
+        pts: LtPts<'a, W>,
+        keys: &dyn BtsKeyRing,
+        stage_ptrs: Option<(*const c_void, *const c_void)>,
+        k_max: usize,
+        kp: usize,
+        ident: Option<&dyn KsKeyRef>,
+    ) -> Result<Self> {
         let lay = ctx.lay;
         let n = lay.n;
         let nh = (n / 2) as i64;
         let primes = ctx.chain.primes();
         let d = ctx.chain.level_unit;
+        if kp == 0 || kp > lay.kp || (kp < lay.kp && kp != ctx.chain.p_sparse) {
+            return Err(shape("LtStage", format!("{kp} special primes (P has {}, P' {})", lay.kp, ctx.chain.p_sparse)));
+        }
+        if ident.is_some() && (geom.g != 1 || geom.offset.rem_euclid(nh) != 0) {
+            return Err(shape("LtStage", "a sparse-input stage (identity key) must be one giant step without an offset"));
+        }
         if pts.prow != top + 1 || pts.npts != geom.npts {
             return Err(shape("LtStage", format!("plaintexts hold {} Q rows / {} diagonals, stage wants {} / {}", pts.prow, pts.npts, top + 1, geom.npts)));
         }
@@ -656,9 +701,13 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         let giant = if geom.g > 1 && giant_r != 0 { Some(KeyGroup::new(arena, s, n, &[keys.rot(giant_r)?], stage_ptrs)?) } else { None };
         let off = geom.offset.rem_euclid(nh);
         let offset_key = if off != 0 { Some(KeyGroup::new(arena, s, n, &[keys.rot(off)?], stage_ptrs)?) } else { None };
-        let rows: Vec<u32> = (0..=top).chain(lay.nq..lay.rows()).map(|t| t as u32).collect();
+        let rows: Vec<u32> = (0..=top).chain(lay.nq..lay.nq + kp).map(|t| t as u32).collect();
         let digit_of: Vec<i32> = (0..lay.rows()).map(|t| ctx.chain.digit_of(t).map(|d| d as i32).unwrap_or(-1)).collect();
-        let specials: Vec<usize> = (lay.nq..lay.rows()).collect();
+        let specials: Vec<usize> = (lay.nq..lay.nq + kp).collect();
+        let ident = match ident {
+            Some(k) => Some(KeyGroup::new(arena, s, n, &[k], stage_ptrs)?),
+            None => None,
+        };
         let mut md_c1 = Vec::with_capacity(geom.g);
         for j in 0..geom.g {
             let need = (j > 0 && giant_r != 0) || (j == 0 && off != 0);
@@ -701,7 +750,7 @@ impl<'a, W: DevWord> LtStage<'a, W> {
                 ScalarTable::new(arena, "bts.lt", s, &primes, &bv)?
             }
         };
-        let bytes = Self::plan_bytes(&lay, &primes, &geom, top, end, k_max)? + LtPts::<W>::bytes(pts.npts, pts.prow + lay.kp, pts.ptw);
+        let bytes = Self::plan_bytes_with(&lay, &primes, &geom, top, end, k_max, kp, ident.is_some())? + LtPts::<W>::bytes(pts.npts, pts.prow + lay.kp, pts.ptw);
         Ok(LtStage {
             geom,
             top,
@@ -722,6 +771,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             digit_of: ConstBuf::new(arena, "bts.lt", s, &digit_of)?,
             giant,
             offset_key,
+            kp,
+            ident,
             md_c1,
             md_end,
             binv,
@@ -797,8 +848,26 @@ impl<'a, W: DevWord> LtStage<'a, W> {
             let ex = &mut *cx.ex;
             ks::modup(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, x, 0, k, 1, top)?;
         }
-        // 2. fused baby rotations x plaintexts, two giant steps per launch
         let ndig = cx.ks.ndig(top)?;
+        // 1b. a sparse-secret input: baby 0 = its switch to the dense secret, extended (P c0 + <D, b>, <D, a>), into the
+        // key-switch workspace (the kernel reads it as stored)
+        let x0: *const c_void = match &self.ident {
+            Some(g) => {
+                let ex = &mut *cx.ex;
+                let v = View::of(x, 0);
+                let out = View::of(&ex.ks.ext, 0).base;
+                let io = DotIo { c1: v.part::<W>(1).base, c0: v.base, ct_stride: v.ct_stride, out, part_stride: pw, out_ct_stride: cw as u64, out_rot_stride: 0, c0_mode: 1 };
+                let staged = source == KskSource::Regen || g.needs_stage() || !g.has_a();
+                if staged {
+                    ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, g, 0, ndig, true)?;
+                }
+                ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, g, 0, 1, k, top, DotRows::All, io, staged)?;
+                out as *const c_void
+            }
+            None => std::ptr::null(),
+        };
+        let (pmod, pmods) = if self.kp < lay.kp { (ctx.ks.ps_mod_q.v.vptr(), ctx.ks.ps_mod_q.s.vptr()) } else { (ctx.ks.p_mod_q.v.vptr(), ctx.ks.p_mod_q.s.vptr()) };
+        // 2. fused baby rotations x plaintexts, two giant steps per launch
         {
             let ex = &*cx.ex;
             let res_base = cx.work.lt_res.buf.vptr_mut() as *mut W;
@@ -822,8 +891,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
                     pts: (self.pts.ptrs.dptr() as *const u8).wrapping_add(pts_off * 8) as *const *const c_void,
                     rows: self.rows.dptr(),
                     digit_of: self.digit_of.dptr(),
-                    pmod: ctx.ks.p_mod_q.v.vptr(),
-                    pmods: ctx.ks.p_mod_q.s.vptr(),
+                    pmod,
+                    pmods,
                     pr: ctx.pr(),
                     ct_stride: cw as u64,
                     part_stride: pw,
@@ -841,9 +910,10 @@ impl<'a, W: DevWord> LtStage<'a, W> {
                     pt_prow: self.pts.prow as i32,
                     enc: self.pts.enc,
                     ngrp: 1,
-                    nrows: (top + 1 + lay.kp) as i32,
+                    nrows: (top + 1 + self.kp) as i32,
                     kmax: if self.group > 0 { self.group } else if k == 1 { 1 } else { 2 },
                     pair_cts: if gl > LT_GMAX_LAUNCH { (self.k_max * LT_GMAX_LAUNCH) as i32 } else { 0 },
+                    x0,
                 };
                 match (self.regen_now(k, ndig), &self.tabs) {
                     (true, Some(t)) => {
@@ -949,7 +1019,8 @@ impl<'a, W: DevWord> LtStage<'a, W> {
         // c1 = (c1 - conv) P^-1 on the Q rows, in the conversion's NTT (the plan's rows sit at the same offsets in
         // lt_res and lt_tmp)
         let res = cx.work.lt_res.buf.vptr_mut();
-        let epi = ntt::Epi::SubMul { out: res, x: res, s: ctx.ks.p_inv_mod_q.v.vptr(), ss: ctx.ks.p_inv_mod_q.s.vptr() };
+        let pinv = if self.kp < lay.kp { &ctx.ks.ps_inv_mod_q } else { &ctx.ks.p_inv_mod_q };
+        let epi = ntt::Epi::SubMul { out: res, x: res, s: pinv.v.vptr(), ss: pinv.s.vptr() };
         md.run_epi(ctx, &ex.compute, &mut cx.work.lt_res.buf, &mut cx.work.lt_tmp.buf, k, Some(epi))?;
         let rv = View {
             base: (cx.work.lt_res.buf.vptr() as *mut W).wrapping_add(res_ct(self.k_max, g, 0, j) * cw) as *mut c_void,

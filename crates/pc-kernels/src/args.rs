@@ -271,6 +271,9 @@ pub struct CtsArgs {
     pub kmax: i32,
     /// > 0: giant pair l of a launch at res + l * pair_cts cts (one K=1 launch of up to 4 giant steps); 0: G <= 2
     pub pair_cts: i32,
+    /// ABI 20: non-null: baby 0 read from here as stored (extended rows, ct c at + c * ct_stride: a key-switched
+    /// identity); null: (P c0, P c1) of x
+    pub x0: *const c_void,
 }
 
 #[repr(C)]
@@ -881,7 +884,7 @@ const _: () = {
     assert!(size_of::<EpiArgs>() == 72);
     assert!(size_of::<KsRegenArgs>() == 312);
     assert!(size_of::<KskExpandArgs>() == 48);
-    assert!(size_of::<CtsArgs>() == 192);
+    assert!(size_of::<CtsArgs>() == 200);
     assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
@@ -905,7 +908,7 @@ const _: () = {
     assert!(size_of::<SpruFftArgs>() == 32);
     assert!(size_of::<SpruScatterArgs>() == 56);
     assert!(size_of::<KeyTab>() == 40);
-    assert!(size_of::<CtsRegenArgs>() == 232);
+    assert!(size_of::<CtsRegenArgs>() == 240);
     assert!(size_of::<KsKeyArgs>() == 216);
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);

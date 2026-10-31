@@ -140,10 +140,11 @@ fn role_secrets(role: KeyRole, n: usize, s: &[Vec<u64>], sp: &[Vec<u64>]) -> (Ve
         KeyRole::Relin => (s.to_vec(), s.to_vec(), true),
         KeyRole::EncDenseToSparse => (sp.to_vec(), s.to_vec(), false),
         KeyRole::EncSparseToDense => (s.to_vec(), sp.to_vec(), false),
-        KeyRole::Rot { .. } | KeyRole::Conj => {
+        KeyRole::Rot { .. } | KeyRole::Conj | KeyRole::SparseRot { .. } => {
             let g = role.galois(n).unwrap();
             let gi = pc_core::galois::galois_inverse(g, n).unwrap();
-            (s.par_iter().map(|r| pc_core::galois::apply_eval(r, gi).unwrap()).collect(), s.to_vec(), false)
+            let old = if matches!(role, KeyRole::SparseRot { .. }) { sp.to_vec() } else { s.to_vec() };
+            (s.par_iter().map(|r| pc_core::galois::apply_eval(r, gi).unwrap()).collect(), old, false)
         }
     }
 }

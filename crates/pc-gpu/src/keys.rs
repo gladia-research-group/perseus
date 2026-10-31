@@ -87,6 +87,15 @@ impl KskShape {
     pub fn bottom(chain: &Chain) -> Result<Self> {
         Ok(KskShape { kp: chain.p_sparse, ..Self::banded(chain, chain.level_unit - 1)? })
     }
+    /// Rows for ciphertexts with top limb <= `q_top` over P' only (`Chain::p_sparse`): the StC-first input stages'
+    /// keys on a lean chain (`KsPlans::new_ps`), one digit whose primes P' exceeds by > 100 bits.
+    pub fn stc_ps(chain: &Chain, q_top: usize) -> Result<Self> {
+        let sh = KskShape { kp: chain.p_sparse, ..Self::banded(chain, q_top)? };
+        if sh.ndig != 1 || chain.p_sparse >= chain.p.len() {
+            return Err(shape("KskShape::stc_ps", format!("top {q_top}: {} digits, P' of {} of {} special primes", sh.ndig, chain.p_sparse, chain.p.len())));
+        }
+        Ok(sh)
+    }
     /// Slots per digit.
     pub fn rows(&self) -> usize {
         self.q_top + 1 + self.kp
@@ -145,6 +154,9 @@ pub enum KeyRole {
     Conj,
     EncDenseToSparse,
     EncSparseToDense,
+    /// Sparse -> dense fused with a left rotation by `step` (s_old = s_sparse, s_new = sigma_{g^-1}(s)): switches a
+    /// freshly raised ciphertext (under s_sparse) inside the first hoisted rotations after the raise.
+    SparseRot { step: i64, galois: u64 },
 }
 
 impl KeyRole {
@@ -154,7 +166,7 @@ impl KeyRole {
     /// The automorphism applied after the switch (None: relin / encapsulation).
     pub fn galois(&self, n: usize) -> Option<u64> {
         match self {
-            KeyRole::Rot { galois, .. } => Some(*galois),
+            KeyRole::Rot { galois, .. } | KeyRole::SparseRot { galois, .. } => Some(*galois),
             KeyRole::Conj => Some(2 * n as u64 - 1),
             _ => None,
         }
@@ -167,6 +179,7 @@ impl KeyRole {
             KeyRole::Conj => (2 * n - 1).to_string(),
             KeyRole::EncDenseToSparse => (2 * n - 2).to_string(),
             KeyRole::EncSparseToDense => (2 * n - 4).to_string(),
+            KeyRole::SparseRot { galois, .. } => format!("sparse-{galois}"),
         }
     }
 }
@@ -420,7 +433,48 @@ pub struct KeySet<'a, W: DevWord> {
     pub bts: Option<BtsKeys<'a, W>>,
     /// Level relinearization keys by limb top (`LevelRelinSpec`; prototype, empty unless carved).
     pub relin_levels: BTreeMap<usize, (LevelRelinSpec, DevKsk<'a, W>)>,
+    /// Rotation keys over P' (`KskShape::stc_ps`) by normalized step (`carve_extra`).
+    pub rots_ps: BTreeMap<i64, DevKsk<'a, W>>,
+    /// Sparse -> dense rotation keys (`KeyRole::SparseRot`) by normalized step (`carve_extra`).
+    pub sparse_rots: BTreeMap<i64, DevKsk<'a, W>>,
     n: usize,
+}
+
+/// Keys outside `KeySetSpec` (`KeySet::carve_extra`): rotation keys over P' (step, q_top) and sparse -> dense rotation
+/// keys (step, shape).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtraKeySpec {
+    pub rots_ps: Vec<(i64, usize)>,
+    pub sparse_rots: Vec<(i64, KskShape)>,
+}
+
+impl ExtraKeySpec {
+    /// Every key (role, shape), carve order (steps normalized mod N/2, duplicates and step 0 dropped).
+    pub fn keys(&self, chain: &Chain) -> Result<Vec<(KeyRole, KskShape)>> {
+        let h = (chain.n / 2) as i64;
+        let mut ps: BTreeMap<i64, usize> = BTreeMap::new();
+        for &(st, t) in &self.rots_ps {
+            let e = ps.entry(st.rem_euclid(h)).or_insert(t);
+            *e = (*e).max(t);
+        }
+        ps.remove(&0);
+        let mut sp: BTreeMap<i64, KskShape> = BTreeMap::new();
+        for &(st, sh) in &self.sparse_rots {
+            sp.insert(st.rem_euclid(h), sh);
+        }
+        sp.remove(&0);
+        let mut v = Vec::new();
+        for (st, t) in ps {
+            v.push((KeyRole::rot(st, chain.n)?, KskShape::stc_ps(chain, t)?));
+        }
+        for (st, sh) in sp {
+            v.push((KeyRole::SparseRot { step: st, galois: galois::rotation_galois(st, chain.n)? }, sh));
+        }
+        Ok(v)
+    }
+    pub fn bytes<W: DevWord>(&self, chain: &Chain, layout: KskLayout) -> Result<usize> {
+        Ok(self.keys(chain)?.iter().map(|(_, sh)| sh.bytes::<W>(chain.n, layout)).sum())
+    }
 }
 
 impl<'a, W: DevWord> KeySet<'a, W> {
@@ -433,7 +487,7 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             }
         }
         let n = chain.n;
-        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, relin_levels: BTreeMap::new(), n };
+        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, relin_levels: BTreeMap::new(), rots_ps: BTreeMap::new(), sparse_rots: BTreeMap::new(), n };
         let (mut d2s, mut s2d) = (None, None);
         for (role, sh) in spec.keys(chain)? {
             let k = DevKsk::carve(arena, role, sh, layout, n)?;
@@ -445,12 +499,41 @@ impl<'a, W: DevWord> KeySet<'a, W> {
                 }
                 KeyRole::EncDenseToSparse => d2s = Some(k),
                 KeyRole::EncSparseToDense => s2d = Some(k),
+                KeyRole::SparseRot { .. } => return Err(shape("KeySet::carve", "sparse rotation keys come from ExtraKeySpec")),
             }
         }
         if let (Some(a), Some(b)) = (d2s, s2d) {
             ks.bts = Some(BtsKeys { enc_dense_to_sparse: a, enc_sparse_to_dense: b });
         }
         Ok(ks)
+    }
+
+    /// Carve the keys of `extra` into this set (setup, before `Arena::freeze`; generated with the rest).
+    pub fn carve_extra(&mut self, arena: &'a Arena, chain: &Chain, extra: &ExtraKeySpec) -> Result<()> {
+        let h = (self.n / 2) as i64;
+        for (role, sh) in extra.keys(chain)? {
+            let k = DevKsk::carve(arena, role, sh, self.layout, self.n)?;
+            match role {
+                KeyRole::Rot { step, .. } => {
+                    self.rots_ps.insert(step.rem_euclid(h), k);
+                }
+                KeyRole::SparseRot { step, .. } => {
+                    self.sparse_rots.insert(step.rem_euclid(h), k);
+                }
+                _ => return Err(shape("KeySet::carve_extra", format!("{role:?}"))),
+            }
+        }
+        Ok(())
+    }
+    /// The P' rotation key of `step` (`KskShape::stc_ps`).
+    pub fn rot_ps(&self, step: i64) -> Result<&DevKsk<'a, W>> {
+        let k = step.rem_euclid((self.n / 2) as i64);
+        self.rots_ps.get(&k).ok_or_else(|| Error::Mem { knob: "ExtraKeySpec::rots_ps", value: k as usize, msg: format!("no P' rotation key for step {step}") })
+    }
+    /// The sparse -> dense rotation key of `step` (`KeyRole::SparseRot`).
+    pub fn sparse_rot(&self, step: i64) -> Result<&DevKsk<'a, W>> {
+        let k = step.rem_euclid((self.n / 2) as i64);
+        self.sparse_rots.get(&k).ok_or_else(|| Error::Mem { knob: "ExtraKeySpec::sparse_rots", value: k as usize, msg: format!("no sparse -> dense rotation key for step {step}") })
     }
 
     /// The rotation key of `step` (any sign; normalized mod N/2). Missing = error naming the knob.
@@ -491,7 +574,13 @@ impl<'a, W: DevWord> KeySet<'a, W> {
     }
     /// Every key, carve order.
     pub fn iter(&self) -> impl Iterator<Item = &DevKsk<'a, W>> {
-        self.relin.iter().chain(self.conj.iter()).chain(self.rots.values()).chain(self.bts.iter().flat_map(|b| [&b.enc_dense_to_sparse, &b.enc_sparse_to_dense]))
+        self.relin
+            .iter()
+            .chain(self.conj.iter())
+            .chain(self.rots.values())
+            .chain(self.bts.iter().flat_map(|b| [&b.enc_dense_to_sparse, &b.enc_sparse_to_dense]))
+            .chain(self.rots_ps.values())
+            .chain(self.sparse_rots.values())
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut DevKsk<'a, W>> {
         self.relin
@@ -499,6 +588,8 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             .chain(self.conj.iter_mut())
             .chain(self.rots.values_mut())
             .chain(self.bts.iter_mut().flat_map(|b| [&mut b.enc_dense_to_sparse, &mut b.enc_sparse_to_dense]))
+            .chain(self.rots_ps.values_mut())
+            .chain(self.sparse_rots.values_mut())
     }
     pub fn len(&self) -> usize {
         self.iter().count()

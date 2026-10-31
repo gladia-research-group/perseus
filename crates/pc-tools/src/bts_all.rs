@@ -25,7 +25,7 @@ use pc_gpu::decrypt::{Decryptor, Which};
 use pc_gpu::encrypt::Encryptor;
 use pc_gpu::graph::{BtsGraphs, CaptureLock, Served};
 use pc_gpu::keygen::{test_prng, KeyGen};
-use pc_gpu::keys::{DevSecret, KeySet, KeySetSpec, KskLayout, KskShape, RotSpec};
+use pc_gpu::keys::{DevSecret, ExtraKeySpec, KeySet, KeySetSpec, KskLayout, KskShape, RotSpec};
 use pc_gpu::ks::{KsPlans, KsWork, KskSource};
 use pc_gpu::ops::{Ops, OpsCfg};
 use pc_gpu::poly::CtBuf;
@@ -254,10 +254,16 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     // dense + StC-first: one StcFirstRoute (its shipped order == DenseRoute word for word)
     // PC_EM_FUSE_RESCALE=1: the EvalMod relinearization-rescale fusion on every route (default off, as BtsSetup)
     let em_fuse = std::env::var("PC_EM_FUSE_RESCALE").is_ok_and(|v| v == "1");
+    // PC_BENCH_MERGE=1: the raise's sparse -> dense switch folded into StC-first's CtS stage 0 and SparseB's first fold
+    // round (`SparseRot` keys); PC_BENCH_STC_PS=1: the StC-first input stages over P' (`KskShape::stc_ps` keys)
+    let merge = std::env::var("PC_BENCH_MERGE").is_ok_and(|v| v == "1");
+    let stc_ps = std::env::var("PC_BENCH_STC_PS").is_ok_and(|v| v == "1");
     let mut setup = BtsSetup::n32_shipped();
     setup.k_max = kb;
     setup.real = true;
     setup.em_fuse_rescale = em_fuse;
+    setup.merge_s2d = merge;
+    setup.stc_ps = stc_ps;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
@@ -275,6 +281,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             let mut c = SparseBCfg::n32(s, 1);
             c.k_max = kb;
             c.em_fuse_rescale = em_fuse;
+            c.merge_s2d = merge;
             c
         })
         .collect();
@@ -288,15 +295,30 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     }
     steps.remove(&0);
     let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let mut extra = ExtraKeySpec::default();
+    let full = KskShape::full(&chain);
+    if merge {
+        extra.sparse_rots.extend(plan.dense.s0_steps().into_iter().map(|st| (st, full)));
+        for c in &sb_cfgs {
+            extra.sparse_rots.extend(pc_gpu::bts::sparse_b::sparse_rot_steps(n, c)?.into_iter().map(|st| (st, full)));
+        }
+    }
+    if stc_ps {
+        extra.rots_ps.extend(plan.input_steps().into_iter().map(|st| (st, plan.entry_top)));
+    }
+    let nextra = extra.keys(&chain)?.len();
 
     let dev = Device::open()?;
     let mcfg = MemCfg { k_max: 8.max(kb), pool: vec![PoolClass { k: 1, count: 1 }], events: 64, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, mcfg)?;
     let lay = mp.lay;
     let mut shapes: Vec<KskShape> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
+    shapes.extend(extra.keys(&chain)?.into_iter().map(|(_, s)| s));
     shapes.push(KskShape::bottom(&chain)?);
+    shapes.sort();
+    shapes.dedup();
     let layout = if o.packed { KskLayout::packed_for::<W>(&chain)? } else { KskLayout::Dense };
-    mp.reserve("keys", spec.bytes::<W>(&chain, layout)?);
+    mp.reserve("keys", spec.bytes::<W>(&chain, layout)? + extra.bytes::<W>(&chain, layout)?);
     mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     mp.reserve("secret", 2 * DevSecret::<W>::bytes(&lay));
     mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, false));
@@ -333,7 +355,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     if o.memdiag {
         mp.reserve("bench.memdiag", 2 * sf_req.total());
     }
-    println!("[bts-all] K={kb}: {} rotation keys; MemPlan {}", steps.len(), mp.report());
+    println!("[bts-all] K={kb}: {} rotation keys, {nextra} extra (merge {merge}, stc_ps {stc_ps}); MemPlan {}", steps.len(), mp.report());
     let arena = mp.allocate(&dev)?;
     let mut ex = Executor::<W>::new(&dev, &arena, &mp)?;
     ex.ks.carve_regen(&arena, &lay)?;
@@ -341,14 +363,24 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let kplans = KsPlans::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?;
     let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
     let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, layout)?;
+    keys.carve_extra(&arena, &chain, &extra)?;
     let mut prng = test_prng(0x6d);
     let sk = SecretKey::sample(&mut prng, n)?;
     let mut sec = DevSecret::<W>::carve(&arena, lay)?;
     sec.load(&ctx, &ex.compute, &sk)?;
     let mut spru_sec = DevSecret::<W>::carve(&arena, lay)?;
     let mut kg = KeyGen::<W>::new(&arena, &ex.compute, &chain, &shapes)?;
+    // the extra keys from their own DRBG after the rest: the base keys, secret and inputs stay the baseline's
+    let (xps, xsp) = (std::mem::take(&mut keys.rots_ps), std::mem::take(&mut keys.sparse_rots));
     let tk = kg.generate_set(&ctx, &mut ex, &sec, &mut keys, &mut prng)?;
-    println!("[bts-all] keygen {} keys in {:.1} s", tk.keys, tk.total);
+    keys.rots_ps = xps;
+    keys.sparse_rots = xsp;
+    let mut prng_x = test_prng(0x6e);
+    for k in keys.rots_ps.values_mut().chain(keys.sparse_rots.values_mut()) {
+        kg.generate(&ctx, &mut ex, &sec, k, &mut prng_x)?;
+    }
+    ex.sync_compute()?;
+    println!("[bts-all] keygen {} keys in {:.1} s (+{nextra} extra)", tk.keys, tk.total);
     let mut encr = Encryptor::<W>::new(&arena, &ex.compute, lay, false, &mut prng)?;
     let mut dec = Decryptor::<W>::new(&arena, &ex.compute, lay, chain.level_unit, 1)?;
     dec.load_secret(&ex.compute, &sec)?;
@@ -533,6 +565,9 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             if rep >= 2 {
                 em.push(ev0.elapsed_ms(&ev1)? as f64);
             }
+        }
+        if prof {
+            dev.profiler(false)?;
         }
         for i in 0..kb {
             cmp(&ex, &graphs.slots.x, i, i)?;

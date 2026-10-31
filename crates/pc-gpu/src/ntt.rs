@@ -172,6 +172,8 @@ pub enum Epi {
     MulAdd { out: *mut c_void, x: *const c_void, s: *const c_void, ss: *const c_void },
     /// out = d + (x_0 + .. + x_(n-1) - v) s, the x_j `stride` words apart (d as in SubMulAcc)
     SubMulAccSum { out: *mut c_void, x: *const c_void, n: usize, stride: usize, s: *const c_void, ss: *const c_void, d: *const c_void },
+    /// out = (x_0 + .. + x_(n-1) - v) s, the x_j `stride` words apart
+    SubMulSum { out: *mut c_void, x: *const c_void, n: usize, stride: usize, s: *const c_void, ss: *const c_void },
 }
 
 impl Epi {
@@ -184,6 +186,7 @@ impl Epi {
             Epi::SubMulAcc { out, x, s, ss, d } => (ntt_epi::SUB_MUL_ACC, out, x, 1, 0, s, ss, d),
             Epi::MulAdd { out, x, s, ss } => (ntt_epi::MUL_ADD, out, x, 1, 0, s, ss, nul),
             Epi::SubMulAccSum { out, x, n, stride, s, ss, d } => (ntt_epi::SUB_MUL_ACC, out, x, n, stride, s, ss, d),
+            Epi::SubMulSum { out, x, n, stride, s, ss } => (ntt_epi::SUB_MUL, out, x, n, stride, s, ss, nul),
         }
     }
 }

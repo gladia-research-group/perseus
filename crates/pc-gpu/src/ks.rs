@@ -559,10 +559,11 @@ struct LevelSpecs {
     moddown: Vec<JobSpec>,
 }
 
-fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSpecs {
-    // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'
+fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, ps: bool) -> LevelSpecs {
+    // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'; `ps`: every level over P'
+    // (`KsPlans::new_ps`, the StC-first input stages' keys `KskShape::stc_ps`)
     let mut specials: Vec<usize> = chain.special_ids();
-    if top + 1 == chain.level_unit {
+    if top + 1 == chain.level_unit || ps {
         specials.truncate(chain.p_sparse);
     }
     // live digits: digit d keeps its limbs <= top (FIDESlib DECOMPmeta sizes cut at the level's limb count)
@@ -680,11 +681,18 @@ pub struct KsPlans<'a> {
 impl<'a> KsPlans<'a> {
     /// Arena bytes of the plans of `chain` at words `W` for `k_max` ciphertexts.
     pub fn bytes<W: DevWord>(chain: &Chain, k_max: usize) -> Result<usize> {
+        Self::bytes_with::<W>(chain, k_max, Layout::from_chain(chain).nq, false)
+    }
+    /// Arena bytes of `new_ps`'s plans.
+    pub fn bytes_ps<W: DevWord>(chain: &Chain, k_max: usize, ps_top: usize) -> Result<usize> {
+        Self::bytes_with::<W>(chain, k_max, ps_top + 1, true)
+    }
+    fn bytes_with<W: DevWord>(chain: &Chain, k_max: usize, ntops: usize, ps: bool) -> Result<usize> {
         let lay = Layout::from_chain(chain);
         let primes = chain.primes();
         let mut b = 2 * Arena::bytes_for::<i32>(lay.rows());
-        for top in 0..lay.nq {
-            let sp = level_specs(chain, &lay, top, k_max);
+        for top in 0..ntops {
+            let sp = level_specs(chain, &lay, top, k_max, ps);
             b += rowlist_bytes(sp.intt.len()) + Arena::bytes_for::<u32>(sp.intt_src.len()) + Arena::bytes_for::<u32>(sp.ks_rows.len());
             b += Arena::bytes_for::<u8>(2 * sp.intt.len() * std::mem::size_of::<W>());
             b += BconvPlan::bytes::<W>(&primes, &sp.modup)? + rowlist_bytes(sp.modup_ntt.len());
@@ -695,15 +703,26 @@ impl<'a> KsPlans<'a> {
     }
 
     pub fn new<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize) -> Result<Self> {
+        Self::new_with(arena, s, ctx, k_max, ctx.lay.nq, false)
+    }
+    /// Plans of the levels `0..=ps_top` with every key switch over P' (the first `Chain::p_sparse` special primes; keys
+    /// of `KskShape::stc_ps`): a lean chain's StC-first input stages, whose single-prime levels P' covers by > 100 bits.
+    pub fn new_ps<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ps_top: usize) -> Result<Self> {
+        if ps_top >= ctx.lay.nq {
+            return Err(shape("KsPlans::new_ps", format!("top {ps_top} above the chain")));
+        }
+        Self::new_with(arena, s, ctx, k_max, ps_top + 1, true)
+    }
+    fn new_with<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, k_max: usize, ntops: usize, ps: bool) -> Result<Self> {
         let chain = &ctx.chain;
         let lay = ctx.lay;
         if k_max == 0 || k_max > ctx.k_max {
             return Err(Error::Mem { knob: "MemCfg::k_max", value: k_max, msg: format!("ks plans for {k_max} cts, context row tables cover {}", ctx.k_max) });
         }
         let primes = chain.primes();
-        let mut levels = Vec::with_capacity(lay.nq);
-        for top in 0..lay.nq {
-            let sp = level_specs(chain, &lay, top, k_max);
+        let mut levels = Vec::with_capacity(ntops);
+        for top in 0..ntops {
+            let sp = level_specs(chain, &lay, top, k_max, ps);
             levels.push(LevelPlan {
                 ndig: sp.ndig,
                 kp: sp.kp,
@@ -1415,7 +1434,7 @@ pub fn moddown_to_j<W: DevWord, M: DevStrategy<W>>(
 }
 
 /// `out += x_0 + .. + x_(n-1)` ModDowned (the extended ciphertexts x_j of `x`, `stride` ciphertexts apart, k each;
-/// `mode` Add or Onto):
+/// `mode` Add or Onto; Set: `out =`):
 /// the special rows' sum rides the INTT's first pass, the Q rows' sum the conversion NTT's epilogue, so the extended
 /// rotations of a hoisted sum are never added row by row. `x`'s special rows of its first k cts are left holding the
 /// sum (coefficient form), `conv` scratch.
@@ -1456,7 +1475,7 @@ pub fn moddown_sum_to_j<W: DevWord, M: DevStrategy<W>>(
     check_cts(x, 0, (n - 1) * stride + k, "ks moddown_sum")?;
     check_cts(conv, 0, k, "ks moddown_sum")?;
     check_md_out(ctx, out, mode, "ks moddown_sum_to")?;
-    let d = mode.onto().ok_or_else(|| shape("ks moddown_sum_to", "the summed ModDown accumulates (Add or Onto)"))?;
+    let d = mode.onto();
     let lay = ctx.lay;
     let lv = plans.level(top)?;
     let words = stride * lay.ct_words();
@@ -1465,7 +1484,10 @@ pub fn moddown_sum_to_j<W: DevWord, M: DevStrategy<W>>(
     md_intt(ctx, s, plans, lv, x, k, Some(src))?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let [_, _, sc, scs] = level_scalars(ctx, lv);
-    let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: sc, ss: scs, d };
+    let epi = match d {
+        Some(d) => ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: sc, ss: scs, d },
+        None => ntt::Epi::SubMulSum { out: out.base, x: xb, n, stride: words, s: sc, ss: scs },
+    };
     if let Some(e) = join {
         s.wait(e)?;
     }
