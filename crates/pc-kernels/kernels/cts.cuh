@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsR
     using Wd = WideOf<W>;
     const CtsArgs& A = R.cts;
     constexpr int NW = BX / 32;
-    constexpr int NBUF = 12;  // digit buffers per warp
+    constexpr int NBUF = KMAX == 1 ? 16 : 12;  // digit buffers per warp (K = 1: 16, fewer part-filled passes)
     __shared__ W sha[NW][NBUF][32];
     __shared__ uint32_t rqs[NW][16];
     const int cg = blockIdx.x % A.ngrp;
@@ -259,6 +259,9 @@ __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsR
     const size_t krow = (size_t)kskey::slot_of(R.key, (int)t, A.nq);
     const int nreg = min(A.ndig, R.key.nregen);
     const int nbaby = nreg > 0 ? NBUF / nreg : NBUF;  // baby steps in flight
+    // lazy (Barrett64 split, p < 2^29): a baby step's sums reduced only to [0, 4p) and its c0 term to [0, 2p): 6p < 2^32
+    // and 8 giant-step products below 6p p < 2^61 keep the accumulators' headroom; same residues
+    const bool lazy = KMAX == 1 && MM::KIND == 0 && q.split != 0 && p < (1u << 29);
     Wd acc0[KMAX][GMAX], acc1[KMAX][GMAX];
 #pragma unroll
     for (int c = 0; c < KMAX; ++c)
@@ -333,7 +336,20 @@ __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsR
             }
 #pragma unroll
             for (int c = 0; c < KMAX; ++c) {
-                if (c < Kg) {
+                if (c < Kg && lazy) {
+                    const uint32_t sp_lo = (uint32_t)q.split, sp_hi = (uint32_t)(q.split >> 32), m32 = (uint32_t)(q.mu_lo >> 32);
+                    auto red4 = [&](uint64_t x) -> uint32_t {  // [0, 4p)
+                        const uint32_t hi = (uint32_t)(x >> 32), lo = (uint32_t)x;
+                        return (hi * sp_lo - __umulhi(hi, sp_hi) * p) + (lo - __umulhi(lo, m32) * p);
+                    };
+                    W r0 = red4(s0[c]);
+                    if (isq) {
+                        const W xa = X[c * A.ct_stride + rowoff + s];
+                        r0 += xa * pm - __umulhi(xa, pms) * p;  // Shoup, [0, 2p)
+                    }
+                    v0[c] = r0;
+                    v1[c] = red4(s1[c]);
+                } else if (c < Kg) {
                     W r0 = MM::reduce(s0[c], q);
                     if (isq) r0 = add<W>(r0, mul_shoup<W>(X[c * A.ct_stride + rowoff + s], pm, pms, p), p);
                     v0[c] = r0;
@@ -410,8 +426,10 @@ __global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsR
                 const uint32_t w = 2u * kq + (m & 1) + 4u * (m >> 1), v = cw[m];
                 if ((need >> w) & 1u) {
                     if (v < m_p || tt == 15u) {
+                        // lazy: the word as drawn (< 2^32, the residue of the expander's value); the products'
+                        // double-word sums hold ndig <= 6 of them times canonical words below 2^29
                         const uint32_t r = v - __umulhi(v, mu32) * p;
-                        dst[w] = r >= p ? r - p : r;
+                        dst[w] = lazy ? v : r >= p ? r - p : r;
                     } else {
                         nn |= 1u << w;
                     }
