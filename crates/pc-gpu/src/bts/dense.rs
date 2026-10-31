@@ -182,7 +182,7 @@ impl DensePlan {
             return Vec::new();
         }
         let st: Vec<(LtGeom, usize)> = self.variants.iter().flat_map(|v| v.cts.iter().map(|h| (h.geom, h.top))).collect();
-        tail_steps(&self.chain, &st, self.setup.lt_regen_digits)
+        tail_steps(&self.chain, &st, self.setup.lt_regen_digits, super::cts::TAIL_MIN_DIGITS_DENSE)
     }
 
     /// Device bytes of every table (MemPlan section "bts.dense") and the work shape.

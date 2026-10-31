@@ -477,14 +477,19 @@ impl BtsKeyRing for TailRing<'_> {
     }
 }
 
-/// The baby steps of `stages` (geometry, input top) whose keys a tail from digit `first` serves: stages that regenerate
-/// more than `first` digits (`LtStage::regen_now`: K = 1 at >= 5 digits).
-pub fn tail_steps(chain: &pc_core::params::Chain, stages: &[(LtGeom, usize)], first: usize) -> Vec<i64> {
+/// Fewest digits of a stage whose baby keys get tails: the dense routes' CtS from 4 (n32a4's top stages: 2 of their 4
+/// digits read, measured faster than all 4 regenerated), SparseB's from 5 (its 4-digit stages measured slower with tails).
+pub const TAIL_MIN_DIGITS_DENSE: usize = 4;
+pub const TAIL_MIN_DIGITS_SPARSE: usize = 5;
+
+/// The baby steps of `stages` (geometry, input top) whose keys a tail from digit `first` serves: stages of at least
+/// `min_digits` digits that regenerate more than `first`.
+pub fn tail_steps(chain: &pc_core::params::Chain, stages: &[(LtGeom, usize)], first: usize, min_digits: usize) -> Vec<i64> {
     let nh = (chain.n / 2) as i64;
     let ndig = |top: usize| chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= top)).count();
     let mut v: Vec<i64> = stages
         .iter()
-        .filter(|(_, top)| ndig(*top) >= 5 && ndig(*top) > first)
+        .filter(|(_, top)| ndig(*top) >= min_digits && ndig(*top) > first)
         .flat_map(|(g, _)| (1..g.b).map(move |i| ((i * g.stride) as i64) % nh))
         .filter(|&r| r != 0)
         .collect();

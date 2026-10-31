@@ -5,7 +5,7 @@
 //! StC + Accumulate + rotate-add -> x 2^correction. Plaintexts are encoded at setup straight at the level they are
 //! used (one rounding; FIDESlib re-levels from the top, two), so device words differ from FIDESlib's by that
 //! rounding. Details: docs/ARCHITECTURE.md "pc-gpu SparseB".
-use super::cts::{tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource, LT_REGEN_DIGITS};
+use super::cts::{tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource, LT_REGEN_DIGITS, TAIL_MIN_DIGITS_SPARSE};
 use super::evalmod::{em_work, EmMode, EvalModPlan};
 use super::raise::RaisePlan;
 use super::{BtsKeyRing, BtsWorkShape};
@@ -195,7 +195,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let mut steps = Vec::new();
         for cfg in cfgs.iter().filter(|c| c.lt_tails) {
             let g = geometry(chain.n, cfg)?;
-            steps.extend(tail_steps(chain, &[(Self::lt_geom(&g), Self::tops(chain, st, cfg)?.0)], LT_REGEN_DIGITS));
+            steps.extend(tail_steps(chain, &[(Self::lt_geom(&g), Self::tops(chain, st, cfg)?.0)], LT_REGEN_DIGITS, TAIL_MIN_DIGITS_SPARSE));
         }
         steps.sort();
         steps.dedup();
@@ -281,7 +281,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let geo = Self::lt_geom(&g);
         let sf_c = st.sf(top as i32)?;
         let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Slots { values: &p, scale: sf_c })?;
-        let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS) } else { Vec::new() };
+        let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS, TAIL_MIN_DIGITS_SPARSE) } else { Vec::new() };
         let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring_of(keys, n, &steps)?, stage, cfg.k_max)?;
         mark("cts", &mut parts);
         let cts_acc = AccRounds::new(arena, s, n, keys, stage, r_cts)?;
