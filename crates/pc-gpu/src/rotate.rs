@@ -68,12 +68,12 @@ fn dots<W: DevWord, M: DevStrategy<W>>(
     io: DotIo,
 ) -> Result<()> {
     if kc.source == KskSource::Cached && !group.needs_stage() && group.has_a() {
-        return ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, group, r0, r, k, top, DotRows::All, io, false);
+        return split_dot(ctx, ex, kc, group, r0, r, k, top, io, false);
     }
     // Regen, or keys whose `b` is packed / banded or whose `a` is not resident: read in place (`ks_dot_key`, every key
     // of the range in one launch per form) when seeded, else one key at a time through staging
     if group.in_place() {
-        return ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, group, r0, r, k, top, DotRows::All, io, true);
+        return split_dot(ctx, ex, kc, group, r0, r, k, top, io, true);
     }
     let ndig = kc.plans.ndig(top)?;
     for j in 0..r {
@@ -82,6 +82,43 @@ fn dots<W: DevWord, M: DevStrategy<W>>(
         ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, group, r0 + j, 1, k, top, DotRows::All, DotIo { out, ..io }, true)?;
     }
     Ok(())
+}
+
+/// The inner products over every row, or (`executor::split_rotations`) the special rows on compute and the Q rows on
+/// the aux lane, forked before both (the two launches share the SMs; compute's carry the ModDown's conversion). The
+/// caller joins aux before anything reads the Q rows: the ModDown's NTT (`ks::moddown_*_j`) or its consumer.
+#[allow(clippy::too_many_arguments)]
+fn split_dot<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    group: &KeyGroup<'_>,
+    r0: usize,
+    r: usize,
+    k: usize,
+    top: usize,
+    io: DotIo,
+    staged: bool,
+) -> Result<()> {
+    // one ciphertext only: K-batched dots already fill the GPU (prefill measured +15 ms with them split)
+    if k != 1 || !crate::executor::split_rotations() {
+        return ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, group, r0, r, k, top, DotRows::All, io, staged);
+    }
+    ex.fork_aux()?;
+    ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, group, r0, r, k, top, DotRows::P, io, staged)?;
+    ks::dot(ctx, &ex.aux, kc.plans, &ex.ks, group, r0, r, k, top, DotRows::Q, io, staged)?;
+    ex.end_aux()
+}
+
+/// The pending aux join (cleared): handed to a `ks::moddown_*_j` that waits for it before its NTT.
+macro_rules! join_of {
+    ($ex:expr) => {
+        if std::mem::replace(&mut $ex.aux_pending, false) {
+            Some(&$ex.aux_join)
+        } else {
+            None
+        }
+    };
 }
 
 /// The dot I/O of `k` ciphertexts of `x` written at `out` (extended layout, (r, c) at r * rot_stride + c * ct).
@@ -157,7 +194,9 @@ fn switch_auto<W: DevWord, M: DevStrategy<W>>(
     ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
     let io = io_of(x, View::of(&out.buf, 0), 0);
     dots(ctx, ex, kc, group, r, 1, k, top, io)?;
-    ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut out.buf, &mut ex.ks.conv, k, top)
+    let v = View::of(&out.buf, 0);
+    let join = join_of!(ex);
+    ks::moddown_to_j(ctx, &ex.compute, kc.plans, &mut out.buf, &mut ex.ks.conv, v, ks::MdOut::Set, k, top, join)
 }
 
 /// Hoisted rotations: `outs[i] = rot(x, steps[i])` from one ModUp. `group` holds the nonzero steps' keys in order.
@@ -202,7 +241,8 @@ pub fn rotate_hoisted<W: DevWord, M: DevStrategy<W>>(
         }
         let io = io_of(x, View::of(&ex.ks.ext, 0), k);
         dots(ctx, ex, kc, group, live[j].1, m, k, top, io)?;
-        ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top)?;
+        let join = join_of!(ex);
+        ks::moddown_conv_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top, join)?;
         for t in 0..m {
             let o = &mut *outs[live[j + t].0];
             ew(ctx, &ex.compute, Ew::SubMulPinv, View::of(&o.buf, 0), View::of(&ex.ks.ext, t * k), Some(View::of(&ex.ks.conv, t * k)), ctx.lay.rs_q(top), k, 2)?;
@@ -308,7 +348,8 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
         }
         let io = io_of(x, View::of(&ex.ks.ext, 0), k);
         dots(ctx, ex, kc, group, live[j].0, m, k, top, io)?;
-        ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top)?;
+        let join = join_of!(ex);
+        ks::moddown_conv_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top, join)?;
         for (t, &(r, _)) in live[j..j + m].iter().enumerate() {
             for (c, s, o) in outs.iter_mut() {
                 if key[*s] == Some(r) {
@@ -408,7 +449,8 @@ fn rotate_sum_core<W: DevWord, M: DevStrategy<W>>(
         // every extended rotation in ks.ext at once, summed inside the ModDown
         let io = io_of(x, View::of(&ex.ks.ext, 0), k);
         dots(ctx, ex, kc, group, keys[0], keys.len(), k, top, io)?;
-        return ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, keys.len(), k, &mut ex.ks.conv, out, mode, k, top);
+        let join = join_of!(ex);
+        return ks::moddown_sum_to_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, keys.len(), k, &mut ex.ks.conv, out, mode, k, top, join);
     }
     // extended rotations, chunk by chunk, summed into ks.conv (Q rows 0..=top and P)
     let mut j = 0;
@@ -421,6 +463,7 @@ fn rotate_sum_core<W: DevWord, M: DevStrategy<W>>(
         {
             let io = io_of(x, View::of(&ex.ks.ext, 0), k);
             dots(ctx, ex, kc, group, keys[j], m, k, top, io)?;
+            ex.join_aux()?;
         }
         let cv = View::of(&ex.ks.conv, 0);
         for t in 0..m {

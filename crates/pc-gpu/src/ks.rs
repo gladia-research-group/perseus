@@ -15,7 +15,7 @@ use crate::ntt::{self, Dir, Parts, RowList, Span};
 use crate::poly::{CtBuf, Layout};
 use pc_core::modmul::{invmod, mulmod};
 use pc_core::params::Chain;
-use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
+use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Event, Lane, Stream};
 use pc_kernels::{EpiArgs, EwArgs, KsArgs, KsKeyArgs, KsRegenArgs, KskExpandArgs, MdEpiArgs, PolyRef, RowSet};
 use std::ffi::c_void;
 
@@ -1266,6 +1266,25 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// `moddown_conv`, then `s` waits for `join` (a forked Q-row dot the caller's epilogue reads).
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_conv_j<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    k: usize,
+    top: usize,
+    join: Option<&Event>,
+) -> Result<()> {
+    moddown_conv(ctx, s, plans, x, conv, k, top)?;
+    if let Some(e) = join {
+        s.wait(e)?;
+    }
+    Ok(())
+}
+
 /// What a fused ModDown stores in its output view, md = (x - conv) P^-1 over Q rows 0..=top: `Set` out = md, `Add`
 /// out += md, `Onto(y)` out = y + md (y: k ciphertexts of the ciphertext layout, read at out's row offsets).
 #[derive(Clone, Copy, Debug)]
@@ -1315,6 +1334,23 @@ pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
     k: usize,
     top: usize,
 ) -> Result<()> {
+    moddown_to_j(ctx, s, plans, x, conv, out, mode, k, top, None)
+}
+
+/// `moddown_to`, `s` waiting for `join` (a forked Q-row dot whose rows the epilogue reads) before the NTT.
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_to_j<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    out: View,
+    mode: MdOut,
+    k: usize,
+    top: usize,
+    join: Option<&Event>,
+) -> Result<()> {
     plans.check_k(k)?;
     check_cts(x, 0, k, "ks moddown")?;
     check_cts(conv, 0, k, "ks moddown")?;
@@ -1328,6 +1364,9 @@ pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
         Some(d) => ntt::Epi::SubMulAcc { out: o, x: xv, s: sc, ss: scs, d },
         None => ntt::Epi::SubMul { out: o, x: xv, s: sc, ss: scs },
     };
+    if let Some(e) = join {
+        s.wait(e)?;
+    }
     ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
 }
 
@@ -1350,6 +1389,25 @@ pub fn moddown_sum_to<W: DevWord, M: DevStrategy<W>>(
     k: usize,
     top: usize,
 ) -> Result<()> {
+    moddown_sum_to_j(ctx, s, plans, x, n, stride, conv, out, mode, k, top, None)
+}
+
+/// `moddown_sum_to`, `s` waiting for `join` before the NTT (see `moddown_to_j`).
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_sum_to_j<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    n: usize,
+    stride: usize,
+    conv: &mut CtBuf<'_, Compute, W>,
+    out: View,
+    mode: MdOut,
+    k: usize,
+    top: usize,
+    join: Option<&Event>,
+) -> Result<()> {
     plans.check_k(k)?;
     check_cts(x, 0, (n - 1) * stride + k, "ks moddown_sum")?;
     check_cts(conv, 0, k, "ks moddown_sum")?;
@@ -1364,6 +1422,9 @@ pub fn moddown_sum_to<W: DevWord, M: DevStrategy<W>>(
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let [_, _, sc, scs] = level_scalars(ctx, lv);
     let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: sc, ss: scs, d };
+    if let Some(e) = join {
+        s.wait(e)?;
+    }
     ntt::forward_k_epi(ctx, s, conv, Span::Q { top }, Parts::Both, k, epi)
 }
 
