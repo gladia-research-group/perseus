@@ -684,6 +684,7 @@ class PlannedRun:
         self.stc_cache, self.pool, self.log = stc_cache, pool, log
         self.debug = False
         self.records, self._next = {}, None
+        self._twin = None                  # the position the CPU twin recorded last (its sequence runs from 0 up to it)
         self.stats = []
         self._pre, self._staged, self._keys, self._alias = {}, None, {}, {}
         self._ahead = None
@@ -692,6 +693,7 @@ class PlannedRun:
     def _record(self, t, rows, argmax):
         if t not in self.records:
             self.records[t] = self.rec.token(t, rows[t], argmax)
+            self._twin = t
         return self.records[t]
 
     def prepare(self, rows, argmax=False):
@@ -829,13 +831,18 @@ class PlannedRun:
         t0, n = time.time(), len(rows)
         self._keys = {lab: p.pt_keys() for lab, p in self.progs.items()}
         steps, pts = [], []
+        # the positions the twin recorded in one sequence from 0 (the probe tokens) are taken as recorded; it goes on
+        # from the last of them
+        k = self._twin + 1 if self._twin is not None and all(u in self.records for u in range(self._twin + 1)) else 0
         for t in range(n):
-            calls, zero, vals = self._steps(t, self.rec.token(t, rows[t], argmax))
+            calls, zero, vals = self._steps(t, self.records[t] if t < k else self.rec.token(t, rows[t], argmax))
             if pts:                        # equal values share the previous position's array
                 last = dict(pts[-1])
                 vals = [(key, last[key] if key in last and np.array_equal(last[key], v) else v) for key, v in vals]
             steps.append((calls, zero))
             pts.append(vals)
+        if n > k:
+            self._twin = n - 1
         # a plaintext's name in the store: the digest of its values at every position (checked equal within a name)
         digest, traj, first = {}, {}, {}
         for i, (key, _v) in enumerate(pts[0]):
