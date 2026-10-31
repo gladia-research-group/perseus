@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 18u
+#define PC_KERNELS_ABI 19u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -297,6 +297,17 @@ struct TensorArgs {
 };
 static_assert(sizeof(TensorArgs) == 192, "TensorArgs layout");
 
+// tensor_y (ABI 19): tensor, then (c0, c1) +-= y * c[row] (Shoup companion cs; both parts of y, after the doubling;
+// d2 unchanged). EvalMod's `x * y +- c t` before the relinearization (= tensor; ew_scale; ew_add, word for word).
+struct TensorYArgs {
+    TensorArgs t;
+    PolyRef y;
+    const void* c;
+    const void* cs;
+    int32_t sub, pad;
+};
+static_assert(sizeof(TensorYArgs) == 240, "TensorYArgs layout");
+
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
 struct MdEpiArgs {
     PolyRef dst, x, t;
@@ -334,6 +345,21 @@ struct WsumKArgs {
     const void* k;
 };
 static_assert(sizeof(WsumKArgs) == 264, "WsumKArgs layout");
+
+// wsum_multi (ABI 19): nout <= 3 weighted sums of one source list read once: out[m] = sum_{j < nsrc <= 8} w[m][j][row] *
+// src_j (both parts; Shoup companions ws[m]) [+ k[m][row] on part 0, raw, reduced once if >= p] on rows [0, n[m]);
+// blocks over rows [0, max n). Each output equals its own wsum / wsum_k word for word (zero weights add exact zeros).
+struct WsumMultiArgs {
+    PolyRef out[3];
+    PolyRef src[8];
+    const void* w[3];
+    const void* ws[3];
+    const void* k[3];
+    const PrimeConst* pr;
+    int32_t nout, nsrc, rowstride, K;
+    int32_t n[3], nmax;
+};
+static_assert(sizeof(WsumMultiArgs) == 376, "WsumMultiArgs layout");
 
 // add_const: part 0 += k[row];  mul_table: out = in * t[row][i] (both parts; general ModMul product)
 struct AddConstArgs {
@@ -822,8 +848,10 @@ struct KernelTable {
     int (*mul_add)(const MulAddArgs*, cudaStream_t);
     int (*rescale_fwd)(const RescaleNttArgs*, cudaStream_t);
     int (*mul_add_n)(const MulAddNArgs*, cudaStream_t);
+    int (*tensor_y)(const TensorYArgs*, cudaStream_t);
+    int (*wsum_multi)(const WsumMultiArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 41 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 43 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

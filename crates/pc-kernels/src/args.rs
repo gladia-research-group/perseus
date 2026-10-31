@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 18;
+pub const ABI: u32 = 19;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -333,6 +333,36 @@ pub struct WsumArgs {
 }
 
 /// wsum then part 0 += k\[row\] (ABI 7; = wsum + add_const).
+/// ABI 19: tensor, then (c0, c1) +-= y * c[row] (Shoup cs) after the doubling (args.cuh `TensorYArgs`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TensorYArgs {
+    pub t: TensorArgs,
+    pub y: PolyRef,
+    pub c: *const c_void,
+    pub cs: *const c_void,
+    pub sub: i32,
+    pub pad: i32,
+}
+
+/// ABI 19: up to 3 weighted sums over one source list read once (args.cuh `WsumMultiArgs`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WsumMultiArgs {
+    pub out: [PolyRef; 3],
+    pub src: [PolyRef; 8],
+    pub w: [*const c_void; 3],
+    pub ws: [*const c_void; 3],
+    pub k: [*const c_void; 3],
+    pub pr: *const PrimeConst,
+    pub nout: i32,
+    pub nsrc: i32,
+    pub rowstride: i32,
+    pub k_cts: i32,
+    pub n: [i32; 3],
+    pub nmax: i32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct WsumKArgs {
@@ -774,7 +804,7 @@ zeroed_default!(
     SpruFftArgs, SpruScatterArgs, SpruExtractArgs, NttArgs, BconvArgs, EwArgs, PtDotArgs, KsArgs, EpiArgs, KsRegenArgs, KskExpandArgs, CtsArgs, TensorArgs, MdEpiArgs,
     WsumArgs, AddConstArgs, MulTableArgs, RescaleArgs, RescaleCombineArgs, AutomorphArgs, EncodeArgs, EncryptArgs, KskGenArgs, KskUnpackArgs, ModRaiseArgs, SmallIntTab, SmallIntArgs,
     KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs, MulAddArgs,
-    RescaleNttArgs, MulAddNArgs
+    RescaleNttArgs, MulAddNArgs, TensorYArgs, WsumMultiArgs
 );
 
 /// A launcher: (args, stream) -> cudaError_t of the launch (0 ok; negative = argument outside the kernel's range).
@@ -828,6 +858,8 @@ pub struct KernelTable {
     pub mul_add: Launch<MulAddArgs>,
     pub rescale_fwd: Launch<RescaleNttArgs>,
     pub mul_add_n: Launch<MulAddNArgs>,
+    pub tensor_y: Launch<TensorYArgs>,
+    pub wsum_multi: Launch<WsumMultiArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -850,6 +882,8 @@ const _: () = {
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
+    assert!(size_of::<TensorYArgs>() == 240);
+    assert!(size_of::<WsumMultiArgs>() == 376);
     assert!(size_of::<AddConstArgs>() == 48);
     assert!(size_of::<MulTableArgs>() == 72);
     assert!(size_of::<RescaleArgs>() == 152);
@@ -872,7 +906,7 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 41 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 43 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<MulAddNArgs>() == 328);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);

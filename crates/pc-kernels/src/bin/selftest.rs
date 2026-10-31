@@ -599,12 +599,37 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
         o.write(&st.ctx, &h[4]);
         ck(unsafe { (st.t.tensor)(&TensorArgs { dbl: 1, ..a }, st.s()) });
         // rows n.. are not the launch's: kept
+        let pz: Vec<u64> = (0..8).map(|r| st.p(r)).collect();
         let two = |v: &[u64]| -> Vec<u64> {
-            v.iter().enumerate().map(|(j, &x)| if (j / N) % 8 < n { (2 * x) % st.p((j / N) % 8) } else { x }).collect()
+            v.iter().enumerate().map(|(j, &x)| if (j / N) % 8 < n { (2 * x) % pz[(j / N) % 8] } else { x }).collect()
         };
         out.push(cmp("tensor dbl (2 pairs, acc) vs host", &o.read(&st.ctx), &two(&wo)));
         out.push(cmp("tensor dbl d2 vs host", &d2.read(&st.ctx), &two(&wd2)));
         out.push(cmp("tensor dbl coef vs host", &coef.read(&st.ctx), &two(&wc)));
+        // tensor_y (ABI 19): the dbl launch with (c0, c1) -+= c[row] y (y = h5) in the same pass, d2 as before
+        let yc = st.per_row(false);
+        let ycs = st.shoup_row(&yc);
+        let (ycd, ycsd) = (st.ctx.up(&yc), st.ctx.up(&ycs));
+        for sub in [0, 1] {
+            o.write(&st.ctx, &h[4]);
+            let ya = TensorYArgs { t: TensorArgs { dbl: 1, ..a }, y: ctref(&d[5]), c: ycd.c(), cs: ycsd.c(), sub, pad: 0 };
+            ck(unsafe { (st.t.tensor_y)(&ya, st.s()) });
+            let mut wy = two(&wo);
+            for c in 0..k {
+                for part in 0..2 {
+                    for r in 0..n {
+                        let p = st.p(r);
+                        for i in 0..N {
+                            let j = idx(c, part, r, i);
+                            let m = mulmod(h[5][j], yc[r], p);
+                            wy[j] = if sub == 1 { submod(wy[j], m, p) } else { addmod(wy[j], m, p) };
+                        }
+                    }
+                }
+            }
+            out.push(cmp(&format!("tensor_y (dbl, sub {sub}) vs host"), &o.read(&st.ctx), &wy));
+            out.push(cmp(&format!("tensor_y d2 (sub {sub}) vs host"), &d2.read(&st.ctx), &two(&wd2)));
+        }
     }
     // md_epilogue (dbl, k), wsum (3 sources), add_const, mul_table
     {
@@ -704,6 +729,58 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
             }
         }
         out.push(cmp("wsum_k (wsum + add_const) vs host", &o4.read(&st.ctx), &w));
+        // wsum_multi (ABI 19): 3 outputs over 4 sources (rows n, n, n - 1; the second without k) == their own wsum_k
+        {
+            let nsrc = 4;
+            let wm: Vec<Vec<u64>> = (0..3).map(|_| (0..nsrc * 8).map(|x| st.rng.below(st.p(x % 8))).collect()).collect();
+            let wms: Vec<Vec<u64>> = wm.iter().map(|v| st.shoup_row(v)).collect();
+            let wmd: Vec<(Dev, Dev)> = wm.iter().zip(&wms).map(|(v, s)| (st.ctx.up(v), st.ctx.up(s))).collect();
+            let outs: Vec<Dev> = (0..3).map(|_| st.ctx.up(&h[5])).collect();
+            let rows = [n, n, n - 1];
+            let mut src = [PolyRef::default(); 8];
+            for j in 0..nsrc {
+                src[j] = ctref(&d[j]);
+            }
+            let mut am = WsumMultiArgs {
+                out: [PolyRef::default(); 3],
+                src,
+                w: [std::ptr::null(); 3],
+                ws: [std::ptr::null(); 3],
+                k: [kd.c(), std::ptr::null(), kd.c()],
+                pr,
+                nout: 3,
+                nsrc: nsrc as i32,
+                rowstride: 8,
+                k_cts: k as i32,
+                n: [rows[0] as i32, rows[1] as i32, rows[2] as i32],
+                nmax: n as i32,
+            };
+            for m in 0..3 {
+                am.out[m] = ctref(&outs[m]);
+                am.w[m] = wmd[m].0.c();
+                am.ws[m] = wmd[m].1.c();
+            }
+            ck(unsafe { (st.t.wsum_multi)(&am, st.s()) });
+            for m in 0..3 {
+                let mut w = h[5].clone();
+                for c in 0..k {
+                    for part in 0..2 {
+                        for r in 0..rows[m] {
+                            let p = st.p(r);
+                            for i in 0..N {
+                                let j = idx(c, part, r, i);
+                                let mut x = (0..nsrc).fold(0, |s, q| addmod(s, mulmod(h[q][j], wm[m][q * 8 + r], p), p));
+                                if part == 0 && m != 1 {
+                                    x = addmod(x, kc[r] % p, p);
+                                }
+                                w[j] = x;
+                            }
+                        }
+                    }
+                }
+                out.push(cmp(&format!("wsum_multi output {m} (rows {}) vs host", rows[m]), &outs[m].read(&st.ctx), &w));
+            }
+        }
 
         let o3 = st.ctx.up(&h[5]);
         let a = AddConstArgs { x: ctref(&o3), k: kd.c(), pr, n: n as i32, kk: k as i32 };

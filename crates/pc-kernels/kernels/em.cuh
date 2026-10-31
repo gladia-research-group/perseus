@@ -8,8 +8,8 @@ namespace pc {
 namespace em {
 constexpr int BX = 256;
 
-template <class W, class MM>
-__global__ void tensor(TensorArgs A) {
+template <class W, class MM, bool Y = false>
+__global__ void tensor(TensorArgs A, TensorYArgs B = {}) {
     using Wd = WideOf<W>;
     const int row = blockIdx.y, c = blockIdx.z;
     const PrimeConst& q = A.pr[row];
@@ -51,6 +51,17 @@ __global__ void tensor(TensorArgs A) {
             r0[w] = add<W>(r0[w], r0[w], p);
             r1[w] = add<W>(r1[w], r1[w], p);
             r2[w] = add<W>(r2[w], r2[w], p);
+        }
+    }
+    if constexpr (Y) {
+        // + / - c y (ew_scale then ew_add / sub: the same Shoup product and modular add)
+        const W yc = ((const W*)B.c)[row], ycs = ((const W*)B.cs)[row];
+        const V4<W> y0 = load4<W>(at<W>(B.y, c, 0, row) + i), y1 = load4<W>(at<W>(B.y, c, 1, row) + i);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const W m0 = mul_shoup<W>(y0.v[w], yc, ycs, p), m1 = mul_shoup<W>(y1.v[w], yc, ycs, p);
+            r0[w] = B.sub ? sub<W>(r0[w], m0, p) : add<W>(r0[w], m0, p);
+            r1[w] = B.sub ? sub<W>(r1[w], m1, p) : add<W>(r1[w], m1, p);
         }
     }
     store4<W>(o0, r0[0], r0[1], r0[2], r0[3]);
@@ -119,6 +130,42 @@ __global__ void wsum(WsumArgs A, const void* kc) {
     }
     store4<W>(at<W>(A.out, c, 0, row) + i, r0[0], r0[1], r0[2], r0[3]);
     store4<W>(at<W>(A.out, c, 1, row) + i, r1[0], r1[1], r1[2], r1[3]);
+}
+
+template <class W>
+__global__ void wsum_multi(WsumMultiArgs A) {
+    const int row = blockIdx.y, c = blockIdx.z;
+    const W p = (W)A.pr[row].p;
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    W r[3][2][4] = {};
+    bool on[3];
+#pragma unroll
+    for (int m = 0; m < 3; ++m) on[m] = m < A.nout && row < A.n[m];
+    for (int j = 0; j < A.nsrc; ++j) {
+        const V4<W> x0 = load4<W>(at<W>(A.src[j], c, 0, row) + i), x1 = load4<W>(at<W>(A.src[j], c, 1, row) + i);
+#pragma unroll
+        for (int m = 0; m < 3; ++m) {
+            if (!on[m]) continue;
+            const W w = ((const W*)A.w[m])[j * A.rowstride + row], ws = ((const W*)A.ws[m])[j * A.rowstride + row];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                r[m][0][u] = add<W>(r[m][0][u], mul_shoup<W>(x0.v[u], w, ws, p), p);
+                r[m][1][u] = add<W>(r[m][1][u], mul_shoup<W>(x1.v[u], w, ws, p), p);
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < 3; ++m) {
+        if (!on[m]) continue;
+        if (A.k[m]) {
+            const W k = ((const W*)A.k[m])[row];
+            const W kr = k >= p ? (W)(k - p) : k;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) r[m][0][u] = add<W>(r[m][0][u], kr, p);
+        }
+        store4<W>(at<W>(A.out[m], c, 0, row) + i, r[m][0][0], r[m][0][1], r[m][0][2], r[m][0][3]);
+        store4<W>(at<W>(A.out[m], c, 1, row) + i, r[m][1][0], r[m][1][1], r[m][1][2], r[m][1][3]);
+    }
 }
 
 // out = alpha x + tmp (rescale_combine with a separate output; x unchanged)
@@ -210,6 +257,18 @@ __global__ void mul_add_n(MulAddNArgs A) {
 template <class W, class MM>
 int tensor_l(const TensorArgs* a, cudaStream_t s) {
     tensor<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W, class MM>
+int tensor_y_l(const TensorYArgs* a, cudaStream_t s) {
+    if (!a->c || !a->cs) return -1;
+    tensor<W, MM, true><<<dim3(N / (4 * BX), a->t.n, a->t.K), BX, 0, s>>>(a->t, *a);
+    return (int)cudaGetLastError();
+}
+template <class W>
+int wsum_multi_l(const WsumMultiArgs* a, cudaStream_t s) {
+    if (a->nsrc < 1 || a->nsrc > 8 || a->nout < 1 || a->nout > 3) return -1;
+    wsum_multi<W><<<dim3(N / (4 * BX), a->nmax, a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W>

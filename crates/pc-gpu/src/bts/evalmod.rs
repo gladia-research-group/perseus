@@ -301,6 +301,11 @@ pub struct EvalModPlan<'a, W: DevWord> {
     rr: BTreeMap<usize, RelinRescale<'a, W>>,
     rr_k: BTreeMap<(usize, usize), RrConst<'a, W>>,
     pub fuse_rescale: bool,
+    /// Exact executor fusions (`plan_fusions`) and their device tables: the wsum_multi weights by group head (one
+    /// pair per output), the folded rescale constants by rescale op (index into `consts_host` / `fused_alpha`).
+    fz: Fuse,
+    wmulti: BTreeMap<usize, Vec<ScalarPair<'a, W>>>,
+    rfold_k: BTreeMap<usize, usize>,
     bytes: usize,
     nq: usize,
 }
@@ -503,6 +508,274 @@ fn ids(op: &EmOp) -> Vec<usize> {
     ids_mut(&mut o).into_iter().map(|x| *x).collect()
 }
 
+/// One output of a `wsum_multi` group: (dst, rows, weights by group source (|srcs| blocks of |Q| rows), the AddConst
+/// folded in (raw constant index)).
+#[derive(Clone, Debug)]
+pub struct WOut {
+    pub dst: usize,
+    pub n: usize,
+    pub w: Vec<u64>,
+    pub k: Option<usize>,
+}
+
+/// Exact executor fusions of the final program (buffer ids), decided at build (`plan_fusions`):
+/// * `addend` (relinearization-rescale path only): a `Mult d; Add d -+= y; Rescale d` whose y is `c * s` (a MulConst on
+///   y, in place or right after a `Copy y <- s`; y read by nothing else): the scaled add rides the tensor (`tensor_y`)
+///   reading s (through earlier copies when their source is unchanged), the MulConst / Copy are skipped (`skip_a`);
+/// * `wgroups`: up to three WSum (+ AddConst) ops over <= 8 distinct sources whose later members commute with the ops
+///   between: one `wsum_multi` launch at the first, the rest skipped (`skip_w`);
+/// * `rfold`: `WSum z = [s] w; Rescale z (folded c)`: the rescale out of place from s with c w (the WSum skipped).
+/// Copies whose value no executed op reads any more are skipped too. Every value is computed with the same modular
+/// operations as before: the outputs are the same words.
+#[derive(Clone, Debug, Default)]
+pub struct Fuse {
+    pub skip_w: Vec<bool>,
+    pub skip_a: Vec<bool>,
+    pub addend: BTreeMap<usize, (usize, usize, bool)>,
+    pub wgroups: BTreeMap<usize, (Vec<usize>, Vec<WOut>)>,
+    pub rfold: BTreeMap<usize, (usize, Vec<u64>)>,
+}
+
+fn writes_of(op: &EmOp) -> Vec<usize> {
+    rw(op).1
+}
+
+/// The last op before `before` (exclusive) writing `v`, or None.
+fn last_writer(ops: &[EmOp], before: usize, v: usize) -> Option<usize> {
+    (0..before).rev().find(|&t| writes_of(&ops[t]).contains(&v))
+}
+
+/// No op in [from, to) writes `v`.
+fn unwritten(ops: &[EmOp], from: usize, to: usize, v: usize) -> bool {
+    (from..to.min(ops.len())).all(|t| !writes_of(&ops[t]).contains(&v))
+}
+
+/// The buffer holding at op `at` the value `v` holds right before op `before`, through copies whose source is unchanged
+/// in between (`v` itself when it is not a copy).
+fn resolve_copy(ops: &[EmOp], skip: &[bool], mut v: usize, mut before: usize, at: usize) -> usize {
+    for _ in 0..4 {
+        match last_writer(ops, before, v) {
+            Some(c) if !skip[c] => match ops[c] {
+                EmOp::Copy { dst, src, .. } if dst == v && src != v && unwritten(ops, c + 1, at + 1, src) => {
+                    v = src;
+                    before = c;
+                }
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    v
+}
+
+/// The fusions of `ops` (see `Fuse`); `consts`: the program's constant rows; `nq`: |Q|; `fusing_addend`: whether the
+/// relinearization-rescale path runs (the addends and the copies they free apply only then).
+pub fn plan_fusions(ops: &[EmOp], consts: &[Vec<u64>], q: &[u64]) -> Fuse {
+    let n = ops.len();
+    let nq = q.len();
+    let mut f = Fuse { skip_w: vec![false; n], skip_a: vec![false; n], ..Default::default() };
+    // rescale folds: WSum z = [s] (one source) then Rescale z (k folded)
+    for i in 0..n.saturating_sub(1) {
+        if let (EmOp::WSum { dst, srcs, n: wn, k: kw }, EmOp::Rescale { x, n: rn, k: Some(kc) }) = (&ops[i], &ops[i + 1]) {
+            if srcs.len() == 1 && x == dst && wn == rn && srcs[0] != *dst {
+                let c = &consts[*kc];
+                let w = &consts[*kw];
+                let row: Vec<u64> = (0..nq).map(|t| pc_core::modmul::mulmod(c[t] % q[t], w[t] % q[t], q[t])).collect();
+                let src = resolve_copy(ops, &f.skip_w, srcs[0], i, i + 1);
+                f.skip_w[i] = true;
+                f.rfold.insert(i + 1, (src, row));
+            }
+        }
+    }
+    // WSum groups (hoisted to the first member)
+    let wsum = |t: usize| match &ops[t] {
+        EmOp::WSum { dst, srcs, n, k } => Some((*dst, srcs.clone(), *n, *k)),
+        _ => None,
+    };
+    let addk = |t: usize, dst: usize, wn: usize| match ops.get(t) {
+        Some(EmOp::AddConst { x, n, k }) if *x == dst && *n == wn => Some(*k),
+        _ => None,
+    };
+    let mut grouped = vec![false; n];
+    for i in 0..n {
+        if grouped[i] || f.skip_w[i] {
+            continue;
+        }
+        let Some((d0, s0, n0, k0)) = wsum(i) else { continue };
+        let mut members = vec![(i, d0, s0.clone(), n0, k0, addk(i + 1, d0, n0))];
+        let mut srcs: Vec<usize> = s0.clone();
+        let mut covered: Vec<usize> = vec![i];
+        if members[0].5.is_some() {
+            covered.push(i + 1);
+        }
+        let mut t = i + 1;
+        while t < n && t <= i + 12 && members.len() < 3 {
+            if covered.contains(&t) || f.skip_w[t] {
+                t += 1;
+                continue;
+            }
+            if let Some((d, s, wn, kw)) = wsum(t) {
+                let mut u: Vec<usize> = srcs.clone();
+                for &x in &s {
+                    if !u.contains(&x) {
+                        u.push(x);
+                    }
+                }
+                let dsts: Vec<usize> = members.iter().map(|m| m.1).collect();
+                let ak = addk(t + 1, d, wn);
+                // hoistable: the ops in (i, t) outside the group neither write its sources nor touch its dst
+                let ok = u.len() <= 8
+                    && !s.contains(&d)
+                    && !dsts.contains(&d)
+                    && !s.iter().any(|x| dsts.contains(x))
+                    && !srcs.contains(&d)
+                    && (i + 1..t).filter(|x| !covered.contains(x)).all(|x| {
+                        let (r, w) = rw(&ops[x]);
+                        !r.contains(&d) && !w.contains(&d) && !s.iter().any(|y| w.contains(y))
+                    });
+                if ok {
+                    srcs = u;
+                    covered.push(t);
+                    if ak.is_some() {
+                        covered.push(t + 1);
+                    }
+                    members.push((t, d, s, wn, kw, ak));
+                    t += if ak.is_some() { 2 } else { 1 };
+                    continue;
+                }
+            }
+            t += 1;
+        }
+        if members.len() < 2 {
+            continue;
+        }
+        let mut outs = Vec::new();
+        for (_, d, s, wn, kw, ak) in &members {
+            let mut w = vec![0u64; srcs.len() * nq];
+            for (j, x) in s.iter().enumerate() {
+                let pos = srcs.iter().position(|y| y == x).unwrap_or(0);
+                w[pos * nq..(pos + 1) * nq].copy_from_slice(&consts[*kw][j * nq..(j + 1) * nq]);
+            }
+            outs.push(WOut { dst: *d, n: *wn, w, k: *ak });
+        }
+        for &c in &covered {
+            grouped[c] = true;
+            if c != i {
+                f.skip_w[c] = true;
+            }
+        }
+        f.wgroups.insert(i, (srcs, outs));
+    }
+    // copies nothing executed reads any more (without the addends)
+    dead_copies(ops, &mut f, false);
+    // addends (relinearization-rescale path)
+    let mut skip_a = f.skip_w.clone();
+    for i in 0..n {
+        let Some((_, _, Some((y, sub)))) = fused_rescale_at(ops, i) else { continue };
+        let (dst, operands) = match &ops[i] {
+            EmOp::Mult { dst, a, b, .. } => (*dst, vec![*a, *b]),
+            EmOp::MultAcc { dst, pairs, .. } => (*dst, pairs.iter().flat_map(|p| [p.0, p.1]).collect()),
+            _ => continue,
+        };
+        let Some(j) = last_writer(ops, i, y) else { continue };
+        let EmOp::MulConst { x, k, .. } = ops[j] else { continue };
+        if x != y || skip_a[j] || operands.contains(&y) || !dead_after(ops, i + 1, y) {
+            continue;
+        }
+        // y read by nothing between the MulConst and the add
+        if (j + 1..i).any(|t| rw(&ops[t]).0.contains(&y)) {
+            continue;
+        }
+        let copy = match ops.get(j.wrapping_sub(1)) {
+            Some(EmOp::Copy { dst: cd, src, .. }) if j > 0 && *cd == y && !skip_a[j - 1] => Some(*src),
+            _ => None,
+        };
+        let (src0, before) = match copy {
+            Some(s0) if unwritten(ops, j, i + 1, s0) => (s0, j - 1),
+            Some(_) => continue,
+            None => (y, j),
+        };
+        let src = resolve_copy(ops, &skip_a, src0, before, i);
+        if src == dst {
+            continue;
+        }
+        skip_a[j] = true;
+        if copy.is_some() {
+            skip_a[j - 1] = true;
+        }
+        f.addend.insert(i, (src, k, sub));
+    }
+    f.skip_a = skip_a;
+    dead_copies(ops, &mut f, true);
+    f
+}
+
+/// Values op `t` reads when it runs under the fusions (`addend`: with the addends applied).
+fn eff_reads(ops: &[EmOp], f: &Fuse, t: usize, addend: bool) -> Vec<usize> {
+    let skip = if addend { &f.skip_a } else { &f.skip_w };
+    if skip[t] {
+        return vec![];
+    }
+    if let Some((srcs, _)) = f.wgroups.get(&t) {
+        return srcs.clone();
+    }
+    if let Some((src, _)) = f.rfold.get(&t) {
+        return vec![*src];
+    }
+    let mut r = rw(&ops[t]).0;
+    if addend {
+        if let Some((src, _, _)) = f.addend.get(&t) {
+            r.push(*src);
+        }
+        // the add a relinearization-rescale's addend replaces reads nothing on its own
+        if t > 0 && f.addend.contains_key(&(t - 1)) && matches!(ops[t], EmOp::Add { .. }) {
+            return vec![];
+        }
+    }
+    r
+}
+
+/// Values op `t` writes when it runs under the fusions.
+fn eff_writes(ops: &[EmOp], f: &Fuse, t: usize, addend: bool) -> Vec<usize> {
+    let skip = if addend { &f.skip_a } else { &f.skip_w };
+    if skip[t] {
+        return vec![];
+    }
+    if let Some((_, outs)) = f.wgroups.get(&t) {
+        return outs.iter().map(|o| o.dst).collect();
+    }
+    rw(&ops[t]).1
+}
+
+/// Skip the copies whose destination no executed op reads before it is written again (never the output value 0).
+fn dead_copies(ops: &[EmOp], f: &mut Fuse, addend: bool) {
+    for t in 0..ops.len() {
+        let skipped = if addend { f.skip_a[t] } else { f.skip_w[t] };
+        let EmOp::Copy { dst, .. } = ops[t] else { continue };
+        if skipped || dst == 0 {
+            continue;
+        }
+        let mut dead = true;
+        for u in t + 1..ops.len() {
+            if eff_reads(ops, f, u, addend).contains(&dst) {
+                dead = false;
+                break;
+            }
+            if eff_writes(ops, f, u, addend).contains(&dst) {
+                break;
+            }
+        }
+        if dead {
+            if addend {
+                f.skip_a[t] = true;
+            } else {
+                f.skip_w[t] = true;
+                f.skip_a[t] = true;
+            }
+        }
+    }
+}
+
 impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// The program of an input with metadata `input` (FIDESlib coordinates) and its buffer count (after the
     /// liveness assignment `new` runs). The returned program's ops are already fused and rewritten (`rewrite`).
@@ -569,6 +842,12 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let mkeys: std::collections::BTreeSet<usize> = mtops.iter().map(|&n| n - 1).collect();
         b += rr_tops.iter().map(|&t| t - 2).filter(|k| !mkeys.contains(k)).collect::<std::collections::BTreeSet<_>>().iter().map(|&k| Arena::bytes_for::<u32>(k + 1)).sum::<usize>();
         b += rr_k.len() * (rows_b(nq) + rows_b(2));
+        // the executor fusions' tables: wsum_multi weights per group output, the folded rescale constants
+        let fz = plan_fusions(&assign_buffers(fused.clone()).0, &prog.consts, &st.q);
+        for (_, outs) in fz.wgroups.values() {
+            b += outs.iter().map(|o| 2 * rows_b(o.w.len())).sum::<usize>();
+        }
+        b += fz.rfold.len() * 2 * rows_b(nq);
         Ok(b)
     }
 
@@ -683,6 +962,25 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                 }
             }
         }
+        // the executor fusions (exact) and their tables
+        let fz = plan_fusions(&ops, &prog.consts, &primes[..nq]);
+        let mut wmulti = BTreeMap::new();
+        for (&h, (_, outs)) in &fz.wgroups {
+            let v: Vec<ScalarPair<'a, W>> = outs.iter().map(|o| ScalarPair::new(arena, s, &primes[..nq], &o.w)).collect::<Result<_>>()?;
+            wmulti.insert(h, v);
+        }
+        let mut consts_host = prog.consts.clone();
+        let mut rfold_k = BTreeMap::new();
+        for (&r, (_, row)) in &fz.rfold {
+            let EmOp::Rescale { n, .. } = ops[r] else { return Err(shape("evalmod fusions", "a rescale fold on a non-rescale op")) };
+            let top = n - 1;
+            let rp = &rescale[&top];
+            let al: Vec<u64> = (0..nq).map(|i| if i + rp.d <= top { mulmod(rp.alpha_host[i], row[i] % primes[i], primes[i]) } else { 0 }).collect();
+            consts_host.push(row.clone());
+            let ki = consts_host.len() - 1;
+            fused_alpha.insert(ki, ScalarPair::new(arena, s, &primes[..nq], &al)?);
+            rfold_k.insert(r, ki);
+        }
         let plan = EvalModPlan {
             mode,
             ops,
@@ -691,7 +989,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             out_meta,
             consts,
             raw,
-            consts_host: prog.consts.clone(),
+            consts_host,
             fused_alpha,
             rescale,
             mono_3n2: ConstBuf::new(arena, "bts.em", s, &monomial_rows(ctx, 3 * n / 2))?,
@@ -704,6 +1002,9 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             rr,
             rr_k,
             fuse_rescale: false,
+            fz,
+            wmulti,
+            rfold_k,
             bytes: 0,
             nq,
         };
@@ -910,9 +1211,21 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         // its in-place operand d comes from s (`from`)
         let mut from: Option<(usize, usize)> = None;
         let mut subst: EmOp;
+        // the relinearization-rescale path runs: its addend fusions (and the ops they skip) apply
+        let fusing = self.fuse_rescale && self.regen_epi.is_some() && self.relin_source == KskSource::Regen && self.relin.seeded();
+        let skip = if fusing { &self.fz.skip_a } else { &self.fz.skip_w };
         while i < self.ops.len() {
+            if skip[i] {
+                i += 1;
+                continue;
+            }
             let mut op = &self.ops[i];
-            if let Some((d, s0)) = from.take() {
+            let absorbed = from.take();
+            let from_sub = |y: usize| match absorbed {
+                Some((d, s0)) if d == y => s0,
+                _ => y,
+            };
+            if let Some((d, s0)) = absorbed {
                 subst = op.clone();
                 for v in ids_mut(&mut subst) {
                     if *v == d {
@@ -947,7 +1260,8 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             let s = &cx.ex.compute;
             match op {
                 EmOp::Copy { dst, src, n } => {
-                    let absorb = match next {
+                    let annotated = skip.get(i).copied().unwrap_or(false) || self.fz.wgroups.contains_key(&i) || self.fz.rfold.contains_key(&i);
+                    let absorb = !annotated && match next {
                         Some(EmOp::Rescale { x, n: n2, .. }) | Some(EmOp::MulConst { x, n: n2, .. }) => x == dst && n2 == n,
                         Some(EmOp::Add { dst: d, n: n2, .. }) | Some(EmOp::Mult { dst: d, n: n2, .. }) | Some(EmOp::WSum { dst: d, n: n2, .. }) => d == dst && n2 == n,
                         _ => false,
@@ -987,17 +1301,25 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                     // SAFETY: as above
                     launch_result("add_const", unsafe { (ctx.table.add_const)(&a, s.raw()) })?;
                 }
-                EmOp::Rescale { x, n, k } => self.rescale_from(cx, base + *x, None, *n, *k, kk)?,
+                EmOp::Rescale { x, n, k } => match self.fz.rfold.get(&(i - 1)) {
+                    // `WSum x = [s] w; Rescale x (c)`: from s with c w
+                    Some((src, _)) => self.rescale_from(cx, base + *x, Some(base + *src), *n, Some(self.rfold_k[&(i - 1)]), kk)?,
+                    None => self.rescale_from(cx, base + *x, None, *n, *k, kk)?,
+                },
                 EmOp::Mult { dst, n, .. } | EmOp::MultAcc { dst, n, .. } => {
                     // the rescale right after the relin rides its ModDown (`RelinRescale`)
                     let regen = self.regen_epi.is_some() && self.relin_source == KskSource::Regen && self.relin.seeded();
                     // (ops[i - 1] is this op, or the copy-absorbed original at the same index)
                     if let Some((_, _, add)) = fused_rescale_at(&self.ops, i - 1) {
                         if self.fuse_rescale && regen && self.rr.contains_key(&(n - 1)) {
-                            i += if add.is_some() { 2 } else { 1 };
+                            // the addend `c s` rides the tensor (`Fuse::addend`; s read for an absorbed copy's d as
+                            // the op's other operands are)
+                            let ya = self.fz.addend.get(&(i - 1)).map(|&(y, k, sub)| (from_sub(y), k, sub));
+                            let add = if ya.is_some() { None } else { add };
+                            i += if self.fz.addend.contains_key(&(i - 1)) || add.is_some() { 2 } else { 1 };
                             match op {
-                                EmOp::Mult { a, b, epi, .. } => self.relin_rescale(cx, base, *dst, &[(*a, *b)], *n, false, *epi, add, kk)?,
-                                EmOp::MultAcc { pairs, epi, .. } => self.relin_rescale(cx, base, *dst, pairs, *n, true, *epi, add, kk)?,
+                                EmOp::Mult { a, b, epi, .. } => self.relin_rescale(cx, base, *dst, &[(*a, *b)], *n, false, *epi, add, ya, kk)?,
+                                EmOp::MultAcc { pairs, epi, .. } => self.relin_rescale(cx, base, *dst, pairs, *n, true, *epi, add, ya, kk)?,
                                 _ => unreachable!(),
                             }
                             continue;
@@ -1016,6 +1338,38 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                         EmOp::MultAcc { pairs, epi, .. } => self.relin(cx, base, *dst, pairs, *n, true, *epi, add, kk)?,
                         _ => unreachable!(),
                     }
+                }
+                EmOp::WSum { .. } if self.fz.wgroups.contains_key(&(i - 1)) => {
+                    // the group's sums in one pass over its sources (`Fuse::wgroups`)
+                    let (srcs, outs) = &self.fz.wgroups[&(i - 1)];
+                    let tabs = &self.wmulti[&(i - 1)];
+                    let mut a = pc_kernels::WsumMultiArgs {
+                        out: [PolyRef::default(); 3],
+                        src: [PolyRef::default(); 8],
+                        w: [std::ptr::null(); 3],
+                        ws: [std::ptr::null(); 3],
+                        k: [std::ptr::null(); 3],
+                        pr,
+                        nout: outs.len() as i32,
+                        nsrc: srcs.len() as i32,
+                        rowstride: self.nq as i32,
+                        k_cts: kk as i32,
+                        n: [0; 3],
+                        nmax: outs.iter().map(|o| o.n).max().unwrap_or(0) as i32,
+                    };
+                    for (j, &x) in srcs.iter().enumerate() {
+                        a.src[j] = slot(cx, from_sub(x)).r();
+                    }
+                    for (m, o) in outs.iter().enumerate() {
+                        a.out[m] = slot(cx, o.dst).r();
+                        a.w[m] = tabs[m].v.vptr();
+                        a.ws[m] = tabs[m].s.vptr();
+                        a.k[m] = o.k.map(|k| self.raw[k].vptr()).unwrap_or(std::ptr::null());
+                        a.n[m] = o.n as i32;
+                    }
+                    // SAFETY: kk-ct views of the program buffers (outputs distinct from the sources, checked by
+                    // `plan_fusions`), weight tables of |srcs| blocks of |Q| rows, raw constants covering every Q row
+                    launch_result("wsum_multi", unsafe { (ctx.table.wsum_multi)(&a, s.raw()) })?;
                 }
                 EmOp::WSum { dst, srcs, n, k } => {
                     if srcs.len() > 8 {
@@ -1176,7 +1530,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// `dst = rescale(relin(sum of pairs' tensors) [x2] [+ const])` with the ModDown fused into the rescale
     /// (`RelinRescale`; Regen relinearization key): rows 0..top-2 of dst, degree 1.
     #[allow(clippy::too_many_arguments)]
-    fn relin_rescale<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, base: usize, dst: usize, pairs: &[(usize, usize)], n: usize, acc: bool, epi: Epi, add: Option<(usize, bool)>, kk: usize) -> Result<()> {
+    fn relin_rescale<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, base: usize, dst: usize, pairs: &[(usize, usize)], n: usize, acc: bool, epi: Epi, add: Option<(usize, bool)>, ya: Option<(usize, usize, bool)>, kk: usize) -> Result<()> {
         let ctx = cx.ctx;
         let lay = ctx.lay;
         let top = n - 1;
@@ -1192,8 +1546,18 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             let (a1, b1) = if pairs.len() > 1 { (v(pairs[1].0), v(pairs[1].1)) } else { (a0, b0) };
             let ext = View::of(&ex.ks.ext, 0);
             let t = TensorArgs { out: dstv.r(), d2: ext.r(), a0, b0, a1, b1, coef: std::ptr::null_mut(), coef_ct_stride: pw, pr: ctx.pr(), npairs: pairs.len() as i32, acc: acc as i32, n: n as i32, k: kk as i32, dbl: epi.dbl as i32, pad: 0 };
-            // SAFETY: as in `relin`
-            launch_result("tensor", unsafe { (ctx.table.tensor)(&t, ex.compute.raw()) })?;
+            match ya {
+                // (d0, d1) -+= c y in the same pass (`Fuse::addend`)
+                Some((y, k, sub)) => {
+                    let c = &self.consts[k];
+                    let a = pc_kernels::TensorYArgs { t, y: v(y), c: c.v.vptr(), cs: c.s.vptr(), sub: sub as i32, pad: 0 };
+                    // SAFETY: as in `relin`; y a program buffer other than dst (checked by `plan_fusions`), read
+                    // before the thread's stores; the constant table covers every Q row
+                    launch_result("tensor_y", unsafe { (ctx.table.tensor_y)(&a, ex.compute.raw()) })?;
+                }
+                // SAFETY: as in `relin`
+                None => launch_result("tensor", unsafe { (ctx.table.tensor)(&t, ex.compute.raw()) })?,
+            }
             // the program's `dst +/-= y` between the relinearization and the rescale: onto the tensor's (d0, d1),
             // which the conversion below rescales with the key-switched d2
             if let Some((y, sub)) = add {
@@ -1437,3 +1801,4 @@ mod tests {
         }
     }
 }
+
