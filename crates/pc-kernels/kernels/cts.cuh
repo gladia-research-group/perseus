@@ -258,8 +258,39 @@ __global__ void __launch_bounds__(BX) cts_fused_rq(CtsRegenArgs R) {
 #pragma unroll
         for (int j = 0; j < GMAX; ++j) acc0[c][j] = acc1[c][j] = 0;
 
+    auto l2 = [](const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); };
+    // K = 1: a baby step's products first ask L2 for the next baby step's lines, so its loads (serialized digit by
+    // digit) hit L2 instead of DRAM. Baby step i's lines (1 <= i < B), one per lane: lanes 2d, 2d+1 the packed `b`
+    // words of digit d (two lines at most), 16 + d the ModUp digit d (c1 at d = dt), 24 + d the resident `a` of
+    // d >= nreg, 30 + j the diagonal of giant step j (j < 2)
+    auto pf = [&](int i) {
+        if (i >= A.B) return;
+        const uint32_t sb = automorph_slot(A.kinv[i - 1], o) & ~31u;
+        const int nd = A.ndig;
+        if ((int)lane < 2 * nd) {
+            const int d = lane >> 1;
+            const uint32_t* r = (const uint32_t*)R.key.kb[i - 1] + ((size_t)d * R.key.srows + krow) * R.key.row_words;
+            if (R.key.bits) {
+                const uint64_t b0 = (uint64_t)sb * (uint32_t)R.key.bits;
+                l2(r + ((lane & 1) ? (b0 + 32u * (uint32_t)R.key.bits) >> 5 : b0 >> 5));
+            } else if ((lane & 1) == 0) {
+                l2((const W*)r + sb);
+            }
+        } else if (lane >= 16 && (int)lane < 16 + nd) {
+            const int d = lane - 16;
+            for (int c = 0; c < Kg; ++c)
+                l2(d == dt ? X + c * A.ct_stride + A.part_stride + rowoff + sb : MU + c * A.mu_ct_stride + d * A.mu_digit_stride + rowoff + sb);
+        } else if (lane >= 24 && (int)lane < 24 + nd) {
+            const int d = lane - 24;
+            if (d >= nreg) l2((const W*)A.ka[i - 1] + rowoff + sb + d * A.key_digit_stride);
+        } else if (lane >= 30) {
+            const int dg = A.B * (lane - 30) + i;
+            if ((int)(lane - 30) < A.G && dg < A.npts) l2((const W*)A.pts[dg] + (size_t)prow * A.ptw + po);
+        }
+    };
     // products of baby step i (its regenerated `a` digits in buffers (i % nbaby) * nreg ..) into the accumulators
     auto mac = [&](int i) {
+        if constexpr (KMAX == 1) pf(i + 1);
         W v0[KMAX], v1[KMAX];
         if (i == 0) {
 #pragma unroll
