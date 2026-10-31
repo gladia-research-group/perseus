@@ -162,6 +162,20 @@ fn t_ntt(st: &mut Setup) -> Vec<TestResult> {
         ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
         out.push(cmp(&format!("ntt.inv(fwd(x)) == x, 16 rows (lazy {lazy})"), &buf16.read(&st.ctx), &host16));
     }
+    // ABI 17: the inverse with a per-row last-pass scale (es / ess by row, in place of N^-1): inv(fwd(x)) = x * c_i
+    let c: Vec<u64> = (0..16).map(|i| st.rng.below(st.primes[i % 8])).collect();
+    let c_h: Vec<u64> = (0..16).map(|i| mulmod(invmod(N as u64 % st.primes[i % 8], st.primes[i % 8]), c[i], st.primes[i % 8])).collect();
+    let cs_h: Vec<u64> = (0..16).map(|i| shoup(c_h[i], st.primes[i % 8], st.wbits)).collect();
+    let (cd, csd) = (st.ctx.up(&c_h), st.ctx.up(&cs_h));
+    let want_c: Vec<u64> = (0..16 * N).map(|e| mulmod(host16[e], c[e / N], st.primes[(e / N) % 8])).collect();
+    for (lazy, chunk) in [(a16.lazy, 0), (0, 0), (a16.lazy, 5)] {
+        let a = NttArgs { lazy, chunk, ..a16 };
+        buf16.write(&st.ctx, &host16);
+        ck(unsafe { (st.t.ntt_fwd)(&a, st.s()) });
+        let a = NttArgs { es: cd.c(), ess: csd.c(), ..a };
+        ck(unsafe { (st.t.ntt_inv)(&a, st.s()) });
+        out.push(cmp(&format!("ntt.inv row-scaled (fwd(x)) == x c_i, 16 rows (lazy {lazy}, chunk {chunk})"), &buf16.read(&st.ctx), &want_c));
+    }
     out
 }
 
@@ -280,10 +294,17 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
     let mut pool: Vec<u64> = Vec::new();
     let mut jobs = Vec::new();
     let mut want = vec![0u64; 9 * N];
+    // the sources times their pre factors (the prescaled jobs' input: ABI 17)
+    let mut src_pre = src_h.clone();
     for j in &jobs_h {
         let (ns, nt) = (j.sp.len(), j.tp.len());
         let off = pool.len();
         let pre: Vec<u64> = j.sp.iter().map(|&s| st.rng.below(st.p(s))).collect();
+        for (i, &s) in j.sp.iter().enumerate() {
+            for idx in 0..N {
+                src_pre[(j.src_off + i) * N + idx] = mulmod(src_h[(j.src_off + i) * N + idx], pre[i], st.p(s));
+            }
+        }
         let m: Vec<Vec<u64>> = j.sp.iter().map(|_| j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect()).collect();
         let rb: Vec<f64> = j.sp.iter().map(|&s| 1.0 / st.p(s) as f64).collect();
         let bmod: Vec<u64> = j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect();
@@ -316,7 +337,8 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
             ntgt: nt as u32,
             pool_off: off as u32,
             exact: j.exact as u32,
-            pad: [0; 2],
+            prescaled: 0,
+            pad: 0,
         });
         for idx in 0..N {
             let y: Vec<u64> = (0..ns)
@@ -358,7 +380,15 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
     };
     ck(unsafe { (st.t.bconv)(&a, st.s()) });
     let got = dst.read(&st.ctx);
-    vec![cmp("bconv (plain + exact HPS) vs host", &got, &want)]
+    // the same jobs prescaled (the source rows hold x pre)
+    let flagged: Vec<u32> = jobs.iter().flat_map(|j| [j.src_off, j.dst_off, j.nsrc, j.ntgt, j.pool_off, j.exact, 1, 0]).collect();
+    let jobs2 = st.ctx.up32(&flagged);
+    let src2 = st.ctx.up(&src_pre);
+    let dst2 = st.ctx.zeros(9 * N);
+    let a2 = BconvArgs { src: src2.c(), dst: dst2.p(), jobs: jobs2.c() as *const BconvJob, ..a };
+    ck(unsafe { (st.t.bconv)(&a2, st.s()) });
+    let got2 = dst2.read(&st.ctx);
+    vec![cmp("bconv (plain + exact HPS) vs host", &got, &want), cmp("bconv prescaled vs host", &got2, &want)]
 }
 
 // ================================================================================================ element-wise

@@ -20,6 +20,14 @@ pub struct JobSpec {
     pub tgt: Vec<(u32, u32)>,
     /// HPS-corrected (exact) conversion.
     pub exact: bool,
+    /// The source rows hold `x_i pre_i` already (`pre_scales`: folded into the INTT's last pass).
+    pub prescaled: bool,
+}
+
+/// `pre_i = (B / b_i)^-1 mod b_i` of the sources `bp` (`B` their product).
+pub fn pre_factors(bp: &[u64]) -> Vec<u64> {
+    let ns = bp.len();
+    (0..ns).map(|i| invmod((0..ns).filter(|&k| k != i).fold(1u64, |h, k| mulmod(h, bp[k] % bp[i], bp[i])), bp[i])).collect()
 }
 
 /// Device job tables of a set of conversions.
@@ -56,9 +64,8 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             push(&mut pool, p as u64);
         }
         // pre_i = (B / b_i)^-1 mod b_i
-        for i in 0..ns {
-            let hat = (0..ns).filter(|&k| k != i).fold(1u64, |h, k| mulmod(h, bp[k] % bp[i], bp[i]));
-            push(&mut pool, invmod(hat, bp[i]));
+        for v in pre_factors(&bp) {
+            push(&mut pool, v);
         }
         for &(r, _) in &j.tgt {
             push(&mut pool, r as u64);
@@ -91,7 +98,7 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             }
         }
         max_tgt = max_tgt.max(j.tgt.len());
-        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, 0, 0]);
+                jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, j.prescaled as u32, 0]);
     }
     Ok((pool, jobs, max_tgt))
 }

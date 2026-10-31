@@ -45,7 +45,7 @@ __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W*
         if (i < ns) {
             const PrimeConst& q = pr[sprime[i]];
             const W x = src[(size_t)(J.src_off + srow[i]) * N + idx];
-            y[i] = MM::mul(x, pre[i], q);
+            y[i] = J.prescaled ? x : MM::mul(x, pre[i], q);
         } else
             y[i] = 0;
     }

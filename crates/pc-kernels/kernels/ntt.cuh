@@ -512,7 +512,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
             }
         }
     }
-    const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
 #pragma unroll
     for (int j = 0; j < 16; ++j) a[(q + 16 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
 }
@@ -569,7 +569,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
         for (int j = 0; j < 8; ++j)
             if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
     }
-    const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
 #pragma unroll
     for (int j = 0; j < 8; ++j) a[(q + 32 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
 }
@@ -620,6 +620,8 @@ int inv(const NttArgs* a, cudaStream_t s) {
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
         b.soff = a->soff ? a->soff + i : nullptr;
+        b.es = a->es ? (const W*)a->es + i : nullptr;
+        b.ess = a->es ? (const W*)a->ess + i : nullptr;
         if (lz) inv_chunk<W, true>(b, m, s);
         else inv_chunk<W, false>(b, m, s);
     }
