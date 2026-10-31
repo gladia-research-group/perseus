@@ -1,0 +1,47 @@
+# One key bundle and one set of input ciphertexts (the lean client's, dev prompts 0-1) saved against record 4's server, then fed
+# to this entry's server and to record 4's again; output frames compared byte for byte. Servers unsandboxed on a dev GPU
+# while other jobs ran: the times are not comparable to the harness's.
+== 23:51:52 save on sr-record
+request 0: times [5.684, 3.21, 3.48, 2.573, 3.015, 3.196, 3.318, 2.662, 3.016, 3.203, 3.508, 3.742, 3.64, 2.597, 3.041, 2.973] max KL 0.000335
+request 1: times [2.958, 3.164, 3.514, 3.681, 2.599, 2.998, 3.158, 3.274, 3.651, 3.805, 2.537, 2.995, 3.163, 2.553, 2.964, 3.141] max KL 0.000265
+== 23:54:47 load on sr-dev
+manifest same
+request 0: times [4.008, 3.233, 3.488, 3.696, 3.728, 2.706, 2.935, 3.13, 3.399, 3.594, 3.703, 3.375, 2.729, 3.028, 3.18, 3.334]
+request 1: times [3.646, 3.737, 2.866, 2.931, 3.067, 3.31, 3.527, 3.703, 3.57, 2.666, 3.315, 3.456, 3.547, 3.711, 3.524, 2.617]
+outputs byte-identical: 32/32
+== 23:57:35 load on sr-record
+manifest same
+request 0: times [7.761, 3.722, 2.702, 3.006, 3.183, 3.419, 3.661, 3.77, 2.751, 2.95, 3.085, 3.304, 3.573, 3.668, 3.186, 2.95]
+request 1: times [3.075, 3.262, 3.594, 3.755, 3.465, 2.812, 3.02, 3.237, 3.51, 3.711, 3.791, 2.606, 2.995, 3.208, 3.422, 3.662]
+outputs byte-identical: 32/32
+== 00:00:21 done
+
+# The kernel commits (base conversion's pre factors in the INTT, the split reduction, the L2 prefetch, the row passes'
+# occupancy): one key bundle and one set of input ciphertexts saved against the K = 16 state's server (the commits before
+# them), then fed to this entry's server; same protocol, dev GPU.
+== 09:58:27 save on sr-next
+request 0: times [2.414, 1.724, 1.723, 1.725, 1.721, 1.722, 1.723, 1.722, 1.724, 1.722, 1.72, 1.722, 1.723, 1.721, 1.721, 1.723] max KL 0.000335
+request 1: times [1.724, 1.721, 1.724, 1.724, 1.724, 1.723, 1.722, 1.725, 1.726, 1.726, 1.725, 1.723, 1.723, 1.726, 1.723, 1.722] max KL 0.000262
+== 10:00:41 load on sr-fuse
+manifest same
+request 0: times [2.424, 1.643, 1.633, 1.632, 1.634, 1.631, 1.631, 1.633, 1.632, 1.632, 1.634, 1.633, 1.635, 1.634, 1.634, 1.633]
+request 1: times [1.631, 1.632, 1.631, 1.633, 1.634, 1.633, 1.632, 1.636, 1.635, 1.633, 1.634, 1.634, 1.634, 1.633, 1.635, 1.636]
+outputs byte-identical: 32/32
+== 10:02:35 done
+
+# Prefill-128: one key bundle and one set of input ciphertexts (dev prompts 0-1) saved against record 4's server, fed to
+# the server of the commits up to K = 16 and to this entry's; same protocol, dev GPU.
+== 12:15:13 save on sr-record
+request 0: times [10.155] max KL 5.52e-06
+request 1: times [10.115] max KL 1.62e-05
+== 12:17:21 load on sr-next
+manifest same
+request 0: times [10.092]
+request 1: times [10.078]
+outputs byte-identical: 2/2
+== 12:19:07 load on sr-fuse
+manifest same
+request 0: times [9.837]
+request 1: times [9.823]
+outputs byte-identical: 2/2
+== 12:20:52 done

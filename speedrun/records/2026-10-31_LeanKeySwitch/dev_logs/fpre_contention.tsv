@@ -1,0 +1,13 @@
+run	arm	max_gpu5_util	max_gpu6_util	node3_cpus_over_50pct
+1	A	0	100	8
+2	B	0	100	8
+3	B	0	100	8
+4	A	0	100	8
+5	B	0	100	7
+6	A	0	100	8
+7	A	0	100	8
+8	B	0	100	8
+9	A	0	100	8
+10	B	0	100	8
+11	B	0	100	8
+12	A	0	100	8

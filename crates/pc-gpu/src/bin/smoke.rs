@@ -96,8 +96,8 @@ fn run() -> Result<u64, Box<dyn std::error::Error>> {
     let mut plan = MemPlan::build::<u32, Barrett64>(&chain, cfg)?;
     // the smoke's own bconv plan is a "later owner" section
     let specs = vec![
-        JobSpec { src_off: 0, dst_off: 0, src: vec![(0, 0), (1, 1), (2, 2)], tgt: vec![(0, nq as u32), (1, nq as u32 + 1), (2, 7)], exact: false },
-        JobSpec { src_off: 0, dst_off: 3, src: vec![(3, 3), (4, 4), (5, 5), (6, 6)], tgt: vec![(0, nq as u32 + 2), (1, 0)], exact: true },
+        JobSpec { src_off: 0, dst_off: 0, src: vec![(0, 0), (1, 1), (2, 2)], tgt: vec![(0, nq as u32), (1, nq as u32 + 1), (2, 7)], exact: false, prescaled: false },
+        JobSpec { src_off: 0, dst_off: 3, src: vec![(3, 3), (4, 4), (5, 5), (6, 6)], tgt: vec![(0, nq as u32 + 2), (1, 0)], exact: true, prescaled: false },
     ];
     plan.reserve("smoke.bconv", BconvPlan::bytes::<u32>(&primes, &specs)?);
     println!("[smoke] MemPlan: {}", plan.report());

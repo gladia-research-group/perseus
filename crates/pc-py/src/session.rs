@@ -12,7 +12,7 @@ use crate::LevelError;
 use pc_core::keys::{Prng, SecretKey};
 use pc_core::modmul::Barrett64;
 use pc_core::params::Chain;
-use pc_cuda::{Arena, Device, Event, EventPool};
+use pc_cuda::{Arena, Compute, DBuf, Device, Event, EventPool};
 use pc_gpu::decrypt::Decryptor;
 use pc_gpu::encrypt::Encryptor;
 use pc_gpu::keygen::KeyGen;
@@ -32,7 +32,7 @@ use pc_program::bind::{Bound as PBound, Slab};
 use pc_program::replay::{CaptureLock, ReplayCfg, Replayer, Routes, SideLane};
 use pc_program::{Kind, Program};
 use pc_shadow::route::Landing;
-use pc_shadow::Shadow;
+use pc_shadow::{PtMeta, Shadow};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::cell::RefCell;
@@ -285,6 +285,11 @@ pub(crate) struct State {
     pub cached: HashMap<String, Named>,
     pub enc_hits: u64,
     pub enc_misses: u64,
+    /// the plaintext position cache (`PtStore.cache` / `restore`): encodings and their metas, in its own arena
+    pub pt_cache: Vec<(DBuf<'static, Compute, W>, PtMeta)>,
+    /// declared after `pt_cache`, which borrows it
+    #[allow(dead_code)]
+    pub pt_cache_arena: Option<Box<Arena>>,
 }
 
 /// What only a session holding the secret has.
@@ -1321,6 +1326,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         cached: HashMap::new(),
         enc_hits: 0,
         enc_misses: 0,
+        pt_cache: Vec::new(),
+        pt_cache_arena: None,
     };
     Ok(Dev {
         st: RefCell::new(state),

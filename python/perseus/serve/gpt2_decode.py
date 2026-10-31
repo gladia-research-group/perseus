@@ -74,7 +74,7 @@ class Gpt2Handler:
                 return x
 
         self.run_ = Served(Recorder(model, self.n), plan, cfg, labels, keys, work_dir=os.path.join(a.work_dir, "ref"),
-                           pt_rows=a.pt_rows, stc_cache=a.stc_cache)
+                           pt_rows=a.pt_rows, stc_cache=a.stc_cache, pt_cache=getattr(a, "pt_cache", False))
         self.rows = None
         self.argmax = False
 
@@ -101,6 +101,10 @@ class Gpt2Handler:
         s, k = r.sess.setup_seconds()
         return {"session_s": round(s, 2), "import_s": round(k, 2), "keys": r.sess.n_keys(), "has_secret": r.sess.has_secret}
 
+    def ahead(self, t):
+        """Position t's patch, applied before its input arrives (PlannedRun.patch_ahead)."""
+        return self.run_.patch_ahead(t)
+
     def run(self, h, frames, ask):
         _pc, r = self._pc, self.run_
         t = int(h["t"])
@@ -108,11 +112,14 @@ class Gpt2Handler:
         r.inputs[t] = _pc.import_ct(r.sess, frames[0])
         t1 = time.time()
         reg, rec = r.token(t, self.rows, self.argmax)
+        # CutMax is issued behind the forward before either output is exported (an export waits for the device), so
+        # the device runs it straight after the forward; it reads the logits' register and leaves it as it was
+        z = r.argmax(t) if h.get("argmax") else None
         lg = _pc.export_ct(r.sess, r.ct(reg))
         t2 = time.time()
         out = [lg]
-        if h.get("argmax"):
-            out.append(_pc.export_ct(r.sess, r.ct(r.argmax(t))))
+        if z is not None:
+            out.append(_pc.export_ct(r.sess, r.ct(z)))
         t3 = time.time()
         return {"t": t, "import_s": t1 - t0, "fwd_s": t2 - t1, "argmax_s": t3 - t2, "server_s": t3 - t1, **rec}, out
 
@@ -204,6 +211,8 @@ def main(argv=None):
     ap.add_argument("--key-layout", choices=("dense", "packed"), default="packed")
     ap.add_argument("--pt-rows", type=int, default=28)
     ap.add_argument("--stc-cache", type=int, default=8)
+    ap.add_argument("--pt-cache", action="store_true", help="encode every position's plaintexts at setup (PlannedRun "
+                    "pt_cache: 7.4 GB at 16 tokens) and copy them per token")
     ap.add_argument("--threads", type=int, default=8, help="client keygen threads")
     ap.add_argument("--work-dir", default=os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), "m12_served"))
     ap.add_argument("--out", default=None)

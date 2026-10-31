@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 16u
+#define PC_KERNELS_ABI 17u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -34,7 +34,7 @@
 //   36   word_bits  BITS of the word this entry was built for (16, 32 or 64); kernels do not read it, checks do
 //   40   mont_pinv  -p^-1 mod 2^BITS                        (Montgomery)
 //   48   mont_r2    2^(2*BITS) mod p                         (Montgomery: R^2, converts a REDC result back)
-//   56   reserved   0
+//   56   split      u32: 2^32 mod p (low word), floor((2^32 mod p) 2^32 / p) (high word); other words 0
 struct PrimeConst {
     uint64_t p;
     uint64_t mu_lo;
@@ -44,7 +44,7 @@ struct PrimeConst {
     uint32_t word_bits;
     uint64_t mont_pinv;
     uint64_t mont_r2;
-    uint64_t reserved;
+    uint64_t split;
 };
 static_assert(sizeof(PrimeConst) == 64, "PrimeConst layout");
 
@@ -77,6 +77,8 @@ static_assert(sizeof(PolyRef) == 24, "PolyRef layout");
 //     2: eout[r] = d[r] + (x - v) s     (the same, accumulated: d = ed, or eout when ed is null; ABI 12)
 //     3: eout[r] = x s + v              (the rescale's combine: alpha x + the correction)
 //   lazy: 1 when every prime of the launch is below 2^30: lazy butterflies at u32 (same canonical result).
+// ABI 17: an inverse transform with es non-null scales row i by es[i] (Shoup companion ess[i]) in place of N^-1 (a
+// per-row constant folded into the last pass: N^-1 times the base conversion's pre factor of the row).
 struct NttArgs {
     void* base;
     const uint32_t* roff;
@@ -106,6 +108,7 @@ static_assert(sizeof(NttArgs) == 176, "NttArgs layout");
 // ------------------------------------------------------------------------------------------------ BConv
 // Batched fast base conversion (coefficient domain), one launch for many jobs (digits x ciphertexts):
 //   y_i = x_i * pre_i mod s_i (i < nsrc <= 16);  out_t = sum_i y_i * M[i][t] mod t;
+//   prescaled jobs (ABI 17): y_i = x_i as stored (the INTT's last pass multiplied by pre_i);
 //   exact jobs: v = sum_i y_i * rb_i (double FMA, source order), u = floor(v + 0.5), out_t -= u * (B mod t).
 // The pool is an array of W words. Pool layout at pool_off (all counts in W words):
 //   src_row[nsrc], src_prime[nsrc], pre[nsrc], tgt_row[ntgt], tgt_prime[ntgt], M[nsrc][ntgt],
@@ -116,7 +119,8 @@ struct BconvJob {
     uint32_t nsrc, ntgt;
     uint32_t pool_off;          // W words
     uint32_t exact;
-    uint32_t pad[2];
+    uint32_t prescaled;  // ABI 17: 1 = the source rows hold y_i = x_i pre_i already (folded into the INTT)
+    uint32_t split;      // ABI 17: 1 = u32 words, every target < 2^30: the sums reduced as hi 2^32 + lo (plain jobs)
 };
 static_assert(sizeof(BconvJob) == 32, "BconvJob layout");
 

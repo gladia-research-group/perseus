@@ -149,6 +149,8 @@ pub struct LtStage<'a, W: DevWord> {
 /// target buffer, NTT of the target rows there.
 pub(crate) struct MdPlan<'a> {
     intt: RowList<'a>,
+    /// `N^-1 pre_t` of every `intt` row (the conversion's pre factors folded into the INTT), then Shoup, W words each.
+    iscale: ConstBuf<'a, u8>,
     conv: BconvPlan<'a>,
     ntt: RowList<'a>,
     /// entries per ciphertext of intt / ntt (prefix unit), jobs per ciphertext
@@ -163,7 +165,9 @@ impl MdPlan<'_> {
     }
     /// `run` with the target NTT's epilogue (`ntt::Epi`, its buffers at the target rows' offsets).
     fn run_epi<W: DevWord, M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, src: &mut DBuf<'_, Compute, W>, dst: &mut DBuf<'_, Compute, W>, k: usize, epi: Option<ntt::Epi>) -> Result<()> {
-        ntt::transform_rows_prefix(ctx, s, Dir::Inverse, src, &self.intt, k * self.intt_per)?;
+        let v = self.iscale.vptr();
+        let sc = (v, (v as *const W).wrapping_add(self.intt.len()) as *const c_void);
+        ntt::inverse_rows_prefix_scaled(ctx, s, src, &self.intt, k * self.intt_per, None, sc)?;
         self.conv.run_prefix(ctx, s, src, 0, dst, 0, k * self.jobs_per)?;
         ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, dst, &self.ntt, k * self.ntt_per, None, epi)
     }
@@ -202,11 +206,15 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
                 src: src_rows.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(),
                 exact,
+                prescaled: true,
             });
         }
     }
     let np = parts.len();
+    let pre = crate::bconv::pre_factors(&src_rows.iter().map(|&t| primes[t]).collect::<Vec<_>>());
+    let ipre: Vec<u64> = (0..intt.len()).map(|e| pre[e % src_rows.len()]).collect();
     Ok(MdPlan {
+        iscale: ConstBuf::new(arena, "lt.md", s, &ks::scale_bytes::<W>(primes, lay.n, &intt, &ipre))?,
         intt: RowList::new(arena, s, &intt)?,
         conv: BconvPlan::new::<S, W>(arena, s, primes, &specs)?,
         ntt: RowList::new(arena, s, &nttr)?,
@@ -217,10 +225,11 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
 }
 
 pub(crate) fn md_plan_bytes<W: DevWord>(primes: &[u64], ncts: usize, nparts: usize, nsrc: usize, ntgt: usize, exact: bool) -> Result<usize> {
-    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact };
+    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact, prescaled: false };
     let specs = vec![spec; ncts * nparts];
     let rl = |n: usize| Arena::bytes_for::<u32>(n) + Arena::bytes_for::<i32>(n);
-    Ok(rl(ncts * nparts * nsrc) + rl(ncts * nparts * ntgt) + BconvPlan::bytes::<W>(primes, &specs)?)
+    let sc = Arena::bytes_for::<u8>(2 * ncts * nparts * nsrc * std::mem::size_of::<W>());
+    Ok(rl(ncts * nparts * nsrc) + rl(ncts * nparts * ntgt) + sc + BconvPlan::bytes::<W>(primes, &specs)?)
 }
 
 /// Compaction shift of a diagonal's integer coefficients: the largest s <= 12 with every nonzero coefficient at an

@@ -25,7 +25,7 @@ import sys
 import time
 import types
 
-from speedrun.record1 import PROMPT, pack, unpack
+from speedrun.record1 import _COUNT, _LEN, PROMPT
 
 HEADER = struct.Struct("<Q")
 STEPS = 16
@@ -48,10 +48,41 @@ def write(root, rel, payload):
     os.rename(tmp, path)
 
 
+def write_packed(root, rel, blobs):
+    """write(root, rel, pack(blobs)) without joining the blobs into one payload first."""
+    head = _COUNT.pack(len(blobs)) + b"".join(_LEN.pack(len(b)) for b in blobs)
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(HEADER.pack(len(head) + sum(len(b) for b in blobs)))
+        f.write(head)
+        for b in blobs:
+            f.write(b)
+    os.rename(tmp, path)
+
+
+def unpacked(payload, most=64):
+    """unpack(payload) as views into the payload: its checks, no copies."""
+    if len(payload) < _COUNT.size:
+        raise ValueError("unpacked: no payload header")
+    (n,) = _COUNT.unpack_from(payload)
+    off = _COUNT.size + n * _LEN.size
+    if n > most or off > len(payload):
+        raise ValueError("unpacked: bad payload header")
+    lens = [_LEN.unpack_from(payload, _COUNT.size + i * _LEN.size)[0] for i in range(n)]
+    if off + sum(lens) != len(payload):
+        raise ValueError("unpacked: lengths do not match the payload")
+    mv, out = memoryview(payload), []
+    for m in lens:
+        out.append(mv[off:off + m])
+        off += m
+    return out
+
+
 def read(root, rel):
-    with open(os.path.join(root, rel), "rb") as f:
-        data = f.read()
-    return data[HEADER.size:HEADER.size + HEADER.unpack_from(data)[0]]
+    with open(os.path.join(root, rel), "rb") as f:          # the payload read straight into its bytes (no slice copy)
+        return f.read(HEADER.unpack(f.read(HEADER.size))[0])
 
 
 def wait(root, *rels):
@@ -78,7 +109,7 @@ def decode(a):
     from perseus.serve import gpt2_decode as served
     args = types.SimpleNamespace(plan=a.plan, chain="n32", layers=None, packing="cachemir_complex",
                                  weights=os.environ["WEIGHTS_PATH"], key_layout="packed", pt_rows=28, stc_cache=8,
-                                 work_dir=os.path.join(os.environ.get("HOME", "/tmp"), "speedrun"))
+                                 pt_cache=True, work_dir=os.path.join(os.environ.get("HOME", "/tmp"), "speedrun"))
     h = served.Gpt2Handler(args)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(a.device)      # the handler exports its own device; the GPU is ours
     man = h.manifest({"tokens": STEPS, "argmax": True, "contract": contract_hash(served._config(args.plan, "n32"))})
@@ -91,7 +122,8 @@ def decode(a):
         for j in range(STEPS):
             wait(a.inbox, f"{k}/{j}")
             _h, outs = h.run({"t": j, "argmax": True}, [read(a.inbox, f"{k}/{j}")], None)
-            write(a.outbox, f"{k}/{j}", pack(outs))
+            write_packed(a.outbox, f"{k}/{j}", outs)
+            h.ahead((j + 1) % STEPS)                # the next position's patch while the client turns around
         k += 1
     h.run_.close()
     return 0
@@ -157,9 +189,9 @@ def prefill(a):
     tail, cutmax = run.reg[model.n_layers][0][1], run.reg[model.n_layers + 1][0][1]
     k = 0
     while wait(a.inbox, f"{k}/0", "quit") != "quit":
-        x0 = [_pc.import_ct(run.sess, f) for f in unpack(read(a.inbox, f"{k}/0"))]
+        x0 = [_pc.import_ct(run.sess, f) for f in unpacked(read(a.inbox, f"{k}/0"))]
         run.run(x0=x0)
-        write(a.outbox, f"{k}/0", pack([_pc.export_ct(run.sess, run.ct(r)) for r in (tail, cutmax)]))
+        write_packed(a.outbox, f"{k}/0", [_pc.export_ct(run.sess, run.ct(r)) for r in (tail, cutmax)])
         del x0
         k += 1
     run.close()

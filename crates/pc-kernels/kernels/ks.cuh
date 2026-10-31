@@ -280,8 +280,10 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
 // Its lanes expand `a` one 16-slot ChaCha block per thread (two digits per pass, through shared memory), and the
 // automorphism maps the segment onto one segment (in the bit-reversed order a slot's segment decides its image's), so
 // the outputs are permuted inside the warp.
+// Each digit first asks L2 for the next digit's lines of the warp's segment (`b`, the ModUp digit or c1, a resident `a`),
+// so its loads hit L2 instead of DRAM. At most 80 registers: 3 blocks per SM (shared memory holds 3).
 template <class MM, bool PACKED>
-__global__ void __launch_bounds__(256) ks_dot_seg(KsKeyArgs G) {
+__global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
     using W = uint32_t;
     using Wd = WideOf<W>;
     __shared__ W sa[8][2][264];
@@ -308,6 +310,22 @@ __global__ void __launch_bounds__(256) ks_dot_seg(KsKeyArgs G) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) key[i] = __ldg(T.seed[r] + i);
         for (int d = 0; d < A.ndig; ++d) {
+            if (d + 1 < A.ndig) {
+                // digit e's lines of the segment, 8 per source: lanes 0-7 `b`, 8-15 the ModUp digit (c1), 16-23 a resident `a`
+                const int e = d + 1;
+                const size_t seg = (size_t)t * N + R * 256;
+                const char* p = nullptr;
+                if (lane < 8) {
+                    const size_t row = ((size_t)e * T.srows + slot) * T.row_words;
+                    p = PACKED ? (const char*)((const uint32_t*)kb + row + (((uint64_t)R * 256 * (uint32_t)T.bits) >> 5))
+                               : (const char*)((const W*)kb + row + R * 256);
+                } else if (lane < 16) {
+                    p = (const char*)((e == dt) ? (const W*)A.c1 + seg : (const W*)A.modup + e * A.mu_digit_stride + seg);
+                } else if (lane < 24 && e >= nreg) {
+                    p = (const char*)((const W*)A.ka[r] + e * A.key_digit_stride + seg);
+                }
+                if (p) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + 128 * (lane & 7)));
+            }
             if ((d & 1) == 0 && d < nreg) {
                 // digits d, d + 1: lanes 0-15 / 16-31 expand the segment's 16 blocks of one digit each
                 const int dd = d + (lane >> 4);

@@ -263,8 +263,9 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
 }
 
 // ---------------------------------------------------------------- forward row pass (warp per row, 8 rows per block)
+// Both row passes at 48 registers: 5 blocks per SM (their loads wait on L2; more warps hide it).
 template <class W, bool L>
-__global__ void __launch_bounds__(256) ntt_fwd_rows(NttArgs T) {
+__global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     __shared__ W s[8][256 + 8];
     const int row = blockIdx.y;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -371,7 +372,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_rows(NttArgs T) {
 
 // ---------------------------------------------------------------- inverse row pass (GS, t = 1 .. 128)
 template <class W, bool L>
-__global__ void __launch_bounds__(256) ntt_inv_rows(NttArgs T) {
+__global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     __shared__ W s[8][256 + 8];
     const int row = blockIdx.y;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -512,7 +513,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
             }
         }
     }
-    const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
 #pragma unroll
     for (int j = 0; j < 16; ++j) a[(q + 16 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
 }
@@ -569,7 +570,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
         for (int j = 0; j < 8; ++j)
             if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
     }
-    const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
 #pragma unroll
     for (int j = 0; j < 8; ++j) a[(q + 32 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
 }
@@ -620,6 +621,8 @@ int inv(const NttArgs* a, cudaStream_t s) {
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
         b.soff = a->soff ? a->soff + i : nullptr;
+        b.es = a->es ? (const W*)a->es + i : nullptr;
+        b.ess = a->es ? (const W*)a->ess + i : nullptr;
         if (lz) inv_chunk<W, true>(b, m, s);
         else inv_chunk<W, false>(b, m, s);
     }

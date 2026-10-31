@@ -6,6 +6,7 @@
 use crate::config::PyConfig;
 use crate::fhe::PyCt;
 use crate::session::{cerr, gerr, nogil, PySession, State};
+use pc_client::wire::{CT_MAGIC, VERSION};
 use pc_client::{Client, ClientSecret, CtHeader, CtWire, WireMeta};
 use pc_core::encode::{Complex, Payload};
 use pc_core::keys::Prng;
@@ -254,31 +255,44 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
     let c = tmp.as_ref().map_or(ct.ct_ref(), |t| t.ct_ref());
     let st = dev.st.borrow();
     let top = dev.ctx.top_of(c.meta.level).map_err(gerr)?;
-    let rows: Vec<usize> = (0..=top).collect();
-    let n = dev.ctx.lay.n;
-    let data = nogil(py, || -> pc_gpu::Result<Vec<u32>> {
-        let mut v = Vec::with_capacity(2 * rows.len() * n);
-        for part in 0..2 {
-            v.extend(c.buf.download_rows(&st.ex.compute, 0, part, &rows)?);
-        }
-        Ok(v)
-    })
-    .map_err(gerr)?;
+    let (rows, n) = (top + 1, dev.ctx.lay.n);
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag } },
-        data,
-    };
-    Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
+    let header = CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows, meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag } };
+    let hj = serde_json::to_vec(&header).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // `CtWire::to_bytes`'s frame, written in place: the header, each part's rows 0..=top (contiguous on the device)
+    // downloaded straight into the frame, the checksum over them
+    let (d0, part_bytes) = (16 + hj.len(), 4 * rows * n);
+    let d1 = d0 + 2 * part_bytes;
+    PyBytes::new_with(py, d1 + 8, |out| {
+        out[..4].copy_from_slice(CT_MAGIC);
+        out[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        out[8..16].copy_from_slice(&(hj.len() as u64).to_le_bytes());
+        out[16..d0].copy_from_slice(&hj);
+        for part in 0..2 {
+            let dst = &mut out[d0 + part * part_bytes..d0 + (part + 1) * part_bytes];
+            c.buf.buf.download_bytes_into(&st.ex.compute, c.buf.offset(0, part, 0), dst).map_err(|x| gerr(x.into()))?;
+        }
+        let sum = sum64_le(&out[d0..d1]);
+        out[d1..].copy_from_slice(&sum.to_le_bytes());
+        Ok(())
+    })
 }
 
-/// A session ciphertext from a wire frame (one ciphertext, this session's chain).
+/// A session ciphertext from a wire frame (one ciphertext, this session's chain; bytes or a memoryview).
 #[pyfunction]
-fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8]) -> PyResult<PyCt> {
+fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> PyResult<PyCt> {
     let dev = session.dev.clone();
-    let w = CtWire::from_bytes(frame).map_err(cerr)?;
-    let h = &w.header;
+    // any contiguous bytes-like frame (bytes, or a memoryview into a payload holding several), read where it lies
+    let fb = PyBuffer::<u8>::get(frame)?;
+    if !fb.is_c_contiguous() {
+        return Err(PyValueError::new_err("import_ct: the frame is not a contiguous buffer"));
+    }
+    // SAFETY: `fb` holds the exporter's buffer (alive and unmoved) until it drops at the end of this call; C-contiguous
+    // u8 items
+    let frame: &[u8] = unsafe { std::slice::from_raw_parts(fb.buf_ptr() as *const u8, fb.len_bytes()) };
+    let (h, data) = ct_frame(frame)?;
+    let h = &h;
     let ph = pc_client::spec::params_hash(&dev.ctx.chain);
     if h.params_hash != ph || h.n != dev.ctx.lay.n || h.k != 1 {
         return Err(PyValueError::new_err(format!("import_ct: frame for params {} n {} k {}; this session runs {ph} n {} (k = 1)", h.params_hash, h.n, h.k, dev.ctx.lay.n)));
@@ -290,20 +304,70 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8]) -> PyResult<PyCt
     let tag = if h.meta.tag.is_null() { Default::default() } else { serde_json::from_value(h.meta.tag.clone()).map_err(|e| PyValueError::new_err(format!("import_ct: tag {e}")))? };
     let meta = CtMeta { level: h.meta.level, deg: h.meta.deg, nf: h.meta.nf, slots: h.meta.slots, tag };
     let mut out = PyCt::acquire(&dev, meta)?;
-    let rows: Vec<usize> = (0..h.rows).collect();
-    let n = h.n;
+    let part_bytes = 4 * h.rows * h.n;
     {
         let st = dev.st.borrow();
         let c = out.ct_mut_ref()?;
+        if h.rows > c.buf.lay.rows() {
+            return Err(PyValueError::new_err(format!("import_ct: {} rows in a {}-row layout", h.rows, c.buf.lay.rows())));
+        }
+        // the frame's words go up where they lie, rows 0..rows of a part contiguous on both sides: one copy per part
         nogil(py, || -> pc_gpu::Result<()> {
             for part in 0..2 {
-                c.buf.upload_rows(&st.ex.compute, 0, part, &rows, &w.data[part * h.rows * n..(part + 1) * h.rows * n])?;
+                let off = c.buf.offset(0, part, 0);
+                c.buf.buf.upload_bytes_at(&st.ex.compute, off, &data[part * part_bytes..(part + 1) * part_bytes])?;
             }
             Ok(())
         })
         .map_err(gerr)?;
     }
     Ok(out)
+}
+
+/// A ciphertext frame (`CtWire::to_bytes`) read in place: its header and its words' little-endian bytes
+/// (`[part][row][N]`), with the magic, version, size and checksum checked as `CtWire::from_bytes` checks them.
+fn ct_frame(frame: &[u8]) -> PyResult<(CtHeader, &[u8])> {
+    let bad = |m: String| PyValueError::new_err(format!("import_ct: {m}"));
+    if frame.len() < 16 || &frame[..4] != CT_MAGIC {
+        return Err(bad("not a ciphertext frame".into()));
+    }
+    let ver = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+    if ver != VERSION {
+        return Err(bad(format!("version {ver}; this build reads version {VERSION}")));
+    }
+    let hl = u64::from_le_bytes(frame[8..16].try_into().expect("8 bytes"));
+    if hl > (frame.len() - 16) as u64 {
+        return Err(bad(format!("a header of {hl} bytes in a frame of {}", frame.len())));
+    }
+    let d0 = 16 + hl as usize;
+    let header: CtHeader = serde_json::from_slice(&frame[16..d0]).map_err(|e| bad(format!("header: {e}")))?;
+    if header.n == 0 || header.k == 0 || header.rows == 0 || header.n > 1 << 17 || header.k > 64 || header.rows > 128 {
+        return Err(bad(format!("ciphertext header out of range: {header:?}")));
+    }
+    let d1 = d0 + 4 * CtWire::words(&header);
+    if frame.len() != d1 + 8 {
+        return Err(bad(format!("{} bytes for a frame of {} words", frame.len(), CtWire::words(&header))));
+    }
+    let data = &frame[d0..d1];
+    if u64::from_le_bytes(frame[d1..].try_into().expect("8 bytes")) != sum64_le(data) {
+        return Err(bad("ciphertext checksum mismatch".into()));
+    }
+    Ok((header, data))
+}
+
+/// `pc_client::wire::sum64` of words given as their little-endian bytes (whole words).
+fn sum64_le(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut it = b.chunks_exact(8);
+    for p in &mut it {
+        h ^= u64::from_le_bytes(p.try_into().expect("8 bytes"));
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if let [x0, x1, x2, x3] = *it.remainder() {
+        h ^= u32::from_le_bytes([x0, x1, x2, x3]) as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -13,7 +13,9 @@
 #     one-hot mass at the record's. The ILP also takes the recipe's raise drops into stage 13 (that refresh and the
 #     record's hint v_54 at raise drop 2).
 # The blocks pass also plans the base capture's stage 13 (the argmax before CutMax) at the old exit; it is dropped,
-# as the served plan's stage 13 is CutMax's. The runtime line gains CHAIN_PRESET=n32a4 (the server's chain).
+# as the served plan's stage 13 is CutMax's. The runtime line gains CHAIN_PRESET=n32a4 (the server's chain) and
+# FIDESLIB_BTS_SPARSE_B_K=16: the SparseB refreshes' EvalMod on the dense route's degree-14 series (Prefill-128's), same
+# levels and landings as K = 24's degree-20 table, about 0.7 ms less per refresh on the RTX PRO 6000.
 # RESUME=1 keeps the blocks already planned (a preempted run). BASE (an n32 Decode-8 plan with a `_cm` CutMax plan
 # beside it), GR (its stages 0-12 capture), CUTMAX_GRAPH (its stage-13 capture) and CONFIGS (its CutMax configs) name
 # another n32 plan to take the recipe and captures of; OUT is BASE with n32a4 for n32.
@@ -56,7 +58,7 @@ rm -rf "bootstrap_placements/${OUT}_b12" "bootstrap_placements/$OUT/block_13_pla
 env $RECIPE bash python/perseus/examples/gpt2/make_plan.sh "$GR" "$OUT" feedback
 TOOL="speedrun/make_n32a4_decode_plan.sh (make_plan.sh blocks; stage 12 alone at block 11's exit with \
 PLAN_ILP_EXIT_CAP=$CAP; feedback)"
-sed -e "s|^tool=.*|tool=$TOOL|" -e "s|^recipe=.*|recipe=$RECIPE|" -e "s|^runtime=\(.*\)|runtime=\1 CHAIN_PRESET=n32a4|" \
+sed -e "s|^tool=.*|tool=$TOOL|" -e "s|^recipe=.*|recipe=$RECIPE|" -e "s|^runtime=\(.*\)|runtime=\1 CHAIN_PRESET=n32a4 FIDESLIB_BTS_SPARSE_B_K=16|" \
     -e "s|make_plan.sh's chain (blocks, argmax, feedback)|make_n32a4_decode_plan.sh's chain|" \
     "bootstrap_placements/$BASE/PLAN_CMD.txt" > "bootstrap_placements/$OUT/PLAN_CMD.txt"
 grep "^capture13=" "bootstrap_placements/${BASE}_cm/PLAN_CMD.txt" >> "bootstrap_placements/$OUT/PLAN_CMD.txt" || true

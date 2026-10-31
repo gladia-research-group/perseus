@@ -1,0 +1,61 @@
+{
+  "name": "LeanKeySwitch",
+  "tracks": [
+    "prefill",
+    "decode"
+  ],
+  "authors": [
+    {
+      "name": "Alessandro Zirilli",
+      "github": "alexzilligmm",
+      "affiliation": "Sapienza University of Rome"
+    }
+  ],
+  "summary": "Record 4's code and plans with the served decode's host work trimmed (every position's plaintexts encoded once at setup and copied into their slots per token, CutMax issued behind the forward, ciphertext frames imported and exported in place, the next position's patch applied ahead of its input; byte-identical outputs), Decode-8's SparseB refreshes on the degree-14 EvalMod series (K = 16), as Prefill-128's, and a leaner key switch for both tracks (base conversion's pre factors folded into the INTT's last pass, double-word sums reduced in 32-bit Shoup products, L2 prefetch of the next key reads in CtS and the inner product, the NTT row passes at five blocks per SM; byte-identical outputs).",
+  "ckks": {
+    "log_n": 16,
+    "log_qp": 1734,
+    "secret": "uniform-ternary",
+    "chain": "n32a4: record 3's n32 without its StC-first prime ids 5-7 (51 Q primes), dnum 4 (13/13/13/12); Prefill-128 stays on n32",
+    "dnum": 4,
+    "special_primes": "record 3's 9 and 158334977, 158072833, 155189249, 154533889 (P 360.5 bits)",
+    "sparse_keys": [
+      {
+        "role": "encapsulation, dense to sparse",
+        "secret": "ternary, Hamming weight 32",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (308 bits), record 1's"
+      },
+      {
+        "role": "SPRU block key",
+        "secret": "binary, one 1 in each of 64 blocks",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (308 bits), record 1's"
+      },
+      {
+        "role": "PCMM ring switch (Prefill-128)",
+        "secret": "ternary on ring dimension 4096",
+        "modulus": "q_0 q_1 P of record 3's chain, on which Prefill-128 stays"
+      }
+    ]
+  },
+  "systems_only": false,
+  "ai_assistance": {
+    "used": true,
+    "share_of_changed_lines": 1.0,
+    "tools": [
+      "Claude Code"
+    ]
+  },
+  "dev_result": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "prefill": {
+      "request_s": 9.842,
+      "record_request_s_same_gpu": 10.13,
+      "mean_kl": 8.64e-06
+    },
+    "decode": {
+      "s_per_token": 1.645,
+      "record_s_per_token_same_gpu": 1.793,
+      "mean_kl": 4.28e-06
+    }
+  }
+}

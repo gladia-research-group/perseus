@@ -8,11 +8,12 @@
 //! (`KsWork`) belong to the `Executor`. Keys are seen through `KsKeyRef` (dense `b` rows `[digit][prime id][N]`,
 //! optional expanded `a`, optional 256-bit KSKA seed); `DevKey` serves the oracle import and the benches.
 //! Step details: docs/ARCHITECTURE.md "pc-gpu key switching".
-use crate::bconv::{BconvPlan, JobSpec};
+use crate::bconv::{pre_factors, BconvPlan, JobSpec};
 use crate::context::{Context, DevStrategy, DevWord};
 use crate::error::{shape, Error, Result};
 use crate::ntt::{self, Dir, Parts, RowList, Span};
 use crate::poly::{CtBuf, Layout};
+use pc_core::modmul::{invmod, mulmod};
 use pc_core::params::Chain;
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
 use pc_kernels::{EpiArgs, EwArgs, KsArgs, KsKeyArgs, KsRegenArgs, KskExpandArgs, MdEpiArgs, PolyRef, RowSet};
@@ -514,6 +515,9 @@ struct LevelPlan<'a> {
     /// layouts apart (m = 1..=SRC_STRIDES, one table each): `c * m * 2 rows + t` (the ModUp's INTT reads the input
     /// there, out of place).
     intt_src: ConstBuf<'a, u32>,
+    /// The INTT's last-pass scale of every `intt` row, `N^-1 pre_t mod q_t` (pre_t: the ModUp conversion's factor of
+    /// limb t in its digit), then the Shoup companions: W words each. The conversion reads `x_t pre_t` as written.
+    intt_scale: ConstBuf<'a, u8>,
     /// ModUp conversions of every live digit, jobs `[c < k_max][digit]` (digit limbs -> the other live Q limbs and
     /// P): one launch for all digits of the first k ciphertexts (a job prefix).
     modup: BconvPlan<'a>,
@@ -527,11 +531,21 @@ struct LevelPlan<'a> {
     moddown: BconvPlan<'a>,
 }
 
+impl LevelPlan<'_> {
+    /// `intt_scale`'s values and Shoup companions.
+    fn scale_ptrs<W: DevWord>(&self) -> (*const c_void, *const c_void) {
+        let v = self.intt_scale.vptr();
+        (v, (v as *const W).wrapping_add(self.intt.len()) as *const c_void)
+    }
+}
+
 /// Host specs of one level (shared by sizing and building).
 struct LevelSpecs {
     kp: usize,
     intt: Vec<(u32, i32)>,
     intt_src: Vec<u32>,
+    /// pre_t of every `intt` entry's row t (its digit's `pre_factors`).
+    intt_pre: Vec<u64>,
     ndig: usize,
     modup: Vec<JobSpec>,
     modup_ntt: Vec<(u32, i32)>,
@@ -552,9 +566,18 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
     let digs: Vec<Vec<usize>> =
         chain.digits.iter().map(|d| d.iter().copied().filter(|&t| t <= top).collect::<Vec<_>>()).filter(|d| !d.is_empty()).collect();
     let (mut intt, mut intt_src) = (Vec::new(), Vec::new());
+    let primes = chain.primes();
+    let mut pre_of = vec![0u64; top + 1];
+    for dl in &digs {
+        for (&t, v) in dl.iter().zip(pre_factors(&dl.iter().map(|&t| primes[t]).collect::<Vec<_>>())) {
+            pre_of[t] = v;
+        }
+    }
+    let mut intt_pre = Vec::new();
     for c in 0..k_max {
         for t in 0..=top {
             intt.push(((c * rows + t) as u32, t as i32));
+            intt_pre.push(pre_of[t]);
         }
     }
     for m in 1..=SRC_STRIDES {
@@ -583,6 +606,7 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
                 src: dl.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: tg.iter().map(|&t| (t as u32, t as u32)).collect(),
                 exact: false,
+                prescaled: true,
             });
         }
     }
@@ -597,10 +621,30 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
                 src: specials.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
                 exact: false,
+                prescaled: true,
             });
         }
     }
-    LevelSpecs { kp: specials.len(), intt, intt_src, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown }
+    LevelSpecs { kp: specials.len(), intt, intt_src, intt_pre, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown }
+}
+
+/// `LevelPlan::intt_scale` of `sp`: `N^-1 pre_t mod q_t` per entry, then the Shoup companions (W words, as bytes).
+fn intt_scale_bytes<W: DevWord>(primes: &[u64], n: usize, sp: &LevelSpecs) -> Vec<u8> {
+    scale_bytes::<W>(primes, n, &sp.intt, &sp.intt_pre)
+}
+
+/// `N^-1 pre mod p` of every row `(_, prime id)` with its `pre`, then the Shoup companions (W words, as bytes).
+pub(crate) fn scale_bytes<W: DevWord>(primes: &[u64], n: usize, rows: &[(u32, i32)], pre: &[u64]) -> Vec<u8> {
+    let (v, s): (Vec<W>, Vec<W>) = rows
+        .iter()
+        .zip(pre)
+        .map(|(&(_, t), &pre)| {
+            let p = primes[t as usize];
+            let c = pc_core::modmul::shoup(W::from_u64(mulmod(invmod(n as u64 % p, p), pre, p)), W::from_u64(p));
+            (c.w, c.w_prime)
+        })
+        .unzip();
+    v.iter().chain(&s).flat_map(|w| w.to_u64().to_le_bytes()[..std::mem::size_of::<W>()].to_vec()).collect()
 }
 
 fn rowlist_bytes(n: usize) -> usize {
@@ -614,6 +658,9 @@ pub struct KsPlans<'a> {
     digit_of: ConstBuf<'a, i32>,
     /// 0..rows (key expansion row list).
     ids: ConstBuf<'a, i32>,
+    /// The ModDown INTT's last-pass scales over the special rows, `N^-1 pre_j mod p_j` (pre_j over P, then over P'):
+    /// one entry per row of the context's span-P tables (period kp), then the Shoup companions, W words each.
+    md_scale: [ConstBuf<'a, u8>; 2],
     pub k_max: usize,
     pub dnum: usize,
     pub lay: Layout,
@@ -629,9 +676,11 @@ impl<'a> KsPlans<'a> {
         for top in 0..lay.nq {
             let sp = level_specs(chain, &lay, top, k_max);
             b += rowlist_bytes(sp.intt.len()) + Arena::bytes_for::<u32>(sp.intt_src.len()) + Arena::bytes_for::<u32>(sp.ks_rows.len());
+            b += Arena::bytes_for::<u8>(2 * sp.intt.len() * std::mem::size_of::<W>());
             b += BconvPlan::bytes::<W>(&primes, &sp.modup)? + rowlist_bytes(sp.modup_ntt.len());
             b += BconvPlan::bytes::<W>(&primes, &sp.moddown)?;
         }
+        b += 2 * Arena::bytes_for::<u8>(2 * 2 * k_max * lay.kp * std::mem::size_of::<W>());
         Ok(b)
     }
 
@@ -650,6 +699,7 @@ impl<'a> KsPlans<'a> {
                 kp: sp.kp,
                 intt: RowList::new(arena, s, &sp.intt)?,
                 intt_src: ConstBuf::new(arena, "ks.plans", s, &sp.intt_src)?,
+                intt_scale: ConstBuf::new(arena, "ks.plans", s, &intt_scale_bytes::<W>(&primes, lay.n, &sp))?,
                 modup: BconvPlan::new::<S, W>(arena, s, &primes, &sp.modup)?,
                 modup_ntt: RowList::new(arena, s, &sp.modup_ntt)?,
                 mu_rows: sp.mu_rows,
@@ -659,15 +709,38 @@ impl<'a> KsPlans<'a> {
         }
         let digit_of: Vec<i32> = (0..lay.rows()).map(|t| chain.digit_of(t).map(|d| d as i32).unwrap_or(-1)).collect();
         let ids: Vec<i32> = (0..lay.rows() as i32).collect();
+        let md = |np: usize| -> Vec<u8> {
+            // specials 0..np (P' = the first p_sparse); rows past np keep N^-1 (their conversion does not read them)
+            let sp: Vec<u64> = (0..lay.kp).map(|j| primes[lay.nq + j]).collect();
+            let pre = pre_factors(&sp[..np]);
+            let (v, w): (Vec<W>, Vec<W>) = (0..2 * k_max * lay.kp)
+                .map(|e| {
+                    let j = e % lay.kp;
+                    let p = sp[j];
+                    let c = pc_core::modmul::shoup(W::from_u64(mulmod(invmod(lay.n as u64 % p, p), if j < np { pre[j] } else { 1 }, p)), W::from_u64(p));
+                    (c.w, c.w_prime)
+                })
+                .unzip();
+            v.iter().chain(&w).flat_map(|x| x.to_u64().to_le_bytes()[..std::mem::size_of::<W>()].to_vec()).collect()
+        };
+        let md_scale = [ConstBuf::new(arena, "ks.plans", s, &md(lay.kp))?, ConstBuf::new(arena, "ks.plans", s, &md(chain.p_sparse.min(lay.kp)))?];
         Ok(KsPlans {
             levels,
             digit_of: ConstBuf::new(arena, "ks.plans", s, &digit_of)?,
             ids: ConstBuf::new(arena, "ks.plans", s, &ids)?,
+            md_scale,
             k_max,
             dnum: chain.dnum(),
             lay,
             method: KeySwitch::of(chain),
         })
+    }
+
+    /// `md_scale` of a level's special set (P, or P' when `lv.kp` < kp): values and Shoup companions.
+    fn md_scale_ptrs<W: DevWord>(&self, lv: &LevelPlan<'_>) -> (*const c_void, *const c_void) {
+        let t = &self.md_scale[(lv.kp < self.lay.kp) as usize];
+        let v = t.vptr();
+        (v, (v as *const W).wrapping_add(2 * self.k_max * self.lay.kp) as *const c_void)
     }
 
     fn level(&self, top: usize) -> Result<&LevelPlan<'a>> {
@@ -799,7 +872,7 @@ pub fn modup_from<W: DevWord, M: DevStrategy<W>>(
     let lv = plans.level(top)?;
     let soff = lv.intt_src.dptr().wrapping_add((m - 1) * plans.k_max * (top + 1));
     let src = ntt::Src { base: src.base, soff, n: 1, stride: 0 };
-    ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, coef, &lv.intt, k * (top + 1), Some(src), None)?;
+    ntt::inverse_rows_prefix_scaled(ctx, s, coef, &lv.intt, k * (top + 1), Some(src), lv.scale_ptrs::<W>())?;
     modup_tail(ctx, s, lv, ks, coef, k)
 }
 
@@ -815,7 +888,7 @@ pub fn modup_coef_ready<W: DevWord, M: DevStrategy<W>>(
 ) -> Result<()> {
     plans.check_k(k)?;
     let lv = plans.level(top)?;
-    ntt::transform_rows_prefix(ctx, s, Dir::Inverse, coef, &lv.intt, k * (top + 1))?;
+    ntt::inverse_rows_prefix_scaled(ctx, s, coef, &lv.intt, k * (top + 1), None, lv.scale_ptrs::<W>())?;
     modup_tail(ctx, s, lv, ks, coef, k)
 }
 
@@ -1131,6 +1204,20 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// The ModDown's INTT of x's special rows (both parts, k ciphertexts; `src`: a summing first pass), its last pass
+/// scaled by the conversion's pre factors (the conversion reads `x_j pre_j` as written).
+fn md_intt<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    lv: &LevelPlan<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    k: usize,
+    src: Option<ntt::Src>,
+) -> Result<()> {
+    ntt::inverse_k_scaled(ctx, s, x, Span::P, Parts::Both, k, src, plans.md_scale_ptrs::<W>(lv))
+}
+
 /// First half of ModDown on the first `k` ciphertexts of `x` (both parts): INTT of x's special rows (in place),
 /// conversion P -> Q rows 0..=top into `conv`, NTT of conv's Q rows. Then `conv` holds the correction.
 pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
@@ -1146,7 +1233,7 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
     check_cts(x, 0, k, "ks moddown")?;
     check_cts(conv, 0, k, "ks moddown")?;
     let lv = plans.level(top)?;
-    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
+    md_intt(ctx, s, plans, lv, x, k, None)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     ntt::transform_k(ctx, s, Dir::Forward, conv, Span::Q { top }, Parts::Both, k)?;
     Ok(())
@@ -1206,7 +1293,7 @@ pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
     check_cts(conv, 0, k, "ks moddown")?;
     check_md_out(ctx, out, mode, "ks moddown_to")?;
     let lv = plans.level(top)?;
-    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
+    md_intt(ctx, s, plans, lv, x, k, None)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let [_, _, sc, scs] = level_scalars(ctx, lv);
     let (o, xv) = (out.base, x.buf.vptr());
@@ -1246,7 +1333,7 @@ pub fn moddown_sum_to<W: DevWord, M: DevStrategy<W>>(
     let words = stride * lay.ct_words();
     let xb = x.buf.vptr();
     let src = ntt::Src { base: xb, soff: std::ptr::null(), n, stride: words };
-    ntt::transform_k_ex(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k, Some(src), None)?;
+    md_intt(ctx, s, plans, lv, x, k, Some(src))?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let [_, _, sc, scs] = level_scalars(ctx, lv);
     let epi = ntt::Epi::SubMulAccSum { out: out.base, x: xb, n, stride: words, s: sc, ss: scs, d };

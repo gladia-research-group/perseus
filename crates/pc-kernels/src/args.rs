@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 16;
+pub const ABI: u32 = 17;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -102,7 +102,11 @@ pub struct BconvJob {
     pub ntgt: u32,
     pub pool_off: u32,
     pub exact: u32,
-    pub pad: [u32; 2],
+    /// ABI 17: 1 = the source rows hold `x_i pre_i` already (folded into the INTT's last pass).
+    pub prescaled: u32,
+    /// ABI 17: 1 = u32 words, every target below 2^30: the sums reduced as `hi 2^32 + lo` in 32-bit products (plain
+    /// jobs; exact ones keep the double-word reduction).
+    pub split: u32,
 }
 
 #[repr(C)]

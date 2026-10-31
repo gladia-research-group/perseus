@@ -77,6 +77,18 @@ __device__ __forceinline__ uint16_t reduce_dw<uint16_t>(uint32_t x, const PrimeC
 }
 template <>
 __device__ __forceinline__ uint32_t reduce_dw<uint32_t>(uint64_t x, const PrimeConst& c) {
+    if (c.split) {
+        // x = hi 2^32 + lo: hi (2^32 mod p) and lo (times 1) as Shoup products in 32-bit words, each in [0, 2p) before
+        // its guard (p < 2^31); m = floor(2^32 / p) is the high word of mu_lo
+        const uint32_t p = (uint32_t)c.p, m = (uint32_t)(c.mu_lo >> 32);
+        const uint32_t hi = (uint32_t)(x >> 32), lo = (uint32_t)x;
+        uint32_t a = hi * (uint32_t)c.split - __umulhi(hi, (uint32_t)(c.split >> 32)) * p;
+        a = a >= p ? a - p : a;
+        uint32_t b = lo - __umulhi(lo, m) * p;
+        b = b >= p ? b - p : b;
+        a += b;
+        return a >= p ? a - p : a;
+    }
     // q underestimates by at most 1, two guards
     const uint64_t p = c.p;
     const uint64_t q = __umul64hi(x, c.mu_lo);
