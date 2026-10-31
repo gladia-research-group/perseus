@@ -22,6 +22,19 @@ __device__ __forceinline__ W b_at(const KeyTab& T, const void* kb, size_t row, u
     }
     return __ldg((const W*)kb + row * T.row_words + s);
 }
+// 4 consecutive words read once (evict-first in L2: the key stream does not push the ModUp digits and the dot's
+// outputs out of L2)
+template <class W>
+__device__ __forceinline__ V4<W> ldcs4(const W* p) {
+    V4<W> r;
+    if constexpr (sizeof(W) == 4) {
+        const uint4 x = __ldcs((const uint4*)p);
+        r.v[0] = x.x; r.v[1] = x.y; r.v[2] = x.z; r.v[3] = x.w;
+    } else {
+        r = ldg4<W>(p);
+    }
+    return r;
+}
 // PACKED: the table's rows are packed (T.bits > 0; u32 only), a compile-time split so dense reads carry no packed code
 template <class W, bool PACKED>
 __device__ __forceinline__ V4<W> b_at4(const KeyTab& T, const void* kb, size_t row, uint32_t s4) {
@@ -35,7 +48,7 @@ __device__ __forceinline__ V4<W> b_at4(const KeyTab& T, const void* kb, size_t r
         const uint32_t nw = (o + 4 * bits + 31) >> 5;
         uint32_t wd[5];
 #pragma unroll
-        for (int t = 0; t < 5; ++t) wd[t] = (uint32_t)t < nw ? __ldg(r + w0 + t) : 0u;
+        for (int t = 0; t < 5; ++t) wd[t] = (uint32_t)t < nw ? __ldcs(r + w0 + t) : 0u;
         const uint32_t mask = (uint32_t)((1ull << bits) - 1);
         V4<W> v;
 #pragma unroll
@@ -47,7 +60,7 @@ __device__ __forceinline__ V4<W> b_at4(const KeyTab& T, const void* kb, size_t r
         }
         return v;
     }
-    return ldg4<W>((const W*)kb + row * T.row_words + s4);
+    return ldcs4<W>((const W*)kb + row * T.row_words + s4);
 }
 }  // namespace kskey
 
@@ -141,7 +154,7 @@ __global__ void __launch_bounds__(BX) ks_dot_regen(KsRegenArgs G) {
         chacha::regen_slots4<W, MM>(G.seed, lane, (uint32_t)base, (uint32_t)d, q, chacha::TAG_KSKA, a4);
         V4<W> b4;
         if constexpr (TAB != 0) b4 = kskey::b_at4<W, TAB == 2>(T, kb, (size_t)d * T.srows + slot, (uint32_t)base);
-        else b4 = ldg4<W>((const W*)kb + d * A.key_digit_stride + roff);
+        else b4 = kskey::ldcs4<W>((const W*)kb + d * A.key_digit_stride + roff);
 #pragma unroll
         for (int c = 0; c < KMAX; ++c) {
             if (c < A.K) {
@@ -324,7 +337,16 @@ __global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
                 } else if (lane < 24 && e >= nreg) {
                     p = (const char*)((const W*)A.ka[r] + e * A.key_digit_stride + seg);
                 }
-                if (p) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + 128 * (lane & 7)));
+                if (lane < 8) {
+                    // the key's lines as evict-first (a 16-byte aligned bulk prefetch with an evict-first policy), the
+                    // segment's bytes only (32 bits per 128-byte line of a packed row)
+                    if (PACKED && lane * 4 >= (int)T.bits) p = nullptr;
+                    uint64_t pol;
+                    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+                    const char* q16 = (const char*)((uintptr_t)(p + 128 * lane) & ~(uintptr_t)15);
+                    if (p) asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], 128, %1;" ::"l"(q16), "l"(pol) : "memory");
+                } else if (p)
+                    asm volatile("prefetch.global.L2 [%0];" ::"l"(p + 128 * (lane & 7)));
             }
             if ((d & 1) == 0 && d < nreg) {
                 // digits d, d + 1: lanes 0-15 / 16-31 expand the segment's 16 blocks of one digit each
