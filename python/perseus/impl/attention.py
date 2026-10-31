@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import re
 
 import numpy as np
 
@@ -891,7 +892,36 @@ def softmax_v(rt, kv: KVCache, probs):
     return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
 
 
+# KV_PUSH_RAISE="4:1,5:1": the K/V push refresh of those blocks raises d composite levels below the top (the dense
+# route's raise variant; FIDESLIB_BTS_RAISE_DROPS must list d): it lands 2 d levels deeper, where the attention has the
+# slack (the planner's deliberate-drop probe, PLAN_RAISE_DELIB). The capture lands it there too (CapFhe.raise_drop)
+# (read at the call: the served handler exports the plan's runtime line after importing this module)
+def _kv_raise(rt) -> int:
+    spec = os.environ.get("KV_PUSH_RAISE", "")
+    if not spec:
+        return 0
+    table = {int(b): int(d) for b, d in (e.split(":") for e in spec.split(",") if e)}
+    for st in getattr(rt.ops.fhe, "steps", None) or ():
+        m = re.fullmatch(r"blk(\d+)", str(st))
+        if m:
+            return table.get(int(m.group(1)), 0)
+    return 0
+
+
 def kv_push(rt, kv, payload, q=None, rope=None, pos=None):
+    d = _kv_raise(rt)
+    if not d:
+        return _kv_push(rt, kv, payload, q, rope=rope, pos=pos)
+    fhe = rt.ops.fhe
+    old = getattr(fhe, "raise_drop", 0)
+    fhe.raise_drop = d
+    try:
+        return _kv_push(rt, kv, payload, q, rope=rope, pos=pos)
+    finally:
+        fhe.raise_drop = old
+
+
+def _kv_push(rt, kv, payload, q=None, rope=None, pos=None):
     """Push one token into the caches: `payload` is the fused K + iV linear output (a ComplexKVCache) or (k, v).
     `q` (QKV_LANES): the Q linear output riding the same refresh; the refreshed Q is returned (else None).
     A cache with a `payload_log` list (the fake's prefix run) also keeps a copy of the payload's slot vectors, to

@@ -195,6 +195,18 @@ impl RouteEnv {
                 }
             }
         }
+        // a dense refresh the code ran under a raise variant (CapFhe.raise_drop: KV_PUSH_RAISE, PF_SM_R_RAISE) lands that
+        // many units deeper: the dense route at the built drop that lands there
+        if sh.cfg.bts.landings.contains_key(&0) {
+            for &d in &sh.cfg.bts.raise_drops {
+                let r = Route { raise_drop: d, ..self.base(0) };
+                let Ok(rec) = sh.bootstrap(input, &r) else { continue };
+                let got = if cap.deg == 2 { (rec.out.level.checked_sub(sh.unit())?, 2) } else { (rec.out.level, rec.out.deg) };
+                if got == (cap.level, cap.deg) {
+                    return Some(r);
+                }
+            }
+        }
         None
     }
 }
