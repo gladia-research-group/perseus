@@ -230,13 +230,14 @@ __device__ __forceinline__ uint32_t mk(uint32_t i, uint32_t d, uint32_t h, uint3
 
 // Blocks per SM the launch bound asks for: the K = 1 four-giant-step variant (the StC stages) at 7 (70 registers;
 // unbounded it takes 96, 5 blocks: its loads wait with too few warps), the others unbounded (0: no bound).
-template <int KMAX, int GMAX>
+template <int KMAX, int GMAX, bool X0 = false>
 constexpr int rq_blocks() {
-    return KMAX == 1 && GMAX == 4 ? 7 : 0;
+    // X0 (a sparse-input stage 0, K = 1): the plain kernel's 9 blocks per SM (its 56 registers)
+    return KMAX == 1 && GMAX == 4 ? 7 : (X0 && KMAX == 1 ? 9 : 0);
 }
 
 template <class MM, int KMAX, int GMAX, bool X0 = false>
-__global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX>()) cts_fused_rq(CtsRegenArgs R) {
+__global__ void __launch_bounds__(BX, rq_blocks<KMAX, GMAX, X0>()) cts_fused_rq(CtsRegenArgs R) {
     using W = uint32_t;
     using Wd = WideOf<W>;
     const CtsArgs& A = R.cts;
