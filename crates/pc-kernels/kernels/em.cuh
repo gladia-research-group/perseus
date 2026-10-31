@@ -176,6 +176,38 @@ __global__ void mul_add(MulAddArgs B) {
 }
 
 template <class W, class MM>
+__global__ void mul_add_n(MulAddNArgs A) {
+    using Wd = WideOf<W>;
+    const int row = blockIdx.y, part = blockIdx.z & 1, cc = blockIdx.z >> 1;
+    const PrimeConst& q = A.pr[row];
+    const W p = (W)q.p;
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    W r[4] = {0, 0, 0, 0};
+    if (A.lazy) {
+        Wd s[4] = {0, 0, 0, 0};
+        for (int j = 0; j < A.nterm; ++j) {
+            const V4<W> x = load4<W>(at<W>(A.x[j], cc, part, row) + i), t = load4<W>((const W*)A.t[j] + (size_t)row * N + i);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) s[w] += (Wd)x.v[w] * t.v[w];
+        }
+#pragma unroll
+        for (int w = 0; w < 4; ++w) r[w] = MM::reduce(s[w], q);
+    } else {
+        for (int j = 0; j < A.nterm; ++j) {
+            const V4<W> x = load4<W>(at<W>(A.x[j], cc, part, row) + i), t = load4<W>((const W*)A.t[j] + (size_t)row * N + i);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) r[w] = add<W>(r[w], MM::mul(x.v[w], t.v[w], q), p);
+        }
+    }
+    if (A.y.base) {
+        const V4<W> y = load4<W>(at<W>(A.y, cc, part, row) + i);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) r[w] = add<W>(y.v[w], r[w], p);
+    }
+    store4<W>(at<W>(A.out, cc, part, row) + i, r[0], r[1], r[2], r[3]);
+}
+
+template <class W, class MM>
 int tensor_l(const TensorArgs* a, cudaStream_t s) {
     tensor<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
@@ -216,6 +248,12 @@ template <class W, class MM>
 int mul_add_l(const MulAddArgs* a, cudaStream_t s) {
     if (a->sub < 0 || a->sub > 2) return -1;
     mul_add<W, MM><<<dim3(N / (4 * BX), a->m.n, 2 * a->m.K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W, class MM>
+int mul_add_n_l(const MulAddNArgs* a, cudaStream_t s) {
+    if (a->nterm < 1 || a->nterm > 8) return -1;
+    mul_add_n<W, MM><<<dim3(N / (4 * BX), a->n, 2 * a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W, class MM>

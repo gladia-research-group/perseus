@@ -738,6 +738,39 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
         }
         let g4 = o4.read(&st.ctx);
         out.push(cmp("mul_table vs host", &g4, &w));
+
+        // ABI 18: mul_add_n = y + sum_j x_j t_j over 5 terms (x from d[0..5], t five tables), lazy and per term, with
+        // y (in place: y = out) and without
+        let tbs: Vec<Vec<u64>> = (0..5).map(|_| (0..8 * N).map(|x| st.rng.below(st.p(x / N))).collect()).collect();
+        let tds: Vec<Dev> = tbs.iter().map(|v| st.ctx.up(v)).collect();
+        for (lazy, with_y) in [(1, true), (0, true), (1, false), (0, false)] {
+            let o5 = if with_y { st.ctx.up(&h[5]) } else { st.ctx.zeros(tot) };
+            let mut a = MulAddNArgs { out: ctref(&o5), y: if with_y { ctref(&o5) } else { PolyRef::default() }, pr, n: n as i32, k: k as i32, nterm: 5, lazy, ..Default::default() };
+            for j in 0..5 {
+                a.x[j] = ctref(&d[j]);
+                a.t[j] = tds[j].c();
+            }
+            ck(unsafe { (st.t.mul_add_n)(&a, st.s()) });
+            let mut w = vec![0u64; tot];
+            for c in 0..k {
+                for part in 0..2 {
+                    for r in 0..n {
+                        let p = st.p(r);
+                        for i in 0..N {
+                            let jj = idx(c, part, r, i);
+                            let mut v = if with_y { h[5][jj] % p } else { 0 };
+                            for j in 0..5 {
+                                v = addmod(v, mulmod(h[j][jj], tbs[j][r * N + i], p), p);
+                            }
+                            w[jj] = v;
+                        }
+                    }
+                }
+            }
+            let g5 = o5.read(&st.ctx);
+            let mask = |v: &[u64]| -> Vec<u64> { (0..k).flat_map(|c| (0..2).flat_map(move |part| (0..n).map(move |r| idx(c, part, r, 0)))).flat_map(|j| v[j..j + N].to_vec()).collect() };
+            out.push(cmp(&format!("mul_add_n (5 terms, lazy {lazy}, y {with_y}) vs host"), &mask(&g5), &mask(&w)));
+        }
     }
     out
 }

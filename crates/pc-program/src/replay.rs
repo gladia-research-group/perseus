@@ -20,7 +20,7 @@ use pc_gpu::ks::{KeyGroup, KsPlans, KskSource};
 use pc_gpu::ops::{Ops, Pt};
 use pc_gpu::rotate::{self, KsCfg};
 use pc_gpu::{Context, Ct, DevStrategy, DevWord, Executor};
-use pc_shadow::{CtMeta, Shadow};
+use pc_shadow::{CtMeta, Shadow, PtMeta};
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -455,7 +455,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         let unit = if in_unit {
             None
         } else {
-            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. })));
+            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. })));
             let unit = at
                 .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
                 .map(|u| (b.unit_of[i], u.hi as usize))
@@ -523,6 +523,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                             }
                             // a fused plaintext product and add leaves the key-switching workspaces alone
                             UnitKind::MultPtAdd { .. } => info.fused += 1,
+                            UnitKind::MultPtAddChain { ref pts, .. } => info.fused += pts.len(),
                             _ => ks_owner = None,
                         }
                         exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, pts, stale)
@@ -642,6 +643,22 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
                 out != u.ins[0] && Ops::<W>::mult_pt_add_fusable(sh, &a, &p, &y, *sub, *product_first).unwrap_or(false)
             }
         }
+        // one pass when no product or add takes a prelude
+        UnitKind::MultPtAddChain { head, pts: ids, pf } => {
+            let pm = |i: u32| pts.get(i as usize).and_then(|p| p.meta);
+            let Some(x0) = meta(&u.ins[0]) else { return false };
+            let mut terms = Vec::with_capacity(ids.len());
+            for (c, (&i, &f)) in ids.iter().zip(pf).enumerate() {
+                let (Some(a), Some(p)) = (u.ins.get(1 + c).and_then(meta), pm(i)) else { return false };
+                terms.push((a, p, f));
+            }
+            let tm: Vec<(&CtMeta, &PtMeta, bool)> = terms.iter().map(|(a, p, f)| (a, p, *f)).collect();
+            let r = match head {
+                Some(h) => pm(*h).map(|p| Ops::<W>::mult_pt_add_chain_meta(sh, Some((&x0, &p)), None, &tm)),
+                None => Some(Ops::<W>::mult_pt_add_chain_meta(sh, None, Some(&x0), &tm)),
+            };
+            matches!(r, Some(Ok(Some(_))))
+        }
     }
 }
 
@@ -743,6 +760,22 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
                 let out = unsafe { &mut *slots.add(span[1].out as usize) };
                 rt.ops.mult_pt_add(rt.ctx, rt.ex, rt.sh, out, xs[0], &p, xs[1], *sub, *product_first)?;
             }
+        }
+        UnitKind::MultPtAddChain { head, pts: ids, pf } => {
+            let ps: Vec<Pt<'_>> = ids.iter().map(|&i| pt(block, pts, i)).collect::<Result<_>>()?;
+            let hp = head.map(|h| pt(block, pts, h)).transpose()?;
+            let out_slot = span[span.len() - 1].out;
+            // y (no head) may be the sum's own slot: its rows and metadata are taken before the output is borrowed
+            let y = if hp.is_none() { Some((xs[0].buf.r(), xs[0].meta)) } else { None };
+            if u.ins[1..].contains(&out_slot) || hp.is_some() && u.ins[0] == out_slot {
+                return Err(rerr(block, format!("product chain at step {}: the sum lands on a term's or the head's operand", u.lo)));
+            }
+            let terms: Vec<(&Ct<'a, W>, &Pt<'_>, bool)> = xs[1..].iter().zip(&ps).zip(pf).map(|((a, p), &f)| (*a, p, f)).collect();
+            let head = hp.as_ref().map(|p| (xs[0], p));
+            // SAFETY: the sum's slot is no term's or head's operand (checked above): the only mutable reference; y may
+            // share it, taken above as rows and metadata (`xs[0]` unused past here in that case)
+            let out = unsafe { &mut *slots.add(out_slot as usize) };
+            rt.ops.mult_pt_add_chain(rt.ctx, rt.ex, rt.sh, out, head, y, &terms)?;
         }
         UnitKind::Refresh { route, kind } => {
             // the inputs gathered into one K-ciphertext buffer, refreshed in place as one K-batch, scattered back

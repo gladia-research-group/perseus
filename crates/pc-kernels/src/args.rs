@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 17;
+pub const ABI: u32 = 18;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -369,6 +369,21 @@ pub struct MulAddArgs {
     pub y: PolyRef,
     pub sub: i32,
     pub pad: i32,
+}
+
+/// out = y + sum_j x\[j\] t\[j\] over `nterm` <= 8 terms (y.base null: no y), args.cuh MulAddNArgs (ABI 18).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MulAddNArgs {
+    pub out: PolyRef,
+    pub y: PolyRef,
+    pub x: [PolyRef; 8],
+    pub t: [*const c_void; 8],
+    pub pr: *const PrimeConst,
+    pub n: i32,
+    pub k: i32,
+    pub nterm: i32,
+    pub lazy: i32,
 }
 
 #[repr(C)]
@@ -759,7 +774,7 @@ zeroed_default!(
     SpruFftArgs, SpruScatterArgs, SpruExtractArgs, NttArgs, BconvArgs, EwArgs, PtDotArgs, KsArgs, EpiArgs, KsRegenArgs, KskExpandArgs, CtsArgs, TensorArgs, MdEpiArgs,
     WsumArgs, AddConstArgs, MulTableArgs, RescaleArgs, RescaleCombineArgs, AutomorphArgs, EncodeArgs, EncryptArgs, KskGenArgs, KskUnpackArgs, ModRaiseArgs, SmallIntTab, SmallIntArgs,
     KeyTab, CtsRegenArgs, KsKeyArgs, PcmmArgs, CcmmArgs, WsumKArgs, RescaleCombineToArgs, MdEpiToArgs, SmallInt1Args, CoeffArgs, MulAddArgs,
-    RescaleNttArgs
+    RescaleNttArgs, MulAddNArgs
 );
 
 /// A launcher: (args, stream) -> cudaError_t of the launch (0 ok; negative = argument outside the kernel's range).
@@ -812,6 +827,7 @@ pub struct KernelTable {
     pub coeff_sum: Launch<CoeffArgs>,
     pub mul_add: Launch<MulAddArgs>,
     pub rescale_fwd: Launch<RescaleNttArgs>,
+    pub mul_add_n: Launch<MulAddNArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -856,8 +872,9 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 40 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 41 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
+    assert!(size_of::<MulAddNArgs>() == 328);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);
     assert!(size_of::<MdEpiToArgs>() == 152);
     assert!(size_of::<RescaleCombineToArgs>() == 104);

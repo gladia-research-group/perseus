@@ -152,6 +152,12 @@ pub enum UnitKind {
     /// `Unit::ins[0]` by plaintext `pt`, step `lo + 1` adds (`sub`: subtracts) it and `Unit::ins[1]`, the product
     /// first when `product_first`.
     MultPtAdd { pt: u32, sub: bool, product_first: bool },
+    /// A chain of plaintext products summed into one value as one pass (`Ops::mult_pt_add_chain`): with `head`
+    /// (plaintext id) step `lo` multiplies `Unit::ins[0]` by it, else `Unit::ins[0]` is the sum the first pair adds onto;
+    /// then fused pairs (`MultPtAdd` without subtraction), pair j multiplying `Unit::ins[1 + j]` by `pts[j]` and adding
+    /// it (`pf[j]`: the product as the add's operand A) onto the previous sum, every intermediate used only by the next
+    /// add (never written).
+    MultPtAddChain { head: Option<u32>, pts: Vec<u32>, pf: Vec<bool> },
 }
 
 /// Steps `lo..hi` issued together (their outputs at once), reading the slots `ins`. `chain`: the rotation chain the
@@ -698,6 +704,63 @@ impl<'a, W: DevWord> Bound<'a, W> {
             }
             unit_of[lo..lo + 2].iter_mut().for_each(|x| *x = units.len() as u32);
             units.push(Unit { lo: lo as u32, hi: lo as u32 + 2, ins: vec![steps[lo].a, y], kind: UnitKind::MultPtAdd { pt: *pt, sub, product_first }, chain: NONE, off: false });
+        }
+        // chains of those pairs (adds only), each adding onto the previous pair's sum used only there, headed by the
+        // plaintext product the first one adds onto when that is a lone product step used only there: one pass each
+        // (`UnitKind::MultPtAddChain`; the pairs' units are replaced)
+        {
+            let mut uses: BTreeMap<u32, usize> = BTreeMap::new();
+            for op in &p.ops {
+                for v in op.all_ins() {
+                    *uses.entry(v).or_default() += 1;
+                }
+            }
+            let once = |st: &Step| uses.get(&st.var) == Some(&1) && !p.outputs.contains(&st.var);
+            let pair = |u: &Unit| matches!(u.kind, UnitKind::MultPtAdd { sub: false, .. });
+            let first = units.iter().position(|u| matches!(u.kind, UnitKind::MultPtAdd { .. })).unwrap_or(units.len());
+            let pairs: Vec<Unit> = units.drain(first..).collect();
+            let mut i = 0;
+            while i < pairs.len() {
+                let mut j = i + 1;
+                if pair(&pairs[i]) {
+                    while j < pairs.len() && pair(&pairs[j]) && pairs[j].lo == pairs[j - 1].hi && pairs[j].ins[1] == steps[pairs[j - 1].hi as usize - 1].out && once(&steps[pairs[j - 1].hi as usize - 1]) {
+                        j += 1;
+                    }
+                }
+                let lo0 = pairs[i].lo as usize;
+                let hs = lo0.checked_sub(1).filter(|&h| {
+                    let st = &steps[h];
+                    matches!(st.op, StepOp::MultPt(_)) && unit_of[h] == NONE && st.out == pairs[i].ins[1] && once(st)
+                });
+                let out = steps[pairs[j - 1].hi as usize - 1].out;
+                let terms: Vec<u32> = pairs[i..j].iter().map(|u| u.ins[0]).collect();
+                // the sum may land on the first sum (y), never on a term's or the head's operand
+                let hs = hs.filter(|&h| steps[h].a != out);
+                let ok = pair(&pairs[i]) && !terms.contains(&out) && (j - i >= 2 || hs.is_some());
+                if !ok {
+                    unit_of[pairs[i].lo as usize..pairs[i].hi as usize].iter_mut().for_each(|x| *x = units.len() as u32);
+                    units.push(pairs[i].clone());
+                    i += 1;
+                    continue;
+                }
+                let (lo, head, y) = match hs {
+                    Some(h) => (h, match steps[h].op { StepOp::MultPt(pt) => Some(pt), _ => None }, steps[h].a),
+                    None => (lo0, None, pairs[i].ins[1]),
+                };
+                let hi = pairs[j - 1].hi as usize;
+                let (mut pts, mut pf) = (Vec::with_capacity(j - i), Vec::with_capacity(j - i));
+                for u in &pairs[i..j] {
+                    if let UnitKind::MultPtAdd { pt, product_first, .. } = u.kind {
+                        pts.push(pt);
+                        pf.push(product_first);
+                    }
+                }
+                let mut ins = vec![y];
+                ins.extend(terms);
+                unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+                units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind: UnitKind::MultPtAddChain { head, pts, pf }, chain: NONE, off: false });
+                i = j;
+            }
         }
         // K-batches of products and of refreshes (siblings of one recipe / route; outputs in slots of their own, the
         // refresh route built for K ciphertexts)

@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulAddNArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -941,6 +941,87 @@ impl<'a, W: DevWord> Ops<'a, W> {
         // SAFETY: as in mult_pt_add; out == y is the element-wise in-place form (each thread reads before it writes)
         launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, ex.compute.raw()) })?;
         acc.meta = r2.out;
+        Ok(())
+    }
+
+    /// The output metadata of `mult_pt_add_chain` when it runs as one pass: the head product (if any) and every pair
+    /// take no prelude (none on the operand, the plaintext or the add), every product sits at one level; None otherwise.
+    pub fn mult_pt_add_chain_meta(sh: &Shadow, head: Option<(&CtMeta, &PtMeta)>, y: Option<&CtMeta>, terms: &[(&CtMeta, &PtMeta, bool)]) -> Result<Option<CtMeta>> {
+        let (mut m, level) = match (head, y) {
+            (Some((a, p)), None) => {
+                let r = sh.mult_pt(a, p)?;
+                if !r.pre.is_empty() || r.out.level != a.level {
+                    return Ok(None);
+                }
+                (r.out, a.level)
+            }
+            (None, Some(y)) => (*y, y.level),
+            _ => return Ok(None),
+        };
+        for &(a, p, pf) in terms {
+            if a.level != level {
+                return Ok(None);
+            }
+            let (r1, r2) = Self::mac_recipes(sh, a, p, &m, false, pf)?;
+            if !r1.pre.is_empty() || !r2.pre.is_empty() || r1.out.level != level || r2.out.level != level {
+                return Ok(None);
+            }
+            m = r2.out;
+        }
+        Ok(Some(m))
+    }
+
+    /// `out = x0 * pt0 + sum_j a_j * pt_j` (`head` = (x0, pt0)) or `out = y + sum_j a_j * pt_j` (`y`: its rows and
+    /// metadata; it may be `out` itself): a product and the chain of `mult_pt_add`s summing onto it (no subtraction;
+    /// `product_first` orders each add's operands) in launches of up to 8 terms, the products summed in the double word
+    /// and reduced once. The same words and metadata as the steps one by one. Needs `mult_pt_add_chain_meta`; `out`
+    /// must not be any term's operand.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_pt_add_chain<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        ex: &mut Executor<'_, W>,
+        sh: &Shadow,
+        out: &mut Ct<'_, W>,
+        head: Option<(&Ct<'_, W>, &Pt<'_>)>,
+        y: Option<(PolyRef, CtMeta)>,
+        terms: &[(&Ct<'_, W>, &Pt<'_>, bool)],
+    ) -> Result<()> {
+        let tm: Vec<(&CtMeta, &PtMeta, bool)> = terms.iter().map(|(a, p, pf)| (&a.meta, &p.meta, *pf)).collect();
+        let m = Self::mult_pt_add_chain_meta(sh, head.map(|(a, p)| (&a.meta, &p.meta)), y.as_ref().map(|(_, m)| m), &tm)?
+            .ok_or_else(|| shape("mult_pt_add_chain", "a product or an add takes a prelude: run the steps one by one"))?;
+        let k = out.k();
+        let ob = out.buf.r().base;
+        for (a, _, _) in terms {
+            Self::check_k("mult_pt_add_chain", a.k(), k)?;
+            if a.buf.r().base == ob {
+                return Err(shape("mult_pt_add_chain", "the sum lands on a term's operand"));
+            }
+        }
+        if let Some((a, _)) = head {
+            Self::check_k("mult_pt_add_chain", a.k(), k)?;
+        }
+        let top = self.top(ctx.shape, &m)?;
+        let xs: Vec<(PolyRef, *const c_void)> = head.into_iter().map(|(a, p)| (a.buf.r(), p.rows)).chain(terms.iter().map(|(a, p, _)| (a.buf.r(), p.rows))).collect();
+        // lazy: 8 products of the largest prime's residues fit the double word
+        let bits = 8 * std::mem::size_of::<W>() as u32;
+        let pm = self.primes.iter().take(top + 1).copied().max().unwrap_or(0).saturating_sub(1) as u128;
+        let lazy = pm.checked_mul(pm).and_then(|x| x.checked_mul(8)).is_some_and(|x| bits >= 64 || x < 1u128 << (2 * bits));
+        let s = &ex.compute;
+        let mut yr = y.map(|(r, _)| r).unwrap_or_default();
+        for c in xs.chunks(8) {
+            let mut a = MulAddNArgs { out: out.buf.w(), y: yr, pr: ctx.pr(), n: (top + 1) as i32, k: k as i32, nterm: c.len() as i32, lazy: lazy as i32, ..Default::default() };
+            for (j, &(x, t)) in c.iter().enumerate() {
+                a.x[j] = x;
+                a.t[j] = t;
+            }
+            // SAFETY: k cts of the context layout over rows 0..=top (the plaintexts broadcast); element-wise, so out may
+            // alias y or the head's operand (each thread reads its operands before writing the same index); a later
+            // launch adds onto out, which no term reads
+            launch_result("mul_add_n", unsafe { (ctx.table.mul_add_n)(&a, s.raw()) })?;
+            yr = out.buf.r();
+        }
+        out.meta = m;
         Ok(())
     }
 

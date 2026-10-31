@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 17u
+#define PC_KERNELS_ABI 18u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -360,6 +360,19 @@ struct MulAddArgs {
     int32_t sub, pad;
 };
 static_assert(sizeof(MulAddArgs) == 104, "MulAddArgs layout");
+
+// mul_add_n (ABI 18): out = y + sum_j x_j * t_j over nterm <= 8 terms (y.base null: no y), rows [0, n) of K
+// ciphertexts, both parts, t_j as mul_table's: a chain of mult_pt_add's in one pass. lazy = 1: the products summed in
+// the double word and reduced once (nterm (max p)^2 < 2^(2 BITS), the host's check), else each reduced. The same
+// canonical words as the chain. out may alias y or any x_j (element-wise).
+struct MulAddNArgs {
+    PolyRef out, y;
+    PolyRef x[8];
+    const void* t[8];
+    const PrimeConst* pr;
+    int32_t n, K, nterm, lazy;
+};
+static_assert(sizeof(MulAddNArgs) == 328, "MulAddNArgs layout");
 
 // ------------------------------------------------------------------------------------------------ rescale
 // Composite one-pass rescale by the top ndrop (1 or 2) primes:
@@ -808,8 +821,9 @@ struct KernelTable {
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
     int (*mul_add)(const MulAddArgs*, cudaStream_t);
     int (*rescale_fwd)(const RescaleNttArgs*, cudaStream_t);
+    int (*mul_add_n)(const MulAddNArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 40 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 41 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms
