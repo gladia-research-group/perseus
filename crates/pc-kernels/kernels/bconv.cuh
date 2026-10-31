@@ -146,6 +146,11 @@ template <class W, class MM>
 int launch(const BconvArgs* a, cudaStream_t s) {
     if (a->njobs == 0) return 0;
     dim3 grid(N / BX, (a->max_tgt + TG - 1) / TG, a->njobs);
+    // a launch short of one wave at 12 blocks per SM: each job's targets over more blocks (down to 8 each), so the
+    // wave fills and every thread's chain is shorter (the sources are read once more per extra block, from L2)
+    const long wave = 12L * num_sms(), per_y = (long)grid.x * grid.z;
+    const int most = (a->max_tgt + 7) / 8;
+    if ((long)grid.y * per_y < wave && (int)grid.y < most) grid.y = (unsigned)max((long)grid.y, min((long)most, wave / per_y));
     if ((long)grid.x * grid.y * grid.z > 10L * num_sms())
         bconv_kernel12<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
     else
