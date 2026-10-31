@@ -120,6 +120,25 @@ __device__ __forceinline__ V4<W> load4_sum(const W* a, int n, uint64_t stride, W
     return x;
 }
 
+// Programmatic dependent launch of a transform's second pass: the first pass lets it launch at once (its blocks fill
+// the slots the first pass frees and set up), the second pass waits for the first grid's completion (and its memory)
+// before its first data access. Both are no-ops in a kernel launched without the attribute.
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+template <class... P, class... A>
+void launch_pdl(void (*k)(P...), dim3 g, cudaStream_t s, A... a) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = g;
+    cfg.blockDim = dim3(256);
+    cfg.stream = s;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, k, a...);
+}
+
 // NttArgs.epi on 4 consecutive transform values v of word r (prime p, scalar s with Shoup companion ss)
 template <class W>
 __device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s, W ss, W p) {
@@ -184,6 +203,7 @@ __device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w
 template <class W, bool L>
 __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     __shared__ W s[256 * 16];
+    pdl_trigger();
     const int row = blockIdx.y;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
     const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 16 : a;
@@ -205,6 +225,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
 template <class W, bool L>
 __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
     __shared__ W s[256 * 8];
+    pdl_trigger();
     const int row = blockIdx.y;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
     const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 8 : a;
@@ -276,6 +297,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     const W* w = (const W*)T.fw + (size_t)pid * N;
     const W* ws = (const W*)T.fws + (size_t)pid * N;
     W x[8];
+    pdl_wait();
     // layout A: x[j] = e = lane + 32 j
 #pragma unroll
     for (int j = 0; j < 8; ++j) x[j] = a[lane + 32 * j];
@@ -374,6 +396,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
 template <class W, bool L>
 __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     __shared__ W s[8][256 + 8];
+    pdl_trigger();
     const int row = blockIdx.y;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     const int R = blockIdx.x * 8 + wp;
@@ -484,6 +507,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
     W x[16];
+    pdl_wait();
 #pragma unroll
     for (int u = 0; u < 16; ++u) x[u] = a[(16 * q + u) * 256 + c];
 #pragma unroll
@@ -530,6 +554,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
     W x[8];
+    pdl_wait();
 #pragma unroll
     for (int u = 0; u < 8; ++u) x[u] = a[(8 * q + u) * 256 + c];
 #pragma unroll
@@ -582,13 +607,13 @@ template <class W, bool L>
 void fwd_chunk(const NttArgs& b, int m, cudaStream_t s) {
     if (m <= COLS8_MAX) ntt_fwd_cols8<W, L><<<dim3(32, m), 256, 0, s>>>(b);
     else ntt_fwd_cols<W, L><<<dim3(16, m), 256, 0, s>>>(b);
-    ntt_fwd_rows<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+    launch_pdl(ntt_fwd_rows<W, L>, dim3(32, m), s, b);
 }
 template <class W, bool L>
 void inv_chunk(const NttArgs& b, int m, cudaStream_t s) {
     ntt_inv_rows<W, L><<<dim3(32, m), 256, 0, s>>>(b);
-    if (m <= COLS8_MAX) ntt_inv_cols8<W, L><<<dim3(32, m), 256, 0, s>>>(b);
-    else ntt_inv_cols<W, L><<<dim3(16, m), 256, 0, s>>>(b);
+    if (m <= COLS8_MAX) launch_pdl(ntt_inv_cols8<W, L>, dim3(32, m), s, b);
+    else launch_pdl(ntt_inv_cols<W, L>, dim3(16, m), s, b);
 }
 
 template <class W>
