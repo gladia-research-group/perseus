@@ -159,6 +159,8 @@ pub struct PtDotArgs {
 
 /// `KsArgs::c0_mode` flag (ABI 16): the inner product is added onto the outputs' words.
 pub const KS_ACC: i32 = 4;
+/// `c0_mode | KS_SUM`: the K = 1 segment dot (u32) sums its R rotations into rotation 0's output (`ks_dot_seg`).
+pub const KS_SUM: i32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

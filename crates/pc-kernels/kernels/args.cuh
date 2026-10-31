@@ -176,6 +176,8 @@ static_assert(sizeof(PtDotArgs) == 128, "PtDotArgs layout");
 // 2 c0 extended; c0_mode | KS_ACC (ABI 16): (s0, s1) added onto the outputs' words. Outputs written at
 // automorph_slot(autok[r], i) (k = 1: identity). Grid row y -> prime id rows[y].
 constexpr int32_t KS_ACC = 4;
+// c0_mode | KS_SUM: ks_dot_seg (u32, K = 1) sums its R rotations into rotation 0's output (other dot launchers refuse it)
+constexpr int32_t KS_SUM = 8;
 struct KsArgs {
     const void* c1;
     const void* modup;

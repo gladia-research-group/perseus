@@ -289,13 +289,23 @@ __global__ void __launch_bounds__(BX) ks_dot_key(KsKeyArgs G) {
     }
 }
 
+// k^-1 mod 2N for an odd Galois element k (Newton: each step doubles the correct low bits)
+__device__ __forceinline__ uint32_t galois_inv(uint32_t k) {
+    uint32_t x = k;
+#pragma unroll
+    for (int i = 0; i < 5; ++i) x *= 2u - k * x;
+    return x & (2u * N - 1);
+}
 // ks_dot_key at K = 1 (u32) on warp-sized row segments: a warp owns slots R * 256.. of row t, 8 consecutive per lane.
 // Its lanes expand `a` one 16-slot ChaCha block per thread (two digits per pass, through shared memory), and the
 // automorphism maps the segment onto one segment (in the bit-reversed order a slot's segment decides its image's), so
 // the outputs are permuted inside the warp.
 // Each digit first asks L2 for the next digit's lines of the warp's segment (`b`, the ModUp digit or c1, a resident `a`),
 // so its loads hit L2 instead of DRAM. At most 80 registers: 3 blocks per SM (shared memory holds 3).
-template <class MM, bool PACKED>
+// SUM (c0_mode & KS_SUM, ABI-free: a bit of c0_mode): the R rotations summed into rotation 0's output, out =
+// sum_r sigma_r(dot_r) (+ out with KS_ACC). A warp owns output segment S; rotation r's dot runs on the input segment
+// sigma_r^-1 maps onto S, its outputs permuted onto S and added: the R extended rotations are never stored.
+template <class MM, bool PACKED, bool SUM>
 __global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
     using W = uint32_t;
     using Wd = WideOf<W>;
@@ -307,14 +317,20 @@ __global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
     const PrimeConst& q = A.pr[t];
     const W p = (W)q.p;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const uint32_t R = blockIdx.x * 8 + wp;
-    const uint32_t base = R * 256 + 8 * lane;
+    const uint32_t S = blockIdx.x * 8 + wp;
     const int dt = (int)t < A.nq ? A.digit_of[t] : -1;
-    const size_t roff = (size_t)t * N + base;
     const int slot = kskey::slot_of(T, (int)t, A.nq);
     const int nreg = min(A.ndig, T.nregen);
     auto pad = [](int e) { return e + (e >> 5); };
+    W acc[2][8];
     for (int r = 0; r < A.R; ++r) {
+        uint32_t R = S;
+        if constexpr (SUM) {
+            const uint32_t k = A.autok[r];
+            if (k != 1) R = automorph_slot(galois_inv(k), S * 256) >> 8;
+        }
+        const uint32_t base = R * 256 + 8 * lane;
+        const size_t roff = (size_t)t * N + base;
         Wd s0[8], s1[8];
 #pragma unroll
         for (int u = 0; u < 8; ++u) s0[u] = s1[u] = 0;
@@ -410,7 +426,28 @@ __global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
             W x[8];
 #pragma unroll
             for (int u = 0; u < 8; ++u) x[u] = so[wp][pad(8 * lane + u)];
+            if constexpr (SUM) {
+#pragma unroll
+                for (int u = 0; u < 8; ++u) acc[part][u] = r == 0 ? x[u] : add<W>(acc[part][u], x[u], p);
+                continue;
+            }
             W* g = (W*)(part ? A.out1 : A.out0) + r * A.out_rot_stride + (size_t)t * N + R2 * 256 + 8 * lane;
+            if (A.c0_mode & KS_ACC) {
+                const V4<W> y0 = load4<W>(g), y1 = load4<W>(g + 4);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) x[u] = add<W>(x[u], y0.v[u], p), x[4 + u] = add<W>(x[4 + u], y1.v[u], p);
+            }
+            store4<W>(g, x[0], x[1], x[2], x[3]);
+            store4<W>(g + 4, x[4], x[5], x[6], x[7]);
+        }
+    }
+    if constexpr (SUM) {
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            W* g = (W*)(part ? A.out1 : A.out0) + (size_t)t * N + S * 256 + 8 * lane;
+            W x[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) x[u] = acc[part][u];
             if (A.c0_mode & KS_ACC) {
                 const V4<W> y0 = load4<W>(g), y1 = load4<W>(g + 4);
 #pragma unroll
@@ -551,6 +588,7 @@ __global__ void ksk_expand(KskExpandArgs A) {
 
 template <class W, class MM>
 int dot_l(const KsArgs* a, cudaStream_t s) {
+    if (a->c0_mode & KS_SUM) return -3;  // the summed rotations: ks_dot_seg only
     dim3 grid(N / BX, a->nrows);
     if (a->K <= 1) ks_dot<W, MM, 1><<<grid, BX, 0, s>>>(*a);
     else if (a->K <= 2) ks_dot<W, MM, 2><<<grid, BX, 0, s>>>(*a);
@@ -595,10 +633,12 @@ int key_k(const KsKeyArgs* a, cudaStream_t s) {
     const int K = a->ks.K;
     if constexpr (sizeof(W) == 4) {
         if (K == 1) {
-            ks_dot_seg<MM, PACKED><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
+            if (a->ks.c0_mode & KS_SUM) ks_dot_seg<MM, PACKED, true><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
+            else ks_dot_seg<MM, PACKED, false><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
             return (int)cudaGetLastError();
         }
     }
+    if (a->ks.c0_mode & KS_SUM) return -3;  // the summed rotations: ks_dot_seg only (u32, K = 1)
     if (K <= 1) ks_dot_key<W, MM, 1, PACKED><<<grid, BX, 0, s>>>(*a);
     else if (K <= 2) ks_dot_key<W, MM, 2, PACKED><<<grid, BX, 0, s>>>(*a);
     else if (K <= 4) ks_dot_key<W, MM, 4, PACKED><<<grid, BX, 0, s>>>(*a);

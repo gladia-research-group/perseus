@@ -382,6 +382,24 @@ fn rotate_sum_core<W: DevWord, M: DevStrategy<W>>(
     ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
     let per = (ex.ks.ext.k / k).max(1);
     let run = keys.iter().enumerate().all(|(j, &r)| r == keys[0] + j);
+    // `dots` reads the keys in place when this holds; the segment kernel can then sum the rotations itself
+    let staged = !(kc.source == KskSource::Cached && !group.needs_stage() && group.has_a()) && group.in_place();
+    if form == SumForm::InModDown && group.dot_sums::<W>(k, staged) {
+        // every rotation summed inside the dot into one extended ciphertext (ks.ext's first), run after run of
+        // consecutive keys onto it, then one ModDown: no extended rotation is stored, any number of keys
+        let io = io_of(x, View::of(&ex.ks.ext, 0), k);
+        let mut j = 0;
+        while j < keys.len() {
+            let mut m = 1;
+            while j + m < keys.len() && keys[j + m] == keys[j] + m {
+                m += 1;
+            }
+            let c0_mode = io.c0_mode | pc_kernels::KS_SUM | if j > 0 { pc_kernels::KS_ACC } else { 0 };
+            dots(ctx, ex, kc, group, keys[j], m, k, top, DotIo { c0_mode, ..io })?;
+            j += m;
+        }
+        return ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, k, &mut ex.ks.conv, out, mode, k, top);
+    }
     if form == SumForm::InModDown && run && keys.len() <= per {
         // every extended rotation in ks.ext at once, summed inside the ModDown
         let io = io_of(x, View::of(&ex.ks.ext, 0), k);

@@ -414,6 +414,11 @@ impl<'a> KeyGroup<'a> {
     pub fn reads_in_place(&self, source: KskSource) -> bool {
         self.in_place() && (source == KskSource::Regen || self.needs_stage() || !self.has_a())
     }
+    /// A dot of `k` ciphertexts over a range of these keys read in place (`staged`) can sum its rotations into one
+    /// output (`KS_SUM`: the u32 K = 1 segment kernel), so a hoisted rotation sum stores one extended ciphertext.
+    pub fn dot_sums<W: DevWord>(&self, k: usize, staged: bool) -> bool {
+        W::BITS == 32 && k == 1 && staged && self.in_place()
+    }
     pub fn len(&self) -> usize {
         self.galois.len()
     }
@@ -1069,7 +1074,11 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
         while c < k {
             let kk = (k - c).min(KEY_KMAX);
             let at = |p: *const c_void, stride: u64| (p as *const W).wrapping_add(c * stride as usize) as *const c_void;
-            let out = (at(io.out, io.out_ct_stride) as *const W).wrapping_add((j - r0) * io.out_rot_stride as usize) as *mut c_void;
+            // KS_SUM: every run of keys sums into rotation 0's output, the runs after the first onto it
+            let sum = io.c0_mode & pc_kernels::KS_SUM != 0;
+            let rot = if sum { 0 } else { j - r0 };
+            let c0_mode = if sum && j > r0 { io.c0_mode | pc_kernels::KS_ACC } else { io.c0_mode };
+            let out = (at(io.out, io.out_ct_stride) as *const W).wrapping_add(rot * io.out_rot_stride as usize) as *mut c_void;
             let a = KsArgs {
                 c1: at(io.c1, io.ct_stride),
                 modup: at(ks.digits.vptr(), mu_ct),
@@ -1093,7 +1102,7 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
                 k: kk as i32,
                 r: len as i32,
                 ndig: lv.ndig as i32,
-                c0_mode: io.c0_mode,
+                c0_mode,
                 nq: lay.nq as i32,
                 nrows: nrows as i32,
             };
