@@ -132,6 +132,142 @@ __global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ s
     bconv_body<W, MM>(src, dst, jobs, pool, pr);
 }
 
+// Wide jobs (ABI 20): up to MW sources (u32 words: 48; u64: 16): each thread's first 16 y_i in registers, the rest
+// in shared memory; otherwise the body above (same sums, same reductions, the exact estimate in source order).
+template <class W>
+__host__ __device__ constexpr int wide_max() { return sizeof(W) == 4 ? 48 : 16; }
+
+template <class W, class MM>
+__global__ void __launch_bounds__(BX) bconv_wide_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                                        const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    using Wd = WideOf<W>;
+    constexpr int MW = wide_max<W>();
+    const BconvJob J = jobs[blockIdx.z];
+    const int per = (((int)J.ntgt + (int)gridDim.y - 1) / (int)gridDim.y + 3) & ~3;
+    const int t0 = blockIdx.y * per;
+    if (t0 >= (int)J.ntgt) return;
+    const int nt = min(per, (int)J.ntgt - t0);
+    const int ns = min((int)J.nsrc, MW);
+    const W* P = pool + J.pool_off;
+    const W* srow = P;
+    const W* sprime = P + J.nsrc;
+    const W* pre = P + 2 * J.nsrc;
+    const W* trow = P + 3 * J.nsrc;
+    const W* tprime = trow + J.ntgt;
+    const W* M = tprime + J.ntgt;
+    __shared__ __align__(32) W sm[MW * TG];
+    __shared__ W ys[(MW > 16 ? MW - 16 : 1) * BX];
+    __shared__ uint32_t stp[TG], str[TG];
+    __shared__ uint32_t sp_[TG], sR[TG], sRs[TG], sm32[TG];
+    const bool fast = sizeof(W) == 4 && J.split && !J.exact;
+    for (int x = threadIdx.x; x < ns * TG; x += BX) {
+        const int i = x / TG, k = x % TG;
+        sm[x] = k < nt ? M[i * J.ntgt + t0 + k] : (W)0;
+    }
+    if (threadIdx.x < TG) {
+        const int k = threadIdx.x < nt ? threadIdx.x : 0;
+        stp[threadIdx.x] = (uint32_t)tprime[t0 + k];
+        str[threadIdx.x] = (uint32_t)trow[t0 + k];
+        if (fast) {
+            const uint32_t p = (uint32_t)pr[stp[threadIdx.x]].p;
+            const uint32_t m = 0xFFFFFFFFu / p;
+            const uint32_t R = 0u - m * p;
+            sp_[threadIdx.x] = p;
+            sm32[threadIdx.x] = m;
+            sR[threadIdx.x] = R;
+            sRs[threadIdx.x] = (uint32_t)(((uint64_t)R << 32) / p);
+        }
+    }
+    const int idx = blockIdx.x * BX + threadIdx.x;
+    const double* rb = nullptr;
+    const W* bmod = nullptr;
+    if (J.exact) {
+        const W* rbw = M + J.nsrc * J.ntgt;
+        while ((uintptr_t)rbw & 7) ++rbw;
+        rb = (const double*)rbw;
+        bmod = (const W*)(rb + J.nsrc);
+    }
+    double v = 0.0;
+    W yr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        if (i < ns) {
+            const PrimeConst& q = pr[sprime[i]];
+            const W x = src[(size_t)(J.src_off + srow[i]) * N + idx];
+            yr[i] = J.prescaled ? x : MM::mul(x, pre[i], q);
+            if (J.exact) v = __fma_rn((double)yr[i], rb[i], v);
+        } else
+            yr[i] = 0;
+    }
+    for (int i = 16; i < ns; ++i) {
+        const PrimeConst& q = pr[sprime[i]];
+        const W x = src[(size_t)(J.src_off + srow[i]) * N + idx];
+        const W y = J.prescaled ? x : MM::mul(x, pre[i], q);
+        ys[(i - 16) * BX + threadIdx.x] = y;
+        if (J.exact) v = __fma_rn((double)y, rb[i], v);
+    }
+    const uint64_t u = J.exact ? (uint64_t)floor(v + 0.5) : 0;
+    __syncthreads();
+    for (int k = 0; k < nt; k += 4) {
+        Wd a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (i < ns) {
+                const V4<W> m = load4<W>(sm + i * TG + k);
+                const Wd yi = yr[i];
+                a0 += yi * m.v[0];
+                a1 += yi * m.v[1];
+                a2 += yi * m.v[2];
+                a3 += yi * m.v[3];
+            }
+        }
+#pragma unroll 4
+        for (int i = 16; i < ns; ++i) {
+            const V4<W> m = load4<W>(sm + i * TG + k);
+            const Wd yi = ys[(i - 16) * BX + threadIdx.x];
+            a0 += yi * m.v[0];
+            a1 += yi * m.v[1];
+            a2 += yi * m.v[2];
+            a3 += yi * m.v[3];
+        }
+        const Wd acc[4] = {a0, a1, a2, a3};
+#pragma unroll
+        for (int q4 = 0; q4 < 4; ++q4) {
+            if (k + q4 < nt) {
+                if constexpr (sizeof(W) == 4) {
+                    if (fast) {
+                        const uint32_t p = sp_[k + q4];
+                        const uint32_t hi = (uint32_t)(acc[q4] >> 32), lo = (uint32_t)acc[q4];
+                        uint32_t a = hi * sR[k + q4] - __umulhi(hi, sRs[k + q4]) * p;
+                        a = a >= p ? a - p : a;
+                        uint32_t b = lo - __umulhi(lo, sm32[k + q4]) * p;
+                        b = b >= p ? b - p : b;
+                        a += b;
+                        dst[(size_t)(J.dst_off + str[k + q4]) * N + idx] = (W)(a >= p ? a - p : a);
+                        continue;
+                    }
+                }
+                const PrimeConst& q = pr[stp[k + q4]];
+                const W p = (W)q.p;
+                W r = MM::reduce(acc[q4], q);
+                if (J.exact) {
+                    const W sv = MM::reduce((Wd)u * bmod[t0 + k + q4], q);
+                    r = sub<W>(r, sv, p);
+                }
+                dst[(size_t)(J.dst_off + str[k + q4]) * N + idx] = r;
+            }
+        }
+    }
+}
+
+template <class W, class MM>
+int launch_wide(const BconvArgs* a, cudaStream_t s) {
+    if (a->njobs == 0) return 0;
+    dim3 grid(N / BX, (a->max_tgt + TG - 1) / TG, a->njobs);
+    bconv_wide_kernel<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+    return (int)cudaGetLastError();
+}
+
 // SMs of the current device (cached; a failed query selects the one-wave kernel everywhere)
 inline int num_sms() {
     static int n = 0;

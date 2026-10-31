@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 19u
+#define PC_KERNELS_ABI 20u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -852,8 +852,10 @@ struct KernelTable {
     int (*mul_add_n)(const MulAddNArgs*, cudaStream_t);
     int (*tensor_y)(const TensorYArgs*, cudaStream_t);
     int (*wsum_multi)(const WsumMultiArgs*, cudaStream_t);
+    // ABI 20: bconv for jobs of more than 16 sources (u32 words: up to 48), the same formula
+    int (*bconv_wide)(const BconvArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 43 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 44 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

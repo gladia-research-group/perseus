@@ -402,6 +402,97 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
     vec![cmp("bconv (plain + exact HPS) vs host", &got, &want), cmp("bconv prescaled + split reduction vs host", &got2, &want)]
 }
 
+// ABI 20: bconv_wide, jobs of 40 sources (prime ids cycled over the 8 test primes; the formula, not a CRT) -> 20 and
+// 12 targets, plain and exact, then prescaled with the split reduction (plain job only), vs host
+fn t_bconv_wide(st: &mut Setup) -> Vec<TestResult> {
+    if st.ctx.wb != 4 {
+        return vec![];
+    }
+    let ns = 40usize;
+    let sp: Vec<usize> = (0..ns).map(|i| i % 8).collect();
+    let src_h: Vec<u64> = (0..ns * N).map(|x| st.rng.below(st.p(sp[x / N]))).collect();
+    let src = st.ctx.up(&src_h);
+    struct J {
+        dst_off: usize,
+        tp: Vec<usize>,
+        exact: bool,
+    }
+    let jobs_h = [J { dst_off: 0, tp: (0..20).map(|t| (3 * t + 1) % 8).collect(), exact: false }, J { dst_off: 20, tp: (0..12).map(|t| (5 * t + 2) % 8).collect(), exact: true }];
+    let ndst = 32;
+    let mut pool: Vec<u64> = Vec::new();
+    let mut jobs = Vec::new();
+    let mut want = vec![0u64; ndst * N];
+    let mut src_pre = src_h.clone();
+    for j in &jobs_h {
+        let nt = j.tp.len();
+        let off = pool.len();
+        let pre: Vec<u64> = sp.iter().map(|&q| st.rng.below(st.p(q))).collect();
+        let m: Vec<Vec<u64>> = sp.iter().map(|_| j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect()).collect();
+        let rb: Vec<f64> = sp.iter().map(|&q| 1.0 / st.p(q) as f64).collect();
+        let bmod: Vec<u64> = j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect();
+        pool.extend((0..ns).map(|i| i as u64));
+        pool.extend(sp.iter().map(|&q| q as u64));
+        pool.extend(&pre);
+        pool.extend((0..nt).map(|i| i as u64));
+        pool.extend(j.tp.iter().map(|&t| t as u64));
+        for row in &m {
+            pool.extend(row);
+        }
+        if j.exact {
+            while (pool.len() * 4) % 8 != 0 {
+                pool.push(0);
+            }
+            for &x in &rb {
+                let bits = x.to_bits();
+                pool.extend([bits & 0xFFFF_FFFF, bits >> 32]);
+            }
+            pool.extend(&bmod);
+        } else {
+            for i in 0..ns {
+                for idx in 0..N {
+                    src_pre[i * N + idx] = mulmod(src_h[i * N + idx], pre[i], st.p(sp[i]));
+                }
+            }
+        }
+        jobs.push([0u32, j.dst_off as u32, ns as u32, nt as u32, off as u32, j.exact as u32]);
+        for idx in 0..N {
+            let y: Vec<u64> = (0..ns).map(|i| mulmod(src_h[i * N + idx], pre[i], st.p(sp[i]))).collect();
+            let mut v = 0.0f64;
+            if j.exact {
+                for i in 0..ns {
+                    v = (y[i] as f64).mul_add(rb[i], v);
+                }
+            }
+            let u = (v + 0.5).floor() as u64;
+            for (k, &t) in j.tp.iter().enumerate() {
+                let p = st.p(t);
+                let acc: u128 = (0..ns).map(|i| y[i] as u128 * m[i][k] as u128).sum();
+                let mut r = (acc % p as u128) as u64;
+                if j.exact {
+                    r = submod(r, mulmod(u % p, bmod[k], p), p);
+                }
+                want[(j.dst_off + k) * N + idx] = r;
+            }
+        }
+    }
+    let pool_d = st.ctx.up(&pool);
+    let words = |pre: u32| -> Vec<u32> { jobs.iter().flat_map(|j| [j[0], j[1], j[2], j[3], j[4], j[5], pre, pre]).collect() };
+    let jobs_d = st.ctx.up32(&words(0));
+    let dst = st.ctx.zeros(ndst * N);
+    let a = BconvArgs { src: src.c(), dst: dst.p(), jobs: jobs_d.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 2, max_tgt: 20 };
+    ck(unsafe { (st.t.bconv_wide)(&a, st.s()) });
+    let mut out = vec![cmp("bconv_wide 40 sources (plain + exact HPS) vs host", &dst.read(&st.ctx), &want)];
+    // the plain job prescaled (rows hold x pre) with the split reduction
+    let jobs2 = st.ctx.up32(&words(1)[..8]);
+    let src2 = st.ctx.up(&src_pre);
+    let dst2 = st.ctx.zeros(ndst * N);
+    let a2 = BconvArgs { src: src2.c(), dst: dst2.p(), jobs: jobs2.c() as *const BconvJob, njobs: 1, ..a };
+    ck(unsafe { (st.t.bconv_wide)(&a2, st.s()) });
+    let got2 = dst2.read(&st.ctx);
+    out.push(cmp("bconv_wide prescaled + split (plain job) vs host", &got2[..20 * N], &want[..20 * N]));
+    out
+}
+
 // ================================================================================================ element-wise
 const RS: RowSet = RowSet { nq: 3, np: 2, qmax: 5, pad: 0 };
 fn rs_rows(rs: RowSet) -> Vec<usize> {
@@ -2017,7 +2108,7 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
             tests.push(t_ntt_wide28);
         }
     }
-    tests.extend([t_bconv as Test, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
+    tests.extend([t_bconv as Test, t_bconv_wide, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
     if has_ntt {
         tests.push(t_encode);
     }

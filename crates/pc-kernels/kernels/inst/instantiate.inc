@@ -76,6 +76,7 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::em::mul_add_n_l<W, MM>,
         &pc::em::tensor_y_l<W, MM>,
         &pc::em::wsum_multi_l<W>,
+        &pc::bconv::launch_wide<W, MM>,
     };
     return &T;
 }

@@ -7,8 +7,10 @@ use pc_core::modmul::{invmod, mulmod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
 use pc_kernels::{BconvArgs, BconvJob};
 
-/// Most sources one job may have (kernel bound).
+/// Most sources one job of the register kernel may have; wider jobs (u32 words) run on `bconv_wide`.
 pub const MAX_SRC: usize = 16;
+/// Most sources of a wide job (u32 words; `bconv_wide`).
+pub const MAX_SRC_WIDE: usize = 48;
 
 /// One conversion: source rows `(limb offset, prime id)` -> target rows, limb offsets relative to `src_off` /
 /// `dst_off` (units of N) in the src / dst buffers.
@@ -36,6 +38,8 @@ pub struct BconvPlan<'a> {
     pool: ConstBuf<'a, u8>,
     pub njobs: usize,
     pub max_tgt: usize,
+    /// Most sources of a job (> MAX_SRC: the wide kernel).
+    pub max_src: usize,
     /// Largest limb read in src / written in dst + 1 (bounds checks at launch).
     pub src_limbs: usize,
     pub dst_limbs: usize,
@@ -51,10 +55,19 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
     let mut max_tgt = 0;
     let push = |pool: &mut Vec<W>, v: u64| pool.push(W::from_u64(v));
     for j in specs {
-        if j.src.is_empty() || j.src.len() > MAX_SRC {
-            return Err(shape("bconv job", format!("{} sources (1..={MAX_SRC})", j.src.len())));
+        let max = if wb == 4 { MAX_SRC_WIDE } else { MAX_SRC };
+        if j.src.is_empty() || j.src.len() > max {
+            return Err(shape("bconv job", format!("{} sources (1..={max})", j.src.len())));
         }
         let ns = j.src.len();
+        if ns > MAX_SRC {
+            // lazy double-word sums: nsrc (max source - 1) (max target - 1) < 2^(2 bits)
+            let ms = j.src.iter().map(|&(_, p)| primes[p as usize]).max().unwrap_or(0) as u128;
+            let mt = j.tgt.iter().map(|&(_, p)| primes[p as usize]).max().unwrap_or(0) as u128;
+            if ns as u128 * ms.saturating_sub(1) * mt.saturating_sub(1) >= 1u128 << (16 * wb) {
+                return Err(shape("bconv job", format!("{ns} sources overflow the lazy double-word sum")));
+            }
+        }
         let off = pool.len();
         let bp: Vec<u64> = j.src.iter().map(|&(_, p)| primes[p as usize]).collect();
         for &(r, _) in &j.src {
@@ -124,6 +137,7 @@ impl<'a> BconvPlan<'a> {
             pool: ConstBuf::new(arena, "bconv.pool", s, &bytes)?,
             njobs: specs.len(),
             max_tgt,
+            max_src: specs.iter().map(|j| j.src.len()).max().unwrap_or(0),
             src_limbs,
             dst_limbs,
             prefix_limbs,
@@ -181,7 +195,8 @@ impl<'a> BconvPlan<'a> {
             max_tgt: self.max_tgt as i32,
         };
         // SAFETY: job records are BconvJob-sized u32 octets; limb ranges checked above; src/dst are distinct borrows
-        launch_result("bconv", unsafe { (ctx.table.bconv)(&a, s.raw()) })?;
+        let f = if self.max_src > MAX_SRC { ctx.table.bconv_wide } else { ctx.table.bconv };
+        launch_result("bconv", unsafe { f(&a, s.raw()) })?;
         Ok(())
     }
 }

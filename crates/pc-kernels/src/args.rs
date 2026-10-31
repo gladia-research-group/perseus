@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 19;
+pub const ABI: u32 = 20;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -862,6 +862,8 @@ pub struct KernelTable {
     pub mul_add_n: Launch<MulAddNArgs>,
     pub tensor_y: Launch<TensorYArgs>,
     pub wsum_multi: Launch<WsumMultiArgs>,
+    /// ABI 20: `bconv` for jobs of more than 16 sources (u32 words: up to 48).
+    pub bconv_wide: Launch<BconvArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -908,7 +910,7 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 43 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 44 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<MulAddNArgs>() == 328);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);
