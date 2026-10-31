@@ -238,9 +238,32 @@ fn contract_hash(config: &PyConfig) -> PyResult<String> {
     crate::session::contract_hash(&config.0)
 }
 
+/// A frame `import_ct` uploaded with its checksum left to a thread, and the frame's buffer (held until the thread is
+/// joined: the thread reads it).
+struct Pending {
+    ok: std::thread::JoinHandle<bool>,
+    _frame: PyBuffer<u8>,
+}
+
+/// The imports whose checksum is still being verified (`import_ct`), joined by `export_ct` before it writes a frame.
+static PENDING: std::sync::Mutex<Vec<Pending>> = std::sync::Mutex::new(Vec::new());
+
+/// Wait for the checksums of every frame imported so far; an error if any of them did not match.
+fn checked_imports() -> PyResult<()> {
+    let v = std::mem::take(&mut *PENDING.lock().map_err(|_| PyRuntimeError::new_err("import_ct: checksum threads poisoned"))?);
+    let n = v.len();
+    let bad = v.into_iter().map(|p| p.ok.join().unwrap_or(false)).filter(|ok| !ok).count();
+    if bad > 0 {
+        return Err(PyValueError::new_err(format!("import_ct: ciphertext checksum mismatch ({bad} of the {n} frames imported since the last export)")));
+    }
+    Ok(())
+}
+
 /// Wire frame of a session ciphertext (a pending rescale is realized on a copy first: the client decodes degree 1).
+/// Every frame imported before it has passed its checksum (`import_ct`) when it returns.
 #[pyfunction]
 fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> PyResult<Bound<'py, PyBytes>> {
+    checked_imports()?;
     let dev = session.dev.clone();
     let meta = ct.ct_ref().meta;
     let tmp = if meta.deg == 2 {
@@ -279,7 +302,9 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
     })
 }
 
-/// A session ciphertext from a wire frame (one ciphertext, this session's chain; bytes or a memoryview).
+/// A session ciphertext from a wire frame (one ciphertext, this session's chain; bytes or a memoryview, unchanged until
+/// the next `export_ct`). The frame's checksum is verified on a thread while the caller goes on; the next `export_ct`
+/// fails if it did not match.
 #[pyfunction]
 fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> PyResult<PyCt> {
     let dev = session.dev.clone();
@@ -288,10 +313,10 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> P
     if !fb.is_c_contiguous() {
         return Err(PyValueError::new_err("import_ct: the frame is not a contiguous buffer"));
     }
-    // SAFETY: `fb` holds the exporter's buffer (alive and unmoved) until it drops at the end of this call; C-contiguous
-    // u8 items
+    // SAFETY: `fb` holds the exporter's buffer (alive and unmoved) until it drops (on an error here, else when the
+    // checksum thread it is handed to is joined); C-contiguous u8 items
     let frame: &[u8] = unsafe { std::slice::from_raw_parts(fb.buf_ptr() as *const u8, fb.len_bytes()) };
-    let (h, data) = ct_frame(frame)?;
+    let (h, data, sum) = ct_frame(frame)?;
     let h = &h;
     let ph = pc_client::spec::params_hash(&dev.ctx.chain);
     if h.params_hash != ph || h.n != dev.ctx.lay.n || h.k != 1 {
@@ -321,12 +346,22 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> P
         })
         .map_err(gerr)?;
     }
+    // SAFETY: `fb` (moved into the pending entry) keeps the exporter's buffer alive and in place until the thread is
+    // joined; the caller leaves the frame unchanged until then
+    let (p, n) = (data.as_ptr() as usize, data.len());
+    let check = move || sum64_le(unsafe { std::slice::from_raw_parts(p as *const u8, n) }) == sum;
+    match std::thread::Builder::new().name("import_ct sum".into()).spawn(check) {
+        Ok(ok) => PENDING.lock().map_err(|_| PyRuntimeError::new_err("import_ct: checksum threads poisoned"))?.push(Pending { ok, _frame: fb }),
+        Err(_) if !check() => return Err(PyValueError::new_err("import_ct: ciphertext checksum mismatch")),
+        Err(_) => {}
+    }
     Ok(out)
 }
 
-/// A ciphertext frame (`CtWire::to_bytes`) read in place: its header and its words' little-endian bytes
-/// (`[part][row][N]`), with the magic, version, size and checksum checked as `CtWire::from_bytes` checks them.
-fn ct_frame(frame: &[u8]) -> PyResult<(CtHeader, &[u8])> {
+/// A ciphertext frame (`CtWire::to_bytes`) read in place: its header, its words' little-endian bytes
+/// (`[part][row][N]`) and their checksum, with the magic, version and size checked as `CtWire::from_bytes` checks them
+/// (the checksum is the caller's to verify).
+fn ct_frame(frame: &[u8]) -> PyResult<(CtHeader, &[u8], u64)> {
     let bad = |m: String| PyValueError::new_err(format!("import_ct: {m}"));
     if frame.len() < 16 || &frame[..4] != CT_MAGIC {
         return Err(bad("not a ciphertext frame".into()));
@@ -348,11 +383,7 @@ fn ct_frame(frame: &[u8]) -> PyResult<(CtHeader, &[u8])> {
     if frame.len() != d1 + 8 {
         return Err(bad(format!("{} bytes for a frame of {} words", frame.len(), CtWire::words(&header))));
     }
-    let data = &frame[d0..d1];
-    if u64::from_le_bytes(frame[d1..].try_into().expect("8 bytes")) != sum64_le(data) {
-        return Err(bad("ciphertext checksum mismatch".into()));
-    }
-    Ok((header, data))
+    Ok((header, &frame[d0..d1], u64::from_le_bytes(frame[d1..].try_into().expect("8 bytes"))))
 }
 
 /// `pc_client::wire::sum64` of words given as their little-endian bytes (whole words).
