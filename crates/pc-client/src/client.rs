@@ -574,14 +574,14 @@ mod tests {
         }
     }
 
-    /// Level relinearization keys (n32a4: tops 30, 40, 42 = 1, 2, 3 digits over P' with idle Q primes): the relation
+    /// Level relinearization keys (n32a4: tops 26, 40 = 2, 3 digits over P' = P x one idle Q prime): the relation
     /// holds with the level's digits and gadget (small |e|), and a wrong shape is refused.
     #[test]
     fn level_relin_keys() {
         let name = "n32a4";
         let mut c = client_on(name, 3);
         let chain = c.chain.clone();
-        let keys: Vec<KeyReq> = [30usize, 40, 42]
+        let keys: Vec<KeyReq> = [26usize, 40]
             .iter()
             .map(|&top| {
                 let (dg, _, q_top) = chain.level_relin_layout(top, crate::spec::LEVEL_RELIN_CAP).unwrap();
@@ -598,7 +598,7 @@ mod tests {
         let path = dir.join("b.pckb");
         let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
         let st = c.keygen(&spec, f, &mut Prng::from_seed([7; 8], 0), 8).unwrap();
-        assert_eq!(st.keys, 3);
+        assert_eq!(st.keys, 2);
         let mut r = wire::BundleReader::open(&path).unwrap();
         let (bits, rw) = (r.header.bits, r.header.row_words);
         for i in 0..r.header.entries.len() {

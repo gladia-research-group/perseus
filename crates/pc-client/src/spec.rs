@@ -87,8 +87,9 @@ impl Role {
     }
 }
 
-/// |P'| bound of the level relinearization keys (the server's wide base conversion: P' + 2 tops <= 48 sources).
-pub const LEVEL_RELIN_CAP: usize = 46;
+/// |P'| bound of the level relinearization keys: 14 (the fused conversion's P' + 2 tops within the 16-source
+/// register kernel; the measured best: larger P' trades the digits it saves for a wider ModDown, no net gain).
+pub const LEVEL_RELIN_CAP: usize = 14;
 
 /// One switching key to generate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
