@@ -38,26 +38,34 @@ template <class W>
 __device__ __forceinline__ W shoup_lz(W a, W w, W ws, W p) {
     return (W)(wlo(a, w) - wlo(Word<W>::mulhi(a, ws), p));
 }
+// 2p as a register the compiler cannot fold back into its multiples (it would turn every lazy "x - 2p" and
+// "2p - t + u" into an IMAD on the FMA pipe, which the row passes saturate, instead of an ALU add)
 template <class W>
-__device__ __forceinline__ W red2p(W a, W p) {
-    return a >= (W)(2 * p) ? (W)(a - 2 * p) : a;
+__device__ __forceinline__ W twice(W p) {
+    if constexpr (sizeof(W) == 4) return __shfl_sync(0xffffffffu, 2 * p, 0);
+    else return (W)(2 * p);
+}
+// a >= 2p ? a - 2p : a (p2 = 2p)
+template <class W>
+__device__ __forceinline__ W red2p(W a, W p2) {
+    return a >= p2 ? (W)(a - p2) : a;
 }
 // a word of [0, 4p) (a forward lazy one) as its residue in [0, p)
 template <class W, bool L>
-__device__ __forceinline__ W canon(W a, W p) {
+__device__ __forceinline__ W canon(W a, W p, W p2) {
     if constexpr (LAZY<W, L>) {
-        a = red2p<W>(a, p);
+        a = red2p<W>(a, p2);
         return a >= p ? (W)(a - p) : a;
     }
     return a;
 }
 // CT with the second operand's product t already taken (t in [0, 2p) when lazy, [0, p) otherwise)
 template <class W, bool L>
-__device__ __forceinline__ void ct_t(W& a, W& b, W t, W p) {
+__device__ __forceinline__ void ct_t(W& a, W& b, W t, W p, W p2) {
     if constexpr (LAZY<W, L>) {
-        const W u = red2p<W>(a, p);
+        const W u = red2p<W>(a, p2);
         a = u + t;
-        b = (W)(u - t + 2 * p);
+        b = (W)(u - t + p2);
     } else {
         const W u = a;
         a = add<W>(u, t, p);
@@ -70,25 +78,25 @@ __device__ __forceinline__ W mul_lz(W b, W w, W ws, W p) {
     return mul_shoup<W>(b, w, ws, p);
 }
 template <class W, bool L>
-__device__ __forceinline__ void ct_lz(W& a, W& b, W w, W ws, W p) {
-    ct_t<W, L>(a, b, mul_lz<W, L>(b, w, ws, p), p);
+__device__ __forceinline__ void ct_lz(W& a, W& b, W w, W ws, W p, W p2) {
+    ct_t<W, L>(a, b, mul_lz<W, L>(b, w, ws, p), p, p2);
 }
 // GS: (a + b, (a - b) w)
 template <class W, bool L>
-__device__ __forceinline__ W gs_sum(W a, W b, W p) {
-    if constexpr (LAZY<W, L>) return red2p<W>(a + b, p);
+__device__ __forceinline__ W gs_sum(W a, W b, W p, W p2) {
+    if constexpr (LAZY<W, L>) return red2p<W>(a + b, p2);
     return add<W>(a, b, p);
 }
 template <class W, bool L>
-__device__ __forceinline__ W gs_dif(W a, W b, W p) {
-    if constexpr (LAZY<W, L>) return (W)(a - b + 2 * p);
+__device__ __forceinline__ W gs_dif(W a, W b, W p, W p2) {
+    if constexpr (LAZY<W, L>) return (W)(a - b + p2);
     return sub<W>(a, b, p);
 }
 template <class W, bool L>
-__device__ __forceinline__ void gs_lz(W& a, W& b, W w, W ws, W p) {
+__device__ __forceinline__ void gs_lz(W& a, W& b, W w, W ws, W p, W p2) {
     const W u = a, v = b;
-    a = gs_sum<W, L>(u, v, p);
-    b = mul_lz<W, L>(gs_dif<W, L>(u, v, p), w, ws, p);
+    a = gs_sum<W, L>(u, v, p, p2);
+    b = mul_lz<W, L>(gs_dif<W, L>(u, v, p, p2), w, ws, p);
 }
 
 // Row-pass twiddles of the last three stages (m = 2^s, s = 13..15) from two factors already in the table: for
@@ -164,6 +172,7 @@ __device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s
 // x[j] = word (q + 16 j) * 256 + c (canonical), stored at a (the block's first word); s: the transpose buffer.
 template <class W, bool L>
 __device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w, const W* ws, W p, int c, int q) {
+    const W p2 = twice<W>(p);
     // stages tr = 128..16 (m = 1..8): pairs (j, j + tr/16), group i = j / (2 tr/16)
 #pragma unroll
     for (int st = 0; st < 4; ++st) {
@@ -173,7 +182,7 @@ __device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w
         for (int j = 0; j < 16; ++j) {
             if ((j & h) == 0) {
                 const int i = j / (2 * h);
-                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
         }
     }
@@ -192,7 +201,7 @@ __device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w
         for (int u = 0; u < 16; ++u) {
             if ((u & h) == 0) {
                 const int i = (m >> 4) * q + u / (2 * h);
-                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
         }
     }
@@ -209,6 +218,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 16 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
     W x[16];
 #pragma unroll
@@ -231,6 +241,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
     const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 8 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const W* w = (const W*)T.fw + (size_t)pid * N;
     const W* ws = (const W*)T.fws + (size_t)pid * N;
     const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
@@ -246,7 +257,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
         const int h = 4 >> st, m = 1 << st;
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-            if ((j & h) == 0) ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
+            if ((j & h) == 0) ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p, p2);
     }
 #pragma unroll
     for (int j = 0; j < 8; ++j) s[(q + 32 * j) * 8 + c] = x[j];
@@ -260,7 +271,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
         for (int j = 0; j < 8; ++j)
             if ((j & h) == 0) {
                 const int i = (m >> 3) * hi + j / (2 * h);
-                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
     }
     __syncthreads();
@@ -276,7 +287,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
         for (int u = 0; u < 8; ++u)
             if ((u & h) == 0) {
                 const int i = (m >> 5) * q + u / (2 * h);
-                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
     }
 #pragma unroll
@@ -294,6 +305,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     W* a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const W* w = (const W*)T.fw + (size_t)pid * N;
     const W* ws = (const W*)T.fws + (size_t)pid * N;
     W x[8];
@@ -304,15 +316,15 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     {  // t = 128, m = 256: i = 0 -> index 256 + R
         const W tw = __ldg(w + 256 + R), tws = __ldg(ws + 256 + R);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) ct_lz<W, L>(x[j], x[j + 4], tw, tws, p);
+        for (int j = 0; j < 4; ++j) ct_lz<W, L>(x[j], x[j + 4], tw, tws, p, p2);
     }
     {  // t = 64, m = 512: i = j / 4 (j<4 -> 0); pairs (j, j+2) for j in {0,1,4,5}
 #pragma unroll
         for (int hb = 0; hb < 2; ++hb) {
             const int ti = 512 + 2 * R + hb;
             const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-            ct_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p);
-            ct_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p);
+            ct_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p, p2);
+            ct_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p, p2);
         }
     }
     {  // t = 32, m = 1024: i = j / 2; pairs (j, j+1) for even j
@@ -320,7 +332,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
         for (int qb = 0; qb < 4; ++qb) {
             const int ti = 1024 + 4 * R + qb;
             const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-            ct_lz<W, L>(x[2 * qb], x[2 * qb + 1], tw, tws, p);
+            ct_lz<W, L>(x[2 * qb], x[2 * qb + 1], tw, tws, p, p2);
         }
     }
     // warp-local transpose to layout B: x[u] = e = 8 lane + u
@@ -342,7 +354,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
             const W o = shfl_xor<W>(0xffffffffu, x[u], 2);
             // lo lane holds U (e), hi lane holds V (e+16)
             W U = lo ? x[u] : o, V = lo ? o : x[u];
-            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p);
+            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2);
             x[u] = lo ? U : V;
         }
     }
@@ -355,12 +367,12 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
         for (int u = 0; u < 8; ++u) {
             const W o = shfl_xor<W>(0xffffffffu, x[u], 1);
             W U = lo ? x[u] : o, V = lo ? o : x[u];
-            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p);
+            ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2);
             x[u] = lo ? U : V;
         }
     }
     // CT butterfly with the factored twiddle U V
-    auto ct_uv = [&](W& a, W& b, int ui, int vi) { ct_t<W, L>(a, b, mul_uv<W, L>(b, w, ws, ui, vi, p), p); };
+    auto ct_uv = [&](W& a, W& b, int ui, int vi) { ct_t<W, L>(a, b, mul_uv<W, L>(b, w, ws, ui, vi, p), p, p2); };
     {  // t = 4, m = 8192: i_local = e / 8 = lane
         const int ui = 8192 + 32 * R, vi = vidx(13, lane);
 #pragma unroll
@@ -380,7 +392,7 @@ __global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
     }
     // store: layout B is 8 consecutive elements per lane -> vectorized, canonical words
 #pragma unroll
-    for (int u = 0; u < 8; ++u) x[u] = canon<W, L>(x[u], p);
+    for (int u = 0; u < 8; ++u) x[u] = canon<W, L>(x[u], p, p2);
     if (T.epi) {
         const size_t r = (size_t)T.roff[row] * N + R * 256 + 8 * lane;
         const W s = ((const W*)T.es)[pid], ss = ((const W*)T.ess)[pid];
@@ -404,6 +416,7 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + R * 256 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const W* w = (const W*)T.iw + (size_t)pid * N;
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     W x[8];
@@ -418,8 +431,8 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
     // GS butterfly with the factored twiddle U V (inverse table)
     auto gs_uv = [&](W& a, W& b, int ui, int vi) {
         const W u = a, v = b;
-        a = gs_sum<W, L>(u, v, p);
-        b = mul_uv<W, L>(gs_dif<W, L>(u, v, p), w, ws, ui, vi, p);
+        a = gs_sum<W, L>(u, v, p, p2);
+        b = mul_uv<W, L>(gs_dif<W, L>(u, v, p, p2), w, ws, ui, vi, p);
     };
     {  // t = 1, m = 32768
 #pragma unroll
@@ -446,7 +459,7 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
         for (int u = 0; u < 8; ++u) {
             const W o = shfl_xor<W>(0xffffffffu, x[u], 1);
             const W U = lo ? x[u] : o, V = lo ? o : x[u];
-            x[u] = lo ? gs_sum<W, L>(U, V, p) : mul_lz<W, L>(gs_dif<W, L>(U, V, p), tw, tws, p);
+            x[u] = lo ? gs_sum<W, L>(U, V, p, p2) : mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
         }
     }
     {  // t = 16, m = 2048: lanes (l, l^2)
@@ -457,7 +470,7 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
         for (int u = 0; u < 8; ++u) {
             const W o = shfl_xor<W>(0xffffffffu, x[u], 2);
             const W U = lo ? x[u] : o, V = lo ? o : x[u];
-            x[u] = lo ? gs_sum<W, L>(U, V, p) : mul_lz<W, L>(gs_dif<W, L>(U, V, p), tw, tws, p);
+            x[u] = lo ? gs_sum<W, L>(U, V, p, p2) : mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
         }
     }
     // transpose B -> A
@@ -473,7 +486,7 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
 #pragma unroll
         for (int qb = 0; qb < 4; ++qb) {
             const int ti = 1024 + 4 * R + qb;
-            gs_lz<W, L>(x[2 * qb], x[2 * qb + 1], __ldg(w + ti), __ldg(ws + ti), p);
+            gs_lz<W, L>(x[2 * qb], x[2 * qb + 1], __ldg(w + ti), __ldg(ws + ti), p, p2);
         }
     }
     {  // t = 64, m = 512
@@ -481,14 +494,14 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
         for (int hb = 0; hb < 2; ++hb) {
             const int ti = 512 + 2 * R + hb;
             const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
-            gs_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p);
-            gs_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p);
+            gs_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p, p2);
+            gs_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p, p2);
         }
     }
     {  // t = 128, m = 256
         const W tw = __ldg(w + 256 + R), tws = __ldg(ws + 256 + R);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) gs_lz<W, L>(x[j], x[j + 4], tw, tws, p);
+        for (int j = 0; j < 4; ++j) gs_lz<W, L>(x[j], x[j + 4], tw, tws, p, p2);
     }
 #pragma unroll
     for (int j = 0; j < 8; ++j) a[lane + 32 * j] = x[j];
@@ -503,6 +516,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const W* w = (const W*)T.iw + (size_t)pid * N;
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
@@ -517,7 +531,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
         for (int u = 0; u < 16; ++u) {
             if ((u & h) == 0) {
                 const int i = (m >> 4) * q + u / (2 * h);
-                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
         }
     }
@@ -533,7 +547,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
         for (int j = 0; j < 16; ++j) {
             if ((j & h) == 0) {
                 const int i = j / (2 * h);
-                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
         }
     }
@@ -550,6 +564,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
+    const W p2 = twice<W>(p);
     const W* w = (const W*)T.iw + (size_t)pid * N;
     const W* ws = (const W*)T.iws + (size_t)pid * N;
     const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
@@ -564,7 +579,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
         for (int u = 0; u < 8; ++u)
             if ((u & h) == 0) {
                 const int i = (m >> 5) * q + u / (2 * h);
-                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
     }
 #pragma unroll
@@ -579,7 +594,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
         for (int j = 0; j < 8; ++j)
             if ((j & h) == 0) {
                 const int i = (m >> 3) * hi + j / (2 * h);
-                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
             }
     }
     __syncthreads();
@@ -593,7 +608,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
         const int h = 4 >> st, m = 1 << st;
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-            if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
+            if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p, p2);
     }
     const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
 #pragma unroll
