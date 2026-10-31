@@ -9,7 +9,7 @@
 //! docs/ARCHITECTURE.md "pc-gpu StC-first route". On a lean chain (`ChainSpec::lean`) the StC stages run on the single
 //! primes above q0, one each, their plaintexts at the prime's scale times a factor (`THIN_SPLIT`; the last stage's per
 //! call): the product keeps the input's scale but for the factors, which spread the 2^-CF reduction over the stages.
-use super::cts::{diag_coeffs, stage_width, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{diag_coeffs, fold_periodic_giants, stage_width, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::dense::{DensePlan, LtHost};
 use super::evalmod::{EmMode, EvalModPlan};
 use super::finish::{pow2_exp, Pow2};
@@ -113,7 +113,8 @@ pub struct SrcHost {
 
 impl SrcHost {
     pub fn new(chain: &Chain, geom: LtGeom, values: &[Vec<C64>]) -> Result<SrcHost> {
-        Ok(SrcHost { geom, coeffs: diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())? })
+        let (geom, coeffs) = fold_periodic_giants(chain.n, geom, diag_coeffs(chain, values, (SRC_LOG2 as f64).exp2())?);
+        Ok(SrcHost { geom, coeffs })
     }
     pub fn bytes<W: DevWord>(&self, n: usize) -> usize {
         Arena::bytes_for::<W>(self.coeffs.len() * SRC_LIMBS * n)

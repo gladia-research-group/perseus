@@ -90,24 +90,37 @@ pub fn diag_coeffs(chain: &pc_core::params::Chain, values: &[Vec<C64>], scale: f
         .collect()
 }
 
-/// A stage whose giant rotation is the identity (b stride = 0 mod N/2: CtS stage 0) as one giant step: the giant
-/// steps' diagonals summed per baby step (integer coefficients, so every prime's encoding is the sum of the
-/// unfolded encodings mod p). The sum over the giant steps then happens in the plaintexts instead of `g` products
-/// per baby step and an add of the extended results; the result is the same residues (bit-identical).
-pub fn fold_identity_giants(n: usize, geom: LtGeom, coeffs: Vec<Vec<i128>>) -> (LtGeom, Vec<Vec<i128>>) {
+/// A stage whose giant rotation R (b stride slots) has an order `ord` below its giant-step count (R^ord = identity
+/// mod N/2) with the giant steps folded mod `ord`: the diagonals of giant steps j and j + ord summed per baby step
+/// (integer coefficients, so every prime's encoding is the sum of the unfolded encodings mod p), `ord` giant steps
+/// left. `ord` = 1 (b stride = N/2: CtS stage 0): one product per baby step instead of `g` and no add of the extended
+/// results, the same residues (bit-identical). `ord` > 1 (the StC stage of stride N/32 at b = 16: R^2 = 1): g - ord
+/// fewer giant key switches, the Horner sums' extra rotations by R^ord being exact identities in the slots (not
+/// bit-identical: fewer key-switch roundings).
+pub fn fold_periodic_giants(n: usize, geom: LtGeom, coeffs: Vec<Vec<i128>>) -> (LtGeom, Vec<Vec<i128>>) {
     let nh = n / 2;
-    if geom.g <= 1 || (geom.b * geom.stride) % nh != 0 {
+    let r = (geom.b * geom.stride) % nh;
+    let ord = nh / gcd(r, nh);
+    if geom.g <= ord {
         return (geom, coeffs);
     }
-    let nb = geom.b.min(geom.npts);
-    let mut out: Vec<Vec<i128>> = Vec::with_capacity(nb);
+    let np = (ord * geom.b).min(geom.npts);
+    let mut out: Vec<Vec<i128>> = Vec::with_capacity(np);
     for (dg, c) in coeffs.into_iter().enumerate() {
-        match out.get_mut(dg % geom.b) {
+        match out.get_mut(dg % (ord * geom.b)) {
             Some(acc) => acc.iter_mut().zip(&c).for_each(|(a, &x)| *a += x),
             None => out.push(c),
         }
     }
-    (LtGeom { g: 1, npts: nb, ..geom }, out)
+    (LtGeom { g: ord, npts: np, ..geom }, out)
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if a == 0 {
+        b
+    } else {
+        gcd(b % a, a)
+    }
 }
 
 /// The stored width of a stage's plaintexts (every diagonal shares the stage's compaction).

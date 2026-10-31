@@ -9,7 +9,7 @@
 //! `mem()`), then `DensePlan::build` (device tables after `MemPlan::allocate`). Every precomputation is encoded from
 //! `pc_core::bts_setup` at the levels of `pc_shadow::route`, one variant per raise drop of the setup.
 //! `iterations` > 1 runs perseus' `eval_bootstrap_iter` residual loop (y = bts(x); y += bts((x - y) 2^p) 2^-p).
-use super::cts::{diag_coeffs, fold_identity_giants, stage_width, tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
+use super::cts::{diag_coeffs, fold_periodic_giants, stage_width, tail_steps, KeyTails, LtEnd, LtGeom, LtPts, LtStage, PtSource};
 use super::evalmod::{em_work, EmMode, EvalModPlan};
 use super::finish::Pow2;
 use super::raise::{self, EncapsKeys, RaisePlan};
@@ -131,7 +131,7 @@ impl DensePlan {
                 if lv.top as usize != (shp.n_q - 1 - m.level) as usize || m.deg != 1 {
                     return Err(shape("dense plan", format!("CtS stage {e} plaintexts at top {} but the input is {m:?}", lv.top)));
                 }
-                let (geom, coeffs) = fold_identity_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, lv.scale)?);
+                let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, lv.scale)?);
                 cts.push(LtHost { geom, top: lv.top as usize, end: inner_end, nf: lv.scale, width: stage_width(n, &coeffs), coeffs });
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 m = sh.rescale(&m)?.out;
@@ -151,8 +151,7 @@ impl DensePlan {
                 }
                 m.level = lv.level;
                 let end = if e + 1 < nst { inner_end } else { LtEnd::ModDown };
-                let geom = LtGeom::from_fides(fs);
-                let coeffs = diag_coeffs(chain, &fs.pts, if e + 1 == nst { lv.scale * fdrop } else { lv.scale })?;
+                let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, if e + 1 == nst { lv.scale * fdrop } else { lv.scale })?);
                 stc.push(LtHost { geom, top: lv.top as usize, end, nf: lv.scale, width: stage_width(n, &coeffs), coeffs });
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 if e + 1 < nst && geom.offset == 0 {
@@ -162,8 +161,9 @@ impl DensePlan {
             let stc_real0 = match &real0 {
                 Some(v) => {
                     let s0 = &stc[0];
-                    let coeffs = diag_coeffs(chain, v, if nst == 1 { s0.nf * fdrop } else { s0.nf })?;
-                    Some(LtHost { geom: s0.geom, top: s0.top, end: s0.end, nf: s0.nf, width: stage_width(n, &coeffs), coeffs })
+                    let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(&lay.stc[0]), diag_coeffs(chain, v, if nst == 1 { s0.nf * fdrop } else { s0.nf })?);
+                    debug_assert_eq!(geom, s0.geom);
+                    Some(LtHost { geom, top: s0.top, end: s0.end, nf: s0.nf, width: stage_width(n, &coeffs), coeffs })
                 }
                 None => None,
             };
