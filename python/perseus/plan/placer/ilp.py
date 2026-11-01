@@ -33,6 +33,14 @@ _ENV_PENALTY = 1.0e4  # `_capacity`'s payable price for a site past the refresh 
 _UNIT = float(2 ** 20)
 
 
+def _chain_hard() -> bool:
+    return os.environ.get("PLAN_CHAIN_HARD", "0") not in ("", "0")
+
+
+class ChainRejected(Exception):
+    """The min-cut incumbent starts a refresh past the chain (PLAN_CHAIN_HARD): the ILP solves without it."""
+
+
 class ModelMismatch(RuntimeError):
     """The solved model disagrees with `simulate()` on a placement."""
 
@@ -594,8 +602,16 @@ class IlpPlacer(Placer):
         # refresh envelope, on the input of every refresh a decision can place: the site's own
         # (its step's and its route's, as the min-cut's _capacity reads it)
         env_pen: dict[int, float] = {}
+        # PLAN_CHAIN_HARD=1: the chain itself is never payable: a refresh whose input (its pending rescale included)
+        # starts past max_level runs its rescales off the chain, which the compile refuses ([bts_input_error]); the
+        # envelope below it stays payable. Off: the old rule (payable up to the envelope's penalty)
+        chain_hard = _chain_hard()
         for v, pe in (pre.items() if constrain else ()):
             xv = x.get(v, ZERO)
+            if chain_hard and not _is(xv, 0.0):
+                past = pe.gt(self.budget.L)
+                if not _is(past, 0.0):
+                    m.add(past + xv, hi=1.0, what=f"refresh input on the chain at {v}")
             deep = pe.gt(env_rel(v))
             if hard:
                 m.add(deep + xv, hi=1.0, what=f"refresh envelope at {v}")
@@ -765,6 +781,8 @@ class IlpPlacer(Placer):
         against the sim. Returns the plan's cost under the ILP objective."""
         forced = set(self.placed)
         m, x, E, D, hints, pre, cost, oc = self._build(set(placed), set(placed))
+        if m.infeasible and _chain_hard() and "on the chain" in str(m.infeasible):
+            raise ChainRejected(f"the min-cut plan starts a refresh past the chain: {m.infeasible}")
         if m.infeasible:
             raise ModelMismatch(f"model rejects the min-cut plan: {m.infeasible}")
         sol, bad_row = m.propagate({})                  # pinned: no solver needed
@@ -809,6 +827,9 @@ class IlpPlacer(Placer):
         if mc_placed is not None:
             try:
                 mc_cost = self._evaluate(mc_placed - forced)
+            except ChainRejected as e:
+                log.info(f"[ilp] {e}: no incumbent")
+                mc_placed, mc_in_eff = None, {}
             except (ModelMismatch, PlanInfeasible) as e:
                 if self.strict:
                     raise
