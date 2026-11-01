@@ -97,10 +97,11 @@ class Gpt2Model(ImplModel):
     def fb_tiles(self):
         if self._fb is None:
             def build():
-                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+                # the token embedding itself: ln_f's fold scales the LM head's tiles only
+                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, False)
                 return W.feedback_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, packed=self.complex)
             self._fb = slotcache.cached(self._slot_key(), "fb", (self.rt.dims, self.vocab, self.W_tile,
-                                                                 self.complex, self.fold[2]), build)
+                                                                 self.complex, False), build)
         return self._fb
 
     def preload(self):
