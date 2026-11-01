@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 20u
-#define PC_RING_ABI 7u
+#define PC_KERNELS_ABI 21u
+#define PC_RING_ABI 8u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
 #define PC_LOGN 16
@@ -125,6 +125,8 @@ struct BconvJob {
 };
 static_assert(sizeof(BconvJob) == 32, "BconvJob layout");
 
+// kind (ABI 21): 0 any jobs; 13, 14 or 15 (u32 words): every job exact with that many sources (a kernel of that body
+// alone, launch() in bconv.cuh); the wide kernel ignores it
 struct BconvArgs {
     const void* src;
     void* dst;
@@ -132,8 +134,9 @@ struct BconvArgs {
     const void* pool;
     const PrimeConst* pr;
     int32_t njobs, max_tgt;
+    int32_t kind, pad;
 };
-static_assert(sizeof(BconvArgs) == 48, "BconvArgs layout");
+static_assert(sizeof(BconvArgs) == 56, "BconvArgs layout");
 
 // ------------------------------------------------------------------------------------------------ element-wise
 // One struct for the four row-set kernels; grid = (N/256, rows of rs, K*nparts).

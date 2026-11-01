@@ -1,5 +1,7 @@
 // Batched fast base conversion, generic over (W, MM); layout and formula in args.cuh BconvArgs.
-// The exact (HPS-corrected) jobs keep FIDESlib's FMA double estimate in source order.
+// The exact (HPS-corrected) jobs keep FIDESlib's FMA double estimate in source order; a launch whose jobs are all exact
+// with 13, 14 or 15 sources (BconvArgs::kind, u32 words) runs a kernel of that body alone, its rounding u taken from
+// an exact fixed-point sum where that sum is clear of the rounding boundary, else from the estimate (the same u).
 #pragma once
 #include "arith.cuh"
 
@@ -13,10 +15,42 @@ constexpr int TG = 32;   // targets per block (blockIdx.y)
 __shared__ __align__(32) unsigned char sh_m[16 * TG * 8];
 __shared__ uint32_t stp[TG], str[TG];
 __shared__ uint4 sk[TG];
+// the exact-kind kernels (u32 words): each source's double 1/p_i as the exact integer m 2^(e + 28) (its value in units
+// of 2^-80; e in [-28, -25] for p_i in (2^24, 2^28], so < 2^56), ~0 outside that range (the block then runs the
+// estimate)
+__shared__ unsigned long long sh_rbm[16];
+
+// u = floor(v + 0.5), v = the source-order FMA estimate sum_i y_i rb_i in doubles, without the doubles where that is
+// safe (u32 words): T = 2^80 sum_i y_i rb_i is exact in 128-bit integers (rb_i's exact binary values, `sh_rbm`), and
+// the estimate's error is below 17 2^-50 (each FMA rounds once, v < 16; the + 0.5 once more), so floor(T 2^-80 + 0.5)
+// is the estimate's u whenever T 2^-80 + 0.5 is 2^-45 or more from an integer and below 16; otherwise (a chance of
+// about 2^-44 per coefficient) the estimate itself runs
+template <class W, int NY>
+__device__ __forceinline__ uint64_t exact_round(const W (&y)[NY], int ns, const double* __restrict__ rb) {
+    unsigned __int128 T = (unsigned __int128)1 << 79;
+    bool amb = false;
+#pragma unroll
+    for (int i = 0; i < NY; ++i) {
+        if (i < ns) {
+            const unsigned long long m = sh_rbm[i];
+            amb |= m == ~0ull;
+            const unsigned long long yi = (unsigned long long)y[i];
+            T += (unsigned __int128)(yi * (m & 0xFFFFFFFFull)) + ((unsigned __int128)(yi * (m >> 32)) << 32);
+        }
+    }
+    const uint64_t uu = (uint64_t)(T >> 80);
+    const uint64_t f = (uint64_t)(T >> 35) & ((1ull << 45) - 1);
+    if (!(amb || f == 0 || f == (1ull << 45) - 1 || uu >= 16)) return uu;
+    double v = 0.0;
+#pragma unroll
+    for (int i = 0; i < NY; ++i)
+        if (i < ns) v = __fma_rn((double)y[i], rb[i], v);
+    return (uint64_t)floor(v + 0.5);
+}
 
 // NS > 0: every job of the launch path has exactly NS sources (a compile-time count: no predicated source steps)
-// EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time)
-template <class W, class MM, int NS, int EXM>
+// EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time); XR (EXM 1, u32 words): u by `exact_round`
+template <class W, class MM, int NS, int EXM, bool XR = false>
 __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restrict__ src, W* __restrict__ dst,
                                            const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     W* const sm = (W*)sh_m;
@@ -53,6 +87,16 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
             sk[threadIdx.x] = make_uint4(p, R, (uint32_t)(((uint64_t)R << 32) / p), m);
         }
     }
+    if constexpr (XR) {
+        static_assert(EXM == 1 && sizeof(W) == 4, "exact_round: exact jobs on u32 words");
+        if (threadIdx.x < ns) {
+            const W* rbw = M + ns * J.ntgt;
+            while ((uintptr_t)rbw & 7) ++rbw;
+            const unsigned long long b = (unsigned long long)__double_as_longlong(((const double*)rbw)[threadIdx.x]);
+            const int e = (int)((b >> 52) & 0x7ff) - 1023;
+            sh_rbm[threadIdx.x] = (b >> 63) == 0 && e >= -28 && e <= -25 ? ((b & ((1ull << 52) - 1)) | (1ull << 52)) << (e + 28) : ~0ull;
+        }
+    }
     __syncthreads();
     // the predecessor's rows (the INTT's) are read from here on; the job tables above are setup constants
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -75,10 +119,14 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
         const W* rbw = M + ns * J.ntgt;
         while ((uintptr_t)rbw & 7) ++rbw;  // 8-byte aligned doubles
         const double* rb = (const double*)rbw;
+        if constexpr (XR) {
+            u = exact_round<W, NY>(y, ns, rb);
+        } else {
 #pragma unroll
-        for (int i = 0; i < NY; ++i)
-            if (NS > 0 || i < ns) v = __fma_rn((double)y[i], rb[i], v);
-        u = (uint64_t)floor(v + 0.5);
+            for (int i = 0; i < NY; ++i)
+                if (NS > 0 || i < ns) v = __fma_rn((double)y[i], rb[i], v);
+            u = (uint64_t)floor(v + 0.5);
+        }
         bmod = (const W*)(rb + ns);
     }
     // 4 targets per step: one vector shared load per source (matrix rows are TG wide, zero past nt)
@@ -154,6 +202,22 @@ template <class W, class MM>
 __global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                          const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     bconv_dispatch<W, MM>(src, dst, jobs, pool, pr);
+}
+
+// A launch of exact jobs of NS sources only (BconvArgs::kind = NS; u32 words): that body alone, its rounding by
+// `exact_round` (an alternating user region's ModDown from P: 13; a fused relinearization-rescale's from P and its one
+// or two dropped tops: 14, 15), at the two occupancies of the dispatch kernels
+template <class W, class MM, int NS>
+__global__ void __launch_bounds__(BX) bconv_exact_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                                         const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
+}
+template <class W, class MM, int NS>
+__global__ void __launch_bounds__(BX, 12) bconv_exact_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                                               const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
 }
 
 // Wide jobs (ABI 20): up to MW sources (u32 words: 48; u64: 16): each thread's first 16 y_i in registers, the rest
@@ -320,10 +384,32 @@ int launch(const BconvArgs* a, cudaStream_t s) {
     at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at;
     cfg.numAttrs = 1;
-    if ((long)grid.x * grid.y * grid.z > 10L * num_sms())
-        cudaLaunchKernelEx(&cfg, bconv_kernel12<W, MM>, (const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+    const bool big = (long)grid.x * grid.y * grid.z > 10L * num_sms();
+    const W* sp = (const W*)a->src;
+    W* dp = (W*)a->dst;
+    const W* pp = (const W*)a->pool;
+    if constexpr (sizeof(W) == 4) {
+        switch (a->kind) {
+            case 13:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 13>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 13>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 14:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 14>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 14>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 15:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 15>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 15>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            default:
+                break;
+        }
+    }
+    if (big)
+        cudaLaunchKernelEx(&cfg, bconv_kernel12<W, MM>, sp, dp, a->jobs, pp, a->pr);
     else
-        cudaLaunchKernelEx(&cfg, bconv_kernel<W, MM>, (const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+        cudaLaunchKernelEx(&cfg, bconv_kernel<W, MM>, sp, dp, a->jobs, pp, a->pr);
     return (int)cudaGetLastError();
 }
 }  // namespace bconv
