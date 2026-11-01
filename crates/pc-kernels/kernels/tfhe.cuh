@@ -1419,7 +1419,8 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 else rotate_k<1, 1, 4, true><<<A.count, th, s4, s>>>(A);
                 break;
             }
-            const bool two = lv == 1 && A.count >= 2 * sms;
+            // two LWEs per block as soon as one per block takes a second round of blocks
+            const bool two = lv == 1 && A.count > sms;
             const unsigned blocks = two ? (A.count + 1) / 2 : A.count;
             if (grp == 2) {
                 if (lv == 2) rotate_k<2, 1, 2><<<blocks, th, s8, s>>>(A);
