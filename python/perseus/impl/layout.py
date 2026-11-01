@@ -356,6 +356,52 @@ def _tile_tH(dims: Dims, out: np.ndarray, periodic) -> np.ndarray:
     return np.tile(out[:gp * dims.tH], dims.N // (gp * dims.tH)) if gp else out
 
 
+# ── paired heads (SoftmaxCfg.pair_heads) ──
+# With the keys on lanes 0..t/2-1 of each head, two heads share a t-lane block: head h < H/2 keeps lanes 0..t/2-1 of
+# block h, head h + H/2 takes lanes t/2..t-1 of it. The scores are then tH/2-periodic (one key window per head in
+# tH/2 slots), so the softmax's refreshes route on tH/2 slots.
+
+@functools.lru_cache(maxsize=None)
+def pair_src(dims: Dims) -> np.ndarray:
+    """For each slot p of the paired period (tH/2): the tH-layout slot (head h, lane l) it holds, h t + l."""
+    w, P = dims.t // 2, dims.tH // 2
+    p = np.arange(P)
+    blk, r = p // dims.t, p % dims.t
+    return (blk + (r // w) * (dims.H // 2)) * dims.t + r % w
+
+
+def pair_pos(dims: Dims, h: int, lane: int) -> int:
+    """The paired-layout slot of (head h, lane < t/2)."""
+    return (h % (dims.H // 2)) * dims.t + (h // (dims.H // 2)) * (dims.t // 2) + lane
+
+
+def pair_tx(dims: Dims, m) -> np.ndarray:
+    """A tH-periodic vector of the tH layout (lanes < t/2 read) in the paired layout, tiled over the N slots."""
+    m = np.asarray(m)
+    return np.tile(m[:dims.tH][pair_src(dims)], dims.N // (dims.tH // 2))
+
+
+@functools.lru_cache(maxsize=None)
+def pair_offsets(dims: Dims) -> dict[int, np.ndarray]:
+    """The pack of a tH-periodic ciphertext x into the paired layout as sum_k sel_k * rotate(x, k): {k: sel_k over one
+    tH block} (k reduced to (-tH/2, tH/2], rotate(x, k)[s] = x[s + k]); every slot of a tH block takes its paired
+    source, so the result is tH/2-periodic."""
+    P = dims.tH // 2
+    s = np.arange(dims.tH)
+    src = pair_src(dims)[s % P]
+    k = (src - s) % dims.tH
+    k = np.where(k > P, k - dims.tH, k)
+    return {int(o): (k == o).astype(np.float64) for o in sorted(set(k.tolist()))}
+
+
+def pair_pack_mask(dims: Dims, m, k: int) -> np.ndarray:
+    """sel_k * rotate(m, k) tiled: the term-k mask of the pack of a ciphertext that was to be multiplied by the tH-layout
+    mask `m` (tH-periodic)."""
+    sel = pair_offsets(dims)[k]
+    m = np.asarray(m)[:dims.tH]
+    return np.tile(sel * np.roll(m, -k), dims.N // dims.tH)
+
+
 def score_mask(dims: Dims, clip_lo: float, mean: float, kc: int, periodic=False) -> np.ndarray:
     """score_mask_vec (cachemir_attention_utils.h)."""
     out = np.full(dims.N, clip_lo - mean)
@@ -480,6 +526,10 @@ def attention_rot_steps(dims: Dims) -> set[int]:
     gap = 1
     while gap < dims.N:
         steps.add(gap); gap *= 2
+    if dims.H % 2 == 0 and dims.t % 2 == 0:
+        # paired heads (SoftmaxCfg.pair_heads): the scores' pack, the V pack and the output's unpack
+        steps |= set(pair_offsets(dims))
+        steps |= {pair_pos(dims, h, 0) - h * dims.t for h in range(dims.H_real)}
     return {s % dims.N for s in steps if s % dims.N}
 
 
