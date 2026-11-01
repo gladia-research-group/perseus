@@ -577,6 +577,20 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, ps: Option
 }
 
 /// `level_specs` over a given digit partition of rows 0..=top and special set (prime ids; may include Q ids above top).
+/// The top limb of an alternating user region's top level (the level above its top single-prime level); None without
+/// one.
+fn sp_user_top(chain: &Chain) -> Option<usize> {
+    chain.spec.sp?;
+    let mut top = chain.q.len();
+    for &g in chain.groups.iter().rev() {
+        if g == 1 {
+            return Some(top - 1 + chain.level_unit);
+        }
+        top -= g;
+    }
+    None
+}
+
 fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs: Vec<Vec<usize>>, specials: Vec<usize>) -> LevelSpecs {
     let rows = lay.rows();
     let dnum = chain.dnum();
@@ -626,6 +640,10 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
         }
     }
     let ks_rows: Vec<u32> = (0..=top).chain(specials.iter().copied()).map(|t| t as u32).collect();
+    // the ModDown's fast conversion from P leaves a multiple of P (up to |P| of them) behind, ~2^24 per slot after the
+    // division, against an alternating user region's scales of 2^36 / 2^44: there (from the pair level above its top
+    // single-prime level down) the HPS-exact conversion
+    let exact = sp_user_top(chain).is_some_and(|u| top <= u);
     let mut moddown = Vec::new();
     for c in 0..k_max {
         for part in 0..2 {
@@ -635,7 +653,7 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
                 dst_off: base,
                 src: specials.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
-                exact: false,
+                exact,
                 prescaled: true,
             });
         }
