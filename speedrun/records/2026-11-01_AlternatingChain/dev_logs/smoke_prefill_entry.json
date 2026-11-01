@@ -1,0 +1,43 @@
+{
+ "run": "20261101-173429-1782382",
+ "track": "prefill",
+ "server_cmd": [
+  "bash",
+  "<perseus>/speedrun/serve.sh",
+  "--device",
+  "0"
+ ],
+ "void": null,
+ "client_perseus": "ea62bcc3bd7f052d8005e9039c74cc476f19f364",
+ "client_file": "3284810cf32a905f99fe4b9be37095e1c8fb364e94d8850706942d2193ce2003",
+ "harness": "None",
+ "server_exit_s": 2.57,
+ "client_rc": 0,
+ "server_rc": 0,
+ "peak_gpu_mib": 58937,
+ "peak_mem_mib": {},
+ "result": {
+  "track": "prefill",
+  "backend": "perseus-spchain",
+  "requests": [
+   {
+    "warmup": false,
+    "times_s": [
+     11.301992713939399
+    ],
+    "score": 11.301992713939399,
+    "prompt": 0,
+    "kl": [
+     6.225436997517791e-06
+    ],
+    "kl_scored_mean": 6.225436997517791e-06,
+    "argmax_ok": [
+     true
+    ],
+    "outputs_ok": true
+   }
+  ],
+  "prompts_sha256": "ce446d42f61728288fc3191f5e697c7ff2fb2c77dd7e3802fb059109292ff5a2",
+  "manifest_sha256": "e422ba855b700e353ab83d7dbce48dac11ef0ed6f09430d35fc4ab87d78f5f01"
+ }
+}

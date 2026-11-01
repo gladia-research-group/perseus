@@ -30,10 +30,11 @@ from speedrun.record1 import _COUNT, _LEN, PROMPT
 
 HEADER = struct.Struct("<Q")
 STEPS = 16
+SCORED = 8                                     # Decode-8's first scored position (harness/protocol.py TRACKS)
 # Decode-8 never holds more than STEPS keys: its plan's softmax and GELU are fitted to positions 0..STEPS-1 (the main
-# decode plan's to 1024-token windows); it runs on the lean chain n32a4 (its runtime line's CHAIN_PRESET:
-# speedrun/make_n32a4_decode_plan.sh)
-DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32a4_kc16r_lh"
+# decode plan's to 1024-token windows); it runs on the alternating chain n32sp (its runtime line's CHAIN_PRESET:
+# speedrun/make_n32sp_decode_plan.sh)
+DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh"
 # speedrun/make_prefill_plan.sh's plan with CutMax's scaled normalisers (stage 13 replanned: its PLAN_CMD.txt), on the
 # lean chain n32a4 too (PRESET=n32a4; its runtime line's CHAIN_PRESET)
 PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cm"
@@ -127,7 +128,8 @@ def decode(a):
             wait(a.inbox, f"{k}/{j}")
             _h, outs = h.run({"t": j, "argmax": True}, [read(a.inbox, f"{k}/{j}")], None)
             write_packed(a.outbox, f"{k}/{j}", outs)
-            h.ahead((j + 1) % STEPS)                # the next position's patch while the client turns around
+            if j + 1 != SCORED:                     # the next position's patch while the client turns around, but
+                h.ahead((j + 1) % STEPS)            # not the first scored one's before its token is released
         k += 1
     h.run_.close()
     return 0

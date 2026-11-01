@@ -18,6 +18,10 @@ pub struct ScaleTables {
     pub d: usize,
     /// Primes a rescale from limb top `t` drops (`Chain::drop_at`), 0 off the level grid.
     pub drop: Vec<usize>,
+    /// The top of the level above limb top `t` (0 at the chain top and off the grid).
+    pub up: Vec<usize>,
+    /// `Chain::singles`: the virtual level grid of an alternating user region (0: levels count primes).
+    pub singles: u64,
     pub q: Vec<u64>,
     pub p: Vec<u64>,
 
@@ -137,7 +141,31 @@ impl ScaleTables {
                 }
             }
         }
-        if chain.spec.lean.is_some() {
+        if let Some(sp) = chain.spec.sp {
+            // an alternating user region: its top level at the orbit's scale, the levels below it by the rescale rule
+            // sf' = sf^2 / (the primes dropped), the levels above it (EvalMod, CtS) by its inverse sf = sqrt(sf' x the
+            // primes dropped), which halves any deviation per level up and leaves the chain top near its pairs' scale
+            let mut tops = vec![];
+            let mut k = 0;
+            for &g in chain.groups.iter().rev() {
+                tops.push((k, g));
+                k += g;
+            }
+            sfr_o.iter_mut().for_each(|x| *x = 1.0);
+            let drop_prod = |k: usize, g: usize| (0..g).map(|j| q[size_q - 1 - k - j] as f64).product::<f64>();
+            let thin = chain.spec.lean.map_or(0, |l| l.thin as usize);
+            let bottom = 1 + thin % d + thin / d;
+            let user_top = chain.groups.iter().rev().take(chain.groups.len() - bottom - sp.levels as usize).sum::<usize>();
+            sfr_o[user_top] = sp.top_scale().exp2();
+            for &(k, g) in tops.iter().filter(|(k, _)| *k >= user_top) {
+                if k + g < size_q {
+                    sfr_o[k + g] = sfr_o[k] * sfr_o[k] / drop_prod(k, g);
+                }
+            }
+            for &(k, g) in tops.iter().rev().filter(|(k, _)| *k < user_top) {
+                sfr_o[k] = (sfr_o[k + g] * drop_prod(k, g)).sqrt();
+            }
+        } else if chain.spec.lean.is_some() {
             // a lean chain's single-prime levels (the composite rule above leaves its sentinel there): walk the levels
             // down from the top, sf' = sf^2 / (the prime dropped); the composite levels keep the rule's values
             let mut k = 0;
@@ -237,10 +265,18 @@ impl ScaleTables {
         }
 
         let drop: Vec<usize> = (0..size_q).map(|t| chain.drop_at(t).unwrap_or(0)).collect();
+        let mut up = vec![0usize; size_q];
+        for t in 0..size_q {
+            if drop[t] > 0 && t >= drop[t] {
+                up[t - drop[t]] = t;
+            }
+        }
         Ok(ScaleTables {
             l,
             d,
             drop,
+            up,
+            singles: chain.singles(),
             q,
             p,
             sf_real_openfhe: sfr_o,

@@ -71,6 +71,47 @@ fn n32a4_chain() {
     println!("n32a4: {} Q + {} P primes (P' {}), logQP = {}", c.q.len(), c.p.len(), c.p_sparse, c.log_qp);
 }
 
+/// n32sp: n32a4 with its 9 user levels replaced by 12 alternating single / pair levels (every prime below 2^28), every
+/// level above and below them n32a4's; the scales alternate 2^36 / 2^44.15 down the user region and approach the
+/// pairs' 2^54 up through EvalMod and CtS.
+#[test]
+fn n32sp_chain() {
+    let a = Chain::generate(&ChainSpec::n32a4()).unwrap();
+    let c = Chain::generate(&ChainSpec::n32sp()).unwrap();
+    check_valid(&c);
+    assert_eq!(c.q.len(), 51);
+    assert_eq!(c.q[..5], a.q[..5]);
+    assert_eq!(c.q[23..], a.q[23..]);
+    assert_eq!(c.p[..9], a.p[..9]);
+    assert_eq!((c.dnum(), c.p_sparse), (4, 9));
+    assert!(c.q.iter().chain(&c.p).all(|&p| p < 1 << 28));
+    let user: Vec<usize> = c.groups[3..15].to_vec();
+    assert_eq!(user, [1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2]);
+    assert_eq!(c.groups.len(), 29);
+    let lg = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
+    let widest = c.digits.iter().map(|d| lg(&d.iter().map(|&i| c.q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
+    assert!(lg(&c.p) >= widest + 8.0);
+    let st = pc_core::scale::ScaleTables::precompute(&c).unwrap();
+    let sf = |t: i32| st.sf(t).unwrap().log2();
+    // the user region from its top (limb 22, a pair's level) down to the StC-first entry (limb 4)
+    let mut t = 22;
+    let mut want = 44.15;
+    for &g in user.iter().rev() {
+        assert!((sf(t) - want).abs() < 0.05, "scale 2^{} at top {t}", sf(t));
+        t -= g as i32;
+        want = if want > 40.0 { 36.0 } else { 44.15 };
+    }
+    assert_eq!(t, 4);
+    assert!((sf(4) - 44.15).abs() < 0.1 && (sf(2) - 35.3).abs() < 0.3);
+    for t in (24..=50).step_by(2) {
+        assert!(sf(t) > 48.5 && sf(t) < 54.5, "scale 2^{} at top {t}", sf(t));
+    }
+    assert_eq!(c.singles().count_ones(), 7);
+    assert_eq!((st.up[4], st.up[20], st.up[21], st.up[22], st.up[50]), (5, 22, 0, 24, 0));
+    println!("n32sp: {} Q + {} P primes (P' {}), logQP = {}; user primes {:?}", c.q.len(), c.p.len(), c.p_sparse, c.log_qp,
+        c.q[5..23].iter().map(|&x| format!("{:.2}", (x as f64).log2())).collect::<Vec<_>>());
+}
+
 #[test]
 fn n64_chain() {
     let c = Chain::generate(&ChainSpec::n64()).unwrap();

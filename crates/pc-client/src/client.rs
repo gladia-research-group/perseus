@@ -89,11 +89,7 @@ impl Client {
 
     /// Top Q prime id of a ciphertext at `level` (primes dropped).
     pub fn top_of(&self, level: u32) -> Result<usize> {
-        let nq = self.chain.q.len();
-        if level as usize >= nq {
-            return Err(Error::Params(format!("level {level} >= Q primes {nq}")));
-        }
-        Ok(nq - 1 - level as usize)
+        self.chain.top_at(level).ok_or_else(|| Error::Params(format!("level {level} is not a level of the {}-prime chain", self.chain.q.len())))
     }
 
     /// The metadata of a fresh encryption at `level`: the level's scaling factor to the power `deg`, every slot.

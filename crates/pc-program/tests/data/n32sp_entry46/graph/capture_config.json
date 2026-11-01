@@ -1,0 +1,92 @@
+{
+  "chain": {
+    "chain": "n32",
+    "ckks_complex": true,
+    "composite_degree": 2,
+    "logn": 16,
+    "preset": "n32sp"
+  },
+  "bts": {
+    "auto_bts_level": 50,
+    "bts_iterations": 1,
+    "bts_max_input_level": 54,
+    "em_fuse_rescale": true,
+    "gpu_encode": true,
+    "raise_drop": "512:1",
+    "raise_drops": [
+      "1",
+      "2",
+      "3"
+    ],
+    "real": true,
+    "shift": true,
+    "sparse_auto": 2,
+    "sparse_b": true,
+    "sparse_bts_slots": [
+      "512",
+      "1"
+    ],
+    "sparse_ln_bts": false,
+    "sparse_sm_bts": false,
+    "spru": 64,
+    "stc_first": 2,
+    "stc_first_cf": 13,
+    "stc_first_routes": [
+      "dense"
+    ]
+  },
+  "mem": {
+    "fhe_pt_coeff_encode": false,
+    "fhe_stage_arena_gb": 24.0,
+    "kv_arena_gb": "24",
+    "rot_key_band": 32
+  },
+  "host": {
+    "hf_home": "/work/erodola/hf-cache",
+    "malloc_arena_max": 2,
+    "omp_num_threads": 1,
+    "python": "/work/erodola/perseus/trees/W5B5/sp/.venv/bin/python",
+    "pythonpath": "/work/erodola/perseus/trees/W5B5/sp/python:/work/erodola/perseus/trees/W5B5/sp/python",
+    "xdg_cache_home": "/work/erodola/.cache"
+  },
+  "model": {
+    "cache_read_level_k": 34,
+    "cache_read_level_v": 34,
+    "cheb_bsgs": true,
+    "cutmax_pair": true,
+    "cutmax_precise_scoped": true,
+    "cutmax_sparse_bts": false,
+    "cutmax_vec_bts_iters": 1,
+    "fhe_lmhead_cap": 44,
+    "fused_ln_var": false,
+    "fused_sm_den": false,
+    "gelu_fold": true,
+    "gpt2_fold_ln1": true,
+    "gpt2_fold_ln2": true,
+    "gpt2_fold_lnf": false,
+    "gpt2_packing": "cachemir_complex",
+    "impl_dead_ops": true,
+    "impl_scoped_names": false,
+    "kv_lanes": true,
+    "ladder_radix_bits": 3,
+    "ln_cheb": true,
+    "qkv_lanes": true,
+    "sm_cheb_gs": true,
+    "sm_den_recip": true,
+    "sm_fold": true,
+    "sm_gs_first": true,
+    "sm_hrs_pack": true,
+    "sm_periodic": 1
+  },
+  "quirks": {
+    "fakecap_sparse_exact": true
+  },
+  "exec": {
+    "all_blocks_io_dir": "/work/erodola/perseus/data/oracle/gpt2/all_blocks_io",
+    "fhe_graph_dir": "/work/erodola/perseus/runs/W5B5/plan/graphs/gpt2_decode_python_n32sp_kc16r_lh_p0",
+    "gpt2_cache": true,
+    "gpt2_inference_mode": "sync",
+    "steps_t": 128,
+    "weights_path": "/work/erodola/perseus/builds/client/.cache/models/openai-community/gpt2/classic/weights.bin.zip"
+  }
+}

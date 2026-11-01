@@ -133,7 +133,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> BtsCall<'r, 'a, W, M> {
         if let StagedRef::StcFirst(r) = self.route {
             let shp = cx.ctx.shape;
             let top = if self.st.stc_folded { r.split_top() } else { r.split_top() + r.step };
-            let want = (shp.n_q - 1 - top as u32, 2u8);
+            let want = (pc_shadow::meta::level_from_top_limb(shp, top as u32)?, 2u8);
             if let Some(x) = cts.iter().find(|x| (x.meta.level, x.meta.deg) != want) {
                 return Err(shape("bts call", format!("at_split: ciphertext at level {} deg {}, the split is {want:?} (entry limb {})", x.meta.level, x.meta.deg, r.entry_top)));
             }
@@ -359,10 +359,10 @@ impl BtsRecorder for BtsLog {
 }
 
 /// The PCMM's input hooks: cap every input at the StC-first entry (after its pending rescale).
-pub fn record_stc_first_inputs<W: DevWord, M: DevStrategy<W>>(rec: &mut dyn BtsRecorder, route: &StcFirstRoute<'_, W, M>, cx: &BtsCx<'_, '_, W, M>, inputs: &[(&str, u32)]) {
-    let shp = cx.ctx.shape;
-    let cap = route.input_cap(shp.n_q, shp.unit);
+pub fn record_stc_first_inputs<W: DevWord, M: DevStrategy<W>>(rec: &mut dyn BtsRecorder, route: &StcFirstRoute<'_, W, M>, cx: &BtsCx<'_, '_, W, M>, inputs: &[(&str, u32)]) -> Result<()> {
+    let cap = route.input_cap(cx.ctx.shape)?;
     for (v, l) in inputs {
         rec.level_hint(v, *l, cap);
     }
+    Ok(())
 }

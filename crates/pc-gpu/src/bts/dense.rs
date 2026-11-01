@@ -69,11 +69,11 @@ pub struct DensePlan {
     pub deg: u32,
 }
 
-fn to_f(shape: pc_shadow::ChainShape, m: &CtMeta) -> FMeta {
-    FMeta { top: (shape.n_q - 1 - m.level) as i32, nl: m.deg as i32, nf: m.nf }
+fn to_f(shape: pc_shadow::ChainShape, m: &CtMeta) -> Result<FMeta> {
+    Ok(FMeta { top: pc_shadow::meta::top_limb(shape, m.level)? as i32, nl: m.deg as i32, nf: m.nf })
 }
-fn from_f(shape: pc_shadow::ChainShape, f: FMeta) -> CtMeta {
-    CtMeta { level: shape.n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..CtMeta::new(0, 1) }
+fn from_f(shape: pc_shadow::ChainShape, f: FMeta) -> Result<CtMeta> {
+    Ok(CtMeta { level: pc_shadow::meta::level_from_top_limb(shape, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..CtMeta::new(0, 1) })
 }
 
 /// A metadata-only Shadow over the chain's scale tables (stage bookkeeping).
@@ -120,12 +120,12 @@ impl DensePlan {
             let fdrop = st.sf((chain.q.len() - 1) as i32)? / st.sf(raise_top as i32)?;
             let exact = (st.sf(raise_top as i32)? / qd) * (1.0 / (setup.boot_k * n as f64)) * 1.0;
             let raised = FMeta { top: raise_top as i32, nl: 1, nf: st.sf(raise_top as i32)? * (setup.cts0_t as f64).exp2() };
-            let mut m = from_f(shp, raised);
+            let mut m = from_f(shp, raised)?;
             let levels = cts_stage_levels(&st, cts_lay.len() as u32, rdrop, Some(setup.cts0_t))?;
             let mut cts = Vec::new();
             for (e, fs) in cts_lay.iter().enumerate() {
                 let lv = levels[e];
-                if lv.top as usize != (shp.n_q - 1 - m.level) as usize || m.deg != 1 {
+                if lv.top as usize != pc_shadow::meta::top_limb(shp, m.level)? as usize || m.deg != 1 {
                     return Err(shape("dense plan", format!("CtS stage {e} plaintexts at top {} but the input is {m:?}", lv.top)));
                 }
                 let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, lv.scale)?);
@@ -133,16 +133,16 @@ impl DensePlan {
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 m = sh.rescale(&m)?.out;
             }
-            let em_in = to_f(shp, &m);
+            let em_in = to_f(shp, &m)?;
             let (_, em_out, em_slots) = EvalModPlan::<u32>::program(&st, em_in, &ps, setup.evalmod_da_its)?;
-            let mo = from_f(shp, em_out);
+            let mo = from_f(shp, em_out)?;
             let slev = stc_stage_levels(&st, mo.level, mo.deg, lay.stc.len() as u32)?;
             let mut m = if mo.deg == 2 { sh.rescale(&mo)?.out } else { mo };
             let mut stc = Vec::new();
             let nst = lay.stc.len();
             for (e, fs) in lay.stc.iter().enumerate() {
                 let lv = slev[e];
-                let top = shp.n_q - 1 - m.level;
+                let top = pc_shadow::meta::top_limb(shp, m.level)?;
                 if lv.top > top {
                     return Err(shape("dense plan", format!("StC stage {e} plaintexts at top {} above the input top {top}", lv.top)));
                 }
@@ -164,7 +164,7 @@ impl DensePlan {
                 }
                 None => None,
             };
-            variants.push(VariantHost { drop, raise_top, exact, cts, stc, stc_real0, raised, em_in, em_out, em_slots, out: to_f(shp, &m) });
+            variants.push(VariantHost { drop, raise_top, exact, cts, stc, stc_real0, raised, em_in, em_out, em_slots, out: to_f(shp, &m)? });
         }
         Ok(DensePlan { setup: setup.clone(), chain: chain.clone(), variants, ps, deg })
     }
@@ -358,11 +358,12 @@ impl<'a, W: DevWord, M: DevStrategy<W>> DenseRoute<'a, W, M> {
         Ok(())
     }
 
-    fn set_meta(cx: &BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], f: FMeta) {
+    fn set_meta(cx: &BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], f: FMeta) -> Result<()> {
         let shp = cx.ctx.shape;
         for x in cts.iter_mut() {
-            x.meta = CtMeta { level: shp.n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..x.meta };
+            x.meta = CtMeta { level: pc_shadow::meta::level_from_top_limb(shp, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..x.meta };
         }
+        Ok(())
     }
 
     fn run_lt(&self, cx: &mut BtsCx<'_, 'a, W, M>, stage: &LtStage<'a, W>, cts: &mut [Ct<'a, W>]) -> Result<()> {
@@ -377,7 +378,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> DenseRoute<'a, W, M> {
             }
             let k = x.k();
             stage.run(cx, &mut x.buf, k, self.setup.ks_source)?;
-            let pt = PtMeta { level: ctx.shape.n_q - 1 - stage.top as u32, deg: 1, nf: stage.pt_nf, tag: Default::default() };
+            let pt = PtMeta { level: pc_shadow::meta::level_from_top_limb(ctx.shape, stage.top as u32)?, deg: 1, nf: stage.pt_nf, tag: Default::default() };
             let m = cx.sh.mult_pt(&x.meta, &pt)?.out;
             let (_, od) = stage.out_top_deg(ctx.chain.level_unit);
             x.meta = if od == 1 { cx.sh.rescale(&m)?.out } else { m };
@@ -472,13 +473,13 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for DenseRoute<'a, W, M
                 // the last CtS stage ended with the plain ModDown (no fused rescale off composite-degree-2 chains)
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
             }
-            let f = to_f(ctx.shape, &x.meta);
+            let f = to_f(ctx.shape, &x.meta)?;
             if f.top != em.in_meta.top || f.nl != em.in_meta.nl || f.nf.to_bits() != em.in_meta.nf.to_bits() {
                 return Err(shape("eval_mod", format!("input {f:?}, the program was built for {:?}", em.in_meta)));
             }
             let k = x.k();
             em.run(cx, &mut x.buf, k)?;
-            Self::set_meta(cx, std::slice::from_mut(x), em.out_meta);
+            Self::set_meta(cx, std::slice::from_mut(x), em.out_meta)?;
             if x.meta.deg == 2 && !st.stc_first {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
             }
@@ -499,7 +500,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for DenseRoute<'a, W, M
                     cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
                 }
                 if x.top(ctx.shape)? > stc_top {
-                    x.meta.level = ctx.shape.n_q - 1 - stc_top as u32;
+                    x.meta.level = pc_shadow::meta::level_from_top_limb(ctx.shape, stc_top as u32)?;
                 }
             }
         }
@@ -536,7 +537,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for DenseRoute<'a, W,
     fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
         let v = self.variant(route.raise_drop)?;
         let f = self.outs[v];
-        Ok(CtMeta { level: sh.cfg.chain.n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..*meta })
+        Ok(CtMeta { level: pc_shadow::meta::level_from_top_limb(sh.cfg.chain, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..*meta })
     }
     fn run(&self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], route: &Route) -> Result<()> {
         if route.iterations <= 1 {

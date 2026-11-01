@@ -230,6 +230,30 @@ fn gpt2_decode_n32a4_kc16r_cmfl() {
     shipped_order_sites("gpt2_decode_python_n32a4_kc16r_cmfl", &progs, &sites);
 }
 
+/// Decode-8's served plan on the alternating chain n32sp (speedrun/make_n32sp_decode_plan.sh): stages 0-12 on the merged
+/// capture, CutMax's stage 13 on its `_cm` capture, joined in one graph dir. Its refreshes all land where EvalMod stays
+/// above the user region (the compile's `[user_region]` check, part of the 0 errors).
+#[test]
+fn gpt2_decode_n32sp_kc16r_lh() {
+    let g = assets().join("graphs");
+    let (base, tail) = (g.join("gpt2_decode_python_n32sp_kc16r_lhm"), g.join("gpt2_decode_python_n32sp_kc16r_lh_cm"));
+    if !base.join("block_0/graph.json").is_file() || !tail.join("block_13/graph.json").is_file() {
+        println!("SKIP gpt2_decode_python_n32sp_kc16r_lh: graphs not on disk");
+        return;
+    }
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("graph_n32sp_lh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for b in 0..14 {
+        let src = if b < 13 { &base } else { &tail };
+        std::os::unix::fs::symlink(src.join(format!("block_{b}")), dir.join(format!("block_{b}"))).unwrap();
+    }
+    for f in ["capture_env.json", "capture_config.json"] {
+        std::fs::copy(base.join(f), dir.join(f)).unwrap();
+    }
+    gate("gpt2_decode_python_n32sp_kc16r_lh", dir.to_str().unwrap());
+}
+
 #[test]
 fn gpt2_prefill() {
     gate("gpt2_prefill_python_n32_pcmmstcf", "gpt2_prefill_python_n32_pcmmstcf");

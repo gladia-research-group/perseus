@@ -518,7 +518,7 @@ fn g0(dir: &str, t: &mut Tally) -> Res<()> {
     let q2 = [chain.q[0], chain.q[1]];
     // entry and landings vs pc-shadow (FAKECAP_STC_ENTRY 46, StC-first lands FAKECAP_STC_DROP = 6 levels above the shipped order)
     let bcfg = BtsConfig::n32_shipped();
-    t.add("entry level vs pc-shadow BtsConfig::stc_first_entry", (Some(route.entry_level(nq)) != bcfg.stc_first_entry) as usize, 1);
+    t.add("entry level vs pc-shadow BtsConfig::stc_first_entry", (route.entry_level(ctx.shape).ok() != bcfg.stc_first_entry) as usize, 1);
     let h_in = bd.ct("2.in");
     let h_out = bd.ct("2.out");
     let r = Route { stc_first: true, real, ..Route::dense() };
@@ -532,7 +532,7 @@ fn g0(dir: &str, t: &mut Tally) -> Res<()> {
     println!("[pc-check]   landing realized {:?} vs shadow {:?}; deep input (level 48) shipped order {:?} vs shadow fallback {:?}", (realized.level, realized.deg), (want.level, want.deg), (fb_r.level, fb_r.deg), (want_fb.level, want_fb.deg));
     t.add("realized StC-first landing vs pc-shadow BtsConfig::landing", ((realized.level, realized.deg) != (want.level, want.deg)) as usize, 1);
     t.add("deep input (level 48 > entry): shipped-order landing vs pc-shadow fallback", ((fb_r.level, fb_r.deg) != (want_fb.level, want_fb.deg)) as usize, 1);
-    let cap = route.input_cap(nq, unit);
+    let cap = route.input_cap(ctx.shape)?;
     t.add("PCMM input cap (entry after a pending rescale) == 44 (old _N32_CAP)", (cap != 44) as usize, 1);
     let st = route.begin_meta(&ctx, &meta_of(nq, &h_in), 1, &r, false)?;
     let sj = &bd.json("2.json")["state"];
@@ -1115,7 +1115,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
                 fin.at_split(&cx, std::slice::from_ref(&x))?;
                 fin.run_to(&mut cx, std::slice::from_mut(&mut x), Phase::Done)?;
                 let mut log = BtsLog::default();
-                pc_gpu::bts::staged::record_stc_first_inputs(&mut log, &route, &cx, &[("x", a.level)]);
+                pc_gpu::bts::staged::record_stc_first_inputs(&mut log, &route, &cx, &[("x", a.level)])?;
                 log.refreshes.push(fin.external(&[("x", a.level)], &x.meta, "bench.pcmm", None));
                 println!("[pc-bench] PCMM pattern hooks: {:?}", log);
                 cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;

@@ -1,0 +1,9 @@
+Prefill-128: record 5 against this entry at the timed commit, one key bundle and one set of input ciphertexts (one
+client session, this entry's perseus_spchain_client.py; record 5's server answers it first, then this entry's server
+the same inbox), dev prompts 0-1, two requests.
+
+tree           commit                                    key request  ready  output frames (sha256, first 16)
+record 5       7640b92b3958545fcdcc8f053505817fb016c0b6  -            -      f9c45928e7eeac0e  99c3fcbb865938a5
+this entry     ea62bcc3bd7f052d8005e9039c74cc476f19f364  equal        equal  f9c45928e7eeac0e  99c3fcbb865938a5   identical
+
+7640b92b serves record 5's code (speedrun 4e034ba0's served files).

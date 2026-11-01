@@ -1,0 +1,57 @@
+{
+  "name": "AlternatingChain",
+  "tracks": [
+    "decode"
+  ],
+  "authors": [
+    {
+      "name": "Emanuele Rodolà",
+      "github": "erodola",
+      "affiliation": "Paradigma"
+    }
+  ],
+  "summary": "Record 5's Decode-8 on the chain n32sp, whose user levels alternate one ~27.85-bit prime and two ~26.15-bit primes (scales 2^36 / 2^44.15, the HPS-exact ModDown there; every prime below 2^28, the bootstrap levels' primes kept), with record 5's configs and recipe replanned on it: 99 refreshes per token instead of 112; position 8's patch no longer applied before its token; CutMax slightly less precise (disclosed); Prefill-128 unchanged.",
+  "ckks": {
+    "log_n": 16,
+    "log_qp": 1734,
+    "secret": "uniform-ternary",
+    "chain": "Decode-8: n32sp, n32a4 with its 9 user pairs replaced by 6 single ~27.85-bit primes alternating with 6 pairs of ~2 x 26.15 bits; 51 Q + 13 special primes, every prime < 2^28, dnum 4, log QP 1728.55. Prefill-128: n32a4, unchanged, log QP 1733.26. log_qp above is the larger; the client bounds every dense-secret key at 1734 bits",
+    "dnum": 4,
+    "special_primes": "Decode-8 (n32sp): record 3's 9 and 142344193, 107216897, 106037249, 104857601 (dense keys only); Prefill-128 (n32a4): record 5's",
+    "sparse_keys": [
+      {
+        "role": "encapsulation, dense to sparse",
+        "secret": "ternary, Hamming weight 32",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (307.6 bits), record 1's, on both chains"
+      },
+      {
+        "role": "SPRU block key",
+        "secret": "binary, one 1 in each of 64 blocks",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (307.6 bits), record 1's, on both chains"
+      },
+      {
+        "role": "PCMM ring switch (Prefill-128)",
+        "secret": "ternary on ring dimension 4096",
+        "modulus": "q_0 q_1 P (87.0 bits): record 3's primes q_0, q_1 and P = 2147352577, unchanged on n32a4"
+      }
+    ]
+  },
+  "systems_only": false,
+  "ai_assistance": {
+    "used": true,
+    "share_of_changed_lines": 1.0,
+    "tools": [
+      "Claude",
+      "Paradigma Flywheel",
+      "Paradigma Discovery Wells"
+    ]
+  },
+  "dev_result": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "decode": {
+      "s_per_token": 2.077,
+      "record_s_per_token_same_gpu": 2.151,
+      "mean_kl": 3.68e-06
+    }
+  }
+}

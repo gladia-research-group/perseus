@@ -20,7 +20,7 @@ pub mod stream;
 use crate::error::{Error, Result};
 use crate::graph::BlockGraph;
 use crate::plan::{BlockPlan, PlanDir};
-use crate::program::{Pairing, Program, VarId};
+use crate::program::{BtsSite, Pairing, Program, VarId};
 use pc_config::{Config, PlanConfig};
 use pc_shadow::graph::{parse_lvl_suffix, LoadOpts};
 use pc_shadow::route::Landing;
@@ -250,7 +250,7 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     // the limbs of the chain the Config names (`chain.preset`, default n32: 54; the lean n32a4: 51)
     let real = chain_of(cfg)?;
     let n_q = real.q.len() as u32;
-    let chain = ChainShape { n_q, unit };
+    let chain = ChainShape { unit, ..ChainShape::of(&real) };
     let mut quirks = Quirks::none();
     if let Some(names) = &cfg.quirks.shadow {
         for n in names {
@@ -304,7 +304,7 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     // the shipped order (a dense refresh not run StC-first) lands where a too-deep StC-first input falls back to
     bts.dense_shipped = bts.stc_first_fallback;
     // a refresh input's deepest effective level: the top of the level above q0's (n32: 50; n32a4's single s1: 48)
-    bts.input_room = Some(n_q - real.groups.iter().take(2).sum::<usize>() as u32);
+    bts.input_room = Some(if chain.singles != 0 { chain.grid().n_q - 2 * unit } else { n_q - real.groups.iter().take(2).sum::<usize>() as u32 });
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 
@@ -527,9 +527,10 @@ pub fn compile_block(
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default });
     if crate::program::lever_on("rr") {
-        rr::fuse(&mut p, &sh);
+        let shape = ChainShape::of(&chain_of(cfg)?);
+        rr::fuse(&mut p, &sh, &shape);
         if crate::program::lever_on("rr_pre") {
-            rr::fuse_preludes(&mut p, &sh);
+            rr::fuse_preludes(&mut p, &sh, &shape);
         }
     }
     if crate::program::lever_on("share") {
@@ -543,6 +544,7 @@ pub fn compile_block(
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);
     let mut rep = check::verify(&sh, &p);
     let mut errors = lower_errors;
+    errors.extend(user_region_sites(&ChainShape::of(&chain_of(cfg)?), &p.bts_sites));
     errors.append(&mut rep.errors);
     rep.errors = errors;
     p.check = rep;
@@ -550,6 +552,35 @@ pub fn compile_block(
         return Err(Error::Check { block: label.into(), n: p.check.errors.len(), first: p.check.errors[0].clone() });
     }
     Ok(p)
+}
+
+/// The refreshes an alternating user region cannot host (`ChainShape::singles`; none on a uniform chain): EvalMod runs
+/// on two-prime levels at the region's scale only (2^36 / 2^44 on n32sp, its series and level keys sized for ~2^54), so
+/// every refresh lands where EvalMod stays above the region. A refresh's landing is (effective level) at most the
+/// region's top level for the dense routes and SPRU, whose EvalMod is their last stage, and one level below it for
+/// SparseB, whose StC follows EvalMod; a dense raise drop is refused outright (no dense raise variant is validated
+/// there). One error per site, like the compile check's.
+pub fn user_region_sites(chain: &ChainShape, sites: &[BtsSite]) -> Vec<String> {
+    if chain.singles == 0 {
+        return vec![];
+    }
+    // the region's top level: the two-prime level right above its first one-prime level from the top
+    let top = chain.unit * (chain.singles.trailing_zeros().max(1) - 1);
+    let mut out = vec![];
+    for s in sites {
+        let land = pc_shadow::meta::effective_level(s.landing.level, s.landing.deg, chain.unit);
+        let (deepest, what) = match s.route.slots {
+            0 => (top, "dense"),
+            1 => (top, "SPRU"),
+            _ => (top + chain.unit, "SparseB"),
+        };
+        if s.route.slots == 0 && s.route.raise_drop > 0 {
+            out.push(format!("[user_region] {}: a dense refresh at raise drop {} on an alternating user region's chain", s.var, s.route.raise_drop));
+        } else if land > deepest {
+            out.push(format!("[user_region] {}: a {what} refresh landing at {land} (raise drop {}) runs EvalMod on the user region (deepest landing {deepest})", s.var, s.route.raise_drop));
+        }
+    }
+    out
 }
 
 /// Every block (and variant) of a plan dir, entries chained from the previous block's compiled exit.

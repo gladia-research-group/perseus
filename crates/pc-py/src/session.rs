@@ -690,7 +690,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 return Err(PyValueError::new_err(format!("refresh pairs up to CF {pair_max} on an StC-first route of reference CF {}", sp.sf.cf_ref)));
             }
             // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for
-            let keys = stc_first_keys(&ps.programs, n, (chain.q.len() - 1 - sp.entry_top) as u32, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
+            let entry = pc_shadow::ChainShape::of(&chain).level_at(sp.entry_top as u32).ok_or_else(|| PyValueError::new_err("StC-first's entry is off the level grid"))?;
+            let keys = stc_first_keys(&ps.programs, n, entry, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
             sp.sf.cache_slots = sp.sf.cache_slots.max(keys);
             // merge_s2d: CtS stage 0 rotates with SparseRot keys only (its plain rotation keys only if another user asks)
             let skip0 = merge_s2d as usize;
@@ -959,32 +960,31 @@ fn key_req(r: &KeyRole, s: &KskShape) -> pc_client::KeyReq {
     pc_client::KeyReq { role, shape: shape_req(s) }
 }
 
+/// The Q rows `0..=top` a ciphertext / plaintext at `level` holds (`Chain::top_at`: the primes dropped, or the level
+/// grid of an alternating user region).
+fn level_rows(chain: &Chain, level: u32, knob: &str) -> PyResult<usize> {
+    chain.top_at(level).map(|t| t + 1).ok_or_else(|| PyValueError::new_err(format!("Session({knob}=...): level {level} is not a level of the {}-prime chain", chain.q.len())))
+}
+
 /// `(rows, count)` classes of the Q rows `0..=top` that ciphertexts / plaintexts at `levels` need.
-fn level_classes(nq: usize, levels: &[u32], knob: &str) -> PyResult<Vec<(usize, usize)>> {
+fn level_classes(chain: &Chain, levels: &[u32], knob: &str) -> PyResult<Vec<(usize, usize)>> {
     let mut h: BTreeMap<usize, usize> = BTreeMap::new();
     for &l in levels {
-        let rows = nq.checked_sub(l as usize).filter(|&r| r > 0).ok_or_else(|| PyValueError::new_err(format!("Session({knob}=...): level {l} is past the bottom of a {nq}-prime chain")))?;
-        *h.entry(rows).or_default() += 1;
+        *h.entry(level_rows(chain, l, knob)?).or_default() += 1;
     }
     Ok(h.into_iter().collect())
 }
 
 /// Each register's layout: Q rows `0..=top` of the richest level it carries and no special rows (registers are
 /// only copied into and out of the slab), else the full layout.
-fn reg_layouts(lay: pc_gpu::Layout, ps: &PlanSpec) -> PyResult<Vec<pc_gpu::Layout>> {
+fn reg_layouts(chain: &Chain, lay: pc_gpu::Layout, ps: &PlanSpec) -> PyResult<Vec<pc_gpu::Layout>> {
     if ps.reg_levels.is_empty() {
         return Ok(vec![lay; ps.regs]);
     }
     if ps.reg_levels.len() != ps.regs {
         return Err(PyValueError::new_err(format!("Session(reg_levels=...): {} levels for {} registers", ps.reg_levels.len(), ps.regs)));
     }
-    ps.reg_levels
-        .iter()
-        .map(|&l| match lay.nq.checked_sub(l as usize) {
-            Some(rows) if rows > 0 => Ok(pc_gpu::Layout { n: lay.n, nq: rows, kp: 0 }),
-            _ => Err(PyValueError::new_err(format!("Session(reg_levels=...): level {l} is past the bottom of a {}-prime chain", lay.nq))),
-        })
-        .collect()
+    ps.reg_levels.iter().map(|&l| Ok(pc_gpu::Layout { n: lay.n, nq: level_rows(chain, l, "reg_levels")?, kp: 0 })).collect()
 }
 
 fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Sizes, geometry: Geometry, debug_refresh: bool, plan: Option<PlanSpec>, pcmm: Option<crate::pcmm::PcmmPlan>, ccmm: Option<crate::matmul::CcmmPlan>) -> PyResult<Dev> {
@@ -1043,7 +1043,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         eager: pc_gpu::encode_dev::EncoderKind::DeviceFft,
         rows: plan.as_ref().map(|p| p.pt_rows).unwrap_or(0),
         classes: match &plan {
-            Some(p) => level_classes(lay.nq, &p.pt_levels, "pt_levels")?,
+            Some(p) => level_classes(&chain, &p.pt_levels, "pt_levels")?,
             None => Vec::new(),
         },
     };
@@ -1098,7 +1098,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, w));
         let n_slab = ps.programs.iter().map(|p| p.mem.slot_bytes.len()).max().unwrap_or(0);
         mp.reserve("replay.slab", Slab::<W>::bytes(&lay, n_slab, held_words(ps, &lay, chain.dnum(), k_max)));
-        let reg_bytes: usize = reg_layouts(lay, ps)?.iter().map(|l| Arena::bytes_for::<W>(pc_gpu::CtBuf::<pc_cuda::Compute, W>::words(l, 1))).sum();
+        let reg_bytes: usize = reg_layouts(&chain, lay, ps)?.iter().map(|l| Arena::bytes_for::<W>(pc_gpu::CtBuf::<pc_cuda::Compute, W>::words(l, 1))).sum();
         mp.reserve("replay.regs", reg_bytes);
         group_bytes = ps.programs.iter().map(|p| PBound::<W>::group_bytes(p, ps.dyn_rot.len())).sum();
         mp.reserve("replay.groups", group_bytes);
@@ -1288,7 +1288,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             let n_slab = ps.programs.iter().map(|p| p.mem.slot_bytes.len()).max().unwrap_or(0);
             let slab = Slab::<W>::new(a, lay, n_slab, held_words(&ps, &lay, chain.dnum(), k_max)).map_err(|x| PyRuntimeError::new_err(x.to_string()))?;
             let mut regs = vec![];
-            for rl in reg_layouts(lay, &ps)? {
+            for rl in reg_layouts(&chain, lay, &ps)? {
                 let mut c = Ct::new(pc_shadow::CtMeta::new(0, 1), pc_gpu::CtBuf::new(a, "replay.regs", rl, 1).map_err(e)?);
                 c.buf.buf.zero(&ex.compute).map_err(|x| e(x.into()))?;
                 regs.push(c);

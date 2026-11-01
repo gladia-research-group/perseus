@@ -67,8 +67,22 @@ impl<'a> Fx<'a> {
         Ok(())
     }
     /// Primes a rescale from `top` drops: `d`, but at a lean chain's single-prime level (scale tables only).
-    fn drop_at(&self, top: i32) -> i32 {
+    pub fn drop_at(&self, top: i32) -> i32 {
         self.st.and_then(|st| st.drop.get(top as usize).copied()).filter(|&g| g > 0).map_or(self.d, |g| g as i32)
+    }
+    /// The top of the level below `top` and of the level above it: `top -+ d`, but by the levels' primes on a chain
+    /// with an alternating user region (`ScaleTables::singles`; scale tables only).
+    pub fn down(&self, top: i32) -> i32 {
+        match self.st {
+            Some(st) if st.singles != 0 => top - self.drop_at(top),
+            _ => top - self.d,
+        }
+    }
+    pub fn up(&self, top: i32) -> i32 {
+        match self.st {
+            Some(st) if st.singles != 0 => st.up.get(top as usize).copied().filter(|&u| u > 0).map_or(top + self.d, |u| u as i32),
+            _ => top + self.d,
+        }
     }
     pub fn drop_to(&self, m: &mut FMeta, top: i32, steps: &mut Vec<Step>) {
         if top < m.top {
@@ -97,7 +111,6 @@ impl<'a> Fx<'a> {
     /// `Ciphertext::adjustForAddOrSubBody` (FLEXIBLEAUTO): bring `a` to `b`'s level and degree. false = `a` is the
     /// deeper (or the lower-degree at the same level) operand and nothing was changed; the caller adjusts a copy of `b`.
     pub fn adjust_add(&self, a: &mut FMeta, b: &FMeta, steps: &mut Vec<Step>) -> Result<bool> {
-        let d = self.d;
         let (c1lvl, c2lvl, c1d, c2d) = (a.top, b.top, a.nl, b.nl);
         if c1lvl > c2lvl {
             if c1d == 2 {
@@ -108,16 +121,16 @@ impl<'a> Fx<'a> {
                     self.rescale(a, steps)?;
                     self.drop_to(a, b.top, steps);
                     a.nf = b.nf;
-                } else if c1lvl - d == c2lvl {
+                } else if self.down(c1lvl) == c2lvl {
                     self.rescale(a, steps)?;
                 } else {
                     let scf1 = a.nf;
-                    let scf2 = self.sf_big(c2lvl + d);
+                    let scf2 = self.sf_big(self.up(c2lvl));
                     let k = self.k_resc(scf2, scf1, c1lvl)?;
                     self.scalar_noprecheck(a, k, steps)?;
                     self.rescale(a, steps)?;
-                    if a.top - d > b.top {
-                        self.drop_to(a, b.top + d, steps);
+                    if a.top > self.up(b.top) {
+                        self.drop_to(a, self.up(b.top), steps);
                     }
                     self.rescale(a, steps)?;
                     a.nf = b.nf;
@@ -130,11 +143,11 @@ impl<'a> Fx<'a> {
                 a.nf = scf2;
             } else {
                 let scf1 = a.nf;
-                let scf2 = self.sf_big(c2lvl + d);
+                let scf2 = self.sf_big(self.up(c2lvl));
                 let k = self.k_plain(scf2, scf1, c1lvl)?;
                 self.scalar_noprecheck(a, k, steps)?;
-                if c1lvl - d > c2lvl {
-                    self.drop_to(a, c2lvl + d, steps);
+                if c1lvl > self.up(c2lvl) {
+                    self.drop_to(a, self.up(c2lvl), steps);
                 }
                 self.rescale(a, steps)?;
                 a.nf = b.nf;
@@ -187,7 +200,6 @@ impl<'a> Fx<'a> {
     /// ciphertext's top, or a richer degree-1 one. A richer degree-2 plaintext would be rescaled twice there
     /// (`multScalar` prechecks, then `rescale` asserts) and a deeper one fails; both are refused.
     pub fn adjust_pt(&self, p: &mut FMeta, c: &FMeta, steps: &mut Vec<Step>) -> Result<bool> {
-        let d = self.d;
         if p.top > c.top {
             if p.nl == 2 {
                 return Err(rule(
@@ -202,11 +214,11 @@ impl<'a> Fx<'a> {
                 self.drop_to(p, c.top, steps);
                 p.nf = c.nf;
             } else {
-                let scf2 = self.sf_big(c.top + d);
+                let scf2 = self.sf_big(self.up(c.top));
                 let k = self.k_plain(scf2, scf1, p.top)?;
                 self.scalar_noprecheck(p, k, steps)?;
-                if p.top - d > c.top {
-                    self.drop_to(p, c.top + d, steps);
+                if p.top > self.up(c.top) {
+                    self.drop_to(p, self.up(c.top), steps);
                 }
                 self.rescale(p, steps)?;
                 p.nf = c.nf;

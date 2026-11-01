@@ -397,10 +397,13 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let mut i = 0;
         while i < mine.len() {
             let top = self.top(shape_, &t.meta)?;
+            // the one-pass (out-of-place, folded) rescale drops a composite level; an alternating user region's single
+            // primes take the plain one
+            let comp = ctx.chain.drop_at(top) == Some(2);
             if let (Some(sv), false) = (src, matches!(mine[i], Prelude::DropTo(..))) {
-                // the first data prelude: it reads `src` (a rescale, or a scalar adjust: folded into the rescale after
-                // it, else the scaling reads `src`), or `src` is copied into x now
-                if !(out_of_place && matches!(mine[i], Prelude::Rescale(_) | Prelude::ScalarAdjust(..))) {
+                // the first data prelude: it reads `src` (a rescale on a composite level, or a scalar adjust: folded
+                // into the rescale after it, else the scaling reads `src`), or `src` is copied into x now
+                if !(out_of_place && (comp && matches!(mine[i], Prelude::Rescale(_)) || matches!(mine[i], Prelude::ScalarAdjust(..)))) {
                     Self::copy_ct(ctx, s, x.w(), sv, x.k, top)?;
                     src = None;
                 }
@@ -421,7 +424,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
                     t.meta.level = l;
                 }
                 Prelude::ScalarAdjust(_, c) => {
-                    let fold = self.cfg.fold_scalar && self.rescaler.can_fold() && matches!(mine.get(i + 1), Some(Prelude::Rescale(_)));
+                    let fold = self.cfg.fold_scalar && self.rescaler.can_fold() && comp && matches!(mine.get(i + 1), Some(Prelude::Rescale(_)));
                     let rows = ctx.scale.elem_for_eval_mult(top as i32, c, -1)?;
                     let q = &ctx.chain.q;
                     let foldable = fold && !(rows[top] % q[top] == 1 && rows[top - 1] % q[top - 1] != 1);

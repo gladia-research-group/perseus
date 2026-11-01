@@ -283,7 +283,7 @@ impl PyRecipe {
 }
 
 fn chain(n_q: Option<u32>, unit: u32) -> ChainShape {
-    ChainShape { n_q: n_q.unwrap_or(ChainShape::N32.n_q), unit }
+    ChainShape { n_q: n_q.unwrap_or(ChainShape::N32.n_q), unit, singles: 0 }
 }
 
 /// FIDESlib's top limb index of a ciphertext at `level` (default chain: n32, 54 primes).

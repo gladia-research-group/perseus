@@ -104,7 +104,7 @@ impl<'a, W: DevWord> StcHighPlan<'a, W> {
         let sh = StcHighShape { out_level: spec.out_level, skip_mask: spec.skip_mask };
         let cache = self.cache(sh)?;
         let entry_top = cache.shape.first().map(|s| s.top).ok_or_else(|| shape("stc_high", "empty shape"))?;
-        let entry_level = ctx.shape.n_q - 1 - entry_top as u32;
+        let entry_level = pc_shadow::meta::level_from_top_limb(ctx.shape, entry_top as u32)?;
         for x in cts.iter_mut() {
             if x.meta.deg == 2 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;

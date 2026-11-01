@@ -507,7 +507,7 @@ pub fn to_bottom<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>
         cx.ops.mult_scalar_inplace(ctx, cx.ex, cx.sh, std::slice::from_mut(x), &[Complex::new(adj, 0.0)])?;
         cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
     }
-    let bottom_level = ctx.shape.n_q - plan.d as u32;
+    let bottom_level = pc_shadow::meta::level_from_top_limb(ctx.shape, (plan.d - 1) as u32)?;
     if x.meta.level > bottom_level {
         return Err(shape("raise", format!("input at level {} is below the composite bottom", x.meta.level)));
     }
@@ -534,7 +534,7 @@ pub fn raise_from_bottom<'a, W: DevWord, M: DevStrategy<W>>(
     }
     let s = &cx.ex.compute;
     ntt::transform_k(ctx, s, Dir::Inverse, &mut x.buf, Span::Q { top: d - 1 }, Parts::Both, k)?;
-    let level = nq - 1 - plan.top as u32;
+    let level = pc_shadow::meta::level_from_top_limb(ctx.shape, plan.top as u32)?;
     if stop == RaiseStop::Raised {
         plan.launch_mod_raise(ctx, s, View::of(&x.buf, 0), k, d, plan.top + 1)?;
         ntt::transform_k(ctx, s, Dir::Forward, &mut x.buf, Span::Q { top: plan.top }, Parts::Both, k)?;

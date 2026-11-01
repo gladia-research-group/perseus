@@ -65,7 +65,7 @@ pub fn shadow_config(c: &Config, plan: Option<&PlanConfig>, mode: &str, strict: 
         None | Some("n32") => {}
         Some(other) => return Err(cfg_err("chain.chain", format!("{other:?}: only the n32 chain shape is known"))),
     }
-    let real_chain = ChainShape { n_q: chain_of(c)?.q.len() as u32, unit };
+    let real_chain = ChainShape { unit, ..ChainShape::of(&chain_of(c)?) };
     let chain = match mode {
         "runtime" => real_chain,
         "planner" => ChainShape::unbounded(unit),

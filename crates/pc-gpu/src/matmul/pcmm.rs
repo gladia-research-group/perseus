@@ -794,7 +794,7 @@ fn prediv<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route
     if x.meta.deg == 2 {
         cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
     }
-    let entry = route.entry_level(ctx.shape.n_q);
+    let entry = route.entry_level(ctx.shape)?;
     if x.meta.level + ctx.shape.unit > entry {
         return Err(shape("pcmm linear", format!("{name}: input at level {} has no level above the StC-first entry {entry} to divide its band shift on", x.meta.level)));
     }
@@ -958,11 +958,11 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
     let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
     let mut inp = BtsCall::begin(StagedRef::StcFirst(route), cx, ins, &r, CallOpts { prescaled: false, own_cf: true })?;
     if inp.stc_first_input(cx, ins)?.is_none() {
-        return Err(shape("pcmm linear", format!("{}: inputs at level {} are below the StC-first entry (cap {})", lin.name, ins[0].meta.level, route.input_cap(cx.ctx.shape.n_q, cx.ctx.shape.unit))));
+        return Err(shape("pcmm linear", format!("{}: inputs at level {} are below the StC-first entry (cap {})", lin.name, ins[0].meta.level, route.input_cap(cx.ctx.shape)?)));
     }
     if let Some(rc) = rec.as_deref_mut() {
         let ni: Vec<(&str, u32)> = names.iter().map(|(n, l)| (n.as_str(), *l)).collect();
-        record_stc_first_inputs(rc, route, cx, &ni);
+        record_stc_first_inputs(rc, route, cx, &ni)?;
     }
     if let Some(e) = hooks.after_stc {
         e.record(&cx.ex.compute)?;

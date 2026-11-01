@@ -625,11 +625,31 @@ class PlannedRun:
             self._twin = t
         return self.records[t]
 
+    def _twin_entry(self):
+        """On the alternating chain n32sp the CPU twin must take StC-first's entry where the plan's runtime does (its
+        FAKECAP_STC_ENTRY = the recipe's PLAN_STC_FIRST_ENTRY): from n32's (46) it captures a deliberate dense refresh
+        whose input sits past it at the shipped order's landing, which the compile could reach only by a dense raise
+        drop into the user region (refused there: compile::user_region_sites)."""
+        if self.cfg["chain.preset"] != "n32sp":
+            return
+        cmd = os.path.join(self.plan_dir, "PLAN_CMD.txt")
+        want = None
+        for line in open(cmd).read().splitlines() if os.path.exists(cmd) else []:
+            if line.startswith("recipe="):
+                for kv in line[len("recipe="):].split():
+                    if kv.startswith("PLAN_STC_FIRST_ENTRY="):
+                        want = int(kv.split("=", 1)[1])
+        got = getattr(self.rec.model.inf.fhe, "stc_entry", None)
+        if want is not None and got is not None and int(got) != want:
+            raise RuntimeError(f"the CPU twin's StC-first entry is {got} (FAKECAP_STC_ENTRY), the plan's {want}: "
+                               f"n32sp's twin must take the chain's own")
+
     def prepare(self, rows, argmax=False):
         """CPU part of the setup: the probe tokens' streams, the programs compiled from the reference token's, the
         dynamic steps, the register map."""
         from perseus import _pc
         t0 = time.time()
+        self._twin_entry()
         self.rec.values = self.debug           # the debug check compares the recorder's float values
         for t in range(min(self.probe, len(rows))):
             self._record(t, rows, argmax)

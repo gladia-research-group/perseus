@@ -87,7 +87,7 @@ impl<'a, W: DevWord> SparseBRoute<'a, W> {
             return Err(shape("sparse lt", format!("input top {} vs the stage's {}", x.top(cx.ctx.shape)?, st.top)));
         }
         st.run(cx, &mut x.buf, k, self.ks_source)?;
-        let pm = PtMeta { level: cx.ctx.shape.n_q - 1 - st.top as u32, deg: 1, nf: st.pt_nf, tag: Default::default() };
+        let pm = PtMeta { level: pc_shadow::meta::level_from_top_limb(cx.ctx.shape, st.top as u32)?, deg: 1, nf: st.pt_nf, tag: Default::default() };
         x.meta = cx.sh.mult_pt(&x.meta, &pm)?.out;
         Ok(())
     }
@@ -177,7 +177,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for SparseBRoute<'a, W>
             }
             let k = x.k();
             em.run(cx, &mut x.buf, k)?;
-            x.meta = CtMeta { level: cx.ctx.shape.n_q - 1 - em.out_meta.top as u32, deg: em.out_meta.nl as u8, nf: em.out_meta.nf, ..x.meta };
+            x.meta = CtMeta { level: pc_shadow::meta::level_from_top_limb(cx.ctx.shape, em.out_meta.top as u32)?, deg: em.out_meta.nl as u8, nf: em.out_meta.nf, ..x.meta };
             Self::realize(cx, x)?;
         }
         Ok(())
@@ -226,13 +226,12 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for SparseBRoute<'a, 
     /// Raw output: the StC stage's top (the EvalMod output rescaled), degree 2, scale = EvalMod's x StC's plaintexts.
     fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
         let pre = &self.variants[self.variant(route.raise_drop)?];
-        let nq = sh.cfg.chain.n_q;
         let em = pre.em.out_meta;
-        let mut m = CtMeta { level: nq - 1 - em.top as u32, deg: em.nl as u8, nf: em.nf, slots: meta.slots, tag: meta.tag };
+        let mut m = CtMeta { level: pc_shadow::meta::level_from_top_limb(sh.cfg.chain, em.top as u32)?, deg: em.nl as u8, nf: em.nf, slots: meta.slots, tag: meta.tag };
         if m.deg == 2 {
             m = sh.rescale(&m)?.out;
         }
-        let pm = PtMeta { level: nq - 1 - pre.stc.top as u32, deg: 1, nf: pre.stc.pt_nf, tag: Default::default() };
+        let pm = PtMeta { level: pc_shadow::meta::level_from_top_limb(sh.cfg.chain, pre.stc.top as u32)?, deg: 1, nf: pre.stc.pt_nf, tag: Default::default() };
         let mut out = sh.mult_pt(&m, &pm)?.out;
         out.slots = meta.slots;
         out.tag = tag::t_bootstrap(&meta.tag, self.slots as i64, total_slots(meta, self.ring_n));
@@ -274,9 +273,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for SpruRoute<'a, W> 
     /// rescale).
     fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
         let level = self.spru.borrow().out_level(sh.cfg.chain.unit, route.raise_drop);
-        let nq = sh.cfg.chain.n_q;
         let tables = sh.tables.as_deref().ok_or_else(|| shape("spru landing", "Shadow without scale tables"))?;
-        let nf = tables.sf((nq - 1 - level) as i32)?.powi(2);
+        let nf = tables.sf(pc_shadow::meta::top_limb(sh.cfg.chain, level)? as i32)?.powi(2);
         Ok(CtMeta { level, deg: 2, nf, slots: meta.slots, tag: tag::t_bootstrap(&meta.tag, 1, total_slots(meta, self.ring_n)) })
     }
     fn run(&self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], route: &Route) -> Result<()> {

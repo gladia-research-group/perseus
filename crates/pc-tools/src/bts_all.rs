@@ -155,23 +155,44 @@ struct RouteCase {
     period: usize,
 }
 
-fn case(name: &str, n: usize, nq: usize, lean: bool) -> Res<RouteCase> {
+/// A bench knob from the environment (`default` when unset).
+fn env_u32(knob: &str, default: u32) -> Res<u32> {
+    match std::env::var(knob) {
+        Ok(v) => Ok(v.parse().map_err(|_| format!("{knob}={v}: not a number"))?),
+        Err(_) => Ok(default),
+    }
+}
+
+fn case(name: &str, n: usize, nq: usize, lean: bool, shape: pc_shadow::ChainShape) -> Res<RouteCase> {
     let n2 = (n / 2) as u32;
     // input levels: the dense ones two levels above the StC-first entry, SparseB at its deepest (the g0 inputs' top 5
-    // on n32; the level above the single prime on a lean chain)
-    let (dense_lv, sparse_lv) = if lean { (44, 48) } else { (nq as u32 - 10, nq as u32 - 6) };
+    // on n32; the level above the single prime on a lean chain, at the same limbs on its alternating user region's
+    // level grid)
+    let (dense_lv, sparse_lv) = if shape.singles != 0 {
+        let l = |top| shape.level_at(top).ok_or("no level at that top");
+        (l(5)?, l(2)?)
+    } else if lean {
+        (44, 48)
+    } else {
+        (nq as u32 - 10, nq as u32 - 6)
+    };
     Ok(match name {
         // shipped-order dense, real payload, CF 6 (the dense timing case), input at the reactive ceiling (44 on n32)
         "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: dense_lv, slots: n2, period: n / 2 },
         // StC-first, real payload, CF 13 (the shipped dense route and timing case)
         "stcf" => RouteCase { route: Route { cf: Some(13), real: true, stc_first: true, ..Route::dense() }, level: dense_lv, slots: n2, period: n / 2 },
-        // SparseB, raise drop 1, CF 6, input at top 5 (the g0 bootstrap inputs' top)
+        // SparseB, raise drop 1 (PC_BENCH_DROP_SPARSE: another total drop), CF 6, input at top 5 (the g0 bootstrap
+        // inputs' top)
         "512" | "256" => {
             let s: u32 = name.parse()?;
-            RouteCase { route: Route { slots: s, raise_drop: 1, sparse_b: true, cf: Some(6), ..Route::dense() }, level: sparse_lv, slots: s, period: s as usize }
+            let drop = env_u32("PC_BENCH_DROP_SPARSE", 1)?;
+            RouteCase { route: Route { slots: s, raise_drop: drop, sparse_b: true, cf: Some(6), ..Route::dense() }, level: sparse_lv, slots: s, period: s as usize }
         }
-        // SPRU h = 64, CF 6, fresh level-26 input
-        "1" => RouteCase { route: Route { slots: 1, spru_h: 64, cf: Some(6), ..Route::dense() }, level: 26, slots: 1, period: 1 },
+        // SPRU h = 64, raise drop 0 (PC_BENCH_DROP_SPRU: another), CF 6, fresh level-26 input
+        "1" => {
+            let drop = env_u32("PC_BENCH_DROP_SPRU", 0)?;
+            RouteCase { route: Route { slots: 1, spru_h: 64, raise_drop: drop, cf: Some(6), ..Route::dense() }, level: 26, slots: 1, period: 1 }
+        }
         o => return Err(format!("unknown route {o}").into()),
     })
 }
@@ -275,11 +296,16 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     geoms.extend(plan.sources.iter().flatten().map(|s| s.geom));
     let mut steps = rot_steps(&geoms, n);
     let sbs: Vec<u32> = [512u32, 256].into_iter().filter(|s| want(&s.to_string())).collect();
+    // PC_BENCH_DROP_SPARSE / PC_BENCH_DROP_SPRU: the routes' raise drops (default 1 / 0); PC_BENCH_SPARSE_B_K:
+    // SparseB's EvalMod K (default 24; 16 = the dense route's series, the served Decode-8's)
+    let sparse_drop = env_u32("PC_BENCH_DROP_SPARSE", 1)?;
+    let sparse_k = env_u32("PC_BENCH_SPARSE_B_K", pc_core::bts_setup::SPARSE_B_K as u32)? as f64;
     let sb_cfgs: Vec<SparseBCfg> = sbs
         .iter()
         .map(|&s| {
-            let mut c = SparseBCfg::n32(s, 1);
+            let mut c = SparseBCfg::n32(s, sparse_drop);
             c.k_max = kb;
+            c.evalmod_k = sparse_k;
             c.em_fuse_rescale = em_fuse;
             c.merge_s2d = merge;
             c
@@ -290,6 +316,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     }
     let mut scfg = SpruCfg::new(64);
     scfg.k_max = kb;
+    scfg.drops = 1 << env_u32("PC_BENCH_DROP_SPRU", 0)?;
     if want("1") {
         steps.extend(scfg.rot_steps(n));
     }
@@ -460,7 +487,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let (ev0, ev1) = (Event::timing(&dev)?, Event::timing(&dev)?);
     let ctw = lay.ct_words();
     for name in &o.routes {
-        let c = case(name, n, nq, chain.lone_top().is_some())?;
+        let c = case(name, n, nq, chain.lone_top().is_some(), ctx.shape)?;
         let (route, work, locks): (&dyn BtsRoute<'_, W, M>, &mut BtsWork<'_, W>, Vec<&dyn CaptureLock>) = match name.as_str() {
             "dense" | "stcf" => (&sfr, &mut sf_work, sfr.last.iter().map(|l| l as &dyn CaptureLock).collect()),
             "512" | "256" => {
@@ -470,7 +497,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             "1" => (spru_route.as_ref().ok_or("spru not built")?, spru_work.as_mut().ok_or("spru work")?, vec![]),
             o => return Err(format!("route {o}").into()),
         };
-        let top = nq - 1 - c.level as usize;
+        let top = ctx.top_of(c.level)?;
         let sf_ = ctx.scale.sf(top as i32)?;
         if let Some((cfs, amps)) = &o.grid {
             // precision grid: one refresh per amplitude, CF and seed; bits = -log2 of the worst real-part error

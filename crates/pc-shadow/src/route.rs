@@ -1,6 +1,6 @@
 //! Bootstrap routes, their landings, and the per-stage encoding rule of the CtS/StC linear transforms.
 use crate::error::{Error, Result};
-use crate::meta::{effective_level, ChainShape};
+use crate::meta::{effective_level, top_limb, ChainShape};
 use crate::quirks::{Quirk, Quirks};
 use pc_core::scale::ScaleTables;
 use serde::{Deserialize, Serialize};
@@ -184,7 +184,7 @@ pub struct StageEnc {
 /// Composite chains store a sentinel 1 off the grid and are uniform by construction: plain `sf[level]` (patch 0006).
 pub fn aux_plaintext_scale(st: &ScaleTables, level: u32) -> f64 {
     let sf = &st.sf_real_openfhe;
-    let lv = level as usize;
+    let lv = ChainShape::from_tables(st).primes_dropped(level).unwrap_or(level) as usize;
     let mut sc = sf[lv];
     let num_q = st.q.len();
     if st.d == 1 && lv + 1 < num_q {
@@ -208,7 +208,7 @@ pub fn cts_stage_levels(st: &ScaleTables, budget_enc: u32, raise_drop: u32, shif
     (0..budget_enc)
         .map(|e| {
             let level = first + d * e;
-            let top = chain.top_max().checked_sub(level).ok_or_else(|| Error::Bts {
+            let top = top_limb(chain, level).map_err(|_| Error::Bts {
                 knob: "budget_enc",
                 msg: format!("CtS stage {e} at level {level} is past the chain bottom"),
             })?;
@@ -231,7 +231,7 @@ pub fn stc_stage_levels(st: &ScaleTables, em_out_level: u32, em_out_deg: u8, bud
     (0..budget_dec)
         .map(|e| {
             let level = first + d * e;
-            let top = chain.top_max().checked_sub(level).ok_or_else(|| Error::Bts {
+            let top = top_limb(chain, level).map_err(|_| Error::Bts {
                 knob: "budget_dec",
                 msg: format!("StC stage {e} at level {level} is past the chain bottom"),
             })?;

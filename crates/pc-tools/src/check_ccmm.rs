@@ -701,7 +701,7 @@ fn bench(args: &[String]) -> Res<bool> {
     sf.cache_slots = 4;
     // SinCBoot's stage-0 level: the StC-first landing of the operands' refresh (pc-shadow), one or two units deeper
     let r = Route { stc_first: true, cf, ..Route::dense() };
-    let cshape = pc_shadow::ChainShape { n_q: chain.q.len() as u32, unit: chain.level_unit as u32 };
+    let cshape = pc_shadow::ChainShape::of(&chain);
     let land = BtsConfig::n32_shipped().landing(cshape, &Quirks::none(), &Route { cf: Some(cf.or(sf.cf_default).unwrap_or(13)), ..r }, level, 1)?;
     let s0 = ccmm::stage0_level(&CtMeta::new(land.level, land.deg), chain.level_unit as u32);
     let high_shapes = vec![StcHighShape { out_level: 50, skip_mask: 1 }, StcHighShape { out_level: s0, skip_mask: 6 }];

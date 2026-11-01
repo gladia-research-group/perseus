@@ -37,6 +37,8 @@ mod dump_g0;
 mod bts_sparse;
 #[path = "../bts_classic.rs"]
 mod bts_classic;
+#[path = "../ops_levels.rs"]
+mod ops_levels;
 #[path = "../replay_g0.rs"]
 mod replay_g0;
 #[path = "../check_bts.rs"]
@@ -650,6 +652,10 @@ fn main() -> ExitCode {
     // PCMM per linear / precision (src/check_pcmm.rs)
     if args.first().map(|s| s.as_str()) == Some("pcmm") {
         return check_pcmm::cmd(check_pcmm::Mode::Bench, &args[1..]);
+    }
+    // the user ops at every level of the user region (src/ops_levels.rs)
+    if args.first().map(|s| s.as_str()) == Some("ops") {
+        return ops_levels::cmd(&args[1..]);
     }
     // a compiled block program replayed on the g0 oracle (src/replay_g0.rs)
     if args.first().map(|s| s.as_str()) == Some("replay") {

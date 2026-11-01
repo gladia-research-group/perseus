@@ -411,7 +411,7 @@ pub fn run_lt<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, s
         }
         let k = x.k();
         stage.run(cx, &mut x.buf, k, source)?;
-        let pt = PtMeta { level: ctx.shape.n_q - 1 - stage.top as u32, deg: 1, nf: stage.pt_nf, tag: Default::default() };
+        let pt = PtMeta { level: pc_shadow::meta::level_from_top_limb(ctx.shape, stage.top as u32)?, deg: 1, nf: stage.pt_nf, tag: Default::default() };
         let m = cx.sh.mult_pt(&x.meta, &pt)?.out;
         let (_, od) = stage.out_top_deg(ctx.chain.level_unit);
         x.meta = if od == 1 { cx.sh.rescale(&m)?.out } else { m };
@@ -434,7 +434,7 @@ fn run_lt_thin<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, 
         let nf = x.meta.nf * pt_nf;
         x.meta = if rescale {
             cx.ops.rescaler.rescale_one(ctx, &cx.ex.compute, &mut x.buf, top)?;
-            CtMeta { level: x.meta.level + 1, deg: 1, nf: nf / ctx.chain.q[top] as f64, ..x.meta.clone() }
+            CtMeta { level: pc_shadow::meta::level_from_top_limb(ctx.shape, (top - 1) as u32)?, deg: 1, nf: nf / ctx.chain.q[top] as f64, ..x.meta.clone() }
         } else {
             CtMeta { deg: 2, nf, ..x.meta.clone() }
         };
@@ -804,8 +804,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
 
     /// Entry level (primes dropped): the deepest EFFECTIVE input level that runs StC-first (pc-shadow
     /// `BtsConfig::stc_first_entry`, FAKECAP_STC_ENTRY).
-    pub fn entry_level(&self, n_q: u32) -> u32 {
-        n_q - 1 - self.entry_top as u32
+    pub fn entry_level(&self, shape: pc_shadow::ChainShape) -> Result<u32> {
+        Ok(pc_shadow::meta::level_from_top_limb(shape, self.entry_top as u32)?)
     }
 
     /// The split's top limb (degree 2 there): the last StC stage's input top.
@@ -820,8 +820,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
 
     /// The deepest level a degree-2 input may sit at and still reach the entry after its pending rescale: the PCMM's
     /// `level_hint` cap (perseus `Pcmm._measure_cap`: total - entry - unit).
-    pub fn input_cap(&self, n_q: u32, unit: u32) -> u32 {
-        self.entry_level(n_q) - unit
+    pub fn input_cap(&self, shape: pc_shadow::ChainShape) -> Result<u32> {
+        Ok(self.entry_level(shape)? - shape.unit)
     }
 
     pub fn variant(&self, drop: u32) -> Result<usize> {
@@ -838,10 +838,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     }
 
     /// Whether an input with metadata `m` runs StC-first (effective limb at or above the entry; FIDESlib `btsBegin`).
-    pub fn runs_stc_first(&self, n_q: u32, unit: u32, m: &CtMeta) -> bool {
-        let top = (n_q - 1).saturating_sub(m.level) as usize;
-        let eff = if m.deg == 2 { top.saturating_sub(unit as usize) } else { top };
-        m.level < n_q && eff >= self.entry_top
+    pub fn runs_stc_first(&self, shape: pc_shadow::ChainShape, m: &CtMeta) -> bool {
+        pc_shadow::meta::top_limb(shape, pc_shadow::meta::effective_level(m.level, m.deg, shape.unit)).is_ok_and(|eff| eff as usize >= self.entry_top)
     }
 
     /// `btsBegin` on metadata (the PCMM takes its finish state from the INPUT's metadata, under the finish's raise
@@ -861,7 +859,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             return Err(shape("bootstrap cf", format!("correction factor {cf} outside [{}, {}] (deg {})", self.setup.cf_window.0, self.setup.cf_window.1, self.deg)));
         }
         let shp = ctx.shape;
-        let stc_first = route.stc_first && self.runs_stc_first(shp.n_q, shp.unit, in_meta);
+        let stc_first = route.stc_first && self.runs_stc_first(shp, in_meta);
         let pre = &self.variants[variant];
         let mut correction = cf - self.deg;
         let cor_factor = 1u64 << correction;
@@ -900,9 +898,10 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         })
     }
 
-    fn set_meta(cx: &BtsCx<'_, 'a, W, M>, x: &mut Ct<'a, W>, f: FMeta) {
+    fn set_meta(cx: &BtsCx<'_, 'a, W, M>, x: &mut Ct<'a, W>, f: FMeta) -> Result<()> {
         let shp = cx.ctx.shape;
-        x.meta = CtMeta { level: shp.n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..x.meta.clone() };
+        x.meta = CtMeta { level: pc_shadow::meta::level_from_top_limb(shp, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..x.meta.clone() };
+        Ok(())
     }
 
     /// x := x + conj(x) on every batch (shipped order, real payload).
@@ -945,7 +944,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         }
         let ctx = cx.ctx;
         let shp = ctx.shape;
-        let entry_level = shp.n_q - 1 - self.entry_top as u32;
+        let entry_level = pc_shadow::meta::level_from_top_limb(shp, self.entry_top as u32)?;
         for x in cts.iter_mut() {
             if x.meta.deg == 2 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
@@ -1001,7 +1000,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             info.cf_stage = cf_stage;
             info.factor = factor;
             info.key = Some(key);
-            let want = (shp.n_q - 1 - self.split_top() as u32, 2u8);
+            let want = (pc_shadow::meta::level_from_top_limb(shp, self.split_top() as u32)?, 2u8);
             if let Some(x) = cts.iter().find(|x| (x.meta.level, x.meta.deg) != want) {
                 return Err(shape("stc_first", format!("folded last stage left the ciphertext at level {} deg {}", x.meta.level, x.meta.deg)));
             }
@@ -1092,10 +1091,10 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     }
 
     /// The landing of a refresh (raw output metadata).
-    fn landing_meta(&self, n_q: u32, unit: u32, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
+    fn landing_meta(&self, chain: pc_shadow::ChainShape, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
         let v = self.variant(route.raise_drop)?;
         let pre = &self.variants[v];
-        let f = if route.stc_first && self.runs_stc_first(n_q, unit, meta) {
+        let f = if route.stc_first && self.runs_stc_first(chain, meta) {
             if route.real {
                 pre.em_real.as_ref().ok_or_else(|| shape("bootstrap real", "real-payload variant not built"))?.out_meta
             } else {
@@ -1104,7 +1103,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         } else {
             *self.outs_shipped.get(v).ok_or_else(|| no_stage("stc_first", "shipped-order landing"))?
         };
-        Ok(CtMeta { level: n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..meta.clone() })
+        Ok(CtMeta { level: pc_shadow::meta::level_from_top_limb(chain, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..meta.clone() })
     }
 
     fn once(&self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], route: &Route) -> Result<()> {
@@ -1118,7 +1117,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     /// singles at a given cache state),
     /// inputs at or above the entry (deeper ones take the shipped order), CFs in the window and below cf_ref (each
     /// member is pre-scaled by 2^(cf_ref - 1 - cf)). Err names the first condition that fails.
-    pub fn pair_check(&self, n_q: u32, unit: u32, mx: &CtMeta, my: &CtMeta, rx: &Route, ry: &Route) -> Result<()> {
+    pub fn pair_check(&self, chain: pc_shadow::ChainShape, mx: &CtMeta, my: &CtMeta, rx: &Route, ry: &Route) -> Result<()> {
         let n = 2 * self.variants.first().map_or(0, |v| v.slots as usize);
         let bad = |what: String| Err(shape("bts pair", what));
         for r in [rx, ry] {
@@ -1143,8 +1142,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         if mx.level != my.level || mx.deg != my.deg || nf_key(mx.nf) != nf_key(my.nf) {
             return bad(format!("inputs at level {} deg {} nf 2^{:.6} and level {} deg {} nf 2^{:.6}", mx.level, mx.deg, mx.nf.log2(), my.level, my.deg, my.nf.log2()));
         }
-        if !self.runs_stc_first(n_q, unit, mx) {
-            return bad(format!("input at level {} deg {} is past the StC-first entry level {}", mx.level, mx.deg, self.entry_level(n_q)));
+        if !self.runs_stc_first(chain, mx) {
+            return bad(format!("input at level {} deg {} is past the StC-first entry level {}", mx.level, mx.deg, self.entry_level(chain)?));
         }
         Ok(())
     }
@@ -1162,10 +1161,10 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         if y.k() != k {
             return Err(shape("bts pair", format!("members of {k} and {} ciphertexts", y.k())));
         }
-        self.pair_check(shp.n_q, shp.unit, &x.meta, &y.meta, rx, ry)?;
-        let (lx, ly) = (self.landing_meta(shp.n_q, shp.unit, &x.meta, rx)?, self.landing_meta(shp.n_q, shp.unit, &y.meta, ry)?);
+        self.pair_check(shp, &x.meta, &y.meta, rx, ry)?;
+        let (lx, ly) = (self.landing_meta(shp, &x.meta, rx)?, self.landing_meta(shp, &y.meta, ry)?);
         let mut st = self.begin_meta(ctx, &x.meta, k, &Route { cf: Some(self.sf.cf_ref), real: false, ..*rx }, false)?;
-        let entry_level = self.entry_level(shp.n_q);
+        let entry_level = self.entry_level(shp)?;
         for (c, r) in [(&mut *x, rx), (&mut *y, ry)] {
             if c.meta.deg == 2 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(c))?;
@@ -1190,7 +1189,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
             self.cts_stage(cx, &st, xs, i)?;
         }
         let em = &self.variants[st.variant].em;
-        let f = FMeta { top: (shp.n_q - 1 - x.meta.level) as i32, nl: x.meta.deg as i32, nf: x.meta.nf };
+        let f = FMeta { top: pc_shadow::meta::top_limb(shp, x.meta.level)? as i32, nl: x.meta.deg as i32, nf: x.meta.nf };
         if f.top != em.in_meta.top || f.nl != em.in_meta.nl || f.nf.to_bits() != em.in_meta.nf.to_bits() {
             return Err(shape("eval_mod", format!("input {f:?}, the program was built for {:?}", em.in_meta)));
         }
@@ -1198,7 +1197,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         let out = em.out_meta;
         for (c, r, l) in [(&mut *x, rx, lx), (&mut *y, ry, ly)] {
             self.pow2.mult(ctx, &cx.ex.compute, View::of(&c.buf, 0), k, out.top as usize, self.call_cf(r))?;
-            if l.level != shp.n_q - 1 - out.top as u32 || l.deg as i32 != out.nl || l.nf.to_bits() != out.nf.to_bits() {
+            if l.level != pc_shadow::meta::level_from_top_limb(shp, out.top as u32)? || l.deg as i32 != out.nl || l.nf.to_bits() != out.nf.to_bits() {
                 return Err(shape("bts pair", format!("EvalMod left {out:?}, the member's landing is level {} deg {} nf 2^{:.6}", l.level, l.deg, l.nf.log2())));
             }
             c.meta = l;
@@ -1241,13 +1240,13 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for StcFirstRoute<'a, W
         let em = if st.real { pre.em_real.as_ref().ok_or_else(|| no_stage("stc_first", "eval_mod (real)"))? } else { &pre.em };
         let ctx = cx.ctx;
         for x in cts.iter_mut() {
-            let f = FMeta { top: (ctx.shape.n_q - 1 - x.meta.level) as i32, nl: x.meta.deg as i32, nf: x.meta.nf };
+            let f = FMeta { top: pc_shadow::meta::top_limb(ctx.shape, x.meta.level)? as i32, nl: x.meta.deg as i32, nf: x.meta.nf };
             if f.top != em.in_meta.top || f.nl != em.in_meta.nl || f.nf.to_bits() != em.in_meta.nf.to_bits() {
                 return Err(shape("eval_mod", format!("input {f:?}, the program was built for {:?}", em.in_meta)));
             }
             let k = x.k();
             em.run(cx, &mut x.buf, k)?;
-            Self::set_meta(cx, x, em.out_meta);
+            Self::set_meta(cx, x, em.out_meta)?;
             if x.meta.deg == 2 && !st.stc_first {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
             }
@@ -1277,7 +1276,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for StcFirstRoute<'a, W
                     cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
                 }
                 if x.top(ctx.shape)? > stc_top {
-                    x.meta.level = ctx.shape.n_q - 1 - stc_top as u32;
+                    x.meta.level = pc_shadow::meta::level_from_top_limb(ctx.shape, stc_top as u32)?;
                 }
             }
         }
@@ -1313,7 +1312,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for StcFirstRoute<'a,
         RouteKind::StcFirst
     }
     fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
-        self.landing_meta(sh.cfg.chain.n_q, sh.cfg.chain.unit, meta, route)
+        self.landing_meta(sh.cfg.chain, meta, route)
     }
     fn run_pair(&self, cx: &mut BtsCx<'_, 'a, W, M>, x: &mut Ct<'a, W>, y: &mut Ct<'a, W>, rx: &Route, ry: &Route) -> Result<()> {
         self.pair(cx, x, y, rx, ry)
