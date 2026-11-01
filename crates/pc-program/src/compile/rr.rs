@@ -8,15 +8,22 @@ use crate::program::{Kind, Op, Program, Var, VarId};
 use pc_shadow::{ChainShape, Shadow};
 use std::collections::HashMap;
 
-/// The deepest level a fused product may sit at (the runtime's tables start at top 6).
+/// The deepest level a fused product may sit at on a chain of uniform levels (the runtime's tables start at top 6).
 pub const MAX_LEVEL: u32 = 44;
 
-/// Whether the rescale that lands at `level` drops a pair of primes on `chain` (the real chain's shape: the compile's
-/// shadow runs an alternating user region's levels on its uniform grid), the only rescale the runtime's tables fuse:
-/// every one on a chain of uniform levels, on an alternating user region (`ChainShape::singles`) not its one-prime
-/// levels'.
-fn pair_rescale(chain: &ChainShape, level: u32) -> bool {
-    chain.singles == 0 || matches!((level.checked_sub(chain.unit).and_then(|l| chain.primes_dropped(l)), chain.primes_dropped(level)), (Some(a), Some(b)) if b == a + 2)
+/// Whether the runtime's tables (`pc_gpu::relin::RelinRescaler`) fuse the rescale that lands at `level` on `chain` (the
+/// real chain's shape: the compile's shadow runs an alternating user region's levels on its uniform grid): on a chain
+/// of uniform levels every one down to `MAX_LEVEL`; on an alternating user region (`ChainShape::singles`) every
+/// rescale that drops one prime or two from a top limb of at least 3 (its levels sit on a virtual grid, so the deepest
+/// level is the chain's, not `MAX_LEVEL`).
+fn served(chain: &ChainShape, level: u32) -> bool {
+    if chain.singles == 0 {
+        return level <= MAX_LEVEL + chain.unit;
+    }
+    match (level.checked_sub(chain.unit).and_then(|l| chain.primes_dropped(l)), chain.primes_dropped(level)) {
+        (Some(a), Some(b)) => (b == a + 1 || b == a + 2) && chain.top_max().checked_sub(a).is_some_and(|t| t >= 3),
+        _ => false,
+    }
 }
 
 pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
@@ -47,7 +54,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
             Kind::Mult if op.ins.len() == 2 && op.ins[0] != op.ins[1] => false,
             _ => continue,
         };
-        if op.outs.len() != 1 || p.vars[op.ins[0] as usize].meta.level > MAX_LEVEL {
+        if op.outs.len() != 1 || !served(chain, p.vars[op.ins[0] as usize].meta.level + sh.unit()) {
             continue;
         }
         let v = op.outs[0];
@@ -87,7 +94,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let want = p.vars[r as usize].meta;
-        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || outs[0].level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, outs[0].level) {
+        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || !served(chain, outs[0].level) {
             continue;
         }
         gone.push(j);
@@ -195,7 +202,7 @@ pub fn fuse_preludes(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize 
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl: false, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let wm = outs[0];
-        if wm.level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, wm.level) {
+        if !served(chain, wm.level) {
             continue;
         }
         let mut cins = c.ins.clone();
