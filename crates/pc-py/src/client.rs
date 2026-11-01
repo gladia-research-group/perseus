@@ -99,6 +99,17 @@ impl PyClient {
     fn slots(&self) -> usize {
         self.c.chain.n / 2
     }
+    /// log2 of every prime of the chain by id, Q then P (a key shape's modulus: the product of the primes it stores;
+    /// the client's `refuse` bounds it per role).
+    #[getter]
+    fn prime_log2(&self) -> Vec<f64> {
+        self.c.chain.primes().iter().map(|&p| (p as f64).log2()).collect()
+    }
+    /// (Q primes, P primes, P' = the sparse secrets' special primes) of the chain.
+    #[getter]
+    fn prime_counts(&self) -> (usize, usize, usize) {
+        (self.c.chain.q.len(), self.c.chain.p.len(), self.c.chain.p_sparse)
+    }
 
     /// Generate every key of `spec` (a server's `Session.key_manifest` JSON) into the bundle file `path`, on a
     /// rayon pool of `threads`. Returns the timings and sizes.
