@@ -350,7 +350,7 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
         dots(ctx, ex, kc, group, live[j].0, m, k, top, io)?;
         // a key whose k outputs (inputs 0..k, one each) lie in consecutive slots takes the ModDown's last step in the
         // conversion NTT's epilogue, written straight into them (no correction stored, no element-wise pass)
-        let heads: Vec<Option<View>> = live[j..j + m].iter().map(|&(r, _)| if ks::lever_on("grid_epi") { grid_head(outs, &key, r, k) } else { None }).collect();
+        let heads: Vec<Option<View>> = live[j..j + m].iter().map(|&(r, _)| grid_head(outs, &key, r, k)).collect();
         let join = join_of!(ex);
         if heads.iter().all(Option::is_none) {
             ks::moddown_conv_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top, join)?;

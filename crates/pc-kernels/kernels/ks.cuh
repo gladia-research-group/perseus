@@ -581,7 +581,7 @@ __global__ void __launch_bounds__(BX) ks_dot_key_sum(KsKeyArgs G) {
 // live at a time): fewer registers than ks_dot_key_sum's K x 4 sums, so more warps per SM. Same words.
 constexpr int SUM_D = 4;
 template <class MM, int KMAX, bool PACKED>
-__global__ void __launch_bounds__(BX) ks_dot_key_sum_c(KsKeyArgs G) {
+__device__ __forceinline__ void key_sum_c(const KsKeyArgs& G) {
     using W = uint32_t;
     using Wd = WideOf<W>;
     const KsArgs& A = G.ks;
@@ -687,6 +687,11 @@ __global__ void __launch_bounds__(BX) ks_dot_key_sum_c(KsKeyArgs G) {
             store4<W>(g1, acc1[c][0], acc1[c][1], acc1[c][2], acc1[c][3]);
         }
     }
+}
+
+template <class MM, int KMAX, bool PACKED>
+__global__ void __launch_bounds__(BX, 5) ks_dot_key_sum_c(KsKeyArgs G) {
+    key_sum_c<MM, KMAX, PACKED>(G);
 }
 
 // ks_dot_regen at K = 1 (u32, key read through its KeyTab) on ks_dot_seg's warp-sized row segments: a warp owns slots
@@ -870,7 +875,7 @@ int key_k(const KsKeyArgs* a, cudaStream_t s) {
     }
     if (a->ks.c0_mode & KS_SUM) {  // the summed rotations: ks_dot_seg (u32, K = 1) or ks_dot_key_sum (u32, K > 1)
         if constexpr (sizeof(W) == 4) {
-            if (a->ks.ndig <= SUM_D && !(a->ks.c0_mode & 16)) {  // bit 16 (bn-prefill A/B): ks_dot_key_sum
+            if (a->ks.ndig <= SUM_D) {
                 if (K <= 2) ks_dot_key_sum_c<MM, 2, PACKED><<<grid, BX, 0, s>>>(*a);
                 else if (K <= 4) ks_dot_key_sum_c<MM, 4, PACKED><<<grid, BX, 0, s>>>(*a);
                 else return -2;
