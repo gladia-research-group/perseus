@@ -8,7 +8,10 @@
 # KV_PUSH_RAISE=b:d,... (the runtime switch, impl/attention.py) also raises those blocks' K/V push refreshes d levels
 # below the top (the planner's deliberate-drop probe, PLAN_RAISE_DELIB=1, finds 1 level of slack in blocks 0, 4, 5, 7,
 # 10; block 0 is left out, its feedback variant enters elsewhere): the pass runs on a copy of the capture with those
-# refreshes landed there (fakecap's landing, CapFhe.raise_drop) and the plan's runtime line gains the switch.
+# refreshes landed there (fakecap's landing, CapFhe.raise_drop; KV_PUSH_RAISE_LANDED=1: the capture was taken with the
+# switch and already lands them, its graph is not edited) and
+# the plan's runtime line gains the switch. The pass refuses a raise that moves a block's exit or starts a refresh
+# downstream past the chain (PLAN_CHAIN_STRICT: the planner checks every placed refresh's effective input level).
 #   bash speedrun/make_n32a4_decode_rd.sh [PLAN]   -> PLAN's blocks 0-11 and block_0_feedback rewritten in place
 #   KV_PUSH_RAISE=4:1,5:1,7:1,10:1 bash speedrun/make_n32a4_decode_rd.sh   (the served plan's; its runtime line also
 #   carries FIDESLIB_CTS_ALT_BUDGET=5: the dense raise variants of drop >= 1 on a 5-stage CtS)
@@ -22,6 +25,9 @@ PLAN=${1:-gpt2_decode_python_n32a4_kc16r_cm}
 GR=$(sed -n 's/^graph=\([^ ]*\).*/\1/p' "bootstrap_placements/$PLAN/PLAN_CMD.txt")
 RECIPE="$(sed -n 's/^recipe=//p' "bootstrap_placements/$PLAN/PLAN_CMD.txt")"
 KEEP="PLAN_KEEP_PLACEMENTS=bootstrap_placements/$PLAN PLAN_KEEP_PLACEMENTS_EXACT=1 PLAN_PLACER=min_cut"
+# the kept program's refresh inputs are checked against the chain once more (a raised K/V push lands its block deeper:
+# a refresh downstream can start past max_level, which the compile refuses): the planner refuses such a block
+export PLAN_CHAIN_STRICT=${PLAN_CHAIN_STRICT-1}
 OUT=_rd_$PLAN
 rm -rf "bootstrap_placements/$OUT"
 GR0=$GR
@@ -29,7 +35,7 @@ if [ -n "${KV_PUSH_RAISE:-}" ]; then
     GR=${GR0}_kvraise
     rm -rf "$GR" && cp -r "$GR0" "$GR"
     "$PYTHON" - "$GR" "$KV_PUSH_RAISE" <<'PY'
-import json, sys
+import json, os, sys
 d, spec = sys.argv[1:]
 for e in spec.split(","):
     b, k = (int(x) for x in e.split(":"))
@@ -38,6 +44,8 @@ for e in spec.split(","):
     hit = [n for n in g["nodes"] if n["op_type"] == "deliberate_bootstrap" and n["step"].endswith("kv_push")]
     assert len(hit) == 1, f"block {b}: {len(hit)} K/V push refreshes"
     n = hit[0]
+    if n["args"]["route"].get("raise_drop") == k or os.environ.get("KV_PUSH_RAISE_LANDED", "0") not in ("", "0"):
+        continue                                  # a capture taken with KV_PUSH_RAISE already lands it there
     n["output_level"] += 2 * k
     n["shadow"]["level"] += 2 * k
     n["args"]["route"]["raise_drop"] = k
