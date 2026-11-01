@@ -162,6 +162,139 @@ def tfhe_lut(ops, x, lut, slots, part=None):
     return ops.add(y, y)
 
 
+# ── native programs (pc-py tfhe.rs TfheRt::prog; PC_TFHE_NATIVE=bufs,rows) ─────────────────────────────────────────
+#
+# One switch in, dependent bootstraps on LWEs (native encoding: v at phase v q / 4), one finish out. Native LUT inputs
+# are read on [-1, 1), negacyclic beyond; the mirror's noise: PF_TFHE_NAT_NOISE (input), PF_TFHE_NAT_OUT (output).
+PROGS: dict = {}
+_NAT_NOISE = float(os.environ.get("PF_TFHE_NAT_NOISE", "") or _NOISE)
+_NAT_OUT = float(os.environ.get("PF_TFHE_NAT_OUT", "0") or 0)
+
+
+def _nat(f, m, pts):
+    """f as a native bootstrap reads it: on the grid of `pts` points of [-1, 1), negacyclic beyond."""
+    m = ((np.asarray(m, dtype=np.float64) + 1.0) % 4.0) - 1.0
+    lo = m < 1.0
+    return np.where(lo, quantize(f, np.where(lo, m, 0.0), pts), -quantize(f, np.where(lo, 0.0, m - 2.0), pts))
+
+
+class Prog:
+    """A native program over `bufs` LWE buffers (module section above). Steps run in order; `run` is the mirror."""
+
+    def __init__(self, name, bufs):
+        self.name, self.bufs = name, int(bufs)
+        self.luts, self.steps = {}, []
+
+    def lut(self, name, *fs, warp=False):
+        """Tables f_j (numpy-vectorized on [-1, 1)): k = len(fs) from one rotation (k times the input noise); warp:
+        one table, the store's (as `register_lut`)."""
+        self.luts[name] = (list(fs), bool(warp))
+        return name
+
+    def load(self, lut, dst):
+        self.steps.append({"op": "load", "lut": lut, "dst": dst})
+
+    def lin(self, dst, a, b, pairs, ca=1, cb=1, c=0.0):
+        """dst[r] = ca a[ia] + cb b[ib] + c for (ia, ib) = pairs[r] (-1: no term); ca, cb integers."""
+        idx = [int(v) for p in pairs for v in p]
+        self.steps.append({"op": "lin", "dst": dst, "a": a, "b": b, "idx": idx, "ca": int(ca), "cb": int(cb), "c": float(c)})
+
+    def pbs(self, src, rows, lut, dst):
+        self.steps.append({"op": "pbs", "src": src, "rows": int(rows), "lut": lut, "dst": list(dst)})
+
+    def store(self, src, rows, lut, slots):
+        self.steps.append({"op": "store", "src": src, "rows": int(rows), "lut": lut, "slots": slots})
+
+    def rows_out(self):
+        return self.steps[-1]["rows"]
+
+    def json(self):
+        import json
+        luts = {}
+        for name, (fs, warp) in self.luts.items():
+            pts = GRID // len(fs)
+            j = np.arange(pts)
+            m = np.where(j < pts // 2, 2.0 * j / pts, 2.0 * (j - pts) / pts)
+            luts[name] = {"tables": [[float(v) for v in np.asarray(f(m), dtype=np.float64)] for f in fs], "warp": warp}
+        return json.dumps({"luts": luts, "steps": self.steps})
+
+    def run(self, m, noise=None):
+        """The mirror on the loaded values `m`: the stored values."""
+        noise = _NAT_NOISE if noise is None else noise
+        rng = _input_rng(np.asarray(m))
+        B = [np.zeros(0) for _ in range(self.bufs)]
+        out = None
+        for st in self.steps:
+            op = st["op"]
+            if op == "load":
+                f = self.luts[st["lut"]][0][0]
+                x = np.asarray(m, dtype=np.float64)
+                x = x + rng.normal(0.0, _NOISE, x.shape) if _NOISE else x
+                B[st["dst"]] = _nat(f, x, GRID)
+            elif op == "lin":
+                idx = np.asarray(st["idx"], dtype=np.int64).reshape(-1, 2)
+                a, b = B[st["a"]], B[st["b"]]
+                ta = np.where(idx[:, 0] >= 0, a[np.maximum(idx[:, 0], 0)] if a.size else 0.0, 0.0)
+                tb = np.where(idx[:, 1] >= 0, b[np.maximum(idx[:, 1], 0)] if b.size else 0.0, 0.0)
+                B[st["dst"]] = st["ca"] * ta + st["cb"] * tb + st["c"]
+            else:
+                fs, warp = self.luts[st["lut"]]
+                x = B[st["src"]][:st["rows"]]
+                x = x + rng.normal(0.0, noise * len(fs), x.shape) if noise else x
+                ys = [_nat(f, x, GRID // len(fs)) for f in fs]
+                if op == "pbs":
+                    for d, y in zip(st["dst"], ys):
+                        B[d] = y + rng.normal(0.0, _NAT_OUT, y.shape) if _NAT_OUT else y
+                else:
+                    out = ys[0] + (_RNG.normal(0.0, _OUT_NOISE, x.shape) if _OUT_NOISE else 0.0)
+        return out
+
+
+def register_prog(prog):
+    PROGS[prog.name] = prog
+    return prog.name
+
+
+def tfhe_prog(ops, x, prog, slots):
+    """Native program `prog` (`register_prog`) on the slot set `slots` (its load); the output on the set its store
+    names, zero elsewhere."""
+    if prog not in PROGS or slots not in SLOTS:
+        raise KeyError(f"tfhe_prog: program {prog!r} / slots {slots!r} not registered")
+    pr = PROGS[prog]
+    out_set = pr.steps[-1]["slots"]
+
+    def values(vec):
+        vec = np.asarray(vec)
+        n = vec.shape[0]
+        out = np.zeros(n, dtype=np.float64)
+        if n > 1:
+            idx, _ = SLOTS[slots]
+            v = pr.run(np.real(vec[idx]))
+            oi, oc = SLOTS[out_set]
+            for c in (0,) + oc:
+                out[(oi + c) % n] = v
+        return out
+    from .ops import NumpyOps
+    if isinstance(ops, NumpyOps):
+        return values(x)
+    fhe = ops.fhe
+    if getattr(ops.core, "bts", None) is not None:
+        raise NotImplementedError("tfhe_prog runs in planned sessions (Session(tfhe=...)), not on the eager device path")
+    ops.bootstrap_hint(x, _N32_CAP, True)
+    fhe.level_hint(x, _N32_CAP)
+    names, levels = [fhe.var_name(x)], [ops.level(x)]
+    from .fake import FakeCt
+    y = FakeCt(values(x.vec) / GAIN, _N32_LAND, 1, getattr(x, "packing", "cachemir"))
+    if hasattr(x, "ptag"):
+        y = type(x)(y.vec, y.meta, packing=y.packing)
+        y.ptag = x.ptag
+    fs, _ = pr.luts[pr.steps[-1]["lut"]]
+    j = np.arange(GRID)
+    rng = float(np.abs(fs[0](np.where(j < GRID // 2, 2.0 * j / GRID, 2.0 * (j - GRID) / GRID))).max())
+    fhe.record_external_bootstrap(y, names, levels, desc={"op": "tfhe", "prog": str(prog), "slots": str(slots), "gain": GAIN, "range": rng / GAIN})
+    return ops.add(y, y)
+
+
 def tfhe_lut_taylor(ops, x, name, f, df, slots):
     """f(x) on `slots` with the switch's input error corrected to first order (after Crasson, Mehats, ePrint 2026/1533):
     f(x) ~ g(m~) + f'(m~) x with g = f - f' m, both LUTs reading the same rounded m~."""
@@ -206,6 +339,8 @@ def setup_session(sess):
         sess.tfhe_lut_sign(name, lo, hi)
     for name, (s, c) in SLOTS.items():
         sess.tfhe_slots(name, [int(i) for i in s], list(c))
+    for name, pr in PROGS.items():
+        sess.tfhe_prog(name, pr.json())
 
 
 # ── common tables ─────────────────────────────────────────────────────────────────────────────────────────────────

@@ -53,12 +53,13 @@ pub struct Params {
     /// phase (`pbs::warp`); |v| <= 1 needs out_cf >= 3.
     pub out_cf: u32,
     /// The extended blind rotation's nu (`pbs::BootstrapKey::blind_rotate_ext`; 1 or 2): the mod switch to 2 nu n_br,
-    /// nu times less of its noise (the input noise's largest term) for ~2.2x the bootstrap; the keys are the same.
+    /// nu times less of its noise; the keys are the same.
     pub nu: usize,
-    /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 795) for small batches: the
-    /// blind rotation's sequential steps fall from n_lwe / pbs_group to n_lwe / lat_group (31 keys per bundle,
-    /// ~2.7x the key's memory; the latency path computes the bundles off the sequential path).
+    /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 795) for small batches: n_lwe /
+    /// lat_group sequential blind-rotation steps.
     pub lat_group: usize,
+    /// The native chains' key switch s_br -> s_lwe (`chain::ChainKey`): bootstrap outputs feed bootstraps directly.
+    pub chain: bool,
 }
 
 impl Params {
@@ -105,6 +106,7 @@ impl Params {
             out_cf: 3,
             nu: 1,
             lat_group: 0,
+            chain: false,
         })
     }
 }

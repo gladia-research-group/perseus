@@ -341,6 +341,10 @@ pub struct TfheSwitch<'a> {
     ninv: [u32; 2],
     rkey: DBuf<'a, Compute, u32>,
     ksk: Vec<DBuf<'a, Compute, u8>>,
+    /// Params::chain: the native chains' key switch (empty: none)
+    cksk: Vec<DBuf<'a, Compute, u8>>,
+    /// native_load: the bootstrap outputs go to this buffer ([b][n_br + 1]) instead of the repack
+    sink: Option<*mut c_void>,
     bsk: DBuf<'a, Compute, u32>,
     bsk_lat: Option<DBuf<'a, Compute, u32>>,
     btw: DBuf<'a, Compute, u32>,
@@ -381,7 +385,7 @@ impl<'a> TfheSwitch<'a> {
             + max * (n_sub + 1) + PLANES * ((nl + 1) * (max + 16) + 64) + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb * p.nu + 2 * nb * p.nu
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
-        let bytes8 = PLANES * (nl + 1) * k + (max + 16) * k + WS;
+        let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + (1 << 20)
     }
 
@@ -400,29 +404,14 @@ impl<'a> TfheSwitch<'a> {
         let tw_f: Vec<u32> = [t0f, t1f, t0f].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
         let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
         let rkey: Vec<u32> = sw.rs.keys().iter().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
-        // the key-switching key as K-contiguous columns W[o][i levels + t] in four balanced base-256 planes
-        let lv = p.ks.1;
-        let k = n_sub * lv;
-        let cols = nl + 1;
-        let mut w = vec![0i64; cols * k];
-        for i in 0..n_sub {
-            for t in 0..lv {
-                let key = &sw.ksk.keys[i][t];
-                for o in 0..cols {
-                    w[o * k + i * lv + t] = pc_tfhe::modq::centered(if o < nl { key.a[o] } else { key.b }, sw.p0);
-                }
-            }
-        }
-        let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
-        drop(w);
-        let mut ksk = Vec::with_capacity(PLANES);
-        for u in 0..PLANES {
-            let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
-            let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
-            b.upload(s, &bytes)?;
-            ksk.push(b);
-        }
-        drop(planes);
+        let (k, cols) = (n_sub * p.ks.1, nl + 1);
+        let ksk = Self::ksk_planes(arena, s, &sw.ksk, sw.p0)?;
+        // the native chains' key switch s_br -> s_lwe: the same GEMM shapes (n_br = N / S inputs)
+        let cksk = match &sw.chain {
+            Some(c) if nb == n_sub => Self::ksk_planes(arena, s, &c.ksk, sw.p0)?,
+            Some(_) => return Err(shape("tfhe switch", format!("native chains need n_br = N / S ({nb} vs {n_sub})"))),
+            None => Vec::new(),
+        };
         let img = pbs_image(&sw.bsk);
         let me = TfheSwitch {
             n,
@@ -442,6 +431,8 @@ impl<'a> TfheSwitch<'a> {
             ninv: [ni0 as u32, ni1 as u32],
             rkey: up32("tfhe.rkey", &rkey)?,
             ksk,
+            cksk,
+            sink: None,
             bsk: up32("tfhe.bsk", &img.bsk)?,
             bsk_lat: match &sw.bsk_lat {
                 Some(k) => Some(up32("tfhe.bsk", &pbs_image(k).bsk)?),
@@ -473,6 +464,32 @@ impl<'a> TfheSwitch<'a> {
             p,
         };
         Ok(me)
+    }
+
+    /// A key-switching key as K-contiguous columns W[o][i levels + t] in four balanced base-256 planes.
+    fn ksk_planes(arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk, p0: u64) -> Result<Vec<DBuf<'a, Compute, u8>>> {
+        let (n_in, lv, nl) = (key.keys.len(), key.gadget.levels, key.n_out);
+        let k = n_in * lv;
+        let cols = nl + 1;
+        let mut w = vec![0i64; cols * k];
+        for i in 0..n_in {
+            for t in 0..lv {
+                let kk = &key.keys[i][t];
+                for o in 0..cols {
+                    w[o * k + i * lv + t] = pc_tfhe::modq::centered(if o < nl { kk.a[o] } else { kk.b }, p0);
+                }
+            }
+        }
+        let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
+        drop(w);
+        let mut ksk = Vec::with_capacity(PLANES);
+        for u in 0..PLANES {
+            let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
+            let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
+            b.upload(s, &bytes)?;
+            ksk.push(b);
+        }
+        Ok(ksk)
     }
 
     fn go<M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, a: &TfheArgs) -> Result<()> {
@@ -615,93 +632,12 @@ impl<'a> TfheSwitch<'a> {
 
             // bootstrap
             let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nu * nb as u64 / kl as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu, 0, 0], ..pb })?;
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: tv, z: self.ms.vptr(), c: cx, ..pb })?;
-            let rot = TfheArgs {
-                op: tfhe_op::PBS_ROTATE,
-                i2: self.p.pbs_group as i32,
-                x: self.acc.vptr_mut(),
-                y: self.bsk.vptr(),
-                z: self.ms.vptr(),
-                tw: self.btw.vptr(),
-                tws: self.btw_s.vptr(),
-                m: self.pbs_m,
-                c: pbs_c,
-                ..pb
-            };
-            // the latency path (nu = 2 or two gadget levels: four-block clusters, sub-batches of up to KB_MAX_EXT LWEs,
-            // two of them still beat the batch path)
-            let one = nu == 1 && self.p.pbs.1 == 1;
-            let sub = if one { KB_MAX } else { KB_MAX_EXT };
-            let lat_max = if one { KB_MAX } else { 2 * KB_MAX_EXT };
-            // a batch beyond whole waves: the whole waves on the batch path, the remainder (up to KB_MAX) concurrently
-            // on the latency path, not a near-empty last wave
-            let (bulk, base) = match cb % self.wave {
-                r if one && cb > self.wave && r > 0 && r <= KB_MAX => (cb - r, cb - r),
-                _ if cb <= lat_max && nu * self.p.pbs.1 as u64 <= 2 => (0, 0),
-                _ => (cb, cb),
-            };
-            let cl = cb - base;   // the latency path's LWEs, from `base`
-            if cl > 0 {
-                // per window the key bundles on `side`, the rotation (on clusters) on `s` once they are in; the bundles
-                // of the next window fill the other half of `kb` meanwhile. Windows of KB_WINDOW groups when two fit
-                // the half, else half that
-                // the latency key for the small chunks (one level, nu 1): fewer, wider groups
-                let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= LAT_MAX);
-                let rot0 = rot;
-                let rot = match lat {
-                    Some(k) => TfheArgs { i2: self.p.lat_group as i32, y: k.vptr(), ..rot },
-                    None => rot,
-                };
-                let groups = nl / if lat.is_some() { self.p.lat_group } else { self.p.pbs_group };
-                let nsub = cl.div_ceil(sub);
-                let ext = self.p.nu * self.p.pbs.1;   // uint4 per bundle word
-                let half = self.max.min(KB_MAX) * KB_WINDOW * 4 * nb * ext;
-                let [e_in, kb0, kb1, r0, r1, e_out] = &self.ev;
-                let (ekb, erot) = ([kb0, kb1], [r0, r1]);
-                s.record(e_in)?;
-                self.side.wait(e_in)?;
-                self.rot.wait(e_in)?;
-                if bulk > 0 {
-                    Self::go(ctx, s, &TfheArgs { count: bulk as i32, ..rot0 })?;
-                }
-                let mut k = 0;
-                for j in 0..nsub {
-                    let (l0, lc) = (base + j * cl / nsub, (j + 1) * cl / nsub - j * cl / nsub);
-                    let win = if lc * KB_WINDOW * 8 * nb * ext <= half { KB_WINDOW } else { KB_WINDOW / 2 };
-                    let rk = TfheArgs {
-                        count: lc as i32,
-                        x: (self.acc.vptr_mut() as *mut u32).wrapping_add(l0 * self.p.nu * 4 * nb) as *mut c_void,
-                        z: (self.ms.vptr() as *const u32).wrapping_add(l0 * cols) as *const c_void,
-                        ..rot
-                    };
-                    for g0 in (0..groups).step_by(win) {
-                        let (gw, b) = (win.min(groups - g0), k % 2);
-                        let kb = (self.kb.vptr_mut() as *mut u32).wrapping_add(b * half) as *mut c_void;
-                        if k >= 2 {
-                            self.side.wait(erot[b])?;
-                        }
-                        Self::go(ctx, &self.side, &TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: kb, ..rk })?;
-                        self.side.record(ekb[b])?;
-                        self.rot.wait(ekb[b])?;
-                        Self::go(ctx, &self.rot, &TfheArgs { w: kb as *const c_void, i0: g0 as i32, i4: gw as i32, ..rk })?;
-                        self.rot.record(erot[b])?;
-                        k += 1;
-                    }
-                }
-                self.rot.record(e_out)?;
-                s.wait(e_out)?;
-            } else {
-                match cb % self.wave {
-                    // a remainder of up to half a wave: one LWE per block, one wave (two per block would take a whole one)
-                    r if one && cb > self.wave && r > KB_MAX && r <= self.wave / 2 => {
-                        Self::go(ctx, s, &TfheArgs { count: (cb - r) as i32, ..rot })?;
-                        let x = (self.acc.vptr_mut() as *mut u32).wrapping_add((cb - r) * 4 * nb) as *mut c_void;
-                        let z = (self.ms.vptr() as *const u32).wrapping_add((cb - r) * cols) as *const c_void;
-                        Self::go(ctx, s, &TfheArgs { count: r as i32, x, z, ..rot })?;
-                    }
-                    _ => Self::go(ctx, s, &rot)?,
-                }
+            self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
+            if let Some(dst) = self.sink {
+                let x = (dst as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[0], p0, 0, 0, 0, nu, cx[6], cx[7]], ..pb })?;
+                lap(s, &mut t, &mut tm.bootstrap)?;
+                continue;
             }
             if kl == 1 {
                 Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[0], p0, 0, 0, 0, nu, cx[6], cx[7]], ..pb })?;
@@ -724,9 +660,199 @@ impl<'a> TfheSwitch<'a> {
             }
             lap(s, &mut t, &mut tm.repack)?;
         }
-        self.finish_into(ctx, s, &pa, x)?;
+        if self.sink.is_none() {
+            self.finish_into(ctx, s, &pa, x)?;
+        }
         lap(s, &mut t, &mut tm.repack)?;
         Ok(tm)
+    }
+
+    // ── native chains (Params::chain): LWE buffers [b][n_br + 1] mod p0 under s_br, native encoding (v at phase
+    // v p0 / 4); one split in (`native_load`), one finish out (`native_store`) ──────────────────────────────────────
+
+    /// The split's coefficients `pos` (as `apply_dev`) through the LUT `tv` + `offset` into `dst` [b][n_br + 1].
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_load<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, tv: *const c_void, offset: u64, dst: *mut c_void, timed: bool) -> Result<Timings> {
+        self.sink = Some(dst);
+        let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, tv, &[offset], timed);
+        self.sink = None;
+        r
+    }
+
+    /// `dst[i] = ca src_a[ia[i]] + cb src_b[ib[i]]` mod p0 (`idx`: int32 pairs [b][2] on the device, -1: no term;
+    /// ca, cb < p0): the chains' differences and running sums.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_lin<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, dst: *mut c_void, src_a: *const c_void, src_b: *const c_void, idx: *const c_void, b: usize, ca: u64, cb: u64) -> Result<()> {
+        self.native_lin_c(ctx, s, dst, src_a, src_b, idx, b, ca, cb, 0)
+    }
+
+    /// `native_lin` + the constant `c` (< p0) on every output's b (a native value v is round(v p0 / 4)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_lin_c<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, dst: *mut c_void, src_a: *const c_void, src_b: *const c_void, idx: *const c_void, b: usize, ca: u64, cb: u64, c: u64) -> Result<()> {
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::LWE_LIN, count: b as i32, i1: self.nb as i32, x: dst, y: src_a, z: src_b, w: idx, q: self.p0, c: [ca, cb, c, 0, 0, 0, 0, 0], ..Default::default() })
+    }
+
+    /// p0 (the native LWEs' modulus).
+    pub fn p0(&self) -> u64 {
+        self.p0
+    }
+
+    /// n_br (native LWE dimension).
+    pub fn n_br(&self) -> usize {
+        self.nb
+    }
+
+    /// The bootstrap of native LWEs `src` [b][n_br + 1] (key switch s_br -> s_lwe, then as `apply_dev_k`): LUT j of
+    /// the `offsets.len()` interleaved ones into `dsts[j]` [b][n_br + 1].
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_pbs<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, tv: *const c_void, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
+        let (nb, nl, p0, qb) = (self.nb, self.nl, self.p0, self.p.q_br);
+        let kl = offsets.len();
+        if self.cksk.is_empty() || b == 0 || kl == 0 || dsts.len() != kl || (2 * nb * self.p.nu) % kl != 0 {
+            return Err(shape("tfhe native", format!("{b} LWEs, {kl} LUTs / {} outputs (needs Params::chain)", dsts.len())));
+        }
+        let (ks_lv, cols, nu) = (self.p.ks.1, nl + 1, self.p.nu as u64);
+        let mut cx = [0u64; 8];
+        cx[5] = nu;
+        cx[6] = self.pbs_c[6];
+        cx[7] = self.pbs_c[7];
+        let mut pbs_c = self.pbs_c;
+        pbs_c[5] = nu;
+        for c0 in (0..b).step_by(self.max) {
+            let cb = self.max.min(b - c0);
+            let sc = (src as *const u32).wrapping_add(c0 * (nb + 1)) as *const c_void;
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: nb as i32, x: self.kdig.vptr_mut(), y: sc, q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+            self.prepare(lt_, cb)?;
+            let mp = cb.next_multiple_of(16);
+            let gemm = &self.gemms[&mp];
+            let ps = (cols * mp).next_multiple_of(64);
+            let gp_ = self.g.dptr_mut();
+            for u in 0..PLANES {
+                // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
+                unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.cksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
+            }
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: nb as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: sc, q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
+            self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
+            let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
+            for (j, (&off, &d)) in offsets.iter().zip(dsts).enumerate() {
+                let x = (d as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [off, p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Native LWEs `src` [b][n_br + 1] (their phase read as the LUT outputs the finish expects: `pbs::warp`ed) into
+    /// the split's coefficients `pos` [reps][b] of `x` (zeros elsewhere), as `apply_dev` leaves it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_store<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, pos: *const c_void, b: usize, reps: usize, x: &mut Ct<'_, W>) -> Result<()> {
+        let (n, nb, p0, p1) = (self.n, self.nb, self.p0, self.p1);
+        let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [self.ninv[0], self.ninv[1], self.ninv[0], 0, 0, 0, 0, 0], ..Default::default() };
+        for c0 in (0..b).step_by(self.max) {
+            let cb = self.max.min(b - c0);
+            self.repack.prepare(lt_, cb)?;
+            let sc = (src as *const u32).wrapping_add(c0 * (nb + 1)) as *const c_void;
+            let pc = (pos as *const u32).wrapping_add(c0) as *const c_void;
+            self.repack.accumulate(ctx.table, s, lt_, sc, pc, cb, c0 == 0, reps, b)?;
+        }
+        self.finish_into(ctx, s, &pa, x)
+    }
+
+    /// The bootstrap of `cb` LWEs in `lwe` (dimension n_lwe, mod p0): mod switch, init on `tv`, the blind rotation
+    /// (batch path, latency path or both) into `acc`.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, cb: usize, tv: *const c_void, kl: usize, cx: &[u64; 8], pbs_c: [u64; 8]) -> Result<()> {
+        let (nb, nl, p0, qb, nu) = (self.nb, self.nl, self.p0, self.p.q_br, self.p.nu as u64);
+        let cols = nl + 1;
+        let cx = *cx;
+        let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nu * nb as u64 / kl as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu, 0, 0], ..pb })?;
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: tv, z: self.ms.vptr(), c: cx, ..pb })?;
+        let rot = TfheArgs {
+            op: tfhe_op::PBS_ROTATE,
+            i2: self.p.pbs_group as i32,
+            x: self.acc.vptr_mut(),
+            y: self.bsk.vptr(),
+            z: self.ms.vptr(),
+            tw: self.btw.vptr(),
+            tws: self.btw_s.vptr(),
+            m: self.pbs_m,
+            c: pbs_c,
+            ..pb
+        };
+        // the latency path (nu = 2 or two gadget levels: four-block clusters, up to two sub-batches of KB_MAX_EXT LWEs)
+        let one = nu == 1 && self.p.pbs.1 == 1;
+        let sub = if one { KB_MAX } else { KB_MAX_EXT };
+        let lat_max = if one { KB_MAX } else { 2 * KB_MAX_EXT };
+        // a batch beyond whole waves: the whole waves on the batch path, the remainder (up to KB_MAX) concurrently
+        // on the latency path, not a near-empty last wave
+        let (bulk, base) = match cb % self.wave {
+            r if one && cb > self.wave && r > 0 && r <= KB_MAX => (cb - r, cb - r),
+            _ if cb <= lat_max && nu * self.p.pbs.1 as u64 <= 2 => (0, 0),
+            _ => (cb, cb),
+        };
+        let cl = cb - base;   // the latency path's LWEs, from `base`
+        if cl > 0 {
+            // per window the key bundles on `side`, the rotation on `s` once they are in, the next window's bundles
+            // filling the other half of `kb` meanwhile
+            // the latency key for the small chunks (one level, nu 1): fewer, wider groups
+            let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= LAT_MAX);
+            let rot0 = rot;
+            let rot = match lat {
+                Some(k) => TfheArgs { i2: self.p.lat_group as i32, y: k.vptr(), ..rot },
+                None => rot,
+            };
+            let groups = nl / if lat.is_some() { self.p.lat_group } else { self.p.pbs_group };
+            let nsub = cl.div_ceil(sub);
+            let ext = self.p.nu * self.p.pbs.1;   // uint4 per bundle word
+            let half = self.max.min(KB_MAX) * KB_WINDOW * 4 * nb * ext;
+            let [e_in, kb0, kb1, r0, r1, e_out] = &self.ev;
+            let (ekb, erot) = ([kb0, kb1], [r0, r1]);
+            s.record(e_in)?;
+            self.side.wait(e_in)?;
+            self.rot.wait(e_in)?;
+            if bulk > 0 {
+                Self::go(ctx, s, &TfheArgs { count: bulk as i32, ..rot0 })?;
+            }
+            let mut k = 0;
+            for j in 0..nsub {
+                let (l0, lc) = (base + j * cl / nsub, (j + 1) * cl / nsub - j * cl / nsub);
+                let win = if lc * KB_WINDOW * 8 * nb * ext <= half { KB_WINDOW } else { KB_WINDOW / 2 };
+                let rk = TfheArgs {
+                    count: lc as i32,
+                    x: (self.acc.vptr_mut() as *mut u32).wrapping_add(l0 * self.p.nu * 4 * nb) as *mut c_void,
+                    z: (self.ms.vptr() as *const u32).wrapping_add(l0 * cols) as *const c_void,
+                    ..rot
+                };
+                for g0 in (0..groups).step_by(win) {
+                    let (gw, b) = (win.min(groups - g0), k % 2);
+                    let kb = (self.kb.vptr_mut() as *mut u32).wrapping_add(b * half) as *mut c_void;
+                    if k >= 2 {
+                        self.side.wait(erot[b])?;
+                    }
+                    Self::go(ctx, &self.side, &TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: kb, ..rk })?;
+                    self.side.record(ekb[b])?;
+                    self.rot.wait(ekb[b])?;
+                    Self::go(ctx, &self.rot, &TfheArgs { w: kb as *const c_void, i0: g0 as i32, i4: gw as i32, ..rk })?;
+                    self.rot.record(erot[b])?;
+                    k += 1;
+                }
+            }
+            self.rot.record(e_out)?;
+            s.wait(e_out)?;
+        } else {
+            match cb % self.wave {
+                // a remainder of up to half a wave: one LWE per block, one wave (two per block would take a whole one)
+                r if one && cb > self.wave && r > KB_MAX && r <= self.wave / 2 => {
+                    Self::go(ctx, s, &TfheArgs { count: (cb - r) as i32, ..rot })?;
+                    let x = (self.acc.vptr_mut() as *mut u32).wrapping_add((cb - r) * 4 * nb) as *mut c_void;
+                    let z = (self.ms.vptr() as *const u32).wrapping_add((cb - r) * cols) as *const c_void;
+                    Self::go(ctx, s, &TfheArgs { count: r as i32, x, z, ..rot })?;
+                }
+                _ => Self::go(ctx, s, &rot)?,
+            }
+        }
+        Ok(())
     }
 
     /// The repack's packed sum into [part][limb][n] mod p0 p1, lifted x p2 p3 into the staging, scattered into `x`

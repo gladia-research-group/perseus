@@ -19,6 +19,7 @@
 //! decryptions of its outputs; decrypted results must not go back to the party holding the ciphertexts.
 //!
 //! Phase convention everywhere: b + <a, s> (LWE), c0 + c1 s (RLWE).
+pub mod chain;
 pub mod gadget;
 pub mod lwe;
 pub mod modq;

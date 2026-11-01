@@ -118,6 +118,9 @@ fn run(args: &[String]) -> Res<bool> {
     if device {
         mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &switch_params(args, n)?, chunk.unwrap_or(n_switch)));
         mp.reserve("check.tfhe", 4 * (n_switch + 2 * 4096) + 512);
+        if args.iter().any(|a| a == "--native-max") {
+            mp.reserve("check.native", 4 * (3 * n_switch * (2048 + 1) + 2 * n_switch + 3 * 2 * 4096) + 1024);
+        }
     }
     let arena = mp.allocate(&dev)?;
     let mut ex = Executor::<W>::new(&dev, &arena, &mp)?;
@@ -154,6 +157,10 @@ fn run(args: &[String]) -> Res<bool> {
     let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, &ex.compute, &sw, chunk.unwrap_or(n_switch))?) } else { None };
     let mut d_pos = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", n_switch)?;
     let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", 2 * sw.params.tv_len())?;
+    let native = args.iter().any(|a| a == "--native-max");
+    let nbuf = |k: usize| arena.alloc::<pc_cuda::Compute, u32>("check.native", if native { k } else { 0 });
+    let row = sw.params.n_br + 1;
+    let mut nat = (nbuf(n_switch * row)?, nbuf(n_switch * row)?, nbuf(n_switch * row)?, nbuf(2 * n_switch)?, nbuf(3 * 2 * sw.params.tv_len())?);
     arena.freeze();
     let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
     let enc = Encoder::new(&chain);
@@ -277,7 +284,62 @@ fn run(args: &[String]) -> Res<bool> {
         let pos: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
         let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &tv);
         // a warm-up call on scratch (x: any content at the split's level) builds the GEMM plan; then the timed one
-        let tm = if chunk.is_some() {
+        let tm = if native {
+            // values / 2 into native LWEs, rounds d = x[2k + 1] - x[2k], x'[k] = x[2k] + relu(d) (compacted,
+            // ping-pong), the max warped for the finish (x 2) into the first coefficient
+            let q = sw.params.q_br;
+            let tl = sw.params.tv_len();
+            let tvs: Vec<u32> = [
+                pc_tfhe::chain::native_tv(tl, q, |m| m / 2.0),
+                pc_tfhe::chain::native_tv(tl, q, |m| m.max(0.0)),
+                pc_tfhe::pbs::test_vector(tl, q, |m| sw.lut_value(2.0 * m)),
+            ]
+            .iter()
+            .flat_map(|t| pc_gpu::tfhe::tv_residues(&sw.bsk, t))
+            .collect();
+            let (a_, b_, d_, ix, tvb) = &mut nat;
+            tvb.upload(&cx.ex.compute, &tvs)?;
+            d_pos.upload(&cx.ex.compute, &pos)?;
+            let tvp = |k: usize| (tvb.vptr() as *const u32).wrapping_add(k * 2 * tl) as *const std::ffi::c_void;
+            // warm-up (the GEMM plans), then the timed run
+            let mut ms = 0.0;
+            for rep in 0..2 {
+                cx.ex.compute.sync()?;
+                let t0 = Instant::now();
+                ts.native_load(&ctx, &cx.ex.compute, &blt.inner, &mut y, d_pos.vptr(), pos.len(), tvp(0), 0, a_.vptr_mut(), false)?;
+                let (mut src, mut dst) = (a_.vptr_mut(), b_.vptr_mut());
+                let mut cnt = pos.len();
+                let p0 = sw.p0;
+                while cnt > 1 {
+                    let pairs = cnt / 2;
+                    let idx: Vec<i32> = (0..pairs).flat_map(|k| [2 * k as i32 + 1, 2 * k as i32]).collect();
+                    ix.upload_at(&cx.ex.compute, 0, bytemuck_i32(&idx))?;
+                    ts.native_lin(&ctx, &cx.ex.compute, d_.vptr_mut(), src, src, ix.vptr(), pairs, 1, p0 - 1)?;
+                    ts.native_pbs(&ctx, &cx.ex.compute, &blt.inner, d_.vptr(), pairs, tvp(1), &[0], &[d_.vptr_mut()])?;
+                    let nx = cnt.div_ceil(2);
+                    let idx: Vec<i32> = (0..nx).flat_map(|k| [2 * k as i32, if k < pairs { k as i32 } else { -1 }]).collect();
+                    ix.upload_at(&cx.ex.compute, 0, bytemuck_i32(&idx))?;
+                    ts.native_lin(&ctx, &cx.ex.compute, dst, src, d_.vptr(), ix.vptr(), nx, 1, 1)?;
+                    std::mem::swap(&mut src, &mut dst);
+                    cnt = nx;
+                }
+                ts.native_pbs(&ctx, &cx.ex.compute, &blt.inner, src, 1, tvp(2), &[0], &[dst])?;
+                if rep == 1 {
+                    ts.native_store(&ctx, &cx.ex.compute, &blt.inner, dst, d_pos.vptr(), 1, 1, &mut y)?;
+                } else {
+                    // the warm-up's input is gone with the load: a fresh split for the timed run
+                    cx.ex.compute.sync()?;
+                    encr.encrypt_sk(&ctx, &cx.ex.compute, &sec, &[enc.encode_slots(&vals, slots, top, Payload::Complex, sf_)?], meta, &mut y, &mut prng)?;
+                    let mut i3 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
+                    i3.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
+                    continue;
+                }
+                cx.ex.compute.sync()?;
+                ms = t0.elapsed().as_secs_f64() * 1e3;
+            }
+            println!("[pc-check] tfhe: native max of {n_switch}: {} rounds, TFHE {ms:.2} ms (load + rounds + warp + repack; no CKKS between)", (n_switch as f64).log2().ceil());
+            pc_gpu::tfhe::Timings::default()
+        } else if chunk.is_some() {
             d_pos.upload(&cx.ex.compute, &pos)?;
             d_tv.upload(&cx.ex.compute, &tvr)?;
             ts.apply_dev(&ctx, &cx.ex.compute, &blt.inner, &mut x, d_pos.vptr(), pos.len(), 1, d_tv.vptr(), off, true)?;
@@ -290,10 +352,19 @@ fn run(args: &[String]) -> Res<bool> {
         let t_fin = Instant::now();
         let mut fin2 = inp2.finish_call(0)?;
         fin2.at_split(&cx, std::slice::from_ref(&y))?;
-        fin2.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;
+        // --finish-steps: each finish phase timed (synchronous)
+        let mut steps = String::new();
+        while fin2.phase() != Phase::Done {
+            let t = Instant::now();
+            let ph = fin2.step(&mut cx, std::slice::from_mut(&mut y))?;
+            if args.iter().any(|a| a == "--finish-steps") {
+                cx.ex.compute.sync()?;
+                steps += &format!(" {ph:?} {:.2}", t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
         cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
         cx.ex.compute.sync()?;
-        println!("[pc-check] tfhe: CKKS sides: StC-first split {t_split:.2} ms, finish {:.2} ms (first calls)", t_fin.elapsed().as_secs_f64() * 1e3);
+        println!("[pc-check] tfhe: CKKS sides: StC-first split {t_split:.2} ms, finish {:.2} ms (first calls){steps}", t_fin.elapsed().as_secs_f64() * 1e3);
         let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
         let (mut bad, mut worst) = (0, 0f64);
         let (mut ss, mut ns) = (0f64, 0usize);
@@ -310,6 +381,15 @@ fn run(args: &[String]) -> Res<bool> {
                 ss += (got[0][i].re * gain - want).powi(2);
                 ns += 1;
             }
+        }
+        if native {
+            let gain = (1u64 << (out_cf - cf)) as f64;
+            let want = chosen.iter().map(|&i| vals[i].re).fold(f64::MIN, f64::max);
+            let rest = (0..slots).filter(|&i| i != chosen[0]).map(|i| got[0][i].re.abs() * gain).fold(0f64, f64::max);
+            println!("[pc-check] tfhe: native max: got {:.4} want {want:.4} (err {:.2e}); other slots max |v| {rest:.2e}", got[0][chosen[0]].re * gain, got[0][chosen[0]].re * gain - want);
+            t.add("tfhe: native max (err < 3e-2)", ((got[0][chosen[0]].re * gain - want).abs() > 3e-2) as usize, 1);
+            println!("[pc-check] tfhe: {} gates, {} failing", t.gates, t.bad);
+            return Ok(t.bad == 0);
         }
         println!("[pc-check] tfhe: device switched slots: rms error {:.3e} over {ns} (the LUT's input noise when --identity)", (ss / ns.max(1) as f64).sqrt());
         println!("[pc-check] tfhe: device switch of {n_switch} coefficients: max err {worst:.3e}; ms to LWE {:.2}, key switch {:.2}, bootstrap {:.2}, repack {:.2}", tm.to_lwe, tm.key_switch, tm.bootstrap, tm.repack);
@@ -851,6 +931,8 @@ fn switch_params(args: &[String], n: usize) -> Res<Params> {
         p.pbs = g;
     }
     p.lat_group = arg(args, "--lat-group").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    // --native-max: the tournament max in TFHE (the native chains' key switch)
+    p.chain = args.iter().any(|a| a == "--native-max");
     if let Some(v) = arg(args, "--rs-gadget") {
         let (b, l) = v.split_once(',').ok_or("--rs-gadget b,l")?;
         p.rs = (b.parse()?, l.parse()?);
@@ -867,4 +949,10 @@ fn pbs_gadget(args: &[String]) -> Res<Option<(u32, usize)>> {
     let Some(v) = arg(args, "--pbs-gadget") else { return Ok(None) };
     let (b, l) = v.split_once(',').ok_or("--pbs-gadget b,l")?;
     Ok(Some((b.parse()?, l.parse()?)))
+}
+
+/// i32 words as the u32 a device index buffer holds.
+fn bytemuck_i32(v: &[i32]) -> &[u32] {
+    // SAFETY: i32 and u32 share size and alignment
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u32, v.len()) }
 }

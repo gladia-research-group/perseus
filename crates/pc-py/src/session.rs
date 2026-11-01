@@ -1679,6 +1679,13 @@ impl PySession {
         let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
         nogil(py, || tf.lut_multi(&ex.compute, name, &values))
     }
+    /// Register TFHE native program `name` (JSON: pc-py tfhe.rs `TfheRt::prog`; needs PC_TFHE_NATIVE=bufs,rows).
+    fn tfhe_prog(&self, py: Python<'_>, name: &str, json: &str) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let State { planned, ex, .. } = &mut *st;
+        let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        nogil(py, || tf.prog(&ex.compute, name, json))
+    }
     /// Register TFHE sign LUT `name`: `lo` for m < 0, `hi` for m >= 0, inputs m in (-2, 2) (pc-py tfhe.rs `lut_sign`).
     fn tfhe_lut_sign(&self, py: Python<'_>, name: &str, lo: f64, hi: f64) -> PyResult<()> {
         let mut st = self.dev.st.borrow_mut();

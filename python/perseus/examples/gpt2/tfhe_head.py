@@ -12,7 +12,8 @@ same inputs (the baseline).
 slots, column cutmax_tile_col_of_slot(m) of tile k at slot m). A plan's PLAN_CMD.txt carries what the run repeats
 (`runtime=`, `twin=`, `sign=`, `env=`, the head's shape). The plans, all on the gpt2_decode recipe and runtime line:
 gpt2_tfhe_{argmax,topk}_ship (TFHE signs), gpt2_tfhe_argmax_ship_hyb512 / gpt2_tfhe_topk_ship_hyb512L1k (the big
-early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_cutmax_ship (CutMax).
+early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_topk_native (top-k's maximum, threshold search and mask as
+native TFHE programs: impl/tfhe_select.py `_topk_native`), gpt2_tfhe_cutmax_ship (CutMax).
 """
 from __future__ import annotations
 
@@ -92,7 +93,7 @@ class Head:
             return sel.argmax(ops, xs[:2], self.valid, R=self.R, fine=self.fine)
         oh, mask = sel.topk_sample(ops, xs[:2], self.valid, self.g, k=self.k, L=self.L, W=self.W, probes=self.probes,
                                    R=self.R, fine=self.fine)
-        return oh + [mask]
+        return oh + [mask] + (list(sel.DEBUG) if os.environ.get("PF_SELECT_DEBUG") else [])
 
     def stages(self):
         return [("select", self.stage)]
@@ -327,6 +328,8 @@ def planned(a, L):
         st = run.sess.tfhe_stats() if run.tfhe_chunk else {}
         print(f"[tfhe_head] wall {walls[-1]:.3f}s; switch calls {st.get('calls')} values {st.get('values')} (cumulative)",
               flush=True)
+    if os.environ.get("PF_HEAD_DUMP"):
+        np.save(os.environ["PF_HEAD_DUMP"], np.array([[np.real(v) for v in o] for o in outs]))
     _report(a, h, L, outs, walls)
     run.close()
 

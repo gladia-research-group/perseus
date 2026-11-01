@@ -771,6 +771,9 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                bundles A, B of PBS_KEYBUNDLE on four-block clusters up to 46 LWEs)
 //   KS_DIGITS    y = u32 LWEs [count][i1 + 1] mod q -> x = int8 [count][i1 levels]: the balanced digits (base 2^c[0],
 //                c[1] levels, approximate, m = floor(2^(64 + levels base) / q)) of a_i at i levels + t
+//   LWE_LIN      x = u32 LWEs [count][i1 + 1] mod q: c[0] y[w[2 k]] + c[1] z[w[2 k + 1]] (w = int32 index pairs, -1:
+//                the term is 0; y, z [..][i1 + 1]; c[0], c[1] < q), + c[2] on b: the native chains' differences, sums and
+//                constants
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
 //                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
 // The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
@@ -807,6 +810,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_REPACK_FIN 17
 #define PC_TFHE_PBS_KEYBUNDLE 18
 #define PC_TFHE_REPACK_COMB 19
+#define PC_TFHE_LWE_LIN 20
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;
