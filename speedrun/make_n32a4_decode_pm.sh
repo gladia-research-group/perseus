@@ -7,16 +7,47 @@
 # Same maths (the mask is applied after the refresh instead of before), not the same rounding.
 # Each edited block is re-run kept-exact (PLAN_KEEP_PLACEMENTS_EXACT: the planner's sim checks the edit, sets the new
 # site's CF, and the raise-drop search runs once more with the new site preset at drop 2: PLAN_RAISE_PRESET).
-#   bash speedrun/make_n32a4_decode_pm.sh [PLAN [OUT]]   -> bootstrap_placements/OUT (PLAN with blocks 2, 9, 11 edited)
+#   bash speedrun/make_n32a4_decode_pm.sh [PLAN [OUT]]   -> bootstrap_placements/OUT (PLAN with those blocks edited:
+#   2, 9 and 11 on gpt2_decode_python_n32a4_kc16r_cmfl and _lh)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/local_env.sh
 export CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1
-PLAN=${1:-gpt2_decode_python_n32a4_kc16r_cmfl} OUT=${2:-${PLAN}_pm}
+PLAN=${1:-gpt2_decode_python_n32a4_kc16r_lh} OUT=${2:-${PLAN}_pm}
 GR=$(sed -n 's/^graph=\([^ ]*\).*/\1/p' "bootstrap_placements/$PLAN/PLAN_CMD.txt")
 RECIPE="$(sed -n 's/^recipe=//p' "bootstrap_placements/$PLAN/PLAN_CMD.txt")"
-# block: (the GELU's Chebyshev sum = the lane mask's input, the down projection's hint the plan fires)
-SITES="2:v_1118:v_1120 9:v_919:v_921 11:v_1180:v_1182"
+# the sites: every fired hint on the GELU's masked output (the lane mask x xmax product) whose input passes the
+# StC-first entry (PLAN_STC_FIRST_ENTRY, effective level: + a unit for a pending rescale) -> block:sum:hint
+ENTRY=$(echo "$RECIPE" | tr ' ' '\n' | sed -n 's/^PLAN_STC_FIRST_ENTRY=//p' | tail -1)
+SITES=$("$PYTHON" - "bootstrap_placements/$PLAN" "$GR" "${ENTRY:-46}" <<'PY'
+import json, sys
+d, gr, entry = sys.argv[1], sys.argv[2], float(sys.argv[3])
+out = []
+for b in range(12):
+    p = json.load(open(f"{d}/block_{b}_placement.json"))
+    g = {n["output"]: n for n in json.load(open(f"{gr}/block_{b}/graph.json"))["nodes"]}
+    lv, dg, unit = p["summary"]["final_named_levels"], p["summary"]["final_named_degs"], 2
+    for h in p["hint_fire"]:
+        n = g.get(h)
+        if not n or n["op_type"] != "hint":
+            continue
+        m = g.get(n["inputs"][0].removesuffix("_auto_bootstrapped"))
+        if not (m and m["op_type"] == "mult" and m.get("args", {}).get("pt", {}).get("name", "").startswith("mask.gelu")):
+            continue
+        eff = lv[m["output"]] + (unit if dg.get(m["output"]) == 2 else 0)
+        if eff > entry:
+            out.append(f"{b}:{m['inputs'][0]}:{h}")
+if any(e.startswith("0:") for e in out):
+    sys.exit("block 0 has a site: its feedback variant would need the same edit")
+print(" ".join(out))
+PY
+)
+echo "sites (block:refreshed sum:hint no longer fired): $SITES"
+# a block whose K/V push the runtime raises (KV_PUSH_RAISE) was planned on a capture copy with that landing: not here
+KVR=$(sed -n 's/^runtime=.*KV_PUSH_RAISE=\([^ ]*\).*/\1/p' "bootstrap_placements/$PLAN/PLAN_CMD.txt")
+for e in $SITES; do
+    case ",$KVR," in *",${e%%:*}:"*) echo "block ${e%%:*}: its K/V push is raised (KV_PUSH_RAISE=$KVR)" >&2; exit 1;; esac
+done
 EDIT=_pm_edit_$OUT
 rm -rf "bootstrap_placements/$OUT" "bootstrap_placements/$EDIT"
 cp -r "bootstrap_placements/$PLAN" "bootstrap_placements/$OUT"
@@ -67,5 +98,5 @@ PY
     rm -rf "bootstrap_placements/${EDIT}_b$b"
 done
 rm -rf "bootstrap_placements/$EDIT"
-echo "pm=blocks 2, 9, 11 by speedrun/make_n32a4_decode_pm.sh: the down projection's hint refresh moved before the GELU's \
-lane mask (StC-first at raise drop 2 instead of the shipped order; PLAN_RAISE_PRESET)" >> "bootstrap_placements/$OUT/PLAN_CMD.txt"
+echo "pm=$SITES (block:site:hint) by speedrun/make_n32a4_decode_pm.sh: the down projection's hint refresh moved before \
+the GELU's lane mask (StC-first at raise drop 2 instead of the shipped order; PLAN_RAISE_PRESET)" >> "bootstrap_placements/$OUT/PLAN_CMD.txt"
