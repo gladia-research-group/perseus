@@ -524,6 +524,8 @@ pub fn compile_block(
     // PC_BTS_PAIR: sibling real refreshes in pairs, where the inputs enter StC-first
     // (CFs up to the route's reference CF less one: 19, or 12 on a lean chain)
     let cf_max = if chain_of(cfg)?.lone_top().is_some() { crate::program::PAIR_CF_MAX_LEAN } else { crate::program::PAIR_CF_MAX };
+    // bts.pair_cf_max: pairs above the reference CF (pc-gpu runs their last stage at the larger CF + 1)
+    let cf_max = cfg.bts.pair_cf_max.map_or(cf_max, |v| v as u32);
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default, window: cfg.bts.pair_window.unwrap_or(0) as u32, loose: cfg.bts.pair_loose.unwrap_or(false) });
     if crate::program::lever_on("rr") {
