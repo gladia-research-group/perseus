@@ -576,7 +576,6 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, ps: Option
     level_specs_with(chain, lay, top, k_max, digs, specials)
 }
 
-/// `level_specs` over a given digit partition of rows 0..=top and special set (prime ids; may include Q ids above top).
 /// The top limb of an alternating user region's top level (the level above its top single-prime level); None without
 /// one.
 fn sp_user_top(chain: &Chain) -> Option<usize> {
@@ -591,6 +590,7 @@ fn sp_user_top(chain: &Chain) -> Option<usize> {
     None
 }
 
+/// `level_specs` over a given digit partition of rows 0..=top and special set (prime ids; may include Q ids above top).
 fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs: Vec<Vec<usize>>, specials: Vec<usize>) -> LevelSpecs {
     let rows = lay.rows();
     let dnum = chain.dnum();
