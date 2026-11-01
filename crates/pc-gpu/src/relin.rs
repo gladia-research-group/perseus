@@ -172,31 +172,43 @@ impl<'a, W: DevWord> Scalars<'a, W> {
 
 /// The relinearization ModDown fused with the rescale after it at one top (EvalMod's `RelinRescale`, for the
 /// program's `Mult [x2]; Rescale`): the extended product is `V = P c + dot` (c the tensor, doubled on x2; dot the key
-/// inner product), the result round(V / (P q_a q_b)) = `c (q_a q_b)^-1 + (dot - conv) (P q_a q_b)^-1` on rows
-/// 0..top-2, conv the exact centred conversion of V from P and the two tops: one rounding, one NTT of the remaining
-/// rows instead of the ModDown's and the rescale's.
+/// inner product), the result round(V / (P q_D)) = `c q_D^-1 + (dot - conv) (P q_D)^-1` on rows 0..=top-g, q_D the
+/// product of the g dropped tops (two on a composite level, one on an alternating user region's single-prime level),
+/// conv the exact centred conversion of V from P and the dropped tops: one rounding, one NTT of the remaining rows
+/// instead of the ModDown's and the rescale's.
 struct RrTop<'a, W: DevWord> {
-    /// dot rows: top - 1, top, then the special rows
+    /// primes dropped (1 or 2)
+    g: usize,
+    /// dot rows: the dropped tops (top - g + 1..=top), then the special rows
     rows: pc_cuda::ConstBuf<'a, u32>,
-    /// rows 0..=top-2
+    /// rows 0..=top-g
     qrows: pc_cuda::ConstBuf<'a, u32>,
     md: crate::bts::cts::MdPlan<'a>,
     alpha: Scalars<'a, W>,
     beta: Scalars<'a, W>,
-    /// `P c + dot` on the two tops: P mod q_(top-1), P mod q_top, 1, 1
+    /// `P c + dot` on the dropped tops: P mod q_t of each, then 1 each
     wtop: Scalars<'a, W>,
 }
 
-/// `RrTop` tables for every composite top the full special set serves (built once at setup).
+/// `RrTop` tables for every composite top the full special set serves, and on an alternating user region's chain
+/// every single-prime top (built once at setup).
 pub struct RelinRescaler<'a, W: DevWord> {
     tops: std::collections::BTreeMap<usize, RrTop<'a, W>>,
     k_max: usize,
 }
 
 impl<'a, W: DevWord> RelinRescaler<'a, W> {
-    fn tops(chain: &pc_core::params::Chain) -> Vec<usize> {
+    /// The served tops and the primes their rescale drops.
+    fn tops(chain: &pc_core::params::Chain) -> Vec<(usize, usize)> {
         let nq = chain.q.len();
-        (3..nq).filter(|&t| chain.drop_at(t) == Some(2) && chain.drop_at(t - 2).is_some()).collect()
+        let singles = chain.spec.sp.is_some();
+        (3..nq)
+            .filter_map(|t| match chain.drop_at(t) {
+                Some(2) if chain.drop_at(t - 2).is_some() => Some((t, 2)),
+                Some(1) if singles && chain.drop_at(t - 1).is_some() => Some((t, 1)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Device bytes of the tables (`MemPlan` section "relin.rr").
@@ -204,10 +216,10 @@ impl<'a, W: DevWord> RelinRescaler<'a, W> {
         let primes = chain.primes();
         let nq = lay.nq;
         let mut b = 0;
-        for top in Self::tops(chain) {
-            b += pc_cuda::Arena::bytes_for::<u32>(2 + lay.kp) + pc_cuda::Arena::bytes_for::<u32>(top - 1);
-            b += crate::bts::cts::md_plan_bytes::<W>(&primes, k_max, 2, lay.kp + 2, top - 1, true)?;
-            b += 2 * Scalars::<W>::bytes(nq) + Scalars::<W>::bytes(4);
+        for (top, g) in Self::tops(chain) {
+            b += pc_cuda::Arena::bytes_for::<u32>(g + lay.kp) + pc_cuda::Arena::bytes_for::<u32>(top + 1 - g);
+            b += crate::bts::cts::md_plan_bytes::<W>(&primes, k_max, 2, lay.kp + g, top + 1 - g, true)?;
+            b += 2 * Scalars::<W>::bytes(nq) + Scalars::<W>::bytes(2 * g);
         }
         Ok(b)
     }
@@ -220,23 +232,27 @@ impl<'a, W: DevWord> RelinRescaler<'a, W> {
         let pmod: Vec<u64> = (0..nq).map(|i| ctx.chain.p.iter().fold(1u64, |a, &x| mulmod(a, x % primes[i], primes[i]))).collect();
         let specials: Vec<usize> = (nq..lay.rows()).collect();
         let mut tops = std::collections::BTreeMap::new();
-        for top in Self::tops(&ctx.chain) {
+        for (top, g) in Self::tops(&ctx.chain) {
+            let dropped: Vec<usize> = (top + 1 - g..=top).collect();
             let mut src = specials.clone();
-            src.extend([top - 1, top]);
-            let r: Vec<u32> = [top - 1, top].into_iter().chain(specials.iter().copied()).map(|t| t as u32).collect();
-            let qr: Vec<u32> = (0..=(top - 2) as u32).collect();
-            let qab = |i: usize| mulmod(primes[top] % primes[i], primes[top - 1] % primes[i], primes[i]);
-            let al: Vec<u64> = (0..nq).map(|i| if i + 2 <= top { invmod(qab(i), primes[i]) } else { 0 }).collect();
-            let be: Vec<u64> = (0..nq).map(|i| if i + 2 <= top { invmod(mulmod(qab(i), pmod[i], primes[i]), primes[i]) } else { 0 }).collect();
+            src.extend(&dropped);
+            let r: Vec<u32> = dropped.iter().chain(&specials).map(|&t| t as u32).collect();
+            let qr: Vec<u32> = (0..=(top - g) as u32).collect();
+            let qd = |i: usize| dropped.iter().fold(1u64, |a, &t| mulmod(a, primes[t] % primes[i], primes[i]));
+            let al: Vec<u64> = (0..nq).map(|i| if i + g <= top { invmod(qd(i), primes[i]) } else { 0 }).collect();
+            let be: Vec<u64> = (0..nq).map(|i| if i + g <= top { invmod(mulmod(qd(i), pmod[i], primes[i]), primes[i]) } else { 0 }).collect();
+            let wp: Vec<u64> = dropped.iter().map(|&t| primes[t]).collect();
+            let wv: Vec<u64> = dropped.iter().map(|&t| pmod[t]).chain(std::iter::repeat_n(1, g)).collect();
             tops.insert(
                 top,
                 RrTop {
+                    g,
                     rows: pc_cuda::ConstBuf::new(arena, "relin.rr", s, &r)?,
                     qrows: pc_cuda::ConstBuf::new(arena, "relin.rr", s, &qr)?,
-                    md: crate::bts::cts::md_plan::<_, W>(arena, s, &lay, &primes, &(0..k_max).collect::<Vec<_>>(), &[0, 1], &src, top - 1, true)?,
+                    md: crate::bts::cts::md_plan::<_, W>(arena, s, &lay, &primes, &(0..k_max).collect::<Vec<_>>(), &[0, 1], &src, top + 1 - g, true)?,
                     alpha: Scalars::new(arena, s, &primes[..nq], &al)?,
                     beta: Scalars::new(arena, s, &primes[..nq], &be)?,
-                    wtop: Scalars::new(arena, s, &[primes[top - 1], primes[top]], &[pmod[top - 1], pmod[top], 1, 1])?,
+                    wtop: Scalars::new(arena, s, &wp, &wv)?,
                 },
             );
         }
@@ -249,7 +265,7 @@ impl<'a, W: DevWord> RelinRescaler<'a, W> {
     }
 
     /// `ct = rescale(c + KeySwitch(d2))` with the tensor staged by `tensor` (c in `ct` rows 0..=top, d2 in `ex.ks.ext`
-    /// part 1; doubled there on x2): rows 0..top-2 of `ct` (the caller sets the rescaled metadata). Regen key.
+    /// part 1; doubled there on x2): rows 0..=top-g of `ct` (the caller sets the rescaled metadata). Regen key.
     pub fn relin_rescale<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: KsCfg<'_, '_>, key: &KeyGroup<'_>, ct: &mut Ct<'_, W>, top: usize) -> Result<()> {
         let k = ct.k();
         let rr = self.tops.get(&top).ok_or_else(|| shape("relin_rescale", format!("no tables for top {top}")))?;
@@ -261,23 +277,25 @@ impl<'a, W: DevWord> RelinRescaler<'a, W> {
         let ext = View::of(&ex.ks.ext, 0);
         ks::modup_from(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, ext.part::<W>(1), k, top)?;
         let io = DotIo { c1: ext.part::<W>(1).base, c0: std::ptr::null(), ct_stride: cw, out: ext.base, part_stride: pw, out_ct_stride: cw, out_rot_stride: 0, c0_mode: 0 };
-        // 1. the dot over the two tops and the special rows, raw into ks.ext
-        ks::dot_regen_ex(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, (rr.rows.dptr(), 2 + lay.kp), io, None)?;
+        let g = rr.g;
+        // 1. the dot over the dropped tops and the special rows, raw into ks.ext
+        ks::dot_regen_ex(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, (rr.rows.dptr(), g + lay.kp), io, None)?;
         // 2. the tops of the extended product: P c + dot
         let dst = View::of(&ct.buf, 0);
         let row = |v: View, r: usize| pc_kernels::PolyRef { base: (v.base as *mut W).wrapping_add(r * nn) as *mut std::ffi::c_void, ct_stride: v.ct_stride, part_stride: v.part_stride };
+        let lo = top + 1 - g;
         let mut src = [pc_kernels::PolyRef::default(); 8];
-        src[0] = row(dst, top - 1);
-        src[1] = row(ext, top - 1);
-        let w = pc_kernels::WsumArgs { out: row(ext, top - 1), src, w: rr.wtop.v.vptr(), ws: rr.wtop.s.vptr(), pr: ctx.pr().wrapping_add(top - 1), nsrc: 2, rowstride: 2, n: 2, k: k as i32 };
-        // SAFETY: rows top-1, top of k cts of ct and of ks.ext (the prime table offset to those rows); element-wise,
+        src[0] = row(dst, lo);
+        src[1] = row(ext, lo);
+        let w = pc_kernels::WsumArgs { out: row(ext, lo), src, w: rr.wtop.v.vptr(), ws: rr.wtop.s.vptr(), pr: ctx.pr().wrapping_add(lo), nsrc: 2, rowstride: g as i32, n: g as i32, k: k as i32 };
+        // SAFETY: rows lo..=top of k cts of ct and of ks.ext (the prime table offset to those rows); element-wise,
         // out aliasing src[1] index by index
         launch_result("wsum", unsafe { (ctx.table.wsum)(&w, ex.compute.raw()) })?;
-        // 3. coefficient form of the source rows, the exact conversion to rows 0..top-2, their NTT
+        // 3. coefficient form of the source rows, the exact conversion to rows 0..=top-g, their NTT
         rr.md.run(ctx, &ex.compute, &mut ex.ks.ext.buf, &mut ex.ks.conv.buf, k)?;
         // 4. the Q-row dot into ct = alpha c + beta (dot - conv)
         let conv = View::of(&ex.ks.conv, 0);
         let e = pc_kernels::EpiArgs { dst: dst.base, conv: conv.base, binv: rr.beta.v.vptr(), binvs: rr.beta.s.vptr(), k: std::ptr::null(), part_stride: pw, dbl: 0, pad: 0, alpha: rr.alpha.v.vptr(), alphas: rr.alpha.s.vptr() };
-        ks::dot_regen_ex(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, (rr.qrows.dptr(), top - 1), io, Some((e, dst.ct_stride, conv.ct_stride)))
+        ks::dot_regen_ex(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, (rr.qrows.dptr(), lo), io, Some((e, dst.ct_stride, conv.ct_stride)))
     }
 }
