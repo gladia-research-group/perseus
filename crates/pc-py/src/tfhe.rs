@@ -37,6 +37,8 @@ pub(crate) const MAX_V: f64 = 1.25;
 pub(crate) struct Desc {
     pub lut: String,
     pub slots: String,
+    /// (j, k): output j of k interleaved LUTs (`TfheRt::lut_multi`); j = 0 runs the switch, the others read its stash
+    pub part: Option<(usize, usize)>,
 }
 
 impl Desc {
@@ -46,8 +48,44 @@ impl Desc {
         if v.get("op")?.as_str()? != "tfhe" {
             return None;
         }
-        Some(Desc { lut: v.get("lut")?.as_str()?.to_string(), slots: v.get("slots")?.as_str()?.to_string() })
+        let part = match v.get("part") {
+            Some(p) => Some((p.get(0)?.as_u64()? as usize, p.get(1)?.as_u64()? as usize)),
+            None => None,
+        };
+        Some(Desc { lut: v.get("lut")?.as_str()?.to_string(), slots: v.get("slots")?.as_str()?.to_string(), part })
     }
+}
+
+/// The switch's parameters: pc-tfhe's defaults and the PC_TFHE_* overrides (PC_TFHE_NU = 2: LUT grids of nu n_br
+/// points, impl/tfhe.py GRID).
+pub(crate) fn params(n: usize) -> PyResult<Params> {
+    let mut p = Params::new(n).map_err(|x| PyValueError::new_err(x.to_string()))?;
+    // PC_TFHE_PBS_GADGET=b,l: the bootstrapping key's gadget (two levels run the batch path)
+    if let Ok(v) = std::env::var("PC_TFHE_PBS_GADGET") {
+        let g = v.split_once(',').and_then(|(b, l)| Some((b.trim().parse::<u32>().ok()?, l.trim().parse::<usize>().ok()?)));
+        p.pbs = match g {
+            Some(g @ (_, 1 | 2)) if g.0 as usize * g.1 < 62 => g,
+            _ => return Err(PyValueError::new_err(format!("PC_TFHE_PBS_GADGET={v}: base log, levels (1 or 2)"))),
+        };
+    }
+    // PC_TFHE_LAT_GROUP=5: the latency key (Params::lat_group)
+    if let Ok(v) = std::env::var("PC_TFHE_LAT_GROUP") {
+        p.lat_group = v.trim().parse().ok().filter(|&g| g == 0 || (2..=5).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP={v}: 2..=5 dividing n_lwe {}", p.n_lwe)))?;
+    }
+    // PC_TFHE_LWE=n,log2: another LWE key (Params::with_lwe; 990,-21 the precise set)
+    if let Ok(v) = std::env::var("PC_TFHE_LWE") {
+        let g = v.split_once(',').and_then(|(n, l)| Some((n.trim().parse::<usize>().ok()?, l.trim().parse::<f64>().ok()?)));
+        let (n_lwe, l) = g.ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LWE={v}: dimension, log2 sigma")))?;
+        p = p.with_lwe(n_lwe, l).map_err(|x| PyValueError::new_err(x.to_string()))?;
+    }
+    if let Ok(v) = std::env::var("PC_TFHE_NU") {
+        p.nu = match v.trim() {
+            "" | "1" => 1,
+            "2" => 2,
+            _ => return Err(PyValueError::new_err(format!("PC_TFHE_NU={v}: 1 or 2"))),
+        };
+    }
+    Ok(p)
 }
 
 /// What the session's MemPlan reserves: the switch (`max` values per pass), the tables, one ciphertext.
@@ -57,10 +95,10 @@ pub(crate) struct TfhePlan {
 
 impl TfhePlan {
     pub fn reserve(&self, mp: &mut MemPlan, n: usize) -> PyResult<()> {
-        let p = Params::new(n).map_err(|x| PyValueError::new_err(x.to_string()))?;
+        let p = params(n)?;
         mp.reserve("tfhe", TfheSwitch::bytes(n, &p, self.max));
-        mp.reserve("tfhe.tables", 4 * (MAX_LUTS * 2 * p.n_br + MAX_POS) + 2 * 256);
-        mp.reserve("tfhe.ct", pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1)));
+        mp.reserve("tfhe.tables", 4 * (MAX_LUTS * 2 * p.tv_len() + MAX_POS) + 2 * 256);
+        mp.reserve("tfhe.ct", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1)));
         Ok(())
     }
 }
@@ -78,6 +116,9 @@ pub(crate) struct TfheRt {
     pos_buf: pc_cuda::DBuf<'static, pc_cuda::Compute, u32>,
     pos_used: usize,
     x: Ct<'static, W>,
+    /// a two-LUT finish's second output (finished), for the part-1 op that follows; tagged by its LUT
+    x2: Ct<'static, W>,
+    stash: Option<String>,
     n: usize,
     pub calls: u64,
     pub values: u64,
@@ -94,24 +135,24 @@ impl TfheRt {
         let ve = |x: pc_tfhe::Error| PyValueError::new_err(x.to_string());
         let n = s.len();
         let t0 = std::time::Instant::now();
-        let params = Params::new(n).map_err(ve)?;
+        let params = params(n)?;
         let s64: Vec<i64> = s.iter().map(|&v| v as i64).collect();
         let host = pc_tfhe::switch::Switcher::generate(params.clone(), &s64, p0, p1, prng).map_err(ve)?;
-        let sw = TfheSwitch::new(arena, st, &host, plan.max).map_err(e)?;
+        let sw = TfheSwitch::new(arena, dev, st, &host, plan.max).map_err(e)?;
         drop(host);
         let lt = Box::new(pc_cuda::blas::Lt::new(dev).map_err(|x| e(x.into()))?);
         let rns = pc_tfhe::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br).map_err(ve)?;
-        let lut_buf = arena.alloc::<pc_cuda::Compute, u32>("tfhe.tables", MAX_LUTS * 2 * params.n_br).map_err(|x| e(x.into()))?;
+        let lut_buf = arena.alloc::<pc_cuda::Compute, u32>("tfhe.tables", MAX_LUTS * 2 * params.tv_len()).map_err(|x| e(x.into()))?;
         let pos_buf = arena.alloc::<pc_cuda::Compute, u32>("tfhe.tables", MAX_POS).map_err(|x| e(x.into()))?;
         let x = Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "tfhe.ct", ctx.lay, 1).map_err(e)?);
-        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
+        let x2 = Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "tfhe.ct", ctx.lay, 1).map_err(e)?);
+        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
     }
 
-    /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / n_br (j < n_br / 2) and 2 (j - n_br) / n_br
-    /// (j >= n_br / 2) of [-1, 1), as read back after the finish (|f| <= `MAX_V`; the arcsine warp and the
-    /// negacyclic signs are applied here). Synchronous.
+    /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / g (j < g / 2) and 2 (j - g) / g (j >= g / 2)
+    /// of [-1, 1), g = n_br nu, as read back after the finish (|f| <= `MAX_V`). Synchronous.
     pub fn lut(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, values: &[f64]) -> PyResult<()> {
-        let nb = self.params.n_br;
+        let nb = self.params.tv_len();
         if values.len() != nb {
             return Err(PyValueError::new_err(format!("tfhe lut {name}: {} values, the grid has {nb}", values.len())));
         }
@@ -132,6 +173,36 @@ impl TfheRt {
         self.store(s, name, &res, 0)
     }
 
+    /// Register k = `values.len()` LUTs interleaved under `name` (one blind rotation): `values[j]` on the grid of
+    /// n_br nu / k points (as `lut`). Synchronous.
+    pub fn lut_multi(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, values: &[Vec<f64>]) -> PyResult<()> {
+        let k = values.len();
+        let nb = self.params.tv_len();
+        if k < 2 || nb % k != 0 || values.iter().any(|v| v.len() != nb / k) {
+            return Err(PyValueError::new_err(format!("tfhe lut {name}: {k} tables of the grid of {} points", nb / k.max(1))));
+        }
+        if let Some(v) = values.iter().flatten().find(|v| !(v.is_finite() && v.abs() <= MAX_V)) {
+            return Err(PyValueError::new_err(format!("tfhe lut {name}: value {v} outside [-{MAX_V}, {MAX_V}]")));
+        }
+        let q = self.params.q_br;
+        let tvs: Vec<Vec<u64>> = values
+            .iter()
+            .map(|vals| {
+                let h = vals.len();
+                vals.iter()
+                    .enumerate()
+                    .map(|(j, &v)| {
+                        let x = (q as f64 * pc_tfhe::pbs::warp(v, self.params.out_cf)).round() as i64;
+                        (if j < h / 2 { x } else { -x }).rem_euclid(q as i64) as u64
+                    })
+                    .collect()
+            })
+            .collect();
+        let tv = pc_tfhe::pbs::interleave(&tvs);
+        let res: Vec<u32> = self.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect();
+        self.store(s, name, &res, 0)
+    }
+
     /// Register sign LUT `name`: `lo` for m < 0, `hi` for m >= 0 on the whole torus, inputs m in (-2, 2) (a constant
     /// test vector (hi - lo) / 2 and the offset (hi + lo) / 2, warped: the negacyclic sign needs no padding half, so
     /// the input range and the resolution double). |lo|, |hi| <= `MAX_V`. Synchronous.
@@ -139,7 +210,7 @@ impl TfheRt {
         if !(lo.is_finite() && hi.is_finite() && lo.abs() <= MAX_V && hi.abs() <= MAX_V) {
             return Err(PyValueError::new_err(format!("tfhe sign lut {name}: ({lo}, {hi}) outside [-{MAX_V}, {MAX_V}]")));
         }
-        let (nb, q) = (self.params.n_br, self.params.q_br);
+        let (nb, q) = (self.params.tv_len(), self.params.q_br);
         let w = |v: f64| q as f64 * pc_tfhe::pbs::warp(v, self.params.out_cf);
         let (c, off) = (((w(hi) - w(lo)) / 2.0).round() as i64, ((w(hi) + w(lo)) / 2.0).round() as i64);
         let tv = vec![c.rem_euclid(q as i64) as u64; nb];
@@ -148,7 +219,7 @@ impl TfheRt {
     }
 
     fn store(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, res: &[u32], offset: u64) -> PyResult<()> {
-        let nb = self.params.n_br;
+        let nb = self.params.tv_len();
         let slot = match self.luts.get(name) {
             Some(&(k, _)) => k,
             None if self.luts.len() < MAX_LUTS => self.luts.len(),
@@ -215,6 +286,15 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
     fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not a TFHE descriptor"))?;
         let rt = &mut *self.rt;
+        if let Some((j, _)) = d.part.filter(|p| p.0 > 0) {
+            // the second output of the many-LUT finish just before (same input: its switch read the same m~)
+            if rt.stash.take().as_deref() != Some(d.lut.as_str()) || j != 1 || f.outs.len() != 1 {
+                return Err(ferr(f, format!("many-LUT part {j} of {} without its part 0 just before", d.lut)));
+            }
+            copy_ct(cx.ctx, &cx.ex.compute, &mut slots[f.outs[0] as usize], &rt.x2)?;
+            rt.calls += 1;
+            return Ok(());
+        }
         let &(k, offset) = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
         let &(off, cnt, reps) = rt.sets.get(&d.slots).ok_or_else(|| ferr(f, format!("slot set {} never registered (Session.tfhe_slots)", d.slots)))?;
         if f.ins.len() != 1 || f.outs.len() != 1 {
@@ -229,10 +309,23 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
         }
         // SAFETY: the box is owned by the service and outlives the switch's plans
         let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&rt.lt.inner as *const pc_cuda::blas::lt::Lt) };
-        let nb = rt.params.n_br;
+        let nb = rt.params.tv_len();
         let pos = (rt.pos_buf.vptr() as *const u32).wrapping_add(off) as *const std::ffi::c_void;
         let tv = (rt.lut_buf.vptr() as *const u32).wrapping_add(k * 2 * nb) as *const std::ffi::c_void;
-        rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, reps, tv, offset, false)?;
+        match d.part {
+            None => {
+                rt.sw.apply_dev(cx.ctx, &cx.ex.compute, ltr, &mut x[0], pos, cnt, reps, tv, offset, false)?;
+            }
+            Some((0, 2)) => {
+                rt.sw.apply_dev_k(cx.ctx, &cx.ex.compute, ltr, &mut x[0], &mut [&mut rt.x2], pos, cnt, reps, tv, &[0, 0], false)?;
+                let x2 = std::slice::from_mut(&mut rt.x2);
+                let mut fin2 = call.finish_call(0)?;
+                fin2.at_split(cx, x2)?;
+                fin2.run_to(cx, x2, Phase::Done)?;
+                rt.stash = Some(d.lut.clone());
+            }
+            Some(p) => return Err(ferr(f, format!("part {p:?} of a many-LUT finish (two LUTs: part 0 runs the switch)"))),
+        }
         let mut fin = call.finish_call(0)?;
         fin.at_split(cx, x)?;
         fin.run_to(cx, x, Phase::Done)?;

@@ -159,7 +159,8 @@ class EncoderPlannedPrefill(PlannedPrefill):
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), v)
         n_pts = len(uniq)
-        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
+        top = _pc.chain_limbs(self.cfg["chain.preset"])
+        pt_rows = self.pt_rows and max(self.pt_rows, top - min((lv for _k, lv in uniq), default=top))
         lins = self.linears()
         t = self.model.rt.dims.t
         specs = session_specs(lins.values(), t)

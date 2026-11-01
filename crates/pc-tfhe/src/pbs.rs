@@ -47,6 +47,15 @@ impl Rns {
         [0, 1].map(|l| v.iter().map(|&x| x % self.ntt[l].q).collect())
     }
 
+    /// NTT(X^e) at prime p, e in [0, 2n).
+    pub fn monomial(&self, p: usize, e: usize) -> Vec<u64> {
+        let (n, q) = (self.n(), self.ntt[p].q);
+        let mut f = vec![0u64; n];
+        f[e % n] = if e < n { 1 } else { q - 1 };
+        self.ntt[p].fwd(&mut f);
+        f
+    }
+
     /// NTT(X^e - 1) at prime p, e in [0, 2n).
     pub fn monomial_m1(&self, p: usize, e: usize) -> Vec<u64> {
         let (n, q) = (self.n(), self.ntt[p].q);
@@ -205,43 +214,69 @@ impl BootstrapKey {
     /// acc = (X^-b~ tv, 0), then per key group acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc) (module doc): the phase
     /// rotates by X^-phi.
     pub fn blind_rotate(&self, tv: &[u64], ct: &Lwe, q_in: u64) -> [Rlwe; 2] {
+        let [acc] = <[_; 1]>::try_from(self.blind_rotate_ext(tv, ct, q_in, 1)).ok().unwrap();
+        acc
+    }
+
+    /// The extended blind rotation: acc in R_(nu n) = R_n[X] / (X^nu - Y) as nu GLWE components of R_n under the same
+    /// key, the input switched to 2 nu n, tv of nu n entries. Returns the components, [component][prime].
+    pub fn blind_rotate_ext(&self, tv: &[u64], ct: &Lwe, q_in: u64, nu: usize) -> Vec<[Rlwe; 2]> {
+        self.blind_rotate_mlut(tv, ct, q_in, nu, 1)
+    }
+
+    /// `blind_rotate_ext` for `k` interleaved LUTs (many-LUT, Carpov, Izabachene, Mollimard 2019): the input switched
+    /// to 2 nu n / k and scaled by k, so coefficient j of acc reads LUT j (tv: `interleave`).
+    pub fn blind_rotate_mlut(&self, tv: &[u64], ct: &Lwe, q_in: u64, nu: usize, kl: usize) -> Vec<[Rlwe; 2]> {
         let n = self.rns.n();
-        let two_n = 2 * n as u64;
-        let m = crate::gadget::fixed_ratio(two_n, q_in);
-        let sw = |x: u64| -> usize { (crate::gadget::scale_round(x, m) % two_n) as usize };
-        let neg = |k: usize| (2 * n - k) % (2 * n);
+        let big = nu * n;
+        assert_eq!(tv.len(), big, "the extended test vector has nu n entries");
+        assert!(kl >= 1 && (2 * big) % kl == 0, "many-LUT: k divides 2 nu n");
+        let two_n = 2 * big as u64;
+        let m = crate::gadget::fixed_ratio(two_n / kl as u64, q_in);
+        let sw = |x: u64| -> usize { kl * (crate::gadget::scale_round(x, m) % (two_n / kl as u64)) as usize };
+        let neg = |k: usize| (2 * big - k) % (2 * big);
         let tvr = self.rns.residues(tv);
-        let bt = crate::gadget::ms_body_mean(&ct.a, ct.b, m, two_n) as usize;
-        let mut acc = [0, 1].map(|p| Rlwe { c0: monomial_mul(&tvr[p], neg(bt), self.rns.ntt[p].q), c1: vec![0; n] });
+        let bt = kl * crate::gadget::ms_body_mean(&ct.a, ct.b, m, two_n / kl as u64) as usize;
+        let tvx = [0, 1].map(|p| monomial_mul(&tvr[p], neg(bt), self.rns.ntt[p].q));
+        let mut acc: Vec<[Rlwe; 2]> =
+            (0..nu).map(|i| [0, 1].map(|p| Rlwe { c0: (0..n).map(|j| tvx[p][nu * j + i]).collect(), c1: vec![0; n] })).collect();
         for (a, keys) in ct.a.chunks(self.group).zip(&self.ggsw) {
             let k: Vec<usize> = a.iter().map(|&x| sw(x)).collect();
             if k.iter().all(|&x| x == 0) {
                 continue;
             }
-            let digits = ntt_digits(&acc, &self.gadget, &self.rns);
-            let mut out = [0, 1].map(|_| (vec![0u64; n], vec![0u64; n]));
-            let exps = (1..1usize << self.group).map(|m| neg(k.iter().enumerate().filter(|(x, _)| m >> x & 1 == 1).map(|(_, &v)| v).sum::<usize>() % (2 * n)));
+            let digits: Vec<_> = acc.iter().map(|c| ntt_digits(c, &self.gadget, &self.rns)).collect();
+            let mut out: Vec<[(Vec<u64>, Vec<u64>); 2]> = (0..nu).map(|_| [0, 1].map(|_| (vec![0u64; n], vec![0u64; n]))).collect();
+            let exps = (1..1usize << self.group).map(|m| neg(k.iter().enumerate().filter(|(x, _)| m >> x & 1 == 1).map(|(_, &v)| v).sum::<usize>() % (2 * big)));
             for (key, e) in keys.iter().zip(exps) {
                 if e == 0 {
                     continue;
                 }
-                let pr = key.mac(&digits, &self.rns);
-                for p in 0..2 {
-                    let q = self.rns.ntt[p].q;
-                    let f = self.rns.monomial_m1(p, e);
-                    for i in 0..n {
-                        out[p].0[i] = addmod(out[p].0[i], mulmod(f[i], pr[p].0[i], q), q);
-                        out[p].1[i] = addmod(out[p].1[i], mulmod(f[i], pr[p].1[i], q), q);
+                for (i, di) in digits.iter().enumerate() {
+                    let pr = key.mac(di, &self.rns);
+                    let ei = (e + i) % (2 * big);
+                    let (t, w) = (ei % nu, ei / nu);   // X^e X^i = X^t Y^w, w < 2 n
+                    for p in 0..2 {
+                        let q = self.rns.ntt[p].q;
+                        let f = self.rns.monomial(p, w);
+                        for x in 0..n {
+                            out[t][p].0[x] = addmod(out[t][p].0[x], mulmod(f[x], pr[p].0[x], q), q);
+                            out[t][p].1[x] = addmod(out[t][p].1[x], mulmod(f[x], pr[p].1[x], q), q);
+                            out[i][p].0[x] = submod(out[i][p].0[x], pr[p].0[x], q);
+                            out[i][p].1[x] = submod(out[i][p].1[x], pr[p].1[x], q);
+                        }
                     }
                 }
             }
-            for p in 0..2 {
-                let ntt = &self.rns.ntt[p];
-                let (o0, o1) = &mut out[p];
-                ntt.inv(o0);
-                ntt.inv(o1);
-                add_into(&mut acc[p].c0, o0, ntt.q);
-                add_into(&mut acc[p].c1, o1, ntt.q);
+            for (ai, oi) in acc.iter_mut().zip(out.iter_mut()) {
+                for p in 0..2 {
+                    let ntt = &self.rns.ntt[p];
+                    let (o0, o1) = &mut oi[p];
+                    ntt.inv(o0);
+                    ntt.inv(o1);
+                    add_into(&mut ai[p].c0, o0, ntt.q);
+                    add_into(&mut ai[p].c1, o1, ntt.q);
+                }
             }
         }
         acc
@@ -249,11 +284,28 @@ impl BootstrapKey {
 
     /// The LUT's output LWE (dimension n_br, mod Q, phase f(m) + offset).
     pub fn bootstrap(&self, tv: &[u64], offset: u64, ct: &Lwe, q_in: u64) -> Lwe {
-        let acc = self.blind_rotate(tv, ct, q_in);
-        let ex = [0, 1].map(|p| acc[p].sample_extract(0, self.rns.ntt[p].q));
+        self.bootstrap_ext(tv, offset, ct, q_in, 1)
+    }
+
+    /// `bootstrap` on the extended blind rotation (`blind_rotate_ext`; tv of nu n entries).
+    pub fn bootstrap_ext(&self, tv: &[u64], offset: u64, ct: &Lwe, q_in: u64, nu: usize) -> Lwe {
+        self.bootstrap_mlut(tv, &[offset], ct, q_in, nu).swap_remove(0)
+    }
+
+    /// The outputs of `offsets.len()` interleaved LUTs from one blind rotation (`blind_rotate_mlut`): LUT j's from
+    /// coefficient j, + offsets[j].
+    pub fn bootstrap_mlut(&self, tv: &[u64], offsets: &[u64], ct: &Lwe, q_in: u64, nu: usize) -> Vec<Lwe> {
+        let acc = self.blind_rotate_mlut(tv, ct, q_in, nu, offsets.len()).swap_remove(0);
         let q = self.rns.q;
-        let a = (0..self.rns.n()).map(|k| self.rns.crt(ex[0].a[k], ex[1].a[k])).collect();
-        Lwe { a, b: addmod(self.rns.crt(ex[0].b, ex[1].b), offset, q) }
+        offsets
+            .iter()
+            .enumerate()
+            .map(|(j, &off)| {
+                let ex = [0, 1].map(|p| acc[p].sample_extract(j, self.rns.ntt[p].q));
+                let a = (0..self.rns.n()).map(|k| self.rns.crt(ex[0].a[k], ex[1].a[k])).collect();
+                Lwe { a, b: addmod(self.rns.crt(ex[0].b, ex[1].b), off, q) }
+            })
+            .collect()
     }
 
     pub fn bootstrap_many(&self, tv: &[u64], offset: u64, cts: &[Lwe], q_in: u64) -> Vec<Lwe> {
@@ -274,6 +326,12 @@ pub fn warp(v: f64, out_cf: u32) -> f64 {
 pub fn unwarp(x: f64, out_cf: u32) -> f64 {
     let t = std::f64::consts::TAU;
     (t * x).sin() / t * (1u64 << out_cf) as f64
+}
+
+/// k test vectors of n / k entries each interleaved into one of n (many-LUT: `BootstrapKey::blind_rotate_mlut`).
+pub fn interleave(tvs: &[Vec<u64>]) -> Vec<u64> {
+    let k = tvs.len();
+    (0..k * tvs[0].len()).map(|x| tvs[x % k][x / k]).collect()
 }
 
 /// The test vector of f (values already scaled mod q) for inputs of phase m q / 4, m in [-1, 1).

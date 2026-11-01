@@ -70,6 +70,14 @@ impl Device {
         self.driver
     }
 
+    /// Streaming multiprocessors of the current device.
+    pub fn sm_count(&self) -> Result<usize> {
+        let mut v = 0i32;
+        // SAFETY: out-pointer to a local; attribute 16 = cudaDevAttrMultiProcessorCount of device 0 (the visible one)
+        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 16, 0) }, "cudaDeviceGetAttribute")?;
+        Ok(v as usize)
+    }
+
     /// (free, total) device memory in bytes.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         let (mut f, mut t) = (0usize, 0usize);

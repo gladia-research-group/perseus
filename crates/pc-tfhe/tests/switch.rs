@@ -25,7 +25,12 @@ fn pbs_sign_on_fresh_lwes() {
     use pc_tfhe::gadget::Gadget;
     use pc_tfhe::pbs::BootstrapKey;
     let mut prng = Prng::from_seed([11, 0, 0, 0, 0, 0, 0, 0], 0);
-    let p = Params::new(N).unwrap();
+    let mut p = Params::new(N).unwrap();
+    // PBS_GADGET=b,l: another bootstrapping gadget (the output noise's study)
+    if let Ok(v) = std::env::var("PBS_GADGET") {
+        let mut it = v.split(',').map(|x| x.parse::<usize>().unwrap());
+        p.pbs = (it.next().unwrap() as u32, it.next().unwrap());
+    }
     let p0 = prime_below(31, 1 << 17).unwrap();
     let s_lwe: Vec<i64> = (0..p.n_lwe).map(|_| (prng.next_u32() & 1) as i64).collect();
     let s_br: Vec<i64> = sample_ternary(&mut prng, p.n_br).into_iter().map(|x| x as i64).collect();
@@ -105,4 +110,36 @@ fn lut_general() {
         assert!((got - want).abs() < 0.03, "j {j} m {} want {want} got {got}", m[j]);
     }
     eprintln!("lut_general: max |out - f(m)| = {worst:.3e}");
+}
+
+/// The extended blind rotation (`bootstrap_ext`) on fresh LWEs: a linear LUT reads the mod switch's noise directly.
+/// NU_LIST (default "1 2").
+#[test]
+#[ignore]
+fn pbs_ext_noise() {
+    use pc_tfhe::gadget::Gadget;
+    use pc_tfhe::pbs::BootstrapKey;
+    let mut prng = Prng::from_seed([12, 0, 0, 0, 0, 0, 0, 0], 0);
+    let p = Params::new(N).unwrap();
+    let p0 = prime_below(28, 1 << 17).unwrap();
+    let s_lwe: Vec<i64> = (0..p.n_lwe).map(|_| (prng.next_u32() & 1) as i64).collect();
+    let s_br: Vec<i64> = sample_ternary(&mut prng, p.n_br).into_iter().map(|x| x as i64).collect();
+    let dg = DiscreteGaussian::new(p.bsk_sigma).unwrap();
+    let dg_in = DiscreteGaussian::new(1.0).unwrap();
+    let rns = pc_tfhe::pbs::Rns::new(p.br_primes.0, p.br_primes.1, p.n_br).unwrap();
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(p.q_br, p.pbs, false), rns, p.pbs_group, &dg, &mut prng);
+    let delta = p.q_br as f64 / 8.0;
+    let ms: Vec<f64> = (0..32).map(|i| -0.9 + 1.8 * i as f64 / 31.0).collect();
+    let lwes: Vec<Lwe> = ms.iter().map(|&m| Lwe::encrypt(((m * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64, &s_lwe, p0, &dg_in, &mut prng)).collect();
+    let nus: Vec<usize> = std::env::var("NU_LIST").unwrap_or("1 2".into()).split_whitespace().map(|x| x.parse().unwrap()).collect();
+    for nu in nus {
+        let tv = test_vector(nu * p.n_br, p.q_br, |x| ((x / 2.0 * delta).round() as i64).rem_euclid(p.q_br as i64) as u64);
+        let outs: Vec<Lwe> = lwes.iter().map(|l| bsk.bootstrap_ext(&tv, 0, l, p0, nu)).collect();
+        let mut ss = 0f64;
+        for (m, o) in ms.iter().zip(&outs) {
+            let got = 2.0 * pc_tfhe::modq::centered(o.phase(&s_br, p.q_br), p.q_br) as f64 / delta;
+            ss += (got - m).powi(2);
+        }
+        eprintln!("pbs_ext_noise: nu {nu}: rms |f^-1(out) - m| = {:.3e} (units of the input range)", (ss / ms.len() as f64).sqrt());
+    }
 }
