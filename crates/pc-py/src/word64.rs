@@ -51,7 +51,7 @@ pub(crate) fn shadow_config_n64(c: &Config) -> PyResult<ShadowConfig> {
         staged: l(14),
         input_room: None,
     };
-    Ok(ShadowConfig { chain: ChainShape { n_q: 28, unit: 1 }, bts, quirks: Quirks::none() })
+    Ok(ShadowConfig { chain: ChainShape { n_q: 28, unit: 1, singles: 0 }, bts, quirks: Quirks::none() })
 }
 
 /// `_pc.w64` = `Session`, `Fhe`, `Ct` and the module functions at u64 (the `KeySource` class is shared).

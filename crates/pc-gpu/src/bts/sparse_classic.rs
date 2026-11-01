@@ -114,11 +114,11 @@ pub struct ClassicPlan {
     pub fold: Vec<Vec<i64>>,
 }
 
-fn to_f(shape: pc_shadow::ChainShape, m: &CtMeta) -> FMeta {
-    FMeta { top: (shape.n_q - 1 - m.level) as i32, nl: m.deg as i32, nf: m.nf }
+fn to_f(shape: pc_shadow::ChainShape, m: &CtMeta) -> Result<FMeta> {
+    Ok(FMeta { top: pc_shadow::meta::top_limb(shape, m.level)? as i32, nl: m.deg as i32, nf: m.nf })
 }
-fn from_f(shape: pc_shadow::ChainShape, f: FMeta) -> CtMeta {
-    CtMeta { level: shape.n_q - 1 - f.top as u32, deg: f.nl as u8, nf: f.nf, ..CtMeta::new(0, 1) }
+fn from_f(shape: pc_shadow::ChainShape, f: FMeta) -> Result<CtMeta> {
+    Ok(CtMeta { level: pc_shadow::meta::level_from_top_limb(shape, f.top as u32)?, deg: f.nl as u8, nf: f.nf, ..CtMeta::new(0, 1) })
 }
 
 impl ClassicPlan {
@@ -148,13 +148,13 @@ impl ClassicPlan {
             let fdrop = st.sf((chain.q.len() - 1) as i32)? / st.sf(raise_top as i32)?;
             let exact = (st.sf(raise_top as i32)? / qd) * (1.0 / (cfg.boot_k * n as f64));
             let raised = FMeta { top: raise_top as i32, nl: 1, nf: st.sf(raise_top as i32)? * (cfg.cts0_t as f64).exp2() };
-            let mut m = from_f(shp, raised);
+            let mut m = from_f(shp, raised)?;
             // the fold (rotations) keeps the raised metadata
             let levels = cts_stage_levels(&st, lay.cts.len() as u32, drop, Some(cfg.cts0_t))?;
             let mut cts = Vec::new();
             for (e, fs) in lay.cts.iter().enumerate() {
                 let lv = levels[e];
-                if lv.top as usize != (shp.n_q - 1 - m.level) as usize || m.deg != 1 {
+                if lv.top as usize != pc_shadow::meta::top_limb(shp, m.level)? as usize || m.deg != 1 {
                     return Err(shape("classic plan", format!("CtS stage {e} plaintexts at top {} but the input is {m:?}", lv.top)));
                 }
                 let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(fs), diag_coeffs(chain, &fs.pts, lv.scale)?);
@@ -162,16 +162,16 @@ impl ClassicPlan {
                 m = sh.mult_pt(&m, &PtMeta { level: lv.level, deg: 1, nf: lv.scale, tag: Default::default() })?.out;
                 m = sh.rescale(&m)?.out;
             }
-            let em_in = to_f(shp, &m);
+            let em_in = to_f(shp, &m)?;
             let (_, em_out, em_slots) = EvalModPlan::<u32>::program(&st, em_in, &ps, cfg.evalmod_da_its)?;
-            let mo = from_f(shp, em_out);
+            let mo = from_f(shp, em_out)?;
             let slev = stc_stage_levels(&st, mo.level, mo.deg, lay.stc.len() as u32)?;
             let mut m = if mo.deg == 2 { sh.rescale(&mo)?.out } else { mo };
             let mut stc = Vec::new();
             let nst = lay.stc.len();
             for (e, fs) in lay.stc.iter().enumerate() {
                 let lv = slev[e];
-                let top = shp.n_q - 1 - m.level;
+                let top = pc_shadow::meta::top_limb(shp, m.level)?;
                 if lv.top > top {
                     return Err(shape("classic plan", format!("StC stage {e} plaintexts at top {} above the input top {top}", lv.top)));
                 }
@@ -185,7 +185,7 @@ impl ClassicPlan {
                     m = sh.rescale(&m)?.out;
                 }
             }
-            variants.push(ClassicVariantHost { drop, raise_top, exact, cts, stc, em_in, em_out, em_slots, out: to_f(shp, &m) });
+            variants.push(ClassicVariantHost { drop, raise_top, exact, cts, stc, em_in, em_out, em_slots, out: to_f(shp, &m)? });
         }
         let fold = super::spru::accumulate_rounds(cfg.acc_bstep, s as usize, n / 2 / s as usize);
         Ok(ClassicPlan { cfg: cfg.clone(), chain: chain.clone(), variants, ps, deg, fold })
@@ -359,7 +359,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> SparseClassicRoute<'a, W, M> {
             }
             let k = x.k();
             stage.run(cx, &mut x.buf, k, self.cfg.ks_source)?;
-            let pt = PtMeta { level: ctx.shape.n_q - 1 - stage.top as u32, deg: 1, nf: stage.pt_nf, tag: Default::default() };
+            let pt = PtMeta { level: pc_shadow::meta::level_from_top_limb(ctx.shape, stage.top as u32)?, deg: 1, nf: stage.pt_nf, tag: Default::default() };
             let m = cx.sh.mult_pt(&x.meta, &pt)?.out;
             let (_, od) = stage.out_top_deg(ctx.chain.level_unit);
             x.meta = if od == 1 { cx.sh.rescale(&m)?.out } else { m };
@@ -453,14 +453,14 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for SparseClassicRoute<
             if x.meta.deg == 2 && em.in_meta.nl == 1 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
             }
-            let f = to_f(ctx.shape, &x.meta);
+            let f = to_f(ctx.shape, &x.meta)?;
             if f.top != em.in_meta.top || f.nl != em.in_meta.nl || f.nf.to_bits() != em.in_meta.nf.to_bits() {
                 return Err(shape("classic eval_mod", format!("input {f:?}, the program was built for {:?}", em.in_meta)));
             }
             let k = x.k();
             em.run(cx, &mut x.buf, k)?;
             let o = em.out_meta;
-            x.meta = CtMeta { level: ctx.shape.n_q - 1 - o.top as u32, deg: o.nl as u8, nf: o.nf, ..x.meta };
+            x.meta = CtMeta { level: pc_shadow::meta::level_from_top_limb(ctx.shape, o.top as u32)?, deg: o.nl as u8, nf: o.nf, ..x.meta };
             if x.meta.deg == 2 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
             }
@@ -481,7 +481,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Staged<'a, W, M> for SparseClassicRoute<
                     cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
                 }
                 if x.top(ctx.shape)? > stc_top {
-                    x.meta.level = ctx.shape.n_q - 1 - stc_top as u32;
+                    x.meta.level = pc_shadow::meta::level_from_top_limb(ctx.shape, stc_top as u32)?;
                 }
             }
         }
@@ -519,7 +519,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for SparseClassicRout
     fn landing(&self, sh: &Shadow, meta: &CtMeta, route: &Route) -> Result<CtMeta> {
         let f = self.outs[self.variant(route.raise_drop)?];
         Ok(CtMeta {
-            level: sh.cfg.chain.n_q - 1 - f.top as u32,
+            level: pc_shadow::meta::level_from_top_limb(sh.cfg.chain, f.top as u32)?,
             deg: f.nl as u8,
             nf: f.nf,
             slots: meta.slots,
@@ -657,7 +657,7 @@ mod tests {
         let p = ClassicPlan::new(&chain, &ClassicCfg::n32(8192, &[0, 1])).unwrap();
         let want = pc_shadow::route::multi_stage_landing([3, 3], 2);
         for v in &p.variants {
-            let raw = from_f(sh.cfg.chain, v.out);
+            let raw = from_f(sh.cfg.chain, v.out)?;
             let real = sh.rescale(&raw).unwrap().out;
             assert_eq!((raw.deg, real.level, real.deg), (2, want.level + 2 * v.drop, 1), "drop {}", v.drop);
             let nd: Vec<usize> = v.cts.iter().chain(&v.stc).map(|h| h.coeffs.len()).collect();

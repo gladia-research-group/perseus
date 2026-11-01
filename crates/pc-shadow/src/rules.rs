@@ -8,7 +8,7 @@
 //! adjusts it). Preludes run in order.
 use crate::error::{rule, Result};
 use crate::fides::{FMeta, Fx, Step};
-use crate::meta::{effective_level, top_limb, ChainShape, CtMeta};
+use crate::meta::{effective_level, level_from_top_limb, top_limb, ChainShape, CtMeta};
 use crate::quirks::{Quirk, Quirks};
 use crate::route::{BtsConfig, Landing, Route};
 use crate::tag::{self, Tag};
@@ -81,7 +81,14 @@ pub struct HintRecipe {
 }
 
 impl Shadow {
-    pub fn new(cfg: ShadowConfig, tables: Option<Arc<ScaleTables>>) -> Shadow {
+    pub fn new(mut cfg: ShadowConfig, tables: Option<Arc<ScaleTables>>) -> Shadow {
+        // an alternating user region: with scale tables its levels map to its limbs, without them the rules run on
+        // the virtual grid as a uniform chain
+        match &tables {
+            Some(st) if st.singles != 0 => cfg.chain = ChainShape::from_tables(st),
+            None if cfg.chain.singles != 0 => cfg.chain = cfg.chain.grid(),
+            _ => {}
+        }
         Shadow { cfg, tables }
     }
     pub fn unit(&self) -> u32 {
@@ -100,16 +107,15 @@ impl Shadow {
         if f.nl < 1 || f.nl > 2 {
             return Err(rule("from_f", format!("degree {} out of range", f.nl)));
         }
-        Ok(CtMeta { level: self.cfg.chain.top_max() - f.top as u32, deg: f.nl as u8, nf: f.nf, slots: like.slots, tag })
+        Ok(CtMeta { level: level_from_top_limb(self.cfg.chain, f.top as u32)?, deg: f.nl as u8, nf: f.nf, slots: like.slots, tag })
     }
-    fn pre(&self, who: Operand, steps: &[Step]) -> Vec<Prelude> {
-        let top_max = self.cfg.chain.top_max();
+    fn pre(&self, who: Operand, steps: &[Step]) -> Result<Vec<Prelude>> {
         steps
             .iter()
             .map(|s| match *s {
-                Step::Rescale => Prelude::Rescale(who),
-                Step::DropTo(t) => Prelude::DropTo(who, top_max - t as u32),
-                Step::Scalar(c) => Prelude::ScalarAdjust(who, c),
+                Step::Rescale => Ok(Prelude::Rescale(who)),
+                Step::DropTo(t) => Ok(Prelude::DropTo(who, level_from_top_limb(self.cfg.chain, t as u32)?)),
+                Step::Scalar(c) => Ok(Prelude::ScalarAdjust(who, c)),
             })
             .collect()
     }
@@ -143,7 +149,7 @@ impl Shadow {
         for _ in 0..3 {
             let mut sa = Vec::new();
             if fx.adjust_add(&mut fa, &fb, &mut sa)? {
-                pre.extend(self.pre(Operand::A, &sa));
+                pre.extend(self.pre(Operand::A, &sa)?);
                 if fa.top != fb.top || fa.nl != fb.nl {
                     return Err(rule(if sub { "sub" } else { "add" }, format!("adjust left {fa:?} vs {fb:?}")));
                 }
@@ -154,7 +160,7 @@ impl Shadow {
             if !fx.adjust_add(&mut fb, &fa, &mut sb)? {
                 return Err(rule("add", format!("adjustForAddOrSub failed both ways: {fa:?} {fb:?}")));
             }
-            pre.extend(self.pre(Operand::B, &sb));
+            pre.extend(self.pre(Operand::B, &sb)?);
         }
         Err(rule("add", "adjustForAddOrSub did not converge"))
     }
@@ -200,7 +206,7 @@ impl Shadow {
         for _ in 0..3 {
             let mut fp = FMeta { top: top_limb(self.cfg.chain, pt.level)? as i32, nl: pt.deg as i32, nf: pt.nf };
             let mut sa = Vec::new();
-            if fp.nl == 1 && fa.nl == 2 && fp.top == fa.top - fx.d {
+            if fp.nl == 1 && fa.nl == 2 && fp.top == fx.down(fa.top) {
                 fx.rescale(&mut fa, &mut sa)?;
             }
             if fp.top != fa.top || fp.nl != fa.nl {
@@ -208,13 +214,13 @@ impl Shadow {
                 if !fx.adjust_pt(&mut fp, &fa, &mut sp)? {
                     // the plaintext is deeper: drop the ciphertext to it and retry
                     fx.drop_to(&mut fa, fp.top, &mut sa);
-                    pre.extend(self.pre(Operand::A, &sa));
+                    pre.extend(self.pre(Operand::A, &sa)?);
                     continue;
                 }
-                pre.extend(self.pre(Operand::A, &sa));
-                pre.extend(self.pre(Operand::B, &sp));
+                pre.extend(self.pre(Operand::A, &sa)?);
+                pre.extend(self.pre(Operand::B, &sp)?);
             } else {
-                pre.extend(self.pre(Operand::A, &sa));
+                pre.extend(self.pre(Operand::A, &sa)?);
             }
             let out = self.from_f(&fa, a, tag)?;
             return Ok(Recipe { pre, out, consts: None });
@@ -236,7 +242,7 @@ impl Shadow {
         for _ in 0..3 {
             let mut sa = Vec::new();
             let ok = fx.adjust_mult(&mut fa, &fb, &mut sa)?;
-            pre.extend(self.pre(Operand::A, &sa));
+            pre.extend(self.pre(Operand::A, &sa)?);
             if ok {
                 if fa.nl != 1 || fa.top != fb.top || fb.nl != 1 {
                     return Err(rule("mult", format!("adjustForMult left {fa:?} vs {fb:?}")));
@@ -248,7 +254,7 @@ impl Shadow {
             if !fx.adjust_mult(&mut fb, &fa, &mut sb)? {
                 return Err(rule("mult", format!("adjustForMult failed both ways: {fa:?} {fb:?}")));
             }
-            pre.extend(self.pre(Operand::B, &sb));
+            pre.extend(self.pre(Operand::B, &sb)?);
         }
         Err(rule("mult", "adjustForMult did not converge"))
     }
@@ -266,7 +272,7 @@ impl Shadow {
             fx.rescale(&mut fa, &mut sa)?;
         }
         let f = FMeta { top: fa.top, nl: 2, nf: fa.nf * fa.nf };
-        Ok(Recipe { pre: self.pre(Operand::A, &sa), out: self.from_f(&f, a, tag)?, consts: None })
+        Ok(Recipe { pre: self.pre(Operand::A, &sa)?, out: self.from_f(&f, a, tag)?, consts: None })
     }
 
     /// ct * scalar (`multScalar`): degree 2 at the effective level; the constant is `ElemForEvalMult(top, c)`.
@@ -287,7 +293,7 @@ impl Shadow {
         let consts = self.mult_consts(fa.top, c)?;
         let mut ignore = Vec::new();
         fx.scalar_noprecheck(&mut fa, c, &mut ignore)?;
-        Ok(Recipe { pre: self.pre(Operand::A, &sa), out: self.from_f(&fa, a, tag)?, consts })
+        Ok(Recipe { pre: self.pre(Operand::A, &sa)?, out: self.from_f(&fa, a, tag)?, consts })
     }
 
     /// -ct. The GPU path of FIDESlib's API (`CryptoContextImpl::EvalNegate`) is `multScalar(-1.0)`: it costs the
@@ -335,8 +341,8 @@ impl Shadow {
                 fx.rescale(&mut fp, &mut sp)?;
             }
         }
-        let mut pre = self.pre(Operand::A, &sa);
-        pre.extend(self.pre(Operand::B, &sp));
+        let mut pre = self.pre(Operand::A, &sa)?;
+        pre.extend(self.pre(Operand::B, &sp)?);
         let f = FMeta { top: fa.top, nl: fa.nl + fp.nl, nf: fa.nf * fp.nf };
         Ok(Recipe { pre, out: self.from_f(&f, a, tag)?, consts: None })
     }

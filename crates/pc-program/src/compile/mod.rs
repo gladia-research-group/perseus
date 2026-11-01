@@ -256,7 +256,7 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     // the limbs of the chain the Config names (`chain.preset`, default n32: 54; the lean n32a4: 51)
     let real = chain_of(cfg)?;
     let n_q = real.q.len() as u32;
-    let chain = ChainShape { n_q, unit };
+    let chain = ChainShape { unit, ..ChainShape::of(&real) };
     let mut quirks = Quirks::none();
     if let Some(names) = &cfg.quirks.shadow {
         for n in names {
@@ -310,7 +310,7 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     // the shipped order (a dense refresh not run StC-first) lands where a too-deep StC-first input falls back to
     bts.dense_shipped = bts.stc_first_fallback;
     // a refresh input's deepest effective level: the top of the level above q0's (n32: 50; n32a4's single s1: 48)
-    bts.input_room = Some(n_q - real.groups.iter().take(2).sum::<usize>() as u32);
+    bts.input_room = Some(if chain.singles != 0 { chain.grid().n_q - 2 * unit } else { n_q - real.groups.iter().take(2).sum::<usize>() as u32 });
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 

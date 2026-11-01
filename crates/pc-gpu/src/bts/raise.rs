@@ -534,7 +534,7 @@ pub fn raise_from_bottom<'a, W: DevWord, M: DevStrategy<W>>(
     }
     let s = &cx.ex.compute;
     ntt::transform_k(ctx, s, Dir::Inverse, &mut x.buf, Span::Q { top: d - 1 }, Parts::Both, k)?;
-    let level = nq - 1 - plan.top as u32;
+    let level = pc_shadow::meta::level_from_top_limb(ctx.shape, plan.top as u32)?;
     if stop == RaiseStop::Raised {
         plan.launch_mod_raise(ctx, s, View::of(&x.buf, 0), k, d, plan.top + 1)?;
         ntt::transform_k(ctx, s, Dir::Forward, &mut x.buf, Span::Q { top: plan.top }, Parts::Both, k)?;

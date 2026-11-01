@@ -155,11 +155,19 @@ struct RouteCase {
     period: usize,
 }
 
-fn case(name: &str, n: usize, nq: usize, lean: bool) -> Res<RouteCase> {
+fn case(name: &str, n: usize, nq: usize, lean: bool, shape: pc_shadow::ChainShape) -> Res<RouteCase> {
     let n2 = (n / 2) as u32;
     // input levels: the dense ones two levels above the StC-first entry, SparseB at its deepest (the g0 inputs' top 5
-    // on n32; the level above the single prime on a lean chain)
-    let (dense_lv, sparse_lv) = if lean { (44, 48) } else { (nq as u32 - 10, nq as u32 - 6) };
+    // on n32; the level above the single prime on a lean chain, at the same limbs on its alternating user region's
+    // level grid)
+    let (dense_lv, sparse_lv) = if shape.singles != 0 {
+        let l = |top| shape.level_at(top).ok_or("no level at that top");
+        (l(5)?, l(2)?)
+    } else if lean {
+        (44, 48)
+    } else {
+        (nq as u32 - 10, nq as u32 - 6)
+    };
     Ok(match name {
         // shipped-order dense, real payload, CF 6 (the dense timing case), input at the reactive ceiling (44 on n32)
         "dense" => RouteCase { route: Route { cf: Some(6), real: true, ..Route::dense() }, level: dense_lv, slots: n2, period: n / 2 },
@@ -460,7 +468,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let (ev0, ev1) = (Event::timing(&dev)?, Event::timing(&dev)?);
     let ctw = lay.ct_words();
     for name in &o.routes {
-        let c = case(name, n, nq, chain.lone_top().is_some())?;
+        let c = case(name, n, nq, chain.lone_top().is_some(), ctx.shape)?;
         let (route, work, locks): (&dyn BtsRoute<'_, W, M>, &mut BtsWork<'_, W>, Vec<&dyn CaptureLock>) = match name.as_str() {
             "dense" | "stcf" => (&sfr, &mut sf_work, sfr.last.iter().map(|l| l as &dyn CaptureLock).collect()),
             "512" | "256" => {
@@ -470,7 +478,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             "1" => (spru_route.as_ref().ok_or("spru not built")?, spru_work.as_mut().ok_or("spru work")?, vec![]),
             o => return Err(format!("route {o}").into()),
         };
-        let top = nq - 1 - c.level as usize;
+        let top = ctx.top_of(c.level)?;
         let sf_ = ctx.scale.sf(top as i32)?;
         if let Some((cfs, amps)) = &o.grid {
             // precision grid: one refresh per amplitude, CF and seed; bits = -log2 of the worst real-part error

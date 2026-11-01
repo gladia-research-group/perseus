@@ -116,7 +116,7 @@ impl<'s> Builder<'s> {
             match *s {
                 Step::Rescale => {
                     self.prog.ops.push(EmOp::Rescale { x, n: (m.top + 1) as usize, k: None });
-                    m.top -= d;
+                    m.top = if self.st.singles != 0 { self.fx().down(m.top) } else { m.top - d };
                 }
                 Step::DropTo(t) => m.top = t,
                 Step::Scalar(c) => {

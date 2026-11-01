@@ -5,7 +5,9 @@
 //! Level conventions: Q prime ids `0..q.len()`, special prime ids `q.len()..q.len()+p.len()` (FIDESlib's id space);
 //! one CKKS level is `level_unit = composite_degree` primes; "limb top" `l` means the primes `0..=l` are live. A lean
 //! chain (`ChainSpec::lean`) keeps that grid from the top but has single-prime levels at the bottom: `Chain::groups`
-//! lists the primes of every level.
+//! lists the primes of every level. An alternating user region (`ChainSpec::sp`) mixes one- and two-prime levels in
+//! the middle of the chain; there `CtMeta::level` counts levels on a virtual grid of `level_unit` per level
+//! (`Chain::singles`, pc-shadow `ChainShape`).
 pub mod check;
 pub mod nbtheory;
 pub mod primegen;
@@ -66,6 +68,8 @@ pub struct ChainSpec {
     /// The lean bottom (composite chains): the base chain of the other fields with its bottom StC levels on single
     /// primes and the key-switching digits re-partitioned.
     pub lean: Option<Lean>,
+    /// An alternating user region above a lean bottom (`Sp`).
+    pub sp: Option<Sp>,
 }
 
 /// `thin` single primes kept above q0 in place of as many composite levels (the StC-first input stages run on them,
@@ -79,6 +83,30 @@ pub struct Lean {
     pub thin: u32,
     pub dnum: u32,
     pub p_margin: u32,
+}
+
+/// An alternating user region on a lean chain: the base chain's `replace` composite levels right above the lean bottom
+/// give way to `levels` levels that drop one prime (S) and two (P) in turn, S at the bottom. A rescale takes a scale
+/// of 2^x to 2^(2x - b) for a drop of b bits, so the levels that drop an S prime sit at 2^`scale` and those that drop a
+/// pair at 2^(2 `scale` - `single`): the primes are NTT primes below 2^28 outside the base chain, picked from the top
+/// level down so that each level lands on that orbit (`sp_primes`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sp {
+    pub replace: u32,
+    pub levels: u32,
+    pub scale: f64,
+    pub single: f64,
+}
+
+impl Sp {
+    /// log2 of the scale of the region's top level (the landing of a bootstrap whose output enters it).
+    pub fn top_scale(&self) -> f64 {
+        if self.levels % 2 == 0 {
+            2.0 * self.scale - self.single
+        } else {
+            self.scale
+        }
+    }
 }
 
 impl ChainSpec {
@@ -97,12 +125,19 @@ impl ChainSpec {
             word: WordId::U32,
             sizes_per_level: None,
             lean: None,
+            sp: None,
         }
     }
     /// n32 with its bottom StC levels on 3 single primes (n32's primes 2..=4; primes 5..=7 dropped) and dnum 4: 51
     /// limbs, the top 46 primes (every user, EvalMod and CtS level) n32's own.
     pub fn n32a4() -> Self {
         ChainSpec { lean: Some(Lean { thin: 3, dnum: 4, p_margin: 8 }), ..Self::n32() }
+    }
+    /// n32a4 with its 9 user levels (the composite levels above the lean bottom) replaced by 12 alternating levels,
+    /// 6 single primes of ~27.85 bits and 6 pairs of ~52.3: the scales alternate 2^36 / 2^44.15 and the top user level,
+    /// where the dense refresh lands, is a pair's at 2^44.15. Every level above and below them is n32a4's.
+    pub fn n32sp() -> Self {
+        ChainSpec { sp: Some(Sp { replace: 9, levels: 12, scale: 36.0, single: 27.85 }), ..Self::n32a4() }
     }
     /// The n64 chain (functional only): logN 16, 53-bit primes, 60-bit q0, depth 27, dnum 7, 60-bit specials.
     pub fn n64() -> Self {
@@ -119,6 +154,7 @@ impl ChainSpec {
             word: WordId::U64,
             sizes_per_level: None,
             lean: None,
+            sp: None,
         }
     }
     pub fn preset(name: &str) -> Result<Self> {
@@ -126,7 +162,8 @@ impl ChainSpec {
             "n32" => Ok(Self::n32()),
             "n64" => Ok(Self::n64()),
             "n32a4" => Ok(Self::n32a4()),
-            _ => Err(Error::Params(format!("unknown chain preset '{name}' (known: n32, n64, n32a4)"))),
+            "n32sp" => Ok(Self::n32sp()),
+            _ => Err(Error::Params(format!("unknown chain preset '{name}' (known: n32, n64, n32a4, n32sp)"))),
         }
     }
     pub fn scaling(&self) -> Scaling {
@@ -240,11 +277,59 @@ fn estimate_log_p(
     Ok((size_p * aux_bits, size_p))
 }
 
+/// The primes of an alternating user region (`Sp`), bottom first, and its levels' prime counts: NTT primes below 2^28
+/// outside `used`, chosen from the top level down. A level at scale 2^x that drops b bits leaves 2^(2x - b), so each
+/// level takes the single prime (or the pair, from [2^25, 2^28)) whose bits bring the next level closest to its scale
+/// on the orbit; the choice at every level absorbs the deviation of the levels above it.
+pub fn sp_primes(sp: &Sp, used: &[u64], cycl_order: u64) -> Result<(Vec<u64>, Vec<usize>)> {
+    let mut pool = Vec::new();
+    let mut c = first_prime(28, cycl_order)?;
+    while c >= 1 << 25 {
+        c = previous_prime(c, cycl_order)?;
+        if c < 1 << 28 && !used.contains(&c) {
+            pool.push(c);
+        }
+    }
+    let lg = |x: u64| (x as f64).log2();
+    let pair_scale = 2.0 * sp.scale - sp.single;
+    let mut x = sp.top_scale();
+    let mut top_down: Vec<Vec<u64>> = Vec::with_capacity(sp.levels as usize);
+    for lv in (0..sp.levels).rev() {
+        let single = lv % 2 == 0;
+        // the level below sits at the other scale of the orbit
+        let want = 2.0 * x - if single { pair_scale } else { sp.scale };
+        let free: Vec<u64> = pool.iter().copied().filter(|p| !top_down.iter().flatten().any(|u| u == p)).collect();
+        let pick = if single {
+            let p = *free.iter().min_by(|a, b| (lg(**a) - want).abs().total_cmp(&(lg(**b) - want).abs())).ok_or_else(|| Error::Params("alternating user region: out of primes".into()))?;
+            vec![p]
+        } else {
+            let mut best: Option<(f64, u64, u64)> = None;
+            for (i, &a) in free.iter().enumerate() {
+                for &b in &free[i + 1..] {
+                    let e = (lg(a) + lg(b) - want).abs();
+                    if best.is_none_or(|(be, _, _)| e < be) {
+                        best = Some((e, a, b));
+                    }
+                }
+            }
+            let (_, a, b) = best.ok_or_else(|| Error::Params("alternating user region: out of primes".into()))?;
+            vec![a.min(b), a.max(b)]
+        };
+        x = 2.0 * x - pick.iter().map(|&p| lg(p)).sum::<f64>();
+        top_down.push(pick);
+    }
+    let sizes = top_down.iter().rev().map(|g| g.len()).collect();
+    Ok((top_down.into_iter().rev().flatten().collect(), sizes))
+}
+
 impl Chain {
     /// ParamsGenCKKSRNSInternal (+ the HYBRID prime/partition part of PrecomputeCRTTables).
     pub fn generate(spec: &ChainSpec) -> Result<Chain> {
+        if spec.sp.is_some() && spec.lean.is_none() {
+            return Err(Error::Params("an alternating user region needs a lean chain".into()));
+        }
         if let Some(lean) = spec.lean {
-            let base = Chain::generate(&ChainSpec { lean: None, ..spec.clone() })?;
+            let base = Chain::generate(&ChainSpec { lean: None, sp: None, ..spec.clone() })?;
             return base.lean(spec, lean);
         }
         let n = 1u64 << spec.logn;
@@ -438,12 +523,28 @@ impl Chain {
             return Err(Error::Params(format!("lean chain: thin {t} on a {levels}-level composite chain")));
         }
         let keep: Vec<usize> = (0..self.q.len()).filter(|&i| i < d + t || i >= d + d * t).collect();
-        let q: Vec<u64> = keep.iter().map(|&i| self.q[i]).collect();
-        let q_roots: Vec<u64> = keep.iter().map(|&i| self.q_roots[i]).collect();
-        let above = q.len() - d;
+        let mut q: Vec<u64> = keep.iter().map(|&i| self.q[i]).collect();
+        let mut q_roots: Vec<u64> = keep.iter().map(|&i| self.q_roots[i]).collect();
+        let cycl_order = 2 * self.n as u64;
         let mut groups = vec![d];
-        groups.extend(std::iter::repeat_n(1, above % d));
-        groups.extend(std::iter::repeat_n(d, above / d));
+        groups.extend(std::iter::repeat_n(1, t % d));
+        groups.extend(std::iter::repeat_n(d, t / d));
+        let mut composite = (q.len() - d - t) / d;
+        if let Some(sp) = spec.sp {
+            let r = d * sp.replace as usize;
+            if d != 2 || sp.replace as usize > composite || sp.levels == 0 {
+                return Err(Error::Params(format!("alternating user region: {} levels for {} on a {composite}-level lean chain", sp.levels, sp.replace)));
+            }
+            let used: Vec<u64> = self.q.iter().chain(&self.p).copied().collect();
+            let (primes, sizes) = sp_primes(&sp, &used, cycl_order)?;
+            let at = d + t;
+            q.splice(at..at + r, primes.iter().copied());
+            let roots = primes.iter().map(|&x| root_of_unity(cycl_order, x)).collect::<Result<Vec<_>>>()?;
+            q_roots.splice(at..at + r, roots);
+            groups.extend(sizes);
+            composite -= sp.replace as usize;
+        }
+        groups.extend(std::iter::repeat_n(d, composite));
         let dnum = lean.dnum as usize;
         let a = q.len().div_ceil(dnum);
         if q.len() <= a * (dnum - 1) {
@@ -452,7 +553,6 @@ impl Chain {
         let digits: Vec<Vec<usize>> = (0..dnum).map(|j| (j * a..((j + 1) * a).min(q.len())).collect()).collect();
         let lg = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
         let widest = digits.iter().map(|dg| lg(&dg.iter().map(|&i| q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
-        let cycl_order = 2 * self.n as u64;
         let mut p = self.p.clone();
         let need = widest + lean.p_margin as f64 - lg(&p);
         if need > 0.0 {
@@ -567,6 +667,30 @@ impl Chain {
             }
         }
         None
+    }
+    /// The virtual level grid of a chain with an alternating user region: bit k is set when the k-th level from the top
+    /// drops one prime, and `CtMeta::level` counts `level_unit` per level; 0 on every other chain, whose levels count
+    /// the primes dropped.
+    pub fn singles(&self) -> u64 {
+        if self.spec.sp.is_none() {
+            return 0;
+        }
+        self.groups.iter().rev().enumerate().filter(|(_, &g)| g == 1).fold(0, |m, (k, _)| m | 1u64 << k)
+    }
+    /// The top limb of a ciphertext at `level` (`CtMeta::level`: the primes dropped, or the virtual grid's level on a
+    /// chain with an alternating user region; None past the bottom or between two levels of that grid).
+    pub fn top_at(&self, level: u32) -> Option<usize> {
+        let singles = self.singles();
+        let d = self.level_unit as u32;
+        let k = level / d;
+        let dropped = if singles == 0 {
+            level
+        } else if d != 2 || k > 63 || (level % 2 == 1 && singles >> k & 1 == 1) {
+            return None;
+        } else {
+            level - (singles & ((1u64 << k) - 1)).count_ones()
+        };
+        (self.q.len() as u32).checked_sub(dropped + 1).map(|t| t as usize)
     }
     /// Top limb of the lowest level above q0 that is narrower than `level_unit` (a lean chain's single-prime level).
     pub fn lone_top(&self) -> Option<usize> {
