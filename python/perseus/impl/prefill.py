@@ -47,7 +47,9 @@ _PRE_PERIODIC = os.environ.get("PF_PRE_PERIODIC", "0") not in ("", "0")
 # w windows once (one hoisted call) and each pair's broadcast pb_a = sum_w M'_(a-w) rot_w(y) (masks on the
 # probabilities' side, at their depth). 4: P.V with the masks on the V side instead (V~_w = sum_a M'_(a-w) vc_a,
 # one level deeper on V's side). 8 (with 2): each window's complex V pair vc_a built once per query and key chunk and
-# shared by the giant steps (one var, so its product preludes can be issued once: PC_MULT_SUM_HOIST)
+# shared by the giant steps (one var, so its product preludes can be issued once: PC_MULT_SUM_HOIST). 16 (with 1):
+# q.K^T's window rotations on the operands, rot_w(q K~_w) = rot_w(q) rot_w(K~_w): K~_w rotated once per key chunk and
+# q once per giant step, so a giant step's nw products are one sum of products (one relinearization under MULT_SUM)
 _WROT = int(os.environ.get("PF_ATTN_WROT", "0") or 0)
 
 
@@ -932,14 +934,25 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 lanes[(m, g)] = (gl, cy)
                 kts = [wsum("K", c, cp, items, K, "K", w, lambda a, w: ("pf.qpk", (a + w) % nw, W),
                             lambda v: (lambda v=v: win_mask(v[1]))) for w in range(nw)]
+                if _WROT & 16:
+                    # rot_w(q K~_w) = rot_w(q) rot_w(K~_w): K~_w rotated once per key chunk, q once per giant step
+                    # (shared by the score ciphertexts), the giant step's nw products one sum (exec.mult_sum)
+                    kts = [kts[0]] + [rot_of(("Kw", c, cp, w), kts[w], w * W * d.tH) for w in range(1, nw)]
                 for i, Q in enumerate(QL):
                     if not cy:
                         qg = rot_of(("Q", qset[id(Q)], c), Q[c], Bb * gl)
                     else:
                         qg = cyc(("Q", qset[id(Q)], c), Q[c], d.t - Bb * gl, "pf.qrot")
-                    acc = ops.mult(qg, kts[0])
-                    for w in range(1, nw):
-                        acc = ops.add(acc, ops.rotate(ops.mult(qg, kts[w]), w * W * d.tH))
+                    if _WROT & 16:
+                        tag = ("Qg", qset[id(Q)], c, cy, gl)
+                        prime(tag, qg, [w * W * d.tH for w in range(1, nw)])
+                        acc = ops.mult(qg, kts[0])
+                        for w in range(1, nw):
+                            acc = ops.add(acc, ops.mult(rot_of(tag, qg, w * W * d.tH), kts[w]))
+                    else:
+                        acc = ops.mult(qg, kts[0])
+                        for w in range(1, nw):
+                            acc = ops.add(acc, ops.rotate(ops.mult(qg, kts[w]), w * W * d.tH))
                     by[(i, m, g)] = acc
             groups = []
         for grp in groups:
