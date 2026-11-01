@@ -42,8 +42,14 @@ def test_argmax_onehot(seed):
     assert _check_onehot(v) and int(np.argmax(v)) == int(np.argmax(lg))
 
 
-def test_topk_sample():
-    """The member set is the top k of the bucket maxima; the sample is the Gumbel-max over it."""
+@pytest.mark.parametrize("native", ["0", "plain", "exact", "draw"])
+def test_topk_sample(native, monkeypatch):
+    """The member set is the top k of the bucket maxima; the sample is the Gumbel-max over it (also with the
+    maximum, threshold search and mask as native programs, both count kinds, and the draw)."""
+    if native != "0":
+        monkeypatch.setenv("PF_SELECT_NATIVE", "1")
+        monkeypatch.setenv("PF_SELECT_NAT_COUNT", "exact" if native == "draw" else native)
+        monkeypatch.setenv("PF_SELECT_NAT_DRAW", "1" if native == "draw" else "0")
     lg = _logits(7)
     h = Head("topk", k=40)
     g = np.random.default_rng(3).gumbel(size=h.L)

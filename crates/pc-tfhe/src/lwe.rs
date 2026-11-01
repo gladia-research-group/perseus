@@ -30,6 +30,16 @@ impl Lwe {
         ct
     }
 
+    /// self + o (mod q), the same key.
+    pub fn add(&self, o: &Lwe, q: u64) -> Lwe {
+        Lwe { a: self.a.iter().zip(&o.a).map(|(&x, &y)| addmod(x, y, q)).collect(), b: addmod(self.b, o.b, q) }
+    }
+
+    /// self - o (mod q), the same key.
+    pub fn sub(&self, o: &Lwe, q: u64) -> Lwe {
+        Lwe { a: self.a.iter().zip(&o.a).map(|(&x, &y)| addmod(x, q - y, q)).collect(), b: addmod(self.b, q - o.b, q) }
+    }
+
     /// Every word x -> round(x to / from) mod `to` (to < from), the device's fixed-point form (`gadget::scale_round`).
     pub fn mod_switch(&self, from: u64, to: u64) -> Lwe {
         let m = fixed_ratio(to, from);

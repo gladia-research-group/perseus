@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 /// The split's correction factor (the forward phase m q0 / 2^CF: |m| < 1 must not wrap; out_cf > CF).
 pub(crate) const CF: u32 = 2;
 /// LUT tables the session holds (each [2 prime][n_br] residues).
-pub(crate) const MAX_LUTS: usize = 16;
+pub(crate) const MAX_LUTS: usize = 64;
 /// Coefficient positions the slot sets may hold in total.
 pub(crate) const MAX_POS: usize = 1 << 16;
 /// The largest LUT value: the warp needs |v| 2 pi < 2^out_cf (8 / 2 pi = 1.27 at out_cf 3).
@@ -39,6 +39,8 @@ pub(crate) struct Desc {
     pub slots: String,
     /// (j, k): output j of k interleaved LUTs (`TfheRt::lut_multi`); j = 0 runs the switch, the others read its stash
     pub part: Option<(usize, usize)>,
+    /// a native program (`TfheRt::prog`) instead of a LUT: loads `slots`, stores where its last step says
+    pub prog: Option<String>,
 }
 
 impl Desc {
@@ -52,7 +54,12 @@ impl Desc {
             Some(p) => Some((p.get(0)?.as_u64()? as usize, p.get(1)?.as_u64()? as usize)),
             None => None,
         };
-        Some(Desc { lut: v.get("lut")?.as_str()?.to_string(), slots: v.get("slots")?.as_str()?.to_string(), part })
+        let prog = v.get("prog").and_then(|p| p.as_str()).map(str::to_string);
+        let lut = match &prog {
+            Some(_) => String::new(),
+            None => v.get("lut")?.as_str()?.to_string(),
+        };
+        Some(Desc { lut, slots: v.get("slots")?.as_str()?.to_string(), part, prog })
     }
 }
 
@@ -78,6 +85,8 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
         let (n_lwe, l) = g.ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LWE={v}: dimension, log2 sigma")))?;
         p = p.with_lwe(n_lwe, l).map_err(|x| PyValueError::new_err(x.to_string()))?;
     }
+    // PC_TFHE_NATIVE=bufs,rows: native programs (Params::chain; `bufs` LWE buffers of `rows` each)
+    p.chain = native_cap().is_some();
     if let Ok(v) = std::env::var("PC_TFHE_NU") {
         p.nu = match v.trim() {
             "" | "1" => 1,
@@ -86,6 +95,25 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
         };
     }
     Ok(p)
+}
+
+/// PC_TFHE_NATIVE=bufs,rows: the native programs' LWE buffers (None: no programs).
+pub(crate) fn native_cap() -> Option<(usize, usize)> {
+    let v = std::env::var("PC_TFHE_NATIVE").ok()?;
+    let (b, r) = v.split_once(',')?;
+    Some((b.trim().parse().ok()?, r.trim().parse().ok()?))
+}
+
+/// Index words the native programs' LIN steps may hold in total.
+const MAX_IDX: usize = 1 << 20;
+
+/// One native program step (`TfheRt::prog`).
+#[derive(Clone, Debug)]
+enum Step {
+    Load { lut: usize, dst: usize },
+    Lin { dst: usize, a: usize, b: usize, idx: usize, rows: usize, ca: u64, cb: u64, c: u64 },
+    Pbs { src: usize, rows: usize, lut: usize, k: usize, dst: Vec<usize> },
+    Store { src: usize, rows: usize, lut: usize, set: String },
 }
 
 /// What the session's MemPlan reserves: the switch (`max` values per pass), the tables, one ciphertext.
@@ -99,6 +127,9 @@ impl TfhePlan {
         mp.reserve("tfhe", TfheSwitch::bytes(n, &p, self.max));
         mp.reserve("tfhe.tables", 4 * (MAX_LUTS * 2 * p.tv_len() + MAX_POS) + 2 * 256);
         mp.reserve("tfhe.ct", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1)));
+        if let Some((b, r)) = native_cap() {
+            mp.reserve("tfhe.native", 4 * ((b + 1) * r * (p.n_br + 1) + MAX_IDX) + 512);
+        }
         Ok(())
     }
 }
@@ -119,6 +150,11 @@ pub(crate) struct TfheRt {
     /// a two-LUT finish's second output (finished), for the part-1 op that follows; tagged by its LUT
     x2: Ct<'static, W>,
     stash: Option<String>,
+    /// native programs: name -> steps; LWE buffers [bufs + 1 scratch][rows][n_br + 1]; LIN index pairs
+    progs: BTreeMap<String, Vec<Step>>,
+    nat: Option<(pc_cuda::DBuf<'static, pc_cuda::Compute, u32>, usize, usize)>,
+    nat_idx: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
+    idx_used: usize,
     n: usize,
     pub calls: u64,
     pub values: u64,
@@ -146,7 +182,14 @@ impl TfheRt {
         let pos_buf = arena.alloc::<pc_cuda::Compute, u32>("tfhe.tables", MAX_POS).map_err(|x| e(x.into()))?;
         let x = Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "tfhe.ct", ctx.lay, 1).map_err(e)?);
         let x2 = Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "tfhe.ct", ctx.lay, 1).map_err(e)?);
-        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
+        let (nat, nat_idx) = match native_cap() {
+            Some((b, r)) => (
+                Some((arena.alloc::<pc_cuda::Compute, u32>("tfhe.native", (b + 1) * r * (params.n_br + 1)).map_err(|x| e(x.into()))?, b, r)),
+                Some(arena.alloc::<pc_cuda::Compute, u32>("tfhe.native", MAX_IDX).map_err(|x| e(x.into()))?),
+            ),
+            None => (None, None),
+        };
+        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
     }
 
     /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / g (j < g / 2) and 2 (j - g) / g (j >= g / 2)
@@ -267,6 +310,166 @@ impl TfheRt {
         Ok(())
     }
 
+    /// Register native program `name` (JSON, perseus impl/tfhe.py `Prog`): `luts` {name: {"tables": [[v on the grid
+    /// of n_br nu / k]; k], "warp": bool}} (native: v at phase v q / 4; warp: as `lut`, for a store), `steps`: load
+    /// {lut, dst} (the finish's slot set through `lut` into buffer dst), lin {dst, a, b, idx: [ia, ib, ..] (-1: no
+    /// term), ca, cb (integers), c (a native constant)}, pbs {src, rows, lut, dst: [..] (one per table)}, store {src,
+    /// rows, lut (warp), slots: a registered set of `rows` values}: the finish's output. Synchronous.
+    pub fn prog(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, json: &str) -> PyResult<()> {
+        let bad = |m: String| PyValueError::new_err(format!("tfhe prog {name}: {m}"));
+        let (bufs, rows) = match &self.nat {
+            Some((_, b, r)) => (*b, *r),
+            None => return Err(bad("the session has no native buffers (PC_TFHE_NATIVE=bufs,rows)".into())),
+        };
+        let v: serde_json::Value = serde_json::from_str(json).map_err(|x| bad(x.to_string()))?;
+        let (q, p0, nb) = (self.params.q_br, self.sw.p0(), self.params.tv_len());
+        let mut lut_k: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (ln, l) in v.get("luts").and_then(|x| x.as_object()).ok_or_else(|| bad("no luts".into()))? {
+            let tables: Vec<Vec<f64>> = serde_json::from_value(l.get("tables").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
+            let warp = l.get("warp").and_then(|x| x.as_bool()).unwrap_or(false);
+            let k = tables.len();
+            if k == 0 || nb % k != 0 || tables.iter().any(|t| t.len() != nb / k) || (warp && k != 1) {
+                return Err(bad(format!("lut {ln}: {k} tables of {} points (warp: one)", nb / k.max(1))));
+            }
+            if tables.iter().flatten().any(|x| !x.is_finite() || x.abs() > if warp { MAX_V } else { 2.0 }) {
+                return Err(bad(format!("lut {ln}: a value outside the range")));
+            }
+            let tvs: Vec<Vec<u64>> = tables
+                .iter()
+                .map(|t| {
+                    let h = t.len();
+                    t.iter()
+                        .enumerate()
+                        .map(|(j, &x)| {
+                            let y = if warp { q as f64 * pc_tfhe::pbs::warp(x, self.params.out_cf) } else { q as f64 * x / 4.0 };
+                            let y = y.round() as i64;
+                            (if j < h / 2 { y } else { -y }).rem_euclid(q as i64) as u64
+                        })
+                        .collect()
+                })
+                .collect();
+            let tv = if k == 1 { tvs.into_iter().next().unwrap() } else { pc_tfhe::pbs::interleave(&tvs) };
+            let res: Vec<u32> = self.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect();
+            let full = format!("{name}/{ln}");
+            self.store(s, &full, &res, 0)?;
+            lut_k.insert(ln.clone(), (self.luts[&full].0, k));
+        }
+        let lut = |x: &serde_json::Value| -> PyResult<(usize, usize)> {
+            let n = x.get("lut").and_then(|y| y.as_str()).ok_or_else(|| bad("a step without its lut".into()))?;
+            lut_k.get(n).copied().ok_or_else(|| bad(format!("lut {n} not in the program")))
+        };
+        let buf = |x: &serde_json::Value, k: &str| -> PyResult<usize> {
+            let b = x.get(k).and_then(|y| y.as_u64()).ok_or_else(|| bad(format!("a step without {k}")))? as usize;
+            if b >= bufs {
+                return Err(bad(format!("buffer {b} (the session holds {bufs})")));
+            }
+            Ok(b)
+        };
+        let nrows = |x: &serde_json::Value| -> PyResult<usize> {
+            let r = x.get("rows").and_then(|y| y.as_u64()).ok_or_else(|| bad("a step without rows".into()))? as usize;
+            if r == 0 || r > rows {
+                return Err(bad(format!("{r} rows (buffers hold {rows})")));
+            }
+            Ok(r)
+        };
+        let modp = |x: i64| x.rem_euclid(p0 as i64) as u64;
+        let mut steps = Vec::new();
+        for st in v.get("steps").and_then(|x| x.as_array()).ok_or_else(|| bad("no steps".into()))? {
+            let op = st.get("op").and_then(|x| x.as_str()).unwrap_or("");
+            steps.push(match op {
+                "load" => {
+                    let (l, k) = lut(st)?;
+                    if k != 1 {
+                        return Err(bad("load: one table".into()));
+                    }
+                    Step::Load { lut: l, dst: buf(st, "dst")? }
+                }
+                "lin" => {
+                    let idx: Vec<i64> = serde_json::from_value(st.get("idx").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
+                    let r = idx.len() / 2;
+                    if idx.len() % 2 != 0 || r == 0 || r > rows || idx.iter().any(|&i| i < -1 || i >= rows as i64) {
+                        return Err(bad(format!("lin: {} index words", idx.len())));
+                    }
+                    if self.idx_used + idx.len() > MAX_IDX {
+                        return Err(bad(format!("the session holds {MAX_IDX} index words")));
+                    }
+                    let w: Vec<u32> = idx.iter().map(|&i| i as i32 as u32).collect();
+                    let ib = self.nat_idx.as_mut().unwrap();
+                    ib.upload_at(s, self.idx_used, &w).map_err(|x| crate::session::gerr(x.into()))?;
+                    let off = self.idx_used;
+                    self.idx_used += w.len();
+                    let int = |k: &str| st.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+                    let c = st.get("c").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    Step::Lin { dst: buf(st, "dst")?, a: buf(st, "a")?, b: buf(st, "b")?, idx: off, rows: r, ca: modp(int("ca")), cb: modp(int("cb")), c: modp((c * p0 as f64 / 4.0).round() as i64) }
+                }
+                "pbs" => {
+                    let (l, k) = lut(st)?;
+                    let dst: Vec<usize> = st.get("dst").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|y| y.as_u64().map(|z| z as usize)).collect()).unwrap_or_default();
+                    if dst.len() != k || dst.iter().any(|&b| b >= bufs) {
+                        return Err(bad(format!("pbs: {} outputs for {k} tables", dst.len())));
+                    }
+                    Step::Pbs { src: buf(st, "src")?, rows: nrows(st)?, lut: l, k, dst }
+                }
+                "store" => {
+                    let (l, _) = lut(st)?;
+                    let set = st.get("slots").and_then(|x| x.as_str()).ok_or_else(|| bad("store: no slots".into()))?.to_string();
+                    let r = nrows(st)?;
+                    match self.sets.get(&set) {
+                        Some(&(_, cnt, _)) if cnt == r => {}
+                        _ => return Err(bad(format!("store: slot set {set} (registered first, {r} values)"))),
+                    }
+                    Step::Store { src: buf(st, "src")?, rows: r, lut: l, set }
+                }
+                o => return Err(bad(format!("step {o:?}"))),
+            });
+        }
+        if !matches!(steps.first(), Some(Step::Load { .. })) || !matches!(steps.last(), Some(Step::Store { .. })) || steps.iter().filter(|x| matches!(x, Step::Store { .. })).count() != 1 {
+            return Err(bad("a program loads first and stores once, last".into()));
+        }
+        s.sync().map_err(|x| crate::session::gerr(x.into()))?;
+        self.progs.insert(name.to_string(), steps);
+        Ok(())
+    }
+
+    /// Run program `name` on the split `x` (the finish's set `pos` / `cnt`): the output into `x`, as `apply_dev`.
+    fn run_prog(&mut self, ctx: &pc_gpu::Context<'static, W, M>, st: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, pos: *const std::ffi::c_void, cnt: usize) -> pc_gpu::Result<()> {
+        use std::ffi::c_void;
+        let steps = self.progs[name].clone();
+        let (nbuf, _, rows) = self.nat.as_ref().map(|(b, n, r)| (b.vptr() as *mut u32, *n, *r)).unwrap();
+        let nb = self.params.tv_len();
+        let row = self.params.n_br + 1;
+        let bp = |b: usize| nbuf.wrapping_add(b * rows * row) as *mut c_void;
+        let scratch = bp(self.nat.as_ref().unwrap().1);
+        let idx = self.nat_idx.as_ref().unwrap().vptr() as *const u32;
+        let tvp = |k: usize| (self.lut_buf.vptr() as *const u32).wrapping_add(k * 2 * nb) as *const c_void;
+        // SAFETY: the box is owned by the service and outlives the switch's plans
+        let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&self.lt.inner as *const pc_cuda::blas::lt::Lt) };
+        for step in &steps {
+            match step {
+                Step::Load { lut, dst } => {
+                    if cnt > rows {
+                        return Err(pc_gpu::Error::Shape { what: "tfhe prog".into(), msg: format!("load of {cnt} values (buffers hold {rows})") });
+                    }
+                    self.sw.native_load(ctx, st, ltr, &mut self.x, pos, cnt, tvp(*lut), 0, bp(*dst), false)?;
+                }
+                Step::Lin { dst, a, b, idx: off, rows: r, ca, cb, c } => {
+                    self.sw.native_lin_c(ctx, st, bp(*dst), bp(*a), bp(*b), idx.wrapping_add(*off) as *const c_void, *r, *ca, *cb, *c)?;
+                }
+                Step::Pbs { src, rows: r, lut, k, dst } => {
+                    let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
+                    self.sw.native_pbs(ctx, st, ltr, bp(*src), *r, tvp(*lut), &vec![0; *k], &dsts)?;
+                }
+                Step::Store { src, rows: r, lut, set } => {
+                    let &(off, _, reps) = &self.sets[set];
+                    self.sw.native_pbs(ctx, st, ltr, bp(*src), *r, tvp(*lut), &[0], &[scratch])?;
+                    let pp = (self.pos_buf.vptr() as *const u32).wrapping_add(off) as *const c_void;
+                    self.sw.native_store(ctx, st, ltr, scratch, pp, *r, reps, &mut self.x)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn names(&self) -> (Vec<String>, Vec<String>) {
         (self.luts.keys().cloned().collect(), self.sets.keys().cloned().collect())
     }
@@ -295,8 +498,29 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
             rt.calls += 1;
             return Ok(());
         }
-        let &(k, offset) = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
         let &(off, cnt, reps) = rt.sets.get(&d.slots).ok_or_else(|| ferr(f, format!("slot set {} never registered (Session.tfhe_slots)", d.slots)))?;
+        if let Some(pn) = &d.prog {
+            if !rt.progs.contains_key(pn) || f.ins.len() != 1 || f.outs.len() != 1 {
+                return Err(ferr(f, format!("program {pn} never registered (Session.tfhe_prog) / not one input and output")));
+            }
+            copy_ct(cx.ctx, &cx.ex.compute, &mut rt.x, &slots[f.ins[0] as usize])?;
+            let r = pc_shadow::Route { cf: Some(CF), stc_first: true, real: false, ..pc_shadow::Route::dense() };
+            let mut call = BtsCall::begin(StagedRef::StcFirst(self.route), cx, std::slice::from_ref(&rt.x), &r, CallOpts { prescaled: false, own_cf: true })?;
+            if call.stc_first_input(cx, std::slice::from_mut(&mut rt.x))?.is_none() {
+                return Err(ferr(f, "input below the StC-first entry"));
+            }
+            let pos = (rt.pos_buf.vptr() as *const u32).wrapping_add(off) as *const std::ffi::c_void;
+            rt.run_prog(cx.ctx, &cx.ex.compute, pn, pos, cnt)?;
+            let x = std::slice::from_mut(&mut rt.x);
+            let mut fin = call.finish_call(0)?;
+            fin.at_split(cx, x)?;
+            fin.run_to(cx, x, Phase::Done)?;
+            copy_ct(cx.ctx, &cx.ex.compute, &mut slots[f.outs[0] as usize], &x[0])?;
+            rt.calls += 1;
+            rt.values += cnt as u64;
+            return Ok(());
+        }
+        let &(k, offset) = rt.luts.get(&d.lut).ok_or_else(|| ferr(f, format!("lut {} never registered (Session.tfhe_lut)", d.lut)))?;
         if f.ins.len() != 1 || f.outs.len() != 1 {
             return Err(ferr(f, format!("{} inputs / {} outputs (a TFHE finish has one of each)", f.ins.len(), f.outs.len())));
         }

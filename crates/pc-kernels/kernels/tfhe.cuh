@@ -1006,6 +1006,20 @@ __global__ void extract_k(TfheArgs A) {
     }
 }
 
+__global__ void lwe_lin_k(TfheArgs A) {
+    const int len = A.i1 + 1;
+    const int2 ix = ((const int2*)A.w)[blockIdx.y];
+    const uint64_t q = A.q;
+    uint32_t* out = (uint32_t*)A.x + (size_t)blockIdx.y * len;
+    const uint32_t* a = ix.x >= 0 ? (const uint32_t*)A.y + (size_t)ix.x * len : nullptr;
+    const uint32_t* b = ix.y >= 0 ? (const uint32_t*)A.z + (size_t)ix.y * len : nullptr;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < len; k += gridDim.x * blockDim.x) {
+        const uint64_t u = a ? (uint64_t)a[k] * A.c[0] % q : 0, v = b ? (uint64_t)b[k] * A.c[1] % q : 0;
+        const uint64_t r = addq(u, v, q);
+        out[k] = (uint32_t)(k == len - 1 ? addq(r, A.c[2], q) : r);
+    }
+}
+
 __global__ void ks_digits_k(TfheArgs A) {
     const int len = A.i1, lv = (int)A.c[1];
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1509,6 +1523,10 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             break;
         case PC_TFHE_REPACK_C0:
             repack_c0_k<<<(A.n + 255) / 256, 256, 0, s>>>(A);
+            break;
+        case PC_TFHE_LWE_LIN:
+            if (A.count > 65535) return -1;
+            lwe_lin_k<<<dim3((A.i1 + 256) / 256, A.count), 256, 0, s>>>(A);
             break;
         default:
             return -2;
