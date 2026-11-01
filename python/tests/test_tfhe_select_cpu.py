@@ -42,14 +42,15 @@ def test_argmax_onehot(seed):
     assert _check_onehot(v) and int(np.argmax(v)) == int(np.argmax(lg))
 
 
-@pytest.mark.parametrize("native", ["0", "plain", "exact", "draw"])
+@pytest.mark.parametrize("native", ["0", "plain", "exact", "draw", "arity3", "arity5"])
 def test_topk_sample(native, monkeypatch):
     """The member set is the top k of the bucket maxima; the sample is the Gumbel-max over it (also with the
-    maximum, threshold search and mask as native programs, both count kinds, and the draw)."""
+    maximum, threshold search and mask as native programs: both count kinds, the draw, k-ary searches)."""
     if native != "0":
         monkeypatch.setenv("PF_SELECT_NATIVE", "1")
-        monkeypatch.setenv("PF_SELECT_NAT_COUNT", "exact" if native == "draw" else native)
+        monkeypatch.setenv("PF_SELECT_NAT_COUNT", "plain" if native == "plain" else "exact")
         monkeypatch.setenv("PF_SELECT_NAT_DRAW", "1" if native == "draw" else "0")
+        monkeypatch.setenv("PF_SELECT_NAT_ARITY", native[5:] if native.startswith("arity") else "2")
     lg = _logits(7)
     h = Head("topk", k=40)
     g = np.random.default_rng(3).gumbel(size=h.L)
@@ -57,10 +58,42 @@ def test_topk_sample(native, monkeypatch):
     bt = h.buckets(lg)
     members = bt[np.rint(mask) > 0.5]
     top = bt[np.argsort(-lg[bt])[:40]]
-    assert 40 <= len(members) <= 44 and set(top) <= set(members)
+    # the k-ary searches' mask sits a margin (0.1 / 0.2 logits) below their threshold: a few more members
+    assert 40 <= len(members) <= (52 if native.startswith("arity") else 44) and set(top) <= set(members)
     gb = np.zeros(VOCAB)
     gb[bt] = g
     assert _check_onehot(v) and int(np.argmax(v)) == int(members[np.argmax(lg[members] + gb[members])])
+
+
+def test_minp_sample():
+    """min-p: the members are the bucket maxima within ln(p) of the largest."""
+    lg = _logits(5)
+    h = Head("minp", minp=0.05)
+    g = np.random.default_rng(4).gumbel(size=h.L)
+    v, mask = h.decode(h.stage(NumpyOps(), h.encode(lg, g)))
+    bt = h.buckets(lg)
+    members = set(bt[np.rint(mask) > 0.5].tolist())
+    want = set(bt[lg[bt] >= lg.max() + np.log(0.05)].tolist())
+    assert members == want and _check_onehot(v) and int(np.argmax(v)) in members
+
+
+@pytest.mark.parametrize("k", ["1", "4"])
+def test_topp_sample(k, monkeypatch):
+    """top-p: the nucleus of the bucket maxima is inside the members (their margin adds a few within it below)."""
+    monkeypatch.setenv("PF_SELECT_NATIVE", "1")
+    monkeypatch.setenv("PF_SELECT_TOPP_K", k)
+    lg = _logits(9)
+    h = Head("topp", topp=0.9)
+    g = np.random.default_rng(2).gumbel(size=h.L)
+    v, mask = h.decode(h.stage(NumpyOps(), h.encode(lg, g)))
+    bt = h.buckets(lg)
+    members = set(bt[np.rint(mask) > 0.5].tolist())
+    o = np.argsort(-lg[bt])
+    c = np.cumsum(np.exp(lg[bt][o] - lg[bt][o[0]]))
+    nuc = set(bt[o[:int(np.searchsorted(c / c[-1], 0.9)) + 1]].tolist())
+    below = lg[bt][o][len(nuc) - 1] - 0.35 * int(k) - 0.2
+    assert nuc <= members and all(lg[t] >= below for t in members)
+    assert _check_onehot(v) and int(np.argmax(v)) in members
 
 
 def test_ckks_sign_baseline(monkeypatch):

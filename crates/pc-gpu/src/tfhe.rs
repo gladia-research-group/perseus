@@ -343,8 +343,8 @@ pub struct TfheSwitch<'a> {
     ksk: Vec<DBuf<'a, Compute, u8>>,
     /// Params::chain: the native chains' key switch (empty: none)
     cksk: Vec<DBuf<'a, Compute, u8>>,
-    /// native_load: the bootstrap outputs go to this buffer ([b][n_br + 1]) instead of the repack
-    sink: Option<*mut c_void>,
+    /// native_load: the bootstrap outputs (one buffer per LUT, [b][n_br + 1]) go here instead of the repack
+    sinks: Vec<*mut c_void>,
     bsk: DBuf<'a, Compute, u32>,
     bsk_lat: Option<DBuf<'a, Compute, u32>>,
     btw: DBuf<'a, Compute, u32>,
@@ -432,7 +432,7 @@ impl<'a> TfheSwitch<'a> {
             rkey: up32("tfhe.rkey", &rkey)?,
             ksk,
             cksk,
-            sink: None,
+            sinks: Vec::new(),
             bsk: up32("tfhe.bsk", &img.bsk)?,
             bsk_lat: match &sw.bsk_lat {
                 Some(k) => Some(up32("tfhe.bsk", &pbs_image(k).bsk)?),
@@ -551,7 +551,8 @@ impl<'a> TfheSwitch<'a> {
     pub fn apply_dev_k<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, extra: &mut [&mut Ct<'_, W>], pos: *const c_void, b: usize, reps: usize, tv: *const c_void, offsets: &[u64], timed: bool) -> Result<Timings> {
         let (n, nb, nl, n_sub) = (self.n, self.nb, self.nl, self.n_sub);
         let kl = offsets.len();
-        if b == 0 || kl == 0 || extra.len() + 1 != kl || (kl > 1 && b > self.max) || (2 * nb * self.p.nu) % kl != 0 {
+        let outs_ok = if self.sinks.is_empty() { extra.len() + 1 == kl } else { self.sinks.len() == kl };
+        if b == 0 || kl == 0 || !outs_ok || (kl > 1 && b > self.max) || (2 * nb * self.p.nu) % kl != 0 {
             return Err(shape("tfhe switch", format!("{b} coefficients, {kl} LUTs ({} outputs; several LUTs: one pass of <= {})", extra.len() + 1, self.max)));
         }
         if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 {
@@ -633,9 +634,11 @@ impl<'a> TfheSwitch<'a> {
             // bootstrap
             let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
             self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
-            if let Some(dst) = self.sink {
-                let x = (dst as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
-                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[0], p0, 0, 0, 0, nu, cx[6], cx[7]], ..pb })?;
+            if !self.sinks.is_empty() {
+                for (j, &dst) in self.sinks.iter().enumerate() {
+                    let x = (dst as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
+                    Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
+                }
                 lap(s, &mut t, &mut tm.bootstrap)?;
                 continue;
             }
@@ -660,7 +663,7 @@ impl<'a> TfheSwitch<'a> {
             }
             lap(s, &mut t, &mut tm.repack)?;
         }
-        if self.sink.is_none() {
+        if self.sinks.is_empty() {
             self.finish_into(ctx, s, &pa, x)?;
         }
         lap(s, &mut t, &mut tm.repack)?;
@@ -673,9 +676,15 @@ impl<'a> TfheSwitch<'a> {
     /// The split's coefficients `pos` (as `apply_dev`) through the LUT `tv` + `offset` into `dst` [b][n_br + 1].
     #[allow(clippy::too_many_arguments)]
     pub fn native_load<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, tv: *const c_void, offset: u64, dst: *mut c_void, timed: bool) -> Result<Timings> {
-        self.sink = Some(dst);
-        let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, tv, &[offset], timed);
-        self.sink = None;
+        self.native_load_k(ctx, s, lt_, x, pos, b, tv, &[offset], &[dst], timed)
+    }
+
+    /// `native_load` through k interleaved LUTs (one rotation; b <= one pass): LUT j into `dsts[j]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_load_k<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, tv: *const c_void, offsets: &[u64], dsts: &[*mut c_void], timed: bool) -> Result<Timings> {
+        self.sinks = dsts.to_vec();
+        let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, tv, offsets, timed);
+        self.sinks.clear();
         r
     }
 

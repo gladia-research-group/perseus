@@ -1,9 +1,9 @@
 graph=graphs/gpt2_tfhe_topk_native
-tool=PF_SELECT_SIGN=hybrid:6000:0.5 PF_SELECT_NATIVE=1 python -m perseus.examples.gpt2.tfhe_head --fake --mode topk --logits <logits.npy> --n 1 --capture graphs/gpt2_tfhe_topk_native --twin-limit 44 (--set the runtime line); <recipe> PLAN_RAISE_DROP_SET=1,3,5 examples/gpt2/make_plan.sh
-recipe=the gpt2_decode recipe line (bootstrap_placements/gpt2_decode/PLAN_CMD.txt) with PLAN_RAISE_DROP_SET=1,3,5 (the head runtime builds raise drops 1,3,5); make_plan.sh defaults misplace the head (bucket maxima off by up to 15 logits on the device)
+tool=PF_SELECT_SIGN=hybrid:4000:0.5 PF_SELECT_NATIVE=1 python -m perseus.examples.gpt2.tfhe_head --fake --mode topk --logits <logits.npy> --n 1 --capture graphs/gpt2_tfhe_topk_native --twin-limit 44 (--set the runtime line); <recipe> PLAN_RAISE_DROP_SET=1,3,5 examples/gpt2/make_plan.sh
+recipe=the gpt2_decode recipe line (bootstrap_placements/gpt2_decode/PLAN_CMD.txt) with PLAN_RAISE_DROP_SET=1,3,5
 runtime=FIDESLIB_BTS_SHIFT=1 FIDESLIB_BTS_RAISE_DROP=512:1 FIDESLIB_SPRU=64 FIDESLIB_BTS_RAISE_DROPS=1,3,5 FIDESLIB_BTS_REAL=1 FIDESLIB_BTS_SPARSE_B=1 FIDESLIB_ROT_KEY_BAND=32 CUTMAX_PAIR=1 IMPL_DEAD_OPS=1 FIDESLIB_BTS_STC_FIRST=2 FIDESLIB_BTS_STC_FIRST_ROUTES=dense FIDESLIB_BTS_STC_FIRST_CF=13 AUTO_BTS_LEVEL=44 BTS_MAX_INPUT_LEVEL=48
 twin=--twin-limit 44
-sign=hybrid:6000:0.5
+sign=hybrid:4000:0.5
 fine=512
 L=1024
-env=PF_SELECT_NATIVE=1 PC_TFHE_NATIVE=12,1024
+env=PF_SELECT_NATIVE=1 PC_TFHE_NATIVE=20,1024

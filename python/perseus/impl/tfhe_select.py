@@ -22,10 +22,8 @@ The vector: tiles `xs` of n real slots, tile 0 full, tile k > 0 valid on `valid[
   a 3-level sign on one slot), the mask [y >= t]; sampling = the Gumbel-max over the members: argmax mask (y + g + C)
   with g Gumbel(0, 1) per bucket (i.i.d. per member, as per token; public server randomness: a plaintext re-encoded
   per token, or a ciphertext).
-* Native top-k (PF_SELECT_NATIVE=1, `_topk_native`): the maxima's maximum and the threshold search with its mask as
-  native TFHE programs (impl/tfhe.py `Prog`): bootstraps chained on LWEs between one switch and one finish, three
-  switches where the CKKS loop takes one per tournament round and two per probe. PF_SELECT_NAT_DRAW=1 also the
-  Gumbel-max (`_prog_gumbel`; its relu values' noise biases the sample: TV ~0.03-0.05 to the members' softmax).
+* Native top-k (PF_SELECT_NATIVE=1, `_topk_native`): the maximum, threshold search and mask as native TFHE programs
+  (impl/tfhe.py `Prog`); PF_SELECT_NAT_DRAW=1 also the Gumbel-max (`_prog_gumbel`).
 """
 from __future__ import annotations
 
@@ -139,9 +137,10 @@ def count_ckks():
     return os.environ.get("PF_SELECT_COUNT", "") == "ckks"
 
 
-def msign(ops, d, n, heads, R, levels, tag, res=None):
+def msign(ops, d, n, heads, R, levels, tag, res=None, pow2=False):
     """[d >= 0] on the slots `heads` (0 elsewhere) for |d| < R: `levels` scales in one switch (module doc). Under
-    PF_SELECT_SIGN=ckks:<r> a composite polynomial at resolution max(r, `res`) instead (the baseline)."""
+    PF_SELECT_SIGN=ckks:<r> a composite polynomial at resolution max(r, `res`) instead (the baseline). `pow2`: the
+    groups at slot offsets 0 and 2^j >= the heads' span (the rotations the tournaments already hold keys for)."""
     heads = np.asarray(heads, dtype=np.int64)
     r = ckks_res()
     if r is not None:
@@ -163,14 +162,18 @@ def msign(ops, d, n, heads, R, levels, tag, res=None):
     # starting at slot 0
     gap = int(np.diff(heads).min()) if len(heads) > 1 else n
     h = 1 if gap >= len(groups) else int(heads.max()) + 1
-    if len(groups) > 1 and h > 1 and len(groups) * h > n:
+    offs = [g * h for g in range(len(groups))]
+    if pow2:
+        b0 = 1 << int(np.ceil(np.log2(int(heads.max()) + 1)))
+        offs = [0] + [b0 << j for j in range(len(groups) - 1)]
+    if len(groups) > 1 and offs[-1] + int(heads.max()) >= n:
         raise ValueError(f"msign {tag}: {len(groups)} groups do not fit the heads (gap {gap}, span {h})")
     terms, const, slots = [], np.zeros(n), []
-    rots = ops.rotate_many(d, [-g * h for g in range(len(groups))])
+    rots = ops.rotate_many(d, [-o for o in offs])
     for g, ((sc, c), r) in enumerate(zip(groups, rots)):
-        terms.append(ops.mult_pt(r, _mask(n, heads + g * h, sc), kind="mask"))
-        const[heads + g * h] = c
-        slots.append(heads + g * h)
+        terms.append(ops.mult_pt(r, _mask(n, heads + offs[g], sc), kind="mask"))
+        const[heads + offs[g]] = c
+        slots.append(heads + offs[g])
     D = terms[0]
     for t in terms[1:]:
         D = ops.add(D, t)
@@ -183,7 +186,7 @@ def msign(ops, d, n, heads, R, levels, tag, res=None):
     if len(groups) == 1:
         return _clean(ops, S, n, heads)
     m = _mask(n, heads)
-    back = [S if g == 0 else ops.rotate(S, g * h) for g in range(len(groups))]
+    back = [S if g == 0 else ops.rotate(S, offs[g]) for g in range(len(groups))]
     b = [ops.mult_pt(x, m, kind="mask") for x in back]
     acc = b[-1]
     for j in range(levels - 2, -1, -1):
@@ -250,8 +253,7 @@ def _bcast(ops, x, B, n):
 
 
 def native():
-    """PF_SELECT_NATIVE=1: top-k's maximum, threshold search and mask as native TFHE programs (`_prog_max`,
-    `_prog_search`): three switches instead of one per tournament round and two per probe."""
+    """PF_SELECT_NATIVE=1: top-k's maximum, threshold search and mask as native TFHE programs."""
     import os
     return os.environ.get("PF_SELECT_NATIVE", "0") not in ("", "0")
 
@@ -273,17 +275,22 @@ def _tree(pr, src, rows, bufs, until=1):
 
 
 def nat_count():
-    """PF_SELECT_NAT_COUNT: _prog_search's counts, `exact` (default: group counts rounded by a staircase, the total
-    read on two levels) or `plain` (one LWE sum, one sign: the outputs' noise times sqrt(L) and the read's)."""
+    """PF_SELECT_NAT_COUNT: _prog_search's counts, `exact` (default: staircase-rounded group counts) or `plain`."""
     import os
     return os.environ.get("PF_SELECT_NAT_COUNT", "exact") or "exact"
 
 
 def nat_draw():
-    """PF_SELECT_NAT_DRAW=1 (with PF_SELECT_NATIVE): the Gumbel-max over the members as one native program
-    (`_prog_gumbel`) instead of a tournament of switches."""
+    """PF_SELECT_NAT_DRAW=1 (with PF_SELECT_NATIVE): the Gumbel-max over the members as one native program."""
     import os
     return os.environ.get("PF_SELECT_NAT_DRAW", "0") not in ("", "0")
+
+
+def nat_tau():
+    """PF_SELECT_NAT_TAU: the native draw scales y by this, cancelling its comparison noise's temperature
+    (softmax(y / sqrt(1 + 6 sigma^2 / pi^2)))."""
+    import os
+    return float(os.environ.get("PF_SELECT_NAT_TAU", "1.08") or 1.08)
 
 
 NAT_GROUP = 32      # exact counts: rows per group (its count read by a staircase at 1.9 / NAT_GROUP per count)
@@ -310,27 +317,23 @@ def _prog_max(L, out):
     return tfhe.register_prog(pr)
 
 
-def _prog_search(L, k, W, probes, slots):
-    """The mask [y >= lo] of the loaded u = y 1.9 / D - 0.95 (y in [0, D), D = W + NAT_PAD): `probes` halvings of
-    the threshold's lower end lo (public start 0, width W / 2^j), count(y >= lo + w) >= k raising it by w. Signs on
-    the torus (-2, 2) as a constant table at +1 (the native LUT's negacyclic half: +h below 0, -h above); the
-    count's comparison is e = a (count - k + 1/2), a = 1.9 / (L - k + 0.5) (in (-2, 2) for any count). Counts
-    (`nat_count`): plain, the LWE sum of bits +-a / 2; exact, bits +-a1 / 2 summed in groups of NAT_GROUP, each
-    group's count rounded by a staircase into a (count - NAT_GROUP / 2), the groups summed, e read as
-    [p + u + b >= 2] for p = [e >= TAU], u = [e >= -TAU], b = [16 e >= 0] (b decides only |e| <= TAU, where 16 e
-    does not wrap). Output: +-1/2 (the caller adds 1/2)."""
+def _prog_search(L, k, W, probes, slots, offset=0.0):
+    """The mask [y >= lo + offset] of the loaded u = y 1.9 / D - 0.95 (y in [0, D), D = W + NAT_PAD): `probes` halvings of
+    the threshold's lower end lo, count(y >= lo + w) >= k raising it by w; the count's comparison is e = a (count - k +
+    1/2), in (-2, 2) for any count. Output: +-1/2 (the caller adds 1/2)."""
     D = W + NAT_PAD
-    a = 1.9 / (L - k + 0.5)
     exact = nat_count() == "exact"
     G = NAT_GROUP
+    kc = min(G, k)                    # exact: a group's count capped at k (the capped sum reaches k iff the count does)
+    a = 1.9 / ((L // G * kc if exact else L) - k + 0.5)
     a1 = 1.9 / G if exact else a
-    name = f"tk.nsel.{L}.{k}.{W:g}.{probes}.{nat_count()}"
+    name = f"tk.nsel.{L}.{k}.{W:g}.{probes}.{nat_count()}" + (f".{offset:.4g}" if offset else "")
     pr = tfhe.Prog(name, 11)
     pr.lut("id", lambda m: m)
     pr.lut("bit", lambda m: np.full_like(m, -a1 / 2))
     pr.lut("out", lambda m: np.full_like(m, -0.5), warp=True)
     if exact:
-        pr.lut("stair", lambda m: a * np.rint(m / a1))                  # a1 (count - G / 2) -> a (count - G / 2)
+        pr.lut("stair", lambda m: a * (np.minimum(np.rint(m / a1) + G / 2, kc) - G / 2))   # a (min(count, k) - G / 2)
         pr.lut("half", lambda m: np.full_like(m, -0.25))                # bits +-1/4
     pr.load("id", 0)
     pr.lin(5, 0, 0, [(-1, -1)])                                       # lo = 0 (u units: lo 1.9 / D)
@@ -362,8 +365,74 @@ def _prog_search(L, k, W, probes, slots):
             pr.lin(6, 6, 9, [(0, 2)], c=1.0)
             pr.pbs(6, 1, f"step{j}", [1])                            # [two or three of p, u, b]: +-wu / 2
         pr.lin(5, 5, 1, [(0, 0)], c=wu / 2)
-    pr.lin(1, 0, 5, [(r, 0) for r in range(L)], ca=1, cb=-1, c=1.0 + 0.95)
+    pr.lin(1, 0, 5, [(r, 0) for r in range(L)], ca=1, cb=-1, c=1.0 + 0.95 - offset * 1.9 / D)
     pr.store(1, L, "out", slots)
+    return tfhe.register_prog(pr)
+
+
+def nat_arity():
+    """PF_SELECT_NAT_ARITY: the native threshold search's split per step (2: binary; 3, 5 (default), 9:
+    `_prog_search_kary`); PF_SELECT_NAT_STEPS: its steps (default: the binary search's resolution)."""
+    import os
+    return int(os.environ.get("PF_SELECT_NAT_ARITY", "5") or 5), int(os.environ.get("PF_SELECT_NAT_STEPS", "0") or 0)
+
+
+def _prog_search_kary(L, k, W, probes, slots, offset=0.0):
+    """`_prog_search` with arity - 1 = kt thresholds per step read by one many-LUT rotation (exact counts), lo raised
+    by gs grid units per threshold whose count reaches k."""
+    arity, steps = nat_arity()
+    kt = arity - 1
+    D = W + NAT_PAD
+    G = NAT_GROUP
+    kc = min(G, k)
+    a = 1.9 / (L // G * kc - k + 0.5)
+    a1 = 1.9 / G
+    dg = 2.0 * kt / tfhe.GRID                                         # a table's grid unit
+    g = int(round(W * 1.9 / D / dg))                                  # the window in grid units
+    if not steps:
+        steps = max(1, int(np.ceil(np.log(2.0 ** probes) / np.log(arity))))
+    name = f"tk.nsk.{L}.{k}.{W:g}.{arity}.{steps}" + (f".{offset:.4g}" if offset else "")
+    Y, P, B0, T0, T1, PK, ST, E0, E1, E2, E3, E4, LO, M = 0, 1, 2, 2 + kt, 3 + kt, 4 + kt, 5 + kt, 6 + kt, 7 + kt, \
+        8 + kt, 9 + kt, 10 + kt, 11 + kt, 12 + kt
+    pr = tfhe.Prog(name, 13 + kt)
+    pr.lut("id", lambda m: m)
+    pr.lut("out", lambda m: np.full_like(m, -0.5), warp=True)
+    pr.lut("stair", lambda m: a * (np.minimum(np.rint(m / a1) + G / 2, kc) - G / 2))
+    pr.lut("half", lambda m: np.full_like(m, -0.25))
+    pr.load("id", Y)
+    pr.lin(LO, Y, Y, [(-1, -1)])
+    off = a * (L / 2 - (k - 0.5))
+    for j in range(steps):
+        gs = max(1, -(-g // arity))
+        c0 = (kt + 1) // 2 * gs * dg                                  # the thresholds centred in the tables' (-1, 1)
+        th = [l * gs * dg - c0 for l in range(1, kt + 1)]
+        pr.lut(f"q{j}", *[lambda m, t=t: a1 * (np.where(m >= t - dg / 2, 1.0, 0.0) - 0.5) for t in th])
+        pr.lut(f"step{j}", lambda m, d=gs * dg: np.full_like(m, -d / 2))
+        pr.lin(P, Y, LO, [(r, 0) for r in range(L)], ca=1, cb=-1, c=0.95 - c0)
+        pr.pbs(P, L, f"q{j}", list(range(B0, B0 + kt)))
+        for l in range(kt):                                           # the group counts of threshold l at rows 32 l..
+            t = _tree(pr, B0 + l, L, (T0, T1), until=L // G)
+            n0 = l * (L // G)
+            pr.lin(PK, PK if l else t, t, [(r, -1) for r in range(n0)] + [(-1, r) for r in range(L // G)])
+        pr.pbs(PK, kt * (L // G), "stair", [ST])
+        t = _tree(pr, ST, kt * (L // G), (T0, T1), until=kt)          # row l: threshold l's capped count
+        pr.lin(E0, t, t, [(r, -1) for r in range(kt)], c=off - NAT_TAU + 1.0)
+        pr.lin(E1, t, t, [(r, -1) for r in range(kt)], c=off + NAT_TAU + 1.0)
+        pr.lin(E2, t, t, [(r, -1) for r in range(kt)], ca=16, c=16 * off + 1.0)
+        pr.lin(E3, E0, E1, [(r, -1) for r in range(kt)] + [(-1, r) for r in range(kt)])
+        pr.lin(E4, E3, E2, [(r, -1) for r in range(2 * kt)] + [(-1, r) for r in range(kt)])
+        pr.pbs(E4, 3 * kt, "half", [E0])
+        pr.lin(E1, E0, E0, [(l, kt + l) for l in range(kt)])
+        pr.lin(E1, E1, E0, [(l, 2 * kt + l) for l in range(kt)], c=1.0)
+        pr.pbs(E1, kt, f"step{j}", [M])                               # +-gs / 2 per threshold
+        t = _tree(pr, M, kt, (T0, T1))
+        pr.lin(LO, LO, t, [(0, 0)], c=kt * gs * dg / 2)
+        g = gs
+    # the mask at the steps' effective threshold (lo - dg / 2) less PF_SELECT_NAT_MARGIN logits
+    import os
+    offset -= float(os.environ.get("PF_SELECT_NAT_MARGIN", "") or (0.1 if arity == 3 else 0.2))
+    pr.lin(P, Y, LO, [(r, 0) for r in range(L)], ca=1, cb=-1, c=1.0 + 0.95 + dg / 2 - offset * 1.9 / D)
+    pr.store(P, L, "out", slots)
     return tfhe.register_prog(pr)
 
 
@@ -407,8 +476,9 @@ def _prog_gumbel(L, slots):
     return tfhe.register_prog(pr)
 
 
-def _topk_native(ops, m, n, heads, *, k, L, W, probes, R):
-    """`topk_sample`'s y (clipped) and mask from the block maxima `m` (on the heads) by two native programs."""
+def _topk_native(ops, m, n, heads, *, k, L, W, probes, R, topp=None):
+    """`topk_sample`'s y (clipped) and mask from the block maxima `m` (on the heads) by two native programs (`topp`:
+    y only, mask None)."""
     B = n // L
     hm = _mask(n, heads)
     sl = tfhe.register_slots(f"tk.heads.{L}", heads)
@@ -417,29 +487,138 @@ def _topk_native(ops, m, n, heads, *, k, L, W, probes, R):
     mx = _bcast(ops, tfhe.tfhe_prog(ops, u, _prog_max(L, tfhe.register_slots("tk.slot0", [0])), sl), B, n)
     y = ops.add_pt(ops.mult_pt(ops.sub(u, mx), _mask(n, heads, NAT_S), kind="mask"), _mask(n, heads, W), kind="mask")
     y = ops.mult(y, msign(ops, y, n, heads, R, 1, "tk.clip"))
+    if topp is not None:
+        return y, None
     D = W + NAT_PAD
     uy = ops.add_pt(ops.mult_pt(y, _mask(n, heads, 1.9 / D), kind="mask"), _mask(n, heads, -0.95), kind="mask")
-    mask = ops.add_pt(tfhe.tfhe_prog(ops, uy, _prog_search(L, k, W, probes, sl), sl), _mask(n, heads, 0.5), kind="mask")
+    search = _prog_search_kary if nat_arity()[0] > 2 else _prog_search
+    prog = search(L, k, W, probes, sl)
+    mask = ops.add_pt(tfhe.tfhe_prog(ops, uy, prog, sl), _mask(n, heads, 0.5), kind="mask")
     DEBUG[:] = [m, u, mx, uy]
     return y, mask
 
 
-def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=512, C=4.0):
+def nuc_offs():
+    """PF_SELECT_TOPP_K (1, 2, 4: default): top-p's thresholds per step from one many-LUT bootstrap; a head's bits at
+    the slot offsets (0, 1, 2, 4)[:k]."""
+    import os
+    return (0, 1, 2, 4)[:int(os.environ.get("PF_SELECT_TOPP_K", "4") or 4)]
+
+
+def _exp_ckks(ops, x, lo, hi, sq=5, deg=10):
+    """exp(x) for x in [lo, hi]: a Chebyshev series of exp(x / 2^sq), squared sq times (relative error ~2^sq times
+    the series')."""
+    from perseus.impl.poly import eval_chebyshev
+    a, b = lo / 2 ** sq, hi / 2 ** sq
+    c = np.polynomial.chebyshev.Chebyshev.interpolate(np.exp, deg, domain=[a, b]).coef
+    y = eval_chebyshev(ops, ops.mult(x, 1.0 / 2 ** sq), list(c), a, b)
+    for _ in range(sq):
+        y = ops.square(y)
+    return y
+
+
+def _prog_bits(L, th, slots):
+    """Bits [p >= theta_l] - 1/2 of the loaded p for the k = 1, 2, 4 thresholds `th` (one many-LUT load, the
+    finish's encoding: stored as they are) on the slot set heads + nuc_offs() (row k i + l)."""
+    k = len(th)
+    dg = 2.0 * k / tfhe.GRID
+    name = "tp.bits." + ".".join(f"{t:.5f}" for t in th)
+    pr = tfhe.Prog(name, 7)
+    pr.lut("b", *[lambda m, t=t: np.where(m >= t - dg / 2, 0.5, -0.5) for t in th], warp=True)
+    pr.load("b", list(range(k)))
+    out = 0
+    if k >= 2:
+        pr.lin(4, 0, 1, [p for i in range(L) for p in ((i, -1), (-1, i))])
+        out = 4
+    if k == 4:
+        pr.lin(5, 2, 3, [p for i in range(L) for p in ((i, -1), (-1, i))])
+        pr.lin(6, 4, 5, [p for i in range(L) for p in ((2 * i, -1), (2 * i + 1, -1), (-1, 2 * i), (-1, 2 * i + 1))])
+        out = 6
+    pr.store(out, k * L, None, slots)
+    return tfhe.register_prog(pr)
+
+
+def _topp_mask(ops, y, n, heads, *, p, W):
+    """Top-p (nucleus; Holtzman et al., arXiv 1904.09751) over the block maxima: the masks [y >= t] for the largest t
+    with mass(y >= t) >= p Z (e = exp(y - W), Z = sum e), by (k + 1)-way steps (`_prog_bits`, `nuc_offs`)."""
+    L = len(heads)
+    B = n // L
+    offs = nuc_offs()
+    D = W + NAT_PAD
+    sc = 1.9 / D
+    kt = len(offs)
+    dg = 2.0 * kt / tfhe.GRID
+    hm = _mask(n, heads)
+    e = ops.mult_pt(_exp_ckks(ops, ops.add_pt(y, _mask(n, heads, -W) + (1.0 - hm) * -W, kind="mask"), -W, NAT_PAD),
+                    hm, kind="mask")
+    Z = ops.mult_pt(ops.rotate_and_sum(e, B, n), _mask(n, [0]), kind="mask")
+    zr = [Z] + ops.rotate_many(Z, [-o for o in offs[1:]])
+    pZ = zr[0]
+    for v in zr[1:]:
+        pZ = ops.add(pZ, v)
+    pZ = ops.mult(pZ, float(p))
+    er = [e] + ops.rotate_many(e, [-o for o in offs[1:]])
+    erep = er[0]
+    for v in er[1:]:
+        erep = ops.add(erep, v)
+    bits_set = tfhe.register_slots(f"tp.bits.{L}.{kt}", (heads[:, None] + np.asarray(offs)[None, :]).ravel())
+    sl = tfhe.register_slots(f"tk.heads.{L}", heads)
+    small = np.asarray(offs)
+    g = int(round(W * sc / dg))                                       # the window in grid units
+    lo = None                                                        # slot 0: the threshold's lower end (y units)
+    while g > 1:
+        gs = -(-g // (kt + 1))
+        du = gs * dg
+        c0 = (kt + 1) // 2 * du
+        th = [l * du - c0 for l in range(1, kt + 1)]
+        lob = None if lo is None else _bcast(ops, lo, B, n)
+        dy = y if lob is None else ops.sub(y, lob)
+        u = ops.add_pt(ops.mult_pt(dy, _mask(n, heads, sc), kind="mask"), _mask(n, heads, -c0), kind="mask")
+        bits = ops.add_pt(tfhe.tfhe_prog(ops, u, _prog_bits(L, th, bits_set), sl),
+                          _mask(n, (heads[:, None] + small[None, :]).ravel(), 0.5), kind="mask")
+        mass = ops.rotate_and_sum(ops.mult(erep, bits), B, n)
+        dm = ops.mult_pt(ops.sub(mass, pZ), _mask(n, small), kind="mask")
+        b = msign(ops, dm, n, small, 2.0 ** 13, 5, f"tp.m{gs}", pow2=True)
+        rs = [b] + ops.rotate_many(b, list(offs[1:]))
+        cnt = rs[0]
+        for v in rs[1:]:
+            cnt = ops.add(cnt, v)
+        step = ops.mult_pt(cnt, _mask(n, [0], gs * dg / sc), kind="mask")
+        lo = step if lo is None else ops.add(lo, step)
+        g = gs
+    # the mask at the steps' effective threshold (lo - dg / 2) less PF_SELECT_TOPP_MARGIN logits: a bit read past its
+    # bucket could lift lo past the top one (an empty nucleus)
+    import os
+    margin = float(os.environ.get("PF_SELECT_TOPP_MARGIN", "") or 0.35 * kt)
+    lob = _bcast(ops, lo, B, n)
+    dt = ops.add_pt(ops.sub(y, lob), _mask(n, heads, dg / 2 / sc + margin), kind="mask")
+    return msign(ops, dt, n, heads, W + 1.0, 1, "tk.mask")
+
+
+def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=512, C=4.0, minp=None, topp=None):
     """The one-hot (K tiles) of a top-k sample: Gumbel-max over the top-k maxima of the L slot blocks of size B = n / L
     (module doc). `g`: Gumbel noise at the slots j B (a ciphertext, or a slot vector used as a plaintext). Returns
-    (one-hot tiles, mask over the block heads j B)."""
+    (one-hot tiles, mask over the block heads j B). `minp`: min-p sampling instead (Nguyen et al., arXiv 2407.01082):
+    the maxima within ln(minp) of the largest (-ln(minp) < W). `topp`: top-p sampling instead (`_topp_mask`; needs the
+    native session). Both leave `k` unused."""
     n = len(valid[0])
     K, B = len(xs), n // L
     m, dec = tournament(ops, xs, valid, upto=B, R=R, fine=fine, tag="tk")
     e0, heads = _mask(n, [0]), np.arange(0, n, B)
     hm = _mask(n, heads)
-    if native():
-        y, mask = _topk_native(ops, m, n, heads, k=k, L=L, W=W, probes=probes, R=R)
+    if native() and minp is None:
+        y, mask = _topk_native(ops, m, n, heads, k=k, L=L, W=W, probes=probes, R=R, topp=topp)
+        if topp is not None:
+            mask = _topp_mask(ops, y, n, heads, p=topp, W=W)
         return _topk_draw(ops, y, mask, g, dec, hm, n, heads, K, C, W, fine)
     mx, _ = tournament(ops, [m], [np.ones(n)], first=B, R=R, fine=fine, tag="tkm")
     M = _bcast(ops, ops.mult_pt(mx, e0, kind="mask"), B, n)
     y = ops.add_pt(ops.mult_pt(ops.sub(m, M), hm, kind="mask"), _mask(n, heads, W), kind="mask")
     y = ops.mult(y, msign(ops, y, n, heads, R, 1, "tk.clip"))
+    if minp is not None:                 # y = W at the maximum: no search
+        mask = msign(ops, ops.add_pt(y, _mask(n, heads, -(W + float(np.log(minp)))), kind="mask"), n, heads, W + 1.0, 1,
+                     "tk.mask")
+        return _topk_draw(ops, y, mask, g, dec, hm, n, heads, K, C, W, fine)
     # the threshold's lower end: public start 0, width W / 2^j; at slot 0 (a switch per count), or in every slot
     # (PF_SELECT_COUNT=ckks: an all-slot constant, no broadcast)
     const = count_ckks()
@@ -470,6 +649,8 @@ def topk_sample(ops, xs, valid, g, *, k, L, W=32.0, probes=8, R=128.0, fine=512,
 def _topk_draw(ops, y, mask, g, dec, hm, n, heads, K, C, W, fine):
     """The Gumbel-max over the members of `mask` (`topk_sample`)."""
     B = n // len(heads)
+    if native() and nat_draw():          # the native draw's noise acts as a temperature
+        y = ops.mult_pt(y, _mask(n, heads, nat_tau()), kind="mask")
     if isinstance(g, np.ndarray):        # the noise as a plaintext (public server randomness, encoded per token)
         z = ops.mult(mask, ops.add_pt(y, np.where(hm > 0, g + C, 0.0), kind="mask"))
     else:                                # g masked first: product + product (a product plus a fresh input is a degree

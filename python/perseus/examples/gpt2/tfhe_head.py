@@ -12,8 +12,10 @@ same inputs (the baseline).
 slots, column cutmax_tile_col_of_slot(m) of tile k at slot m). A plan's PLAN_CMD.txt carries what the run repeats
 (`runtime=`, `twin=`, `sign=`, `env=`, the head's shape). The plans, all on the gpt2_decode recipe and runtime line:
 gpt2_tfhe_{argmax,topk}_ship (TFHE signs), gpt2_tfhe_argmax_ship_hyb512 / gpt2_tfhe_topk_ship_hyb512L1k (the big
-early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_topk_native (top-k's maximum, threshold search and mask as
-native TFHE programs: impl/tfhe_select.py `_topk_native`), gpt2_tfhe_cutmax_ship (CutMax).
+early rounds as CKKS signs, the rest TFHE), gpt2_tfhe_argmax_h512 (rounds of >= 512 heads as CKKS signs),
+gpt2_tfhe_topk_native (impl/tfhe_select.py `_topk_native`), gpt2_tfhe_topk_native_draw (the Gumbel-max too),
+gpt2_tfhe_minp_hyb (`--mode minp`, p = 0.1), gpt2_tfhe_topp_native (`--mode topp`, p = 0.9), gpt2_tfhe_cutmax_ship
+(CutMax).
 """
 from __future__ import annotations
 
@@ -39,8 +41,10 @@ def tile_cols(k):
 class Head:
     """The selection stage on K = 2 logit tiles; `mode`: argmax | topk."""
 
-    def __init__(self, mode="argmax", k=40, L=1024, W=32.0, probes=8, R=128.0, fine=512, temp=1.0):
+    def __init__(self, mode="argmax", k=40, L=1024, W=32.0, probes=8, R=128.0, fine=512, temp=1.0, minp=0.1, topp=0.9):
         self.mode, self.k, self.L, self.W, self.probes, self.R, self.fine, self.temp = mode, k, L, W, probes, R, fine, temp
+        self.minp, self.topp = minp, topp
+        self.sampling = mode in ("topk", "minp", "topp")
         self.cols = [tile_cols(0), tile_cols(1)]
         self.valid = [c >= 0 for c in self.cols]
 
@@ -52,7 +56,7 @@ class Head:
         if self.mode == "taylor":           # the LUT's input: the logits standardized into (-0.9, 0.9)
             z = np.clip((logits - logits.mean()) / (6.0 * logits.std()), -0.9, 0.9)
             out = [np.where(c >= 0, z[np.maximum(c, 0)], 0.0) for c in self.cols]
-        if self.mode == "topk" and gumbel is not None:
+        if self.sampling and gumbel is not None:
             self.g = np.zeros(N)              # a plaintext: one draw per run (re-encoded per token in a deployment)
             self.g[::N // self.L] = gumbel
         return out
@@ -92,7 +96,8 @@ class Head:
         if self.mode == "argmax":
             return sel.argmax(ops, xs[:2], self.valid, R=self.R, fine=self.fine)
         oh, mask = sel.topk_sample(ops, xs[:2], self.valid, self.g, k=self.k, L=self.L, W=self.W, probes=self.probes,
-                                   R=self.R, fine=self.fine)
+                                   R=self.R, fine=self.fine, minp=self.minp if self.mode == "minp" else None,
+                                   topp=self.topp if self.mode == "topp" else None)
         return oh + [mask] + (list(sel.DEBUG) if os.environ.get("PF_SELECT_DEBUG") else [])
 
     def stages(self):
@@ -133,7 +138,7 @@ class Head:
         for c, o in zip(self.cols, outs[:2]):
             ok = c >= 0
             v[c[ok]] = np.real(np.asarray(o))[ok]
-        return v, (np.real(np.asarray(outs[2]))[::N // self.L] if self.mode == "topk" else None)
+        return v, (np.real(np.asarray(outs[2]))[::N // self.L] if self.sampling else None)
 
     def buckets(self, logits):
         """The token of each bucket's maximum (slot i of tile 0 folded with tile 1, then blocks of N / L slots)."""
@@ -163,10 +168,22 @@ def _check_onehot(v):
     return bool((np.abs(v - r).max() < 0.1) and r.sum() == 1 and r.min() >= 0)
 
 
+def _exact_set(a, lg):
+    """The exact sampling set: the top k tokens, or (min-p) those within ln(minp) of the largest logit."""
+    if a.mode == "minp":
+        return set(np.nonzero(lg >= lg.max() + np.log(a.minp))[0].tolist())
+    if a.mode == "topp":                 # the smallest top set of softmax mass >= p
+        o = np.argsort(-lg)
+        q = np.exp(lg[o] - lg[o[0]])
+        c = np.cumsum(q) / q.sum()
+        return set(o[:int(np.searchsorted(c, a.topp)) + 1].tolist())
+    return set(np.argsort(-lg)[:a.k].tolist())
+
+
 def mirror(a, L):
     from perseus.impl.ops import NumpyOps
     ops = NumpyOps()
-    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine)
+    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine, minp=a.minp, topp=a.topp)
     rng = np.random.default_rng(1)
     res = []
     t0 = time.time()
@@ -183,14 +200,14 @@ def mirror(a, L):
             v, mask = h.decode(h.stage(ops, h.encode(lg, g)))
             bt = h.buckets(lg)
             members = set(bt[np.rint(mask) > 0.5].tolist())
-            exact = set(np.argsort(-lg)[:a.k].tolist())
+            exact = _exact_set(a, lg)
             got = int(np.argmax(v))
             # the sample the same Gumbel draw gives on the member set in plaintext
             mem = np.array(sorted(members))
             gb = np.zeros(VOCAB)
             gb[bt] = g
             ref = int(mem[np.argmax(lg[mem] + gb[mem])]) if len(mem) else -1
-            res.append((_check_onehot(v), got == ref, len(members), len(members & exact) / a.k, got in exact,
+            res.append((_check_onehot(v), got == ref, len(members), len(members & exact) / max(len(exact), 1), got in exact,
                         _tv(lg, exact, members)))
     dt = time.time() - t0
     if a.mode == "argmax":
@@ -237,32 +254,32 @@ def _report(a, h, L, outs, walls):
         lg, g = x[:VOCAB], x[VOCAB:]
         v, mask = h.decode(o)
         got, ok = int(np.argmax(v)), _check_onehot(v)
-        if a.mode != "topk":
+        if a.mode not in ("topk", "minp", "topp"):
             res.append((ok, got == int(np.argmax(lg)), float(lg.max() - lg[got])))
             print(f"[tfhe_head] pos {p}: argmax {got} ref {int(np.argmax(lg))} valid {ok} deficit {res[-1][2]:.3g} "
                   f"max|v - onehot| {np.abs(v - np.rint(v)).max():.3g}", flush=True)
         else:
             bt = h.buckets(lg)
             members = set(bt[np.rint(mask) > 0.5].tolist())
-            exact = set(np.argsort(-lg)[:a.k].tolist())
+            exact = _exact_set(a, lg)
             mem = np.array(sorted(members))
             gb = np.zeros(VOCAB)
             gb[bt] = g
             ref = int(mem[np.argmax(lg[mem] + gb[mem])]) if len(mem) else -1
-            res.append((ok, got == ref, len(members), len(members & exact) / a.k, _tv(lg, exact, members)))
+            res.append((ok, got == ref, len(members), len(members & exact) / max(len(exact), 1), _tv(lg, exact, members)))
             print(f"[tfhe_head] pos {p}: sample {got} (plaintext Gumbel-max on the members {ref}) valid {ok} |members| "
                   f"{len(members)} recall {res[-1][3]:.3f} TV {res[-1][4]:.4f} max|mask - 0/1| "
                   f"{np.abs(mask - np.rint(mask)).max():.3g}", flush=True)
     print(f"[tfhe_head] SUMMARY {a.mode} n={len(res)}: valid {sum(r[0] for r in res)}, agree {sum(r[1] for r in res)}"
           + (f", recall mean {np.mean([r[3] for r in res]):.4f}, TV mean {np.mean([r[4] for r in res]):.4f}"
-             if a.mode == "topk" else f", max deficit {max(r[2] for r in res):.3g}")
+             if a.mode in ("topk", "minp", "topp") else f", max deficit {max(r[2] for r in res):.3g}")
           + (f"; s/token median {np.median(walls):.3f} (walls {' '.join(f'{w:.3f}' for w in walls)})" if walls else ""),
           flush=True)
 
 
 def fake(a, L):
     from perseus.examples.resnet.run import _twin
-    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine)
+    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine, minp=a.minp, topp=a.topp)
     model = _twin(a, h)
     h.rt = model.rt
     outs = []
@@ -296,7 +313,7 @@ def planned(a, L):
     from perseus.examples.bert.planned import plan_config
     from perseus.examples.resnet.impl import ResnetPlanned
     from perseus.examples.resnet.run import _twin
-    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine)
+    h = Head(a.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine, minp=a.minp, topp=a.topp)
     model = _twin(a, h)
     h.rt = model.rt
     keys = _pc.KeySource.generate([], conj=True, layout="packed")
@@ -348,7 +365,7 @@ def _plan_settings(a):
     for kv in lines.get("env", "").split():                  # selection switches (PF_SELECT_*)
         k, v = kv.split("=", 1)
         os.environ.setdefault(k, v)
-    for key, cast in (("fine", int), ("L", int), ("k", int), ("W", float), ("probes", int)):
+    for key, cast in (("fine", int), ("L", int), ("k", int), ("W", float), ("probes", int), ("minp", float), ("topp", float)):
         if key in lines:
             setattr(a, key, cast(lines[key]))
 
@@ -371,7 +388,9 @@ def main(argv=None):
     ap.add_argument("--stc-cache", type=int, default=64, help="StC-first last-stage cache entries (graphs keep theirs)")
     ap.add_argument("--graphs", action="store_true", help="--plan: CUDA graph replay (exec.use_graphs)")
     ap.add_argument("--logits", required=True)
-    ap.add_argument("--mode", choices=("argmax", "topk", "cutmax", "taylor"), default="argmax")
+    ap.add_argument("--mode", choices=("argmax", "topk", "minp", "topp", "cutmax", "taylor"), default="argmax")
+    ap.add_argument("--minp", type=float, default=0.1, help="--mode minp: the probability floor relative to the top")
+    ap.add_argument("--topp", type=float, default=0.9, help="--mode topp: the nucleus' mass")
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--k", type=int, default=40)
     ap.add_argument("--L", type=int, default=1024)
