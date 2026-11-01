@@ -43,7 +43,8 @@ _PRE_PERIODIC = os.environ.get("PF_PRE_PERIODIC", "0") not in ("", "0")
 # query and key chunk, each giant step's products q K~_w summed over w rotated by w windows. 2: P.V with y rotated by
 # w windows once (one hoisted call) and each pair's broadcast pb_a = sum_w M'_(a-w) rot_w(y) (masks on the
 # probabilities' side, at their depth). 4: P.V with the masks on the V side instead (V~_w = sum_a M'_(a-w) vc_a,
-# one level deeper on V's side)
+# one level deeper on V's side). 8 (with 2): each window's complex V pair vc_a built once per query and key chunk and
+# shared by the giant steps (one var, so its product preludes can be issued once: PC_MULT_SUM_HOIST)
 _WROT = int(os.environ.get("PF_ATTN_WROT", "0") or 0)
 
 
@@ -944,8 +945,16 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                         a = w
                         pb = rt.mult_mask_sum(rs, [("pf.vup", (a - x) % nw, W) for x in range(nw)],
                                               [lambda v=(a - x) % nw: win_mask(v, W - 1) for x in range(nw)])
-                        vrs = [baby(V, "V", c, cp_, e % Bb) for _, cp_, e in items[a]]
-                        prod = ops.mult(pb, ops.add(vrs[0], ops.mult_i(vrs[1])))
+                        if _WROT & 8:
+                            # one complex V pair per (query chunk, key chunk, window), shared by the giant steps
+                            if ("vc", c, cp, a) not in wsums:
+                                vrs = [baby(V, "V", c, cp_, e % Bb) for _, cp_, e in items[a]]
+                                wsums[("vc", c, cp, a)] = ops.add(vrs[0], ops.mult_i(vrs[1]))
+                            vc = wsums[("vc", c, cp, a)]
+                        else:
+                            vrs = [baby(V, "V", c, cp_, e % Bb) for _, cp_, e in items[a]]
+                            vc = ops.add(vrs[0], ops.mult_i(vrs[1]))
+                        prod = ops.mult(pb, vc)
                     if (i, g) in sums:
                         ops.inplace_add(sums[(i, g)], prod)
                     else:

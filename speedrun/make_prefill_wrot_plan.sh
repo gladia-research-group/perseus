@@ -10,6 +10,7 @@
 # PAIR_WINDOW: the runtime line's PC_BTS_PAIR_WINDOW (the attention's extra ops move same-depth refreshes further apart
 # than the default pair window: 6144 keeps WROT=3's refresh pairs, 4096 WROT=1's).
 # MULT_SUM=1: the runtime line's PC_MULT_SUM=1 (P.V's products of a giant step relinearized once: compile::msum).
+# EXTRA: more runtime switches for the line (they bind before the compile checks).
 #   WROT=3 PAIR_WINDOW=6144 MULT_SUM=1 bash speedrun/make_prefill_wrot_plan.sh   -> bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -25,7 +26,7 @@ PLAN=bootstrap_placements/$BASE $R record "$T/new" "$W"
 rm -rf "bootstrap_placements/$OUT"
 # blocks 0-10 run prefill_attention; block 11 (the last position alone) and the tail stages keep BASE's stream
 $R remap "$T/old" "$T/new" "bootstrap_placements/$BASE" "bootstrap_placements/$OUT" --blocks 0-10 --unpin "$STEPS"
-sed -i "s/^runtime=\(.*\)$/runtime=\1 PF_ATTN_WROT=$W${PAIR_WINDOW:+ PC_BTS_PAIR_WINDOW=$PAIR_WINDOW}${MULT_SUM:+ PC_MULT_SUM=1}/" "bootstrap_placements/$OUT/PLAN_CMD.txt"
+sed -i "s/^runtime=\(.*\)$/runtime=\1 PF_ATTN_WROT=$W${PAIR_WINDOW:+ PC_BTS_PAIR_WINDOW=$PAIR_WINDOW}${MULT_SUM:+ PC_MULT_SUM=1}${EXTRA:+ $EXTRA}/" "bootstrap_placements/$OUT/PLAN_CMD.txt"
 PLAN=bootstrap_placements/$OUT COMPILE=1 $R record "$T/cw" "$W"
 $R pin "bootstrap_placements/$OUT" "$T/cw" --blocks 0-10 --steps "$STEPS"
 PLAN=bootstrap_placements/$OUT COMPILE=1 $R record "$T/cw2" "$W"
