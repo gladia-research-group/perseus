@@ -166,6 +166,50 @@ __device__ __forceinline__ void regen4(const uint32_t* seed, uint32_t lane, uint
     }
 }
 
+// regen4 where lane m of the 4-lane group takes the block's quarter (jsel >> 2m) & 3 (words 4j..4j+3) instead of
+// quarter m: jsel names a permutation of the quarters, the same value on the group's 4 lanes. The same words.
+__device__ __forceinline__ void regen4q(const uint32_t* seed, uint32_t lane, uint32_t b0, uint32_t w13, uint32_t p,
+                                        uint32_t n16, uint32_t tag, uint32_t jsel, uint32_t out[4]) {
+    const uint32_t k = lane & 3u;
+    const uint32_t gmask = 0xFu << (lane & ~3u);
+    const uint32_t key0 = seed[k], key4 = seed[4 + k];
+    const uint32_t m_p = (0xFFFFFFFFu / p) * p;
+    uint32_t ca, cb, cc, cd;
+    chacha_coop4(gmask, k, key0, key4, b0, w13, p, tag, ca, cb, cc, cd);
+    uint32_t need = ((ca >= m_p) ? 1u : 0u) | ((cb >= m_p) ? 2u : 0u) | ((cc >= m_p) ? 4u : 0u) | ((cd >= m_p) ? 8u : 0u);
+    uint32_t gneed = need;
+    gneed |= __shfl_xor_sync(gmask, gneed, 1, 4);
+    gneed |= __shfl_xor_sync(gmask, gneed, 2, 4);
+    if (gneed) {
+        for (uint32_t t = 1; t < 16u; ++t) {
+            uint32_t ea, eb, ec, ed;
+            chacha_coop4(gmask, k, key0, key4, b0 + t * n16, w13, p, tag, ea, eb, ec, ed);
+            if (need & 1u) { ca = ea; if (ea < m_p) need &= ~1u; }
+            if (need & 2u) { cb = eb; if (eb < m_p) need &= ~2u; }
+            if (need & 4u) { cc = ec; if (ec < m_p) need &= ~4u; }
+            if (need & 8u) { cd = ed; if (ed < m_p) need &= ~8u; }
+            gneed = need;
+            gneed |= __shfl_xor_sync(gmask, gneed, 1, 4);
+            gneed |= __shfl_xor_sync(gmask, gneed, 2, 4);
+            if (!gneed) break;
+        }
+    }
+    // transpose: lane m wants quarter j_m = column word j_m of lanes 0..3; at step s lane k reads lane (k + s) & 3,
+    // which publishes the column its reader (k) wants
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const uint32_t rd = (k - (uint32_t)s) & 3u;
+        const uint32_t pub = sel4((jsel >> (2u * rd)) & 3u, ca, cb, cc, cd);
+        const uint32_t rcv = __shfl_sync(gmask, pub, (k + (uint32_t)s) & 3u, 4);
+        out[(k + (uint32_t)s) & 3u] = rcv;
+    }
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t v = out[w] - __umulhi(out[w], 0xFFFFFFFFu / p) * p;
+        out[w] = v >= p ? v - p : v;
+    }
+}
+
 // ---------------------------------------------------------------- per-thread u32 blocks
 // The 16 words of block b0 of digit d expanded by one thread: four independent quarter-rounds per step, no shuffles,
 // rejection with the block stride n16 and the final reduction of regen4 (the same words).

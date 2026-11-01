@@ -1523,6 +1523,74 @@ fn keytab(st: &mut Setup, g: &KsGeo, all: bool) -> Vec<TestResult> {
             }
         }
     }
+    // ---- KS_SUM (u32): the R rotations summed into rotation 0's output (K = 1: ks_dot_seg; K > 1: ks_dot_key_sum)
+    // == the sum of ks_dot's R outputs (automorphisms 125 and 2N - 5: both rotations permute)
+    if st.ctx.wb == 4 {
+        let autos = st.ctx.up32(&[125, 2 * N as u32 - 5]);
+        for (key, rowsd, nrows, name) in [(key_full, &rows_full, 6, "dense full".to_string()), (key_band, &rows_band, 5, band_name.clone())] {
+            for (kc, mode) in [1usize, 2, 3].into_iter().flat_map(|kc| [1, 2, 1 | KS_ACC].map(|m| (kc, m))) {
+                let pre = if mode & KS_ACC != 0 { st.rand_slots(k * r) } else { zero.clone() };
+                o0.write(&st.ctx, &zero);
+                o1.write(&st.ctx, &zero);
+                let mut a = KsArgs {
+                    c1: c1.c(),
+                    modup: mu.c(),
+                    c0: c0.c(),
+                    out0: o0.p(),
+                    out1: o1.p(),
+                    kb: kbp.c() as *const *const c_void,
+                    ka: kap.c() as *const *const c_void,
+                    autok: autos.c() as *const u32,
+                    rows: rowsd.c() as *const u32,
+                    digit_of: dod.c() as *const i32,
+                    pmod: pmd.c(),
+                    pmods: pmsd.c(),
+                    pr: st.pr(),
+                    ct_stride: (8 * N) as u64,
+                    mu_ct_stride: (g.ndig * 8 * N) as u64,
+                    mu_digit_stride: (8 * N) as u64,
+                    out_ct_stride: (r * 8 * N) as u64,
+                    out_rot_stride: (8 * N) as u64,
+                    key_digit_stride: kds as u64,
+                    k: kc as i32,
+                    r: r as i32,
+                    ndig: g.ndig as i32,
+                    c0_mode: mode & 3,
+                    nq: g.nq as i32,
+                    nrows,
+                };
+                ck(unsafe { (st.t.ks_dot)(&a, st.s()) });
+                // want: output (c, rotation 0) = pre + sum_r dot_r, every other output = pre
+                let (d0, d1) = (o0.read(&st.ctx), o1.read(&st.ctx));
+                let ctw = r * 8 * N;
+                let mut want = pre.clone();
+                want.extend(pre.iter().copied());
+                for (part, d) in [&d0, &d1].into_iter().enumerate() {
+                    for c in 0..kc {
+                        for i in 0..8 * N {
+                            let p = st.p(i / N);
+                            let w = &mut want[part * pre.len() + c * ctw + i];
+                            for rr in 0..r {
+                                *w = (*w + d[c * ctw + rr * 8 * N + i]) % p;
+                            }
+                        }
+                    }
+                }
+                q0.write(&st.ctx, &pre);
+                q1.write(&st.ctx, &pre);
+                a.out0 = q0.p();
+                a.out1 = q1.p();
+                a.kb = std::ptr::null();
+                a.ka = std::ptr::null();
+                a.c0_mode = mode | KS_SUM;
+                let ka = KsKeyArgs { ks: a, key };
+                ck(unsafe { (st.t.ks_dot_key)(&ka, st.s()) });
+                let mut got = q0.read(&st.ctx);
+                got.extend(q1.read(&st.ctx));
+                out.push(cmp(&format!("ks_dot_key KS_SUM ({name}, {} digits, K={kc}, R=2, c0 mode {mode}) == sum of ks_dot", g.ndig), &got, &want));
+            }
+        }
+    }
     if !all {
         return out;
     }

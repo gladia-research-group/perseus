@@ -415,9 +415,10 @@ impl<'a> KeyGroup<'a> {
         self.in_place() && (source == KskSource::Regen || self.needs_stage() || !self.has_a())
     }
     /// A dot of `k` ciphertexts over a range of these keys read in place (`staged`) can sum its rotations into one
-    /// output (`KS_SUM`: the u32 K = 1 segment kernel), so a hoisted rotation sum stores one extended ciphertext.
+    /// output per ciphertext (`KS_SUM`: the u32 K = 1 segment kernel, `ks_dot_key_sum` at K > 1), so a hoisted
+    /// rotation sum stores one extended ciphertext per member.
     pub fn dot_sums<W: DevWord>(&self, k: usize, staged: bool) -> bool {
-        W::BITS == 32 && k == 1 && staged && self.in_place()
+        W::BITS == 32 && (k == 1 || lever_on("ksum")) && staged && self.in_place()
     }
     pub fn len(&self) -> usize {
         self.galois.len()
@@ -1602,4 +1603,11 @@ pub fn stage_key<W: DevWord, M: DevStrategy<W>>(
         }
     }
     Ok(())
+}
+
+/// Experiment switches (bn-prefill A/B; read once): `PC_PF_OFF` = comma list of levers to turn off (`ksum`: the K > 1
+/// summed rotation dots).
+pub fn lever_on(name: &str) -> bool {
+    static OFF: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    !OFF.get_or_init(|| std::env::var("PC_PF_OFF").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).iter().any(|s| s == name)
 }
