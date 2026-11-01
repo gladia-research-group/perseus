@@ -263,10 +263,25 @@ class PlanDiagnostics:
     cf_clamp: CfClampReport | None = None
 
 
-def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
-    """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune)."""
+def _prune_redundant(placer, sim: SimResult, keep=(), chain_cap: float | None = None,
+                     unit: int = 2) -> tuple[SimResult, int]:
+    """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune). `chain_cap` (PLAN_CHAIN_STRICT:
+    the chain's max_level): a removal may not start a placed refresh past it (its effective input, the pending rescale
+    included, as P3c(chain) measures it)."""
     from .place import refresh_env_cap
     g = placer.g
+
+    def past_chain(s):
+        if chain_cap is None:
+            return 0
+        k = 0
+        for v in placer.placed:
+            if g.producer_of.get(v) is None:
+                continue
+            nom, deg = s.input_state(g, v)
+            if placer.bootstrap_level + nom + (unit if deg == 2 else 0) > chain_cap + 1e-9:
+                k += 1
+        return k
 
     def count(s):
         return len(placer.placed) + sum(1 for f in s.hint_fired.values() if f)
@@ -293,13 +308,13 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
                     k += 1
         return k
 
-    best, deep, removed = count(sim), past_env(sim), 0
+    best, deep, chain, removed = count(sim), past_env(sim), past_chain(sim), 0
     origin = getattr(placer, "_origin", None)
     for v in sorted(placer.placed - set(keep)):
         kept = placer.placed
         placer.placed = kept - {v}
         s2 = placer._sim()
-        if not s2.over_budget and count(s2) < best and past_env(s2) <= deep:
+        if not s2.over_budget and count(s2) < best and past_env(s2) <= deep and past_chain(s2) <= chain:
             sim, best = s2, count(s2)
             removed += 1
             if origin is not None:
@@ -1062,8 +1077,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
 
     if cfg.prune:
         # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)
+        _strict = os.environ.get("PLAN_CHAIN_STRICT", "0") not in ("", "0")
         sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(force_place or ())
-                                         + tuple(sorted(kept_sites)))
+                                         + tuple(sorted(kept_sites)), chain_cap=cfg.max_level if _strict else None,
+                                         unit=int(cfg.level_unit) or 1)
         if hasattr(placer, "meta"):
             placer.meta["pruned"] = n_pruned
         if cfg.verbose:
