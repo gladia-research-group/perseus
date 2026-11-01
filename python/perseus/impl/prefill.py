@@ -16,7 +16,7 @@ from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
 from .linear import _baby_sum, linear_multi, prepare_linear_input
 from .pcmm import session_specs
-from .poly import eval_chebyshev, im_cleanse, rotsum, rotsum_neg
+from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse, rotsum, rotsum_neg
 import os
 _DBG = bool(os.environ.get("PF_DEBUG"))
 # PF_ATTN_PAIR=1: two offsets per q.K^T / P.V product on the complex axis
@@ -601,11 +601,22 @@ def recip_lanes(rt, D, a_vals, b_vals, iters: int, key, cheb=None):
     return ops.mult_i(ops.sub(ops.conjugate(P), P))
 
 
+def _sm_active(d, cfg, ch: Chunks, c: int, prefix: bool, m: int, valid, f: float = 1.0, periodic=None):
+    """(key, build) of score ciphertext m's active mask: 0.5 / kc per lane on the valid slots, times f."""
+    lane_scale = [f * 0.5 / kc for kc in _kcs_of(ch, c)]
+    key = ("pf.sm.active", c, m) + ch.key_tag + (prefix,) + ((f,) if f != 1.0 else ()) + \
+        (("per",) if m == periodic else ()) + _layout_tag(ch)
+    return key, (lambda: np.where(valid, _lane_vec(d, lane_scale), 0.0))
+
+
 def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic=None):
-    """Score masks and the exp's Chebyshev of chunk c's score ciphertexts m0, m0 + 1, ...: [(z, valid)]."""
+    """Score masks and the exp's Chebyshev of chunk c's score ciphertexts m0, m0 + 1, ...: [(z, valid)].
+    SoftmaxCfg.exp_mask_fold: the active mask's 2^log2delta1-th root rides the series (poly.eval_chebyshev_masked), and
+    _sm_tail applies no mask: (p M^(1/2^s))^(2^s) = p^(2^s) M, a level less after the exp."""
     ops, d = rt.ops, rt.dims
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
+    pw = 2 ** cfg.log2delta1
     out = []
     for m, s in enumerate(S, m0):
         per = m == periodic
@@ -613,26 +624,36 @@ def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic
         s = rt.add_mask(s, ("pf.sm.score", c, m, cfg.clip_lo, mean) + ch.key_tag + (prefix,) + (("per",) if per else ())
                         + _layout_tag(ch),
                         lambda valid=valid: np.where(valid, -mean, cfg.clip_lo - mean))
-        out.append((eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf), valid))
+        if cfg.exp_mask_fold:
+            key, build = _sm_active(d, cfg, ch, c, prefix, m, valid, periodic=periodic)
+            root = lambda sc, build=build: (lambda: sc * build() ** (1.0 / pw))
+            z = eval_chebyshev_masked(
+                ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf, None,
+                lambda ct, sc, key=key: rt.mult_mask(ct, key + ("fold", pw, sc), root(sc)),
+                lambda ct, sc, key=key: rt.add_mask(ct, key + ("fold+", pw, sc), root(sc)))
+        else:
+            z = eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        out.append((z, valid))
     return out
 
 
 def _sm_tail(rt, zs, cfg, ch: Chunks, c: int, prefix: bool, factor=None, m0: int = 0, periodic=None):
-    """Squarings, cleanse and active mask (0.5 / kc per lane, times factor[j]) of chunk c's exps."""
+    """Squarings, cleanse and active mask (0.5 / kc per lane, times factor[j]) of chunk c's exps (the mask folded
+    into the series under exp_mask_fold: _sm_cheb)."""
     ops, d = rt.ops, rt.dims
-    kcs = _kcs_of(ch, c)
+    if cfg.exp_mask_fold and factor is not None:
+        raise ValueError("exp_mask_fold: the joint exp refresh (PF_SM_JOINT) is not folded")
     Z = []
     for j, (z, valid) in enumerate(zs):
         m = m0 + j
         for _ in range(cfg.log2delta1):
             z = ops.square(z)
         z = im_cleanse(ops, z)
+        if cfg.exp_mask_fold:
+            Z.append(z)
+            continue
         f = 1.0 if factor is None else factor[j]
-        lane_scale = [f * 0.5 / kc for kc in kcs]
-        key = ("pf.sm.active", c, m) + ch.key_tag + (prefix,) + ((f,) if f != 1.0 else ()) + \
-            (("per",) if m == periodic else ()) + _layout_tag(ch)
-        Z.append(rt.mult_mask(z, key,
-                              lambda valid=valid, ls=lane_scale: np.where(valid, _lane_vec(d, ls), 0.0)))
+        Z.append(rt.mult_mask(z, *_sm_active(d, cfg, ch, c, prefix, m, valid, f, periodic)))
     return Z
 
 

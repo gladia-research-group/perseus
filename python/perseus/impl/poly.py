@@ -458,13 +458,28 @@ def cheb_mask_scales(coeffs, eps: float | None = None):
     return [1.0] + sorted({s for s in out if s != 1.0})
 
 
-def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask):
+def _cheb_leaf_masked(ops, T, y, c, mask, add_mask):
+    """sum_i c_i T_i times M with the mask in every term's product (T_i (c_i M), c_0 M added): the leaf's own depth."""
+    r = None
+    for i in range(1, len(c)):
+        if c[i] != 0.0:
+            t = mask(T[i], float(c[i]))
+            r = t if r is None else ops.add(r, t)
+    if r is None:
+        r = ops.sub(y, y)
+    return add_mask(r, float(c[0])) if c[0] != 0.0 else r
+
+
+def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask, add_mask=None):
     """_cheb_rec(c) times the mask at _cheb_rec's own depth where a level of slack allows: a split takes the mask on
     its giant when the giant is shallower than the quotient (q (T_k M)), else inside the quotient ((q M) T_k); the
-    remainder recursively; a leaf after its sum (one past the leaf, where the sibling products land)."""
+    remainder recursively; a leaf after its sum (one past the leaf, where the sibling products land), or, with
+    `add_mask` (ct + s M), in each of its terms' products (the leaf's own depth: no slack needed)."""
     d = _deg(c)
     c = c[: d + 1]
     if d < m:
+        if add_mask is not None and leaves is None:
+            return _cheb_leaf_masked(ops, T, y, c, mask, add_mask)
         return mask(_cheb_leaf(ops, T if leaves is None else leaves, y, c), 1.0)
     k = 1 << (d.bit_length() - 1)
     q, r = _cheb_split(c, k)
@@ -473,15 +488,17 @@ def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask):
     elif dt[k] < _cheb_dep(q, m, dt):
         prod = ops.mult(_cheb_rec(ops, T, y, m, q, leaves), mask(T[k], 1.0))
     else:
-        prod = ops.mult(_cheb_rec_masked(ops, T, y, m, q, leaves, dt, mask), T[k])
-    return ops.add(prod, _cheb_rec_masked(ops, T, y, m, r, leaves, dt, mask))
+        prod = ops.mult(_cheb_rec_masked(ops, T, y, m, q, leaves, dt, mask, add_mask), T[k])
+    return ops.add(prod, _cheb_rec_masked(ops, T, y, m, r, leaves, dt, mask, add_mask))
 
 
-def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask):
+def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask, add_mask=None):
     """eval_chebyshev_bsgs times a plaintext mask M, at the series' own depth instead of a level more: M rides the
     giants and leaves that have a level of slack (_cheb_rec_masked); a constant quotient q_0 rides its giant's mask
-    (T_k (q_0 M)). `mask(ct, s)` returns ct times s M (s from cheb_mask_scales). Same value as
-    mult(eval_chebyshev(...), M) up to rounding; needs CHEB_BSGS (degree > 3)."""
+    (T_k (q_0 M)). `mask(ct, s)` returns ct times s M (s from cheb_mask_scales). `add_mask(ct, s)` (ct plus s M):
+    every leaf takes the mask in its terms' products instead of after its sum (any scale s: the coefficients), so a
+    series whose leaves have no slack keeps its depth too. Same value as mult(eval_chebyshev(...), M) up to rounding;
+    needs CHEB_BSGS (degree > 3)."""
     coeffs, n, m, dt = _cheb_geometry(coeffs, eps)
     if n <= 3 or not getattr(ops, "cheb_bsgs", False):
         raise ValueError("eval_chebyshev_masked: a BSGS series of degree > 3 (CHEB_BSGS=1)")
@@ -516,7 +533,7 @@ def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None,
             ops.realize(T[k])
         k *= 2
     leaves = _AlignedBabies(ops, T, m, shared) if getattr(ops, "cheb_align", False) else None
-    return _cheb_rec_masked(ops, T, y, m, coeffs, leaves, dt, mask)
+    return _cheb_rec_masked(ops, T, y, m, coeffs, leaves, dt, mask, add_mask)
 
 
 class _NoBsgs:
