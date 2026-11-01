@@ -87,7 +87,9 @@ def step_consts(z0: float, k: int):
     for c in cs:
         kap.append(kap[-1] ** 2 / c)
         lam.append(lam[-1] * kap[-2] / c)
-    return tuple(kap[:k - 1]), k0, 1.0 / lam[-1]
+    # lambda_K is 1 by construction (kappa_0 = prod c_i^(2^-(i+1))): mu = 1 exactly, not 1 +- a few ulps that differ
+    # between cache lengths (a planned decode takes a scalar its probe tokens kept equal for a constant)
+    return tuple(kap[:k - 1]), k0, 1.0
 
 
 def rounds(cfg, kc: int):
