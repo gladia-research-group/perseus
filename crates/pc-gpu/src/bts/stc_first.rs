@@ -84,12 +84,16 @@ pub struct StcFirstSetup {
     /// A lean chain's fixed input stages once more at these factors (log2), for calls at their own CF (the PCMM's
     /// inputs, `THIN_SPLIT_PCMM`); None = every call takes `THIN_SPLIT`.
     pub own_split: Option<[f64; 2]>,
+    /// The largest member CF of a refresh pair (config `bts.pair_cf_max`; None = cf_ref - 1, the pair's last stage at
+    /// cf_ref). A pair with a member at cf_ref or above runs its last stage at its larger CF + 1 (the entry's x + conj x
+    /// doubles the payload), each member pre-scaled by 2^(stage CF - 1 - CF) as below the reference.
+    pub pair_cf_max: Option<u32>,
 }
 
 impl StcFirstSetup {
     /// The shipped n32 StC-first configuration: mode 2, reference CF 20, route CF 13, 4 cache entries.
     pub fn n32_shipped() -> StcFirstSetup {
-        StcFirstSetup { mode: StcFirstMode::Folded, cf_ref: 20, cf_default: Some(13), cache_slots: 4, own_cf: false, high: None, own_split: None }
+        StcFirstSetup { mode: StcFirstMode::Folded, cf_ref: 20, cf_default: Some(13), cache_slots: 4, own_cf: false, high: None, own_split: None, pair_cf_max: None }
     }
 }
 
@@ -1144,7 +1148,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
     /// member's coefficients pass through it as in the member's own single, so the pair adds no scale error over the
     /// singles at a given cache state),
     /// inputs at or above the entry (deeper ones take the shipped order), CFs in the window and below cf_ref (each
-    /// member is pre-scaled by 2^(cf_ref - 1 - cf)). Err names the first condition that fails.
+    /// member is pre-scaled by 2^(cf_ref - 1 - cf); above cf_ref up to `pair_cf_max`, the last stage at the larger CF
+    /// + 1, `pair_stage_cf`). Err names the first condition that fails.
     pub fn pair_check(&self, chain: pc_shadow::ChainShape, mx: &CtMeta, my: &CtMeta, rx: &Route, ry: &Route) -> Result<()> {
         let n = 2 * self.variants.first().map_or(0, |v| v.slots as usize);
         let bad = |what: String| Err(shape("bts pair", what));
@@ -1153,8 +1158,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 return bad(format!("route {r:?}: a pair takes real dense StC-first refreshes without iterations"));
             }
             let cf = self.call_cf(r);
-            if cf < self.setup.cf_window.0 || cf < self.deg || cf >= self.sf.cf_ref {
-                return bad(format!("CF {cf} outside [{}, {}) (deg {})", self.setup.cf_window.0.max(self.deg), self.sf.cf_ref, self.deg));
+            if cf < self.setup.cf_window.0 || cf < self.deg || cf > self.pair_cf_max() {
+                return bad(format!("CF {cf} outside [{}, {}] (deg {})", self.setup.cf_window.0.max(self.deg), self.pair_cf_max(), self.deg));
             }
         }
         if rx.raise_drop != ry.raise_drop {
@@ -1253,8 +1258,19 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         Ok(())
     }
 
+    /// The largest member CF a pair takes (`StcFirstSetup::pair_cf_max`, at most one below the CF window's top).
+    pub fn pair_cf_max(&self) -> u32 {
+        self.sf.pair_cf_max.unwrap_or(self.sf.cf_ref - 1).min(self.setup.cf_window.1 - 1)
+    }
+
+    /// The CF of a pair's last stage: cf_ref, or above it the larger member's CF + 1.
+    pub fn pair_stage_cf(&self, rx: &Route, ry: &Route) -> u32 {
+        self.sf.cf_ref.max(self.call_cf(rx).max(self.call_cf(ry)) + 1)
+    }
+
     /// Two real refreshes as one complex refresh (`BtsRoute::run_pair`). Each member goes to the entry as alone
-    /// (pending rescale, drop), is multiplied by 2^(cf_ref - 1 - cf) (exact) and becomes x + conj x = 2 Re x (what a
+    /// (pending rescale, drop), is multiplied by 2^(c - 1 - cf) (exact; c = `pair_stage_cf`, cf_ref unless a member's
+    /// CF reaches it) and becomes x + conj x = 2 Re x (what a
     /// single's real EvalMod chain reads, whatever the imaginary lane holds); z = x + i y runs the input stages and the
     /// last stage cached at cf_ref (the entry a single of that input asks for), the raise, the CtS and the complex
     /// EvalMod, whose Re chain is x's output and Im chain y's (no recombination); each is multiplied by its 2^cf. Per
@@ -1273,7 +1289,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         }
         let (lx, ly) = (self.landing_meta(shp, &x.meta, rx)?, self.landing_meta(shp, &y.meta, ry)?);
         let drop = rx.raise_drop.min(ry.raise_drop);
-        let mut st = self.begin_meta(ctx, &x.meta, k, &Route { cf: Some(self.sf.cf_ref), real: false, raise_drop: drop, ..*rx }, false)?;
+        let cf_stage = self.pair_stage_cf(rx, ry);
+        let mut st = self.begin_meta(ctx, &x.meta, k, &Route { cf: Some(cf_stage), real: false, raise_drop: drop, ..*rx }, false)?;
         let entry_level = self.entry_level(shp)?;
         if loose {
             for c in [&mut *x, &mut *y] {
@@ -1293,7 +1310,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
                 return Err(shape("bts pair", format!("input at level {} is below the StC-first entry level {entry_level}", c.meta.level)));
             }
             c.meta.level = entry_level;
-            self.pow2.mult(ctx, &cx.ex.compute, View::of(&c.buf, 0), k, self.entry_top, self.sf.cf_ref - 1 - self.call_cf(r))?;
+            self.pow2.mult(ctx, &cx.ex.compute, View::of(&c.buf, 0), k, self.entry_top, cf_stage - 1 - self.call_cf(r))?;
             self.add_conj(cx, std::slice::from_mut(c))?;
         }
         cx.ops.mult_i_inplace(ctx, cx.ex, cx.sh, std::slice::from_mut(y))?;
@@ -1302,7 +1319,7 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         let xs = std::slice::from_mut(x);
         let info = self.stc_first_input_cf(cx, &st, xs, false)?;
         if info.is_none_or(|i| i.pre_factor_log2 != 0) {
-            return Err(shape("bts pair", format!("the pair's input stage ran {info:?}, not the last stage at cf_ref {}", self.sf.cf_ref)));
+            return Err(shape("bts pair", format!("the pair's input stage ran {info:?}, not the last stage at CF {cf_stage}")));
         }
         self.mod_raise(cx, &mut st, xs)?;
         for i in 0..st.n_cts {

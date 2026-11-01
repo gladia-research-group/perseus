@@ -478,6 +478,18 @@ fn const_slots(ps: &PlanSpec) -> usize {
 fn stc_first_keys(progs: &[Program], n: usize, entry_level: u32, cf_default: u32, cf_ref: u32) -> usize {
     let mut keys: BTreeSet<(u32, u32, u32, u8, u32)> = BTreeSet::new();
     for p in progs {
+        // a refresh pair's last stage: cf_ref, or the larger member's CF + 1 at or above it (bts.pair_cf_max)
+        for o in &p.ops {
+            let m = o.members();
+            if m.len() == 2 && m.iter().all(|x| matches!(x.kind, Kind::Bootstrap(s) if RouteKind::of(&p.bts_sites[s as usize].route, n) == RouteKind::StcFirst && p.bts_sites[s as usize].route.real)) {
+                let rs: Vec<&pc_shadow::Route> = m.iter().filter_map(|x| if let Kind::Bootstrap(s) = x.kind { Some(&p.bts_sites[s as usize].route) } else { None }).collect();
+                let x = p.vars[m[0].ins[0] as usize].meta;
+                let cf = rs.iter().map(|r| r.cf.unwrap_or(cf_default)).max().unwrap_or(cf_default);
+                if x.level <= entry_level && cf >= cf_ref {
+                    keys.insert((rs.iter().map(|r| r.raise_drop).min().unwrap_or(0), cf + 1, x.level, x.deg, 0));
+                }
+            }
+        }
         for m in p.ops.iter().flat_map(|o| o.members()) {
             match &m.kind {
                 Kind::Bootstrap(s) => {
@@ -699,6 +711,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 eprintln!("[session] stc_high: {} shape(s) x {hs} entries", shapes.len());
                 sfs.high = Some(pc_gpu::bts::stc_high::StcHighSetup { shapes, slots: hs });
             }
+            // bts.pair_cf_max: pairs with members at or above the reference CF (their last stage at the larger CF + 1)
+            sfs.pair_cf_max = cfg.bts.pair_cf_max.map(|v| v as u32);
             let mut sp = StcFirstPlan::new(chain, &setup, &sfs).map_err(e)?;
             // refresh pairs (bts.pair): the compile pairs CFs up to PAIR_CF_MAX (a lean chain's: PAIR_CF_MAX_LEAN),
             // run_pair takes CFs below cf_ref

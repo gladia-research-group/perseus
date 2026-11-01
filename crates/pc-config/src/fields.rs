@@ -73,6 +73,9 @@ section! {
         #[doc = "Refreshes left unpaired by `pair` pair across input levels and raise drops too (pc-program `compile::batch::pull_pairs`, pc-gpu `StcFirstRoute::pair`: the shallower input's scale aligned to the deeper's, the member of the deeper drop landed where its single lands; default off)."]
         #[doc = "Runtime switch `PC_BTS_PAIR_LOOSE` [kernel]: binds no plan and no key bundle."]
         pair_loose: Flag = "PC_BTS_PAIR_LOOSE", "(unset)";
+        #[doc = "The largest member CF of a refresh pair (pc-program `Pairing::cf_max`, pc-gpu `StcFirstSetup::pair_cf_max`: a pair with a member at the StC-first reference CF or above runs its last stage at its larger CF + 1; unset = the reference CF - 1)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_CF_MAX` [kernel]: binds no plan and no key bundle."]
+        pair_cf_max: Int = "PC_BTS_PAIR_CF_MAX", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";
