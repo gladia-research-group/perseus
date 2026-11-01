@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulAddNArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulAddNArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs, WsumKArgs};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -50,6 +50,41 @@ impl Default for OpsCfg {
 
 /// wsum takes at most this many sources per launch (`WsumArgs::src`).
 pub const WSUM_MAX: usize = 8;
+
+/// An operand of an affine step (`Ops::affine`): source `i` of the group, or the value of the group's step `i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffRef {
+    Src(u16),
+    Val(u16),
+}
+
+/// The element-wise ops an affine group fuses, each as the op layer runs it alone (`mult_scalar` of a real constant,
+/// `negate`, `add_scalar`, `add`, `sub`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AffOp {
+    MultConst(f64),
+    Negate,
+    AddConst(f64),
+    Add,
+    Sub,
+}
+
+/// One step of an affine group: `op` on `a` (and `b` for an add or sub).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AffStep {
+    pub op: AffOp,
+    pub a: AffRef,
+    pub b: Option<AffRef>,
+}
+
+/// A group value as an affine form of the sources: per source its weight rows (residues mod each prime), the constant
+/// rows added to part 0, the bookkeeping.
+#[derive(Clone)]
+struct AffVal {
+    w: Vec<(u16, Vec<u64>)>,
+    k: Option<Vec<u64>>,
+    meta: CtMeta,
+}
 
 /// Per-call constant vectors: `slots` device slots of `slot_words` words, each with its own pinned host slot and an
 /// event recorded after its upload. A push writes the pinned slot (after syncing that event when the slot is reused),
@@ -992,6 +1027,279 @@ impl<'a, W: DevWord> Ops<'a, W> {
             Self::mul_table(ctx, &ex.compute, b, b, self.mono.vptr(), top + 1, o.k())?;
             o.meta = r.out;
         }
+        Ok(())
+    }
+
+    // ── i * a added ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// The add / sub recipe of `mult_i_add` (the product as operand A when `product_first`).
+    fn iadd_recipe(sh: &Shadow, a: &CtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<Recipe> {
+        let m = sh.mult_i(a).out;
+        let (x, z) = if product_first { (m, *y) } else { (*y, m) };
+        Ok(if sub { sh.sub(&x, &z)? } else { sh.add(&x, &z)? })
+    }
+
+    /// Whether `mult_i_add` runs `y +- i a` as one pass: the add's recipe takes no prelude but limb drops.
+    pub fn mult_i_add_fusable(sh: &Shadow, a: &CtMeta, y: &CtMeta, sub: bool, product_first: bool) -> Result<bool> {
+        Ok(Self::iadd_recipe(sh, a, y, sub, product_first)?.pre.iter().all(|p| matches!(p, Prelude::DropTo(..))))
+    }
+
+    /// `out = y + i a` (`sub`: `y - i a`, or `i a - y` when `product_first`): exactly `mult_i` into a temporary, then
+    /// `add` / `sub` of it with `y`, as one pass (`mul_add` with the X^{N/2} rows `mult_i` multiplies by). `a`, `y`:
+    /// rows, metadata, batch size (`out` may share either's rows). Needs `mult_i_add_fusable`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_i_add<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, a: (PolyRef, CtMeta, usize), y: (PolyRef, CtMeta, usize), sub: bool, product_first: bool) -> Result<()> {
+        let r = Self::iadd_recipe(sh, &a.1, &y.1, sub, product_first)?;
+        if r.pre.iter().any(|p| !matches!(p, Prelude::DropTo(..))) {
+            return Err(shape("mult_i_add", "the add takes a data prelude: run mult_i then add"));
+        }
+        let k = out.k();
+        if a.2 != k || y.2 != k {
+            return Err(shape("mult_i_add", "operands and output of different batch sizes"));
+        }
+        let top = self.top(ctx.shape, &r.out)?;
+        let m = MulTableArgs { out: out.buf.w(), inp: a.0, t: self.mono.vptr(), pr: ctx.pr(), n: (top + 1) as i32, k: k as i32 };
+        let args = MulAddArgs { m, y: y.0, sub: if !sub { 0 } else if product_first { 2 } else { 1 }, pad: 0 };
+        // SAFETY: k cts of the context layout over rows 0..=top for out, a and y (the monomial rows cover every Q row);
+        // element-wise, so out may share a's or y's rows (each thread reads its operands before writing the same index)
+        launch_result("mul_add", unsafe { (ctx.table.mul_add)(&args, ex.compute.raw()) })?;
+        out.meta = r.out;
+        Ok(())
+    }
+
+    // ── affine groups ────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// The output metadata of `affine` when it runs as one pass: every step's recipe (the op's own, on the metadata the
+    /// steps before it leave) takes element-wise preludes only (limb drops, scalar adjusts not folded into a rescale),
+    /// except on at most one operand that is a group source (its preludes, a rescale among them, run into the
+    /// executor's scratch first), and a constant add has its constant rows; None otherwise.
+    pub fn affine_meta(sh: &Shadow, srcs: &[CtMeta], steps: &[AffStep]) -> Result<Option<CtMeta>> {
+        let mut vals: Vec<CtMeta> = Vec::with_capacity(steps.len());
+        let get = |r: AffRef, vals: &[CtMeta]| match r {
+            AffRef::Src(i) => srcs.get(i as usize).copied(),
+            AffRef::Val(i) => vals.get(i as usize).copied(),
+        };
+        let mut mats = 0;
+        for st in steps {
+            let Some(a) = get(st.a, &vals) else { return Ok(None) };
+            let b = match (st.op, st.b) {
+                (AffOp::Add | AffOp::Sub, Some(b)) => match get(b, &vals) {
+                    Some(m) => Some(m),
+                    None => return Ok(None),
+                },
+                (AffOp::Add | AffOp::Sub, None) => return Ok(None),
+                _ => None,
+            };
+            let Some(r) = Self::aff_recipe(sh, st.op, &a, b.as_ref())? else { return Ok(None) };
+            for (who, x) in [(Operand::A, Some(st.a)), (Operand::B, st.b)] {
+                let Some(x) = x else { continue };
+                if r.pre.iter().any(|p| matches!(p, Prelude::Rescale(o) if *o == who)) {
+                    mats += 1;
+                    if mats > 1 || !matches!(x, AffRef::Src(_)) {
+                        return Ok(None);
+                    }
+                }
+            }
+            vals.push(r.out);
+        }
+        Ok(vals.last().copied())
+    }
+
+    /// The recipe of one affine step on its operands' metadata; None when a constant add has no constant rows.
+    fn aff_recipe(sh: &Shadow, op: AffOp, a: &CtMeta, b: Option<&CtMeta>) -> Result<Option<Recipe>> {
+        Ok(Some(match op {
+            AffOp::MultConst(c) => sh.mult_scalar(a, c)?,
+            AffOp::Negate => sh.negate(a)?,
+            AffOp::AddConst(c) => {
+                let r = sh.add_scalar(a, c)?;
+                if c != 0.0 && !matches!(r.consts, Some(pc_shadow::Consts::Add(_))) {
+                    return Ok(None);
+                }
+                r
+            }
+            AffOp::Add | AffOp::Sub => {
+                let b = b.ok_or_else(|| shape("affine", "add without operand b"))?;
+                if op == AffOp::Sub {
+                    sh.sub(a, b)?
+                } else {
+                    sh.add(a, b)?
+                }
+            }
+        }))
+    }
+
+    /// The last step of an affine group (constant products, negations, constant adds, adds and subs, each value but the
+    /// last read only by a later step of the group) written to `out` in one pass over the sources: per prime, the
+    /// value is sum_s w_s x_s (+ k on part 0) with the weights and constant composed from the steps' own constant
+    /// rows (their scalar-adjust preludes' too) mod the prime; every op is exact mod the prime and every kernel leaves
+    /// residues in [0, p), so the words are those of the steps run one by one. The one source operand whose preludes
+    /// hold a rescale has them run first, as the op would (`run_pre_from`, into the executor's scratch). Needs
+    /// `affine_meta`; `srcs`: each source's rows, metadata and batch size (`out` may share a source's rows).
+    pub fn affine<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Ct<'_, W>, srcs: &[(PolyRef, CtMeta, usize)], steps: &[AffStep]) -> Result<()> {
+        let np = self.primes.len();
+        let k = out.k();
+        if srcs.iter().any(|x| x.2 != k) {
+            return Err(shape("affine", "sources and output of different batch sizes"));
+        }
+        let primes = self.primes.clone();
+        let mul = |a: u64, b: u64, p: u64| ((a as u128 * b as u128) % p as u128) as u64;
+        let scaled = |v: &mut AffVal, rows: &[u64]| {
+            for (_, w) in v.w.iter_mut() {
+                for (i, x) in w.iter_mut().enumerate() {
+                    *x = mul(*x, rows.get(i).copied().unwrap_or(0) % primes[i], primes[i]);
+                }
+            }
+            if let Some(kv) = v.k.as_mut() {
+                for (i, x) in kv.iter_mut().enumerate() {
+                    *x = mul(*x, rows.get(i).copied().unwrap_or(0) % primes[i], primes[i]);
+                }
+            }
+        };
+        // the materialized source (its preludes run into the scratch): view, metadata
+        let mut mat: Option<(PolyRef, CtMeta)> = None;
+        let nsrc = srcs.len() as u16;
+        let mut vals: Vec<AffVal> = Vec::with_capacity(steps.len());
+        for st in steps {
+            let fetch = |r: AffRef, vals: &[AffVal]| -> Result<AffVal> {
+                match r {
+                    AffRef::Src(i) => {
+                        let m = srcs.get(i as usize).ok_or_else(|| shape("affine", format!("source {i} of {}", srcs.len())))?.1;
+                        Ok(AffVal { w: vec![(i, vec![1; np])], k: None, meta: m })
+                    }
+                    AffRef::Val(i) => vals.get(i as usize).cloned().ok_or_else(|| shape("affine", format!("value {i} before its step"))),
+                }
+            };
+            let mut a = fetch(st.a, &vals)?;
+            let mut b = match st.b {
+                Some(x) if matches!(st.op, AffOp::Add | AffOp::Sub) => Some(fetch(x, &vals)?),
+                _ => None,
+            };
+            let r = Self::aff_recipe(sh, st.op, &a.meta, b.as_ref().map(|v| &v.meta))?.ok_or_else(|| shape("affine", "a constant add without constant rows"))?;
+            // each operand's preludes: element-wise ones on the affine form, a rescale (with what precedes it) by
+            // `run_pre_from` on the source into the scratch, as the op runs its preludes
+            for (who, x, v) in [(Operand::A, Some(st.a), Some(&mut a)), (Operand::B, st.b, b.as_mut())] {
+                let (Some(x), Some(v)) = (x, v) else { continue };
+                let mine: Vec<Prelude> = r.pre.iter().copied().filter(|p| matches!(p, Prelude::Rescale(o) | Prelude::DropTo(o, _) | Prelude::ScalarAdjust(o, _) if *o == who)).collect();
+                if mine.iter().any(|p| matches!(p, Prelude::Rescale(_))) {
+                    let AffRef::Src(i) = x else { return Err(shape("affine", "a rescale on a group value: run the steps one by one")) };
+                    if mat.is_some() {
+                        return Err(shape("affine", "two rescaled sources: run the steps one by one"));
+                    }
+                    if k > ex.scratch.k {
+                        return Err(Error::Mem { knob: "MemCfg::scratch_cts", value: ex.scratch.k, msg: format!("rescaled source of {k} cts") });
+                    }
+                    let kfull = ex.scratch.k;
+                    ex.scratch.k = k;
+                    let mut t = Track { meta: srcs[i as usize].1 };
+                    let view = self.run_pre_from(ctx, &ex.compute, &mut ex.scratch, Some(srcs[i as usize].0), &mut t, &r.pre, who);
+                    ex.scratch.k = kfull;
+                    mat = Some((view?, t.meta));
+                    *v = AffVal { w: vec![(nsrc, vec![1; np])], k: None, meta: t.meta };
+                    continue;
+                }
+                for p in mine {
+                    match p {
+                        Prelude::DropTo(_, l) => {
+                            if l < v.meta.level {
+                                return Err(shape("affine", format!("DropTo {l} above the operand's level {}", v.meta.level)));
+                            }
+                            v.meta.level = l;
+                        }
+                        Prelude::ScalarAdjust(_, c) => {
+                            let top = top_limb(ctx.shape, v.meta.level)? as i32;
+                            let rows = ctx.scale.elem_for_eval_mult(top, c, -1)?;
+                            scaled(v, &rows);
+                            v.meta.deg += 1;
+                        }
+                        Prelude::Rescale(_) => {}
+                    }
+                }
+            }
+            match st.op {
+                AffOp::MultConst(c) => {
+                    let top = top_limb(ctx.shape, a.meta.level)? as i32;
+                    let rows = match &r.consts {
+                        Some(pc_shadow::Consts::Mult(rows)) => rows.clone(),
+                        _ => ctx.scale.elem_for_eval_mult(top, c, -1)?,
+                    };
+                    scaled(&mut a, &rows);
+                }
+                AffOp::Negate => {
+                    let rows: Vec<u64> = match &r.consts {
+                        Some(pc_shadow::Consts::Mult(rows)) => rows.clone(),
+                        _ => primes.iter().map(|p| p - 1).collect(),
+                    };
+                    scaled(&mut a, &rows);
+                }
+                AffOp::AddConst(_) => {
+                    if let Some(pc_shadow::Consts::Add(rows)) = &r.consts {
+                        let kv = a.k.get_or_insert_with(|| vec![0; np]);
+                        for (i, x) in kv.iter_mut().enumerate() {
+                            *x = (*x + rows.get(i).copied().unwrap_or(0) % primes[i]) % primes[i];
+                        }
+                    }
+                }
+                AffOp::Add | AffOp::Sub => {
+                    let b = b.take().ok_or_else(|| shape("affine", "add without operand b"))?;
+                    let neg = |x: u64, p: u64| if x == 0 { 0 } else { p - x };
+                    for (sb, wb) in b.w {
+                        let wb: Vec<u64> = if st.op == AffOp::Sub { wb.iter().zip(&primes).map(|(&x, &p)| neg(x, p)).collect() } else { wb };
+                        match a.w.iter().position(|t| t.0 == sb) {
+                            Some(x) => a.w[x].1.iter_mut().zip(&wb).zip(&primes).for_each(|((x, &y), &p)| *x = (*x + y) % p),
+                            None => a.w.push((sb, wb)),
+                        }
+                    }
+                    if let Some(kb) = b.k {
+                        let kb: Vec<u64> = if st.op == AffOp::Sub { kb.iter().zip(&primes).map(|(&x, &p)| neg(x, p)).collect() } else { kb };
+                        let ka = a.k.get_or_insert_with(|| vec![0; np]);
+                        ka.iter_mut().zip(&kb).zip(&primes).for_each(|((x, &y), &p)| *x = (*x + y) % p);
+                    }
+                }
+            }
+            a.meta = r.out;
+            vals.push(a);
+        }
+        let v = vals.pop().ok_or_else(|| shape("affine", "no steps"))?;
+        let top = top_limb(ctx.shape, v.meta.level)? as usize;
+        // the sources (a weight of 0 on every live row reads nothing), the one sharing out's rows first (the first
+        // launch writes out before a later launch would read it)
+        let ob = out.buf.r().base;
+        let view = |i: u16| if i < nsrc { srcs[i as usize].0 } else { mat.map(|m| m.0).unwrap_or_default() };
+        let mut terms: Vec<(PolyRef, Vec<u64>)> = v.w.into_iter().filter(|(_, w)| w[..=top].iter().any(|&x| x != 0)).map(|(i, w)| (view(i), w)).collect();
+        terms.sort_by_key(|t| t.0.base != ob);
+        let s = &ex.compute;
+        let o = out.buf.w();
+        let ones = vec![1u64; np];
+        let mut next = 0;
+        let mut first = true;
+        while first || next < terms.len() {
+            let mut src = [PolyRef::default(); WSUM_MAX];
+            let mut rows: Vec<&[u64]> = Vec::with_capacity(WSUM_MAX);
+            if !first {
+                src[0] = out.buf.r();
+                rows.push(&ones);
+            }
+            while rows.len() < WSUM_MAX && next < terms.len() {
+                src[rows.len()] = terms[next].0;
+                rows.push(&terms[next].1);
+                next += 1;
+            }
+            let (w, ws) = self.ring.push_rows(s, &primes, &rows)?;
+            let args = WsumArgs { out: o, src, w, ws, pr: ctx.pr(), nsrc: rows.len() as i32, rowstride: np as i32, n: (top + 1) as i32, k: k as i32 };
+            match (&v.k, first) {
+                (Some(kv), true) => {
+                    let kp = self.ring.push_plain(s, kv)?;
+                    // SAFETY: k cts of the context layout over rows 0..=top for out and every source (sources hold their
+                    // rows through every live level); element-wise per (ct, row, i): out may share a source's rows, each
+                    // thread reads its sources before writing the same index; w / ws / kp are ring slots pushed above
+                    launch_result("wsum_k", unsafe { (ctx.table.wsum_k)(&WsumKArgs { w: args, k: kp }, s.raw()) })?;
+                }
+                // SAFETY: as above
+                _ => launch_result("wsum", unsafe { (ctx.table.wsum)(&args, s.raw()) })?,
+            }
+            first = false;
+        }
+        out.meta = v.meta;
         Ok(())
     }
 
