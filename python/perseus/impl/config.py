@@ -88,6 +88,9 @@ class SoftmaxCfg:
     # to a t-lane block (head h + H/2 on lanes t/2.. of head h's block), tH/2-periodic, so its refreshes route on
     # tH/2 slots (attention._pair); 0 = the tH-periodic layout
     pair_heads: int = 0
+    # gs_num: every reciprocal round's scores folded into its Goldschmidt recursion (poly.goldschmidt_recip num=): the
+    # round's product goes, and inside a round the state is one ciphertext (a refresh may sit anywhere in it)
+    gs_num: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -242,7 +245,7 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
         key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
-        pair_heads=int(j.get("pair_heads", 0)))
+        pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:

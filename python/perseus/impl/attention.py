@@ -914,6 +914,11 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     fold = getattr(ops, "sm_fold", False) and not getattr(ops, "fused_sm_den", False)
     lanes = _key_lanes(rt.dims, cfg, kc)
     pair = _pair(rt, cfg, kc)
+    # SoftmaxCfg.gs_num: each round's scores ride the reciprocal's packed recursion (poly.goldschmidt_recip num=):
+    # no final product, and between rounds' starts the state is one ciphertext, so a refresh can sit inside a round
+    fold_num = bool(int(getattr(cfg, "gs_num", 0) or 0))
+    if fold_num and not (ops.complex_payload and getattr(ops, "sm_cheb_gs", False)):
+        raise ValueError("gs_num needs a complex payload and SM_CHEB_GS=1")
     for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
         if k:
             z = ops.square(im_cleanse(ops, y))
@@ -921,11 +926,17 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
             s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
                                     seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k), lanes=lanes,
                                     pair=pair)
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
+            if fold_num:
+                y = goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb, num=z)
+            else:
+                y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
         else:
             s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc), lanes=lanes,
                                 pair=pair)
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
+            if fold_num:
+                y = goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb, num=z)
+            else:
+                y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
     return y
 
 
