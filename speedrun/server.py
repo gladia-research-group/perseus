@@ -34,7 +34,7 @@ SCORED = 8                                     # Decode-8's first scored positio
 # Decode-8 never holds more than STEPS keys: its plan's softmax and GELU are fitted to positions 0..STEPS-1 (the main
 # decode plan's to 1024-token windows); it runs on the alternating chain n32sp (its runtime line's CHAIN_PRESET:
 # speedrun/make_n32sp_decode_plan.sh)
-DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh"
+DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gn"
 # speedrun/make_prefill_plan.sh's plan with CutMax's scaled normalisers (stage 13 replanned: its PLAN_CMD.txt), on the
 # lean chain n32a4 too (PRESET=n32a4; its runtime line's CHAIN_PRESET), carried onto the attention whose window ladders
 # are one rotation per window (speedrun/make_prefill_wrot_plan.sh, PF_ATTN_WROT=3)
