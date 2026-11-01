@@ -66,6 +66,58 @@ def rms_norm_lanes(rt, x, cfg: NormCfg, lanes):
     return ops.mult(xs, inv)
 
 
+def _spru_consts(cfg: NormCfg, d):
+    """(a, b, s, o) of _norm_spru: the Chebyshev's argument u = s var - o, var = m2 - mu^2 (+ eps c^2), from the
+    refreshed slot mean a mu + i b m2 with 2 a = sqrt(s) and 2 b = s (so re^2 = s mu^2 and im = s m2 cost no
+    constant product)."""
+    s = 2.0 / (cfg.cheb_hi - cfg.cheb_lo)
+    o = (cfg.cheb_hi + cfg.cheb_lo) / (cfg.cheb_hi - cfg.cheb_lo)
+    return 0.5 * math.sqrt(s), 0.5 * s, s, o
+
+
+def _spru_items(cfg: NormCfg, d, c: float):
+    """The two position-scaled masks of _norm_spru: N/d (a, b) times c on the token's slots."""
+    a, b, _s, _o = _spru_consts(cfg, d)
+    k = d.N / d.dim
+    return [(("ln.spru.a", c, a), lambda: active_token_mask(d.N, d.dim, d.t, 0.5 * c * k * a)),
+            (("ln.spru.b", c, b), lambda: active_token_mask(d.N, d.dim, d.t, 0.5 * c * k * b))]
+
+
+def _norm_spru(rt, x2, xs, cfg: NormCfg, c: float):
+    """norm() with the token's statistics from ONE 1-slot refresh instead of the mean and variance ladders (22 + 35
+    hoisted rotations): z = (N/d) (a xs + i b xs^2) on the token's slots, stamped one slot; that refresh (SPRU,
+    bts/spru.rs) returns the slot mean of ANY input, Re and Im, so it lands as a mu + i b m2 in every slot (mu, m2
+    the mean and mean square of xs = c x over the d real features). One conjugation splits it; var = m2 - mu^2.
+    The hint fires at any level (threshold 0): the plan places that refresh (its landing and factor) and must route
+    it on 1 slot."""
+    ops, d = rt.ops, rt.dims
+    N, t, dr = d.N, d.t, d.dim
+    a, b, s, o = _spru_consts(cfg, d)
+    (ka, fa), (kb, fb) = _spru_items(cfg, d, c)
+    xa = rt.mult_mask(x2, ka, fa)                         # (N/d) a xs
+    xb = rt.mult_mask(x2, kb, fb)                         # (N/d) b xs
+    z = ops.add(xa, ops.mult_i(ops.mult(xs, xb)))         # (N/d) (a xs + i b xs^2)
+    z = ops.tag_reduce(z, 1)
+    ops.bootstrap_hint(z, 0)                              # -> a mu + i b m2 in every slot
+    zc = ops.conjugate(z)
+    re = ops.add(z, zc)                                   # sqrt(s) mu
+    im = ops.mult_i(ops.sub(zc, z))                       # s m2
+    u = ops.sub(im, ops.square(re))                       # s (m2 - mu^2)
+    u = ops.add(u, s * cfg.epsilon * c * c - o)           # s (var + eps c^2) - o, in [-1, 1]
+    init = eval_chebyshev(ops, u, cfg.cheb_coeffs, -1.0, 1.0)
+    if cfg.cheb_nr_iters > 0:
+        var = ops.add(ops.mult(u, 1.0 / s), o / s)
+        inv = inv_sqrt_newton_d2(ops, var, init, cfg.cheb_nr_iters, 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale))
+    else:
+        inv = init
+    mean = rt.mult_mask(re, ("ln.spru.mu", a), lambda: stride_mask(N, dr, t, -0.5 / a))
+    centered = ops.add(xs, mean)
+    if getattr(ops, "realize_shared", False):
+        ops.realize(centered)
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(centered, inv)
+
+
 def norm(rt, x, cfg: NormCfg, pos: int):
     """norm(): returns inv_out_scale * LN(x) on the lanes (no gamma/beta); pos is the
     absolute token position (capture_t) selecting center_scale_sq."""
@@ -76,6 +128,8 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     # im_cleanse + centering-scale mask (norm.cu)
     x2 = im_cleanse(ops, x)
     xs = rt.mult_mask(x2, ("ln.center", c), lambda: active_token_mask(N, dr, t, 0.5 * c))
+    if cfg.spru and cfg.cheb_coeffs and ops.ln_cheb:
+        return _norm_spru(rt, x2, xs, cfg, c)
     # mean: mod-t class sum (cachemir_norm_utils.cu) times -1/d on the lanes (norm.cu)
     mean = ops.tag_reduce(rotsum(ops, xs, t, N), t)       # t-periodic (mod-t class sum)
     mean = rt.mult_mask(mean, "ln.scalemask", lambda: stride_mask(N, dr, t, -1.0 / dr))
@@ -182,4 +236,7 @@ def norm_step_masks(rt, cfg: NormCfg, pos: int):
     a run-constant mask when the config has no per-position center_scale_sq)."""
     d = rt.dims
     c = math.sqrt(cfg.c_eff_sq(pos))
-    return [(("ln.center", c), lambda: active_token_mask(d.N, d.dim, d.t, 0.5 * c))]
+    items = [(("ln.center", c), lambda: active_token_mask(d.N, d.dim, d.t, 0.5 * c))]
+    if cfg.spru and cfg.cheb_coeffs and getattr(rt.ops, "ln_cheb", True):
+        items += _spru_items(cfg, d, c)
+    return items
