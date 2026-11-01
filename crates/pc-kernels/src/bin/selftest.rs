@@ -722,7 +722,7 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
     // tensor (2 pairs, accumulate into out = d[4]), d2 and coef written
     {
         let o = st.ctx.up(&h[4]);
-        let d2 = st.ctx.zeros(tot);
+        let mut d2 = st.ctx.zeros(tot);
         let coef = st.ctx.zeros(k * 8 * N);
         let a = TensorArgs {
             out: ctref(&o),
@@ -739,7 +739,7 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
             n: n as i32,
             k: k as i32,
             dbl: 0,
-            pad: 0,
+            acc_d2: 0,
         };
         ck(unsafe { (st.t.tensor)(&a, st.s()) });
         let mut wo = h[4].clone();
@@ -764,8 +764,15 @@ fn t_em(st: &mut Setup) -> Vec<TestResult> {
         out.push(cmp("tensor (2 pairs, acc) vs host", &go, &wo));
         out.push(cmp("tensor d2 vs host", &d2.read(&st.ctx), &wd2));
         out.push(cmp("tensor coef vs host", &coef.read(&st.ctx), &wc));
-        // dbl: the same launch again from out = h[4], every output doubled
+        // acc_d2: the same launch again from out = h[4], d2 (holding the first launch's) accumulating too
         let mut o = o;
+        o.write(&st.ctx, &h[4]);
+        ck(unsafe { (st.t.tensor)(&TensorArgs { acc_d2: 1, ..a }, st.s()) });
+        let wd2x: Vec<u64> = wd2.iter().enumerate().map(|(j, &x)| if (j / N) % 8 < n { (2 * x as u128 % st.p((j / N) % 8) as u128) as u64 } else { x }).collect();
+        out.push(cmp("tensor acc_d2 (2 pairs, acc) vs host", &o.read(&st.ctx), &wo));
+        out.push(cmp("tensor acc_d2 d2 vs host", &d2.read(&st.ctx), &wd2x));
+        d2.write(&st.ctx, &wd2);
+        // dbl: the same launch again from out = h[4], every output doubled
         o.write(&st.ctx, &h[4]);
         ck(unsafe { (st.t.tensor)(&TensorArgs { dbl: 1, ..a }, st.s()) });
         // rows n.. are not the launch's: kept

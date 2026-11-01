@@ -1650,7 +1650,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             let (a0, b0) = (v(pairs[0].0), v(pairs[0].1));
             let (a1, b1) = if pairs.len() > 1 { (v(pairs[1].0), v(pairs[1].1)) } else { (a0, b0) };
             let ext = View::of(&ex.ks.ext, 0);
-            let t = TensorArgs { out: dstv.r(), d2: ext.r(), a0, b0, a1, b1, coef: std::ptr::null_mut(), coef_ct_stride: pw, pr: ctx.pr(), npairs: pairs.len() as i32, acc: acc as i32, n: n as i32, k: kk as i32, dbl: epi.dbl as i32, pad: 0 };
+            let t = TensorArgs { out: dstv.r(), d2: ext.r(), a0, b0, a1, b1, coef: std::ptr::null_mut(), coef_ct_stride: pw, pr: ctx.pr(), npairs: pairs.len() as i32, acc: acc as i32, n: n as i32, k: kk as i32, dbl: epi.dbl as i32, acc_d2: 0 };
             match ya {
                 // (d0, d1) -+= c y in the same pass (`Fuse::addend`)
                 Some((y, k, sub)) => {
@@ -1750,7 +1750,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             n: n as i32,
             k: kk as i32,
             dbl: 0,
-            pad: 0,
+            acc_d2: 0,
         };
         // SAFETY: kk-ct views of the program buffers (out may be a source: element-wise, each thread reads its
         // operands before writing), d2 into the key-switching workspace

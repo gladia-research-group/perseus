@@ -1063,7 +1063,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             n: (top + 1) as i32,
             k: k as i32,
             dbl: 0,
-            pad: 0,
+            acc_d2: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1 and d2[c] part 1, so
         // out aliasing an input is element-wise safe; rows 0..=top of k cts
@@ -1128,7 +1128,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             n: (top + 1) as i32,
             k: k as i32,
             dbl: dbl as i32,
-            pad: 0,
+            acc_d2: 0,
         };
         // SAFETY: per (ct, row, i) the kernel reads all inputs before writing out[c] parts 0/1, so out aliasing the A
         // operand (it holds A's adjusted copy) is element-wise safe; ext is distinct from out and the scratch copy of
@@ -1145,6 +1145,64 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let (top, r) = self.tensor_for_relin(ctx, ex, sh, out, a, Some(b))?;
         crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
         out.meta = r.out;
+        Ok(())
+    }
+
+    /// `sum_j a_j * b_j` relinearized once (lazy relinearization): pair 0 as `mult`'s tensor (its preludes, `out` and
+    /// the staged d2 written), every later pair's tensor accumulated onto both (its Recipe preludes on copies: B in the
+    /// executor scratch, A in `tmp`), then one `relin_staged`. Every pair's recipe must land on one meta (level,
+    /// degree, scale). The same value as the sum of the `mult`s up to the key-switching error. `out` and `tmp` are
+    /// none of the operands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_sum<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, out: &mut Ct<'_, W>, tmp: &mut Ct<'_, W>, pairs: &[(&Ct<'_, W>, &Ct<'_, W>)]) -> Result<()> {
+        let Some(&(a0, b0)) = pairs.first() else {
+            return Err(shape("mult_sum", "no pairs"));
+        };
+        let (top, r0) = self.tensor_for_relin_of(ctx, ex, sh, out, Some(a0), Some(b0), false)?;
+        let k = a0.k();
+        for (j, &(a, b)) in pairs.iter().enumerate().skip(1) {
+            let r = sh.mult(&a.meta, &b.meta)?;
+            if r.out.level != r0.out.level || r.out.deg != r0.out.deg || (r.out.nf - r0.out.nf).abs() > 1e-9 * r0.out.nf.abs() {
+                return Err(shape("mult_sum", format!("pair {j} lands at ({}, {}, {}) , pair 0 at ({}, {}, {})", r.out.level, r.out.deg, r.out.nf, r0.out.level, r0.out.deg, r0.out.nf)));
+            }
+            Self::check_k("mult_sum", k, a.k())?;
+            Self::check_k("mult_sum", k, b.k())?;
+            let bp = self.prep_b(ctx, ex, b.buf.r(), b.meta, k, &r.pre)?;
+            let a_pre = r.pre.iter().any(|p| matches!(p, Prelude::Rescale(Operand::A) | Prelude::DropTo(Operand::A, _) | Prelude::ScalarAdjust(Operand::A, _)));
+            let (am, aref) = if a_pre {
+                let t = self.prep_a(ctx, &ex.compute, tmp, Some(a), &r.pre)?;
+                (t.meta, tmp.buf.r())
+            } else {
+                (a.meta, a.buf.r())
+            };
+            let bm = bp.map_or(b.meta, |x| x.1);
+            if am.level != r.out.level || bm.level != r.out.level {
+                return Err(shape("mult_sum", format!("pair {j}: preludes left levels {} / {}, the recipe's output is at {}", am.level, bm.level, r.out.level)));
+            }
+            let bref = bp.map_or(b.buf.r(), |x| x.0);
+            let args = TensorArgs {
+                out: out.buf.w(),
+                d2: crate::ks::View::of(&ex.ks.ext, 0).r(),
+                a0: aref,
+                b0: bref,
+                a1: aref,
+                b1: bref,
+                coef: std::ptr::null_mut(),
+                coef_ct_stride: ctx.lay.poly_words() as u64,
+                pr: ctx.pr(),
+                npairs: 1,
+                acc: 1,
+                n: (top + 1) as i32,
+                k: k as i32,
+                dbl: 0,
+                acc_d2: 1,
+            };
+            // SAFETY: out (the running (c0, c1)) and ext part 1 (the running d2) are read before the thread's stores;
+            // A / B are the operands or their prelude copies (tmp, the scratch), distinct from out and ext
+            launch_result("tensor", unsafe { (ctx.table.tensor)(&args, ex.compute.raw()) })?;
+        }
+        crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
+        out.meta = r0.out;
         Ok(())
     }
 

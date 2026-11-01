@@ -146,6 +146,23 @@ pub fn rule(sh: &Shadow, kind: &Kind, ins: &[CtMeta], pts: &[PtRef], sites: &[Bt
             return Ok((vec![], vec![CtMeta::new(landing.level, landing.deg)]));
         }
         Kind::Batched(_) => return Err("rule() of a batch: run it per member".into()),
+        Kind::MultSum { .. } => {
+            // the chain it stands for: each pair's product (its own preludes, run inside the op), all landing on one
+            // meta, added up without preludes
+            if ins.len() < 4 || ins.len() % 2 != 0 {
+                return Err(format!("mult_sum of {} cipher inputs (pairs, at least two)", ins.len()));
+            }
+            let mut out: Option<CtMeta> = None;
+            for (j, ab) in ins.chunks(2).enumerate() {
+                let r = sh.mult(&ab[0], &ab[1]).map_err(e)?;
+                match out {
+                    None => out = Some(r.out),
+                    Some(o) if o.level == r.out.level && o.deg == r.out.deg && (o.nf - r.out.nf).abs() <= 1e-9 * o.nf.abs() => {}
+                    Some(o) => return Err(format!("mult_sum pair {j} lands at ({}, {}), pair 0 at ({}, {})", r.out.level, r.out.deg, o.level, o.deg)),
+                }
+            }
+            return Ok((vec![], out.into_iter().collect()));
+        }
         Kind::CoeffSum { pts: ids, .. } => {
             // the loop it stands for: mult_pt of each term, add into the first; no prelude anywhere (the fusion's
             // condition)
@@ -260,7 +277,7 @@ pub fn verify(sh: &Shadow, p: &Program) -> CheckReport {
                     }
                     // a fused sum's intermediates keep their lowered states (pins and the ceiling read them)
                     let fz: &[VarId] = match &m.kind {
-                        Kind::CoeffSum { fused, .. } | Kind::MultRescale { fused, .. } => fused,
+                        Kind::CoeffSum { fused, .. } | Kind::MultRescale { fused, .. } | Kind::MultSum { fused } => fused,
                         _ => &[],
                     };
                     {

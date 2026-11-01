@@ -222,6 +222,7 @@ struct Tables<'t, 'a> {
     pts: &'t [BoundPt],
     finishes: &'t [FinishStep],
     coeff_sums: &'t [CoeffSumStep],
+    mult_sums: &'t [Vec<u32>],
     stream_base: *const f32,
 }
 
@@ -268,6 +269,20 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
         // SAFETY: the frame holds `Bound::streams.total` rows of N floats (StreamRing sized it); bind checked rows
         let rows: Vec<*const f32> = cs.rows.iter().map(|&r| unsafe { t.stream_base.add(r as usize * n) }).collect();
         crd.sum(ctx, &rt.ex.compute, sh, o, &cts, &rows)?;
+        return Ok(());
+    }
+    if let StepOp::MultSum { s } = &st.op {
+        let ms = t.mult_sums.get(*s as usize).ok_or_else(|| rerr(block, format!("mult_sum {s} out of range")))?;
+        if ms.len() < 4 || ms.len() % 2 != 0 || ms.iter().chain(std::iter::once(&st.out)).any(|&x| x as usize >= n_slots) || ms.contains(&st.out) {
+            return Err(rerr(block, format!("mult_sum {s}: {} operand slots, slots outside the {n_slots} bound slots, or the output among them", ms.len())));
+        }
+        // SAFETY: bind checked the slots (< n_slots, output not an operand); the output and `tmp` are the only
+        // mutable references
+        let o: &mut Ct<'a, W> = unsafe { &mut *slots.add(st.out as usize) };
+        let pairs: Vec<(&Ct<'a, W>, &Ct<'a, W>)> = ms.chunks(2).map(|ab| unsafe { (&*slots.add(ab[0] as usize), &*slots.add(ab[1] as usize)) }).collect();
+        let kc = KsCfg { plans: rt.ks, source: rt.source };
+        let key = group(block, t.groups, t.relin)?;
+        rt.ops.mult_sum(ctx, rt.ex, kc, sh, key, o, tmp, &pairs)?;
         return Ok(());
     }
     // SAFETY: indices checked at bind (< slots.len()); `o` is the only mutable reference, and inputs are taken as
@@ -398,6 +413,7 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
         }
         StepOp::Finish { .. } => return Err(rerr(block, "finish step reached the single-output lowering")),
         StepOp::CoeffSum { .. } => return Err(rerr(block, "coeff_sum step reached the single-output lowering")),
+        StepOp::MultSum { .. } => return Err(rerr(block, "mult_sum step reached the single-output lowering")),
         StepOp::Bootstrap { route, kind, .. } => {
             if !st.inplace {
                 copy_ct(ctx, &rt.ex.compute, o, at(st.a))?;
@@ -516,7 +532,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 None
             };
             {
-                let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, stream_base, names, .. } = &mut *b;
+                let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, mult_sums, stream_base, names, .. } = &mut *b;
                 let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
                 let r = match unit {
                     Some((u, _)) => {
@@ -540,7 +556,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                         if lane == 0 && !quiet(&steps[i].op) {
                             ks_owner = None;
                         }
-                        let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, stream_base: *stream_base };
+                        let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, mult_sums, stream_base: *stream_base };
                         exec_step(label, rt, &steps[i], slots.as_mut_ptr(), slots.len(), tmp, &t)
                     }
                 };

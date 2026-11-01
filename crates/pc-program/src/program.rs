@@ -91,6 +91,13 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fused: Vec<VarId>,
     },
+    /// `sum_j ins[2j] * ins[2j + 1]` relinearized once (`compile::msum`: a chain of single-use relinearized products
+    /// added up, each with its own operand preludes; pc-gpu `Ops::mult_sum`). `fused`: the products' and partial sums'
+    /// vars, never materialized (their lowered metadata stays for the check).
+    MultSum {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fused: Vec<VarId>,
+    },
 }
 
 impl Kind {
@@ -116,6 +123,7 @@ impl Kind {
             Kind::Finish { .. } => "finish",
             Kind::Batched(_) => "batched",
             Kind::CoeffSum { .. } => "coeff_sum",
+            Kind::MultSum { .. } => "mult_sum",
         }
     }
 }
