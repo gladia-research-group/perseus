@@ -348,9 +348,26 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
         }
         let io = io_of(x, View::of(&ex.ks.ext, 0), k);
         dots(ctx, ex, kc, group, live[j].0, m, k, top, io)?;
+        // a key whose k outputs (inputs 0..k, one each) lie in consecutive slots takes the ModDown's last step in the
+        // conversion NTT's epilogue, written straight into them (no correction stored, no element-wise pass)
+        let heads: Vec<Option<View>> = live[j..j + m].iter().map(|&(r, _)| if ks::lever_on("grid_epi") { grid_head(outs, &key, r, k) } else { None }).collect();
         let join = join_of!(ex);
-        ks::moddown_conv_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top, join)?;
+        if heads.iter().all(Option::is_none) {
+            ks::moddown_conv_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top, join)?;
+        } else {
+            // the special rows only up to the conversion; the forked Q-row dot joins before the epilogues read ext
+            ks::moddown_conv_coef(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top)?;
+            if let Some(e) = join {
+                ex.compute.wait(e)?;
+            }
+            for (t, h) in heads.iter().enumerate() {
+                ks::moddown_conv_out(ctx, &ex.compute, kc.plans, &ex.ks.ext, &mut ex.ks.conv, t * k, k, *h, top)?;
+            }
+        }
         for (t, &(r, _)) in live[j..j + m].iter().enumerate() {
+            if heads[t].is_some() {
+                continue;
+            }
             for (c, s, o) in outs.iter_mut() {
                 if key[*s] == Some(r) {
                     let e = t * k + *c;
@@ -361,6 +378,28 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
         j += m;
     }
     Ok(())
+}
+
+/// The outputs of key `r` in a rotation grid as one view: Some when they are exactly one per input `c < k`, in
+/// consecutive slots of the layout in input order.
+fn grid_head<W: DevWord>(outs: &[(usize, usize, &mut Ct<'_, W>)], key: &[Option<usize>], r: usize, k: usize) -> Option<View> {
+    let mut at: Vec<Option<View>> = vec![None; k];
+    for (c, s, o) in outs {
+        if key[*s] == Some(r) {
+            if at[*c].is_some() {
+                return None;
+            }
+            at[*c] = Some(View::of(&o.buf, 0));
+        }
+    }
+    let v0 = at[0]?;
+    let cw = v0.ct_stride as usize;
+    for (c, v) in at.iter().enumerate() {
+        if (*v)?.base as usize != v0.base as usize + c * cw * std::mem::size_of::<W>() {
+            return None;
+        }
+    }
+    Some(v0)
 }
 
 /// In place: `acc = acc + sum_k rot(acc, steps[k])`, the rotations summed in the extended basis, one ModDown.

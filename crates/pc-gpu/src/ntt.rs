@@ -343,6 +343,29 @@ pub fn forward_k_epi<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// Forward `transform_k` of ciphertexts `[c0, c0 + k)` of `ct`, storing `epi` of the transform when given (its
+/// buffers at the same row offsets from their own bases, as `forward_k_epi`).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_k_at<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    ct: &mut CtBuf<'_, Compute, W>,
+    c0: usize,
+    span: Span,
+    parts: Parts,
+    k: usize,
+    epi: Option<Epi>,
+) -> Result<()> {
+    if ct.lay != ctx.lay || c0 + k > ct.k {
+        return Err(shape("ntt", format!("cts [{c0}, {}) of {}, buffer layout {:?}, context {:?}", c0 + k, ct.k, ct.lay, ctx.lay)));
+    }
+    let base = (ct.buf.vptr_mut() as *mut W).wrapping_add(c0 * ct.lay.ct_words()) as *mut c_void;
+    for (start, n) in ctx.rows.launches(span, parts, k)? {
+        launch_ex(ctx, s, Dir::Forward, base, ctx.rows.roff.dptr_at(start)?, ctx.rows.rprime.dptr_at(start)?, n, None, epi)?;
+    }
+    Ok(())
+}
+
 /// `transform_k` with an out-of-place (summing) first pass from `src` at the row tables' offsets (`Src::soff` unused:
 /// the context's own row offsets are the source offsets) and an optional forward epilogue.
 #[allow(clippy::too_many_arguments)]

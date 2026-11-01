@@ -1358,6 +1358,54 @@ pub fn moddown_conv_j<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// `moddown_conv` up to its NTT: x's special rows INTT'd (in place) and converted into conv's Q rows (coefficient
+/// form), the first `k` ciphertexts; `moddown_conv_out` finishes a range of them.
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_conv_coef<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    k: usize,
+    top: usize,
+) -> Result<()> {
+    plans.check_k(k)?;
+    check_cts(x, 0, k, "ks moddown")?;
+    check_cts(conv, 0, k, "ks moddown")?;
+    let lv = plans.level(top)?;
+    md_intt(ctx, s, plans, lv, x, k, None)?;
+    lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)
+}
+
+/// The rest of `moddown_conv_coef`'s ModDown for ciphertexts `[c0, c0 + k)`: `out` (Some: k consecutive ciphertexts
+/// of the layout) = (x - NTT(conv)) P^-1 over Q rows 0..=top in the conversion NTT's epilogue (`moddown_to`'s Set);
+/// None: conv's NTT only (conv then holds the correction, as after `moddown_conv`).
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_conv_out<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    x: &CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    c0: usize,
+    k: usize,
+    out: Option<View>,
+    top: usize,
+) -> Result<()> {
+    check_cts(x, c0, k, "ks moddown_conv_out")?;
+    let lv = plans.level(top)?;
+    let epi = match out {
+        Some(o) => {
+            check_md_out(ctx, o, MdOut::Set, "ks moddown_conv_out")?;
+            let [_, _, sc, scs] = level_scalars(ctx, lv);
+            Some(ntt::Epi::SubMul { out: o.base, x: View::of(x, c0).base, s: sc, ss: scs })
+        }
+        None => None,
+    };
+    ntt::forward_k_at(ctx, s, conv, c0, Span::Q { top }, Parts::Both, k, epi)
+}
+
 /// What a fused ModDown stores in its output view, md = (x - conv) P^-1 over Q rows 0..=top: `Set` out = md, `Add`
 /// out += md, `Onto(y)` out = y + md (y: k ciphertexts of the ciphertext layout, read at out's row offsets).
 #[derive(Clone, Copy, Debug)]
