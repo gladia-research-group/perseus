@@ -70,6 +70,9 @@ section! {
         #[doc = "How far ahead (launches) a refresh pair's second member is looked for, the ops it may bring forward scaling with it (pc-program `compile::batch::pull_pairs`; unset = 2560 launches, 1024 ops)."]
         #[doc = "Runtime switch `PC_BTS_PAIR_WINDOW`."]
         pair_window: Int = "PC_BTS_PAIR_WINDOW", "(unset)";
+        #[doc = "Refreshes left unpaired by `pair` pair across input levels and raise drops too (pc-program `compile::batch::pull_pairs`, pc-gpu `StcFirstRoute::pair`: the shallower input's scale aligned to the deeper's, the member of the deeper drop landed where its single lands; default off)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_LOOSE` [kernel]: binds no plan and no key bundle."]
+        pair_loose: Flag = "PC_BTS_PAIR_LOOSE", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";

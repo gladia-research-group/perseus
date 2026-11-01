@@ -543,7 +543,7 @@ pub fn compile_block(
     // (CFs up to the route's reference CF less one: 19, or 12 on a lean chain)
     let cf_max = if chain_of(cfg)?.lone_top().is_some() { crate::program::PAIR_CF_MAX_LEAN } else { crate::program::PAIR_CF_MAX };
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
-    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default, window: cfg.bts.pair_window.unwrap_or(0) as u32 });
+    let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default, window: cfg.bts.pair_window.unwrap_or(0) as u32, loose: cfg.bts.pair_loose.unwrap_or(false) });
     if crate::program::lever_on("rr") {
         let shape = ChainShape::of(&chain_of(cfg)?);
         rr::fuse(&mut p, &sh, &shape);

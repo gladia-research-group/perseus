@@ -10,6 +10,7 @@
 //! replay runs them as one complex refresh (pc-gpu `BtsRoute::run_pair`), each member keeping its own CF. `Schedule::Siblings` pulls them together from further
 //! apart than other siblings (`pull_pairs`).
 use crate::program::{BatchReport, Kind, KindCount, Op, Pairing, Program, VarId};
+use pc_shadow::Route;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Members of a refresh pair (x + i y: two real payloads in one complex refresh).
@@ -172,7 +173,11 @@ pub fn batch(p: &mut Program, k_max: u32, schedule: Schedule, cf_free: bool, pai
                 if schedule == Schedule::Siblings {
                     // pairs first, on the capture's order: the pull's batches would tie independent chains together
                     if let Some(pr) = pair {
-                        pull_pairs(p, pr);
+                        pull_pairs(p, pr, false);
+                        if pr.loose {
+                            // the refreshes left unpaired, across input levels and raise drops
+                            pull_pairs(p, pr, true);
+                        }
                     }
                     pull(p, k.min(PULL_K), cf_free, pair);
                 }
@@ -283,7 +288,7 @@ fn pull(p: &mut Program, k_max: usize, cf_free: bool, pair: Option<Pairing>) {
 /// fewest candidates (then fewest ops); a pair the issue order cannot keep (its second member issued earlier as another
 /// pair's ancestor) is dropped from the candidates and the matching redone, `PAIR_ROUNDS` times at most, keeping the
 /// order that forms the most pairs.
-fn pull_pairs(p: &mut Program, pr: Pairing) {
+fn pull_pairs(p: &mut Program, pr: Pairing, loose: bool) {
     let ops = std::mem::take(&mut p.ops);
     let n = ops.len();
     let mut prod: HashMap<VarId, usize> = HashMap::new();
@@ -301,7 +306,15 @@ fn pull_pairs(p: &mut Program, pr: Pairing) {
             d
         })
         .collect();
-    let keys: Vec<Option<String>> = ops.iter().map(|o| if paired(p, o, Some(pr)) { key(p, o, None, false, Some(pr)) } else { None }).collect();
+    let keys: Vec<Option<String>> = ops
+        .iter()
+        .map(|o| match &o.kind {
+            // loose: the route without its CF and raise drop, any input level and degree
+            Kind::Bootstrap(s) if loose && paired(p, o, Some(pr)) => Some(format!("pairL|{:?}|{:?}", Route { cf: None, raise_drop: 0, ..p.bts_sites[*s as usize].route }, o.pre)),
+            _ if paired(p, o, Some(pr)) => key(p, o, None, false, Some(pr)),
+            _ => None,
+        })
+        .collect();
     let mut bucket: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, k) in keys.iter().enumerate() {
         if let Some(k) = k {

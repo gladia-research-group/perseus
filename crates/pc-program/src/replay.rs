@@ -475,7 +475,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         } else {
             let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. })));
             let unit = at
-                .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
+                .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh, &rt.routes))
                 .map(|u| (b.unit_of[i], u.hi as usize))
                 .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == s.lane[i])));
             if at.is_some_and(|u| matches!(u.kind, UnitKind::Pair { .. })) {
@@ -636,7 +636,7 @@ fn quiet(op: &StepOp) -> bool {
 /// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
 /// rotations only need one level; a refresh pair's members share level, degree and the StC-first stage cache's scale
 /// key (`nf_key`: the pair's last stage is built for the first member's scale, as a single refresh takes its cached one).
-fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow) -> bool {
+fn unit_fits<'a, W: DevWord, M: DevStrategy<W>>(u: &Unit, slots: &[Ct<'a, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow, routes: &Routes<'_, 'a, W, M>) -> bool {
     let meta = |s: &u32| slots.get(*s as usize).map(|c| c.meta);
     let one = |v: &[u32], scale: bool| {
         let m0 = v.first().and_then(meta);
@@ -648,8 +648,10 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
         UnitKind::RotAcc { .. } => one(&u.ins, true),
         UnitKind::Mult { b, .. } => one(&u.ins, true) && one(b, true),
         UnitKind::Refresh { .. } => one(&u.ins, true),
-        UnitKind::Pair { .. } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
-            (Some(x), Some(y)) => x.level == y.level && x.deg == y.deg && nf_key(x.nf) == nf_key(y.nf),
+        UnitKind::Pair { routes: rs, kind } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
+            (Some(x), Some(y)) if x.level == y.level && x.deg == y.deg && rs[0].raise_drop == rs[1].raise_drop => nf_key(x.nf) == nf_key(y.nf),
+            // a loose pair (bts.pair_loose): two levels or raise drops, as the route takes them
+            (Some(x), Some(y)) => routes.get(*kind).is_some_and(|r| r.pair_ok(sh, &x, &y, &rs[0], &rs[1])),
             _ => false,
         },
         // one pass when neither the add nor the plaintext needs a prelude; a sum landing on the add's other operand
