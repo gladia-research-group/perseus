@@ -386,7 +386,7 @@ section! {
 }
 
 section! {
-    /// `model.prefill` (92 legacy env names).
+    /// `model.prefill` (93 legacy env names).
     PrefillSection "model.prefill" {
         #[doc = "`PF_ACT_FOLD`. Default '0'. Read at impl/activation.py::<module>."]
         #[doc = "Shipped plans: runtime= 7."]
@@ -403,6 +403,9 @@ section! {
         #[doc = "`PF_ATTN_PAIR`. Default '1'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         attn_pair: Flag = "PF_ATTN_PAIR", "'1'";
+        #[doc = "`PF_ATTN_WROT`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 1."]
+        attn_wrot: Int = "PF_ATTN_WROT", "'0'";
         #[doc = "`PF_CCMM_CAP`. Default '0'. Read at impl/ccmm.py::Ccmm.__init__."]
         #[doc = "Shipped plans: none."]
         ccmm_cap: Int = "PF_CCMM_CAP", "'0'";

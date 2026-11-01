@@ -40,6 +40,14 @@ _KV_SHARE = os.environ.get("PF_KV_SHARE", "0") not in ("", "0")
 # PF_PRE_PERIODIC=1: a prefix score alone in its score ciphertext stays tH-periodic (sparse refreshes, no block select);
 # the prefix key / value plaintexts are encoded once per level
 _PRE_PERIODIC = os.environ.get("PF_PRE_PERIODIC", "0") not in ("", "0")
+# PF_ATTN_WROT=bits (with PF_ATTN_BSGS): the packed reductions' window ladders (a sum over the nw windows per product)
+# traded for one rotation per window. A window mask after the sum over the windows is the shifted mask before it
+# (M_a rot_w(y) = rot_w(M_(a+w) y)). 1: q.K^T with the masks on the K side, K~_w = sum_a M_(a+w) kc_a built once per
+# query and key chunk, each giant step's products q K~_w summed over w rotated by w windows. 2: P.V with y rotated by
+# w windows once (one hoisted call) and each pair's broadcast pb_a = sum_w M'_(a-w) rot_w(y) (masks on the
+# probabilities' side, at their depth). 4: P.V with the masks on the V side instead (V~_w = sum_a M'_(a-w) vc_a,
+# one level deeper on V's side)
+_WROT = int(os.environ.get("PF_ATTN_WROT", "0") or 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -769,7 +777,7 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         raise ValueError("PF_ATTN_BSGS: needs d_head a multiple of t lanes, t a multiple of the baby range")
     lane_of = np.arange(d.N) % d.t
     start = blk_of % W == 0
-    rots, cycs = {}, {}
+    rots, cycs, wsums = {}, {}, {}
 
     def prime(tag, x, steps):
         """Plain rotations of x (one hoisted call for the new steps)."""
@@ -853,11 +861,65 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 else:
                     ops.inplace_add(S[m], x)
 
+    def wrot_items(groups, bits):
+        """PF_ATTN_WROT: {(m, g): (cp, {a: grp})} when every giant step of every score ciphertext holds all nw pairs
+        of one key chunk (else None: the per-product ladders)."""
+        if not _WROT & bits:
+            return None
+        out = {}
+        for grp in groups:
+            u, cp, _ = grp[0]
+            m, r = divmod(u, d.d_head)
+            g, b = divmod(r, Bb)
+            if b % 2 or len(grp) != 2 or any(cp_ != cp for _, cp_, _ in grp):
+                return None
+            cp0, items = out.setdefault((m, g), (cp, {}))
+            if cp0 != cp or b // 2 in items:
+                return None
+            items[b // 2] = grp
+        if not out or any(sorted(items) != list(range(nw)) for _, items in out.values()):
+            return None
+        return out
+
+    def wsum(tag, c, cp, items, src, name, w, mkey, mbuild):
+        """K~_w / V~_w of key chunk cp for query chunk c: sum_a mask_(a, w) (baby(src, b) + i baby(src, b + 1))."""
+        key = (tag, c, cp, w)
+        if key not in wsums:
+            cts, keys, builds = [], [], []
+            for a in range(nw):
+                vrs = [baby(src, name, c, cp_, e % Bb) for _, cp_, e in items[a]]
+                cts.append(ops.add(vrs[0], ops.mult_i(vrs[1])))
+                v = mkey(a, w)
+                keys.append(v)
+                builds.append(mbuild(v))
+            wsums[key] = rt.mult_mask_sum(cts, keys, builds)
+        return wsums[key]
+
     def qkt_bsgs(c, QL, SL, groups, pre):
         """qkt_packed with offset e = b + Bb g as K rotated by b and Q by Bb g (cyclic across chunks): the nw pairs of a
         giant step share a packed ciphertext, whose lane shift back by Bb g rides each window's placing rotation. With
         d_head > t a score ciphertext's giant steps span several key chunks: block step g, lane step g mod t / Bb."""
         by, lanes = {}, {}
+        wi = wrot_items(groups, 1)
+        if wi is not None:
+            # window v of K~_w holds kc_(v - w): q K~_w rotated by w windows puts each pair's window sum on its window
+            # (the giant step's lane offset and its cyclic wrap as the per-pair form: bidirectional chunks, d_head > t)
+            for (m, g), (cp, items) in sorted(wi.items()):
+                gl = (Bb * g % d.t) // Bb
+                cy = cp != c or ch.bidir
+                lanes[(m, g)] = (gl, cy)
+                kts = [wsum("K", c, cp, items, K, "K", w, lambda a, w: ("pf.qpk", (a + w) % nw, W),
+                            lambda v: (lambda v=v: win_mask(v[1]))) for w in range(nw)]
+                for i, Q in enumerate(QL):
+                    if not cy:
+                        qg = rot_of(("Q", qset[id(Q)], c), Q[c], Bb * gl)
+                    else:
+                        qg = cyc(("Q", qset[id(Q)], c), Q[c], d.t - Bb * gl, "pf.qrot")
+                    acc = ops.mult(qg, kts[0])
+                    for w in range(1, nw):
+                        acc = ops.add(acc, ops.rotate(ops.mult(qg, kts[w]), w * W * d.tH))
+                    by[(i, m, g)] = acc
+            groups = []
         for grp in groups:
             u, cp, _ = grp[0]
             m, r = divmod(u, d.d_head)
@@ -900,12 +962,47 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
         """pv_packed with offset e = b + Bb g: each giant step's probabilities unpacked shifted by Bb g lanes, times V
         rotated by b, summed per giant step and shifted back by Bb g (cyclic once chunk c attends an earlier chunk)."""
         by, lanes = {}, {}
+        wi = wrot_items(groups, 6)
+        if wi is not None:
+            groups = []
         for grp in groups:
             u, cp = grp[0][0], grp[0][1]
             m, r = divmod(u, d.d_head)
             by.setdefault((m, r // Bb), []).append((r % Bb // 2, grp))
             lanes[(m, r // Bb)] = ((r % d.t) // Bb, cp != c or ch.bidir)
         sums = {}
+        vside = bool(_WROT & 4)
+        for (m, g), (cp, items) in sorted((wi or {}).items()):
+            # pb_a = sum_w M'_(a - w) rot_w(y); vside: window v of V~_w holds vc_(v + w) (its broadcast mask), y
+            # rotated by w windows times V~_w summed over w (lane offset and wrap as the per-pair form)
+            gl = (Bb * g % d.t) // Bb
+            cy = cp != c or ch.bidir
+            if vside:
+                vts = [wsum("V", c, cp, items, V, "V", w, lambda a, w: ("pf.vup", (a - w) % nw, W),
+                            lambda v: (lambda v=v: win_mask(v[1], W - 1))) for w in range(nw)]
+            for i, P in enumerate(PL):
+                y = None
+                for par, coef in ((0, 0.5), (1, -0.5j)):
+                    for part, (sh, sel) in enumerate(lane_parts((2 * g + par) * d.tH, Bb * gl, cy)):
+                        x = P[m] if sh % d.N == 0 else ops.rotate(P[m], sh % d.N)
+                        x = rt.mult_mask(x, ("pf.vpk.b", W, Bb * gl, part, complex(coef)),
+                                         lambda sel=sel, coef=coef: np.where(start & sel, coef, 0.0))
+                        y = x if y is None else ops.add(y, x)
+                y = rotsum(ops, y, d.tH, W * d.tH)
+                rs = [y] + ops.rotate_many(y, [w * W * d.tH for w in range(1, nw)])
+                for w in range(nw):
+                    if vside:
+                        prod = ops.mult(rs[w], vts[w])
+                    else:
+                        a = w
+                        pb = rt.mult_mask_sum(rs, [("pf.vup", (a - x) % nw, W) for x in range(nw)],
+                                              [lambda v=(a - x) % nw: win_mask(v, W - 1) for x in range(nw)])
+                        vrs = [baby(V, "V", c, cp_, e % Bb) for _, cp_, e in items[a]]
+                        prod = ops.mult(pb, ops.add(vrs[0], ops.mult_i(vrs[1])))
+                    if (i, gl) in sums:
+                        ops.inplace_add(sums[(i, gl)], prod)
+                    else:
+                        sums[(i, gl)] = prod
         for (m, g), items in sorted(by.items()):
             gl, cy = lanes[(m, g)]
             ys = []
