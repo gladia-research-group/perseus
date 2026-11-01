@@ -443,7 +443,8 @@ fn rotate_sum_core<W: DevWord, M: DevStrategy<W>>(
             dots(ctx, ex, kc, group, keys[j], m, k, top, DotIo { c0_mode, ..io })?;
             j += m;
         }
-        return ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, k, &mut ex.ks.conv, out, mode, k, top);
+        let join = join_of!(ex);
+        return ks::moddown_sum_to_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, k, &mut ex.ks.conv, out, mode, k, top, join);
     }
     if form == SumForm::InModDown && run && keys.len() <= per {
         // every extended rotation in ks.ext at once, summed inside the ModDown
@@ -595,6 +596,8 @@ pub fn rotate_acc<W: DevWord, M: DevStrategy<W>>(
             return Err(shape("rotate_acc", "inputs must be single ciphertexts at one level, no identity"));
         }
         let r = key_index(keys[j], gal[j])?;
+        // the previous input's Q-row dot (aux) reads the ModUp digits this one overwrites
+        ex.join_aux()?;
         ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, 1, 1, top)?;
         let mut io = io_of(x, View::of(&ex.ks.ext, 0), 1);
         if j > 0 {
@@ -612,7 +615,8 @@ pub fn rotate_acc<W: DevWord, M: DevStrategy<W>>(
         None => ks::MdOut::Add,
     };
     let o = View::of(&out.buf, 0);
-    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, 1, &mut ex.ks.conv, o, mode, 1, top)?;
+    let join = join_of!(ex);
+    ks::moddown_sum_to_j(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, 1, 1, &mut ex.ks.conv, o, mode, 1, top, join)?;
     out.meta = meta;
     Ok(())
 }
