@@ -546,6 +546,17 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
             consumers[i] += 1
             if not n.output:
                 stores.add(i)
+    # PLAN_RAISE_PRESET="v:k,...": those sites start the search at drop k, so the block outputs are pinned at the plan
+    # they make (a site whose drop sets the block exit: pinned at the all-zero plan, the earlier sites would lose theirs)
+    preset = {v: int(k) for v, k in (e.split(":") for e in os.environ.get("PLAN_RAISE_PRESET", "").split(",") if e)}
+    preset = {v: k for v, k in preset.items() if v in placer.placed}
+    for v, k in preset.items():
+        sp = refresh.spec(v)
+        rs = float(g.level_unit) if sp.prescale is not None else 0.0
+        refresh.site_out_levels[v] = int(round(cfg.bootstrap_level + sp.out_consumed - rs + k * unit))
+        refresh._cache.pop(v, None)
+    if preset:
+        sim = placer._sim()
     pinned = sorted(stores | {v for v in sim.consumed if not consumers[v]})
 
     def inputs(s: SimResult) -> dict[str, tuple[float, float]]:
@@ -591,6 +602,9 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
     sites = set(placer.placed) | fired
     order = sorted(sites, key=lambda v: g.producer_of[v].idx if v in g.producer_of else -1)
     for p in order:
+        if p in preset:
+            drops[p] = preset[p]
+            continue
         s = refresh.spec(p)
         route = int(s.route or 0)
         if route not in cfg.raise_drop_routes:
