@@ -85,6 +85,9 @@ fn run(args: &[String]) -> Res<bool> {
     let mut setup = BtsSetup::n32_shipped();
     setup.raise_drops = vec![0];
     setup.k_max = 1;
+    // --real: the device finish on the real-payload route (one EvalMod chain: the switched values are real)
+    let real_fin = args.iter().any(|a| a == "--real");
+    setup.real = real_fin;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 2;
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
@@ -278,6 +281,8 @@ fn run(args: &[String]) -> Res<bool> {
         cx.ex.compute.sync()?;
         let t_split = Instant::now();
         let mut inp2 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
+        let rr = Route { real: true, ..r };
+        let fin_real = if real_fin { Some(BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &rr, CallOpts { prescaled: false, own_cf: true })?) } else { None };
         inp2.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
         cx.ex.compute.sync()?;
         let t_split = t_split.elapsed().as_secs_f64() * 1e3;
@@ -350,7 +355,7 @@ fn run(args: &[String]) -> Res<bool> {
         };
         cx.ex.compute.sync()?;
         let t_fin = Instant::now();
-        let mut fin2 = inp2.finish_call(0)?;
+        let mut fin2 = match fin_real { Some(c) => c, None => inp2.finish_call(0)? };
         fin2.at_split(&cx, std::slice::from_ref(&y))?;
         // --finish-steps: each finish phase timed (synchronous)
         let mut steps = String::new();
