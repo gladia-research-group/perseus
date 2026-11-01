@@ -401,8 +401,8 @@ pub fn acc_round<W: DevWord, M: DevStrategy<W>>(
 }
 
 /// `acc_round` on a raised ciphertext under the sparse secret: `x = s2d(x) + sum_j rot(x, steps[j])` switched to the
-/// dense secret, `g` = [sparse -> dense, SparseRot(steps[j])..] (`AccRounds::new_merged`): one ModUp, the m + 1 dots,
-/// one ModDown summing them (no add of x: its value is the identity term).
+/// dense secret, `g` = [sparse -> dense, SparseRot(steps[j])..] (`AccRounds::new_merged`): one ModUp, the m + 1 dots
+/// (summed in the dot at K = 1, KS_SUM), one ModDown (no add of x: its value is the identity term).
 pub fn acc_round_sparse<W: DevWord, M: DevStrategy<W>>(
     ctx: &crate::Context<'_, W, M>,
     ex: &mut crate::Executor<'_, W>,
@@ -425,9 +425,13 @@ pub fn acc_round_sparse<W: DevWord, M: DevStrategy<W>>(
     ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &x.buf, 0, k, 1, top)?;
     let va = View::of(&x.buf, 0);
     let ext0 = View::of(&ex.ks.ext, 0);
-    let io = DotIo { c1: va.part::<W>(1).base, c0: va.base, ct_stride: va.ct_stride, out: ext0.base, part_stride: lay.poly_words() as u64, out_ct_stride: cw, out_rot_stride: k as u64 * cw, c0_mode: 1 };
+    // the m extended products summed inside the dot when its kernel can (KS_SUM), else inside the ModDown
+    let sum = g.dot_sums::<W>(k, in_place);
+    let c0_mode = if sum { 1 | pc_kernels::KS_SUM } else { 1 };
+    let io = DotIo { c1: va.part::<W>(1).base, c0: va.base, ct_stride: va.ct_stride, out: ext0.base, part_stride: lay.poly_words() as u64, out_ct_stride: cw, out_rot_stride: k as u64 * cw, c0_mode };
     ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, g, 0, m, k, top, DotRows::All, io, in_place)?;
-    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, m, k, &mut ex.ks.conv, View::of(&x.buf, 0), ks::MdOut::Set, k, top)?;
+    let n = if sum { 1 } else { m };
+    ks::moddown_sum_to(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, n, k, &mut ex.ks.conv, View::of(&x.buf, 0), ks::MdOut::Set, k, top)?;
     x.meta = sh.rotate_sum(&x.meta, steps).out;
     Ok(())
 }
