@@ -432,9 +432,9 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let mut i = 0;
         while i < mine.len() {
             let top = self.top(shape_, &t.meta)?;
-            // the one-pass (out-of-place, folded) rescale drops a composite level; an alternating user region's single
-            // primes take the plain one
-            let comp = ctx.chain.drop_at(top) == Some(2);
+            // the one-pass (out-of-place, folded) rescale: a composite level's, and an alternating user region's
+            // one-prime drop (`Rescaler::one_pass_at`)
+            let comp = self.rescaler.one_pass_at(ctx, top);
             if let (Some(sv), false) = (src, matches!(mine[i], Prelude::DropTo(..))) {
                 // the first data prelude: it reads `src` (a rescale on a composite level, or a scalar adjust: folded
                 // into the rescale after it, else the scaling reads `src`), or `src` is copied into x now
@@ -462,9 +462,10 @@ impl<'a, W: DevWord> Ops<'a, W> {
                     let fold = self.cfg.fold_scalar && self.rescaler.can_fold() && comp && matches!(mine.get(i + 1), Some(Prelude::Rescale(_)));
                     let rows = ctx.scale.elem_for_eval_mult(top as i32, c, -1)?;
                     let q = &ctx.chain.q;
-                    let foldable = fold && !(rows[top] % q[top] == 1 && rows[top - 1] % q[top - 1] != 1);
+                    let one = ctx.chain.drop_at(top) == Some(1);
+                    let foldable = fold && (one || !(rows[top] % q[top] == 1 && rows[top - 1] % q[top - 1] != 1));
                     if foldable {
-                        let al = self.rescaler.folded_alpha(top, &rows, q)?;
+                        let al = if one { self.rescaler.folded_alpha_one(ctx, top, &rows) } else { self.rescaler.folded_alpha(top, &rows, q)? };
                         let (av, als) = self.ring.push_rows(s, &self.primes, &[&al])?;
                         match src.take() {
                             Some(sv) => self.rescaler.rescale_to(ctx, s, sv, x, top, Some((&rows, av, als)))?,
