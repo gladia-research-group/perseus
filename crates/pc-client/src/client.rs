@@ -462,7 +462,7 @@ impl Client {
                 let sn = s_new[id].as_ref().expect("row");
                 let (inq, gm) = match &lvl {
                     Some((dof, g)) => (id < nq && dof[id] == d as i32, g[id]),
-                    None => (id < nq && self.ring.digit_of(id) == Some(d), self.ring.gadget(key.shape.kp)[id]),
+                    None => (id < nq && self.ring.digit_of(id) == Some(d), if id < nq { self.ring.gadget(key.shape.kp)[id] } else { 0 }),
                 };
                 let mut e: Vec<u32> = (0..n)
                     .map(|i| {
