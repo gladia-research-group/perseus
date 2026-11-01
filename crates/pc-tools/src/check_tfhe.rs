@@ -116,7 +116,7 @@ fn run(args: &[String]) -> Res<bool> {
     mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
     mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1)));
     if device {
-        mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &Params::new(n)?, chunk.unwrap_or(n_switch)));
+        mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &switch_params(args, n)?, chunk.unwrap_or(n_switch)));
         mp.reserve("check.tfhe", 4 * (n_switch + 2 * 4096) + 512);
     }
     let arena = mp.allocate(&dev)?;
@@ -127,7 +127,9 @@ fn run(args: &[String]) -> Res<bool> {
     let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
     let mut work = BtsWork::<W>::new(&arena, lay, wshape)?;
     let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, KskLayout::Dense)?;
-    let mut prng = test_prng(0x7f);
+    // --seed S: another draw of the keys and values (the key switch's error is key-dependent: average over seeds)
+    let seed: u32 = arg(args, "--seed").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    let mut prng = test_prng(0x7f + 0x100 * seed);
     let sk = SecretKey::sample(&mut prng, n)?;
     let mut sec = DevSecret::<W>::carve(&arena, lay)?;
     sec.load(&ctx, &ex.compute, &sk)?;
@@ -139,18 +141,19 @@ fn run(args: &[String]) -> Res<bool> {
     let route = plan.build(&arena, &dev, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs())?;
     let mut x = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
     let mut y = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
+    let mut z = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
     println!("[pc-check] tfhe: device setup {:.1} s", t0.elapsed().as_secs_f64());
     // the host switch, keyed by the same CKKS secret (and its device copy)
     let s: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
     let (p0, p1) = (chain.q[0], chain.q[1]);
-    let mut params = Params::new(n)?;
+    let mut params = switch_params(args, n)?;
     params.out_cf = out_cf;
     let tk = Instant::now();
     let sw = Switcher::generate(params, &s, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe: host switch keys {:.1} s (p0 {p0}, p1 {p1})", tk.elapsed().as_secs_f64());
-    let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &ex.compute, &sw, chunk.unwrap_or(n_switch))?) } else { None };
+    let mut dsw = if device { Some(pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, &ex.compute, &sw, chunk.unwrap_or(n_switch))?) } else { None };
     let mut d_pos = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", n_switch)?;
-    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", 2 * sw.params.n_br)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("check.tfhe", 2 * sw.params.tv_len())?;
     arena.freeze();
     let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
     let enc = Encoder::new(&chain);
@@ -220,7 +223,7 @@ fn run(args: &[String]) -> Res<bool> {
     let valid: Vec<usize> = chosen.iter().map(|&i| coef_of(i)).collect();
     // --identity: the LUT f(m) = m, its finished output against the input measures the switch's input noise
     let identity = args.iter().any(|a| a == "--identity");
-    let (tv, off) = if identity { (pc_tfhe::pbs::test_vector(sw.params.n_br, sw.params.q_br, |m| sw.lut_value(m)), 0) } else { sign01(sw.params.n_br, sw.delta_br()) };
+    let (tv, off) = if identity { (pc_tfhe::pbs::test_vector(sw.params.tv_len(), sw.params.q_br, |m| sw.lut_value(m)), 0) } else { sign01(sw.params.tv_len(), sw.delta_br()) };
     let ts = Instant::now();
     let out = sw.apply(&ct, &valid, &tv, off);
     println!("[pc-check] tfhe: host switch of {n_switch} coefficients {:.1} s", ts.elapsed().as_secs_f64());
@@ -265,8 +268,12 @@ fn run(args: &[String]) -> Res<bool> {
         let msg = enc.encode_slots(&vals, slots, top, Payload::Complex, sf_)?;
         encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg], meta, &mut y, &mut prng)?;
         let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+        cx.ex.compute.sync()?;
+        let t_split = Instant::now();
         let mut inp2 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
         inp2.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
+        cx.ex.compute.sync()?;
+        let t_split = t_split.elapsed().as_secs_f64() * 1e3;
         let pos: Vec<u32> = valid.iter().map(|&j| j as u32).collect();
         let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &tv);
         // a warm-up call on scratch (x: any content at the split's level) builds the GEMM plan; then the timed one
@@ -279,10 +286,14 @@ fn run(args: &[String]) -> Res<bool> {
             ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut x, &pos, &tvr, off)?;
             ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut y, &pos, &tvr, off)?
         };
+        cx.ex.compute.sync()?;
+        let t_fin = Instant::now();
         let mut fin2 = inp2.finish_call(0)?;
         fin2.at_split(&cx, std::slice::from_ref(&y))?;
         fin2.run_to(&mut cx, std::slice::from_mut(&mut y), Phase::Done)?;
         cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut y))?;
+        cx.ex.compute.sync()?;
+        println!("[pc-check] tfhe: CKKS sides: StC-first split {t_split:.2} ms, finish {:.2} ms (first calls)", t_fin.elapsed().as_secs_f64() * 1e3);
         let got = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?;
         let (mut bad, mut worst) = (0, 0f64);
         let (mut ss, mut ns) = (0f64, 0usize);
@@ -303,6 +314,72 @@ fn run(args: &[String]) -> Res<bool> {
         println!("[pc-check] tfhe: device switched slots: rms error {:.3e} over {ns} (the LUT's input noise when --identity)", (ss / ns.max(1) as f64).sqrt());
         println!("[pc-check] tfhe: device switch of {n_switch} coefficients: max err {worst:.3e}; ms to LWE {:.2}, key switch {:.2}, bootstrap {:.2}, repack {:.2}", tm.to_lwe, tm.key_switch, tm.bootstrap, tm.repack);
         t.add("tfhe: device CKKS -> TFHE sign -> CKKS slots (err < 1e-2)", bad, slots);
+        if args.iter().any(|a| a == "--taylor") {
+            // first-order correction of the switch's input error (after Crasson, Mehats, ePrint 2026/1533): LUTs on one
+            // switch input, f(m) ~ g(m~) + f'(m~) m with g = f - f' m; --taylor-fn tanh (tanh(2 m) / 2) or phi
+            let phi = arg(args, "--taylor-fn").as_deref() == Some("phi");
+            let f = move |m: f64| if phi { 0.5 * libm_erf(3.0 * m / std::f64::consts::SQRT_2) } else { (2.0 * m).tanh() / 2.0 };
+            let fd = move |m: f64| if phi { 3.0 / (2.0 * std::f64::consts::PI).sqrt() * (-(3.0 * m).powi(2) / 2.0).exp() } else { 1.0 / (2.0 * m).cosh().powi(2) };
+            let g = move |m: f64| f(m) - fd(m) * m;
+            let luts: [&dyn Fn(f64) -> f64; 4] = [&f, &fd, &|m| m, &g];
+            let msg = enc.encode_slots(&vals, slots, top, Payload::Complex, sf_)?;
+            encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg], meta, &mut y, &mut prng)?;
+            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+            let mut inp3 = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r, CallOpts { prescaled: false, own_cf: true })?;
+            inp3.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
+            let gain = (1u64 << (out_cf - cf)) as f64;
+            let mut outs: Vec<Vec<f64>> = Vec::new();
+            for lut in luts {
+                let tv = pc_tfhe::pbs::test_vector(sw.params.tv_len(), sw.params.q_br, |m| sw.lut_value(lut(m)));
+                let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &tv);
+                pc_program::replay::copy_ct(&ctx, &cx.ex.compute, &mut z, &y)?;
+                ts.apply(&ctx, &cx.ex.compute, &blt.inner, &mut z, &pos, &tvr, 0)?;
+                let mut fin3 = inp3.finish_call(0)?;
+                fin3.at_split(&cx, std::slice::from_ref(&z))?;
+                fin3.run_to(&mut cx, std::slice::from_mut(&mut z), Phase::Done)?;
+                cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut z))?;
+                let got = dec.decrypt_slots(&ctx, &cx.ex.compute, &enc, &z, Payload::Complex, Which::Dense)?;
+                outs.push(chosen.iter().map(|&i| got[0][i].re * gain).collect());
+            }
+            // --mlut: g and f' interleaved into one switch (one blind rotation, apply_dev_k: two outputs)
+            if args.iter().any(|a| a == "--mlut") {
+                let half = sw.params.tv_len() / 2;
+                let tvs: Vec<Vec<u64>> = [&g as &dyn Fn(f64) -> f64, &fd].iter().map(|lut| pc_tfhe::pbs::test_vector(half, sw.params.q_br, |m| sw.lut_value(lut(m)))).collect();
+                let tvr = pc_gpu::tfhe::tv_residues(&sw.bsk, &pc_tfhe::pbs::interleave(&tvs));
+                d_pos.upload(&cx.ex.compute, &pos)?;
+                d_tv.upload(&cx.ex.compute, &tvr)?;
+                pc_program::replay::copy_ct(&ctx, &cx.ex.compute, &mut z, &y)?;
+                let tm = ts.apply_dev_k(&ctx, &cx.ex.compute, &blt.inner, &mut z, &mut [&mut x], d_pos.vptr(), pos.len(), 1, d_tv.vptr(), &[0, 0], true)?;
+                let mut got2: Vec<Vec<f64>> = Vec::new();
+                for c in [&mut z, &mut x] {
+                    let mut fin4 = inp3.finish_call(0)?;
+                    fin4.at_split(&cx, std::slice::from_ref(&*c))?;
+                    fin4.run_to(&mut cx, std::slice::from_mut(c), Phase::Done)?;
+                    cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(c))?;
+                    let got = dec.decrypt_slots(&ctx, &cx.ex.compute, &enc, c, Payload::Complex, Which::Dense)?;
+                    got2.push(chosen.iter().map(|&i| got[0][i].re * gain).collect());
+                }
+                let (mut e2, mut w2) = (0f64, 0f64);
+                for (k, &i) in chosen.iter().enumerate() {
+                    let m = vals[i].re;
+                    let d = got2[0][k] + got2[1][k] * m - f(m);
+                    e2 += d * d;
+                    w2 = w2.max(d.abs());
+                }
+                println!("[pc-check] tfhe: taylor many-LUT (one rotation) over {}: g(m~) + f'(m~) m rms {:.3e} max {:.3e}; ms bootstrap {:.2}, repack {:.2}", chosen.len(), (e2 / chosen.len() as f64).sqrt(), w2, tm.bootstrap, tm.repack);
+            }
+            let (mut e, mut w) = ([0f64; 3], [0f64; 3]);
+            for (k, &i) in chosen.iter().enumerate() {
+                let m = vals[i].re;
+                let d = [outs[0][k] - f(m), outs[0][k] + outs[1][k] * (m - outs[2][k]) - f(m), outs[3][k] + outs[1][k] * m - f(m)];
+                for j in 0..3 {
+                    e[j] += d[j] * d[j];
+                    w[j] = w[j].max(d[j].abs());
+                }
+            }
+            let k = chosen.len() as f64;
+            println!("[pc-check] tfhe: taylor over {}: f(m~) rms {:.3e} max {:.3e}; f(m~) + f'(m~) (m - m~) rms {:.3e} max {:.3e}; g(m~) + f'(m~) m rms {:.3e} max {:.3e}", chosen.len(), (e[0] / k).sqrt(), w[0], (e[1] / k).sqrt(), w[1], (e[2] / k).sqrt(), w[2]);
+        }
     }
     println!("[pc-check] tfhe: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
@@ -328,12 +405,35 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     use pc_tfhe::lwe::Lwe;
     use pc_tfhe::pbs::{BootstrapKey, Rns};
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(256);
+    // --nu 2: the extended blind rotation (pc-tfhe bootstrap_ext; the batch path)
+    let nu: usize = arg(args, "--nu").map(|s| s.parse()).transpose()?.unwrap_or(1);
+    // --mlut K: K interleaved sign LUTs (deltas q >> (out_cf + j)) from one blind rotation, every extraction checked
+    let kl: usize = arg(args, "--mlut").map(|s| s.parse()).transpose()?.unwrap_or(1);
     // the latency path (PBS_KEYBUNDLE then PBS_ROTATE on the bundles) for small batches; --no-kb forces the batch path
-    let kb_path = count <= pc_gpu::tfhe::KB_MAX && !args.iter().any(|a| a == "--no-kb");
-    let no_cl = args.iter().any(|a| a == "--no-cluster");
+    let lv = pbs_gadget(args)?.map_or(1, |g| g.1);
+    let kb_path = count <= if nu == 1 && lv == 1 { pc_gpu::tfhe::KB_MAX } else { pc_gpu::tfhe::KB_MAX_EXT } && !args.iter().any(|a| a == "--no-kb");
+    // --no-cluster: one block per LWE; --cluster 2 / 4: that cluster size (default: by batch)
+    let cl_mode: i32 = if args.iter().any(|a| a == "--no-cluster") { 1 } else { arg(args, "--cluster").map(|s| s.parse()).transpose()?.unwrap_or(0) };
+    // --no-check: time the device only (no host reference); --reps R: the median of R timed runs
+    let no_check = args.iter().any(|a| a == "--no-check");
+    // --overlap: the latency path's key bundles of window k + 1 on a second stream while window k rotates (two buffers)
+    let overlap = args.iter().any(|a| a == "--overlap");
+    // --prio (with --overlap): the rotations on a high-priority stream (joined by events)
+    let prio = args.iter().any(|a| a == "--prio");
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
-    let p = Params::new(chain.n)?;
+    let mut p = Params::new(chain.n)?;
+    if let Some(g) = pbs_gadget(args)? {
+        p.pbs = g;
+    }
+    // --n-lwe N --group G: another LWE dimension / multi-bit group (N a multiple of G)
+    if let Some(v) = arg(args, "--n-lwe") {
+        p.n_lwe = v.parse()?;
+    }
+    if let Some(v) = arg(args, "--group") {
+        p.pbs_group = v.parse()?;
+    }
     let (n, nl, q) = (p.n_br, p.n_lwe, p.q_br);
     let groups = p.n_lwe / p.pbs_group;
     let win: usize = arg(args, "--window").map(|s| s.parse()).transpose()?.unwrap_or(pc_gpu::tfhe::KB_WINDOW).min(groups);
@@ -345,7 +445,9 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let t0 = Instant::now();
     let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, p.pbs_group, &dg, &mut prng);
     println!("[pc-check] tfhe-pbs: host bootstrapping key {:.1} s (n_lwe {nl}, n_br {n}, Q {q} = {} x {}, gadget {:?})", t0.elapsed().as_secs_f64(), p.br_primes.0, p.br_primes.1, p.pbs);
-    let (tv, off) = sign01(n, q >> p.out_cf);
+    let sub: Vec<(Vec<u64>, u64)> = (0..kl).map(|j| sign01(nu * n / kl, q >> (p.out_cf + j as u32))).collect();
+    let tv = pc_tfhe::pbs::interleave(&sub.iter().map(|x| x.0.clone()).collect::<Vec<_>>());
+    let offs: Vec<u64> = sub.iter().map(|x| x.1).collect();
     let lwes: Vec<Lwe> = (0..count)
         .map(|_| {
             let m = prng.uniform_f64() * 1.8 - 0.9;
@@ -353,15 +455,20 @@ fn run_pbs(args: &[String]) -> Res<bool> {
         })
         .collect();
     let th = Instant::now();
-    let want: Vec<Lwe> = bsk.bootstrap_many(&tv, off, &lwes, p0).iter().map(|o| o.mod_switch(q, p0)).collect();
+    let want: Vec<Lwe> = if no_check {
+        vec![]
+    } else {
+        use rayon::prelude::*;
+        lwes.par_iter().flat_map(|l| bsk.bootstrap_mlut(&tv, &offs, l, p0, nu).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect()
+    };
     let host_s = th.elapsed().as_secs_f64();
 
     let img = pc_gpu::tfhe::pbs_image(&bsk);
     let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
-    let kb_words = if kb_path { count * win * 4 * n * 2 } else { 0 };
-    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * 4 * n + 2 * lin.len() + count * (n + 1) + kb_words;
+    let kb_words = if kb_path { count * win * 4 * n * 2 * nu * lv * if overlap { 2 } else { 1 } } else { 0 };
+    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * nu * 4 * n + 2 * lin.len() + kl * count * (n + 1) + kb_words;
     let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
@@ -374,46 +481,94 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let d_tws = up("tfhe.tw", &img.tws)?;
     let d_tv = up("tfhe.tv", &tvr)?;
     let d_in = up("tfhe.in", &lin)?;
-    let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.acc", count * 4 * n)?;
+    let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.acc", count * nu * 4 * n)?;
     let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", lin.len())?;
-    let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * (n + 1))?;
+    let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", kl * count * (n + 1))?;
     let mut d_kb = arena.alloc::<pc_cuda::Compute, u32>("tfhe.kb", kb_words.max(1))?;
     let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
+    let s2 = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
+    let s3 = pc_cuda::Stream::<pc_cuda::Compute>::high_priority(&dev)?;
+    let go3 = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s3.raw()) })?) };
+    let e_out = pc_cuda::Event::new(&dev)?;
+    let go2 = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s2.raw()) })?) };
+    let ev = || pc_cuda::Event::new(&dev);
+    let (e_in, ekb, erot) = (ev()?, [ev()?, ev()?], [ev()?, ev()?]);
+    let kb_half = kb_words / if overlap { 2 } else { 1 };
     let base = TfheArgs { n: n as i32, count: count as i32, i1: nl as i32, q, ..Default::default() };
     let mut cx = [0u64; 8];
+    cx[5] = nu as u64;
     cx[6] = img.c[6];
     cx[7] = img.c[7];
+    let mut ic = img.c;
+    ic[5] = nu as u64;
     let mut run = || -> Res<()> {
-        go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 0, 0, 0, 0], ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio((2 * nu * n / kl) as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu as u64, 0, 0], ..base })?;
         go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
-        let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: img.c, ..base };
-        if kb_path {
+        let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: ic, ..base };
+        if kb_path && overlap {
+            s.record(&e_in)?;
+            s2.wait(&e_in)?;
+            if prio {
+                s3.wait(&e_in)?;
+            }
+            let (rs, gor): (&pc_cuda::Stream<pc_cuda::Compute>, &dyn Fn(&TfheArgs) -> Res<()>) = if prio { (&s3, &go3) } else { (&s, &go) };
+            for (k, g0) in (0..groups).step_by(win).enumerate() {
+                let gw = win.min(groups - g0);
+                let b = k % 2;
+                let kb = (d_kb.vptr_mut() as *mut u32).wrapping_add(b * kb_half) as *mut std::ffi::c_void;
+                if k >= 2 {
+                    s2.wait(&erot[b])?;
+                }
+                go2(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: kb, ..rot })?;
+                s2.record(&ekb[b])?;
+                rs.wait(&ekb[b])?;
+                gor(&TfheArgs { w: kb as *const std::ffi::c_void, i3: cl_mode, i0: g0 as i32, i4: gw as i32, ..rot })?;
+                rs.record(&erot[b])?;
+            }
+            if prio {
+                s3.record(&e_out)?;
+                s.wait(&e_out)?;
+            }
+        } else if kb_path {
             for g0 in (0..groups).step_by(win) {
                 let gw = win.min(groups - g0);
                 go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: d_kb.vptr_mut(), ..rot })?;
-                go(&TfheArgs { w: d_kb.vptr(), i3: no_cl as i32, i0: g0 as i32, i4: gw as i32, ..rot })?;
+                go(&TfheArgs { w: d_kb.vptr(), i3: cl_mode, i0: g0 as i32, i4: gw as i32, ..rot })?;
             }
         } else {
             go(&rot)?;
         }
-        go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, 0, 0, cx[6], cx[7]], ..base })?;
+        for (j, &off) in offs.iter().enumerate() {
+            let x = (d_out.vptr_mut() as *mut u32).wrapping_add(j * count * (n + 1)) as *mut std::ffi::c_void;
+            go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [off, p0, 0, 0, j as u64, nu as u64, cx[6], cx[7]], ..base })?;
+        }
         Ok(())
     };
     run()?;
     s.sync()?;
-    let td = Instant::now();
-    run()?;
-    s.sync()?;
-    let dev_s = td.elapsed().as_secs_f64();
+    let mut ts: Vec<f64> = (0..reps)
+        .map(|_| -> Res<f64> {
+            let td = Instant::now();
+            run()?;
+            s.sync()?;
+            Ok(td.elapsed().as_secs_f64())
+        })
+        .collect::<Res<_>>()?;
+    ts.sort_by(f64::total_cmp);
+    let dev_s = ts[reps / 2];
     let got = d_out.download(&s)?;
     let mut bad = 0;
-    for (i, w) in want.iter().enumerate() {
-        let row = &got[i * (n + 1)..(i + 1) * (n + 1)];
+    for (iw, w) in want.iter().enumerate() {
+        // want: [lwe][lut]; got: [lut][lwe]
+        let (i, j) = (iw / kl, iw % kl);
+        let row = &got[(j * count + i) * (n + 1)..(j * count + i + 1) * (n + 1)];
         bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[n] as u64) as usize;
     }
     let mut t = Tally::default();
-    t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs, every word"), bad, count * (n + 1));
+    if !no_check {
+        t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs x {kl} LUTs, every word"), bad, kl * count * (n + 1));
+    }
     println!("[pc-check] tfhe-pbs: {} path", if kb_path { format!("latency (key bundles, windows of {win} groups)") } else { "batch".to_string() });
     println!("[pc-check] tfhe-pbs: device {:.2} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);
     println!("[pc-check] tfhe-pbs: {} gates, {} failing", t.gates, t.bad);
@@ -440,6 +595,7 @@ fn run_ks(args: &[String]) -> Res<bool> {
     use pc_tfhe::gadget::Gadget;
     use pc_tfhe::lwe::{Lwe, LweKsk};
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(4096);
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
     const PLANES: usize = 4;
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
@@ -509,10 +665,16 @@ fn run_ks(args: &[String]) -> Res<bool> {
     };
     run()?;
     s.sync()?;
-    let td = Instant::now();
-    run()?;
-    s.sync()?;
-    let dev_s = td.elapsed().as_secs_f64();
+    let mut ts: Vec<f64> = (0..reps)
+        .map(|_| -> Res<f64> {
+            let td = Instant::now();
+            run()?;
+            s.sync()?;
+            Ok(td.elapsed().as_secs_f64())
+        })
+        .collect::<Res<_>>()?;
+    ts.sort_by(f64::total_cmp);
+    let dev_s = ts[reps / 2];
     let got = d_out.download(&s)?;
     let mut bad = 0;
     for (i, w) in want.iter().enumerate() {
@@ -660,4 +822,49 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-bridge: device ms: rescale {:.3}, ring switch {:.3}, extract {:.3} ({n_valid}), repack {:.3}", t_rescale * 1e3, t_rs * 1e3, t_ext * 1e3, t_rep * 1e3);
     println!("[pc-check] tfhe-bridge: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
+}
+
+/// erf by its series / continued fraction (to ~1e-15)
+fn libm_erf(x: f64) -> f64 {
+    let t = x.abs();
+    let r = if t < 3.0 {
+        // Maclaurin series
+        let (mut sum, mut term, mut k) = (t, t, 0.0f64);
+        while term.abs() > 1e-17 * sum.abs() {
+            k += 1.0;
+            term *= -t * t / k;
+            sum += term / (2.0 * k + 1.0);
+        }
+        2.0 / std::f64::consts::PI.sqrt() * sum
+    } else {
+        1.0 - (-t * t).exp() / (t * std::f64::consts::PI.sqrt())
+    };
+    r.copysign(x)
+}
+
+/// The tfhe check's switch parameters: Params' defaults, --nu, --pbs-gadget, --lat-group G, --rs-gadget b,l (the ring
+/// switch's), --lwe n,log2 (Params::with_lwe)
+fn switch_params(args: &[String], n: usize) -> Res<Params> {
+    let mut p = Params::new(n)?;
+    p.nu = arg(args, "--nu").map(|s| s.parse()).transpose()?.unwrap_or(1);
+    if let Some(g) = pbs_gadget(args)? {
+        p.pbs = g;
+    }
+    p.lat_group = arg(args, "--lat-group").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    if let Some(v) = arg(args, "--rs-gadget") {
+        let (b, l) = v.split_once(',').ok_or("--rs-gadget b,l")?;
+        p.rs = (b.parse()?, l.parse()?);
+    }
+    if let Some(v) = arg(args, "--lwe") {
+        let (n_lwe, l) = v.split_once(',').ok_or("--lwe n,log2")?;
+        p = p.with_lwe(n_lwe.parse()?, l.parse()?)?;
+    }
+    Ok(p)
+}
+
+/// --pbs-gadget b,l: the bootstrapping key's gadget (base log, levels) instead of Params' (two levels: the batch path)
+fn pbs_gadget(args: &[String]) -> Res<Option<(u32, usize)>> {
+    let Some(v) = arg(args, "--pbs-gadget") else { return Ok(None) };
+    let (b, l) = v.split_once(',').ok_or("--pbs-gadget b,l")?;
+    Ok(Some((b.parse()?, l.parse()?)))
 }

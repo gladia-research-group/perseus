@@ -19,7 +19,9 @@ _ACT_FOLD = os.environ.get("PF_ACT_FOLD", "0") not in ("", "0")
 _GELU_TFHE = os.environ.get("PF_GELU_TFHE", "0") not in ("", "0")
 # PF_GELU_TFHE=2: the LUT reads Phi (GELU = x Phi(x)) and one CKKS product makes GELU: the switch's input noise then
 # enters as x phi(x) sigma (<= 0.24 sigma) instead of GELU's slope (<= 1.13 sigma)
-_GELU_TFHE_PHI = os.environ.get("PF_GELU_TFHE", "0") == "2"
+_GELU_TFHE_PHI = os.environ.get("PF_GELU_TFHE", "0") in ("2", "3")
+# PF_GELU_TFHE=3: as 2 with the switch's input error corrected to first order (tfhe.tfhe_lut_taylor: two LUTs)
+_GELU_TFHE_TAYLOR = os.environ.get("PF_GELU_TFHE", "0") == "3"
 
 
 def gelu_tfhe(rt, x, cfg: GeluCfg, lanes=None):
@@ -40,7 +42,11 @@ def gelu_tfhe(rt, x, cfg: GeluCfg, lanes=None):
     L = () if lanes is None else ("L", int(lanes))
     act = np.nonzero(np.real(_expanded(d, 1.0, lanes)))[0]
     sl = tfhe.register_slots(f"mlp.lanes{L}", act)
-    y = tfhe.tfhe_lut(ops, x, name, sl)
+    if _GELU_TFHE_TAYLOR:
+        dphi = lambda m, xm=xm: xm / sqrt(2.0 * np.pi) * np.exp(-(np.asarray(m) * xm) ** 2 / 2.0)
+        y = tfhe.tfhe_lut_taylor(ops, x, name, lambda m, xm=xm: phi(np.asarray(m) * xm), dphi, sl)
+    else:
+        y = tfhe.tfhe_lut(ops, x, name, sl)
     if _GELU_TFHE_PHI:
         y = ops.mult(x, y)
     return rt.mult_mask(y, ("gelu.tfhe", xm) + L, lambda: _expanded(d, xm, lanes))

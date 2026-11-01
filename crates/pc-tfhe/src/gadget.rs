@@ -56,6 +56,9 @@ impl Gadget {
         assert!(bits < 62, "gadget: {bits} bits");
         if exact {
             assert!(1u128 << bits >= q as u128, "exact gadget: {levels} x {base_log} bits do not cover q = {q}");
+        } else {
+            // the rounding multiplier floor(2^(64 + l b) / q) must fit 64 bits
+            assert!((1u128 << bits) < q as u128, "approximate gadget: {levels} x {base_log} bits cover q = {q} (use the exact one)");
         }
         let g = (0..levels)
             .map(|t| {
@@ -76,7 +79,8 @@ impl Gadget {
         self.g[t]
     }
 
-    /// Balanced digits d_t in [-B/2, B/2) of x (low digit first).
+    /// Balanced digits d_t in [-B/2, B/2) of x (low digit first); base 2 takes the non-adjacent form (digits in
+    /// {-1, 0, 1}, no two adjacent nonzero: E d^2 = 1/3).
     pub fn decompose(&self, x: u64, out: &mut [i64]) {
         let bits = self.base_log as usize * self.levels;
         let mut v: i128 = if self.exact {
@@ -91,10 +95,12 @@ impl Gadget {
         };
         let b = 1i128 << self.base_log;
         for t in 0..self.levels {
-            let mut r = v.rem_euclid(b);
-            if r >= b / 2 {
-                r -= b;
-            }
+            let r = if self.base_log == 1 {
+                if v & 1 == 1 { 2 - (v & 3) } else { 0 }
+            } else {
+                let r = v.rem_euclid(b);
+                if r >= b / 2 { r - b } else { r }
+            };
             out[t] = r as i64;
             v = (v - r) >> self.base_log;
         }
@@ -111,7 +117,7 @@ mod tests {
     #[test]
     fn recompose() {
         let q = prime_below(31, 1 << 17).unwrap();
-        for (exact, gl) in [(true, (16u32, 2usize)), (false, (8, 3)), (false, (3, 5))] {
+        for (exact, gl) in [(true, (16u32, 2usize)), (false, (8, 3)), (false, (3, 5)), (false, (1, 16))] {
             let g = Gadget::new(q, gl, exact);
             let mut d = vec![0i64; gl.1];
             for x in [0u64, 1, q / 2, q / 2 + 1, q - 1, 123456789 % q, 2_000_000_001 % q] {
@@ -119,7 +125,7 @@ mod tests {
                 let mut acc: i128 = 0;
                 for t in 0..gl.1 {
                     acc += d[t] as i128 * centered(g.g(t), q) as i128;
-                    assert!(d[t].abs() <= 1 << gl.0, "digit {} out of range", d[t]);
+                    assert!(d[t].abs() <= (1 << gl.0) + (gl.0 == 1) as i64, "digit {} out of range", d[t]);
                 }
                 let err = (acc - centered(x, q) as i128).rem_euclid(q as i128);
                 let err = err.min(q as i128 - err);

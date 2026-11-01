@@ -1671,6 +1671,14 @@ impl PySession {
         let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
         nogil(py, || tf.lut(&ex.compute, name, &values))
     }
+    /// Register k TFHE LUTs interleaved under `name` (many-LUT, pc-py tfhe.rs `lut_multi`): `values[j]` on the grid of
+    /// n_br nu / k points. Finishes of part (0, k) run the switch, the next one reads output 1.
+    fn tfhe_lut_multi(&self, py: Python<'_>, name: &str, values: Vec<Vec<f64>>) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let State { planned, ex, .. } = &mut *st;
+        let tf = planned.as_mut().and_then(|p| p.tfhe.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no TFHE service (tfhe=)"))?;
+        nogil(py, || tf.lut_multi(&ex.compute, name, &values))
+    }
     /// Register TFHE sign LUT `name`: `lo` for m < 0, `hi` for m >= 0, inputs m in (-2, 2) (pc-py tfhe.rs `lut_sign`).
     fn tfhe_lut_sign(&self, py: Python<'_>, name: &str, lo: f64, hi: f64) -> PyResult<()> {
         let mut st = self.dev.st.borrow_mut();

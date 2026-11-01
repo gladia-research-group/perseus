@@ -763,6 +763,12 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //   PBS_ROTATE   PBS_STEP for every key 0 .. i1 in one launch (the accumulator stays in shared memory)
 //   PBS_EXTRACT  y = acc -> x = u32 LWEs [count][n + 1] mod c[1]: sample extract of coefficient 0, b + c[0] (offset),
 //                then round(v c[1] / q) = (v m + 2^63) >> 64 mod c[1]  (m = floor(2^64 c[1] / q))
+//   c[4] (PBS_MS: k, 0 = 1): k interleaved LUTs (many-LUT), the switch to 2 nu n / k times k; (PBS_EXTRACT: j) the
+//                coefficient extracted (LUT j)
+//   c[5] = nu (PBS_MS, PBS_INIT, PBS_ROTATE, PBS_KEYBUNDLE, PBS_EXTRACT; 0 = 1): the extended rotation in R_(nu n),
+//                acc [count][nu][2 part][2 prime][n] (component i: the coefficients nu j + i), the test vector nu n
+//                words, the mod switch to 2 nu n, the extraction from component 0; nu = 2 only (the batch path, or the
+//                bundles A, B of PBS_KEYBUNDLE on four-block clusters up to 46 LWEs)
 //   KS_DIGITS    y = u32 LWEs [count][i1 + 1] mod q -> x = int8 [count][i1 levels]: the balanced digits (base 2^c[0],
 //                c[1] levels, approximate, m = floor(2^(64 + levels base) / q)) of a_i at i levels + t
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs

@@ -8,6 +8,8 @@
 //! - binary LWE key (LWE key switch), n = 795 (a multiple of the PBS group), sigma 2^-17 p0: 133.2 bits. The switch's
 //!   input noise is the mod switch to 2 n_br (mean-compensated, `gadget::ms_body_mean`) plus the LWE key switch's
 //!   2048 x levels digit x key-noise terms (binary digits: E d^2 = 1/2);
+//!   precise set `Params::with_lwe(990, -21)` (n a multiple of 3 and 5);
+//! - ring switch gadget (4, 6): its key-noise term grows with sqrt(N) of the CKKS ring;
 //! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 254.6;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
 //!   RNS), sigma 18.5 = TFHE-rs's q / sigma ~2^47.8: 138.6 (at sigma 3.19: 131.3, a warning). PBS output noise by
@@ -50,9 +52,31 @@ pub struct Params {
     /// v / 2^(out_cf - cf), folded into the consumer). Its EvalMod is a sine, so the LUT stores the arcsine-warped
     /// phase (`pbs::warp`); |v| <= 1 needs out_cf >= 3.
     pub out_cf: u32,
+    /// The extended blind rotation's nu (`pbs::BootstrapKey::blind_rotate_ext`; 1 or 2): the mod switch to 2 nu n_br,
+    /// nu times less of its noise (the input noise's largest term) for ~2.2x the bootstrap; the keys are the same.
+    pub nu: usize,
+    /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 795) for small batches: the
+    /// blind rotation's sequential steps fall from n_lwe / pbs_group to n_lwe / lat_group (31 keys per bundle,
+    /// ~2.7x the key's memory; the latency path computes the bundles off the sequential path).
+    pub lat_group: usize,
 }
 
 impl Params {
+    /// Test-vector entries (`pbs::test_vector(tv_len, ..)`): n_br nu.
+    pub fn tv_len(&self) -> usize {
+        self.n_br * self.nu
+    }
+
+    /// Another binary LWE key: dimension `n_lwe` (a multiple of the PBS groups) and sigma 2^`sigma_log2` p0.
+    pub fn with_lwe(mut self, n_lwe: usize, sigma_log2: f64) -> Result<Params> {
+        if n_lwe % self.pbs_group != 0 || self.lat_group != 0 && n_lwe % self.lat_group != 0 {
+            return Err(crate::Error::Params(format!("n_lwe {n_lwe}: not a multiple of the PBS groups {} / {}", self.pbs_group, self.lat_group)));
+        }
+        self.n_lwe = n_lwe;
+        self.lwe_sigma_rel = sigma_log2.exp2();
+        Ok(self)
+    }
+
     /// The default set for a CKKS ring of degree `n_ckks` (2^16 in production; tests use 4096 with S = 2).
     pub fn new(n_ckks: usize) -> Result<Params> {
         let n_br = 2048;
@@ -74,11 +98,13 @@ impl Params {
             pbs: (23, 1),
             pbs_group: 3,
             ks: (1, 16),
-            rs: (8, 3),
+            rs: (4, 6),
             rp: (15, 2),
             rp_aux: prime_below(25, m)?,
             rs_factor: n_ckks / 2048,
             out_cf: 3,
+            nu: 1,
+            lat_group: 0,
         })
     }
 }

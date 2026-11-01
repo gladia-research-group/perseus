@@ -26,7 +26,7 @@ __device__ __forceinline__ uint64_t scale_round(uint64_t x, uint64_t m) {
     const uint64_t lo2 = lo + (1ull << 63);
     return __umul64hi(x, m) + (lo2 < lo ? 1 : 0);
 }
-// digit t of the approximate balanced decomposition (pc-tfhe Gadget::decompose)
+// digit t of the approximate balanced decomposition (pc-tfhe Gadget::decompose; base 2: the non-adjacent form)
 __device__ __forceinline__ int64_t digit(uint64_t x, int t, int bl, int lv, uint64_t m) {
     const int bits = bl * lv;
     int64_t v = (int64_t)scale_round(x, m);
@@ -34,8 +34,12 @@ __device__ __forceinline__ int64_t digit(uint64_t x, int t, int bl, int lv, uint
     const int64_t B = 1ll << bl;
     int64_t r = 0;
     for (int s = 0; s <= t; s++) {
-        r = v & (B - 1);
-        if (r >= B / 2) r -= B;
+        if (bl == 1) {
+            r = v & 1 ? 2 - (v & 3) : 0;
+        } else {
+            r = v & (B - 1);
+            if (r >= B / 2) r -= B;
+        }
         v = (v - r) >> bl;
     }
     if (t == lv - 1) r += v << bl;   // the carry of the edge value folds into the top digit
@@ -83,7 +87,8 @@ __global__ void __launch_bounds__(MS_TH) ms_k(TfheArgs A) {
     const size_t base = (size_t)blockIdx.x * (n + 1);
     const uint32_t* y = (const uint32_t*)A.y + base;
     uint32_t* x = (uint32_t*)A.x + base;
-    const uint64_t two_n = 2ull * A.n, m = A.m;
+    // c[5] = nu: the extended rotation's 2 nu n; c[4] = k: k interleaved LUTs, the switch to 2 nu n / k, times k
+    const uint64_t kl = A.c[4] ? A.c[4] : 1, two_n = 2ull * A.n * (A.c[5] ? A.c[5] : 1) / kl, m = A.m;
     long long s = 0;
     for (int i = threadIdx.x; i < n; i += MS_TH) {
         const uint64_t v = y[i], lo = v * m;
@@ -94,7 +99,7 @@ __global__ void __launch_bounds__(MS_TH) ms_k(TfheArgs A) {
         } else {
             s -= (long long)((lo + 0xffffffffull) >> 32);
         }
-        x[i] = (uint32_t)(hi % two_n);
+        x[i] = (uint32_t)(kl * (hi % two_n));
     }
     __shared__ long long red[MS_TH];
     red[threadIdx.x] = s;
@@ -106,7 +111,7 @@ __global__ void __launch_bounds__(MS_TH) ms_k(TfheArgs A) {
     if (threadIdx.x == 0) {
         const __int128 v = (__int128)((unsigned __int128)y[n] * m) - ((__int128)red[0] << 31) + ((__int128)1 << 63);
         long long r = (long long)(v >> 64) % (long long)two_n;
-        x[n] = (uint32_t)(r < 0 ? r + (long long)two_n : r);
+        x[n] = (uint32_t)(kl * (r < 0 ? r + (long long)two_n : r));
     }
 }
 
@@ -218,6 +223,9 @@ constexpr int RN = 2048, RLN = 11;
 // 3-4). The phases with groups of stride 1 and 8 then hit 32 distinct banks per warp (plain layout: 8- and 4-way
 // conflicts); stride >= 32 stays a permutation of one row.
 __device__ __forceinline__ int swz(int j) { return j ^ ((j >> 5) & 7) ^ (((j >> 6) & 3) << 3); }
+// pm1 [prime][2 n] in shared memory, word x at x ^ (bits 7-11 into 0-4): a warp's gathers pm1[E[k] e mod 2 n] over 32
+// consecutive k differ only in bits >= 7 (E[k] = 2 brev(k) + 1), all in one bank unswizzled (32-way conflicts)
+__device__ __forceinline__ int pswz(int x) { return x ^ ((x >> 7) & 31); }
 // c (1, 2 or 4) consecutive twiddles and companions from wi (a multiple of c) in one vector load each
 template <bool TS = false>   // TS: the tables sit in shared memory (plain loads)
 __device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int wi, int c, uint32_t* w, uint32_t* ws) {
@@ -319,38 +327,20 @@ __device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t*
     inv_phase<3, TS>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
     inv_phase<2, TS>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
 }
-__device__ void ntt2_inv(uint32_t* a, int n, const uint32_t* tw, const uint32_t* tws, const TfheArgs& A, uint32_t qa, uint32_t qb) {
-    for (int m = n / 2, t = 1, lt = 0; m >= 1; m /= 2, t *= 2, lt++) {
-        for (int bb = threadIdx.x; bb < n; bb += blockDim.x) {
-            const int p = bb >= n / 2, b = bb - p * (n / 2);
-            const uint32_t q = p ? qb : qa;
-            uint32_t* x = a + p * n;
-            const int i = b >> lt, j = (i << (lt + 1)) + (b & (t - 1));
-            const int wi = p * 2 * n + n + m + i;
-            const uint32_t u = x[j], v = x[j + t];
-            x[j] = add32(u, v, q);
-            x[j + t] = shoup32(sub32(u, v, q), tw[wi], tws[wi], q);
-        }
-        __syncthreads();
-    }
-    for (int k = threadIdx.x; k < 2 * n; k += blockDim.x) {
-        const int p = k >= n;
-        a[k] = shoup32(a[k], (uint32_t)A.c[p ? 4 : 2], (uint32_t)A.c[p ? 5 : 3], p ? qb : qa);
-    }
-    __syncthreads();
-}
 
-// acc [count][2 part][2 prime][n]: part 0 = X^-b~ tv (y = tv residues [2 prime][n]), part 1 = 0
+// acc [count][nu][2 part][2 prime][n] (c[5] = nu, 0: 1): part 0 = X^-b~ tv in R_(nu n), component i holding the
+// coefficients nu j + i (y = tv residues [2 prime][nu n]), part 1 = 0
 __global__ void init_k(TfheArgs A) {
-    const int n = A.n;
+    const int n = A.n, nu = A.c[5] ? (int)A.c[5] : 1, big = nu * n;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
     const uint32_t bt = ((const uint32_t*)A.z)[(size_t)blockIdx.y * (A.i1 + 1) + A.i1];
-    const int kp = (int)((2 * n - bt) % (2 * n));
-    uint32_t* acc = (uint32_t*)A.x + (size_t)blockIdx.y * 4 * n;
-    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n; o += gridDim.x * blockDim.x) {
+    const int kp = (int)((2 * big - bt) % (2 * big));
+    uint32_t* acc = (uint32_t*)A.x + (size_t)blockIdx.y * nu * 4 * n;
+    for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < big; x += gridDim.x * blockDim.x) {
+        const int i = x / n, o = x % n;
         for (int p = 0; p < 2; p++) {
-            acc[p * n + o] = mono32((const uint32_t*)A.y + p * n, n, kp, o, p ? qb : qa);
-            acc[(2 + p) * n + o] = 0;
+            acc[(i * 4 + p) * n + o] = mono32((const uint32_t*)A.y + p * big, big, kp, nu * o + i, p ? qb : qa);
+            acc[(i * 4 + 2 + p) * n + o] = 0;
         }
     }
 }
@@ -368,21 +358,27 @@ __global__ void init_k(TfheArgs A) {
 #define RT_SKIP 0   // EXPERIMENT timing: 1 skip MAC, 2 skip NTTs
 #endif
 constexpr int RT_E = 4;   // coefficients of [prime][n] (2 n) per thread at n = 2048, 1024 threads
-template <int LV, int NB, int G, bool KB = false>
+constexpr int CL4_MAX = 46;   // PBS_ROTATE latency path: four-block clusters up to this many LWEs (47 x 4 blocks no longer fit)
+// NU = 2 (NB = 2, one LWE per block): the extended rotation (pc-tfhe blind_rotate_ext) at nu = 2, the two slots its
+// components; per word the group's bundles A = sum_(e even) (y^(e/2) - 1) K_m - sum_(e odd) K_m and B = sum_(e odd)
+// y^((e - 1) / 2) K_m (y = NTT(Y), Y = X^2) give o_0 = A d_0 + B (y d_1), o_1 = A d_1 + B d_0.
+template <int LV, int NB, int G, bool KB = false, int NU = 1>
 __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
+    static_assert(NU == 1 || (NU == 2 && NB == 2 && LV == 1 && !KB), "the extended rotation: nu = 2 on the two slots");
     constexpr int KM = (1 << G) - 1;   // keys per group
+    constexpr int NL = NB / NU;        // LWEs per block
     extern __shared__ uint32_t sm32[];
     const int n = A.n, L = A.i1, bl = (int)A.c[0];
-    const int nbv = min(NB, A.count - (int)blockIdx.x * NB);   // LWEs of this block (the last may hold fewer)
+    const int nbv = NU == 1 ? min(NB, A.count - (int)blockIdx.x * NB) : NB;   // slots of this block (the last may hold fewer)
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
     const size_t tbs = (size_t)4 * LV * n;
     const uint32_t* at[NB];
     uint32_t ar[NB][2][4];   // [lwe][jj][c prime]: coefficient th + 1024 jj
 #pragma unroll
     for (int b = 0; b < NB; b++) {
-        const int lw = (int)blockIdx.x * NB + min(b, nbv - 1);
+        const int lw = (int)blockIdx.x * NL + min(b, nbv - 1) / NU;
         at[b] = (const uint32_t*)A.z + (size_t)lw * (L + 1);
-        const uint32_t* g = (const uint32_t*)A.x + (size_t)lw * 4 * n;
+        const uint32_t* g = (const uint32_t*)A.x + ((size_t)lw * NU + (NU == 1 ? 0 : b)) * 4 * n;
 #pragma unroll
         for (int jj = 0; jj < 2; jj++)
 #pragma unroll
@@ -393,13 +389,13 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     const uint32_t* ex = tw + 8 * n;
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
     const size_t kstride = (size_t)2 * LV * 2 * 2 * n;   // one GGSW
-    const int bits = bl * LV, n2 = 2 * n;
+    const int bits = bl * LV, n2 = 2 * n, n2e = NU * n2;   // the exponents live mod 2 nu n
     // the groups [g0, g0 + gw) (i0, i4; i4 = 0: all): the latency path runs its windows of key bundles one at a time
     const int g0 = A.i0, gw = A.i4 ? A.i4 : L / G - A.i0;
     // pm1 [prime][2 n] in shared memory after the digits: its gathers (data-dependent, 2^G - 1 per word) sat on the
     // MAC's critical path from L2
     uint32_t* pm1 = sm32 + NB * tbs;
-    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[x] = __ldg(tw + 4 * n + x);
+    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[(x & ~(n2 - 1)) + pswz(x & (n2 - 1))] = __ldg(tw + 4 * n + x);
     const int64_t B = 1ll << bl;
     for (int pr = g0; pr < g0 + gw; pr++) {
         int em[NB][KM];
@@ -420,7 +416,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
                 for (int x = 0; x < G; x++)
                     if (m >> x & 1) e += kx[x];
-                em[b][m - 1] = on ? (int)((G * n2 - e) % n2) : 0;
+                em[b][m - 1] = on ? (int)((G * n2e - e) % n2e) : 0;
             }
             any |= on && nz;
         }
@@ -468,6 +464,39 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 const uint64_t s1 = (uint64_t)d[0][0] * g.y + (uint64_t)d[0][1] * g.w;
                 sm32[swz(k)] = redc(s0, q, mi);   // < 2 q
                 sm32[2 * n + swz(k)] = redc(s1, q, mi);
+            } else if constexpr (NU == 2) {
+                const uint32_t r1 = (uint32_t)((1ull << 32) % q), mone = q - r1;   // 1, -1 in Montgomery form
+                uint64_t ga[2][2] = {}, gb[2][2] = {};   // the bundles A, B at this word: [ct][part], KM terms < q q
+                uint4 wn = __ldg(bsk + e * blockDim.x);   // one m ahead (as the generic MAC)
+    #pragma unroll
+                for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
+                    const uint4 w = wn;
+                    if (m + 1 < KM) wn = __ldg(bsk + ((m + 1) * RT_E + e) * blockDim.x);
+                    const int x = em[0][m];   // the exponent, mod 2 nu n
+                    if (!x) continue;
+                    const uint32_t pj = pm1[p * n2 + pswz((ej * (x >> 1)) & (n2 - 1))];   // y^j - 1, j = x div 2
+                    const uint64_t fa = x & 1 ? mone : pj, fb = x & 1 ? add32(pj, r1, q) : 0;
+                    ga[0][0] += w.x * fa, ga[0][1] += w.y * fa, ga[1][0] += w.z * fa, ga[1][1] += w.w * fa;
+                    gb[0][0] += w.x * fb, gb[0][1] += w.y * fb, gb[1][0] += w.z * fb, gb[1][1] += w.w * fb;
+                }
+                const uint32_t yk = add32(pm1[p * n2 + pswz(ej & (n2 - 1))], r1, q);   // y at this word
+                uint32_t ra[2][2], rb[2][2], d1y[2];
+    #pragma unroll
+                for (int ct = 0; ct < 2; ct++) {
+                    d1y[ct] = fold32(redc((uint64_t)d[1][ct] * yk, q, mi), q);
+    #pragma unroll
+                    for (int pt = 0; pt < 2; pt++) ra[ct][pt] = fold32(redc(ga[ct][pt], q, mi), q), rb[ct][pt] = fold32(redc(gb[ct][pt], q, mi), q);
+                }
+                // o_0 = A d_0 + B (y d_1), o_1 = A d_1 + B d_0; two terms per reduction (< 46 q q < q 2^32)
+    #pragma unroll
+                for (int pt = 0; pt < 2; pt++) {
+                    const uint32_t a0 = redc((uint64_t)d[0][0] * ra[0][pt] + (uint64_t)d[0][1] * ra[1][pt], q, mi);
+                    const uint32_t b0 = redc((uint64_t)d1y[0] * rb[0][pt] + (uint64_t)d1y[1] * rb[1][pt], q, mi);
+                    const uint32_t a1 = redc((uint64_t)d[1][0] * ra[0][pt] + (uint64_t)d[1][1] * ra[1][pt], q, mi);
+                    const uint32_t b1 = redc((uint64_t)d[0][0] * rb[0][pt] + (uint64_t)d[0][1] * rb[1][pt], q, mi);
+                    sm32[swz(k) + pt * 2 * n] = fold32(a0 + b0, 2 * q);   // < 2 q
+                    sm32[tbs + swz(k) + pt * 2 * n] = fold32(a1 + b1, 2 * q);
+                }
             } else {
                 // the group's key first (TFHE-rs's key bundle, in NTT form): G[ct][part] = sum_m f_m K_m[ct][part], f_m =
                 // NTT(X^-e_m - 1) (KM <= 7 terms < q q: < q 2^32), then one product with the digits: 2 KM LV + 2 LV wide
@@ -477,15 +506,22 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 for (int b = 0; b < NB; b++)
     #pragma unroll
                     for (int ct = 0; ct < 2 * LV; ct++) gk[b][ct][0] = gk[b][ct][1] = 0;
+                // the key words one m ahead: a load's L2 latency hides behind the MACs of the one before
+                uint4 wn[LV];
+    #pragma unroll
+                for (int h = 0; h < LV; h++) wn[h] = __ldg(bsk + (e * LV + h) * blockDim.x);
     #pragma unroll
                 for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
                     uint4 w[LV];
     #pragma unroll
-                    for (int h = 0; h < LV; h++) w[h] = __ldg(bsk + ((m * RT_E + e) * LV + h) * blockDim.x);
+                    for (int h = 0; h < LV; h++) {
+                        w[h] = wn[h];
+                        if (m + 1 < KM) wn[h] = __ldg(bsk + (((m + 1) * RT_E + e) * LV + h) * blockDim.x);
+                    }
     #pragma unroll
                     for (int b = 0; b < NB; b++) {
                         if (!em[b][m]) continue;
-                        const uint64_t f = pm1[p * n2 + ((ej * em[b][m]) & (n2 - 1))];
+                        const uint64_t f = pm1[p * n2 + pswz((ej * em[b][m]) & (n2 - 1))];
     #pragma unroll
                         for (int h = 0; h < LV; h++) {
                             gk[b][2 * h][0] += w[h].x * f;
@@ -498,14 +534,21 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 // o aliases the digits: this thread alone reads and writes word k
     #pragma unroll
                 for (int b = 0; b < NB; b++) {
-                    uint64_t s0 = 0, s1 = 0;   // 2 LV terms < 23 q q: < q 2^32 (the launcher checks 46 LV q < 2^32)
+                    // per level, 2 terms < 23 q q: < q 2^32 (the launcher checks 46 q < 2^32); levels add reduced
+                    uint32_t o0 = 0, o1 = 0;
     #pragma unroll
-                    for (int ct = 0; ct < 2 * LV; ct++) {
-                        s0 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][0], q, mi), q);
-                        s1 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][1], q, mi), q);
+                    for (int h = 0; h < LV; h++) {
+                        uint64_t s0 = 0, s1 = 0;
+    #pragma unroll
+                        for (int ct = 2 * h; ct < 2 * h + 2; ct++) {
+                            s0 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][0], q, mi), q);
+                            s1 += (uint64_t)d[b][ct] * fold32(redc(gk[b][ct][1], q, mi), q);
+                        }
+                        o0 = h ? fold32(o0 + redc(s0, q, mi), 2 * q) : redc(s0, q, mi);   // < 2 q
+                        o1 = h ? fold32(o1 + redc(s1, q, mi), 2 * q) : redc(s1, q, mi);
                     }
-                    sm32[b * tbs + swz(k)] = redc(s0, q, mi);   // < 2 q
-                    sm32[b * tbs + 2 * n + swz(k)] = redc(s1, q, mi);
+                    sm32[b * tbs + swz(k)] = o0;
+                    sm32[b * tbs + 2 * n + swz(k)] = o1;
     
             }
         }
@@ -617,22 +660,260 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
     for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) g[(2 * (x / n) + r) * n + x % n] = acc[st * 2 * n + x];
 }
 
+// PBS_ROTATE's latency path on a cluster of four blocks per LWE, block rank 2 c + r: RNS prime r, acc part c (n = 2048,
+// 1024 threads, two positions each). Layouts P1: j = x 2^10 + l 2^5 + w, P2: j = (l >> 4) 2^10 + w 2^5 + y 2^4 + (l & 15),
+// one shared-memory transpose between them; the partners' copies are read through distributed shared memory.
+__device__ __forceinline__ int sw(int j) { return j ^ ((j >> 5) & 31) ^ ((j >> 10) << 4); }
+// CT butterfly over lane bit lb (partner lane l ^ 2^lb): the lane with the bit set holds x[j + t]
+__device__ __forceinline__ uint32_t ct_shfl(uint32_t me, bool hi, int lb, uint32_t w, uint32_t ws, uint32_t q) {
+    const uint32_t t = hi ? shoup32l(me, w, ws, q) : me;
+    const uint32_t o = __shfl_xor_sync(0xffffffffu, t, 1 << lb);
+    return hi ? o - t + 2 * q : t + o;
+}
+// GS butterfly over lane bit lb
+__device__ __forceinline__ uint32_t gs_shfl(uint32_t me, bool hi, int lb, uint32_t w, uint32_t ws, uint32_t q) {
+    const uint32_t o = __shfl_xor_sync(0xffffffffu, me, 1 << lb);
+    return hi ? shoup32l(o - me + 2 * q, w, ws, q) : fold32(me + o, 2 * q);
+}
+// NU = 2 (c[5]): the extended rotation, both components per block (bundles A, B as rotate_k); LV = 2: two gadget
+// levels, the bundle's two uint4 per word the decomposed parts p.
+template <int G, int NU = 1, int LV = 1>
+__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(STEP_TH) rotate_cl4_k(TfheArgs A) {
+    extern __shared__ uint32_t sm32[];
+    namespace cg = cooperative_groups;
+    cg::cluster_group cl = cg::this_cluster();
+    constexpr int n = RN, NF = NU * LV, NK = NU > LV ? NU : LV;   // forward polys; uint4 bundle words per position
+    static_assert(NU == 1 || LV == 1, "the extended rotation at one level");
+    const int rk = (int)cl.block_rank(), r = rk & 1, c = rk >> 1;
+    const int L = A.i1, bl = (int)A.c[0], lw = (int)blockIdx.x / 4;
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
+    const uint32_t q = r ? qb : qa, mi = mont_neg_inv(q);
+    // acc copy [NU][n], digit copy [NF][n], transpose buffers [NF][n] and [NU][n]; then twiddles and companions 2 n each
+    uint32_t *acp = sm32, *dgp = sm32 + NU * n, *ta = dgp + NF * n, *tb = ta + NF * n, *tw = tb + NU * n, *tws = tw + 2 * n;
+    const uint32_t* pacc = cl.map_shared_rank(acp, rk ^ 1);   // the other prime's acc part c
+    const uint32_t* pdg = cl.map_shared_rank(dgp, rk ^ 2);    // the other part's digits at prime r
+    uint32_t* g = (uint32_t*)A.x + (size_t)lw * NU * 4 * n + (size_t)(2 * c + r) * n;   // [component][part][prime][n]
+    int j1[2], j2[2];
+#pragma unroll
+    for (int x = 0; x < 2; x++) {
+        j1[x] = (x << 10) | (l << 5) | w;
+        j2[x] = ((l >> 4) << 10) | (w << 5) | (x << 4) | (l & 15);
+    }
+    uint32_t ac[NU][2], v[NF][2], yk[2] = {};
+#pragma unroll
+    for (int i = 0; i < NU; i++)
+#pragma unroll
+        for (int x = 0; x < 2; x++) {
+            ac[i][x] = g[i * 4 * n + j1[x]];
+            acp[i * n + x * 1024 + threadIdx.x] = ac[i][x];
+        }
+    for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) {
+        tw[x] = __ldg((const uint32_t*)A.tw + (size_t)r * 2 * n + x);
+        tws[x] = __ldg((const uint32_t*)A.tws + (size_t)r * 2 * n + x);
+    }
+    if constexpr (NU == 2) {   // y = NTT(Y) at the P2 positions: pm1 [prime][2 n] + 1, E [prime][n] (PBS_ROTATE's tables)
+        const uint32_t* t = (const uint32_t*)A.tw;
+#pragma unroll
+        for (int y = 0; y < 2; y++) yk[y] = add32(__ldg(t + 4 * n + r * 2 * n + __ldg(t + 8 * n + r * n + j2[y])), (uint32_t)((1ull << 32) % q), q);
+    }
+    const uint32_t* at = (const uint32_t*)A.z + (size_t)lw * (L + 1);
+    const int64_t B = 1ll << bl;
+    const int g0 = A.i0, gw = A.i4 ? A.i4 : L / G - A.i0;   // the window of groups (as rotate_k)
+    for (int pr = g0; pr < g0 + gw; pr++) {
+        bool nz = false;
+#pragma unroll
+        for (int x = 0; x < G; x++) nz |= at[G * pr + x] != 0;
+        if (!nz) continue;   // the same in every block
+        // the bundle words (G[0][c], G[1][c]; NU = 2: of A and of B) of the P2 positions first: their L2 latency hides
+        // behind the forward NTT
+        uint32_t k0[NK][2], k1[NK][2];
+        const uint4* bw = (const uint4*)A.w + ((size_t)lw * gw + pr - g0) * RT_E * NK * blockDim.x;
+#pragma unroll
+        for (int ab = 0; ab < NK; ab++)
+#pragma unroll
+            for (int y = 0; y < 2; y++) {
+                const uint4 kk = __ldg(bw + ((2 * r + (j2[y] >> 10)) * NK + ab) * blockDim.x + (j2[y] & 1023));
+                k0[ab][y] = c ? kk.y : kk.x;
+                k1[ab][y] = c ? kk.w : kk.z;
+            }
+        cl.sync();
+#pragma unroll
+        for (int i = 0; i < NF; i++) {
+            if (i % LV == 0)   // the digits of component i / LV, both levels (interleaved with the components' NTTs)
+#pragma unroll
+                for (int x = 0; x < 2; x++) {
+                    const uint32_t oth = pacc[(i / LV) * n + x * 1024 + threadIdx.x];
+                    const uint32_t own = ac[i / LV][x];
+                    int64_t d = (int64_t)scale_round(crt(r ? oth : own, r ? own : oth, qa, qb, inv, invs), A.m);
+                    if constexpr (LV == 1) {
+                        if (d >= B / 2) d -= B;   // one level: the digit is the centred value
+                        v[i][x] = d < 0 ? (uint32_t)((int64_t)q + d) : (uint32_t)d;
+                    } else {
+                        if (d >= (1ll << (LV * bl - 1))) d -= 1ll << (LV * bl);   // centred in 2^(LV b)
+#pragma unroll
+                        for (int t = 0; t < LV; t++) {   // balanced digits, the edge carry into the top one (rotate_k)
+                            int64_t rr = d & (B - 1);
+                            if (rr >= B / 2) rr -= B;
+                            d = (d - rr) >> bl;
+                            if (t == LV - 1) rr += d << bl;
+                            v[i + t][x] = rr < 0 ? (uint32_t)((int64_t)q + rr) : (uint32_t)rr;
+                        }
+                    }
+                }
+            {   // forward: bit 10 (registers), bits 9..5 (lanes) in P1
+                const uint32_t u = v[i][0], t = shoup32l(v[i][1], tw[1], tws[1], q);
+                v[i][0] = u + t;
+                v[i][1] = u - t + 2 * q;
+            }
+#pragma unroll
+            for (int b = 9; b >= 5; b--) {
+                const bool hi = (l >> (b - 5)) & 1;
+#pragma unroll
+                for (int x = 0; x < 2; x++) {
+                    const int wi = (n >> (b + 1)) + (j1[x] >> (b + 1));
+                    v[i][x] = ct_shfl(v[i][x], hi, b - 5, tw[wi], tws[wi], q);
+                }
+            }
+#pragma unroll
+            for (int x = 0; x < 2; x++) ta[i * n + sw(j1[x])] = v[i][x];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < NF; i++) {
+#pragma unroll
+            for (int y = 0; y < 2; y++) v[i][y] = ta[i * n + sw(j2[y])];
+            {   // bit 4 (registers), bits 3..0 (lanes) in P2
+                const int wi = (n >> 5) + (j2[0] >> 5);
+                const uint32_t u = v[i][0], t = shoup32l(v[i][1], tw[wi], tws[wi], q);
+                v[i][0] = u + t;
+                v[i][1] = u - t + 2 * q;
+            }
+#pragma unroll
+            for (int b = 3; b >= 0; b--) {
+                const bool hi = (l >> b) & 1;
+#pragma unroll
+                for (int y = 0; y < 2; y++) {
+                    const int wi = (n >> (b + 1)) + (j2[y] >> (b + 1));
+                    v[i][y] = ct_shfl(v[i][y], hi, b, tw[wi], tws[wi], q);
+                }
+            }
+#pragma unroll
+            for (int y = 0; y < 2; y++) dgp[i * n + y * 1024 + threadIdx.x] = v[i][y];
+        }
+        cl.sync();
+        // the MAC: o[c] = d0 K[0][c] + d1 K[1][c] (NU = 2: per component, A and B as above)
+        if constexpr (NU == 1 && LV == 1) {
+#pragma unroll
+            for (int y = 0; y < 2; y++) {
+                const uint64_t od = pdg[y * 1024 + threadIdx.x];
+                const uint64_t d0 = c ? od : v[0][y], d1 = c ? v[0][y] : od;
+                v[0][y] = redc(d0 * k0[0][y] + d1 * k1[0][y], q, mi);   // < 2 q
+            }
+        } else if constexpr (LV == 2) {
+            // o[c] = sum_(p, t) d[p][t] G[p][t][c]: bundle word p holds both levels of the decomposed part p
+#pragma unroll
+            for (int y = 0; y < 2; y++) {
+                uint64_t dp[2][2];   // [part p][level]
+#pragma unroll
+                for (int t = 0; t < 2; t++) {
+                    const uint64_t od = pdg[t * n + y * 1024 + threadIdx.x];
+                    dp[c][t] = v[t][y];
+                    dp[1 - c][t] = od;
+                }
+                const uint32_t a0 = redc(dp[0][0] * k0[0][y] + dp[0][1] * k1[0][y], q, mi);
+                const uint32_t a1 = redc(dp[1][0] * k0[1][y] + dp[1][1] * k1[1][y], q, mi);
+                v[0][y] = fold32(a0 + a1, 2 * q);   // < 2 q
+            }
+        } else {
+#pragma unroll
+            for (int y = 0; y < 2; y++) {
+                uint64_t d[2][2];   // [component][ct]
+#pragma unroll
+                for (int i = 0; i < 2; i++) {
+                    const uint64_t od = pdg[i * n + y * 1024 + threadIdx.x];
+                    d[i][0] = c ? od : v[i][y];
+                    d[i][1] = c ? v[i][y] : od;
+                }
+                const uint64_t y0 = fold32(redc(d[1][0] * yk[y], q, mi), q), y1 = fold32(redc(d[1][1] * yk[y], q, mi), q);
+                const uint32_t a0 = redc(d[0][0] * k0[0][y] + d[0][1] * k1[0][y], q, mi), b0 = redc(y0 * k0[1][y] + y1 * k1[1][y], q, mi);
+                const uint32_t a1 = redc(d[1][0] * k0[0][y] + d[1][1] * k1[0][y], q, mi), b1 = redc(d[0][0] * k0[1][y] + d[0][1] * k1[1][y], q, mi);
+                v[0][y] = fold32(a0 + b0, 2 * q);   // < 2 q
+                v[1][y] = fold32(a1 + b1, 2 * q);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < NU; i++) {
+            // inverse: bits 0..3 (lanes), bit 4 (registers) in P2
+#pragma unroll
+            for (int b = 0; b <= 3; b++) {
+                const bool hi = (l >> b) & 1;
+#pragma unroll
+                for (int y = 0; y < 2; y++) {
+                    const int wi = n + (n >> (b + 1)) + (j2[y] >> (b + 1));
+                    v[i][y] = gs_shfl(v[i][y], hi, b, tw[wi], tws[wi], q);
+                }
+            }
+            {
+                const int wi = n + (n >> 5) + (j2[0] >> 5);
+                const uint32_t u = v[i][0], t = v[i][1];
+                v[i][0] = fold32(u + t, 2 * q);
+                v[i][1] = shoup32l(u - t + 2 * q, tw[wi], tws[wi], q);
+            }
+#pragma unroll
+            for (int y = 0; y < 2; y++) tb[i * n + sw(j2[y])] = v[i][y];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < NU; i++) {
+#pragma unroll
+            for (int x = 0; x < 2; x++) v[i][x] = tb[i * n + sw(j1[x])];
+            // bits 5..9 (lanes), bit 10 (registers) in P1
+#pragma unroll
+            for (int b = 5; b <= 9; b++) {
+                const bool hi = (l >> (b - 5)) & 1;
+#pragma unroll
+                for (int x = 0; x < 2; x++) {
+                    const int wi = n + (n >> (b + 1)) + (j1[x] >> (b + 1));
+                    v[i][x] = gs_shfl(v[i][x], hi, b - 5, tw[wi], tws[wi], q);
+                }
+            }
+            {
+                const uint32_t u = v[i][0], t = v[i][1];
+                v[i][0] = fold32(u + t, 2 * q);
+                v[i][1] = shoup32l(u - t + 2 * q, tw[n + 1], tws[n + 1], q);
+            }
+#pragma unroll
+            for (int x = 0; x < 2; x++) {
+                ac[i][x] = add32(ac[i][x], fold32(v[i][x], q), q);
+                acp[i * n + x * 1024 + threadIdx.x] = ac[i][x];
+            }
+        }
+    }
+    cl.sync();   // the partners may still read this block's copies
+#pragma unroll
+    for (int i = 0; i < NU; i++)
+#pragma unroll
+        for (int x = 0; x < 2; x++) g[i * 4 * n + j1[x]] = ac[i][x];
+}
+
 // PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
 // [count][group][e][thread] uint4 = (G[0][0], G[0][1], G[1][0], G[1][1]), G[c][part] = sum_m f_m K_m[c][part] (Montgomery
 // form, < q; one level), the MAC of rotate_k computed for a window of groups at once (i0 = the first, i4 = how many),
 // off the rotation's sequential path. y = bsk, z = the mod-switched LWEs, tw as PBS_ROTATE; grid (window, count),
-// 1024 threads; x [count][window group][e][thread].
-template <int G>
+// 1024 threads; x [count][window group][e][thread]. NU = 2 (c[5]) / LV = 2 (c[1]): two uint4 per word,
+// x [..][e][A | B][thread] / x [..][e][p][thread].
+template <int G, int NU = 1, int LV = 1>
 __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
     extern __shared__ uint32_t sm32[];
     constexpr int KM = (1 << G) - 1;
-    const int n = A.n, L = A.i1, n2 = 2 * n, pr = A.i0 + blockIdx.x;
+    const int n = A.n, L = A.i1, n2 = 2 * n, n2e = NU * n2, pr = A.i0 + blockIdx.x;
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
     const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
     const uint32_t* tw = (const uint32_t*)A.tw;
     const uint32_t* ex = tw + 8 * n;
     uint32_t* pm1 = sm32;
-    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[x] = __ldg(tw + 4 * n + x);
+    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[(x & ~(n2 - 1)) + pswz(x & (n2 - 1))] = __ldg(tw + 4 * n + x);
     const uint32_t* at = (const uint32_t*)A.z + (size_t)blockIdx.y * (L + 1);
     int em[KM];
 #pragma unroll
@@ -641,23 +922,59 @@ __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
 #pragma unroll
         for (int x = 0; x < G; x++)
             if (m >> x & 1) e += at[G * pr + x];
-        em[m - 1] = (int)((G * n2 - e) % n2);
+        em[m - 1] = (int)((G * n2e - e) % n2e);
     }
     __syncthreads();
-    const size_t kstride = (size_t)2 * 2 * 2 * n;   // one GGSW at one level
+    constexpr int NK = NU > LV ? NU : LV;   // uint4 per word
+    const size_t kstride = (size_t)2 * LV * 2 * 2 * n;   // one GGSW
     const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
-    uint4* out = (uint4*)A.x + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * RT_E * blockDim.x + threadIdx.x;
+    uint4* out = (uint4*)A.x + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * RT_E * NK * blockDim.x + threadIdx.x;
 #pragma unroll
     for (int e = 0; e < RT_E; e++) {
         const int k = threadIdx.x + e * blockDim.x, p = k >= n;
         const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
         const int ej = (int)ex[k];
+        if constexpr (LV == 2) {
+            uint64_t gh[2][4] = {};
+#pragma unroll
+            for (int m = 0; m < KM; m++) {
+                if (!em[m]) continue;
+                const uint64_t f = pm1[p * n2 + pswz((ej * em[m]) & (n2 - 1))];
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const uint4 w = __ldg(bsk + ((m * RT_E + e) * 2 + h) * blockDim.x);
+                    gh[h][0] += w.x * f, gh[h][1] += w.y * f, gh[h][2] += w.z * f, gh[h][3] += w.w * f;
+                }
+            }
+            auto r = [&](uint64_t v) { return fold32(redc(v, q, mi), q); };
+#pragma unroll
+            for (int h = 0; h < 2; h++) out[(2 * e + h) * blockDim.x] = make_uint4(r(gh[h][0]), r(gh[h][1]), r(gh[h][2]), r(gh[h][3]));
+            continue;
+        }
+        if constexpr (NU == 2) {
+            const uint32_t r1 = (uint32_t)((1ull << 32) % q), mone = q - r1;   // 1, -1 in Montgomery form
+            uint64_t ga[4] = {}, gb[4] = {};
+#pragma unroll
+            for (int m = 0; m < KM; m++) {
+                const int x = em[m];
+                if (!x) continue;
+                const uint4 w = __ldg(bsk + (m * RT_E + e) * blockDim.x);
+                const uint32_t pj = pm1[p * n2 + pswz((ej * (x >> 1)) & (n2 - 1))];
+                const uint64_t fa = x & 1 ? mone : pj, fb = x & 1 ? add32(pj, r1, q) : 0;
+                ga[0] += w.x * fa, ga[1] += w.y * fa, ga[2] += w.z * fa, ga[3] += w.w * fa;
+                gb[0] += w.x * fb, gb[1] += w.y * fb, gb[2] += w.z * fb, gb[3] += w.w * fb;
+            }
+            auto r = [&](uint64_t v) { return fold32(redc(v, q, mi), q); };
+            out[2 * e * blockDim.x] = make_uint4(r(ga[0]), r(ga[1]), r(ga[2]), r(ga[3]));
+            out[(2 * e + 1) * blockDim.x] = make_uint4(r(gb[0]), r(gb[1]), r(gb[2]), r(gb[3]));
+            continue;
+        }
         uint64_t g00 = 0, g01 = 0, g10 = 0, g11 = 0;   // KM <= 15 terms < q q
 #pragma unroll
         for (int m = 0; m < KM; m++) {
             if (!em[m]) continue;
             const uint4 w = __ldg(bsk + (m * RT_E + e) * blockDim.x);
-            const uint64_t f = pm1[p * n2 + ((ej * em[m]) & (n2 - 1))];
+            const uint64_t f = pm1[p * n2 + pswz((ej * em[m]) & (n2 - 1))];
             g00 += w.x * f;
             g01 += w.y * f;
             g10 += w.z * f;
@@ -672,16 +989,17 @@ __global__ void extract_k(TfheArgs A) {
     const int n = A.n;
     const uint64_t Q = A.q, to = A.c[1];
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
-    const uint32_t* acc = (const uint32_t*)A.y + (size_t)blockIdx.y * 4 * n;
+    const uint32_t* acc = (const uint32_t*)A.y + (size_t)blockIdx.y * (A.c[5] ? A.c[5] : 1) * 4 * n;   // component 0
     uint32_t* out = (uint32_t*)A.x + (size_t)blockIdx.y * (n + 1);
+    const int j = (int)A.c[4];   // the coefficient (many-LUT: LUT j)
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k <= n; k += gridDim.x * blockDim.x) {
         uint64_t v;
         if (k == n) {
-            v = addq(crt(acc[0], acc[n], qa, qb, inv, invs), A.c[0], Q);
-        } else if (k == 0) {
-            v = crt(acc[2 * n], acc[3 * n], qa, qb, inv, invs);
+            v = addq(crt(acc[j], acc[n + j], qa, qb, inv, invs), A.c[0], Q);
+        } else if (k <= j) {
+            v = crt(acc[2 * n + j - k], acc[3 * n + j - k], qa, qb, inv, invs);
         } else {
-            const uint64_t c1 = crt(acc[2 * n + n - k], acc[3 * n + n - k], qa, qb, inv, invs);
+            const uint64_t c1 = crt(acc[2 * n + n + j - k], acc[3 * n + n + j - k], qa, qb, inv, invs);
             v = c1 ? Q - c1 : 0;
         }
         out[k] = (uint32_t)(scale_round(v, A.m) % to);
@@ -974,9 +1292,10 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             // blocks per SM (one level only: the digits of two LWEs then fit in 64 KB)
             const int th = STEP_TH, lv = (int)A.c[1];
             const uint64_t qa = A.c[6] & 0xffffffffull, qb = A.c[6] >> 32, qmax = qa > qb ? qa : qb;
-            if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * lv * qmax >= (1ull << 32)) return -1;
+            if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * qmax >= (1ull << 32)) return -1;
             const int grp = A.i2 ? A.i2 : 2;
-            if (grp < 2 || grp > 4 || A.i1 % grp) return -1;
+            // groups of 5 (31 keys per bundle): the one-level four-block latency path only
+            if (grp < 2 || grp > 5 || A.i1 % grp || (grp == 5 && (!A.w || lv != 1 || A.c[5] > 1 || A.count > CL4_MAX || A.i3 == 1 || A.i3 == 2))) return -1;
             static int sms = 0;
             static bool attr_r = false;
             if (!attr_r) {   // the shared-memory opt-ins (64 / 96 KB), once
@@ -997,6 +1316,35 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             }
             // digits (4 / 8 n words) + pm1 (4 n)
             const int s4 = 8 * A.n * (int)sizeof(uint32_t), s8 = 12 * A.n * (int)sizeof(uint32_t);
+            if (A.c[5] > 1 && A.w) {   // the extended rotation's latency path: four-block clusters, both components each
+                if (A.c[5] != 2 || lv != 1 || A.count > CL4_MAX) return -1;
+                const int sc = 12 * A.n * (int)sizeof(uint32_t);
+                static bool attr_e4 = false;
+                if (!attr_e4) {
+                    cudaFuncSetAttribute(rotate_cl4_k<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                    cudaFuncSetAttribute(rotate_cl4_k<3, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                    cudaFuncSetAttribute(rotate_cl4_k<4, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                    attr_e4 = true;
+                }
+                if (grp == 2) rotate_cl4_k<2, 2><<<4 * A.count, th, sc, s>>>(A);
+                else if (grp == 3) rotate_cl4_k<3, 2><<<4 * A.count, th, sc, s>>>(A);
+                else rotate_cl4_k<4, 2><<<4 * A.count, th, sc, s>>>(A);
+                break;
+            }
+            if (A.c[5] > 1) {   // the extended rotation (c[5] = nu = 2): one LWE per block, its components on the two slots
+                if (A.c[5] != 2 || lv != 1) return -1;
+                static bool attr_e = false;
+                if (!attr_e) {
+                    cudaFuncSetAttribute(rotate_k<1, 2, 2, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
+                    cudaFuncSetAttribute(rotate_k<1, 2, 3, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
+                    cudaFuncSetAttribute(rotate_k<1, 2, 4, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, s8);
+                    attr_e = true;
+                }
+                if (grp == 2) rotate_k<1, 2, 2, false, 2><<<A.count, th, s8, s>>>(A);
+                else if (grp == 3) rotate_k<1, 2, 3, false, 2><<<A.count, th, s8, s>>>(A);
+                else rotate_k<1, 2, 4, false, 2><<<A.count, th, s8, s>>>(A);
+                break;
+            }
             if (A.w) {   // the latency path: the key bundles precomputed (PBS_KEYBUNDLE), one LWE per block, one level
                 static bool attr_k = false;
                 if (!attr_k) {
@@ -1005,8 +1353,40 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                     cudaFuncSetAttribute(rotate_k<1, 1, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, s4);
                     attr_k = true;
                 }
+                if (lv == 2) {   // two gadget levels: four-block clusters, both levels of the block's part
+                    if (A.count > CL4_MAX) return -1;
+                    const int sc = 12 * A.n * (int)sizeof(uint32_t);
+                    static bool attr_l2 = false;
+                    if (!attr_l2) {
+                        cudaFuncSetAttribute(rotate_cl4_k<2, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                        cudaFuncSetAttribute(rotate_cl4_k<3, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                        cudaFuncSetAttribute(rotate_cl4_k<4, 1, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, sc);
+                        attr_l2 = true;
+                    }
+                    if (grp == 2) rotate_cl4_k<2, 1, 2><<<4 * A.count, th, sc, s>>>(A);
+                    else if (grp == 3) rotate_cl4_k<3, 1, 2><<<4 * A.count, th, sc, s>>>(A);
+                    else rotate_cl4_k<4, 1, 2><<<4 * A.count, th, sc, s>>>(A);
+                    break;
+                }
                 if (lv != 1) return -1;
-                if (A.i3 != 1) {   // a cluster of two blocks per LWE (i3 = 1: one block, for comparison)
+                // i3: 0 = by batch (four blocks per LWE up to CL4_MAX LWEs, else two), 1 = one block, 2 / 4 = that cluster
+                if (A.i3 == 4 || (A.i3 == 0 && A.count <= CL4_MAX)) {
+                    const int sc = 8 * A.n * (int)sizeof(uint32_t);
+                    static bool attr_c4 = false;
+                    if (!attr_c4) {
+                        cudaFuncSetAttribute(rotate_cl4_k<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl4_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl4_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl4_k<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        attr_c4 = true;
+                    }
+                    if (grp == 2) rotate_cl4_k<2><<<4 * A.count, th, sc, s>>>(A);
+                    else if (grp == 3) rotate_cl4_k<3><<<4 * A.count, th, sc, s>>>(A);
+                    else if (grp == 4) rotate_cl4_k<4><<<4 * A.count, th, sc, s>>>(A);
+                    else rotate_cl4_k<5><<<4 * A.count, th, sc, s>>>(A);
+                    break;
+                }
+                if (A.i3 != 1) {   // a cluster of two blocks per LWE
                     const int sc = 10 * A.n * (int)sizeof(uint32_t);
                     static bool attr_c = false;
                     if (!attr_c) {
@@ -1044,14 +1424,30 @@ int launch(const TfheArgs* a, cudaStream_t s) {
         }
         case PC_TFHE_PBS_KEYBUNDLE: {
             const int grp = A.i2 ? A.i2 : 2;
-            if (A.n != 2048 || A.c[1] != 1 || grp < 2 || grp > 4 || A.i1 % grp || A.count > 65535) return -1;
+            if (A.n != 2048 || (A.c[1] != 1 && A.c[1] != 2) || grp < 2 || grp > 5 || A.i1 % grp || A.count > 65535) return -1;
+            if (grp == 5 && (A.c[1] != 1 || A.c[5] > 1)) return -1;
             const int sm = 4 * A.n * (int)sizeof(uint32_t);   // pm1
             const int gw = A.i4 ? A.i4 : A.i1 / grp - A.i0;
             if (A.i0 < 0 || gw < 1 || A.i0 + gw > A.i1 / grp) return -1;
             const dim3 grid(gw, A.count);
+            if (A.c[1] == 2) {   // two gadget levels
+                if (A.c[5] > 1) return -1;
+                if (grp == 2) keybundle_k<2, 1, 2><<<grid, STEP_TH, sm, s>>>(A);
+                else if (grp == 3) keybundle_k<3, 1, 2><<<grid, STEP_TH, sm, s>>>(A);
+                else keybundle_k<4, 1, 2><<<grid, STEP_TH, sm, s>>>(A);
+                break;
+            }
+            if (A.c[5] == 2) {   // the extended rotation's A, B
+                if (grp == 2) keybundle_k<2, 2><<<grid, STEP_TH, sm, s>>>(A);
+                else if (grp == 3) keybundle_k<3, 2><<<grid, STEP_TH, sm, s>>>(A);
+                else keybundle_k<4, 2><<<grid, STEP_TH, sm, s>>>(A);
+                break;
+            }
+            if (A.c[5] > 1) return -1;
             if (grp == 2) keybundle_k<2><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 3) keybundle_k<3><<<grid, STEP_TH, sm, s>>>(A);
-            else keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);
+            else if (grp == 4) keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);
+            else keybundle_k<5><<<grid, STEP_TH, sm, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:

@@ -1,0 +1,156 @@
+{
+  "version": 2,
+  "heuristic_config": "min_cut",
+  "input_graph": {
+    "version": 1,
+    "num_nodes": 15,
+    "num_nodes_deliberate_bootstrap": 3,
+    "num_nodes_optimized": 15
+  },
+  "rules": {
+    "bootstrap_level": 36,
+    "max_level": 50,
+    "source_level": 36,
+    "cache_read_level": 36,
+    "cache_pin_level": 36
+  },
+  "placements": [],
+  "weight_levels": {},
+  "mask_levels": {},
+  "hint_fire": [],
+  "hint_decisions_bound": true,
+  "rescale_after": [],
+  "summary": {
+    "num_placements": 0,
+    "num_hint_bootstraps": 0,
+    "num_hints_total": 3,
+    "num_deliberate_bootstrap_nodes": 3,
+    "final_named_levels": {
+      "v_1": 26,
+      "v_2": 26,
+      "v_3": 26,
+      "v_4": 36,
+      "v_5": 36,
+      "v_6": 26,
+      "v_7": 26,
+      "v_8": 36,
+      "v_9": 36,
+      "v_10": 38,
+      "v_11": 38,
+      "v_12": 26,
+      "v_13": 26,
+      "v_14": 36,
+      "v_15": 36
+    },
+    "final_named_degs": {
+      "v_1": 1,
+      "v_2": 1,
+      "v_3": 1,
+      "v_4": 2,
+      "v_5": 2,
+      "v_6": 1,
+      "v_7": 1,
+      "v_8": 2,
+      "v_9": 2,
+      "v_10": 2,
+      "v_11": 2,
+      "v_12": 1,
+      "v_13": 1,
+      "v_14": 2,
+      "v_15": 2
+    },
+    "total_bootstraps": 3,
+    "num_weight_levels": 0,
+    "exit_var": "v_15",
+    "exit_level": 36,
+    "exit_deg": 2,
+    "bts_quality": {
+      "err_target": 0.01,
+      "table_measured": true,
+      "num_sites": 0,
+      "predicted_rel_err": {
+        "median": null,
+        "p90": null,
+        "p99": null,
+        "max": null
+      },
+      "num_sites_missing_target": 0,
+      "cf_histogram": {},
+      "out_level_histogram": {},
+      "num_offset": 0,
+      "num_prescale": 0,
+      "num_raise_drop": 0,
+      "num_real_route": 0,
+      "num_sparse": 0,
+      "worst_sites": [],
+      "placed_input_level_hist": {},
+      "raise_drop_hist": {},
+      "raise_drop_skipped": {},
+      "blind_branches": {
+        "count": 0,
+        "vars": []
+      },
+      "placed_input_levels": {},
+      "placed_input_degs": {},
+      "env_cap": {
+        "limit": 48.0,
+        "relaxed": false,
+        "vetoed_hints": [],
+        "placed_past_cap": [],
+        "hints_predicted_past_cap": [],
+        "reactive_past_cap": []
+      },
+      "num_at_cf_max": 0,
+      "num_cf_clamped": 0,
+      "cf_clamped_sites": [],
+      "cf_clamped_missing_target": [],
+      "cf_clamp_probe_cf": 21,
+      "cf_table_max": 20
+    },
+    "hints_retained": []
+  },
+  "config": {
+    "chain": {
+      "chain": "n32",
+      "ckks_complex": true,
+      "logn": 16
+    },
+    "bts": {
+      "auto_bts_level": 44,
+      "bts_iterations": 1,
+      "sparse_auto": 0,
+      "sparse_bts_slots": [
+        "0"
+      ]
+    },
+    "mem": {
+      "fhe_pt_coeff_encode": false
+    },
+    "model": {
+      "cache_read_level_k": 34,
+      "cache_read_level_v": 34,
+      "cutmax_pair": true,
+      "fhe_lmhead_cap": 44,
+      "fused_ln_var": false,
+      "fused_sm_den": false,
+      "gelu_fold": true,
+      "gpt2_fold_ln1": true,
+      "gpt2_fold_ln2": true,
+      "gpt2_fold_lnf": false,
+      "gpt2_packing": "cachemir",
+      "impl_dead_ops": true,
+      "impl_scoped_names": false,
+      "kv_lanes": true,
+      "ladder_radix_bits": 3,
+      "ln_cheb": true,
+      "sm_den_recip": true,
+      "sm_fold": true,
+      "sm_gs_first": true,
+      "sm_hrs_pack": true,
+      "sm_periodic": 1
+    },
+    "exec": {
+      "gpt2_cache": true
+    }
+  }
+}

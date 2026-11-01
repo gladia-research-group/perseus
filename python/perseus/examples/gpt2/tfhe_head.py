@@ -48,13 +48,37 @@ class Head:
         if logits.shape[0] > VOCAB:                      # logits ++ gumbel: the runners' one input vector
             logits, gumbel = logits[:VOCAB], logits[VOCAB:]
         out = [np.where(c >= 0, logits[np.maximum(c, 0)] / self.temp, 0.0) for c in self.cols]
+        if self.mode == "taylor":           # the LUT's input: the logits standardized into (-0.9, 0.9)
+            z = np.clip((logits - logits.mean()) / (6.0 * logits.std()), -0.9, 0.9)
+            out = [np.where(c >= 0, z[np.maximum(c, 0)], 0.0) for c in self.cols]
         if self.mode == "topk" and gumbel is not None:
             self.g = np.zeros(N)              # a plaintext: one draw per run (re-encoded per token in a deployment)
             self.g[::N // self.L] = gumbel
         return out
 
+    def taylor_slots(self):
+        """--mode taylor: the first 4096 valid slots of tile 0 below N / 2 (a real payload)."""
+        return np.nonzero(self.valid[0][:N // 2])[0][:4096]
+
+    @staticmethod
+    def taylor_f(m):
+        from math import erf, sqrt
+        return np.vectorize(lambda z: 0.5 * erf(3.0 * z / sqrt(2.0)))(np.asarray(m))
+
+    @staticmethod
+    def taylor_df(m):
+        return 3.0 / np.sqrt(2.0 * np.pi) * np.exp(-(3.0 * np.asarray(m)) ** 2 / 2.0)
+
     def stage(self, ops, xs):
         from perseus.impl import tfhe_select as sel
+        if self.mode == "taylor":           # Phi(3 m) - 1/2 on the standardized logits: corrected LUT next to the plain one
+            from perseus.impl import tfhe
+            sl = tfhe.register_slots("taylor.s", self.taylor_slots())
+            if "taylor.plain" not in tfhe.LUTS:
+                tfhe.register_lut("taylor.plain", self.taylor_f)
+            x = ops.copy(xs[0])     # the LUTs' hints rename their input in place: not the stage's
+            return [tfhe.tfhe_lut_taylor(ops, x, "taylor", self.taylor_f, self.taylor_df, sl),
+                    tfhe.tfhe_lut(ops, x, "taylor.plain", sl)]
         if self.mode == "cutmax":           # the CKKS baseline: the shipped decode's packed CutMax, StC-first refreshes
             from perseus.examples.gpt2 import env
             from perseus.examples.gpt2.head import cutmax_argmax_packed, pack_tiles
@@ -75,6 +99,8 @@ class Head:
 
     def rotations(self):
         """The rotation steps the stage issues (one mirror pass with a recording NumpyOps; CutMax: the powers of 2)."""
+        if self.mode == "taylor":
+            return []
         if self.mode == "cutmax":
             return sorted({(1 << j) % N for j in range(15)} | {(-(1 << j)) % N for j in range(15)})
         from perseus.impl.ops import NumpyOps
@@ -191,6 +217,20 @@ def _inputs(a, L):
 
 def _report(a, h, L, outs, walls):
     """The run's one-hots vs the plaintext selection on its input logits."""
+    if a.mode == "taylor":
+        idx = h.taylor_slots()
+        e = {"taylor": [], "plain": []}
+        for o, x in zip(outs, _inputs(a, L)):
+            m = h.encode(x[:VOCAB])[0][idx]
+            for k, out in zip(("taylor", "plain"), o):
+                e[k].append(np.real(np.asarray(out))[idx] - h.taylor_f(m))
+        for k, v in e.items():
+            v = np.concatenate(v)
+            print(f"[tfhe_head] taylor {k}: rms {np.sqrt(np.mean(v ** 2)):.3e} max {np.abs(v).max():.3e} over {v.size}",
+                  flush=True)
+        if walls:
+            print(f"[tfhe_head] SUMMARY taylor s/token median {np.median(walls):.3f}", flush=True)
+        return
     res = []
     for p, (o, x) in enumerate(zip(outs, _inputs(a, L))):
         lg, g = x[:VOCAB], x[VOCAB:]
@@ -328,7 +368,7 @@ def main(argv=None):
     ap.add_argument("--stc-cache", type=int, default=64, help="StC-first last-stage cache entries (graphs keep theirs)")
     ap.add_argument("--graphs", action="store_true", help="--plan: CUDA graph replay (exec.use_graphs)")
     ap.add_argument("--logits", required=True)
-    ap.add_argument("--mode", choices=("argmax", "topk", "cutmax"), default="argmax")
+    ap.add_argument("--mode", choices=("argmax", "topk", "cutmax", "taylor"), default="argmax")
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--k", type=int, default=40)
     ap.add_argument("--L", type=int, default=1024)
