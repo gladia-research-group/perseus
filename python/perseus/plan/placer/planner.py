@@ -1193,7 +1193,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     def _cap_of(v: str) -> float:          # the envelope of the step that produces `v` (PLAN_REFRESH_ENV_CAP_STEPS)
         _pn = g.producer_of.get(v)
         return _refresh_env_cap(getattr(_pn, "step", None) if _pn is not None else None)
-    _bad_cut, _bad_hint = [], []
+    _bad_cut, _bad_hint, _bad_chain = [], [], []
     # A var past the envelope that nothing refreshes is NOT harmless: the runtime meets it
     # there and fires a REACTIVE bootstrap, which is the one class neither the cut nor the
     # hint check covers, and it stops the run with [bts_depth_error]. Collect it.
@@ -1210,6 +1210,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             # deeper input; its ceiling stays the runtime guard's, as before).
             _p = g.producer_of.get(_v)
             _sparse = _refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+            if _p is not None and not _p.is_deliberate_bts and _p.hint_level is None:
+                # any route: the refresh's own rescales (the raise of a pending one included) run on the chain, so
+                # an input past max_level by its effective level is one the compile refuses ([bts_input_error])
+                _nom, _deg = sim.input_state(g, _v)
+                _eff = cfg.bootstrap_level + _nom + (cfg.level_unit if _deg == 2 else 0)
+                if _eff > cfg.max_level + 1e-9:
+                    _bad_chain.append((_v, _eff))
             if _p is None or _p.is_deliberate_bts or _p.hint_level is not None or _sparse:
                 continue
             _nom, _deg = sim.input_state(g, _v)
@@ -1238,6 +1245,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 + (cfg.level_unit if sim.deg.get(_in, 1) == 2 else 0))
         if _eff > _refresh_env_cap(_n.step):
             _bad_hint.append((_n.output or _in, _eff))
+    if _bad_chain:
+        _msg = (f"{len(_bad_chain)} placed refresh(es) start past the chain (effective level > {cfg.max_level}): "
+                + ", ".join(f"{v}@{l:g}" for v, l in _bad_chain[:6]))
+        # PLAN_CHAIN_STRICT=1: refuse the block (a kept-exact pass whose landings moved, e.g. a K/V push raised)
+        if os.environ.get("PLAN_CHAIN_STRICT", "0") not in ("", "0"):
+            raise PlanInfeasible("P3c(chain): " + _msg)
+        log.warning("[plan] P3c(chain): " + _msg + " -- the compile refuses it ([bts_input_error])")
     if _bad_hint and cfg.verbose:
         log.info(f"[plan] P3c(hint): {len(_bad_hint)} hint-fired refresh(es) PREDICTED past the "
               f"envelope (abs level > {_ENV_CAP:g}): "
