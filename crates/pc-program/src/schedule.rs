@@ -117,7 +117,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
             // a unit issues all its steps at once, on compute (its gather buffers are compute's); a product-add pair on
             // one lane, compute when either step is held there
             let unit = b.unit_of.get(i).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]);
-            let gathers = unit.is_some_and(|u| !matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. }));
+            let gathers = unit.is_some_and(|u| !matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. }));
             if on_cp || gathers || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
                 0
             } else {
@@ -125,7 +125,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
             }
         })
         .collect();
-    for u in b.units.iter().filter(|u| matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. })) {
+    for u in b.units.iter().filter(|u| matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. })) {
         let (lo, hi) = (u.lo as usize, u.hi as usize);
         let l = lane[lo..hi].iter().copied().min().unwrap_or(0);
         lane[lo..hi].iter_mut().for_each(|x| *x = l);

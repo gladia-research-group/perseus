@@ -489,7 +489,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         let unit = if in_unit {
             None
         } else {
-            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. })));
+            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. })));
             let unit = at
                 .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh, &rt.routes))
                 .map(|u| (b.unit_of[i], u.hi as usize))
@@ -558,6 +558,8 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                             // a fused plaintext product and add leaves the key-switching workspaces alone
                             UnitKind::MultPtAdd { .. } => info.fused += 1,
                             UnitKind::MultPtAddChain { ref pts, .. } => info.fused += pts.len(),
+                            UnitKind::Affine { ref steps } => info.fused += steps.len(),
+                            UnitKind::MultIAdd { .. } => info.fused += 1,
                             _ => ks_owner = None,
                         }
                         exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, pts, stale)
@@ -697,6 +699,15 @@ fn unit_fits<'a, W: DevWord, M: DevStrategy<W>>(u: &Unit, slots: &[Ct<'a, W>], s
             };
             matches!(r, Some(Ok(Some(_))))
         }
+        // one pass when no step takes a prelude but limb drops
+        UnitKind::Affine { steps: st } => {
+            let Some(ms) = u.ins.iter().map(meta).collect::<Option<Vec<CtMeta>>>() else { return false };
+            matches!(Ops::<W>::affine_meta(sh, &ms, st), Ok(Some(_)))
+        }
+        UnitKind::MultIAdd { sub, product_first } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
+            (Some(a), Some(y)) => Ops::<W>::mult_i_add_fusable(sh, &a, &y, *sub, *product_first).unwrap_or(false),
+            _ => false,
+        },
     }
 }
 
@@ -868,6 +879,20 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
             // share it, taken above as rows and metadata (`xs[0]` unused past here in that case)
             let out = unsafe { &mut *slots.add(out_slot as usize) };
             rt.ops.mult_pt_add_chain(rt.ctx, rt.ex, rt.sh, out, head, y, &terms)?;
+        }
+        UnitKind::Affine { steps: st } => {
+            // the sources' rows and metadata are taken before the output (which may share a source's slot) is borrowed
+            let srcs: Vec<(pc_kernels::PolyRef, CtMeta, usize)> = xs.iter().map(|x| (x.buf.r(), x.meta, x.k())).collect();
+            // SAFETY: the group's last output slot, the only mutable reference; the sources are read through `srcs`
+            // (`xs` unused past here)
+            let out = unsafe { &mut *slots.add(span[span.len() - 1].out as usize) };
+            rt.ops.affine(rt.ctx, rt.ex, rt.sh, out, &srcs, st)?;
+        }
+        UnitKind::MultIAdd { sub, product_first } => {
+            let (a, y) = ((xs[0].buf.r(), xs[0].meta, xs[0].k()), (xs[1].buf.r(), xs[1].meta, xs[1].k()));
+            // SAFETY: the add's output slot, the only mutable reference; a and y are read through their rows taken above
+            let out = unsafe { &mut *slots.add(span[1].out as usize) };
+            rt.ops.mult_i_add(rt.ctx, rt.ex, rt.sh, out, a, y, *sub, *product_first)?;
         }
         UnitKind::Refresh { route, kind } => {
             // the inputs gathered into one K-ciphertext buffer, refreshed in place as one K-batch, scattered back
