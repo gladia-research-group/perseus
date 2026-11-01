@@ -498,6 +498,16 @@ fn ferr(f: &FinishStep, msg: impl Into<String>) -> pc_program::Error {
     pc_program::Error::Replay { block: format!("finish {}", f.desc), msg: msg.into() }
 }
 
+/// The finish's own call on the real-payload route (a TFHE output is real), begun on the input before its split;
+/// None when the route has no real variant or PC_TFHE_REAL_FINISH=0.
+fn real_finish<'r>(route: &'r StcFirstRoute<'static, W, M>, cx: &BtsCx<'_, 'static, W, M>, x: &[Ct<'static, W>]) -> pc_program::Result<Option<BtsCall<'r, 'static, W, M>>> {
+    if !route.setup.real || std::env::var("PC_TFHE_REAL_FINISH").is_ok_and(|v| v == "0") {
+        return Ok(None);
+    }
+    let r = pc_shadow::Route { cf: Some(CF), stc_first: true, real: true, ..pc_shadow::Route::dense() };
+    Ok(Some(BtsCall::begin(StagedRef::StcFirst(route), cx, x, &r, CallOpts { prescaled: false, own_cf: true })?))
+}
+
 /// `FinishExec` over the session's TFHE service and its StC-first route.
 pub(crate) struct TfheExec<'r> {
     pub rt: &'r mut TfheRt,
@@ -525,13 +535,14 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
             copy_ct(cx.ctx, &cx.ex.compute, &mut rt.x, &slots[f.ins[0] as usize])?;
             let r = pc_shadow::Route { cf: Some(CF), stc_first: true, real: false, ..pc_shadow::Route::dense() };
             let mut call = BtsCall::begin(StagedRef::StcFirst(self.route), cx, std::slice::from_ref(&rt.x), &r, CallOpts { prescaled: false, own_cf: true })?;
+            let rcall = real_finish(self.route, cx, std::slice::from_ref(&rt.x))?;
             if call.stc_first_input(cx, std::slice::from_mut(&mut rt.x))?.is_none() {
                 return Err(ferr(f, "input below the StC-first entry"));
             }
             let pos = (rt.pos_buf.vptr() as *const u32).wrapping_add(off) as *const std::ffi::c_void;
             rt.run_prog(cx.ctx, &cx.ex.compute, pn, pos, cnt)?;
             let x = std::slice::from_mut(&mut rt.x);
-            let mut fin = call.finish_call(0)?;
+            let mut fin = match rcall { Some(c) => c, None => call.finish_call(0)? };
             fin.at_split(cx, x)?;
             fin.run_to(cx, x, Phase::Done)?;
             copy_ct(cx.ctx, &cx.ex.compute, &mut slots[f.outs[0] as usize], &x[0])?;
@@ -547,6 +558,8 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
         let r = pc_shadow::Route { cf: Some(CF), stc_first: true, real: false, ..pc_shadow::Route::dense() };
         let x = std::slice::from_mut(&mut rt.x);
         let mut call = BtsCall::begin(StagedRef::StcFirst(self.route), cx, x, &r, CallOpts { prescaled: false, own_cf: true })?;
+        let rcall = real_finish(self.route, cx, x)?;
+        let rcall2 = if d.part.is_some() { real_finish(self.route, cx, x)? } else { None };
         if call.stc_first_input(cx, x)?.is_none() {
             return Err(ferr(f, "input below the StC-first entry"));
         }
@@ -562,14 +575,14 @@ impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
             Some((0, 2)) => {
                 rt.sw.apply_dev_k(cx.ctx, &cx.ex.compute, ltr, &mut x[0], &mut [&mut rt.x2], pos, cnt, reps, tv, &[0, 0], false)?;
                 let x2 = std::slice::from_mut(&mut rt.x2);
-                let mut fin2 = call.finish_call(0)?;
+                let mut fin2 = match rcall2 { Some(c) => c, None => call.finish_call(0)? };
                 fin2.at_split(cx, x2)?;
                 fin2.run_to(cx, x2, Phase::Done)?;
                 rt.stash = Some(d.lut.clone());
             }
             Some(p) => return Err(ferr(f, format!("part {p:?} of a many-LUT finish (two LUTs: part 0 runs the switch)"))),
         }
-        let mut fin = call.finish_call(0)?;
+        let mut fin = match rcall { Some(c) => c, None => call.finish_call(0)? };
         fin.at_split(cx, x)?;
         fin.run_to(cx, x, Phase::Done)?;
         copy_ct(cx.ctx, &cx.ex.compute, &mut slots[f.outs[0] as usize], &x[0])?;
