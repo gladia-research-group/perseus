@@ -493,6 +493,85 @@ fn t_bconv_wide(st: &mut Setup) -> Vec<TestResult> {
     out
 }
 
+/// Lean-chain-sized conversions (u32 words): 13 sources -> 26 targets (a full digit's ModUp, two target blocks) and an
+/// exact 15 -> 37 (the fused ModDown + rescale: P and two tops; more targets than one block's table), prescaled, with
+/// and without the split reduction.
+fn t_bconv_lean(st: &mut Setup) -> Vec<TestResult> {
+    if st.ctx.wb != 4 {
+        return Vec::new();
+    }
+    let src_h = st.rand_slots(2);
+    // (sources: rows 0..ns, prime ids r % 8; targets: prime ids k % 8 at dst rows dst_off..; exact)
+    let shapes = [(13usize, 26usize, 0usize, false), (15, 37, 26, true)];
+    let mut pool: Vec<u64> = Vec::new();
+    let mut words: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+    let mut want = vec![0u64; 63 * N];
+    let mut src_pre: Vec<Vec<u64>> = Vec::new();
+    for &(ns, nt, dst_off, exact) in &shapes {
+        let off = pool.len();
+        let pre: Vec<u64> = (0..ns).map(|i| st.rng.below(st.p(i % 8))).collect();
+        let m: Vec<Vec<u64>> = (0..ns).map(|_| (0..nt).map(|k| st.rng.below(st.p(k % 8))).collect()).collect();
+        let rb: Vec<f64> = (0..ns).map(|i| 1.0 / st.p(i % 8) as f64).collect();
+        let bmod: Vec<u64> = (0..nt).map(|k| st.rng.below(st.p(k % 8))).collect();
+        pool.extend((0..ns).map(|i| i as u64));
+        pool.extend((0..ns).map(|i| (i % 8) as u64));
+        pool.extend(&pre);
+        pool.extend((0..nt).map(|k| k as u64));
+        pool.extend((0..nt).map(|k| (k % 8) as u64));
+        for row in &m {
+            pool.extend(row);
+        }
+        if exact {
+            while pool.len() % 2 != 0 {
+                pool.push(0);
+            }
+            for &x in &rb {
+                pool.extend([x.to_bits() & 0xFFFF_FFFF, x.to_bits() >> 32]);
+            }
+            pool.extend(&bmod);
+        }
+        let y: Vec<u64> = (0..ns * N).map(|e| mulmod(src_h[e], pre[e / N], st.p((e / N) % 8))).collect();
+        for idx in 0..N {
+            let mut v = 0.0f64;
+            if exact {
+                for (i, &r) in rb.iter().enumerate() {
+                    v = (y[i * N + idx] as f64).mul_add(r, v);
+                }
+            }
+            let u = (v + 0.5).floor() as u64;
+            for k in 0..nt {
+                let p = st.p(k % 8);
+                let acc: u128 = (0..ns).map(|i| y[i * N + idx] as u128 * m[i][k] as u128).sum();
+                let mut r = (acc % p as u128) as u64;
+                if exact {
+                    r = submod(r, mulmod(u % p, bmod[k], p), p);
+                }
+                want[(dst_off + k) * N + idx] = r;
+            }
+        }
+        src_pre.push(y);
+        for (split, w) in words.iter_mut().enumerate() {
+            w.extend([0, dst_off as u32, ns as u32, nt as u32, off as u32, exact as u32, 1, split as u32]);
+        }
+    }
+    let pool_d = st.ctx.up(&pool);
+    let mut out = Vec::new();
+    for (split, w) in words.iter().enumerate() {
+        // one launch per job (each reads its own prescaled rows from row 0)
+        let dst = st.ctx.zeros(63 * N);
+        for (j, sp) in src_pre.iter().enumerate() {
+            let sd = st.ctx.up(sp);
+            let jw = st.ctx.up32(&w[8 * j..8 * j + 8]);
+            let a = BconvArgs { src: sd.c(), dst: dst.p(), jobs: jw.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 1, max_tgt: shapes[j].1 as i32 };
+            ck(unsafe { (st.t.bconv)(&a, st.s()) });
+        }
+        let got = dst.read(&st.ctx);
+        let name = if split == 1 { "bconv 13 -> 26, exact 15 -> 37, prescaled + split vs host" } else { "bconv 13 -> 26, exact 15 -> 37, prescaled vs host" };
+        out.push(cmp(name, &got, &want));
+    }
+    out
+}
+
 // ================================================================================================ element-wise
 const RS: RowSet = RowSet { nq: 3, np: 2, qmax: 5, pad: 0 };
 fn rs_rows(rs: RowSet) -> Vec<usize> {
@@ -2179,7 +2258,7 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
             tests.push(t_ntt_wide28);
         }
     }
-    tests.extend([t_bconv as Test, t_bconv_wide, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
+    tests.extend([t_bconv as Test, t_bconv_wide, t_bconv_lean, t_ew, t_pt_dot, t_em, t_mul_range, t_ks, t_regen, t_cts, t_keytab, t_rescale, t_automorph]);
     if has_ntt {
         tests.push(t_encode);
     }

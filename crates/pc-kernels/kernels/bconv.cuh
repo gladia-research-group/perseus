@@ -8,17 +8,26 @@ namespace bconv {
 constexpr int BX = 128;  // coefficients per block
 constexpr int TG = 32;   // targets per block (blockIdx.y)
 
-template <class W, class MM>
-__device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+// The block's shared tables, one set for every body: M (TG wide, zero past the block's targets), the targets' prime
+// ids and rows, and (p, R, Rs, m) of each target (the split reduction's constants)
+__shared__ __align__(32) unsigned char sh_m[16 * TG * 8];
+__shared__ uint32_t stp[TG], str[TG];
+__shared__ uint4 sk[TG];
+
+// NS > 0: every job of the launch path has exactly NS sources (a compile-time count: no predicated source steps)
+// EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time)
+template <class W, class MM, int NS, int EXM>
+__device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restrict__ src, W* __restrict__ dst,
                                            const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    W* const sm = (W*)sh_m;
     using Wd = WideOf<W>;
-    const BconvJob J = jobs[blockIdx.z];
+    constexpr int NY = NS > 0 ? NS : 16;
     // the job's targets split evenly over the gridDim.y blocks (a multiple of 4 each, at most TG): no light last block
     const int per = (((int)J.ntgt + (int)gridDim.y - 1) / (int)gridDim.y + 3) & ~3;
     const int t0 = blockIdx.y * per;
     if (t0 >= (int)J.ntgt) return;
     const int nt = min(per, (int)J.ntgt - t0);
-    const int ns = J.nsrc;
+    const int ns = NS > 0 ? NS : (int)J.nsrc;
     const W* P = pool + J.pool_off;
     const W* srow = P;
     const W* sprime = P + ns;
@@ -26,12 +35,9 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
     const W* trow = P + 3 * ns;
     const W* tprime = trow + J.ntgt;
     const W* M = tprime + J.ntgt;
-    __shared__ __align__(32) W sm[16 * TG];
-    __shared__ uint32_t stp[TG], str[TG];
     // J.split (u32 words, every target below 2^30): the sums are reduced as hi 2^32 + lo with 32-bit Shoup products
     // (R = 2^32 mod p, Rs = floor(R 2^32 / p), m = floor(2^32 / p)) from shared memory: the same canonical residue
-    __shared__ uint32_t sp_[TG], sR[TG], sRs[TG], sm32[TG];
-    const bool fast = sizeof(W) == 4 && J.split && !J.exact;
+    const bool fast = sizeof(W) == 4 && J.split && (EXM != 2 || !J.exact);
     for (int x = threadIdx.x; x < ns * TG; x += BX) {
         const int i = x / TG, k = x % TG;
         sm[x] = k < nt ? M[i * J.ntgt + t0 + k] : (W)0;
@@ -44,19 +50,16 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
             const uint32_t p = (uint32_t)pr[stp[threadIdx.x]].p;
             const uint32_t m = 0xFFFFFFFFu / p;  // floor(2^32 / p): p odd
             const uint32_t R = 0u - m * p;       // 2^32 mod p
-            sp_[threadIdx.x] = p;
-            sm32[threadIdx.x] = m;
-            sR[threadIdx.x] = R;
-            sRs[threadIdx.x] = (uint32_t)(((uint64_t)R << 32) / p);
+            sk[threadIdx.x] = make_uint4(p, R, (uint32_t)(((uint64_t)R << 32) / p), m);
         }
     }
     __syncthreads();
     const int idx = blockIdx.x * BX + threadIdx.x;
-    W y[16];
+    W y[NY];
     double v = 0.0;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        if (i < ns) {
+    for (int i = 0; i < NY; ++i) {
+        if (NS > 0 || i < ns) {
             const PrimeConst& q = pr[sprime[i]];
             const W x = src[(size_t)(J.src_off + srow[i]) * N + idx];
             y[i] = J.prescaled ? x : MM::mul(x, pre[i], q);
@@ -65,13 +68,14 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
     }
     uint64_t u = 0;
     const W* bmod = nullptr;
-    if (J.exact) {
+    const bool ex = EXM == 1 || (EXM == 2 && J.exact);
+    if (EXM != 0 && ex) {
         const W* rbw = M + ns * J.ntgt;
         while ((uintptr_t)rbw & 7) ++rbw;  // 8-byte aligned doubles
         const double* rb = (const double*)rbw;
 #pragma unroll
-        for (int i = 0; i < 16; ++i)
-            if (i < ns) v = __fma_rn((double)y[i], rb[i], v);
+        for (int i = 0; i < NY; ++i)
+            if (NS > 0 || i < ns) v = __fma_rn((double)y[i], rb[i], v);
         u = (uint64_t)floor(v + 0.5);
         bmod = (const W*)(rb + ns);
     }
@@ -79,8 +83,8 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
     for (int k = 0; k < nt; k += 4) {
         Wd a0 = 0, a1 = 0, a2 = 0, a3 = 0;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            if (i < ns) {
+        for (int i = 0; i < NY; ++i) {
+            if (NS > 0 || i < ns) {
                 const V4<W> m = load4<W>(sm + i * TG + k);
                 const Wd yi = y[i];
                 a0 += yi * m.v[0];
@@ -95,21 +99,27 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
             if (k + q4 < nt) {
                 if constexpr (sizeof(W) == 4) {
                     if (fast) {
-                        const uint32_t p = sp_[k + q4];
-                        const uint32_t hi = (uint32_t)(acc[q4] >> 32), lo = (uint32_t)acc[q4];
-                        uint32_t a = hi * sR[k + q4] - __umulhi(hi, sRs[k + q4]) * p;  // hi R mod p, in [0, 2p)
-                        a = a >= p ? a - p : a;
-                        uint32_t b = lo - __umulhi(lo, sm32[k + q4]) * p;  // lo mod p, in [0, 2p)
-                        b = b >= p ? b - p : b;
-                        a += b;
-                        dst[(size_t)(J.dst_off + str[k + q4]) * N + idx] = (W)(a >= p ? a - p : a);
+                        const uint4 c = sk[k + q4];  // p, R, Rs, m
+                        const uint32_t p = c.x;
+                        // x mod p for a 64-bit x as hi 2^32 + lo: [0, 4p) before the two min-subtracts (p < 2^30)
+                        auto red = [&](uint64_t x) {
+                            const uint32_t hi = (uint32_t)(x >> 32), lo = (uint32_t)x;
+                            const uint32_t a = hi * c.y - __umulhi(hi, c.z) * p;  // hi R mod p, in [0, 2p)
+                            const uint32_t b = lo - __umulhi(lo, c.w) * p;         // lo mod p, in [0, 2p)
+                            uint32_t r = a + b;
+                            r = min(r, r - 2 * p);
+                            return min(r, r - p);
+                        };
+                        uint32_t r = red(acc[q4]);
+                        if (EXM != 0 && ex) r = sub<uint32_t>(r, red(u * (uint64_t)bmod[t0 + k + q4]), p);
+                        dst[(size_t)(J.dst_off + str[k + q4]) * N + idx] = (W)r;
                         continue;
                     }
                 }
                 const PrimeConst& q = pr[stp[k + q4]];
                 const W p = (W)q.p;
                 W r = MM::reduce(acc[q4], q);
-                if (J.exact) {
+                if (EXM != 0 && ex) {
                     const W sv = MM::reduce((Wd)u * bmod[t0 + k + q4], q);
                     r = sub<W>(r, sv, p);
                 }
@@ -119,17 +129,28 @@ __device__ __forceinline__ void bconv_body(const W* __restrict__ src, W* __restr
     }
 }
 
+// the body by job kind: exact (HPS) jobs, plain jobs of 13 sources (a full digit of the lean chain, the special set P,
+// unrolled at compile time), other plain jobs
+template <class W, class MM>
+__device__ __forceinline__ void bconv_dispatch(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+                                               const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    const BconvJob J = jobs[blockIdx.z];
+    if (J.exact && J.nsrc == 15) bconv_body<W, MM, 15, 1>(J, src, dst, pool, pr);  // P and the two tops of the lean chain
+    else if (!J.exact && J.nsrc == 13) bconv_body<W, MM, 13, 0>(J, src, dst, pool, pr);
+    else bconv_body<W, MM, 0, 2>(J, src, dst, pool, pr);
+}
+
 // Two occupancies of one body: the compiler's registers (46: 10 blocks per SM, the shorter per-thread chains) for a
 // launch that fits in one wave there, 40 registers (12 blocks per SM) for a larger one, which then runs in fewer waves.
 template <class W, class MM>
 __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                    const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
-    bconv_body<W, MM>(src, dst, jobs, pool, pr);
+    bconv_dispatch<W, MM>(src, dst, jobs, pool, pr);
 }
 template <class W, class MM>
 __global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                          const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
-    bconv_body<W, MM>(src, dst, jobs, pool, pr);
+    bconv_dispatch<W, MM>(src, dst, jobs, pool, pr);
 }
 
 // Wide jobs (ABI 20): up to MW sources (u32 words: 48; u64: 16): each thread's first 16 y_i in registers, the rest
