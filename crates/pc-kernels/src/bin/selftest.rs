@@ -1576,18 +1576,21 @@ fn keytab(st: &mut Setup, g: &KsGeo, all: bool) -> Vec<TestResult> {
                         }
                     }
                 }
-                q0.write(&st.ctx, &pre);
-                q1.write(&st.ctx, &pre);
-                a.out0 = q0.p();
-                a.out1 = q1.p();
                 a.kb = std::ptr::null();
                 a.ka = std::ptr::null();
-                a.c0_mode = mode | KS_SUM;
-                let ka = KsKeyArgs { ks: a, key };
-                ck(unsafe { (st.t.ks_dot_key)(&ka, st.s()) });
-                let mut got = q0.read(&st.ctx);
-                got.extend(q1.read(&st.ctx));
-                out.push(cmp(&format!("ks_dot_key KS_SUM ({name}, {} digits, K={kc}, R=2, c0 mode {mode}) == sum of ks_dot", g.ndig), &got, &want));
+                // bit 16: K > 1 on ks_dot_key_sum instead of ks_dot_key_sum_c (<= 4 digits)
+                for alt in [0, 16] {
+                    q0.write(&st.ctx, &pre);
+                    q1.write(&st.ctx, &pre);
+                    a.out0 = q0.p();
+                    a.out1 = q1.p();
+                    a.c0_mode = mode | KS_SUM | alt;
+                    let ka = KsKeyArgs { ks: a, key };
+                    ck(unsafe { (st.t.ks_dot_key)(&ka, st.s()) });
+                    let mut got = q0.read(&st.ctx);
+                    got.extend(q1.read(&st.ctx));
+                    out.push(cmp(&format!("ks_dot_key KS_SUM{} ({name}, {} digits, K={kc}, R=2, c0 mode {mode}) == sum of ks_dot", if alt != 0 { " (alt)" } else { "" }, g.ndig), &got, &want));
+                }
             }
         }
     }

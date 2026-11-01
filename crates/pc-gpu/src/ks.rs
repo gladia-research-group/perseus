@@ -1151,6 +1151,8 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
             let sum = io.c0_mode & pc_kernels::KS_SUM != 0;
             let rot = if sum { 0 } else { j - r0 };
             let c0_mode = if sum && j > r0 { io.c0_mode | pc_kernels::KS_ACC } else { io.c0_mode };
+            // bn-prefill A/B: PC_PF_OFF=sumc runs the K > 1 sums on ks_dot_key_sum instead of ks_dot_key_sum_c
+            let c0_mode = if sum && !lever_on("sumc") { c0_mode | 16 } else { c0_mode };
             let out = (at(io.out, io.out_ct_stride) as *const W).wrapping_add(rot * io.out_rot_stride as usize) as *mut c_void;
             let a = KsArgs {
                 c1: at(io.c1, io.ct_stride),
