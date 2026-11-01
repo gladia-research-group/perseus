@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .layout import Dims, lanes_mask, lanes_periodic, ladder_chunks
-from .poly import eval_chebyshev, im_cleanse, inv_sqrt_newton_d2, rotsum
+from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse, inv_sqrt_newton_d2, rotsum
 from . import prefill
 from .prefill import Chunks, join, prefill_attention
 
@@ -430,10 +430,20 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int):
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     S = rt.add_mask(S, ("bl.last.score", B.nch, cfg.clip_lo, mean), lambda: np.where(valid, -mean, cfg.clip_lo - mean))
-    z = eval_chebyshev(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
-    for _ in range(cfg.log2delta1):
-        z = ops.square(z)
-    Z = rt.mult_mask(im_cleanse(ops, z), ("bl.last.active", B.nch, kc), lambda: np.where(valid, 0.5 / kc, 0.0))
+    if cfg.exp_mask_fold:       # the active mask's root rides the series (prefill._sm_cheb)
+        pw = 2 ** cfg.log2delta1
+        root = lambda sc: (lambda: np.where(valid, sc * (0.5 / kc) ** (1.0 / pw), 0.0))
+        z = eval_chebyshev_masked(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf, None,
+                                  lambda ct, sc: rt.mult_mask(ct, ("bl.last.active", B.nch, kc, "fold", pw, sc), root(sc)),
+                                  lambda ct, sc: rt.add_mask(ct, ("bl.last.active", B.nch, kc, "fold+", pw, sc), root(sc)))
+        for _ in range(cfg.log2delta1):
+            z = ops.square(z)
+        Z = im_cleanse(ops, z)
+    else:
+        z = eval_chebyshev(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        for _ in range(cfg.log2delta1):
+            z = ops.square(z)
+        Z = rt.mult_mask(im_cleanse(ops, z), ("bl.last.active", B.nch, kc), lambda: np.where(valid, 0.5 / kc, 0.0))
     cheb = getattr(ops, "sm_cheb_gs", False)
     rounds = smcheb.rounds(cfg, kc) if cheb else _recip_rounds(_KcExtrapolated(cfg), kc, ops.sm_gs_first)
     first = np.arange(t) == 0

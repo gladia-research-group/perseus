@@ -2,7 +2,7 @@
 """map_plan_decisions.py OLD_GRAPHS OLD_PLAN NEW_GRAPHS NEW_PLAN: carry a Decode-8 plan's decisions (placements, fired hints, realize
 anchors, routes, CFs, drops) onto another capture of the same blocks whose steps differ only inside (each step's op
 sequence aligned by difflib on the op signatures, the capture's reactive refreshes left out). Unmapped realize anchors
-are dropped (reported); an unmapped decision stops. Blocks 0-11 and 0_feedback; stages 12-13 copied. Then
+are dropped (reported); an unmapped decision stops. Blocks 0-11 (and 0_feedback when the plan has it); stages 12-13 copied. Then
 RD_FREE_CF=1 speedrun/make_n32a4_decode_rd.sh on NEW_PLAN keeps those decisions and searches the raise drops (and CFs)
 on the new capture, e.g. the GELU / exp mask folds' capture with _lh's decisions:
     python scripts/utils/map_plan_decisions.py graphs/gpt2_decode_python_n32_kc16r_lhm \
@@ -36,10 +36,15 @@ def steps(ns):
 def sig(n):
     return (n["op_type"], len(n["inputs"]))
 
+_NEW_IDX = {}
+
+
 def vmap(on, nn):
     """Per step a difflib alignment of the op signatures; a matched pair is kept only when every input it reads that
     is itself mapped maps onto the new node's input in the same position (else the match is a coincidence)."""
     import difflib
+    _NEW_IDX.clear()
+    _NEW_IDX.update({n["output"]: n for n in nn})
     so, sn = steps(on), steps(nn)
     if [s for s, _ in so] != [s for s, _ in sn]:
         raise SystemExit("step sequences differ")
@@ -53,17 +58,36 @@ def vmap(on, nn):
                 ok = all(m.get(u, w) == w for u, w in zip(x["inputs"], y["inputs"]) if u in m or u.startswith("v_"))
                 if ok:
                     m[x["output"]] = y["output"]; hit += 1
-        if s.endswith("softmax"):
+        if s.endswith("softmax") or s.endswith(".attn"):
             # exp_mask_fold: the active mask's product is gone; its value is its input's (already masked) image
             for x in a:
+                ptn = str(((x.get("args") or {}).get("pt") or {}).get("name", ""))
                 if x["output"] not in m and x["op_type"] == "mult" and len(x["inputs"]) == 2 \
-                        and x["inputs"][1].startswith("pt_") and x["inputs"][0] in m:
+                        and x["inputs"][1].startswith("pt_") and x["inputs"][0] in m \
+                        and (s.endswith("softmax") or "active" in ptn):
                     y = m[x["inputs"][0]]
                     if not any(m.get(z["output"]) == y for z in a if z is not x and z["output"] != x["inputs"][0]):
                         m[x["output"]] = y
                         hit += 1
         if hit < max(len(a), len(b)):
             changed.append((s, len(a), len(b), hit))
+    # a matched consumer whose producer is unmatched on both sides (the same value computed another way, e.g. a
+    # Chebyshev sum that now carries the folded mask): the old producer's name onto the new one
+    byname = {x["output"]: x for x in on}
+    grow = True
+    while grow:
+        grow = False
+        used = set(m.values())
+        for x in on:
+            y = m.get(x["output"])
+            if y is None:
+                continue
+            yn = next((n for n in nn if n["output"] == y), None) if y not in _NEW_IDX else _NEW_IDX[y]
+            for u, w in zip(x["inputs"], yn["inputs"]):
+                if u in byname and u not in m and w.startswith("v_") and w not in used:
+                    m[u] = w
+                    used.add(w)
+                    grow = True
     return m, changed
 
 
@@ -75,7 +99,8 @@ def tr(m, v, what, b, strict=True):
     return None
 
 os.makedirs(NP, exist_ok=True)
-for b in [str(i) for i in range(12)] + ["0_feedback"]:
+BLOCKS = [str(i) for i in range(12)] + (["0_feedback"] if os.path.exists(f"{OP}/block_0_feedback_placement.json") else [])
+for b in BLOCKS:
     gb = b.split("_")[0]
     m, changed = vmap(nodes(OG, gb), nodes(NG, gb))
     d = json.load(open(f"{OP}/block_{b}_placement.json"))
