@@ -18,8 +18,8 @@ from .layout import (active_mask, complex_vlane_mask, hrs_pos0, pair_offsets, pa
                      stride_mask, vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
 from . import smcheb
-from .poly import (cheb_mask_scales, eval_chebyshev, eval_chebyshev_masked, goldschmidt_inv_ndf, goldschmidt_recip,
-                   im_cleanse, rotsum, rotsum_neg)
+from .poly import (cheb_mask_scales, cheb_mask_scales_terms, eval_chebyshev, eval_chebyshev_masked, goldschmidt_inv_ndf,
+                   goldschmidt_recip, im_cleanse, rotsum, rotsum_neg)
 
 
 def sm_periodic(rt, kc: int) -> int:
@@ -172,7 +172,15 @@ def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)
     # last leaf, one item per scale cheb_mask_scales gives (a constant quotient rides its giant's mask)
     p = 2 ** cfg.log2delta1
     return [score] + [(("sm.activef" + sfx, kc, p, sc), lambda sc=sc: sc * active_mask(d, kc, periodic=per) ** (1.0 / p))
-                      for sc in cheb_mask_scales(cfg.cheb_coeffs)]
+                      for sc in _exp_fold_scales(cfg)]
+
+
+def _exp_fold_scales(cfg: SoftmaxCfg):
+    """exp_mask_fold 1: the masked series' scales; 2: also the leaves that take the mask term by term (their
+    coefficients, added or multiplied: poly leaf_terms="budget"), so a series with no leaf slack keeps its depth."""
+    if cfg.exp_mask_fold == 2:
+        return cheb_mask_scales_terms(cfg.cheb_coeffs)
+    return cheb_mask_scales(cfg.cheb_coeffs)
 
 
 # ── reference-key centring (cfg.ref_keys) ──
@@ -929,8 +937,10 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
     a, b = (-1.0, 1.0) if affine != (1.0, 0.0) else (cfg.cheb_a / sf, cfg.cheb_b / sf)
     if cfg.exp_mask_fold:       # the active mask's root rides the series: (p M^(1/2^s))^(2^s) = p^(2^s) M
-        fold = dict(zip(cheb_mask_scales(cfg.cheb_coeffs), items[1:]))
-        z = eval_chebyshev_masked(ops, ct, cfg.cheb_coeffs, a, b, None, lambda c, sc: rt.mult_mask(c, *fold[sc]))
+        fold = dict(zip(_exp_fold_scales(cfg), items[1:]))
+        z = eval_chebyshev_masked(ops, ct, cfg.cheb_coeffs, a, b, None, lambda c, sc: rt.mult_mask(c, *fold[sc]),
+                                  (lambda c, sc: rt.add_mask(c, *fold[sc])) if cfg.exp_mask_fold == 2 else None,
+                                  leaf_terms="budget")
     else:
         z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, a, b)
     for _ in range(cfg.log2delta1):

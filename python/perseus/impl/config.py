@@ -82,7 +82,8 @@ class SoftmaxCfg:
     # (attention._key_lanes); 0 = t
     key_lanes: int = 0
     # exp_mask_fold: the active mask (its 2^log2delta1-th root) rides the exp's Chebyshev giants and last leaf
-    # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower
+    # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower; 2: a leaf with
+    # no slack takes it term by term (leaf_terms="budget"), so a series whose leaves have none keeps its depth too
     exp_mask_fold: int = 0
     # pair_heads: while the key window (key_lanes) is half a head's t lanes, the softmax runs on scores packed two heads
     # to a t-lane block (head h + H/2 on lanes t/2.. of head h's block), tH/2-periodic, so its refreshes route on
@@ -129,7 +130,8 @@ class GeluCfg:
     cheb_b: float = 1.0
     cheb_eps: float | None = None     # coefficient trim (relative to the largest), None = poly.CHEB_COEFF_EPS
     # mask_fold (chebyshev under GELU_FOLD): the lane mask rides the series' giants and last leaf
-    # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower
+    # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower; 2: term by term in
+    # the leaves with no slack (leaf_terms="budget")
     mask_fold: int = 0
 
 

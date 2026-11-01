@@ -15,7 +15,7 @@ from perseus._paths import PKG  # noqa: E402
 
 from perseus.impl import attention, config, fake, layout  # noqa: E402
 from perseus.impl.ops import FheOps  # noqa: E402
-from perseus.impl.poly import cheb_mask_scales, eval_chebyshev, eval_chebyshev_masked  # noqa: E402
+from perseus.impl.poly import cheb_mask_scales, cheb_mask_scales_terms, eval_chebyshev, eval_chebyshev_masked  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 
 CFG = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lh/configs.json"
@@ -146,3 +146,67 @@ def test_masked_series_leaf_terms_keep_depth(layer):
                                 lambda ct, s: _V(ct.v + s * M, ct.d))
     np.testing.assert_allclose(got.v, ref.v * M, rtol=0, atol=1e-13 * np.abs(ref.v).max())
     assert got.d == ref.d
+
+
+@pytest.mark.parametrize("block", range(12))
+def test_masked_series_budget_leaves_keep_depth(block):
+    """leaf_terms="budget" (GeluCfg.mask_fold 2): a leaf takes the mask term by term only where one product after its
+    sum would deepen the series, so every GELU series (block 7's trimmed degree 60 too) keeps its own depth."""
+    c = json.load(open(CFG))["softgelu"][f"transformer.h.{block}.mlp.act"]
+    coeffs, eps = c["cheb_coeffs"], c["cheb_eps"]
+    rng = np.random.default_rng(5)
+    x = rng.uniform(-1, 1, 1024)
+    M = (rng.uniform(0, 1, x.size) > 0.3) * 1.0
+    ops = _DepthOps()
+    ref = eval_chebyshev(ops, _V(x, 0), coeffs, -1.0, 1.0, eps)
+    got = eval_chebyshev_masked(ops, _V(x, 0), coeffs, -1.0, 1.0, eps, lambda ct, s: _V(ct.v * (s * M), ct.d + 1),
+                                lambda ct, s: _V(ct.v + s * M, ct.d), leaf_terms="budget")
+    np.testing.assert_allclose(got.v, ref.v * M, rtol=0, atol=1e-13 * np.abs(ref.v).max())
+    assert got.d == ref.d
+
+
+@pytest.mark.parametrize("kc", [1, 16])
+@pytest.mark.parametrize("block", [0, 4])
+def test_softmax_exp_mask_fold_terms(monkeypatch, kc, block):
+    """exp_mask_fold 2 on a degree-6 exp (no leaf slack): the same exponentials as unfolded, and the masked series
+    lands at the plain series' depth (fold 1 would cost a level there)."""
+    monkeypatch.setenv("SM_CHEB_GS", "1")
+    base = config.load_configs(str(CFG)).softmax[f"transformer.h.{block}.attn"]
+    base = dataclasses.replace(base, cheb_coeffs=list(base.cheb_coeffs[:7]))
+    zs = []
+    for fold in (0, 2):
+        cfg = dataclasses.replace(base, exp_mask_fold=fold)
+        rt, _fhe, _inf = _rt()
+        ops = rt.ops
+        ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+        d = rt.dims
+        rng = np.random.default_rng(43)
+        kv = attention.ComplexKVCache(d.d_head, centre=True)
+        for _tok in range(kc):
+            k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
+            for arr in (k, v):
+                arr[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+            attention.cache_kv_push_packed_complex(rt, kv, fake.FakeCt(np.repeat(k, d.t) + 1j * np.repeat(v, d.t), 18))
+        q = rng.standard_normal(d.hid)
+        q[(np.arange(d.hid) % d.H) >= d.H_real] = 0.0
+        a = attention.sm_fold_affine(rt, cfg)[0]
+        scores = attention.complex_qkt(rt, kv, fake.FakeCt(layout.lane_vec(q, d.N, d.t), 18), a, cfg=cfg)
+        zs.append(attention._thor_exp(rt, scores, cfg, kc, folded=True).vec.copy())
+    np.testing.assert_allclose(zs[1], zs[0], rtol=1e-9, atol=1e-12 * np.abs(zs[0]).max())
+    ops = _DepthOps()
+    x = np.random.default_rng(6).uniform(-1, 1, 512)
+    M = (np.arange(512) % 5 > 0) * 1.0
+    ref = eval_chebyshev(ops, _V(x, 0), base.cheb_coeffs, -1.0, 1.0)
+    used = []
+
+    def mask(ct, s):
+        used.append(s)
+        return _V(ct.v * (s * M), ct.d + 1)
+
+    def add_mask(ct, s):
+        used.append(s)
+        return _V(ct.v + s * M, ct.d)
+    got = eval_chebyshev_masked(ops, _V(x, 0), base.cheb_coeffs, -1.0, 1.0, None, mask, add_mask, leaf_terms="budget")
+    np.testing.assert_allclose(got.v, ref.v * M, rtol=0, atol=1e-13 * np.abs(ref.v).max())
+    assert got.d == ref.d == 3
+    assert set(used) <= set(cheb_mask_scales_terms(base.cheb_coeffs))
