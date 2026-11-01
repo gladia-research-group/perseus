@@ -67,7 +67,9 @@ keys = ("placements", "hint_fire", "sparse_slots", "real_route", "rescale_after"
     (() if os.environ.get("RD_FREE_CF") else ("correction_factor",))
 for k in [str(i) for i in range(12)] + ["0_feedback"]:
     x, y = (json.load(open(f"{d}/block_{k}_placement.json")) for d in (a, b))
-    bad = [f for f in keys if x.get(f) != y.get(f)]
+    # rescale_after is a set (a carried plan lists it in the mapping's order)
+    norm = lambda f, v: sorted(v) if f == "rescale_after" and v else v
+    bad = [f for f in keys if norm(f, x.get(f)) != norm(f, y.get(f))]
     ex = lambda s: (s["exit_level"], s.get("exit_deg") or 1)
     if bad or ex(x["summary"]) != ex(y["summary"]):
         sys.exit(f"block {k}: the pass changed {bad or 'the exit'}")

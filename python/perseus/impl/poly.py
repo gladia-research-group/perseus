@@ -458,6 +458,35 @@ def cheb_mask_scales(coeffs, eps: float | None = None):
     return [1.0] + sorted({s for s in out if s != 1.0})
 
 
+class _ScaleRec:
+    """ops stand-in for a dry run: eval_chebyshev_masked's mask scales come from its callbacks."""
+    cheb_bsgs = dead_ops = True
+    realize_shared = cheb_align = False
+
+    def mult(self, a, b):
+        return a
+
+    add = sub = mult
+
+    def square(self, a):
+        return a
+
+    def inplace_add(self, a, b):
+        pass
+
+
+def cheb_mask_scales_terms(coeffs, eps: float | None = None, leaf_terms: str = "budget"):
+    """The distinct scalars s of every `mask(ct, s)` and `add_mask(ct, s)` eval_chebyshev_masked takes with an
+    add_mask and `leaf_terms` (1.0 first): the term-by-term leaves bring their coefficients."""
+    out = []
+
+    def rec(ct, s):
+        out.append(float(s))
+        return ct
+    eval_chebyshev_masked(_ScaleRec(), 0.0, coeffs, -1.0, 1.0, eps, rec, rec, leaf_terms)
+    return [1.0] + sorted({s for s in out if s != 1.0})
+
+
 def _cheb_leaf_masked(ops, T, y, c, mask, add_mask):
     """sum_i c_i T_i times M with the mask in every term's product (T_i (c_i M), c_0 M added): the leaf's own depth."""
     r = None
@@ -468,6 +497,32 @@ def _cheb_leaf_masked(ops, T, y, c, mask, add_mask):
     if r is None:
         r = ops.sub(y, y)
     return add_mask(r, float(c[0])) if c[0] != 0.0 else r
+
+
+def _cheb_leafdep(c, dt) -> int:
+    return max((dt[i] + 1 for i in range(1, len(c)) if c[i] != 0.0), default=0)
+
+
+def _cheb_rec_budget(ops, T, y, m, c, dt, mask, add_mask, budget):
+    """_cheb_rec(c) times the mask within `budget` levels (the depth its unmasked sibling sets): as _cheb_rec_masked,
+    but a leaf takes the mask after its sum (one plaintext product) when that fits the budget and term by term only
+    when it does not."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        if _cheb_leafdep(c, dt) + 1 <= budget:
+            return mask(_cheb_leaf(ops, T, y, c), 1.0)
+        return _cheb_leaf_masked(ops, T, y, c, mask, add_mask)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    dq = _cheb_dep(q, m, dt)
+    if _deg(q) == 0:
+        prod = mask(T[k], float(q[0]))
+    elif max(dq, dt[k] + 1) + 1 <= budget:
+        prod = ops.mult(_cheb_rec(ops, T, y, m, q, None), mask(T[k], 1.0))
+    else:
+        prod = ops.mult(_cheb_rec_budget(ops, T, y, m, q, dt, mask, add_mask, budget - 1), T[k])
+    return ops.add(prod, _cheb_rec_budget(ops, T, y, m, r, dt, mask, add_mask, budget))
 
 
 def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask, add_mask=None):
@@ -492,13 +547,15 @@ def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask, add_mask=None):
     return ops.add(prod, _cheb_rec_masked(ops, T, y, m, r, leaves, dt, mask, add_mask))
 
 
-def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask, add_mask=None):
+def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask, add_mask=None,
+                          leaf_terms: str = "always"):
     """eval_chebyshev_bsgs times a plaintext mask M, at the series' own depth instead of a level more: M rides the
     giants and leaves that have a level of slack (_cheb_rec_masked); a constant quotient q_0 rides its giant's mask
     (T_k (q_0 M)). `mask(ct, s)` returns ct times s M (s from cheb_mask_scales). `add_mask(ct, s)` (ct plus s M):
     every leaf takes the mask in its terms' products instead of after its sum (any scale s: the coefficients), so a
-    series whose leaves have no slack keeps its depth too. Same value as mult(eval_chebyshev(...), M) up to rounding;
-    needs CHEB_BSGS (degree > 3)."""
+    series whose leaves have no slack keeps its depth too; `leaf_terms="budget"` takes that term-by-term form only for
+    the leaves that need it (the others: one product after the sum). Same value as mult(eval_chebyshev(...), M) up to
+    rounding; needs CHEB_BSGS (degree > 3)."""
     coeffs, n, m, dt = _cheb_geometry(coeffs, eps)
     if n <= 3 or not getattr(ops, "cheb_bsgs", False):
         raise ValueError("eval_chebyshev_masked: a BSGS series of degree > 3 (CHEB_BSGS=1)")
@@ -533,6 +590,9 @@ def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None,
             ops.realize(T[k])
         k *= 2
     leaves = _AlignedBabies(ops, T, m, shared) if getattr(ops, "cheb_align", False) else None
+    if add_mask is not None and leaf_terms == "budget" and leaves is None:
+        # every leaf masked after its sum where that fits the series' own depth, term by term where it does not
+        return _cheb_rec_budget(ops, T, y, m, coeffs, dt, mask, add_mask, _cheb_dep(coeffs, m, dt))
     return _cheb_rec_masked(ops, T, y, m, coeffs, leaves, dt, mask, add_mask)
 
 
