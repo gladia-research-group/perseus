@@ -75,6 +75,10 @@ class SoftmaxCfg:
     # ref_window: the most keys the centred config covers (the broadcast ladder's length)
     ref_keys: tuple = ()
     ref_window: int = 0
+    # key_lanes: while the cache holds at most this many keys (a power of two below t), the attention's lane ladders
+    # (q's replicate, the head sums and their replicates, P.V's key sum) run over that many lanes instead of t
+    # (attention._key_lanes); 0 = t
+    key_lanes: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -223,7 +227,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")),
         gs_iters_first=int(j.get("gs_iters_first", 0)),
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
-        ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)))
+        ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
+        key_lanes=int(j.get("key_lanes", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:

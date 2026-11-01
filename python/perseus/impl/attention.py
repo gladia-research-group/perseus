@@ -43,6 +43,16 @@ def _general(rt) -> bool:
     return bool(getattr(rt.ops, "sm_periodic_general", False))
 
 
+def _key_lanes(d, cfg, kc: int) -> int:
+    """The lanes the attention's lane ladders cover at kc keys: cfg.key_lanes (a power of two below t) while every key
+    fits it (the keys sit on lanes 0..kc-1 and every other lane of the scores, z and P is zero, so a shorter window
+    sums the same), else t. With SM_PERIODIC=1 only (one group, tH-periodic scores)."""
+    w = int(getattr(cfg, "key_lanes", 0) or 0) if cfg is not None else 0
+    if w and w < d.t and (w & (w - 1)) == 0 and 0 < kc <= w:
+        return w
+    return d.t
+
+
 def _gp_scope(rt, per: int):
     """SM_PERIODIC=2: the ops whose count depends on Gp run in a sub-step keyed by it, so every name a plan pins is
     the same at every cache length (one token-0 plan binds throughout; plan with FORBID_STEPS .gp)."""
@@ -507,8 +517,9 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
     `cfg` with ref_keys: the scores come out centred on each head's reference key (_ref_broadcast)."""
     ops, d = rt.ops, rt.dims
     q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
-    q = rotsum_neg(ops, q, d.t)
     kc = kv.k_count
+    lanes = _key_lanes(d, cfg, kc) if sm_periodic(rt, kc) == 1 and not merge else d.t
+    q = rotsum_neg(ops, q, lanes)
     attn = None
     def accum(r):
         nonlocal attn
@@ -558,7 +569,7 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
     return attn
 
 
-def complex_softmax_v(rt, kv: ComplexKVCache, probs):
+def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0):
     """complex_softmax_v: pair the scores of lanes 2j and 2j+1 as s_2j - i s_2j+1, so one
     product with the V pair bucket sums both lanes on the real axis; hoisted rotations feed
     the pair products, then the token ladder, 2 Re and the tok0 half mask."""
@@ -596,7 +607,7 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs):
         for b in kv.v_buckets[1:n_pairs]:
             ops.inplace_add(vs, b)
         res = ops.mult(vs, ops.sub(probs, ops.mult_i(probs)))
-        res = rotsum(ops, res, 1, d.t)
+        res = rotsum(ops, res, 1, lanes or d.t)          # `lanes`: the keys' window (_key_lanes)
         res = im_cleanse(ops, res)
         return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
     scores_b = ops.copy(probs)
@@ -709,7 +720,7 @@ def fold_sm_prescale(copies: float, s0_expected: float) -> float:
 
 
 def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, seed: float | None = None,
-                    seed_site: str = "hrs.seed"):
+                    seed_site: str = "hrs.seed", lanes: int = 0):
     """cachemir_attention.cu: per-head total broadcast over the head's t slots and
     over the lane copies. With FUSED_SM_DEN the lane-copy ladder stops at the sparse slot
     count and a fold bootstrap finishes it (the denominator comes out refreshed);
@@ -721,11 +732,12 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     them, hold the full tH-periodic sum at every cache length. Added after the ladder, those refreshes landed on the
     partial sums, which repeat only every Gp tH slots: the sparse refresh returned them wrong (Llama past 256 keys)."""
     ops, d = rt.ops, rt.dims
+    lanes = lanes if (lanes and periodic == 1 and not _general(rt)) else d.t   # `lanes`: the keys' window (_key_lanes)
     if periodic and _general(rt):
         with _gp_scope(rt, periodic):
             if periodic > 1:
                 x = ops.tag_reduce(rotsum(ops, x, d.tH, int(periodic) * d.tH), d.tH)
-    out = rotsum(ops, x, 1, d.t)
+    out = rotsum(ops, x, 1, lanes)
     if seed is not None and getattr(ops, "hrs_pack", False) and ops.complex_payload:
         if ops.fused_sm_den:
             raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
@@ -737,12 +749,12 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
             # here, the mask halved; the sub-step `hrs` (FORBID_STEPS .hrs) keeps refreshes off the pack until the
             # split (a refresh of either split output is relative to its own value)
             with rt.step("hrs"):
-                z = rotsum_neg(ops, rt.mult_mask(im_cleanse(ops, out), *_hrs_pack_item(d, seed, seed_site, 0.5)), d.t)
+                z = rotsum_neg(ops, rt.mult_mask(im_cleanse(ops, out), *_hrs_pack_item(d, seed, seed_site, 0.5)), lanes)
                 cz = ops.conjugate(z)
             h = ops.mult_i(ops.sub(cz, z))
             out = ops.add(z, cz)
         else:
-            z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), d.t)
+            z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), lanes)
             cz = ops.conjugate(z)
             h = ops.mult_i(ops.sub(cz, z))
             out = ops.add(z, cz)
@@ -750,11 +762,11 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         if seed is not None:
             tot = out
         out = rt.mult_mask(out, "hrs.pos0", lambda: hrs_pos0(d))
-        out = rotsum_neg(ops, out, d.t)
+        out = rotsum_neg(ops, out, lanes)
         if seed is not None:
             if ops.fused_sm_den:
                 raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
-            h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), d.t)
+            h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), lanes)
     if seed is not None:
         if not periodic:
             h = rotsum(ops, h, d.tH, d.N)
@@ -812,15 +824,16 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     Same arithmetic as the default path."""
     ops = rt.ops
     fold = getattr(ops, "sm_fold", False) and not getattr(ops, "fused_sm_den", False)
+    lanes = _key_lanes(rt.dims, cfg, kc)
     for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
         if k:
             z = ops.square(im_cleanse(ops, y))
         if fold:
             s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
-                                    seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k))
+                                    seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k), lanes=lanes)
             y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
         else:
-            s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc))
+            s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc), lanes=lanes)
             y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
     return y
 
@@ -990,7 +1003,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
         probs = softmax_thor(rt, scores, sm_cfg, kv.k_count, folded)
     tap("attn.probs", probs)
     with rt.step("softmax_v"):
-        x = complex_softmax_v(rt, kv, probs) if cplx else softmax_v(rt, kv, probs)
+        x = complex_softmax_v(rt, kv, probs, _key_lanes(rt.dims, sm_cfg, kv.k_count)) if cplx \
+            else softmax_v(rt, kv, probs)
     tap("attn.pv", x)
     with rt.step("out_proj"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
