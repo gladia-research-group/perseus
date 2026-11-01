@@ -507,7 +507,7 @@ pub fn to_bottom<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>
         cx.ops.mult_scalar_inplace(ctx, cx.ex, cx.sh, std::slice::from_mut(x), &[Complex::new(adj, 0.0)])?;
         cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(x))?;
     }
-    let bottom_level = ctx.shape.n_q - plan.d as u32;
+    let bottom_level = pc_shadow::meta::level_from_top_limb(ctx.shape, (plan.d - 1) as u32)?;
     if x.meta.level > bottom_level {
         return Err(shape("raise", format!("input at level {} is below the composite bottom", x.meta.level)));
     }
