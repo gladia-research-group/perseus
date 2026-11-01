@@ -567,9 +567,6 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
                 em.push(ev0.elapsed_ms(&ev1)? as f64);
             }
         }
-        if prof {
-            dev.profiler(false)?;
-        }
         for i in 0..kb {
             cmp(&ex, &graphs.slots.x, i, i)?;
         }
