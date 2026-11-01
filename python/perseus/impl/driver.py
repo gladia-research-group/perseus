@@ -670,7 +670,8 @@ class PlannedRun:
     stage's stream under the plan's `block_<b>_<variant>_placement.json` (e.g. block 0 for a token fed back by
     generation); they share the stage's registers, dynamic steps and plaintext values. `pt_cache`: `precompute`
     encodes every position's plaintexts once into a device cache, and a token copies its position's into their
-    slots instead of encoding them (a few positions: GPT-2's 16 hold 1550 distinct values, 7.4 GB)."""
+    slots instead of encoding them (a few positions: GPT-2's 16 hold 1550 distinct values, 7.4 GB). `schedule`: the
+    compile's K-batching order (`Program.compile(schedule=)`: "program", "siblings", "lockstep")."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, ref_token=2, probe=4, work_dir, pt_rows=0,
                  dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, schedule="program",
