@@ -6,6 +6,8 @@
 # exactly, the drops searched) with the PCMM finishes landed where PF_PCMM_RAISE / PF_PCMM_RAISE_OUT drop them
 # (RD_SRC's runtime values by default; the plan's runtime line gets the ones used), then speedrun/make_prefill_wrot_plan.sh
 # with the served switches. Stages 12-13 are RD_SRC's. ROUTES_FREE=1 lets the pass re-pick a refresh's route (reported).
+# GRAPH=<capture> with REUSE_CAPTURE=1 takes an existing capture; KEEP_FROM=<pfbh-level plan on it> takes its decisions
+# as they are instead of mapping BASE's (e.g. blocks replanned on the ILP over the capture).
 #   NAME=mfsab2 CONFIGS=gpt2_base_n32_pf_mf_s16_ab2 CM_CONFIGS=gpt2_base_n32_pf_cm_mf_s16_ab2 \
 #   PF_PCMM_RAISE=up:3:2-2,up:3:11-11,up:2:0-1,up:2:3-10,up:1,qkv:5:11-11,qkv:1:3-3 bash speedrun/make_prefill_carry_plan.sh
 #   -> graphs/gpt2_prefill128_pfbh_$NAME, bootstrap_placements/gpt2_prefill128_n32a4_pfbh{,rd_cm,rd_cmw}_$NAME
@@ -16,7 +18,7 @@ export CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH
 : "${NAME:?}" "${CONFIGS:?}" "${CM_CONFIGS:?}"
 BASE=${BASE:-gpt2_prefill128_n32a4_pfbh_mfs} BASE_GRAPH=${BASE_GRAPH:-graphs/gpt2_prefill128_pfbh_mfs}
 RD_SRC=${RD_SRC:-gpt2_prefill128_n32a4_pfbhrd_cm_mf}
-GR=graphs/gpt2_prefill128_pfbh_$NAME KEEP=gpt2_prefill128_n32a4_pfbh_$NAME
+GR=${GRAPH:-graphs/gpt2_prefill128_pfbh_$NAME} KEEP=gpt2_prefill128_n32a4_pfbh_$NAME
 RD=gpt2_prefill128_n32a4_pfbhrd_cm_$NAME OUT=gpt2_prefill128_n32a4_pfbhrd_cmw_$NAME
 A=configs/model/approximation
 src_rt() { sed -n 's/^runtime=//p' "bootstrap_placements/$RD_SRC/PLAN_CMD.txt" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
@@ -31,6 +33,7 @@ FIDESLIB_BTS_RAISE_DROP=512:1 SM_CHEB_GS=1 PF_QKV_PACK=1 PF_ATTN_PACK=3 PF_ATTN_
 SETS=$(echo "$RUNTIME" | tr ' ' '\n' | grep = | sed 's/^/--set /')
 ROWS=${ROWS:-4096 8192 12288 16384}
 CALIB=graphs/gpt2_prefill128_pfbh/pcmm_calib.json
+if [ "${REUSE_CAPTURE:-0}" != 1 ] || [ ! -d "$GR/block_13" ]; then
 TMP="$(mktemp -d graphs/_carry_XXXX)"
 pids=()
 for r in $ROWS; do
@@ -45,10 +48,15 @@ first=${ROWS%% *}
 "$PYTHON" scripts/utils/merge_mags.py "$TMP/r$first" "$GR" $(for r in $ROWS; do echo "$TMP/r$r"; done) > /dev/null
 cp "$CALIB" "$GR/"
 rm -rf "$TMP"
+fi
 
 # 2. BASE's decisions on it
-rm -rf "bootstrap_placements/$KEEP"
-"$PYTHON" scripts/utils/map_plan_decisions.py "$BASE_GRAPH" "bootstrap_placements/$BASE" "$GR" "bootstrap_placements/$KEEP"
+if [ -n "${KEEP_FROM:-}" ]; then
+    [ "$KEEP_FROM" = "$KEEP" ] || { rm -rf "bootstrap_placements/$KEEP" && cp -r "bootstrap_placements/$KEEP_FROM" "bootstrap_placements/$KEEP"; }
+else
+    rm -rf "bootstrap_placements/$KEEP"
+    "$PYTHON" scripts/utils/map_plan_decisions.py "$BASE_GRAPH" "bootstrap_placements/$BASE" "$GR" "bootstrap_placements/$KEEP"
+fi
 
 # 3. the raise-drop pass on the capture with the PCMM finishes landed lower
 DROP="$GR.pcmmrd" OUTB=_carry_$NAME
@@ -104,8 +112,8 @@ sed -i -e "s#^graph=$(sed -n 's/^graph=\([^ ]*\).*/\1/p' "bootstrap_placements/$
     -e "s#^configs=.*#configs=$A/$CM_CONFIGS/configs.json#" \
     -e "/^runtime=/s#PF_PCMM_RAISE=[^ ]*#PF_PCMM_RAISE=$RAISE#" \
     -e "/^runtime=/s#PF_PCMM_RAISE_OUT=[^ ]*#PF_PCMM_RAISE_OUT=$RAISE_OUT#" "bootstrap_placements/$RD/PLAN_CMD.txt"
-echo "carry=blocks 0-11 by speedrun/make_prefill_carry_plan.sh: $BASE's decisions carried onto $GR (configs $CONFIGS, \
-make_prefill_plan.sh's rows, $CALIB's band shifts) by scripts/utils/map_plan_decisions.py, then $RD_SRC's raise-drop pass \
+echo "carry=blocks 0-11 by speedrun/make_prefill_carry_plan.sh: ${KEEP_FROM:-$BASE}'s decisions $([ -n "${KEEP_FROM:-}" ] && echo on || echo "carried onto") $GR (configs $CONFIGS, \
+make_prefill_plan.sh's rows, $CALIB's band shifts)$([ -n "${KEEP_FROM:-}" ] || echo " by scripts/utils/map_plan_decisions.py"), then $RD_SRC's raise-drop pass \
 (decisions kept exact$([ "${ROUTES_FREE:-0}" = 1 ] && echo ", routes free")) with PF_PCMM_RAISE=$RAISE PF_PCMM_RAISE_OUT=$RAISE_OUT\
 ${NOTE:+; $NOTE}" >> "bootstrap_placements/$RD/PLAN_CMD.txt"
 
