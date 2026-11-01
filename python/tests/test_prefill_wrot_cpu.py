@@ -43,7 +43,7 @@ def _attend(T, pack, wrot, monkeypatch):
     return np.concatenate([o.vec for o in O])
 
 
-@pytest.mark.parametrize("T,pack,bits", [(128, 3, 1), (128, 3, 2), (128, 3, 4), (128, 3, 3), (128, 2, 3), (64, 3, 3),
+@pytest.mark.parametrize("T,pack,bits", [(128, 3, 1), (128, 3, 2), (128, 3, 4), (128, 3, 3), (128, 3, 11), (128, 2, 3), (64, 3, 3),
                                          (100, 3, 3), (100, 3, 5)])
 def test_wrot_matches_ladders(T, pack, bits, monkeypatch):
     a = _attend(T, pack, 0, monkeypatch)
