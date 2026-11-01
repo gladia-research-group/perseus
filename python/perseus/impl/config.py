@@ -84,6 +84,10 @@ class SoftmaxCfg:
     # exp_mask_fold: the active mask (its 2^log2delta1-th root) rides the exp's Chebyshev giants and last leaf
     # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower
     exp_mask_fold: int = 0
+    # pair_heads: while the key window (key_lanes) is half a head's t lanes, the softmax runs on scores packed two heads
+    # to a t-lane block (head h + H/2 on lanes t/2.. of head h's block), tH/2-periodic, so its refreshes route on
+    # tH/2 slots (attention._pair); 0 = the tH-periodic layout
+    pair_heads: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -237,7 +241,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         gs_iters_first=int(j.get("gs_iters_first", 0)),
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
-        key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)))
+        key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
+        pair_heads=int(j.get("pair_heads", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
