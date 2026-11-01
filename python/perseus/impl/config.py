@@ -81,6 +81,9 @@ class SoftmaxCfg:
     # (q's replicate, the head sums and their replicates, P.V's key sum) run over that many lanes instead of t
     # (attention._key_lanes); 0 = t
     key_lanes: int = 0
+    # exp_mask_fold: the active mask (its 2^log2delta1-th root) rides the exp's Chebyshev giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower
+    exp_mask_fold: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -118,6 +121,9 @@ class GeluCfg:
     cheb_a: float = -1.0
     cheb_b: float = 1.0
     cheb_eps: float | None = None     # coefficient trim (relative to the largest), None = poly.CHEB_COEFF_EPS
+    # mask_fold (chebyshev under GELU_FOLD): the lane mask rides the series' giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower
+    mask_fold: int = 0
 
 
 @dataclasses.dataclass
@@ -231,7 +237,7 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         gs_iters_first=int(j.get("gs_iters_first", 0)),
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
-        key_lanes=int(j.get("key_lanes", 0)))
+        key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
@@ -246,7 +252,8 @@ def parse_gelu(j: dict) -> GeluCfg:
         # xmax: with GELU_FOLD the up-projection carries 1/xmax and the output mask xmax (as for thor_composite)
         return GeluCfg(method=method, xmax=float(j.get("xmax", 1.0)), cheb_coeffs=_tup(j["cheb_coeffs"]),
                        cheb_a=float(j["cheb_a"]), cheb_b=float(j["cheb_b"]),
-                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None))
+                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None),
+                       mask_fold=int(j.get("mask_fold", 0)))
     raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
 
 

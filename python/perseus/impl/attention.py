@@ -18,8 +18,8 @@ from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_
                      stride_mask, vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
 from . import smcheb
-from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cleanse, rotsum,
-                   rotsum_neg)
+from .poly import (cheb_mask_scales, eval_chebyshev, eval_chebyshev_masked, goldschmidt_inv_ndf, goldschmidt_recip,
+                   im_cleanse, rotsum, rotsum_neg)
 
 
 def sm_periodic(rt, kc: int) -> int:
@@ -117,7 +117,13 @@ def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)
     else:
         score = (("sm.score" + sfx, cfg.clip_lo, mean, kc, "affine", al, be),
                  lambda: al * score_mask(d, cfg.clip_lo, mean, kc, periodic=per) - be)
-    return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+    if not cfg.exp_mask_fold:
+        return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+    # exp_mask_fold: the active mask's p-th root (p = 2^log2delta1, the exp's squarings) on the Chebyshev's giants and
+    # last leaf, one item per scale cheb_mask_scales gives (a constant quotient rides its giant's mask)
+    p = 2 ** cfg.log2delta1
+    return [score] + [(("sm.activef" + sfx, kc, p, sc), lambda sc=sc: sc * active_mask(d, kc, periodic=per) ** (1.0 / p))
+                      for sc in cheb_mask_scales(cfg.cheb_coeffs)]
 
 
 # ── reference-key centring (cfg.ref_keys) ──
@@ -795,19 +801,22 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
     affine = sm_fold_affine(rt, cfg) if folded else (1.0, 0.0)   # `folded`: q.K^T already applied alpha (mha)
-    score_item, active_item = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine)
-    ct = rt.add_mask(scores, *score_item)
+    items = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine)
+    ct = rt.add_mask(scores, *items[0])
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     if not cfg.cheb_coeffs:
         raise ValueError("softmax: cfg.cheb_coeffs is empty (only the Chebyshev exp is ported)")
-    if affine != (1.0, 0.0):    # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
-        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, -1.0, 1.0)
+    # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
+    a, b = (-1.0, 1.0) if affine != (1.0, 0.0) else (cfg.cheb_a / sf, cfg.cheb_b / sf)
+    if cfg.exp_mask_fold:       # the active mask's root rides the series: (p M^(1/2^s))^(2^s) = p^(2^s) M
+        fold = dict(zip(cheb_mask_scales(cfg.cheb_coeffs), items[1:]))
+        z = eval_chebyshev_masked(ops, ct, cfg.cheb_coeffs, a, b, None, lambda c, sc: rt.mult_mask(c, *fold[sc]))
     else:
-        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, a, b)
     for _ in range(cfg.log2delta1):
         z = ops.square(z)
     z = im_cleanse(ops, z)
-    return rt.mult_mask(z, *active_item)
+    return z if cfg.exp_mask_fold else rt.mult_mask(z, *items[1])
 
 
 def first_iters(cfg: SoftmaxCfg, lean: bool) -> int:

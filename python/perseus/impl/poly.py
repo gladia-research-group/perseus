@@ -390,6 +390,135 @@ def _cheb_rec(ops, T, y, m, c, leaves=None):
     return ops.add(prod, rv)
 
 
+def _deg(c) -> int:
+    d = len(c) - 1
+    while d > 0 and c[d] == 0.0:
+        d -= 1
+    return d
+
+
+def _cheb_depths(n: int, m: int):
+    """Depth (products past y) of every baby T_1..T_{m-1} and giant T_m, T_2m, .. <= n as eval_chebyshev_bsgs builds
+    them."""
+    dt = {1: 0}
+    for i in range(2, m):
+        dt[i] = dt[i // 2] + 1 if i % 2 == 0 else max(dt[i // 2 + 1], dt[i // 2]) + 1
+    k = m
+    while k <= n:
+        dt[k] = dt[k // 2] + 1
+        k *= 2
+    return dt
+
+
+def _cheb_dep(c, m: int, dt) -> int:
+    """Depth of _cheb_rec(c): a leaf one past its deepest baby (the coefficient products), a split one past the
+    deeper of its quotient and giant."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        return max((dt[i] + 1 for i in range(1, len(c)) if c[i] != 0.0), default=0)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    return max(max(_cheb_dep(q, m, dt), dt[k]) + 1, _cheb_dep(r, m, dt))
+
+
+def _cheb_mask_plan(c, m: int, dt, out):
+    """The scales the masked recursion of `c` puts on the mask (see eval_chebyshev_masked), appended to `out`."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        out.append(1.0)
+        return
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    if _deg(q) == 0:
+        out.append(float(q[0]))
+    elif dt[k] < _cheb_dep(q, m, dt):
+        out.append(1.0)
+    else:
+        _cheb_mask_plan(q, m, dt, out)
+    _cheb_mask_plan(r, m, dt, out)
+
+
+def _cheb_geometry(coeffs, eps):
+    c = _cheb_trim(coeffs, eps)
+    n = len(c) - 1
+    m = 1 << ((n.bit_length() + 1) // 2)
+    return c, n, m, _cheb_depths(n, m)
+
+
+def cheb_mask_scales(coeffs, eps: float | None = None):
+    """The distinct scalars s eval_chebyshev_masked's `mask(ct, s)` takes, 1.0 first (a constant quotient q_0 rides
+    its giant's mask: T_k (q_0 M) is one plaintext product)."""
+    c, n, m, dt = _cheb_geometry(coeffs, eps)
+    if n <= 3:
+        return [1.0]
+    out = []
+    _cheb_mask_plan(c, m, dt, out)
+    return [1.0] + sorted({s for s in out if s != 1.0})
+
+
+def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask):
+    """_cheb_rec(c) times the mask at _cheb_rec's own depth where a level of slack allows: a split takes the mask on
+    its giant when the giant is shallower than the quotient (q (T_k M)), else inside the quotient ((q M) T_k); the
+    remainder recursively; a leaf after its sum (one past the leaf, where the sibling products land)."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        return mask(_cheb_leaf(ops, T if leaves is None else leaves, y, c), 1.0)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    if _deg(q) == 0:
+        prod = mask(T[k], float(q[0]))
+    elif dt[k] < _cheb_dep(q, m, dt):
+        prod = ops.mult(_cheb_rec(ops, T, y, m, q, leaves), mask(T[k], 1.0))
+    else:
+        prod = ops.mult(_cheb_rec_masked(ops, T, y, m, q, leaves, dt, mask), T[k])
+    return ops.add(prod, _cheb_rec_masked(ops, T, y, m, r, leaves, dt, mask))
+
+
+def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask):
+    """eval_chebyshev_bsgs times a plaintext mask M, at the series' own depth instead of a level more: M rides the
+    giants and leaves that have a level of slack (_cheb_rec_masked); a constant quotient q_0 rides its giant's mask
+    (T_k (q_0 M)). `mask(ct, s)` returns ct times s M (s from cheb_mask_scales). Same value as
+    mult(eval_chebyshev(...), M) up to rounding; needs CHEB_BSGS (degree > 3)."""
+    coeffs, n, m, dt = _cheb_geometry(coeffs, eps)
+    if n <= 3 or not getattr(ops, "cheb_bsgs", False):
+        raise ValueError("eval_chebyshev_masked: a BSGS series of degree > 3 (CHEB_BSGS=1)")
+    alpha = 2.0 / (b - a)
+    beta = (a + b) / (b - a)
+    y = x if alpha == 1.0 else ops.mult(x, alpha)
+    if beta != 0.0:
+        y = ops.add(y, -beta)
+    T = {1: y}
+    shared = getattr(ops, "realize_shared", False)
+    need = _cheb_needed(coeffs, m, n) if getattr(ops, "dead_ops", False) else None
+    for i in range(2, m):
+        if need is not None and i not in need:
+            continue
+        if i % 2 == 0:
+            sq = ops.square(T[i // 2])
+            T[i] = ops.add(ops.add(sq, sq), -1.0)
+        else:
+            j = i // 2
+            prod = ops.mult(T[j + 1], T[j])
+            T[i] = ops.sub(ops.add(prod, prod), y)
+        if shared:
+            ops.realize(T[i])
+    k = m
+    while k <= n:
+        if need is not None and k not in need:
+            k *= 2
+            continue
+        sq = ops.square(T[k // 2])
+        T[k] = ops.add(ops.add(sq, sq), -1.0)
+        if shared:
+            ops.realize(T[k])
+        k *= 2
+    leaves = _AlignedBabies(ops, T, m, shared) if getattr(ops, "cheb_align", False) else None
+    return _cheb_rec_masked(ops, T, y, m, coeffs, leaves, dt, mask)
+
+
 class _NoBsgs:
     """ops view with the BSGS switch off (tiny series take the direct recursion)."""
     cheb_bsgs = False
