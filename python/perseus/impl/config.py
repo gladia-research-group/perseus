@@ -34,6 +34,8 @@ class NormCfg:
     # spru: the token's mean and mean square of c x from ONE 1-slot refresh (norm._norm_spru) instead of the two
     # rotation-sum ladders (decode only; needs the Chebyshev seed)
     spru: int = 0
+    # zladder: the token's sum and sum of squares on one complex ladder (norm._norm_zladder) instead of two
+    zladder: int = 0
 
     @property
     def descale(self) -> float:
@@ -211,6 +213,7 @@ def parse_norm(j: dict) -> NormCfg:
             cfg.cheb_lo, cfg.cheb_hi = float(j["cheb_lo"]), float(j["cheb_hi"])
             cfg.cheb_nr_iters = int(j["cheb_nr_iters"])
         cfg.spru = int(j.get("spru", 0))
+        cfg.zladder = int(j.get("zladder", 0))
     return cfg
 
 

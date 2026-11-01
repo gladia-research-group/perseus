@@ -44,6 +44,24 @@ def test_norm_spru_matches_ladders(site, pos):
         del n_bts
 
 
+@pytest.mark.parametrize("site", ["transformer.h.3.ln_1", "transformer.h.10.ln_2", "transformer.h.11.ln_2"])
+def test_norm_zladder_matches_ladders(site):
+    cfg = config.load_configs(str(CFG)).norm[site]
+    rng = np.random.default_rng(9)
+    for scale in (0.15, 0.3):
+        rt, fhe, inf = _rt()
+        x = rng.standard_normal(inf.size.dim) * scale + 0.05
+        want = fake.core.decode_token_output(inf, norm.norm(rt, fake.core.encode_token_input(inf, x), cfg, 5))
+        rt, fhe, inf = _rt()
+        y = norm.norm(rt, fake.core.encode_token_input(inf, x), dataclasses.replace(cfg, zladder=1), 5)
+        np.testing.assert_allclose(fake.core.decode_token_output(inf, y), want, rtol=1e-8,
+                                   atol=1e-10 * np.abs(want).max())
+        d = rt.dims
+        off = np.ones(d.N, bool)
+        off[np.arange(d.dim) * d.t] = False
+        assert np.abs(y.vec[off]).max() < 1e-12
+
+
 def test_norm_spru_step_masks():
     cfg = dataclasses.replace(config.load_configs(str(CFG)).norm["transformer.h.3.ln_1"], spru=1)
     rt, _fhe, _inf = _rt()

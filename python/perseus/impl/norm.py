@@ -118,6 +118,37 @@ def _norm_spru(rt, x2, xs, cfg: NormCfg, c: float):
     return ops.mult(centered, inv)
 
 
+def _norm_zladder(rt, xs, cfg: NormCfg, c: float):
+    """norm() with the token's sum and sum of squares on ONE complex ladder: z = alpha xs + i beta xs^2 summed over
+    every slot (the stride-t ladder, then the t lanes: 22 + 10 hoisted rotations instead of the mean's 22 and the
+    variance's 35), split by one conjugation; var = m2 - mu^2. alpha, beta (constant products, no plaintext) make
+    the split's halves sqrt(s) mu and s m2, so the Chebyshev's argument u = im - re^2 + const costs no affine
+    level; the centring reads the mean from the same split. The refreshes stay the plan's (var or inv)."""
+    ops, d = rt.ops, rt.dims
+    N, t, dr = d.N, d.t, d.dim
+    _a, _b, s, o = _spru_consts(cfg, d)
+    alpha, beta = 0.5 * math.sqrt(s) / dr, 0.5 * s / dr
+    z = ops.add(ops.mult(xs, alpha), ops.mult_i(ops.mult(ops.square(xs), beta)))
+    z = ops.tag_reduce(rotsum(ops, rotsum(ops, z, t, N), 1, t), 1)       # alpha S1 + i beta S2 in every slot
+    zc = ops.conjugate(z)
+    re = ops.add(z, zc)                                   # sqrt(s) mu
+    im = ops.mult_i(ops.sub(zc, z))                       # s m2
+    u = ops.sub(im, ops.square(re))                       # s (m2 - mu^2)
+    u = ops.add(u, s * cfg.epsilon * c * c - o)           # s (var + eps c^2) - o, in [-1, 1]
+    init = eval_chebyshev(ops, u, cfg.cheb_coeffs, -1.0, 1.0)
+    if cfg.cheb_nr_iters > 0:
+        var = ops.add(ops.mult(u, 1.0 / s), o / s)
+        inv = inv_sqrt_newton_d2(ops, var, init, cfg.cheb_nr_iters, 1.0 / (cfg.inv_out_scale * cfg.inv_out_scale))
+    else:
+        inv = init
+    mean = rt.mult_mask(re, ("ln.zl.mu", s), lambda: stride_mask(N, dr, t, -1.0 / math.sqrt(s)))
+    centered = ops.add(xs, mean)
+    if getattr(ops, "realize_shared", False):
+        ops.realize(centered)
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(centered, inv)
+
+
 def norm(rt, x, cfg: NormCfg, pos: int):
     """norm(): returns inv_out_scale * LN(x) on the lanes (no gamma/beta); pos is the
     absolute token position (capture_t) selecting center_scale_sq."""
@@ -130,6 +161,8 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     xs = rt.mult_mask(x2, ("ln.center", c), lambda: active_token_mask(N, dr, t, 0.5 * c))
     if cfg.spru and cfg.cheb_coeffs and ops.ln_cheb:
         return _norm_spru(rt, x2, xs, cfg, c)
+    if cfg.zladder and cfg.cheb_coeffs and ops.ln_cheb:
+        return _norm_zladder(rt, xs, cfg, c)
     # mean: mod-t class sum (cachemir_norm_utils.cu) times -1/d on the lanes (norm.cu)
     mean = ops.tag_reduce(rotsum(ops, xs, t, N), t)       # t-periodic (mod-t class sum)
     mean = rt.mult_mask(mean, "ln.scalemask", lambda: stride_mask(N, dr, t, -1.0 / dr))
