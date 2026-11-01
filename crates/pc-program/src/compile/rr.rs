@@ -5,13 +5,21 @@
 //! (`pc_gpu::relin::RelinRescaler`): not bit-identical.
 use super::check::rule;
 use crate::program::{Kind, Op, Program, Var, VarId};
-use pc_shadow::Shadow;
+use pc_shadow::{ChainShape, Shadow};
 use std::collections::HashMap;
 
 /// The deepest level a fused product may sit at (the runtime's tables start at top 6).
 pub const MAX_LEVEL: u32 = 44;
 
-pub fn fuse(p: &mut Program, sh: &Shadow) -> usize {
+/// Whether the rescale that lands at `level` drops a pair of primes on `chain` (the real chain's shape: the compile's
+/// shadow runs an alternating user region's levels on its uniform grid), the only rescale the runtime's tables fuse:
+/// every one on a chain of uniform levels, on an alternating user region (`ChainShape::singles`) not its one-prime
+/// levels'.
+fn pair_rescale(chain: &ChainShape, level: u32) -> bool {
+    chain.singles == 0 || matches!((level.checked_sub(chain.unit).and_then(|l| chain.primes_dropped(l)), chain.primes_dropped(level)), (Some(a), Some(b)) if b == a + 2)
+}
+
+pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
     let mut uses: HashMap<VarId, usize> = HashMap::new();
     for op in &p.ops {
         for v in op.all_ins() {
@@ -79,7 +87,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow) -> usize {
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let want = p.vars[r as usize].meta;
-        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || outs[0].level > MAX_LEVEL + sh.unit() {
+        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || outs[0].level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, outs[0].level) {
             continue;
         }
         gone.push(j);
@@ -139,7 +147,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow) -> usize {
 /// A product whose one reader pays its rescale as a prelude (`Rescale` its only prelude on that operand) becomes a
 /// `MultRescale` the reader reads with no prelude on it (its recipe re-derived and unchanged otherwise, its output
 /// meta unchanged). Run after `fuse`.
-pub fn fuse_preludes(p: &mut Program, sh: &Shadow) -> usize {
+pub fn fuse_preludes(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
     use pc_shadow::{Operand, Prelude};
     let pos_of = |o: Operand| if o == Operand::A { 0usize } else { 1 };
     let mut uses: HashMap<VarId, usize> = HashMap::new();
@@ -187,7 +195,7 @@ pub fn fuse_preludes(p: &mut Program, sh: &Shadow) -> usize {
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl: false, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let wm = outs[0];
-        if wm.level > MAX_LEVEL + sh.unit() {
+        if wm.level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, wm.level) {
             continue;
         }
         let mut cins = c.ins.clone();

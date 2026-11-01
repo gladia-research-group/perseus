@@ -533,9 +533,10 @@ pub fn compile_block(
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default });
     if crate::program::lever_on("rr") {
-        rr::fuse(&mut p, &sh);
+        let shape = ChainShape::of(&chain_of(cfg)?);
+        rr::fuse(&mut p, &sh, &shape);
         if crate::program::lever_on("rr_pre") {
-            rr::fuse_preludes(&mut p, &sh);
+            rr::fuse_preludes(&mut p, &sh, &shape);
         }
     }
     if crate::program::lever_on("share") {
