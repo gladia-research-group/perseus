@@ -54,6 +54,8 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
         }
     }
     __syncthreads();
+    // the predecessor's rows (the INTT's) are read from here on; the job tables above are setup constants
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     const int idx = blockIdx.x * BX + threadIdx.x;
     W y[NY];
     double v = 0.0;
@@ -134,6 +136,7 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
 template <class W, class MM>
 __device__ __forceinline__ void bconv_dispatch(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     const BconvJob J = jobs[blockIdx.z];
     if (J.exact && J.nsrc == 15) bconv_body<W, MM, 15, 1>(J, src, dst, pool, pr);  // P and the two tops of the lean chain
     else if (!J.exact && J.nsrc == 13) bconv_body<W, MM, 13, 0>(J, src, dst, pool, pr);
@@ -308,10 +311,19 @@ int launch(const BconvArgs* a, cudaStream_t s) {
     const long wave = 12L * num_sms(), per_y = (long)grid.x * grid.z;
     const int most = (a->max_tgt + 7) / 8;
     if ((long)grid.y * per_y < wave && (int)grid.y < most) grid.y = (unsigned)max((long)grid.y, min((long)most, wave / per_y));
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(BX);
+    cfg.stream = s;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = 1;
     if ((long)grid.x * grid.y * grid.z > 10L * num_sms())
-        bconv_kernel12<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+        cudaLaunchKernelEx(&cfg, bconv_kernel12<W, MM>, (const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
     else
-        bconv_kernel<W, MM><<<grid, BX, 0, s>>>((const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
+        cudaLaunchKernelEx(&cfg, bconv_kernel<W, MM>, (const W*)a->src, (W*)a->dst, a->jobs, (const W*)a->pool, a->pr);
     return (int)cudaGetLastError();
 }
 }  // namespace bconv

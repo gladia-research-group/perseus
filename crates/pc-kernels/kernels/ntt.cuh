@@ -274,6 +274,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
     const W p2 = kp<W>(p, 2);
     const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
     W x[16];
+    pdl_wait();
 #pragma unroll
     for (int j = 0; j < 16; ++j) x[j] = in[(q + 16 * j) * 256 + c];
     for (int m = 1; m < T.snum; ++m) {
@@ -300,6 +301,7 @@ __global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
     const W* ws = (const W*)T.fws + (size_t)pid * N;
     const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
     W x[8];
+    pdl_wait();
 #pragma unroll
     for (int j = 0; j < 8; ++j) x[j] = in[(q + 32 * j) * 256 + c];
     for (int m = 1; m < T.snum; ++m) {
@@ -564,6 +566,7 @@ __global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
 template <class W, int L>
 __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
     __shared__ W s[256 * 16];
+    pdl_trigger();
     const int row = blockIdx.y;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
     const int pid = T.rprime[row];
@@ -612,6 +615,7 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
 template <class W, int L>
 __global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
     __shared__ W s[256 * 8];
+    pdl_trigger();
     const int row = blockIdx.y;
     W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
     const int pid = T.rprime[row];
@@ -672,8 +676,8 @@ constexpr int COLS8_MAX = 9;
 
 template <class W, int L>
 void fwd_chunk(const NttArgs& b, int m, cudaStream_t s) {
-    if (m <= COLS8_MAX) ntt_fwd_cols8<W, L><<<dim3(32, m), 256, 0, s>>>(b);
-    else ntt_fwd_cols<W, L><<<dim3(16, m), 256, 0, s>>>(b);
+    if (m <= COLS8_MAX) launch_pdl(ntt_fwd_cols8<W, L>, dim3(32, m), s, b);
+    else launch_pdl(ntt_fwd_cols<W, L>, dim3(16, m), s, b);
     launch_pdl(ntt_fwd_rows<W, L>, dim3(32, m), s, b);
 }
 template <class W, int L>

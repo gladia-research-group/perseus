@@ -81,12 +81,14 @@ __global__ void rescale_combine(RescaleCombineArgs A) {
 // rescale_coef's two sources of every coefficient (ndrop 2), into tmp rows top (y_a, scaled by ca) and top - 1 (y')
 template <class W, class MM>
 __global__ void rescale_prep(RescaleArgs A) {
+    ntt::pdl_trigger();
     const int c = blockIdx.z >> 1, part = blockIdx.z & 1;
     const int i = blockIdx.x * BX + threadIdx.x;
     const int a = A.top, b = A.top - 1;
     const PrimeConst& pa = A.pr[a];
     const PrimeConst& pb = A.pr[b];
     const W qb = (W)pb.p;
+    ntt::pdl_wait();
     W ya = at<W>(A.x, c, part, a)[i];
     W yb = at<W>(A.x, c, part, b)[i];
     if (A.ca != 1) {
@@ -115,6 +117,7 @@ __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     const W qam = ((const W*)A.qam)[r], qbm = ((const W*)A.qbm)[r];
     const int c = threadIdx.x & 15, g = threadIdx.x >> 4;
     W x[16];
+    ntt::pdl_wait();
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const int o = (g + 16 * j) * 256 + c;
@@ -133,7 +136,18 @@ int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
     const RescaleArgs& R = a->rs;
     const NttArgs& T = a->ntt;
     if (R.ndrop != 2 || T.soff || T.epi < 0 || T.epi > 3 || (T.epi && (!T.eout || !T.ex || !T.es || !T.ess))) return -1;
-    rescale_prep<W, MM><<<dim3(N / BX, 1, 2 * R.K), BX, 0, s>>>(R);
+    {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(N / BX, 1, 2 * R.K);
+        cfg.blockDim = dim3(BX);
+        cfg.stream = s;
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = at;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, rescale_prep<W, MM>, R);
+    }
     NttArgs b = T;
     b.snum = 1;
     b.xnum = max(T.xnum, 1);
@@ -145,13 +159,13 @@ int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
         b.roff = T.roff + i;
         b.rprime = T.rprime + i;
         if (lz >= 2) {
-            cols_rs<W, MM, 2><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(cols_rs<W, MM, 2>, dim3(16, m), s, b, R);
             ntt::launch_pdl(ntt::ntt_fwd_rows<W, 2>, dim3(32, m), s, b);
         } else if (lz) {
-            cols_rs<W, MM, 1><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(cols_rs<W, MM, 1>, dim3(16, m), s, b, R);
             ntt::launch_pdl(ntt::ntt_fwd_rows<W, 1>, dim3(32, m), s, b);
         } else {
-            cols_rs<W, MM, 0><<<dim3(16, m), 256, 0, s>>>(b, R);
+            ntt::launch_pdl(cols_rs<W, MM, 0>, dim3(16, m), s, b, R);
             ntt::launch_pdl(ntt::ntt_fwd_rows<W, 0>, dim3(32, m), s, b);
         }
     }
