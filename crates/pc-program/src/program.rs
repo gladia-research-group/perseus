@@ -268,6 +268,10 @@ pub struct Pairing {
     /// The largest member CF (`PAIR_CF_MAX`, or `PAIR_CF_MAX_LEAN` on a lean chain) and the CF of a route without one.
     pub cf_max: u32,
     pub cf_default: u32,
+    /// Launches ahead a refresh's mate is looked for (config `bts.pair_window`; 0 = `compile::batch`'s default), the
+    /// ops its chain may bring forward scaling with it.
+    #[serde(default)]
+    pub window: u32,
 }
 
 /// The largest correction factor of a pair member (the pair's 1/2 comes out of a member's pre-scale 2^(19 - CF)):

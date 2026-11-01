@@ -67,6 +67,9 @@ section! {
         #[doc = "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh (pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own)."]
         #[doc = "Runtime switch `PC_BTS_PAIR`."]
         pair: Flag = "PC_BTS_PAIR", "(unset)";
+        #[doc = "How far ahead (launches) a refresh pair's second member is looked for, the ops it may bring forward scaling with it (pc-program `compile::batch::pull_pairs`; unset = 2560 launches, 1024 ops)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_WINDOW`."]
+        pair_window: Int = "PC_BTS_PAIR_WINDOW", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";

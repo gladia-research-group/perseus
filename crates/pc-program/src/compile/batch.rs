@@ -309,13 +309,15 @@ fn pull_pairs(p: &mut Program, pr: Pairing) {
         }
     }
     let ops: Vec<Option<Op>> = ops.into_iter().map(Some).collect();
+    // bts.pair_window: a wider window, the ops a member may bring along scaled with it
+    let (window, max_ops) = if pr.window > 0 { (pr.window as usize, pr.window as usize * PAIR_OPS / PAIR_WINDOW) } else { (PAIR_WINDOW, PAIR_OPS) };
     // the candidate graph on the order as it is (everything up to the first member counts as issued)
     let mut adj: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
     for list in bucket.values() {
         for (a, &i) in list.iter().enumerate() {
             let before: Vec<bool> = (0..n).map(|x| x <= i).collect();
-            for &j in list[a + 1..].iter().filter(|&&j| j <= i + PAIR_WINDOW) {
-                if let Some((_, c)) = unissued_ancestors(&preds, &[i], j, &before, &ops) {
+            for &j in list[a + 1..].iter().filter(|&&j| j <= i + window) {
+                if let Some((_, c)) = unissued_ancestors(&preds, &[i], j, &before, &ops, max_ops) {
                     adj.entry(i).or_default().push((j, c));
                     adj.entry(j).or_default().push((i, c));
                 }
@@ -326,7 +328,7 @@ fn pull_pairs(p: &mut Program, pr: Pairing) {
     let mut best: Option<(usize, Vec<Op>)> = None;
     for _ in 0..PAIR_ROUNDS {
         let mate = matching(&adj, &banned);
-        let (out, formed, lost) = issue_pairs(&preds, &mate, ops.clone());
+        let (out, formed, lost) = issue_pairs(&preds, &mate, ops.clone(), max_ops);
         if best.as_ref().is_none_or(|b| formed > b.0) {
             best = Some((formed, out));
         }
@@ -341,8 +343,8 @@ fn pull_pairs(p: &mut Program, pr: Pairing) {
 /// Rounds of `pull_pairs`' matching.
 const PAIR_ROUNDS: usize = 8;
 
-/// j's unissued ancestors (launches) and their ops; None when one of `not` is among them or they exceed `PAIR_OPS` ops.
-fn unissued_ancestors(preds: &[Vec<usize>], not: &[usize], j: usize, done: &[bool], ops: &[Option<Op>]) -> Option<(Vec<usize>, usize)> {
+/// j's unissued ancestors (launches) and their ops; None when one of `not` is among them or they exceed `max_ops` ops.
+fn unissued_ancestors(preds: &[Vec<usize>], not: &[usize], j: usize, done: &[bool], ops: &[Option<Op>], max_ops: usize) -> Option<(Vec<usize>, usize)> {
     let mut anc: Vec<usize> = vec![];
     let mut seen: HashSet<usize> = HashSet::new();
     let mut stack: Vec<usize> = preds[j].clone();
@@ -355,7 +357,7 @@ fn unissued_ancestors(preds: &[Vec<usize>], not: &[usize], j: usize, done: &[boo
             continue;
         }
         n_ops += ops[a].as_ref().map_or(0, |o| o.members().len());
-        if n_ops > PAIR_OPS {
+        if n_ops > max_ops {
             return None;
         }
         anc.push(a);
@@ -380,7 +382,7 @@ fn matching(adj: &BTreeMap<usize, Vec<(usize, usize)>>, banned: &HashSet<(usize,
 
 /// The launches in order with the matched pairs issued (see `pull_pairs`): the order, the pairs formed, the matched
 /// pairs it could not keep (as (first, second) launch indices).
-fn issue_pairs(preds: &[Vec<usize>], mate: &HashMap<usize, usize>, mut ops: Vec<Option<Op>>) -> (Vec<Op>, usize, Vec<(usize, usize)>) {
+fn issue_pairs(preds: &[Vec<usize>], mate: &HashMap<usize, usize>, mut ops: Vec<Option<Op>>, max_ops: usize) -> (Vec<Op>, usize, Vec<(usize, usize)>) {
     let n = ops.len();
     let pair = |a: usize, b: usize, ops: &mut [Option<Op>]| -> Op {
         let m: Vec<Op> = [a, b].iter().filter_map(|&x| ops[x].take()).collect();
@@ -397,7 +399,7 @@ fn issue_pairs(preds: &[Vec<usize>], mate: &HashMap<usize, usize>, mut ops: Vec<
             out.extend(ops[i].take());
             continue;
         };
-        let Some((_, mut anc)) = Some(j).filter(|&j| !done[j]).and_then(|j| unissued_ancestors(preds, &[i], j, &done, &ops)).map(|a| (j, a.0)) else {
+        let Some((_, mut anc)) = Some(j).filter(|&j| !done[j]).and_then(|j| unissued_ancestors(preds, &[i], j, &done, &ops, max_ops)).map(|a| (j, a.0)) else {
             lost.push((i, j));
             out.extend(ops[i].take());
             continue;
@@ -409,7 +411,7 @@ fn issue_pairs(preds: &[Vec<usize>], mate: &HashMap<usize, usize>, mut ops: Vec<
             }
             done[a] = true;
             // a matched refresh among them comes with its mate (and the mate's ancestors) when it can
-            let nested = mate.get(&a).copied().filter(|&b| b != i && b != j && !done[b]).and_then(|b| unissued_ancestors(preds, &[i, j, a], b, &done, &ops).map(|(x, _)| (b, x)));
+            let nested = mate.get(&a).copied().filter(|&b| b != i && b != j && !done[b]).and_then(|b| unissued_ancestors(preds, &[i, j, a], b, &done, &ops, max_ops).map(|(x, _)| (b, x)));
             match nested {
                 Some((b, mut bx)) => {
                     bx.sort_unstable();
