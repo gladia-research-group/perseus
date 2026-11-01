@@ -127,3 +127,22 @@ def poly_eval(ops, x, c):
 def poly_eval_masked(rt, x, c):
     return eval_chebyshev_masked(rt.ops, x, c, -1.0, 1.0, None,
                                  lambda ct, s: rt.mult_mask(ct, ("t.m", s), lambda: np.full(rt.dims.N, s)))
+
+
+CFG_PF = PKG / "configs/model/approximation/gpt2_base_n32_pf_cm/configs.json"
+
+
+@pytest.mark.parametrize("layer", range(12))
+def test_masked_series_leaf_terms_keep_depth(layer):
+    """With add_mask (the prefill's exp: degree-8 series whose trimmed top leaves no slack) every leaf takes the mask
+    term by term: the masked series lands at the series' own depth."""
+    coeffs = json.load(open(CFG_PF))["softmax"][f"transformer.h.{layer}.attn"]["cheb_coeffs"]
+    rng = np.random.default_rng(4)
+    x = rng.uniform(-1, 1, 1024)
+    M = (rng.uniform(0, 1, x.size) > 0.3) * 0.37
+    ops = _DepthOps()
+    ref = eval_chebyshev(ops, _V(x, 0), coeffs, -1.0, 1.0)
+    got = eval_chebyshev_masked(ops, _V(x, 0), coeffs, -1.0, 1.0, None, lambda ct, s: _V(ct.v * (s * M), ct.d + 1),
+                                lambda ct, s: _V(ct.v + s * M, ct.d))
+    np.testing.assert_allclose(got.v, ref.v * M, rtol=0, atol=1e-13 * np.abs(ref.v).max())
+    assert got.d == ref.d

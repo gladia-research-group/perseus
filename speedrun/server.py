@@ -38,7 +38,7 @@ DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh"
 # speedrun/make_prefill_plan.sh's plan with CutMax's scaled normalisers (stage 13 replanned: its PLAN_CMD.txt), on the
 # lean chain n32a4 too (PRESET=n32a4; its runtime line's CHAIN_PRESET), carried onto the attention whose window ladders
 # are one rotation per window (speedrun/make_prefill_wrot_plan.sh, PF_ATTN_WROT=3)
-PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw"
+PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw_mf"
 
 
 def write(root, rel, payload):
