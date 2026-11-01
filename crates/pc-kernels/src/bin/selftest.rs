@@ -388,6 +388,8 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
         pr: st.pr(),
         njobs: 2,
         max_tgt: 5,
+        kind: 0,
+        pad: 0,
     };
     ck(unsafe { (st.t.bconv)(&a, st.s()) });
     let got = dst.read(&st.ctx);
@@ -479,7 +481,7 @@ fn t_bconv_wide(st: &mut Setup) -> Vec<TestResult> {
     let words = |pre: u32| -> Vec<u32> { jobs.iter().flat_map(|j| [j[0], j[1], j[2], j[3], j[4], j[5], pre, pre]).collect() };
     let jobs_d = st.ctx.up32(&words(0));
     let dst = st.ctx.zeros(ndst * N);
-    let a = BconvArgs { src: src.c(), dst: dst.p(), jobs: jobs_d.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 2, max_tgt: 20 };
+    let a = BconvArgs { src: src.c(), dst: dst.p(), jobs: jobs_d.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 2, max_tgt: 20, kind: 0, pad: 0 };
     ck(unsafe { (st.t.bconv_wide)(&a, st.s()) });
     let mut out = vec![cmp("bconv_wide 40 sources (plain + exact HPS) vs host", &dst.read(&st.ctx), &want)];
     // the plain job prescaled (rows hold x pre) with the split reduction
@@ -493,19 +495,21 @@ fn t_bconv_wide(st: &mut Setup) -> Vec<TestResult> {
     out
 }
 
-/// Lean-chain-sized conversions (u32 words): 13 sources -> 26 targets (a full digit's ModUp, two target blocks) and an
-/// exact 15 -> 37 (the fused ModDown + rescale: P and two tops; more targets than one block's table), prescaled, with
-/// and without the split reduction.
+/// Lean-chain-sized conversions (u32 words): 13 sources -> 26 targets (a full digit's ModUp, two target blocks), an
+/// exact 15 -> 37 (the fused ModDown + rescale: P and two tops; more targets than one block's table), and exact 13 -> 23
+/// and 14 -> 22 (an alternating region's ModDown from P, a one-prime fused ModDown + rescale), prescaled, with and
+/// without the split reduction; the exact jobs also by their kind's kernel (ABI 21: the rounding by `exact_round`).
 fn t_bconv_lean(st: &mut Setup) -> Vec<TestResult> {
     if st.ctx.wb != 4 {
         return Vec::new();
     }
     let src_h = st.rand_slots(2);
     // (sources: rows 0..ns, prime ids r % 8; targets: prime ids k % 8 at dst rows dst_off..; exact)
-    let shapes = [(13usize, 26usize, 0usize, false), (15, 37, 26, true)];
+    let shapes = [(13usize, 26usize, 0usize, false), (15, 37, 26, true), (13, 23, 63, true), (14, 22, 86, true)];
+    let ndst = 108;
     let mut pool: Vec<u64> = Vec::new();
     let mut words: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
-    let mut want = vec![0u64; 63 * N];
+    let mut want = vec![0u64; ndst * N];
     let mut src_pre: Vec<Vec<u64>> = Vec::new();
     for &(ns, nt, dst_off, exact) in &shapes {
         let off = pool.len();
@@ -556,18 +560,25 @@ fn t_bconv_lean(st: &mut Setup) -> Vec<TestResult> {
     }
     let pool_d = st.ctx.up(&pool);
     let mut out = Vec::new();
-    for (split, w) in words.iter().enumerate() {
-        // one launch per job (each reads its own prescaled rows from row 0)
-        let dst = st.ctx.zeros(63 * N);
-        for (j, sp) in src_pre.iter().enumerate() {
-            let sd = st.ctx.up(sp);
-            let jw = st.ctx.up32(&w[8 * j..8 * j + 8]);
-            let a = BconvArgs { src: sd.c(), dst: dst.p(), jobs: jw.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 1, max_tgt: shapes[j].1 as i32 };
-            ck(unsafe { (st.t.bconv)(&a, st.s()) });
+    for by_kind in [false, true] {
+        for (split, w) in words.iter().enumerate() {
+            // one launch per job (each reads its own prescaled rows from row 0)
+            let dst = st.ctx.zeros(ndst * N);
+            for (j, sp) in src_pre.iter().enumerate() {
+                let sd = st.ctx.up(sp);
+                let jw = st.ctx.up32(&w[8 * j..8 * j + 8]);
+                let kind = if by_kind && shapes[j].3 { shapes[j].0 as i32 } else { 0 };
+                let a = BconvArgs { src: sd.c(), dst: dst.p(), jobs: jw.c() as *const BconvJob, pool: pool_d.c(), pr: st.pr(), njobs: 1, max_tgt: shapes[j].1 as i32, kind, pad: 0 };
+                ck(unsafe { (st.t.bconv)(&a, st.s()) });
+            }
+            let got = dst.read(&st.ctx);
+            let name = format!(
+                "bconv 13 -> 26, exact 15 -> 37, 13 -> 23, 14 -> 22, prescaled{}{} vs host",
+                if split == 1 { " + split" } else { "" },
+                if by_kind { ", exact jobs by kind" } else { "" }
+            );
+            out.push(cmp(&name, &got, &want));
         }
-        let got = dst.read(&st.ctx);
-        let name = if split == 1 { "bconv 13 -> 26, exact 15 -> 37, prescaled + split vs host" } else { "bconv 13 -> 26, exact 15 -> 37, prescaled vs host" };
-        out.push(cmp(name, &got, &want));
     }
     out
 }

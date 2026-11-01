@@ -40,6 +40,9 @@ pub struct BconvPlan<'a> {
     pub max_tgt: usize,
     /// Most sources of a job (> MAX_SRC: the wide kernel).
     pub max_src: usize,
+    /// `BconvArgs::kind`: 13, 14 or 15 when every job is exact with that many sources (u32 words: a kernel of that
+    /// body alone), else 0.
+    kind: i32,
     /// Largest limb read in src / written in dst + 1 (bounds checks at launch).
     pub src_limbs: usize,
     pub dst_limbs: usize,
@@ -138,6 +141,10 @@ impl<'a> BconvPlan<'a> {
             njobs: specs.len(),
             max_tgt,
             max_src: specs.iter().map(|j| j.src.len()).max().unwrap_or(0),
+            kind: match specs.first() {
+                Some(f) if std::mem::size_of::<W>() == 4 && (13..=15).contains(&f.src.len()) && specs.iter().all(|j| j.exact && j.src.len() == f.src.len()) => f.src.len() as i32,
+                _ => 0,
+            },
             src_limbs,
             dst_limbs,
             prefix_limbs,
@@ -193,6 +200,8 @@ impl<'a> BconvPlan<'a> {
             pr: ctx.pr(),
             njobs: njobs as i32,
             max_tgt: self.max_tgt as i32,
+            kind: self.kind,
+            pad: 0,
         };
         // SAFETY: job records are BconvJob-sized u32 octets; limb ranges checked above; src/dst are distinct borrows
         let f = if self.max_src > MAX_SRC { ctx.table.bconv_wide } else { ctx.table.bconv };
