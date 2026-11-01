@@ -9,7 +9,7 @@ import numpy as np
 
 from .config import GeluCfg
 from .layout import active_expanded_lanes, active_expanded_mask
-from .poly import eval_chebyshev, eval_polynomial_ps, im_cleanse
+from .poly import eval_chebyshev, eval_chebyshev_masked, eval_polynomial_ps, im_cleanse
 
 
 # PF_ACT_FOLD=1: fold a constant output mask into the THOR coefficients (changes the captured op stream)
@@ -72,6 +72,10 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
     if cfg.method == "chebyshev":
         if ops.gelu_fold:   # x arrives as x / xmax (the up-projection carries 1/xmax): GELU(x) = xmax q(x / xmax),
             # q the Chebyshev series on [cheb_a, cheb_b]; xmax rides the lane mask, the refreshes are the plan's
+            if cfg.mask_fold:   # xmax rides the coefficients, the 0/1 lane mask the series' giants and last leaf
+                return eval_chebyshev_masked(
+                    ops, x, [cfg.xmax * float(c) for c in cfg.cheb_coeffs], cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps,
+                    lambda ct, s: rt.mult_mask(ct, ("gelu.cheb.m", s) + L, lambda: _expanded(d, s, lanes)))
             g = eval_chebyshev(ops, x, cfg.cheb_coeffs, cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps)
             return rt.mult_mask(g, ("gelu.cheb", cfg.xmax) + L, lambda: _expanded(d, cfg.xmax, lanes))
         ops.bootstrap_hint(x, ops.headroom(4))
