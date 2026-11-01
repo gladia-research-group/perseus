@@ -7,7 +7,8 @@
 # (RD_SRC's runtime values by default; the plan's runtime line gets the ones used), then speedrun/make_prefill_wrot_plan.sh
 # with the served switches. Stages 12-13 are RD_SRC's. ROUTES_FREE=1 lets the pass re-pick a refresh's route (reported).
 # GRAPH=<capture> with REUSE_CAPTURE=1 takes an existing capture; KEEP_FROM=<pfbh-level plan on it> takes its decisions
-# as they are instead of mapping BASE's (e.g. blocks replanned on the ILP over the capture).
+# as they are instead of mapping BASE's (e.g. blocks replanned on the ILP over the capture). PLAN_RAISE_DELIB=1 reports
+# the PCMM finishes (and other deliberate refreshes) that could land lower still (the planner's probe).
 #   NAME=mfsab2 CONFIGS=gpt2_base_n32_pf_mf_s16_ab2 CM_CONFIGS=gpt2_base_n32_pf_cm_mf_s16_ab2 \
 #   PF_PCMM_RAISE=up:3:2-2,up:3:11-11,up:2:0-1,up:2:3-10,up:1,qkv:5:11-11,qkv:1:3-3 bash speedrun/make_prefill_carry_plan.sh
 #   -> graphs/gpt2_prefill128_pfbh_$NAME, bootstrap_placements/gpt2_prefill128_n32a4_pfbh{,rd_cm,rd_cmw}_$NAME
@@ -90,6 +91,7 @@ cp graphs/gpt2_prefill128_pfbh/capture_env.json "$B/"
 # shellcheck disable=SC2086
 env $RECIPE PF_PCMM_RAISE="$RAISE" PF_PCMM_RAISE_OUT="$RAISE_OUT" PLAN_KEEP_PLACEMENTS="bootstrap_placements/$KEEP" bash python/perseus/examples/gpt2/make_plan.sh "$B" "$OUTB" blocks \
     > "bootstrap_placements/$OUTB.log" 2>&1 || { tail -5 "bootstrap_placements/$OUTB.log" >&2; exit 1; }
+grep -h "delib drop probe" "bootstrap_placements/$OUTB.log" || true      # PLAN_RAISE_DELIB=1's report
 rm -rf "$B" "bootstrap_placements/$OUTB.log"
 "$PYTHON" - "bootstrap_placements/$KEEP" "bootstrap_placements/$OUTB" "bootstrap_placements/$RD_SRC" "${ROUTES_FREE:-0}" <<'PY'
 import json, sys
