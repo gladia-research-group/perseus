@@ -7,7 +7,9 @@
 # drops, routes and realize anchors renamed onto the new stream (remap), the new nodes left lazy (no realize anchor)
 # and unpinned except where they sit at the reactive ceiling as the nodes they replace did (pin, from a keep-going
 # compile); a last compile checks every remaining pin (level one-sided, degree exact) with no error.
-#   WROT=1 bash speedrun/make_prefill_wrot_plan.sh   -> bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw
+# PAIR_WINDOW: the runtime line's PC_BTS_PAIR_WINDOW (the attention's extra ops move same-depth refreshes further apart
+# than the default pair window: 6144 keeps WROT=3's refresh pairs, 4096 WROT=1's).
+#   WROT=3 PAIR_WINDOW=6144 bash speedrun/make_prefill_wrot_plan.sh   -> bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/local_env.sh
@@ -22,7 +24,7 @@ PLAN=bootstrap_placements/$BASE $R record "$T/new" "$W"
 rm -rf "bootstrap_placements/$OUT"
 # blocks 0-10 run prefill_attention; block 11 (the last position alone) and the tail stages keep BASE's stream
 $R remap "$T/old" "$T/new" "bootstrap_placements/$BASE" "bootstrap_placements/$OUT" --blocks 0-10 --unpin "$STEPS"
-sed -i "s/^runtime=\(.*\)$/runtime=\1 PF_ATTN_WROT=$W/" "bootstrap_placements/$OUT/PLAN_CMD.txt"
+sed -i "s/^runtime=\(.*\)$/runtime=\1 PF_ATTN_WROT=$W${PAIR_WINDOW:+ PC_BTS_PAIR_WINDOW=$PAIR_WINDOW}/" "bootstrap_placements/$OUT/PLAN_CMD.txt"
 PLAN=bootstrap_placements/$OUT COMPILE=1 $R record "$T/cw" "$W"
 $R pin "bootstrap_placements/$OUT" "$T/cw" --blocks 0-10 --steps "$STEPS"
 PLAN=bootstrap_placements/$OUT COMPILE=1 $R record "$T/cw2" "$W"
@@ -35,4 +37,4 @@ PY
 rm -rf "$T"
 echo "wrot=blocks 0-10 by speedrun/make_prefill_wrot_plan.sh (WROT=$W): $BASE's decisions carried by name onto the op \
 stream with PF_ATTN_WROT=$W ($STEPS rewritten: their new nodes lazy, unpinned but at the reactive ceiling); blocks 11-13 \
-are $BASE's" >> "bootstrap_placements/$OUT/PLAN_CMD.txt"
+are $BASE's${PAIR_WINDOW:+; refresh pairs looked for $PAIR_WINDOW launches ahead (PC_BTS_PAIR_WINDOW)}" >> "bootstrap_placements/$OUT/PLAN_CMD.txt"
