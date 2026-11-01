@@ -151,6 +151,48 @@ class Head:
         return tok.reshape(self.L, -1)[np.arange(self.L), i]
 
 
+class Sampler:
+    """The head as generation's selection stage (`Gpt2Model.sampler`, in place of CutMax), set up from the head plan dir
+    `plan`; a fresh Gumbel draw per position, seeded by (seed, position)."""
+
+    def __init__(self, plan, seed=0):
+        import re
+        from types import SimpleNamespace
+        a = SimpleNamespace(plan=plan, set=[], k=40, L=1024, W=32.0, probes=8, fine=512, minp=0.1, topp=0.9)
+        _plan_settings(a)
+        tool = open(os.path.join(plan, "PLAN_CMD.txt")).read()
+        mode = re.search(r"--mode (\w+)", tool)
+        self.mode = mode.group(1) if mode else "topk"
+        self.head = Head(self.mode, k=a.k, L=a.L, W=a.W, probes=a.probes, fine=a.fine, minp=a.minp, topp=a.topp)
+        self.args, self.seed = a, seed
+
+    def gumbel(self, pos):
+        return np.random.default_rng((self.seed, pos)).gumbel(size=self.head.L)
+
+    def rotations(self):
+        return self.head.rotations()
+
+    def __call__(self, rt, tiles, pos):
+        from perseus.examples.gpt2.head import pack_tiles
+        ops = rt.ops
+        if len(tiles) == 1:              # t0 + i t1: Re and Im, tagged real (their refreshes take the real route)
+            z, zc = tiles[0], ops.conjugate(tiles[0])
+            tiles = [ops.mult(ops.add(z, zc), 0.5), ops.mult(ops.mult_i(ops.sub(zc, z)), 0.5)]
+        h = self.head
+        h.g = np.zeros(N)
+        h.g[::N // h.L] = self.gumbel(pos)
+        return [pack_tiles(rt, h.stage(ops, tiles)[:2])]
+
+
+def sampler_env():
+    """GPT2_SAMPLER=<head plan dir> (GPT2_SAMPLER_SEED): the generation's `Sampler`, or None (CutMax's argmax)."""
+    plan = os.environ.get("GPT2_SAMPLER")
+    if not plan:
+        return None
+    from perseus._paths import resolve
+    return Sampler(str(resolve(plan)), int(os.environ.get("GPT2_SAMPLER_SEED", "0")))
+
+
 def _tv(lg, a, b):
     """The total variation between softmax sampling restricted to the token sets a and b."""
     p = np.zeros(len(lg))

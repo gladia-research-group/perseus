@@ -7,6 +7,9 @@ token never leaves the ciphertext domain. The client decrypts the logits and z o
 
 Gate: at every step CutMax's token equals the argmax of the decrypted logits, and the tokens equal greedy decoding
 of the plaintext model (numpy GPT-2 on the same weights) from the same prompt.
+
+GPT2_SAMPLER=<head plan> samples by TFHE instead (tfhe_head.Sampler; a plan whose block 13 is that head, e.g.
+bootstrap_placements/gpt2_gen_topk with --stc-cache 64): the gate is valid one-hots.
 """
 from __future__ import annotations
 
@@ -84,6 +87,18 @@ class GenerateRun(PlannedRun):
                 json.dump(stub, fh)
         return super().prepare(rows, argmax)
 
+    tfhe_chunk = 0                         # > 0: the session serves the TFHE sampler (impl/tfhe.py)
+
+    def open_session(self, kw):
+        return super().open_session({**kw, "tfhe": self.tfhe_chunk} if self.tfhe_chunk else kw)
+
+    def setup(self, rows, argmax=False):
+        super().setup(rows, argmax)
+        if self.tfhe_chunk:
+            from perseus.impl import tfhe
+            tfhe.setup_session(self.sess)
+        return self
+
     def feedback(self, t):
         """Issue the feedback stage on token t's CutMax output; returns the register of position t+1's input."""
         n = self.rec.n_layers
@@ -129,6 +144,19 @@ def greedy_reference(store, ids, n_tokens):
     return out
 
 
+def _sampled_ref(smp, lg, pos):
+    """The plaintext sample: the Gumbel-max (the sampler's draw at `pos`) over the bucket maxima in the exact set."""
+    from types import SimpleNamespace
+    from .tfhe_head import VOCAB, _exact_set
+    a = smp.args
+    lg = lg[:VOCAB]
+    exact = _exact_set(SimpleNamespace(mode=smp.mode, k=a.k, minp=a.minp, topp=a.topp), lg)
+    bt = smp.head.buckets(lg)
+    g = smp.gumbel(pos)
+    best = [(lg[t] + g[j], int(t)) for j, t in enumerate(bt) if int(t) in exact]
+    return max(best)[1] if best else -1
+
+
 def prompt_ids(store, rows):
     """The token ids of embedding rows wte[id] + wpe[pos] (the oracle stores rows, not ids)."""
     from .weights import WPE, WTE
@@ -157,6 +185,7 @@ def main(argv=None):
     ap.add_argument("--work-dir", default=None, help="where the reference token's stream and the plan overlay go")
     ap.add_argument("--compile-only", action="store_true", help="record and compile on the CPU, no device")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--tfhe-chunk", type=int, default=4096, help="GPT2_SAMPLER: values per TFHE switch pass")
     a = ap.parse_args(argv)
     from perseus.examples.defaults import default_plan
     a.plan = a.plan or default_plan("gpt2_decode")
@@ -180,12 +209,15 @@ def main(argv=None):
         a.configs = env.plan_configs(a.plan, chain, "configs/model/approximation/gpt2_base_n32/configs.json")
     # the CPU twin that records the op streams (as run_decode's planned path)
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over}, chain, True)
+    from .tfhe_head import sampler_env
+    smp = sampler_env()                 # GPT2_SAMPLER: the selection stage samples by TFHE
     d = Dims.gpt2()
     band, _ = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real)
-    _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND)
+    _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND | set(smp.rotations() if smp else ()))
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
     rmodel = Gpt2Model(inf, store, cfgs, core=fakecap.core, packing=a.packing, kv_offload=False)
+    rmodel.sampler = smp
     n = rmodel.n_layers
 
     # the twin records every position the run reaches with the oracle's rows; only the prompt's are run inputs
@@ -194,7 +226,7 @@ def main(argv=None):
     os.environ["MULTI_T"] = str(a.prompt + a.tokens)
     rows = oracle_io.read_teacher_forced_inputs(oracle_io.RunConfig.from_env())[:a.prompt + a.tokens]
     ids = prompt_ids(store, rows[:a.prompt])
-    ref = greedy_reference(store, ids, a.tokens)
+    ref = greedy_reference(store, ids, a.tokens) if smp is None else [-1] * a.tokens
     print(f"[generate] prompt ids {ids}; plaintext greedy {ref}", flush=True)
 
     cfg = pcfg.plan_runtime(a.plan, chain, base=pcfg.preset("n32_gpt2_decode"))
@@ -204,6 +236,7 @@ def main(argv=None):
     keys = None if a.compile_only else _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     run = GenerateRun(GenRecorder(rmodel, n), resolve(a.plan), cfg, keys, work_dir=work, pt_rows=a.pt_rows,
                       stc_cache=a.stc_cache)
+    run.tfhe_chunk = a.tfhe_chunk if smp is not None else 0
     t0 = time.time()
     run.prepare(rows, argmax=True)
     print(f"[generate] compiled {len(run.progs)} programs in {time.time() - t0:.1f}s; refreshes: feedback stage "
@@ -221,21 +254,31 @@ def main(argv=None):
     for j in range(a.tokens):
         pos = a.prompt - 1 + j
         ts = time.time()
-        lg = dmodel.logits([run.ct(reg)])
+        lg = dmodel.logits([run.ct(reg)])             # decrypting waits for the forward
+        th = time.time()
         z = run.argmax(pos)
         zdec = dmodel.decode_z([run.ct(z)])
+        head_s = time.time() - th                      # the selection stage (+ z's decryption)
         cm, am = int(np.argmax(zdec)), int(np.argmax(lg))
         r = {"pos": pos, "cutmax": cm, "fhe_argmax": am, "ref": ref[j], "z_mass": float(zdec[cm]),
              "z_off_max": float(np.abs(np.delete(zdec, cm)).max())}
+        if smp is not None:             # the sample vs the same Gumbel draw's Gumbel-max over the exact set's buckets
+            r["fhe_argmax"] = r["ref"] = _sampled_ref(smp, np.asarray(lg, dtype=np.float64), pos)
+            r["ok_onehot"] = r["z_off_max"] < 0.1 and abs(r["z_mass"] - 1) < 0.1
         if j + 1 < a.tokens:
             x = run.feedback(pos)
             reg, _ = run.token(pos + 1, rows, argmax=True, entry=x, variant=run.FB_VARIANT)
-        r["step_s"] = time.time() - ts
+        r["step_s"], r["head_s"] = time.time() - ts, head_s
         res.append(r)
         ok = r["cutmax"] == r["fhe_argmax"] == r["ref"]
-        print(f"[generate] pos={pos} cutmax={cm} fhe_argmax={am} ref={ref[j]} {'OK' if ok else 'MISS'} "
-              f"z_mass={r['z_mass']:.4f} z_off_max={r['z_off_max']:.3e} step={r['step_s']:.2f}s", flush=True)
+        print(f"[generate] pos={pos} cutmax={cm} fhe_argmax={am} ref={r['ref']} {'OK' if ok else 'MISS'} "
+              f"z_mass={r['z_mass']:.4f} z_off_max={r['z_off_max']:.3e} step={r['step_s']:.2f}s head={head_s:.2f}s", flush=True)
     ok = all(r["cutmax"] == r["fhe_argmax"] == r["ref"] for r in res)
+    if smp is not None:                 # sampling: valid one-hots; agreement with the plaintext draw is reported
+        ok = all(r["ok_onehot"] for r in res)
+        print(f"[generate] {smp.mode} samples == plaintext Gumbel-max on the exact set {sum(r['cutmax'] == r['ref'] for r in res)}"
+              f"/{len(res)}; steps median {np.median([r['step_s'] for r in res]):.2f}s"
+              f", heads median {np.median([r['head_s'] for r in res]):.2f}s", flush=True)
     print(f"[generate] tokens={[r['cutmax'] for r in res]} ref={ref} wall={time.time() - t0:.0f}s "
           f"{'PASS' if ok else 'FAIL'}", flush=True)
     run.close()
