@@ -87,6 +87,7 @@ fn run(args: &[String]) -> Res<()> {
     mp.reserve("ks.groups", 2 * KeyGroup::bytes(1, true));
     let ocfg = OpsCfg::default();
     Ops::<W>::reserve(&mut mp, &ocfg);
+    mp.reserve("relin.rr", pc_gpu::relin::RelinRescaler::<W>::bytes(&chain, &lay, 1)?);
     let ctb = pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1));
     mp.reserve("bench.cts", 3 * ctb);
     let arena = mp.allocate(&dev)?;
@@ -95,6 +96,7 @@ fn run(args: &[String]) -> Res<()> {
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
     let kplans = KsPlans::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?;
     let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
+    ops.rr = Some(pc_gpu::relin::RelinRescaler::new(&arena, &ex.compute, &ctx, 1)?);
     let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, layout)?;
     let mut prng = test_prng(0x5b);
     let sk = SecretKey::sample(&mut prng, n)?;
@@ -121,9 +123,24 @@ fn run(args: &[String]) -> Res<()> {
     let shape = ctx.shape;
     let entry = shape.level_at(chain.lone_top().map_or(7, |t| t + 2) as u32).ok_or("no entry level")?;
     println!("[ops] chain {name}: {} Q + {} P primes (log QP {}), entry level {entry};", chain.q.len(), chain.p.len(), chain.log_qp);
-    println!("[ops] level, top, live limbs, log2 scale, ms (rotate, relin x*x, rescale, scalar x c, add), bits (x*x, rot)");
-    println!("| level | top | live | log2 sf | rotate | x*x relin | rescale | x*c | add | bits x*x | bits rot |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("[ops] level, top, live limbs, log2 scale, ms (rotate, relin x*x, rescale, scalar x c, add, fused relin-rescale x*x), bits (x*x, rot, fused x*x), FNV of the outputs (rot, x*x relin, x*x rescaled, fused x*x)");
+    println!("| level | top | live | log2 sf | rotate | x*x relin | rescale | x*c | add | x*x fused | bits x*x | bits rot | bits fused | fnv rot | fnv relin | fnv rescaled | fnv fused |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    // FNV-1a of a ciphertext's live rows (both parts, rows 0..=top)
+    let rows = lay.rows();
+    let fnv = |c: &Ct<'_, W>, ex: &Executor<'_, W>| -> Res<u64> {
+        let t = ctx.top_of(c.meta.level)?;
+        let h = c.buf.buf.download(&ex.compute)?;
+        let mut f = 0xcbf29ce484222325u64;
+        for part in 0..2 {
+            for r in 0..=t {
+                for &w in &h[(part * rows + r) * n..(part * rows + r + 1) * n] {
+                    f = (f ^ w as u64).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        Ok(f)
+    };
     let mut lv = 28;
     while lv <= entry + shape.unit {
         let top = ctx.top_of(lv)?;
@@ -161,20 +178,49 @@ fn run(args: &[String]) -> Res<()> {
             Ok(ops.mult_scalar_inplace(&ctx, ex, &sh, std::slice::from_mut(&mut z), &[Complex::new(0.75, 0.0)])?)
         })?;
         let t_add = time(&mut ex, &mut |ex| Ok(ops.add(&ctx, ex, &sh, std::slice::from_mut(&mut z), &[&x], &[&x])?))?;
-        let (mut b_mul, mut b_rot) = (f64::INFINITY, f64::INFINITY);
+        let served = ops.rr.as_ref().is_some_and(|rr| rr.serves(top, 1));
+        let t_rr = if served { time(&mut ex, &mut |ex| Ok(ops.mult_rescale(&ctx, ex, kc, &sh, &relin, &mut y, Some(&x), Some(&x), false)?))? } else { f64::NAN };
+        let (mut b_mul, mut b_rot, mut b_rr) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut fnvs = [0u64; 4];
         for s in 0..seeds {
             let v = fresh(&mut x, &mut ex, &mut prng, 101 + s as u64)?;
             ops.mult(&ctx, &mut ex, kc, &sh, &relin, &mut y, &x, &x)?;
+            if s == 0 {
+                fnvs[1] = fnv(&y, &ex)?;
+            }
             ops.rescale(&ctx, &mut ex, &sh, std::slice::from_mut(&mut y))?;
+            if s == 0 {
+                fnvs[2] = fnv(&y, &ex)?;
+            }
             let out = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?.remove(0);
             let e = out.iter().zip(&v).map(|(o, a)| (o.re - a.re * a.re).abs()).fold(0.0, f64::max);
             b_mul = b_mul.min(-e.log2());
+            if served {
+                ops.mult_rescale(&ctx, &mut ex, kc, &sh, &relin, &mut y, Some(&x), Some(&x), false)?;
+                if s == 0 {
+                    fnvs[3] = fnv(&y, &ex)?;
+                }
+                let out = dec.decrypt_slots(&ctx, &ex.compute, &enc, &y, Payload::Complex, Which::Dense)?.remove(0);
+                let e = out.iter().zip(&v).map(|(o, a)| (o.re - a.re * a.re).abs()).fold(0.0, f64::max);
+                b_rr = b_rr.min(-e.log2());
+            }
             rotate(&ctx, &mut ex, kc, &sh, &rot1, &x, 1, &mut z)?;
+            if s == 0 {
+                fnvs[0] = fnv(&z, &ex)?;
+            }
             let out = dec.decrypt_slots(&ctx, &ex.compute, &enc, &z, Payload::Complex, Which::Dense)?.remove(0);
             let e = (0..n / 2).map(|j| (out[j].re - v[(j + 1) % (n / 2)].re).abs()).fold(0.0, f64::max);
             b_rot = b_rot.min(-e.log2());
         }
-        println!("| {lv} | {top} | {} | {:.2} | {t_rot:.3} | {t_mul:.3} | {t_res:.3} | {t_sc:.3} | {t_add:.3} | {b_mul:.2} | {b_rot:.2} |", top + 1, sf.log2());
+        println!(
+            "| {lv} | {top} | {} | {:.2} | {t_rot:.3} | {t_mul:.3} | {t_res:.3} | {t_sc:.3} | {t_add:.3} | {t_rr:.3} | {b_mul:.2} | {b_rot:.2} | {b_rr:.2} | {:016x} | {:016x} | {:016x} | {:016x} |",
+            top + 1,
+            sf.log2(),
+            fnvs[0],
+            fnvs[1],
+            fnvs[2],
+            fnvs[3]
+        );
         lv += shape.unit;
     }
     Ok(())
