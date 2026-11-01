@@ -69,6 +69,23 @@ def vmap(on, nn):
                     if not any(m.get(z["output"]) == y for z in a if z is not x and z["output"] != x["inputs"][0]):
                         m[x["output"]] = y
                         hit += 1
+        if s.endswith("softmax"):
+            # gs_num: a reciprocal round's product y = z R is gone (the recursion returns z R): its value is the
+            # recursion's result, the image of R (an old ct x ct product whose one operand is mapped to a new node
+            # that no other old node maps to and whose other operand is a ciphertext)
+            for x in a:
+                if x["output"] in m or x["op_type"] != "mult" or len(x["inputs"]) != 2:
+                    continue
+                if not all(u.startswith("v_") for u in x["inputs"]):
+                    continue
+                for u in x["inputs"][::-1]:
+                    y = m.get(u)
+                    if y is None:
+                        continue
+                    if not any(m.get(z["output"]) == y for z in a if z is not x and z["output"] != u):
+                        m[x["output"]] = y
+                        hit += 1
+                        break
         if hit < max(len(a), len(b)):
             changed.append((s, len(a), len(b), hit))
     # a matched consumer whose producer is unmatched on both sides (the same value computed another way, e.g. a
