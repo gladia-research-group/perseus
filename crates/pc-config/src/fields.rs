@@ -802,6 +802,9 @@ section! {
         #[doc = "Report device free memory and arena use around every planned token (the '0 allocations after setup' check; default off)."]
         #[doc = "No legacy env name."]
         trace_alloc: Flag = "", "(unset)";
+        #[doc = "A chain of added relinearized products (each read only by the chain, all on one meta) relinearized once (pc-program `compile::msum`, pc-gpu `Ops::mult_sum`; default off). The same value up to the key-switching error."]
+        #[doc = "Runtime switch `PC_MULT_SUM`."]
+        mult_sum: Flag = "PC_MULT_SUM", "(unset)";
         #[doc = "Replay a bound block program's static segments as captured CUDA graphs after its first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."]
         #[doc = "No legacy env name."]
         use_graphs: Flag = "", "(unset)";

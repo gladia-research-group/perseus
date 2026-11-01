@@ -299,7 +299,7 @@ struct TensorArgs {
     uint64_t coef_ct_stride;
     const PrimeConst* pr;
     int32_t npairs, acc, n, K;
-    int32_t dbl, pad;
+    int32_t dbl, acc_d2;   // acc_d2: d2 += the pairs' x1 y1 too (acc adds onto (c0, c1) only)
 };
 static_assert(sizeof(TensorArgs) == 192, "TensorArgs layout");
 

@@ -44,7 +44,7 @@ pub fn tensor<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &mut E
         n: (top + 1) as i32,
         k: k as i32,
         dbl: 0,
-        pad: 0,
+        acc_d2: 0,
     };
     // SAFETY: k-ct views of live buffers of the context layout; out, ext and the workspace are distinct from a / b
     launch_result("tensor", unsafe { (ctx.table.tensor)(&args, ex.compute.raw()) })?;

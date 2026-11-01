@@ -11,6 +11,7 @@ pub mod alloc;
 pub mod apply_plan;
 pub mod batch;
 pub mod check;
+pub mod msum;
 pub mod resolve;
 pub mod rotacc;
 pub mod rr;
@@ -558,6 +559,10 @@ pub fn compile_block(
     }
     if crate::program::lever_on("rotacc") && crate::program::lever_on("rotacc_lazy") {
         rotacc::sink(&mut p);
+    }
+    // PC_MULT_SUM: a chain of added relinearized products relinearized once
+    if cfg.exec.mult_sum.unwrap_or(false) {
+        msum::fuse(&mut p);
     }
     batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;

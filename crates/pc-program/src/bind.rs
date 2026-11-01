@@ -58,6 +58,9 @@ pub enum StepOp {
     /// Streamed-weight sum `c` (`Bound::coeff_sums`), run by the runtime's `CoeffRowsDevice` on the rows of the
     /// block's weight frame (`Bound::stream_base`).
     CoeffSum { c: u32 },
+    /// Lazily relinearized product sum `s` (`Bound::mult_sums`: the pairs' slots), one relinearization (pc-gpu
+    /// `Ops::mult_sum`).
+    MultSum { s: u32 },
 }
 
 /// A `Kind::CoeffSum` as bound: the term ciphertexts' slots and their rows' offsets in the weight frame (rows of N
@@ -337,6 +340,8 @@ pub struct Bound<'a, W: DevWord> {
     pub finishes: Vec<FinishStep>,
     /// Streamed-weight sums (`StepOp::CoeffSum`) and the weight frame they read.
     pub coeff_sums: Vec<CoeffSumStep>,
+    /// Lazily relinearized product sums (`StepOp::MultSum`): the operand slots, pair after pair.
+    pub mult_sums: Vec<Vec<u32>>,
     pub streams: StreamLayout,
     /// Device address of the frame holding this block's rows (`residency::StreamRing::adopt`), null until staged.
     pub stream_base: *const f32,
@@ -377,7 +382,7 @@ fn key_needs(p: &Program) -> (bool, bool, Vec<Vec<i64>>) {
     for op in &p.ops {
         for m in op.members() {
             match &m.kind {
-                Kind::Mult | Kind::Square | Kind::MultRescale { .. } => relin = true,
+                Kind::Mult | Kind::Square | Kind::MultRescale { .. } | Kind::MultSum { .. } => relin = true,
                 Kind::Conjugate => conj = true,
                 Kind::Rotate(k) => {
                     if !lists.contains(&vec![*k]) {
@@ -515,6 +520,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         let mut alias: Vec<String> = vec![];
         let mut finishes: Vec<FinishStep> = vec![];
         let mut coeff_sums: Vec<CoeffSumStep> = vec![];
+        let mut mult_sums: Vec<Vec<u32>> = vec![];
         let streams = match env.streams {
             Some(src) => stream_layout(p, src).map_err(|missing| berr(block, format!("{} streamed linear(s) the runtime does not hold (StreamSource): {}", missing.len(), list(&missing))))?,
             None if p.ops.iter().any(|o| o.members().iter().any(|m| matches!(m.kind, Kind::CoeffSum { .. }))) => {
@@ -582,6 +588,21 @@ impl<'a, W: DevWord> Bound<'a, W> {
                     steps.push(Step { op: StepOp::CoeffSum { c: coeff_sums.len() as u32 - 1 }, out, a: ins[0], b: NONE, inplace: false, var, meta: p.vars[var as usize].meta, a_meta: vm(0), b_meta: None });
                     continue;
                 }
+                if let Kind::MultSum { .. } = &m.kind {
+                    let ins = m.ins.iter().map(|&v| slot_of(v)).collect::<Result<Vec<_>>>()?;
+                    let var = *m.outs.first().ok_or_else(|| berr(block, format!("mult_sum {:?} without an output", m.origin)))?;
+                    let out = slot_of(var)?;
+                    if ins.contains(&out) {
+                        alias.push(format!("{:?}: mult_sum output slot {out} is one of its operands", m.origin));
+                    }
+                    if relin == NONE {
+                        return Err(berr(block, "mult_sum without a relinearization key group"));
+                    }
+                    mult_sums.push(ins.clone());
+                    let vm = |k: usize| m.ins.get(k).map(|&v| p.vars[v as usize].meta);
+                    steps.push(Step { op: StepOp::MultSum { s: mult_sums.len() as u32 - 1 }, out, a: ins[0], b: ins[1], inplace: false, var, meta: p.vars[var as usize].meta, a_meta: vm(0), b_meta: vm(1) });
+                    continue;
+                }
                 if m.outs.len() != 1 {
                     return Err(berr(block, format!("{} op with {} outputs ({:?}): PCMM/CCMM finishes replay through the matmul services only", m.kind.name(), m.outs.len(), m.origin)));
                 }
@@ -614,6 +635,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
                     }
                     Kind::Finish { .. } => return Err(berr(block, "finish reached the single-output lowering")),
                     Kind::CoeffSum { .. } => return Err(berr(block, "coeff_sum reached the single-output lowering")),
+                    Kind::MultSum { .. } => return Err(berr(block, "mult_sum reached the single-output lowering")),
                     Kind::Batched(_) => return Err(berr(block, "nested batch")),
                 };
                 let inplace = m.inplace;
@@ -875,7 +897,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         } else {
             (vec![], None, None)
         };
-        let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, n_slots);
+        let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, &mult_sums, n_slots);
         // a block on its own slots carves no held-chain buffers: those chains issue step by step
         let io = |vs: &[u32]| -> Result<Vec<(String, u32, CtMeta)>> { vs.iter().map(|&v| Ok((p.vars[v as usize].name.clone(), slot_of(v)?, p.vars[v as usize].meta))).collect() };
         Ok(Bound {
@@ -898,6 +920,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
             pts,
             finishes,
             coeff_sums,
+            mult_sums,
             streams,
             stream_base: std::ptr::null(),
             inputs: io(&p.inputs)?,
@@ -1092,7 +1115,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
 /// `Bound::plain`: per slot, the richest (lowest) level its writes land at when every step touching it is an
 /// element-wise op (add, sub, plaintext add / product, constants, negate, times i; a ct x ct product reading it),
 /// outside units other than plaintext product-adds, and no compiled prelude runs on it; else None.
-fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]], finishes: &[FinishStep], coeff_sums: &[CoeffSumStep], n: usize) -> Vec<Option<u32>> {
+fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]], finishes: &[FinishStep], coeff_sums: &[CoeffSumStep], mult_sums: &[Vec<u32>], n: usize) -> Vec<Option<u32>> {
     let mut lv: Vec<Option<u32>> = vec![Some(u32::MAX); n];
     let bad = |lv: &mut Vec<Option<u32>>, s: u32| {
         if let Some(x) = lv.get_mut(s as usize) {
@@ -1107,6 +1130,7 @@ fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]
         match &st.op {
             StepOp::Finish { f } => finishes[*f as usize].ins.iter().chain(&finishes[*f as usize].outs).for_each(|&s| bad(&mut lv, s)),
             StepOp::CoeffSum { c } => coeff_sums[*c as usize].ins.iter().for_each(|&s| bad(&mut lv, s)),
+            StepOp::MultSum { s } => mult_sums[*s as usize].iter().for_each(|&x| bad(&mut lv, x)),
             _ => {}
         }
         if !unit_ok || !(ew || prod) {

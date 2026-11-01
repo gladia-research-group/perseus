@@ -294,7 +294,8 @@ pub struct TensorArgs {
     pub k: i32,
     /// ABI 13: 1 doubles the three outputs.
     pub dbl: i32,
-    pub pad: i32,
+    /// 1: d2 accumulates too (d2 += the pairs' x1 y1, before the doubling); `acc` adds onto (c0, c1) only.
+    pub acc_d2: i32,
 }
 
 #[repr(C)]
