@@ -20,7 +20,7 @@ from perseus.impl import blocked as BL
 from perseus.impl.prefill import evict_block_masks
 from perseus.impl.pcmm import PcmmLinear, band_shift, run as pcmm_run
 
-from .head import final_ln, lm_head
+from .head import centre_lm, final_ln, lm_head
 from .model import Gpt2Model, dist_report
 from . import weights as W
 
@@ -384,6 +384,7 @@ class Gpt2Prefill(Gpt2Model):
         CutMax then runs on one tile, as the decode's does."""
         if getattr(self, "_lm_paired", None) is None:
             Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+            Wlm = centre_lm(Wlm, self.vocab) if self.lm_centre() else Wlm
             self._lm_paired = W.lm_head_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, paired=True)
         return self._lm_paired
 

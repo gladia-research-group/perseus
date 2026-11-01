@@ -24,6 +24,16 @@ def final_ln(rt, x, cfg: NormCfg, params: dict, pos: int, cap: int | None = 44):
     return h
 
 
+def centre_lm(W, vocab: int):
+    """The LM head's (hid, vocab) matrix with its columns centred on their mean (CutMaxCfg.lm_centre): every logit
+    moves by the same h . mean_v W_v, so the argmax and the softmax are unchanged, and the vocabulary sum CutMax centres
+    with is ~0 instead of 2 n x mean (whose product with its mask, M k / 2n, would carry that mask's rounding at the
+    entry level's scale). The padding columns stay zero."""
+    W = np.array(W, dtype=np.float64)
+    W[:, :vocab] -= W[:, :vocab].mean(axis=1, keepdims=True)
+    return W
+
+
 def lm_head(rt, h, tiles):
     """gpt2_head.cu: one prepared input, one apply per vocab tile."""
     prep = prepare_linear_input(rt, h, tiles[0].d_in, tiles[0].d_out)
@@ -289,7 +299,11 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
         return (inv_sqrt_newton_folded if cfg.newton_fold else inv_sqrt_newton_scaled)(ops, t, steps, scale)
 
     sgn = 1.0
+    fold = 1.0          # P against the schedule's (cfg.out_scale: the previous iteration's y was out_scale times its own)
     for ii, it in enumerate(cfg.iters):
+        s = cfg.out_scale[ii] if cfg.out_scale else 1.0
+        if s != 1.0 and not it.newton:
+            raise ValueError("cutmax: out_scale folds into the scaled normalisers' Newton steps only")
         if it.newton:
             # the scaled normaliser: D = k (x - mu) on both tiles, k = 0.5 sqrt(n x_scale) / (c m), so that
             # y = 2 Re(D u) + 1 / m for u = 1 / sqrt(t), t = x_scale n sigma^2 = (x_scale / k^2) sum |D|^2 in (0, 1]
@@ -325,15 +339,17 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
                 t = None
                 P = ops.add(A, B)                         # free: B lives on the imaginary axis
                 R2 = sum2(rotsum_all(P), sgn)
-                D = ops.sub(ops.mult(P, k), mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * k / n),
-                                              tagged=False))
+                kp = k / fold                             # D as the schedule's: P (and its sum R2) are fold times its
+                D = ops.sub(ops.mult(P, kp), mm(R2, ("cutmax.mu", ii, sgn), lambda: M() * (0.5 * kp / n),
+                                               tagged=False))
             # t is refreshed where it is formed (one 1-slot refresh): every Newton step then reads it at the landing,
             # and u ends early enough for D u to reach the vector's refresh inside its envelope
             if t is None:
                 t = mean_refresh(ops.mult(D, ops.conjugate(D)), it.x_scale / (k * k), it.newton)
             if tap: tap(f"i{ii}.S2", t)
-            u = newton(t, it.newton)
-            yP = am(ops.mult(D, u), ("cutmax.sh", ii, it.m, sgn), lambda: M() * (0.5 / it.m), tagged=False)
+            u = newton(t, it.newton, s)                   # s u, and the shift s / 2m: y comes out s times the schedule's
+            yP = am(ops.mult(D, u), ("cutmax.sh", ii, it.m, sgn) + ((s,) if s != 1.0 else ()),
+                    lambda: M() * (0.5 * s / it.m), tagged=False)
         else:
             P = ops.add(A, B)                             # free: B lives on the imaginary axis
             R_c = rotsum_all(P)                           # S0 + i sgn S1
@@ -359,17 +375,21 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
         A = pow_odd(ops, ops.add(yP, cj), it.p)                    # y0^p
         B = pow_odd(ops, ops.sub(yP, cj if cfg.conj_once else ops.conjugate(yP)), it.p)   # i^p sgn y1^p
         sgn *= 1.0 if it.p % 4 == 1 else -1.0
+        fold = s ** it.p
         if tap: tap(f"i{ii}.end", B)
     P = ops.add(A, B)
     if cfg.sum_newton:
-        # 1 / S = u^2, u = 1 / sqrt(S) from Newton steps on sum_scale S in (0, 1] (sum2 is 2 S)
+        # 1 / S = u^2, u = 1 / sqrt(S) from Newton steps on sum_scale S in (0, 1] (sum2 is 2 S); P is fold times the
+        # schedule's: t reads S as the schedule's and r comes out 1 / (fold S)
         if cfg.spru_mean:
             # sum2 per slot, 2 Re((1 - i sgn) P): the sum of its slots is sum2's 2 S
-            t = mean_refresh(sum2(P, sgn), 0.5 * cfg.sum_scale, cfg.sum_newton)
+            t = mean_refresh(sum2(P, sgn), 0.5 * cfg.sum_scale / fold, cfg.sum_newton)
         else:
-            t = mean_refresh(None, 0.5 * cfg.sum_scale, cfg.sum_newton, summed=sum2(rotsum_all(P), sgn))
-        r = ops.square(newton(t, cfg.sum_newton, math.sqrt(cfg.sum_scale)))
+            t = mean_refresh(None, 0.5 * cfg.sum_scale / fold, cfg.sum_newton, summed=sum2(rotsum_all(P), sgn))
+        r = ops.square(newton(t, cfg.sum_newton, math.sqrt(cfg.sum_scale / fold)))
     else:
+        if fold != 1.0:
+            raise ValueError("cutmax: out_scale on the last iteration needs the Newton sum (sum_newton)")
         S_c = rotsum_all(P)
         S = im_cleanse(ops, ops.mult_const(S_c, 0.5, -0.5 * sgn))
         g = 1.0 / math.sqrt(cfg.sum_lo * cfg.sum_hi)
