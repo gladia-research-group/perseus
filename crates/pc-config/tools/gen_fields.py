@@ -68,6 +68,9 @@ EXTRA = [
      "`BtsSetup::lt_tails`; default on, off = those stages regenerate every digit).", "PC_LT_TAILS"),
     ("bts", "pair", "Flag", "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh "
      "(pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own).", "PC_BTS_PAIR"),
+    ("bts", "pair_loose", "Flag", "Refreshes left unpaired by `pair` pair across input levels and raise drops too "
+     "(pc-program `compile::batch::pull_pairs`, pc-gpu `StcFirstRoute::pair`: the shallower input's scale aligned to the "
+     "deeper's, the member of the deeper drop landed where its single lands; default off).", "PC_BTS_PAIR_LOOSE"),
     ("bts", "em_level_keys", "Flag", "EvalMod: relinearization-rescales over level relinearization keys (P' = P x the Q "
      "primes idle above the level, fewer digits; pc-gpu `keys::LevelRelinSpec`; default off).", "PC_EM_LEVEL_KEYS"),
     ("bts", "merge_s2d", "Flag", "The raise's sparse -> dense switch folded into the first hoisted rotations after it: "

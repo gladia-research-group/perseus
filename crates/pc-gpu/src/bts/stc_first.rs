@@ -1148,6 +1148,83 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         Ok(())
     }
 
+    /// `pair_check` across input levels and raise drops (config `bts.pair_loose`): the routes and the stage as there;
+    /// after their pending rescales (`sh`) the inputs sit at one level and scale key, or a whole number of levels
+    /// apart (`align` brings the shallower to the deeper's level and scale); the pair runs the smaller raise drop and
+    /// a member of a larger one lands where its single does (`land`: a rescale, a drop and one scalar product).
+    pub fn pair_check_loose(&self, sh: &Shadow, mx: &CtMeta, my: &CtMeta, rx: &Route, ry: &Route) -> Result<()> {
+        let (chain, unit) = (sh.cfg.chain, sh.cfg.chain.unit);
+        let bad = |what: String| Err(shape("bts pair", what));
+        // the strict check at one drop and the first input for both: the routes, the stage, the entry
+        self.pair_check(chain, mx, mx, rx, &Route { raise_drop: rx.raise_drop, ..*ry })?;
+        self.variant(ry.raise_drop)?;
+        for m in [mx, my] {
+            if !self.runs_stc_first(chain, m) {
+                return bad(format!("input at level {} deg {} is past the StC-first entry level {}", m.level, m.deg, self.entry_level(chain)?));
+            }
+        }
+        let flat = |m: &CtMeta| if m.deg == 2 { sh.rescale(m).map(|r| r.out) } else { Ok(*m) };
+        let (a, b) = (flat(mx)?, flat(my)?);
+        if a.level == b.level {
+            if nf_key(a.nf) != nf_key(b.nf) {
+                return bad(format!("inputs at level {} of scales 2^{:.6} and 2^{:.6}", a.level, a.nf.log2(), b.nf.log2()));
+            }
+        } else if (a.level.max(b.level) - a.level.min(b.level)) % unit != 0 {
+            return bad(format!("inputs at levels {} and {} (unit {unit})", a.level, b.level));
+        }
+        if rx.raise_drop != ry.raise_drop {
+            let (m, r) = if rx.raise_drop > ry.raise_drop { (mx, rx) } else { (my, ry) };
+            let lp = self.landing_meta(chain, m, &Route { raise_drop: rx.raise_drop.min(ry.raise_drop), ..*r })?;
+            let l = self.landing_meta(chain, m, r)?;
+            if lp.deg != 2 || l.deg != 2 || l.level < lp.level + unit {
+                return bad(format!("landing level {} deg {} from the pair's level {} deg {}", l.level, l.deg, lp.level, lp.deg));
+            }
+        }
+        Ok(())
+    }
+
+    /// A loose pair's entry: of two degree-1 inputs a whole number of levels apart, the shallower dropped to one level
+    /// above the deeper, then one scalar product and rescale land it at the deeper's level and scale (the raise's
+    /// adjust: the scalar carries the scale ratio).
+    fn align(&self, cx: &mut BtsCx<'_, 'a, W, M>, x: &mut Ct<'a, W>, y: &mut Ct<'a, W>) -> Result<()> {
+        let ctx = cx.ctx;
+        let unit = ctx.shape.unit;
+        let (deep, low) = if x.meta.level > y.meta.level { (x, y) } else { (y, x) };
+        let target = deep.meta;
+        if low.meta.deg != 1 || deep.meta.deg != 1 || low.meta.level + unit > target.level {
+            return Err(shape("bts pair", format!("align level {} deg {} to level {} deg {}", low.meta.level, low.meta.deg, target.level, target.deg)));
+        }
+        low.meta.level = target.level - unit;
+        let top_in = low.top(ctx.shape)?;
+        let a = raise::adjust_factor(ctx, target.nf, low.meta.nf, top_in, 0)?;
+        cx.ops.mult_scalar_inplace(ctx, cx.ex, cx.sh, std::slice::from_mut(low), &[Complex::new(a, 0.0)])?;
+        cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(low))?;
+        if low.meta.level != target.level || low.meta.deg != 1 {
+            return Err(shape("bts pair", format!("aligned to level {} deg {}, not {}", low.meta.level, low.meta.deg, target.level)));
+        }
+        low.meta.nf = target.nf;
+        Ok(())
+    }
+
+    /// A loose pair's member of the larger raise drop: from the pair's landing (degree 2) to its own `l` (a whole
+    /// number of levels deeper, degree 2): the pending rescale, the drop, one scalar product whose constant carries
+    /// the scale ratio.
+    fn land(&self, cx: &mut BtsCx<'_, 'a, W, M>, c: &mut Ct<'a, W>, l: &CtMeta) -> Result<()> {
+        let ctx = cx.ctx;
+        cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(c))?;
+        if c.meta.level > l.level || c.meta.deg != 1 || l.deg != 2 {
+            return Err(shape("bts pair", format!("land level {} deg {} at level {} deg {}", c.meta.level, c.meta.deg, l.level, l.deg)));
+        }
+        c.meta.level = l.level;
+        let one = cx.sh.mult_scalar(&c.meta, 1.0)?.out;
+        cx.ops.mult_scalar_inplace(ctx, cx.ex, cx.sh, std::slice::from_mut(c), &[Complex::new(l.nf / one.nf, 0.0)])?;
+        if c.meta.level != l.level || c.meta.deg != l.deg {
+            return Err(shape("bts pair", format!("landed at level {} deg {}, not {} deg {}", c.meta.level, c.meta.deg, l.level, l.deg)));
+        }
+        c.meta = *l;
+        Ok(())
+    }
+
     /// Two real refreshes as one complex refresh (`BtsRoute::run_pair`). Each member goes to the entry as alone
     /// (pending rescale, drop), is multiplied by 2^(cf_ref - 1 - cf) (exact) and becomes x + conj x = 2 Re x (what a
     /// single's real EvalMod chain reads, whatever the imaginary lane holds); z = x + i y runs the input stages and the
@@ -1161,10 +1238,25 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         if y.k() != k {
             return Err(shape("bts pair", format!("members of {k} and {} ciphertexts", y.k())));
         }
-        self.pair_check(shp, &x.meta, &y.meta, rx, ry)?;
+        // loose (bts.pair_loose): inputs at two levels or refreshes of two raise drops
+        let loose = self.pair_check(shp, &x.meta, &y.meta, rx, ry).is_err();
+        if loose {
+            self.pair_check_loose(cx.sh, &x.meta, &y.meta, rx, ry)?;
+        }
         let (lx, ly) = (self.landing_meta(shp, &x.meta, rx)?, self.landing_meta(shp, &y.meta, ry)?);
-        let mut st = self.begin_meta(ctx, &x.meta, k, &Route { cf: Some(self.sf.cf_ref), real: false, ..*rx }, false)?;
+        let drop = rx.raise_drop.min(ry.raise_drop);
+        let mut st = self.begin_meta(ctx, &x.meta, k, &Route { cf: Some(self.sf.cf_ref), real: false, raise_drop: drop, ..*rx }, false)?;
         let entry_level = self.entry_level(shp)?;
+        if loose {
+            for c in [&mut *x, &mut *y] {
+                if c.meta.deg == 2 {
+                    cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(c))?;
+                }
+            }
+            if x.meta.level != y.meta.level {
+                self.align(cx, x, y)?;
+            }
+        }
         for (c, r) in [(&mut *x, rx), (&mut *y, ry)] {
             if c.meta.deg == 2 {
                 cx.ops.rescale(ctx, cx.ex, cx.sh, std::slice::from_mut(c))?;
@@ -1197,6 +1289,11 @@ impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
         let out = em.out_meta;
         for (c, r, l) in [(&mut *x, rx, lx), (&mut *y, ry, ly)] {
             self.pow2.mult(ctx, &cx.ex.compute, View::of(&c.buf, 0), k, out.top as usize, self.call_cf(r))?;
+            if loose && r.raise_drop > drop {
+                c.meta = CtMeta { level: pc_shadow::meta::level_from_top_limb(shp, out.top as u32)?, deg: out.nl as u8, nf: out.nf, ..c.meta };
+                self.land(cx, c, &l)?;
+                continue;
+            }
             if l.level != pc_shadow::meta::level_from_top_limb(shp, out.top as u32)? || l.deg as i32 != out.nl || l.nf.to_bits() != out.nf.to_bits() {
                 return Err(shape("bts pair", format!("EvalMod left {out:?}, the member's landing is level {} deg {} nf 2^{:.6}", l.level, l.deg, l.nf.log2())));
             }
@@ -1316,6 +1413,9 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for StcFirstRoute<'a,
     }
     fn run_pair(&self, cx: &mut BtsCx<'_, 'a, W, M>, x: &mut Ct<'a, W>, y: &mut Ct<'a, W>, rx: &Route, ry: &Route) -> Result<()> {
         self.pair(cx, x, y, rx, ry)
+    }
+    fn pair_ok(&self, sh: &Shadow, mx: &CtMeta, my: &CtMeta, rx: &Route, ry: &Route) -> bool {
+        self.pair_check(sh.cfg.chain, mx, my, rx, ry).is_ok() || self.pair_check_loose(sh, mx, my, rx, ry).is_ok()
     }
     fn run(&self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>], route: &Route) -> Result<()> {
         if route.iterations <= 1 {
