@@ -12,6 +12,8 @@
 #   bash speedrun/make_n32a4_decode_rd.sh [PLAN]   -> PLAN's blocks 0-11 and block_0_feedback rewritten in place
 #   KV_PUSH_RAISE=4:1,5:1,7:1,10:1 bash speedrun/make_n32a4_decode_rd.sh   (the served plan's; its runtime line also
 #   carries FIDESLIB_CTS_ALT_BUDGET=5: the dense raise variants of drop >= 1 on a 5-stage CtS)
+# RD_FREE_CF=1: the pass may also change the refreshes' CFs (a plan's decisions carried onto another capture by
+# scripts/utils/map_plan_decisions.py: new levels, new CFs)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/local_env.sh
@@ -51,9 +53,10 @@ rm -rf "$TMP"
 # shellcheck disable=SC2086
 env $RECIPE $KEEP bash python/perseus/examples/gpt2/make_plan.sh "$GR" "$OUT" feedback
 "$PYTHON" - "bootstrap_placements/$PLAN" "bootstrap_placements/$OUT" <<'PY'
-import json, sys
+import json, os, sys
 a, b = sys.argv[1:]
-keys = ("placements", "hint_fire", "sparse_slots", "correction_factor", "real_route", "rescale_after")
+keys = ("placements", "hint_fire", "sparse_slots", "real_route", "rescale_after") + \
+    (() if os.environ.get("RD_FREE_CF") else ("correction_factor",))
 for k in [str(i) for i in range(12)] + ["0_feedback"]:
     x, y = (json.load(open(f"{d}/block_{k}_placement.json")) for d in (a, b))
     bad = [f for f in keys if x.get(f) != y.get(f)]
