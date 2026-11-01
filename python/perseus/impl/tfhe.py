@@ -186,12 +186,13 @@ class Prog:
         self.luts, self.steps = {}, []
 
     def lut(self, name, *fs, warp=False):
-        """Tables f_j (numpy-vectorized on [-1, 1)): k = len(fs) from one rotation (k times the input noise); warp:
-        one table, the store's (as `register_lut`)."""
+        """Tables f_j (numpy-vectorized on [-1, 1)): k = len(fs) from one rotation; warp: the finish's encoding (a
+        store's table, or a pbs whose outputs a raw store keeps)."""
         self.luts[name] = (list(fs), bool(warp))
         return name
 
     def load(self, lut, dst):
+        """`dst`: a buffer, or a list of one per table of `lut`."""
         self.steps.append({"op": "load", "lut": lut, "dst": dst})
 
     def lin(self, dst, a, b, pairs, ca=1, cb=1, c=0.0):
@@ -203,6 +204,7 @@ class Prog:
         self.steps.append({"op": "pbs", "src": src, "rows": int(rows), "lut": lut, "dst": list(dst)})
 
     def store(self, src, rows, lut, slots):
+        """`lut` None: the rows as they are (a warp pbs's outputs)."""
         self.steps.append({"op": "store", "src": src, "rows": int(rows), "lut": lut, "slots": slots})
 
     def rows_out(self):
@@ -227,16 +229,20 @@ class Prog:
         for st in self.steps:
             op = st["op"]
             if op == "load":
-                f = self.luts[st["lut"]][0][0]
+                fs = self.luts[st["lut"]][0]
                 x = np.asarray(m, dtype=np.float64)
-                x = x + rng.normal(0.0, _NOISE, x.shape) if _NOISE else x
-                B[st["dst"]] = _nat(f, x, GRID)
+                x = x + rng.normal(0.0, _NOISE * len(fs), x.shape) if _NOISE else x
+                for d, f in zip(st["dst"] if isinstance(st["dst"], list) else [st["dst"]], fs):
+                    B[d] = _nat(f, x, GRID // len(fs))
             elif op == "lin":
                 idx = np.asarray(st["idx"], dtype=np.int64).reshape(-1, 2)
                 a, b = B[st["a"]], B[st["b"]]
                 ta = np.where(idx[:, 0] >= 0, a[np.maximum(idx[:, 0], 0)] if a.size else 0.0, 0.0)
                 tb = np.where(idx[:, 1] >= 0, b[np.maximum(idx[:, 1], 0)] if b.size else 0.0, 0.0)
                 B[st["dst"]] = st["ca"] * ta + st["cb"] * tb + st["c"]
+            elif op == "store" and st["lut"] is None:
+                x = B[st["src"]][:st["rows"]]
+                out = x + (_RNG.normal(0.0, _OUT_NOISE, x.shape) if _OUT_NOISE else 0.0)
             else:
                 fs, warp = self.luts[st["lut"]]
                 x = B[st["src"]][:st["rows"]]
@@ -288,9 +294,14 @@ def tfhe_prog(ops, x, prog, slots):
     if hasattr(x, "ptag"):
         y = type(x)(y.vec, y.meta, packing=y.packing)
         y.ptag = x.ptag
-    fs, _ = pr.luts[pr.steps[-1]["lut"]]
-    j = np.arange(GRID)
-    rng = float(np.abs(fs[0](np.where(j < GRID // 2, 2.0 * j / GRID, 2.0 * (j - GRID) / GRID))).max())
+    last = pr.steps[-1]["lut"]                 # a raw store: its range is the program's warp tables'
+    rng = 0.0
+    for name, (fs, warp) in pr.luts.items():
+        if name == last or (last is None and warp):
+            pts = GRID // len(fs)
+            j = np.arange(pts)
+            rng = max(rng, max(float(np.abs(f(np.where(j < pts // 2, 2.0 * j / pts, 2.0 * (j - pts) / pts))).max())
+                               for f in fs))
     fhe.record_external_bootstrap(y, names, levels, desc={"op": "tfhe", "prog": str(prog), "slots": str(slots), "gain": GAIN, "range": rng / GAIN})
     return ops.add(y, y)
 

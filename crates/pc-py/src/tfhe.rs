@@ -110,10 +110,10 @@ const MAX_IDX: usize = 1 << 20;
 /// One native program step (`TfheRt::prog`).
 #[derive(Clone, Debug)]
 enum Step {
-    Load { lut: usize, dst: usize },
+    Load { lut: usize, dst: Vec<usize> },
     Lin { dst: usize, a: usize, b: usize, idx: usize, rows: usize, ca: u64, cb: u64, c: u64 },
     Pbs { src: usize, rows: usize, lut: usize, k: usize, dst: Vec<usize> },
-    Store { src: usize, rows: usize, lut: usize, set: String },
+    Store { src: usize, rows: usize, lut: Option<usize>, set: String },
 }
 
 /// What the session's MemPlan reserves: the switch (`max` values per pass), the tables, one ciphertext.
@@ -310,11 +310,8 @@ impl TfheRt {
         Ok(())
     }
 
-    /// Register native program `name` (JSON, perseus impl/tfhe.py `Prog`): `luts` {name: {"tables": [[v on the grid
-    /// of n_br nu / k]; k], "warp": bool}} (native: v at phase v q / 4; warp: as `lut`, for a store), `steps`: load
-    /// {lut, dst} (the finish's slot set through `lut` into buffer dst), lin {dst, a, b, idx: [ia, ib, ..] (-1: no
-    /// term), ca, cb (integers), c (a native constant)}, pbs {src, rows, lut, dst: [..] (one per table)}, store {src,
-    /// rows, lut (warp), slots: a registered set of `rows` values}: the finish's output. Synchronous.
+    /// Register native program `name` (JSON of perseus impl/tfhe.py `Prog`: `luts` with native tables, v at phase
+    /// v q / 4, and `steps` load / lin / pbs / store). Synchronous.
     pub fn prog(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, json: &str) -> PyResult<()> {
         let bad = |m: String| PyValueError::new_err(format!("tfhe prog {name}: {m}"));
         let (bufs, rows) = match &self.nat {
@@ -328,8 +325,8 @@ impl TfheRt {
             let tables: Vec<Vec<f64>> = serde_json::from_value(l.get("tables").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
             let warp = l.get("warp").and_then(|x| x.as_bool()).unwrap_or(false);
             let k = tables.len();
-            if k == 0 || nb % k != 0 || tables.iter().any(|t| t.len() != nb / k) || (warp && k != 1) {
-                return Err(bad(format!("lut {ln}: {k} tables of {} points (warp: one)", nb / k.max(1))));
+            if k == 0 || nb % k != 0 || tables.iter().any(|t| t.len() != nb / k) {
+                return Err(bad(format!("lut {ln}: {k} tables of {} points", nb / k.max(1))));
             }
             if tables.iter().flatten().any(|x| !x.is_finite() || x.abs() > if warp { MAX_V } else { 2.0 }) {
                 return Err(bad(format!("lut {ln}: a value outside the range")));
@@ -378,11 +375,16 @@ impl TfheRt {
             let op = st.get("op").and_then(|x| x.as_str()).unwrap_or("");
             steps.push(match op {
                 "load" => {
+                    // dst: a buffer, or one per table (k interleaved tables)
                     let (l, k) = lut(st)?;
-                    if k != 1 {
-                        return Err(bad("load: one table".into()));
+                    let dst: Vec<usize> = match st.get("dst") {
+                        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|y| y.as_u64().map(|z| z as usize)).collect(),
+                        _ => vec![buf(st, "dst")?],
+                    };
+                    if dst.len() != k || dst.iter().any(|&b| b >= bufs) {
+                        return Err(bad(format!("load: {} outputs for {k} tables", dst.len())));
                     }
-                    Step::Load { lut: l, dst: buf(st, "dst")? }
+                    Step::Load { lut: l, dst }
                 }
                 "lin" => {
                     let idx: Vec<i64> = serde_json::from_value(st.get("idx").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
@@ -411,7 +413,17 @@ impl TfheRt {
                     Step::Pbs { src: buf(st, "src")?, rows: nrows(st)?, lut: l, k, dst }
                 }
                 "store" => {
-                    let (l, _) = lut(st)?;
+                    // no lut: the rows are stored as they are (a warp table's outputs)
+                    let l = match st.get("lut") {
+                        Some(x) if !x.is_null() => {
+                            let (l, k) = lut(st)?;
+                            if k != 1 {
+                                return Err(bad("store: one table".into()));
+                            }
+                            Some(l)
+                        }
+                        _ => None,
+                    };
                     let set = st.get("slots").and_then(|x| x.as_str()).ok_or_else(|| bad("store: no slots".into()))?.to_string();
                     let r = nrows(st)?;
                     match self.sets.get(&set) {
@@ -450,7 +462,8 @@ impl TfheRt {
                     if cnt > rows {
                         return Err(pc_gpu::Error::Shape { what: "tfhe prog".into(), msg: format!("load of {cnt} values (buffers hold {rows})") });
                     }
-                    self.sw.native_load(ctx, st, ltr, &mut self.x, pos, cnt, tvp(*lut), 0, bp(*dst), false)?;
+                    let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
+                    self.sw.native_load_k(ctx, st, ltr, &mut self.x, pos, cnt, tvp(*lut), &vec![0; dst.len()], &dsts, false)?;
                 }
                 Step::Lin { dst, a, b, idx: off, rows: r, ca, cb, c } => {
                     self.sw.native_lin_c(ctx, st, bp(*dst), bp(*a), bp(*b), idx.wrapping_add(*off) as *const c_void, *r, *ca, *cb, *c)?;
@@ -461,9 +474,15 @@ impl TfheRt {
                 }
                 Step::Store { src, rows: r, lut, set } => {
                     let &(off, _, reps) = &self.sets[set];
-                    self.sw.native_pbs(ctx, st, ltr, bp(*src), *r, tvp(*lut), &[0], &[scratch])?;
+                    let out = match lut {
+                        Some(l) => {
+                            self.sw.native_pbs(ctx, st, ltr, bp(*src), *r, tvp(*l), &[0], &[scratch])?;
+                            scratch
+                        }
+                        None => bp(*src),
+                    };
                     let pp = (self.pos_buf.vptr() as *const u32).wrapping_add(off) as *const c_void;
-                    self.sw.native_store(ctx, st, ltr, scratch, pp, *r, reps, &mut self.x)?;
+                    self.sw.native_store(ctx, st, ltr, out, pp, *r, reps, &mut self.x)?;
                 }
             }
         }
