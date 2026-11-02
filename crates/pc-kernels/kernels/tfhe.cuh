@@ -584,6 +584,14 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     }
 }
 
+// Thread-block clusters need sm_90+: below it (the image's sm_89 pass) the cluster kernels compile to a trap and
+// the launcher takes the one-block path (tfhe_clusters).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define PC_CLUSTER_DIMS(x)
+#else
+#define PC_CLUSTER_DIMS(x) __cluster_dims__(x, 1, 1)
+#endif
+
 // PBS_ROTATE's latency path on a cluster of two blocks per LWE, one per RNS prime (r = the block's rank, on the key
 // bundles of PBS_KEYBUNDLE, one level): each block keeps its prime's acc [2 part][n] in shared memory, double-buffered
 // by step parity, and reads the partner's through distributed shared memory for the digits (the CRT of both
@@ -592,7 +600,10 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 // (the partner may still read this one: no second sync). Shared: acc 2 x 2 n, tb 2 n, this prime's twiddles and
 // companions 4 n words.
 template <int G>
-__global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k(TfheArgs A) {
+__global__ void PC_CLUSTER_DIMS(2) __launch_bounds__(STEP_TH) rotate_cl_k(TfheArgs A) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();   // no clusters below sm_90: the launcher never picks this kernel there
+#else
     extern __shared__ uint32_t sm32[];
     namespace cg = cooperative_groups;
     cg::cluster_group cl = cg::this_cluster();
@@ -658,6 +669,7 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(STEP_TH) rotate_cl_k
     }
     cl.sync();   // the partner may still read this block's acc
     for (int x = threadIdx.x; x < 2 * n; x += blockDim.x) g[(2 * (x / n) + r) * n + x % n] = acc[st * 2 * n + x];
+#endif
 }
 
 // PBS_ROTATE's latency path on a cluster of four blocks per LWE, block rank 2 c + r: RNS prime r, acc part c (n = 2048,
@@ -678,7 +690,10 @@ __device__ __forceinline__ uint32_t gs_shfl(uint32_t me, bool hi, int lb, uint32
 // NU = 2 (c[5]): the extended rotation, both components per block (bundles A, B as rotate_k); LV = 2: two gadget
 // levels, the bundle's two uint4 per word the decomposed parts p.
 template <int G, int NU = 1, int LV = 1>
-__global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(STEP_TH) rotate_cl4_k(TfheArgs A) {
+__global__ void PC_CLUSTER_DIMS(4) __launch_bounds__(STEP_TH) rotate_cl4_k(TfheArgs A) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();   // no clusters below sm_90: the launcher never picks this kernel there
+#else
     extern __shared__ uint32_t sm32[];
     namespace cg = cooperative_groups;
     cg::cluster_group cl = cg::this_cluster();
@@ -895,6 +910,7 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(STEP_TH) rotate_cl4_
     for (int i = 0; i < NU; i++)
 #pragma unroll
         for (int x = 0; x < 2; x++) g[i * 4 * n + j1[x]] = ac[i][x];
+#endif
 }
 
 // PBS_KEYBUNDLE: the key bundle of every (LWE, group) for the latency path (TFHE-rs's multi-bit keybundle): x
@@ -1287,6 +1303,18 @@ __global__ void repack_c0_k(TfheArgs A) {
     }
 }
 
+// Thread-block clusters (sm_90+) on the current device, queried once: without them PBS_ROTATE's latency path runs one
+// block per LWE, and the cluster-only variants (two gadget levels, the extended rotation, groups of 5) are refused.
+static bool tfhe_clusters() {
+    static const bool c = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    return c;
+}
+
 int launch(const TfheArgs* a, cudaStream_t s) {
     const TfheArgs A = *a;
     if (A.count < 1) return -1;
@@ -1308,8 +1336,9 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             const uint64_t qa = A.c[6] & 0xffffffffull, qb = A.c[6] >> 32, qmax = qa > qb ? qa : qb;
             if (A.n != 2048 || (lv != 1 && lv != 2) || 46ull * qmax >= (1ull << 32)) return -1;
             const int grp = A.i2 ? A.i2 : 2;
+            const bool cl = tfhe_clusters();
             // groups of 5 (31 keys per bundle): the one-level four-block latency path only
-            if (grp < 2 || grp > 5 || A.i1 % grp || (grp == 5 && (!A.w || lv != 1 || A.c[5] > 1 || A.count > CL4_MAX || A.i3 == 1 || A.i3 == 2))) return -1;
+            if (grp < 2 || grp > 5 || A.i1 % grp || (grp == 5 && (!A.w || lv != 1 || A.c[5] > 1 || A.count > CL4_MAX || A.i3 == 1 || A.i3 == 2 || !cl))) return -1;
             static int sms = 0;
             static bool attr_r = false;
             if (!attr_r) {   // the shared-memory opt-ins (64 / 96 KB), once
@@ -1331,7 +1360,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             // digits (4 / 8 n words) + pm1 (4 n)
             const int s4 = 8 * A.n * (int)sizeof(uint32_t), s8 = 12 * A.n * (int)sizeof(uint32_t);
             if (A.c[5] > 1 && A.w) {   // the extended rotation's latency path: four-block clusters, both components each
-                if (A.c[5] != 2 || lv != 1 || A.count > CL4_MAX) return -1;
+                if (A.c[5] != 2 || lv != 1 || A.count > CL4_MAX || !cl) return -1;
                 const int sc = 12 * A.n * (int)sizeof(uint32_t);
                 static bool attr_e4 = false;
                 if (!attr_e4) {
@@ -1368,7 +1397,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                     attr_k = true;
                 }
                 if (lv == 2) {   // two gadget levels: four-block clusters, both levels of the block's part
-                    if (A.count > CL4_MAX) return -1;
+                    if (A.count > CL4_MAX || !cl) return -1;
                     const int sc = 12 * A.n * (int)sizeof(uint32_t);
                     static bool attr_l2 = false;
                     if (!attr_l2) {
@@ -1384,7 +1413,8 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 }
                 if (lv != 1) return -1;
                 // i3: 0 = by batch (four blocks per LWE up to CL4_MAX LWEs, else two), 1 = one block, 2 / 4 = that cluster
-                if (A.i3 == 4 || (A.i3 == 0 && A.count <= CL4_MAX)) {
+                const int i3 = cl ? A.i3 : 1;
+                if (i3 == 4 || (i3 == 0 && A.count <= CL4_MAX)) {
                     const int sc = 8 * A.n * (int)sizeof(uint32_t);
                     static bool attr_c4 = false;
                     if (!attr_c4) {
@@ -1400,7 +1430,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                     else rotate_cl4_k<5><<<4 * A.count, th, sc, s>>>(A);
                     break;
                 }
-                if (A.i3 != 1) {   // a cluster of two blocks per LWE
+                if (i3 != 1) {   // a cluster of two blocks per LWE
                     const int sc = 10 * A.n * (int)sizeof(uint32_t);
                     static bool attr_c = false;
                     if (!attr_c) {

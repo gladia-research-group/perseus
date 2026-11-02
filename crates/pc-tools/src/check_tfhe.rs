@@ -552,6 +552,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
+    // without thread-block clusters (below sm_90) the latency path is one level, nu 1 only
+    let kb_path = kb_path && (nu == 1 && lv == 1 || dev.clusters()?);
     let kb_words = if kb_path { count * win * 4 * n * 2 * nu * lv * if overlap { 2 } else { 1 } } else { 0 };
     let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * nu * 4 * n + 2 * lin.len() + kl * count * (n + 1) + kb_words;
     let arena = pc_cuda::Arena::new(&dev, 4 * words + (64 << 20))?;
