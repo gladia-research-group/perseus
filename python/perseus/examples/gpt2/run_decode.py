@@ -49,7 +49,7 @@ def _planned(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"m7c_ref_{os.getpid()}")
     labels = [f"block_{b}" for b in range(n + 2)]
     run = PlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, pt_rows=a.pt_rows,
-                     stc_cache=a.stc_cache, pt_cache=a.pt_cache)
+                     stc_cache=a.stc_cache, pt_cache=a.pt_cache, schedule=a.schedule)
     run.debug = a.debug_blocks
     run.setup(inputs, argmax=a.argmax)
     if a.pt_cache:
@@ -167,6 +167,8 @@ def main(argv=None, results=None):
                     help="planned: rotation keys resident (dense) or 28-bit b + seed regenerated per use (packed)")
     ap.add_argument("--pt-rows", type=int, default=28, help="planned: rows per plaintext slot (0 = every prime)")
     ap.add_argument("--stc-cache", type=int, default=8, help="planned: StC-first last-stage cache entries")
+    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
+                    help="planned: op order before K-batching (siblings: the served decode's)")
     ap.add_argument("--pt-cache", action="store_true",
                     help="planned: every position's patch precomputed and its plaintexts encoded once at setup, as the served "
                          "decode does")

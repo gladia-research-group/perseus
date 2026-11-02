@@ -11,7 +11,7 @@ PLANS: dict[str, dict[int | None, str]] = {
     # position, CutMax's scaled normalisers with ln_f folded into the LM head, the LayerNorm statistics from one refresh
     # or one complex ladder, on the alternating chain n32sp with record 5's key set. Any other length: the
     # shipped decode capture's plan, 133 refreshes / token (CutMax: 12 of them); those that run the shipped order at its CF
-    "gpt2_decode": {16: "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh",
+    "gpt2_decode": {16: "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7",
                     None: "bootstrap_placements/gpt2_decode_python_n32_m16i_fcf_cm"},
     # StC-first dense refreshes + the runtime's measured landings
     "gpt2_prefill": {128: "bootstrap_placements/gpt2_prefill128_m16s0"},
