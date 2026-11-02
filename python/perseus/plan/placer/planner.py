@@ -615,6 +615,11 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
             k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
         # the plan's drop is absolute: the route's default (raise_drop_base) plus k must be a built variant
         b = dict(cfg.raise_drop_base).get(route, 0)
+        # PLAN_RAISE_ROUTE_MAX="route:drop,...": a route's deepest absolute drop (an alternating user region's chain:
+        # EvalMod may end on the region's top pair level, no deeper; compile::user_region_sites)
+        rmax = {int(r): int(k) for r, k in (e.split(":") for e in os.environ.get("PLAN_RAISE_ROUTE_MAX", "").split(",") if e)}
+        if route in rmax:
+            k_max = min(k_max, rmax[route] - b)
         ks = [k for k in range(k_max, 0, -1)
               if route == 1 or not cfg.raise_drop_set or k + b in cfg.raise_drop_set]
         saved = refresh.site_out_levels.get(p)
