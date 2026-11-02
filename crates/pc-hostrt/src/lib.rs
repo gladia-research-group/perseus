@@ -1,7 +1,8 @@
 //! The host stand-in for the CUDA stream model, behind the same raw handles (`*mut c_void`) the kernel launchers and
 //! cuBLASLt take. A host stream runs its work inline, in issue order: host issue order is a valid schedule of every
 //! correctly evented CUDA program, so waits and syncs have nothing to wait for. While a stream captures, its work is
-//! recorded instead (by value, as a CUDA graph keeps its nodes' arguments) and replayed by `HostGraph::launch`.
+//! recorded instead (by value, as a CUDA graph keeps its nodes' arguments) and replayed by `HostGraph::launch`. As
+//! in CUDA, a stream that waits on an event recorded inside a capture joins that capture until it ends.
 //! Kernel bodies run on one thread pool sized by `PERSEUS_CPU_THREADS` (default: the visible cores, at most 36).
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -13,10 +14,27 @@ use std::time::Instant;
 /// One unit of recorded work.
 pub type Op = Rc<dyn Fn()>;
 
-/// A host stream: inline execution, or recording between `begin_capture` and `end_capture`.
+/// One capture: the recorded work of its origin stream and of every stream that joined it.
+struct Capture {
+    ops: RefCell<Vec<Op>>,
+    active: std::cell::Cell<bool>,
+}
+
+/// A host stream: inline execution, or recording into a capture (its own, or one it joined).
 #[derive(Default)]
 pub struct HostStream {
-    rec: RefCell<Option<Vec<Op>>>,
+    rec: RefCell<Option<Rc<Capture>>>,
+}
+
+impl HostStream {
+    /// The capture this stream records into (a joined capture that ended no longer counts).
+    fn capture(&self) -> Option<Rc<Capture>> {
+        let mut rec = self.rec.borrow_mut();
+        if rec.as_ref().is_some_and(|c| !c.active.get()) {
+            *rec = None;
+        }
+        rec.clone()
+    }
 }
 
 /// A new host stream as a raw handle (freed with `destroy_stream`).
@@ -42,12 +60,9 @@ unsafe fn stream<'a>(raw: *mut c_void) -> &'a HostStream {
 /// `raw` is a live handle from `new_stream`; everything `op` dereferences stays valid until it ran (eager: the
 /// call; captured: every launch of the graph), as for the CUDA work it stands for.
 pub unsafe fn submit(raw: *mut c_void, op: impl Fn() + 'static) {
-    let s = stream(raw);
-    let mut rec = s.rec.borrow_mut();
-    match rec.as_mut() {
-        Some(v) => v.push(Rc::new(op)),
+    match stream(raw).capture() {
+        Some(c) => c.ops.borrow_mut().push(Rc::new(op)),
         None => {
-            drop(rec);
             op();
             fence(Ordering::SeqCst);
         }
@@ -59,24 +74,28 @@ pub unsafe fn submit(raw: *mut c_void, op: impl Fn() + 'static) {
 /// # Safety
 /// `raw` is a live handle from `new_stream`.
 pub unsafe fn capturing(raw: *mut c_void) -> bool {
-    stream(raw).rec.borrow().is_some()
+    stream(raw).capture().is_some()
 }
 
 /// # Safety
 /// `raw` is a live handle from `new_stream`.
 pub unsafe fn begin_capture(raw: *mut c_void) -> Result<(), &'static str> {
-    let mut rec = stream(raw).rec.borrow_mut();
-    if rec.is_some() {
+    let s = stream(raw);
+    if s.capture().is_some() {
         return Err("capture already active on this stream");
     }
-    *rec = Some(Vec::new());
+    *s.rec.borrow_mut() = Some(Rc::new(Capture { ops: RefCell::new(Vec::new()), active: std::cell::Cell::new(true) }));
     Ok(())
 }
 
 /// # Safety
 /// `raw` is a live handle from `new_stream`.
 pub unsafe fn end_capture(raw: *mut c_void) -> Result<HostGraph, &'static str> {
-    stream(raw).rec.borrow_mut().take().map(|ops| HostGraph { ops: Rc::new(ops) }).ok_or("no capture active on this stream")
+    let c = stream(raw).capture().ok_or("no capture active on this stream")?;
+    *stream(raw).rec.borrow_mut() = None;
+    c.active.set(false);
+    let ops = c.ops.take();
+    Ok(HostGraph { ops: Rc::new(ops) })
 }
 
 /// A recorded sequence of work, replayed in order.
@@ -101,10 +120,12 @@ impl HostGraph {
     }
 }
 
-/// A host event: the time its stream passed the record point (timing), nothing else (ordering is the issue order).
+/// A host event: the time its stream passed the record point (timing) and, when it was last recorded inside a
+/// capture, that capture (a stream waiting on it joins). Ordering is the issue order.
 #[derive(Default)]
 pub struct HostEvent {
     at: Mutex<Option<Instant>>,
+    cap: RefCell<Option<Rc<Capture>>>,
 }
 
 pub fn new_event() -> *mut c_void {
@@ -123,7 +144,23 @@ pub unsafe fn destroy_event(raw: *mut c_void) {
 /// Both handles are live; `ev` outlives every graph that recorded it.
 pub unsafe fn record(ev: *mut c_void, stream: *mut c_void) {
     let e = ev as *const HostEvent;
+    *(*e).cap.borrow_mut() = self::stream(stream).capture();
     submit(stream, move || *(*e).at.lock().unwrap() = Some(Instant::now()));
+}
+
+/// Make `stream` wait for `ev`: nothing to wait for on the host, but an event recorded inside a live capture pulls
+/// the stream into that capture (cudaStreamWaitEvent under capture).
+///
+/// # Safety
+/// Both handles are live.
+pub unsafe fn wait(stream: *mut c_void, ev: *mut c_void) {
+    let c = (*(ev as *const HostEvent)).cap.borrow().clone();
+    if let Some(c) = c.filter(|c| c.active.get()) {
+        let s = self::stream(stream);
+        if s.capture().is_none() {
+            *s.rec.borrow_mut() = Some(c);
+        }
+    }
 }
 
 /// Milliseconds between two recorded events (`None` while either was never recorded).
@@ -256,6 +293,31 @@ mod tests {
             g.launch(s);
             assert_eq!(n.get(), 21);
             destroy_stream(s);
+        }
+    }
+
+    #[test]
+    fn a_waiting_stream_joins_the_capture() {
+        let (a, b, e) = (new_stream(), new_stream(), new_event());
+        let n = Rc::new(Cell::new(0));
+        unsafe {
+            begin_capture(a).unwrap();
+            record(e, a);
+            wait(b, e);
+            assert!(capturing(b));
+            let m = n.clone();
+            submit(b, move || m.set(m.get() + 1));
+            let g = end_capture(a).unwrap();
+            assert_eq!(n.get(), 0);
+            assert!(!capturing(b));
+            let m = n.clone();
+            submit(b, move || m.set(m.get() + 100));
+            assert_eq!(n.get(), 100);
+            g.launch(a);
+            assert_eq!(n.get(), 101);
+            destroy_event(e);
+            destroy_stream(a);
+            destroy_stream(b);
         }
     }
 
