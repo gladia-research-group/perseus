@@ -15,7 +15,12 @@ from perseus.impl import config, fake, layout, norm  # noqa: E402
 from perseus.impl.ops import FheOps  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 
-CFG = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cmfl/configs.json"
+CFG = PKG / "configs/model/approximation/gpt2_base_n32_ctx512s/configs.json"
+
+
+def _ladders(cfg):
+    """The norm config with both statistics on their own ladders (the reference form)."""
+    return dataclasses.replace(cfg, spru=0, zladder=0)
 
 
 def _rt():
@@ -26,7 +31,7 @@ def _rt():
 @pytest.mark.parametrize("site", ["transformer.h.3.ln_1", "transformer.h.10.ln_2", "transformer.h.11.ln_2"])
 @pytest.mark.parametrize("pos", [0, 5])
 def test_norm_spru_matches_ladders(site, pos):
-    cfg = config.load_configs(str(CFG)).norm[site]
+    cfg = _ladders(config.load_configs(str(CFG)).norm[site])
     rng = np.random.default_rng(7)
     for scale in (0.15, 0.3):
         rt, fhe, inf = _rt()
@@ -46,7 +51,7 @@ def test_norm_spru_matches_ladders(site, pos):
 
 @pytest.mark.parametrize("site", ["transformer.h.3.ln_1", "transformer.h.10.ln_2", "transformer.h.11.ln_2"])
 def test_norm_zladder_matches_ladders(site):
-    cfg = config.load_configs(str(CFG)).norm[site]
+    cfg = _ladders(config.load_configs(str(CFG)).norm[site])
     rng = np.random.default_rng(9)
     for scale in (0.15, 0.3):
         rt, fhe, inf = _rt()
@@ -63,13 +68,13 @@ def test_norm_zladder_matches_ladders(site):
 
 
 def test_norm_spru_step_masks():
-    cfg = dataclasses.replace(config.load_configs(str(CFG)).norm["transformer.h.3.ln_1"], spru=1)
+    cfg = dataclasses.replace(_ladders(config.load_configs(str(CFG)).norm["transformer.h.3.ln_1"]), spru=1)
     rt, _fhe, _inf = _rt()
     keys = [k for k, _ in norm.norm_step_masks(rt, cfg, 3)]
     assert [k[0] for k in keys] == ["ln.center", "ln.spru.a", "ln.spru.b"]
 
 
-CFG_REF = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cm/configs.json"
+CFG_REF = CFG
 
 
 @pytest.mark.parametrize("kc", [1, 2, 9, 16])

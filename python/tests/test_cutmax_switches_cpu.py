@@ -16,8 +16,21 @@ from perseus.impl.ops import FheOps
 from perseus.impl.rt import Rt
 
 
-def _cutmax(cfgs, logits):
-    """head.cutmax_argmax_packed of `logits` on a production-size fake under configs `cfgs`: (z, refreshes)."""
+CFG = "gpt2_base_n32_ctx512s"
+# the switch sets the speedrun's records served (Decode-8 _cmf, then _cmfl), applied to main's 512-context decode CutMax
+SWITCHES = {"cmf": dict(spru_mean=1, newton_fold=1, conj_once=1),
+            "cmfl": dict(spru_mean=1, newton_fold=1, conj_once=1, entry_dd=1)}
+OFF = dict(spru_mean=0, newton_fold=0, conj_once=0, entry_dd=0)
+
+
+def _cfg(sw):
+    import dataclasses
+    return dataclasses.replace(config.load_configs(str(PKG / f"configs/model/approximation/{CFG}/configs.json")).cutmax,
+                               **{**OFF, **sw})
+
+
+def _cutmax(cfg, logits):
+    """head.cutmax_argmax_packed of `logits` on a production-size fake under CutMax config `cfg`: (z, refreshes)."""
     fhe, inf = fake.make_fake(N=32768, hid=1024, dim=768, H=16, H_real=12, E=4096, E_real=3072, complex_payload=True)
     rt = Rt(FheOps(inf, fake.core, fhe.unit), layout.Dims.from_inf(inf))
     d = rt.dims
@@ -25,29 +38,28 @@ def _cutmax(cfgs, logits):
     t1 = np.zeros(d.N)
     ok = d.N + col < len(logits)
     t1[ok] = logits[d.N + col[ok]]
-    cfg = config.load_configs(str(PKG / f"configs/model/approximation/{cfgs}/configs.json")).cutmax
     Z = head.cutmax_argmax_packed(rt, fake.FakeCt(logits[col] + 1j * t1, 34), len(logits), cfg)
     return head.decode_z(rt, [Z], len(logits), d.N), fhe.n_bootstraps
 
 
-@pytest.mark.parametrize("cfgs", ["gpt2_base_n32_kc16r_cmf", "gpt2_base_n32_kc16r_cmfl"])
-def test_switched_cutmax_is_the_record_one(cfgs):
-    """Every switch is exact arithmetic: the switched CutMax's one-hot is the record's (gpt2_base_n32_kc16r_cm) and the
-    plaintext mirror's."""
+@pytest.mark.parametrize("sw", sorted(SWITCHES))
+def test_switched_cutmax_is_the_record_one(sw):
+    """Every switch is exact arithmetic: the switched CutMax's one-hot is the unswitched one's and the plaintext
+    mirror's."""
     rng = np.random.default_rng(11)
     logits = rng.standard_normal(50257) * 3.0
     logits[4321] = logits.max() + 2.0
-    z0, _ = _cutmax("gpt2_base_n32_kc16r_cm", logits)
-    z1, _ = _cutmax(cfgs, logits)
+    z0, _ = _cutmax(_cfg({}), logits)
+    cfg = _cfg(SWITCHES[sw])
+    z1, _ = _cutmax(cfg, logits)
     np.testing.assert_allclose(z1, z0, rtol=1e-9, atol=1e-12)
-    cfg = config.load_configs(str(PKG / f"configs/model/approximation/{cfgs}/configs.json")).cutmax
     np.testing.assert_allclose(z1, ref.cutmax_ref(logits, cfg), rtol=1e-6, atol=1e-9)
     assert int(np.argmax(z1)) == 4321 and z1[4321] > 0.99
 
 
 def test_newton_folded_is_newton_scaled():
     """poly.inv_sqrt_newton_folded from w = -b1 x is inv_sqrt_newton_scaled of x, served steps and scales alike."""
-    with open(PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cm/configs.json") as f:
+    with open(PKG / f"configs/model/approximation/{CFG}/configs.json") as f:
         raw = json.load(f)["cutmax"]
     x = np.geomspace(1e-5, 1.0, 2001)
     for steps in raw["newton"] + [raw["sum_newton"]]:
