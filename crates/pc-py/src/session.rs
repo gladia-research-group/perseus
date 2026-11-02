@@ -1021,7 +1021,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     }
     if !levels.is_empty() {
-        // the level relinearization keys, their keygen tables and the EvalMod level plans (prototype: a fixed
+        // the level relinearization keys, their keygen tables and the EvalMod level plans (a fixed
         // allowance per EvalMod plan for the latter)
         mp.reserve("keys.level", KeySet::<W>::relin_levels_bytes(&levels, layout, n));
         if matches!(origin, Origin::Generate) {

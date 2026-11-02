@@ -34,7 +34,7 @@ pub struct KeyGen<'a, W: DevWord> {
     /// The gadget (first kp special primes mod q) of shapes over a prefix of P other than P and P' (`stc_ps_kp`).
     gadgets: BTreeMap<usize, crate::context::ScalarTable<'a, W>>,
     gauss: DiscreteGaussian,
-    /// Level relinearization keys (prototype): digit_of and (P' mod q, Shoup) by prime id, per limb top.
+    /// Level relinearization keys: digit_of and (P' mod q, Shoup) by prime id, per limb top.
     levels: BTreeMap<usize, (ConstBuf<'a, i32>, ConstBuf<'a, W>, ConstBuf<'a, W>)>,
 }
 

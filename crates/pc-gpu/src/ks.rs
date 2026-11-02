@@ -944,7 +944,7 @@ pub fn modup_coef_ready<W: DevWord, M: DevStrategy<W>>(
     modup_tail(ctx, s, lv, ks, coef, k)
 }
 
-/// A key-switching level plan over a custom digit partition of rows 0..=top and special set (TIMING PROTOTYPE: keys
+/// A key-switching level plan over a custom digit partition of rows 0..=top and special set (the level keys,
 /// whose special modulus takes the Q primes idle above the level), for `k_max` ciphertexts.
 pub fn custom_level<'a, W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, top: usize, k_max: usize, digs: Vec<Vec<usize>>, specials: Vec<usize>) -> Result<LevelPlan<'a>> {
     let chain = &ctx.chain;

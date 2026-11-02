@@ -332,7 +332,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         mark("cts_acc", &mut parts);
         let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
         em.fuse_rescale = cfg.em_fuse_rescale;
-        // level relinearization keys (prototype): only when the key ring carries them
+        // level relinearization keys: only when the key ring carries them
         em.attach_level_keys(arena, s, ctx, keys, stage)?;
         mark("em", &mut parts);
         let sf_s = st.sf(stc_top as i32)?;

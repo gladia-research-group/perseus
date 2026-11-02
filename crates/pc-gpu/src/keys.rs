@@ -398,7 +398,7 @@ impl KeySetSpec {
     }
 }
 
-/// A level relinearization key (PROTOTYPE, bn-evalmod): for a ciphertext at limb top `top`, the special modulus is
+/// A level relinearization key: for a ciphertext at limb top `top`, the special modulus is
 /// P' = (Q primes top + 1 ..= q_top, idle at that level) x P and the digits partition Q primes 0..=top into `ndig`
 /// balanced runs of at most |P'| limbs (`level_relin_spec`). Relation, every slot t of the shape (Q ids 0..=q_top, P):
 ///   b_d[t] = -a_d[t] s[t] + e_d[t] + (t <= top && t in digit d ? (P' mod q_t) s^2[t] : 0),  a_d = KSKA(seed, d)
@@ -440,7 +440,7 @@ pub struct KeySet<'a, W: DevWord> {
     /// Rotation keys by step normalized to `[0, N/2)` (`rot` normalizes the lookup).
     pub rots: BTreeMap<i64, DevKsk<'a, W>>,
     pub bts: Option<BtsKeys<'a, W>>,
-    /// Level relinearization keys by limb top (`LevelRelinSpec`; prototype, empty unless carved).
+    /// Level relinearization keys by limb top (`LevelRelinSpec`; empty unless carved).
     pub relin_levels: BTreeMap<usize, (LevelRelinSpec, DevKsk<'a, W>)>,
     /// Rotation keys over P' (`KskShape::stc_ps`) by normalized step (`carve_extra`).
     pub rots_ps: BTreeMap<i64, DevKsk<'a, W>>,

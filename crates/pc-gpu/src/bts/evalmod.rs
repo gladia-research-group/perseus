@@ -103,7 +103,7 @@ struct RelinRescale<'a, W: DevWord> {
     wtop: ScalarPair<'a, W>,
 }
 
-/// A fused relinearization-rescale at a top over a level relinearization key (`keys::LevelRelinSpec`, prototype): fewer
+/// A fused relinearization-rescale at a top over a level relinearization key (`keys::LevelRelinSpec`): fewer
 /// digits, special modulus P' = P x the Q primes idle above the level (`attach_level_keys`).
 struct LevelKs<'a, W: DevWord> {
     lv: crate::ks::LevelPlan<'a>,
@@ -1144,7 +1144,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     }
 
     /// Run the fused relinearization-rescales whose top has a level relinearization key in `ring` over that key
-    /// (prototype; `keys::LevelRelinSpec`). Setup only; the plan's carved bytes grow by the level tables.
+    /// (`keys::LevelRelinSpec`). Setup only; the plan's carved bytes grow by the level tables.
     pub fn attach_level_keys<M: DevStrategy<W>>(&mut self, arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, ring: &dyn super::BtsKeyRing, stage: Option<(*const c_void, *const c_void)>) -> Result<usize> {
         let used0 = arena.used_bytes();
         let pairs = relin_rescale_pairs(&self.ops, ctx.chain.level_unit);

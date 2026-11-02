@@ -619,7 +619,7 @@ impl Chain {
         v.extend((0..self.q.len()).filter(|i| !self.digits[d].contains(i)));
         v
     }
-    /// A level relinearization key's layout (bn-evalmod prototype) for a ciphertext at limb top `top`: digits of Q
+    /// A level relinearization key's layout for a ciphertext at limb top `top`: digits of Q
     /// primes 0..=top, balanced, at most |P'| limbs each, P' = (the Q primes top + 1 .. top + e, idle at that level) x P,
     /// |P'| <= `cap`: (digits, P' prime ids, the key's top stored Q id). None when the chain's partition has no more
     /// digits there. The key's modulus is the chain's Q P.

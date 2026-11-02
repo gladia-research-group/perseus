@@ -200,7 +200,7 @@ pub trait BtsKeyRing {
     fn dense_to_sparse(&self) -> Result<&dyn KsKeyRef>;
     /// Encapsulation: sparse secret -> dense secret (applied at the raised level).
     fn sparse_to_dense(&self) -> Result<&dyn KsKeyRef>;
-    /// The level relinearization key of limb top `top` (prototype; `keys::LevelRelinSpec`), when carved.
+    /// The level relinearization key of limb top `top` (`keys::LevelRelinSpec`), when carved.
     fn relin_level(&self, _top: usize) -> Option<(&crate::keys::LevelRelinSpec, &dyn KsKeyRef)> {
         None
     }
