@@ -589,8 +589,10 @@ pub fn compile_block(
 /// 0's; one level deeper, on the first single prime, it loses 6-30 bits). A refresh's landing (effective level, the
 /// pending rescale included) is at most one level below the region's top for the dense routes and SPRU, whose EvalMod
 /// is their last stage (n32sp: dense raise drop 1, SPRU 7); SparseB, whose StC follows EvalMod, keeps its EvalMod
-/// above the region (landing one level below its top; an StC on single-prime levels is not validated). One error per
-/// site, like the compile check's.
+/// above the region (landing one level below its top; an StC on single-prime levels is not validated). A raise drop
+/// moves the whole refresh down with its landing, so it is checked the same way: on n32sp one dense drop at most, on
+/// n32sph, whose region sits under three of n32a4's uniform pairs, up to four. One error per site, like the compile
+/// check's.
 pub fn user_region_sites(chain: &ChainShape, sites: &[BtsSite]) -> Vec<String> {
     if chain.singles == 0 {
         return vec![];
