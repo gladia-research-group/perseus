@@ -535,6 +535,10 @@ pub fn compile_block(
         if crate::program::lever_on("rr_pre") {
             rr::fuse_preludes(&mut p, &sh, &shape);
         }
+        // eager rescales (PC_LIN_OFF=rr_early: off)
+        if crate::program::lever_on("rr_early") {
+            rr::early(&mut p, &sh);
+        }
     }
     if crate::program::lever_on("share") {
         share::share_rescales(&mut p, &sh);
