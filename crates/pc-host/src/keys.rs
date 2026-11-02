@@ -5,6 +5,7 @@ use crate::arith::Hw;
 use crate::expand::{expand_row, seed_at, TAG_ENCA, TAG_KSKA};
 use crate::launch;
 use crate::raw::{el, par_for};
+use crate::simd::w as v;
 use pc_kernels::args::*;
 
 type S = CudaStream;
@@ -83,19 +84,27 @@ pub extern "C" fn ksk_gen<W: Hw>(a: *const KskGenArgs, s: S) -> i32 {
             } else {
                 (None, W::default(), W::default())
             };
-            let r: Vec<W> = (0..N)
-                .map(|i| {
-                    let mut x = e[i];
-                    if let Some(so) = so {
-                        let mut t = so[i];
-                        if a.sq != 0 {
-                            t = W::mul(t, t, q);
-                        }
-                        x = W::add(x, W::mul_shoup(t, pm, pms, p), p);
-                    }
-                    W::sub(x, W::mul(ar[i], sn[i], q), p)
-                })
-                .collect();
+            // r = e (+ pmod s_old'(^2)) - a s_new, as row operations
+            let mut acc = crate::raw::buf::<W::Acc>(N);
+            let mut r = crate::raw::buf::<W>(N);
+            let mut t = crate::raw::buf::<W>(N);
+            r.copy_from_slice(e);
+            if let Some(so) = so {
+                if a.sq != 0 {
+                    acc.fill(W::Acc::default());
+                    v::mac::<W>(&mut acc, so, so);
+                    v::reduce::<W>(&acc, q, &mut t);
+                } else {
+                    t.copy_from_slice(so);
+                }
+                v::shoup_row::<W>(&mut r, &t, pm, pms, p, false);
+            }
+            acc.fill(W::Acc::default());
+            v::mac::<W>(&mut acc, &ar, sn);
+            v::reduce::<W>(&acc, q, &mut t);
+            for (x, &y) in r.iter_mut().zip(t.iter()) {
+                *x = W::sub(*x, y, p);
+            }
             if !a.a.is_null() {
                 rowm::<W>(a.a, row * N).copy_from_slice(&ar);
             }
