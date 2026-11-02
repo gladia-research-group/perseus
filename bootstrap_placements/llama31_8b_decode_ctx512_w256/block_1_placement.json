@@ -20554,41 +20554,8 @@
         "no_slack": 2
       },
       "blind_branches": {
-        "count": 109,
-        "vars": [
-          "sc_blk1_ln1_76",
-          "sc_blk1_ln1_79",
-          "sc_blk1_ln2_22",
-          "sc_blk1_ln2_23",
-          "sc_blk1_ln2_24",
-          "sc_blk1_ln2_25",
-          "sc_blk1_ln2_26",
-          "sc_blk1_ln2_27",
-          "sc_blk1_ln2_28",
-          "sc_blk1_ln2_29",
-          "sc_blk1_ln2_30",
-          "sc_blk1_ln2_31",
-          "sc_blk1_ln2_32",
-          "sc_blk1_ln2_33",
-          "sc_blk1_ln2_34",
-          "sc_blk1_ln2_35",
-          "sc_blk1_ln2_36",
-          "sc_blk1_ln2_41",
-          "sc_blk1_ln2_45",
-          "sc_blk1_ln2_46",
-          "sc_blk1_ln2_47",
-          "sc_blk1_ln2_48",
-          "sc_blk1_ln2_49",
-          "sc_blk1_ln2_50",
-          "sc_blk1_ln2_51",
-          "sc_blk1_ln2_52",
-          "sc_blk1_ln2_53",
-          "sc_blk1_ln2_54",
-          "sc_blk1_ln2_55",
-          "sc_blk1_ln2_56",
-          "sc_blk1_ln2_57",
-          "sc_blk1_ln2_61"
-        ]
+        "count": 0,
+        "vars": []
       },
       "placed_input_levels": {
         "sc_blk1_ln1_12": 42.0,

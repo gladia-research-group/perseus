@@ -20729,41 +20729,8 @@
         "no_slack": 5
       },
       "blind_branches": {
-        "count": 83,
-        "vars": [
-          "sc_blk0_ln2_34",
-          "sc_blk0_ln2_35",
-          "sc_blk0_ln2_36",
-          "sc_blk0_ln2_39",
-          "sc_blk0_ln2_47",
-          "sc_blk0_ln2_48",
-          "sc_blk0_ln2_49",
-          "sc_blk0_ln2_50",
-          "sc_blk0_ln2_51",
-          "sc_blk0_ln2_52",
-          "sc_blk0_ln2_53",
-          "sc_blk0_ln2_54",
-          "sc_blk0_ln2_55",
-          "sc_blk0_ln2_63",
-          "sc_blk0_ln2_64",
-          "sc_blk0_ln2_65",
-          "sc_blk0_ln2_66",
-          "sc_blk0_ln2_67",
-          "sc_blk0_ln2_68",
-          "sc_blk0_ln2_69",
-          "sc_blk0_ln2_70",
-          "sc_blk0_ln2_78",
-          "sc_blk0_ln2_79",
-          "sc_blk0_ln2_80",
-          "sc_blk0_ln2_81",
-          "sc_blk0_ln2_82",
-          "sc_blk0_ln2_83",
-          "sc_blk0_ln2_84",
-          "sc_blk0_ln2_85",
-          "sc_blk0_ln2_86",
-          "sc_blk0_silu_10",
-          "sc_blk0_silu_11"
-        ]
+        "count": 0,
+        "vars": []
       },
       "placed_input_levels": {
         "sc_blk0_ln2_3": 38.0,
