@@ -4,7 +4,8 @@
 use crate::arith::{automorph_slot, Hw};
 use crate::expand::{expand_row, seed_at, TAG_KSKA};
 use crate::launch;
-use crate::raw::{el, par_for};
+use crate::raw::{buf, el, par_for, Buf};
+use crate::simd::w as v;
 use pc_kernels::args::*;
 
 type S = CudaStream;
@@ -30,28 +31,6 @@ pub(crate) fn slot_of(k: &KeyTab, t: usize, nq: usize) -> usize {
     }
 }
 
-/// Stored `b` row `r` of a KeyTab key: dense W words, or `bits`-wide values packed in a little-endian u32 stream.
-pub(crate) fn b_row<W: Hw>(k: &KeyTab, kb: *const std::ffi::c_void, r: usize, out: &mut [W]) {
-    if k.bits == 0 {
-        out.copy_from_slice(row::<W>(kb, r * k.row_words as usize));
-        return;
-    }
-    // SAFETY: packed row of row_words u32 words (with its guard word)
-    let w = unsafe { std::slice::from_raw_parts((kb as *const u32).add(r * k.row_words as usize), k.row_words as usize) };
-    if W::BITS == 32 {
-        // SAFETY: W is u32
-        return crate::simd::unpack(w, k.bits as u32, unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len()) });
-    }
-    let bits = k.bits as u64;
-    let mask = (1u64 << bits) - 1;
-    for (s, o) in out.iter_mut().enumerate() {
-        let bit = s as u64 * bits;
-        let (i, sh) = ((bit >> 5) as usize, bit & 31);
-        let v = (w[i] as u64 | (w.get(i + 1).copied().unwrap_or(0) as u64) << 32) >> sh;
-        *o = W::from_u64(v & mask);
-    }
-}
-
 /// The operand of digit d for ciphertext c: c1 itself in its own digit, else the ModUp output.
 fn x_row<W: Hw>(a: &KsArgs, c: usize, d: usize, dt: i64, roff: usize) -> &'static [W] {
     if d as i64 == dt {
@@ -61,50 +40,98 @@ fn x_row<W: Hw>(a: &KsArgs, c: usize, d: usize, dt: i64, roff: usize) -> &'stati
     }
 }
 
-/// (s0, s1)[c] = sum_d x_{c,d} (b_d, a_d) for the K ciphertexts of row t; `ab(d, b, a)` fills the key rows.
-fn dot_rows<W: Hw>(a: &KsArgs, t: usize, ab: &mut impl FnMut(usize, &mut [W], &mut [W])) -> (crate::raw::Buf<W::Acc>, crate::raw::Buf<W::Acc>) {
+/// Chunk of slots per task (u32: 16 per row; other words take whole rows: their `a` expands per row).
+fn chunk<W: Hw>() -> usize {
+    if W::BITS == 32 {
+        4096
+    } else {
+        N
+    }
+}
+
+/// (s0, s1)[c] = sum_d x_{c,d} (b_d, a_d) over slots [lo, lo + n) of row t for the K ciphertexts; `ab(d, b, a)` fills
+/// the key words of those slots.
+fn dot_chunk<W: Hw>(a: &KsArgs, t: usize, lo: usize, n: usize, ab: &mut impl FnMut(usize, &mut [W], &mut [W])) -> (Buf<W::Acc>, Buf<W::Acc>) {
     let k = a.k as usize;
     let dt = if (t as i32) < a.nq { el::<i32>(a.digit_of as _, t) as i64 } else { -1 };
-    let (mut s0, mut s1) = (crate::raw::buf::<W::Acc>(k * N), crate::raw::buf::<W::Acc>(k * N));
-    let (mut b, mut ar) = (crate::raw::buf::<W>(N), crate::raw::buf::<W>(N));
+    let (mut s0, mut s1) = (buf::<W::Acc>(k * n), buf::<W::Acc>(k * n));
+    let (mut b, mut ar) = (buf::<W>(n), buf::<W>(n));
     for d in 0..a.ndig as usize {
         ab(d, &mut b, &mut ar);
         for c in 0..k {
-            let x = x_row::<W>(a, c, d, dt, t * N);
-            crate::simd::w::mac2::<W>(&mut s0[c * N..(c + 1) * N], &mut s1[c * N..(c + 1) * N], x, &b, &ar);
+            let x = &x_row::<W>(a, c, d, dt, t * N)[lo..lo + n];
+            v::mac2::<W>(&mut s0[c * n..(c + 1) * n], &mut s1[c * n..(c + 1) * n], x, &b, &ar);
         }
     }
     (s0, s1)
 }
 
-/// ks_dot's outputs of key r for row t: c0 modes, automorphism, accumulation.
-fn store_rot<W: Hw>(a: &KsArgs, t: usize, r: usize, s0: &[W::Acc], s1: &[W::Acc]) {
+/// The key words of slots [lo, lo + out.len()) of a stored `b` row: dense, or unpacked from the packed row's own
+/// words (lo a multiple of 32: 32 values of `bits` bits are `bits` whole words).
+fn b_chunk<W: Hw>(k: &KeyTab, kb: *const std::ffi::c_void, r: usize, lo: usize, out: &mut [W]) {
+    if k.bits == 0 {
+        out.copy_from_slice(&row::<W>(kb, r * k.row_words as usize)[lo..lo + out.len()]);
+        return;
+    }
+    // SAFETY: packed row of row_words u32 words (with its guard word)
+    let w = unsafe { std::slice::from_raw_parts((kb as *const u32).add(r * k.row_words as usize), k.row_words as usize) };
+    let w0 = lo / 32 * k.bits as usize;
+    // SAFETY: packed keys exist at W = u32 only (launch check)
+    let o = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len()) };
+    crate::simd::unpack(&w[w0..(w0 + out.len() / 32 * k.bits as usize + 2).min(w.len())], k.bits as u32, o);
+}
+
+/// The expanded `a` (KSKA lane) of (seed, digit, prime) at slots [lo, lo + out.len()).
+fn a_chunk<W: Hw>(seed: &[u32; 8], d: usize, p: u64, lo: usize, out: &mut [W]) {
+    if W::BITS == 32 {
+        let r = crate::expand::cache::get(seed, d as u32, p as u32, N);
+        // SAFETY: W is u32
+        let o = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len()) };
+        o.copy_from_slice(&r[lo..lo + out.len()]);
+    } else {
+        // whole-row chunks at other words
+        expand_row::<W>(seed, d as u32, p, TAG_KSKA, out);
+    }
+}
+
+/// ks_dot's outputs of key r for slots [lo, lo + n) of row t: c0 modes, automorphism, accumulation.
+fn store_rot<W: Hw>(a: &KsArgs, t: usize, r: usize, lo: usize, n: usize, s0: &[W::Acc], s1: &[W::Acc]) {
     let q = prime(a.pr, t);
     let p = W::from_u64(q.p);
     let kexp = el::<u32>(a.autok as _, r);
     let mode = a.c0_mode & 3;
-    let (pm, pms) = if mode == 1 && (t as i32) < a.nq { (el::<W>(a.pmod, t), el::<W>(a.pmods, t)) } else { (W::default(), W::default()) };
+    let (mut r0, mut r1) = (buf::<W>(n), buf::<W>(n));
     for c in 0..a.k as usize {
-        let c0 = if mode != 0 { Some(row::<W>(a.c0, c * a.ct_stride as usize + t * N)) } else { None };
+        v::reduce::<W>(&s0[c * n..(c + 1) * n], q, &mut r0);
+        v::reduce::<W>(&s1[c * n..(c + 1) * n], q, &mut r1);
+        let c0 = || &row::<W>(a.c0, c * a.ct_stride as usize + t * N)[lo..lo + n];
+        match mode {
+            1 if (t as i32) < a.nq => v::shoup_row::<W>(&mut r0, c0(), el::<W>(a.pmod, t), el::<W>(a.pmods, t), p, false),
+            2 => v::add_rows::<W>(&mut r0, c0(), p),
+            _ => {}
+        }
         let ob = c * a.out_ct_stride as usize + r * a.out_rot_stride as usize + t * N;
         let (o0, o1) = (a.out0 as *mut W, a.out1 as *mut W);
-        for i in 0..N {
-            let mut r0 = W::reduce(s0[c * N + i], q);
-            let mut r1 = W::reduce(s1[c * N + i], q);
-            match mode {
-                1 if (t as i32) < a.nq => r0 = W::add(r0, W::mul_shoup(c0.unwrap()[i], pm, pms, p), p),
-                2 => r0 = W::add(r0, c0.unwrap()[i], p),
-                _ => {}
-            }
-            let o = if kexp == 1 { i } else { automorph_slot(kexp, i as u32, LOG_N) as usize };
-            // SAFETY: output word inside the launch's buffers
+        let acc = a.c0_mode & KS_ACC != 0;
+        if kexp == 1 && !acc {
+            // SAFETY: the chunk of the output rows
             unsafe {
-                if a.c0_mode & KS_ACC != 0 {
-                    r0 = W::add(r0, *o0.add(ob + o), p);
-                    r1 = W::add(r1, *o1.add(ob + o), p);
+                std::slice::from_raw_parts_mut(o0.add(ob + lo), n).copy_from_slice(&r0);
+                std::slice::from_raw_parts_mut(o1.add(ob + lo), n).copy_from_slice(&r1);
+            }
+            continue;
+        }
+        for i in 0..n {
+            let o = if kexp == 1 { lo + i } else { automorph_slot(kexp, (lo + i) as u32, LOG_N) as usize };
+            // SAFETY: output word inside the launch's buffers (the automorphism permutes the row's slots)
+            unsafe {
+                let (mut x0, mut x1) = (r0[i], r1[i]);
+                if acc {
+                    x0 = W::add(x0, *o0.add(ob + o), p);
+                    x1 = W::add(x1, *o1.add(ob + o), p);
                 }
-                *o0.add(ob + o) = r0;
-                *o1.add(ob + o) = r1;
+                *o0.add(ob + o) = x0;
+                *o1.add(ob + o) = x1;
             }
         }
     }
@@ -116,16 +143,17 @@ fn row_id(a: &KsArgs, y: usize) -> usize {
 
 pub extern "C" fn ks_dot<W: Hw>(a: *const KsArgs, s: S) -> i32 {
     launch(a, s, |a| if a.k > 8 { -1 } else { 0 }, |a| {
-        par_for(a.nrows as usize, a, |a, y| {
-            let t = row_id(a, y);
+        let n = chunk::<W>();
+        par_for(a.nrows as usize * (N / n), a, |a, task| {
+            let (t, lo) = (row_id(a, task / (N / n)), task % (N / n) * n);
             for r in 0..a.r as usize {
                 let (kb, ka) = (el::<*const std::ffi::c_void>(a.kb as _, r), el::<*const std::ffi::c_void>(a.ka as _, r));
-                let off = |d: usize| d * a.key_digit_stride as usize + t * N;
-                let (s0, s1) = dot_rows::<W>(a, t, &mut |d, b, ar| {
-                    b.copy_from_slice(row::<W>(kb, off(d)));
-                    ar.copy_from_slice(row::<W>(ka, off(d)));
+                let off = |d: usize| d * a.key_digit_stride as usize + t * N + lo;
+                let (s0, s1) = dot_chunk::<W>(a, t, lo, n, &mut |d, b, ar| {
+                    b.copy_from_slice(&row::<W>(kb, off(d))[..n]);
+                    ar.copy_from_slice(&row::<W>(ka, off(d))[..n]);
                 });
-                store_rot::<W>(a, t, r, &s0, &s1);
+                store_rot::<W>(a, t, r, lo, n, &s0, &s1);
             }
         })
     })
@@ -142,24 +170,25 @@ pub extern "C" fn ks_dot_key<W: Hw>(a: *const KsKeyArgs, s: S) -> i32 {
         }
     };
     launch(a, s, bad, |g| {
-        par_for(g.ks.nrows as usize, g, |g, y| {
+        let n = chunk::<W>();
+        par_for(g.ks.nrows as usize * (N / n), g, |g, task| {
             let (a, kt) = (&g.ks, &g.key);
-            let t = row_id(a, y);
+            let (t, lo) = (row_id(a, task / (N / n)), task % (N / n) * n);
             let p = prime(a.pr, t).p;
             let slot = slot_of(kt, t, a.nq as usize);
             for r in 0..a.r as usize {
                 let kb = el::<*const std::ffi::c_void>(kt.kb as _, r);
                 let seed = seed_at(el::<*const u32>(kt.seed as _, r));
-                let (s0, s1) = dot_rows::<W>(a, t, &mut |d, b, ar| {
+                let (s0, s1) = dot_chunk::<W>(a, t, lo, n, &mut |d, b, ar| {
                     if (d as i32) < kt.nregen {
-                        expand_row::<W>(&seed, d as u32, p, TAG_KSKA, ar);
+                        a_chunk::<W>(&seed, d, p, lo, ar);
                     } else {
                         let ka = el::<*const std::ffi::c_void>(a.ka as _, r);
-                        ar.copy_from_slice(row::<W>(ka, d * a.key_digit_stride as usize + t * N));
+                        ar.copy_from_slice(&row::<W>(ka, d * a.key_digit_stride as usize + t * N + lo)[..n]);
                     }
-                    b_row::<W>(kt, kb, d * kt.srows as usize + slot, b);
+                    b_chunk::<W>(kt, kb, d * kt.srows as usize + slot, lo, b);
                 });
-                store_rot::<W>(a, t, r, &s0, &s1);
+                store_rot::<W>(a, t, r, lo, n, &s0, &s1);
             }
         })
     })
@@ -178,34 +207,32 @@ pub extern "C" fn ks_dot_regen<W: Hw>(a: *const KsRegenArgs, s: S) -> i32 {
         }
     };
     launch(a, s, bad, |g| {
-        par_for(g.ks.nrows as usize, g, |g, y| {
+        let n = chunk::<W>();
+        par_for(g.ks.nrows as usize * (N / n), g, |g, task| {
             let (a, kt, e) = (&g.ks, &g.key, &g.epi);
-            let t = row_id(a, y);
+            let (t, lo) = (row_id(a, task / (N / n)), task % (N / n) * n);
             let q = prime(a.pr, t);
             let p = W::from_u64(q.p);
             let seed = seed_at(g.seed);
             let tab = !kt.kb.is_null();
             let kb = if tab { el::<*const std::ffi::c_void>(kt.kb as _, 0) } else { el::<*const std::ffi::c_void>(a.kb as _, 0) };
             let slot = if tab { slot_of(kt, t, a.nq as usize) } else { 0 };
-            let (s0, s1) = dot_rows::<W>(a, t, &mut |d, b, ar| {
-                expand_row::<W>(&seed, d as u32, q.p, TAG_KSKA, ar);
+            let (s0, s1) = dot_chunk::<W>(a, t, lo, n, &mut |d, b, ar| {
+                a_chunk::<W>(&seed, d, q.p, lo, ar);
                 if tab {
-                    b_row::<W>(kt, kb, d * kt.srows as usize + slot, b);
+                    b_chunk::<W>(kt, kb, d * kt.srows as usize + slot, lo, b);
                 } else {
-                    b.copy_from_slice(row::<W>(kb, d * a.key_digit_stride as usize + t * N));
+                    b.copy_from_slice(&row::<W>(kb, d * a.key_digit_stride as usize + t * N + lo)[..n]);
                 }
             });
+            let mut x = buf::<W>(n);
             for c in 0..a.k as usize {
-                let ob = c * a.out_ct_stride as usize + t * N;
+                let ob = c * a.out_ct_stride as usize + t * N + lo;
                 if g.use_epi == 0 {
-                    let (o0, o1) = (a.out0 as *mut W, a.out1 as *mut W);
-                    for i in 0..N {
-                        // SAFETY: output words of row t
-                        unsafe {
-                            *o0.add(ob + i) = W::reduce(s0[c * N + i], q);
-                            *o1.add(ob + i) = W::reduce(s1[c * N + i], q);
-                        }
-                    }
+                    // SAFETY: the chunk of the output rows
+                    let (o0, o1) = unsafe { (std::slice::from_raw_parts_mut((a.out0 as *mut W).add(ob), n), std::slice::from_raw_parts_mut((a.out1 as *mut W).add(ob), n)) };
+                    v::reduce::<W>(&s0[c * n..(c + 1) * n], q, o0);
+                    v::reduce::<W>(&s1[c * n..(c + 1) * n], q, o1);
                     continue;
                 }
                 let (bi, bis) = (el::<W>(e.binv, t), el::<W>(e.binvs, t));
@@ -213,18 +240,18 @@ pub extern "C" fn ks_dot_regen<W: Hw>(a: *const KsRegenArgs, s: S) -> i32 {
                 let al = (!e.alpha.is_null()).then(|| (el::<W>(e.alpha, t), el::<W>(e.alphas, t)));
                 for part in 0..2 {
                     let off = ob + part * e.part_stride as usize;
-                    let (dp, cv) = ((e.dst as *mut W), row::<W>(e.conv, off));
-                    let add = (!g.add.is_null()).then(|| row::<W>(g.add, off));
+                    let cv = &row::<W>(e.conv, off)[..n];
+                    let add = (!g.add.is_null()).then(|| &row::<W>(g.add, off)[..n]);
                     let sx = if part == 0 { &s0 } else { &s1 };
-                    for i in 0..N {
-                        let x = W::reduce(sx[c * N + i], q);
-                        // SAFETY: epilogue destination word of row t
-                        let dv = unsafe { *dp.add(off + i) };
+                    v::reduce::<W>(&sx[c * n..(c + 1) * n], q, &mut x);
+                    // SAFETY: the chunk of the epilogue destination (read, then written)
+                    let dp = unsafe { std::slice::from_raw_parts_mut((e.dst as *mut W).add(off), n) };
+                    for i in 0..n {
                         let dv = match al {
-                            Some((ai, ais)) => W::mul_shoup(dv, ai, ais, p),
-                            None => dv,
+                            Some((ai, ais)) => W::mul_shoup(dp[i], ai, ais, p),
+                            None => dp[i],
                         };
-                        let mut r = W::add(dv, W::mul_shoup(W::sub(x, cv[i], p), bi, bis, p), p);
+                        let mut r = W::add(dv, W::mul_shoup(W::sub(x[i], cv[i], p), bi, bis, p), p);
                         if e.dbl != 0 {
                             r = W::add(r, r, p);
                         }
@@ -234,8 +261,7 @@ pub extern "C" fn ks_dot_regen<W: Hw>(a: *const KsRegenArgs, s: S) -> i32 {
                         if let Some(ad) = add {
                             r = W::add(r, ad[i], p);
                         }
-                        // SAFETY: as above
-                        unsafe { *dp.add(off + i) = r };
+                        dp[i] = r;
                     }
                 }
             }

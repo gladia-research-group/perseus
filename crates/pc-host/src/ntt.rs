@@ -191,7 +191,13 @@ pub extern "C" fn fwd<W: Hw>(a: *const NttArgs, s: S) -> i32 {
             0
         }
     };
-    launch(a, s, bad, |a| fwd_with::<W>(a, &|a, i, p, x| load(a, i, p, x)))
+    launch(a, s, bad, |a| {
+        #[cfg(target_arch = "x86_64")]
+        if phased_ok::<W>(a) {
+            return phased(a, true);
+        }
+        fwd_with::<W>(a, &|a, i, p, x| load(a, i, p, x))
+    })
 }
 
 /// The forward transform of the launch's rows (epilogues included), row i's input from `src(a, i, p, x)`.
@@ -229,33 +235,121 @@ pub(crate) fn fwd_with<W: Hw>(a: &NttArgs, src: &(dyn Fn(&NttArgs, usize, W, &mu
                 row.copy_from_slice(&x);
                 return;
             }
-            let (sc, ss) = (el::<W>(a.es, pid), el::<W>(a.ess, pid));
-            let r = roff * N;
-            for (e, &v) in x.iter().enumerate() {
-                let mut xs = el::<W>(a.ex, r + e);
-                for j in 1..a.xnum.max(1) as usize {
-                    xs = W::add(xs, el::<W>(a.ex, r + e + j * a.xstride as usize), p);
-                }
-                // SAFETY: word r + e of the epilogue output
-                let o = unsafe { (a.eout as *mut W).add(r + e) };
-                let y = match a.epi {
-                    3 => W::add(W::mul_shoup(xs, sc, ss, p), v, p),
-                    1 => W::mul_shoup(W::sub(xs, v, p), sc, ss, p),
-                    _ => {
-                        // SAFETY: the accumulated term, read before the store
-                        let d = if a.ed.is_null() { unsafe { *o } } else { el::<W>(a.ed, r + e) };
-                        W::add(d, W::mul_shoup(W::sub(xs, v, p), sc, ss, p), p)
-                    }
-                };
-                // SAFETY: as above
-                unsafe { *o = y };
-            }
+            epilogue::<W>(a, roff, pid, p, 0, &x);
         })
     }
 }
 
+/// The forward epilogue of the transform values `vals` of row words [lo, lo + vals.len()) (NttArgs::epi).
+fn epilogue<W: Hw>(a: &NttArgs, roff: usize, pid: usize, p: W, lo: usize, vals: &[W]) {
+    let (sc, ss) = (el::<W>(a.es, pid), el::<W>(a.ess, pid));
+    let r = roff * N + lo;
+    for (e, &v) in vals.iter().enumerate() {
+        let mut xs = el::<W>(a.ex, r + e);
+        for j in 1..a.xnum.max(1) as usize {
+            xs = W::add(xs, el::<W>(a.ex, r + e + j * a.xstride as usize), p);
+        }
+        // SAFETY: word r + e of the epilogue output
+        let o = unsafe { (a.eout as *mut W).add(r + e) };
+        let y = match a.epi {
+            3 => W::add(W::mul_shoup(xs, sc, ss, p), v, p),
+            1 => W::mul_shoup(W::sub(xs, v, p), sc, ss, p),
+            _ => {
+                // SAFETY: the accumulated term, read before the store
+                let d = if a.ed.is_null() { unsafe { *o } } else { el::<W>(a.ed, r + e) };
+                W::add(d, W::mul_shoup(W::sub(xs, v, p), sc, ss, p), p)
+            }
+        };
+        // SAFETY: as above
+        unsafe { *o = y };
+    }
+}
+
+/// Row i's (offset, prime id, prime) and its base row.
+fn row_of(a: &NttArgs, i: usize) -> (usize, usize, u32, &'static mut [u32]) {
+    // SAFETY: rows / prime ids of nrows entries; the base row of N words (u32 instantiation)
+    unsafe {
+        let (roff, pid) = (*a.roff.add(i) as usize, *a.rprime.add(i) as usize);
+        let p = (*a.pr.add(pid)).p as u32;
+        (roff, pid, p, std::slice::from_raw_parts_mut((a.base as *mut u32).add(roff * N), N))
+    }
+}
+
+/// Words [lo, lo + n) of row i's input: the sum mod p of its snum sources into `dst`.
+fn src_sum(a: &NttArgs, i: usize, p: u32, lo: usize, dst: &mut [u32]) {
+    // SAFETY: source rows of the launch (soff set)
+    unsafe {
+        let src = (a.src as *const u32).add(*a.soff.add(i) as usize * N + lo);
+        dst.copy_from_slice(std::slice::from_raw_parts(src, dst.len()));
+        for m in 1..a.snum.max(1) as usize {
+            crate::simd::add_rows(dst, std::slice::from_raw_parts(src.add(m * a.sstride as usize), dst.len()), p);
+        }
+    }
+}
+
+/// The u32 lazy transform as two parallel phases (strips of the first pass, blocks of the second), so a launch of
+/// few rows still spreads over the pool; the words are those of the row-at-a-time transform.
+#[cfg(target_arch = "x86_64")]
+fn phased(a: &NttArgs, fwd: bool) {
+    use crate::ntt_avx::{block, strip, BLOCK, BLOCK_STAGES, MID, STRIP};
+    let (nr, ns, nb) = (a.nrows as usize, BLOCK / STRIP, N / BLOCK);
+    let tw = move |a: &NttArgs, pid: usize| if fwd { (as_u32c(table::<u32>(a.fw, pid)), as_u32c(table::<u32>(a.fws, pid))) } else { (as_u32c(table::<u32>(a.iw, pid)), as_u32c(table::<u32>(a.iws, pid))) };
+    let strips = |a: &NttArgs, task: usize| {
+        let (i, c0) = (task / ns, task % ns * STRIP);
+        let (_, pid, p, row) = row_of(a, i);
+        if fwd && !a.soff.is_null() {
+            for k in 0..N / BLOCK {
+                let lo = c0 + BLOCK * k;
+                src_sum(a, i, p, lo, &mut row[lo..lo + STRIP]);
+            }
+        }
+        let ninv = (!fwd).then(|| (el::<u32>(a.ninv, pid), el::<u32>(a.ninvs, pid)));
+        let (w, ws) = tw(a, pid);
+        // SAFETY: CPU features checked by the caller
+        unsafe { strip(row, w, ws, p, fwd, ninv, c0) };
+    };
+    let blocks = |a: &NttArgs, task: usize| {
+        let (i, lo) = (task / nb, task % nb * BLOCK);
+        let (roff, pid, p, row) = row_of(a, i);
+        let (w, ws) = tw(a, pid);
+        let xb = &mut row[lo..lo + BLOCK];
+        if !fwd && !a.soff.is_null() {
+            src_sum(a, i, p, lo, xb);
+        }
+        // SAFETY: CPU features checked by the caller
+        unsafe {
+            if a.epi == 0 {
+                block(xb, w, ws, p, fwd, lo, 0, BLOCK_STAGES, fwd);
+            } else {
+                // the row keeps the column-pass state; the transform finishes on a copy, into the epilogue
+                block(xb, w, ws, p, true, lo, 0, MID, false);
+                let mut y = crate::raw::buf::<u32>(BLOCK);
+                y.copy_from_slice(xb);
+                block(&mut y, w, ws, p, true, lo, MID, BLOCK_STAGES, true);
+                epilogue::<u32>(a, roff, pid, p, lo, &y);
+            }
+        }
+    };
+    if fwd {
+        par_for(nr * ns, a, strips);
+        par_for(nr * nb, a, blocks);
+    } else {
+        par_for(nr * nb, a, blocks);
+        par_for(nr * ns, a, strips);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn phased_ok<W: Hw>(a: &NttArgs) -> bool {
+    W::BITS == 32 && a.lazy != 0 && wide()
+}
+
 pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {
     launch(a, s, |a| if a.epi != 0 { -1 } else { 0 }, |a| {
+        #[cfg(target_arch = "x86_64")]
+        if phased_ok::<W>(a) {
+            return phased(a, false);
+        }
         par_for(a.nrows as usize, a, |a, i| {
             // SAFETY: rows / prime ids of nrows entries
             let (roff, pid) = unsafe { (*a.roff.add(i) as usize, *a.rprime.add(i) as usize) };

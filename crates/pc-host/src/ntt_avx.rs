@@ -56,7 +56,7 @@ fn small_t(t: usize) -> ([i32; 16], [i32; 16], [i32; 16]) {
 }
 
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
-unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize) {
+unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize, base: usize) {
     let (lo, hi, g) = small_t(t);
     let (ilo, ihi, ig) = (ld(lo.as_ptr() as *const u32), ld(hi.as_ptr() as *const u32), ld(g.as_ptr() as *const u32));
     // inverse placement: word j of the block from lo (j mod 2t < t) or hi, at lane (j / 2t) t + j mod t (+16 for hi)
@@ -68,7 +68,7 @@ unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, 
     let (ib0, ib1) = (ld(back.as_ptr() as *const u32), ld(back.as_ptr().add(16) as *const u32));
     let groups = 32 / (2 * t);
     for blk in (lo_..hi_).step_by(32) {
-        let (x0, x1) = (ld(x.as_ptr().add(blk)), ld(x.as_ptr().add(blk + 16)));
+        let (x0, x1) = (ld(x.as_ptr().add(blk - base)), ld(x.as_ptr().add(blk - base + 16)));
         let a = _mm512_permutex2var_epi32(x0, ilo, x1);
         let b = _mm512_permutex2var_epi32(x0, ihi, x1);
         let i0 = m + blk / (2 * t);
@@ -77,16 +77,16 @@ unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, 
         let wsv = if groups >= 16 { ld(ws.as_ptr().add(i0)) } else { _mm512_maskz_loadu_epi32((1u16 << groups).wrapping_sub(1), ws.as_ptr().add(i0) as *const _) };
         let (tw, tws) = (_mm512_permutexvar_epi32(ig, wv), _mm512_permutexvar_epi32(ig, wsv));
         let (a, b) = if fwd { ct(a, b, tw, tws, p, p2) } else { gs(a, b, tw, tws, p, p2) };
-        st(x.as_mut_ptr().add(blk), _mm512_permutex2var_epi32(a, ib0, b));
-        st(x.as_mut_ptr().add(blk + 16), _mm512_permutex2var_epi32(a, ib1, b));
+        st(x.as_mut_ptr().add(blk - base), _mm512_permutex2var_epi32(a, ib0, b));
+        st(x.as_mut_ptr().add(blk - base + 16), _mm512_permutex2var_epi32(a, ib1, b));
     }
 }
 
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
-unsafe fn big_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize) {
+unsafe fn big_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize, base: usize) {
     for i in lo_ / (2 * t)..hi_ / (2 * t) {
         let (tw, tws) = (_mm512_set1_epi32(w[m + i] as i32), _mm512_set1_epi32(ws[m + i] as i32));
-        let base = x.as_mut_ptr().add(2 * i * t);
+        let base = x.as_mut_ptr().add(2 * i * t - base);
         for j in (0..t).step_by(16) {
             let (pa, pb) = (base.add(j), base.add(j + t));
             let (a, b) = if fwd { ct(ld(pa), ld(pb), tw, tws, p, p2) } else { gs(ld(pa), ld(pb), tw, tws, p, p2) };
@@ -104,7 +104,7 @@ const S1: usize = 4;
 /// The first S1 stages on 16 columns at once: element c + BLK k (k < 16) of column c only meets the same column's
 /// elements in these stages, so a strip of 16 columns runs them in registers (one read and one write of the row).
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
-unsafe fn cols_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m512i, fwd: bool, scale: Option<(__m512i, __m512i)>) {
+unsafe fn cols_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m512i, fwd: bool, scale: Option<(__m512i, __m512i)>, c0: usize, c1: usize) {
     // twiddles of stage s (m = 2^s): group of k is k >> (S1 - s)... broadcast once per call
     let mut tw = [_mm512_setzero_si512(); 16];
     let mut tws = [_mm512_setzero_si512(); 16];
@@ -114,7 +114,7 @@ unsafe fn cols_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m512
             tws[m + i] = _mm512_set1_epi32(ws[m + i] as i32);
         }
     }
-    for c in (0..BLK).step_by(16) {
+    for c in (c0..c1).step_by(16) {
         let mut v = [_mm512_setzero_si512(); 16];
         for k in 0..16 {
             v[k] = ld(x.as_ptr().add(c + BLK * k));
@@ -158,9 +158,9 @@ unsafe fn block_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m51
     for (n, &m) in order.iter().enumerate() {
         let t = N / (2 * m);
         if t >= 16 {
-            big_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK);
+            big_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK, 0);
         } else {
-            small_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK);
+            small_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK, 0);
         }
         // the forward state after the stages m = 1..128 (8 stages: S1 of the first pass, then 4 here)
         if fwd && S1 + n + 1 == 8 {
@@ -175,7 +175,7 @@ unsafe fn block_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m51
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn fwd(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, mut mid: Option<&mut [u32]>) {
     let (pv, p2) = (_mm512_set1_epi32(p as i32), _mm512_set1_epi32(2 * p as i32));
-    cols_pass(x, w, ws, pv, p2, true, None);
+    cols_pass(x, w, ws, pv, p2, true, None, 0, BLK);
     for lo in (0..N).step_by(BLK) {
         block_pass(x, w, ws, pv, p2, true, lo, mid.as_deref_mut());
         for i in (lo..lo + BLK).step_by(16) {
@@ -192,5 +192,46 @@ pub unsafe fn inv(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, ni: u32, nis: u3
     for lo in (0..N).step_by(BLK) {
         block_pass(x, w, ws, pv, p2, false, lo, None);
     }
-    cols_pass(x, w, ws, pv, p2, false, Some((_mm512_set1_epi32(ni as i32), _mm512_set1_epi32(nis as i32))));
+    cols_pass(x, w, ws, pv, p2, false, Some((_mm512_set1_epi32(ni as i32), _mm512_set1_epi32(nis as i32))), 0, BLK);
 }
+
+/// Columns of the first pass handled by one strip task.
+pub const STRIP: usize = 256;
+/// Words of a second-pass block.
+pub const BLOCK: usize = BLK;
+/// Second-pass stages before the forward column-pass state is complete (the stages m = 1..128 end there).
+pub const MID: usize = 8 - S1;
+
+/// First-pass stages on columns [c0, c0 + STRIP) of the row (forward; or the inverse with the N^-1 scaling).
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+pub unsafe fn strip(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, fwd: bool, ninv: Option<(u32, u32)>, c0: usize) {
+    let (pv, p2) = (_mm512_set1_epi32(p as i32), _mm512_set1_epi32(2 * p as i32));
+    let sc = ninv.map(|(n1, n2)| (_mm512_set1_epi32(n1 as i32), _mm512_set1_epi32(n2 as i32)));
+    cols_pass(x, w, ws, pv, p2, fwd, sc, c0, c0 + STRIP);
+}
+
+/// Second-pass stages [from, to) (in transform order) of the block `xb` holding the row's words [lo, lo + BLOCK);
+/// `canon`: the forward transform's final canonicalization after them.
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+pub unsafe fn block(xb: &mut [u32], w: &[u32], ws: &[u32], p: u32, fwd: bool, lo: usize, from: usize, to: usize, canon: bool) {
+    let (pv, p2) = (_mm512_set1_epi32(p as i32), _mm512_set1_epi32(2 * p as i32));
+    let ms: Vec<usize> = (S1..16).map(|s| 1usize << s).collect();
+    let order: Vec<usize> = if fwd { ms } else { ms.into_iter().rev().collect() };
+    for &m in &order[from..to] {
+        let t = N / (2 * m);
+        if t >= 16 {
+            big_stage(xb, w, ws, m, t, pv, p2, fwd, lo, lo + BLK, lo);
+        } else {
+            small_stage(xb, w, ws, m, t, pv, p2, fwd, lo, lo + BLK, lo);
+        }
+    }
+    if canon {
+        for i in (0..BLK).step_by(16) {
+            let a = ld(xb.as_ptr().add(i));
+            st(xb.as_mut_ptr().add(i), red(red(a, p2), pv));
+        }
+    }
+}
+
+/// Second-pass stages of the transform.
+pub const BLOCK_STAGES: usize = 16 - S1;
