@@ -4,14 +4,17 @@
 //! one host table per word size stands for every (word, ModMul) instantiation of that word.
 mod arith;
 mod bconv;
+mod cts;
 mod elem;
 mod encode;
 mod expand;
 mod keys;
 mod ks;
 mod ntt;
+mod raise;
 mod raw;
 mod rescale;
+mod spru;
 
 use pc_kernels::args::*;
 use pc_kernels::{Instance, TableError};
@@ -47,16 +50,8 @@ macro_rules! missing {
     )*};
 }
 missing!(
-    cts_fused: CtsArgs,
-    mod_raise: ModRaiseArgs,
-    small_int: SmallIntArgs,
-    spru_extract: SpruExtractArgs,
-    spru_fft_pass: SpruFftArgs,
-    spru_scatter: SpruScatterArgs,
-    cts_fused_regen: CtsRegenArgs,
     pcmm: PcmmArgs,
     ccmm: CcmmArgs,
-    small_int1: SmallInt1Args,
     coeff_sum: CoeffArgs,
     tfhe: TfheArgs,
 );
@@ -82,7 +77,7 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         ks_dot: ks::ks_dot::<W>,
         ks_dot_regen: ks::ks_dot_regen::<W>,
         ksk_expand: ks::ksk_expand::<W>,
-        cts_fused,
+        cts_fused: cts::cts_fused::<W>,
         tensor: elem::tensor::<W>,
         md_epilogue: elem::md_epilogue::<W>,
         wsum: elem::wsum::<W>,
@@ -95,19 +90,19 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         encrypt: keys::encrypt::<W>,
         ksk_gen: keys::ksk_gen::<W>,
         ksk_unpack: keys::ksk_unpack::<W>,
-        mod_raise,
-        small_int,
-        spru_extract,
-        spru_fft_pass,
-        spru_scatter,
-        cts_fused_regen,
+        mod_raise: raise::mod_raise::<W>,
+        small_int: raise::small_int::<W>,
+        spru_extract: spru::spru_extract::<W>,
+        spru_fft_pass: spru::spru_fft_pass,
+        spru_scatter: spru::spru_scatter::<W>,
+        cts_fused_regen: cts::cts_fused_regen::<W>,
         ks_dot_key: ks::ks_dot_key::<W>,
         pcmm,
         ccmm,
         wsum_k: elem::wsum_k::<W>,
         rescale_combine_to: elem::rescale_combine_to::<W>,
         md_epilogue_to: elem::md_epilogue_to::<W>,
-        small_int1,
+        small_int1: raise::small_int1::<W>,
         coeff_sum,
         mul_add: elem::mul_add::<W>,
         rescale_fwd: rescale::rescale_fwd::<W>,

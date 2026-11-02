@@ -81,15 +81,18 @@ fn coeff_twiddles() -> &'static [(f64, f64)] {
     T.get_or_init(|| (0..N).map(|k| sincospi(-(k as f64) / N as f64)).collect())
 }
 
-/// One forward Stockham pass of half-size ns over N complex values (`tw` the pass's twiddles).
-pub fn stockham_pass(inp: &[[f64; 2]], out: &mut [[f64; 2]], ns: usize, tw: &(dyn Fn(usize) -> (f64, f64) + Sync)) {
+/// One forward Stockham pass of half-size ns over N complex values (`tw(k)` = (sin, cos) of the pass's twiddle k).
+/// `spru`: the imaginary part as spru_fft_pass compiles (fma(v.y, cos, v.x sin)), else as encode's fft_pass
+/// (fma(v.x, sin, v.y cos)).
+pub fn stockham_pass(inp: &[[f64; 2]], out: &mut [[f64; 2]], ns: usize, spru: bool, tw: &(dyn Fn(usize) -> (f64, f64) + Sync)) {
     let half = inp.len() / 2;
     let outp = out.as_mut_ptr() as usize;
     (0..half).into_par_iter().with_min_len(4096).for_each(|j| {
         let (v0, v1) = (inp[j], inp[j + half]);
         let k = j % ns;
         let (sn, cs) = tw(k);
-        let t = [v1[0].mul_add(cs, -(v1[1] * sn)), v1[0].mul_add(sn, v1[1] * cs)];
+        let ty = if spru { v1[1].mul_add(cs, v1[0] * sn) } else { v1[0].mul_add(sn, v1[1] * cs) };
+        let t = [v1[0].mul_add(cs, -(v1[1] * sn)), ty];
         let idx = (j / ns) * ns * 2 + k;
         let o = outp as *mut [f64; 2];
         // SAFETY: (idx, idx + ns) are distinct across j (the Stockham output map is a permutation)
@@ -154,7 +157,7 @@ pub extern "C" fn encode<W: Hw>(a: *const EncodeArgs, s: CudaStream) -> i32 {
             let (mut inp, mut out) = (bufa, bufb);
             let mut ns = 1;
             while ns < N {
-                stockham_pass(inp, out, ns, &|k| tw[ns - 1 + k]);
+                stockham_pass(inp, out, ns, false, &|k| tw[ns - 1 + k]);
                 std::mem::swap(&mut inp, &mut out);
                 ns <<= 1;
             }
