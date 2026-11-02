@@ -15,16 +15,25 @@ from perseus.impl import config, fake, layout  # noqa: E402
 from perseus.impl.ops import FheOps  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 
-CFG = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lhs2_mflp/configs.json"
+# main's 512-context decode config (SM_CHEB_GS, centred on key 0)
+CFG = PKG / "configs/model/approximation/gpt2_base_n32_ctx512s/configs.json"
 
 
-def _run(cfg, kc, seed=5):
+def _run(cfg, kc, seed=5, general=False, cleanse=False):
     from perseus.examples.gpt2 import ref  # noqa: F401
     from perseus.impl import attention
     fhe, inf = fake.make_fake(complex_payload=True)
     rt = Rt(FheOps(inf, fake.core, fhe.unit), layout.Dims.from_inf(inf))
     ops = rt.ops
+    n = [0]
+    mult = ops.mult
+
+    def counted(*a, **kw):
+        n[0] += 1
+        return mult(*a, **kw)
+    ops.mult = counted
     ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
+    ops.sm_periodic_general, ops.hrs_cleanse = general, cleanse     # SM_PERIODIC=2, SM_HRS_CLEANSE (main's decode)
     d = rt.dims
     rng = np.random.default_rng(seed)
     kv = attention.ComplexKVCache(d.d_head, centre=bool(cfg.ref_keys))
@@ -39,15 +48,17 @@ def _run(cfg, kc, seed=5):
     scores = attention.complex_qkt(rt, kv, fake.FakeCt(layout.lane_vec(q, d.N, d.t), 34), a, cfg=cfg)
     probs = attention.softmax_thor(rt, scores, cfg, kc, folded=True)
     pv = attention.complex_softmax_v(rt, kv, probs, attention._key_lanes(d, cfg, kc), pair=attention._pair(rt, cfg, kc))
-    return probs, pv
+    return probs, pv, n[0]
 
 
 @pytest.mark.parametrize("layer", [0, 4, 8, 11])
-@pytest.mark.parametrize("kc", [1, 5, 16])
-def test_gs_num_matches_product(monkeypatch, layer, kc):
+@pytest.mark.parametrize("kc,general,cleanse", [(1, False, False), (5, False, False), (16, False, False),
+                                                (40, True, True), (200, True, True)])
+def test_gs_num_matches_product(monkeypatch, layer, kc, general, cleanse):
     monkeypatch.setenv("SM_CHEB_GS", "1")
     base = config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"]
-    p0, v0 = _run(base, kc)
-    p1, v1 = _run(dataclasses.replace(base, gs_num=1), kc)
+    p0, v0, n0 = _run(base, kc, general=general, cleanse=cleanse)
+    p1, v1, n1 = _run(dataclasses.replace(base, gs_num=1), kc, general=general, cleanse=cleanse)
+    assert n1 < n0, (n0, n1)          # gs_num took effect: a product per reciprocal round folded into the recursion
     np.testing.assert_allclose(p1.vec, p0.vec, rtol=1e-9, atol=1e-12 * np.abs(p0.vec).max())
     np.testing.assert_allclose(v1.vec, v0.vec, rtol=1e-9, atol=1e-12 * np.abs(v0.vec).max())
