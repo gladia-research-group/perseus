@@ -1,12 +1,13 @@
 // Batched fast base conversion (bconv.cuh, BconvArgs): per job, y_i = x_i pre_i mod s_i, out_t = sum_i y_i M[i][t]
-// mod t, the exact jobs' correction from the FMA double estimate in source order (f64::mul_add is the device's
-// __fma_rn). One task per (job, block of coefficients).
+// mod t, the exact jobs' correction from the FMA double estimate in source order (one fused multiply-add per source,
+// as the device's __fma_rn chain). One task per (job, block of coefficients); rows through the vector primitives.
 use crate::arith::Hw;
 use crate::launch;
-use crate::raw::{el, par_for};
+use crate::raw::{buf, el, par_for};
+use crate::simd::w as v;
 use pc_kernels::args::*;
 
-const BLK: usize = 1024;
+const BLK: usize = 2048;
 
 pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
     launch(a, s, |_| 0, |a| {
@@ -22,18 +23,15 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                 unsafe { &*a.pr.add(id) }
             };
             let (srow, sprime, pre, trow, tprime, m) = (0, ns, 2 * ns, 3 * ns, 3 * ns + nt, 3 * ns + 2 * nt);
-            let mut y = vec![W::default(); ns * BLK];
+            let mut y = buf::<W>(ns * BLK);
+            let mut acc = buf::<W::Acc>(BLK);
             for i in 0..ns {
                 let q = pr(pool(sprime + i).u64() as usize);
-                let pi = pool(pre + i);
                 // SAFETY: source row inside the launch's input
-                let x = unsafe { (a.src as *const W).add((j.src_off as usize + pool(srow + i).u64() as usize) * N + c0) };
-                for c in 0..BLK {
-                    // SAFETY: as above
-                    y[i * BLK + c] = W::mul(unsafe { *x.add(c) }, pi, q);
-                }
+                let x = unsafe { std::slice::from_raw_parts((a.src as *const W).add((j.src_off as usize + pool(srow + i).u64() as usize) * N + c0), BLK) };
+                v::mul_s::<W>(&mut y[i * BLK..(i + 1) * BLK], x, pool(pre + i), q, &mut acc);
             }
-            let mut u = vec![0u64; BLK];
+            let mut u = buf::<u64>(BLK);
             let mut bmod_off = 0usize;
             if j.exact != 0 {
                 // the doubles start at the first 8-byte aligned word past M
@@ -43,36 +41,42 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                     rbw += 1;
                 }
                 let rb = (base + rbw * std::mem::size_of::<W>()) as *const f64;
-                for (c, uc) in u.iter_mut().enumerate() {
-                    let mut v = 0.0f64;
-                    for i in 0..ns {
-                        // SAFETY: ns doubles in the pool
-                        v = (y[i * BLK + c].u64() as f64).mul_add(unsafe { *rb.add(i) }, v);
+                let mut vd = buf::<f64>(BLK);
+                for i in 0..ns {
+                    // SAFETY: ns doubles in the pool
+                    let r = unsafe { *rb.add(i) };
+                    let yi = &y[i * BLK..(i + 1) * BLK];
+                    if W::BITS == 32 {
+                        // SAFETY: W is u32
+                        crate::simd::fma_f64(&mut vd, unsafe { std::slice::from_raw_parts(yi.as_ptr() as *const u32, BLK) }, r);
+                    } else {
+                        for (d, &yv) in vd.iter_mut().zip(yi) {
+                            *d = (yv.u64() as f64).mul_add(r, *d);
+                        }
                     }
-                    *uc = (v + 0.5).floor() as u64;
+                }
+                for (uc, &d) in u.iter_mut().zip(vd.iter()) {
+                    *uc = (d + 0.5).floor() as u64;
                 }
                 bmod_off = (rbw * std::mem::size_of::<W>() + ns * 8) / std::mem::size_of::<W>();
             }
-            let mut acc = vec![W::Acc::default(); BLK];
+            let mut r = buf::<W>(BLK);
             for tt in 0..nt {
                 let q = pr(pool(tprime + tt).u64() as usize);
                 let p = W::from_u64(q.p);
                 acc.fill(W::Acc::default());
                 for i in 0..ns {
-                    let mi = pool(m + i * nt + tt);
-                    let yi = &y[i * BLK..(i + 1) * BLK];
-                    acc.iter_mut().zip(yi).for_each(|(s, &v)| *s += W::wmul(v, mi));
+                    v::mac_s::<W>(&mut acc, &y[i * BLK..(i + 1) * BLK], pool(m + i * nt + tt));
                 }
-                let bm = if j.exact != 0 { el::<W>(a.pool, bmod_off + tt) } else { W::default() };
                 // SAFETY: target row inside the launch's output
-                let o = unsafe { (a.dst as *mut W).add((j.dst_off as usize + pool(trow + tt).u64() as usize) * N + c0) };
-                for c in 0..BLK {
-                    let mut r = W::reduce(acc[c], q);
-                    if j.exact != 0 {
-                        r = W::sub(r, W::reduce(W::wmul(W::from_u64(u[c]), bm), q), p);
+                let o = unsafe { std::slice::from_raw_parts_mut((a.dst as *mut W).add((j.dst_off as usize + pool(trow + tt).u64() as usize) * N + c0), BLK) };
+                v::reduce::<W>(&acc, q, o);
+                if j.exact != 0 {
+                    let bm = el::<W>(a.pool, bmod_off + tt);
+                    for (c, oc) in o.iter_mut().enumerate() {
+                        r[c] = W::reduce(W::wmul(W::from_u64(u[c]), bm), q);
+                        *oc = W::sub(*oc, r[c], p);
                     }
-                    // SAFETY: as above
-                    unsafe { *o.add(c) = r };
                 }
             }
         })

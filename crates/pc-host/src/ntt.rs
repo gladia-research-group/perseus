@@ -204,7 +204,7 @@ pub(crate) fn fwd_with<W: Hw>(a: &NttArgs, src: &(dyn Fn(&NttArgs, usize, W, &mu
             let (roff, pid) = unsafe { (*a.roff.add(i) as usize, *a.rprime.add(i) as usize) };
             let p = W::from_u64(el::<PrimeConst>(a.pr as *const std::ffi::c_void, pid).p);
             let (w, ws) = (table::<W>(a.fw, pid), table::<W>(a.fws, pid));
-            let mut x = vec![W::default(); N];
+            let mut x = crate::raw::buf::<W>(N);
             (sh.get())(a, i, p, &mut x);
             // SAFETY: row roff of the base buffer
             let row = unsafe { std::slice::from_raw_parts_mut((a.base as *mut W).add(roff * N), N) };
@@ -262,7 +262,7 @@ pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {
             let p = W::from_u64(el::<PrimeConst>(a.pr as *const std::ffi::c_void, pid).p);
             let (w, ws) = (table::<W>(a.iw, pid), table::<W>(a.iws, pid));
             let (ni, nis) = (el::<W>(a.ninv, pid), el::<W>(a.ninvs, pid));
-            let mut x = vec![W::default(); N];
+            let mut x = crate::raw::buf::<W>(N);
             load(a, i, p, &mut x);
             match as_u32(&mut x) {
                 Some(x32) if a.lazy != 0 => {

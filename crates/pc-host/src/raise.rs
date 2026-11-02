@@ -31,7 +31,7 @@ pub extern "C" fn mod_raise<W: Hw>(a: *const ModRaiseArgs, s: S) -> i32 {
             let x = (a.x as *mut W).wrapping_add(c * a.ct_stride as usize + part * a.part_stride as usize);
             let qt = prime(a.pr, t);
             let pt = qt.p;
-            let mut acc = vec![W::default(); N];
+            let mut acc = crate::raw::buf::<W>(N);
             for k in 0..a.d as usize {
                 let qk = prime(a.pr, k);
                 let pk = qk.p;

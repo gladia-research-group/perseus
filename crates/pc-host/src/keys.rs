@@ -24,7 +24,7 @@ pub extern "C" fn encrypt<W: Hw>(a: *const EncryptArgs, s: S) -> i32 {
             // SAFETY: prime table entry l
             let q = unsafe { &*a.pr.add(l) };
             let p = W::from_u64(q.p);
-            let mut ar = vec![W::default(); N];
+            let mut ar = crate::raw::buf::<W>(N);
             expand_row::<W>(&seed_at(a.seed), a.nonce, q.p, TAG_ENCA, &mut ar);
             let (sk, e) = (rowp::<W>(a.s, l * N), rowp::<W>(a.e, l * N));
             let m = (!a.m.is_null()).then(|| rowp::<W>(a.m, l * N));
@@ -73,7 +73,7 @@ pub extern "C" fn ksk_gen<W: Hw>(a: *const KskGenArgs, s: S) -> i32 {
             // SAFETY: prime table entry id
             let q = unsafe { &*a.pr.add(id) };
             let p = W::from_u64(q.p);
-            let mut ar = vec![W::default(); N];
+            let mut ar = crate::raw::buf::<W>(N);
             expand_row::<W>(&seed_at(a.seed), d as u32, q.p, TAG_KSKA, &mut ar);
             let row = d * nr + m;
             let (e, sn) = (rowp::<W>(a.e, row * N), rowp::<W>(a.s_new, id * N));

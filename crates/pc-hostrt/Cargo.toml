@@ -7,3 +7,4 @@ description = "perseus: the host stand-in for the CUDA stream model (inline stre
 
 [dependencies]
 rayon = { workspace = true }
+libc = "0.2"

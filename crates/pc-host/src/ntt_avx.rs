@@ -56,7 +56,7 @@ fn small_t(t: usize) -> ([i32; 16], [i32; 16], [i32; 16]) {
 }
 
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
-unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool) {
+unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize) {
     let (lo, hi, g) = small_t(t);
     let (ilo, ihi, ig) = (ld(lo.as_ptr() as *const u32), ld(hi.as_ptr() as *const u32), ld(g.as_ptr() as *const u32));
     // inverse placement: word j of the block from lo (j mod 2t < t) or hi, at lane (j / 2t) t + j mod t (+16 for hi)
@@ -67,7 +67,7 @@ unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, 
     }
     let (ib0, ib1) = (ld(back.as_ptr() as *const u32), ld(back.as_ptr().add(16) as *const u32));
     let groups = 32 / (2 * t);
-    for blk in (0..N).step_by(32) {
+    for blk in (lo_..hi_).step_by(32) {
         let (x0, x1) = (ld(x.as_ptr().add(blk)), ld(x.as_ptr().add(blk + 16)));
         let a = _mm512_permutex2var_epi32(x0, ilo, x1);
         let b = _mm512_permutex2var_epi32(x0, ihi, x1);
@@ -83,8 +83,8 @@ unsafe fn small_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, 
 }
 
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
-unsafe fn big_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool) {
-    for i in 0..m {
+unsafe fn big_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p: __m512i, p2: __m512i, fwd: bool, lo_: usize, hi_: usize) {
+    for i in lo_ / (2 * t)..hi_ / (2 * t) {
         let (tw, tws) = (_mm512_set1_epi32(w[m + i] as i32), _mm512_set1_epi32(ws[m + i] as i32));
         let base = x.as_mut_ptr().add(2 * i * t);
         for j in (0..t).step_by(16) {
@@ -96,30 +96,92 @@ unsafe fn big_stage(x: &mut [u32], w: &[u32], ws: &[u32], m: usize, t: usize, p:
     }
 }
 
+/// Block size of the second pass: the stages with 2t <= BLK run block by block in L1.
+const BLK: usize = 4096;
+/// Stages of the first pass (t = N/2 .. BLK): log2(N / BLK).
+const S1: usize = 4;
+
+/// The first S1 stages on 16 columns at once: element c + BLK k (k < 16) of column c only meets the same column's
+/// elements in these stages, so a strip of 16 columns runs them in registers (one read and one write of the row).
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn cols_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m512i, fwd: bool, scale: Option<(__m512i, __m512i)>) {
+    // twiddles of stage s (m = 2^s): group of k is k >> (S1 - s)... broadcast once per call
+    let mut tw = [_mm512_setzero_si512(); 16];
+    let mut tws = [_mm512_setzero_si512(); 16];
+    for m in [1usize, 2, 4, 8] {
+        for i in 0..m {
+            tw[m + i] = _mm512_set1_epi32(w[m + i] as i32);
+            tws[m + i] = _mm512_set1_epi32(ws[m + i] as i32);
+        }
+    }
+    for c in (0..BLK).step_by(16) {
+        let mut v = [_mm512_setzero_si512(); 16];
+        for k in 0..16 {
+            v[k] = ld(x.as_ptr().add(c + BLK * k));
+        }
+        let stage = |m: usize, v: &mut [__m512i; 16]| {
+            // stage m: t = N / 2m, i.e. 8 / m columns apart in k; group i = k / (16 / m)
+            let h = 8 / m;
+            for k in 0..16 {
+                if k & h == 0 {
+                    let i = k / (2 * h);
+                    let (a, b) = if fwd { ct(v[k], v[k + h], tw[m + i], tws[m + i], p, p2) } else { gs(v[k], v[k + h], tw[m + i], tws[m + i], p, p2) };
+                    v[k] = a;
+                    v[k + h] = b;
+                }
+            }
+        };
+        if fwd {
+            for m in [1usize, 2, 4, 8] {
+                stage(m, &mut v);
+            }
+        } else {
+            for m in [8usize, 4, 2, 1] {
+                stage(m, &mut v);
+            }
+        }
+        for k in 0..16 {
+            let o = match scale {
+                Some((n1, n2)) => red(shoup_lz(v[k], n1, n2, p), p),
+                None => v[k],
+            };
+            st(x.as_mut_ptr().add(c + BLK * k), o);
+        }
+    }
+}
+
+/// Stages m0 .. N/2 (forward: m doubling) or N/2 .. m0 (inverse) of one BLK block at `lo`.
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn block_pass(x: &mut [u32], w: &[u32], ws: &[u32], p: __m512i, p2: __m512i, fwd: bool, lo: usize, mut mid: Option<&mut [u32]>) {
+    let ms: Vec<usize> = (S1..16).map(|s| 1usize << s).collect();
+    let order: Vec<usize> = if fwd { ms } else { ms.into_iter().rev().collect() };
+    for (n, &m) in order.iter().enumerate() {
+        let t = N / (2 * m);
+        if t >= 16 {
+            big_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK);
+        } else {
+            small_stage(x, w, ws, m, t, p, p2, fwd, lo, lo + BLK);
+        }
+        // the forward state after the stages m = 1..128 (8 stages: S1 of the first pass, then 4 here)
+        if fwd && S1 + n + 1 == 8 {
+            if let Some(o) = mid.take() {
+                o[lo..lo + BLK].copy_from_slice(&x[lo..lo + BLK]);
+            }
+        }
+    }
+}
+
 /// Forward lazy NTT of one row (canonical output); `mid` receives the words after the stages m = 1..128.
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn fwd(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, mut mid: Option<&mut [u32]>) {
     let (pv, p2) = (_mm512_set1_epi32(p as i32), _mm512_set1_epi32(2 * p as i32));
-    let mut m = 1;
-    let mut stage = 0;
-    while m < N {
-        let t = N / (2 * m);
-        if t >= 16 {
-            big_stage(x, w, ws, m, t, pv, p2, true);
-        } else {
-            small_stage(x, w, ws, m, t, pv, p2, true);
+    cols_pass(x, w, ws, pv, p2, true, None);
+    for lo in (0..N).step_by(BLK) {
+        block_pass(x, w, ws, pv, p2, true, lo, mid.as_deref_mut());
+        for i in (lo..lo + BLK).step_by(16) {
+            let a = ld(x.as_ptr().add(i));
+            st(x.as_mut_ptr().add(i), red(red(a, p2), pv));
         }
-        stage += 1;
-        if stage == 8 {
-            if let Some(o) = mid.take() {
-                o.copy_from_slice(x);
-            }
-        }
-        m *= 2;
-    }
-    for i in (0..N).step_by(16) {
-        let a = ld(x.as_ptr().add(i));
-        st(x.as_mut_ptr().add(i), red(red(a, p2), pv));
     }
 }
 
@@ -127,19 +189,8 @@ pub unsafe fn fwd(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, mut mid: Option<
 #[target_feature(enable = "avx512f,avx512dq,avx512vl")]
 pub unsafe fn inv(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, ni: u32, nis: u32) {
     let (pv, p2) = (_mm512_set1_epi32(p as i32), _mm512_set1_epi32(2 * p as i32));
-    let mut m = N / 2;
-    while m >= 1 {
-        let t = N / (2 * m);
-        if t >= 16 {
-            big_stage(x, w, ws, m, t, pv, p2, false);
-        } else {
-            small_stage(x, w, ws, m, t, pv, p2, false);
-        }
-        m /= 2;
+    for lo in (0..N).step_by(BLK) {
+        block_pass(x, w, ws, pv, p2, false, lo, None);
     }
-    let (n1, n2) = (_mm512_set1_epi32(ni as i32), _mm512_set1_epi32(nis as i32));
-    for i in (0..N).step_by(16) {
-        let a = ld(x.as_ptr().add(i));
-        st(x.as_mut_ptr().add(i), red(shoup_lz(a, n1, n2, pv), pv));
-    }
+    cols_pass(x, w, ws, pv, p2, false, Some((_mm512_set1_epi32(ni as i32), _mm512_set1_epi32(nis as i32))));
 }
