@@ -193,6 +193,32 @@ pub fn par<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     pool().install(f)
 }
 
+/// Back `bytes` at `p` with transparent huge pages where the kernel allows (MADV_HUGEPAGE) and fault every page
+/// in now, in parallel on the kernel pool, so first launches do not pay page faults one 4 KB page at a time.
+/// `PERSEUS_CPU_PREFAULT=0` leaves the memory lazy.
+///
+/// # Safety
+/// `p .. p + bytes` is one live writable allocation whose contents the caller does not need (a byte per page is
+/// overwritten with zero).
+pub unsafe fn prefault(p: *mut u8, bytes: usize) {
+    if std::env::var("PERSEUS_CPU_PREFAULT").is_ok_and(|v| v == "0") {
+        return;
+    }
+    const PAGE: usize = 4096;
+    let start = (p as usize).next_multiple_of(PAGE);
+    if start < p as usize + bytes {
+        libc::madvise(start as *mut c_void, (p as usize + bytes - start) / PAGE * PAGE, libc::MADV_HUGEPAGE);
+    }
+    let (base, pages) = (p as usize, bytes.div_ceil(PAGE));
+    use rayon::prelude::*;
+    par(|| {
+        (0..pages).into_par_iter().with_min_len(512).for_each(|i| {
+            // SAFETY: inside the allocation (caller contract)
+            unsafe { std::ptr::write_volatile((base + (i * PAGE).min(bytes - 1)) as *mut u8, 0) };
+        })
+    });
+}
+
 /// (available, total) host memory in bytes (`/proc/meminfo`), the host's `cudaMemGetInfo`.
 pub fn mem_info() -> (usize, usize) {
     let txt = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
