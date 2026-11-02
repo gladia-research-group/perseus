@@ -22,7 +22,7 @@ fn row<W>(base: *const std::ffi::c_void, off: usize) -> &'static [W] {
 }
 
 /// Slot of prime id t in a KeyTab's digit (q_top < 0: full layout).
-fn slot_of(k: &KeyTab, t: usize, nq: usize) -> usize {
+pub(crate) fn slot_of(k: &KeyTab, t: usize, nq: usize) -> usize {
     if t < nq || k.q_top < 0 {
         t
     } else {
@@ -31,7 +31,7 @@ fn slot_of(k: &KeyTab, t: usize, nq: usize) -> usize {
 }
 
 /// Stored `b` row `r` of a KeyTab key: dense W words, or `bits`-wide values packed in a little-endian u32 stream.
-fn b_row<W: Hw>(k: &KeyTab, kb: *const std::ffi::c_void, r: usize, out: &mut [W]) {
+pub(crate) fn b_row<W: Hw>(k: &KeyTab, kb: *const std::ffi::c_void, r: usize, out: &mut [W]) {
     if k.bits == 0 {
         out.copy_from_slice(row::<W>(kb, r * k.row_words as usize));
         return;
