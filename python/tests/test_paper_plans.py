@@ -119,6 +119,14 @@ def _recipe(plan_dir: Path):
     return graph, recipe, tool, route
 
 
+def _rd_switches(plan_dir: Path) -> dict[str, str] | None:
+    """The rd= line's switches ({} for the pass alone), None when the plan has no raise-drop re-pass."""
+    for line in (plan_dir / "PLAN_CMD.txt").read_text().splitlines():
+        if line.startswith("rd="):
+            return dict(kv.split("=", 1) for kv in shlex.split(line[len("rd="):])[1:])
+    return None
+
+
 def _get(doc, field: str):
     for k in field.split("."):
         if not isinstance(doc, dict) or k not in doc:
@@ -218,10 +226,19 @@ def replan(name: str, log: Path) -> tuple[Path, float]:
         cmds = [["bash", str(TOOLS[tool]), graph, out_name] + ([] if s == "blocks" else [s]) for s in stages]
     rc = 0
     t0 = time.perf_counter()
+    rd = _rd_switches(plan_dir)
     try:
         with log.open("w") as f:
             for cmd, e in pre + [(c, env) for c in cmds]:
                 rc = rc or subprocess.run(cmd, cwd=REPO, env=e, stdout=f, stderr=subprocess.STDOUT).returncode
+            if rc == 0 and rd is not None:
+                # the raise-drop re-pass (scripts/utils/rd_pass.sh) on the regenerated program, with the switches
+                # the plan's rd= line names; it reads graph= and recipe= from the plan's own PLAN_CMD.txt
+                (BP / out_name / "PLAN_CMD.txt").write_text((plan_dir / "PLAN_CMD.txt").read_text())
+                renv = {k: v for k, v in env.items() if not k.startswith("PLAN_KEEP_PLACEMENTS")}
+                renv.update(rd)
+                rc = subprocess.run(["bash", str(REPO / "scripts" / "utils" / "rd_pass.sh"), out_name], cwd=REPO,
+                                    env=renv, stdout=f, stderr=subprocess.STDOUT).returncode
     finally:
         for _, e in pre:
             subprocess.run(["rm", "-rf", str(BP / e["OUT_NAME"])], check=False)
