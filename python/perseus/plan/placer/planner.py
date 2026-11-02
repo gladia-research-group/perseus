@@ -634,6 +634,9 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
         k_max = cfg.raise_drop_max
         if cfg.raise_drop_landing_max is not None:
             k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
+        # PLAN_RAISE_ROUTE_MAX="route:drop,...": a route's deepest absolute drop (an alternating user region's chain:
+        # EvalMod may end on the region's top pair level, no deeper; compile::user_region_sites)
+        rmax = {int(r): int(x) for r, x in (e.split(":") for e in os.environ.get("PLAN_RAISE_ROUTE_MAX", "").split(",") if e)}
         saved = refresh.site_out_levels.get(p)
         found = 0
         for k in range(k_max, 0, -1):
@@ -642,6 +645,8 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
             # the plan's drop is absolute (the route's default and any step landing floor under base_abs included):
             # it must be a built variant
             if route != 1 and cfg.raise_drop_set and refresh.spec(p).raise_drop not in cfg.raise_drop_set:
+                continue
+            if route in rmax and refresh.spec(p).raise_drop > rmax[route]:
                 continue
             s2 = placer._sim()
             in2 = inputs(s2)
