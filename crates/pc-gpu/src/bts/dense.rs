@@ -88,7 +88,7 @@ impl DensePlan {
         let shp = sh.cfg.chain;
         let d = chain.level_unit;
         let n = chain.n;
-        let ps = PsPlan::from_coeffs(&setup.evalmod_coeffs)?;
+        let ps = setup.evalmod_ps()?;
         let mut qd = chain.q[0] as f64;
         for j in 1..d {
             qd *= chain.q[j] as f64;
@@ -113,6 +113,8 @@ impl DensePlan {
                 Some(a) if drop >= 1 => (&a.cts, drop - 1),
                 _ => (&lay.cts, drop),
             };
+            // the even EvalMod series spends a level less: the raise and CtS run that much lower, same landing
+            let rdrop = rdrop + setup.even_levels_saved();
             let raise_top = chain.q.len() - 1 - d * rdrop as usize;
             // the shipped StC's decoding constant compensates q0 / sf(chain top); a raise to a lower top carries
             // sf(top) / sf(raise top) on its last StC stage (FIDESlib AddBootstrapRaiseVariant `fdrop`; ~1 at drop 1,
@@ -584,5 +586,47 @@ impl<'a, W: DevWord, M: DevStrategy<W>> BtsRoute<'a, W, M> for DenseRoute<'a, W,
     }
     fn mem(&self) -> (MemReq, BtsWorkShape) {
         (self.mem.clone(), self.work_shape)
+    }
+}
+
+#[cfg(test)]
+mod even_series_tests {
+    use super::*;
+    use pc_core::params::ChainSpec;
+
+    fn plan(even: bool, alt: u32) -> DensePlan {
+        let chain = Chain::generate(&ChainSpec::n32sp()).expect("chain");
+        let setup = BtsSetup { raise_drops: vec![0, 1, 2, 3], cts_alt_budget: alt, evalmod_even: even, ..BtsSetup::n32_shipped() };
+        DensePlan::new(&chain, &setup).expect("dense plan")
+    }
+
+    /// The even series spends one CKKS level less, so every raise drop's variant raises one level lower and lands where
+    /// the shipped one does, bit for bit, with and without the alternative CtS: the plan's routes hold.
+    #[test]
+    fn even_variants_raise_lower_and_land_as_shipped() {
+        for alt in [0, 5] {
+            let (a, e) = (plan(false, alt), plan(true, alt));
+            let d = a.chain.level_unit;
+            for (x, y) in a.variants.iter().zip(&e.variants) {
+                assert_eq!(x.drop, y.drop);
+                assert_eq!(y.raise_top, x.raise_top - d, "alt {alt} drop {}", x.drop);
+                assert_eq!(y.em_in.top, x.em_in.top - d as i32, "alt {alt} drop {}", x.drop);
+                assert_eq!((x.em_out.top, x.em_out.nl, x.em_out.nf.to_bits()), (y.em_out.top, y.em_out.nl, y.em_out.nf.to_bits()), "alt {alt} drop {}", x.drop);
+                assert_eq!((x.out.top, x.out.nl, x.out.nf.to_bits()), (y.out.top, y.out.nl, y.out.nf.to_bits()), "alt {alt} drop {}", x.drop);
+                assert_eq!(x.cts.len(), y.cts.len());
+            }
+        }
+    }
+
+    /// The key request reads the stages' geometry (`lt_steps`, `s0_steps`), and a bundle made for the shipped series must
+    /// serve the even one (`bts.em_even` binds no key bundle): raising lower moves no rotation.
+    #[test]
+    fn even_variants_need_the_same_rotation_keys() {
+        let geoms = |p: &DensePlan| -> Vec<Vec<LtGeom>> { p.variants.iter().map(|v| v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter()).map(|h| h.geom).collect()).collect() };
+        for alt in [0, 5] {
+            let (a, e) = (plan(false, alt), plan(true, alt));
+            assert_eq!(geoms(&a), geoms(&e), "alt {alt}");
+            assert_eq!(a.s0_steps(), e.s0_steps(), "alt {alt}");
+        }
     }
 }

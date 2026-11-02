@@ -46,6 +46,9 @@ section! {
         #[doc = "`FIDESLIB_CTS_ALT_BUDGET`. Default (unset). Read at RawCiphertext.cu: alternative CtS level budget (0 = off)."]
         #[doc = "Shipped plans: runtime= llama128."]
         cts_alt_budget: Int = "FIDESLIB_CTS_ALT_BUDGET", "(unset)";
+        #[doc = "EvalMod: the even series (pc-core `EVALMOD_EVEN_CHEB`, degree 5 in z = 2 (y - 1/64)^2 - 1, then the 5 double angles) on every K = 16 route (dense, StC-first, SparseB at K = 16): one CKKS level less, spent on raising and running CtS one level lower, so every landing and plan holds (pc-gpu `BtsSetup::evalmod_even`; default off = the shipped degree-14 series)."]
+        #[doc = "Runtime switch `PC_EM_EVEN` [kernel]: binds no plan and no key bundle."]
+        em_even: Flag = "PC_EM_EVEN", "(unset)";
         #[doc = "EvalMod: a Regen relinearization and the rescale after it as one exact conversion (pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale)."]
         #[doc = "Runtime switch `PC_EM_FUSE_RESCALE` [kernel]: binds no plan and no key bundle."]
         em_fuse_rescale: Flag = "PC_EM_FUSE_RESCALE", "(unset)";

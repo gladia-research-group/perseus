@@ -110,6 +110,32 @@ pub fn evalmod_coeffs() -> &'static [f64] {
     &EVALMOD_CHEB
 }
 
+/// The even EvalMod series (`PsPlan::even_shift`, switch `bts.em_even` / `PC_EM_EVEN`): the shipped target
+/// (2 pi)^(-1/32) cos(2 pi (16 y - 0.25) / 32) is even in w = y - 1/64, so it is a Chebyshev series of about half the
+/// degree in z = 2 w^2 - 1: w by a constant add, z by one square whose x2 and -1 ride its relinearization's epilogue,
+/// then this degree-5 series in z and the shipped 5 double angles. Depth 1 + PS(5) + 5 = 9, one CKKS level less than the
+/// shipped series' PS(14) + 5, at the same output level and scale (`EVALMOD_EVEN_LEVELS_SAVED`). Least squares on the
+/// final (double-angled) error, weighted by the overflow integer's distribution (the fit took the density of 34 uniforms
+/// at the integers; I = round(the sum of h = 32 uniforms) is the density of 33, and refitting to it moves the RMS by 0.03
+/// bits), |delta| <= 2^-4, not minimax on |I| <= 15: what reaches a slot is the error over that distribution, RMS 29.0
+/// bits (the shipped table 30.2). The error grows with |I| where the distribution thins out: worst 26.9 bits at |I| <= 5,
+/// 20.5 at |I| <= 8 (P(|I| >= 8) = 2.1e-6 per coefficient), 12.9 at |I| <= 12 (P(|I| >= 12) = 6.0e-15), 10.7 at |I| <= 15
+/// (the shipped table 27.4 everywhere). OpenFHE evaluator convention (c0 not halved). Provenance: perseus-speedrun
+/// `tmodel/z5/em_rms.py`, `tmodel/z5/profile_by_I.py` (`fits/even_ls_k16_z5_r5.json`).
+pub const EVALMOD_EVEN_CHEB: [f64; 6] = [
+    -0.5745377251677196,
+    -0.916700971342353,
+    0.28591387226312487,
+    -0.027497223315037466,
+    0.00129806776429133,
+    -4.3254981590185784e-05,
+];
+/// CKKS levels the even series saves at the shipped output level and scale: its routes raise and run CtS that much
+/// lower, so every landing and plan holds and the raise, CtS and EvalMod run on fewer limbs.
+pub const EVALMOD_EVEN_LEVELS_SAVED: u32 = 1;
+/// The even series' shift in y (= 0.25 / K): w = y - EVALMOD_EVEN_SHIFT.
+pub const EVALMOD_EVEN_SHIFT: f64 = 0.25 / EVALMOD_K;
+
 /// SparseB's EvalMod series for K = 24: (2 pi)^(-1/32) cos(2 pi (24 y - 0.25) / 32), Chebyshev degree 20 (same PS
 /// depth as degree 14), 5 double angles. Provenance: FIDESlib `SparseB.cu::sparseBChebyshevK24`.
 pub const SPARSE_B_CHEB_K24: [f64; 21] = [

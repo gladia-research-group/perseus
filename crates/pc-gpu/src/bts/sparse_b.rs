@@ -44,6 +44,9 @@ pub struct SparseBCfg {
     pub evalmod_k: f64,
     /// An EvalMod series replacing the K = 16 table (same K, double angles and depth; empty = the frozen table).
     pub em_coeffs: Vec<f64>,
+    /// The even series in place of the K = 16 table (`BtsSetup::evalmod_even`, config `bts.em_even`; with the frozen
+    /// table only, so not with `em_coeffs`): the raise and CtS run one level below `raise_drop`'s, same landing.
+    pub em_even: bool,
     /// The raise's sparse -> dense switch folded into the fold's first round (`BtsSetup::merge_s2d`): its hoisted
     /// group is the sparse -> dense key and `SparseRot` keys of the round's steps, summed with no add of the input.
     pub merge_s2d: bool,
@@ -51,15 +54,17 @@ pub struct SparseBCfg {
 
 impl SparseBCfg {
     pub fn n32(slots: u32, raise_drop: u32) -> Self {
-        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K, em_coeffs: Vec::new(), merge_s2d: false }
+        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K, em_coeffs: Vec::new(), em_even: false, merge_s2d: false }
     }
 
     /// The EvalMod series' Paterson-Stockmeyer plan for `evalmod_k`.
     pub fn em_series(&self) -> Result<PsPlan> {
-        if self.evalmod_k == pc_core::bts_setup::EVALMOD_K && !self.em_coeffs.is_empty() {
+        if self.em_even && (self.evalmod_k != pc_core::bts_setup::EVALMOD_K || !self.em_coeffs.is_empty()) {
+            Err(shape("sparse_b", format!("em_even replaces the frozen K = 16 table only (K = {}, {} custom coefficients)", self.evalmod_k, self.em_coeffs.len())))
+        } else if self.evalmod_k == pc_core::bts_setup::EVALMOD_K && !self.em_coeffs.is_empty() {
             Ok(PsPlan::from_coeffs(&self.em_coeffs)?)
         } else if self.evalmod_k == pc_core::bts_setup::EVALMOD_K {
-            Ok(PsPlan::from_coeffs(pc_core::bts_setup::evalmod_coeffs())?)
+            Ok(PsPlan::evalmod_k16(self.em_even))
         } else if self.evalmod_k == pc_core::bts_setup::SPARSE_B_K {
             ps_k24()
         } else {
@@ -268,7 +273,9 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
     /// (CtS top, EvalMod input meta, StC top) of the variant.
     fn tops(chain: &Chain, st: &ScaleTables, cfg: &SparseBCfg) -> Result<(usize, FMeta, usize)> {
         let d = chain.level_unit;
-        let top = chain.q.len() - 1 - d * cfg.raise_drop as usize;
+        // the even EvalMod series spends a level less: the raise and CtS run that much lower, same landing
+        let saved = if cfg.em_even { pc_core::bts_setup::EVALMOD_EVEN_LEVELS_SAVED } else { 0 };
+        let top = chain.q.len() - 1 - d * (cfg.raise_drop + saved) as usize;
         let raised_nf = st.sf(top as i32)? * (cfg.cts0_t as f64).exp2();
         let pt_nf = st.sf(top as i32)? * (-(cfg.cts0_t as f64)).exp2();
         let em_in = FMeta { top: top as i32, nl: 2, nf: raised_nf * pt_nf };
@@ -348,5 +355,30 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let (em_n, em_kk) = em_work(nslots, cfg.k_max, EmMode::Real);
         let work = BtsWorkShape { k_max: cfg.k_max, g_max: g.g_step as usize, em_slots: em_n, em_kk, spare: 1 };
         Ok(SparseBPrecomp { cfg, geom: g, raise, fold, cts, cts_acc, em, stc, stc_acc, half, cts0_const, carved, work, parts })
+    }
+}
+
+#[cfg(test)]
+mod even_series_tests {
+    use super::*;
+    use pc_core::params::ChainSpec;
+
+    /// The even series spends one CKKS level less, so a K = 16 SparseB variant raises one level lower and its StC runs
+    /// where the shipped one does, on the same EvalMod output: the plan's routes hold. K = 24 has no even series.
+    #[test]
+    fn even_variants_raise_lower_and_land_as_shipped() {
+        let chain = Chain::generate(&ChainSpec::n32sp()).expect("chain");
+        let st = ScaleTables::precompute(&chain).expect("tables");
+        for drop in [0, 1, 2] {
+            let shipped = SparseBCfg { evalmod_k: pc_core::bts_setup::EVALMOD_K, ..SparseBCfg::n32(256, drop) };
+            let even = SparseBCfg { em_even: true, ..shipped.clone() };
+            let (a, e) = (SparseBPrecomp::<u32>::tops(&chain, &st, &shipped).unwrap(), SparseBPrecomp::<u32>::tops(&chain, &st, &even).unwrap());
+            assert_eq!(e.0, a.0 - chain.level_unit, "drop {drop}");
+            assert_eq!(e.1.top, a.1.top - chain.level_unit as i32, "drop {drop}");
+            assert_eq!(e.2, a.2, "drop {drop}");
+            let (_, oa, _) = EvalModPlan::<u32>::program(&st, a.1, &shipped.em_series().unwrap(), SPARSE_B_DA_ITS).unwrap();
+            let (_, oe, _) = EvalModPlan::<u32>::program(&st, e.1, &even.em_series().unwrap(), SPARSE_B_DA_ITS).unwrap();
+            assert_eq!((oa.top, oa.nl, oa.nf.to_bits()), (oe.top, oe.nl, oe.nf.to_bits()), "drop {drop}");
+        }
     }
 }

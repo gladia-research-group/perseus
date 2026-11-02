@@ -112,7 +112,7 @@ fn fmeta(d: &Dump, name: &str) -> FMeta {
 pub fn ps_plan(pj: &Value) -> PsPlan {
     let ps = &pj["cheb_ps"];
     let f = |k: &str| crate::dump::as_f64v(&ps[k]);
-    PsPlan { k: ps["k"].as_u64().unwrap_or(0) as usize, m: ps["m"].as_u64().unwrap_or(0) as usize, divqr_q: f("divqr_q"), divcs_q: f("divcs_q"), s2: f("s2"), coeffs: vec![] }
+    PsPlan { k: ps["k"].as_u64().unwrap_or(0) as usize, m: ps["m"].as_u64().unwrap_or(0) as usize, divqr_q: f("divqr_q"), divcs_q: f("divcs_q"), s2: f("s2"), coeffs: vec![], even_shift: None }
 }
 
 /// A dumped stage's geometry and plaintexts (`<prefix><k>.pt<j>.{q,p}.bin` with `pts[j]` metadata).

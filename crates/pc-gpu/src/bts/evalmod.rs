@@ -1890,7 +1890,7 @@ mod tests {
         let plan = crate::bts::dense::DensePlan::new(&chain, &setup).expect("dense plan");
         let st = pc_core::scale::ScaleTables::precompute(&chain).expect("tables");
         let v = &plan.variants[0];
-        let ps = PsPlan::from_coeffs(&setup.evalmod_coeffs).expect("ps");
+        let ps = setup.evalmod_ps().expect("ps");
         let (prog, _) = build_evalmod_opts(&st, v.em_in, &ps, setup.evalmod_da_its as i32, true).expect("program");
         let fused = prog.fused();
         let before = slots_of(&fused);

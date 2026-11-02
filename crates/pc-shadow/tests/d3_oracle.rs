@@ -60,6 +60,7 @@ fn evalmod_memo_gate() {
         divcs_q: f64v(&ps_j["divcs_q"]),
         s2: f64v(&ps_j["s2"]),
         coeffs: pc_core::bts_setup::evalmod_coeffs().to_vec(),
+        even_shift: None,
     };
     // the computed plan (pc_core::cheb long divisions) must equal the dump's, field for field
     assert_eq!(PsPlan::evalmod(), ps, "pc_core::cheb PS plan != d3 cheb_ps");
