@@ -9,7 +9,7 @@ import numpy as np
 from . import sinc as sc
 from . import smcheb
 from .attention import _recip_rounds, sink_only
-from .poly import eval_chebyshev, im_cleanse
+from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse
 from .prefill import _KcExtrapolated, split
 
 LO = (sc.slot_coords()[2] < 16).astype(float)
@@ -92,11 +92,24 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
             al, be = score_affine(cfg)
             s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T, "pre"),
                             lambda: al * np.where(valid, -mean, cfg.clip_lo - mean) - be)
-            z = eval_chebyshev(ops, s, cfg.cheb_coeffs, -1.0, 1.0)
+            a, b = -1.0, 1.0
         else:
             s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T),
                             lambda: np.where(valid, -mean, cfg.clip_lo - mean))
-            z = eval_chebyshev(ops, s, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+            a, b = cfg.cheb_a / sf, cfg.cheb_b / sf
+        if cfg.exp_mask_fold:
+            # the active mask's 2^log2delta1-th root rides the series, as the packed prefill's (prefill._sm_cheb):
+            # (p M^(1/2^s))^(2^s) = p^(2^s) M, a level less after the exp
+            pw = 2 ** cfg.log2delta1
+            act = np.where(valid, 0.5 / kc, 0.0)
+            root = lambda sc_: (lambda: sc_ * act ** (1.0 / pw))
+            z = eval_chebyshev_masked(ops, s, cfg.cheb_coeffs, a, b, None,
+                                      lambda ct, sc_: rt.mult_mask(ct, site + ("active", T, "fold", pw, sc_), root(sc_)),
+                                      lambda ct, sc_: rt.add_mask(ct, site + ("active", T, "fold+", pw, sc_), root(sc_)))
+            for _ in range(cfg.log2delta1):
+                z = ops.square(z)
+            return im_cleanse(ops, z)
+        z = eval_chebyshev(ops, s, cfg.cheb_coeffs, a, b)
         for _ in range(cfg.log2delta1):
             z = ops.square(z)
         z = im_cleanse(ops, z)
