@@ -475,7 +475,7 @@ pub fn compile_block(
             pins.insert(name.clone(), (l, s.final_named_degs.get(name).copied().unwrap_or(1)));
         }
     }
-    let names: BTreeMap<String, VarId> = lw.cur.iter().map(|(k, &v)| (k.clone(), v)).collect();
+    let mut names: BTreeMap<String, VarId> = lw.cur.iter().map(|(k, &v)| (k.clone(), v)).collect();
     // outputs: the plan's exit var, then every final state nothing reads
     let mut consumed: BTreeSet<VarId> = lw.ops.iter().flat_map(|o| o.ins.iter().copied()).collect();
     // a fused sum's intermediates are never materialized: not outputs
@@ -495,10 +495,22 @@ pub fn compile_block(
             outputs.push(i);
         }
     }
-    if let Some(names) = opts.live_out.get(label) {
+    if let Some(want) = opts.live_out.get(label) {
         let mut unknown = vec![];
-        for n in names {
-            match lw.cur.get(n) {
+        for n in want {
+            // a reactive refresh of the recording (`<x>_auto_bootstrapped`) that the plan erased: its value is x's
+            // (the plan placed no refresh there), e.g. a CutMax whose last product ends at the twin's AUTO_BTS_LEVEL
+            let mut key = n.as_str();
+            while !lw.cur.contains_key(key) {
+                match key.strip_suffix("_auto_bootstrapped") {
+                    Some(k) => key = k,
+                    None => break,
+                }
+            }
+            if let Some(&v) = lw.cur.get(key) {
+                names.entry(n.clone()).or_insert(v);
+            }
+            match lw.cur.get(key) {
                 Some(&v) if !outputs.contains(&v) => outputs.push(v),
                 Some(_) => {}
                 None => unknown.push(n.clone()),
