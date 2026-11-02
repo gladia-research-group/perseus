@@ -29,8 +29,8 @@ def test_config_fields_and_presets():
     # plan.fallback_cf,
     # plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
     # plan.keep_placements_exact, plan.mag_safety_steps, plan.resume; chain.preset
-    # + bts.merge_s2d, bts.stc_ps, bts.em_level_keys, model.pcmm_raise_out, model.kv_push_raise
-    assert len(_pc.Config.fields()) == 266 and len(_pc.PlanConfig.fields()) == 104
+    # + bts.merge_s2d, bts.stc_ps, bts.em_level_keys, model.pcmm_raise_out, model.kv_push_raise, bts.sb_em_table
+    assert len(_pc.Config.fields()) == 267 and len(_pc.PlanConfig.fields()) == 104
     assert all(f["env"] == "" or f"`{f['env']}`" in f["doc"] for f in _pc.Config.fields())
     assert set(config.PRESETS) == {"n32_gpt2_decode", "n32_gpt2_prefill", "n32_llama_decode", "n32_llama_prefill"}
     c = config.preset("n32_gpt2_decode")
