@@ -38,6 +38,10 @@ pub(crate) fn b_row<W: Hw>(k: &KeyTab, kb: *const std::ffi::c_void, r: usize, ou
     }
     // SAFETY: packed row of row_words u32 words (with its guard word)
     let w = unsafe { std::slice::from_raw_parts((kb as *const u32).add(r * k.row_words as usize), k.row_words as usize) };
+    if W::BITS == 32 {
+        // SAFETY: W is u32
+        return crate::simd::unpack(w, k.bits as u32, unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u32, out.len()) });
+    }
     let bits = k.bits as u64;
     let mask = (1u64 << bits) - 1;
     for (s, o) in out.iter_mut().enumerate() {
@@ -67,11 +71,7 @@ fn dot_rows<W: Hw>(a: &KsArgs, t: usize, ab: &mut impl FnMut(usize, &mut [W], &m
         ab(d, &mut b, &mut ar);
         for c in 0..k {
             let x = x_row::<W>(a, c, d, dt, t * N);
-            let (o0, o1) = (&mut s0[c * N..(c + 1) * N], &mut s1[c * N..(c + 1) * N]);
-            for i in 0..N {
-                o0[i] += W::wmul(x[i], b[i]);
-                o1[i] += W::wmul(x[i], ar[i]);
-            }
+            crate::simd::w::mac2::<W>(&mut s0[c * N..(c + 1) * N], &mut s1[c * N..(c + 1) * N], x, &b, &ar);
         }
     }
     (s0, s1)

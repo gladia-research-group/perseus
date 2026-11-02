@@ -132,19 +132,19 @@ fn inv_exact<W: Hw>(x: &mut [W], w: &[W], ws: &[W], p: W, ni: W, nis: W) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq,avx512vl,avx2,bmi2")]
 unsafe fn fwd_lazy_v(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, mid: Option<&mut [u32]>) {
-    fwd_lazy(x, w, ws, p, mid)
+    crate::ntt_avx::fwd(x, w, ws, p, mid)
 }
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq,avx512vl,avx2,bmi2")]
 unsafe fn inv_lazy_v(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, ni: u32, nis: u32) {
-    inv_lazy(x, w, ws, p, ni, nis)
+    crate::ntt_avx::inv(x, w, ws, p, ni, nis)
 }
 
 fn wide() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *W.get_or_init(|| std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq"))
+        *W.get_or_init(|| std::env::var_os("PC_HOST_SCALAR").is_none_or(|v| !v.to_string_lossy().contains("NTT")) && std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq") && std::is_x86_feature_detected!("avx512vl"))
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
@@ -283,4 +283,71 @@ pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {
             unsafe { std::slice::from_raw_parts_mut((a.base as *mut W).add(roff * N), N) }.copy_from_slice(&x);
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_rows_are_the_scalar_rows() {
+        if !wide() {
+            return;
+        }
+        let p = 268042241u32;
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut rnd = |m: u32| {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((st >> 33) as u32) % m
+        };
+        let w: Vec<u32> = (0..N).map(|_| rnd(p)).collect();
+        let ws: Vec<u32> = w.iter().map(|&v| (((v as u64) << 32) / p as u64) as u32).collect();
+        let x: Vec<u32> = (0..N).map(|_| rnd(p)).collect();
+        let (mut a, mut b) = (x.clone(), x.clone());
+        let (mut ma, mut mb) = (vec![0u32; N], vec![0u32; N]);
+        fwd_lazy(&mut a, &w, &ws, p, Some(&mut ma));
+        // SAFETY: features checked
+        unsafe { fwd_lazy_v(&mut b, &w, &ws, p, Some(&mut mb)) };
+        assert_eq!(ma, mb);
+        assert_eq!(a, b);
+        let ni = rnd(p);
+        let nis = (((ni as u64) << 32) / p as u64) as u32;
+        inv_lazy(&mut a, &w, &ws, p, ni, nis);
+        // SAFETY: as above
+        unsafe { inv_lazy_v(&mut b, &w, &ws, p, ni, nis) };
+        assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn row_times() {
+        let p = 268042241u32;
+        let w: Vec<u32> = (0..N as u32).map(|i| i.wrapping_mul(2654435761) % p).collect();
+        let ws: Vec<u32> = w.iter().map(|&v| (((v as u64) << 32) / p as u64) as u32).collect();
+        let mut x: Vec<u32> = (0..N as u32).map(|i| i % p).collect();
+        let reps = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            fwd_lazy(&mut x, &w, &ws, p, None);
+        }
+        let s = t.elapsed().as_secs_f64() / reps as f64 * 1e6;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            // SAFETY: bench on an AVX-512 machine
+            unsafe { fwd_lazy_v(&mut x, &w, &ws, p, None) };
+        }
+        let v = t.elapsed().as_secs_f64() / reps as f64 * 1e6;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            // SAFETY: as above
+            unsafe { inv_lazy_v(&mut x, &w, &ws, p, 5, 80) };
+        }
+        let vi = t.elapsed().as_secs_f64() / reps as f64 * 1e6;
+        eprintln!("ntt row: scalar fwd {s:.1} us, avx512 fwd {v:.1} us, avx512 inv {vi:.1} us");
+    }
 }

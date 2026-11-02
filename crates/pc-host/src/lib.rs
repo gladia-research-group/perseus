@@ -4,6 +4,7 @@
 //! one host table per word size stands for every (word, ModMul) instantiation of that word.
 mod arith;
 mod bconv;
+mod chacha;
 mod coeffrows;
 mod cts;
 mod elem;
@@ -12,9 +13,11 @@ mod expand;
 mod keys;
 mod ks;
 mod ntt;
+mod ntt_avx;
 mod raise;
 mod raw;
 mod rescale;
+mod simd;
 mod spru;
 
 use pc_kernels::args::*;
@@ -37,8 +40,43 @@ fn launch<A: Copy + 'static>(a: *const A, s: S, check: impl FnOnce(&A) -> i32, f
     }
     // SAFETY: `s` is a host stream (the host device only resolves host tables); the pointers in `a` follow the
     // CUDA launch's lifetime rules, which the callers keep
-    unsafe { pc_hostrt::submit(s, move || f(&a)) };
+    unsafe {
+        if prof_on() {
+            pc_hostrt::submit(s, move || {
+                let t = std::time::Instant::now();
+                f(&a);
+                prof_add(std::any::type_name::<A>(), t.elapsed().as_secs_f64());
+            })
+        } else {
+            pc_hostrt::submit(s, move || f(&a))
+        }
+    };
     0
+}
+
+fn prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PC_HOST_PROF").is_some())
+}
+
+static PROF: std::sync::Mutex<Vec<(&'static str, f64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn prof_add(name: &'static str, secs: f64) {
+    let mut p = PROF.lock().unwrap();
+    match p.iter_mut().find(|e| e.0 == name) {
+        Some(e) => {
+            e.1 += secs;
+            e.2 += 1;
+        }
+        None => p.push((name, secs, 1)),
+    }
+}
+
+/// Seconds and launches per kernel argument type since the process started (PC_HOST_PROF=1), largest first.
+pub fn profile() -> Vec<(String, f64, u64)> {
+    let mut v: Vec<_> = PROF.lock().unwrap().iter().map(|(n, s, c)| (n.rsplit("::").next().unwrap_or(n).to_string(), *s, *c)).collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1));
+    v
 }
 
 /// A table entry the host does not implement: refuses the launch, naming the kernel.
@@ -126,3 +164,4 @@ pub fn table(inst: Instance) -> Result<&'static KernelTable, TableError> {
         Instance::U16Barrett32 => &U16_B32,
     })
 }
+
