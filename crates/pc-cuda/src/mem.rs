@@ -52,12 +52,19 @@ enum Backing {
 }
 
 /// One `ARENA_ALIGN`-aligned host allocation of `bytes` (at least one alignment unit); `zeroed` for pinned buffers.
+/// Allocations of `HUGE` bytes and more are huge-page aligned and faulted in up front (`pc_hostrt::prefault`).
 fn host_alloc(bytes: usize, zeroed: bool) -> Result<(*mut u8, std::alloc::Layout)> {
-    let layout = std::alloc::Layout::from_size_align(bytes.max(ARENA_ALIGN), ARENA_ALIGN).map_err(|_| Error::Host("allocation size"))?;
+    const HUGE: usize = 2 << 20;
+    let align = if bytes >= HUGE { HUGE } else { ARENA_ALIGN };
+    let layout = std::alloc::Layout::from_size_align(bytes.max(ARENA_ALIGN), align).map_err(|_| Error::Host("allocation size"))?;
     // SAFETY: non-zero size
     let p = unsafe { if zeroed { std::alloc::alloc_zeroed(layout) } else { std::alloc::alloc(layout) } };
     if p.is_null() {
         return Err(Error::Host("host allocation failed"));
+    }
+    if bytes >= HUGE && !zeroed {
+        // SAFETY: the fresh allocation, contents unspecified
+        unsafe { pc_hostrt::prefault(p, layout.size()) };
     }
     Ok((p, layout))
 }
