@@ -4,6 +4,7 @@
 //! one host table per word size stands for every (word, ModMul) instantiation of that word.
 mod arith;
 mod bconv;
+mod coeffrows;
 mod cts;
 mod elem;
 mod encode;
@@ -52,7 +53,6 @@ macro_rules! missing {
 missing!(
     pcmm: PcmmArgs,
     ccmm: CcmmArgs,
-    coeff_sum: CoeffArgs,
     tfhe: TfheArgs,
 );
 
@@ -103,7 +103,7 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         rescale_combine_to: elem::rescale_combine_to::<W>,
         md_epilogue_to: elem::md_epilogue_to::<W>,
         small_int1: raise::small_int1::<W>,
-        coeff_sum,
+        coeff_sum: coeffrows::coeff_sum::<W>,
         mul_add: elem::mul_add::<W>,
         rescale_fwd: rescale::rescale_fwd::<W>,
         tfhe,

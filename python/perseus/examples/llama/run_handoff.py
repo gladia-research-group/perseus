@@ -281,6 +281,7 @@ def main(argv=None):
     ap.add_argument("--decode-plan", default=None)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     ap.add_argument("--no-handoff", action="store_true", help="decode every position from the BOS prefix (control)")
     ap.add_argument("--keys", choices=("all", "plan"), default="all", help="plan: the prefill plan's keys only (diag)")
     ap.add_argument("--prefill-only", action="store_true", help="no decode model (diag)")
@@ -300,6 +301,8 @@ def main(argv=None):
     ap.add_argument("--handoff-only", action="store_true",
                     help="planned: prefill + hand-off on the device, the handed K/V checked against the twin (no decode)")
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus.examples.defaults import default_plan
     if a.prefill_plan is None and a.decode_plan is None and not (a.fake or a.old_path):
         # BOS + tokens = the prefill's T

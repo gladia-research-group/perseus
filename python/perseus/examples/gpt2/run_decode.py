@@ -212,6 +212,7 @@ def main(argv=None, results=None):
                     help="override one of the port's session env values (env.ENV), repeatable")
     ap.add_argument("--force", action="store_true", help="run even if GPU is busy")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     ap.add_argument("--profile", action="store_true", help="per-primitive wall-time split")
     ap.add_argument("--check", action="store_true", help="exit 1 unless the dist gate passes (the default now)")
     ap.add_argument("--no-graphs", action="store_true", help="planned: replay every block eagerly (exec.use_graphs=0)")
@@ -224,6 +225,8 @@ def main(argv=None, results=None):
     ap.add_argument("--work-dir", default=None, help="planned: where the reference token's stream is written")
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output / K/V state vs the CPU twin (synchronous)")
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus._paths import resolve
     from perseus.examples.defaults import default_plan, default_windows
     a.windows = None

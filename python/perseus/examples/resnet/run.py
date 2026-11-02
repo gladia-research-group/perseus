@@ -197,6 +197,7 @@ def main(argv=None, results=None):
     mode.add_argument("--mirror", action="store_true", help="plaintext mirror (NumpyOps)")
     mode.add_argument("--eager", action="store_true", help="GPU, eager (needs --debug-refresh)")
     mode.add_argument("--fake", action="store_true", help="the CPU twin (perseus.impl.fakecap)")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir")
     ap.add_argument("--capture", default=None, help="--fake: write the stage graphs here")
     ap.add_argument("--one-stage", action="store_true", help="twin / plan: the network as one stage")
@@ -221,6 +222,8 @@ def main(argv=None, results=None):
     ap.add_argument("--pool", type=int, default=256)
     ap.add_argument("--pt-slots", type=int, default=8)
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus._paths import resolve
     from . import weights as R
     from .model import relu_exact

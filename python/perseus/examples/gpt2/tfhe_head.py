@@ -417,6 +417,7 @@ def main(argv=None):
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--mirror", action="store_true", help="plaintext mirror (NumpyOps; PF_TFHE_NOISE)")
     mode.add_argument("--fake", action="store_true", help="the CPU twin (perseus.impl.fakecap)")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir")
     ap.add_argument("--capture", default=None, help="--fake: write the stage graph here")
     ap.add_argument("--twin-limit", type=int, default=50)
@@ -440,6 +441,8 @@ def main(argv=None):
     ap.add_argument("--probes", type=int, default=8)
     ap.add_argument("--fine", type=int, default=512)
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     L = np.load(a.logits)
     if a.mirror:
         mirror(a, L)

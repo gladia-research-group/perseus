@@ -178,6 +178,7 @@ def main(argv=None):
                          "decode turns host-bound, ~2.5x slower)")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     ap.add_argument("--tap-blocks", default="", help="blocks whose sub-steps are tapped too (comma list)")
     ap.add_argument("--taps", default=None, help="decrypt every block output; save {pos_block: vec} to this .npz")
     ap.add_argument("--profile", action="store_true")
@@ -195,6 +196,8 @@ def main(argv=None):
     ap.add_argument("--tap-token", type=int, default=0,
                     help="with --tap-block: the token (position - 1) tapped; the first token of its program class")
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus._paths import resolve
     from perseus.examples.defaults import default_windows
     a.windows = None

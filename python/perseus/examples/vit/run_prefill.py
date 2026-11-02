@@ -126,6 +126,7 @@ def main(argv=None, results=None):
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--check", action="store_true", help="compare every block with the float64 model")
     ap.add_argument("--fake", action="store_true", help="the numpy fake (perseus.impl.fakecap): no GPU")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     ap.add_argument("--key-layout", choices=("dense", "packed"), default="packed",
                     help="planned: rotation keys resident (dense) or 28-bit b + seed regenerated per use (packed)")
     ap.add_argument("--pt-rows", type=int, default=28, help="planned: rows per plaintext slot (0 = every prime)")
@@ -136,6 +137,8 @@ def main(argv=None, results=None):
     ap.add_argument("--ccmm-kappa", default="256,16", help="planned: CCMM operating points QK,PV (SinCBoot input x kappa)")
     ap.add_argument("--ccmm-sweep", default="", help="planned: comma list of kappas: QK / PV probe precision per kappa")
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
         a.plan = default_plan("vit")

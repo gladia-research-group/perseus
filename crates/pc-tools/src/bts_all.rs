@@ -499,6 +499,12 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             let rows: Vec<usize> = (0..=t).collect();
             let mut w = sep[i].buf.download_rows(&ex.compute, 0, 0, &rows)?;
             w.extend(sep[i].buf.download_rows(&ex.compute, 0, 1, &rows)?);
+            if let Some(d) = std::env::var_os("PC_XDEV_DUMP") {
+                // cross-device check: the same seeded run on another device writes the same bytes
+                // SAFETY: plain words viewed as bytes
+                let b = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, std::mem::size_of_val(&w[..])) };
+                std::fs::write(std::path::Path::new(&d).join(format!("bts_{name}_k{kb}_{i}.bin")), b)?;
+            }
             refs.push(w);
             ref_meta = Some(sep[i].meta);
         }
