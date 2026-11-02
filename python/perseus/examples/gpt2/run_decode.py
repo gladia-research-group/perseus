@@ -220,8 +220,9 @@ def main(argv=None, results=None):
                     help="planned: rotation keys resident (dense) or 28-bit b + seed regenerated per use (packed)")
     ap.add_argument("--pt-rows", type=int, default=28, help="planned: rows per plaintext slot (0 = every prime)")
     ap.add_argument("--stc-cache", type=int, default=8, help="planned: StC-first last-stage cache entries")
-    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
-                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
+    ap.add_argument("--schedule", choices=("siblings", "program", "lockstep"), default="siblings",
+                    help="planned: op order before K-batching (siblings, as the prefills: refresh pairs (PC_BTS_PAIR) "
+                         "and independent rotate-sum / relinearization siblings in one K-batch)")
     ap.add_argument("--work-dir", default=None, help="planned: where the reference token's stream is written")
     ap.add_argument("--pt-cache", type=int, default=int(os.environ.get("PC_PT_CACHE", "1") or 0),
                     help="planned: every position's plaintexts staged at setup, none encoded in a token (default 1; 0 = off)")

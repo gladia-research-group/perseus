@@ -86,7 +86,7 @@ def streamed_run(a, twin, lw, plan, *, log=print):
     run = StreamedPlannedRun(rec, plan, cfg, labels, keys, work_dir=work, streams=streams, stream_rows=lw.coeff_rows,
                              prefix=prefix, input_vec=lw.embedding, routes_for=routes_for, stc_cache=a.stc_cache,
                              size=size, slim=not (a.debug_blocks or a.tap_block is not None), log=log,
-                             schedule=getattr(a, "schedule", "program"), plan_windows=windows,
+                             schedule=getattr(a, "schedule", "siblings"), plan_windows=windows,
                              pt_cache=bool(getattr(a, "pt_cache", 0)))
     run.debug = a.debug_blocks or a.tap_block is not None
     run.tail = n == n_total
@@ -187,8 +187,9 @@ def main(argv=None):
     ap.add_argument("--graphs", action="store_true", help="planned: CUDA graphs per block (default eager replay)")
     ap.add_argument("--key-layout", default="packed", choices=("dense", "packed"))
     ap.add_argument("--stc-cache", type=int, default=8)
-    ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
-                    help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
+    ap.add_argument("--schedule", choices=("siblings", "program", "lockstep"), default="siblings",
+                    help="planned: op order before K-batching (siblings, as the prefills: refresh pairs (PC_BTS_PAIR) "
+                         "and independent rotate-sum / relinearization siblings in one K-batch)")
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--pt-cache", type=int, default=int(os.environ.get("PC_PT_CACHE", "1") or 0),
                     help="planned: every position's plaintexts staged at setup, none encoded in a token (default 1; 0 = off)")
