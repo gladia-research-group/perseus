@@ -61,6 +61,8 @@ impl<S: Lane> Stream<S> {
     /// Make this stream wait for `e` (recorded on any stream).
     pub fn wait(&self, e: &Event) -> Result<()> {
         if self.host {
+            // SAFETY: both handles are live (borrowed)
+            unsafe { pc_hostrt::wait(self.raw, e.raw) };
             return Ok(());
         }
         // SAFETY: both handles are live (borrowed)
