@@ -191,14 +191,21 @@ pub extern "C" fn fwd<W: Hw>(a: *const NttArgs, s: S) -> i32 {
             0
         }
     };
-    launch(a, s, bad, |a| {
+    launch(a, s, bad, |a| fwd_with::<W>(a, &|a, i, p, x| load(a, i, p, x)))
+}
+
+/// The forward transform of the launch's rows (epilogues included), row i's input from `src(a, i, p, x)`.
+pub(crate) fn fwd_with<W: Hw>(a: &NttArgs, src: &(dyn Fn(&NttArgs, usize, W, &mut [W]) + Sync)) {
+    let sh = crate::raw::Shared(src);
+    let sh = &sh;
+    {
         par_for(a.nrows as usize, a, |a, i| {
             // SAFETY: rows / prime ids of nrows entries
             let (roff, pid) = unsafe { (*a.roff.add(i) as usize, *a.rprime.add(i) as usize) };
             let p = W::from_u64(el::<PrimeConst>(a.pr as *const std::ffi::c_void, pid).p);
             let (w, ws) = (table::<W>(a.fw, pid), table::<W>(a.fws, pid));
             let mut x = vec![W::default(); N];
-            load(a, i, p, &mut x);
+            (sh.get())(a, i, p, &mut x);
             // SAFETY: row roff of the base buffer
             let row = unsafe { std::slice::from_raw_parts_mut((a.base as *mut W).add(roff * N), N) };
             let mid = if a.epi != 0 { Some(&mut row[..]) } else { None };
@@ -244,7 +251,7 @@ pub extern "C" fn fwd<W: Hw>(a: *const NttArgs, s: S) -> i32 {
                 unsafe { *o = y };
             }
         })
-    })
+    }
 }
 
 pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {

@@ -5,12 +5,12 @@ use pc_kernels::args::{PolyRef, RowSet, N};
 use rayon::prelude::*;
 
 /// Shares a launch's argument struct (raw pointers inside) with the pool's tasks.
-pub struct Shared<'a, A>(pub &'a A);
+pub struct Shared<'a, A: ?Sized>(pub &'a A);
 // SAFETY: the tasks of one launch touch disjoint outputs and read inputs nobody writes during the launch (the device
 // kernel's own race freedom, which the launch contract guarantees)
-unsafe impl<A> Sync for Shared<'_, A> {}
-unsafe impl<A> Send for Shared<'_, A> {}
-impl<'a, A> Shared<'a, A> {
+unsafe impl<A: ?Sized> Sync for Shared<'_, A> {}
+unsafe impl<A: ?Sized> Send for Shared<'_, A> {}
+impl<'a, A: ?Sized> Shared<'a, A> {
     /// The shared value (a method, so closures capture the whole `Shared`, not its field).
     #[inline(always)]
     pub fn get(&self) -> &'a A {
