@@ -2,15 +2,13 @@
 //!
 //! * every `VarId` -> its compiler-assigned slot, one full-layout ciphertext buffer each (`CtBuf::words(lay, 1)`),
 //!   plus one scratch ciphertext for the in-place ops without an in-place kernel;
-//! * every `PtRef` -> a `PtStore` key `(name, level, Eval)` (`resolve_pts` -> device row addresses);
-//! * every rotation step list / conjugation / relinearization -> a setup-built `KeyGroup`;
-//! * every refresh site -> its `Route`; every scalar -> an exact `f64`;
-//! * every streamed weight row (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
+//! * every `PtRef` -> a `PtStore` key `(name, level, Eval)` (`resolve_pts` -> device row addresses); every rotation
+//!   step list / conjugation / relinearization -> a setup-built `KeyGroup`;
+//! * every refresh site -> its `Route`; every scalar -> an exact `f64`; every streamed weight row
+//!   (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
 //! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata;
-//! * the steps issued together (`Unit`): rotation grids and chains (`Program::rotation_grids` / `rotation_chains`),
-//!   K-batches, refresh pairs, plaintext products with their add (`mult_pt_adds`), affine element-wise groups
-//!   (constant products, negations, constant adds, adds and subs, one pass); other batches member by member.
-//! Details in docs/ARCHITECTURE.md "pc-program bind".
+//! * the steps issued together (`Unit`): rotation grids and chains, K-batches, refresh pairs, plaintext products
+//!   with their add, affine element-wise groups (one pass); others member by member (ARCHITECTURE.md, pc-program bind).
 use crate::compile::batch::{paired, PAIR_K};
 use crate::error::{Error, Result};
 use crate::program::{Kind, Op, Origin, Program, Scalar, GRID_INPUTS};
