@@ -2341,7 +2341,8 @@
    ],
    "cheb_lo": 0.0613073988074086,
    "cheb_hi": 0.9734886385147835,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.0.ln_2": {
    "method": "remez",
@@ -3420,7 +3421,8 @@
    ],
    "cheb_lo": 0.07459296037858532,
    "cheb_hi": 0.8683262676858038,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.1.ln_1": {
    "method": "remez",
@@ -4501,7 +4503,8 @@
    ],
    "cheb_lo": 0.022889783891315914,
    "cheb_hi": 0.31349678975533857,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.1.ln_2": {
    "method": "remez",
@@ -5583,7 +5586,8 @@
    ],
    "cheb_lo": 0.017793775100232393,
    "cheb_hi": 0.2780819642958185,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.10.ln_1": {
    "method": "remez",
@@ -6673,7 +6677,8 @@
    ],
    "cheb_lo": 0.008980472958133154,
    "cheb_hi": 0.2480704150165806,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.10.ln_2": {
    "method": "remez",
@@ -7764,7 +7769,8 @@
    ],
    "cheb_lo": 0.0066071345872070935,
    "cheb_hi": 0.184619110465268,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.11.ln_1": {
    "method": "remez",
@@ -8842,7 +8848,8 @@
    ],
    "cheb_lo": 0.006585107783804653,
    "cheb_hi": 0.2310100108948171,
-   "cheb_nr_iters": 1
+   "cheb_nr_iters": 1,
+   "zladder": 1
   },
   "transformer.h.11.ln_2": {
    "method": "remez",
@@ -9922,7 +9929,8 @@
    ],
    "cheb_lo": 0.003033313517599589,
    "cheb_hi": 0.4087988926197531,
-   "cheb_nr_iters": 2
+   "cheb_nr_iters": 2,
+   "zladder": 1
   },
   "transformer.h.2.ln_1": {
    "method": "remez",
@@ -11003,7 +11011,8 @@
    ],
    "cheb_lo": 0.014031081216348686,
    "cheb_hi": 0.19702995857807562,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.2.ln_2": {
    "method": "remez",
@@ -12085,7 +12094,8 @@
    ],
    "cheb_lo": 0.013513092922129736,
    "cheb_hi": 0.20890183301386211,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.3.ln_1": {
    "method": "remez",
@@ -13168,7 +13178,8 @@
    ],
    "cheb_lo": 0.01274225983754712,
    "cheb_hi": 0.20656323113595446,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.3.ln_2": {
    "method": "remez",
@@ -14252,7 +14263,8 @@
    ],
    "cheb_lo": 0.012309392789331259,
    "cheb_hi": 0.2135440936454915,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.4.ln_1": {
    "method": "remez",
@@ -15337,7 +15349,8 @@
    ],
    "cheb_lo": 0.011483068994526719,
    "cheb_hi": 0.21205915363125802,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.4.ln_2": {
    "method": "remez",
@@ -16421,7 +16434,8 @@
    ],
    "cheb_lo": 0.011644355257063317,
    "cheb_hi": 0.20118792366728053,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.5.ln_1": {
    "method": "remez",
@@ -17508,7 +17522,8 @@
    ],
    "cheb_lo": 0.010686181052722399,
    "cheb_hi": 0.24081980275772769,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.5.ln_2": {
    "method": "remez",
@@ -18594,7 +18609,8 @@
    ],
    "cheb_lo": 0.010478563587911634,
    "cheb_hi": 0.21632283404491653,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.6.ln_1": {
    "method": "remez",
@@ -19681,7 +19697,8 @@
    ],
    "cheb_lo": 0.010319066806175255,
    "cheb_hi": 0.23150010353829756,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.6.ln_2": {
    "method": "remez",
@@ -20766,7 +20783,8 @@
    ],
    "cheb_lo": 0.010492626278920027,
    "cheb_hi": 0.20547168599508794,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.7.ln_1": {
    "method": "remez",
@@ -21854,7 +21872,8 @@
    ],
    "cheb_lo": 0.010619008297012398,
    "cheb_hi": 0.2482571556509542,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.7.ln_2": {
    "method": "remez",
@@ -22939,7 +22958,8 @@
    ],
    "cheb_lo": 0.01127139373341059,
    "cheb_hi": 0.21054311546747553,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.8.ln_1": {
    "method": "remez",
@@ -24026,7 +24046,8 @@
    ],
    "cheb_lo": 0.012104865723867115,
    "cheb_hi": 0.27451141906748844,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.8.ln_2": {
    "method": "remez",
@@ -25112,7 +25133,8 @@
    ],
    "cheb_lo": 0.01095087956315814,
    "cheb_hi": 0.22487302293783243,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.9.ln_1": {
    "method": "remez",
@@ -26200,7 +26222,8 @@
    ],
    "cheb_lo": 0.010678108248794779,
    "cheb_hi": 0.2561142344611301,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.h.9.ln_2": {
    "method": "remez",
@@ -27287,7 +27310,8 @@
    ],
    "cheb_lo": 0.009267793201674566,
    "cheb_hi": 0.20330444551480348,
-   "cheb_nr_iters": 0
+   "cheb_nr_iters": 0,
+   "zladder": 1
   },
   "transformer.ln_f": {
    "method": "remez",
@@ -32669,6 +32693,11 @@
     1.5029761885288642,
     0.5029761885288642
    ]
-  ]
- }
+  ],
+  "spru_mean": 1,
+  "newton_fold": 1,
+  "conj_once": 1,
+  "entry_dd": 1
+ },
+ "lnf_fold": 1
 }
