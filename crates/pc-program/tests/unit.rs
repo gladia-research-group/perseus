@@ -79,7 +79,9 @@ fn lowering_and_check() {
     let kinds: Vec<&str> = p.ops.iter().map(|o| o.kind.name()).collect();
     assert_eq!(
         kinds,
-        ["square", "rotate_sum", "mult_const", "bootstrap", "rescale", "mult_pt", "bootstrap", "rescale", "add_const"]
+        // the square rescaled eagerly (compile::rr::early: its rotate-sum reads it rescaled, the constant product drops
+        // its rescale)
+        ["mult_rescale", "rotate_sum", "mult_const", "bootstrap", "rescale", "mult_pt", "bootstrap", "rescale", "add_const"]
     );
     // v2 args: exact scalar, steps
     assert!(matches!(p.ops[2].kind, Kind::MultConst(s) if s.exact && s.value == 1.0 / 3.0));

@@ -1600,7 +1600,17 @@ impl<'a, W: DevWord> Ops<'a, W> {
         };
         let top = self.top(ctx.shape, &r0.out)?;
         if !self.rr.as_ref().is_some_and(|rr| rr.serves(top, out.k())) {
-            return Err(shape("mult_rescale", format!("no fused relin-rescale tables for top {top}")));
+            // no fused tables at this top (an alternating user region's one-prime drop; the compile's eager rescales
+            // emit the op wherever a product is rescaled): the relinearization and the rescale one after the other
+            let (top, r) = self.tensor_for_relin_of(ctx, ex, sh, out, a, b, dbl)?;
+            crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
+            let mut m = r.out;
+            if dbl {
+                m = sh.add(&m, &m)?.out;
+            }
+            self.rescaler.rescale(ctx, &ex.compute, &mut out.buf, top, None)?;
+            out.meta = sh.realize(&m)?.out;
+            return Ok(());
         }
         let (top, r) = self.tensor_for_relin_of(ctx, ex, sh, out, a, b, dbl)?;
         let rr = self.rr.as_ref().ok_or_else(|| shape("mult_rescale", "no tables"))?;
