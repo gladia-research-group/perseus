@@ -240,6 +240,9 @@ fn run(o: &Opts) -> Res<bool> {
         );
     }
     println!("[bts-all] verdict: mismatches {bad}, MemPlan differences {mem_bad}");
+    for (k, secs, n) in pc_host::profile() {
+        println!("[bts-all] host kernel {k}: {secs:.3} s over {n} launches");
+    }
     Ok(bad == 0 && mem_bad == 0)
 }
 

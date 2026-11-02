@@ -11,6 +11,7 @@ serde_json = { workspace = true }
 # the device runtime (pc-check, pc-bench)
 pc-cuda = { path = "../pc-cuda" }
 pc-gpu = { path = "../pc-gpu" }
+pc-host = { path = "../pc-host" }
 pc-kernels = { path = "../pc-kernels" }
 pc-shadow = { path = "../pc-shadow" }
 pc-tfhe = { path = "../pc-tfhe" }
