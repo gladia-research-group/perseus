@@ -1658,7 +1658,10 @@ _silu_single_cache = {}
 
 
 def silu_single_coeffs(cfg):
-    """The single-series coefficients of sigma(xmax t) - 1/2 on t in [-1, 1], or None (keep the composite)."""
+    """The single-series coefficients of sigma(xmax t) - 1/2 on t in [-1, 1], or None (keep the composite): the
+    config's (single_cheb_coeffs), else derived here over PF_SILU_SINGLE_DEGS."""
+    if cfg.single_cheb:
+        return [float(v) for v in cfg.single_cheb]
     from numpy.polynomial import chebyshev as C
     from .poly import _cheb_trim
     key = (float(cfg.xmax), tuple(cfg.thor_p1_cheb), tuple(cfg.thor_p2_cheb))

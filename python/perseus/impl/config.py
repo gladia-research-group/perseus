@@ -133,6 +133,10 @@ class GeluCfg:
     # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower; 2: term by term in
     # the leaves with no slack (leaf_terms="budget")
     mask_fold: int = 0
+    # single_cheb (thor_composite, the prefill's joint GLU path under PF_SILU_SINGLE): the odd series of
+    # sigma(xmax t) - 1/2 on t in [-1, 1] the site runs instead of the composite; empty = derived at runtime
+    # (prefill.silu_single_coeffs over PF_SILU_SINGLE_DEGS)
+    single_cheb: tuple = ()
 
 
 @dataclasses.dataclass
@@ -269,7 +273,8 @@ def parse_gelu(j: dict) -> GeluCfg:
                        thor_p2=_tup(j["thor_p2"]), thor_p1_cheb=_tup(j.get("thor_p1_cheb")),
                        thor_p2_cheb=_tup(j.get("thor_p2_cheb")),
                        thor_p1_a=float(j.get("thor_p1_a", -1.0)), thor_p1_b=float(j.get("thor_p1_b", 1.0)),
-                       thor_p2_a=float(j.get("thor_p2_a", -1.0)), thor_p2_b=float(j.get("thor_p2_b", 1.0)))
+                       thor_p2_a=float(j.get("thor_p2_a", -1.0)), thor_p2_b=float(j.get("thor_p2_b", 1.0)),
+                       single_cheb=_tup(j.get("single_cheb_coeffs")))
     if method == "chebyshev":
         # xmax: with GELU_FOLD the up-projection carries 1/xmax and the output mask xmax (as for thor_composite)
         return GeluCfg(method=method, xmax=float(j.get("xmax", 1.0)), cheb_coeffs=_tup(j["cheb_coeffs"]),
