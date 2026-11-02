@@ -869,3 +869,88 @@ mod rns_tests {
         }
     }
 }
+
+/// The approximate balanced digits of TFHE key switching (tfhe.rs `digits8`) for a run of words, as int8 rows
+/// out[i * lv + t]; false when the CPU (or lv > 16, or bl lv > 62) leaves it to the scalar code. Eight words per
+/// vector; the rounding product splits into two vpmuludq. The serial rule has closed forms, so the digits are
+/// independent: for bl > 1, digit t of v + sum_t (b/2) b^t, minus b/2 (digits in [-b/2, b/2)); for bl = 1 (the
+/// NAF), bit t of np minus bit t of nm with h = v >> 1, x3 = v + h, c = h ^ x3, np = x3 & c, nm = h & c. The last
+/// digit takes the rest of v. One VBMI two-source byte permute turns the lv digit vectors into the eight rows.
+pub fn tfhe_digits(x: &[u32], bl: u32, lv: usize, m: u64, out: &mut [i8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if lv <= 16 && bl as usize * lv <= 62 && wide() && vbmi() {
+        // SAFETY: CPU features checked; out holds x.len() * lv bytes
+        unsafe { tfhe_digits_v(x, bl, lv, m, out) };
+        return true;
+    }
+    let _ = (x, bl, lv, m, out);
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vl,avx512dq")]
+unsafe fn tfhe_digits_v(x: &[u32], bl: u32, lv: usize, m: u64, out: &mut [i8]) {
+    assert!(out.len() >= x.len() * lv);
+    let bits = bl * lv as u32;
+    // output byte o (word o / lv, digit o % lv) <- digit buffer byte 8 (o % lv) + o / lv
+    let mut ix = [0u8; 128];
+    for (o, e) in ix.iter_mut().enumerate().take(8 * lv) {
+        *e = ((o % lv) * 8 + o / lv) as u8;
+    }
+    let (i0, i1) = (_mm512_loadu_si512(ix.as_ptr() as *const _), _mm512_loadu_si512(ix.as_ptr().add(64) as *const _));
+    let (mh, ml) = (_mm512_set1_epi64((m >> 32) as i64), _mm512_set1_epi64((m & 0xffff_ffff) as i64));
+    let rnd = _mm512_set1_epi64(1 << 31);
+    let thr = _mm512_set1_epi64(1i64.wrapping_shl(bits.wrapping_sub(1)));
+    let full = _mm512_set1_epi64(1i64.wrapping_shl(bits));
+    let b = 1i64 << bl;
+    let (bm1, half) = (_mm512_set1_epi64(b - 1), _mm512_set1_epi64(b / 2));
+    let off = _mm512_set1_epi64((0..lv).fold(0i64, |h, t| h + ((b / 2) << (bl as usize * t))));
+    let one = _mm512_set1_epi64(1);
+    let low = _mm512_set1_epi64((1i64 << (lv - 1)) - 1);
+    let top = _mm512_set1_epi64((bl as usize * (lv - 1)) as i64);
+    for (c, xs) in x.chunks(8).enumerate() {
+        let k = xs.len();
+        let w = _mm512_cvtepu32_epi64(_mm256_maskz_loadu_epi32(((1u32 << k) - 1) as u8, xs.as_ptr() as *const _));
+        let p2 = _mm512_mul_epu32(w, mh);
+        let p1 = _mm512_mul_epu32(w, ml);
+        let s = _mm512_srli_epi64::<32>(_mm512_add_epi64(_mm512_add_epi64(p2, _mm512_srli_epi64::<32>(p1)), rnd));
+        let v = _mm512_mask_sub_epi64(s, _mm512_cmpge_epi64_mask(s, thr), s, full);
+        // digit t's eight bytes go to qword t % 8 of s0 (t < 8) or s1
+        let (mut s0, mut s1) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+        let mut put = |t: usize, r: __m512i| {
+            let q = _mm512_cvtepi64_epi8(r);
+            if t < 8 {
+                s0 = _mm512_mask_broadcastq_epi64(s0, 1 << t, q);
+            } else {
+                s1 = _mm512_mask_broadcastq_epi64(s1, 1 << (t - 8), q);
+            }
+        };
+        if bl == 1 {
+            let h = _mm512_srai_epi64::<1>(v);
+            let x3 = _mm512_add_epi64(v, h);
+            let cc = _mm512_xor_si512(h, x3);
+            let (np, nm) = (_mm512_and_si512(x3, cc), _mm512_and_si512(h, cc));
+            for t in 0..lv - 1 {
+                let sh = _mm512_set1_epi64(t as i64);
+                put(t, _mm512_sub_epi64(_mm512_and_si512(_mm512_srlv_epi64(np, sh), one), _mm512_and_si512(_mm512_srlv_epi64(nm, sh), one)));
+            }
+            let lo = _mm512_sub_epi64(_mm512_and_si512(np, low), _mm512_and_si512(nm, low));
+            put(lv - 1, _mm512_srav_epi64(_mm512_sub_epi64(v, lo), top));
+        } else {
+            let u = _mm512_add_epi64(v, off);
+            for t in 0..lv - 1 {
+                let sh = _mm512_set1_epi64((bl as usize * t) as i64);
+                put(t, _mm512_sub_epi64(_mm512_and_si512(_mm512_srav_epi64(u, sh), bm1), half));
+            }
+            put(lv - 1, _mm512_sub_epi64(_mm512_srav_epi64(u, top), half));
+        }
+        let nb = k * lv;
+        let dst = out.as_mut_ptr().add(c * 8 * lv);
+        let lo = if nb >= 64 { u64::MAX } else { (1u64 << nb) - 1 };
+        _mm512_mask_storeu_epi8(dst, lo, _mm512_permutex2var_epi8(s0, i0, s1));
+        if nb > 64 {
+            let hi = if nb >= 128 { u64::MAX } else { (1u64 << (nb - 64)) - 1 };
+            _mm512_mask_storeu_epi8(dst.add(64), hi, _mm512_permutex2var_epi8(s0, i1, s1));
+        }
+    }
+}

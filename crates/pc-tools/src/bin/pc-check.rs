@@ -179,7 +179,7 @@ fn cmd_word_seam(a: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(|s| s.as_str()) {
+    let code = match args.first().map(|s| s.as_str()) {
         Some("bts") => cmd_bts(&args[1..]),
         Some("load") => cmd_load(&args[1..]),
         Some("keys") => check_keys::cmd_keys(&args[1..]),
@@ -197,5 +197,9 @@ fn main() -> ExitCode {
         Some("tfhe-bridge") => check_tfhe::cmd_bridge(&args[1..]),
         Some("n64") => cmd_word_seam(&args[1..]),
         _ => usage(),
+    };
+    for (k, secs, n) in pc_host::profile() {
+        println!("[pc-check] host kernel {k}: {secs:.3} s over {n} launches");
     }
+    code
 }
