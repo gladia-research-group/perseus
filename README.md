@@ -17,23 +17,21 @@ Every entry is a pull request to this branch. See [Submitting](#submitting).
 
 ## Running the current record
 
-This branch is both tracks' record; the client of every run is the commit its client file pins: the key-set client of
-record 5 for Prefill-128 and the alternating-chain client of record 6 for Decode-8 (record 1's client exports the
-weights).
+This branch is both tracks' record; the client of every run is the commit its client file pins: the alternating-chain
+client of record 6 for both tracks (record 1's client exports the weights).
 
 ```bash
 git clone -b speedrun https://github.com/gladia-research-group/perseus && cd perseus
 git worktree add ../perseus-client 89bc830017fe12ab967ddb10c24feae65d8af6df
-git worktree add ../perseus-keyset-client 811eadc02d8938ca825e508525f8ece56f4a7f6c
 git worktree add ../perseus-spchain-client ea62bcc3bd7f052d8005e9039c74cc476f19f364
-for d in . ../perseus-client ../perseus-keyset-client ../perseus-spchain-client; do (cd $d && uv venv --python 3.12 .venv &&
+for d in . ../perseus-client ../perseus-spchain-client; do (cd $d && uv venv --python 3.12 .venv &&
   uv pip install --python .venv/bin/python -e ".[hf,examples,dev]" && .venv/bin/maturin develop --release); done
 (cd ../perseus-client && .venv/bin/perseus-export --model openai-community/gpt2 --out .cache/models/openai-community/gpt2)
 
 CLIENT=../perseus-spchain-client WEIGHTS=../perseus-client/.cache/models/openai-community/gpt2/classic/weights.bin.zip \
   bash speedrun/runner/entry.sh perseus-spchain . decode 0                         # Decode-8, on GPU 0
-CLIENT=../perseus-keyset-client WEIGHTS=../perseus-client/.cache/models/openai-community/gpt2/classic/weights.bin.zip \
-  bash speedrun/runner/entry.sh perseus-keyset . prefill 0                         # Prefill-128
+CLIENT=../perseus-spchain-client WEIGHTS=../perseus-client/.cache/models/openai-community/gpt2/classic/weights.bin.zip \
+  bash speedrun/runner/entry.sh perseus-spchain . prefill 0                        # Prefill-128
 ```
 
 You need Linux, `bwrap`, a systemd user session, a GPU with 48 GB or more, and `HF_HOME` holding
@@ -49,7 +47,7 @@ You need Linux, `bwrap`, a systemd user session, a GPU with 48 GB or more, and `
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="speedrun/records/progress-dark.svg">
-    <img src="speedrun/records/progress-light.svg" width="100%" alt="Record progression of both GPT-2 tracks. Prefill-128: 35.78 s (record 0), 22.22 s (record 1), 15.11 s (record 2), 12.20 s (record 3), 10.12 s (record 4), 7.07 s (record 5). Decode-8: 3.993 s/token (record 0), 3.384 s/token (record 1), 3.031 s/token (record 2), 2.325 s/token (record 3), 1.798 s/token (record 4), 1.213 s/token (record 5), 1.199 s/token (record 6). Dotted lines: 1 token/s, and GPT-2 unencrypted on the same GPU, 0.77 ms and 0.65 ms/token.">
+    <img src="speedrun/records/progress-light.svg" width="100%" alt="Record progression of both GPT-2 tracks. Prefill-128: 35.78 s (record 0), 22.22 s (record 1), 15.11 s (record 2), 12.20 s (record 3), 10.12 s (record 4), 7.07 s (record 5), 6.37 s (record 6). Decode-8: 3.993 s/token (record 0), 3.384 s/token (record 1), 3.031 s/token (record 2), 2.325 s/token (record 3), 1.798 s/token (record 4), 1.213 s/token (record 5), 1.199 s/token (record 6), 0.968 s/token (record 7). Dotted lines: 1 token/s, and GPT-2 unencrypted on the same GPU, 0.77 ms and 0.65 ms/token.">
   </picture>
 </p>
 
@@ -66,8 +64,11 @@ unencrypted on the same GPU (at the bottom, not to scale).
 | 3 | 12.20 | BabyStepPrefill: baby-step attention rotations, paired bootstraps, fewer bootstraps | 2026‑10‑26 | [`946694d`](https://github.com/gladia-research-group/perseus/tree/946694db552fc4858b68a314f35bf7ccb1c14893) · [log](speedrun/records/2026-10-26_BabyStepPrefill) | [@erodola](https://github.com/erodola) |
 | 4 | 10.12 | LeanChainPrefill: leaner key-switching chain, exactly pre-divided matrix products | 2026‑10‑27 | [`e3e6b6b`](https://github.com/gladia-research-group/perseus/tree/e3e6b6b5834f73766aaec531436f8808a5e276e3) · [log](speedrun/records/2026-10-27_LeanChainPrefill) | [@erodola](https://github.com/erodola) |
 | 5 | 7.07 | LeanKeySwitch: leaner key switch and bootstraps, raise drops, own key set | 2026‑10‑31 | [`811eadc`](https://github.com/gladia-research-group/perseus/tree/811eadc02d8938ca825e508525f8ece56f4a7f6c) · [log](speedrun/records/2026-10-31_LeanKeySwitch) | [@alexzilligmm](https://github.com/alexzilligmm) |
+| 6 | 6.37 | FlippingToTokenPerSecond: folded masks, one rotation per attention window, lazy relinearization | 2026‑11‑02 | [`7f84aa1`](https://github.com/gladia-research-group/perseus/tree/7f84aa1fc0bfbb6c0581c1b8c89a083eb6f7bb20) · [log](speedrun/records/2026-11-02_FlippingToTokenPerSecond) | [@alexzilligmm](https://github.com/alexzilligmm) |
 |  | $`\color{gray}\textsf{0.00077}`$ | $`\color{gray}\textsf{Unencrypted GPT-2}`$ | $`\color{gray}\textsf{2026-10-24}`$ | [code](speedrun/records/plaintext.py) · [log](speedrun/records/plaintext.json) |  |
 
+- **Record 6, FlippingToTokenPerSecond**: masks ride inside the polynomial series, attention rotates once per window
+  and relinearizes each sum of products once, more refreshes run in pairs, and the GELU and exp are lighter.
 - **Record 5, LeanKeySwitch**: key switching and bootstraps take fewer passes and roundings, refreshes with levels to
   spare raise to a lower modulus, and new keys fold switches into the rotations after a refresh.
 - **Record 4, LeanChainPrefill**: Prefill-128 on Decode-8's shorter modulus chain, its matrix products' inputs
@@ -91,8 +92,12 @@ unencrypted on the same GPU (at the bottom, not to scale).
 | 4 | 1.798 | LeanChainDecode: leaner key-switching chain, centred softmax | 2026‑10‑27 | [`24d4b3f`](https://github.com/gladia-research-group/perseus/tree/24d4b3fd04c67293524aac354cc290d02ae2647b) · [log](speedrun/records/2026-10-27_LeanChainDecode) | [@erodola](https://github.com/erodola) |
 | 5 | 1.213 | LeanKeySwitch: leaner key switch and bootstraps, shorter argmax, leaner LayerNorms | 2026‑10‑31 | [`811eadc`](https://github.com/gladia-research-group/perseus/tree/811eadc02d8938ca825e508525f8ece56f4a7f6c) · [log](speedrun/records/2026-10-31_LeanKeySwitch) | [@alexzilligmm](https://github.com/alexzilligmm) |
 | 6 | 1.199 | AlternatingChain: alternating one- and two-prime levels, fewer refreshes | 2026‑11‑01 | [`ea62bcc`](https://github.com/gladia-research-group/perseus/tree/ea62bcc3bd7f052d8005e9039c74cc476f19f364) · [log](speedrun/records/2026-11-01_AlternatingChain) | [@erodola](https://github.com/erodola) |
+| 7 | 0.968 | FlippingToTokenPerSecond: lighter configs on the alternating chain, deeper raise drops, fused one-prime rescales | 2026‑11‑02 | [`7f84aa1`](https://github.com/gladia-research-group/perseus/tree/7f84aa1fc0bfbb6c0581c1b8c89a083eb6f7bb20) · [log](speedrun/records/2026-11-02_FlippingToTokenPerSecond) | [@alexzilligmm](https://github.com/alexzilligmm) |
 |  | $`\color{gray}\textsf{0.00065}`$ | $`\color{gray}\textsf{Unencrypted GPT-2}`$ | $`\color{gray}\textsf{2026-10-24}`$ | [code](speedrun/records/plaintext.py) · [log](speedrun/records/plaintext.json) |  |
 
+- **Record 7, FlippingToTokenPerSecond**: under a second per token: lighter configs replanned on the alternating chain
+  (87 refreshes per token instead of 99), refreshes that end lower in the chain, and one-prime rescales fused into
+  the products and key switches.
 - **Record 6, AlternatingChain**: the levels between refreshes alternate one prime and two, which fits 12 levels in the
   bits of 9: 99 refreshes per token instead of 112.
 - **Record 5, LeanKeySwitch**: Prefill-128's leaner key switching and bootstraps, the argmax in 11 bootstraps instead
@@ -148,8 +153,9 @@ Records that change it:
 ### Track 1: Prefill-128
 
 - Server: the planned prefill, [`PlannedPrefill`](python/perseus/impl/prefill.py)
-- Plan: [`bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cm`](bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cm), on
-  the lean chain `n32a4`, made by `PRESET=n32a4 bash` [`speedrun/make_prefill_plan.sh`](speedrun/make_prefill_plan.sh)
+- Plan: [`bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw_mfsab2q`](bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw_mfsab2q),
+  on the lean chain `n32a4`, made by [`speedrun/make_prefill_carry_plan.sh`](speedrun/make_prefill_carry_plan.sh) and
+  [`speedrun/make_prefill_wrot_plan.sh`](speedrun/make_prefill_wrot_plan.sh) (its `PLAN_CMD.txt`)
 - In one process: [`scripts/repro/gpt2_prefill128.sh`](scripts/repro/gpt2_prefill128.sh), through
   [`run_prefill.py`](python/perseus/examples/gpt2/run_prefill.py)
 - [`prefill.py`](python/perseus/examples/gpt2/prefill.py) runs the 128 positions through the 12 blocks, packed as complex chunk
@@ -163,8 +169,8 @@ Records that change it:
 ### Track 2: Decode-8
 
 - Server: Perseus's served decode, [`perseus.serve.gpt2_decode`](python/perseus/serve/gpt2_decode.py)
-- Plan: [`bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh`](bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh), on the
-  alternating chain `n32sp`, made by [`speedrun/make_n32sp_decode_plan.sh`](speedrun/make_n32sp_decode_plan.sh) (its `PLAN_CMD.txt`)
+- Plan: [`bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7`](bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7), on the
+  alternating chain `n32sp`, made by [`speedrun/make_n32sp_decode_plan_gn.sh`](speedrun/make_n32sp_decode_plan_gn.sh) (its `PLAN_CMD.txt`)
 - In one process, with per-token times: [`scripts/repro/gpt2_decode.sh`](scripts/repro/gpt2_decode.sh), through
   [`run_decode.py`](python/perseus/examples/gpt2/run_decode.py)
 - [`model.py`](python/perseus/examples/gpt2/model.py) holds the per-block K/V caches and the decode step: the 12 blocks of

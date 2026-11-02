@@ -20,14 +20,13 @@ The machine provides what this folder cannot:
   Policies) allows `pull_request_target` for that file only; without one, GitHub blocks the event in public
   repositories.
 - Build the commit the records' client pins (`PERSEUS` in [`harness/perseus_spchain_client.py`](harness/perseus_spchain_client.py),
-  Decode-8, and [`harness/perseus_keyset_client.py`](harness/perseus_keyset_client.py), Prefill-128 and Decode-8's record 5;
+  both tracks, and [`harness/perseus_keyset_client.py`](harness/perseus_keyset_client.py) for record 5;
   [`harness/perseus_lean_client.py`](harness/perseus_lean_client.py) for record 4,
   [`harness/perseus_core_client.py`](harness/perseus_core_client.py) for records 1-3),
   with GPT-2's weights, and the current record if it is another commit:
   `EXPORT=1 bash speedrun/runner/build.sh https://github.com/gladia-research-group/perseus <commit> <client build>`.
-  Today Prefill-128's record is record 5, LeanKeySwitch, `811eadc`, with its key-set client at `811eadc`, and
-  Decode-8's is record 6, AlternatingChain, `ea62bcc`, with its alternating-chain client at `ea62bcc`. Rebuild a
-  track's record arm whenever its record changes.
+  Today both tracks' record is FlippingToTokenPerSecond, `7f84aa1` (Prefill-128's record 6, Decode-8's record 7),
+  with the alternating-chain client at `ea62bcc`. Rebuild a track's record arm whenever its record changes.
 
 ## When a PR arrives
 

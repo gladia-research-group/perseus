@@ -5,6 +5,7 @@ prefill,2,2026-10-24,15.11,PackedPrefill,erodola
 prefill,3,2026-10-26,12.20,BabyStepPrefill,erodola
 prefill,4,2026-10-27,10.12,LeanChainPrefill,erodola
 prefill,5,2026-10-31,7.07,LeanKeySwitch,alexzilligmm
+prefill,6,2026-11-02,6.37,FlippingToTokenPerSecond,alexzilligmm
 decode,0,2026-10-22,3.993,Perseus (FIDESlib),alexzilligmm Davide-F5-Marincione
 decode,1,2026-10-22,3.384,Perseus on perseus-core,alexzilligmm Davide-F5-Marincione
 decode,2,2026-10-24,3.031,FusedUnits,erodola
@@ -12,3 +13,4 @@ decode,3,2026-10-26,2.325,FittedDecode,erodola
 decode,4,2026-10-27,1.798,LeanChainDecode,erodola
 decode,5,2026-10-31,1.213,LeanKeySwitch,alexzilligmm
 decode,6,2026-11-01,1.199,AlternatingChain,erodola
+decode,7,2026-11-02,0.968,FlippingToTokenPerSecond,alexzilligmm
