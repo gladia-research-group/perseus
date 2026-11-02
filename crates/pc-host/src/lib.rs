@@ -4,6 +4,7 @@
 //! one host table per word size stands for every (word, ModMul) instantiation of that word.
 mod arith;
 mod bconv;
+mod ccmm;
 mod chacha;
 mod coeffrows;
 mod cts;
@@ -12,13 +13,18 @@ mod encode;
 mod expand;
 mod keys;
 mod ks;
+mod mm;
 mod ntt;
 mod ntt_avx;
+mod ntt_g;
+mod pbs_v;
+mod pcmm;
 mod raise;
 mod raw;
 mod rescale;
 mod simd;
 mod spru;
+mod tfhe;
 
 use pc_kernels::args::*;
 use pc_kernels::{Instance, TableError};
@@ -79,21 +85,6 @@ pub fn profile() -> Vec<(String, f64, u64)> {
     v
 }
 
-/// A table entry the host does not implement: refuses the launch, naming the kernel.
-macro_rules! missing {
-    ($($name:ident : $args:ty),* $(,)?) => {$(
-        extern "C" fn $name(_a: *const $args, _s: S) -> i32 {
-            eprintln!("[pc-host] kernel `{}` has no host implementation", stringify!($name));
-            -100
-        }
-    )*};
-}
-missing!(
-    pcmm: PcmmArgs,
-    ccmm: CcmmArgs,
-    tfhe: TfheArgs,
-);
-
 const fn build<W: Hw>(inst: Instance) -> KernelTable {
     KernelTable {
         abi: ABI,
@@ -135,8 +126,8 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         spru_scatter: spru::spru_scatter::<W>,
         cts_fused_regen: cts::cts_fused_regen::<W>,
         ks_dot_key: ks::ks_dot_key::<W>,
-        pcmm,
-        ccmm,
+        pcmm: pcmm::pcmm::<W>,
+        ccmm: ccmm::ccmm::<W>,
         wsum_k: elem::wsum_k::<W>,
         rescale_combine_to: elem::rescale_combine_to::<W>,
         md_epilogue_to: elem::md_epilogue_to::<W>,
@@ -144,7 +135,7 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         coeff_sum: coeffrows::coeff_sum::<W>,
         mul_add: elem::mul_add::<W>,
         rescale_fwd: rescale::rescale_fwd::<W>,
-        tfhe,
+        tfhe: tfhe::tfhe,
     }
 }
 

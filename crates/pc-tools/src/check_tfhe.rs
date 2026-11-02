@@ -570,7 +570,8 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", lin.len())?;
     let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", kl * count * (n + 1))?;
     let mut d_kb = arena.alloc::<pc_cuda::Compute, u32>("tfhe.kb", kb_words.max(1))?;
-    let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
+    let inst = pc_kernels::table::Instance::U32Barrett64;
+    let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
     let s2 = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let s3 = pc_cuda::Stream::<pc_cuda::Compute>::high_priority(&dev)?;
@@ -736,7 +737,8 @@ fn run_ks(args: &[String]) -> Res<bool> {
     let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * cols)?;
     let mut d_ws = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ws", ws_bytes)?;
     let gemm = pc_gpu::matmul::gemm::I8Gemm::new(&lt.inner, count as u64, cols as u64, k as u64, 8, ws_bytes)?;
-    let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
+    let inst = pc_kernels::table::Instance::U32Barrett64;
+    let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::KS_DIGITS, count: count as i32, i1: n_in as i32, x: d_dig.vptr_mut(), y: d_in.vptr(), q: p0, m: gad.m, c: [p.ks.0 as u64, lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
@@ -837,7 +839,8 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     let bytes = 4 * (6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + n_valid * (nb + 1) + n_valid) + pc_gpu::tfhe::DevRepack::bytes(n, nb, rp_lv) + (64 << 20);
     let arena = pc_cuda::Arena::new(&dev, bytes)?;
     let st = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
-    let table = pc_kernels::table::table(pc_kernels::table::Instance::U32Barrett64)?;
+    let inst = pc_kernels::table::Instance::U32Barrett64;
+    let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, st.raw()) })?) };
     let gp = |a: &PcmmArgs| -> Res<()> { Ok(pc_cuda::launch_result("pcmm", unsafe { (table.pcmm)(a, st.raw()) })?) };
     let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
