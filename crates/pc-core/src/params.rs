@@ -139,6 +139,10 @@ impl ChainSpec {
     pub fn n32sp() -> Self {
         ChainSpec { sp: Some(Sp { replace: 9, levels: 12, scale: 36.0, single: 27.85 }), ..Self::n32a4() }
     }
+    /// Investigation: n32a4 with its 6 lowest user pairs replaced by 8 alternating levels (its 3 top user pairs kept).
+    pub fn n32sph() -> Self {
+        ChainSpec { sp: Some(Sp { replace: 6, levels: 8, scale: 36.0, single: 27.85 }), ..Self::n32a4() }
+    }
     /// The n64 chain (functional only): logN 16, 53-bit primes, 60-bit q0, depth 27, dnum 7, 60-bit specials.
     pub fn n64() -> Self {
         ChainSpec {
@@ -163,6 +167,7 @@ impl ChainSpec {
             "n64" => Ok(Self::n64()),
             "n32a4" => Ok(Self::n32a4()),
             "n32sp" => Ok(Self::n32sp()),
+            "n32sph" => Ok(Self::n32sph()),
             _ => Err(Error::Params(format!("unknown chain preset '{name}' (known: n32, n64, n32a4, n32sp)"))),
         }
     }

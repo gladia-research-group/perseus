@@ -702,7 +702,7 @@ class PlannedRun:
         FAKECAP_STC_ENTRY = the recipe's PLAN_STC_FIRST_ENTRY): from n32's (46) it captures a deliberate dense refresh
         whose input sits past it at the shipped order's landing, which the compile could reach only by a dense raise
         drop into the user region (refused there: compile::user_region_sites)."""
-        if self.cfg["chain.preset"] != "n32sp":
+        if self.cfg["chain.preset"] not in ("n32sp", "n32sph"):
             return
         cmd = os.path.join(self.plan_dir, "PLAN_CMD.txt")
         want = None

@@ -36,6 +36,14 @@ fn run() -> Result<usize, String> {
     );
     let Some(path) = check_path else {
         println!("q = {:?}", chain.q);
+        if std::env::var("PC_PARAMS_SCALES").is_ok() {
+            // investigation: limb top, primes dropped by its rescale, log2 of the level's scale and of its primes
+            for t in (1..chain.q.len()).rev() {
+                if st.drop[t] == 0 { continue; }
+                let bits: f64 = (0..st.drop[t]).map(|j| (chain.q[t - j] as f64).log2()).sum();
+                println!("top {t:2} drops {} ({bits:6.2} bits) scale 2^{:.2}", st.drop[t], st.sfr[t].log2());
+            }
+        }
         println!("p = {:?}", chain.p);
         return Ok(0);
     };

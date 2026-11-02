@@ -208,6 +208,8 @@ fn run(a: Args) -> Res<()> {
     match a.chain.as_str() {
         "n32" => run_t::<W, M>(a, ChainSpec::n32(), BtsSetup::n32_shipped()),
         "n32a4" => run_t::<W, M>(a, ChainSpec::n32a4(), BtsSetup::n32_shipped()),
+        "n32sp" => run_t::<W, M>(a, ChainSpec::n32sp(), BtsSetup::n32_shipped()),
+        "n32sph" => run_t::<W, M>(a, ChainSpec::n32sph(), BtsSetup::n32_shipped()),
         "n64" => run_t::<u64, Barrett64>(a, ChainSpec::n64(), BtsSetup::n64()),
         c => Err(format!("--chain {c}: n32 | n32a4 | n64").into()),
     }
