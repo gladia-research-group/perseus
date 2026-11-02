@@ -1,0 +1,11 @@
+[package]
+name = "pc-tfhe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "perseus: CKKS <-> TFHE scheme switching (host reference): ring switch + LWE extraction, LWE key switch, programmable bootstrapping, repack into a CKKS split ciphertext"
+
+[dependencies]
+pc-core = { path = "../pc-core" }
+rayon = { workspace = true }
+thiserror = { workspace = true }

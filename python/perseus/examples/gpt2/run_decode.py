@@ -271,6 +271,8 @@ def main(argv=None, results=None):
 
     # `over` has to reach open_session as well: it calls export_env a second time, and a
     # second call re-applies env.ENV over anything set here.
+    from .tfhe_head import sampler_env
+    smp = sampler_env()                 # GPT2_SAMPLER: the selection stage samples by TFHE
     if a.fake:
         from perseus.impl import fake, fakecap
         from perseus.impl.layout import Dims
@@ -280,7 +282,7 @@ def main(argv=None, results=None):
                             a.payload == "complex")
         d = Dims.gpt2()
         band, _ = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real)
-        _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND)
+        _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND | set(smp.rotations() if smp else ()))
         sess, core = fakecap.FakeSession(inf), fakecap.core
     else:
         # the new runtime runs planned only: every block is a compiled Program (impl.driver.PlannedRun), its
@@ -294,12 +296,13 @@ def main(argv=None, results=None):
                             a.payload == "complex")
         d = Dims.gpt2()
         band, _ = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real)
-        _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND)
+        _, inf = fakecap.make_session(d, set(band.loaded_rot_steps) | fakecap.GPT2_BAND | set(smp.rotations() if smp else ()))
         sess, core = fakecap.FakeSession(inf), fakecap.core
     store = weights.RawStore(a.weights)
     cfgs = config.load_configs(a.configs)
     model = Gpt2Model(inf, store, cfgs, core=core, n_layers=a.layers, profile=a.profile, packing=a.packing,
                       kv_offload=False)
+    model.sampler = smp
     missing = env.rotation_audit(inf.fhe, model.rt.dims)
     if missing:
         print(f"rotation keys missing from the band: {missing}", file=sys.stderr)

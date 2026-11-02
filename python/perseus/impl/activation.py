@@ -14,6 +14,42 @@ from .poly import eval_chebyshev, eval_polynomial_ps, im_cleanse
 
 # PF_ACT_FOLD=1: fold a constant output mask into the THOR coefficients (changes the captured op stream)
 _ACT_FOLD = os.environ.get("PF_ACT_FOLD", "0") not in ("", "0")
+# PF_GELU_TFHE=1: the folded GELU as a TFHE LUT (impl/tfhe.py) on the active MLP lanes instead of its polynomial (an
+# experiment: the switch's input noise is too large for GELU)
+_GELU_TFHE = os.environ.get("PF_GELU_TFHE", "0") not in ("", "0")
+# PF_GELU_TFHE=2: the LUT reads Phi (GELU = x Phi(x)) and one CKKS product makes GELU: the switch's input noise then
+# enters as x phi(x) sigma (<= 0.24 sigma) instead of GELU's slope (<= 1.13 sigma)
+_GELU_TFHE_PHI = os.environ.get("PF_GELU_TFHE", "0") in ("2", "3")
+# PF_GELU_TFHE=3: as 2 with the switch's input error corrected to first order (tfhe.tfhe_lut_taylor: two LUTs)
+_GELU_TFHE_TAYLOR = os.environ.get("PF_GELU_TFHE", "0") == "3"
+
+
+def gelu_tfhe(rt, x, cfg: GeluCfg, lanes=None):
+    """GELU(x) = xmax f(x / xmax), f(m) = GELU(m xmax) / xmax read by a TFHE LUT on the active lanes (|f| <= 1 on
+    [-1, 1)); x arrives as x / xmax (the up-projection carries it), xmax rides the lane mask as in the Chebyshev
+    branch. Every other slot comes back zero (the imaginary halves too)."""
+    from . import tfhe
+    ops, d = rt.ops, rt.dims
+    from math import erf, sqrt
+    xm = float(cfg.xmax)
+    phi = np.vectorize(lambda y: 0.5 * (1.0 + erf(y / sqrt(2.0))))
+    name = f"{'phi' if _GELU_TFHE_PHI else 'gelu'}/{xm:.9g}"
+    if name not in tfhe.LUTS:
+        if _GELU_TFHE_PHI:
+            tfhe.register_lut(name, lambda m, xm=xm: phi(np.asarray(m) * xm))
+        else:
+            tfhe.register_lut(name, lambda m, xm=xm: np.asarray(m) * phi(np.asarray(m) * xm))
+    L = () if lanes is None else ("L", int(lanes))
+    act = np.nonzero(np.real(_expanded(d, 1.0, lanes)))[0]
+    sl = tfhe.register_slots(f"mlp.lanes{L}", act)
+    if _GELU_TFHE_TAYLOR:
+        dphi = lambda m, xm=xm: xm / sqrt(2.0 * np.pi) * np.exp(-(np.asarray(m) * xm) ** 2 / 2.0)
+        y = tfhe.tfhe_lut_taylor(ops, x, name, lambda m, xm=xm: phi(np.asarray(m) * xm), dphi, sl)
+    else:
+        y = tfhe.tfhe_lut(ops, x, name, sl)
+    if _GELU_TFHE_PHI:
+        y = ops.mult(x, y)
+    return rt.mult_mask(y, ("gelu.tfhe", xm) + L, lambda: _expanded(d, xm, lanes))
 
 def gelu_thor_core(rt, t, cfg: GeluCfg, out_scale: float | None = None):
     """nonlinear.cu. With GELU_FOLD the refreshes are the plan's, not these hints. `out_scale` (Chebyshev THOR only):
@@ -62,6 +98,8 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
                 return ops.mult(g, im_cleanse(ops, x))
         g = ops.mult(gelu_thor_core(rt, x, cfg), im_cleanse(ops, x))
         return rt.mult_mask(g, (mask[0], cfg.xmax), lambda: mask[1](0.5 * cfg.xmax))
+    if _GELU_TFHE and cfg.method == "chebyshev" and ops.gelu_fold:
+        return gelu_tfhe(rt, x, cfg, lanes)
     if mask is not None and ops.gelu_fold and cfg.method == "chebyshev":
         m = np.asarray(mask[1](1.0))
         if _ACT_FOLD and np.all(m == m.flat[0]):          # constant mask: xmax and the mask ride the coefficients

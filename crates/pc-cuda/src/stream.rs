@@ -21,6 +21,16 @@ impl<S: Lane> Stream<S> {
         check(unsafe { ffi::cudaStreamCreateWithFlags(&mut raw, ffi::STREAM_NON_BLOCKING) }, "cudaStreamCreateWithFlags")?;
         Ok(Stream { raw, _s: PhantomData })
     }
+    /// A stream of the device's highest priority (its blocks are scheduled before the default streams' pending ones).
+    pub fn high_priority(_dev: &Device) -> Result<Self> {
+        let (mut least, mut greatest) = (0, 0);
+        // SAFETY: out-pointers to locals
+        check(unsafe { ffi::cudaDeviceGetStreamPriorityRange(&mut least, &mut greatest) }, "cudaDeviceGetStreamPriorityRange")?;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: out-pointer to a local
+        check(unsafe { ffi::cudaStreamCreateWithPriority(&mut raw, ffi::STREAM_NON_BLOCKING, greatest) }, "cudaStreamCreateWithPriority")?;
+        Ok(Stream { raw, _s: PhantomData })
+    }
     /// The `cudaStream_t` for a kernel launcher.
     pub fn raw(&self) -> RawStream {
         self.raw

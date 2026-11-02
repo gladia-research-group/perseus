@@ -1,0 +1,5 @@
+graph=graphs/resnet20_stcf1
+tool=python/perseus/examples/gpt2/make_plan.sh (PLAN_SPARSE_SLOTS= BTS_LEVEL=28 PLAN_STC_FIRST_ENTRY=46 PLAN_STC_FIRST_FALLBACK=34:1 PLAN_STC_FIRST_REROUTE=1 PLAN_ACC_CHAIN=n32s PLAN_SLIM_CUBIC=1)
+runtime=FIDESLIB_BTS_STC_FIRST=2 FIDESLIB_BTS_STC_FIRST_ROUTES=dense FIDESLIB_BTS_STC_FIRST_CF=13 FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=0
+configs=configs/model/approximation/resnet20_cifar10/configs.json
+replanned=dense, one stage, on the StC-first capture, with the StC-first accuracy curves (plan/data/bts_accuracy_n32s.json): the CF per site from the StC-first order's precision

@@ -755,6 +755,79 @@ struct CoeffArgs {
 };
 static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 
+// ------------------------------------------------------------------------------------------------ tfhe (ABI 11)
+// CKKS <-> TFHE scheme switching (pc-tfhe is the bit-exact host reference). One launcher, op-coded. Blind rotation
+// runs over the GLWE ring of degree n (power of two, <= 2048) at the bootstrapping prime q < 2^62 (u64, Shoup products):
+//   PBS_MS       y = u32 LWEs [count][i1 + 1] mod c[0] (a, then b) -> x = u32 [count][i1 + 1] in [0, 2n):
+//                round(v 2n / c[0]) = (v m + 2^63) >> 64 mod 2n  (m = floor(2^64 2n / c[0]))
+//   PBS_INIT     y = test vector u64 [n], z = PBS_MS output -> x = acc u64 [count][2][n]: X^-b~ tv, 0
+//   PBS_STEP     key i0 of i1: acc += GGSW_i0 [x] (acc X^-a~_i0 - acc); y = bsk u64 [i1][2 c][l][2 part][n] (NTT form),
+//                w = its Shoup companions, z = PBS_MS output, tw = [psi n | ipsi n], tws = their Shoup companions;
+//                gadget: c[0] = base log, c[1] = levels, m = floor(2^(64 + levels base) / q); c[2] = n^-1, c[3] its Shoup
+//   PBS_ROTATE   PBS_STEP for every key 0 .. i1 in one launch (the accumulator stays in shared memory)
+//   PBS_EXTRACT  y = acc -> x = u32 LWEs [count][n + 1] mod c[1]: sample extract of coefficient 0, b + c[0] (offset),
+//                then round(v c[1] / q) = (v m + 2^63) >> 64 mod c[1]  (m = floor(2^64 c[1] / q))
+//   c[4] (PBS_MS: k, 0 = 1): k interleaved LUTs (many-LUT), the switch to 2 nu n / k times k; (PBS_EXTRACT: j) the
+//                coefficient extracted (LUT j)
+//   c[5] = nu (PBS_MS, PBS_INIT, PBS_ROTATE, PBS_KEYBUNDLE, PBS_EXTRACT; 0 = 1): the extended rotation in R_(nu n),
+//                acc [count][nu][2 part][2 prime][n] (component i: the coefficients nu j + i), the test vector nu n
+//                words, the mod switch to 2 nu n, the extraction from component 0; nu = 2 only (the batch path, or the
+//                bundles A, B of PBS_KEYBUNDLE on four-block clusters up to 46 LWEs)
+//   KS_DIGITS    y = u32 LWEs [count][i1 + 1] mod q -> x = int8 [count][i1 levels]: the balanced digits (base 2^c[0],
+//                c[1] levels, approximate, m = floor(2^(64 + levels base) / q)) of a_i at i levels + t
+//   LWE_LIN      x = u32 LWEs [count][i1 + 1] mod q: c[0] y[w[2 k]] + c[1] z[w[2 k + 1]] (w = int32 index pairs, -1:
+//                the term is 0; y, z [..][i1 + 1]; c[0], c[1] < q), + c[2] on b: the native chains' differences, sums and
+//                constants
+//   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
+//                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
+// The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
+// floor(2^64 / q); NTTs run on the pcmm launcher's NTT op with pc-tfhe's tables):
+//   RESCALE_P1   y = [2 part][2 limb][n] mod (q, c[1]) -> x = [2 part][n] mod q: (x_0 - centered(x_1)) c[0] (c[0] = p1^-1)
+//   RS_DIGITS    y = c1 [n] -> x = [levels][n]: the approximate digits (base 2^c[0], c[1] levels, m) mod q
+//   MAC          y = [count][n], z = keys [count][i1][n] (NTT form) -> x = [i1][n] = sum_t y_t z_t,o mod q
+//   RS_EXTRACT   y = [2 part][n] (c0, c1 under s'(X^i2), coefficient form), z = int32 positions [count] ->
+//                x = u32 LWEs [count][i1 + 1]: a_k = +-c1[j - i2 k mod n], b = c0[j]
+//   REPACK_DIGITS y = PBS outputs [count][i1 + 1] mod q, w = int32 [n] position -> output row (-1: none), chunk
+//                k0 = i0, i3 keys -> x = [2 limb][i3][levels][n]: the exact digits (base 2^c[0], c[1] levels) of
+//                a_(row, k0 + kk) at their positions, mod the limb prime (q, c[4])
+//   REPACK_MAC   y = REPACK_DIGITS (NTT form), z = keys of the chunk [i3][levels][2 limb][2 part][n] -> x = acc
+//                [2 part][2 limb][n] += sum; c[4] = p1, c[6] = its mu
+//   REPACK_B     x = acc (coefficient form) part 0 += (c[1] mod p_l) centered(b_row) at the row's position
+//                (y = PBS outputs, z = int32 positions [count]); c[2] = p1 mod q
+#define PC_TFHE_PBS_MS 0
+#define PC_TFHE_PBS_INIT 1
+#define PC_TFHE_PBS_STEP 2
+#define PC_TFHE_PBS_EXTRACT 3
+#define PC_TFHE_KS_DIGITS 4
+#define PC_TFHE_KS_RECOMBINE 5
+#define PC_TFHE_RESCALE_P1 6
+#define PC_TFHE_RS_DIGITS 7
+#define PC_TFHE_MAC 8
+#define PC_TFHE_RS_EXTRACT 9
+#define PC_TFHE_REPACK_DIGITS 10
+#define PC_TFHE_REPACK_MAC 11
+#define PC_TFHE_REPACK_SCATTER 12
+#define PC_TFHE_PBS_ROTATE 13
+#define PC_TFHE_REPACK_RING 14
+#define PC_TFHE_REPACK_RMAC 15
+#define PC_TFHE_REPACK_C0 16
+#define PC_TFHE_REPACK_FIN 17
+#define PC_TFHE_PBS_KEYBUNDLE 18
+#define PC_TFHE_REPACK_COMB 19
+#define PC_TFHE_LWE_LIN 20
+struct TfheArgs {
+    int32_t op, n, count, i0, i1, i2, i3, i4;
+    void* x;
+    const void* y;
+    const void* z;
+    const void* w;
+    const void* tw;
+    const void* tws;
+    uint64_t q, m;
+    uint64_t c[8];
+};
+static_assert(sizeof(TfheArgs) == 32 + 6 * 8 + 16 + 64, "TfheArgs layout");
+
 // ------------------------------------------------------------------------------------------------ KernelTable
 // One table per (W, MM) instantiation, exported as `extern "C" const KernelTable* pc_table_<w>_<mm>()`.
 // Every launcher: (args, stream) -> cudaError_t of the launch (0 = ok; -1/-2 = argument out of the kernel's range).
@@ -803,8 +876,9 @@ struct KernelTable {
     int (*coeff_sum)(const CoeffArgs*, cudaStream_t);
     int (*mul_add)(const MulAddArgs*, cudaStream_t);
     int (*rescale_fwd)(const RescaleNttArgs*, cudaStream_t);
+    int (*tfhe)(const TfheArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 40 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 41 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

@@ -23,6 +23,9 @@ extern "C" {
     pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, n: usize, kind: i32, s: cudaStream_t) -> cudaError_t;
     pub fn cudaMemsetAsync(dst: *mut c_void, v: i32, n: usize, s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: u32) -> cudaError_t;
+    pub fn cudaStreamCreateWithPriority(s: *mut cudaStream_t, flags: u32, priority: i32) -> cudaError_t;
+    pub fn cudaDeviceGetStreamPriorityRange(least: *mut i32, greatest: *mut i32) -> cudaError_t;
+    pub fn cudaDeviceGetAttribute(v: *mut i32, attr: i32, dev: i32) -> cudaError_t;
     pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamSynchronize(s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: u32) -> cudaError_t;

@@ -70,6 +70,22 @@ impl Device {
         self.driver
     }
 
+    /// Streaming multiprocessors of the current device.
+    pub fn sm_count(&self) -> Result<usize> {
+        let mut v = 0i32;
+        // SAFETY: out-pointer to a local; attribute 16 = cudaDevAttrMultiProcessorCount of device 0 (the visible one)
+        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 16, 0) }, "cudaDeviceGetAttribute")?;
+        Ok(v as usize)
+    }
+
+    /// Thread-block clusters (compute capability 9.0+) on the current device.
+    pub fn clusters(&self) -> Result<bool> {
+        let mut v = 0i32;
+        // SAFETY: out-pointer to a local; attribute 75 = cudaDevAttrComputeCapabilityMajor of device 0 (the visible one)
+        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 75, 0) }, "cudaDeviceGetAttribute")?;
+        Ok(v >= 9)
+    }
+
     /// (free, total) device memory in bytes.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         let (mut f, mut t) = (0usize, 0usize);

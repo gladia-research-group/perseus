@@ -61,6 +61,7 @@ class Gpt2Model(ImplModel):
         self._lm = None
         self._fb = None
         self.ones = None
+        self.sampler = None      # tfhe_head.Sampler: the selection stage samples by TFHE instead of CutMax's argmax
         self.stats = {"bootstraps": 0, "tok_s": []}
 
     # ── weights (host numpy, lazily encoded) ──
@@ -197,6 +198,11 @@ class Gpt2Model(ImplModel):
     def argmax_encrypted(self, tiles, pos):
         b = self.n_layers + 1
         cap = self.enter_stage(b, pos)
+        if self.sampler is not None:
+            with self.rt.step("select"):
+                z = self.sampler(self.rt, tiles, pos)
+            self.exit_stage(b, cap)
+            return z
         marks, tap = {}, None
         if os.environ.get("IMPL_CUTMAX_MARKS"):          # refreshes per phase, like [cutmax_bts]
             tap = lambda name, ct: marks.__setitem__(name, int(self.inf.fhe.total_bootstraps))
