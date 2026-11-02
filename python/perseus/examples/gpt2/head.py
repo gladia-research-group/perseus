@@ -295,8 +295,12 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
         ops.bootstrap(t)
         return t
 
-    def newton(t, steps, scale=1.0):
-        return (inv_sqrt_newton_folded if cfg.newton_fold else inv_sqrt_newton_scaled)(ops, t, steps, scale)
+    def newton(t, steps, scale=1.0, carry=1.0):
+        if cfg.newton_fold:
+            return inv_sqrt_newton_folded(ops, t, steps, scale, carry)
+        if carry != 1.0:
+            raise ValueError("cutmax: newton_carry needs the folded Newton (newton_fold)")
+        return inv_sqrt_newton_scaled(ops, t, steps, scale)
 
     sgn = 1.0
     fold = 1.0          # P against the schedule's (cfg.out_scale: the previous iteration's y was out_scale times its own)
@@ -347,7 +351,8 @@ def cutmax_argmax_packed(rt, pair, vocab: int, cfg: CutMaxCfg, ones=None, tap=No
             if t is None:
                 t = mean_refresh(ops.mult(D, ops.conjugate(D)), it.x_scale / (k * k), it.newton)
             if tap: tap(f"i{ii}.S2", t)
-            u = newton(t, it.newton, s)                   # s u, and the shift s / 2m: y comes out s times the schedule's
+            u = newton(t, it.newton, s, cfg.newton_carry[ii] if cfg.newton_carry else 1.0)   # s u, and the shift
+            # s / 2m: y comes out s times the schedule's
             yP = am(ops.mult(D, u), ("cutmax.sh", ii, it.m, sgn) + ((s,) if s != 1.0 else ()),
                     lambda: M() * (0.5 * s / it.m), tagged=False)
         else:

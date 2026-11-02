@@ -790,12 +790,14 @@ def inv_sqrt_newton_scaled(ops, x, steps, scale: float = 1.0):
     return y
 
 
-def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0):
+def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0, carry: float = 1.0):
     """inv_sqrt_newton_scaled from w = -b1 x instead of x (b1 = steps[0][1], applied before x's refresh): the
     closed-form first step is w + a1, no product and no level; the second step's cubic term reads w itself (its
     constant b2 / b1 carried into the next step's constants: y2 = (b2 / b1) (a2 b1 / b2 y1 + w y1^3)), so its
     critical path is (w y1) y1^2 from the landing, two levels below inv_sqrt_newton_scaled's; every later step's -b x
-    is w b / b1, shallow beside y."""
+    is w b / b1, shallow beside y. `carry`: the steps between the second and the last hold y / carry (their constants
+    take it, no product), so where x is small and y = 1 / sqrt(x) large, w b / b1 is not a tiny operand carried from
+    the landing to a deep level (whose adjusted copy's rounding would dwarf it) and y stays near 1."""
     last = len(steps) - 1
     a1, b1 = steps[0]
     if last == 0:
@@ -809,9 +811,11 @@ def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0):
             kappa = b / b1
             y = ops.add(ops.mult(y, a / kappa), ops.mult(ops.mult(w, y), ops.square(y)))
             continue
-        c = ops.mult(w, b * k * kappa ** 3 / b1)
-        y = ops.add(ops.mult(y, a * k * kappa), ops.mult(ops.mult(c, y), ops.square(y)))
-        kappa = 1.0
+        # y holds y_true / kappa and leaves as y_true k / out
+        out = carry if i < last else 1.0
+        c = ops.mult(w, b * k * kappa ** 3 / b1 / out)
+        y = ops.add(ops.mult(y, a * k * kappa / out), ops.mult(ops.mult(c, y), ops.square(y)))
+        kappa = out
     return y
 
 
