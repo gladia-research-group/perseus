@@ -370,6 +370,8 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     let ocfg = OpsCfg::default();
     Ops::<W>::reserve(&mut mp, &ocfg);
+    // the session's fused relinearization-rescale tables (pc-py session.rs), which SPRU's product uses
+    mp.reserve("relin.rr", pc_gpu::relin::RelinRescaler::<W>::bytes(&chain, &lay, mp.cfg.k_max)?);
     // predictions: route tables and each route's own work shape
     let (sf_req, sf_shape) = plan.mem::<W>()?;
     let mut pred: Vec<(String, &'static str, usize)> = Vec::new();
@@ -405,6 +407,10 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
     let kplans = KsPlans::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?;
     let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
+    // PC_BENCH_NO_RR=1: without them (SPRU's product relinearized and rescaled apart)
+    if std::env::var("PC_BENCH_NO_RR").map_or(true, |v| v != "1") {
+        ops.rr = Some(pc_gpu::relin::RelinRescaler::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?);
+    }
     let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, layout)?;
     keys.carve_extra(&arena, &chain, &extra)?;
     let mut prng = test_prng(0x6d);
