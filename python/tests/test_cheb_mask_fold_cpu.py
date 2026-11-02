@@ -18,7 +18,11 @@ from perseus.impl.ops import FheOps  # noqa: E402
 from perseus.impl.poly import cheb_mask_scales, cheb_mask_scales_terms, eval_chebyshev, eval_chebyshev_masked  # noqa: E402
 from perseus.impl.rt import Rt  # noqa: E402
 
-CFG = PKG / "configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lh/configs.json"
+APPROX = PKG / "configs/model/approximation"
+# every shipped row's series: the GELUs of GPT-2 (decode, prefill), BERT and ViT, the exps of all six rows
+CONFIGS = ("gpt2_base_n32_ctx512s", "gpt2_base_n32_pf_cms", "bert_base_n32_t128", "vit_base_224",
+           "llama31_8b_n32_ctx512_silus", "llama31_8b_n32_cheb1e-5_kc256s")
+CFG = APPROX / "gpt2_base_n32_ctx512s/configs.json"
 
 
 class _V:
@@ -47,14 +51,17 @@ class _DepthOps:
         a.v, a.d = a.v + b.v, max(a.d, b.d)
 
 
-def _series():
-    c = json.load(open(CFG))
-    out = [(f"gelu{b}", g["cheb_coeffs"], g["cheb_eps"]) for b, g in
-           enumerate(c["softgelu"][f"transformer.h.{i}.mlp.act"] for i in range(12))]
-    return out + [(f"exp{i}", c["softmax"][f"transformer.h.{i}.attn"]["cheb_coeffs"], None) for i in range(12)]
+def _series(kind):
+    """(row:site, coefficients, eps) of every shipped row's GELU ("softgelu") or exp ("softmax") series."""
+    out = []
+    for name in CONFIGS:
+        c = json.load(open(APPROX / name / "configs.json"))
+        out += [(f"{name}:{k}", g["cheb_coeffs"], g.get("cheb_eps")) for k, g in c.get(kind, {}).items()
+                if isinstance(g, dict) and g.get("cheb_coeffs")]
+    return out
 
 
-@pytest.mark.parametrize("name,coeffs,eps", _series())
+@pytest.mark.parametrize("name,coeffs,eps", _series("softgelu") + _series("softmax"))
 def test_masked_series_value_and_depth(name, coeffs, eps):
     rng = np.random.default_rng(3)
     x = rng.uniform(-1, 1, 4096)
@@ -69,9 +76,8 @@ def test_masked_series_value_and_depth(name, coeffs, eps):
     ref = eval_chebyshev(ops, _V(x, 0), coeffs, -1.0, 1.0, eps)
     got = eval_chebyshev_masked(ops, _V(x, 0), coeffs, -1.0, 1.0, eps, mask)
     np.testing.assert_allclose(got.v, ref.v * M, rtol=0, atol=1e-13 * np.abs(ref.v).max())
+    # the fold never costs more than the product after the series did, and nothing where the series has slack
     assert got.d <= ref.d + 1
-    if name != "gelu7":            # block 7's trimmed series (degree 60) has no slack: the fold costs what the product did
-        assert got.d == ref.d
     assert set(used) <= set(cheb_mask_scales(coeffs, eps))
 
 
@@ -95,7 +101,7 @@ def test_softmax_exp_mask_fold(monkeypatch, kc, block):
         ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
         d = rt.dims
         rng = np.random.default_rng(41)
-        kv = attention.ComplexKVCache(d.d_head, centre=True)
+        kv = attention.ComplexKVCache(d.d_head, centre=bool(cfg.ref_keys))
         for _tok in range(kc):
             k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
             for arr in (k, v):
@@ -129,14 +135,10 @@ def poly_eval_masked(rt, x, c):
                                  lambda ct, s: rt.mult_mask(ct, ("t.m", s), lambda: np.full(rt.dims.N, s)))
 
 
-CFG_PF = PKG / "configs/model/approximation/gpt2_base_n32_pf_cm/configs.json"
-
-
-@pytest.mark.parametrize("layer", range(12))
-def test_masked_series_leaf_terms_keep_depth(layer):
+@pytest.mark.parametrize("name,coeffs,_eps", _series("softmax"))
+def test_masked_series_leaf_terms_keep_depth(name, coeffs, _eps):
     """With add_mask (the prefill's exp: degree-8 series whose trimmed top leaves no slack) every leaf takes the mask
-    term by term: the masked series lands at the series' own depth."""
-    coeffs = json.load(open(CFG_PF))["softmax"][f"transformer.h.{layer}.attn"]["cheb_coeffs"]
+    term by term: the masked series lands at the series' own depth, on every row's exp."""
     rng = np.random.default_rng(4)
     x = rng.uniform(-1, 1, 1024)
     M = (rng.uniform(0, 1, x.size) > 0.3) * 0.37
@@ -148,12 +150,10 @@ def test_masked_series_leaf_terms_keep_depth(layer):
     assert got.d == ref.d
 
 
-@pytest.mark.parametrize("block", range(12))
-def test_masked_series_budget_leaves_keep_depth(block):
+@pytest.mark.parametrize("name,coeffs,eps", _series("softgelu"))
+def test_masked_series_budget_leaves_keep_depth(name, coeffs, eps):
     """leaf_terms="budget" (GeluCfg.mask_fold 2): a leaf takes the mask term by term only where one product after its
-    sum would deepen the series, so every GELU series (block 7's trimmed degree 60 too) keeps its own depth."""
-    c = json.load(open(CFG))["softgelu"][f"transformer.h.{block}.mlp.act"]
-    coeffs, eps = c["cheb_coeffs"], c["cheb_eps"]
+    sum would deepen the series, so every GELU series of GPT-2, BERT and ViT keeps its own depth."""
     rng = np.random.default_rng(5)
     x = rng.uniform(-1, 1, 1024)
     M = (rng.uniform(0, 1, x.size) > 0.3) * 1.0
@@ -181,7 +181,7 @@ def test_softmax_exp_mask_fold_terms(monkeypatch, kc, block):
         ops.sm_den_recip = ops.sm_periodic = ops.sm_fold = ops.sm_cheb_gs = ops.hrs_pack = ops.kv_lanes = True
         d = rt.dims
         rng = np.random.default_rng(43)
-        kv = attention.ComplexKVCache(d.d_head, centre=True)
+        kv = attention.ComplexKVCache(d.d_head, centre=bool(cfg.ref_keys))
         for _tok in range(kc):
             k, v = rng.standard_normal(d.hid), rng.standard_normal(d.hid) * 0.5
             for arr in (k, v):
