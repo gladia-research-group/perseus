@@ -2,18 +2,38 @@
 //! Shared machines can opt into a guard: with `PERSEUS_GPU_GUARD=<gpu>` set, `Device::open` refuses unless exactly
 //! that GPU is visible and the process holds the machine's GPU lock (`PERSEUS_CORE_LOCKED=1`, which `tools/gpu.sh`
 //! exports in guarded mode). Every other entry point of this crate needs the `Device` it returns.
+//! `PERSEUS_DEVICE=cpu` (or `Device::open_host`) opens the host device instead: the same API over host memory, inline
+//! streams and the host kernel tables (pc-hostrt), no GPU touched.
 use crate::error::{check, Error, Result};
 use crate::ffi;
 use std::marker::PhantomData;
 
 /// Opt-in guard: the one GPU index this process may use. Unset or empty = no guard.
 pub const GUARD_VAR: &str = "PERSEUS_GPU_GUARD";
+/// `cpu` selects the host device in `Device::open`.
+pub const DEVICE_VAR: &str = "PERSEUS_DEVICE";
+
+thread_local! {
+    /// Whether the device opened last on this thread is the host (CUDA's current device is per thread too).
+    static HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's current device is the host one.
+pub fn current_is_host() -> bool {
+    HOST.with(|h| h.get())
+}
+
+/// Whether `PERSEUS_DEVICE` asks for the host device.
+pub fn host_requested() -> bool {
+    std::env::var(DEVICE_VAR).is_ok_and(|v| matches!(v.trim(), "cpu" | "host"))
+}
 
 /// Proof that device selection passed and the device is current on this thread. Not `Send`: CUDA's
 /// current device is per host thread, and one host thread issues all work.
 pub struct Device {
     runtime: i32,
     driver: i32,
+    host: bool,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -38,8 +58,12 @@ pub fn guard_check(guard: Option<&str>, locked: Option<&str>, visible: Option<&s
 }
 
 impl Device {
-    /// Check the opt-in guard, select visible device 0 and read the runtime version.
+    /// Check the opt-in guard, select visible device 0 and read the runtime version; the host device when
+    /// `PERSEUS_DEVICE=cpu`.
     pub fn open() -> Result<Device> {
+        if host_requested() {
+            return Ok(Device::open_host());
+        }
         let guard = std::env::var(GUARD_VAR).ok();
         let locked = std::env::var("PERSEUS_CORE_LOCKED").ok();
         let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
@@ -59,7 +83,18 @@ impl Device {
             check(ffi::cudaRuntimeGetVersion(&mut runtime), "cudaRuntimeGetVersion")?;
             check(ffi::cudaDriverGetVersion(&mut driver), "cudaDriverGetVersion")?;
         }
-        Ok(Device { runtime, driver, _not_send: PhantomData })
+        HOST.with(|h| h.set(false));
+        Ok(Device { runtime, driver, host: false, _not_send: PhantomData })
+    }
+
+    /// The host device (no GPU, no guard): runtime and driver versions read 0.
+    pub fn open_host() -> Device {
+        HOST.with(|h| h.set(true));
+        Device { runtime: 0, driver: 0, host: true, _not_send: PhantomData }
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.host
     }
 
     /// cudart version (e.g. 13020 for 13.2).
@@ -72,6 +107,9 @@ impl Device {
 
     /// Streaming multiprocessors of the current device.
     pub fn sm_count(&self) -> Result<usize> {
+        if self.host {
+            return Ok(pc_hostrt::threads());
+        }
         let mut v = 0i32;
         // SAFETY: out-pointer to a local; attribute 16 = cudaDevAttrMultiProcessorCount of device 0 (the visible one)
         check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 16, 0) }, "cudaDeviceGetAttribute")?;
@@ -80,6 +118,9 @@ impl Device {
 
     /// (free, total) device memory in bytes.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
+        if self.host {
+            return Ok(pc_hostrt::mem_info());
+        }
         let (mut f, mut t) = (0usize, 0usize);
         // SAFETY: out-pointers to locals
         check(unsafe { ffi::cudaMemGetInfo(&mut f, &mut t) }, "cudaMemGetInfo")?;
@@ -89,12 +130,18 @@ impl Device {
     /// Whole-device barrier. Setup and teardown only: the hot path syncs the owning stream (host reads) or fences
     /// with events, never the device.
     pub fn synchronize(&self) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
         // SAFETY: no arguments
         check(unsafe { ffi::cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
     }
 
     /// Profiler capture range (ncu --profile-from-start off / nsys --capture-range=cudaProfilerApi).
     pub fn profiler(&self, on: bool) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
         self.synchronize()?;
         // SAFETY: no arguments
         check(unsafe { if on { ffi::cudaProfilerStart() } else { ffi::cudaProfilerStop() } }, "cudaProfiler")
@@ -122,6 +169,9 @@ mod tests {
 
 /// (free, total) memory of the calling thread's current device, in bytes (`Device::mem_info` without the handle).
 pub fn mem_info_current() -> Result<(usize, usize)> {
+    if current_is_host() {
+        return Ok(pc_hostrt::mem_info());
+    }
     let (mut f, mut t) = (0usize, 0usize);
     // SAFETY: out-pointers to locals
     check(unsafe { ffi::cudaMemGetInfo(&mut f, &mut t) }, "cudaMemGetInfo")?;

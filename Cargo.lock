@@ -140,6 +140,8 @@ dependencies = [
 name = "pc-cublas"
 version = "0.1.0"
 dependencies = [
+ "pc-hostrt",
+ "rayon",
  "thiserror",
 ]
 
@@ -149,6 +151,7 @@ version = "0.1.0"
 dependencies = [
  "pc-core",
  "pc-cublas",
+ "pc-hostrt",
  "thiserror",
 ]
 
@@ -158,11 +161,29 @@ version = "0.1.0"
 dependencies = [
  "pc-core",
  "pc-cuda",
+ "pc-host",
  "pc-kernels",
  "pc-shadow",
  "pc-tfhe",
  "rayon",
  "thiserror",
+]
+
+[[package]]
+name = "pc-host"
+version = "0.1.0"
+dependencies = [
+ "pc-core",
+ "pc-hostrt",
+ "pc-kernels",
+ "rayon",
+]
+
+[[package]]
+name = "pc-hostrt"
+version = "0.1.0"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]

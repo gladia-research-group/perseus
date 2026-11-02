@@ -8,8 +8,10 @@
 //!
 //! Exactness: int8 operands with |x| <= 128 give |a b| <= 2^14 per product, so a dot of length k accumulated over
 //! `pairs` beta=1 calls stays inside i32 iff pairs * k * 2^14 < 2^31 (`exact_k_limit`). cuBLASLt's int32 compute
-//! paths are integer MMA (no rounding): within that bound the result is the exact integer.
+//! paths are integer MMA (no rounding): within that bound the result is the exact integer. A host `Lt` (`Lt::host`)
+//! plans nothing and runs the same contract on the CPU (`host.rs`), on pc-hostrt streams.
 pub mod ffi;
+mod host;
 
 use std::ffi::{c_void, CStr};
 use std::marker::PhantomData;
@@ -67,13 +69,21 @@ pub fn version_string() -> String {
 /// A cuBLASLt handle. Not `Send`/`Sync`: one host thread issues work through it.
 pub struct Lt {
     h: ffi::cublasLtHandle_t,
+    host: bool,
     _nosend: PhantomData<*const ()>,
 }
 impl Lt {
     pub fn new() -> Result<Self> {
         let mut h = std::ptr::null_mut();
         check("cublasLtCreate", unsafe { ffi::cublasLtCreate(&mut h) })?;
-        Ok(Lt { h, _nosend: PhantomData })
+        Ok(Lt { h, host: false, _nosend: PhantomData })
+    }
+    /// The host GEMM (no library handle); its plans run on pc-hostrt streams.
+    pub fn host() -> Self {
+        Lt { h: std::ptr::null_mut(), host: true, _nosend: PhantomData }
+    }
+    pub fn is_host(&self) -> bool {
+        self.host
     }
     pub fn raw(&self) -> ffi::cublasLtHandle_t {
         self.h
@@ -81,7 +91,9 @@ impl Lt {
 }
 impl Drop for Lt {
     fn drop(&mut self) {
-        unsafe { ffi::cublasLtDestroy(self.h) };
+        if !self.host {
+            unsafe { ffi::cublasLtDestroy(self.h) };
+        }
     }
 }
 
@@ -381,13 +393,18 @@ pub struct Workspace {
 pub struct GemmI8I32<'lt> {
     lt: &'lt Lt,
     spec: GemmSpec,
+    /// The cuBLASLt descriptors (None for a host plan).
+    plan: Option<Plan>,
+    algos: Vec<Algo>,
+    sel: usize,
+    align: Align,
+}
+
+struct Plan {
     desc: Desc,
     a: Layout,
     b: Layout,
     c: Layout,
-    algos: Vec<Algo>,
-    sel: usize,
-    align: Align,
 }
 
 impl<'lt> GemmI8I32<'lt> {
@@ -409,6 +426,10 @@ impl<'lt> GemmI8I32<'lt> {
             b: eff(prefs.align.b, spec.stride_b, 1),
             c: eff(prefs.align.c, spec.stride_c, 4),
         };
+        if lt.host {
+            let algo = Algo { raw: Default::default(), workspace: 0, waves: 0.0, id: -1, tile: 0, stages: 0, splitk: 1 };
+            return Ok(GemmI8I32 { lt, spec, plan: None, algos: vec![algo], sel: 0, align });
+        }
         let mut d = std::ptr::null_mut();
         // int32 scale: alpha/beta are exact integers (1 and 0/1)
         check("cublasLtMatmulDescCreate", unsafe {
@@ -454,7 +475,7 @@ impl<'lt> GemmI8I32<'lt> {
         if algos.is_empty() {
             return Err(Error::NoAlgo { spec: format!("{spec:?}") });
         }
-        Ok(GemmI8I32 { lt, spec, desc, a, b, c, algos, sel: 0, align })
+        Ok(GemmI8I32 { lt, spec, plan: Some(Plan { desc, a, b, c }), algos, sel: 0, align })
     }
     pub fn spec(&self) -> &GemmSpec {
         &self.spec
@@ -500,23 +521,28 @@ impl<'lt> GemmI8I32<'lt> {
         if ws.bytes < algo.workspace {
             return Err(Error::Workspace { have: ws.bytes, need: algo.workspace });
         }
+        let Some(p) = &self.plan else {
+            let spec = self.spec;
+            pc_hostrt::submit(stream, move || host::run(&spec, a, b, c, accumulate));
+            return Ok(());
+        };
         let one = 1i32;
         let beta = accumulate as i32;
         check(
             "cublasLtMatmul",
             ffi::cublasLtMatmul(
                 self.lt.h,
-                self.desc.0,
+                p.desc.0,
                 &one as *const i32 as *const c_void,
                 a as *const c_void,
-                self.a.0,
+                p.a.0,
                 b as *const c_void,
-                self.b.0,
+                p.b.0,
                 &beta as *const i32 as *const c_void,
                 c as *const c_void,
-                self.c.0,
+                p.c.0,
                 c as *mut c_void,
-                self.c.0,
+                p.c.0,
                 &algo.raw,
                 ws.ptr,
                 ws.bytes,

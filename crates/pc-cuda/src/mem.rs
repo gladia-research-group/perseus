@@ -4,7 +4,8 @@
 //!
 //! Buffers are typed by their element, `DBuf<'a, S, T: Pod>`, lengths and offsets in elements; `'a` borrows the
 //! arena, `S` is the lane whose stream orders every access, and moving a buffer to another lane consumes it
-//! (`handoff`, `Ready::join`). Host reads (`download`) synchronize the owning stream only. Design notes:
+//! (`handoff`, `Ready::join`). Host reads (`download`) synchronize the owning stream only. On the host device the
+//! arena is one host allocation and every copy a memcpy issued on the (inline) stream. Design notes:
 //! docs/ARCHITECTURE.md "pc-cuda memory".
 use crate::device::Device;
 use crate::error::{check, Error, Result};
@@ -46,10 +47,33 @@ unsafe impl<T: Pod, const K: usize> Pod for [T; K] {}
 
 enum Backing {
     Device,
-    /// Host bytes standing in for device memory: only for the GPU-free carve/freeze unit tests (never dereferenced
-    /// as device memory, never passed to a kernel).
-    #[cfg(test)]
-    Host(#[allow(dead_code)] Vec<u8>),
+    /// The host device's memory (and the GPU-free unit tests').
+    Host(std::alloc::Layout),
+}
+
+/// One `ARENA_ALIGN`-aligned host allocation of `bytes` (at least one alignment unit); `zeroed` for pinned buffers.
+fn host_alloc(bytes: usize, zeroed: bool) -> Result<(*mut u8, std::alloc::Layout)> {
+    let layout = std::alloc::Layout::from_size_align(bytes.max(ARENA_ALIGN), ARENA_ALIGN).map_err(|_| Error::Host("allocation size"))?;
+    // SAFETY: non-zero size
+    let p = unsafe { if zeroed { std::alloc::alloc_zeroed(layout) } else { std::alloc::alloc(layout) } };
+    if p.is_null() {
+        return Err(Error::Host("host allocation failed"));
+    }
+    Ok((p, layout))
+}
+
+/// A copy of `bytes` from `src` to `dst` ordered on `s` (`kind`: the cudaMemcpyKind; the host device copies with
+/// memcpy, inline or recorded with the stream).
+///
+/// # Safety
+/// Both ranges valid for `bytes` until the copy ran on `s`; distinct.
+unsafe fn copy<S: Lane>(s: &Stream<S>, dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, call: &'static str) -> Result<()> {
+    if s.is_host() {
+        let (d, x) = (dst as *mut u8, src as *const u8);
+        pc_hostrt::submit(s.raw(), move || std::ptr::copy(x, d, bytes));
+        return Ok(());
+    }
+    check(ffi::cudaMemcpyAsync(dst, src, bytes, kind, s.raw()), call)
 }
 
 /// The one device allocation of a process, carved by a bump pointer. Not `Sync`: carving happens on the setup
@@ -63,21 +87,25 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// One `cudaMalloc` of `bytes`.
-    pub fn new(_dev: &Device, bytes: usize) -> Result<Self> {
+    /// One `cudaMalloc` of `bytes` (a host allocation on the host device).
+    pub fn new(dev: &Device, bytes: usize) -> Result<Self> {
+        if dev.is_host() {
+            return Self::host(bytes);
+        }
         let mut p = std::ptr::null_mut();
         // SAFETY: out-pointer to a local; the guard passed (`Device` exists)
         check(unsafe { cudaMalloc(&mut p, bytes.max(ARENA_ALIGN)) }, "cudaMalloc (arena)")?;
         Ok(Arena { base: p as *mut u8, cap: bytes, used: Cell::new(0), frozen: Cell::new(false), backing: Backing::Device })
     }
 
+    fn host(bytes: usize) -> Result<Self> {
+        let (base, layout) = host_alloc(bytes, false)?;
+        Ok(Arena { base, cap: bytes, used: Cell::new(0), frozen: Cell::new(false), backing: Backing::Host(layout) })
+    }
+
     #[cfg(test)]
     pub(crate) fn host_for_test(bytes: usize) -> Self {
-        let mut v = vec![0u8; bytes + ARENA_ALIGN];
-        let off = v.as_mut_ptr().align_offset(ARENA_ALIGN);
-        // SAFETY: off < ARENA_ALIGN <= len
-        let base = unsafe { v.as_mut_ptr().add(off) };
-        Arena { base, cap: bytes, used: Cell::new(0), frozen: Cell::new(false), backing: Backing::Host(v) }
+        Self::host(bytes).unwrap()
     }
 
     /// Bytes `n` elements of `T` consume in an arena (one carve, alignment included). `MemPlan` sums these.
@@ -119,13 +147,15 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        if matches!(self.backing, Backing::Device) {
+        match self.backing {
             // SAFETY: no buffer outlives the arena (borrow); wait for in-flight work, then the one free. Errors are
             // ignored in Drop.
-            unsafe {
+            Backing::Device => unsafe {
                 ffi::cudaDeviceSynchronize();
                 cudaFree(self.base as *mut c_void);
-            }
+            },
+            // SAFETY: allocated by host_alloc with this layout; host work ran inline
+            Backing::Host(layout) => unsafe { std::alloc::dealloc(self.base, layout) },
         }
     }
 }
@@ -173,16 +203,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         bounds("upload", off + data.len(), self.len)?;
         // SAFETY: range checked above; host slice live for the call, and the stream is synced before returning
         unsafe {
-            check(
-                ffi::cudaMemcpyAsync(
-                    self.ptr.add(off) as *mut c_void,
-                    data.as_ptr() as *const c_void,
-                    std::mem::size_of_val(data),
-                    MEMCPY_H2D,
-                    s.raw(),
-                ),
-                "cudaMemcpyAsync H2D",
-            )?;
+            copy(s, self.ptr.add(off) as *mut c_void, data.as_ptr() as *const c_void, std::mem::size_of_val(data), MEMCPY_H2D, "cudaMemcpyAsync H2D")?;
         }
         s.sync()
     }
@@ -197,16 +218,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         // SAFETY: range checked; the copy writes n elements into the reserved capacity, completed by the sync
         // before set_len (T: Pod, any bit pattern valid)
         unsafe {
-            check(
-                ffi::cudaMemcpyAsync(
-                    v.as_mut_ptr() as *mut c_void,
-                    self.ptr.add(off) as *const c_void,
-                    n * std::mem::size_of::<T>(),
-                    MEMCPY_D2H,
-                    s.raw(),
-                ),
-                "cudaMemcpyAsync D2H",
-            )?;
+            copy(s, v.as_mut_ptr() as *mut c_void, self.ptr.add(off) as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2H, "cudaMemcpyAsync D2H")?;
             s.sync()?;
             v.set_len(n);
         }
@@ -223,16 +235,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// covers it before reusing the pinned slot).
     pub unsafe fn upload_pinned_async(&mut self, s: &Stream<S>, off: usize, src: &PinnedBuf<T>) -> Result<()> {
         bounds("upload_pinned_async", off + src.len(), self.len)?;
-        check(
-            ffi::cudaMemcpyAsync(
-                self.ptr.add(off) as *mut c_void,
-                src.as_ptr() as *const c_void,
-                src.len() * std::mem::size_of::<T>(),
-                MEMCPY_H2D,
-                s.raw(),
-            ),
-            "cudaMemcpyAsync H2D (pinned)",
-        )
+        copy(s, self.ptr.add(off) as *mut c_void, src.as_ptr() as *const c_void, src.len() * std::mem::size_of::<T>(), MEMCPY_H2D, "cudaMemcpyAsync H2D (pinned)")
     }
 
     /// Asynchronous H2D of the pinned words `src[src_off..src_off + n]` into `[off, off + n)`.
@@ -242,16 +245,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     pub unsafe fn upload_pinned_range_async(&mut self, s: &Stream<S>, off: usize, src: &PinnedBuf<T>, src_off: usize, n: usize) -> Result<()> {
         bounds("upload_pinned_range_async", off + n, self.len)?;
         bounds("upload_pinned_range_async (source)", src_off + n, src.len())?;
-        check(
-            ffi::cudaMemcpyAsync(
-                self.ptr.add(off) as *mut c_void,
-                src.as_ptr().add(src_off) as *const c_void,
-                n * std::mem::size_of::<T>(),
-                MEMCPY_H2D,
-                s.raw(),
-            ),
-            "cudaMemcpyAsync H2D (pinned range)",
-        )
+        copy(s, self.ptr.add(off) as *mut c_void, src.as_ptr().add(src_off) as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_H2D, "cudaMemcpyAsync H2D (pinned range)")
     }
 
     /// Asynchronous D2H of `[off, off + dst.len())` into pinned memory.
@@ -260,20 +254,17 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// `dst` must not be read or dropped until the stream has passed this copy.
     pub unsafe fn download_pinned_async(&self, s: &Stream<S>, off: usize, dst: &mut PinnedBuf<T>) -> Result<()> {
         bounds("download_pinned_async", off + dst.len(), self.len)?;
-        check(
-            ffi::cudaMemcpyAsync(
-                dst.as_mut_ptr() as *mut c_void,
-                self.ptr.add(off) as *const c_void,
-                dst.len() * std::mem::size_of::<T>(),
-                MEMCPY_D2H,
-                s.raw(),
-            ),
-            "cudaMemcpyAsync D2H (pinned)",
-        )
+        copy(s, dst.as_mut_ptr() as *mut c_void, self.ptr.add(off) as *const c_void, dst.len() * std::mem::size_of::<T>(), MEMCPY_D2H, "cudaMemcpyAsync D2H (pinned)")
     }
 
     /// Zero the whole buffer (ordered on the lane).
     pub fn zero(&mut self, s: &Stream<S>) -> Result<()> {
+        if s.is_host() {
+            let (p, n) = (self.ptr as *mut u8, self.len * std::mem::size_of::<T>());
+            // SAFETY: whole owned range, valid while the arena lives
+            unsafe { pc_hostrt::submit(s.raw(), move || std::ptr::write_bytes(p, 0, n)) };
+            return Ok(());
+        }
         // SAFETY: whole owned range
         check(
             unsafe { ffi::cudaMemsetAsync(self.ptr as *mut c_void, 0, self.len * std::mem::size_of::<T>(), s.raw()) },
@@ -285,36 +276,14 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         bounds("copy_from (dst)", n, self.len)?;
         bounds("copy_from (src)", n, src.len)?;
         // SAFETY: ranges checked; distinct buffers (&mut self vs &src)
-        check(
-            unsafe {
-                ffi::cudaMemcpyAsync(
-                    self.ptr as *mut c_void,
-                    src.ptr as *const c_void,
-                    n * std::mem::size_of::<T>(),
-                    MEMCPY_D2D,
-                    s.raw(),
-                )
-            },
-            "cudaMemcpyAsync D2D",
-        )
+        unsafe { copy(s, self.ptr as *mut c_void, src.ptr as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D") }
     }
     /// Device-to-device copy of `n` elements of constant data into this buffer.
     pub fn copy_from_const(&mut self, s: &Stream<S>, src: &ConstBuf<'_, T>, n: usize) -> Result<()> {
         bounds("copy_from_const (dst)", n, self.len)?;
         bounds("copy_from_const (src)", n, src.len)?;
         // SAFETY: ranges checked; constant data is never written after setup
-        check(
-            unsafe {
-                ffi::cudaMemcpyAsync(
-                    self.ptr as *mut c_void,
-                    src.ptr as *const c_void,
-                    n * std::mem::size_of::<T>(),
-                    MEMCPY_D2D,
-                    s.raw(),
-                )
-            },
-            "cudaMemcpyAsync D2D (const)",
-        )
+        unsafe { copy(s, self.ptr as *mut c_void, src.ptr as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D (const)") }
     }
 
     /// Move the buffer to lane `U`: `ev` is recorded after the last access on `S` and `U` waits on it.
@@ -398,17 +367,23 @@ impl<'a, T: Pod> ConstBuf<'a, T> {
 pub struct PinnedBuf<T: Pod> {
     ptr: *mut T,
     len: usize,
+    /// Host device: plain host memory of this layout.
+    host: Option<std::alloc::Layout>,
 }
 
 impl<T: Pod> PinnedBuf<T> {
-    pub fn new(_dev: &Device, len: usize) -> Result<Self> {
+    pub fn new(dev: &Device, len: usize) -> Result<Self> {
         let bytes = (len * std::mem::size_of::<T>()).max(1);
+        if dev.is_host() {
+            let (p, layout) = host_alloc(bytes, true)?;
+            return Ok(PinnedBuf { ptr: p as *mut T, len, host: Some(layout) });
+        }
         let mut p = std::ptr::null_mut();
         // SAFETY: out-pointer to a local
         check(unsafe { cudaMallocHost(&mut p, bytes) }, "cudaMallocHost")?;
         // SAFETY: freshly allocated `bytes` of host memory; zero is a valid T (Pod)
         unsafe { std::ptr::write_bytes(p as *mut u8, 0, bytes) };
-        Ok(PinnedBuf { ptr: p as *mut T, len })
+        Ok(PinnedBuf { ptr: p as *mut T, len, host: None })
     }
     pub fn len(&self) -> usize {
         self.len
@@ -434,9 +409,14 @@ impl<T: Pod> PinnedBuf<T> {
 
 impl<T: Pod> Drop for PinnedBuf<T> {
     fn drop(&mut self) {
-        // SAFETY: owned allocation (cudaFreeHost synchronizes); errors ignored in Drop
+        // SAFETY: owned allocation (cudaFreeHost synchronizes; host work ran inline); errors ignored in Drop
         unsafe {
-            cudaFreeHost(self.ptr as *mut c_void);
+            match self.host {
+                Some(layout) => std::alloc::dealloc(self.ptr as *mut u8, layout),
+                None => {
+                    cudaFreeHost(self.ptr as *mut c_void);
+                }
+            }
         }
     }
 }

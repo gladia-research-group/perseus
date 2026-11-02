@@ -18,6 +18,8 @@ pub enum Error {
     Bounds { what: &'static str, len: usize, cap: usize },
     #[error("{0} is not available in this build")]
     Unavailable(&'static str),
+    #[error("host device: {0}")]
+    Host(&'static str),
     #[error("cuBLASLt: {0}")]
     Blas(String),
 }
@@ -53,6 +55,9 @@ pub fn launch_result(kernel: &'static str, rc: i32) -> Result<()> {
 
 /// The sticky/last launch error (`cudaGetLastError`), for launch paths that do not return one.
 pub fn last_error(call: &'static str) -> Result<()> {
+    if crate::device::current_is_host() {
+        return Ok(());
+    }
     // SAFETY: no arguments
     check(unsafe { ffi::cudaGetLastError() }, call)
 }

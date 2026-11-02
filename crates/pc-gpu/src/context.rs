@@ -158,7 +158,8 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
         if plan.lay != lay || plan.word_bits != W::BITS {
             return Err(shape("Context::new", format!("MemPlan built for {:?} at {} bits, chain is {lay:?} at {}", plan.lay, plan.word_bits, W::BITS)));
         }
-        let table = pc_kernels::table(M::INSTANCE)?;
+        // the host device runs the host tables (pc-host), word for word the device kernels' results
+        let table = if s.is_host() { pc_host::table(M::INSTANCE)? } else { pc_kernels::table(M::INSTANCE)? };
         let scale = ScaleTables::precompute(&chain)?;
         let shape = ChainShape::from_tables(&scale);
         let primes_v = chain.primes();
