@@ -82,7 +82,7 @@ fn inv_lazy(x: &mut [u32], w: &[u32], ws: &[u32], p: u32, ni: u32, nis: u32) {
 
 /// Exact forward (any word): canonical words throughout.
 #[inline(always)]
-fn fwd_exact<W: Hw>(x: &mut [W], w: &[W], ws: &[W], p: W, mid: Option<&mut [W]>) {
+pub(crate) fn fwd_exact<W: Hw>(x: &mut [W], w: &[W], ws: &[W], p: W, mid: Option<&mut [W]>) {
     let mut mid = mid;
     let mut m = 1;
     let mut stage = 0;

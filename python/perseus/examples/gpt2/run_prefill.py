@@ -127,6 +127,7 @@ def main(argv=None, results=None):
     ap.add_argument("--check", action="store_true", help="also compare every block with the float64 reference")
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 reference")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
+    ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
     ap.add_argument("--random-ids", type=int, default=None, metavar="SEED",
                     help="a random prompt (wte[ids] + wpe), gated against the float64 model instead of the oracle "
                          "(any T up to the 1024 positions)")
@@ -146,6 +147,8 @@ def main(argv=None, results=None):
                     help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR) and pulled sibling "
                          "batches; lockstep: more batched refreshes)")
     a = ap.parse_args(argv)
+    if a.cpu:
+        os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
         a.plan = default_plan("gpt2_prefill", a.tokens)

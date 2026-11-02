@@ -108,12 +108,14 @@ def session(profile=None, options=None, family: str = "gpt2", mode: str | None =
     then CKKSOptions are read); options: an explicit _core.InferenceOptions (wins over
     profile); neither: the environment. family picks the rotation-key band
     ("gpt2" | "vit" | "bert" | "generic"). mode overrides the residency scheduling
-    ("sync" | "prefetch" | "threaded"). device: the GPU index this process should use
+    ("sync" | "prefetch" | "threaded"). device: the GPU index this process should use, or "cpu" (the host device)
     (sets CUDA_VISIBLE_DEVICES before the runtime's first CUDA call; the runtime has no
     per-context device selection, so this must be the first session of the process).
     """
     global _live_session
-    if device is not None:
+    if device == "cpu":
+        os.environ["PERSEUS_DEVICE"] = "cpu"
+    elif device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
     from . import _pc as _core
     from .nn.pipeline import resolve_overlap
