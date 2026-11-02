@@ -12,7 +12,9 @@
     "correction_factor": 6,
     "cts_alt_budget": 5,
     "em_fuse_rescale": true,
+    "em_level_keys": true,
     "gpu_encode": true,
+    "merge_s2d": true,
     "pair": true,
     "raise_drop": "512:1",
     "raise_drops": [
@@ -25,6 +27,7 @@
       "7",
       "8"
     ],
+    "stc_ps": 6,
     "real": true,
     "shift": true,
     "sparse_auto": 2,
@@ -58,8 +61,8 @@
     "hf_home": "/data02/users/azirilli/cache/huggingface",
     "malloc_arena_max": 2,
     "omp_num_threads": 2,
-    "python": "/data02/users/azirilli/perseus-wt/main-port/.venv/bin/python",
-    "pythonpath": "python"
+    "python": "/data02/users/azirilli/perseus-wt/r56-venv/bin/python",
+    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-port/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -73,6 +76,7 @@
     "fused_ln_var": false,
     "fused_sm_den": false,
     "gelu_fold": true,
+    "gelu_out_hint": true,
     "gpt2_fold_ln1": true,
     "gpt2_fold_ln2": true,
     "gpt2_fold_lnf": false,
@@ -87,12 +91,13 @@
     "sm_den_recip": true,
     "sm_fold": true,
     "sm_gs_first": true,
+    "sm_hrs_cleanse": true,
     "sm_hrs_pack": true,
     "sm_periodic": 2
   },
   "exec": {
     "all_blocks_io_dir": "/data02/users/azirilli/scratch/.cache/perseus/oracle/gpt2_ctx1024/all_blocks_io",
-    "fhe_graph_dir": "graphs/_gc2_p0",
+    "fhe_graph_dir": "graphs/_v4_p0",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "steps_t": 16,
