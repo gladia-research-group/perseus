@@ -216,6 +216,42 @@ pub mod w {
             r[i] = if set { v } else { W::add(r[i], v, p) };
         }
     }
+    pub fn mac_s<W: Hw>(acc: &mut [W::Acc], x: &[W], w: W) {
+        if is32::<W>() {
+            return super::mac_s(accm(acc), u32s(x), w.u64() as u32);
+        }
+        for i in 0..acc.len() {
+            acc[i] += W::wmul(x[i], w);
+        }
+    }
+    /// out[i] = x[i] w mod p (general product: the row through the accumulator).
+    pub fn mul_s<W: Hw>(out: &mut [W], x: &[W], w: W, q: &PrimeConst, scratch: &mut [W::Acc]) {
+        scratch.fill(W::Acc::default());
+        mac_s::<W>(scratch, x, w);
+        reduce::<W>(scratch, q, out);
+    }
+    /// out[i] = x[i] mod q for residues of another prime (any word value).
+    pub fn red_other<W: Hw>(out: &mut [W], x: &[W], q: &PrimeConst, scratch: &mut [W::Acc]) {
+        mul_s::<W>(out, x, W::from_u64(1), q, scratch)
+    }
+    pub fn csub_gt<W: Hw>(x: &mut [W], u: &[W], h: W, c: W, q: W) {
+        if is32::<W>() {
+            return super::csub_gt(u32m(x), u32s(u), h.u64() as u32, c.u64() as u32, q.u64() as u32);
+        }
+        for i in 0..x.len() {
+            if u[i] > h {
+                x[i] = W::sub(x[i], c, q);
+            }
+        }
+    }
+    pub fn add_rows<W: Hw>(x: &mut [W], y: &[W], p: W) {
+        if is32::<W>() {
+            return super::add_rows(u32m(x), u32s(y), p.u64() as u32);
+        }
+        for i in 0..x.len() {
+            x[i] = W::add(x[i], y[i], p);
+        }
+    }
     pub fn gather<W: Hw>(out: &mut [W], src: &[W], idx: &[u32]) {
         if is32::<W>() {
             return super::gather(u32m(out), u32s(src), idx);
@@ -397,5 +433,154 @@ unsafe fn gather_v(out: &mut [u32], src: &[u32], idx: &[u32]) {
     }
     for i in n..out.len() {
         out[i] = src[idx[i] as usize];
+    }
+}
+
+/// acc[i] += x[i] * w (one weight for the row).
+pub fn mac_s(acc: &mut [u64], x: &[u32], w: u32) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() {
+        // SAFETY: CPU features checked
+        return unsafe { mac_s_v(acc, x, w) };
+    }
+    for i in 0..acc.len() {
+        acc[i] += x[i] as u64 * w as u64;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn mac_s_v(acc: &mut [u64], x: &[u32], w: u32) {
+    let n = acc.len() / 8 * 8;
+    let wv = _mm512_set1_epi64(w as i64);
+    for i in (0..n).step_by(8) {
+        let xv = _mm512_cvtepu32_epi64(_mm256_loadu_si256(x.as_ptr().add(i) as *const _));
+        let a = _mm512_loadu_si512(acc.as_ptr().add(i) as *const _);
+        _mm512_storeu_si512(acc.as_mut_ptr().add(i) as *mut _, _mm512_add_epi64(a, _mm512_mul_epu32(xv, wv)));
+    }
+    for i in n..acc.len() {
+        acc[i] += x[i] as u64 * w as u64;
+    }
+}
+
+/// v[i] = fma(y[i] as f64, r, v[i]) (IEEE fused multiply-add, as the device's __fma_rn).
+pub fn fma_f64(v: &mut [f64], y: &[u32], r: f64) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() {
+        // SAFETY: CPU features checked
+        return unsafe { fma_f64_v(v, y, r) };
+    }
+    for i in 0..v.len() {
+        v[i] = (y[i] as f64).mul_add(r, v[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn fma_f64_v(v: &mut [f64], y: &[u32], r: f64) {
+    let n = v.len() / 8 * 8;
+    let rv = _mm512_set1_pd(r);
+    for i in (0..n).step_by(8) {
+        let yv = _mm512_cvtepu32_pd(_mm256_loadu_si256(y.as_ptr().add(i) as *const _));
+        let a = _mm512_loadu_pd(v.as_ptr().add(i));
+        _mm512_storeu_pd(v.as_mut_ptr().add(i), _mm512_fmadd_pd(yv, rv, a));
+    }
+    for i in n..v.len() {
+        v[i] = (y[i] as f64).mul_add(r, v[i]);
+    }
+}
+
+/// x[i] = u[i] > h ? x[i] - c mod q : x[i] (c < q): the centred lift's correction.
+pub fn csub_gt(x: &mut [u32], u: &[u32], h: u32, c: u32, q: u32) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() {
+        // SAFETY: CPU features checked
+        return unsafe { csub_gt_v(x, u, h, c, q) };
+    }
+    for i in 0..x.len() {
+        if u[i] > h {
+            x[i] = if x[i] >= c { x[i] - c } else { x[i] + q - c };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn csub_gt_v(x: &mut [u32], u: &[u32], h: u32, c: u32, q: u32) {
+    let n = x.len() / 16 * 16;
+    let (hv, cv, qv) = (_mm512_set1_epi32(h as i32), _mm512_set1_epi32(c as i32), _mm512_set1_epi32(q as i32));
+    for i in (0..n).step_by(16) {
+        let xv = _mm512_loadu_si512(x.as_ptr().add(i) as *const _);
+        let m = _mm512_cmpgt_epu32_mask(_mm512_loadu_si512(u.as_ptr().add(i) as *const _), hv);
+        // x - c + q, then one conditional q down (min trick)
+        let d = _mm512_add_epi32(_mm512_sub_epi32(xv, cv), qv);
+        let d = _mm512_min_epu32(d, _mm512_sub_epi32(d, qv));
+        _mm512_storeu_si512(x.as_mut_ptr().add(i) as *mut _, _mm512_mask_mov_epi32(xv, m, d));
+    }
+    if n < x.len() {
+        csub_gt(&mut x[n..], &u[n..], h, c, q);
+    }
+}
+
+/// x[i] = x[i] + y[i] mod p.
+pub fn add_rows(x: &mut [u32], y: &[u32], p: u32) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() {
+        // SAFETY: CPU features checked
+        return unsafe { add_rows_v(x, y, p) };
+    }
+    for i in 0..x.len() {
+        let s = x[i] + y[i];
+        x[i] = if s >= p { s - p } else { s };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn add_rows_v(x: &mut [u32], y: &[u32], p: u32) {
+    let n = x.len() / 16 * 16;
+    let pv = _mm512_set1_epi32(p as i32);
+    for i in (0..n).step_by(16) {
+        let s = addm32(_mm512_loadu_si512(x.as_ptr().add(i) as *const _), _mm512_loadu_si512(y.as_ptr().add(i) as *const _), pv);
+        _mm512_storeu_si512(x.as_mut_ptr().add(i) as *mut _, s);
+    }
+    if n < x.len() {
+        add_rows(&mut x[n..], &y[n..], p);
+    }
+}
+
+#[cfg(test)]
+mod port_bench {
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn multiplier_throughput() {
+        use std::arch::x86_64::*;
+        #[target_feature(enable = "avx512f,avx512ifma,avx512dq")]
+        unsafe fn run(kind: u32, iters: u64) -> f64 {
+            let mut a = [_mm512_set1_epi64(3); 8];
+            let b = _mm512_set1_epi64(5);
+            let mut f = [_mm512_set1_pd(1.0000001); 8];
+            let fb = _mm512_set1_pd(0.9999999);
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for k in 0..8 {
+                    match kind {
+                        0 => a[k] = _mm512_mul_epu32(a[k], b),
+                        1 => a[k] = _mm512_madd52lo_epu64(a[k], a[k], b),
+                        2 => f[k] = _mm512_fmadd_pd(f[k], fb, fb),
+                        _ => a[k] = _mm512_mullo_epi64(a[k], b),
+                    }
+                }
+            }
+            let ns = t.elapsed().as_nanos() as f64;
+            std::hint::black_box((a, f));
+            ns / (iters * 8) as f64
+        }
+        for (k, name) in [(0, "vpmuludq"), (1, "vpmadd52luq"), (2, "vfmadd231pd"), (3, "vpmullq")] {
+            // SAFETY: AVX-512 IFMA machine (bench only)
+            let ns = unsafe { run(k, 50_000_000) };
+            eprintln!("{name}: {ns:.3} ns per zmm op (8 independent chains)");
+        }
     }
 }

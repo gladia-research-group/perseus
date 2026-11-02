@@ -46,7 +46,7 @@ pub extern "C" fn coeff_sum<W: Hw>(a: *const CoeffArgs, s: CudaStream) -> i32 {
             let (w, ws) = unsafe { (std::slice::from_raw_parts((a.fw as *const W).add(l * N), N), std::slice::from_raw_parts((a.fws as *const W).add(l * N), N)) };
             let ps = a.part_stride as usize;
             let out = a.out as *mut W;
-            let (mut acc0, mut acc1) = (vec![W::default(); N], vec![W::default(); N]);
+            let (mut acc0, mut acc1) = (crate::raw::buf::<W>(N), crate::raw::buf::<W>(N));
             if a.accumulate != 0 {
                 for i in 0..N {
                     // SAFETY: row l of both output parts
@@ -56,7 +56,7 @@ pub extern "C" fn coeff_sum<W: Hw>(a: *const CoeffArgs, s: CudaStream) -> i32 {
                     }
                 }
             }
-            let mut x = vec![W::default(); N];
+            let mut x = crate::raw::buf::<W>(N);
             for r in 0..a.n as usize {
                 // SAFETY: float row r (N coefficients)
                 let src = unsafe { std::slice::from_raw_parts(a.rows[r], N) };

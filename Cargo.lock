@@ -183,6 +183,7 @@ dependencies = [
 name = "pc-hostrt"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rayon",
 ]
 
@@ -255,6 +256,7 @@ dependencies = [
  "pc-core",
  "pc-cuda",
  "pc-gpu",
+ "pc-host",
  "pc-kernels",
  "pc-program",
  "pc-shadow",

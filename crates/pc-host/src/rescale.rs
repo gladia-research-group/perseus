@@ -4,7 +4,8 @@
 use crate::arith::Hw;
 use crate::launch;
 use crate::ntt::fwd_with;
-use crate::raw::{at, el, par_for};
+use crate::raw::{at, buf, el, par_for};
+use crate::simd::w as v;
 use pc_kernels::args::*;
 
 type S = CudaStream;
@@ -15,74 +16,55 @@ fn prime(pr: *const PrimeConst, id: usize) -> &'static PrimeConst {
     unsafe { &*pr.add(id) }
 }
 
-/// y mod q for a residue of another prime (reduce_small: exact either way).
-#[inline(always)]
-fn red<W: Hw>(y: W, q: u64) -> W {
-    let mut v = y.u64();
-    if v >= 3 * q {
-        return W::from_u64(v % q);
-    }
-    while v >= q {
-        v -= q;
-    }
-    W::from_u64(v)
-}
-
-/// Centred representative of y (mod qo), reduced mod qn.
-#[inline(always)]
-fn lift<W: Hw>(y: W, qo: W, qn: u64) -> W {
-    let yr = W::from_u64(y.u64() % qn);
-    if y.u64() > qo.u64() >> 1 {
-        let qor = qo.u64() % qn;
-        let v = if yr.u64() >= qor { yr.u64() - qor } else { yr.u64() + qn - qor };
-        return W::from_u64(v);
-    }
-    yr
-}
-
-/// (y_a, y') of coefficient i of (c, part): the tops (scaled by ca / cb), y' = qinv_ab y_b + C_ab lift(y_a) mod q_b.
-#[inline(always)]
-fn sources<W: Hw>(a: &RescaleArgs, c: usize, part: usize, i: usize) -> (W, W) {
+/// Rows of the two sources of coefficients [lo, lo + n) of (c, part): y_a (scaled by ca) and, at ndrop 2,
+/// y' = qinv_ab y_b + C_ab lift(y_a) mod q_b.
+fn sources<W: Hw>(a: &RescaleArgs, c: usize, part: usize, lo: usize, ya: &mut [W], yp: &mut [W], acc: &mut [W::Acc]) {
+    let n = ya.len();
     let (ta, tb) = (a.top as usize, a.top as usize - 1);
     let pa = prime(a.pr, ta);
-    // SAFETY: word i of the top rows
-    let mut ya = unsafe { *at::<W>(&a.x, c, part, ta).add(i) };
+    // SAFETY: words [lo, lo + n) of the top rows
+    let xa = unsafe { std::slice::from_raw_parts(at::<W>(&a.x, c, part, ta).add(lo), n) };
     if a.ca != 1 {
-        ya = W::mul(ya, W::from_u64(a.ca), pa);
+        v::mul_s::<W>(ya, xa, W::from_u64(a.ca), pa, acc);
+    } else {
+        ya.copy_from_slice(xa);
     }
     if a.ndrop != 2 {
-        return (ya, W::default());
+        return;
     }
     let pb = prime(a.pr, tb);
-    // SAFETY: as above
-    let mut yb = unsafe { *at::<W>(&a.x, c, part, tb).add(i) };
-    if a.ca != 1 {
-        yb = W::mul(yb, W::from_u64(a.cb), pb);
-    }
     let qb = W::from_u64(pb.p);
-    let yp = W::add(W::mul(W::from_u64(a.qinv_ab), yb, pb), W::mul(W::from_u64(a.c_ab), lift(ya, W::from_u64(pa.p), pb.p), pb), qb);
-    (ya, yp)
+    // SAFETY: as above
+    let xb = unsafe { std::slice::from_raw_parts(at::<W>(&a.x, c, part, tb).add(lo), n) };
+    let mut t = buf::<W>(n);
+    if a.ca != 1 {
+        v::mul_s::<W>(&mut t, xb, W::from_u64(a.cb), pb, acc);
+        v::mul_s::<W>(yp, &t, W::from_u64(a.qinv_ab), pb, acc);
+    } else {
+        v::mul_s::<W>(yp, xb, W::from_u64(a.qinv_ab), pb, acc);
+    }
+    // lift(y_a) mod q_b, times C_ab
+    v::red_other::<W>(&mut t, ya, pb, acc);
+    v::csub_gt::<W>(&mut t, ya, W::from_u64(pa.p >> 1), W::from_u64(pa.p % pb.p), qb);
+    let mut u = buf::<W>(n);
+    v::mul_s::<W>(&mut u, &t, W::from_u64(a.c_ab), pb, acc);
+    v::add_rows::<W>(yp, &u, qb);
 }
 
-/// tmp word of row r from the sources (u = y_a, v = y').
-#[inline(always)]
-fn tmp_word<W: Hw>(a: &RescaleArgs, r: usize, u: W, v: W) -> W {
-    let q = prime(a.pr, r).p;
-    let qw = W::from_u64(q);
+/// The correction row of prime r from the sources: A_r lift(y_a) [+ B_r lift(y')].
+fn tmp_row<W: Hw>(a: &RescaleArgs, r: usize, ya: &[W], yp: &[W], out: &mut [W], acc: &mut [W::Acc]) {
+    let pq = prime(a.pr, r);
+    let q = W::from_u64(pq.p);
     let (ha, hb) = (prime(a.pr, a.top as usize).p >> 1, prime(a.pr, a.top as usize - 1).p >> 1);
-    let mut la = red(u, q);
-    if u.u64() > ha {
-        la = W::sub(la, el::<W>(a.qam, r), qw);
-    }
-    let mut w = W::mul_shoup(la, el::<W>(a.a, r), el::<W>(a.a_s, r), qw);
+    let mut l = buf::<W>(out.len());
+    v::red_other::<W>(&mut l, ya, pq, acc);
+    v::csub_gt::<W>(&mut l, ya, W::from_u64(ha), el::<W>(a.qam, r), q);
+    v::shoup_row::<W>(out, &l, el::<W>(a.a, r), el::<W>(a.a_s, r), q, true);
     if a.ndrop == 2 {
-        let mut lb = red(v, q);
-        if v.u64() > hb {
-            lb = W::sub(lb, el::<W>(a.qbm, r), qw);
-        }
-        w = W::add(w, W::mul_shoup(lb, el::<W>(a.b, r), el::<W>(a.b_s, r), qw), qw);
+        v::red_other::<W>(&mut l, yp, pq, acc);
+        v::csub_gt::<W>(&mut l, yp, W::from_u64(hb), el::<W>(a.qbm, r), q);
+        v::shoup_row::<W>(out, &l, el::<W>(a.b, r), el::<W>(a.b_s, r), q, false);
     }
-    w
 }
 
 pub extern "C" fn rescale_coef<W: Hw>(a: *const RescaleArgs, s: S) -> i32 {
@@ -92,13 +74,12 @@ pub extern "C" fn rescale_coef<W: Hw>(a: *const RescaleArgs, s: S) -> i32 {
         par_for(2 * a.k as usize * nb, a, |a, t| {
             let (z, b) = (t / nb, t % nb);
             let (c, part) = (z >> 1, z & 1);
-            let src: Vec<(W, W)> = (b * BLK..(b + 1) * BLK).map(|i| sources::<W>(a, c, part, i)).collect();
+            let (mut ya, mut yp, mut acc) = (buf::<W>(BLK), buf::<W>(BLK), buf::<W::Acc>(BLK));
+            sources::<W>(a, c, part, b * BLK, &mut ya, &mut yp, &mut acc);
             for row in 0..a.nrows as usize {
-                let o = at::<W>(&a.tmp, c, part, row);
-                for (j, &(u, v)) in src.iter().enumerate() {
-                    // SAFETY: word of the tmp row
-                    unsafe { *o.add(b * BLK + j) = tmp_word(a, row, u, v) };
-                }
+                // SAFETY: the block of the tmp row (the sources were read first, as on the device)
+                let o = unsafe { std::slice::from_raw_parts_mut(at::<W>(&a.tmp, c, part, row).add(b * BLK), BLK) };
+                tmp_row::<W>(a, row, &ya, &yp, o, &mut acc);
             }
         })
     })
@@ -118,15 +99,12 @@ pub extern "C" fn rescale_fwd<W: Hw>(a: *const RescaleNttArgs, s: S) -> i32 {
         // rescale_prep: y_a, y' into tmp rows top, top - 1
         par_for(2 * r.k as usize, r, |r, z| {
             let (c, part) = (z >> 1, z & 1);
-            let (oa, ob) = (at::<W>(&r.tmp, c, part, r.top as usize), at::<W>(&r.tmp, c, part, r.top as usize - 1));
-            for i in 0..N {
-                let (u, v) = sources::<W>(r, c, part, i);
-                // SAFETY: words of the two source rows
-                unsafe {
-                    *oa.add(i) = u;
-                    *ob.add(i) = v;
-                }
-            }
+            // SAFETY: the two source rows of (c, part)
+            let (oa, ob) = unsafe {
+                (std::slice::from_raw_parts_mut(at::<W>(&r.tmp, c, part, r.top as usize), N), std::slice::from_raw_parts_mut(at::<W>(&r.tmp, c, part, r.top as usize - 1), N))
+            };
+            let mut acc = buf::<W::Acc>(N);
+            sources::<W>(r, c, part, 0, oa, ob, &mut acc);
         });
         let mut t = a.ntt;
         t.snum = 1;
@@ -137,11 +115,10 @@ pub extern "C" fn rescale_fwd<W: Hw>(a: *const RescaleNttArgs, s: S) -> i32 {
             // SAFETY: rows / prime ids of nrows entries; the sources sit top - rr and top - 1 - rr rows above
             let (roff, rr) = unsafe { (*t.roff.add(i) as usize, *t.rprime.add(i) as usize) };
             let base = t.base as *const W;
-            for (o, xo) in x.iter_mut().enumerate() {
-                // SAFETY: as above
-                let (u, v) = unsafe { (*base.add((roff + r.top as usize - rr) * N + o), *base.add((roff + r.top as usize - 1 - rr) * N + o)) };
-                *xo = tmp_word(r, rr, u, v);
-            }
+            // SAFETY: as above
+            let (u, v) = unsafe { (std::slice::from_raw_parts(base.add((roff + r.top as usize - rr) * N), N), std::slice::from_raw_parts(base.add((roff + r.top as usize - 1 - rr) * N), N)) };
+            let mut acc = buf::<W::Acc>(N);
+            tmp_row::<W>(r, rr, u, v, x, &mut acc);
         });
     })
 }

@@ -112,8 +112,8 @@ pub extern "C" fn pt_dot<W: Hw>(a: *const PtDotArgs, s: S) -> i32 {
             let prow = if y < a.rs.nq as usize { y } else { a.pt_prow as usize + (y - a.rs.nq as usize) };
             let q = prime(a.pr, row);
             let k = a.k as usize;
-            let mut s0 = vec![W::Acc::default(); k * N];
-            let mut s1 = vec![W::Acc::default(); k * N];
+            let mut s0 = crate::raw::buf::<W::Acc>(k * N);
+            let mut s1 = crate::raw::buf::<W::Acc>(k * N);
             for j in 0..a.gstep as usize {
                 s0.fill(W::Acc::default());
                 s1.fill(W::Acc::default());
@@ -252,7 +252,7 @@ fn wsum_run<W: Hw>(a: &WsumArgs, k: *const std::ffi::c_void) {
         let kr = (!sh.get().is_null()).then(|| W::red1(el::<W>(*sh.get(), row), p));
         for part in 0..2 {
             let o = at::<W>(&a.out, c, part, row);
-            let mut acc = vec![W::default(); N];
+            let mut acc = crate::raw::buf::<W>(N);
             for j in 0..a.nsrc as usize {
                 let (w, ws) = (el::<W>(a.w, j * a.rowstride as usize + row), el::<W>(a.ws, j * a.rowstride as usize + row));
                 let x = at::<W>(&a.src[j], c, part, row);

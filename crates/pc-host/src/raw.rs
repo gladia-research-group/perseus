@@ -53,3 +53,64 @@ pub fn el<W: Copy>(p: *const std::ffi::c_void, i: usize) -> W {
     // SAFETY: table index within the launch contract
     unsafe { *(p as *const W).add(i) }
 }
+
+/// A zeroed scratch buffer of n elements from the calling thread's pool, returned to it on drop: kernel tasks take
+/// row-sized buffers per launch, which the system allocator would otherwise map and unmap every time (>= 128 KB).
+pub struct Buf<T: Copy> {
+    v: Vec<u128>,
+    n: usize,
+    _t: std::marker::PhantomData<T>,
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Vec<Vec<u128>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// n zeroed elements (T: plain integers or floats, all-zero bits = 0).
+pub fn buf<T: Copy>(n: usize) -> Buf<T> {
+    assert!(std::mem::align_of::<T>() <= 16);
+    let words = (n * std::mem::size_of::<T>()).div_ceil(16);
+    let mut v = POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.iter().position(|b| b.capacity() >= words) {
+            Some(i) => p.swap_remove(i),
+            None => Vec::new(),
+        }
+    });
+    v.clear();
+    v.resize(words, 0);
+    Buf { v, n, _t: std::marker::PhantomData }
+}
+
+impl<T: Copy> Drop for Buf<T> {
+    fn drop(&mut self) {
+        let v = std::mem::take(&mut self.v);
+        POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < 64 {
+                p.push(v);
+            }
+        });
+    }
+}
+impl<T: Copy> std::ops::Deref for Buf<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: the backing words hold n elements of T (size and alignment checked at creation), zero-initialized
+        unsafe { std::slice::from_raw_parts(self.v.as_ptr() as *const T, self.n) }
+    }
+}
+impl<T: Copy> std::ops::DerefMut for Buf<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as above, exclusively borrowed
+        unsafe { std::slice::from_raw_parts_mut(self.v.as_mut_ptr() as *mut T, self.n) }
+    }
+}
+
+/// Runs the closure on drop.
+pub struct Defer<F: FnMut()>(pub F);
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}

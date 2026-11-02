@@ -140,8 +140,43 @@ pub unsafe fn elapsed_ms(a: *mut c_void, b: *mut c_void) -> Option<f32> {
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new().num_threads(threads()).thread_name(|i| format!("pc-host-{i}")).build().expect("host kernel pool")
+        let cpus = if std::env::var("PERSEUS_CPU_PIN").is_ok_and(|v| v == "0") { Vec::new() } else { core_cpus() };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads())
+            .thread_name(|i| format!("pc-host-{i}"))
+            .start_handler(move |i| {
+                if !cpus.is_empty() {
+                    pin(cpus[i % cpus.len()]);
+                }
+            })
+            .build()
+            .expect("host kernel pool")
     })
+}
+
+/// One allowed CPU per physical core (the first sibling of each), in CPU order: the AVX-512 kernels are bound by
+/// the multiply ports, which hyperthread siblings share.
+fn core_cpus() -> Vec<usize> {
+    // SAFETY: plain syscall into a zeroed cpu_set_t
+    let allowed: Vec<usize> = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+    };
+    let topo = |c: usize, f: &str| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/{f}")).ok().map(|s| s.trim().to_string());
+    let mut seen = std::collections::HashSet::new();
+    allowed.into_iter().filter(|&c| seen.insert((topo(c, "physical_package_id"), topo(c, "core_id")))).collect()
+}
+
+fn pin(cpu: usize) {
+    // SAFETY: plain syscall on the calling thread with a zeroed cpu_set_t
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
 }
 
 /// Threads of the kernel pool: `PERSEUS_CPU_THREADS`, else the available cores capped at 36.

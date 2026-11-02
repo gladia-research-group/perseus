@@ -62,11 +62,11 @@ fn x_row<W: Hw>(a: &KsArgs, c: usize, d: usize, dt: i64, roff: usize) -> &'stati
 }
 
 /// (s0, s1)[c] = sum_d x_{c,d} (b_d, a_d) for the K ciphertexts of row t; `ab(d, b, a)` fills the key rows.
-fn dot_rows<W: Hw>(a: &KsArgs, t: usize, ab: &mut impl FnMut(usize, &mut [W], &mut [W])) -> (Vec<W::Acc>, Vec<W::Acc>) {
+fn dot_rows<W: Hw>(a: &KsArgs, t: usize, ab: &mut impl FnMut(usize, &mut [W], &mut [W])) -> (crate::raw::Buf<W::Acc>, crate::raw::Buf<W::Acc>) {
     let k = a.k as usize;
     let dt = if (t as i32) < a.nq { el::<i32>(a.digit_of as _, t) as i64 } else { -1 };
-    let (mut s0, mut s1) = (vec![W::Acc::default(); k * N], vec![W::Acc::default(); k * N]);
-    let (mut b, mut ar) = (vec![W::default(); N], vec![W::default(); N]);
+    let (mut s0, mut s1) = (crate::raw::buf::<W::Acc>(k * N), crate::raw::buf::<W::Acc>(k * N));
+    let (mut b, mut ar) = (crate::raw::buf::<W>(N), crate::raw::buf::<W>(N));
     for d in 0..a.ndig as usize {
         ab(d, &mut b, &mut ar);
         for c in 0..k {
