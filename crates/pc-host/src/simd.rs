@@ -584,3 +584,288 @@ mod port_bench {
         }
     }
 }
+
+/// u64 lanes mod p (p >= 2^12, any 64-bit value): the fp64-mantissa quotient of `reduce`, one correction each way.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn red64(a: __m512i, pinv: __m512d, pv: __m512i) -> __m512i {
+    let q = _mm512_cvttpd_epu64(_mm512_mul_pd(_mm512_cvtepu64_pd(a), pinv));
+    let r = _mm512_sub_epi64(a, _mm512_mullo_epi64(q, pv));
+    let r = _mm512_mask_add_epi64(r, _mm512_cmplt_epi64_mask(r, _mm512_setzero_si512()), r, pv);
+    _mm512_mask_sub_epi64(r, _mm512_cmpge_epi64_mask(r, pv), r, pv)
+}
+
+/// 8 words widened to u64 lanes.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn wid8(p: *const u32) -> __m512i {
+    _mm512_cvtepu32_epi64(_mm256_loadu_si256(p as *const _))
+}
+
+/// r[i] = (r[i] + x[i] w[i]) mod p (any words in; canonical out).
+pub fn mac_mod(r: &mut [u32], x: &[u32], w: &[u32], p: u32) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() && p >= 1 << 12 {
+        // SAFETY: CPU features checked
+        return unsafe { mac_mod_v(r, x, w, p) };
+    }
+    for i in 0..r.len() {
+        r[i] = ((r[i] as u64 + x[i] as u64 * w[i] as u64) % p as u64) as u32;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn mac_mod_v(r: &mut [u32], x: &[u32], w: &[u32], p: u32) {
+    let (pinv, pv) = (_mm512_set1_pd(1.0 / p as f64), _mm512_set1_epi64(p as i64));
+    let n = r.len() / 8 * 8;
+    for i in (0..n).step_by(8) {
+        let a = _mm512_add_epi64(wid8(r.as_ptr().add(i)), _mm512_mul_epu32(wid8(x.as_ptr().add(i)), wid8(w.as_ptr().add(i))));
+        _mm256_storeu_si256(r.as_mut_ptr().add(i) as *mut _, _mm512_cvtepi64_epi32(red64(a, pinv, pv)));
+    }
+    for i in n..r.len() {
+        r[i] = ((r[i] as u64 + x[i] as u64 * w[i] as u64) % p as u64) as u32;
+    }
+}
+
+/// out[i] = sum_e g[e][i] 256^e mod p (signed planes, canonical out): the GEMM planes' recombination.
+pub fn horner256(out: &mut [u32], g: &[&[i32]], p: u32) {
+    // g + 2^31 in [0, 2^32): each term (g + 2^31) (256^e mod p) < 2^63 reduces exactly, the offset comes off at the end
+    let pw: Vec<u64> = (0..g.len()).scan(1u64, |a, _| {
+        let v = *a;
+        *a = *a * 256 % p as u64;
+        Some(v)
+    }).collect();
+    let off = pw.iter().fold(0u64, |s, &w| (s + (1u64 << 31) % p as u64 * w) % p as u64) as u32;
+    #[cfg(target_arch = "x86_64")]
+    if wide() && p >= 1 << 12 {
+        // SAFETY: CPU features checked
+        return unsafe { horner256_v(out, g, p, &pw, off) };
+    }
+    horner256_s(out, g, p, &pw, off, 0)
+}
+
+fn horner256_s(out: &mut [u32], g: &[&[i32]], p: u32, pw: &[u64], off: u32, from: usize) {
+    let p64 = p as u64;
+    for i in from..out.len() {
+        let mut s = 0u64;
+        for (e, ge) in g.iter().enumerate() {
+            s = (s + (ge[i] as i64 + (1i64 << 31)) as u64 * pw[e] % p64) % p64;
+        }
+        out[i] = ((s + p64 - off as u64) % p64) as u32;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn horner256_v(out: &mut [u32], g: &[&[i32]], p: u32, pw: &[u64], off: u32) {
+    let (pinv, pv) = (_mm512_set1_pd(1.0 / p as f64), _mm512_set1_epi64(p as i64));
+    let (p32, offv, bias) = (_mm256_set1_epi32(p as i32), _mm256_set1_epi32(off as i32), _mm256_set1_epi32(i32::MIN));
+    let n = out.len() / 8 * 8;
+    for i in (0..n).step_by(8) {
+        let mut s = _mm256_setzero_si256();
+        for (e, ge) in g.iter().enumerate() {
+            let u = _mm512_cvtepu32_epi64(_mm256_xor_si256(_mm256_loadu_si256(ge.as_ptr().add(i) as *const _), bias));
+            let t = _mm512_cvtepi64_epi32(red64(_mm512_mul_epu32(u, _mm512_set1_epi64(pw[e] as i64)), pinv, pv));
+            let a = _mm256_add_epi32(s, t);
+            s = _mm256_min_epu32(a, _mm256_sub_epi32(a, p32));
+        }
+        let d = _mm256_add_epi32(_mm256_sub_epi32(s, offv), p32);
+        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut _, _mm256_min_epu32(d, _mm256_sub_epi32(d, p32)));
+    }
+    horner256_s(out, g, p, pw, off, n)
+}
+
+#[cfg(test)]
+mod mm_tests {
+    use super::*;
+
+    #[test]
+    fn mac_mod_matches_the_wide_product() {
+        for &p in &[2147352577u32, 268042241, 65521] {
+            let x: Vec<u32> = (0..77u32).map(|i| i.wrapping_mul(0x9E37_79B9) | (i & 1) << 31).collect();
+            let w: Vec<u32> = (0..77u32).map(|i| u32::MAX - i * 12345).collect();
+            let r0: Vec<u32> = (0..77u32).map(|i| i.wrapping_mul(0x85EB_CA6B)).collect();
+            let mut r = r0.clone();
+            mac_mod(&mut r, &x, &w, p);
+            for i in 0..77 {
+                assert_eq!(r[i] as u64, (r0[i] as u64 + x[i] as u64 * w[i] as u64) % p as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn horner_matches_the_integer_sum() {
+        for &p in &[2147352577u32, 268042241, 65521] {
+            for planes in [1usize, 4, 7] {
+                let g: Vec<Vec<i32>> = (0..planes).map(|e| (0..53).map(|i: i32| i.wrapping_mul(0x2545_F491).wrapping_add(e as i32 * 77) ^ if i % 5 == 0 { i32::MIN } else { 0 }).collect()).collect();
+                let gs: Vec<&[i32]> = g.iter().map(|v| v.as_slice()).collect();
+                let mut out = vec![0u32; 53];
+                horner256(&mut out, &gs, p);
+                for i in 0..53 {
+                    let v = (0..planes).rev().fold(0i128, |a, e| a * 256 + g[e][i] as i128);
+                    assert_eq!(out[i] as i128, v.rem_euclid(p as i128), "p {p} planes {planes} i {i}");
+                }
+            }
+        }
+    }
+}
+
+/// The blind rotation's gadget over an RNS pair (tfhe.cuh rotate_k's digits): the residues (r_a, r_b) of x mod
+/// Q = q_a q_b, x = r_a + q_a ((r_b - r_a) inv mod q_b) (Shoup companion invs), x~ = round(x 2^(l b) / Q) = (x m +
+/// 2^63) >> 64 centred in 2^(l b), its balanced base-2^b digits (the edge carry into the top one); digit t's residues
+/// at out[(2 t + prime) n ..] (q + d for a negative digit; canonical for |d| < q).
+#[derive(Clone, Copy)]
+pub struct RnsGadget {
+    pub qa: u32,
+    pub qb: u32,
+    pub inv: u32,
+    pub invs: u32,
+    pub m: u64,
+    pub bl: u32,
+    pub lv: usize,
+}
+
+pub fn rns_digits(ra: &[u32], rb: &[u32], g: &RnsGadget, out: &mut [u32]) {
+    #[cfg(target_arch = "x86_64")]
+    if wide() && g.qa < 1 << 31 && g.qb < 1 << 31 && g.bl * g.lv as u32 <= 62 {
+        // SAFETY: CPU features checked
+        return unsafe { rns_digits_v(ra, rb, g, out) };
+    }
+    rns_digits_s(ra, rb, g, out, 0)
+}
+
+fn rns_digits_s(ra: &[u32], rb: &[u32], g: &RnsGadget, out: &mut [u32], from: usize) {
+    let n = ra.len();
+    let bits = g.bl as usize * g.lv;
+    let bb = 1i64 << g.bl;
+    let res = |d: i64, q: u32| {
+        let v = if d < 0 { (q as i64 + d) as u32 } else { d as u32 };
+        if v >= q {
+            v % q
+        } else {
+            v
+        }
+    };
+    for j in from..n {
+        let ram = if ra[j] >= g.qb { ra[j] - g.qb } else { ra[j] };
+        let d = if rb[j] >= ram { rb[j] - ram } else { rb[j].wrapping_add(g.qb).wrapping_sub(ram) };
+        let k = {
+            let r = d.wrapping_mul(g.inv).wrapping_sub((((d as u64) * g.invs as u64) >> 32) as u32 * g.qb);
+            if r >= g.qb {
+                r - g.qb
+            } else {
+                r
+            }
+        };
+        let x = ra[j] as u64 + g.qa as u64 * k as u64;
+        let mut v = ((x as u128 * g.m as u128 + (1u128 << 63)) >> 64) as i64;
+        if v >= 1i64 << (bits - 1) {
+            v -= 1i64 << bits;
+        }
+        for t in 0..g.lv {
+            let mut r = v & (bb - 1);
+            if r >= bb / 2 {
+                r -= bb;
+            }
+            v = (v - r) >> g.bl;
+            if t == g.lv - 1 {
+                r += v << g.bl;
+            }
+            out[2 * t * n + j] = res(r, g.qa);
+            out[(2 * t + 1) * n + j] = res(r, g.qb);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+unsafe fn rns_digits_v(ra: &[u32], rb: &[u32], g: &RnsGadget, out: &mut [u32]) {
+    let n = ra.len();
+    let bits = g.bl as usize * g.lv;
+    let (qa, qb) = (_mm512_set1_epi64(g.qa as i64), _mm512_set1_epi64(g.qb as i64));
+    let (inv, invs) = (_mm512_set1_epi64(g.inv as i64), _mm512_set1_epi64(g.invs as i64));
+    let (ml, mh) = (_mm512_set1_epi64(g.m as u32 as i64), _mm512_set1_epi64((g.m >> 32) as i64));
+    let (lo32, half) = (_mm512_set1_epi64(0xffff_ffff), _mm512_set1_epi64(1 << 31));
+    let (top, wrap) = (_mm512_set1_epi64(1i64 << (bits - 1)), _mm512_set1_epi64(1i64 << bits));
+    let (bm, bh, bb) = (_mm512_set1_epi64((1i64 << g.bl) - 1), _mm512_set1_epi64(1i64 << (g.bl - 1)), _mm512_set1_epi64(1i64 << g.bl));
+    let blv = _mm512_set1_epi64(g.bl as i64);
+    let zero = _mm512_setzero_si512();
+    let n8 = n / 8 * 8;
+    for j in (0..n8).step_by(8) {
+        let a = wid8(ra.as_ptr().add(j));
+        let b = wid8(rb.as_ptr().add(j));
+        let ram = _mm512_min_epu64(a, _mm512_sub_epi64(a, qb));
+        let d = _mm512_add_epi64(_mm512_sub_epi64(b, ram), qb);
+        let d = _mm512_min_epu64(d, _mm512_sub_epi64(d, qb));
+        // Shoup: d inv - floor(d invs / 2^32) q_b, one correction (32-bit words)
+        let qt = _mm512_srli_epi64::<32>(_mm512_mul_epu32(d, invs));
+        let k = _mm512_and_si512(_mm512_sub_epi64(_mm512_mul_epu32(d, inv), _mm512_mul_epu32(qt, qb)), lo32);
+        let k = _mm512_min_epu64(k, _mm512_sub_epi64(k, qb));
+        let x = _mm512_add_epi64(a, _mm512_mul_epu32(qa, k));
+        // (x m + 2^63) >> 64 from the four 32-bit partial products
+        let xh = _mm512_srli_epi64::<32>(x);
+        let (p0, p1, p2, p3) = (_mm512_mul_epu32(x, ml), _mm512_mul_epu32(xh, ml), _mm512_mul_epu32(x, mh), _mm512_mul_epu32(xh, mh));
+        let mid = _mm512_add_epi64(_mm512_add_epi64(_mm512_srli_epi64::<32>(p0), half), _mm512_add_epi64(_mm512_and_si512(p1, lo32), _mm512_and_si512(p2, lo32)));
+        let hi = _mm512_add_epi64(_mm512_add_epi64(p3, _mm512_srli_epi64::<32>(mid)), _mm512_add_epi64(_mm512_srli_epi64::<32>(p1), _mm512_srli_epi64::<32>(p2)));
+        let mut v = _mm512_mask_sub_epi64(hi, _mm512_cmpge_epi64_mask(hi, top), hi, wrap);
+        for t in 0..g.lv {
+            let r = _mm512_and_si512(v, bm);
+            let mut r = _mm512_mask_sub_epi64(r, _mm512_cmpge_epi64_mask(r, bh), r, bb);
+            v = _mm512_srav_epi64(_mm512_sub_epi64(v, r), blv);
+            if t == g.lv - 1 {
+                r = _mm512_add_epi64(r, _mm512_sllv_epi64(v, blv));
+            }
+            let neg = _mm512_cmplt_epi64_mask(r, zero);
+            for (p, q) in [(0usize, qa), (1, qb)] {
+                let o = _mm512_mask_add_epi64(r, neg, r, q);
+                // |d| >= q (outside the gadget's range): the scalar word
+                if _mm512_cmpge_epu64_mask(o, q) != 0 {
+                    return rns_digits_s(ra, rb, g, out, j);
+                }
+                _mm256_storeu_si256(out.as_mut_ptr().add((2 * t + p) * n + j) as *mut _, _mm512_cvtepi64_epi32(o));
+            }
+        }
+    }
+    rns_digits_s(ra, rb, g, out, n8)
+}
+
+#[cfg(test)]
+mod rns_tests {
+    use super::*;
+
+    #[test]
+    fn rns_digits_match_the_scalar_words() {
+        let (qa, qb) = (67104769u32, 67084289u32);
+        let inv = {
+            let (mut r, mut b, mut e) = (1u64, qa as u64 % qb as u64, qb as u64 - 2);
+            while e > 0 {
+                if e & 1 == 1 {
+                    r = r * b % qb as u64;
+                }
+                b = b * b % qb as u64;
+                e >>= 1;
+            }
+            r as u32
+        };
+        let invs = (((inv as u64) << 32) / qb as u64) as u32;
+        let big = qa as u128 * qb as u128;
+        for (bl, lv) in [(23u32, 1usize), (12, 2), (8, 3)] {
+            let m = (((1u128 << (bl as usize * lv)) << 64) / big) as u64;
+            let g = RnsGadget { qa, qb, inv, invs, m, bl, lv };
+            let n = 2048;
+            let mut st = 99u64 + bl as u64;
+            let mut rnd = |q: u32| {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((st >> 33) as u32) % q
+            };
+            let mut ra: Vec<u32> = (0..n).map(|_| rnd(qa)).collect();
+            let mut rb: Vec<u32> = (0..n).map(|_| rnd(qb)).collect();
+            (ra[0], rb[0], ra[1], rb[1], ra[2], rb[2]) = (0, 0, qa - 1, qb - 1, qa - 1, 0);
+            let (mut v, mut s) = (vec![0u32; 2 * lv * n], vec![0u32; 2 * lv * n]);
+            rns_digits(&ra, &rb, &g, &mut v);
+            rns_digits_s(&ra, &rb, &g, &mut s, 0);
+            assert_eq!(v, s, "bl {bl} lv {lv}");
+        }
+    }
+}
