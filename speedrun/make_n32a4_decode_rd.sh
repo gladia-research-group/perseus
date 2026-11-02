@@ -71,7 +71,13 @@ for k in [str(i) for i in range(12)] + ["0_feedback"]:
     norm = lambda f, v: sorted(v) if f == "rescale_after" and v else v
     bad = [f for f in keys if norm(f, x.get(f)) != norm(f, y.get(f))]
     ex = lambda s: (s["exit_level"], s.get("exit_deg") or 1)
-    if bad or ex(x["summary"]) != ex(y["summary"]):
+    # RD_EXIT_SHALLOWER=1: a block may exit at a lower level (same degree) than the kept plan's (a carried plan on a
+    # shallower capture: the next stage enters with more room)
+    moved = ex(x["summary"]) != ex(y["summary"])
+    if moved and os.environ.get("RD_EXIT_SHALLOWER") and ex(y["summary"])[1] == ex(x["summary"])[1] \
+            and ex(y["summary"])[0] <= ex(x["summary"])[0]:
+        moved = False
+    if bad or moved:
         sys.exit(f"block {k}: the pass changed {bad or 'the exit'}")
     print(f"block {k}: raise drops {x.get('raise_drop', {})} -> {y.get('raise_drop', {})}")
 PY

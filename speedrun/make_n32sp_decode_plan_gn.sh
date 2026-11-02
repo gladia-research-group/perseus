@@ -33,7 +33,7 @@ source scripts/local_env.sh
 export CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=1
 REC=bootstrap_placements/gpt2_decode_python_n32a4_kc16r_lhs2_mflkp_gnk
 OUT=${OUT:-gpt2_decode_python_n32sp_kc16r_gn}
-CFG=configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lhs2_mflp_gn/configs.json
+CFG=${CFG:-configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lhs2_mflp_gn/configs.json}
 G0=graphs/${OUT}_p0 GM=graphs/${OUT}m G13=graphs/${OUT}_cm
 CAP=52
 RUNTIME="$(sed -n 's/^runtime=//p' "$REC/PLAN_CMD.txt" | sed -e 's/CHAIN_PRESET=n32a4/CHAIN_PRESET=n32sp/' \
@@ -108,6 +108,10 @@ solver=scipy 1.18.1 milp (HiGHS 1.12.0; numpy 2.5.4, Python 3.12.15), one HiGHS 
 capture13=graphs/${OUT}_cm: the position-0 capture's stage 13, its magnitudes capture_mags --argmax --rows (the logit rows of graphs/gpt2_decode_python_n32_cm/cutmax_rows.json) --blocks 13, and the merged capture's stage 12
 EOF
 } > "bootstrap_placements/$OUT/PLAN_CMD.txt"
+# CFG=<other configs> (OUT another name): the configs= line names them (CFG_NOTE: their description)
+[ "$CFG" = configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lhs2_mflp_gn/configs.json ] || sed -i \
+    "s#^configs=configs/model/approximation/gpt2_base_n32_kc16r_cmfl_lhs2_mflp_gn/configs.json .*#configs=$CFG  (${CFG_NOTE:-})#" \
+    "bootstrap_placements/$OUT/PLAN_CMD.txt"
 # 3. stage 13
 if ! resume || [ ! -f "$G13/block_13/graph.json" ]; then
     rm -rf "$G13" && mkdir -p "$G13"
