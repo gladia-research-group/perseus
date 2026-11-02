@@ -103,6 +103,7 @@ def _planned_classed(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
             logs = [[z[f"b{b}_{p}"] for p in range(first)] for b in range(n)]
             src = f"cached {cpath}"
         else:
+            print(f"[impl] plain prefix: computing positions 0..{first - 1} into {cpath}", flush=True)
             fmodel, _ffhe, _finf = fake_model(a.weights, a.configs, a.packing)
             for kv in fmodel.kv:
                 kv.payload_log = []
@@ -129,7 +130,7 @@ def _planned_classed(a, rmodel, cfgs, store, inputs, gt_logits, on_token):
     run = StreamedPlannedRun(Recorder(rmodel, n), resolve(a.plan), cfg, labels, keys, work_dir=work, streams={},
                              stream_rows=None, routes_for=routes_for, base_routes=base, stc_cache=a.stc_cache,
                              argmax=a.argmax, slim=True, log=lambda m: print(m, flush=True), schedule=a.schedule,
-                             prefix=prefix, plan_windows=a.windows)
+                             prefix=prefix, plan_windows=a.windows, pt_cache=bool(a.pt_cache))
     run.debug = a.debug_blocks
     if first:
         run.rec.first, run.rec.restart = first, False
@@ -222,6 +223,8 @@ def main(argv=None, results=None):
     ap.add_argument("--schedule", choices=("program", "siblings", "lockstep"), default="program",
                     help="planned: op order before K-batching (siblings: refresh pairs (PC_BTS_PAIR))")
     ap.add_argument("--work-dir", default=None, help="planned: where the reference token's stream is written")
+    ap.add_argument("--pt-cache", type=int, default=int(os.environ.get("PC_PT_CACHE", "1") or 0),
+                    help="planned: every position's plaintexts staged at setup, none encoded in a token (default 1; 0 = off)")
     ap.add_argument("--debug-blocks", action="store_true", help="planned: decrypt every block output / K/V state vs the CPU twin (synchronous)")
     a = ap.parse_args(argv)
     from perseus._paths import resolve

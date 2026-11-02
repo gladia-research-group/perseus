@@ -1133,8 +1133,9 @@ class StreamedPlannedRun:
     def __init__(self, recorder, plan_dir, config, labels, keys, *, work_dir, streams, stream_rows, prefix=None,
                  kv_init=None, input_vec=None, routes_for=None, frames=None, stc_cache=8, pool=16, base_routes=(256, 1),
                  size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print,
-                 schedule="program", plan_windows=None):
+                 schedule="program", plan_windows=None, pt_cache=False):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
+        self.pt_cache = pt_cache        # every position's plaintexts staged at setup (`setup`, `_patch`)
         self.plan_windows = [(int(b), str(d)) for b, d in plan_windows] if plan_windows else None
         if self.plan_windows:
             self.window_rot = check_plan_windows([plan_dir] + [d for _b, d in self.plan_windows])
@@ -1451,7 +1452,22 @@ class StreamedPlannedRun:
             k = len({(id(r[b].pts[nm]), lv_) for b in r for nm, lv_, _d, f in progs_t[b].pt_refs if f != "stream"})
             if k > peak:
                 peak, at = k, t
+        if self.pt_cache:
+            # pt_cache: every value any recorded position reads holds its own slot, staged at setup, so no token
+            # encodes a plaintext (record 5's position cache, for the streamed decode). Off when that would more than
+            # double the store (a full-context chain records every position: its union is ~12x one token's)
+            union = len({(id(self.records[t][b].pts[nm]), lv_) for t in self.records
+                         for b in self.records[t] for nm, lv_, _d, f in self.classes[self.class_of[t]]["progs"][b].pt_refs
+                         if f != "stream"})
+            if union > 2 * peak:
+                self.log(f"[planned] position cache off: {union} plaintexts over {len(self.records)} positions, "
+                         f"more than twice one token's {peak}")
+                self.pt_cache = False
+            else:
+                peak = union
         n_slots = self.pt_slots if self.pt_slots is not None else peak + 64
+        if self.pt_cache:
+            n_slots = max(n_slots, peak + 64)
         self.log(f"[planned] plaintext slots {n_slots + self.extra_pt_slots}: the most one token reads {peak} (position "
                  f"{at + self.rec.first}; recorded {self.n_pts})")
         pt_level = min(lev for c in self.classes for p in c["progs"].values() for _nm, lev, _d, f in p.pt_refs if f != "stream")
@@ -1506,6 +1522,13 @@ class StreamedPlannedRun:
         self.kv_init_s = time.time() - ti
         self._resident = {}          # (id(values), level) -> (values, store name)
         self._pt_serial = 0
+        if self.pt_cache:
+            tp, n_pre = time.time(), 0
+            for t in sorted(self.records):
+                n_pre += self._patch(t, self.classes[self.class_of[t]], self.records[t])
+            self.fhe.device_sync()
+            self.log(f"[planned] position cache: {n_pre} plaintexts of {len(self.records)} positions staged in "
+                     f"{time.time() - tp:.1f} s")
         self.setup_s = time.time() - t0 + getattr(self, "prepare_s", 0.0)
         st = self.sess.stream_stats()
         self.log(f"[planned] {len(progs)} programs in {len(self.classes)} classes, {regs} registers, K/V {n} x {self.U} "
@@ -1563,12 +1586,13 @@ class StreamedPlannedRun:
                     need[key] = have
                 pairs.append((i, need[key][1]))
             p.retarget_pts(pairs)
-        gone = [(name, lv) for key, (_v, name) in self._resident.items() if key not in need for lv in (key[1],)]
+        gone = [] if self.pt_cache else [(name, lv) for key, (_v, name) in self._resident.items() if key not in need
+                                         for lv in (key[1],)]
         if gone:
             self.store.evict(gone)
         if items:
             self.store.stage(items)
-        self._resident = need
+        self._resident = {**self._resident, **need} if self.pt_cache else need
         return len(items)
 
     def token(self, t, rows, argmax=None):
