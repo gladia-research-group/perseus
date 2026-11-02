@@ -138,6 +138,30 @@ pub const SPARSE_B_CHEB_K24: [f64; 21] = [
 pub const SPARSE_B_K: f64 = 24.0;
 pub const SPARSE_B_DA_ITS: u32 = 5;
 
+/// SparseB's K = 16 series refitted for the overflow integer it meets: the degree-14 least-squares fit of
+/// `EVALMOD_CHEB`'s function on t / 16, t within 1/32 of each integer I, weighted by sqrt(P(I)) (I a rounded sum of the
+/// h = 32 encapsulation secret's 33 uniforms). Same degree, products, depth and double angles as `EVALMOD_CHEB`, so it
+/// replaces it with no other change; its EvalMod error (5 double angles, noise-free) is 2^-35 or less for |I| <= 6
+/// (`EVALMOD_CHEB`: 2^-29.6), 2^-33.8 or less up to |I| = 7, no worse than `EVALMOD_CHEB` at |I| = 8, worse from |I| = 9
+/// (P(|I| >= 9) ~ 5e-8).
+pub const SPARSE_B_K16_W14: [f64; 15] = [
+    -0.57382947630327,
+    0.02637185350745373,
+    -0.9155742365679239,
+    -0.0308975418423564,
+    0.28560105273647235,
+    0.004831291368967446,
+    -0.0274350669956903,
+    -0.00031691938216668613,
+    0.0013129519873082535,
+    1.1582715628454975e-05,
+    -3.7901496763804674e-05,
+    -2.707038127090425e-07,
+    7.331598959140216e-07,
+    4.63808824848783e-09,
+    -1.068560591081154e-08,
+];
+
 /// FNV-1a 64 over the little-endian f64 bit patterns: the checksum recorded for a frozen table.
 pub fn table_checksum(t: &[f64]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

@@ -421,6 +421,16 @@ fn knob(cfg: Option<i64>, default: i64, name: &str) -> PyResult<i64> {
     Ok(v)
 }
 
+/// bts.sb_em_table: SparseB's K = 16 EvalMod series ("w14": pc-core `SPARSE_B_K16_W14`, the frozen table's degree and
+/// products); unset or empty = the frozen table (an empty `SparseBCfg::em_coeffs`).
+fn sb_em_table(v: &Option<String>, k: f64) -> PyResult<Vec<f64>> {
+    match v.as_deref().map(str::trim) {
+        None | Some("") => Ok(Vec::new()),
+        Some("w14") if k == pc_core::bts_setup::EVALMOD_K => Ok(pc_core::bts_setup::SPARSE_B_K16_W14.to_vec()),
+        Some(s) => Err(crate::ConfigError::new_err(format!("bts.sb_em_table = {s:?}: 'w14', with bts.sparse_b_k = 16 (here {k})"))),
+    }
+}
+
 /// The rotation steps of LT stages (BSGS babies, the giant stride, the offset).
 fn lt_steps(geoms: &[pc_gpu::bts::cts::LtGeom], n: usize) -> BTreeSet<i64> {
     let mut steps = BTreeSet::new();
@@ -733,6 +743,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 (c.lt_tails, c.em_fuse_rescale) = (lt_tails, em_fuse);
                 c.merge_s2d = merge_s2d;
                 c.evalmod_k = knob(cfg.bts.sparse_b_k, pc_core::bts_setup::SPARSE_B_K as i64, "bts.sparse_b_k")? as f64;
+                c.em_coeffs = sb_em_table(&cfg.bts.sb_em_table, c.evalmod_k)?;
                 extra.sparse_rots.extend(pc_gpu::bts::sparse_b::sparse_rot_steps(n, &c).map_err(e)?.into_iter().map(|st| (st, KskShape::full(chain))));
                 full.extend(pc_gpu::bts::sparse_b::rot_steps(n, &c).map_err(e)?.into_iter().map(|k| k.rem_euclid(half)));
                 sb_cfgs.push(c);

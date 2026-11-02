@@ -75,6 +75,9 @@ EXTRA = [
      "`BtsSetup::merge_s2d`; default off).", "PC_BTS_MERGE_S2D"),
     ("bts", "stc_ps", "Int", "A lean chain's StC-first input stages switch over a prefix of P (pc-gpu `BtsSetup::stc_ps`, "
      "`KskShape::stc_ps_kp` rotation keys): 0 = off, 1 = P' (n32's 9 special primes), k > 1 = the first k.", "PC_BTS_STC_PS"),
+    ("bts", "sb_em_table", "Str", "SparseB's EvalMod series at K = 16 (with bts.sparse_b_k = 16): 'w14' = the degree-14 "
+     "table refitted by least squares weighted with the overflow integer's distribution (pc-core `SPARSE_B_K16_W14`: the "
+     "frozen table's degree, products and depth); unset = the frozen K = 16 table.", "PC_BTS_SB_EM_TABLE"),
     ("exec", "use_graphs", "Flag", "Replay a bound block program's static segments as captured CUDA graphs after its "
      "first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."),
     ("exec", "trace_alloc", "Flag", "Report device free memory and arena use around every planned token (the "

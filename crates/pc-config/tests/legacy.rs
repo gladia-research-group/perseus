@@ -41,8 +41,8 @@ fn field_table() {
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
     // bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack}, chain.preset,
     // the GELU output hint, the head-sum cleanse
-    // + bts.merge_s2d, bts.stc_ps, bts.em_level_keys (key-set switches), model.pcmm_raise_out, model.kv_push_raise
-    assert_eq!(cf.len(), 266);
+    // + bts.merge_s2d, bts.stc_ps, bts.em_level_keys (key-set switches), model.pcmm_raise_out, model.kv_push_raise, bts.sb_em_table
+    assert_eq!(cf.len(), 267);
     // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
     // plan.fallback_cf, plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
     // plan.keep_placements_exact, plan.mag_safety_steps, plan.resume; the lean chain's plan.envelope_strict,
@@ -64,8 +64,8 @@ fn field_table() {
     // PLAN_PACK_CF, PLAN_KEEP_PLACEMENTS_EXACT, PLAN_MAG_SAFETY_STEPS, PLAN_RESUME, FIDESLIB_BTS_SPARSE_B_K, CHAIN_PRESET,
     // GELU_OUT_HINT, PLAN_ENVELOPE_STRICT, PLAN_ENV_EFFECTIVE, PLAN_PCMM_PREDIV_CAP, PLAN_PCMM_STAMPS,
     // PLAN_STC_FIRST_STAGED_ONLY, PLAN_STEP_ROUTE_PRICING, SM_HRS_CLEANSE
-    // + PC_BTS_MERGE_S2D, PC_BTS_STC_PS, PC_EM_LEVEL_KEYS, PF_PCMM_RAISE_OUT, KV_PUSH_RAISE
-    assert_eq!(envs.len(), 364);
+    // + PC_BTS_MERGE_S2D, PC_BTS_STC_PS, PC_EM_LEVEL_KEYS, PF_PCMM_RAISE_OUT, KV_PUSH_RAISE, PC_BTS_SB_EM_TABLE
+    assert_eq!(envs.len(), 365);
 }
 
 #[test]

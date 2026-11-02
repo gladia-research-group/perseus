@@ -82,6 +82,9 @@ section! {
         #[doc = "A lean chain's StC-first input stages switch over a prefix of P (pc-gpu `BtsSetup::stc_ps`, `KskShape::stc_ps_kp` rotation keys): 0 = off, 1 = P' (n32's 9 special primes), k > 1 = the first k."]
         #[doc = "Runtime switch `PC_BTS_STC_PS`: binds the key bundle (P' rotation keys), not the plan."]
         stc_ps: Int = "PC_BTS_STC_PS", "(unset)";
+        #[doc = "SparseB's EvalMod series at K = 16 (with bts.sparse_b_k = 16): 'w14' = the degree-14 table refitted by least squares weighted with the overflow integer's distribution (pc-core `SPARSE_B_K16_W14`: the frozen table's degree, products and depth); unset = the frozen K = 16 table."]
+        #[doc = "Runtime switch `PC_BTS_SB_EM_TABLE`: binds the key bundle's SparseB series, not the plan."]
+        sb_em_table: Str = "PC_BTS_SB_EM_TABLE", "(unset)";
         #[doc = "`FIDESLIB_BTS_REAL`. Default '0'. Read at impl/ops.py::FheOps.bootstrap_real."]
         #[doc = "Shipped plans: runtime= 15."]
         real: Flag = "FIDESLIB_BTS_REAL", "'0'";
