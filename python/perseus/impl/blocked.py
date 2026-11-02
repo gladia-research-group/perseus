@@ -226,6 +226,9 @@ def _region(N, t, R, k, val):
 def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512):
     """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks."""
     ops, N, t, dr = rt.ops, B.d.N, B.t, B.d.dim
+    # zladder (LayerNorm only): one complex ladder for the mean and the variance instead of two
+    zl = not rms and bool(getattr(cfg, "zladder", 0)) and bool(cfg.cheb_coeffs) and ops.ln_cheb
+    alpha = 0.5 / dr
     halves = []                              # (g, half, lane scales, [x_k], statistic)
     for g, blk in enumerate(Xs):
         for half in (0, 1):
@@ -249,6 +252,21 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
                     sq = s2 if sq is None else ops.add(sq, s2)
                 S = ops.tag_reduce(rotsum(ops, sq, t, N), t)
                 halves.append((g, half, cs, xs, S))
+            elif zl:
+                # the sum and the sum of squares on ONE ladder: z = S1 / (2 dr) + i S2, split by one conjugation into
+                # re = S1 / dr = the mean and im = 2 S2, so var = im / (2 dr) - re^2 at the two-pass variance's level.
+                # The centring subtracts re unmasked (no level: the norm's output stays at the two-pass level; the
+                # padded channels carry -mean, which the next linear's zero rows or the affine's zero gamma drop)
+                tot, sq = None, None
+                for x in live:
+                    tot = x if tot is None else ops.add(tot, x)
+                    s2 = ops.square(x)
+                    sq = s2 if sq is None else ops.add(sq, s2)
+                z = ops.tag_reduce(rotsum(ops, ops.add(ops.mult(tot, alpha), ops.mult_i(sq)), t, N), t)
+                zc = ops.conjugate(z)
+                re = ops.add(z, zc)
+                u = ops.sub(ops.mult(ops.mult_i(ops.sub(zc, z)), alpha), ops.square(re))
+                halves.append((g, half, cs, [None if x is None else ops.sub(x, re) for x in xs], u))
             else:
                 tot = live[0]
                 for x in live[1:]:
@@ -276,7 +294,7 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
         eps = np.zeros(N)
         mid = (dr if rms else 1.0) * 0.5 * (cfg.cheb_lo + cfg.cheb_hi) if cfg.cheb_coeffs else 1.0
         for k, (_g, _h, cs, _x, st) in enumerate(grp):
-            sc = 1.0 if rms else 1.0 / dr
+            sc = 1.0 if rms or zl else 1.0 / dr
             m = rt.mult_mask(st, ("bl.nreg", R, k, sc), lambda R=R, k=k, sc=sc: _region(N, t, R, k, sc))
             V = m if V is None else ops.add(V, m)
             e = [(dr if rms else 1.0) * cfg.epsilon * c_ * c_ for c_ in cs]
