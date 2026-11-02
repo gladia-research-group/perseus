@@ -1,0 +1,9 @@
+[package]
+name = "pc-hostrt"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "perseus: the host stand-in for the CUDA stream model (inline streams, recorded graphs, the CPU thread pool) shared by pc-cuda, pc-cublas and the host kernels"
+
+[dependencies]
+rayon = { workspace = true }

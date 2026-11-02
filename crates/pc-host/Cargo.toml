@@ -1,0 +1,12 @@
+[package]
+name = "pc-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "perseus: the host kernel tables (args.cuh semantics on the CPU, word for word the device's results) behind the host device"
+
+[dependencies]
+pc-core = { path = "../pc-core" }
+pc-kernels = { path = "../pc-kernels" }
+pc-hostrt = { path = "../pc-hostrt" }
+rayon = { workspace = true }

@@ -17,6 +17,7 @@ mont = ["pc-kernels/mont"]
 pc-core = { path = "../pc-core" }
 pc-cuda = { path = "../pc-cuda", features = ["cublas"] }
 pc-kernels = { path = "../pc-kernels" }
+pc-host = { path = "../pc-host" }
 pc-shadow = { path = "../pc-shadow" }
 pc-tfhe = { path = "../pc-tfhe" }
 rayon = { workspace = true }

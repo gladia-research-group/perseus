@@ -1,4 +1,5 @@
-//! Lane-typed streams, events (single and pooled), captured graphs and the `Ready` hand-over token.
+//! Lane-typed streams, events (single and pooled), captured graphs and the `Ready` hand-over token. Each handle is a
+//! CUDA one or, on the host device, a pc-hostrt one (inline streams, recorded graphs).
 use crate::device::Device;
 use crate::error::{check, Error, Result};
 use crate::ffi;
@@ -11,37 +12,57 @@ use std::ops::Deref;
 /// An owned non-blocking CUDA stream of lane `S`. Not `Clone`, not `Send`: one host thread issues it.
 pub struct Stream<S: Lane> {
     raw: ffi::cudaStream_t,
+    host: bool,
     _s: PhantomData<(S, *const ())>,
 }
 
 impl<S: Lane> Stream<S> {
-    pub fn new(_dev: &Device) -> Result<Self> {
+    pub fn new(dev: &Device) -> Result<Self> {
+        if dev.is_host() {
+            return Ok(Self::host());
+        }
         let mut raw = std::ptr::null_mut();
         // SAFETY: out-pointer to a local
         check(unsafe { ffi::cudaStreamCreateWithFlags(&mut raw, ffi::STREAM_NON_BLOCKING) }, "cudaStreamCreateWithFlags")?;
-        Ok(Stream { raw, _s: PhantomData })
+        Ok(Stream { raw, host: false, _s: PhantomData })
+    }
+    fn host() -> Self {
+        Stream { raw: pc_hostrt::new_stream(), host: true, _s: PhantomData }
     }
     /// A stream of the device's highest priority (its blocks are scheduled before the default streams' pending ones).
-    pub fn high_priority(_dev: &Device) -> Result<Self> {
+    pub fn high_priority(dev: &Device) -> Result<Self> {
+        if dev.is_host() {
+            return Ok(Self::host());
+        }
         let (mut least, mut greatest) = (0, 0);
         // SAFETY: out-pointers to locals
         check(unsafe { ffi::cudaDeviceGetStreamPriorityRange(&mut least, &mut greatest) }, "cudaDeviceGetStreamPriorityRange")?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: out-pointer to a local
         check(unsafe { ffi::cudaStreamCreateWithPriority(&mut raw, ffi::STREAM_NON_BLOCKING, greatest) }, "cudaStreamCreateWithPriority")?;
-        Ok(Stream { raw, _s: PhantomData })
+        Ok(Stream { raw, host: false, _s: PhantomData })
     }
     /// The `cudaStream_t` for a kernel launcher.
     pub fn raw(&self) -> RawStream {
         self.raw
     }
+    /// Whether this is a host stream (its launches take the host kernel tables).
+    pub fn is_host(&self) -> bool {
+        self.host
+    }
     /// Block the host until everything issued on this stream finished (host reads of this lane's buffers).
     pub fn sync(&self) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
         // SAFETY: valid stream handle owned by self
         check(unsafe { ffi::cudaStreamSynchronize(self.raw) }, "cudaStreamSynchronize")
     }
     /// Make this stream wait for `e` (recorded on any stream).
     pub fn wait(&self, e: &Event) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
         // SAFETY: both handles are live (borrowed)
         check(unsafe { ffi::cudaStreamWaitEvent(self.raw, e.raw, 0) }, "cudaStreamWaitEvent")
     }
@@ -52,6 +73,14 @@ impl<S: Lane> Stream<S> {
     /// Capture everything `f` issues on this stream into one instantiated graph (replayed with `GraphExec::launch`).
     /// The capture is ended even when `f` fails, so the stream is usable afterwards.
     pub fn capture<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<(GraphExec, R)> {
+        if self.host {
+            // SAFETY: live host stream
+            unsafe { pc_hostrt::begin_capture(self.raw) }.map_err(Error::Host)?;
+            let r = f(self);
+            // SAFETY: as above
+            let g = unsafe { pc_hostrt::end_capture(self.raw) }.map_err(Error::Host)?;
+            return Ok((GraphExec { raw: std::ptr::null_mut(), host: Some(g) }, r?));
+        }
         // SAFETY: valid stream; global capture mode
         check(unsafe { ffi::cudaStreamBeginCapture(self.raw, ffi::CAPTURE_MODE_GLOBAL) }, "cudaStreamBeginCapture")?;
         let r = f(self);
@@ -73,7 +102,7 @@ impl<S: Lane> Stream<S> {
         let inst = check(unsafe { ffi::cudaGraphInstantiate(&mut e, g, 0) }, "cudaGraphInstantiate");
         unsafe { ffi::cudaGraphDestroy(g) };
         inst?;
-        Ok((GraphExec { raw: e }, r))
+        Ok((GraphExec { raw: e, host: None }, r))
     }
 }
 
@@ -81,8 +110,12 @@ impl<S: Lane> Drop for Stream<S> {
     fn drop(&mut self) {
         // SAFETY: owned handle; errors are ignored in Drop
         unsafe {
-            ffi::cudaStreamSynchronize(self.raw);
-            ffi::cudaStreamDestroy(self.raw);
+            if self.host {
+                pc_hostrt::destroy_stream(self.raw);
+            } else {
+                ffi::cudaStreamSynchronize(self.raw);
+                ffi::cudaStreamDestroy(self.raw);
+            }
         }
     }
 }
@@ -90,34 +123,53 @@ impl<S: Lane> Drop for Stream<S> {
 /// A CUDA event. Ordering events are created without timing (cheaper); `timing()` events support `elapsed_ms`.
 pub struct Event {
     raw: ffi::cudaEvent_t,
+    host: bool,
 }
 
 impl Event {
     /// Ordering-only event (cudaEventDisableTiming).
-    pub fn new(_dev: &Device) -> Result<Self> {
-        Self::with_flags(ffi::EVENT_DISABLE_TIMING)
+    pub fn new(dev: &Device) -> Result<Self> {
+        Self::with_flags(dev, ffi::EVENT_DISABLE_TIMING)
     }
     /// Timing event (for benchmarks).
-    pub fn timing(_dev: &Device) -> Result<Self> {
-        Self::with_flags(0)
+    pub fn timing(dev: &Device) -> Result<Self> {
+        Self::with_flags(dev, 0)
     }
-    fn with_flags(flags: u32) -> Result<Self> {
+    fn with_flags(dev: &Device, flags: u32) -> Result<Self> {
+        if dev.is_host() {
+            return Ok(Event { raw: pc_hostrt::new_event(), host: true });
+        }
         let mut raw = std::ptr::null_mut();
         // SAFETY: out-pointer to a local
         check(unsafe { ffi::cudaEventCreateWithFlags(&mut raw, flags) }, "cudaEventCreateWithFlags")?;
-        Ok(Event { raw })
+        Ok(Event { raw, host: false })
     }
     pub fn record<S: Lane>(&self, s: &Stream<S>) -> Result<()> {
+        if self.host || s.host {
+            if self.host != s.host {
+                return Err(Error::Host("event and stream of different devices"));
+            }
+            // SAFETY: both handles live; the event outlives its records (pooled or owned by the recorder)
+            unsafe { pc_hostrt::record(self.raw, s.raw()) };
+            return Ok(());
+        }
         // SAFETY: both handles are live (borrowed)
         check(unsafe { ffi::cudaEventRecord(self.raw, s.raw()) }, "cudaEventRecord")
     }
     /// Block the host until the recorded work completed.
     pub fn sync(&self) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
         // SAFETY: live handle
         check(unsafe { ffi::cudaEventSynchronize(self.raw) }, "cudaEventSynchronize")
     }
     /// Milliseconds from `self` to `later` (both timing events, both recorded and completed).
     pub fn elapsed_ms(&self, later: &Event) -> Result<f32> {
+        if self.host {
+            // SAFETY: live handles
+            return unsafe { pc_hostrt::elapsed_ms(self.raw, later.raw) }.ok_or(Error::Host("elapsed_ms of an event never recorded"));
+        }
         let mut ms = 0f32;
         // SAFETY: live handles, out-pointer to a local
         check(unsafe { ffi::cudaEventElapsedTime(&mut ms, self.raw, later.raw) }, "cudaEventElapsedTime")?;
@@ -129,7 +181,11 @@ impl Drop for Event {
     fn drop(&mut self) {
         // SAFETY: owned handle; errors ignored in Drop
         unsafe {
-            ffi::cudaEventDestroy(self.raw);
+            if self.host {
+                pc_hostrt::destroy_event(self.raw);
+            } else {
+                ffi::cudaEventDestroy(self.raw);
+            }
         }
     }
 }
@@ -180,18 +236,26 @@ impl Drop for PoolEvent<'_> {
 /// An instantiated CUDA graph (one per (block, variant) in replay).
 pub struct GraphExec {
     raw: ffi::cudaGraphExec_t,
+    host: Option<pc_hostrt::HostGraph>,
 }
 impl GraphExec {
     pub fn launch<S: Lane>(&self, s: &Stream<S>) -> Result<()> {
+        if let Some(g) = &self.host {
+            // SAFETY: live host stream; the graph's buffers live in the arena that outlives the replay
+            unsafe { g.launch(s.raw()) };
+            return Ok(());
+        }
         // SAFETY: live exec and stream
         check(unsafe { ffi::cudaGraphLaunch(self.raw, s.raw()) }, "cudaGraphLaunch")
     }
 }
 impl Drop for GraphExec {
     fn drop(&mut self) {
-        // SAFETY: owned handle; errors ignored in Drop
-        unsafe {
-            ffi::cudaGraphExecDestroy(self.raw);
+        if self.host.is_none() {
+            // SAFETY: owned handle; errors ignored in Drop
+            unsafe {
+                ffi::cudaGraphExecDestroy(self.raw);
+            }
         }
     }
 }
