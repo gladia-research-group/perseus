@@ -505,6 +505,10 @@ pub trait BtsRoute<'a, W: DevWord, M: DevStrategy<W>> {
     fn run_pair(&self, _cx: &mut BtsCx<'_, 'a, W, M>, _x: &mut Ct<'a, W>, _y: &mut Ct<'a, W>, _rx: &Route, _ry: &Route) -> Result<()> {
         Err(shape("bts pair", format!("route {:?} has no paired refresh", self.kind())))
     }
+    /// Whether `run_pair` takes inputs at `mx` on `rx` and `my` on `ry` (strict or loose).
+    fn pair_ok(&self, _sh: &Shadow, _mx: &CtMeta, _my: &CtMeta, _rx: &Route, _ry: &Route) -> bool {
+        false
+    }
     fn staged(&self) -> Option<&dyn Staged<'a, W, M>>;
     /// Device bytes this route holds (precomputation tables) and the work shape it needs.
     fn mem(&self) -> (MemReq, BtsWorkShape);

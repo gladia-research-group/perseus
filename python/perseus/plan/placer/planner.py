@@ -263,10 +263,25 @@ class PlanDiagnostics:
     cf_clamp: CfClampReport | None = None
 
 
-def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
-    """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune)."""
+def _prune_redundant(placer, sim: SimResult, keep=(), chain_cap: float | None = None,
+                     unit: int = 2) -> tuple[SimResult, int]:
+    """Drop redundant refreshes from `placer.placed` in name order (see PlanConfig.prune). `chain_cap` (PLAN_CHAIN_STRICT:
+    the chain's max_level): a removal may not start a placed refresh past it (its effective input, the pending rescale
+    included, as P3c(chain) measures it)."""
     from .place import refresh_env_cap
     g = placer.g
+
+    def past_chain(s):
+        if chain_cap is None:
+            return 0
+        k = 0
+        for v in placer.placed:
+            if g.producer_of.get(v) is None:
+                continue
+            nom, deg = s.input_state(g, v)
+            if placer.bootstrap_level + nom + (unit if deg == 2 else 0) > chain_cap + 1e-9:
+                k += 1
+        return k
 
     def count(s):
         return len(placer.placed) + sum(1 for f in s.hint_fired.values() if f)
@@ -293,13 +308,13 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
                     k += 1
         return k
 
-    best, deep, removed = count(sim), past_env(sim), 0
+    best, deep, chain, removed = count(sim), past_env(sim), past_chain(sim), 0
     origin = getattr(placer, "_origin", None)
     for v in sorted(placer.placed - set(keep)):
         kept = placer.placed
         placer.placed = kept - {v}
         s2 = placer._sim()
-        if not s2.over_budget and count(s2) < best and past_env(s2) <= deep:
+        if not s2.over_budget and count(s2) < best and past_env(s2) <= deep and past_chain(s2) <= chain:
             sim, best = s2, count(s2)
             removed += 1
             if origin is not None:
@@ -525,6 +540,17 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
             consumers[i] += 1
             if not n.output:
                 stores.add(i)
+    # PLAN_RAISE_PRESET="v:k,...": those sites start the search at drop k, so the block outputs are pinned at the plan
+    # they make (a site whose drop sets the block exit: pinned at the all-zero plan, the earlier sites would lose theirs)
+    preset = {v: int(k) for v, k in (e.split(":") for e in os.environ.get("PLAN_RAISE_PRESET", "").split(",") if e)}
+    preset = {v: k for v, k in preset.items() if v in placer.placed}
+    for v, k in preset.items():
+        sp = refresh.spec(v)
+        rs = float(g.level_unit) if sp.prescale is not None else 0.0
+        refresh.site_out_levels[v] = int(round(cfg.bootstrap_level + sp.out_consumed - rs + k * unit))
+        refresh._cache.pop(v, None)
+    if preset:
+        sim = placer._sim()
     pinned = sorted(stores | {v for v in sim.consumed if not consumers[v]})
 
     def inputs(s: SimResult) -> dict[str, tuple[float, float]]:
@@ -570,6 +596,9 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
     sites = set(placer.placed) | fired
     order = sorted(sites, key=lambda v: g.producer_of[v].idx if v in g.producer_of else -1)
     for p in order:
+        if p in preset:
+            drops[p] = preset[p]
+            continue
         s = refresh.spec(p)
         route = int(s.route or 0)
         if route not in cfg.raise_drop_routes:
@@ -586,6 +615,11 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
             k_max = min(k_max, int(math.floor((cfg.raise_drop_landing_max - base_abs) / unit + 1e-9)))
         # the plan's drop is absolute: the route's default (raise_drop_base) plus k must be a built variant
         b = dict(cfg.raise_drop_base).get(route, 0)
+        # PLAN_RAISE_ROUTE_MAX="route:drop,...": a route's deepest absolute drop (an alternating user region's chain:
+        # EvalMod may end on the region's top pair level, no deeper; compile::user_region_sites)
+        rmax = {int(r): int(k) for r, k in (e.split(":") for e in os.environ.get("PLAN_RAISE_ROUTE_MAX", "").split(",") if e)}
+        if route in rmax:
+            k_max = min(k_max, rmax[route] - b)
         ks = [k for k in range(k_max, 0, -1)
               if route == 1 or not cfg.raise_drop_set or k + b in cfg.raise_drop_set]
         saved = refresh.site_out_levels.get(p)
@@ -1048,8 +1082,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
 
     if cfg.prune:
         # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)
+        _strict = os.environ.get("PLAN_CHAIN_STRICT", "0") not in ("", "0")
         sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(force_place or ())
-                                         + tuple(sorted(kept_sites)))
+                                         + tuple(sorted(kept_sites)), chain_cap=cfg.max_level if _strict else None,
+                                         unit=int(cfg.level_unit) or 1)
         if hasattr(placer, "meta"):
             placer.meta["pruned"] = n_pruned
         if cfg.verbose:
@@ -1179,7 +1215,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     def _cap_of(v: str) -> float:          # the envelope of the step that produces `v` (PLAN_REFRESH_ENV_CAP_STEPS)
         _pn = g.producer_of.get(v)
         return _refresh_env_cap(getattr(_pn, "step", None) if _pn is not None else None)
-    _bad_cut, _bad_hint = [], []
+    _bad_cut, _bad_hint, _bad_chain = [], [], []
     # A var past the envelope that nothing refreshes is NOT harmless: the runtime meets it
     # there and fires a REACTIVE bootstrap, which is the one class neither the cut nor the
     # hint check covers, and it stops the run with [bts_depth_error]. Collect it.
@@ -1196,6 +1232,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             # deeper input; its ceiling stays the runtime guard's, as before).
             _p = g.producer_of.get(_v)
             _sparse = _refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+            if _p is not None and not _p.is_deliberate_bts and _p.hint_level is None:
+                # any route: the refresh's own rescales (the raise of a pending one included) run on the chain, so
+                # an input past max_level by its effective level is one the compile refuses ([bts_input_error])
+                _nom, _deg = sim.input_state(g, _v)
+                _eff = cfg.bootstrap_level + _nom + (cfg.level_unit if _deg == 2 else 0)
+                if _eff > cfg.max_level + 1e-9:
+                    _bad_chain.append((_v, _eff))
             if _p is None or _p.is_deliberate_bts or _p.hint_level is not None or _sparse:
                 continue
             _nom, _deg = sim.input_state(g, _v)
@@ -1224,6 +1267,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 + (cfg.level_unit if sim.deg.get(_in, 1) == 2 else 0))
         if _eff > _refresh_env_cap(_n.step):
             _bad_hint.append((_n.output or _in, _eff))
+    if _bad_chain:
+        _msg = (f"{len(_bad_chain)} placed refresh(es) start past the chain (effective level > {cfg.max_level}): "
+                + ", ".join(f"{v}@{l:g}" for v, l in _bad_chain[:6]))
+        # PLAN_CHAIN_STRICT=1: refuse the block (a kept-exact pass whose landings moved, e.g. a K/V push raised)
+        if os.environ.get("PLAN_CHAIN_STRICT", "0") not in ("", "0"):
+            raise PlanInfeasible("P3c(chain): " + _msg)
+        log.warning("[plan] P3c(chain): " + _msg + " -- the compile refuses it ([bts_input_error])")
     if _bad_hint and cfg.verbose:
         log.info(f"[plan] P3c(hint): {len(_bad_hint)} hint-fired refresh(es) PREDICTED past the "
               f"envelope (abs level > {_ENV_CAP:g}): "

@@ -81,6 +81,17 @@ class SoftmaxCfg:
     # (q's replicate, the head sums and their replicates, P.V's key sum) run over that many lanes instead of t
     # (attention._key_lanes); 0 = t
     key_lanes: int = 0
+    # exp_mask_fold: the active mask (its 2^log2delta1-th root) rides the exp's Chebyshev giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower; 2: a leaf with
+    # no slack takes it term by term (leaf_terms="budget"), so a series whose leaves have none keeps its depth too
+    exp_mask_fold: int = 0
+    # pair_heads: while the key window (key_lanes) is half a head's t lanes, the softmax runs on scores packed two heads
+    # to a t-lane block (head h + H/2 on lanes t/2.. of head h's block), tH/2-periodic, so its refreshes route on
+    # tH/2 slots (attention._pair); 0 = the tH-periodic layout
+    pair_heads: int = 0
+    # gs_num: every reciprocal round's scores folded into its Goldschmidt recursion (poly.goldschmidt_recip num=): the
+    # round's product goes, and inside a round the state is one ciphertext (a refresh may sit anywhere in it)
+    gs_num: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -118,6 +129,10 @@ class GeluCfg:
     cheb_a: float = -1.0
     cheb_b: float = 1.0
     cheb_eps: float | None = None     # coefficient trim (relative to the largest), None = poly.CHEB_COEFF_EPS
+    # mask_fold (chebyshev under GELU_FOLD): the lane mask rides the series' giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower; 2: term by term in
+    # the leaves with no slack (leaf_terms="budget")
+    mask_fold: int = 0
 
 
 @dataclasses.dataclass
@@ -158,6 +173,18 @@ class CutMaxCfg:
     entry_dd: int = 0
     # the packed CutMax's pow_odd lanes share one conjugate of the refreshed vector
     conj_once: int = 0
+    # the scaled normalisers' centring sums at a usable plaintext scale (the masks M k / 2n multiply a sum over the
+    # vocabulary, so a mask that rounds to a few integers at its level's scale (2^36 / 2^44.15 on n32sp) shifts one tile
+    # against the other). out_scale[i]: iteration i's output y times this factor, folded into u's last Newton step and
+    # the shift (no product), so the next iteration's powers and its centring sum are out_scale^p times smaller and its
+    # mask as much larger (the next k reads it back; empty = 1). lm_centre: the LM head's columns centred on their
+    # mean (an exact shift of every logit by the same value), so the entry's centring sum is ~0, not 2 n mean.
+    # Out of repr: the slot cache keys its variant on repr(cfgs); lm_tiles keys lm_centre itself.
+    out_scale: tuple = dataclasses.field(default=(), repr=False)
+    # newton_carry[i]: iteration i's folded Newton steps after the second hold y / newton_carry (poly.
+    # inv_sqrt_newton_folded's carry): y = 1 / sqrt(t) is ~100 where t is small, and its w b / b1 operands ~1e-4
+    newton_carry: tuple = dataclasses.field(default=(), repr=False)
+    lm_centre: int = dataclasses.field(default=0, repr=False)
 
 
 @dataclasses.dataclass
@@ -231,7 +258,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         gs_iters_first=int(j.get("gs_iters_first", 0)),
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
-        key_lanes=int(j.get("key_lanes", 0)))
+        key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
+        pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
@@ -246,7 +274,8 @@ def parse_gelu(j: dict) -> GeluCfg:
         # xmax: with GELU_FOLD the up-projection carries 1/xmax and the output mask xmax (as for thor_composite)
         return GeluCfg(method=method, xmax=float(j.get("xmax", 1.0)), cheb_coeffs=_tup(j["cheb_coeffs"]),
                        cheb_a=float(j["cheb_a"]), cheb_b=float(j["cheb_b"]),
-                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None))
+                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None),
+                       mask_fold=int(j.get("mask_fold", 0)))
     raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
 
 
@@ -260,12 +289,18 @@ def parse_cutmax(j: dict) -> CutMaxCfg:
         for k in ("c", "m", "x_scale", "newton"):
             if len(j[k]) != T:
                 raise ValueError("cutmax calib: ragged/empty schedule arrays")
+        for k in ("out_scale", "newton_carry"):
+            if len(j.get(k, ())) not in (0, T):
+                raise ValueError(f"cutmax calib: {k} needs one factor per iteration")
         iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]), 0.0, 0, 0,
                                  x_scale=float(j["x_scale"][i]), newton=_steps(j["newton"][i])) for i in range(T))
         return CutMaxCfg(iters=iters, entry_scale=float(j["entry_scale"]), sum_scale=float(j["sum_scale"]),
                          sum_newton=_steps(j["sum_newton"]), spru_mean=int(j.get("spru_mean", 0)),
                          newton_fold=int(j.get("newton_fold", 0)), conj_once=int(j.get("conj_once", 0)),
-                         entry_dd=int(j.get("entry_dd", 0)))
+                         entry_dd=int(j.get("entry_dd", 0)),
+                         out_scale=tuple(float(s) for s in j.get("out_scale", ())),
+                         newton_carry=tuple(float(s) for s in j.get("newton_carry", ())),
+                         lm_centre=int(j.get("lm_centre", 0)))
     for k in ("c", "m", "s2_hi", "passes", "ex2", "chord_a", "chord_b", "cascade_iters"):
         if len(j[k]) != T:
             raise ValueError("cutmax calib: ragged/empty schedule arrays")

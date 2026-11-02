@@ -8,15 +8,22 @@ use crate::program::{Kind, Op, Program, Var, VarId};
 use pc_shadow::{ChainShape, Shadow};
 use std::collections::HashMap;
 
-/// The deepest level a fused product may sit at (the runtime's tables start at top 6).
+/// The deepest level a fused product may sit at on a chain of uniform levels (the runtime's tables start at top 6).
 pub const MAX_LEVEL: u32 = 44;
 
-/// Whether the rescale that lands at `level` drops a pair of primes on `chain` (the real chain's shape: the compile's
-/// shadow runs an alternating user region's levels on its uniform grid), the only rescale the runtime's tables fuse:
-/// every one on a chain of uniform levels, on an alternating user region (`ChainShape::singles`) not its one-prime
-/// levels'.
-fn pair_rescale(chain: &ChainShape, level: u32) -> bool {
-    chain.singles == 0 || matches!((level.checked_sub(chain.unit).and_then(|l| chain.primes_dropped(l)), chain.primes_dropped(level)), (Some(a), Some(b)) if b == a + 2)
+/// Whether the runtime's tables (`pc_gpu::relin::RelinRescaler`) fuse the rescale that lands at `level` on `chain` (the
+/// real chain's shape: the compile's shadow runs an alternating user region's levels on its uniform grid): on a chain
+/// of uniform levels every one down to `MAX_LEVEL`; on an alternating user region (`ChainShape::singles`) every
+/// rescale that drops one prime or two from a top limb of at least 3 (its levels sit on a virtual grid, so the deepest
+/// level is the chain's, not `MAX_LEVEL`).
+fn served(chain: &ChainShape, level: u32) -> bool {
+    if chain.singles == 0 {
+        return level <= MAX_LEVEL + chain.unit;
+    }
+    match (level.checked_sub(chain.unit).and_then(|l| chain.primes_dropped(l)), chain.primes_dropped(level)) {
+        (Some(a), Some(b)) => (b == a + 1 || b == a + 2) && chain.top_max().checked_sub(a).is_some_and(|t| t >= 3),
+        _ => false,
+    }
 }
 
 pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
@@ -47,7 +54,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
             Kind::Mult if op.ins.len() == 2 && op.ins[0] != op.ins[1] => false,
             _ => continue,
         };
-        if op.outs.len() != 1 || p.vars[op.ins[0] as usize].meta.level > MAX_LEVEL {
+        if op.outs.len() != 1 || !served(chain, p.vars[op.ins[0] as usize].meta.level + sh.unit()) {
             continue;
         }
         let v = op.outs[0];
@@ -87,7 +94,7 @@ pub fn fuse(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize {
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let want = p.vars[r as usize].meta;
-        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || outs[0].level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, outs[0].level) {
+        if outs[0].level != want.level || outs[0].deg != want.deg || outs[0].nf.to_bits() != want.nf.to_bits() || !served(chain, outs[0].level) {
             continue;
         }
         gone.push(j);
@@ -195,7 +202,7 @@ pub fn fuse_preludes(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize 
         let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
         let Ok((_, outs)) = rule(sh, &Kind::MultRescale { square, dbl: false, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
         let wm = outs[0];
-        if wm.level > MAX_LEVEL + sh.unit() || !pair_rescale(chain, wm.level) {
+        if !served(chain, wm.level) {
             continue;
         }
         let mut cins = c.ins.clone();
@@ -219,6 +226,185 @@ pub fn fuse_preludes(p: &mut Program, sh: &Shadow, chain: &ChainShape) -> usize 
         let c = &mut p.ops[j];
         c.ins = cins;
         c.pre = npre;
+        n += 1;
+    }
+    n
+}
+
+/// Eager rescales: a product (`Mult` / `Square`) whose value only flows through rescale-commuting ops (conjugations,
+/// rotations, rotate-sums, negations, products by i, constant adds, and adds / subs of two such values) into readers
+/// that each pay its rescale as their only prelude on it (a Goldschmidt round's `x y + conj(x y) + c`, a pending
+/// square read by several products) becomes a `MultRescale` (fused where the runtime's tables serve the top, else its
+/// relinearization and rescale one after the other): those ops then run a level lower on the rescaled values and the
+/// readers drop their rescale. Rescaling commutes with them up to rounding (the constants encoded at the lower scale,
+/// one rounding of the product in place of one per reader): the same value, not bit-identical. The original vars stay
+/// in the fused list at their planned states (the plan's pins); the ops write new `~er` vars. Run after `fuse_preludes`.
+pub fn early(p: &mut Program, sh: &Shadow) -> usize {
+    use pc_shadow::{Operand, Prelude};
+    use std::collections::{BTreeMap, BTreeSet};
+    let pos_of = |o: Operand| if o == Operand::A { 0usize } else { 1 };
+    let limit = sh.cfg.bts.level_limit;
+    let outputs: BTreeSet<VarId> = p.outputs.iter().copied().collect();
+    let consumers = |p: &Program| -> HashMap<VarId, Vec<usize>> {
+        let mut cons: HashMap<VarId, Vec<usize>> = HashMap::new();
+        for (i, op) in p.ops.iter().enumerate() {
+            for v in op.all_ins() {
+                let c = cons.entry(v).or_default();
+                if c.last() != Some(&i) {
+                    c.push(i);
+                }
+            }
+        }
+        cons
+    };
+    // a rescale-commuting op with no prelude: unary, or an add / sub of two region values (checked below; an outside
+    // operand would need its own rescale, which measured slower than the readers' rescales it saves)
+    let linear = |op: &Op| -> bool {
+        op.pre.is_empty()
+            && op.outs.len() == 1
+            && match op.kind {
+                Kind::Conjugate | Kind::Rotate(_) | Kind::RotateSum(_) | Kind::Negate | Kind::MultI | Kind::AddConst(_) => op.ins.len() == 1,
+                Kind::Add | Kind::Sub => op.ins.len() == 2,
+                _ => false,
+            }
+    };
+    let mut cons = consumers(p);
+    // region ops already rewritten (a rescaled value's ops are not rescaled again); a sink may later be a product
+    let mut done: BTreeSet<usize> = BTreeSet::new();
+    let mut n = 0;
+    'prod: for i in 0..p.ops.len() {
+        let op = &p.ops[i];
+        let square = match op.kind {
+            Kind::Square if op.ins.len() == 1 => true,
+            Kind::Mult if op.ins.len() == 2 && op.ins[0] != op.ins[1] => false,
+            _ => continue,
+        };
+        if op.outs.len() != 1 || done.contains(&i) {
+            continue;
+        }
+        let v = op.outs[0];
+        // the region: vars reachable through rescale-commuting ops; sinks: readers whose only prelude on it is a Rescale
+        let mut vars = vec![v];
+        let mut region: Vec<usize> = vec![];
+        let mut sinks: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut q = 0;
+        while q < vars.len() {
+            let x = vars[q];
+            q += 1;
+            if outputs.contains(&x) || vars.len() > 24 {
+                continue 'prod;
+            }
+            for &j in cons.get(&x).map(|c| c.as_slice()).unwrap_or(&[]) {
+                let c = &p.ops[j];
+                if done.contains(&j) {
+                    continue 'prod;
+                }
+                if linear(c) {
+                    if !region.contains(&j) {
+                        region.push(j);
+                        vars.push(c.outs[0]);
+                    }
+                    continue;
+                }
+                if matches!(c.kind, Kind::Batched(_) | Kind::Rescale | Kind::Bootstrap(_) | Kind::Finish { .. } | Kind::CoeffSum { .. } | Kind::MultRescale { .. } | Kind::MultSum { .. }) || c.outs.len() != 1 {
+                    continue 'prod;
+                }
+                let ks: Vec<usize> = c.ins.iter().enumerate().filter(|(_, &y)| y == x).map(|(k, _)| k).collect();
+                if ks.len() != 1 || ks[0] > 1 || (c.ins.len() == 2 && c.ins[0] == c.ins[1]) {
+                    continue 'prod;
+                }
+                let k = ks[0];
+                let on: Vec<&Prelude> = c.pre.iter().filter(|y| match y {
+                    Prelude::Rescale(o) | Prelude::DropTo(o, _) | Prelude::ScalarAdjust(o, _) => pos_of(*o) == k,
+                }).collect();
+                if on.len() != 1 || !matches!(on[0], Prelude::Rescale(_)) {
+                    continue 'prod;
+                }
+                let e = sinks.entry(j).or_default();
+                if !e.contains(&k) {
+                    e.push(k);
+                }
+            }
+        }
+        if sinks.is_empty() || (region.is_empty() && sinks.len() < 2) {
+            continue;
+        }
+        let vset: BTreeSet<VarId> = vars.iter().copied().collect();
+        region.sort();
+        if region.iter().any(|&j| j < i || p.ops[j].ins.iter().any(|y| !vset.contains(y))) || sinks.keys().any(|&j| region.contains(&j) || j <= i) {
+            continue;
+        }
+        // the product rescaled, then every region op re-derived on the rescaled values (no prelude), every sink without
+        // its rescale and with its outputs unchanged
+        let ins_m: Vec<_> = op.ins.iter().map(|&x| p.vars[x as usize].meta).collect();
+        let Ok((ppre, pouts)) = rule(sh, &Kind::MultRescale { square, dbl: false, fused: vec![] }, &ins_m, &p.pt_refs, &p.bts_sites) else { continue };
+        if ppre != op.pre || pouts[0].level >= limit {
+            continue;
+        }
+        let mut map: BTreeMap<VarId, VarId> = BTreeMap::new();
+        let mut metas: BTreeMap<VarId, pc_shadow::CtMeta> = BTreeMap::new();
+        let mut names: Vec<(VarId, String)> = vec![];
+        let mut next = p.vars.len() as VarId;
+        let mut fresh = |x: VarId, map: &mut BTreeMap<VarId, VarId>, names: &mut Vec<(VarId, String)>| {
+            let w = next;
+            next += 1;
+            map.insert(x, w);
+            names.push((w, format!("{}~er", p.vars[x as usize].name)));
+            w
+        };
+        let w = fresh(v, &mut map, &mut names);
+        metas.insert(w, pouts[0]);
+        let meta_of = |x: VarId, map: &BTreeMap<VarId, VarId>, metas: &BTreeMap<VarId, pc_shadow::CtMeta>| map.get(&x).and_then(|y| metas.get(y)).copied().unwrap_or(p.vars[x as usize].meta);
+        for &j in &region {
+            let c = &p.ops[j];
+            let m: Vec<_> = c.ins.iter().map(|&x| meta_of(x, &map, &metas)).collect();
+            let Ok((pre, outs)) = rule(sh, &c.kind, &m, &p.pt_refs, &p.bts_sites) else { continue 'prod };
+            if !pre.is_empty() || outs[0].level >= limit {
+                continue 'prod;
+            }
+            let o = fresh(c.outs[0], &mut map, &mut names);
+            metas.insert(o, outs[0]);
+        }
+        let mut snk = vec![];
+        for (&j, ks) in &sinks {
+            let c = &p.ops[j];
+            let m: Vec<_> = c.ins.iter().map(|&x| meta_of(x, &map, &metas)).collect();
+            let Ok((npre, nouts)) = rule(sh, &c.kind, &m, &p.pt_refs, &p.bts_sites) else { continue 'prod };
+            let old: Vec<Prelude> = c.pre.iter().copied().filter(|y| !matches!(y, Prelude::Rescale(o) if ks.contains(&pos_of(*o)))).collect();
+            let same = nouts.len() >= c.outs.len()
+                && c.outs.iter().zip(&nouts).all(|(&o, n)| {
+                    let want = p.vars[o as usize].meta;
+                    n.level == want.level && n.deg == want.deg && n.nf.to_bits() == want.nf.to_bits()
+                });
+            if npre != old || !same {
+                continue 'prod;
+            }
+            snk.push((j, npre));
+        }
+        // apply
+        for (w, name) in &names {
+            p.vars.push(Var { name: name.clone(), meta: metas[w], slot: None });
+        }
+        let fused: Vec<VarId> = map.keys().copied().collect();
+        let op = &mut p.ops[i];
+        op.kind = Kind::MultRescale { square, dbl: false, fused };
+        op.outs = vec![map[&v]];
+        op.inplace = false;
+        for &j in &region {
+            let c = &mut p.ops[j];
+            c.ins = c.ins.iter().map(|x| *map.get(x).unwrap_or(x)).collect();
+            c.outs = c.outs.iter().map(|x| *map.get(x).unwrap_or(x)).collect();
+            c.inplace = false;
+            done.insert(j);
+        }
+        for (j, npre) in snk {
+            let c = &mut p.ops[j];
+            c.ins = c.ins.iter().map(|x| *map.get(x).unwrap_or(x)).collect();
+            c.pre = npre;
+            c.inplace = false;
+        }
+        done.insert(i);
+        cons = consumers(p);
         n += 1;
     }
     n

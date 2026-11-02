@@ -13,13 +13,13 @@ import numpy as np
 
 from .config import REF_PREV, REF_SELF, REF_SINK, SoftmaxCfg, ref_key
 from .layout import Dims
-from .layout import (active_mask, complex_vlane_mask, hrs_pos0, qkt_complex_odd_mask,
-                     qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
+from .layout import (active_mask, complex_vlane_mask, hrs_pos0, pair_offsets, pair_pack_mask, pair_pos, pair_tx,
+                     qkt_complex_odd_mask, qkt_group_mask, real_head_half_mask, real_head_tok0_mask, score_mask,
                      stride_mask, vlane_mask, vpair_mask_complex)
 from .linear import linear, linear_multi
 from . import smcheb
-from .poly import (eval_chebyshev, goldschmidt_inv_ndf, goldschmidt_recip, im_cleanse, rotsum,
-                   rotsum_neg)
+from .poly import (cheb_mask_scales, cheb_mask_scales_terms, eval_chebyshev, eval_chebyshev_masked, goldschmidt_inv_ndf,
+                   goldschmidt_recip, im_cleanse, rotsum, rotsum_neg)
 
 
 def sm_periodic(rt, kc: int) -> int:
@@ -51,6 +51,46 @@ def _key_lanes(d, cfg, kc: int) -> int:
     if w and w < d.t and (w & (w - 1)) == 0 and 0 < kc <= w:
         return w
     return d.t
+
+
+def _pair(rt, cfg, kc: int) -> bool:
+    """SoftmaxCfg.pair_heads at kc keys: the key window is t/2 lanes (_key_lanes) on tH-periodic scores of one group
+    (SM_PERIODIC=1), so two heads share a t-lane block (layout.pair_src) and the softmax runs tH/2-periodic. complex_qkt
+    packs its scores into that layout (no level: the pack's selectors ride the group mask), the softmax's masks are
+    the paired ones, and complex_softmax_v pairs the summed V the same way and unpacks its output to the tok0 slots."""
+    if cfg is None or not int(getattr(cfg, "pair_heads", 0) or 0):
+        return False
+    d = rt.dims
+    return (sm_periodic(rt, kc) == 1 and not _general(rt) and d.H % 2 == 0
+            and 2 * _key_lanes(d, cfg, kc) == d.t)
+
+
+def _pair_item(d, item):
+    """A tH-layout mask item in the paired layout."""
+    key, build = item
+    return (key + ("pair",) if isinstance(key, tuple) else (key, "pair")), lambda: pair_tx(d, build())
+
+
+def _pack_items(d, item):
+    """The pack terms of a tH-layout mask item applied to a tH-periodic ciphertext: one per pair_offsets step."""
+    key, build = item
+    base = key if isinstance(key, tuple) else (key,)
+    return [(base + ("pk", k), lambda k=k: pair_pack_mask(d, build(), k)) for k in pair_offsets(d)]
+
+
+def _pack(rt, rots, item):
+    """sum_k pack_k(mask) * rotate(x, k) over rots = {k: rotate(x, k)}: x times the mask, in the paired layout."""
+    items = _pack_items(rt.dims, item)
+    ks = list(pair_offsets(rt.dims))
+    return rt.mult_mask_sum([rots[k] for k in ks], [i[0] for i in items], [i[1] for i in items])
+
+
+def _pack_rots(rt, x):
+    """{k: rotate(x, k)} for the pack's steps (one hoisted decomposition)."""
+    ks = [k for k in pair_offsets(rt.dims) if k]
+    out = dict(zip(ks, rt.ops.rotate_many(x, ks)))
+    out[0] = x
+    return out
 
 
 def _gp_scope(rt, per: int):
@@ -99,11 +139,20 @@ def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
             and not getattr(rt.ops, "fused_sm_den", False)):
         return []
     item = _hrs_pack_item if getattr(rt.ops, "hrs_pack", False) else _hrs_seed_item
-    return [item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
-            for k, (_a, beta, _i, scale, _c) in enumerate(_recip_rounds_ops(rt.ops, cfg, kc))]
+    items = [item(rt.dims, 0.5 * beta * scale * scale, _seed_site(cfg, k))
+             for k, (_a, beta, _i, scale, _c) in enumerate(_recip_rounds_ops(rt.ops, cfg, kc))]
+    return [_pair_item(rt.dims, i) for i in items] if _pair(rt, cfg, kc) else items
 
 
-def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)):
+def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0), pair: bool = False):
+    if pair:
+        # the paired layout: every item transformed, but the centred score mask, whose broadcast spill lands where
+        # the paired ladder puts it (_ref_score_mask_pair)
+        items = [_pair_item(d, i) for i in _softmax_mask_items(d, cfg, kc, per, affine)]
+        if cfg.ref_keys and _ref_covers(d, cfg, kc):
+            al, be = affine
+            items[0] = (items[0][0][:-1] + ("pairref",), lambda: al * _ref_score_mask_pair(d, cfg, kc) - be)
+        return items
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sfx = (".p" if per == 1 else f".p{int(per)}") if per else ""
     al, be = affine
@@ -117,7 +166,21 @@ def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0)
     else:
         score = (("sm.score" + sfx, cfg.clip_lo, mean, kc, "affine", al, be),
                  lambda: al * score_mask(d, cfg.clip_lo, mean, kc, periodic=per) - be)
-    return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+    if not cfg.exp_mask_fold:
+        return [score, (("sm.active" + sfx, kc), lambda: active_mask(d, kc, periodic=per))]
+    # exp_mask_fold: the active mask's p-th root (p = 2^log2delta1, the exp's squarings) on the Chebyshev's giants and
+    # last leaf, one item per scale cheb_mask_scales gives (a constant quotient rides its giant's mask)
+    p = 2 ** cfg.log2delta1
+    return [score] + [(("sm.activef" + sfx, kc, p, sc), lambda sc=sc: sc * active_mask(d, kc, periodic=per) ** (1.0 / p))
+                      for sc in _exp_fold_scales(cfg)]
+
+
+def _exp_fold_scales(cfg: SoftmaxCfg):
+    """exp_mask_fold 1: the masked series' scales; 2: also the leaves that take the mask term by term (their
+    coefficients, added or multiplied: poly leaf_terms="budget"), so a series with no leaf slack keeps its depth."""
+    if cfg.exp_mask_fold == 2:
+        return cheb_mask_scales_terms(cfg.cheb_coeffs)
+    return cheb_mask_scales(cfg.cheb_coeffs)
 
 
 # ── reference-key centring (cfg.ref_keys) ──
@@ -170,6 +233,23 @@ def _ref_score_mask(d, cfg: SoftmaxCfg, kc: int, mean: float, per):
     return out
 
 
+def _ref_score_mask_pair(d, cfg: SoftmaxCfg, kc: int):
+    """_ref_score_mask in the paired layout: the forward ladder copies a reference down over ref_window slots of the
+    paired period, spilling onto key slots kc.. of the half block before (empty: their score takes the active
+    constant, the active mask zeroes them after the exp)."""
+    _ref_check(d, cfg, kc)
+    mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+    out = pair_tx(d, score_mask(d, cfg.clip_lo, mean, kc, periodic=1))
+    P = d.tH // 2
+    blk = np.arange(0, d.N, P)
+    for kind in (REF_SELF, REF_PREV):
+        for h in _ref_heads(d, cfg, kind):
+            top = pair_pos(d, h, _ref_top(cfg, kind, kc))
+            for j in range(cfg.ref_window):
+                out[blk + (top - j) % P] = -mean
+    return out
+
+
 def _ref_push_item(d, kc: int):
     """The K push's copy of key 0 into k_ref: the push mask at the first token, zero after."""
     if kc == 1:
@@ -188,26 +268,29 @@ def _ref_sel_item(d, cfg: SoftmaxCfg, kc: int, kind: int, scale: float):
 
 
 def _ref_broadcast(rt, result, cfg: SoftmaxCfg, kc: int, scale: float):
-    """(s_r - s_0) of the self / prev heads over their key slots (None when every head is centred on key 0)."""
+    """(s_r - s_0) of the self / prev heads over their key slots (None when every head is centred on key 0).
+    `result` a dict {k: rotate(raw, k)}: the paired layout (the selectors packed)."""
     ops, d = rt.ops, rt.dims
     x = None
     for kind in (REF_SELF, REF_PREV):
         if not _ref_heads(d, cfg, kind):
             continue
-        sel = rt.mult_mask(result, *_ref_sel_item(d, cfg, kc, kind, scale))
+        item = _ref_sel_item(d, cfg, kc, kind, scale)
+        sel = _pack(rt, result, item) if isinstance(result, dict) else rt.mult_mask(result, *item)
         if kind == REF_PREV:
             sel = ops.rotate(sel, -1)
         x = sel if x is None else ops.add(x, sel)
     return None if x is None else rotsum(ops, x, 1, cfg.ref_window)
 
 
-def _ref_step_items(d, cfg: SoftmaxCfg, kc: int, scale: float):
+def _ref_step_items(d, cfg: SoftmaxCfg, kc: int, scale: float, pair: bool = False):
     if not cfg.ref_keys or not _ref_covers(d, cfg, kc):
         return []
     items = [_ref_push_item(d, kc)]
     for kind in (REF_SELF, REF_PREV):
         if _ref_heads(d, cfg, kind):
-            items.append(_ref_sel_item(d, cfg, kc, kind, scale))
+            it = _ref_sel_item(d, cfg, kc, kind, scale)
+            items += _pack_items(d, it) if pair else [it]
     return items
 
 
@@ -523,6 +606,9 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         _ref_check(d, cfg, kc)
         if per != 1 or merge or kv.k_buckets:
             raise ValueError("reference-key centring needs one pending K group of tH-periodic scores")
+    pair = _pair(rt, cfg, kc) and not merge
+    if pair and (kv.k_buckets or len(kv.k_pend) != 1):
+        raise ValueError("pair_heads needs one pending K group")
     for j, pend in enumerate(kv.k_pend):
         g = 2 * len(kv.k_buckets) + j
         result = ops.mult(q, pend)
@@ -530,23 +616,61 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         if per:
             result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
         n = min(d.t, kc - g * d.t)
-        raw = result
-        result = rt.mult_mask(result, *_group_mask_item(d, n, g0 + g, per_m, scale))
+        raw = _pack_rots(rt, result) if pair else result
+        item = _group_mask_item(d, n, g0 + g, per_m, scale)
+        result = _pack(rt, raw, item) if pair else rt.mult_mask(result, *item)
         if centred:
             ref = _ref_broadcast(rt, raw, cfg, kc, scale)
             if ref is not None:
                 result = ops.sub(result, ref)
         accum(im_cleanse(ops, result))
+    if pair:
+        attn = ops.tag_reduce(attn, d.tH // 2)                  # the paired scores repeat every tH/2 slots
     return attn
 
 
-def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0):
+def _pair_v(rt, vs):
+    """The summed V (tH layout) paired: vs + rotate(vs, H/2 t - t/2), no mask, no level. V is zero off the key window
+    (lanes t/2..t-1) and on the padded heads, so on the first tH/2 slots of every tH block the sum is exactly the paired
+    V (head h + H/2 lands on lanes t/2.. of block h); the second tH/2 slots hold heads H/2.. of the tH layout, whose
+    products with P only reach the lane-0 slots of blocks H/2.., which the output unpack's masks leave out."""
+    d = rt.dims
+    return rt.ops.add(vs, rt.ops.rotate(vs, (d.H // 2) * d.t - d.t // 2))
+
+
+def _unpair_items(d):
+    """{k: the tok0 half mask of the heads whose paired output slot sits k slots past their tok0 slot}, k = src - dst."""
+    out = {}
+    for h in range(d.H_real):
+        src = pair_pos(d, h, 0)
+        m = out.setdefault(src - h * d.t, np.zeros(d.N))
+        m[np.arange(d.d_head_real) * d.tH + src] = 0.5
+    return out
+
+
+def _unpair_out(rt, res):
+    """The paired P.V output (lane 0 of each half block) moved to the tok0 slots, at the tok0 half mask's value: one
+    mask per offset at the mask's level, the moved terms rotated after it."""
+    ops, d = rt.ops, rt.dims
+    out = None
+    for k in sorted(_unpair_items(d), key=abs):
+        x = rt.mult_mask(res, ("tok0.h.pair", k), lambda k=k: _unpair_items(d)[k])
+        if k:
+            x = ops.rotate(x, k)
+        out = x if out is None else ops.add(out, x)
+    return out
+
+
+def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0, pair: bool = False):
     """complex_softmax_v: pair the scores of lanes 2j and 2j+1 as s_2j - i s_2j+1, so one
     product with the V pair bucket sums both lanes on the real axis; hoisted rotations feed
-    the pair products, then the token ladder, 2 Re and the tok0 half mask."""
+    the pair products, then the token ladder, 2 Re and the tok0 half mask.
+    `pair` (_pair): P is in the paired layout; the summed V is paired the same way (_pair_v), the output unpacked."""
     ops, d = rt.ops, rt.dims
     n_pairs = d.d_head_real // 2
     per = sm_periodic(rt, kv.k_count)
+    if pair and per != 1:
+        raise ValueError("pair_heads needs tH-periodic scores of one group")
     if per and _general(rt):
         # SM_PERIODIC=2 (every Gp, 1 included): pair j's rotation 2j tH only matters mod Gp, so the buckets of each
         # class are summed and each class takes one product
@@ -577,9 +701,13 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0):
         vs = ops.copy(kv.v_buckets[0])
         for b in kv.v_buckets[1:n_pairs]:
             ops.inplace_add(vs, b)
+        if pair:
+            vs = _pair_v(rt, vs)
         res = ops.mult(vs, ops.sub(probs, ops.mult_i(probs)))
         res = rotsum(ops, res, 1, lanes or d.t)          # `lanes`: the keys' window (_key_lanes)
         res = im_cleanse(ops, res)
+        if pair:
+            return _unpair_out(rt, res)
         return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
     scores_b = ops.copy(probs)
     rot1 = ops.rotate(scores_b, d.tH)
@@ -691,7 +819,7 @@ def fold_sm_prescale(copies: float, s0_expected: float) -> float:
 
 
 def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, seed: float | None = None,
-                    seed_site: str = "hrs.seed", lanes: int = 0):
+                    seed_site: str = "hrs.seed", lanes: int = 0, pair: bool = False):
     """cachemir_attention.cu: per-head total broadcast over the head's t slots and
     over the lane copies. With FUSED_SM_DEN the lane-copy ladder stops at the sparse slot
     count and a fold bootstrap finishes it (the denominator comes out refreshed);
@@ -704,6 +832,12 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     partial sums, which repeat only every Gp tH slots: the sparse refresh returned them wrong (Llama past 256 keys)."""
     ops, d = rt.ops, rt.dims
     lanes = lanes if (lanes and periodic == 1 and not _general(rt)) else d.t   # `lanes`: the keys' window (_key_lanes)
+    # `pair` (_pair): x is in the paired layout (tH/2-periodic, a head per t/2-lane half block): the head ladder and the
+    # replicate run over the half block as they do over the key window, the position masks are the paired ones
+    pi = (lambda it: _pair_item(d, it)) if pair else (lambda it: it)
+    if pair and (periodic != 1 or 2 * lanes != d.t):
+        raise ValueError("pair_heads: the head sum needs tH-periodic scores on a t/2-lane key window")
+    per_t = getattr(rt, "gq_merge", 1) * d.tH // (2 if pair else 1)
     if periodic and _general(rt):
         with _gp_scope(rt, periodic):
             if periodic > 1:
@@ -713,25 +847,25 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         if ops.fused_sm_den:
             raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
         # SM_HRS_PACK: one replicate ladder for both sums (the input is real), split by one conjugation
-        z = rotsum_neg(ops, rt.mult_mask(out, *_hrs_pack_item(d, seed, seed_site)), lanes)
+        z = rotsum_neg(ops, rt.mult_mask(out, *pi(_hrs_pack_item(d, seed, seed_site))), lanes)
         cz = ops.conjugate(z)
         h = ops.mult_i(ops.sub(cz, z))
         out = ops.add(z, cz)
     else:
         if seed is not None:
             tot = out
-        out = rt.mult_mask(out, "hrs.pos0", lambda: hrs_pos0(d))
+        out = rt.mult_mask(out, *pi(("hrs.pos0", lambda: hrs_pos0(d))))
         out = rotsum_neg(ops, out, lanes)
         if seed is not None:
             if ops.fused_sm_den:
                 raise ValueError("SM_FOLD=1 does not combine with FUSED_SM_DEN=1")
-            h = rotsum_neg(ops, rt.mult_mask(tot, *_hrs_seed_item(d, seed, seed_site)), lanes)
+            h = rotsum_neg(ops, rt.mult_mask(tot, *pi(_hrs_seed_item(d, seed, seed_site))), lanes)
     if seed is not None:
         if not periodic:
             h = rotsum(ops, h, d.tH, d.N)
         elif _general(rt):
             h = _gp_out(rt, h)
-        h = ops.tag_reduce(h, getattr(rt, "gq_merge", 1) * d.tH)
+        h = ops.tag_reduce(h, per_t)
     if periodic:
         if ops.fused_sm_den:
             raise ValueError("SM_PERIODIC=1 does not combine with FUSED_SM_DEN=1")
@@ -745,8 +879,8 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         ops.fold_bootstrap(out, s_eff, 1, p)
     else:
         out = rotsum(ops, out, d.tH, d.N)
-    # tH-periodic (G tH for merged GQA scores)
-    out = ops.tag_reduce(out, getattr(rt, "gq_merge", 1) * d.tH)
+    # tH-periodic (G tH for merged GQA scores; tH/2 paired)
+    out = ops.tag_reduce(out, per_t)
     return out if seed is None else (out, h)
 
 
@@ -754,19 +888,24 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
     affine = sm_fold_affine(rt, cfg) if folded else (1.0, 0.0)   # `folded`: q.K^T already applied alpha (mha)
-    score_item, active_item = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine)
-    ct = rt.add_mask(scores, *score_item)
+    items = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine, _pair(rt, cfg, kc))
+    ct = rt.add_mask(scores, *items[0])
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     if not cfg.cheb_coeffs:
         raise ValueError("softmax: cfg.cheb_coeffs is empty (only the Chebyshev exp is ported)")
-    if affine != (1.0, 0.0):    # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
-        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, -1.0, 1.0)
+    # the scores arrive as alpha x - beta (SM_FOLD): the identity map costs no level
+    a, b = (-1.0, 1.0) if affine != (1.0, 0.0) else (cfg.cheb_a / sf, cfg.cheb_b / sf)
+    if cfg.exp_mask_fold:       # the active mask's root rides the series: (p M^(1/2^s))^(2^s) = p^(2^s) M
+        fold = dict(zip(_exp_fold_scales(cfg), items[1:]))
+        z = eval_chebyshev_masked(ops, ct, cfg.cheb_coeffs, a, b, None, lambda c, sc: rt.mult_mask(c, *fold[sc]),
+                                  (lambda c, sc: rt.add_mask(c, *fold[sc])) if cfg.exp_mask_fold == 2 else None,
+                                  leaf_terms="budget")
     else:
-        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, a, b)
     for _ in range(cfg.log2delta1):
         z = ops.square(z)
     z = im_cleanse(ops, z)
-    return rt.mult_mask(z, *active_item)
+    return z if cfg.exp_mask_fold else rt.mult_mask(z, *items[1])
 
 
 def first_iters(cfg: SoftmaxCfg, lean: bool) -> int:
@@ -784,16 +923,30 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     ops = rt.ops
     fold = getattr(ops, "sm_fold", False) and not getattr(ops, "fused_sm_den", False)
     lanes = _key_lanes(rt.dims, cfg, kc)
+    pair = _pair(rt, cfg, kc)
+    # SoftmaxCfg.gs_num: each round's scores ride the reciprocal's packed recursion (poly.goldschmidt_recip num=):
+    # no final product, and between rounds' starts the state is one ciphertext, so a refresh can sit inside a round
+    fold_num = bool(int(getattr(cfg, "gs_num", 0) or 0))
+    if fold_num and not (ops.complex_payload and getattr(ops, "sm_cheb_gs", False)):
+        raise ValueError("gs_num needs a complex payload and SM_CHEB_GS=1")
     for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
         if k:
             z = ops.square(im_cleanse(ops, y))
         if fold:
             s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
-                                    seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k), lanes=lanes)
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
+                                    seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k), lanes=lanes,
+                                    pair=pair)
+            if fold_num:
+                y = goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb, num=z)
+            else:
+                y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, Dh=sh, cheb=cheb))
         else:
-            s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc), lanes=lanes)
-            y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
+            s = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc), lanes=lanes,
+                                pair=pair)
+            if fold_num:
+                y = goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb, num=z)
+            else:
+                y = ops.mult(z, goldschmidt_recip(ops, s, alpha, beta, iters, scale, cheb=cheb))
     return y
 
 
@@ -804,6 +957,8 @@ def softmax_thor(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     z = _thor_exp(rt, scores, cfg, kc, folded)
     if ops.sm_den_recip:
         return _softmax_recip(rt, z, cfg, kc)
+    if _pair(rt, cfg, kc):
+        raise ValueError("pair_heads needs SM_DEN_RECIP=1")
     if getattr(ops, "sm_cheb_gs", False):
         raise ValueError("SM_CHEB_GS=1 needs SM_DEN_RECIP=1")
     s = head_reduce_sum(rt, z, s0_expected=2.0 / cfg.init_alpha, periodic=sm_periodic(rt, kc))
@@ -930,6 +1085,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     cplx = isinstance(kv, ComplexKVCache)
     if not cplx:
         uncentred_only(sm_cfg, "mha on the real packing")
+        if getattr(sm_cfg, "pair_heads", 0):
+            raise ValueError("pair_heads needs the complex-packed decode (complex_qkt)")
     qkvl = cplx and getattr(ops, "kv_lanes", False) and getattr(ops, "qkv_lanes", False)
     with rt.step("qkv"):
         # QKV_LANES: the hint fires only past the session limit; at or under it the linear runs on the LayerNorm
@@ -962,8 +1119,8 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
         probs = softmax_thor(rt, scores, sm_cfg, kv.k_count, folded)
     tap("attn.probs", probs)
     with rt.step("softmax_v"):
-        x = complex_softmax_v(rt, kv, probs, _key_lanes(rt.dims, sm_cfg, kv.k_count)) if cplx \
-            else softmax_v(rt, kv, probs)
+        x = complex_softmax_v(rt, kv, probs, _key_lanes(rt.dims, sm_cfg, kv.k_count),
+                              pair=_pair(rt, sm_cfg, kv.k_count)) if cplx else softmax_v(rt, kv, probs)
     tap("attn.pv", x)
     with rt.step("out_proj"):
         ops.bootstrap_hint(x, ops.headroom(1), True)
@@ -1061,8 +1218,9 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     d = rt.dims
     per = sm_periodic(rt, kc)
     affine = sm_fold_affine(rt, cfg)
-    items = (_softmax_mask_items(d, cfg, kc, per, affine) + _fold_mask_items(rt, cfg, kc)
-             + _ref_step_items(d, cfg, kc, affine[0]))
+    pair = _pair(rt, cfg, kc)
+    items = (_softmax_mask_items(d, cfg, kc, per, affine, pair) + _fold_mask_items(rt, cfg, kc)
+             + _ref_step_items(d, cfg, kc, affine[0], pair))
     Nb = kc // (2 * d.t)
     G = (kc + d.t - 1) // d.t
     for gc in range(Nb):
@@ -1074,7 +1232,8 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
             items.append(_odd_mask_item(d, n, go, affine[0], per))
     for g in range(2 * Nb, G):
         n = min(d.t, kc - g * d.t)
-        items.append(_group_mask_item(d, n, g, per, affine[0]))
+        it = _group_mask_item(d, n, g, per, affine[0])
+        items += _pack_items(d, it) if pair else [it]
     rr = pos_in_group
     c = (kc - 1) // d.t                     # the push's v_count // t
     for p in range(d.d_head_real // 2):

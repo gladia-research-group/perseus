@@ -21,7 +21,7 @@ from perseus.impl.norm import norm_step_masks
 
 from . import slotcache
 from .block import transformer_block
-from .head import (cutmax_argmax, cutmax_argmax_packed, decode_logits, decode_z, feedback_embed,
+from .head import (centre_lm, cutmax_argmax, cutmax_argmax_packed, decode_logits, decode_z, feedback_embed,
                    final_ln, lm_head, make_ones, pack_tiles)
 from . import weights as W
 
@@ -85,13 +85,19 @@ class Gpt2Model(ImplModel):
             self._lnf = W.final_ln_params(self.store, self.cfgs.ln_f, self.rt.dims, self.fold[2])
         return self._lnf
 
+    def lm_centre(self):
+        return bool(self.cfgs.cutmax is not None and self.cfgs.cutmax.lm_centre)
+
     def lm_tiles(self):
         if self._lm is None:
+            centre = self.lm_centre()
             def build():
                 Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+                Wlm = centre_lm(Wlm, self.vocab) if centre else Wlm
                 return W.lm_head_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, paired=self.complex_packing)
             self._lm = slotcache.cached(self._slot_key(), "lm", (self.rt.dims, self.vocab, self.W_tile,
-                                                                 self.complex_packing, self.fold[2]), build)
+                                                                 self.complex_packing, self.fold[2])
+                                        + (("lm_centre",) if centre else ()), build)
         return self._lm
 
     def fb_tiles(self):

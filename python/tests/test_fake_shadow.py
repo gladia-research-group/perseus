@@ -30,7 +30,7 @@ def test_config_fields_and_presets():
     # plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
     # plan.keep_placements_exact, plan.mag_safety_steps, plan.resume; chain.preset
     # + bts.merge_s2d, bts.stc_ps, bts.em_level_keys
-    assert len(_pc.Config.fields()) == 264 and len(_pc.PlanConfig.fields()) == 98
+    assert len(_pc.Config.fields()) == 269 and len(_pc.PlanConfig.fields()) == 98
     assert all(f["env"] == "" or f"`{f['env']}`" in f["doc"] for f in _pc.Config.fields())
     assert set(config.PRESETS) == {"n32_gpt2_decode", "n32_gpt2_prefill", "n32_llama_decode", "n32_llama_prefill"}
     c = config.preset("n32_gpt2_decode")

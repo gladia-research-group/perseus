@@ -34,10 +34,11 @@ SCORED = 8                                     # Decode-8's first scored positio
 # Decode-8 never holds more than STEPS keys: its plan's softmax and GELU are fitted to positions 0..STEPS-1 (the main
 # decode plan's to 1024-token windows); it runs on the alternating chain n32sp (its runtime line's CHAIN_PRESET:
 # speedrun/make_n32sp_decode_plan.sh)
-DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_lh"
+DECODE_PLAN = "bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7"
 # speedrun/make_prefill_plan.sh's plan with CutMax's scaled normalisers (stage 13 replanned: its PLAN_CMD.txt), on the
-# lean chain n32a4 too (PRESET=n32a4; its runtime line's CHAIN_PRESET)
-PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cm"
+# lean chain n32a4 too (PRESET=n32a4; its runtime line's CHAIN_PRESET), carried onto the attention whose window ladders
+# are one rotation per window (speedrun/make_prefill_wrot_plan.sh, PF_ATTN_WROT=3)
+PREFILL_PLAN = "bootstrap_placements/gpt2_prefill128_n32a4_pfbhrd_cmw_mfsab2q"
 
 
 def write(root, rel, payload):
@@ -114,7 +115,8 @@ def decode(a):
     from perseus.serve import gpt2_decode as served
     args = types.SimpleNamespace(plan=a.plan, chain="n32", layers=None, packing="cachemir_complex",
                                  weights=os.environ["WEIGHTS_PATH"], key_layout="packed", pt_rows=28, stc_cache=8,
-                                 pt_cache=True, work_dir=os.path.join(os.environ.get("HOME", "/tmp"), "speedrun"))
+                                 pt_cache=True, schedule="siblings",
+                                 work_dir=os.path.join(os.environ.get("HOME", "/tmp"), "speedrun"))
     h = served.Gpt2Handler(args)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(a.device)      # the handler exports its own device; the GPU is ours
     man = h.manifest({"tokens": STEPS, "argmax": True, "contract": contract_hash(served._config(args.plan, "n32"))})

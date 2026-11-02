@@ -222,6 +222,7 @@ struct Tables<'t, 'a> {
     pts: &'t [BoundPt],
     finishes: &'t [FinishStep],
     coeff_sums: &'t [CoeffSumStep],
+    mult_sums: &'t [Vec<u32>],
     stream_base: *const f32,
 }
 
@@ -268,6 +269,20 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
         // SAFETY: the frame holds `Bound::streams.total` rows of N floats (StreamRing sized it); bind checked rows
         let rows: Vec<*const f32> = cs.rows.iter().map(|&r| unsafe { t.stream_base.add(r as usize * n) }).collect();
         crd.sum(ctx, &rt.ex.compute, sh, o, &cts, &rows)?;
+        return Ok(());
+    }
+    if let StepOp::MultSum { s } = &st.op {
+        let ms = t.mult_sums.get(*s as usize).ok_or_else(|| rerr(block, format!("mult_sum {s} out of range")))?;
+        if ms.len() < 4 || ms.len() % 2 != 0 || ms.iter().chain(std::iter::once(&st.out)).any(|&x| x as usize >= n_slots) || ms.contains(&st.out) {
+            return Err(rerr(block, format!("mult_sum {s}: {} operand slots, slots outside the {n_slots} bound slots, or the output among them", ms.len())));
+        }
+        // SAFETY: bind checked the slots (< n_slots, output not an operand); the output and `tmp` are the only
+        // mutable references
+        let o: &mut Ct<'a, W> = unsafe { &mut *slots.add(st.out as usize) };
+        let pairs: Vec<(&Ct<'a, W>, &Ct<'a, W>)> = ms.chunks(2).map(|ab| unsafe { (&*slots.add(ab[0] as usize), &*slots.add(ab[1] as usize)) }).collect();
+        let kc = KsCfg { plans: rt.ks, source: rt.source };
+        let key = group(block, t.groups, t.relin)?;
+        rt.ops.mult_sum(ctx, rt.ex, kc, sh, key, o, tmp, &pairs)?;
         return Ok(());
     }
     // SAFETY: indices checked at bind (< slots.len()); `o` is the only mutable reference, and inputs are taken as
@@ -398,6 +413,7 @@ fn exec_step<'a, W: DevWord, M: DevStrategy<W>>(block: &str, rt: &mut Rt<'_, 'a,
         }
         StepOp::Finish { .. } => return Err(rerr(block, "finish step reached the single-output lowering")),
         StepOp::CoeffSum { .. } => return Err(rerr(block, "coeff_sum step reached the single-output lowering")),
+        StepOp::MultSum { .. } => return Err(rerr(block, "mult_sum step reached the single-output lowering")),
         StepOp::Bootstrap { route, kind, .. } => {
             if !st.inplace {
                 copy_ct(ctx, &rt.ex.compute, o, at(st.a))?;
@@ -461,9 +477,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
         let unit = if in_unit {
             None
         } else {
-            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. })));
+            let at = b.unit_at(i).filter(|u| !(stepwise && matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::RotAcc { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. })));
             let unit = at
-                .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh))
+                .filter(|u| unit_fits(u, &b.slots, &b.steps, &b.pts, rt.sh, &rt.routes))
                 .map(|u| (b.unit_of[i], u.hi as usize))
                 .filter(|&(_, e)| e <= hi && sched.is_none_or(|s| s.lane[i..e].iter().all(|&l| l == s.lane[i])));
             if at.is_some_and(|u| matches!(u.kind, UnitKind::Pair { .. })) {
@@ -516,7 +532,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 None
             };
             {
-                let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, stream_base, names, .. } = &mut *b;
+                let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, pts, finishes, coeff_sums, mult_sums, stream_base, names, .. } = &mut *b;
                 let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
                 let r = match unit {
                     Some((u, _)) => {
@@ -532,6 +548,8 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                             // a fused plaintext product and add leaves the key-switching workspaces alone
                             UnitKind::MultPtAdd { .. } => info.fused += 1,
                             UnitKind::MultPtAddChain { ref pts, .. } => info.fused += pts.len(),
+                            UnitKind::Affine { ref steps } => info.fused += steps.len(),
+                            UnitKind::MultIAdd { .. } => info.fused += 1,
                             _ => ks_owner = None,
                         }
                         exec_unit(label, rt, unit, steps, slots.as_mut_ptr(), slots.len(), gather, held.as_mut(), groups, *relin, step_lists, pts, stale)
@@ -540,7 +558,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                         if lane == 0 && !quiet(&steps[i].op) {
                             ks_owner = None;
                         }
-                        let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, stream_base: *stream_base };
+                        let t = Tables { groups, relin: *relin, lists: step_lists, pts, finishes, coeff_sums, mult_sums, stream_base: *stream_base };
                         exec_step(label, rt, &steps[i], slots.as_mut_ptr(), slots.len(), tmp, &t)
                     }
                 };
@@ -626,7 +644,7 @@ fn quiet(op: &StepOp) -> bool {
 /// recipe for every member, so their operands must share level, degree and scale (else the steps issue one by one);
 /// rotations only need one level; a refresh pair's members share level, degree and the StC-first stage cache's scale
 /// key (`nf_key`: the pair's last stage is built for the first member's scale, as a single refresh takes its cached one).
-fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow) -> bool {
+fn unit_fits<'a, W: DevWord, M: DevStrategy<W>>(u: &Unit, slots: &[Ct<'a, W>], steps: &[Step], pts: &[BoundPt], sh: &Shadow, routes: &Routes<'_, 'a, W, M>) -> bool {
     let meta = |s: &u32| slots.get(*s as usize).map(|c| c.meta);
     let one = |v: &[u32], scale: bool| {
         let m0 = v.first().and_then(meta);
@@ -638,8 +656,10 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
         UnitKind::RotAcc { .. } => one(&u.ins, true),
         UnitKind::Mult { b, .. } => one(&u.ins, true) && one(b, true),
         UnitKind::Refresh { .. } => one(&u.ins, true),
-        UnitKind::Pair { .. } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
-            (Some(x), Some(y)) => x.level == y.level && x.deg == y.deg && nf_key(x.nf) == nf_key(y.nf),
+        UnitKind::Pair { routes: rs, kind } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
+            (Some(x), Some(y)) if x.level == y.level && x.deg == y.deg && rs[0].raise_drop == rs[1].raise_drop => nf_key(x.nf) == nf_key(y.nf),
+            // a loose pair (bts.pair_loose): two levels or raise drops, as the route takes them
+            (Some(x), Some(y)) => routes.get(*kind).is_some_and(|r| r.pair_ok(sh, &x, &y, &rs[0], &rs[1])),
             _ => false,
         },
         // one pass when neither the add nor the plaintext needs a prelude; a sum landing on the add's other operand
@@ -669,6 +689,15 @@ fn unit_fits<W: DevWord>(u: &Unit, slots: &[Ct<'_, W>], steps: &[Step], pts: &[B
             };
             matches!(r, Some(Ok(Some(_))))
         }
+        // one pass when no step takes a prelude but limb drops
+        UnitKind::Affine { steps: st } => {
+            let Some(ms) = u.ins.iter().map(meta).collect::<Option<Vec<CtMeta>>>() else { return false };
+            matches!(Ops::<W>::affine_meta(sh, &ms, st), Ok(Some(_)))
+        }
+        UnitKind::MultIAdd { sub, product_first } => match (meta(&u.ins[0]), meta(&u.ins[1])) {
+            (Some(a), Some(y)) => Ops::<W>::mult_i_add_fusable(sh, &a, &y, *sub, *product_first).unwrap_or(false),
+            _ => false,
+        },
     }
 }
 
@@ -840,6 +869,20 @@ fn exec_unit<'a, W: DevWord, M: DevStrategy<W>>(
             // share it, taken above as rows and metadata (`xs[0]` unused past here in that case)
             let out = unsafe { &mut *slots.add(out_slot as usize) };
             rt.ops.mult_pt_add_chain(rt.ctx, rt.ex, rt.sh, out, head, y, &terms)?;
+        }
+        UnitKind::Affine { steps: st } => {
+            // the sources' rows and metadata are taken before the output (which may share a source's slot) is borrowed
+            let srcs: Vec<(pc_kernels::PolyRef, CtMeta, usize)> = xs.iter().map(|x| (x.buf.r(), x.meta, x.k())).collect();
+            // SAFETY: the group's last output slot, the only mutable reference; the sources are read through `srcs`
+            // (`xs` unused past here)
+            let out = unsafe { &mut *slots.add(span[span.len() - 1].out as usize) };
+            rt.ops.affine(rt.ctx, rt.ex, rt.sh, out, &srcs, st)?;
+        }
+        UnitKind::MultIAdd { sub, product_first } => {
+            let (a, y) = ((xs[0].buf.r(), xs[0].meta, xs[0].k()), (xs[1].buf.r(), xs[1].meta, xs[1].k()));
+            // SAFETY: the add's output slot, the only mutable reference; a and y are read through their rows taken above
+            let out = unsafe { &mut *slots.add(span[1].out as usize) };
+            rt.ops.mult_i_add(rt.ctx, rt.ex, rt.sh, out, a, y, *sub, *product_first)?;
         }
         UnitKind::Refresh { route, kind } => {
             // the inputs gathered into one K-ciphertext buffer, refreshed in place as one K-batch, scattered back

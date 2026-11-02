@@ -67,6 +67,15 @@ section! {
         #[doc = "Two sibling real dense StC-first refreshes of one level and degree run as one complex refresh (pc-program K-batching pairs them, pc-gpu `BtsRoute::run_pair`; default off = each on its own)."]
         #[doc = "Runtime switch `PC_BTS_PAIR`."]
         pair: Flag = "PC_BTS_PAIR", "(unset)";
+        #[doc = "How far ahead (launches) a refresh pair's second member is looked for, the ops it may bring forward scaling with it (pc-program `compile::batch::pull_pairs`; unset = 2560 launches, 1024 ops)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_WINDOW`."]
+        pair_window: Int = "PC_BTS_PAIR_WINDOW", "(unset)";
+        #[doc = "Refreshes left unpaired by `pair` pair across input levels and raise drops too (pc-program `compile::batch::pull_pairs`, pc-gpu `StcFirstRoute::pair`: the shallower input's scale aligned to the deeper's, the member of the deeper drop landed where its single lands; default off)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_LOOSE` [kernel]: binds no plan and no key bundle."]
+        pair_loose: Flag = "PC_BTS_PAIR_LOOSE", "(unset)";
+        #[doc = "The largest member CF of a refresh pair (pc-program `Pairing::cf_max`, pc-gpu `StcFirstSetup::pair_cf_max`: a pair with a member at the StC-first reference CF or above runs its last stage at its larger CF + 1; unset = the reference CF - 1)."]
+        #[doc = "Runtime switch `PC_BTS_PAIR_CF_MAX` [kernel]: binds no plan and no key bundle."]
+        pair_cf_max: Int = "PC_BTS_PAIR_CF_MAX", "(unset)";
         #[doc = "`FIDESLIB_BTS_RAISE_DROP`. Default (unset). Read at examples/gpt2/env.py::RUNTIME_LEGACY."]
         #[doc = "Shipped plans: runtime= 3."]
         raise_drop: Str = "FIDESLIB_BTS_RAISE_DROP", "(unset)";
@@ -377,7 +386,7 @@ section! {
 }
 
 section! {
-    /// `model.prefill` (92 legacy env names).
+    /// `model.prefill` (93 legacy env names).
     PrefillSection "model.prefill" {
         #[doc = "`PF_ACT_FOLD`. Default '0'. Read at impl/activation.py::<module>."]
         #[doc = "Shipped plans: runtime= 7."]
@@ -394,6 +403,9 @@ section! {
         #[doc = "`PF_ATTN_PAIR`. Default '1'. Read at impl/prefill.py::<module>."]
         #[doc = "Shipped plans: none."]
         attn_pair: Flag = "PF_ATTN_PAIR", "'1'";
+        #[doc = "`PF_ATTN_WROT`. Default '0'. Read at impl/prefill.py::<module>."]
+        #[doc = "Shipped plans: runtime= 1."]
+        attn_wrot: Int = "PF_ATTN_WROT", "'0'";
         #[doc = "`PF_CCMM_CAP`. Default '0'. Read at impl/ccmm.py::Ccmm.__init__."]
         #[doc = "Shipped plans: none."]
         ccmm_cap: Int = "PF_CCMM_CAP", "'0'";
@@ -781,6 +793,9 @@ section! {
         #[doc = "Report device free memory and arena use around every planned token (the '0 allocations after setup' check; default off)."]
         #[doc = "No legacy env name."]
         trace_alloc: Flag = "", "(unset)";
+        #[doc = "A chain of added relinearized products (each read only by the chain, all on one meta) relinearized once (pc-program `compile::msum`, pc-gpu `Ops::mult_sum`; default off). The same value up to the key-switching error."]
+        #[doc = "Runtime switch `PC_MULT_SUM`."]
+        mult_sum: Flag = "PC_MULT_SUM", "(unset)";
         #[doc = "Replay a bound block program's static segments as captured CUDA graphs after its first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."]
         #[doc = "No legacy env name."]
         use_graphs: Flag = "", "(unset)";

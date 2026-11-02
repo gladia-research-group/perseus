@@ -1,0 +1,14 @@
+Byte-identity replays: one key bundle and one set of input ciphertexts (one client session) saved against the first
+tree's server, then fed to the second tree's server; every output frame compared byte for byte. Dev prompts 0-1, two
+requests, GPU 1, servers unsandboxed. Commits are the pre-rebase ones (same code as this branch's).
+
+change                                                     first tree   second tree  track        outputs
+the stack rebased onto #19 (Prefill-128 unchanged)         fa47e8df     0ac601fb     Prefill-128  2/2 identical
+exact conversions in their own kernels, one-prime rescale  3555e107     b0c2f108     Decode-8     32/32 frames identical
+  out of place                                                                       Prefill-128  2/2 identical
+SPRU's product on the fused relinearization-rescale        b0c2f108     a2b39690     Prefill-128  2/2 identical
+CutMax's masks at a usable scale (Decode-8 configs only)   b0c2f108     257dc8c7     Prefill-128  2/2 identical
+
+Decode-8 for SPRU's fused product: the served replay of one saved request, 16/16 frames identical in two rounds
+(0.9882 / 0.9886 -> 0.9826 / 0.9823 s/token). CutMax's masks change Decode-8's constants (not its ops or refreshes):
+4 key draws x 32 prompts, argmax 2048/2048 against #19's plan's 2033/2048, mean KL 3.93e-6 against 3.87e-6.

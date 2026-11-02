@@ -207,6 +207,23 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         Ok(h.alpha.iter().zip(c).zip(q).map(|((&a, &ci), &qi)| mulmod(a, ci % qi, qi)).collect())
     }
 
+    /// `folded_alpha` of a one-prime drop from `top` (an alternating user region's single-prime level): `q_top^-1 c_i`
+    /// on rows `0..top`.
+    pub fn folded_alpha_one<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, top: usize, c: &[u64]) -> Vec<u64> {
+        let q = &ctx.chain.q;
+        (0..top).map(|i| mulmod(ctx.scale.q_inv[top][i], c[i] % q[i], q[i])).collect()
+    }
+
+    /// Whether `rescale_to` and a scalar fold serve a rescale from `top`: a composite drop (`can_fold`), or a one-prime
+    /// drop of a chain with an alternating user region (`one_from`).
+    pub fn one_pass_at<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, top: usize) -> bool {
+        match ctx.chain.drop_at(top) {
+            Some(2) => self.can_fold(),
+            Some(1) => ctx.chain.spec.sp.is_some() && top >= 1,
+            _ => false,
+        }
+    }
+
     /// Rescale the `x.k` ciphertexts of `x` (live top limb `top`) by the chain's level unit. `fold` = (`c` rows by
     /// prime id over `0..=top`, device `alpha c` values, their Shoup companions): rescale `c * x` in the same pass
     /// (composite only; the kernel scales the tops only when `c[top] != 1`, so callers fold only then).
@@ -231,6 +248,9 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         }
         if self.kind == RescaleKind::CompositeOnePass && self.d == 2 && g == 2 {
             return self.composite_from(ctx, s, x, None, top, fold);
+        }
+        if g == 1 && fold.is_some() && self.one_pass_at(ctx, top) {
+            return self.one_from(ctx, s, x, None, top, fold);
         }
         if fold.is_some() {
             return Err(shape("rescale fold", "the scalar fold is a composite one-pass option"));
@@ -263,6 +283,20 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         top: usize,
         fold: Option<(&[u64], *const c_void, *const c_void)>,
     ) -> Result<()> {
+        if ctx.chain.drop_at(top) == Some(1) && self.one_pass_at(ctx, top) {
+            if dst.lay != self.lay || dst.k == 0 || dst.k > self.k_max || top >= self.lay.nq {
+                return Err(shape("rescale_to", format!("{} cts at top {top}", dst.k)));
+            }
+            if self.ct_layout(src) {
+                return self.one_from(ctx, s, dst, Some(src), top, fold);
+            }
+            // a source without the ciphertext layout: copied whole, then in place (copy + `rescale`)
+            let rs = RowSet { nq: (top + 1) as i32, np: 0, qmax: self.lay.nq as i32, pad: 0 };
+            let cp = EwArgs { out: dst.w(), a: src, b: src, rs, sc: std::ptr::null(), scs: std::ptr::null(), pr: ctx.pr(), k: dst.k as i32, nparts: 2, sub: 0, zero_p: 0 };
+            // SAFETY: rows 0..=top of k cts of two buffers (the caller's src holds >= k cts at top)
+            launch_result("ew_copy", unsafe { (ctx.table.ew_copy)(&cp, s.raw()) })?;
+            return self.one_from(ctx, s, dst, None, top, fold);
+        }
         if !self.can_fold() {
             return Err(shape("rescale_to", "out-of-place rescale is a composite one-pass option"));
         }
@@ -403,6 +437,64 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&args, s.raw()) })?;
         let (al, als) = self.s_alpha.at(top)?;
         self.ntt_tmp_and_combine(ctx, s, x, top - 1, al, als)
+    }
+
+    /// `single` out of place and / or with a scalar fold: `src` = Some (the ciphertext layout): the top's INTT reads it
+    /// from src into x, the combine reads the other rows from src (the same words as copy + `single`); `fold` = (`c`
+    /// by prime id, device `q_top^-1 c_i` values, Shoup companions): the rescale of `c * x` (the top scaled by c_top
+    /// in coefficient form, the rows by the folded alpha: the same residues as the scaling pass + `single`).
+    fn one_from<M: DevStrategy<W>>(
+        &mut self,
+        ctx: &Context<'_, W, M>,
+        s: &Stream<Compute>,
+        x: &mut CtBuf<'_, Compute, W>,
+        src: Option<PolyRef>,
+        top: usize,
+        fold: Option<(&[u64], *const c_void, *const c_void)>,
+    ) -> Result<()> {
+        let k = x.k;
+        let np = self.lay.rows();
+        let list = &self.intt1[top][k - 1];
+        match src {
+            Some(sv) => {
+                let from = ntt::Src { base: sv.base, soff: list.roff.dptr(), n: 1, stride: 0 };
+                ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, &mut x.buf, list, list.len(), Some(from), None)?
+            }
+            None => ntt::transform_rows(ctx, s, Dir::Inverse, &mut x.buf, list)?,
+        }
+        let (a, a_s) = self.s_a.at(top)?;
+        let (ca, al, als) = match fold {
+            Some((c, av, avs)) => (c[top] % ctx.chain.q[top], av, avs),
+            None => {
+                let (al, als) = self.s_alpha.at(top)?;
+                (1, al, als)
+            }
+        };
+        let args = RescaleArgs {
+            x: x.w(),
+            tmp: self.tmp.w(),
+            a,
+            b: std::ptr::null(),
+            a_s,
+            b_s: std::ptr::null(),
+            qam: self.s_qam.dptr_at(top * np)? as *const c_void,
+            qbm: std::ptr::null(),
+            pr: ctx.pr(),
+            qinv_ab: 0,
+            c_ab: 0,
+            ca,
+            cb: 1,
+            top: top as i32,
+            nrows: top as i32,
+            k: k as i32,
+            ndrop: 1,
+        };
+        // SAFETY: as in `composite` (x's top row in coefficient form, written by the INTT above)
+        launch_result("rescale_coef", unsafe { (ctx.table.rescale_coef)(&args, s.raw()) })?;
+        let from = src.map(|r| r.base as *const c_void).unwrap_or(x.buf.vptr());
+        let epi = ntt::Epi::MulAdd { out: x.buf.vptr_mut(), x: from, s: al, ss: als };
+        let list = &self.fwd_tmp[top - 1][k - 1];
+        ntt::transform_rows_prefix_ex(ctx, s, Dir::Forward, &mut self.tmp.buf, list, list.len(), None, Some(epi))
     }
 
     fn ntt_tmp_and_combine<M: DevStrategy<W>>(

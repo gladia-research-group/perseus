@@ -1,12 +1,14 @@
 //! Every bootstrap route in one process: the route x K x {eager, batched, graph} table and the MemPlan assert per
 //! (route, K).
 //!
-//!   pc-bench bts --all [--k 1,2,4,8] [--reps 10] [--routes dense,stcf,512,256,1]
+//!   pc-bench bts --all [--k 1,2,4,8] [--reps 10] [--routes dense,stcf,512,256,1] [--pair-members cf:amp,... --k 2]
 //!
 //! One setup per K; every route's tables and `BtsWork` are carved between aligned arena offsets and must equal the
 //! MemPlan prediction. Per route and K, on K fresh inputs: `ref` (each alone), `eager` (one K-batch `Ct`), `batched`
 //! (`BtsBatch`), `graph` (`BtsGraphs`); device ms median of `reps` after 2 warm-ups; every output must equal its input's
-//! reference words. Keys fresh, generated on the device.
+//! reference words. Keys fresh, generated on the device. `--pair-members` (route stcf, K = 2): every ordered pair of
+//! the members as one complex refresh (`run_pair`, `StcFirstSetup::pair_cf_max` = their largest CF) against each
+//! member's single real refresh on the same input, over `--seeds` seeds: max-error and rms bits.
 use pc_core::encode::{Complex, Encoder, Payload};
 use pc_core::keys::SecretKey;
 use pc_core::modmul::Barrett64;
@@ -61,10 +63,12 @@ struct Opts {
     /// `--grid cfs:amps`: decrypted bits of one refresh per route x CF x amplitude (no timing), over `--seeds` inputs
     grid: Option<(Vec<u32>, Vec<f64>)>,
     seeds: usize,
+    /// `--pair-members`: (CF, amplitude) of refresh-pair members (route stcf)
+    pair_members: Vec<(u32, f64)>,
 }
 
 fn parse(a: &[String]) -> Res<Opts> {
-    let mut o = Opts { ks: vec![1, 2, 4, 8], reps: 10, routes: ["dense", "stcf", "512", "256", "1"].iter().map(|s| s.to_string()).collect(), memdiag: false, packed: false, grid: None, seeds: 1 };
+    let mut o = Opts { ks: vec![1, 2, 4, 8], reps: 10, routes: ["dense", "stcf", "512", "256", "1"].iter().map(|s| s.to_string()).collect(), memdiag: false, packed: false, grid: None, seeds: 1, pair_members: vec![] };
     let mut i = 0;
     while i < a.len() {
         let v = a.get(i + 1).cloned().unwrap_or_default();
@@ -82,6 +86,15 @@ fn parse(a: &[String]) -> Res<Opts> {
             "--reps" => o.reps = v.parse()?,
             "--routes" => o.routes = v.split(',').map(|s| s.to_string()).collect(),
             "--seeds" => o.seeds = v.parse()?,
+            "--pair-members" => {
+                o.pair_members = v
+                    .split(',')
+                    .map(|m| -> Res<(u32, f64)> {
+                        let (c, a) = m.split_once(':').ok_or("--pair-members cf:amp,...")?;
+                        Ok((c.parse()?, a.parse()?))
+                    })
+                    .collect::<Res<_>>()?
+            }
             "--grid" => {
                 let (c, a) = v.split_once(':').ok_or("--grid cfs:amps")?;
                 let cfs = c.split(',').map(|x| x.parse()).collect::<std::result::Result<_, _>>()?;
@@ -287,6 +300,8 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     setup.stc_ps = stc_ps;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
+    // --pair-members: pairs up to the members' largest CF (above the reference CF: the pair's last stage at CF + 1)
+    sf.pair_cf_max = o.pair_members.iter().map(|m| m.0).max();
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
     let mut geoms: Vec<LtGeom> = Vec::new();
     for v in &plan.dense.variants {
@@ -355,6 +370,8 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     let ocfg = OpsCfg::default();
     Ops::<W>::reserve(&mut mp, &ocfg);
+    // the session's fused relinearization-rescale tables (pc-py session.rs), which SPRU's product uses
+    mp.reserve("relin.rr", pc_gpu::relin::RelinRescaler::<W>::bytes(&chain, &lay, mp.cfg.k_max)?);
     // predictions: route tables and each route's own work shape
     let (sf_req, sf_shape) = plan.mem::<W>()?;
     let mut pred: Vec<(String, &'static str, usize)> = Vec::new();
@@ -390,6 +407,10 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
     let kplans = KsPlans::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?;
     let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
+    // PC_BENCH_NO_RR=1: without them (SPRU's product relinearized and rescaled apart)
+    if std::env::var("PC_BENCH_NO_RR").map_or(true, |v| v != "1") {
+        ops.rr = Some(pc_gpu::relin::RelinRescaler::new(&arena, &ex.compute, &ctx, mp.cfg.k_max)?);
+    }
     let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, layout)?;
     keys.carve_extra(&arena, &chain, &extra)?;
     let mut prng = test_prng(0x6d);
@@ -533,6 +554,80 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
                     println!("[bts-all] grid {name} cf {cf} A {amp}: bits min {mn:.2} mean {me:.2}; rms {mer:.2} ({} seeds), out level {lv}", o.seeds);
                 }
             }
+            continue;
+        }
+        if !o.pair_members.is_empty() && name == "stcf" {
+            if kb < 2 {
+                return Err("--pair-members takes --k 2".into());
+            }
+            // refresh pairs: every ordered pair of members, each against its own single on the same input
+            let real_vals = |seed: u64, amp: f64| -> Vec<Complex> { rand_vals(seed, n / 2, c.period).into_iter().map(|z| Complex::new(amp * z.re, 0.0)).collect() };
+            let bits = |out: &[Complex], v: &[Complex]| -> (f64, f64) {
+                let a = v.iter().map(|z| z.re.abs()).fold(0.0, f64::max);
+                let e = out.iter().zip(v).map(|(x, y)| (x.re - y.re).abs()).fold(0.0, f64::max) / a;
+                let er = (out.iter().zip(v).map(|(x, y)| (x.re - y.re).powi(2)).sum::<f64>() / v.len() as f64).sqrt() / a;
+                (-e.log2(), -er.log2())
+            };
+            let mut gate = 0;
+            for (mi, &(cfx, ax)) in o.pair_members.iter().enumerate() {
+                for (mj, &(cfy, ay)) in o.pair_members.iter().enumerate() {
+                    let (rx, ry) = (Route { cf: Some(cfx), ..c.route }, Route { cf: Some(cfy), ..c.route });
+                    let (mut dx, mut dy) = (vec![], vec![]);
+                    for seed in 0..o.seeds {
+                        let vs = [real_vals(1000 * mi as u64 + 10 * seed as u64 + 1, ax), real_vals(1000 * mj as u64 + 10 * seed as u64 + 2, ay)];
+                        for (i, v) in vs.iter().enumerate() {
+                            let mut meta = CtMeta::new(c.level, 1).with_nf(sf_);
+                            meta.slots = c.slots;
+                            let msg = enc.encode_slots(v, n / 2, top, Payload::Complex, sf_)?;
+                            encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg], meta, &mut src[i], &mut prng)?;
+                        }
+                        let mut out = |x: &Ct<'_, W>, ex: &mut Executor<'_, W>, ops: &mut Ops<'_, W>, probe: &mut Ct<'_, W>| -> Res<Vec<Complex>> {
+                            probe.buf.buf.copy_from(&ex.compute, &x.buf.buf, ctw)?;
+                            probe.meta = CtMeta { slots: 0, ..x.meta };
+                            ops.realize(&ctx, ex, &sh, std::slice::from_mut(probe))?;
+                            Ok(dec.decrypt_slots(&ctx, &ex.compute, &enc, probe, Payload::Complex, Which::Dense)?.remove(0))
+                        };
+                        // singles
+                        let mut single = vec![];
+                        for (i, r) in [(0, &rx), (1, &ry)] {
+                            sep[i].buf.buf.copy_from(&ex.compute, &src[i].buf.buf, ctw)?;
+                            sep[i].meta = src[i].meta;
+                            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut *work };
+                            route.run(&mut cx, std::slice::from_mut(&mut sep[i]), r)?;
+                            let o_ = out(&sep[i], &mut ex, &mut ops, &mut probe)?;
+                            single.push(bits(&o_, &vs[i]));
+                        }
+                        // the pair
+                        for i in 0..2 {
+                            sep[i].buf.buf.copy_from(&ex.compute, &src[i].buf.buf, ctw)?;
+                            sep[i].meta = src[i].meta;
+                        }
+                        {
+                            let (a, b) = sep.split_at_mut(1);
+                            let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut *work };
+                            route.run_pair(&mut cx, &mut a[0], &mut b[0], &rx, &ry)?;
+                        }
+                        let ox = out(&sep[0], &mut ex, &mut ops, &mut probe)?;
+                        let oy = out(&sep[1], &mut ex, &mut ops, &mut probe)?;
+                        let (bx, by) = (bits(&ox, &vs[0]), bits(&oy, &vs[1]));
+                        println!(
+                            "[bts-all] pair seed {seed} x {cfx}:{ax} y {cfy}:{ay}: x {:.2} (rms {:.2}) vs single {:.2} ({:.2}); y {:.2} ({:.2}) vs single {:.2} ({:.2})",
+                            bx.0, bx.1, single[0].0, single[0].1, by.0, by.1, single[1].0, single[1].1
+                        );
+                        dx.push((bx.0 - single[0].0, bx.1 - single[0].1));
+                        dy.push((by.0 - single[1].0, by.1 - single[1].1));
+                    }
+                    for (role, cf, amp, d) in [("x", cfx, ax, &dx), ("y", cfy, ay, &dy)] {
+                        let k = d.len() as f64;
+                        let (dm, dr) = (d.iter().map(|v| v.0).sum::<f64>() / k, d.iter().map(|v| v.1).sum::<f64>() / k);
+                        let worst = d.iter().map(|v| v.0).fold(f64::INFINITY, f64::min);
+                        let bad = dm < -0.15 || dr < -0.1;
+                        gate += bad as usize;
+                        println!("[bts-all] pair {cfx}:{ax} + {cfy}:{ay}, member {role} cf {cf} A {amp}: pair - single over {} seeds: max-error bits {dm:+.3} (worst {worst:+.3}), rms bits {dr:+.3}{}", d.len(), if bad { "  BELOW GATE" } else { "" });
+                    }
+                }
+            }
+            println!("[bts-all] pair gate (mean pair - single >= -0.15 bits max error, >= -0.1 rms): {gate} member cases below");
             continue;
         }
         // fresh inputs

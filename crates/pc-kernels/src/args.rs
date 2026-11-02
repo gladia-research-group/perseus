@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 20;
+pub const ABI: u32 = 21;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -119,6 +119,10 @@ pub struct BconvArgs {
     pub pr: *const PrimeConst,
     pub njobs: i32,
     pub max_tgt: i32,
+    /// ABI 21: 0 any jobs; 13, 14 or 15 (u32 words): every job exact with that many sources (a kernel of that body
+    /// alone); the wide kernel ignores it.
+    pub kind: i32,
+    pub pad: i32,
 }
 
 #[repr(C)]
@@ -294,7 +298,8 @@ pub struct TensorArgs {
     pub k: i32,
     /// ABI 13: 1 doubles the three outputs.
     pub dbl: i32,
-    pub pad: i32,
+    /// 1: d2 accumulates too (d2 += the pairs' x1 y1, before the doubling); `acc` adds onto (c0, c1) only.
+    pub acc_d2: i32,
 }
 
 #[repr(C)]
@@ -877,7 +882,7 @@ const _: () = {
     assert!(size_of::<PolyRef>() == 24);
     assert!(size_of::<NttArgs>() == 176);
     assert!(size_of::<BconvJob>() == 32);
-    assert!(size_of::<BconvArgs>() == 48);
+    assert!(size_of::<BconvArgs>() == 56);
     assert!(size_of::<EwArgs>() == 128);
     assert!(size_of::<PtDotArgs>() == 128);
     assert!(size_of::<KsArgs>() == 176);

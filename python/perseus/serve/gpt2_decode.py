@@ -74,7 +74,8 @@ class Gpt2Handler:
                 return x
 
         self.run_ = Served(Recorder(model, self.n), plan, cfg, labels, keys, work_dir=os.path.join(a.work_dir, "ref"),
-                           pt_rows=a.pt_rows, stc_cache=a.stc_cache, pt_cache=getattr(a, "pt_cache", False))
+                           pt_rows=a.pt_rows, stc_cache=a.stc_cache, pt_cache=getattr(a, "pt_cache", False),
+                           schedule=getattr(a, "schedule", "program"))
         self.rows = None
         self.argmax = False
 

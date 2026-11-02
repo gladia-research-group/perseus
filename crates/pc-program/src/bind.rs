@@ -8,7 +8,8 @@
 //! * every streamed weight row (`PtForm::CoeffStream`) -> its row in the block's weight frame (`StreamLayout`);
 //! * the per-op argument table (`Step`): kind, slot indices, the compiled output metadata;
 //! * the steps issued together (`Unit`): rotation grids and chains (`Program::rotation_grids` / `rotation_chains`),
-//!   K-batches, refresh pairs, plaintext products with their add (`mult_pt_adds`); other batches member by member.
+//!   K-batches, refresh pairs, plaintext products with their add (`mult_pt_adds`), affine element-wise groups
+//!   (constant products, negations, constant adds, adds and subs, one pass); other batches member by member.
 //! Details in docs/ARCHITECTURE.md "pc-program bind".
 use crate::compile::batch::{paired, PAIR_K};
 use crate::error::{Error, Result};
@@ -18,6 +19,7 @@ use pc_cuda::{Arena, Compute, Stream};
 use pc_gpu::bts::{BtsKeyRing, RouteKind};
 use pc_gpu::encode_dev::PtForm as DevForm;
 use pc_gpu::ks::{KeyGroup, KsKeyRef};
+use pc_gpu::ops::{AffOp, AffRef, AffStep};
 use pc_gpu::pt_store::{PtKey, PtStore};
 use pc_gpu::{Ct, CtBuf, DevStrategy, DevWord, Layout};
 use pc_shadow::rules::{Operand, Prelude};
@@ -58,6 +60,9 @@ pub enum StepOp {
     /// Streamed-weight sum `c` (`Bound::coeff_sums`), run by the runtime's `CoeffRowsDevice` on the rows of the
     /// block's weight frame (`Bound::stream_base`).
     CoeffSum { c: u32 },
+    /// Lazily relinearized product sum `s` (`Bound::mult_sums`: the pairs' slots), one relinearization (pc-gpu
+    /// `Ops::mult_sum`).
+    MultSum { s: u32 },
 }
 
 /// A `Kind::CoeffSum` as bound: the term ciphertexts' slots and their rows' offsets in the weight frame (rows of N
@@ -165,6 +170,15 @@ pub enum UnitKind {
     /// `[rot(t_1), add, rot(t_2), add, ...]`, `Unit::ins` = `[acc_0, t_1, t_2, ...]`, `gs[j]` the key group of
     /// `steps[j]`; the rotations summed in the extended basis and ModDowned once onto `acc_0`.
     RotAcc { gs: Vec<u32>, gal: Vec<u64>, steps: Vec<Option<i64>> },
+    /// An affine element-wise group (pc-gpu `Ops::affine`): steps `lo..hi` are constant products, negations, constant
+    /// adds, adds and subs, every output but the last read once and only by a later step of the group, at most one
+    /// source taken with a rescale in its preludes; `steps[j]` is step `lo + j` over the group's sources (`Unit::ins`)
+    /// and earlier values; the last step's output is written in one pass, the other outputs never.
+    Affine { steps: Vec<AffStep> },
+    /// A product by i read once, by the add or sub after it (pc-gpu `Ops::mult_i_add`): step `lo` multiplies
+    /// `Unit::ins[0]` by i, step `lo + 1` adds (`sub`: subtracts) it and `Unit::ins[1]`, the product first when
+    /// `product_first`.
+    MultIAdd { sub: bool, product_first: bool },
 }
 
 /// Steps `lo..hi` issued together (their outputs at once), reading the slots `ins`. `chain`: the rotation chain the
@@ -328,6 +342,8 @@ pub struct Bound<'a, W: DevWord> {
     pub finishes: Vec<FinishStep>,
     /// Streamed-weight sums (`StepOp::CoeffSum`) and the weight frame they read.
     pub coeff_sums: Vec<CoeffSumStep>,
+    /// Lazily relinearized product sums (`StepOp::MultSum`): the operand slots, pair after pair.
+    pub mult_sums: Vec<Vec<u32>>,
     pub streams: StreamLayout,
     /// Device address of the frame holding this block's rows (`residency::StreamRing::adopt`), null until staged.
     pub stream_base: *const f32,
@@ -368,7 +384,7 @@ fn key_needs(p: &Program) -> (bool, bool, Vec<Vec<i64>>) {
     for op in &p.ops {
         for m in op.members() {
             match &m.kind {
-                Kind::Mult | Kind::Square | Kind::MultRescale { .. } => relin = true,
+                Kind::Mult | Kind::Square | Kind::MultRescale { .. } | Kind::MultSum { .. } => relin = true,
                 Kind::Conjugate => conj = true,
                 Kind::Rotate(k) => {
                     if !lists.contains(&vec![*k]) {
@@ -506,6 +522,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         let mut alias: Vec<String> = vec![];
         let mut finishes: Vec<FinishStep> = vec![];
         let mut coeff_sums: Vec<CoeffSumStep> = vec![];
+        let mut mult_sums: Vec<Vec<u32>> = vec![];
         let streams = match env.streams {
             Some(src) => stream_layout(p, src).map_err(|missing| berr(block, format!("{} streamed linear(s) the runtime does not hold (StreamSource): {}", missing.len(), list(&missing))))?,
             None if p.ops.iter().any(|o| o.members().iter().any(|m| matches!(m.kind, Kind::CoeffSum { .. }))) => {
@@ -529,11 +546,17 @@ impl<'a, W: DevWord> Bound<'a, W> {
         let mut first_step: Vec<usize> = Vec::with_capacity(p.ops.len() + 1);
         // per step: the compiled op's preludes on operands A and B
         let mut pre: Vec<[bool; 2]> = vec![];
+        // per step: the compiled op's preludes are limb drops only; a rescale among operand A's / B's preludes
+        let mut pre_drop: Vec<bool> = vec![];
+        let mut pre_resc: Vec<[bool; 2]> = vec![];
         for op in &p.ops {
             first_step.push(steps.len());
             for m in op.members() {
                 let on = |o: Operand| m.pre.iter().any(|x| matches!(x, Prelude::Rescale(w) | Prelude::DropTo(w, _) | Prelude::ScalarAdjust(w, _) if *w == o));
                 pre.push([on(Operand::A), on(Operand::B)]);
+                pre_drop.push(m.pre.iter().all(|x| matches!(x, Prelude::DropTo(..))));
+                let resc = |o: Operand| m.pre.iter().any(|x| matches!(x, Prelude::Rescale(w) if *w == o));
+                pre_resc.push([resc(Operand::A), resc(Operand::B)]);
                 let a = m.ins.first().map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
                 let b = m.ins.get(1).map(|&v| slot_of(v)).transpose()?.unwrap_or(NONE);
                 if let Kind::Finish { desc, .. } = &m.kind {
@@ -573,6 +596,21 @@ impl<'a, W: DevWord> Bound<'a, W> {
                     steps.push(Step { op: StepOp::CoeffSum { c: coeff_sums.len() as u32 - 1 }, out, a: ins[0], b: NONE, inplace: false, var, meta: p.vars[var as usize].meta, a_meta: vm(0), b_meta: None });
                     continue;
                 }
+                if let Kind::MultSum { .. } = &m.kind {
+                    let ins = m.ins.iter().map(|&v| slot_of(v)).collect::<Result<Vec<_>>>()?;
+                    let var = *m.outs.first().ok_or_else(|| berr(block, format!("mult_sum {:?} without an output", m.origin)))?;
+                    let out = slot_of(var)?;
+                    if ins.contains(&out) {
+                        alias.push(format!("{:?}: mult_sum output slot {out} is one of its operands", m.origin));
+                    }
+                    if relin == NONE {
+                        return Err(berr(block, "mult_sum without a relinearization key group"));
+                    }
+                    mult_sums.push(ins.clone());
+                    let vm = |k: usize| m.ins.get(k).map(|&v| p.vars[v as usize].meta);
+                    steps.push(Step { op: StepOp::MultSum { s: mult_sums.len() as u32 - 1 }, out, a: ins[0], b: ins[1], inplace: false, var, meta: p.vars[var as usize].meta, a_meta: vm(0), b_meta: vm(1) });
+                    continue;
+                }
                 if m.outs.len() != 1 {
                     return Err(berr(block, format!("{} op with {} outputs ({:?}): PCMM/CCMM finishes replay through the matmul services only", m.kind.name(), m.outs.len(), m.origin)));
                 }
@@ -605,6 +643,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
                     }
                     Kind::Finish { .. } => return Err(berr(block, "finish reached the single-output lowering")),
                     Kind::CoeffSum { .. } => return Err(berr(block, "coeff_sum reached the single-output lowering")),
+                    Kind::MultSum { .. } => return Err(berr(block, "mult_sum reached the single-output lowering")),
                     Kind::Batched(_) => return Err(berr(block, "nested batch")),
                 };
                 let inplace = m.inplace;
@@ -846,6 +885,149 @@ impl<'a, W: DevWord> Bound<'a, W> {
             unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
             units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind, chain: NONE, off: false });
         }
+        // affine element-wise groups: runs of constant products, negations, constant adds, adds and subs outside the
+        // units, cut at every output read outside the run, read twice, by the driver (a block output) or through a
+        // rescale prelude: each group's last output in one pass over the group's sources (`UnitKind::Affine`), the
+        // others never written
+        if crate::program::lever_on("ew_affine") || crate::program::lever_on("ew_iadd") {
+            let n = steps.len();
+            let affine_on = crate::program::lever_on("ew_affine");
+            let reads = |st: &Step| -> Vec<u32> {
+                match &st.op {
+                    StepOp::Finish { f } => finishes[*f as usize].ins.clone(),
+                    StepOp::CoeffSum { c } => coeff_sums[*c as usize].ins.clone(),
+                    StepOp::MultSum { s } => mult_sums[*s as usize].clone(),
+                    _ => [st.a, st.b].into_iter().filter(|&s| s != NONE).collect(),
+                }
+            };
+            let writes = |st: &Step| -> Vec<u32> {
+                match &st.op {
+                    StepOp::Finish { f } => finishes[*f as usize].outs.clone(),
+                    _ => vec![st.out],
+                }
+            };
+            // readers[i]: the steps reading step i's output before its slot is written again (a step reading it twice
+            // counts twice)
+            let mut readers: Vec<Vec<usize>> = vec![vec![]; n];
+            let mut last: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for (i, st) in steps.iter().enumerate() {
+                for s in reads(st) {
+                    if let Some(&w) = last.get(&s) {
+                        readers[w].push(i);
+                    }
+                }
+                for s in writes(st) {
+                    last.insert(s, i);
+                }
+            }
+            let outs: std::collections::HashSet<u32> = p.outputs.iter().copied().collect();
+            let aff = |i: usize, unit_of: &[u32]| affine_on && unit_of[i] == NONE && matches!(steps[i].op, StepOp::MultConst(_) | StepOp::Negate | StepOp::AddConst(_) | StepOp::Add | StepOp::Sub);
+            // a group [g0, k] when every output but the last is read once, inside it, and is no block output
+            let valid = |g0: usize, k: usize| k > g0 && (g0..k).all(|q| readers[q].len() == 1 && readers[q][0] <= k && !outs.contains(&steps[q].var));
+            let mut i = 0;
+            while i < n {
+                if !aff(i, &unit_of) {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i;
+                while j + 1 < n && aff(j + 1, &unit_of) {
+                    j += 1;
+                }
+                // groups inside the run [i, j]: an output read with a rescale in the reader's preludes closes its group
+                // (the reader takes it as a source and runs that rescale first, one source per group); a step that would
+                // rescale a second source starts a new group
+                let rescaled_by = |q: usize, c: usize| (steps[c].a == steps[q].out && pre_resc[c][0]) || (steps[c].b == steps[q].out && pre_resc[c][1]);
+                let mut groups: Vec<(usize, usize)> = vec![];
+                let mut g0 = i;
+                let mut wr: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                let mut mat = 0usize;
+                for k in i..=j {
+                    let st = &steps[k];
+                    let opnds: Vec<(u32, bool)> = match st.op {
+                        StepOp::Add | StepOp::Sub => vec![(st.a, pre_resc[k][0]), (st.b, pre_resc[k][1])],
+                        _ => vec![(st.a, pre_resc[k][0])],
+                    };
+                    let inner_resc = opnds.iter().any(|&(s, r)| r && wr.contains(&s));
+                    let mut src_resc = opnds.iter().filter(|&&(s, r)| r && !wr.contains(&s)).count();
+                    if inner_resc || mat + src_resc > 1 {
+                        if k > g0 && valid(g0, k - 1) {
+                            groups.push((g0, k - 1));
+                        }
+                        g0 = k;
+                        wr.clear();
+                        mat = 0;
+                        src_resc = opnds.iter().filter(|&&(_, r)| r).count();
+                        if src_resc > 1 {
+                            // both operands rescaled: the step runs alone
+                            g0 = k + 1;
+                            continue;
+                        }
+                    }
+                    mat += src_resc;
+                    wr.insert(st.out);
+                    let inner = readers[k].len() == 1 && readers[k][0] > k && readers[k][0] <= j && !outs.contains(&st.var) && !rescaled_by(k, readers[k][0]);
+                    if !inner {
+                        if valid(g0, k) {
+                            groups.push((g0, k));
+                        }
+                        g0 = k + 1;
+                        wr.clear();
+                        mat = 0;
+                    }
+                }
+                for (g0, k) in groups {
+                    let mut ins: Vec<u32> = vec![];
+                    let mut wr: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+                    let mut asteps = Vec::with_capacity(k + 1 - g0);
+                    for q in g0..=k {
+                        let st = &steps[q];
+                        let mut r = |s: u32| -> AffRef {
+                            match wr.get(&s) {
+                                Some(&w) => AffRef::Val((w - g0) as u16),
+                                None => AffRef::Src(match ins.iter().position(|&x| x == s) {
+                                    Some(x) => x as u16,
+                                    None => {
+                                        ins.push(s);
+                                        ins.len() as u16 - 1
+                                    }
+                                }),
+                            }
+                        };
+                        let (op, a, b) = match st.op {
+                            StepOp::MultConst(c) => (AffOp::MultConst(c), r(st.a), None),
+                            StepOp::Negate => (AffOp::Negate, r(st.a), None),
+                            StepOp::AddConst(c) => (AffOp::AddConst(c), r(st.a), None),
+                            StepOp::Add => (AffOp::Add, r(st.a), Some(r(st.b))),
+                            _ => (AffOp::Sub, r(st.a), Some(r(st.b))),
+                        };
+                        asteps.push(AffStep { op, a, b });
+                        wr.insert(st.out, q);
+                    }
+                    unit_of[g0..=k].iter_mut().for_each(|x| *x = units.len() as u32);
+                    units.push(Unit { lo: g0 as u32, hi: k as u32 + 1, ins, kind: UnitKind::Affine { steps: asteps }, chain: NONE, off: false });
+                }
+                i = j + 1;
+            }
+            // a product by i read once, by the next step (an add or sub outside the units): one pass
+            // (`UnitKind::MultIAdd`)
+            for i in 0..n.saturating_sub(1) {
+                let (m, ad) = (&steps[i], &steps[i + 1]);
+                if !matches!(m.op, StepOp::MultI) || !matches!(ad.op, StepOp::Add | StepOp::Sub) || unit_of[i] != NONE || unit_of[i + 1] != NONE {
+                    continue;
+                }
+                if !pre_drop[i] || !pre_drop[i + 1] || readers[i] != [i + 1] || outs.contains(&m.var) || !crate::program::lever_on("ew_iadd") {
+                    continue;
+                }
+                let product_first = ad.a == m.out;
+                let y = if product_first { ad.b } else { ad.a };
+                if y == NONE || y == m.out || !product_first && ad.b != m.out {
+                    continue;
+                }
+                unit_of[i..i + 2].iter_mut().for_each(|x| *x = units.len() as u32);
+                units.push(Unit { lo: i as u32, hi: i as u32 + 2, ins: vec![m.a, y], kind: UnitKind::MultIAdd { sub: ad.op == StepOp::Sub, product_first }, chain: NONE, off: false });
+            }
+        }
         if !missing.is_empty() {
             missing.dedup();
             return Err(berr(block, format!("{} key(s) missing from the key ring: {}", missing.len(), list(&missing))));
@@ -866,7 +1048,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
         } else {
             (vec![], None, None)
         };
-        let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, n_slots);
+        let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, &mult_sums, n_slots);
         // a block on its own slots carves no held-chain buffers: those chains issue step by step
         let io = |vs: &[u32]| -> Result<Vec<(String, u32, CtMeta)>> { vs.iter().map(|&v| Ok((p.vars[v as usize].name.clone(), slot_of(v)?, p.vars[v as usize].meta))).collect() };
         Ok(Bound {
@@ -889,6 +1071,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
             pts,
             finishes,
             coeff_sums,
+            mult_sums,
             streams,
             stream_base: std::ptr::null(),
             inputs: io(&p.inputs)?,
@@ -1083,7 +1266,7 @@ impl<'a, W: DevWord> Bound<'a, W> {
 /// `Bound::plain`: per slot, the richest (lowest) level its writes land at when every step touching it is an
 /// element-wise op (add, sub, plaintext add / product, constants, negate, times i; a ct x ct product reading it),
 /// outside units other than plaintext product-adds, and no compiled prelude runs on it; else None.
-fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]], finishes: &[FinishStep], coeff_sums: &[CoeffSumStep], n: usize) -> Vec<Option<u32>> {
+fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]], finishes: &[FinishStep], coeff_sums: &[CoeffSumStep], mult_sums: &[Vec<u32>], n: usize) -> Vec<Option<u32>> {
     let mut lv: Vec<Option<u32>> = vec![Some(u32::MAX); n];
     let bad = |lv: &mut Vec<Option<u32>>, s: u32| {
         if let Some(x) = lv.get_mut(s as usize) {
@@ -1092,12 +1275,13 @@ fn plain_slots(steps: &[Step], units: &[Unit], unit_of: &[u32], pre: &[[bool; 2]
     };
     for (i, st) in steps.iter().enumerate() {
         let u = unit_of[i];
-        let unit_ok = u == NONE || matches!(units[u as usize].kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. });
+        let unit_ok = u == NONE || matches!(units[u as usize].kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. });
         let ew = matches!(st.op, StepOp::Add | StepOp::Sub | StepOp::AddPt(_) | StepOp::MultPt(_) | StepOp::AddConst(_) | StepOp::MultConst(_) | StepOp::Negate | StepOp::MultI);
         let prod = matches!(st.op, StepOp::Mult | StepOp::Square);
         match &st.op {
             StepOp::Finish { f } => finishes[*f as usize].ins.iter().chain(&finishes[*f as usize].outs).for_each(|&s| bad(&mut lv, s)),
             StepOp::CoeffSum { c } => coeff_sums[*c as usize].ins.iter().for_each(|&s| bad(&mut lv, s)),
+            StepOp::MultSum { s } => mult_sums[*s as usize].iter().for_each(|&x| bad(&mut lv, x)),
             _ => {}
         }
         if !unit_ok || !(ew || prod) {

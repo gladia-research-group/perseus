@@ -596,13 +596,29 @@ impl<'a, W: DevWord> Spru<'a, W> {
             super::sparse::acc_round(ctx, ex, kc, sh, g, acc, &steps)?;
         }
         mark(ex, 5)?;
-        // 6. product over the blocks (acc and acc2 alternate)
+        // 6. product over the blocks (acc and acc2 alternate); each product's relinearization fused with its rescale
+        //    where the session's tables serve the top (`relin::RelinRescaler`: one exact rounding in place of the
+        //    ModDown's and the rescale's)
         let (mut a, mut b) = (acc, acc2);
         for st in self.cfg.product_steps() {
             let g = self.groups.get(&vec![st]).ok_or_else(|| shape("spru", format!("no key group for rotation {st}")))?;
             rotate::rotate(ctx, ex, kc, sh, g, a, st, tmp)?;
-            crate::relin::mult(ctx, ex, kc_relin, sh, relin_g, a, tmp, b)?;
-            ops.rescale(ctx, ex, sh, std::slice::from_mut(b))?;
+            let top = a.top(ctx.shape)?;
+            match ops.rr.as_ref().filter(|rr| rr.serves(top, kb) && kc_relin.source == KskSource::Regen) {
+                Some(rr) => {
+                    let r = sh.mult(&a.meta, &tmp.meta)?;
+                    if !r.pre.is_empty() {
+                        return Err(shape("spru", format!("product operands need preludes {:?}", r.pre)));
+                    }
+                    crate::relin::tensor(ctx, ex, a, tmp, b, top)?;
+                    rr.relin_rescale(ctx, ex, kc_relin, relin_g, b, top)?;
+                    b.meta = sh.rescale(&r.out)?.out;
+                }
+                None => {
+                    crate::relin::mult(ctx, ex, kc_relin, sh, relin_g, a, tmp, b)?;
+                    ops.rescale(ctx, ex, sh, std::slice::from_mut(b))?;
+                }
+            }
             std::mem::swap(&mut a, &mut b);
         }
         mark(ex, 6)?;

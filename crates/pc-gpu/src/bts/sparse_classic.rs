@@ -657,7 +657,7 @@ mod tests {
         let p = ClassicPlan::new(&chain, &ClassicCfg::n32(8192, &[0, 1])).unwrap();
         let want = pc_shadow::route::multi_stage_landing([3, 3], 2);
         for v in &p.variants {
-            let raw = from_f(sh.cfg.chain, v.out)?;
+            let raw = from_f(sh.cfg.chain, v.out).unwrap();
             let real = sh.rescale(&raw).unwrap().out;
             assert_eq!((raw.deg, real.level, real.deg), (2, want.level + 2 * v.drop, 1), "drop {}", v.drop);
             let nd: Vec<usize> = v.cts.iter().chain(&v.stc).map(|h| h.coeffs.len()).collect();

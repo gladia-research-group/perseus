@@ -390,6 +390,212 @@ def _cheb_rec(ops, T, y, m, c, leaves=None):
     return ops.add(prod, rv)
 
 
+def _deg(c) -> int:
+    d = len(c) - 1
+    while d > 0 and c[d] == 0.0:
+        d -= 1
+    return d
+
+
+def _cheb_depths(n: int, m: int):
+    """Depth (products past y) of every baby T_1..T_{m-1} and giant T_m, T_2m, .. <= n as eval_chebyshev_bsgs builds
+    them."""
+    dt = {1: 0}
+    for i in range(2, m):
+        dt[i] = dt[i // 2] + 1 if i % 2 == 0 else max(dt[i // 2 + 1], dt[i // 2]) + 1
+    k = m
+    while k <= n:
+        dt[k] = dt[k // 2] + 1
+        k *= 2
+    return dt
+
+
+def _cheb_dep(c, m: int, dt) -> int:
+    """Depth of _cheb_rec(c): a leaf one past its deepest baby (the coefficient products), a split one past the
+    deeper of its quotient and giant."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        return max((dt[i] + 1 for i in range(1, len(c)) if c[i] != 0.0), default=0)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    return max(max(_cheb_dep(q, m, dt), dt[k]) + 1, _cheb_dep(r, m, dt))
+
+
+def _cheb_mask_plan(c, m: int, dt, out):
+    """The scales the masked recursion of `c` puts on the mask (see eval_chebyshev_masked), appended to `out`."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        out.append(1.0)
+        return
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    if _deg(q) == 0:
+        out.append(float(q[0]))
+    elif dt[k] < _cheb_dep(q, m, dt):
+        out.append(1.0)
+    else:
+        _cheb_mask_plan(q, m, dt, out)
+    _cheb_mask_plan(r, m, dt, out)
+
+
+def _cheb_geometry(coeffs, eps):
+    c = _cheb_trim(coeffs, eps)
+    n = len(c) - 1
+    m = 1 << ((n.bit_length() + 1) // 2)
+    return c, n, m, _cheb_depths(n, m)
+
+
+def cheb_mask_scales(coeffs, eps: float | None = None):
+    """The distinct scalars s eval_chebyshev_masked's `mask(ct, s)` takes, 1.0 first (a constant quotient q_0 rides
+    its giant's mask: T_k (q_0 M) is one plaintext product)."""
+    c, n, m, dt = _cheb_geometry(coeffs, eps)
+    if n <= 3:
+        return [1.0]
+    out = []
+    _cheb_mask_plan(c, m, dt, out)
+    return [1.0] + sorted({s for s in out if s != 1.0})
+
+
+class _ScaleRec:
+    """ops stand-in for a dry run: eval_chebyshev_masked's mask scales come from its callbacks."""
+    cheb_bsgs = dead_ops = True
+    realize_shared = cheb_align = False
+
+    def mult(self, a, b):
+        return a
+
+    add = sub = mult
+
+    def square(self, a):
+        return a
+
+    def inplace_add(self, a, b):
+        pass
+
+
+def cheb_mask_scales_terms(coeffs, eps: float | None = None, leaf_terms: str = "budget"):
+    """The distinct scalars s of every `mask(ct, s)` and `add_mask(ct, s)` eval_chebyshev_masked takes with an
+    add_mask and `leaf_terms` (1.0 first): the term-by-term leaves bring their coefficients."""
+    out = []
+
+    def rec(ct, s):
+        out.append(float(s))
+        return ct
+    eval_chebyshev_masked(_ScaleRec(), 0.0, coeffs, -1.0, 1.0, eps, rec, rec, leaf_terms)
+    return [1.0] + sorted({s for s in out if s != 1.0})
+
+
+def _cheb_leaf_masked(ops, T, y, c, mask, add_mask):
+    """sum_i c_i T_i times M with the mask in every term's product (T_i (c_i M), c_0 M added): the leaf's own depth."""
+    r = None
+    for i in range(1, len(c)):
+        if c[i] != 0.0:
+            t = mask(T[i], float(c[i]))
+            r = t if r is None else ops.add(r, t)
+    if r is None:
+        r = ops.sub(y, y)
+    return add_mask(r, float(c[0])) if c[0] != 0.0 else r
+
+
+def _cheb_leafdep(c, dt) -> int:
+    return max((dt[i] + 1 for i in range(1, len(c)) if c[i] != 0.0), default=0)
+
+
+def _cheb_rec_budget(ops, T, y, m, c, dt, mask, add_mask, budget):
+    """_cheb_rec(c) times the mask within `budget` levels (the depth its unmasked sibling sets): as _cheb_rec_masked,
+    but a leaf takes the mask after its sum (one plaintext product) when that fits the budget and term by term only
+    when it does not."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        if _cheb_leafdep(c, dt) + 1 <= budget:
+            return mask(_cheb_leaf(ops, T, y, c), 1.0)
+        return _cheb_leaf_masked(ops, T, y, c, mask, add_mask)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    dq = _cheb_dep(q, m, dt)
+    if _deg(q) == 0:
+        prod = mask(T[k], float(q[0]))
+    elif max(dq, dt[k] + 1) + 1 <= budget:
+        prod = ops.mult(_cheb_rec(ops, T, y, m, q, None), mask(T[k], 1.0))
+    else:
+        prod = ops.mult(_cheb_rec_budget(ops, T, y, m, q, dt, mask, add_mask, budget - 1), T[k])
+    return ops.add(prod, _cheb_rec_budget(ops, T, y, m, r, dt, mask, add_mask, budget))
+
+
+def _cheb_rec_masked(ops, T, y, m, c, leaves, dt, mask, add_mask=None):
+    """_cheb_rec(c) times the mask at _cheb_rec's own depth where a level of slack allows: a split takes the mask on
+    its giant when the giant is shallower than the quotient (q (T_k M)), else inside the quotient ((q M) T_k); the
+    remainder recursively; a leaf after its sum (one past the leaf, where the sibling products land), or, with
+    `add_mask` (ct + s M), in each of its terms' products (the leaf's own depth: no slack needed)."""
+    d = _deg(c)
+    c = c[: d + 1]
+    if d < m:
+        if add_mask is not None and leaves is None:
+            return _cheb_leaf_masked(ops, T, y, c, mask, add_mask)
+        return mask(_cheb_leaf(ops, T if leaves is None else leaves, y, c), 1.0)
+    k = 1 << (d.bit_length() - 1)
+    q, r = _cheb_split(c, k)
+    if _deg(q) == 0:
+        prod = mask(T[k], float(q[0]))
+    elif dt[k] < _cheb_dep(q, m, dt):
+        prod = ops.mult(_cheb_rec(ops, T, y, m, q, leaves), mask(T[k], 1.0))
+    else:
+        prod = ops.mult(_cheb_rec_masked(ops, T, y, m, q, leaves, dt, mask, add_mask), T[k])
+    return ops.add(prod, _cheb_rec_masked(ops, T, y, m, r, leaves, dt, mask, add_mask))
+
+
+def eval_chebyshev_masked(ops, x, coeffs, a: float, b: float, eps: float | None, mask, add_mask=None,
+                          leaf_terms: str = "always"):
+    """eval_chebyshev_bsgs times a plaintext mask M, at the series' own depth instead of a level more: M rides the
+    giants and leaves that have a level of slack (_cheb_rec_masked); a constant quotient q_0 rides its giant's mask
+    (T_k (q_0 M)). `mask(ct, s)` returns ct times s M (s from cheb_mask_scales). `add_mask(ct, s)` (ct plus s M):
+    every leaf takes the mask in its terms' products instead of after its sum (any scale s: the coefficients), so a
+    series whose leaves have no slack keeps its depth too; `leaf_terms="budget"` takes that term-by-term form only for
+    the leaves that need it (the others: one product after the sum). Same value as mult(eval_chebyshev(...), M) up to
+    rounding; needs CHEB_BSGS (degree > 3)."""
+    coeffs, n, m, dt = _cheb_geometry(coeffs, eps)
+    if n <= 3 or not getattr(ops, "cheb_bsgs", False):
+        raise ValueError("eval_chebyshev_masked: a BSGS series of degree > 3 (CHEB_BSGS=1)")
+    alpha = 2.0 / (b - a)
+    beta = (a + b) / (b - a)
+    y = x if alpha == 1.0 else ops.mult(x, alpha)
+    if beta != 0.0:
+        y = ops.add(y, -beta)
+    T = {1: y}
+    shared = getattr(ops, "realize_shared", False)
+    need = _cheb_needed(coeffs, m, n) if getattr(ops, "dead_ops", False) else None
+    for i in range(2, m):
+        if need is not None and i not in need:
+            continue
+        if i % 2 == 0:
+            sq = ops.square(T[i // 2])
+            T[i] = ops.add(ops.add(sq, sq), -1.0)
+        else:
+            j = i // 2
+            prod = ops.mult(T[j + 1], T[j])
+            T[i] = ops.sub(ops.add(prod, prod), y)
+        if shared:
+            ops.realize(T[i])
+    k = m
+    while k <= n:
+        if need is not None and k not in need:
+            k *= 2
+            continue
+        sq = ops.square(T[k // 2])
+        T[k] = ops.add(ops.add(sq, sq), -1.0)
+        if shared:
+            ops.realize(T[k])
+        k *= 2
+    leaves = _AlignedBabies(ops, T, m, shared) if getattr(ops, "cheb_align", False) else None
+    if add_mask is not None and leaf_terms == "budget" and leaves is None:
+        # every leaf masked after its sum where that fits the series' own depth, term by term where it does not
+        return _cheb_rec_budget(ops, T, y, m, coeffs, dt, mask, add_mask, _cheb_dep(coeffs, m, dt))
+    return _cheb_rec_masked(ops, T, y, m, coeffs, leaves, dt, mask, add_mask)
+
+
 class _NoBsgs:
     """ops view with the BSGS switch off (tiny series take the direct recursion)."""
     cheb_bsgs = False
@@ -429,7 +635,7 @@ def goldschmidt_inv_ndf(ops, N_init, D_init, F_init, iters: int):
     return N
 
 
-def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0, Dh=None, cheb=None):
+def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: float = 1.0, Dh=None, cheb=None, num=None):
     """1/D by the goldschmidt_inv_ndf recurrence with its numerator left out, the seed
     F_init = alpha - beta x calibrated for x = scale D (F_k = 2 - D_k, D_{k+1} = D_k F_k on
     scale D; the product of the F's, times scale, is 1/D). A caller dividing a wide payload by a
@@ -440,16 +646,26 @@ def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: floa
     SM_FOLD) takes the seed's ciphertext x constant products off the chain: one level less per call.
     `cheb` = (kappas, mu) (SM_CHEB_GS, impl smcheb): the Chebyshev-scaled steps, F = 2 kappa_j + P + conj P, on a
     seed already scaled by kappa_0 (alpha, beta); the reciprocal's seed is scaled by mu = 1/lambda_K, which on a
-    complex payload rides the seed product itself: P = G (D - i mu) = -i (G (i D + mu)) (no extra level or product)."""
+    complex payload rides the seed product itself: P = G (D - i mu) = -i (G (i D + mu)) (no extra level or product).
+    `num` (SM_CHEB_GS on a complex payload only): a real numerator N the reciprocal multiplies, folded into the seed
+    product, P = -i (G (i D + mu N)): the recursion's imaginary part carries N R, so the result is N / D with no final
+    product (one level and one product less) and the running state is the one ciphertext P throughout (a refresh
+    anywhere inside the recursion refreshes all of it)."""
     a, b = alpha * scale, beta * scale * scale        # scale F_init(scale D) = a - b D
     if cheb is not None:
         kap, mu = cheb
         if ops.complex_payload:
             G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a) if Dh is None else ops.add(Dh, -0.5 * a)
-            P = ops.negate(ops.mult_i(ops.mult(G, ops.add(ops.mult_i(D), mu))))   # -kappa_0 D F / 2 + i mu kappa_0 F / 2
+            if num is None:
+                m = mu
+            else:
+                m = num if mu == 1.0 else ops.mult(num, mu)
+            P = ops.negate(ops.mult_i(ops.mult(G, ops.add(ops.mult_i(D), m))))   # -kappa_0 D F / 2 + i mu kappa_0 F / 2 (x N)
             for j in range(iters - 1):
                 P = ops.mult(P, ops.add(ops.add(P, ops.conjugate(P)), 2.0 * kap[j]))
             return ops.mult_i(ops.sub(ops.conjugate(P), P))
+        if num is not None:
+            raise ValueError("goldschmidt_recip: a folded numerator needs a complex payload")
         bD = ops.mult(D, b) if Dh is None else ops.add(Dh, Dh)
         R = ops.add(ops.mult(bD, -mu), mu * a)                                  # mu kappa_0 F
         D_neg = ops.mult(D, ops.add(bD, -a))                                   # -kappa_0 D F
@@ -459,6 +675,8 @@ def goldschmidt_recip(ops, D, alpha: float, beta: float, iters: int, scale: floa
             if j + 2 < iters:
                 D_neg = ops.mult(D_neg, F)
         return R
+    if num is not None:
+        raise ValueError("goldschmidt_recip: a folded numerator needs SM_CHEB_GS")
     if ops.complex_payload:
         if Dh is None:
             G = ops.add(ops.mult(D, 0.5 * b), -0.5 * a)                   # -scale F_init / 2
@@ -572,12 +790,14 @@ def inv_sqrt_newton_scaled(ops, x, steps, scale: float = 1.0):
     return y
 
 
-def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0):
+def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0, carry: float = 1.0):
     """inv_sqrt_newton_scaled from w = -b1 x instead of x (b1 = steps[0][1], applied before x's refresh): the
     closed-form first step is w + a1, no product and no level; the second step's cubic term reads w itself (its
     constant b2 / b1 carried into the next step's constants: y2 = (b2 / b1) (a2 b1 / b2 y1 + w y1^3)), so its
     critical path is (w y1) y1^2 from the landing, two levels below inv_sqrt_newton_scaled's; every later step's -b x
-    is w b / b1, shallow beside y."""
+    is w b / b1, shallow beside y. `carry`: the steps between the second and the last hold y / carry (their constants
+    take it, no product), so where x is small and y = 1 / sqrt(x) large, w b / b1 is not a tiny operand carried from
+    the landing to a deep level (whose adjusted copy's rounding would dwarf it) and y stays near 1."""
     last = len(steps) - 1
     a1, b1 = steps[0]
     if last == 0:
@@ -591,9 +811,11 @@ def inv_sqrt_newton_folded(ops, w, steps, scale: float = 1.0):
             kappa = b / b1
             y = ops.add(ops.mult(y, a / kappa), ops.mult(ops.mult(w, y), ops.square(y)))
             continue
-        c = ops.mult(w, b * k * kappa ** 3 / b1)
-        y = ops.add(ops.mult(y, a * k * kappa), ops.mult(ops.mult(c, y), ops.square(y)))
-        kappa = 1.0
+        # y holds y_true / kappa and leaves as y_true k / out
+        out = carry if i < last else 1.0
+        c = ops.mult(w, b * k * kappa ** 3 / b1 / out)
+        y = ops.add(ops.mult(y, a * k * kappa / out), ops.mult(ops.mult(c, y), ops.square(y)))
+        kappa = out
     return y
 
 

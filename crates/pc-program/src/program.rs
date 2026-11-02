@@ -91,6 +91,13 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fused: Vec<VarId>,
     },
+    /// `sum_j ins[2j] * ins[2j + 1]` relinearized once (`compile::msum`: a chain of single-use relinearized products
+    /// added up, each with its own operand preludes; pc-gpu `Ops::mult_sum`). `fused`: the products' and partial sums'
+    /// vars, never materialized (their lowered metadata stays for the check).
+    MultSum {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fused: Vec<VarId>,
+    },
 }
 
 impl Kind {
@@ -116,6 +123,7 @@ impl Kind {
             Kind::Finish { .. } => "finish",
             Kind::Batched(_) => "batched",
             Kind::CoeffSum { .. } => "coeff_sum",
+            Kind::MultSum { .. } => "mult_sum",
         }
     }
 }
@@ -268,6 +276,15 @@ pub struct Pairing {
     /// The largest member CF (`PAIR_CF_MAX`, or `PAIR_CF_MAX_LEAN` on a lean chain) and the CF of a route without one.
     pub cf_max: u32,
     pub cf_default: u32,
+    /// Launches ahead a refresh's mate is looked for (config `bts.pair_window`; 0 = `compile::batch`'s default), the
+    /// ops its chain may bring forward scaling with it.
+    #[serde(default)]
+    pub window: u32,
+    /// Config `bts.pair_loose`: refreshes left unpaired pair across input levels and raise drops too (pc-gpu
+    /// `StcFirstRoute::pair` aligns the shallower input's scale to the deeper's and lands the member of the deeper drop
+    /// where its single would).
+    #[serde(default)]
+    pub loose: bool,
 }
 
 /// The largest correction factor of a pair member (the pair's 1/2 comes out of a member's pre-scale 2^(19 - CF)):

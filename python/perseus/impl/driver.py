@@ -601,11 +601,13 @@ class PlannedRun:
     stage's stream under the plan's `block_<b>_<variant>_placement.json` (e.g. block 0 for a token fed back by
     generation); they share the stage's registers, dynamic steps and plaintext values. `pt_cache`: `precompute`
     encodes every position's plaintexts once into a device cache, and a token copies its position's into their
-    slots instead of encoding them (a few positions: GPT-2's 16 hold 1550 distinct values, 7.4 GB)."""
+    slots instead of encoding them (a few positions: GPT-2's 16 hold 1550 distinct values, 7.4 GB). `schedule`: the
+    compile's K-batching order (`Program.compile(schedule=)`: "program", "siblings", "lockstep")."""
 
     def __init__(self, recorder, plan_dir, config, labels, keys, *, ref_token=2, probe=4, work_dir, pt_rows=0,
-                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, pt_cache=False):
+                 dyn_rot=None, stc_cache=8, pool=16, log=print, variants=None, pt_cache=False, schedule="program"):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
+        self.schedule = schedule
         self.variants = dict(variants or {})
         self.ref_token, self.probe, self.work_dir, self.pt_rows = ref_token, probe, work_dir, pt_rows
         self.pt_cache = pt_cache
@@ -678,7 +680,7 @@ class PlannedRun:
             live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
         self.progs = _pc.Program.compile(self.work_dir, str(self.plan_dir), config=self.cfg,
                                          blocks=[self.labels[b] for b in ref] + list(self.variants), live_out=live,
-                                         input_metas=metas)
+                                         input_metas=metas, schedule=self.schedule)
         # dynamic steps: everything a probe token changes
         dyn = {b: set() for b in ref}
         for t, rec in self.records.items():
