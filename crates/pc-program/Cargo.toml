@@ -12,7 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # feature `gpu`: bind / replay / residency / kv on the device runtime
-pc-core = { path = "../pc-core", optional = true }
+pc-core = { path = "../pc-core" }
 pc-cuda = { path = "../pc-cuda", optional = true }
 pc-gpu = { path = "../pc-gpu", optional = true }
 pc-kernels = { path = "../pc-kernels", optional = true }
@@ -20,4 +20,4 @@ rayon = { workspace = true, optional = true }
 
 [features]
 default = []
-gpu = ["dep:pc-core", "dep:pc-cuda", "dep:pc-gpu", "dep:pc-kernels", "dep:rayon"]
+gpu = ["dep:pc-cuda", "dep:pc-gpu", "dep:pc-kernels", "dep:rayon"]

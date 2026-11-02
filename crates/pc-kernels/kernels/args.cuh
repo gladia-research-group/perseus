@@ -168,7 +168,9 @@ static_assert(sizeof(PtDotArgs) == 128, "PtDotArgs layout");
 // Batched hybrid key-switch inner product, K ciphertexts x R keys per launch (each key element read once):
 //   s1 = sum_d D_d[t][i] a_{r,d}[t][i],  s0 = C0[t][i] + sum_d D_d[t][i] b_{r,d}[t][i]
 // D_d[t] = c1 itself when t is in digit d, else the NTT'd ModUp output; C0: c0_mode 0 none, 1 P*c0 on Q rows,
-// 2 c0 extended. Outputs written at automorph_slot(autok[r], i) (k = 1: identity). Grid row y -> prime id rows[y].
+// 2 c0 extended; c0_mode | KS_ACC (ABI 16): (s0, s1) added onto the outputs' words. Outputs written at
+// automorph_slot(autok[r], i) (k = 1: identity). Grid row y -> prime id rows[y].
+constexpr int32_t KS_ACC = 4;
 struct KsArgs {
     const void* c1;
     const void* modup;
@@ -585,8 +587,9 @@ struct CtsRegenArgs {
 static_assert(sizeof(CtsRegenArgs) == 232, "CtsRegenArgs layout");
 
 // ks_dot (K <= 4 ciphertexts x R keys, automorphism, c0 modes) with the keys read through KeyTab (`ks.kb` unused;
-// `ks.ka` / `ks.key_digit_stride` only for digits >= key.nregen); 4 consecutive slots per thread (cooperative ChaCha
-// at u32).
+// `ks.ka` / `ks.key_digit_stride` only for digits >= key.nregen); at K = 1 (u32) on warp-sized row segments, 8 slots
+// per lane and one ChaCha block per thread (ks_dot_seg), else 4 consecutive slots per thread (cooperative ChaCha at
+// u32).
 struct KsKeyArgs {
     KsArgs ks;
     KeyTab key;
@@ -597,11 +600,12 @@ static_assert(sizeof(KsKeyArgs) == 216, "KsKeyArgs layout");
 // PCMM at the StC-first split (FIDESlib Pcmm.cu): one launcher, op-coded. Buffers are u32 residues
 // unless stated; "staging" = W words [part][4][N] (part 0 = c1 "a", part 1 = c0 "b"); primes p[] are q0, q1, P (key
 // ops) or the chain's q0..q3 (in_rescale), mu[i] = floor(2^64 / p[i]); n = ring degree of the op (N or N1 = N/16).
-//   GATHER     x = staging (W) <- ct member i0 (PolyRef ct), rows 0..3 of both parts
-//   SCATTER    ct member i0 rows 0..3 <- y = staging (W)
-//   IN_RESCALE y = staging (W, coefficient form) -> x [part][2][N]: exact rescale by p[3] then p[2]
+//   GATHER     x = staging (W) <- ct member i0 (PolyRef ct), rows 0..i4-1 of both parts (i4: the split's limbs, 3
+//              or 4; 0 = 4)
+//   SCATTER    ct member i0 rows 0..i4-1 <- y = staging (W)
+//   IN_RESCALE y = staging (W, coefficient form) -> x [part][2][N]: exact rescale by p[3] then p[2] (i4 = 3: by p[2])
 //              (c[0..3) = p[3]^-1 mod p[0..3), c[3..5) = p[2]^-1 mod p[0], p[1])
-//   LIFT       y = f [2][N] -> x = staging part [4][N] (W): limb i < 2 = f[i] c[i] mod p[i], limbs 2, 3 = 0
+//   LIFT       y = f [2][N] -> x = staging part [4][N] (W): limb i < 2 = f[i] c[i] mod p[i], limbs 2..i4-1 = 0
 //   KS_DIGITS  y = x [2][count][n] -> x = D [2][3][count][n] = centered(x[j] c[j] mod p[j]) mod p[pi]
 //   KS_MAC     y = D [2][3][i0 i1][n], z = keys [i1][2][3][2][n] -> x = acc [2][3][i0][n] (outs i0, nl i1)
 //   MOD_DOWN   y = acc -> x = [2][2][i0][n]: (acc_i - centered(acc_P)) c[i] mod p[i]   (c = P^-1 mod q_i)

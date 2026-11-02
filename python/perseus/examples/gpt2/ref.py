@@ -14,7 +14,7 @@ import numpy as np
 
 from perseus.impl import smcheb
 from perseus.impl.attention import first_iters
-from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg
+from perseus.impl.config import CutMaxCfg, GeluCfg, NormCfg, SoftmaxCfg, ref_key
 from perseus.impl.poly import (NumpyOps, eval_chebyshev, eval_polynomial_ps, eval_remez_31,
                    eval_taylor_inv_sqrt, goldschmidt_inv_ndf, goldschmidt_inv_x0, goldschmidt_recip,
                    inv_sqrt_newton, inv_sqrt_newton_d2, inv_sqrt_newton_safe, inv_sqrt_newton_scaled,
@@ -80,10 +80,18 @@ def gelu_exact(x):
     return 0.5 * x * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3)))
 
 
-def softmax_ref(scores, cfg: SoftmaxCfg, kc: int):
-    """THOR softmax over the LAST axis of scores[..., kc] (attention.softmax_thor)."""
+def softmax_ref(scores, cfg: SoftmaxCfg, kc: int, head=None):
+    """THOR softmax over the LAST axis of scores[..., kc] (attention.softmax_thor). With reference-key centring
+    (cfg.ref_keys) the scores are head `head`'s, or, when `head` is None, the second-to-last axis runs over the heads."""
     s = np.asarray(scores, dtype=np.float64)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+    if cfg.ref_keys:
+        if head is None:
+            idx = np.array([ref_key(r, kc) for r in cfg.ref_keys[:s.shape[-2]]])
+            ref = np.take_along_axis(s, np.broadcast_to(idx[:, None], s.shape[:-1] + (1,)), -1)
+        else:
+            ref = s[..., ref_key(cfg.ref_keys[head], kc), None]
+        s = s - ref
     ct = s - mean
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     z = eval_chebyshev(_ops, ct, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
@@ -128,7 +136,7 @@ def attention_ref(q, K, V, cfg: SoftmaxCfg, H_real: int, d_head: int, softmax=so
     for h in range(H_real):
         idx = h + H * np.arange(d_head)
         sc = (K[:, idx] @ q[idx]) / math.sqrt(d_head)
-        p = softmax(sc, cfg, kc) if softmax is softmax_ref else softmax(sc)
+        p = softmax(sc, cfg, kc, head=h) if softmax is softmax_ref else softmax(sc)
         out[idx] = p @ V[:, idx]
     return out
 

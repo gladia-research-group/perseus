@@ -54,16 +54,21 @@ impl<'a> Fx<'a> {
         if m.nl < 2 {
             return Err(rule("rescale", format!("NoiseLevel {} has no pending rescale (top {})", m.nl, m.top)));
         }
-        if m.top < self.d {
-            return Err(rule("rescale", format!("top limb {} has no {} primes left to drop", m.top, self.d)));
+        let g = self.drop_at(m.top);
+        if m.top < g {
+            return Err(rule("rescale", format!("top limb {} has no {g} primes left to drop", m.top)));
         }
         steps.push(Step::Rescale);
-        m.top -= self.d;
+        m.top -= g;
         if self.st.is_some() {
-            m.nf /= self.mrp(m.top + self.d);
+            m.nf /= self.mrp(m.top + g);
         }
         m.nl -= 1;
         Ok(())
+    }
+    /// Primes a rescale from `top` drops: `d`, but at a lean chain's single-prime level (scale tables only).
+    fn drop_at(&self, top: i32) -> i32 {
+        self.st.and_then(|st| st.drop.get(top as usize).copied()).filter(|&g| g > 0).map_or(self.d, |g| g as i32)
     }
     pub fn drop_to(&self, m: &mut FMeta, top: i32, steps: &mut Vec<Step>) {
         if top < m.top {

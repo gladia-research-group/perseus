@@ -50,8 +50,12 @@ class Gpt2Model(ImplModel):
         # push refreshes K + iV with one bootstrap, CutMax runs on the packed tile pair and
         # the feedback goes through the complex tile
         self.complex = bool(self.rt.ops.complex_payload)
-        Cache = ComplexKVCache if self.complex_packing else KVCache
-        self.kv = [Cache(self.rt.dims.d_head) for _ in range(self.n_layers)]
+        if self.complex_packing:
+            # a layer whose softmax is centred on reference keys pushes its keys minus key 0 (attention._ref_*)
+            self.kv = [ComplexKVCache(self.rt.dims.d_head, centre=bool(cfgs.block(b)[2].ref_keys))
+                       for b in range(self.n_layers)]
+        else:
+            self.kv = [KVCache(self.rt.dims.d_head) for _ in range(self.n_layers)]
         self._bw = {}
         self._lnf = None
         self._lm = None

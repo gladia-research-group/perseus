@@ -153,6 +153,9 @@ pub struct PtDotArgs {
     pub pad: i32,
 }
 
+/// `KsArgs::c0_mode` flag (ABI 16): the inner product is added onto the outputs' words.
+pub const KS_ACC: i32 = 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct KsArgs {

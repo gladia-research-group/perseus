@@ -166,6 +166,35 @@ __device__ __forceinline__ void regen4(const uint32_t* seed, uint32_t lane, uint
     }
 }
 
+// ---------------------------------------------------------------- per-thread u32 blocks
+// The 16 words of block b0 of digit d expanded by one thread: four independent quarter-rounds per step, no shuffles,
+// rejection with the block stride n16 and the final reduction of regen4 (the same words).
+__device__ __forceinline__ void regen_block16(const uint32_t (&key)[8], uint32_t b0, uint32_t d, uint32_t p, uint32_t n16,
+                                              uint32_t tag, uint32_t (&v)[16]) {
+    chacha12(key, b0, d, p, tag, v);
+    const uint32_t m_p = (0xFFFFFFFFu / p) * p;
+    uint32_t need = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) need |= (v[i] >= m_p ? 1u : 0u) << i;
+    for (uint32_t t = 1; need && t < 16u; ++t) {
+        uint32_t e[16];
+        chacha12(key, b0 + t * n16, d, p, tag, e);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (need >> i & 1u) {
+                v[i] = e[i];
+                if (e[i] < m_p) need &= ~(1u << i);
+            }
+        }
+    }
+    const uint32_t r = 0xFFFFFFFFu / p;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t x = v[i] - __umulhi(v[i], r) * p;
+        v[i] = x >= p ? x - p : x;
+    }
+}
+
 // 4 consecutive slots base4..base4+3 of this thread (lane-group cooperative at u32, per-thread otherwise).
 // All 32 lanes of the warp must call it together at u32.
 template <class W, class MM>

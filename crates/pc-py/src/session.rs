@@ -11,7 +11,7 @@ use crate::shadow::shadow_config;
 use crate::LevelError;
 use pc_core::keys::{Prng, SecretKey};
 use pc_core::modmul::Barrett64;
-use pc_core::params::{Chain, ChainSpec};
+use pc_core::params::Chain;
 use pc_cuda::{Arena, Device, Event, EventPool};
 use pc_gpu::decrypt::Decryptor;
 use pc_gpu::encrypt::Encryptor;
@@ -292,8 +292,10 @@ pub(crate) struct State {
 /// What only a session holding the secret has.
 pub(crate) struct SecretSide {
     pub secret: DevSecret<'static, W>,
-    /// bottom-pair and 4-row decryptors (a value above q0 q1 / 2 at its scale decodes from 4 rows)
+    /// bottom-pair and 4-row decryptors (a value above q0 q1 / 2 at its scale decodes from 4 rows), and a 3-row one
+    /// for a lean chain's level 48 (q0 q1 q2: the deepest a value sits once realized, below its 4 rows)
     pub dec2: Decryptor<'static, W>,
+    pub dec3: Decryptor<'static, W>,
     pub dec4: Decryptor<'static, W>,
 }
 
@@ -667,6 +669,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 sfs.cf_default = Some(cf as u32);
             }
             sfs.cache_slots = ps.stc_cache.max(1);
+            if pcmm.is_some() {
+                // a lean chain's PCMM inputs take their own fixed StC stages (no-op on a composite chain)
+                sfs.own_split = Some(pc_gpu::bts::stc_first::THIN_SPLIT_PCMM);
+            }
             if ccmm.is_some() {
                 // the CCMM operands' stc_high (50, skip 1) and SinCBoot's stage 0 for every left-operand state, plus
                 // the calibration probes' (fresh tokens at the bootstrap output level)
@@ -681,9 +687,11 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 sfs.high = Some(pc_gpu::bts::stc_high::StcHighSetup { shapes, slots: hs });
             }
             let mut sp = StcFirstPlan::new(chain, &setup, &sfs).map_err(e)?;
-            // refresh pairs (bts.pair): the compile pairs CFs up to PAIR_CF_MAX, run_pair takes CFs below cf_ref
-            if ps.programs.iter().any(|p| p.batch_report.pairs > 0) && pc_program::program::PAIR_CF_MAX + 1 != sp.sf.cf_ref {
-                return Err(PyValueError::new_err(format!("refresh pairs up to CF {} on an StC-first route of reference CF {}", pc_program::program::PAIR_CF_MAX, sp.sf.cf_ref)));
+            // refresh pairs (bts.pair): the compile pairs CFs up to PAIR_CF_MAX (a lean chain's: PAIR_CF_MAX_LEAN),
+            // run_pair takes CFs below cf_ref
+            let pair_max = if chain.lone_top().is_some() { pc_program::program::PAIR_CF_MAX_LEAN } else { pc_program::program::PAIR_CF_MAX };
+            if ps.programs.iter().any(|p| p.batch_report.pairs > 0) && pair_max + 1 != sp.sf.cf_ref {
+                return Err(PyValueError::new_err(format!("refresh pairs up to CF {pair_max} on an StC-first route of reference CF {}", sp.sf.cf_ref)));
             }
             // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for
             let keys = stc_first_keys(&ps.programs, n, (chain.q.len() - 1 - sp.entry_top) as u32, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
@@ -772,7 +780,7 @@ fn manifest(cfg: &pc_config::Config, chain: &Chain, nd: &Needs, pcmm: &Option<cr
         None => None,
     };
     Ok(pc_client::KeySpec {
-        chain: "n32".into(),
+        chain: cfg.chain.preset.clone().unwrap_or_else(|| "n32".into()),
         params_hash: pc_client::spec::params_hash(chain),
         contract: contract_hash(cfg)?,
         keys,
@@ -968,7 +976,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let complex = cfg.chain.ckks_complex.unwrap_or(false);
     let radix_bits = knob(cfg.model.ladder_radix_bits, 3, "model.ladder_radix_bits")? as u32;
     let device = Device::open().map_err(|x| e(x.into()))?;
-    let chain = Chain::generate(&ChainSpec::n32()).map_err(|x| e(x.into()))?;
+    let chain = crate::shadow::chain_of(cfg)?;
     let n = chain.n;
     let half = (n / 2) as i64;
     let k_max = 8;
@@ -1014,7 +1022,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let with_secret = !matches!(origin, Origin::Bundle(_));
     mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, !with_secret));
     if with_secret {
-        mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, 2, 1) + Decryptor::<W>::bytes(&lay, 4, 1));
+        mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, 2, 1) + Decryptor::<W>::bytes(&lay, 3, 1) + Decryptor::<W>::bytes(&lay, 4, 1));
         mp.reserve("keys.secret", DevSecret::<W>::bytes(&lay));
     }
     // planned: route tables + work, the shared slab, the registers, the programs' key groups
@@ -1033,6 +1041,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             wshape = Some(wshape.map_or(w, |x| x.max(w)));
         }
         let st_tables = pc_core::scale::ScaleTables::precompute(&chain).map_err(|x| e(x.into()))?;
+        mp.reserve("bts.sparse", SparseBPrecomp::<W>::tails_bytes(&chain, &st_tables, &lay, &sb_cfgs).map_err(e)?);
         for (i, c) in sb_cfgs.iter().enumerate() {
             let (b, w) = SparseBPrecomp::<W>::bytes(&chain, &st_tables, &lay, c).map_err(e)?;
             mp.reserve("bts.sparse", b);
@@ -1175,10 +1184,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let secret_side = match secret.take() {
         Some(sec) => {
             let mut dec2 = Decryptor::new(a, &ex.compute, lay, 2, 1).map_err(e)?;
+            let mut dec3 = Decryptor::new(a, &ex.compute, lay, 3, 1).map_err(e)?;
             let mut dec4 = Decryptor::new(a, &ex.compute, lay, 4, 1).map_err(e)?;
             dec2.load_secret(&ex.compute, &sec).map_err(e)?;
+            dec3.load_secret(&ex.compute, &sec).map_err(e)?;
             dec4.load_secret(&ex.compute, &sec).map_err(e)?;
-            Some(SecretSide { secret: sec, dec2, dec4 })
+            Some(SecretSide { secret: sec, dec2, dec3, dec4 })
         }
         None => None,
     };
@@ -1199,9 +1210,10 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 None => None,
             };
             let mut sparse: Vec<SparseBRoute<'_, W>> = vec![];
+            let sb_tails = SparseBPrecomp::<W>::tails(a, &ex.compute, &ctx, &keys, &sb_cfgs).map_err(e)?;
             for c in &sb_cfgs {
                 let s = &ex.compute;
-                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, stage).map_err(e)?;
+                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, &sb_tails, stage).map_err(e)?;
                 // the raise variants of one slot count are one route (`SparseBRoute::variant` picks by drop)
                 if let Some(r) = sparse.iter_mut().find(|r| r.slots == c.slots) {
                     r.variants.push(pre);
@@ -1515,7 +1527,7 @@ impl PySession {
     #[allow(clippy::too_many_arguments)]
     fn key_manifest(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usize>>, pool: usize, pt_slots: usize, encode_threads: usize, programs: Option<Vec<PyRef<'_, crate::program::PyProgram>>>, regs: usize, pt_rows: usize, dyn_rot: Vec<i64>, stc_cache: usize, pcmm: Option<Vec<crate::pcmm::LinSpec>>, pcmm_cf: u32, check_meta: bool, ccmm: bool, streams: Option<BTreeMap<String, usize>>, stream_frames: usize, kv: Option<(usize, usize, usize)>, reg_levels: Vec<u32>, pt_levels: Vec<u32>, tfhe: Option<usize>) -> PyResult<String> {
         let x = args(config, keys, size, pool, pt_slots, encode_threads, programs, regs, pt_rows, dyn_rot, stc_cache, pcmm, pcmm_cf, check_meta, ccmm, streams, stream_frames, kv, reg_levels, pt_levels, tfhe)?;
-        let chain = Chain::generate(&ChainSpec::n32()).map_err(|e| gerr(e.into()))?;
+        let chain = crate::shadow::chain_of(&x.cfg)?;
         let nd = key_needs(&x.cfg, &x.ks, &chain, &x.plan, &x.pp, &x.cp)?;
         manifest(&x.cfg, &chain, &nd, &x.pp, x.cp.is_some())?.to_json().map_err(cerr)
     }

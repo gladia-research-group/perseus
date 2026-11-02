@@ -101,10 +101,10 @@ __global__ void rescale_prep(RescaleArgs A) {
 // (the same words rescale_coef stores, never stored here); row i of T is tmp row (c, part, r = rprime[i]).
 template <class W, class MM, bool L>
 __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
-    __shared__ W s[256 * 32 / ntt::PH<W>];
+    __shared__ W s[256 * 16];
     const int row = blockIdx.y;
     const int r = T.rprime[row];
-    W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
+    W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
     const W* ya = base + (size_t)(A.top - r) * N;
     const W* yp = base + (size_t)(A.top - 1 - r) * N;
     const PrimeConst& pq = A.pr[r];
@@ -112,11 +112,11 @@ __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     const W ha = (W)A.pr[A.top].p >> 1, hb = (W)A.pr[A.top - 1].p >> 1;
     const W av = ((const W*)A.A)[r], as = ((const W*)A.As)[r], bv = ((const W*)A.B)[r], bs = ((const W*)A.Bs)[r];
     const W qam = ((const W*)A.qam)[r], qbm = ((const W*)A.qbm)[r];
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    W x[32];
+    const int c = threadIdx.x & 15, g = threadIdx.x >> 4;
+    W x[16];
 #pragma unroll
-    for (int j = 0; j < 32; ++j) {
-        const int o = (wp + 8 * j) * 256 + lane;
+    for (int j = 0; j < 16; ++j) {
+        const int o = (g + 16 * j) * 256 + c;
         const W u = ya[o], v = yp[o];
         W la = reduce_small<W, MM>(u, pq);
         if (u > ha) la = sub<W>(la, qam, q);
@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
         if (v > hb) lb = sub<W>(lb, qbm, q);
         x[j] = add<W>(mul_shoup<W>(la, av, as, q), mul_shoup<W>(lb, bv, bs, q), q);
     }
-    ntt::fwd_cols_core<W, L>(x, base, s, (const W*)T.fw + (size_t)r * N, (const W*)T.fws + (size_t)r * N, q, lane, wp);
+    ntt::fwd_cols_core<W, L>(x, base, s, (const W*)T.fw + (size_t)r * N, (const W*)T.fws + (size_t)r * N, q, c, g);
 }
 
 template <class W, class MM>
@@ -143,10 +143,10 @@ int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
         b.roff = T.roff + i;
         b.rprime = T.rprime + i;
         if (lz) {
-            cols_rs<W, MM, true><<<dim3(8, m), 256, 0, s>>>(b, R);
+            cols_rs<W, MM, true><<<dim3(16, m), 256, 0, s>>>(b, R);
             ntt::ntt_fwd_rows<W, true><<<dim3(32, m), 256, 0, s>>>(b);
         } else {
-            cols_rs<W, MM, false><<<dim3(8, m), 256, 0, s>>>(b, R);
+            cols_rs<W, MM, false><<<dim3(16, m), 256, 0, s>>>(b, R);
             ntt::ntt_fwd_rows<W, false><<<dim3(32, m), 256, 0, s>>>(b);
         }
     }

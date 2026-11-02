@@ -11,11 +11,12 @@ import math
 import numpy as np
 
 from . import smcheb
-from .attention import _recip_rounds, first_iters
+from .attention import _recip_rounds, first_iters, sink_only
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
 from .linear import _baby_sum, linear_multi, prepare_linear_input
-from .poly import eval_chebyshev, im_cleanse, rotsum
+from .pcmm import session_specs
+from .poly import eval_chebyshev, im_cleanse, rotsum, rotsum_neg
 import os
 _DBG = bool(os.environ.get("PF_DEBUG"))
 # PF_ATTN_PAIR=1: two offsets per q.K^T / P.V product on the complex axis
@@ -646,7 +647,9 @@ def _sm_joint(rt, za, zb, cfg):
 
 def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None, periodic=None):
     """softmax_thor over chunk c's packed scores S with per-lane (kc-dependent) reciprocal seeds.
-    `Z`: precomputed masked exps (the joint path)."""
+    `Z`: precomputed masked exps (the joint path). A config centred on key 0 takes scores whose keys came off key 0
+    (prefill_attention's centre_keys)."""
+    sink_only(cfg, "prefill_softmax")
     ops, d = rt.ops, rt.dims
     c0 = _hp_pair(c)
     pos = ch.lanes(c if c0 is None else c0)
@@ -690,6 +693,16 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     return Y
 
 
+def centre_keys(rt, K, ch: Chunks):
+    """A softmax centred on key 0 (cfg.ref_keys): every chunk's keys minus key 0's (chunk 0, lane 0), so q.K^T returns
+    s - s_0. Key 0 is selected by one plaintext product and copied over the t lanes by the replicate-right ladder (no
+    level); the slots of no real score stay 0, since the score placing masks select the real ones."""
+    ops, d = rt.ops, rt.dims
+    k0 = rt.mult_mask(K[0], ("pf.kref0", ch.t), lambda: (np.arange(d.N) % ch.t == 0).astype(float))
+    k0 = rotsum_neg(ops, k0, ch.t)
+    return [None if k is None else ops.sub(k, k0) for k in K]
+
+
 def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False):
     """Causal attention on dense complex Q/K/V (scale 1/2); returns dense outputs (scale 1) as the decode's P.V.
     `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt.
@@ -716,6 +729,10 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             K[k] = rope_lanes(rt, K[k], rope, ch.lanes(k), "pf.rope.k")
     if kv is not None:
         kv["K"], kv["V"] = K, V
+    if getattr(cfg, "ref_keys", ()):
+        if prefix is not None:
+            raise ValueError("prefill_attention: a softmax centred on key 0 with a public prefix key runs on the CCMM")
+        K = centre_keys(rt, K, ch)
     gscale = 1.0 / math.sqrt(d.d_head_real)
     rotK, rotV = {}, {}
 
@@ -1550,8 +1567,13 @@ def gelu_joint(rt, A, B, cfg, mask, us=None):
             if cs is not None:
                 so = 2.0 * s_out if lean else s_out
                 cs = [so * c for c in cs]
-                return [ops.mult(ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * so), w)
-                        for x, w in zip((A, B), xu)]
+                out = []
+                for x, w in zip((A, B), xu):
+                    g = ops.add(eval_chebyshev(ops, x, cs, -1.0, 1.0, _SILU_SINGLE_EPS), 0.5 * so)
+                    if getattr(ops, "gelu_out_hint", False):   # GELU_OUT_HINT: the series' sum, before x u
+                        ops.bootstrap_hint(g, ops.headroom(2), True)
+                    out.append(ops.mult(g, w))
+                return out
         p1 = [eval_chebyshev(ops, x, c1, cfg.thor_p1_a, cfg.thor_p1_b) for x in (A, B)]
         X = ops.add(p1[0], ops.mult_i(p1[1]))
         ops.bootstrap(X)
@@ -1701,6 +1723,7 @@ class PlannedPrefill:
         """The planned Session's arguments after (config, keys), which `Session.key_manifest` and `from_bundle` take
         too; records the plaintext aliases `setup` binds."""
         import hashlib
+        from perseus import _pc
         from .driver import register_levels
         progs = [self.progs[lab] for lab in self.labels]
         # plaintexts by value: the blocks' masks repeat (one resident slot per distinct (values, level))
@@ -1715,11 +1738,11 @@ class PlannedPrefill:
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), v)
         self.uniq = uniq
-        # a compact plaintext slot holds the rows of its level (n32: 54 - level Q primes); the deepest plaintext sizes it
-        pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
+        # a compact plaintext slot holds the rows of its level (the chain's Q primes less the level); the deepest
+        # plaintext sizes it
+        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
         t = self.model.rt.dims.t
-        specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
-                  int(lin.shift)) for lin in self.linears().values()]
+        specs = session_specs(self.linears().values(), t)
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_stages) for j, r in self.reg[b]])
         return dict(pool=self.pool, pt_slots=len(uniq) + 8, programs=progs, regs=self.n_regs, pt_rows=pt_rows,
                     stc_cache=self.stc_cache, pcmm=specs or None, pcmm_cf=self.pcmm_cf, check_meta=self.check_meta,

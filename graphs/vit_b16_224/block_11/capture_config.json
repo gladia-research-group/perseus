@@ -9,6 +9,7 @@
     "auto_bts_level": 46,
     "bts_iterations": 1,
     "bts_max_input_level": 50,
+    "cts_alt_budget": 5,
     "em_fuse_rescale": true,
     "gpu_encode": true,
     "pair": true,
@@ -27,7 +28,7 @@
     "shift": true,
     "sparse_auto": 2,
     "sparse_b": true,
-    "sparse_b_k": 16,
+    "sparse_b_k": 24,
     "sparse_bts_slots": [
       "512",
       "1"
@@ -53,9 +54,9 @@
   "host": {
     "hf_home": "/data02/users/azirilli/cache/huggingface",
     "malloc_arena_max": 2,
-    "omp_num_threads": 4,
+    "omp_num_threads": 8,
     "python": "/data02/users/azirilli/perseus-wt/main-port/.venv/bin/python",
-    "pythonpath": "/data02/users/azirilli/perseus-wt/main-replan/python"
+    "pythonpath": "python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -96,7 +97,7 @@
       "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "/data02/users/azirilli/perseus-wt/main-replan/bootstrap_placements/_rp_vit_d8/pcmm_calib.json",
+      "pcmm_calib_in": "bootstrap_placements/vit_b16_224/pcmm_calib.json",
       "pcmm_raise": [
         "out:2",
         "down:2"
@@ -117,12 +118,14 @@
     }
   },
   "exec": {
+    "all_blocks_io_dir": ".cache/oracle/gpt2/all_blocks_io",
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "graphs/_rp_vit_pr_od2",
+    "fhe_graph_dir": "graphs/_vgh_vit_b16_224",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
-    "steps_t": 128
+    "steps_t": 128,
+    "weights_path": ".cache/models/openai-community/gpt2/classic/weights.bin.zip"
   }
 }

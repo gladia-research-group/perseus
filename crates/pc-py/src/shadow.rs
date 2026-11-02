@@ -52,6 +52,12 @@ fn u32_of(knob: &str, v: Option<i64>, default: u32) -> PyResult<u32> {
     }
 }
 
+/// The chain a Config names: the preset `chain.preset` (default n32).
+pub fn chain_of(c: &Config) -> PyResult<pc_core::params::Chain> {
+    let spec = pc_core::params::ChainSpec::preset(c.chain.preset.as_deref().unwrap_or("n32")).map_err(|e| cfg_err("chain.preset", e))?;
+    pc_core::params::Chain::generate(&spec).map_err(|e| cfg_err("chain.preset", e))
+}
+
 /// The ShadowConfig a Config means in `mode` (pc-shadow stays untouched).
 pub fn shadow_config(c: &Config, plan: Option<&PlanConfig>, mode: &str, strict: bool) -> PyResult<ShadowConfig> {
     let unit = u32_of("chain.composite_degree", c.chain.composite_degree, 2)?;
@@ -59,7 +65,7 @@ pub fn shadow_config(c: &Config, plan: Option<&PlanConfig>, mode: &str, strict: 
         None | Some("n32") => {}
         Some(other) => return Err(cfg_err("chain.chain", format!("{other:?}: only the n32 chain shape is known"))),
     }
-    let real_chain = ChainShape { n_q: ChainShape::N32.n_q, unit };
+    let real_chain = ChainShape { n_q: chain_of(c)?.q.len() as u32, unit };
     let chain = match mode {
         "runtime" => real_chain,
         "planner" => ChainShape::unbounded(unit),
@@ -169,9 +175,8 @@ pub struct PyShadow {
 }
 
 impl PyShadow {
-    fn build(cfg: ShadowConfig, tables: bool, mode: &str) -> PyResult<PyShadow> {
+    fn build(cfg: ShadowConfig, tables: bool, mode: &str, chain: &pc_core::params::Chain) -> PyResult<PyShadow> {
         let st = if tables {
-            let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::n32()).map_err(|e| cfg_err("tables", e))?;
             Some(Arc::new(pc_core::scale::ScaleTables::precompute(&chain).map_err(|e| cfg_err("tables", e))?))
         } else {
             None
@@ -245,7 +250,7 @@ impl PyShadow {
     #[pyo3(signature = (config, mode="runtime", plan=None, tables=false, strict=false))]
     fn new(config: &PyConfig, mode: &str, plan: Option<&PyPlanConfig>, tables: bool, strict: bool) -> PyResult<Self> {
         let cfg = shadow_config(&config.0, plan.map(|p| &p.0), mode, strict)?;
-        PyShadow::build(cfg, tables, mode)
+        PyShadow::build(cfg, tables, mode, &chain_of(&config.0)?)
     }
     #[getter]
     fn mode(&self) -> &str {

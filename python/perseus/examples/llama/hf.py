@@ -121,14 +121,14 @@ def collect_sites(model, toks, rows_per_layer=8192, seed=0, rot=None):
     return out
 
 
-def prompt_kv(toks, n: int, path=None):
+def prompt_kv(toks, n: int, path=None, device="cuda"):
     """The plain prefix: exact fp32 pre-RoPE K / V of the first `n` positions of a teacher-forced window,
     (k, v) each (layers, n, H_kv * d_head) float64 (the k_proj / v_proj outputs), cached at `path` (.npz)."""
     if path and os.path.exists(path):
         z = np.load(path)
         return z["k"], z["v"]
     import torch
-    m = load_model()
+    m = load_model(device=device)
     out = {}
 
     def hook(b, kind):

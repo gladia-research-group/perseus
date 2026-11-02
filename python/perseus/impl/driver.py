@@ -1357,7 +1357,8 @@ class StreamedPlannedRun:
             for b in range(n):
                 p = c["progs"][b]
                 lv += [p.outputs[j][1] for j, _u in c["kv_out"][b]] + [p.inputs[i][1] for i, _u in c["kv_in"][b]]
-        kv_rows = 54 - min(lv) if lv else 1
+        n_q = _pc.chain_limbs(self.cfg["chain.preset"])
+        kv_rows = n_q - min(lv) if lv else 1
         pages = 2 * self.U
         # plaintext slots: the most (value, level) pairs one token's class programs read (`_patch`'s keys). `_patch`
         # evicts the values a token no longer reads before it stages the new ones, so the store never holds more than
@@ -1377,7 +1378,7 @@ class StreamedPlannedRun:
         # first one sit in different frames
         frames = self.frames or self._frames(n + 1, int(self.cfg["host.n_in_flight"] or 2))
         self.sess = _pc.Session(self.cfg, self.keys, size=self.size, pool=self.pool, pt_slots=n_slots + self.extra_pt_slots, programs=progs,
-                                regs=regs, pt_rows=54 - pt_level, dyn_rot=self.dyn_rot, stc_cache=self.stc_cache,
+                                regs=regs, pt_rows=n_q - pt_level, dyn_rot=self.dyn_rot, stc_cache=self.stc_cache,
                                 streams=self.streams, stream_frames=frames, kv=(n * self.U, kv_rows, pages),
                                 check_meta=self.check_meta)
         self.store = self.sess.pt_store

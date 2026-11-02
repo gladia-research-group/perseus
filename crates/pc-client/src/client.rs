@@ -133,7 +133,7 @@ impl Client {
             kska_expand_row(seed, d as u32, p as u32, &mut a);
             let sn = s_new[id].as_ref().expect("s_new row of every stored prime id");
             let inq = id < nq && self.ring.digit_of(id) == Some(d);
-            let pm = if inq { self.ring.p_mod_q[id] } else { 0 };
+            let pm = if inq { self.ring.gadget(shape.kp)[id] } else { 0 };
             let so = &s_old[id];
             for i in 0..n {
                 let mut v = b[i] as u64 + p - mm(a[i], sn[i], p);
@@ -361,7 +361,8 @@ impl Client {
             return Err(Error::Wire(format!("ciphertext of {} rows at level {} (top {})", h.rows, h.meta.level, self.top_of(h.meta.level)?)));
         }
         let unit = self.chain.level_unit;
-        let d = if h.rows >= 4 { 4 } else { unit };
+        // a lean chain's level 48 holds q0 q1 q2: its 3 rows decode together (the bottom pair alone wraps above ~2^1.3)
+        let d = if h.rows >= 4 { 4 } else if h.rows == 3 && self.chain.lone_top().is_some() { 3 } else { unit };
         if h.rows < d {
             return Err(Error::Wire(format!("ciphertext of {} rows is below the bottom level ({d})", h.rows)));
         }
@@ -379,8 +380,8 @@ impl Client {
                         m.into_iter().map(|x| x as u64).collect()
                     })
                     .collect();
-                if d == 4 {
-                    Ok(decode4(&self.enc, &self.chain.q[..4], &rows, slots, payload, h.meta.nf, n))
+                if d >= 3 {
+                    Ok(decode4(&self.enc, &self.chain.q[..d], &rows, slots, payload, h.meta.nf, n))
                 } else {
                     Ok(self.enc.decode_slots(&rows, slots, payload, h.meta.nf)?)
                 }
@@ -427,7 +428,7 @@ impl Client {
                         if inq {
                             let so = s_old[id][i];
                             let x = if sq { mm(so, so, p) as u32 } else { so };
-                            v += p - mm(self.ring.p_mod_q[id], x, p);
+                            v += p - mm(self.ring.gadget(key.shape.kp)[id], x, p);
                         }
                         (v % p) as u32
                     })
@@ -505,9 +506,13 @@ mod tests {
     use crate::spec::KeyShape;
 
     fn client(seed: u32) -> Client {
+        client_on("n32", seed)
+    }
+
+    fn client_on(chain: &str, seed: u32) -> Client {
         let mut g = Prng::from_seed([seed, 1, 2, 3, 4, 5, 6, 7], 0);
         let sec = ClientSecret::generate(&mut g, 1 << 16).unwrap();
-        Client::new("n32", sec).unwrap()
+        Client::new(chain, sec).unwrap()
     }
 
     /// sigma_{g^-1}(s) gathered in eval form == the coefficient-form automorphism transformed.
@@ -524,10 +529,17 @@ mod tests {
         assert_eq!(got[7].as_ref().unwrap(), &want);
     }
 
-    /// Every role's key satisfies its switch relation (max |e| within 14 sigma), and the bundle round-trips.
+    /// Every role's key satisfies its switch relation (max |e| within 14 sigma), and the bundle round-trips: on n32 and
+    /// on the lean n32a4, whose bottom-shape keys (the sparse secrets') switch over P' only.
     #[test]
     fn keygen_relations_and_bundle() {
-        let mut c = client(2);
+        for name in ["n32", "n32a4"] {
+            keygen_relations_and_bundle_on(name);
+        }
+    }
+
+    fn keygen_relations_and_bundle_on(name: &str) {
+        let mut c = client_on(name, 2);
         let chain = c.chain.clone();
         let full = KeyShape::full(&chain);
         let keys = vec![
@@ -541,7 +553,7 @@ mod tests {
             KeyReq { role: Role::Auto { galois: 2 * chain.n as u64 - 5 }, shape: full },
         ];
         let spec = KeySpec {
-            chain: "n32".into(),
+            chain: name.into(),
             params_hash: c.params_hash.clone(),
             contract: "test".into(),
             keys,
@@ -550,7 +562,13 @@ mod tests {
             ccmm: false,
             public_key: true,
         };
-        let dir = std::env::temp_dir().join(format!("pc_client_test_{}", std::process::id()));
+        if chain.p_sparse < chain.p.len() {
+            // a key to a sparse secret over the whole of P is refused
+            let mut wide = spec.clone();
+            wide.keys[4].shape = KeyShape::banded(&chain, 1).unwrap();
+            assert!(wide.check(&chain).is_err());
+        }
+        let dir = std::env::temp_dir().join(format!("pc_client_test_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("b.pckb");
         let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());

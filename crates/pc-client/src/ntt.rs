@@ -112,6 +112,10 @@ pub struct Ring {
     pub ntt: Vec<Ntt>,
     /// P mod q_i for every Q prime id.
     pub p_mod_q: Vec<u32>,
+    /// P' mod q_i (P' = the first `Chain::p_sparse` special primes: the bottom-shape keys' gadget).
+    pub ps_mod_q: Vec<u32>,
+    /// Special primes in P (a key over fewer uses P').
+    pub kp: usize,
 }
 
 impl Ring {
@@ -119,8 +123,18 @@ impl Ring {
         let primes = chain.primes();
         let roots = chain.roots();
         let ntt = primes.par_iter().zip(roots.par_iter()).map(|(&p, &r)| Ntt::new(p, r, chain.n)).collect::<Result<Vec<_>>>()?;
-        let p_mod_q = chain.q.iter().map(|&q| chain.p.iter().fold(1u64, |a, &pj| mulmod(a, pj % q, q)) as u32).collect();
-        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q })
+        let prod = |ps: &[u64]| chain.q.iter().map(|&q| ps.iter().fold(1u64, |a, &pj| mulmod(a, pj % q, q)) as u32).collect();
+        let (p_mod_q, ps_mod_q) = (prod(&chain.p), prod(&chain.p[..chain.p_sparse]));
+        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, kp: chain.p.len() })
+    }
+
+    /// The gadget factor (P or P' mod q) of a key over `kp` special primes.
+    pub fn gadget(&self, kp: usize) -> &[u32] {
+        if kp < self.kp {
+            &self.ps_mod_q
+        } else {
+            &self.p_mod_q
+        }
     }
 
     /// Eval row of a signed small polynomial at prime id `id`.

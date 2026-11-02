@@ -177,16 +177,39 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let lt = |top: usize| -> Result<usize> {
             Ok(LtPts::<W>::coeffs_bytes(geo.npts, top + 1 + lay.kp, n, n) + LtStage::<W>::plan_bytes(&lay, &primes, &geo, top, LtEnd::ModDown, cfg.k_max)?)
         };
-        let tails = if cfg.lt_tails { tail_steps(chain, &[(geo, tops.0)], LT_REGEN_DIGITS).len() } else { 0 };
         Ok(vec![
             ("raise", RaisePlan::<W>::table_bytes()),
             ("fold", AccRounds::bytes(&rr[0])),
-            ("cts", lt(tops.0)? + KeyTails::<W>::bytes(&lay, chain.dnum(), LT_REGEN_DIGITS, tails)),
+            ("cts", lt(tops.0)?),
             ("cts_acc", AccRounds::bytes(&rr[1])),
             ("em", Self::em_bytes(st, &lay, tops.1, cfg)?),
             ("stc", lt(tops.2)?),
             ("stc_acc+half", AccRounds::bytes(&rr[2]) + AccRounds::bytes(&rr[3])),
         ])
+    }
+
+    /// The CtS baby steps of the variants `cfgs` whose keys get a resident `a` tail (`KeyTails` from digit
+    /// `LT_REGEN_DIGITS` on). One `KeyTails` of these steps serves every variant and slot count: a tail belongs to its
+    /// key, and the raise variants of a route share their CtS keys.
+    pub fn tail_steps(chain: &Chain, st: &ScaleTables, cfgs: &[SparseBCfg]) -> Result<Vec<i64>> {
+        let mut steps = Vec::new();
+        for cfg in cfgs.iter().filter(|c| c.lt_tails) {
+            let g = geometry(chain.n, cfg)?;
+            steps.extend(tail_steps(chain, &[(Self::lt_geom(&g), Self::tops(chain, st, cfg)?.0)], LT_REGEN_DIGITS));
+        }
+        steps.sort();
+        steps.dedup();
+        Ok(steps)
+    }
+
+    /// Device bytes of the shared tails of `cfgs` (`tail_steps`).
+    pub fn tails_bytes(chain: &Chain, st: &ScaleTables, lay: &Layout, cfgs: &[SparseBCfg]) -> Result<usize> {
+        Ok(KeyTails::<W>::bytes(lay, chain.dnum(), LT_REGEN_DIGITS, Self::tail_steps(chain, st, cfgs)?.len()))
+    }
+
+    /// The shared tails of `cfgs`, expanded from the keys' seeds (setup; `tails_bytes`).
+    pub fn tails<M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, keys: &dyn BtsKeyRing, cfgs: &[SparseBCfg]) -> Result<KeyTails<'a, W>> {
+        KeyTails::new(arena, s, ctx, keys, &Self::tail_steps(&ctx.chain, &ctx.scale, cfgs)?, LT_REGEN_DIGITS)
     }
 
     /// The EvalMod plan's tables as `EvalModPlan::new` carves them.
@@ -211,6 +234,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
     }
 
     /// Build the variant: raise tables, diagonals (encoded at their stage levels), accumulate key groups, EvalMod.
+    /// `tails`: the routes' shared CtS key tails (`tail_steps` of every variant built at setup).
     #[allow(clippy::too_many_arguments)]
     pub fn new<M: DevStrategy<W>>(
         arena: &'a Arena,
@@ -218,6 +242,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         ctx: &Context<'_, W, M>,
         cfg: SparseBCfg,
         keys: &dyn BtsKeyRing,
+        tails: &KeyTails<'_, W>,
         stage: Option<(*const c_void, *const c_void)>,
     ) -> Result<Self> {
         // carves are measured between aligned arena offsets (every allocation starts aligned)
@@ -257,8 +282,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let sf_c = st.sf(top as i32)?;
         let cts_pts = LtPts::new(arena, s, ctx, top, PtSource::Slots { values: &p, scale: sf_c })?;
         let steps = if cfg.lt_tails { tail_steps(&ctx.chain, &[(geo, top)], LT_REGEN_DIGITS) } else { Vec::new() };
-        let tails = KeyTails::new(arena, s, ctx, keys, &steps, LT_REGEN_DIGITS)?;
-        let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring(keys, n)?, stage, cfg.k_max)?;
+        let cts = LtStage::new(arena, s, ctx, geo, top, LtEnd::ModDown, sf_c * shift_t, cts_pts, &tails.ring_of(keys, n, &steps)?, stage, cfg.k_max)?;
         mark("cts", &mut parts);
         let cts_acc = AccRounds::new(arena, s, n, keys, stage, r_cts)?;
         mark("cts_acc", &mut parts);

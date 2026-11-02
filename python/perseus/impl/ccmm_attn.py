@@ -69,8 +69,14 @@ def attention_ccmm(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=
                 kv[bb]["K"], kv[bb]["V"] = Kr[-1], Vr[-1]
         Qs = sc.to_sinc_q(rt, Qc)
         Ks = sc.to_sinc_kv(rt, Kr)
-        kpat = sc.kv_row_pattern(kb)
-        Ks = [rt.add_mask(x, ("ccmm.kbos", layer, o), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
+        if cfg.ref_keys:
+            # a softmax centred on key 0: every prompt key row minus the (public) BOS key, the BOS row left 0, so
+            # q.K^T returns s - s_BOS (no level: a plaintext sum)
+            kpat = sc.kv_rows_pattern(-kb, range(ch.T))
+            Ks = [rt.add_mask(x, ("ccmm.kref", layer, o), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
+        else:
+            kpat = sc.kv_row_pattern(kb)
+            Ks = [rt.add_mask(x, ("ccmm.kbos", layer, o), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
         if cm.MERGE:
             Qs, Ks = sc.dup(rt, Qs), sc.dup(rt, Ks)
         S = eng.apply(Qs, Ks, b_transposed=True, amax=QMAX, bmax=KMAX, shift=SHIFT_QK, out_scale=0.5 * gscale,

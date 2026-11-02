@@ -3,7 +3,7 @@
   "heuristic_config": "min_cut",
   "input_graph": {
     "version": 1,
-    "num_nodes": 2314,
+    "num_nodes": 2300,
     "num_nodes_deliberate_bootstrap": 0,
     "num_nodes_optimized": 2294
   },
@@ -21,23 +21,13 @@
   "placements": [
     {
       "type": "bootstrap_after_node",
-      "node_op": "mult",
-      "target_var": "sc_tail_103"
-    },
-    {
-      "type": "bootstrap_after_node",
       "node_op": "add",
-      "target_var": "sc_tail_20"
+      "target_var": "sc_tail_18"
     },
     {
       "type": "bootstrap_after_node",
       "node_op": "mult",
-      "target_var": "sc_tail_93"
-    },
-    {
-      "type": "bootstrap_after_node",
-      "node_op": "mult",
-      "target_var": "sc_tail_98"
+      "target_var": "sc_tail_3"
     }
   ],
   "weight_levels": {},
@@ -47,54 +37,46 @@
   "rescale_after": [
     "sc_tail_10",
     "sc_tail_101",
-    "sc_tail_103",
     "sc_tail_18",
-    "sc_tail_20",
     "sc_tail_23",
     "sc_tail_26",
     "sc_tail_29",
+    "sc_tail_3",
     "sc_tail_32",
     "sc_tail_35",
     "sc_tail_38",
     "sc_tail_41",
     "sc_tail_90",
     "sc_tail_91",
-    "sc_tail_93",
-    "sc_tail_96",
-    "sc_tail_98"
+    "sc_tail_96"
   ],
   "sparse_slots": {
-    "sc_tail_103": 1,
-    "sc_tail_20": 1,
-    "sc_tail_93": 1,
-    "sc_tail_98": 1
+    "sc_tail_18": 1
   },
   "correction_factor": {
-    "sc_tail_103": 11,
-    "sc_tail_20": 11,
-    "sc_tail_93": 11,
-    "sc_tail_98": 11
+    "sc_tail_18": 10,
+    "sc_tail_3": 11
   },
   "raise_drop": {
-    "sc_tail_103": 11,
-    "sc_tail_20": 1,
-    "sc_tail_93": 7,
-    "sc_tail_98": 9
+    "sc_tail_3": 5
   },
+  "real_route": [
+    "sc_tail_3"
+  ],
   "summary": {
-    "num_placements": 4,
+    "num_placements": 2,
     "num_hint_bootstraps": 0,
     "num_hints_total": 2,
     "num_deliberate_bootstrap_nodes": 0,
     "final_named_levels": {
-      "sc_tail_1": 36,
-      "sc_tail_2": 36,
-      "sc_tail_3": 36,
-      "sc_tail_4": 36,
-      "sc_tail_5": 36,
-      "sc_tail_6": 36,
-      "sc_tail_7": 36,
-      "sc_tail_8": 36,
+      "sc_tail_1": 44,
+      "sc_tail_2": 44,
+      "sc_tail_3": 38,
+      "sc_tail_4": 38,
+      "sc_tail_5": 38,
+      "sc_tail_6": 38,
+      "sc_tail_7": 38,
+      "sc_tail_8": 38,
       "sc_tail_9": 38,
       "sc_tail_10": 40,
       "sc_tail_11": 40,
@@ -104,9 +86,9 @@
       "sc_tail_15": 40,
       "sc_tail_16": 40,
       "sc_tail_17": 42,
-      "sc_tail_18": 44,
-      "sc_tail_19": 44,
-      "sc_tail_20": 18,
+      "sc_tail_18": 16,
+      "sc_tail_19": 16,
+      "sc_tail_20": 16,
       "sc_tail_21": 18,
       "sc_tail_22": 18,
       "sc_tail_23": 20,
@@ -177,19 +159,19 @@
       "sc_tail_88": 24,
       "sc_tail_89": 26,
       "sc_tail_90": 28,
-      "sc_tail_91": 46,
+      "sc_tail_91": 18,
       "sc_tail_92": 28,
-      "sc_tail_93": 30,
+      "sc_tail_93": 28,
       "sc_tail_94": 30,
       "sc_tail_95": 28,
       "sc_tail_96": 32,
       "sc_tail_97": 32,
-      "sc_tail_98": 34,
+      "sc_tail_98": 32,
       "sc_tail_99": 34,
       "sc_tail_100": 32,
       "sc_tail_101": 36,
       "sc_tail_102": 36,
-      "sc_tail_103": 38,
+      "sc_tail_103": 36,
       "sc_tail_104": 38,
       "sc_tail_105": 36,
       "sc_tail_106": 38,
@@ -2385,12 +2367,12 @@
     "final_named_degs": {
       "sc_tail_1": 1,
       "sc_tail_2": 1,
-      "sc_tail_3": 2,
-      "sc_tail_4": 2,
-      "sc_tail_5": 2,
-      "sc_tail_6": 2,
-      "sc_tail_7": 2,
-      "sc_tail_8": 2,
+      "sc_tail_3": 1,
+      "sc_tail_4": 1,
+      "sc_tail_5": 1,
+      "sc_tail_6": 1,
+      "sc_tail_7": 1,
+      "sc_tail_8": 1,
       "sc_tail_9": 2,
       "sc_tail_10": 1,
       "sc_tail_11": 2,
@@ -2402,7 +2384,7 @@
       "sc_tail_17": 2,
       "sc_tail_18": 1,
       "sc_tail_19": 2,
-      "sc_tail_20": 1,
+      "sc_tail_20": 2,
       "sc_tail_21": 2,
       "sc_tail_22": 2,
       "sc_tail_23": 1,
@@ -2475,17 +2457,17 @@
       "sc_tail_90": 1,
       "sc_tail_91": 1,
       "sc_tail_92": 2,
-      "sc_tail_93": 1,
+      "sc_tail_93": 2,
       "sc_tail_94": 2,
       "sc_tail_95": 2,
       "sc_tail_96": 1,
       "sc_tail_97": 2,
-      "sc_tail_98": 1,
+      "sc_tail_98": 2,
       "sc_tail_99": 2,
       "sc_tail_100": 2,
       "sc_tail_101": 1,
       "sc_tail_102": 2,
-      "sc_tail_103": 1,
+      "sc_tail_103": 2,
       "sc_tail_104": 2,
       "sc_tail_105": 2,
       "sc_tail_106": 2,
@@ -4678,7 +4660,7 @@
       "sc_tail_2293": 2,
       "sc_tail_2294": 2
     },
-    "total_bootstraps": 4,
+    "total_bootstraps": 2,
     "num_weight_levels": 0,
     "exit_var": "sc_tail_2294",
     "exit_level": 44,
@@ -4686,72 +4668,57 @@
     "bts_quality": {
       "err_target": 0.01,
       "table_measured": true,
-      "num_sites": 4,
+      "num_sites": 2,
       "predicted_rel_err": {
-        "median": 1.1392132205839138e-05,
-        "p90": 1.1401986519931546e-05,
-        "p99": 1.1401986519931546e-05,
-        "max": 1.1401986519931546e-05
+        "median": 0.002015419556191503,
+        "p90": 0.002015419556191503,
+        "p99": 0.002015419556191503,
+        "max": 0.002015419556191503
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
-        "11": 4
+        "10": 1,
+        "11": 1
       },
       "out_level_histogram": {
-        "18": 1,
-        "30": 1,
-        "34": 1,
+        "16": 1,
         "38": 1
       },
       "num_offset": 0,
       "num_prescale": 0,
-      "num_raise_drop": 4,
-      "num_real_route": 0,
-      "num_sparse": 4,
+      "num_raise_drop": 1,
+      "num_real_route": 1,
+      "num_sparse": 1,
       "worst_sites": [
         {
-          "var": "sc_tail_93",
-          "rel_err": 1.1401986519931546e-05,
-          "max_abs": 0.8456376373028609,
-          "pack_period": 1,
+          "var": "sc_tail_3",
+          "rel_err": 0.002015419556191503,
+          "max_abs": 11.98343700393181,
+          "pack_period": 32768,
           "step": "tail"
         },
         {
-          "var": "sc_tail_98",
-          "rel_err": 1.1392132205839138e-05,
-          "max_abs": 0.8505334366385712,
-          "pack_period": 1,
-          "step": "tail"
-        },
-        {
-          "var": "sc_tail_103",
-          "rel_err": 1.1392046089860334e-05,
-          "max_abs": 0.850576364006334,
-          "pack_period": 1,
-          "step": "tail"
-        },
-        {
-          "var": "sc_tail_20",
-          "rel_err": 1.1325959710469485e-05,
-          "max_abs": 0.884266286110787,
+          "var": "sc_tail_18",
+          "rel_err": 7.16240973791495e-06,
+          "max_abs": 0.20448441296665174,
           "pack_period": 1,
           "step": "tail"
         }
       ],
       "placed_input_level_hist": {
-        "46": 1,
-        "48": 3
+        "44": 1,
+        "46": 1
       },
       "raise_drop_hist": {
-        "1": 1,
-        "7": 1,
-        "9": 1,
-        "11": 1
+        "5": 1
       },
-      "raise_drop_skipped": {},
+      "raise_drop_skipped": {
+        "no_slack": 1
+      },
       "blind_branches": {
-        "count": 2191,
+        "count": 2199,
         "vars": [
+          "sc_tail_100",
           "sc_tail_1000",
           "sc_tail_1001",
           "sc_tail_1002",
@@ -4762,6 +4729,7 @@
           "sc_tail_1007",
           "sc_tail_1008",
           "sc_tail_1009",
+          "sc_tail_101",
           "sc_tail_1010",
           "sc_tail_1011",
           "sc_tail_1012",
@@ -4772,6 +4740,7 @@
           "sc_tail_1017",
           "sc_tail_1018",
           "sc_tail_1019",
+          "sc_tail_102",
           "sc_tail_1020",
           "sc_tail_1021",
           "sc_tail_1022",
@@ -4780,26 +4749,19 @@
           "sc_tail_1025",
           "sc_tail_1026",
           "sc_tail_1027",
-          "sc_tail_1028",
-          "sc_tail_1029",
-          "sc_tail_1030",
-          "sc_tail_1031"
+          "sc_tail_1028"
         ]
       },
       "placed_input_levels": {
-        "sc_tail_103": 46.0,
-        "sc_tail_20": 44.0,
-        "sc_tail_93": 46.0,
-        "sc_tail_98": 46.0
+        "sc_tail_18": 42.0,
+        "sc_tail_3": 44.0
       },
       "placed_input_degs": {
-        "sc_tail_103": 2,
-        "sc_tail_20": 2,
-        "sc_tail_93": 2,
-        "sc_tail_98": 2
+        "sc_tail_18": 2,
+        "sc_tail_3": 2
       },
       "env_cap": {
-        "limit": 50.0,
+        "limit": 48.0,
         "relaxed": false,
         "vetoed_hints": [],
         "placed_past_cap": [],

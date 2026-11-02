@@ -227,6 +227,9 @@ class PlanConfig:
     #: the model's final block may not exit deeper than the min-cut's plan (its exit feeds
     #: the unplanned encrypted argmax; see IlpPlacer.cap_exit)
     ilp_cap_exit: bool = True
+    #: a lean chain's PCMMs of band shift above PCMM_PREDIV_SHIFT: their inputs' caps (`hint_lev`, `lvl_cap`), one
+    #: level above the captured ones (PLAN_PCMM_PREDIV_CAP; the runtime spends that level dividing the shift)
+    pcmm_prediv_cap: int | None = None
     #: a dense refresh whose input is past the StC-first entry runs the shipped order at the plan's CF: give it that
     #: order's CF (PLAN_FALLBACK_CF; off: the StC-first choice, sized on slot magnitudes, as every shipped plan has)
     fallback_cf: bool = False
@@ -269,6 +272,8 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
         # a refresh's input level: its producer's output before the refresh, which for a
         # refresh on a hint's output is the hint's input (the sim records a placed hint's
         # output as already refreshed)
+        if eff_env:
+            return past_env_eff(s)
         k = 0
         for v in placer.placed:
             p = g.producer_of.get(v)
@@ -286,6 +291,28 @@ def _prune_redundant(placer, sim: SimResult, keep=()) -> tuple[SimResult, int]:
                 if s.consumed.get(n.cipher_inputs[0], 0.0) > env_n + 1e-9:
                     k += 1
         return k
+
+    # PLAN_ENV_EFFECTIVE=1: the envelope the compile check enforces, the effective input (a pending rescale counts)
+    # of every refresh, every route, each against its step's and route's cap; a removal may not put any refresh
+    # past it that was not already
+    eff_env = os.environ.get("PLAN_ENV_EFFECTIVE") == "1"
+    unit = g.level_unit
+
+    def past_env_eff(s):
+        out = set()
+        for v in placer.placed:
+            p = g.producer_of.get(v)
+            if p is None:
+                continue
+            cap = refresh_env_cap(getattr(p, "step", None), route=placer.refresh.spec(v).route or 0)
+            if placer.bootstrap_level + s.input_eff(g, v, unit) > cap + 1e-9:
+                out.add(v)
+        for n in g.nodes:
+            if n.hint_level is not None and s.hint_fired.get(n.idx) and n.cipher_inputs:
+                cap = refresh_env_cap(n.step, route=placer.refresh.route_for(n.output) or 0)
+                if placer.bootstrap_level + s.effective(n.cipher_inputs[0], unit) > cap + 1e-9:
+                    out.add(f"hint:{n.idx}")
+        return out
 
     best, deep, removed = count(sim), past_env(sim), 0
     origin = getattr(placer, "_origin", None)
@@ -628,6 +655,57 @@ def recipe_plan_config(cfg: PlanConfig):
     return _pc.PlanConfig.from_legacy_env(env)
 
 
+#: pc-gpu `matmul::pcmm::PREDIV_SHIFT`: on a lean chain a PCMM of a larger band shift divides it on the level above
+#: the StC-first entry, and only when its stamp w_scale 2^shift exceeds 2^PCMM_PREDIV_STAMP_LOG2 (`PREDIV_STAMP_LOG2`)
+PCMM_PREDIV_SHIFT = 1
+PCMM_PREDIV_STAMP_LOG2 = 20
+
+
+def pcmm_stamps() -> dict[str, int] | None:
+    """PLAN_PCMM_STAMPS=<json>: each PCMM linear's stamp, round(log2(w_scale 2^shift)), as the runner declares it
+    (PF_PCMM_STAMPS_OUT, `perseus.impl.pcmm.session_specs`); None: unset."""
+    path = os.environ.get("PLAN_PCMM_STAMPS")
+    return {k: int(v) for k, v in json.loads(Path(path).read_text()).items()} if path else None
+
+
+def pcmm_prediv_caps(nodes: list[dict], cap: int, stamps: dict[str, int] | None = None) -> list[dict]:
+    """The captured nodes with the input caps (`hint_lev`, `lvl_cap`) of every PCMM whose band shift exceeds
+    PCMM_PREDIV_SHIFT lowered to `cap`: on a lean chain those inputs reach the PCMM one level above the StC-first entry,
+    which the runtime spends dividing their scale by 2^(shift - PCMM_PREDIV_SHIFT) (pc-gpu `matmul::pcmm::prediv`).
+    With `stamps` (`pcmm_stamps`), only the linears the runtime pre-divides: a stamp above 2^PCMM_PREDIV_STAMP_LOG2
+    (a linear missing from them counts as one)."""
+    prod = {n["output"]: i for i, n in enumerate(nodes) if n.get("output")}
+    hit: set[int] = set()
+    for n in nodes:
+        ext = (n.get("args") or {}).get("external")
+        if not (isinstance(ext, dict) and ext.get("op") == "pcmm" and int(ext.get("shift", 0)) > PCMM_PREDIV_SHIFT):
+            continue
+        if stamps is not None and stamps.get(ext.get("linear"), PCMM_PREDIV_STAMP_LOG2 + 1) <= PCMM_PREDIV_STAMP_LOG2:
+            continue
+        for v in n.get("inputs", []):
+            i = prod.get(v)
+            while i is not None and i not in hit and nodes[i].get("op_type") in ("level_hint", "hint"):
+                hit.add(i)
+                i = prod.get(nodes[i]["inputs"][0])
+
+    def lower(x: str) -> str:
+        for pre in ("lvl_cap(", "hint_lev("):
+            if x.startswith(pre) and x.endswith(")"):
+                return f"{pre}{min(cap, int(float(x[len(pre):-1])))})"
+        return x
+
+    out = []
+    for i, n in enumerate(nodes):
+        if i in hit:
+            args = dict(n.get("args") or {})
+            for k in ("thr", "cap"):
+                if k in args:
+                    args[k] = min(cap, int(args[k]))
+            n = dict(n, inputs=[lower(x) for x in n["inputs"]], args=args)
+        out.append(n)
+    return out
+
+
 def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                entry_level: int | None = None,
                entry_deg: int | None = None,
@@ -643,14 +721,16 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     """
     raw = json.loads(Path(graph_file).read_text(encoding="utf-8"))
     num_nodes_raw = len(raw.get("nodes", []))
-    g0 = Graph.from_nodes(raw.get("nodes", []), level_unit=cfg.level_unit)
+    nodes = raw.get("nodes", [])
+    if cfg.pcmm_prediv_cap is not None:
+        nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap, pcmm_stamps())
+    g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
 
     g, erase = erase_reactive_bootstraps(g0)
     if cfg.verbose:
         log.info(f"[plan] erased {erase.n_erased} reactive auto_bootstrap(s); "
               f"{erase.n_deliberate_kept} deliberate fixed point(s) kept")
 
-    kept_sites: set[str] = set()
     input_level_of: dict[str, float] = {}
     first_consumer_seed: dict[str, float] = {}
     for n in g.nodes:
@@ -810,11 +890,14 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
                             objective=cfg.ilp_objective,
                             cap_exit=bool(final_block and cfg.ilp_cap_exit), tiebreak=cfg.ilp_tiebreak)
+    # forced: sites refreshed whatever the levels say. force_place is the exit refresh
+    # of plan_graph_dir's terminal-exit retry; the exact path adds the keep_placements
+    # sites and the force_step_refresh keep-anchors below. The exact placers and the
+    # re-cut trials start from them, and the cut still adds whatever else it needs;
+    # every forced site goes through P2. The baseline placers take no seed: for them a
+    # forced site is only exempt from the prune.
+    forced = set(force_place or ())
     if exact:
-        # force_place: pre-seeded placements (the terminal-exit refresh retry in
-        # plan_graph_dir, and the magnitude keep-anchors). The cut still adds
-        # whatever else it needs; every forced site goes through P2.
-        forced = set(force_place or ())
         if cfg.keep_placements:
             # kept sites also survive the prune below
             kept = Path(cfg.keep_placements) / f"{block_name}_placement.json"
@@ -881,11 +964,15 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                              **placer_kwargs)
         sim = placer.run()
 
+    def trial_placer(realized: set) -> Placer:
+        """A re-cut trial (rescale_opt, shared_realize, ks_realize): the first placer's configuration, quiet, with
+        `realized` as its realize anchors, started from the same forced sites. A trial replaces the incumbent when
+        it needs no more bootstraps, so one that did not start from the forced sites (the retry's exit refresh, the
+        keep-anchors, the kept placements) would drop every one the block's own levels do not need, and win for it."""
+        return PlacerCls(**{**placer_kwargs, "verbose": False}, placed=set(forced), realized=set(realized),
+                         hint_force=hint_force)
+
     rescale_anchors: set = set()
-    # the realize-anchor trials re-run the cut: kept and forced sites stay placed in them too (the terminal-exit refresh
-    # of the block-loop retry was dropped by those trials, so the retry re-planned the same exit)
-    _kept_all = set(kept_sites) | (set(force_place or ()) if exact else set())
-    _kept = {"placed": _kept_all} if _kept_all else {}
     if cfg.rescale_opt and exact:
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
@@ -900,8 +987,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_kept)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -924,7 +1010,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial), hint_force=hint_force, **_kept)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -951,8 +1037,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             if not cands:
                 break
             trial = rescale_anchors | cands
-            p2 = PlacerCls(**{**placer_kwargs, "verbose": False}, realized=set(trial),
-                           hint_force=hint_force, **_kept)
+            p2 = trial_placer(trial)
             try:
                 s2 = p2.run()
             except PlanInfeasible:
@@ -967,9 +1052,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             log.info(f"[plan] ks_realize: {n_ks} key-switch realize anchor(s), bootstraps {base_ks} -> {best_ks}")
 
     if cfg.prune:
-        # forced sites stay (the exit refresh of the terminal-exit retry is needed by the next block)
-        sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(force_place or ())
-                                         + tuple(sorted(kept_sites)))
+        # forced sites stay: the exit refresh of the terminal-exit retry is needed by the next block, and a
+        # keep-anchor or a kept placement is placed whether or not the levels need it, so the prune would remove
+        # it wherever they do not
+        sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(sorted(forced)))
         if hasattr(placer, "meta"):
             placer.meta["pruned"] = n_pruned
         if cfg.verbose:
@@ -1108,6 +1194,11 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     _bad_reactive = []
     _bad_nom: dict[str, float] = {}      # nominal input level of each entry in _bad_cut (eff = nominal + pending unit)
     _refresh_obj = getattr(placer, "refresh", None)
+    if os.environ.get("PLAN_DEBUG_SITES") == "1":
+        for _v in sorted(placer.placed):
+            _nom, _deg = sim.input_state(g, _v)
+            _r = _refresh_obj.spec(_v).route if _refresh_obj is not None else None
+            log.info(f"[plan] site {_v} route={_r} in=({cfg.bootstrap_level + _nom:g},{_deg}) cap={_cap_of(_v):g}")
     for _v, _c in sim.consumed.items():
         if _v in placer.placed:
             # a placed site's `consumed` is its LANDING; the envelope applies to the level its refresh STARTS
@@ -1115,7 +1206,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             # check below, and the envelope was measured on the dense route (a sparse route tolerates a
             # deeper input; its ceiling stays the runtime guard's, as before).
             _p = g.producer_of.get(_v)
-            _sparse = _refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+            _sparse = (_refresh_obj is not None and bool(_refresh_obj.spec(_v).route)
+                       and os.environ.get("PLAN_ENV_EFFECTIVE") != "1")      # PLAN_ENV_EFFECTIVE: every route
             if _p is None or _p.is_deliberate_bts or _p.hint_level is not None or _sparse:
                 continue
             _nom, _deg = sim.input_state(g, _v)

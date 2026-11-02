@@ -96,7 +96,9 @@ class LlamaModel(ImplModel):
         self.H, self.H_kv = int(c["num_attention_heads"]), int(c["num_key_value_heads"])
         self.rope = Rope(cfgs.model["rope_inv_freq"])
         Cache = ComplexKVCache if packing == "cachemir_complex" else KVCache
-        self.kv = [Cache(self.rt.dims.d_head) for _ in range(self.n_layers)]
+        # a softmax centred on key 0 (ref_keys): its block's K cache holds every key minus key 0
+        self.kv = [ComplexKVCache(self.rt.dims.d_head, centre=self._centred(b)) if Cache is ComplexKVCache
+                   else Cache(self.rt.dims.d_head) for b in range(self.n_layers)]
         # LLAMA_GQA=1: K / V caches hold each KV head once (attention.mha_gqa on self.sub)
         self.G = self.H // self.H_kv if os.environ.get("LLAMA_GQA", "0") not in ("", "0") else 1
         self.sub = None
@@ -157,6 +159,9 @@ class LlamaModel(ImplModel):
     def load_plans(self, plan_dir, validate=True):
         return super().load_plans(plan_dir, range(self.n_layers + 1), validate=validate)
 
+    def _centred(self, b):
+        return bool(self.cfgs.block(b)[2].ref_keys)
+
     # ── the BOS prefix ──
     def prefix_caches(self):
         """The plain slot vectors of every block's cache after the BOS push (prefix.py)."""
@@ -172,13 +177,13 @@ class LlamaModel(ImplModel):
                 for b in range(self.n_layers):
                     kfs = [P.expanded_heads(k, Hc, self.H_kv, dh) for k in Ks[b]]
                     vfs = [P.expanded_heads(v, Hc, self.H_kv, dh) for v in Vs[b]]
-                    out.append(P.plain_cache_n(dc, kfs, vfs, self.packing, self.rope))
+                    out.append(P.plain_cache_n(dc, kfs, vfs, self.packing, self.rope, centre=self._centred(b)))
                 self._prefix = out
                 return out
-            for k, v in self.w.bos_kv(self.n_layers):
+            for b, (k, v) in enumerate(self.w.bos_kv(self.n_layers)):
                 kf = P.expanded_heads(k, Hc, self.H_kv, dh)
                 vf = P.expanded_heads(v, Hc, self.H_kv, dh)
-                out.append(P.plain_cache(dc, kf, vf, self.packing, self.rope))
+                out.append(P.plain_cache(dc, kf, vf, self.packing, self.rope, centre=self._centred(b)))
             self._prefix = out
         return self._prefix
 
@@ -197,6 +202,7 @@ class LlamaModel(ImplModel):
                 kv.k_buckets = [enc(c) for c in pk.k_buckets]
                 kv.k_pend = [enc(c) for c in pk.k_pend]
                 kv.v_buckets = [None if c is None else enc(c) for c in pk.v_buckets]
+                kv.k_ref = None if pk.k_ref is None else enc(pk.k_ref)
             else:
                 kv.k_groups = [enc(c) for c in pk.k_groups]
                 kv.v_lanes = [None if c is None else enc(c) for c in pk.v_lanes]

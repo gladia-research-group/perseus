@@ -358,6 +358,11 @@ def dim_of_col(col):
     return ((col >> 3) & 15) | (((col >> 2) & 1) << 4) | (((col >> 1) & 1) << 5) | ((col & 1) << 6)
 
 
+def kv_rows_pattern(vals, toks):
+    """kv_row_pattern summed over key rows `toks`."""
+    return sum(kv_row_pattern(vals, t) for t in toks)
+
+
 def kv_row_pattern(vals, tok=BOS_TOK):
     """Slot vectors (16 ciphertexts) holding vals[kv][dim] on key row `tok` of a (rows = keys, cols = dims) SinC
     operand, both replicas."""

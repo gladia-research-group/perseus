@@ -224,19 +224,30 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         if x.k == 0 || x.k > self.k_max {
             return Err(shape("rescale", format!("{} ciphertexts, the rescaler covers 1..={} (MemCfg::k_max)", x.k, self.k_max)));
         }
-        if top < self.d || top >= self.lay.nq {
-            return Err(shape("rescale", format!("top limb {top} has no {} primes to drop", self.d)));
+        // a lean chain's single-prime level drops one prime
+        let g = ctx.chain.drop_at(top).unwrap_or(self.d);
+        if top < g || top >= self.lay.nq {
+            return Err(shape("rescale", format!("top limb {top} has no {g} primes to drop")));
         }
-        if self.kind == RescaleKind::CompositeOnePass && self.d == 2 {
+        if self.kind == RescaleKind::CompositeOnePass && self.d == 2 && g == 2 {
             return self.composite_from(ctx, s, x, None, top, fold);
         }
         if fold.is_some() {
             return Err(shape("rescale fold", "the scalar fold is a composite one-pass option"));
         }
-        for j in 0..self.d {
+        for j in 0..g {
             self.single(ctx, s, x, top - j)?;
         }
         Ok(())
+    }
+
+    /// Drop exactly one prime (`top`) and divide by it, whatever the chain's level there: the single-prime stages of a
+    /// lean chain's StC-first input walk the bottom one prime at a time.
+    pub fn rescale_one<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, x: &mut CtBuf<'_, Compute, W>, top: usize) -> Result<()> {
+        if x.lay != self.lay || x.k == 0 || x.k > self.k_max || top == 0 || top >= self.lay.nq {
+            return Err(shape("rescale_one", format!("{} cts at top {top}", x.k)));
+        }
+        self.single(ctx, s, x, top)
     }
 
     /// Out-of-place `rescale`: `dst` (k cts) = the rescale of `src` (live top limb `top`), `src` untouched (no
@@ -255,8 +266,8 @@ impl<'a, W: DevWord> Rescaler<'a, W> {
         if !self.can_fold() {
             return Err(shape("rescale_to", "out-of-place rescale is a composite one-pass option"));
         }
-        if dst.lay != self.lay || dst.k == 0 || dst.k > self.k_max || top < self.d || top >= self.lay.nq {
-            return Err(shape("rescale_to", format!("{} cts at top {top}", dst.k)));
+        if dst.lay != self.lay || dst.k == 0 || dst.k > self.k_max || top < self.d || top >= self.lay.nq || ctx.chain.drop_at(top) != Some(2) {
+            return Err(shape("rescale_to", format!("{} cts at top {top} (a composite level)", dst.k)));
         }
         let k = dst.k;
         if self.ct_layout(src) {

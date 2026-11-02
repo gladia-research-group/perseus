@@ -59,7 +59,7 @@
     "malloc_arena_max": 2,
     "omp_num_threads": 2,
     "python": "/data02/users/azirilli/perseus-wt/main-port/.venv/bin/python",
-    "pythonpath": "/data02/users/azirilli/perseus-wt/llama-stcf/python"
+    "pythonpath": "python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -92,7 +92,7 @@
   },
   "exec": {
     "all_blocks_io_dir": "/data02/users/azirilli/scratch/.cache/perseus/oracle/gpt2_ctx1024/all_blocks_io",
-    "fhe_graph_dir": "graphs/_winz_g_p0",
+    "fhe_graph_dir": "graphs/_gc2_p0",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "steps_t": 16,

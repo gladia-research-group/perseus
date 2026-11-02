@@ -187,6 +187,9 @@ def main() -> None:
                    dest="ilp_cap_exit",
                    help="placer ilp: let the final block exit deeper than the min-cut's plan "
                         "(off by default: that exit feeds the unplanned encrypted argmax)")
+    p.add_argument("--pcmm-prediv-cap", type=int, dest="pcmm_prediv_cap",
+                   help="a lean chain's PCMMs of band shift above PCMM_PREDIV_SHIFT: their inputs' level caps (one "
+                        "level above the captured ones: the runtime divides the shift on it)")
     p.add_argument("--ilp-tiebreak", action="store_true", default=None, dest="ilp_tiebreak",
                    help="placer ilp: among equal-cost optima take the one fixed per-site weights rank first (the "
                         "model in whole cost units, then a second solve): one plan on every machine and solver build; "

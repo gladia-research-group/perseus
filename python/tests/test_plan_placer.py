@@ -453,6 +453,43 @@ class PlanResume(unittest.TestCase):
         self.assertEqual(list(part.glob("*.part")), [])
 
 
+class PcmmPredivCaps(unittest.TestCase):
+    """PLAN_PCMM_PREDIV_CAP (the PCMM pre-division on a lean chain): the hint and level-cap nodes feeding a PCMM of band
+    shift above PCMM_PREDIV_SHIFT are capped at the given level, in their inputs (`hint_lev(..)`, `lvl_cap(..)`) and
+    their args (`thr`, `cap`); a PCMM at band shift 1, a hint that feeds no PCMM and a cap already below are left as
+    they are."""
+
+    @staticmethod
+    def _pcmm(i: int, shift: int, lev: int = 44) -> list[dict]:
+        x, h, c, o = (f"v_{i}{k}" for k in "xhco")
+        return [
+            {"op_type": "hint", "inputs": [x, f"hint_lev({lev})"], "output": h,
+             "args": {"thr": lev, "acct": True, "fired": False}},
+            {"op_type": "level_hint", "inputs": [h, f"lvl_cap({lev})"], "output": c, "args": {"cap": lev}},
+            {"op_type": "deliberate_bootstrap", "inputs": [c], "output": o,
+             "args": {"external": {"op": "pcmm", "linear": f"b{i}.out", "out": 0, "shift": shift}}},
+        ]
+
+    def test_caps(self):
+        from perseus.plan.placer.planner import PCMM_PREDIV_SHIFT, pcmm_prediv_caps
+        self.assertEqual(PCMM_PREDIV_SHIFT, 1)
+        nodes = self._pcmm(1, 3) + self._pcmm(2, 1) + self._pcmm(3, 5, lev=40)
+        nodes.append({"op_type": "hint", "inputs": ["v_9", "hint_lev(44)"], "output": "v_9h",
+                      "args": {"thr": 44, "acct": True, "fired": False}})
+        before = json.dumps(nodes)
+        out = pcmm_prediv_caps(nodes, 42)
+        self.assertEqual(json.dumps(nodes), before)              # the input list is not modified
+        by = {n["output"]: n for n in out}
+        self.assertEqual(by["v_1h"]["inputs"], ["v_1x", "hint_lev(42)"])
+        self.assertEqual(by["v_1h"]["args"]["thr"], 42)
+        self.assertEqual(by["v_1c"]["inputs"], ["v_1h", "lvl_cap(42)"])
+        self.assertEqual(by["v_1c"]["args"]["cap"], 42)
+        for v in ("v_2h", "v_2c", "v_9h"):                       # band shift 1; no PCMM
+            self.assertEqual(by[v], next(n for n in nodes if n["output"] == v))
+        self.assertEqual(by["v_3c"]["inputs"], ["v_3h", "lvl_cap(40)"])   # already below the cap
+        self.assertEqual([n["output"] for n in out], [n["output"] for n in nodes])
+
+
 class CutPricingKnobs(unittest.TestCase):
     """depth_weight / level_weight: off by default, and each form moves the cut when on.
 

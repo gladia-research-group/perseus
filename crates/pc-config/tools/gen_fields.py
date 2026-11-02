@@ -55,6 +55,8 @@ STRUCTS = {"chain": "ChainSection", "bts": "BtsSection", "mem": "MemSection", "h
 # fields with no legacy env (env name ""): what perseus-core configures that perseus hard-coded; a fifth element is the
 # env name of a perseus-core runtime switch (settable from a plan's runtime= line like the legacy ones)
 EXTRA = [
+    ("chain", "preset", "Str", "The CKKS chain preset the runtime and the client build (pc-core `ChainSpec::preset`: n32, "
+     "or the lean n32a4; default n32).", "CHAIN_PRESET"),
     ("quirks", "shadow", "List", "pc-shadow `Quirk` names switched on, replacing the mode's preset (`Quirks::planner()` / "
      "`fake()` / `fakecap()`); retiring a quirk = dropping it here and re-planning (docs/QUIRKS.md)."),
     ("quirks", "fake_bts_out", "Int", "The numpy fake's refresh landing level (perseus `FakeFhe(bts_out=34)` argument; "

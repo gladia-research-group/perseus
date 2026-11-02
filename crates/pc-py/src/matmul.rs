@@ -77,12 +77,12 @@ pub(crate) fn factors(c_unit: f64, amax: f64, bmax: f64, shift: u32, out_scale: 
     ((p * bmax / amax).sqrt(), (p * amax / bmax).sqrt())
 }
 
-/// The stc_high shapes the service needs on the StC-first route (StcFirstSetup::high): the operands' (50, skip 1)
+/// The stc_high shapes the service needs on the StC-first route (StcFirstSetup::high): the operands' (`operand_level`, skip 1)
 /// and SinCBoot's stage 0 for every left-operand state (`levels`: (level, deg) of the `a` operands the programs
 /// and the probes use, with the raise drop of their finish). The landing is the StC-first route's (`BtsConfig::n32_shipped`:
 /// a plan's runtime Shadow may not configure StC-first for its own dense sites).
 pub(crate) fn high_shapes(chain: pc_shadow::ChainShape, cf: u32, levels: &std::collections::BTreeSet<(u32, u8, u32)>) -> PyResult<Vec<StcHighShape>> {
-    let mut out = vec![StcHighShape { out_level: 50, skip_mask: 1 }];
+    let mut out = vec![StcHighShape { out_level: ccmm::operand_level(chain.n_q), skip_mask: 1 }];
     let mut bts = pc_shadow::BtsConfig::n32_shipped();
     // the route builds a variant for every drop its finishes use (session `route_needs`)
     bts.raise_drops.extend(levels.iter().map(|x| x.2).filter(|&x| x > 0));
@@ -189,7 +189,8 @@ impl CcmmRt {
         let a_meta: Vec<CtMeta> = self.a[..NBIG].iter().map(|x| x.meta).collect();
         let slots = (cx.ctx.lay.n / 2) as u32;
         let nf_ref = self.nf_ref;
-        let hi = |f: f64| StcHigh { slots, out_level: 50, factor: f, skip_mask: 1, nf_ref };
+        let out_level = ccmm::operand_level(cx.ctx.shape.n_q);
+        let hi = |f: f64| StcHigh { slots, out_level, factor: f, skip_mask: 1, nf_ref };
         // operands whose scales differ (Q chunks of distinct producers) are taken one by one: the factor is
         // normalised per ciphertext against nf_ref
         for (xs, f) in [(&mut self.a, fa), (&mut self.b, fb)] {
@@ -252,9 +253,7 @@ impl CcmmRt {
 /// `ccmm::sinc_boot` with the StC stage-0 transform scaled by `factor` (its plaintexts: exact, no extra level).
 fn sinc_boot_scaled(cx: &mut BtsCx<'_, 'static, W, M>, route: &StcFirstRoute<'static, W, M>, st: &BtsState, cts: &mut [Ct<'static, W>], nf_split: f64, factor: f64) -> pc_gpu::Result<()> {
     use pc_gpu::bts::staged::{BtsCall, CallOpts, Phase, StagedRef};
-    for x in cts.iter_mut() {
-        ccmm::leaf::set_scale(x, nf_split, 2);
-    }
+    ccmm::enter_split(cx, route, cts, nf_split)?;
     let mut call = BtsCall::resume(StagedRef::StcFirst(route), st.clone(), Phase::Split, CallOpts::default());
     call.at_split(cx, cts)?;
     call.run_to(cx, cts, Phase::Done)?;

@@ -416,6 +416,21 @@ def run(rt, xs, lin):
     return engine(rt, lin.t).apply(xs, lin)
 
 
+def session_specs(lins, t: int) -> list[tuple]:
+    """The Session's PCMM linears (name, t, n_in, n_out, weight planes, w_scale, shift), `t` the runtime's token lanes
+    for a linear without its own. PF_PCMM_STAMPS_OUT=<json> also writes each one's stamp round(log2(w_scale 2^shift))
+    there: the planner's PLAN_PCMM_STAMPS (`plan.placer.planner.pcmm_prediv_caps`)."""
+    specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
+              int(lin.shift)) for lin in lins]
+    out = os.environ.get("PF_PCMM_STAMPS_OUT")
+    if out:
+        import json
+        stamps = {s[0]: round(math.log2(s[5] * 2.0 ** s[6])) for s in specs}
+        with open(out, "w") as f:
+            f.write(json.dumps(stamps, indent=1, sort_keys=True) + "\n")
+    return specs
+
+
 def pinned_planes(core, a):
     """`a` (int8 digit planes) copied into pinned host memory; `a` itself when that is unavailable."""
     alloc = getattr(core, "pinned_empty", None)

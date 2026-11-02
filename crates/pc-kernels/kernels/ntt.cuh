@@ -1,6 +1,8 @@
 // NTT (register passes) generic over the word W: N = 2^16 as 256 x 256.
-//  column pass: 256 threads = 8 warps x 32 columns; a thread holds 32 rows of its column, 5 butterfly stages in
-//               registers, one shared-memory transpose (two halves for u64), 3 more stages in registers.
+//  column pass: 256 threads = 16 columns x 16 threads; a thread holds 16 rows of its column, 4 butterfly stages in
+//               registers, one shared-memory transpose, 4 more stages in registers. Chunks of at most COLS8_MAX rows,
+//               whose passes are latency-bound, run on 8-column blocks: 32 threads per column, 8 rows each, 3 + 3 + 2
+//               stages around two transposes (twice the blocks at half the work per thread).
 //  row pass:    one warp per 256-element row, 8 elements per lane: 3 stages in registers, a warp-local transpose,
 //               2 stages across lane pairs (shuffles), 3 stages in registers (no block barrier).
 // Only Shoup products (twiddles are constants), so the kernels do not depend on the ModMul strategy. NttArgs.lazy (u32,
@@ -12,7 +14,7 @@
 namespace pc {
 namespace ntt {
 template <class W>
-constexpr int PH = sizeof(W) == 8 ? 2 : 1;  // column-pass transpose phases (shared memory <= 32 KB)
+constexpr int PH = sizeof(W) == 8 ? 2 : 1;  // transpose phases of a 32-column pass (coeffrows.cuh; shared memory <= 32 KB)
 
 template <class W>
 __device__ __forceinline__ void ct_bf(W& a, W& b, W w, W ws, W p) {
@@ -138,85 +140,126 @@ __device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s
     store4<W>(o, y[0], y[1], y[2], y[3]);
 }
 
-// ---------------------------------------------------------------- forward column pass
-// The column pass of one 32-column block of a row (prime p, twiddles w / ws) on x = the block's words held as
-// x[j] = word (wp + 8 j) * 256 + lane (canonical), stored at a (the block's first word); s: the transpose buffer.
+// ---------------------------------------------------------------- forward column passes
+// The column pass of one 16-column block of a row (prime p, twiddles w / ws) on x = the block's words held as
+// x[j] = word (q + 16 j) * 256 + c (canonical), stored at a (the block's first word); s: the transpose buffer.
 template <class W, bool L>
-__device__ __forceinline__ void fwd_cols_core(W (&x)[32], W* a, W* s, const W* w, const W* ws, W p, int lane, int wp) {
-    // stages tr = 128..8 (m = 1..16): pairs (j, j + tr/8), group i = j / (2 tr/8)
+__device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w, const W* ws, W p, int c, int q) {
+    // stages tr = 128..16 (m = 1..8): pairs (j, j + tr/16), group i = j / (2 tr/16)
 #pragma unroll
-    for (int st = 0; st < 5; ++st) {
-        const int h = 16 >> st;  // tr / 8
+    for (int st = 0; st < 4; ++st) {
+        const int h = 8 >> st;  // tr / 16
         const int m = 1 << st;
 #pragma unroll
-        for (int j = 0; j < 32; ++j) {
+        for (int j = 0; j < 16; ++j) {
             if ((j & h) == 0) {
                 const int i = j / (2 * h);
                 ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
             }
         }
     }
-    // now groups g = wp + 8 q (q < 4) of 8 consecutive rows: x[8 q + u] = row 8 g + u. With PH = 2 (u64) the
-    // exchange runs in two halves of 128 rows (32 KB of shared memory each).
+    // now the 16 consecutive rows of group q: x[u] = row 16 q + u
 #pragma unroll
-    for (int ph = 0; ph < PH<W>; ++ph) {
-        if (ph) __syncthreads();
+    for (int j = 0; j < 16; ++j) s[(q + 16 * j) * 16 + c] = x[j];
+    __syncthreads();
 #pragma unroll
-        for (int j = ph * 32 / PH<W>; j < (ph + 1) * 32 / PH<W>; ++j) s[(wp + 8 * j - ph * 256 / PH<W>) * 32 + lane] = x[j];
-        __syncthreads();
+    for (int u = 0; u < 16; ++u) x[u] = s[(16 * q + u) * 16 + c];
+    // stages tr = 8..1 (m = 16..128): pairs (u, u + tr), group i = (16 q + u) / (2 tr)
 #pragma unroll
-        for (int q = ph * 4 / PH<W>; q < (ph + 1) * 4 / PH<W>; ++q)
+    for (int st = 0; st < 4; ++st) {
+        const int h = 8 >> st;  // tr
+        const int m = 16 << st;
 #pragma unroll
-            for (int u = 0; u < 8; ++u) x[8 * q + u] = s[(8 * (wp + 8 * q) + u - ph * 256 / PH<W>) * 32 + lane];
-    }
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int g = wp + 8 * q;
-        W* y = x + 8 * q;
-        {  // tr = 4, m = 32, i = g
-            const W tw = __ldg(w + 32 + g), tws = __ldg(ws + 32 + g);
-#pragma unroll
-            for (int u = 0; u < 4; ++u) ct_lz<W, L>(y[u], y[u + 4], tw, tws, p);
-        }
-        {  // tr = 2, m = 64, i = 2g + u/4
-#pragma unroll
-            for (int hb = 0; hb < 2; ++hb) {
-                const W tw = __ldg(w + 64 + 2 * g + hb), tws = __ldg(ws + 64 + 2 * g + hb);
-                ct_lz<W, L>(y[4 * hb], y[4 * hb + 2], tw, tws, p);
-                ct_lz<W, L>(y[4 * hb + 1], y[4 * hb + 3], tw, tws, p);
-            }
-        }
-        {  // tr = 1, m = 128, i = 4g + u/2
-#pragma unroll
-            for (int qb = 0; qb < 4; ++qb) {
-                const W tw = __ldg(w + 128 + 4 * g + qb), tws = __ldg(ws + 128 + 4 * g + qb);
-                ct_lz<W, L>(y[2 * qb], y[2 * qb + 1], tw, tws, p);
+        for (int u = 0; u < 16; ++u) {
+            if ((u & h) == 0) {
+                const int i = (m >> 4) * q + u / (2 * h);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
             }
         }
     }
 #pragma unroll
-    for (int q = 0; q < 4; ++q)
-#pragma unroll
-        for (int u = 0; u < 8; ++u) a[(8 * (wp + 8 * q) + u) * 256 + lane] = x[8 * q + u];
+    for (int u = 0; u < 16; ++u) a[(16 * q + u) * 256 + c] = x[u];
 }
 
 template <class W, bool L>
 __global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
-    __shared__ W s[256 * 32 / PH<W>];
+    __shared__ W s[256 * 16];
     const int row = blockIdx.y;
-    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
-    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 32 : a;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 16 : a;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    W x[32];
+    const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    W x[16];
 #pragma unroll
-    for (int j = 0; j < 32; ++j) x[j] = in[(wp + 8 * j) * 256 + lane];
+    for (int j = 0; j < 16; ++j) x[j] = in[(q + 16 * j) * 256 + c];
     for (int m = 1; m < T.snum; ++m) {
 #pragma unroll
-        for (int j = 0; j < 32; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (wp + 8 * j) * 256 + lane], p);
+        for (int j = 0; j < 16; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 16 * j) * 256 + c], p);
     }
-    fwd_cols_core<W, L>(x, a, s, (const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, p, lane, wp);
+    fwd_cols_core<W, L>(x, a, s, (const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, p, c, q);
+}
+
+// The column pass of a short chunk on 8-column blocks, x[j] in three layouts: rows q + 32 j (tr = 128..32), rows
+// lo + 4 j + 32 hi with q = 4 hi + lo (tr = 16..4), rows 8 q + u (tr = 2, 1).
+template <class W, bool L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
+    __shared__ W s[256 * 8];
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 8 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W* w = (const W*)T.fw + (size_t)pid * N;
+    const W* ws = (const W*)T.fws + (size_t)pid * N;
+    const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    W x[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = in[(q + 32 * j) * 256 + c];
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 32 * j) * 256 + c], p);
+    }
+#pragma unroll
+    for (int st = 0; st < 3; ++st) {  // m = 1, 2, 4
+        const int h = 4 >> st, m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(q + 32 * j) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int st = 0; st < 3; ++st) {  // m = 8, 16, 32: group (lo + 4 j + 32 hi) / (2 tr)
+        const int h = 4 >> st, m = 8 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const int i = (m >> 3) * hi + j / (2 * h);
+                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = s[(8 * q + u) * 8 + c];
+#pragma unroll
+    for (int st = 0; st < 2; ++st) {  // m = 64, 128: group (8 q + u) / (2 tr)
+        const int h = 2 >> st, m = 64 << st;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const int i = (m >> 5) * q + u / (2 * h);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) a[(8 * q + u) * 256 + c] = x[u];
 }
 
 // ---------------------------------------------------------------- forward row pass (warp per row, 8 rows per block)
@@ -427,63 +470,42 @@ __global__ void __launch_bounds__(256) ntt_inv_rows(NttArgs T) {
     for (int j = 0; j < 8; ++j) a[lane + 32 * j] = x[j];
 }
 
-// ---------------------------------------------------------------- inverse column pass (GS tr = 1..128), N^-1
+// ---------------------------------------------------------------- inverse column passes (GS tr = 1..128), N^-1
+// ntt_fwd_cols' layouts in reverse order: rows 16 q + u (tr = 1..8), one transpose, rows q + 16 j (tr = 16..128)
 template <class W, bool L>
 __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
-    __shared__ W s[256 * 32 / PH<W>];
+    __shared__ W s[256 * 16];
     const int row = blockIdx.y;
-    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 32;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
     const int pid = T.rprime[row];
     const W p = (W)T.pr[pid].p;
     const W* w = (const W*)T.iw + (size_t)pid * N;
     const W* ws = (const W*)T.iws + (size_t)pid * N;
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    W x[32];
+    const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    W x[16];
 #pragma unroll
-    for (int q = 0; q < 4; ++q)
+    for (int u = 0; u < 16; ++u) x[u] = a[(16 * q + u) * 256 + c];
 #pragma unroll
-        for (int u = 0; u < 8; ++u) x[8 * q + u] = a[(8 * (wp + 8 * q) + u) * 256 + lane];
+    for (int st = 3; st >= 0; --st) {  // m = 128..16
+        const int h = 8 >> st, m = 16 << st;
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        const int g = wp + 8 * q;
-        W* y = x + 8 * q;
-        {  // tr = 1, m = 128
-#pragma unroll
-            for (int qb = 0; qb < 4; ++qb)
-                gs_lz<W, L>(y[2 * qb], y[2 * qb + 1], __ldg(w + 128 + 4 * g + qb), __ldg(ws + 128 + 4 * g + qb), p);
-        }
-        {  // tr = 2, m = 64
-#pragma unroll
-            for (int hb = 0; hb < 2; ++hb) {
-                const W tw = __ldg(w + 64 + 2 * g + hb), tws = __ldg(ws + 64 + 2 * g + hb);
-                gs_lz<W, L>(y[4 * hb], y[4 * hb + 2], tw, tws, p);
-                gs_lz<W, L>(y[4 * hb + 1], y[4 * hb + 3], tw, tws, p);
+        for (int u = 0; u < 16; ++u) {
+            if ((u & h) == 0) {
+                const int i = (m >> 4) * q + u / (2 * h);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
             }
         }
-        {  // tr = 4, m = 32
-            const W tw = __ldg(w + 32 + g), tws = __ldg(ws + 32 + g);
-#pragma unroll
-            for (int u = 0; u < 4; ++u) gs_lz<W, L>(y[u], y[u + 4], tw, tws, p);
-        }
     }
 #pragma unroll
-    for (int ph = 0; ph < PH<W>; ++ph) {
-        if (ph) __syncthreads();
+    for (int u = 0; u < 16; ++u) s[(16 * q + u) * 16 + c] = x[u];
+    __syncthreads();
 #pragma unroll
-        for (int q = ph * 4 / PH<W>; q < (ph + 1) * 4 / PH<W>; ++q)
+    for (int j = 0; j < 16; ++j) x[j] = s[(q + 16 * j) * 16 + c];
 #pragma unroll
-            for (int u = 0; u < 8; ++u) s[(8 * (wp + 8 * q) + u - ph * 256 / PH<W>) * 32 + lane] = x[8 * q + u];
-        __syncthreads();
+    for (int st = 3; st >= 0; --st) {  // m = 8..1
+        const int h = 8 >> st, m = 1 << st;
 #pragma unroll
-        for (int j = ph * 32 / PH<W>; j < (ph + 1) * 32 / PH<W>; ++j) x[j] = s[(wp + 8 * j - ph * 256 / PH<W>) * 32 + lane];
-    }
-    // stages tr = 8..128 (m = 16..1): pairs (j, j + tr/8)
-#pragma unroll
-    for (int st = 4; st >= 0; --st) {
-        const int h = 16 >> st;
-        const int m = 1 << st;
-#pragma unroll
-        for (int j = 0; j < 32; ++j) {
+        for (int j = 0; j < 16; ++j) {
             if ((j & h) == 0) {
                 const int i = j / (2 * h);
                 gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
@@ -492,7 +514,80 @@ __global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
     }
     const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
 #pragma unroll
-    for (int j = 0; j < 32; ++j) a[(wp + 8 * j) * 256 + lane] = mul_shoup<W>(x[j], ni, nis, p);
+    for (int j = 0; j < 16; ++j) a[(q + 16 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
+}
+
+// ntt_fwd_cols8's layouts in reverse order
+template <class W, bool L>
+__global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
+    __shared__ W s[256 * 8];
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W* w = (const W*)T.iw + (size_t)pid * N;
+    const W* ws = (const W*)T.iws + (size_t)pid * N;
+    const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    W x[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = a[(8 * q + u) * 256 + c];
+#pragma unroll
+    for (int st = 1; st >= 0; --st) {  // m = 128, 64
+        const int h = 2 >> st, m = 64 << st;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const int i = (m >> 5) * q + u / (2 * h);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) s[(8 * q + u) * 8 + c] = x[u];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int st = 2; st >= 0; --st) {  // m = 32, 16, 8
+        const int h = 4 >> st, m = 8 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const int i = (m >> 3) * hi + j / (2 * h);
+                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(q + 32 * j) * 8 + c];
+#pragma unroll
+    for (int st = 2; st >= 0; --st) {  // m = 4, 2, 1
+        const int h = 4 >> st, m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p);
+    }
+    const W ni = ((const W*)T.ninv)[pid], nis = ((const W*)T.ninvs)[pid];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) a[(q + 32 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
+}
+
+// Chunks of at most this many rows run their column passes on 8-column blocks.
+constexpr int COLS8_MAX = 9;
+
+template <class W, bool L>
+void fwd_chunk(const NttArgs& b, int m, cudaStream_t s) {
+    if (m <= COLS8_MAX) ntt_fwd_cols8<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+    else ntt_fwd_cols<W, L><<<dim3(16, m), 256, 0, s>>>(b);
+    ntt_fwd_rows<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+}
+template <class W, bool L>
+void inv_chunk(const NttArgs& b, int m, cudaStream_t s) {
+    ntt_inv_rows<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+    if (m <= COLS8_MAX) ntt_inv_cols8<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+    else ntt_inv_cols<W, L><<<dim3(16, m), 256, 0, s>>>(b);
 }
 
 template <class W>
@@ -508,13 +603,8 @@ int fwd(const NttArgs* a, cudaStream_t s) {
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
         b.soff = a->soff ? a->soff + i : nullptr;
-        if (lz) {
-            ntt_fwd_cols<W, true><<<dim3(8, m), 256, 0, s>>>(b);
-            ntt_fwd_rows<W, true><<<dim3(32, m), 256, 0, s>>>(b);
-        } else {
-            ntt_fwd_cols<W, false><<<dim3(8, m), 256, 0, s>>>(b);
-            ntt_fwd_rows<W, false><<<dim3(32, m), 256, 0, s>>>(b);
-        }
+        if (lz) fwd_chunk<W, true>(b, m, s);
+        else fwd_chunk<W, false>(b, m, s);
     }
     return (int)cudaGetLastError();
 }
@@ -530,13 +620,8 @@ int inv(const NttArgs* a, cudaStream_t s) {
         b.roff = a->roff + i;
         b.rprime = a->rprime + i;
         b.soff = a->soff ? a->soff + i : nullptr;
-        if (lz) {
-            ntt_inv_rows<W, true><<<dim3(32, m), 256, 0, s>>>(b);
-            ntt_inv_cols<W, true><<<dim3(8, m), 256, 0, s>>>(b);
-        } else {
-            ntt_inv_rows<W, false><<<dim3(32, m), 256, 0, s>>>(b);
-            ntt_inv_cols<W, false><<<dim3(8, m), 256, 0, s>>>(b);
-        }
+        if (lz) inv_chunk<W, true>(b, m, s);
+        else inv_chunk<W, false>(b, m, s);
     }
     return (int)cudaGetLastError();
 }

@@ -660,6 +660,30 @@ pub fn split_nf<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>,
     Ok(scratch.meta.nf)
 }
 
+/// The CCMM operands' level, limbs 0..NQ-1 (`stc_high`'s output): n32 50, a lean chain 47.
+pub fn operand_level(n_q: u32) -> u32 {
+    n_q - NQ as u32
+}
+
+/// CCMM outputs (limbs 0..NQ-1) restamped as the StC-first split (degree 2, scale `nf_split`: perseus `set_scale`).
+/// A lean chain's split is limbs 0..2 (q2 its single prime): q3 is divided out first, exactly (one prime's rescale),
+/// which the calibrated `c_unit` takes in (its probes run this path).
+pub fn enter_split<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, cts: &mut [Ct<'a, W>], nf_split: f64) -> Result<()> {
+    let ctx = cx.ctx;
+    let split = route.split_top();
+    for x in cts.iter_mut() {
+        let top = x.top(ctx.shape)?;
+        if top == split + 1 && route.thin() {
+            cx.ops.rescaler.rescale_one(ctx, &cx.ex.compute, &mut x.buf, top)?;
+            x.meta.level += 1;
+        } else if top != split {
+            return Err(shape("ccmm split", format!("output at limb {top}, the split is limb {split}")));
+        }
+        leaf::set_scale(x, nf_split, 2);
+    }
+    Ok(())
+}
+
 /// Output level of SinCBoot's stage-0 transform for a HalfBTS landing `m` (ccmm.py: `stc_high(d, S, d.level - 2 -
 /// (2 if deg 2 else 0), 1.0, 6)`, limb indices with unit 2): one unit below, two when a rescale is pending.
 pub fn stage0_level(m: &CtMeta, unit: u32) -> u32 {
@@ -677,9 +701,7 @@ pub fn sinc_boot_shape<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s
 /// (degree 2, scale `nf_split`: perseus `set_scale`), HalfBTS (mod_raise .. stc_first_output) under `st`, then StC
 /// stage 0 alone in the slot domain (stc_high skip mask 6, factor 1). Slots come back in the SinC layout.
 pub fn sinc_boot<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, st: &BtsState, cts: &mut [Ct<'a, W>], nf_split: f64) -> Result<()> {
-    for x in cts.iter_mut() {
-        leaf::set_scale(x, nf_split, 2);
-    }
+    enter_split(cx, route, cts, nf_split)?;
     let mut call = BtsCall::resume(StagedRef::StcFirst(route), st.clone(), Phase::Split, CallOpts::default());
     call.at_split(cx, cts)?;
     call.run_to(cx, cts, Phase::Done)?;

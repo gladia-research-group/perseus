@@ -68,6 +68,8 @@ def streamed_run(a, twin, lw, plan, *, log=print):
         out = {f"kb.{j}": v for j, v in enumerate(pk.k_buckets)}
         out.update({f"kp.{j}": v for j, v in enumerate(pk.k_pend)})
         out.update({f"vb.{j}": v for j, v in enumerate(pk.v_buckets) if v is not None})
+        if pk.k_ref is not None:
+            out["kref"] = pk.k_ref
         return out
 
     def routes_for(pos):
@@ -237,10 +239,13 @@ def main(argv=None):
     gt = None if a.fake else hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
     a.plain_kv = None
     if a.plain_prefix:
-        if a.fake or not a.plan:
-            print("--plain-prefix: planned device runs only", file=sys.stderr)
+        # a fake run from a plain prefix decodes (and captures) its first position alone: the magnitudes of a late
+        # position at the cost of one
+        if not (a.fake or a.plan):
+            print("--plain-prefix: planned device runs or fake runs only", file=sys.stderr)
             return 2
-        a.plain_kv = hf.prompt_kv(toks, a.plain_prefix, cache[:-4] + f"_pkv{a.plain_prefix}.npz")
+        a.plain_kv = hf.prompt_kv(toks, a.plain_prefix, cache[:-4] + f"_pkv{a.plain_prefix}.npz",
+                                  device="cpu" if a.fake else "cuda")
 
     over = {**env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": a.packing,
             **dict(kv.split("=", 1) for kv in a.set)}
@@ -248,8 +253,8 @@ def main(argv=None):
         over["KV_ARENA_GB"] = os.environ.get("LLAMA_KV_ARENA_GB", "56")     # the offloaded K/V of 32 layers
     if a.capture:
         os.environ["FHE_GRAPH_DIR"] = a.capture
-        # the first encrypted position is 1 (the BOS prefix is plaintext)
-        os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", "1")
+        # the first encrypted position is 1 (the BOS prefix is plaintext), or the plain prefix's length
+        os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", str(a.plain_prefix or 1))
     cfgs = load_configs(a.configs)
     dims = W.llama_dims(store.config)
     t0 = time.time()
@@ -347,8 +352,13 @@ def main(argv=None):
             model.rt.ops.reset()
 
     t1 = time.time()
+    start = None
+    if a.plain_kv is not None:
+        model.plain_prompt = a.plain_kv
+        model.start()
+        start = a.plain_prefix
     res = model.run_decode(toks, gt if model.n_layers == int(store.config["num_hidden_layers"]) else None,
-                           on_token=on_token)
+                           on_token=on_token, start=start)
     kls = sorted(r["kl"] for r in res if "kl" in r)
     hits = sum(1 for r in res if r.get("hit"))
     print(f"[llama] SUMMARY positions={len(res)} top1={hits}/{len(res)} "

@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 
+from perseus.impl.pcmm import session_specs
 from perseus.impl.prefill import PlannedPrefill
 
 
@@ -242,6 +243,7 @@ class LlamaPlannedPrefill(PlannedPrefill):
     def session_kwargs(self):
         """The planned Session's arguments after (config, keys) (`Session.key_manifest` / `from_bundle` take the
         same); keeps the plaintext aliases and the distinct (value, level) plaintexts for `setup`."""
+        from perseus import _pc
         progs = [self.progs[lab] for lab in self.labels]
         self.alias, uniq = {}, {}
         for b, p in enumerate(progs):
@@ -251,11 +253,10 @@ class LlamaPlannedPrefill(PlannedPrefill):
                 store = f"{lab}/{nm}" if (form == "at_use" or nm.startswith("pt_")) else nm
                 self.alias.setdefault(lab, {})[store] = key
                 uniq.setdefault((key, lv), self.uniq[key])
-        pt_rows = self.pt_rows and max(self.pt_rows, 54 - min(lv for _k, lv in uniq))
+        pt_rows = self.pt_rows and max(self.pt_rows, _pc.chain_limbs(self.cfg["chain.preset"]) - min(lv for _k, lv in uniq))
         lins = self.linears()
         t = self.model.rt.dims.t
-        specs = [(lin.name, int(lin.t or t), int(lin.n_in), int(lin.n_out), int(lin.Wd.shape[0]), float(lin.w_scale),
-                  int(lin.shift)) for lin in lins.values()]
+        specs = session_specs(lins.values(), t)
         self._uniq, self._lins = uniq, lins
         from perseus.impl.driver import register_levels
         reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_layers) for j, r in self.reg[b]])

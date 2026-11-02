@@ -12,7 +12,7 @@ from . import ccmm as cm
 from . import sinc as sc
 from . import sinc_softmax as sm
 from . import smcheb
-from .attention import _recip_rounds
+from .attention import _recip_rounds, sink_only
 from .blocked import Blocks, sub_rt
 from .ccmm_attn import KMAX, QMAX, SHIFT_PV, SHIFT_QK, UNPACK_FOLD, VMAX, _bos, _halves
 from .poly import eval_chebyshev, im_cleanse
@@ -165,6 +165,7 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
         raise ValueError("attention_paged needs PF_SM_UNPACK_FOLD=1")
     if len(store) != p:
         raise ValueError(f"attention_paged: page {p} with {len(store)} stored pages")
+    sink_only(cfg, "attention_paged")
     eng = cm.engine(rt)
     eng.prepare(rt.dims.dim)
     g0 = sub_rt(rt, B, 0)
@@ -191,10 +192,15 @@ def attention_paged(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, page: int, store: l
                 kv[bb]["K"], kv[bb]["V"] = Kr[-1], Vr[-1]
         Qs = sc.to_sinc_q(rt, Qc)
         Ks, Vs = sc.to_sinc_kv(rt, Kr), sc.to_sinc_kv(rt, Vr)
-        # the BOS key / value only on page 0; later pages add zeros (the same op stream)
-        kpat = sc.kv_row_pattern(kb) if p == 0 else np.zeros((sc.NCT, sc.SLOTS))
+        # the BOS key / value only on page 0; later pages add zeros (the same op stream). A softmax centred on key 0:
+        # every page's token rows minus the (public) BOS key instead, page 0's BOS row left 0 (q.K^T = s - s_BOS)
+        if cfg.ref_keys:
+            kpat = sc.kv_rows_pattern(-kb, range(page_tokens(p)))
+            Ks = [rt.add_mask(x, ("ccmm.kref", layer, o, p == 0), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
+        else:
+            kpat = sc.kv_row_pattern(kb) if p == 0 else np.zeros((sc.NCT, sc.SLOTS))
+            Ks = [rt.add_mask(x, ("ccmm.kbos", layer, o, p == 0), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
         vpat = sc.kv_row_pattern(vb) if p == 0 else np.zeros((sc.NCT, sc.SLOTS))
-        Ks = [rt.add_mask(x, ("ccmm.kbos", layer, o, p == 0), lambda o=o: kpat[o]) for o, x in enumerate(Ks)]
         Vs = [rt.add_mask(x, ("ccmm.vbos", layer, o, p == 0), lambda o=o: vpat[o]) for o, x in enumerate(Vs)]
         if merge:
             Qs, Ks, Vs = sc.dup(rt, Qs), sc.dup(rt, Ks), sc.dup(rt, Vs)
