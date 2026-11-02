@@ -5,10 +5,13 @@
 mod arith;
 mod bconv;
 mod elem;
+mod encode;
 mod expand;
+mod keys;
 mod ks;
 mod ntt;
 mod raw;
+mod rescale;
 
 use pc_kernels::args::*;
 use pc_kernels::{Instance, TableError};
@@ -45,11 +48,6 @@ macro_rules! missing {
 }
 missing!(
     cts_fused: CtsArgs,
-    rescale_coef: RescaleArgs,
-    encode: EncodeArgs,
-    encrypt: EncryptArgs,
-    ksk_gen: KskGenArgs,
-    ksk_unpack: KskUnpackArgs,
     mod_raise: ModRaiseArgs,
     small_int: SmallIntArgs,
     spru_extract: SpruExtractArgs,
@@ -60,7 +58,6 @@ missing!(
     ccmm: CcmmArgs,
     small_int1: SmallInt1Args,
     coeff_sum: CoeffArgs,
-    rescale_fwd: RescaleNttArgs,
     tfhe: TfheArgs,
 );
 
@@ -91,13 +88,13 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         wsum: elem::wsum::<W>,
         add_const: elem::add_const::<W>,
         mul_table: elem::mul_table::<W>,
-        rescale_coef,
+        rescale_coef: rescale::rescale_coef::<W>,
         rescale_combine: elem::rescale_combine::<W>,
         automorph: elem::automorph::<W>,
-        encode,
-        encrypt,
-        ksk_gen,
-        ksk_unpack,
+        encode: encode::encode::<W>,
+        encrypt: keys::encrypt::<W>,
+        ksk_gen: keys::ksk_gen::<W>,
+        ksk_unpack: keys::ksk_unpack::<W>,
         mod_raise,
         small_int,
         spru_extract,
@@ -113,7 +110,7 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         small_int1,
         coeff_sum,
         mul_add: elem::mul_add::<W>,
-        rescale_fwd,
+        rescale_fwd: rescale::rescale_fwd::<W>,
         tfhe,
     }
 }
