@@ -85,6 +85,60 @@ fn digits_of(x: u64, bl: u32, lv: usize, m: u64, out: &mut [i64]) {
         *o = r;
     }
 }
+/// `digits_of` for up to 8 words at once, as int8 (out[l * lv + t]): branch-free lanes the compiler vectorizes.
+/// scale_round(x, m) for x < 2^32 is (x m_hi + (x m_lo >> 32) + 2^31) >> 32 (the low word only adds a fraction).
+#[inline(always)]
+fn digits8(x: &[u32], bl: u32, lv: usize, m: u64, out: &mut [i8]) {
+    let bits = bl as usize * lv;
+    let (mh, ml) = (m >> 32, m & 0xffff_ffff);
+    let mut w = [0u64; 8];
+    for (l, &e) in x.iter().enumerate() {
+        w[l] = e as u64;
+    }
+    let mut v = [0i64; 8];
+    for l in 0..8 {
+        let s = (w[l] * mh + ((w[l] * ml) >> 32) + (1 << 31)) >> 32;
+        let s = s as i64;
+        v[l] = if s >= 1i64 << (bits - 1) { s - (1i64 << bits) } else { s };
+    }
+    let (b, half) = (1i64 << bl, (1i64 << bl) / 2);
+    let mut d = [[0i8; 8]; 64];
+    for dt in d.iter_mut().take(lv - 1) {
+        if bl == 1 {
+            for l in 0..8 {
+                let r = (v[l] & 1) * (2 - (v[l] & 3));
+                v[l] = (v[l] - r) >> 1;
+                dt[l] = r as i8;
+            }
+        } else {
+            for l in 0..8 {
+                let r0 = v[l] & (b - 1);
+                let r = if r0 >= half { r0 - b } else { r0 };
+                v[l] = (v[l] - r) >> bl;
+                dt[l] = r as i8;
+            }
+        }
+    }
+    for l in 0..8 {
+        let r = if bl == 1 {
+            (v[l] & 1) * (2 - (v[l] & 3))
+        } else {
+            let r0 = v[l] & (b - 1);
+            if r0 >= half {
+                r0 - b
+            } else {
+                r0
+            }
+        };
+        let rest = (v[l] - r) >> bl;
+        d[lv - 1][l] = (r + (rest << bl)) as i8;
+    }
+    for l in 0..x.len() {
+        for t in 0..lv {
+            out[l * lv + t] = d[t][l];
+        }
+    }
+}
 fn digit_exact(mut v: i64, t: usize, bl: u32, lv: usize) -> i64 {
     let b = 1i64 << bl;
     let mut r = 0;
@@ -253,37 +307,45 @@ fn run(a: &TfheArgs) {
         KS_DIGITS => {
             let (len, lv) = (a.i1 as usize, a.c[1] as usize);
             par_for(a.count as usize, a, |a, b| {
-                let mut d = [0i64; 64];
-                for i in 0..len {
-                    digits_of(rd::<u32>(a.y, b * (len + 1) + i) as u64, a.c[0] as u32, lv, a.m, &mut d);
-                    for (t, &v) in d.iter().enumerate().take(lv) {
-                        wr(a.x, (b * len + i) * lv + t, v as i8);
+                let src = rows::<u32>(a.y, b * (len + 1), len);
+                let dst = rows_mut::<i8>(a.x, b * len * lv, len * lv);
+                if crate::simd::tfhe_digits(src, a.c[0] as u32, lv, a.m, dst) {
+                    return;
+                }
+                for (x, d) in src.chunks(8).zip(dst.chunks_mut(8 * lv)) {
+                    digits8(x, a.c[0] as u32, lv, a.m, d);
+                }
+            });
+        }
+        KS_RECOMBINE => {
+            // blocks of 64 LWEs: the planes' rows are read contiguously (b inner), the 64 output rows stay in L1
+            const BB: usize = 64;
+            par_for((a.count as usize).div_ceil(BB), a, |a, blk| {
+                let cols = a.i2 as usize + 1;
+                let planes = a.c[2] as usize;
+                let nrows = if a.c[4] != 0 { a.c[4] as usize } else { a.count as usize };
+                let plane = if a.c[3] != 0 { a.c[3] as usize } else { cols * nrows };
+                let q = a.q as i64;
+                let bs = blk * BB..(a.count as usize).min((blk + 1) * BB);
+                for o in 0..cols {
+                    for b in bs.clone() {
+                        let mut v = 0i64;
+                        for p in (0..planes).rev() {
+                            v = v.wrapping_mul(256).wrapping_add(rd::<i32>(a.y, p * plane + o * nrows + b) as i64);
+                        }
+                        v %= q;
+                        if v < 0 {
+                            v += q;
+                        }
+                        let mut r = v as u64;
+                        if o == a.i2 as usize {
+                            r = addq(r, rd::<u32>(a.z, b * (a.i1 as usize + 1) + a.i1 as usize) as u64, a.q);
+                        }
+                        wr(a.x, b * cols + o, r as u32);
                     }
                 }
             });
         }
-        KS_RECOMBINE => par_for(a.count as usize, a, |a, b| {
-            let cols = a.i2 as usize + 1;
-            let planes = a.c[2] as usize;
-            let nrows = if a.c[4] != 0 { a.c[4] as usize } else { a.count as usize };
-            let plane = if a.c[3] != 0 { a.c[3] as usize } else { cols * nrows };
-            let q = a.q as i64;
-            for o in 0..cols {
-                let mut v = 0i64;
-                for p in (0..planes).rev() {
-                    v = v.wrapping_mul(256).wrapping_add(rd::<i32>(a.y, p * plane + o * nrows + b) as i64);
-                }
-                v %= q;
-                if v < 0 {
-                    v += q;
-                }
-                let mut r = v as u64;
-                if o == a.i2 as usize {
-                    r = addq(r, rd::<u32>(a.z, b * (a.i1 as usize + 1) + a.i1 as usize) as u64, a.q);
-                }
-                wr(a.x, b * cols + o, r as u32);
-            }
-        }),
         RESCALE_P1 => par_for(2, a, |a, part| {
             let n = a.n as usize;
             let (q, p1) = (a.q, a.c[1]);
@@ -934,5 +996,60 @@ mod bench {
         let ni = t.elapsed().as_secs_f64() / reps as f64 * 1e6;
         eprintln!("4 inverse NTTs {ni:.1} us");
         eprintln!("step {st:.1} us: words {wd:.1} us, 4 forward NTTs {nt:.1} us, digits {dg:.1} us");
+    }
+}
+
+#[cfg(test)]
+mod digits_tests {
+    #[test]
+    #[ignore]
+    fn digits8_rate() {
+        let (len, lv) = (1usize << 20, 16usize);
+        let x: Vec<u32> = (0..len as u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let mut out = vec![0i8; len * lv];
+        for bl in [1u32, 2] {
+            let lv = if bl == 1 { lv } else { 8 };
+            let t = std::time::Instant::now();
+            for (x, d) in x.chunks(8).zip(out.chunks_mut(8 * lv)) {
+                super::digits8(x, bl, lv, 1 << 32, d);
+            }
+            eprintln!("bl {bl} lv {lv}: {:.2} ns/word", t.elapsed().as_secs_f64() * 1e9 / len as f64);
+            let t = std::time::Instant::now();
+            assert!(crate::simd::tfhe_digits(&x, bl, lv, 1 << 32, &mut out));
+            eprintln!("vector bl {bl} lv {lv}: {:.2} ns/word", t.elapsed().as_secs_f64() * 1e9 / len as f64);
+        }
+        std::hint::black_box(&out);
+    }
+
+    #[test]
+    fn digits8_matches_digits_of() {
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        for (bl, lv) in [(1u32, 16usize), (2, 8), (3, 5), (4, 4), (8, 2), (1, 1), (5, 1)] {
+            for m in [1u64 << 32, 0x1234_5678_9abc_def1, (1u64 << 63) + 12345, u64::MAX] {
+                let x: Vec<u32> = (0..67)
+                    .map(|_| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng as u32
+                    })
+                    .collect();
+                let mut out = vec![0i8; 67 * lv];
+                for (x, d) in x.chunks(8).zip(out.chunks_mut(8 * lv)) {
+                    super::digits8(x, bl, lv, m, d);
+                }
+                let mut vec_out = vec![0i8; 67 * lv];
+                if crate::simd::tfhe_digits(&x, bl, lv, m, &mut vec_out) {
+                    assert_eq!(vec_out, out, "vector digits bl {bl} lv {lv} m {m:#x}");
+                }
+                let mut want = [0i64; 64];
+                for (i, &w) in x.iter().enumerate() {
+                    super::digits_of(w as u64, bl, lv, m, &mut want);
+                    for t in 0..lv {
+                        assert_eq!(out[i * lv + t], want[t] as i8, "bl {bl} lv {lv} m {m:#x} x {w:#x} t {t}");
+                    }
+                }
+            }
+        }
     }
 }

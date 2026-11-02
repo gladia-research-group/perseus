@@ -1,6 +1,7 @@
 // The host GEMM behind a host `Lt`: D (+)= op(A) op(B) over every GemmSpec layout, exact in i32 (int8 products summed
 // in i32, as the device's integer MMA). The col-TN form the matmuls use (both operands K-contiguous) runs as
-// contiguous int8 dots, vectorized per CPU; every other layout takes the strided reference loop.
+// AMX-INT8 tiles where the CPU has them (amx.rs), else contiguous int8 dots; every other layout takes the strided
+// reference loop.
 use crate::{GemmSpec, Op, Order};
 use rayon::prelude::*;
 
@@ -51,6 +52,10 @@ fn is_col_tn(s: &GemmSpec) -> bool {
 pub(crate) unsafe fn run(spec: &GemmSpec, a: *const i8, b: *const i8, c: *mut i32, accumulate: bool) {
     let (m, n, k) = (spec.m as usize, spec.n as usize, spec.k as usize);
     let (a, b, c) = (a as usize, b as usize, c as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_col_tn(spec) && spec.m > 0 && spec.n > 0 && spec.k > 0 && crate::amx::available() {
+        return crate::amx::run(spec, a as *const i8, b as *const i8, c as *mut i32, accumulate);
+    }
     #[cfg(target_arch = "x86_64")]
     let wide = std::is_x86_feature_detected!("avx512bw");
     pc_hostrt::par(|| {

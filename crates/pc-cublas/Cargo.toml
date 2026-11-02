@@ -9,3 +9,4 @@ description = "Hand-written cuBLASLt FFI (int8 -> int32 GEMM) with safe wrappers
 thiserror = { workspace = true }
 rayon = { workspace = true }
 pc-hostrt = { path = "../pc-hostrt" }
+libc = "0.2"

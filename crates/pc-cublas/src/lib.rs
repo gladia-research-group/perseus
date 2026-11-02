@@ -11,6 +11,8 @@
 //! paths are integer MMA (no rounding): within that bound the result is the exact integer. A host `Lt` (`Lt::host`)
 //! plans nothing and runs the same contract on the CPU (`host.rs`), on pc-hostrt streams.
 pub mod ffi;
+#[cfg(target_arch = "x86_64")]
+mod amx;
 mod host;
 
 use std::ffi::{c_void, CStr};

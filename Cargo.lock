@@ -140,6 +140,7 @@ dependencies = [
 name = "pc-cublas"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "pc-hostrt",
  "rayon",
  "thiserror",
