@@ -372,6 +372,8 @@ pub struct TfheSwitch<'a> {
     rot: Stream<Compute>,
     /// LWEs per batch-path wave (two per block, one block per SM)
     wave: usize,
+    /// thread-block clusters on the device (sm_90+): without them the latency path is one level, nu 1, groups <= 4
+    clusters: bool,
     ev: [Event; 6],
 }
 
@@ -460,6 +462,7 @@ impl<'a> TfheSwitch<'a> {
             side: Stream::new(dev)?,
             rot: Stream::high_priority(dev)?,
             wave: 2 * dev.sm_count()?,
+            clusters: dev.clusters()?,
             ev: [Event::new(dev)?, Event::new(dev)?, Event::new(dev)?, Event::new(dev)?, Event::new(dev)?, Event::new(dev)?],
             p,
         };
@@ -797,7 +800,7 @@ impl<'a> TfheSwitch<'a> {
         // on the latency path, not a near-empty last wave
         let (bulk, base) = match cb % self.wave {
             r if one && cb > self.wave && r > 0 && r <= KB_MAX => (cb - r, cb - r),
-            _ if cb <= lat_max && nu * self.p.pbs.1 as u64 <= 2 => (0, 0),
+            _ if cb <= lat_max && nu * self.p.pbs.1 as u64 <= 2 && (one || self.clusters) => (0, 0),
             _ => (cb, cb),
         };
         let cl = cb - base;   // the latency path's LWEs, from `base`
@@ -805,7 +808,7 @@ impl<'a> TfheSwitch<'a> {
             // per window the key bundles on `side`, the rotation on `s` once they are in, the next window's bundles
             // filling the other half of `kb` meanwhile
             // the latency key for the small chunks (one level, nu 1): fewer, wider groups
-            let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= LAT_MAX);
+            let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= LAT_MAX && (self.clusters || self.p.lat_group <= 4));
             let rot0 = rot;
             let rot = match lat {
                 Some(k) => TfheArgs { i2: self.p.lat_group as i32, y: k.vptr(), ..rot },
