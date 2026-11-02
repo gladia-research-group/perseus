@@ -206,6 +206,27 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     return ops.mult(centered, inv)
 
 
+def _rms_spru(rt, x2, xs, cfg: NormCfg, c: float):
+    """rms_norm() with the token's mean square from ONE 1-slot refresh instead of the all-slot ladder (_norm_spru's
+    rule for RMSNorm's one statistic): z = (N/d) b xs^2 on the token's slots, stamped one slot; the refresh (SPRU)
+    returns its slot mean b m2 in every slot, one conjugation keeps the real part (2 b = s: s m2), and the Chebyshev
+    seed runs on u = s (m2 + eps c^2) - o in [-1, 1], the normalised argument rms_norm's seed takes on S / d."""
+    ops, d = rt.ops, rt.dims
+    _a, _b, s, o = _spru_consts(cfg, d)
+    (_ka, _fa), (kb, fb) = _spru_items(cfg, d, c)
+    z = ops.tag_reduce(ops.mult(xs, rt.mult_mask(x2, kb, fb)), 1)    # (N/d) b xs^2
+    ops.bootstrap_hint(z, 0)                                           # -> b m2 in every slot
+    u = ops.add(ops.add(z, ops.conjugate(z)), s * cfg.epsilon * c * c - o)
+    init = eval_chebyshev(ops, u, cfg.cheb_coeffs, -1.0, 1.0)
+    if cfg.cheb_nr_iters > 0:
+        S = ops.add(ops.mult(u, d.dim / s), d.dim * o / s)             # sum (c x)^2 + d eps c^2, rms_norm's S
+        inv = inv_sqrt_newton_d2(ops, S, init, cfg.cheb_nr_iters, 1.0 / (d.dim * cfg.inv_out_scale * cfg.inv_out_scale))
+    else:
+        inv = init
+    ops.bootstrap_hint(inv, ops.headroom(4))
+    return ops.mult(xs, inv)
+
+
 def rms_norm(rt, x, cfg: NormCfg, pos: int):
     """RMSNorm without its gamma (the next linear carries gamma / inv_out_scale):
     inv_out_scale * x / sqrt(mean(x^2) + eps) on the lanes. The norm() pipeline minus the mean:
@@ -221,6 +242,8 @@ def rms_norm(rt, x, cfg: NormCfg, pos: int):
     c = math.sqrt(c2)
     x2 = im_cleanse(ops, x)
     xs = rt.mult_mask(x2, ("ln.center", c), lambda: active_token_mask(N, dr, t, 0.5 * c))
+    if cfg.spru and ops.ln_cheb:
+        return _rms_spru(rt, x2, xs, cfg, c)
     S = ops.tag_reduce(rotsum(ops, ops.square(xs), 1, N), 1)       # broadcast constant
     S = ops.add(S, dr * cfg.epsilon * c2)
     init = eval_chebyshev(ops, S, cfg.cheb_coeffs, dr * cfg.cheb_lo, dr * cfg.cheb_hi)
