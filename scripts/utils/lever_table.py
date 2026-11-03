@@ -60,6 +60,19 @@ def activation_series(configs: str | None) -> str:
     return f"{n}/{len(sec)}" if sec else "-"
 
 
+def config_count(configs: str | None, sec: str, field: str) -> str:
+    """'n/m' entries of a config section whose `field` is set (truthy), or '-' without the section."""
+    if not configs:
+        return "?"
+    p = ROOT / "python/perseus" / configs
+    if not p.exists():
+        p = ROOT / configs
+    if not p.exists():
+        return "?"
+    ent = [v for v in json.loads(p.read_text()).get(sec, {}).values() if isinstance(v, dict)]
+    return f"{sum(1 for v in ent if v.get(field))}/{len(ent)}" if ent else "-"
+
+
 def levers(f: dict) -> dict[str, str]:
     """One column: lever -> cell text, from the plan lines and the run flags."""
     cmds = [plan_cmd(p) for p in f["plans"]]
@@ -112,6 +125,14 @@ def levers(f: dict) -> dict[str, str]:
         "One softmax per chunk pair (HPACK)": on(rt("PF_SM_HPACK") == "1") if pre else "-",
         "K/V of the last head group packed": on(rt("PF_QKV_PACK") == "1") if pre else "-",
         "Last block on one position": on(rt("PF_LAST_QUERY") == "1" or "--tail" in flags) if pre else "-",
+        "Window rotations (PF_ATTN_WROT)": ((rt("PF_ATTN_WROT") or "off") if att != "CCMM" else "n/a (CCMM)")
+                                           if pre else "-",
+        "Lazy relinearization (PC_MULT_SUM)": on(rt("PC_MULT_SUM") == "1"),
+        "Loose refresh pairs (PC_BTS_PAIR_LOOSE)": on(rt("PC_BTS_PAIR_LOOSE") == "1"),
+        "Refresh pair window (PC_BTS_PAIR_WINDOW)": rt("PC_BTS_PAIR_WINDOW") or "default",
+        "Pairs above StC-first's CF (PC_BTS_PAIR_CF_MAX)": rt("PC_BTS_PAIR_CF_MAX") or "off",
+        "Activation constant folded (PF_ACT_FOLD)": on(rt("PF_ACT_FOLD") == "1") if pre else "-",
+        "Exp mask folded into the series": config_count(cmds[0]["configs"], "softmax", "exp_mask_fold"),
         "Softmax: Chebyshev-scaled Goldschmidt": on(rt("SM_CHEB_GS") == "1"),
         "Softmax head sum cleanse": on(rt("SM_HRS_CLEANSE") == "1"),
         "Activation: one Chebyshev series": (on(True, "SiLU, driver") if rt("PF_SILU_SINGLE") == "1"
