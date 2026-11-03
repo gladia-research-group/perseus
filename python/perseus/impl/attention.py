@@ -46,7 +46,8 @@ def _general(rt) -> bool:
 def _key_lanes(d, cfg, kc: int) -> int:
     """The lanes the attention's lane ladders cover at kc keys: cfg.key_lanes (a power of two below t) while every key
     fits it (the keys sit on lanes 0..kc-1 and every other lane of the scores, z and P is zero, so a shorter window
-    sums the same), else t. With SM_PERIODIC=1 only (one group, tH-periodic scores)."""
+    sums the same), else t. Only on tH-periodic scores of one group (sm_periodic 1: SM_PERIODIC=1, or SM_PERIODIC=2 while
+    Gp is 1, the same layout), so on a 512-token config the levers act at the first key_lanes positions only."""
     w = int(getattr(cfg, "key_lanes", 0) or 0) if cfg is not None else 0
     if w and w < d.t and (w & (w - 1)) == 0 and 0 < kc <= w:
         return w
@@ -58,11 +59,10 @@ def _pair(rt, cfg, kc: int) -> bool:
     (SM_PERIODIC=1), so two heads share a t-lane block (layout.pair_src) and the softmax runs tH/2-periodic. complex_qkt
     packs its scores into that layout (no level: the pack's selectors ride the group mask), the softmax's masks are
     the paired ones, and complex_softmax_v pairs the summed V the same way and unpacks its output to the tok0 slots."""
-    if cfg is None or not int(getattr(cfg, "pair_heads", 0) or 0):
+    if cfg is None or not int(getattr(cfg, "pair_heads", 0) or 0) or getattr(rt, "gq_merge", 1) > 1:
         return False
     d = rt.dims
-    return (sm_periodic(rt, kc) == 1 and not _general(rt) and d.H % 2 == 0
-            and 2 * _key_lanes(d, cfg, kc) == d.t)
+    return sm_periodic(rt, kc) == 1 and d.H % 2 == 0 and 2 * _key_lanes(d, cfg, kc) == d.t
 
 
 def _pair_item(d, item):
@@ -601,7 +601,7 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
     ops, d = rt.ops, rt.dims
     q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
     kc = kv.k_count
-    lanes = _key_lanes(d, cfg, kc) if sm_periodic(rt, kc) == 1 and not merge else d.t
+    lanes = _key_lanes(d, cfg, kc) if sm_periodic(rt, kc) == 1 else d.t   # GQA's merged heads too: same key lanes
     q = rotsum_neg(ops, q, lanes)
     attn = None
     def accum(r):
@@ -700,7 +700,10 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0, pair: bool 
     per = sm_periodic(rt, kv.k_count)
     if pair and per != 1:
         raise ValueError("pair_heads needs tH-periodic scores of one group")
-    if per and _general(rt):
+    # SM_PERIODIC=2 at Gp = 1 is the one-group layout: with a key window or paired heads it takes that path (the
+    # classes' product is the summed buckets' one); without them the op stream stays the general one
+    narrowed = per == 1 and (pair or 0 < int(lanes or 0) < d.t)
+    if per and _general(rt) and not narrowed:
         # SM_PERIODIC=2 (every Gp, 1 included): pair j's rotation 2j tH only matters mod Gp, so the buckets of each
         # class are summed and each class takes one product
         scores_b = ops.copy(probs)
@@ -860,7 +863,7 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
     them, hold the full tH-periodic sum at every cache length. Added after the ladder, those refreshes landed on the
     partial sums, which repeat only every Gp tH slots: the sparse refresh returned them wrong (Llama past 256 keys)."""
     ops, d = rt.ops, rt.dims
-    lanes = lanes if (lanes and periodic == 1 and not _general(rt)) else d.t   # `lanes`: the keys' window (_key_lanes)
+    lanes = lanes if (lanes and periodic == 1) else d.t   # `lanes`: the keys' window (_key_lanes)
     # `pair` (_pair): x is in the paired layout (tH/2-periodic, a head per t/2-lane half block): the head ladder and the
     # replicate run over the half block as they do over the key window, the position masks are the paired ones
     pi = (lambda it: _pair_item(d, it)) if pair else (lambda it: it)
@@ -1231,7 +1234,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
                     d_s = sub.dims
                     p = sub.mult_mask(probs, ("gqa.psel", G, g), lambda g=g: _gqa_psel(d_s, G, g))
                     p = ops.tag_reduce(rotsum(ops, p, d_s.tH, G * d_s.tH), d_s.tH)
-                    outs.append(complex_softmax_v(sub, kv, p))
+                    outs.append(complex_softmax_v(sub, kv, p, _key_lanes(d_s, sm_cfg, kv.k_count)))
         G_loop = 0
     else:
         G_loop = G
@@ -1243,7 +1246,8 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
             with rt.step("softmax"):
                 probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
             with rt.step("softmax_v"):
-                outs.append(complex_softmax_v(sub, kv, probs))
+                outs.append(complex_softmax_v(sub, kv, probs, _key_lanes(sub.dims, sm_cfg, kv.k_count),
+                                              pair=_pair(sub, sm_cfg, kv.k_count)))
     with rt.step("gather"):
         x = outs[0]
         for g in range(1, G):
