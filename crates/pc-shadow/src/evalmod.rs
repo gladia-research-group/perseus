@@ -1253,8 +1253,9 @@ mod even_series_tests {
         x as f64
     }
 
-    /// P(|I| = i), i = 0..=15, of the overflow integer: I = round(X), X the sum of h = 32 uniforms, so the density of 33
-    /// uniforms at i (exact rationals; 5.2e9 coefficients under the production sparse secret agree).
+    /// P(|I| = i), i = 0..=15, of the overflow integer under the centred lift (`Lift::Centred`, the even series' raise):
+    /// I = round(X), X the sum of h = 32 uniforms, so the density of 33 uniforms at i (exact rationals; the raise kernels
+    /// on 1.3e8 coefficients under the production sparse secret agree). FIDESlib's per-prime lift is wider (sigma 2.35).
     const P_ABS_I: [f64; 16] = [
         2.394752e-01, 4.005643e-01, 2.337782e-01, 9.453113e-02,
         2.615467e-02, 4.858999e-03, 5.901276e-04, 4.513991e-05,

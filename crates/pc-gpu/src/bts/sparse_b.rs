@@ -58,6 +58,15 @@ impl SparseBCfg {
     }
 
     /// The EvalMod series' Paterson-Stockmeyer plan for `evalmod_k`.
+    /// The raise's lift: the even series covers only the centred lift's overflow integer, the shipped one both.
+    pub fn raise_lift(&self) -> super::raise::Lift {
+        if self.em_even {
+            super::raise::Lift::Centred
+        } else {
+            super::raise::Lift::PerPrime
+        }
+    }
+
     pub fn em_series(&self) -> Result<PsPlan> {
         if self.em_even && (self.evalmod_k != pc_core::bts_setup::EVALMOD_K || !self.em_coeffs.is_empty()) {
             Err(shape("sparse_b", format!("em_even replaces the frozen K = 16 table only (K = {}, {} custom coefficients)", self.evalmod_k, self.em_coeffs.len())))
@@ -311,7 +320,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
             let u = arena.used_bytes().div_ceil(align) * align - used0 - parts.iter().map(|p| p.1).sum::<usize>();
             parts.push((what, u));
         };
-        let raise = RaisePlan::new(arena, s, ctx, top, cts0_const, cfg.cts0_t)?;
+        let raise = RaisePlan::new(arena, s, ctx, top, cts0_const, cfg.cts0_t, cfg.raise_lift())?;
         mark("raise", &mut parts);
         let rr = rounds(n, &cfg, &g);
         let [r_fold, r_cts, r_stc, r_half] = rr;
@@ -362,6 +371,14 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
 mod even_series_tests {
     use super::*;
     use pc_core::params::ChainSpec;
+
+    /// The even series is fitted to the overflow integer of the centred lift; the shipped series keeps FIDESlib's raise.
+    #[test]
+    fn even_variants_raise_with_the_centred_lift() {
+        let shipped = SparseBCfg { evalmod_k: pc_core::bts_setup::EVALMOD_K, ..SparseBCfg::n32(256, 0) };
+        assert_eq!(shipped.raise_lift(), crate::bts::raise::Lift::PerPrime);
+        assert_eq!(SparseBCfg { em_even: true, ..shipped }.raise_lift(), crate::bts::raise::Lift::Centred);
+    }
 
     /// The even series spends one CKKS level less, so a K = 16 SparseB variant raises one level lower and its StC runs
     /// where the shipped one does, on the same EvalMod output: the plan's routes hold. K = 24 has no even series.

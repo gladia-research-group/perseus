@@ -115,10 +115,11 @@ pub fn evalmod_coeffs() -> &'static [f64] {
 /// degree in z = 2 w^2 - 1: w by a constant add, z by one square whose x2 and -1 ride its relinearization's epilogue,
 /// then this degree-5 series in z and the shipped 5 double angles. Depth 1 + PS(5) + 5 = 9, one CKKS level less than the
 /// shipped series' PS(14) + 5, at the same output level and scale (`EVALMOD_EVEN_LEVELS_SAVED`). Least squares on the
-/// final (double-angled) error, weighted by the overflow integer's distribution (the fit took the density of 34 uniforms
-/// at the integers; I = round(the sum of h = 32 uniforms) is the density of 33, and refitting to it moves the RMS by 0.03
-/// bits), |delta| <= 2^-4, not minimax on |I| <= 15: what reaches a slot is the error over that distribution, RMS 29.0
-/// bits (the shipped table 30.2). The error grows with |I| where the distribution thins out: worst 26.9 bits at |I| <= 5,
+/// final (double-angled) error, weighted by the overflow integer's distribution under the centred lift
+/// (`pc_gpu::bts::raise::Lift::Centred`; FIDESlib's raise has sigma 2.35 and this series fails on it). The fit took the
+/// density of 34 uniforms at the integers; I = round(the sum of h = 32 uniforms) is the density of 33, and refitting to
+/// it moves the RMS by 0.03 bits. |delta| <= 2^-4, not minimax on |I| <= 15: what reaches a slot is the error over that
+/// distribution, RMS 29.0 bits (the shipped table 30.2). The error grows with |I| where the distribution thins out: worst 26.9 bits at |I| <= 5,
 /// 20.5 at |I| <= 8 (P(|I| >= 8) = 2.1e-6 per coefficient), 12.9 at |I| <= 12 (P(|I| >= 12) = 6.0e-15), 10.7 at |I| <= 15
 /// (the shipped table 27.4 everywhere). OpenFHE evaluator convention (c0 not halved). Provenance: perseus-speedrun
 /// `tmodel/z5/em_rms.py`, `tmodel/z5/profile_by_I.py` (`fits/even_ls_k16_z5_r5.json`).

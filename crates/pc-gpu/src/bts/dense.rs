@@ -265,7 +265,7 @@ impl DensePlan {
             variants.push(BtsPrecomp {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
-                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, self.setup.cts0_t)?,
+                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, self.setup.cts0_t, self.setup.raise_lift())?,
                 cts: v.cts.iter().map(lt).collect::<Result<_>>()?,
                 stc: v.stc.iter().map(lt).collect::<Result<_>>()?,
                 stc_real0: v.stc_real0.as_ref().map(lt).transpose()?,
@@ -616,6 +616,13 @@ mod even_series_tests {
                 assert_eq!(x.cts.len(), y.cts.len());
             }
         }
+    }
+
+    /// The even series is fitted to the overflow integer of the centred lift; the shipped series keeps FIDESlib's raise.
+    #[test]
+    fn even_variants_raise_with_the_centred_lift() {
+        assert_eq!(plan(false, 0).setup.raise_lift(), crate::bts::raise::Lift::PerPrime);
+        assert_eq!(plan(true, 0).setup.raise_lift(), crate::bts::raise::Lift::Centred);
     }
 
     /// The key request reads the stages' geometry (`lt_steps`, `s0_steps`), and a bundle made for the shipped series must

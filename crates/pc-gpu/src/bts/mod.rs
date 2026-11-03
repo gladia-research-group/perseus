@@ -121,7 +121,7 @@ pub struct BtsSetup {
     pub boot_k: f64,
     /// EvalMod: the even series in place of the shipped K = 16 table (`PsPlan::evalmod_even`, config `bts.em_even`):
     /// one CKKS level less, so every raise-drop variant raises and runs CtS one level lower and lands where the shipped
-    /// one does. Needs the frozen K = 16 table in `evalmod_coeffs`.
+    /// one does, with the centred lift (`raise_lift`). Needs the frozen K = 16 table in `evalmod_coeffs`.
     pub evalmod_even: bool,
     /// Build the real-payload variants (FIDESLIB_BTS_REAL: StC stage 0 for `Route::real`).
     pub real: bool,
@@ -164,6 +164,15 @@ impl BtsSetup {
             return Err(shape("bts", "evalmod_even replaces the frozen K = 16 table (degree 14, 5 double angles) only"));
         }
         Ok(PsPlan::evalmod_even())
+    }
+
+    /// The raise's lift: the even series covers only the centred lift's overflow integer, the shipped one both.
+    pub fn raise_lift(&self) -> raise::Lift {
+        if self.evalmod_even {
+            raise::Lift::Centred
+        } else {
+            raise::Lift::PerPrime
+        }
     }
 
     /// CKKS levels every variant raises below its raise drop's level: what the even series saves.

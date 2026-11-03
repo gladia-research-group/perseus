@@ -258,7 +258,7 @@ fn d3(dir: &str, ks_list: &[usize], graph: bool, t: &mut Tally) -> Res<()> {
     let pre = BtsPrecomp {
         slots: (n / 2) as u32,
         raise_drop: drop,
-        raise: RaisePlan::new(&arena, s, &ctx, raise_top, exact, cts0_t)?,
+        raise: RaisePlan::new(&arena, s, &ctx, raise_top, exact, cts0_t, setup.raise_lift())?,
         cts: stages,
         stc: vec![],
         stc_real0: None,
