@@ -27,11 +27,12 @@
       "8"
     ],
     "stc_ps": 6,
+    "sb_em_table": "w14",
     "real": true,
     "shift": true,
     "sparse_auto": 2,
     "sparse_b": true,
-    "sparse_b_k": 24,
+    "sparse_b_k": 16,
     "sparse_bts_slots": [
       "512",
       "1"
@@ -57,9 +58,9 @@
   "host": {
     "hf_home": "/data02/users/azirilli/scratch/.cache",
     "malloc_arena_max": 2,
-    "omp_num_threads": 3,
+    "omp_num_threads": 2,
     "python": "/data02/users/azirilli/perseus-wt/r56-venv/bin/python",
-    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-zl/python"
+    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-pfw/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -91,14 +92,16 @@
     "sm_hrs_pack": true,
     "sm_periodic": 1,
     "prefill": {
+      "act_fold": true,
       "attn": "",
       "attn_bsgs": true,
       "attn_pack": 3,
+      "attn_wrot": 27,
       "ccmm_merge": true,
       "last_query": true,
       "layout": "blocked",
       "linear": "pcmm",
-      "pcmm_calib_in": "bootstrap_placements/_src_bert_sst2_128/pcmm_calib.json",
+      "pcmm_calib_in": "bootstrap_placements/_pfw_src_bert_sst2_128/pcmm_calib.json",
       "pcmm_raise": [
         "out:2",
         "down:2"
@@ -122,11 +125,12 @@
     "all_blocks_io_dir": "/data02/users/azirilli/scratch/.cache/perseus/oracle/gpt2/all_blocks_io",
     "ccmm_async": true,
     "encode_nosync": true,
-    "fhe_graph_dir": "graphs/_zl_bert",
+    "fhe_graph_dir": "graphs/_pfw_E_bert_sst2_128",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "pcmm_nosync": true,
     "steps_t": 128,
+    "mult_sum": true,
     "weights_path": "/data02/users/azirilli/scratch/.cache/perseus/models/openai-community/gpt2/classic/weights.bin.zip"
   }
 }
