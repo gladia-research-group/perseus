@@ -23,6 +23,8 @@ def tag_round_squares(nodes: list[dict]) -> int:
         if n.get("op_type") != "square" or not n.get("step", "").endswith(".softmax") or not n.get("inputs"):
             continue
         a = prod.get(n["inputs"][0])
+        if a is not None and a.get("op_type") in ("deliberate_bootstrap", "bootstrap") and a.get("inputs"):
+            a = prod.get(a["inputs"][0])        # SoftmaxCfg.gs_num_refresh: the square reads the refreshed 2 Re
         if a is None or a.get("op_type") != "add" or len(a.get("inputs", ())) != 2:
             continue
         x, y = a["inputs"]
@@ -44,7 +46,7 @@ def _is_2re(n: dict, prod: dict) -> bool:
                 (cx and cx.get("op_type") == "conjugate" and cx["inputs"][0] == y))
 
 
-def tag_numerators(nodes: list[dict]) -> int:
+def tag_numerators(nodes: list[dict], below: float | None = None) -> int:
     """FORBID_STEPS `.num`, the round-square rule extended to every value that carries the softmax's per-key
     numerators: from round 0's numerator (2 Re of the exp's last squaring) and each refine round's square on, every
     value of the `*.softmax` step computed from them, up to a key reduction (rotate_sum: a head sum is a sum, its
@@ -53,7 +55,13 @@ def tag_numerators(nodes: list[dict]) -> int:
     P.V add up over the keys (Llama decode, 512 keys: KL 3.9e-3 vs 5e-6); off gs_num the same values are the round's
     probabilities y = z R, by the same mechanism. Values before the squarings (the exp series) stay refreshable: the
     squarings shrink a relative error's floor with the value. Tags those values `<step>.num` (the round squares
-    `<step>.sq` as tag_round_squares); returns how many were tagged `.num`."""
+    `<step>.sq` as tag_round_squares); returns how many were tagged `.num`.
+
+    `below` (the refresh band's floor, plan_block: band_lo(cf_min) / mag_safety): only the numerator values whose
+    captured magnitude sits under it are kept off refreshes. Inside the band a refresh's floor error is below the
+    value's own scale, and under gs_num the recursion is longer than one refresh window, so it must be refreshed
+    somewhere: the rule keeps it where the state has grown into the band (Llama decode: the packed state starts at
+    5e-4 and grows ~4x per Goldschmidt step; GPT-2's smallest refreshed state is 0.024, so its plans are unchanged)."""
     tag_round_squares(nodes)
     prod = {n["output"]: n for n in nodes if n.get("output")}
     taint: set = set()
@@ -69,6 +77,9 @@ def tag_numerators(nodes: list[dict]) -> int:
         if not hot:
             continue
         taint.add(n["output"])
+        mag = n.get("output_max_abs")
+        if below is not None and mag is not None and mag >= below:
+            continue
         if not st.endswith(SQ):
             n["step"] = st + NUM
             k += 1

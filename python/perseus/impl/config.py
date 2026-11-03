@@ -92,6 +92,14 @@ class SoftmaxCfg:
     # gs_num: every reciprocal round's scores folded into its Goldschmidt recursion (poly.goldschmidt_recip num=): the
     # round's product goes, and inside a round the state is one ciphertext (a refresh may sit anywhere in it)
     gs_num: int = 0
+    # gs_num_refresh (with gs_num): a deliberate refresh of each round's numerator right before its last squaring
+    # (round 0: the exp's last squaring; a refine round: its square of 2 Re y). The squaring turns the refresh's
+    # absolute floor e into 2 v e, proportional to each key's own value, and the round's whole recursion then fits the
+    # window after it (the planner keeps refreshes off the packed state: FORBID_STEPS .num). Refreshing the packed
+    # state instead gives every key's numerator an independent floor at the scale of the state's maximum (the head
+    # sum or the sink key), which the next round and P.V sum over the keys (512-key decode: KL 3.5e-3 on GPT-2,
+    # 3.9e-3 on Llama, against ~5e-6 without gs_num)
+    gs_num_refresh: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -263,7 +271,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
         key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
-        pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)))
+        pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)),
+        gs_num_refresh=int(j.get("gs_num_refresh", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:

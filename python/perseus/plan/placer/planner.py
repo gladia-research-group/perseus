@@ -792,9 +792,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     num_nodes_raw = len(raw.get("nodes", []))
     nodes = raw.get("nodes", [])
     if round_sq.NUM in cfg.forbid_steps:    # the softmax's per-key numerators as their sub-step (round_sq)
-        n_num = round_sq.tag_numerators(nodes)
+        # PLAN_NUM_BAND=1: only the numerators under the refresh band at the smallest CF (band_lo(cf_min) / kappa)
+        below = (btserr.band(cfg.cf_min)[0] / max(cfg.mag_safety, 1.0)
+                 if os.environ.get("PLAN_NUM_BAND", "0") not in ("", "0") else None)
+        n_num = round_sq.tag_numerators(nodes, below)
         if cfg.verbose:
-            log.info(f"[plan] {n_num} softmax numerator value(s) kept off refreshes (.num)")
+            log.info(f"[plan] {n_num} softmax numerator value(s) kept off refreshes (.num"
+                     + (f", under {below:.3g})" if below is not None else ")"))
     elif round_sq.SQ in cfg.forbid_steps:   # the refine rounds' squares as their sub-step (round_sq)
         n_sq = round_sq.tag_round_squares(nodes)
         if cfg.verbose:

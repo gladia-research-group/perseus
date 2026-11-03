@@ -946,10 +946,19 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
                                   leaf_terms="budget")
     else:
         z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, a, b)
-    for _ in range(cfg.log2delta1):
+    refresh = _gs_num_refresh(ops, cfg)
+    for i in range(cfg.log2delta1):
+        if refresh and i == cfg.log2delta1 - 1:
+            z = ops.bootstrap(z)            # SoftmaxCfg.gs_num_refresh: before the last squaring
         z = ops.square(z)
     z = im_cleanse(ops, z)
     return z if cfg.exp_mask_fold else rt.mult_mask(z, *items[1])
+
+
+def _gs_num_refresh(ops, cfg: SoftmaxCfg) -> bool:
+    """SoftmaxCfg.gs_num_refresh: each round's numerator refreshed before its last squaring (gs_num only)."""
+    return bool(int(getattr(cfg, "gs_num", 0) or 0)) and bool(int(getattr(cfg, "gs_num_refresh", 0) or 0)) \
+        and ops.complex_payload and getattr(ops, "sm_cheb_gs", False)
 
 
 def first_iters(cfg: SoftmaxCfg, lean: bool) -> int:
@@ -975,7 +984,10 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
         raise ValueError("gs_num needs a complex payload and SM_CHEB_GS=1")
     for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
         if k:
-            z = ops.square(im_cleanse(ops, y))
+            y = im_cleanse(ops, y)
+            if fold_num and _gs_num_refresh(ops, cfg):
+                y = ops.bootstrap(y)            # SoftmaxCfg.gs_num_refresh: before the round's square
+            z = ops.square(y)
         if fold:
             s, sh = head_reduce_sum(rt, z, s0_expected=2.0 / (alpha * scale), periodic=sm_periodic(rt, kc),
                                     seed=0.5 * beta * scale * scale, seed_site=_seed_site(cfg, k), lanes=lanes,
