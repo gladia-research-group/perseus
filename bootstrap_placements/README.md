@@ -23,7 +23,7 @@ default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one s
 | `bert_sst2_128` | BERT-base, SST-2 classification of a 128-token input (blocked attention, the last block on [CLS] alone) |
 | `vit_b16_224` | ViT-B/16, one 224 x 224 image |
 | `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context in one plan (below) |
-| `llama31_8b_decode_ctx512_w128` ... `_w512` | Llama-3.1-8B, decode up to a 512-token context, one plan per 128-position window (below) |
+| `llama31_8b_decode_ctx512_w16`, `_w128` ... `_w512` | Llama-3.1-8B, decode up to a 512-token context: a plan for the first 16 positions, then one per 128-position window (below) |
 | `llama31_8b_prefill128` | Llama-3.1-8B, 128-token prefill: one planner run (python/perseus/examples/llama/make_plan.sh, `prefill` stage) on the fake recording made under its runtime= line |
 | `llama31_8b_handoff_decode` | Llama-3.1-8B, decode on the K / V handed over by `llama31_8b_prefill128` (`run_handoff`): cut for the hand-off's cache level (`KV_ENTRY_LEVEL=38`), on the refresh sites of the same recipe's plain decode plan (`PLAN_KEEP_PLACEMENTS`, see its `sites=` line), every softmax refresh one scaling step lower (`PLAN_SITE_CF=softmax:-1`) |
 
@@ -138,9 +138,10 @@ bootstrap_placements/llama31_8b_decode`, RTX PRO 6000): top-1 488/511, median KL
 keys; setup 2.5 h (recording 511 positions).
 
 `gpt2_decode_ctx512_w<B>` and `llama31_8b_decode_ctx512_w<B>` are the default decodes up to a 512-token context (GPT-2
-past its main plan's 32 keys): one plan per 128-position window, `_w<B>` serving the positions below B
-(`--plan-windows`), each planned on the magnitudes of its window's positions only. A model's four plans share one
-runtime= line, configs (`gpt2_base_n32_ctx1024_g3`, `llama31_8b_n32_ctx512_silu`) and recipe (the dense refreshes
-capped at the StC-first entry, `PLAN_REFRESH_ENV_CAP_ROUTES=0:46`, and the strict envelope), so one session serves
-them: 160 refreshes per GPT-2 token (12 of them in the encrypted argmax), 349 per Llama token. `PP=500` runs either
+past its main plan's 32 keys): a plan for the first 16 positions (`_w16`, the attention's lanes over the keys'
+window), then one per 128-position window, `_w<B>` serving the positions below B (`--plan-windows`), each planned on
+the magnitudes of its window's positions only. A model's five plans share one runtime= line on the hybrid chain
+`n32sph`, one config (`gpt2_base_n32_ctx512s`, `llama31_8b_n32_ctx512_silus`) and recipe (the dense refreshes capped
+at the StC-first entry, the strict envelope, no refresh on a reciprocal round's square), so one session serves
+them: 139 refreshes per GPT-2 token (11 of them in the encrypted argmax), 301 per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.

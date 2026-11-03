@@ -26,7 +26,7 @@ PLANS: dict[str, dict[int | None, str]] = {
 # one per 128 positions, each sized on its window's magnitudes, one runtime for all
 WINDOWS: dict[str, list[tuple[int, str]]] = {
     "gpt2_decode": [(b, f"bootstrap_placements/gpt2_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
-    "llama_decode": [(b, f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}") for b in (128, 256, 384, 512)],
+    "llama_decode": [(b, f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
 }
 
 
