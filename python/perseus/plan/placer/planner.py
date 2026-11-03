@@ -11,6 +11,7 @@ from pathlib import Path
 from .. import btserr
 from .. import contract
 from .ir import ADD_FAMILY, MULT_FAMILY, Graph, parse_lvl_suffix
+from . import round_sq
 from .place import Placer, PlanInfeasible, erase_reactive_bootstraps
 from .refresh import CfClampReport, RefreshPlanner
 from .sim import Budget, PlannerShadow, SimResult, step_bts_offsets
@@ -790,6 +791,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     raw = json.loads(Path(graph_file).read_text(encoding="utf-8"))
     num_nodes_raw = len(raw.get("nodes", []))
     nodes = raw.get("nodes", [])
+    if round_sq.SQ in cfg.forbid_steps:     # the refine rounds' squares as their sub-step (round_sq)
+        n_sq = round_sq.tag_round_squares(nodes)
+        if cfg.verbose:
+            log.info(f"[plan] {n_sq} reciprocal round square(s) kept off refreshes (.sq)")
     if cfg.pcmm_prediv_cap is not None:
         nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap, pcmm_stamps())
     g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
