@@ -791,7 +791,11 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     raw = json.loads(Path(graph_file).read_text(encoding="utf-8"))
     num_nodes_raw = len(raw.get("nodes", []))
     nodes = raw.get("nodes", [])
-    if round_sq.SQ in cfg.forbid_steps:     # the refine rounds' squares as their sub-step (round_sq)
+    if round_sq.NUM in cfg.forbid_steps:    # the softmax's per-key numerators as their sub-step (round_sq)
+        n_num = round_sq.tag_numerators(nodes)
+        if cfg.verbose:
+            log.info(f"[plan] {n_num} softmax numerator value(s) kept off refreshes (.num)")
+    elif round_sq.SQ in cfg.forbid_steps:   # the refine rounds' squares as their sub-step (round_sq)
         n_sq = round_sq.tag_round_squares(nodes)
         if cfg.verbose:
             log.info(f"[plan] {n_sq} reciprocal round square(s) kept off refreshes (.sq)")

@@ -11,6 +11,7 @@ sub-step from the graph instead, only when the forbid list names `.sq`."""
 from __future__ import annotations
 
 SQ = ".sq"
+NUM = ".num"
 
 
 def tag_round_squares(nodes: list[dict]) -> int:
@@ -29,5 +30,46 @@ def tag_round_squares(nodes: list[dict]) -> int:
         if (cy and cy.get("op_type") == "conjugate" and cy["inputs"][0] == x) or \
            (cx and cx.get("op_type") == "conjugate" and cx["inputs"][0] == y):
             n["step"] = n["step"] + SQ
+            k += 1
+    return k
+
+
+def _is_2re(n: dict, prod: dict) -> bool:
+    """n = x + conjugate(x) (im_cleanse: 2 Re x)."""
+    if n.get("op_type") != "add" or len(n.get("inputs", ())) != 2:
+        return False
+    x, y = n["inputs"]
+    cx, cy = prod.get(x), prod.get(y)
+    return bool((cy and cy.get("op_type") == "conjugate" and cy["inputs"][0] == x) or
+                (cx and cx.get("op_type") == "conjugate" and cx["inputs"][0] == y))
+
+
+def tag_numerators(nodes: list[dict]) -> int:
+    """FORBID_STEPS `.num`, the round-square rule extended to every value that carries the softmax's per-key
+    numerators: from round 0's numerator (2 Re of the exp's last squaring) and each refine round's square on, every
+    value of the `*.softmax` step computed from them, up to a key reduction (rotate_sum: a head sum is a sum, its
+    refresh is relative to it). Under SoftmaxCfg.gs_num the numerator rides the Goldschmidt recursion's packed state
+    (P = G D - i G mu N), whose refresh would leave each key's numerator an absolute floor error that the head sums and
+    P.V add up over the keys (Llama decode, 512 keys: KL 3.9e-3 vs 5e-6); off gs_num the same values are the round's
+    probabilities y = z R, by the same mechanism. Values before the squarings (the exp series) stay refreshable: the
+    squarings shrink a relative error's floor with the value. Tags those values `<step>.num` (the round squares
+    `<step>.sq` as tag_round_squares); returns how many were tagged `.num`."""
+    tag_round_squares(nodes)
+    prod = {n["output"]: n for n in nodes if n.get("output")}
+    taint: set = set()
+    k = 0
+    for n in nodes:
+        st = n.get("step", "")
+        base = st[:-len(SQ)] if st.endswith(SQ) else st
+        if not base.endswith(".softmax") or not n.get("output"):
+            continue
+        root = (_is_2re(n, prod) and any((prod.get(i) or {}).get("op_type") == "square" for i in n["inputs"])) \
+            or st.endswith(SQ)
+        hot = root or (n.get("op_type") != "rotate_sum" and any(i in taint for i in n.get("inputs", ())))
+        if not hot:
+            continue
+        taint.add(n["output"])
+        if not st.endswith(SQ):
+            n["step"] = st + NUM
             k += 1
     return k
