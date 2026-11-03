@@ -707,6 +707,30 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
     return drops, dict(skipped), placer._sim()
 
 
+def cache_route_deliberates(g: Graph, step_landing: str, raw: tuple[float, int]) -> tuple[Graph, int]:
+    """A code's own (deliberate) refresh in a cache-following step (plan.step_landing, PLAN_STEP_LANDING: SM_PERIODIC=2,
+    a per-key value's period grows with the cache) is planned on the dense StC-first route: its landing `raw` (the
+    route's level before its realize, degree 2) and the StC-first entry on its input. The capture records the route of
+    the merge's base position (a sparse one at a short cache, landing deeper in the chain's budget), while the long
+    positions run it dense: planned on the sparse landing, every later level of the block is 2 units shallower than
+    the compiled program's (the compile's [bts_input_error]: a refresh input past the chain). The compile pins levels
+    one-sided, so the dense landing also holds where a short cache runs it sparse. Refreshes placed by the cut take
+    the step's landing floor instead (refresh.py). Returns the graph and how many nodes were re-routed."""
+    from .refresh import _step_landing_floor
+    if not step_landing:
+        return g, 0
+    k = 0
+    out = []
+    for n in g.nodes:
+        if (n.is_deliberate_bts and not n.external and not n.stc_first and n.output_level is not None
+                and _step_landing_floor(step_landing, n.step) is not None
+                and n.output_level <= raw[0] and (n.output_level, n.output_deg) != raw):
+            n = dataclasses.replace(n, output_level=raw[0], output_deg=raw[1], stc_first=True)
+            k += 1
+        out.append(n)
+    return (g.replace_nodes(out) if k else g), k
+
+
 def recipe_plan_config(cfg: PlanConfig):
     """The planner recipe as the typed `_pc.PlanConfig`: the PLAN_* knobs of this process's environment (the
     planner's recipe knobs stay CLI/env for now, docs/ENV_INVENTORY.md `plan.*`) with the CLI-resolved values the
@@ -891,6 +915,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                   for n in g.nodes]
         if any(a is not b for a, b in zip(marked, g.nodes)):
             g = g.replace_nodes(marked)
+        g, n_follow = cache_route_deliberates(g, shadow.plan.get("plan.step_landing") or "", raw)
+        if n_follow and cfg.verbose:
+            log.info(f"[plan] {n_follow} deliberate refresh(es) of a cache-following step planned on the dense "
+                     f"StC-first route")
     refresh = RefreshPlanner(
         table=table if table is not None else _load_table(cfg),
         policy=policy,
