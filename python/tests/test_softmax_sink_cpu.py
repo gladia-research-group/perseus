@@ -59,7 +59,8 @@ def test_sink_centred_matches_uncentred(monkeypatch, kc):
     """kc = 65 = 2 t + 1 spans a full K bucket and a pending group: the centred scores are the uncentred ones minus key 0's on
     each head's key slots, and the attention outputs agree to the approximations' accuracy."""
     monkeypatch.setenv("SM_CHEB_GS", "1")
-    sink = config.load_configs(str(CFG_SINK)).softmax[LAYER]
+    # the centring alone: the attention's lanes over the first 16 keys off (their own tests: test_key_lanes_general_cpu.py)
+    sink = dataclasses.replace(config.load_configs(str(CFG_SINK)).softmax[LAYER], key_lanes=0, pair_heads=0)
     base = config.load_configs(str(CFG_BASE)).softmax[LAYER]
     assert sink.ref_keys and all(r == config.REF_SINK for r in sink.ref_keys) and sink.ref_window >= 512
     rt, sc_c, out_c, s0, nb = _attend(sink, kc, True)

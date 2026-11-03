@@ -85,7 +85,8 @@ def test_key_lanes_match_full_ladders(monkeypatch, kc):
     from perseus.impl import attention
     monkeypatch.setenv("SM_CHEB_GS", "1")
     base = config.load_configs(str(CFG_REF)).softmax["transformer.h.0.attn"]
-    base = dataclasses.replace(base, ref_keys=(config.REF_SELF, config.REF_PREV, config.REF_SINK) + base.ref_keys[3:])
+    base = dataclasses.replace(base, ref_keys=(config.REF_SELF, config.REF_PREV, config.REF_SINK) + base.ref_keys[3:],
+                               pair_heads=0)     # key lanes alone (paired heads: test_key_lanes_general_cpu.py)
     outs = []
     for lanes in (0, 16):
         cfg = dataclasses.replace(base, key_lanes=lanes)

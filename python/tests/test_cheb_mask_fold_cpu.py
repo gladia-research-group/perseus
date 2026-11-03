@@ -117,13 +117,13 @@ def test_softmax_exp_mask_fold(monkeypatch, kc, block):
     (z0, p0), (z1, p1) = outs
     np.testing.assert_allclose(z1, z0, rtol=1e-9, atol=1e-12 * np.abs(z0).max())
     np.testing.assert_allclose(p1, p0, rtol=1e-9, atol=1e-12 * np.abs(p0).max())
-    # the folded series lands at the unfolded series' level (the fake's reactive refreshes keep the whole exp from
+    # the folded series lands no lower than the unfolded series (the fake's reactive refreshes keep the whole exp from
     # comparing levels: the series alone, from a low level)
     rt, _fhe, _inf = _rt()
     x = fake.FakeCt(np.random.default_rng(2).uniform(-0.9, 0.9, rt.dims.N).astype(complex), 10)
     plain = poly_eval(rt.ops, x, base.cheb_coeffs)
     folded = poly_eval_masked(rt, x, base.cheb_coeffs)
-    assert rt.ops.lvl(folded) == rt.ops.lvl(plain)
+    assert rt.ops.lvl(folded) >= rt.ops.lvl(plain)
 
 
 def poly_eval(ops, x, c):

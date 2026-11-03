@@ -19,14 +19,18 @@ from perseus.impl.rt import Rt
 CFG = "gpt2_base_n32_ctx512s"
 # the switch sets the speedrun's records served (Decode-8 _cmf, then _cmfl), applied to main's 512-context decode CutMax
 SWITCHES = {"cmf": dict(spru_mean=1, newton_fold=1, conj_once=1),
-            "cmfl": dict(spru_mean=1, newton_fold=1, conj_once=1, entry_dd=1)}
-OFF = dict(spru_mean=0, newton_fold=0, conj_once=0, entry_dd=0)
+            "cmfl": dict(spru_mean=1, newton_fold=1, conj_once=1, entry_dd=1),
+            # the centring at a usable mask scale, with the shipped config's values
+            "cmflc": dict(spru_mean=1, newton_fold=1, conj_once=1, entry_dd=1, out_scale=None, lm_centre=None,
+                          newton_carry=None)}
+OFF = dict(spru_mean=0, newton_fold=0, conj_once=0, entry_dd=0, out_scale=(), lm_centre=0, newton_carry=())
 
 
 def _cfg(sw):
+    """The shipped CutMax config with every switch off, then `sw` (None: the shipped value)."""
     import dataclasses
-    return dataclasses.replace(config.load_configs(str(PKG / f"configs/model/approximation/{CFG}/configs.json")).cutmax,
-                               **{**OFF, **sw})
+    shipped = config.load_configs(str(PKG / f"configs/model/approximation/{CFG}/configs.json")).cutmax
+    return dataclasses.replace(shipped, **{**OFF, **{k: getattr(shipped, k) if v is None else v for k, v in sw.items()}})
 
 
 def _cutmax(cfg, logits):
