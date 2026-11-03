@@ -2,7 +2,8 @@
 //! compiler knows the DAG: steps off the block's critical path (under a static cost model: refreshes and key
 //! switches dominate) go to the side lane, everything on it stays on compute. Refreshes, finishes,
 //! streamed-weight sums, units (grids, K-batches), dynamic steps and steps using the block's scratch slot always run on compute
-//! (their workspaces are compute's); a fused plaintext product and add (no gather buffer) may run on the side lane.
+//! (their workspaces are compute's); a fused plaintext product and add (no gather buffer) may run on the side lane, and
+//! an element-wise group runs as one pass only when its steps share a lane.
 //!
 //! Correctness does not depend on the heuristic: every slot hazard between the lanes (read after write, write after
 //! read, write after write) becomes one event wait on the latest conflicting step of the other lane (stream order
@@ -23,6 +24,8 @@ pub struct Sched {
     /// Record an event after this step (some later step of the other lane waits for it).
     pub signal: Vec<bool>,
     pub n_side: usize,
+    /// Element-wise groups whose steps sit on two lanes (issued step by step).
+    pub n_split: usize,
     /// Static cost estimates (ms): every step, the critical path.
     pub total_ms: f64,
     pub critical_ms: f64,
@@ -115,7 +118,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
             let st = &b.steps[i];
             let on_cp = fin[i] + tail[i] >= total_cp - 1e-6;
             // a unit issues all its steps at once, on compute (its gather buffers are compute's); a product-add pair on
-            // one lane, compute when either step is held there
+            // one lane, compute when either step is held there; an element-wise group keeps its steps' lanes (`unit_lanes`)
             let unit = b.unit_of.get(i).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]);
             let gathers = unit.is_some_and(|u| !matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. }));
             if on_cp || gathers || dynamic.contains(&(i as u32)) || pinned(st, side_ok) {
@@ -125,11 +128,16 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
             }
         })
         .collect();
-    for u in b.units.iter().filter(|u| matches!(u.kind, UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } | UnitKind::Affine { .. } | UnitKind::MultIAdd { .. })) {
-        let (lo, hi) = (u.lo as usize, u.hi as usize);
-        let l = lane[lo..hi].iter().copied().min().unwrap_or(0);
-        lane[lo..hi].iter_mut().for_each(|x| *x = l);
-    }
+    let spans: Vec<(usize, usize, bool)> = b
+        .units
+        .iter()
+        .filter_map(|u| match u.kind {
+            UnitKind::MultPtAdd { .. } | UnitKind::MultPtAddChain { .. } => Some((u.lo as usize, u.hi as usize, true)),
+            UnitKind::Affine { .. } | UnitKind::MultIAdd { .. } => Some((u.lo as usize, u.hi as usize, false)),
+            _ => None,
+        })
+        .collect();
+    let n_split = unit_lanes(&mut lane, &spans);
     // hazards per region: last writer and the latest reader per lane of every slot since its last write
     let mut wait = vec![NONE; n];
     let mut signal = vec![false; n];
@@ -183,5 +191,24 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool) -> Sc
         }
     }
     let n_side = lane.iter().filter(|&&x| x == 1).count();
-    Sched { lane, wait, signal, n_side, total_ms: costs.iter().sum(), critical_ms: total_cp }
+    Sched { lane, wait, signal, n_side, n_split, total_ms: costs.iter().sum(), critical_ms: total_cp }
+}
+
+/// Lanes of the steps that a unit issues as one launch, over `spans` = (first step, end, unify): a unified unit (a
+/// fused plaintext product and add) takes one lane, compute when any of its steps is there; an element-wise group
+/// (affine, a product by i and its add) keeps its steps' own lanes, so it issues as one pass only where they agree
+/// (the replay issues a group whose steps sit on two lanes step by step). Pulling a side step onto compute would make
+/// compute wait there for the side lane's work. Returns the groups left on two lanes.
+pub fn unit_lanes(lane: &mut [u8], spans: &[(usize, usize, bool)]) -> usize {
+    let mut split = 0;
+    for &(lo, hi, unify) in spans {
+        let Some(s) = lane.get_mut(lo..hi) else { continue };
+        let l = s.iter().copied().min().unwrap_or(0);
+        if unify {
+            s.iter_mut().for_each(|x| *x = l);
+        } else if s.iter().any(|&x| x != l) {
+            split += 1;
+        }
+    }
+    split
 }
