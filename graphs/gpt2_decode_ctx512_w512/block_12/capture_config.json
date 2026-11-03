@@ -3,12 +3,13 @@
     "chain": "n32",
     "ckks_complex": true,
     "composite_degree": 2,
-    "logn": 16
+    "logn": 16,
+    "preset": "n32sph"
   },
   "bts": {
-    "auto_bts_level": 46,
+    "auto_bts_level": 50,
     "bts_iterations": 1,
-    "bts_max_input_level": 50,
+    "bts_max_input_level": 54,
     "correction_factor": 6,
     "cts_alt_budget": 5,
     "em_fuse_rescale": true,
@@ -16,26 +17,28 @@
     "gpu_encode": true,
     "merge_s2d": true,
     "pair": true,
-    "raise_drop": "512:1",
+    "pair_window": 6144,
+    "pair_loose": true,
+    "pair_cf_max": 15,
+    "raise_drop": "512:1,256:1",
     "raise_drops": [
       "1",
       "2",
       "3",
       "4",
-      "5",
-      "6",
-      "7",
-      "8"
+      "5"
     ],
     "stc_ps": 6,
+    "sb_em_table": "w14",
     "real": true,
     "shift": true,
     "sparse_auto": 2,
     "sparse_b": true,
     "sparse_b_max": 1024,
-    "sparse_b_k": 24,
+    "sparse_b_k": 16,
     "sparse_bts_slots": [
       "512",
+      "256",
       "1"
     ],
     "sparse_level_budget": [
@@ -62,7 +65,7 @@
     "malloc_arena_max": 2,
     "omp_num_threads": 2,
     "python": "/data02/users/azirilli/perseus-wt/r56-venv/bin/python",
-    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-port/python"
+    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-dec/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -95,12 +98,17 @@
     "sm_hrs_pack": true,
     "sm_periodic": 2
   },
+  "quirks": {
+    "fakecap_sparse_exact": true,
+    "fakecap_stc_entry": 50
+  },
   "exec": {
     "all_blocks_io_dir": "/data02/users/azirilli/scratch/.cache/perseus/oracle/gpt2_ctx1024/all_blocks_io",
-    "fhe_graph_dir": "graphs/_v4_p0",
+    "fhe_graph_dir": "graphs/_gg-g_p0",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
     "steps_t": 16,
+    "mult_sum": true,
     "weights_path": "/data02/users/azirilli/scratch/.cache/perseus/models/openai-community/gpt2/classic/weights.bin.zip"
   }
 }

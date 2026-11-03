@@ -22,7 +22,7 @@ def test_shape_lookup():
 
 
 def test_window_lookup():
-    assert [b for b, _d in default_windows("gpt2_decode", 512)] == [128, 256, 384, 512]
+    assert [b for b, _d in default_windows("gpt2_decode", 512)] == [16, 128, 256, 384, 512]
     assert default_windows("gpt2_decode", 513) is None
     assert default_windows("llama_decode")[-1][1].endswith("bootstrap_placements/llama31_8b_decode_ctx512_w512")
     assert default_windows("bert") is None

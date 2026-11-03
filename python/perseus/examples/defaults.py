@@ -21,10 +21,11 @@ PLANS: dict[str, dict[int | None, str]] = {
     "llama_handoff_decode": {None: "bootstrap_placements/llama31_8b_handoff_decode"},
 }
 
-# model -> [(bound, plan dir)]: up to a 512-token context, one plan per 128-position window (`--plan-windows`: a
-# window's plan serves the positions below its bound), each sized on its window's magnitudes, one runtime for all
+# model -> [(bound, plan dir)]: up to a 512-token context, a plan per position window (`--plan-windows`: a window's plan
+# serves the positions below its bound): the first 16 positions (the attention's lanes over the keys' window), then
+# one per 128 positions, each sized on its window's magnitudes, one runtime for all
 WINDOWS: dict[str, list[tuple[int, str]]] = {
-    "gpt2_decode": [(b, f"bootstrap_placements/gpt2_decode_ctx512_w{b}") for b in (128, 256, 384, 512)],
+    "gpt2_decode": [(b, f"bootstrap_placements/gpt2_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
     "llama_decode": [(b, f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}") for b in (128, 256, 384, 512)],
 }
 
