@@ -990,7 +990,11 @@ impl Replayer {
                 _ => true,
             }
         };
-        let s = schedule::plan(b, &side_ok);
+        // the share of the chain's primes live at a level (the simulation's cost scale)
+        let chain = rt.sh.cfg.chain;
+        let top = chain.top_max() as f64 + 1.0;
+        let live = |level: u32| chain.primes_dropped(level).map_or(1.0, |d| ((top - d as f64) / top).clamp(0.02, 1.0));
+        let s = schedule::plan(b, &side_ok, &live);
         self.scheds.insert(b.label.clone(), (dynamic, s.clone()));
         Some(s)
     }
