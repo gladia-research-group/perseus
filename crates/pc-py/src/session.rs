@@ -665,6 +665,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
         let (lt_tails, em_fuse) = (cfg.bts.lt_tails.unwrap_or(true), cfg.bts.em_fuse_rescale.unwrap_or(false));
         // PC_BTS_MERGE_S2D / PC_BTS_STC_PS (default off): key-set switches (pc-gpu BtsSetup::merge_s2d / stc_ps)
         let (merge_s2d, stc_ps) = (cfg.bts.merge_s2d.unwrap_or(false), knob(cfg.bts.stc_ps, 0, "bts.stc_ps")? as usize);
+        // PC_EM_EVEN (default off): the even EvalMod series on every K = 16 route (pc-gpu BtsSetup::evalmod_even)
+        let em_even = cfg.bts.em_even.unwrap_or(false);
         for p in &ps.programs {
             steps.extend(prog_steps(p, half));
         }
@@ -678,6 +680,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.cts_alt_budget = cts_alt;
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             (setup.merge_s2d, setup.stc_ps) = (merge_s2d, stc_ps);
+            setup.evalmod_even = em_even;
             let mut sfs = StcFirstSetup::n32_shipped();
             sfs.cache_slots = ps.stc_cache.max(1);
             if pcmm.is_some() {
@@ -727,6 +730,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.real = rn.plain_real;
             setup.cts_alt_budget = cts_alt;
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
+            setup.evalmod_even = em_even;
             setup.k_max = 1;
             let dp = pc_gpu::bts::dense::DensePlan::new(chain, &setup).map_err(e)?;
             let geoms: Vec<_> = dp.variants.iter().flat_map(|v| v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter())).map(|h| h.geom).collect();
@@ -740,6 +744,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
                 (c.lt_tails, c.em_fuse_rescale) = (lt_tails, em_fuse);
                 c.merge_s2d = merge_s2d;
                 c.evalmod_k = knob(cfg.bts.sparse_b_k, pc_core::bts_setup::SPARSE_B_K as i64, "bts.sparse_b_k")? as f64;
+                // the even series replaces the K = 16 table only (K = 24 keeps FIDESlib's degree-20 one)
+                c.em_even = em_even && c.evalmod_k == pc_core::bts_setup::EVALMOD_K;
                 extra.sparse_rots.extend(pc_gpu::bts::sparse_b::sparse_rot_steps(n, &c).map_err(e)?.into_iter().map(|st| (st, KskShape::full(chain))));
                 full.extend(pc_gpu::bts::sparse_b::rot_steps(n, &c).map_err(e)?.into_iter().map(|k| k.rem_euclid(half)));
                 sb_cfgs.push(c);

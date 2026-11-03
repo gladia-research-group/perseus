@@ -1,0 +1,51 @@
+[pc-bench] stcf host plan 0.7 s: entry limb 7, 2 input stages, 75 rotation keys
+[pc-bench] MemPlan context 63.9 MB, ks_work 1890.0 MB, bconv_work 126.0 MB, scratch 504.0 MB, ct_pool 31.5 MB, keys 14747.5 MB, keygen 31.5 MB, secret 31.5 MB, encrypt 0.0 MB, decrypt 10.0 MB, ks.plans 4.1 MB, ks.regen_a 189.0 MB, ops 14.5 MB, rescale 253.5 MB, bts.dense 5510.1 MB, bts.stc_first 2603.2 MB, bench.dense 5510.1 MB, bts.work 7056.0 MB, bench.cts 504.0 MB, total 39080.4 MB
+[pc-bench] keygen 79 keys in 2.0 s
+[pc-bench] stcf route tables 2.5 s; arena used 40.4 of 41.0 GB
+[pc-check] cf=8 own_cf=false real=false: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=8 own_cf=false real=false: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=8 own_cf=false real=false cf_stage=20 input level 44 A=0.5: Re 3.312e-5 (14.88 bits), complex 4.355e-5 (14.49 bits), rms 1.3456e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=8 own_cf=false real=false cf_stage=20 input level 44 A=1: Re 1.012e-4 (13.27 bits), complex 1.404e-4 (12.80 bits), rms 5.3531e-5; landing 28 deg 1
+[pc-check] cf=8 own_cf=false real=true: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=8 own_cf=false real=true: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=8 own_cf=false real=true cf_stage=20 input level 44 A=0.5: Re 3.604e-5 (14.76 bits), complex 3.604e-5 (14.76 bits), rms 9.5168e-6; landing 28 deg 1
+[pc-bench] stcf-prec cf=8 own_cf=false real=true cf_stage=20 input level 44 A=1: Re 1.012e-4 (13.27 bits), complex 1.012e-4 (13.27 bits), rms 3.7897e-5; landing 28 deg 1
+[pc-check] cf=8 own_cf=true real=false: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=8 own_cf=true real=false: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=8 own_cf=true real=false cf_stage=8 input level 44 A=0.5: Re 3.748e-5 (14.70 bits), complex 4.176e-5 (14.55 bits), rms 1.3446e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=8 own_cf=true real=false cf_stage=8 input level 44 A=1: Re 1.035e-4 (13.24 bits), complex 1.413e-4 (12.79 bits), rms 5.3528e-5; landing 28 deg 1
+[pc-check] cf=8 own_cf=true real=true: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=8 own_cf=true real=true: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=8 own_cf=true real=true cf_stage=8 input level 44 A=0.5: Re 4.395e-5 (14.47 bits), complex 4.395e-5 (14.47 bits), rms 9.5274e-6; landing 28 deg 1
+[pc-bench] stcf-prec cf=8 own_cf=true real=true cf_stage=8 input level 44 A=1: Re 1.089e-4 (13.16 bits), complex 1.089e-4 (13.16 bits), rms 3.7894e-5; landing 28 deg 1
+[pc-check] cf=13 own_cf=false real=false: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=13 own_cf=false real=false: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=13 own_cf=false real=false cf_stage=20 input level 44 A=0.5: Re 1.069e-3 (9.87 bits), complex 1.070e-3 (9.87 bits), rms 4.5047e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=13 own_cf=false real=false cf_stage=20 input level 44 A=1: Re 5.340e-4 (10.87 bits), complex 5.344e-4 (10.87 bits), rms 2.2199e-5; landing 28 deg 1
+[pc-check] cf=13 own_cf=false real=true: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=13 own_cf=false real=true: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=13 own_cf=false real=true cf_stage=20 input level 44 A=0.5: Re 1.087e-3 (9.84 bits), complex 1.087e-3 (9.84 bits), rms 3.1696e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=13 own_cf=false real=true cf_stage=20 input level 44 A=1: Re 3.490e-4 (11.48 bits), complex 3.490e-4 (11.48 bits), rms 1.5357e-5; landing 28 deg 1
+[pc-check] cf=13 own_cf=true real=false: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=13 own_cf=true real=false: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=13 own_cf=true real=false cf_stage=13 input level 44 A=0.5: Re 1.001e-2 (6.64 bits), complex 1.001e-2 (6.64 bits), rms 7.0835e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=13 own_cf=true real=false cf_stage=13 input level 44 A=1: Re 5.162e-4 (10.92 bits), complex 5.302e-4 (10.88 bits), rms 2.1680e-5; landing 28 deg 1
+[pc-check] cf=13 own_cf=true real=true: output metadata == route landing: 0 mismatches of 1
+[pc-check] cf=13 own_cf=true real=true: realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] stcf-prec cf=13 own_cf=true real=true cf_stage=13 input level 44 A=0.5: Re 6.817e-4 (10.52 bits), complex 6.853e-4 (10.51 bits), rms 3.0084e-5; landing 28 deg 1
+[pc-bench] stcf-prec cf=13 own_cf=true real=true cf_stage=13 input level 44 A=1: Re 3.187e-4 (11.62 bits), complex 3.361e-4 (11.54 bits), rms 1.4162e-5; landing 28 deg 1
+[pc-check] contract: input level 44 stc_first=true (ran StC-first: true): realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] contract cf=8 input level 44 stc_first=true: ran StC-first true, landing 28 deg 1, 15.18 bits (gauss 0.1)
+[pc-check] contract: input level 44 stc_first=false: this route's shipped order == DenseRoute (words + metadata): 0 mismatches of 2883585
+[pc-check] contract: input level 44 stc_first=false (ran StC-first: false): realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] contract cf=8 input level 44 stc_first=false: ran StC-first false, landing 34 deg 1, 7.58 bits (gauss 0.1)
+[pc-check] contract: input level 48 stc_first=true: this route's shipped order == DenseRoute (words + metadata): 0 mismatches of 2883585
+[pc-check] contract: input level 48 stc_first=true (ran StC-first: false): realized landing == pc-shadow: 0 mismatches of 1
+[pc-bench] contract cf=8 input level 48 stc_first=true: ran StC-first false, landing 34 deg 1, 7.87 bits (gauss 0.1)
+[pc-check] K=8 StC-first batch of 8 distinct ciphertexts == each at K=1, every word: 0 mismatches of 29360129
+[pc-bench] PCMM pattern hooks: BtsLog { hints: [("x", 44, 44)], refreshes: [ExternalBts { inputs: ["x"], input_levels: [44], out: CtMeta { level: 28, deg: 2, nf: 1.9096350526318888e32, slots: 32768, tag: Tag { slots: 0, period: 0, support: Support { kind: 2, offset: 0, stride: 1, count: 0, width: 1 }, field: 0, conj_of: None } }, landing: None, route: Route { slots: 0, cf: Some(8), real: false, raise_drop: 1, stc_first: true, sparse_b: false, spru_h: 0, iterations: 1 }, desc: "bench.pcmm" }], total_bootstraps: 0 }
+[pc-check] PCMM pattern (finish at raise drop 1): realized landing == pc-shadow (drop 1): 0 mismatches of 1
+[pc-bench] PCMM pattern (own CF 8, finish at raise drop 1): complex 2.344e-4 (12.06 bits), landing 30 deg 1
+[pc-bench] last-stage cache: CacheStats { hits: 16, misses: 3, evictions: 0 }
+[pc-bench] wrote /root/perseus-entry/out-ab/stcf_prec_1.json
+[pc-bench] stcf-prec: 23 gates, 0 failing

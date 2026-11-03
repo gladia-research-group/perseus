@@ -1,0 +1,61 @@
+{
+  "name": "CentredEvenEvalMod",
+  "tracks": [
+    "decode"
+  ],
+  "authors": [
+    {
+      "name": "Gabriel Zocal",
+      "github": "z0cal",
+      "affiliation": "USP-Brazil"
+    }
+  ],
+  "summary": "Record 7's Decode-8 with EvalMod on an even series (degree 5 in z = 2 (y - 1/64)^2 - 1, then the 5 double angles), one CKKS level shallower, fitted to the overflow integer's distribution, and a raise that centres in q_0 q_1, which gives that distribution; same placements, landings, keys and client.",
+  "ckks": {
+    "log_n": 16,
+    "log_qp": 1734,
+    "secret": "uniform-ternary",
+    "chain": "Decode-8: n32sp (record 6), 51 Q + 13 special primes, every prime < 2^28, dnum 4, log QP 1728.55. Prefill-128: n32a4 (record 5), log QP 1733.26. log_qp above is the larger; record 6's client bounds every dense-secret key at 1734 bits",
+    "dnum": 4,
+    "special_primes": "Decode-8 (n32sp): record 6's (record 3's 9 and 142344193, 107216897, 106037249, 104857601); Prefill-128 (n32a4): record 5's",
+    "sparse_keys": [
+      {
+        "role": "encapsulation, dense to sparse",
+        "secret": "ternary, Hamming weight 32",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (307.6 bits), record 1's, on both chains"
+      },
+      {
+        "role": "SPRU block key",
+        "secret": "binary, one 1 in each of 64 blocks",
+        "modulus": "q_0 q_1 and P' = record 3's 9 special primes (307.6 bits), record 1's, on both chains"
+      },
+      {
+        "role": "PCMM ring switch (Prefill-128)",
+        "secret": "ternary on ring dimension 4096",
+        "modulus": "q_0 q_1 P (87.0 bits): record 3's primes q_0, q_1 and P = 2147352577, unchanged on n32a4"
+      }
+    ]
+  },
+  "systems_only": false,
+  "ai_assistance": {
+    "used": true,
+    "share_of_changed_lines": 1.0,
+    "tools": [
+      "Claude Code"
+    ]
+  },
+  "dev_result": {
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "note": "Outside the harness's sandbox: a RunPod container, run.json harness null (see Disclosures). The track the entry does not claim is listed to show it is unchanged.",
+    "prefill": {
+      "request_s": 6.517,
+      "record_request_s_same_gpu": 6.518,
+      "mean_kl": 4.89e-05
+    },
+    "decode": {
+      "s_per_token": 0.9575,
+      "record_s_per_token_same_gpu": 1.0052,
+      "mean_kl": 2.42e-05
+    }
+  }
+}

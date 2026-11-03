@@ -4,7 +4,8 @@
 //! bottom; (3) coefficient form, composite raise (`mod_raise`) and exact small-integer scaling (`small_int`), NTT;
 //! (4) sparse -> dense key switch at the raised level. On composite degree 1 (n64) step 3 is one kernel
 //! (`small_int1`, exact rounding of x * c; not FIDESlib-bit-exact). `Encapsulated` is the only implementation; the
-//! per-drop variants differ only in the target top limb `L - d * raise_drop` and the constant of step 3.
+//! per-drop variants differ only in the target top limb `L - d * raise_drop` and the constant of step 3. Step 3's lift is
+//! FIDESlib's unless the plan asks for the centred one (`Lift`).
 //! Details: docs/ARCHITECTURE.md "pc-gpu mod raise".
 use super::BtsCx;
 use crate::context::{DevStrategy, DevWord};
@@ -212,6 +213,59 @@ pub fn small_int_host(t: &SmallIntTab, x_rows: &[u64], out_primes: &[u64]) -> Ve
         .collect()
 }
 
+/// How the raise lifts a coefficient from the composite bottom Qd. The two differ by a multiple of Qd, which is what the
+/// overflow integer I = (c0' + c1' s - m) / Qd counts, so the choice sets the distribution EvalMod's series must cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lift {
+    /// FIDESlib: `mod_raise` fills the third limb with each Garner term centred on its own prime, `small_int` reconstructs
+    /// from three limbs. Every coefficient is a sum of two uniforms: I has sigma 2.35 at h = 32 (66 uniforms).
+    PerPrime,
+    /// `small_int` reconstructs from the d bottom limbs and centres in Qd: I has sigma 1.66 at h = 32 (33 uniforms), one
+    /// kernel less. Not FIDESlib-bit-exact.
+    Centred,
+}
+
+impl Lift {
+    /// Rows `[r0, r1)` the composite `mod_raise` fills before `small_int` reads its sources. Only FIDESlib's lift at d = 2
+    /// runs it: d = 1 has its own kernel and at d = 3 the three sources are the bottom.
+    pub fn mod_raise_rows(self, d: usize) -> Option<(usize, usize)> {
+        match (self, d) {
+            (Lift::PerPrime, 2) => Some((2, 3)),
+            _ => None,
+        }
+    }
+
+    /// Source limbs of `small_int` at composite degree d (2 or 3).
+    fn sources(self, d: usize) -> usize {
+        match self {
+            Lift::PerPrime => 3,
+            Lift::Centred => d,
+        }
+    }
+}
+
+/// The `mod_raise` constants of a raise to `top` (composite degree d); launch fields left for `launch_mod_raise`.
+pub fn raise_args(q: &[u64], d: usize, top: usize) -> ModRaiseArgs {
+    // SAFETY: plain data, zero is valid
+    let mut ra: ModRaiseArgs = unsafe { std::mem::zeroed() };
+    for k in 0..d {
+        let qk = q[k];
+        let hat_k = (0..d).filter(|&j| j != k).fold(1u64, |h, j| mulmod(h, q[j] % qk, qk));
+        ra.qhatinv[k] = invmod(hat_k, qk);
+        for (i, &qi) in q.iter().enumerate().take(top + 1) {
+            ra.qhat[k][i] = (0..d).filter(|&j| j != k).fold(1u64, |v, j| mulmod(v, q[j] % qi, qi));
+        }
+    }
+    ra.d = d as i32;
+    ra
+}
+
+/// The `small_int` table of a raise to `top` (composite degree d >= 2): every row 0..=top from the lift's source limbs.
+pub fn raise_tab(q: &[u64], d: usize, top: usize, c: Option<f64>, lift: Lift) -> Result<SmallIntTab> {
+    let rows: Vec<usize> = (0..=top).collect();
+    small_int_tab(&q[..lift.sources(d)], &rows, &q[..=top], c)
+}
+
 // ── device plan ──────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// Words of a `SmallIntTab` on the device (it is all 4-byte fields).
@@ -234,6 +288,8 @@ pub struct RaisePlan<'a, W: DevWord> {
     pub t: u32,
     /// The scale of the raised ciphertext before the shift: sf(top).
     pub target_sf: f64,
+    /// How the bottom is lifted.
+    pub lift: Lift,
     raise: ModRaiseArgs,
     /// `SmallIntTab` as words (device).
     tab: ConstBuf<'a, u32>,
@@ -297,31 +353,20 @@ impl<'a, W: DevWord> RaisePlan<'a, W> {
     }
 
     /// Tables for a raise to `top` with the exact constant `exact * 2^t`.
-    pub fn new<S: Lane, M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<S>, ctx: &crate::Context<'_, W, M>, top: usize, exact: f64, t: u32) -> Result<Self> {
+    pub fn new<S: Lane, M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<S>, ctx: &crate::Context<'_, W, M>, top: usize, exact: f64, t: u32, lift: Lift) -> Result<Self> {
         let chain = &ctx.chain;
         let d = chain.level_unit;
         let q = &chain.q;
         if !(1..=3).contains(&d) || top >= q.len() || top < 3 || top >= 64 {
             return Err(shape("raise", format!("composite degree {d} / target top {top} (the encapsulated raise needs d in 1..=3)")));
         }
-        // SAFETY: plain data, zero is valid
-        let mut ra: ModRaiseArgs = unsafe { std::mem::zeroed() };
-        for k in 0..d {
-            let qk = q[k];
-            let hat_k = (0..d).filter(|&j| j != k).fold(1u64, |h, j| mulmod(h, q[j] % qk, qk));
-            ra.qhatinv[k] = invmod(hat_k, qk);
-            for (i, &qi) in q.iter().enumerate().take(top + 1) {
-                ra.qhat[k][i] = (0..d).filter(|&j| j != k).fold(1u64, |v, j| mulmod(v, q[j] % qi, qi));
-            }
-        }
-        ra.d = d as i32;
+        let ra = raise_args(q, d, top);
         let c = exact * (t as f64).exp2();
-        let rows: Vec<usize> = (0..=top).collect();
         let (tab, single) = if d == 1 {
             // SAFETY: plain integers; the table is unused at d = 1 (carved anyway: the variant's bytes do not depend on d)
             (unsafe { std::mem::zeroed::<SmallIntTab>() }, Some(single_scale(c, q[0])?))
         } else {
-            (small_int_tab(&q[..3], &rows, &q[..=top], Some(c))?, None)
+            (raise_tab(q, d, top, Some(c), lift)?, None)
         };
         Ok(RaisePlan {
             top,
@@ -329,6 +374,7 @@ impl<'a, W: DevWord> RaisePlan<'a, W> {
             exact,
             t,
             target_sf: ctx.scale.sf(top as i32)?,
+            lift,
             raise: ra,
             tab: ConstBuf::new(arena, "bts.raise", s, &tab_words(&tab))?,
             kind: Raise::Encapsulated,
@@ -360,7 +406,7 @@ impl<'a, W: DevWord> RaisePlan<'a, W> {
         Ok(())
     }
 
-    /// `small_int` kernel: rows 0..=top of the first k cts of `x` := round(c * value), sources rows 0..2.
+    /// `small_int` kernel: rows 0..=top of the first k cts of `x` := round(c * value), sources the lift's first rows.
     pub fn launch_small_int<M: DevStrategy<W>>(&self, ctx: &crate::Context<'_, W, M>, s: &Stream<pc_cuda::Compute>, x: View, k: usize) -> Result<()> {
         if let Some((mc, sh)) = self.single {
             let a = SmallInt1Args { x: x.base, pr: ctx.pr(), ct_stride: x.ct_stride, part_stride: x.part_stride, mc, sh, nrows: (self.top + 1) as i32, k: k as i32, nparts: 2 };
@@ -381,7 +427,7 @@ impl<'a, W: DevWord> RaisePlan<'a, W> {
             k: k as i32,
             nparts: 2,
         };
-        // SAFETY: each thread reads its coefficient of the 3 source rows before writing that coefficient of the output
+        // SAFETY: each thread reads its coefficient of the source rows before writing that coefficient of the output
         // rows (in place is element-wise); rows 0..=top of k cts lie inside the buffer
         launch_result("small_int", unsafe { (ctx.table.small_int)(&a, s.raw()) })?;
         Ok(())
@@ -541,8 +587,8 @@ pub fn raise_from_bottom<'a, W: DevWord, M: DevStrategy<W>>(
         x.meta = CtMeta { level, deg: 1, nf: plan.target_sf, ..x.meta };
         return Ok(());
     }
-    if (2..3).contains(&d) {
-        plan.launch_mod_raise(ctx, s, View::of(&x.buf, 0), k, d, 3)?;
+    if let Some((r0, r1)) = plan.lift.mod_raise_rows(d) {
+        plan.launch_mod_raise(ctx, s, View::of(&x.buf, 0), k, r0, r1)?;
     }
     plan.launch_small_int(ctx, s, View::of(&x.buf, 0), k)?;
     ntt::transform_k(ctx, s, Dir::Forward, &mut x.buf, Span::Q { top: plan.top }, Parts::Both, k)?;
@@ -646,5 +692,125 @@ mod tests {
             let want: Vec<u64> = out.iter().map(|&p| want_i.rem_euclid(p as i128) as u64).collect();
             assert_eq!(got, want, "x {x}");
         }
+    }
+
+    const Q: [u64; 4] = [268042241, 265420801, 156499969, 95027201];
+    const QD: i128 = Q[0] as i128 * Q[1] as i128;
+
+    fn tables(lift: Lift, c: Option<f64>) -> (ModRaiseArgs, SmallIntTab) {
+        (raise_args(&Q, 2, 3), raise_tab(&Q, 2, 3, c, lift).unwrap())
+    }
+
+    /// What `raise_from_bottom` launches for `lift` on one coefficient of residues `bottom` (d = 2): the raised value on
+    /// `Q`. The `mod_raise` kernel's host twin is inline.
+    fn raised(lift: Lift, ra: &ModRaiseArgs, tab: &SmallIntTab, bottom: [u64; 2]) -> Vec<u64> {
+        let mut rows = bottom.to_vec();
+        if let Some((r0, r1)) = lift.mod_raise_rows(2) {
+            for t in r0..r1 {
+                let mut acc = 0u64;
+                for k in 0..2 {
+                    let y = mulmod(rows[k], ra.qhatinv[k], Q[k]);
+                    let v = if y > Q[k] >> 1 { (y as i128 - Q[k] as i128).rem_euclid(Q[t] as i128) as u64 } else { y % Q[t] };
+                    acc = (acc + mulmod(v, ra.qhat[k][t], Q[t])) % Q[t];
+                }
+                rows.push(acc);
+            }
+        }
+        small_int_host(tab, &rows, &Q)
+    }
+
+    fn residues(x: i128) -> [u64; 2] {
+        [x.rem_euclid(Q[0] as i128) as u64, x.rem_euclid(Q[1] as i128) as u64]
+    }
+
+    /// The centred lift raises a bottom value to its representative in (-Qd/2, Qd/2], on every output row.
+    #[test]
+    fn centred_lift_raises_to_the_centred_value() {
+        let (ra, tab) = tables(Lift::Centred, None);
+        let mut pr = pc_core::keys::Prng::from_seed([1, 2, 3, 4, 5, 6, 7, 8], 1);
+        let mut xs = vec![0i128, 1, -1, QD / 2, -(QD / 2), QD / 2 - 1, QD / 4, -(QD / 4), 3 * QD / 8, -(3 * QD / 8)];
+        xs.extend((0..4000).map(|_| (pr.uniform_f64() * QD as f64) as i128 - QD / 2));
+        for x in xs {
+            let want: Vec<u64> = Q.iter().map(|&p| x.rem_euclid(p as i128) as u64).collect();
+            assert_eq!(raised(Lift::Centred, &ra, &tab, residues(x)), want, "x {x}");
+        }
+    }
+
+    /// Both lifts keep the value modulo the bottom: they differ by a multiple of Qd only.
+    #[test]
+    fn both_lifts_keep_the_bottom() {
+        let mut pr = pc_core::keys::Prng::from_seed([2, 2, 3, 4, 5, 6, 7, 8], 1);
+        for lift in [Lift::PerPrime, Lift::Centred] {
+            let (ra, tab) = tables(lift, None);
+            for _ in 0..4000 {
+                let x = (pr.uniform_f64() * QD as f64) as i128 - QD / 2;
+                let b = residues(x);
+                let r = raised(lift, &ra, &tab, b);
+                assert_eq!([r[0], r[1]], b, "{lift:?} x {x}");
+            }
+        }
+    }
+
+    /// The overflow integer I = (c0' + c1' s - m) / Qd under the production sparse secret. FIDESlib's raise centres each
+    /// Garner term on its own prime, so every coefficient is a sum of two uniforms: I has sigma 2.35 (66 uniforms). The
+    /// centred lift has sigma 1.66 (33 uniforms), the distribution the even EvalMod series is fitted to.
+    #[test]
+    fn centred_lift_narrows_the_overflow_integer() {
+        let n = 1usize << 16;
+        let mut pr = pc_core::keys::Prng::from_seed([3, 2, 3, 4, 5, 6, 7, 8], 1);
+        let s = pc_core::keys::sample_sparse_ternary(&mut pr, n, pc_core::keys::SecretKey::SPARSE_H).unwrap();
+        let s: Vec<(usize, i64)> = s.iter().enumerate().filter(|(_, &v)| v != 0).map(|(i, &v)| (i, v as i64)).collect();
+        let rows: Vec<[Vec<u64>; 2]> = (0..2).map(|_| [(0..n).map(|_| pr.uniform_below(Q[0])).collect(), (0..n).map(|_| pr.uniform_below(Q[1])).collect()]).collect();
+        let c1 = &rows[0];
+        let c0: [Vec<u64>; 2] = [0, 1].map(|r| {
+            let p = Q[r] as i64;
+            (0..n)
+                .map(|j| {
+                    let x: i64 = s.iter().map(|&(i, v)| if j >= i { v * c1[r][j - i] as i64 } else { -v * c1[r][n + j - i] as i64 }).sum();
+                    (-x).rem_euclid(p) as u64
+                })
+                .collect()
+        });
+        let t = Q[3];
+        let qdinv = invmod((QD % t as i128) as u64, t);
+        let spread = |lift: Lift| -> (f64, i64) {
+            let (ra, tab) = tables(lift, None);
+            let lift_row = |c: &[Vec<u64>; 2]| -> Vec<i64> { (0..n).map(|j| raised(lift, &ra, &tab, [c[0][j], c[1][j]])[3] as i64).collect() };
+            let (l0, l1) = (lift_row(&c0), lift_row(c1));
+            let (mut var, mut max) = (0f64, 0i64);
+            for j in 0..n {
+                let x: i64 = l0[j] + s.iter().map(|&(i, v)| if j >= i { v * l1[j - i] } else { -v * l1[n + j - i] }).sum::<i64>();
+                let i = mulmod(x.rem_euclid(t as i64) as u64, qdinv, t) as i64;
+                let i = if i > t as i64 / 2 { i - t as i64 } else { i };
+                var += (i * i) as f64;
+                max = max.max(i.abs());
+            }
+            ((var / n as f64).sqrt(), max)
+        };
+        let (fides, max_fides) = spread(Lift::PerPrime);
+        let (centred, max_centred) = spread(Lift::Centred);
+        assert!((fides - 2.345).abs() < 0.05, "per-prime sigma {fides}");
+        assert!((centred - 1.659).abs() < 0.03, "centred sigma {centred}");
+        assert!(max_centred <= 10 && max_centred < max_fides, "max |I|: centred {max_centred}, per-prime {max_fides}");
+    }
+
+    /// The record's raise is FIDESlib's: `mod_raise` on the third limb, `small_int` from three sources.
+    #[test]
+    fn per_prime_lift_is_the_shipped_raise() {
+        let tab = raise_tab(&Q, 2, 3, Some(0.25), Lift::PerPrime).unwrap();
+        assert_eq!(tab_words(&tab), tab_words(&small_int_tab(&Q[..3], &[0, 1, 2, 3], &Q, Some(0.25)).unwrap()));
+        assert_eq!(Lift::PerPrime.mod_raise_rows(2), Some((2, 3)));
+    }
+
+    /// The composite raise only ever fills the third source at d = 2; the centred lift reads the bottom directly.
+    #[test]
+    fn lift_rows_by_composite_degree() {
+        assert_eq!(Lift::Centred.mod_raise_rows(2), None);
+        for lift in [Lift::PerPrime, Lift::Centred] {
+            assert_eq!(lift.mod_raise_rows(1), None);
+            assert_eq!(lift.mod_raise_rows(3), None);
+        }
+        assert_eq!(raise_tab(&Q, 2, 3, None, Lift::Centred).unwrap().k, 2);
+        assert_eq!(raise_tab(&Q, 2, 3, None, Lift::PerPrime).unwrap().k, 3);
     }
 }

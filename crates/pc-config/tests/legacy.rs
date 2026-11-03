@@ -41,8 +41,8 @@ fn field_table() {
     // inventory sections 1-2, 5a/5b, 6a/6b + exec.use_graphs, exec.trace_alloc, host.n_in_flight, bts.em_fuse_rescale,
     // bts.lt_tails, bts.pair, bts.sparse_b_k, model.prefill.{last_query,qkv_pack,attn_bsgs,sm_hpack}, chain.preset
     // + bts.merge_s2d, bts.stc_ps, bts.em_level_keys (key-set switches); model.pcmm_raise_out, model.kv_push_raise;
-    // model.prefill.attn_wrot, bts.pair_window, bts.pair_loose, bts.pair_cf_max, exec.mult_sum
-    assert_eq!(cf.len(), 269);
+    // model.prefill.attn_wrot, bts.pair_window, bts.pair_loose, bts.pair_cf_max, exec.mult_sum; bts.em_even
+    assert_eq!(cf.len(), 270);
     // + section 7a: plan.kv_entry_level, plan.kv_entry_deg, plan.keep_placements; 8a: plan.stc_first_reroute, plan.site_cf;
     // plan.fallback_cf, plan.argmax_mincut, plan.ilp_tiebreak, plan.raise_drop_base, plan.raise_drop_search, plan.pack_cf,
     // plan.keep_placements_exact, plan.mag_safety_steps, plan.resume
@@ -61,8 +61,8 @@ fn field_table() {
     // PF_SM_HPACK, PLAN_FALLBACK_CF, PLAN_ARGMAX_MINCUT, PLAN_ILP_TIEBREAK, PLAN_RAISE_DROP_BASE, PLAN_RAISE_SEARCH,
     // PLAN_PACK_CF, PLAN_KEEP_PLACEMENTS_EXACT, PLAN_MAG_SAFETY_STEPS, PLAN_RESUME, FIDESLIB_BTS_SPARSE_B_K, CHAIN_PRESET
     // + PC_BTS_MERGE_S2D, PC_BTS_STC_PS, PC_EM_LEVEL_KEYS + PF_PCMM_RAISE_OUT, KV_PUSH_RAISE
-    // + PF_ATTN_WROT, PC_BTS_PAIR_WINDOW, PC_BTS_PAIR_LOOSE, PC_BTS_PAIR_CF_MAX, PC_MULT_SUM
-    assert_eq!(envs.len(), 361);
+    // + PF_ATTN_WROT, PC_BTS_PAIR_WINDOW, PC_BTS_PAIR_LOOSE, PC_BTS_PAIR_CF_MAX, PC_MULT_SUM; PC_EM_EVEN
+    assert_eq!(envs.len(), 362);
 }
 
 #[test]
@@ -114,6 +114,10 @@ fn dotted_access_and_errors() {
     assert_eq!(lb.model, c.model);
     // the perseus-core kernel switches bind nothing
     let (k, _) = Config::from_legacy_env([("PC_EM_FUSE_RESCALE", Some("1")), ("PC_LT_TAILS", Some("0"))]).unwrap();
+    assert_eq!(k.load_bearing(), Config::default().load_bearing());
+    // the even EvalMod series too: a plan's runtime= line turns it on over a stamp cut without it
+    let (k, _) = Config::from_legacy_env([("PC_EM_EVEN", Some("1"))]).unwrap();
+    assert_eq!(k.bts.em_even, Some(true));
     assert_eq!(k.load_bearing(), Config::default().load_bearing());
 }
 

@@ -258,7 +258,7 @@ fn d3(dir: &str, ks_list: &[usize], graph: bool, t: &mut Tally) -> Res<()> {
     let pre = BtsPrecomp {
         slots: (n / 2) as u32,
         raise_drop: drop,
-        raise: RaisePlan::new(&arena, s, &ctx, raise_top, exact, cts0_t)?,
+        raise: RaisePlan::new(&arena, s, &ctx, raise_top, exact, cts0_t, setup.raise_lift())?,
         cts: stages,
         stc: vec![],
         stc_real0: None,
@@ -816,6 +816,8 @@ pub fn bench(args: &[String]) -> Res<bool> {
     setup.real = true;
     // PC_EM_FUSE_RESCALE=1: the EvalMod relinearization-rescale fusion (stcf-prec compares the two forms' errors)
     setup.em_fuse_rescale = std::env::var("PC_EM_FUSE_RESCALE").is_ok_and(|v| v == "1");
+    // PC_EM_EVEN=1: the even EvalMod series (stcf-prec compares its error with the shipped series')
+    setup.evalmod_even = std::env::var("PC_EM_EVEN").is_ok_and(|v| v == "1");
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     let high_shapes = vec![StcHighShape { out_level: 50, skip_mask: 1 }, StcHighShape { out_level: 30, skip_mask: 6 }, StcHighShape { out_level: 40, skip_mask: 0 }];

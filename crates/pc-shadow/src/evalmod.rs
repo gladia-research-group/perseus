@@ -55,18 +55,47 @@ pub struct PsPlan {
     /// The series itself (needed by the general m > 2 / recursive shape; empty for dumped single-level plans).
     #[serde(default)]
     pub coeffs: Vec<f64>,
+    /// An even series (`build_even_prestep`): the series is in z = 2 (y - s)^2 - 1, not in the input y. None: the
+    /// series is in y (every table but `pc_core::bts_setup::EVALMOD_EVEN_CHEB`).
+    #[serde(default)]
+    pub even_shift: Option<f64>,
 }
 
 impl PsPlan {
     /// The plan for a Chebyshev coefficient table, computed by OpenFHE's long divisions (`pc_core::cheb`).
     pub fn from_coeffs(coefficients: &[f64]) -> pc_core::error::Result<Self> {
         let p = pc_core::cheb::PsPlan::new(coefficients)?;
-        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec() })
+        Ok(PsPlan {
+            k: p.k,
+            m: p.m,
+            divqr_q: p.divqr.q.clone(),
+            divcs_q: p.divcs.q.clone(),
+            s2: p.s2.clone(),
+            coeffs: coefficients.to_vec(),
+            even_shift: None,
+        })
     }
 
     /// The EvalMod plan of the shipped bootstrap (degree 14, K=16 table).
     pub fn evalmod() -> Self {
         Self::from_coeffs(pc_core::bts_setup::evalmod_coeffs()).expect("frozen EvalMod table has a PS plan")
+    }
+
+    /// The even EvalMod plan (`pc_core::bts_setup::EVALMOD_EVEN_CHEB`, K = 16): degree 5 in z = 2 (y - 1/64)^2 - 1, one
+    /// level less than the shipped series at the same output level and scale.
+    pub fn evalmod_even() -> Self {
+        let mut p = Self::from_coeffs(&pc_core::bts_setup::EVALMOD_EVEN_CHEB).expect("frozen even EvalMod table has a PS plan");
+        p.even_shift = Some(pc_core::bts_setup::EVALMOD_EVEN_SHIFT);
+        p
+    }
+
+    /// The K = 16 EvalMod plan: the even one when `even`, else the shipped one.
+    pub fn evalmod_k16(even: bool) -> Self {
+        if even {
+            Self::evalmod_even()
+        } else {
+            Self::evalmod()
+        }
     }
 }
 
@@ -851,11 +880,24 @@ pub fn build_evalmod(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_i
     build_evalmod_opts(st, input, ps, double_angle_its, false)
 }
 
+/// The even series' argument in place: x <- 2 (x - s)^2 - 1 (a constant add, one square, and the x2 and -1 that
+/// `EmProgram::fused` folds into the square's relinearization epilogue): one level, so a series of degree n in z
+/// costs the depth of PS(n) + 1 where the series of degree 2n in y costs PS(2n).
+pub fn build_even_prestep(b: &mut Builder, x: usize, shift: f64) -> Result<()> {
+    b.add_scalar(x, -shift)?;
+    b.square(x)?;
+    b.add(x, x)?;
+    b.add_scalar(x, -1.0)
+}
+
 /// `build_evalmod` with `Builder::lean`.
 pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32, lean: bool) -> Result<(EmProgram, FMeta)> {
     let mut b = Builder::new(st);
     b.lean = lean;
     let x = b.input(input);
+    if let Some(s) = ps.even_shift {
+        build_even_prestep(&mut b, x, s)?;
+    }
     build_chebyshev(&mut b, x, ps)?;
     build_double_angle(&mut b, x, double_angle_its)?;
     let out = b.metas[x];
@@ -965,5 +1007,311 @@ mod general_ps_tests {
         let (prog, out) = build_evalmod(&st, input, &ps, 5).unwrap();
         assert!(!prog.ops.is_empty());
         println!("K24 EvalMod: {} ops, out {:?}", prog.ops.len(), out);
+    }
+}
+
+#[cfg(test)]
+mod even_series_tests {
+    use super::*;
+    use pc_core::modmul::{invmod, mulmod};
+    use pc_core::params::{Chain, ChainSpec};
+
+    fn tables(spec: ChainSpec) -> ScaleTables {
+        ScaleTables::precompute(&Chain::generate(&spec).expect("chain")).expect("tables")
+    }
+
+    fn specs() -> Vec<(&'static str, ChainSpec)> {
+        vec![("n32", ChainSpec::n32()), ("n32a4", ChainSpec::n32a4()), ("n32sp", ChainSpec::n32sp())]
+    }
+
+    /// The program of the whole chain with a trailing rescale when the output is still degree 2 (so that the
+    /// interpreter decodes at a single scale), and its output metadata.
+    fn program(st: &ScaleTables, input: FMeta, ps: &PsPlan, lean: bool, finish: bool) -> Result<(EmProgram, FMeta)> {
+        let mut b = Builder::new(st);
+        b.lean = lean;
+        let x = b.input(input);
+        if let Some(s) = ps.even_shift {
+            build_even_prestep(&mut b, x, s)?;
+        }
+        build_chebyshev(&mut b, x, ps)?;
+        build_double_angle(&mut b, x, 5)?;
+        if finish && b.metas[x].nl == 2 {
+            b.rescale(x)?;
+        }
+        Ok((b.prog, b.metas[x]))
+    }
+
+    /// The even plan: degree 5 in z, shifted by 1/64 of y.
+    #[test]
+    fn even_plan_shape() {
+        let ps = PsPlan::evalmod_even();
+        assert_eq!(ps.coeffs.len(), 6);
+        assert_eq!(ps.even_shift, Some(1.0 / 64.0));
+        assert_eq!(PsPlan::evalmod().even_shift, None);
+        assert_eq!(PsPlan::evalmod_k16(false), PsPlan::evalmod());
+        assert_eq!(PsPlan::evalmod_k16(true), ps);
+    }
+
+    /// On every chain the runtime builds, wherever the shipped series builds from an input top and degree, the even
+    /// series builds from the same degree one CKKS level lower and ends at the shipped output's level, degree and scale
+    /// (bit for bit): the routes raise that level lower and no landing changes.
+    #[test]
+    fn even_lands_as_shipped_one_level_lower() {
+        let (sh, ev) = (PsPlan::evalmod(), PsPlan::evalmod_even());
+        for (name, spec) in specs() {
+            let st = tables(spec);
+            let d = st.d as i32;
+            let mut n = 0;
+            for top in d..=st.l as i32 {
+                let low = top - d;
+                if st.drop[top as usize] == 0 || st.drop[low as usize] == 0 {
+                    continue;
+                }
+                let (sf, sf_low) = (st.sf(top).unwrap(), st.sf(low).unwrap());
+                for (nl, nf, nf_low) in [(1, sf, sf_low), (2, sf * sf, sf_low * sf_low)] {
+                    for lean in [false, true] {
+                        let Ok((_, a)) = build_evalmod_opts(&st, FMeta { top, nl, nf }, &sh, 5, lean) else { continue };
+                        let (_, e) = build_evalmod_opts(&st, FMeta { top: low, nl, nf: nf_low }, &ev, 5, lean)
+                            .unwrap_or_else(|err| panic!("{name} top {top} nl {nl} lean {lean}: even fails: {err}"));
+                        assert_eq!((a.top, a.nl, a.nf.to_bits()), (e.top, e.nl, e.nf.to_bits()), "{name} top {top} nl {nl} lean {lean}");
+                        n += 1;
+                    }
+                }
+            }
+            assert!(n > 0, "{name}: no input top builds");
+            println!("[even] {name}: {n} (top, degree, lean) inputs land as the shipped series");
+        }
+    }
+
+    /// Op census: from one level lower, the even program does fewer products, rescales and weighted-sum terms than the
+    /// shipped one, on fewer limbs.
+    #[test]
+    fn even_is_cheaper() {
+        let st = tables(ChainSpec::n32sp());
+        let top = (0..=st.l as i32).rev().find(|&t| st.drop[t as usize] > 0 && {
+            let sf = st.sf(t).unwrap();
+            build_evalmod_opts(&st, FMeta { top: t, nl: 2, nf: sf * sf }, &PsPlan::evalmod(), 5, true).is_ok()
+        }).unwrap();
+        let sf = st.sf(top).unwrap();
+        let low = top - st.d as i32;
+        let sf_low = st.sf(low).unwrap();
+        let census = |ps: &PsPlan, input: FMeta| {
+            let (p, _) = build_evalmod_opts(&st, input, ps, 5, true).unwrap();
+            let ops = p.fused();
+            let (mut mult, mut resc, mut wsum, mut limbs) = (0, 0, 0, [0usize; 3]);
+            for o in &ops {
+                match o {
+                    EmOp::Mult { n, .. } | EmOp::MultAcc { n, .. } => {
+                        mult += 1;
+                        limbs[0] += n;
+                    }
+                    EmOp::Rescale { n, .. } => {
+                        resc += 1;
+                        limbs[1] += n;
+                    }
+                    EmOp::WSum { n, srcs, .. } => {
+                        wsum += srcs.len();
+                        limbs[2] += n * srcs.len();
+                    }
+                    _ => {}
+                }
+            }
+            (mult, resc, wsum, limbs)
+        };
+        let a = census(&PsPlan::evalmod(), FMeta { top, nl: 2, nf: sf * sf });
+        let e = census(&PsPlan::evalmod_even(), FMeta { top: low, nl: 2, nf: sf_low * sf_low });
+        println!("[even] n32sp top {top}: shipped mult/rescale/wsum terms {:?}, limbs {:?}; even top {low}: {:?}, limbs {:?}", (a.0, a.1, a.2), a.3, (e.0, e.1, e.2), e.3);
+        assert!(e.0 < a.0 && e.1 < a.1 && e.2 < a.2, "even not cheaper: {a:?} vs {e:?}");
+        assert!(e.3.iter().sum::<usize>() < a.3.iter().sum::<usize>());
+    }
+
+    // ---- an exact interpreter of the program on constant polynomials (a trivial ciphertext's c0: every ring product
+    // is the product of the constant terms, the slots all hold c / scale), residue by residue as the device does
+
+    fn center(v: u64, q: u64) -> i128 {
+        if v > q / 2 {
+            v as i128 - q as i128
+        } else {
+            v as i128
+        }
+    }
+
+    fn run(st: &ScaleTables, prog: &EmProgram, input_top: i32, x: Vec<u64>) -> Vec<Vec<u64>> {
+        let nq = st.q.len();
+        let mut bufs: Vec<Vec<u64>> = vec![vec![0; nq]; 1];
+        bufs[0] = x;
+        let q = &st.q;
+        let fx = Fx { d: st.d as i32, st: Some(st) };
+        let get = |bufs: &mut Vec<Vec<u64>>, i: usize| {
+            if bufs.len() <= i {
+                bufs.resize(i + 1, vec![0; nq]);
+            }
+        };
+        let _ = input_top;
+        for op in &prog.ops {
+            match op {
+                EmOp::Copy { dst, src, n } => {
+                    get(&mut bufs, (*dst).max(*src));
+                    let s = bufs[*src].clone();
+                    bufs[*dst][..*n].copy_from_slice(&s[..*n]);
+                }
+                EmOp::Add { dst, a, b, n, sub } => {
+                    get(&mut bufs, (*dst).max(*a).max(*b));
+                    for i in 0..*n {
+                        let (va, vb) = (bufs[*a][i], bufs[*b][i] % q[i]);
+                        bufs[*dst][i] = if *sub { (va + q[i] - vb) % q[i] } else { (va + vb) % q[i] };
+                    }
+                }
+                EmOp::MulConst { x, n, k } => {
+                    for i in 0..*n {
+                        bufs[*x][i] = mulmod(bufs[*x][i], prog.consts[*k][i] % q[i], q[i]);
+                    }
+                }
+                EmOp::AddConst { x, n, k } => {
+                    for i in 0..*n {
+                        bufs[*x][i] = (bufs[*x][i] + prog.consts[*k][i] % q[i]) % q[i];
+                    }
+                }
+                EmOp::Rescale { x, n, k } => {
+                    if let Some(k) = k {
+                        for i in 0..*n {
+                            bufs[*x][i] = mulmod(bufs[*x][i], prog.consts[*k][i] % q[i], q[i]);
+                        }
+                    }
+                    let top = *n as i32 - 1;
+                    let new = fx.down(top);
+                    let mut t = top;
+                    while t > new {
+                        let p = q[t as usize];
+                        let r = center(bufs[*x][t as usize], p);
+                        for i in 0..t as usize {
+                            let rm = r.rem_euclid(q[i] as i128) as u64;
+                            let d = (bufs[*x][i] + q[i] - rm) % q[i];
+                            bufs[*x][i] = mulmod(d, invmod(p % q[i], q[i]), q[i]);
+                        }
+                        t -= 1;
+                    }
+                }
+                EmOp::Mult { dst, a, b, n, epi } => {
+                    get(&mut bufs, (*dst).max(*a).max(*b));
+                    for i in 0..*n {
+                        let mut v = mulmod(bufs[*a][i], bufs[*b][i], q[i]);
+                        if epi.dbl {
+                            v = (v + v) % q[i];
+                        }
+                        if let Some(k) = epi.k {
+                            v = (v + prog.consts[k][i] % q[i]) % q[i];
+                        }
+                        bufs[*dst][i] = v;
+                    }
+                }
+                EmOp::MultAcc { dst, pairs, n, epi } => {
+                    let mx = pairs.iter().map(|&(a, b)| a.max(b)).max().unwrap_or(0).max(*dst);
+                    get(&mut bufs, mx);
+                    for i in 0..*n {
+                        let mut v = bufs[*dst][i];
+                        for &(a, b) in pairs {
+                            v = (v + mulmod(bufs[a][i], bufs[b][i], q[i])) % q[i];
+                        }
+                        if epi.dbl {
+                            v = (v + v) % q[i];
+                        }
+                        if let Some(k) = epi.k {
+                            v = (v + prog.consts[k][i] % q[i]) % q[i];
+                        }
+                        bufs[*dst][i] = v;
+                    }
+                }
+                EmOp::WSum { dst, srcs, n, k } => {
+                    let mx = srcs.iter().copied().max().unwrap_or(0).max(*dst);
+                    get(&mut bufs, mx);
+                    for i in 0..*n {
+                        let mut v = 0u64;
+                        for (j, &s) in srcs.iter().enumerate() {
+                            v = (v + mulmod(bufs[s][i], prog.consts[*k][j * nq + i] % q[i], q[i])) % q[i];
+                        }
+                        bufs[*dst][i] = v;
+                    }
+                }
+            }
+        }
+        bufs
+    }
+
+    /// Garner on the bottom three primes: the centred value of a residue vector whose integer is below their product / 2.
+    fn decode3(v: &[u64], q: &[u64]) -> f64 {
+        let (q0, q1, q2) = (q[0] as i128, q[1] as i128, q[2] as i128);
+        let a0 = v[0] as i128;
+        let a1 = ((v[1] as i128 - a0).rem_euclid(q1) * invmod(q[0] % q[1], q[1]) as i128).rem_euclid(q1);
+        let t = (a0 + a1 * q0).rem_euclid(q2);
+        let a2 = ((v[2] as i128 - t).rem_euclid(q2) * invmod(((q[0] as u128 * q[1] as u128) % q[2] as u128) as u64, q[2]) as i128).rem_euclid(q2);
+        let m = q0 * q1 * q2;
+        let mut x = a0 + a1 * q0 + a2 * q0 * q1;
+        if x > m / 2 {
+            x -= m;
+        }
+        x as f64
+    }
+
+    /// P(|I| = i), i = 0..=15, of the overflow integer under the centred lift (`Lift::Centred`, the even series' raise):
+    /// I = round(X), X the sum of h = 32 uniforms, so the density of 33 uniforms at i (exact rationals; the raise kernels
+    /// on 1.3e8 coefficients under the production sparse secret agree). FIDESlib's per-prime lift is wider (sigma 2.35).
+    const P_ABS_I: [f64; 16] = [
+        2.394752e-01, 4.005643e-01, 2.337782e-01, 9.453113e-02,
+        2.615467e-02, 4.858999e-03, 5.901276e-04, 4.513991e-05,
+        2.064469e-06, 5.243321e-08, 6.634776e-10, 3.536999e-12,
+        6.012096e-15, 1.953140e-18, 4.120381e-23, 3.279280e-30,
+    ];
+
+    /// The executed program against sin(2 pi u) / (2 pi), |delta| <= 2^-4: the worst error's bits at each |I| and the RMS
+    /// bits over `P_ABS_I`.
+    fn value_bits(st: &ScaleTables, input: FMeta, ps: &PsPlan, lean: bool) -> ([f64; 16], f64) {
+        let (prog, out) = program(st, input, ps, lean, true).unwrap();
+        let (mut worst, mut mse) = ([0.0f64; 16], 0.0f64);
+        for abs_i in 0..16usize {
+            let (mut e2, mut n) = (0.0f64, 0.0f64);
+            for ii in [abs_i as i32, -(abs_i as i32)] {
+                for dj in -8..=8 {
+                    let u = ii as f64 + dj as f64 / 8.0 * 0.0625;
+                    let c = (u / 16.0 * input.nf).round() as i128;
+                    let x: Vec<u64> = (0..st.q.len()).map(|i| if i as i32 <= input.top { c.rem_euclid(st.q[i] as i128) as u64 } else { 0 }).collect();
+                    let bufs = run(st, &prog, input.top, x);
+                    let e = decode3(&bufs[0], &st.q) / out.nf - (2.0 * std::f64::consts::PI * u).sin() / (2.0 * std::f64::consts::PI);
+                    worst[abs_i] = worst[abs_i].max(e.abs());
+                    e2 += e * e;
+                    n += 1.0;
+                }
+            }
+            mse += P_ABS_I[abs_i] * e2 / n;
+        }
+        (worst.map(|w| -w.log2()), -mse.sqrt().log2())
+    }
+
+    /// The executed program, from the inputs the routes give it. The shipped table keeps 27.4 bits on every |I| <= 15
+    /// (the interpreter reproduces them). The even series is fitted to the overflow integer's distribution: its RMS over
+    /// `P_ABS_I` is what reaches a slot, and its error grows with |I|, floors from an independent evaluation of the table.
+    #[test]
+    fn even_series_value() {
+        for (name, spec) in [("n32", ChainSpec::n32()), ("n32sp", ChainSpec::n32sp())] {
+            let st = tables(spec);
+            let top = (0..=st.l as i32).rev().find(|&t| st.drop[t as usize] > 0 && {
+                let sf = st.sf(t).unwrap();
+                build_evalmod_opts(&st, FMeta { top: t, nl: 2, nf: sf * sf }, &PsPlan::evalmod(), 5, true).is_ok()
+            }).unwrap();
+            let low = top - st.d as i32;
+            let (sf, sf_low) = (st.sf(top).unwrap(), st.sf(low).unwrap());
+            for lean in [false, true] {
+                let (worst, rms) = value_bits(&st, FMeta { top, nl: 2, nf: sf * sf }, &PsPlan::evalmod(), lean);
+                println!("[even] {name} top {top} shipped lean {lean}: rms {rms:.2} bits, worst by |I| {worst:.1?}");
+                assert!(worst.iter().all(|&b| b >= 27.0), "{name} shipped lean {lean}: {worst:.1?}");
+                let (worst, rms) = value_bits(&st, FMeta { top: low, nl: 2, nf: sf_low * sf_low }, &PsPlan::evalmod_even(), lean);
+                println!("[even] {name} top {low} even lean {lean}: rms {rms:.2} bits, worst by |I| {worst:.1?}");
+                assert!(rms >= 28.9, "{name} even lean {lean}: rms {rms:.2} bits");
+                for (upto, floor) in [(5, 26.8), (8, 20.4), (12, 12.8), (15, 10.6)] {
+                    let w = worst[..=upto].iter().cloned().fold(f64::INFINITY, f64::min);
+                    assert!(w >= floor, "{name} even lean {lean}: |I| <= {upto} worst {w:.2} bits");
+                }
+            }
+        }
     }
 }

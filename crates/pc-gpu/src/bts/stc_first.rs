@@ -681,7 +681,7 @@ impl StcFirstPlan {
             variants.push(BtsPrecomp {
                 slots: (n / 2) as u32,
                 raise_drop: v.drop,
-                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, setup.cts0_t)?,
+                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, setup.cts0_t, setup.raise_lift())?,
                 cts: cts_of(v)?,
                 stc: v.stc.iter().map(lt).collect::<Result<_>>()?,
                 stc_real0: v.stc_real0.as_ref().map(lt).transpose()?,

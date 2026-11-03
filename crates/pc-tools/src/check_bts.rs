@@ -112,7 +112,7 @@ fn fmeta(d: &Dump, name: &str) -> FMeta {
 pub fn ps_plan(pj: &Value) -> PsPlan {
     let ps = &pj["cheb_ps"];
     let f = |k: &str| crate::dump::as_f64v(&ps[k]);
-    PsPlan { k: ps["k"].as_u64().unwrap_or(0) as usize, m: ps["m"].as_u64().unwrap_or(0) as usize, divqr_q: f("divqr_q"), divcs_q: f("divcs_q"), s2: f("s2"), coeffs: vec![] }
+    PsPlan { k: ps["k"].as_u64().unwrap_or(0) as usize, m: ps["m"].as_u64().unwrap_or(0) as usize, divqr_q: f("divqr_q"), divcs_q: f("divcs_q"), s2: f("s2"), coeffs: vec![], even_shift: None }
 }
 
 /// A dumped stage's geometry and plaintexts (`<prefix><k>.pt<j>.{q,p}.bin` with `pts[j]` metadata).
@@ -261,7 +261,7 @@ pub fn d3_finish(dir: &str, ks_list: &[usize], graph: bool, lt_baby: KskSource, 
     let exact = eval_const(&ctx, drop, pc_core::bts_setup::EVALMOD_K);
     let dumped = boot["cts0_const"].as_f64().ok_or("cts0_const")?;
     t.add("post-raise constant pre/(K N) vs dumped cts0_const (bits)", (exact.to_bits() != dumped.to_bits()) as usize, 1);
-    let rplan = RaisePlan::new(&arena, s, &ctx, raise_top, exact, boot["cts0_t"].as_u64().ok_or("cts0_t")? as u32)?;
+    let rplan = RaisePlan::new(&arena, s, &ctx, raise_top, exact, boot["cts0_t"].as_u64().ok_or("cts0_t")? as u32, raise::Lift::PerPrime)?;
     s.sync()?;
     println!("[pc-check] key source (LT babies, giant / offset rotations, raise): {lt_baby:?}");
     println!("[pc-check] d3 setup {:.1} s: {} rotation keys, arena {:.1} GB, EvalMod {} ops / {} buffers", t0.elapsed().as_secs_f64(), keys.rot.len(), arena.used_bytes() as f64 / 1e9, em.ops.len(), em.nslots);
@@ -441,8 +441,8 @@ pub fn g0_bts(dir: &str, lt_baby: KskSource, t: &mut Tally) -> Res<()> {
     let drop512 = r512["raise_drop"].as_u64().unwrap_or(0) as usize;
     let exact512 = eval_const(&ctx, drop512, pc_core::bts_setup::EVALMOD_K);
     t.add("g0 post-raise constant (dense) vs cts0_const (bits)", (exact0.to_bits() != route["cts0_const"].as_f64().unwrap_or(0.0).to_bits()) as usize, 1);
-    let rp0 = RaisePlan::new(&arena, s, &ctx, chain.q.len() - 1, exact0, route["cts0_t"].as_u64().ok_or("cts0_t")? as u32)?;
-    let rp512 = RaisePlan::new(&arena, s, &ctx, chain.q.len() - 1 - 2 * drop512, exact512, r512["cts0_t"].as_u64().ok_or("cts0_t")? as u32)?;
+    let rp0 = RaisePlan::new(&arena, s, &ctx, chain.q.len() - 1, exact0, route["cts0_t"].as_u64().ok_or("cts0_t")? as u32, raise::Lift::PerPrime)?;
+    let rp512 = RaisePlan::new(&arena, s, &ctx, chain.q.len() - 1 - 2 * drop512, exact512, r512["cts0_t"].as_u64().ok_or("cts0_t")? as u32, raise::Lift::PerPrime)?;
     let mut x = Ct::new(CtMeta::new(0, 1), CtBuf::<Compute, W>::new(&arena, "check.x", lay, 1)?);
     // our own CtS encodings (pc_core factors at pc_shadow levels) vs the route's dumped plaintexts
     let dplan = pc_gpu::bts::dense::DensePlan::new(&chain, &pc_gpu::bts::BtsSetup::n32_shipped())?;

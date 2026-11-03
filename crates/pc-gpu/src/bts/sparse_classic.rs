@@ -265,7 +265,7 @@ impl ClassicPlan {
             variants.push(BtsPrecomp {
                 slots: self.cfg.slots,
                 raise_drop: v.drop,
-                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, self.cfg.cts0_t)?,
+                raise: RaisePlan::new(arena, s, ctx, v.raise_top, v.exact, self.cfg.cts0_t, super::raise::Lift::PerPrime)?,
                 cts: v.cts.iter().map(lt).collect::<Result<_>>()?,
                 stc: v.stc.iter().map(lt).collect::<Result<_>>()?,
                 stc_real0: None,

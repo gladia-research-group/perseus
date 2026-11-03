@@ -62,6 +62,10 @@ EXTRA = [
     ("quirks", "fake_bts_out", "Int", "The numpy fake's refresh landing level (perseus `FakeFhe(bts_out=34)` argument; "
      "every route lands there realized, quirk `FakeBootstrapRealized`)."),
     ("bts", "k_max", "Int", "Ciphertexts per batched bootstrap launch (PLAN.md Program: K-batching; 8)."),
+    ("bts", "em_even", "Flag", "EvalMod: the even series (pc-core `EVALMOD_EVEN_CHEB`, degree 5 in z = 2 (y - 1/64)^2 - 1, "
+     "then the 5 double angles) on every K = 16 route (dense, StC-first, SparseB at K = 16): one CKKS level less, spent on "
+     "raising and running CtS one level lower, so every landing and plan holds (pc-gpu `BtsSetup::evalmod_even`; default "
+     "off = the shipped degree-14 series).", "PC_EM_EVEN"),
     ("bts", "em_fuse_rescale", "Flag", "EvalMod: a Regen relinearization and the rescale after it as one exact conversion "
      "(pc-gpu `BtsSetup::em_fuse_rescale`; default off = relinearize, then rescale).", "PC_EM_FUSE_RESCALE"),
     ("bts", "lt_tails", "Flag", "Resident key `a` tails for the CtS baby keys of packed key sets (pc-gpu "

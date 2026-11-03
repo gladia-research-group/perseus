@@ -15,6 +15,7 @@ use crate::mem::MemPlan;
 use crate::ops::Ops;
 use crate::poly::{CtBuf, Layout};
 use pc_cuda::{Arena, Compute};
+use pc_shadow::evalmod::PsPlan;
 use pc_shadow::{CtMeta, Route, Shadow};
 
 pub mod cts;
@@ -118,6 +119,10 @@ pub struct BtsSetup {
     pub evalmod_coeffs: Vec<f64>,
     pub evalmod_da_its: u32,
     pub boot_k: f64,
+    /// EvalMod: the even series in place of the shipped K = 16 table (`PsPlan::evalmod_even`, config `bts.em_even`):
+    /// one CKKS level less, so every raise-drop variant raises and runs CtS one level lower and lands where the shipped
+    /// one does, with the centred lift (`raise_lift`). Needs the frozen K = 16 table in `evalmod_coeffs`.
+    pub evalmod_even: bool,
     /// Build the real-payload variants (FIDESLIB_BTS_REAL: StC stage 0 for `Route::real`).
     pub real: bool,
     /// Ciphertexts per launch the work buffers are sized for (`cfg.bts.k_max`, <= `MemCfg::k_max`).
@@ -150,6 +155,35 @@ pub struct BtsSetup {
 }
 
 impl BtsSetup {
+    /// The EvalMod series' Paterson-Stockmeyer plan: `evalmod_coeffs`, or the even series (`evalmod_even`).
+    pub fn evalmod_ps(&self) -> Result<PsPlan> {
+        if !self.evalmod_even {
+            return Ok(PsPlan::from_coeffs(&self.evalmod_coeffs)?);
+        }
+        if self.evalmod_coeffs.as_slice() != pc_core::bts_setup::evalmod_coeffs() || self.evalmod_da_its != pc_core::bts_setup::EVALMOD_DA_ITS {
+            return Err(shape("bts", "evalmod_even replaces the frozen K = 16 table (degree 14, 5 double angles) only"));
+        }
+        Ok(PsPlan::evalmod_even())
+    }
+
+    /// The raise's lift: the even series covers only the centred lift's overflow integer, the shipped one both.
+    pub fn raise_lift(&self) -> raise::Lift {
+        if self.evalmod_even {
+            raise::Lift::Centred
+        } else {
+            raise::Lift::PerPrime
+        }
+    }
+
+    /// CKKS levels every variant raises below its raise drop's level: what the even series saves.
+    pub fn even_levels_saved(&self) -> u32 {
+        if self.evalmod_even {
+            pc_core::bts_setup::EVALMOD_EVEN_LEVELS_SAVED
+        } else {
+            0
+        }
+    }
+
     /// The shipped n32 configuration of the dense route (LEVEL_BUDGET 4:3, CF 6 in 2..20, SHIFT_T 12, EvalMod deg 14
     /// K 16 with 5 double angles, real payload on, raise drop 0).
     pub fn n32_shipped() -> BtsSetup {
@@ -164,6 +198,7 @@ impl BtsSetup {
             evalmod_coeffs: pc_core::bts_setup::evalmod_coeffs().to_vec(),
             evalmod_da_its: pc_core::bts_setup::EVALMOD_DA_ITS,
             boot_k: pc_core::bts_setup::EVALMOD_K,
+            evalmod_even: false,
             real: true,
             k_max: 8,
             ks_source: KskSource::Regen,
@@ -397,7 +432,7 @@ impl<'a, W: DevWord> BtsWork<'a, W> {
 pub struct BtsPrecomp<'a, W: DevWord> {
     pub slots: u32,
     pub raise_drop: u32,
-    /// Raise target top limb (`L - d * raise_drop`) and its tables (raise.rs).
+    /// Raise target top limb (`L - d * raise_drop`, one level lower on the even EvalMod series) and its tables (raise.rs).
     pub raise: raise::RaisePlan<'a, W>,
     /// CtS stages in execution order (FIDESlib CtS; OpenFHE s = budget-1 .. 0).
     pub cts: Vec<cts::LtStage<'a, W>>,

@@ -205,7 +205,8 @@ fn old_err(doc: &Option<serde_json::Value>, cf: u32, amp: f64) -> Option<f64> {
 
 fn run(a: Args) -> Res<()> {
     match a.chain.as_str() {
-        "n32" => run_t::<W, M>(a, ChainSpec::n32(), BtsSetup::n32_shipped()),
+        // PC_EM_EVEN=1: the even EvalMod series (the dense route's bts / bts-prec)
+        "n32" => run_t::<W, M>(a, ChainSpec::n32(), BtsSetup { evalmod_even: std::env::var("PC_EM_EVEN").is_ok_and(|v| v == "1"), ..BtsSetup::n32_shipped() }),
         "n64" => run_t::<u64, Barrett64>(a, ChainSpec::n64(), BtsSetup::n64()),
         c => Err(format!("--chain {c}: n32 | n64").into()),
     }

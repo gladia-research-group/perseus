@@ -1,0 +1,20 @@
+[pc-bench] dense route key source Regen
+[pc-bench] scale_dec 4.116491880636786e0; raised FMeta { top: 51, nl: 1, nf: 7.078983181978619e19 }; em in FMeta { top: 43, nl: 1, nf: 1.6028639906232838e16 } out FMeta { top: 27, nl: 2, nf: 2.174275920601507e32 }; out FMeta { top: 21, nl: 2, nf: 1.8864302918787144e32 }
+[pc-bench]   cts top 51 nf 4.219402779328e12 width 65536 geom LtGeom { b: 16, g: 1, stride: 2048, npts: 16, offset: 0 } end FusedRescale max|coeff| 2^38.2
+[pc-bench]   cts top 49 nf 1.6452029344456868e16 width 4096 geom LtGeom { b: 16, g: 2, stride: 128, npts: 31, offset: 0 } end FusedRescale max|coeff| 2^50.4
+[pc-bench]   cts top 47 nf 1.6590348881187384e16 width 256 geom LtGeom { b: 16, g: 2, stride: 8, npts: 31, offset: 0 } end FusedRescale max|coeff| 2^51.8
+[pc-bench]   cts top 45 nf 1.5947063113602444e16 width 16 geom LtGeom { b: 8, g: 2, stride: 1, npts: 15, offset: 0 } end FusedRescale max|coeff| 2^53.0
+[pc-bench]   stc top 25 nf 1.3818954564770394e16 width 64 geom LtGeom { b: 16, g: 4, stride: 1, npts: 63, offset: 0 } end FusedRescale max|coeff| 2^52.3
+[pc-bench]   stc top 23 nf 1.6796882795788668e16 width 2048 geom LtGeom { b: 16, g: 4, stride: 32, npts: 63, offset: 0 } end FusedRescale max|coeff| 2^50.5
+[pc-bench]   stc top 21 nf 1.3734738045840906e16 width 65536 geom LtGeom { b: 16, g: 2, stride: 1024, npts: 32, offset: 2 } end ModDown max|coeff| 2^51.1
+[pc-bench] host plan 0.4 s: 75 rotation keys, EvalMod buffers 8
+[pc-bench] MemPlan context 63.9 MB, ks_work 1890.0 MB, bconv_work 126.0 MB, scratch 504.0 MB, ct_pool 31.5 MB, keys 14747.5 MB, keygen 31.5 MB, secret 31.5 MB, encrypt 0.0 MB, decrypt 10.0 MB, ks.plans 4.1 MB, ks.regen_a 189.0 MB, ops 14.5 MB, rescale 253.5 MB, bts.dense 4421.9 MB, bts.work 7056.0 MB, bench.dbg 256.0 MB, bench.cts 252.0 MB, total 29882.9 MB
+[pc-bench] keygen 79 keys in 1.7 s
+[pc-bench] dense route tables 0.4 s; arena used 30.8 of 31.3 GB
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=0.01: rel_err 1.391e-2 (6.17 bits), complex |out - in| 6.049e-2 (4.05 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=0.1: rel_err 1.268e-3 (9.62 bits), complex |out - in| 5.690e-3 (7.46 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=0.5: rel_err 2.425e-4 (12.01 bits), complex |out - in| 1.082e-3 (9.85 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=1: rel_err 1.221e-4 (13.00 bits), complex |out - in| 5.294e-4 (10.88 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=2: rel_err 6.134e-5 (13.99 bits), complex |out - in| 2.759e-4 (11.82 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=5: rel_err 2.416e-5 (15.34 bits), complex |out - in| 1.156e-4 (13.08 bits)
+[pc-bench] bts-prec route=dense real=false level=44 iters=1 cf=6 A=10: rel_err 1.325e-5 (16.20 bits), complex |out - in| 5.528e-5 (14.14 bits)

@@ -292,12 +292,15 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     // round (`SparseRot` keys); PC_BENCH_STC_PS=1: the StC-first input stages over P' (`KskShape::stc_ps` keys)
     let merge = std::env::var("PC_BENCH_MERGE").is_ok_and(|v| v == "1");
     let stc_ps: usize = std::env::var("PC_BENCH_STC_PS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // PC_EM_EVEN=1: the even EvalMod series on the dense / StC-first routes and on SparseB at K = 16 (default off)
+    let em_even = std::env::var("PC_EM_EVEN").is_ok_and(|v| v == "1");
     let mut setup = BtsSetup::n32_shipped();
     setup.k_max = kb;
     setup.real = true;
     setup.em_fuse_rescale = em_fuse;
     setup.merge_s2d = merge;
     setup.stc_ps = stc_ps;
+    setup.evalmod_even = em_even;
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     // --pair-members: pairs up to the members' largest CF (above the reference CF: the pair's last stage at CF + 1)
@@ -321,6 +324,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             let mut c = SparseBCfg::n32(s, sparse_drop);
             c.k_max = kb;
             c.evalmod_k = sparse_k;
+            c.em_even = em_even && sparse_k == pc_core::bts_setup::EVALMOD_K;
             c.em_fuse_rescale = em_fuse;
             c.merge_s2d = merge;
             c
