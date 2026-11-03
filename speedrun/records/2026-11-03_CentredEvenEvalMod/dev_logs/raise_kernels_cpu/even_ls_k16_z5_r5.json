@@ -1,0 +1,28 @@
+{
+  "K": 16,
+  "L": 16.0,
+  "shift_y": 0.015625,
+  "degree_z": 5,
+  "double_angle_its": 5,
+  "levels": 9,
+  "objective": "mínimos quadrados no erro final, pesos P(I) da soma de 33 uniformes (h = 32), |delta| <= 2^-4, piso 1e-10; tmodel/z5/em_rms.py",
+  "convention": "OpenFHE (c0 not halved)",
+  "pipeline": "w = y - 1/64; z = 2 w^2 - 1; p = sum c_k T_k(z); 5 x (x <- 2 x^2 - s^2)",
+  "rms_bits_teorico": {
+    "2^-4": 28.86,
+    "2^-2": 29.27
+  },
+  "coeffs": [
+    -0.5745377251677196,
+    -0.916700971342353,
+    0.28591387226312487,
+    -0.027497223315037466,
+    0.00129806776429133,
+    -4.3254981590185784e-05
+  ],
+  "rms_bits_distribuicao_medida": {
+    "2^-4": 29.03,
+    "2^-2": 29.44
+  },
+  "nota_pesos": "o ajuste usou a densidade de 34 uniformes nos inteiros; a distribuição medida é a de 33 (tmodel/z5/profile_by_I.py). Reajustar com ela dá 29,06 bits: não compensa trocar. Essa distribuição só vale com o lift centrado em Qd (Lift::Centred, branch em-z5); no mod_raise do FIDESlib I tem sigma 2,35 e o z5 reprova em GPU (gpu/results-2026-11-02b-runpod/)."
+}

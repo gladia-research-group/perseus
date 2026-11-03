@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Lê o result.json de cada run e encerra o A/B no primeiro pedido com KL médio > 1e-3 ou posição com KL > 1."""
+import glob, json, subprocess, sys, time
+BAR, CATA = 1e-3, 1.0
+once = "--once" in sys.argv
+seen = set()
+while True:
+    bad = False
+    for f in sorted(glob.glob("out-ab/runs/*/client/result.json")):
+        if f in seen:
+            continue
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue  # ainda sendo escrito
+        seen.add(f)
+        run = f.split("/")[2]
+        m = [r.get("kl_scored_mean") for r in d.get("requests", [])]
+        peak = max((max(r.get("kl", [0])) for r in d.get("requests", [])), default=0)
+        print(f"KL_RUN {run} medias {['%.2e' % x for x in m]} pico {peak:.2e}", flush=True)
+        if any(x is not None and x > BAR for x in m) or peak > CATA:
+            print(f"KL_ABORT {run}", flush=True)
+            bad = True
+    if once:
+        sys.exit(0)
+    if bad:
+        for pat in ("run_gpu_r7.sh", "runner/entry.sh", "runner/run.py", "speedrun/server.py"):
+            subprocess.run(["pkill", "-f", pat])
+        sys.exit(1)
+    time.sleep(10)

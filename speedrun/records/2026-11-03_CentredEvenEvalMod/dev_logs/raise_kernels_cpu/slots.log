@@ -1,0 +1,20 @@
+sf/Qd: [0.24282801325446357, 0.24273077155104197, 0.24273077155104197]; f = (sf 2^deg / Qd) 2^-CF v, deg = 2 (correction = CF - deg)
+(-log2) lift      serie    rota        : max por polinomio p05 / mediana / p95 ; rms mediano
+PerPrime  recorde  densa CF  6:  14.89 /  15.06 /  15.19 ; rms 6.854e-6
+PerPrime  z7       densa CF  6:  14.51 /  14.81 /  15.01 ; rms 5.424e-6
+PerPrime  z5       densa CF  6:   6.96 /   8.07 /   8.94 ; rms 1.108e-3
+PerPrime  recorde  stcf CF  8:  13.36 /  13.36 /  13.36 ; rms 3.581e-5
+PerPrime  z7       stcf CF  8:  13.36 /  13.36 /  13.37 ; rms 3.578e-5
+PerPrime  z5       stcf CF  8:   6.26 /   8.74 /   9.86 ; rms 4.330e-5
+PerPrime  recorde  stcf CF 13:  16.52 /  16.56 /  16.56 ; rms 6.586e-6
+PerPrime  z7       stcf CF 13:  16.47 /  16.47 /  16.47 ; rms 3.852e-6
+PerPrime  z5       stcf CF 13:   1.26 /   3.81 /   4.86 ; rms 7.158e-4
+Centred  recorde  densa CF  6:  14.97 /  15.14 /  15.26 ; rms 6.497e-6
+Centred  z7       densa CF  6:  15.54 /  15.81 /  15.99 ; rms 3.143e-6
+Centred  z5       densa CF  6:  13.19 /  13.62 /  13.77 ; rms 1.859e-5
+Centred  recorde  stcf CF  8:  13.36 /  13.36 /  13.36 ; rms 3.581e-5
+Centred  z7       stcf CF  8:  13.36 /  13.37 /  13.37 ; rms 3.578e-5
+Centred  z5       stcf CF  8:  13.22 /  13.35 /  13.36 ; rms 3.578e-5
+Centred  recorde  stcf CF 13:  16.56 /  16.56 /  16.56 ; rms 7.159e-6
+Centred  z7       stcf CF 13:  16.47 /  16.47 /  16.48 ; rms 2.237e-6
+Centred  z5       stcf CF 13:   9.94 /  10.84 /  11.53 ; rms 1.320e-5

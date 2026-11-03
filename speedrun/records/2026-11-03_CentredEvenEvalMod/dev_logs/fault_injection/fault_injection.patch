@@ -1,0 +1,76 @@
+diff --git a/crates/pc-gpu/src/bts/raise.rs b/crates/pc-gpu/src/bts/raise.rs
+index f1189d2..ea3c965 100644
+--- a/crates/pc-gpu/src/bts/raise.rs
++++ b/crates/pc-gpu/src/bts/raise.rs
+@@ -266,6 +266,29 @@ pub fn raise_tab(q: &[u64], d: usize, top: usize, c: Option<f64>, lift: Lift) ->
+     small_int_tab(&q[..lift.sources(d)], &rows, &q[..=top], c)
+ }
+ 
++// ── fault injection (throwaway branch em-z5-fault, never in a PR) ──────────────────────────────────────────────────
++
++/// `/tmp/pc_fault.txt` = "k log2_rate": `small_int` shifts the overflow integer of part 0's coefficients of index 0 mod
++/// 128 (those every route keeps) by +-k, each with probability 2^-log2_rate, chosen by a hash of its own residues.
++pub fn fault_cfg() -> Option<(i64, u32)> {
++    let s = std::fs::read_to_string("/tmp/pc_fault.txt").ok()?;
++    let mut it = s.split_whitespace();
++    let (k, l) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
++    eprintln!("[pc-fault] k {k}, log2 rate {l}");
++    Some((k, l))
++}
++
++/// Arms a table: the unused `pad` holds the rate, the unused last word of `pow32` the residue of round(c k Qd).
++pub fn set_fault(tab: &mut SmallIntTab, q: &[u64], top: usize, c: f64, k: i64, log2_rate: u32) {
++    let qd = q[0] as i128 * q[1] as i128;
++    // c = 1 (lift only): exact, since Qd does not fit a double's mantissa; the production c Qd (~2^46) does
++    let delta = if c == 1.0 { k as i128 * qd } else { (c * k as f64 * qd as f64).round() as i128 };
++    tab.pad = log2_rate as i32;
++    for (o, &p) in q.iter().enumerate().take(top + 1) {
++        tab.pow32[o][SI_MAXW + SI_MAXR - 1] = delta.rem_euclid(p as i128) as u32;
++    }
++}
++
+ // ── device plan ──────────────────────────────────────────────────────────────────────────────────────────────────
+ 
+ /// Words of a `SmallIntTab` on the device (it is all 4-byte fields).
+@@ -366,7 +389,11 @@ impl<'a, W: DevWord> RaisePlan<'a, W> {
+             // SAFETY: plain integers; the table is unused at d = 1 (carved anyway: the variant's bytes do not depend on d)
+             (unsafe { std::mem::zeroed::<SmallIntTab>() }, Some(single_scale(c, q[0])?))
+         } else {
+-            (raise_tab(q, d, top, Some(c), lift)?, None)
++            let mut tab = raise_tab(q, d, top, Some(c), lift)?;
++            if let Some((k, l)) = fault_cfg() {
++                set_fault(&mut tab, q, top, c, k, l);
++            }
++            (tab, None)
+         };
+         Ok(RaisePlan {
+             top,
+diff --git a/crates/pc-kernels/kernels/bts.cuh b/crates/pc-kernels/kernels/bts.cuh
+index 8c43ab3..ee9d883 100644
+--- a/crates/pc-kernels/kernels/bts.cuh
++++ b/crates/pc-kernels/kernels/bts.cuh
+@@ -85,6 +85,12 @@ __global__ void __launch_bounds__(BX) small_int(SmallIntArgs A) {
+             v[i] = t;
+         }
+     }
++    // FAULT INJECTION (branch em-z5-fault, never in a PR; raise.rs `set_fault`): tab->pad = log2 of the rate, off at 0
++    bool fault = false, fault_neg = false;
++    if (tab->pad != 0 && part == 0 && (idx & 127) == 0) {
++        fault = ((v[0] * 0x9E3779B1u) >> (32 - tab->pad)) == 0;
++        fault_neg = ((v[1] * 0x9E3779B1u) >> 31) != 0;
++    }
+     // x = v[k-1] q[k-2] ... + v[0] (mixed radix, at most k words)
+     uint32_t x[XW];
+ #pragma unroll
+@@ -172,6 +178,11 @@ __global__ void __launch_bounds__(BX) small_int(SmallIntArgs A) {
+             if (w < nq) acc += (uint64_t)x[w] * tab->pow32[o][w];
+         W r = MM::reduce((WideOf<W>)acc, q);
+         if (neg && r) r = (W)q.p - r;
++        if (fault) {
++            const uint32_t p = (uint32_t)q.p, f = tab->pow32[o][XW - 1];
++            const uint32_t sum = (uint32_t)r + (fault_neg && f ? p - f : f);
++            r = (W)(sum >= p ? sum - p : sum);
++        }
+         out[(size_t)row * N + idx] = r;
+     }
+ }

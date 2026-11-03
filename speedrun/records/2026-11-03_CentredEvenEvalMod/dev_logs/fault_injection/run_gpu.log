@@ -1,0 +1,35 @@
+[2026-11-03 01:20:58] preflight
+[2026-11-03 01:20:58] preflight: NOSANDBOX=1, the A/B outside the harness's sandbox (gpu/ab/sandbox.sh): NOT harness runs
+[2026-11-03 01:20:58] preflight ok (A/B): NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 595.91.07, nvcc 13.0
+[2026-11-03 01:20:58] setup in /root/perseus-entry
+[2026-11-03 01:21:40] entry at 43e86503, on record 7
+[2026-11-03 01:21:48] build .
+[2026-11-03 01:23:00] build ../perseus-client
+[2026-11-03 01:23:43] build ../perseus-spchain-client
+[2026-11-03 01:24:42] build ../perseus-record
+[2026-11-03 01:26:07] A/B runner at /root/perseus-entry/ab/speedrun (sandbox stand-in, NOT the harness's isolation)
+[2026-11-03 01:26:07] setup done
+[2026-11-03 01:26:07] step setup done; results in /root/perseus-entry/out-ab
+GO_SETUP_EXIT=0
+FAULT_SPEC 14 9
+[2026-11-03 01:26:07] smoke: one Decode-8 entry run
+[2026-11-03 01:28:01] smoke ok: /root/perseus-entry/out-ab/runs/20261103-012607-9975/run.json
+[2026-11-03 01:28:01] step smoke done; results in /root/perseus-entry/out-ab
+GO_FAULT_EXIT=0 spec=14 9
+KL_RUN 20261103-012607-9975 medias ['6.88e+02', '6.86e+02', '6.87e+02', '6.89e+02'] pico 6.91e+02
+KL_ABORT 20261103-012607-9975
+FAULT_SPEC 10 9
+[2026-11-03 01:28:01] smoke: one Decode-8 entry run
+[2026-11-03 01:29:59] smoke ok: /root/perseus-entry/out-ab/runs/20261103-012801-12850/run.json
+[2026-11-03 01:29:59] step smoke done; results in /root/perseus-entry/out-ab
+GO_FAULT_EXIT=0 spec=10 9
+KL_RUN 20261103-012801-12850 medias ['6.88e+02', '6.86e+02', '6.87e+02', '6.89e+02'] pico 6.91e+02
+KL_ABORT 20261103-012801-12850
+FAULT_SPEC 8 9
+[2026-11-03 01:29:59] smoke: one Decode-8 entry run
+[2026-11-03 01:31:56] smoke ok: /root/perseus-entry/out-ab/runs/20261103-012959-15804/run.json
+[2026-11-03 01:31:56] step smoke done; results in /root/perseus-entry/out-ab
+GO_FAULT_EXIT=0 spec=8 9
+KL_RUN 20261103-012959-15804 medias ['6.02e+02', '6.71e-02', '6.01e+02', '6.89e+02'] pico 6.91e+02
+KL_ABORT 20261103-012959-15804
+STAGE_F_DONE

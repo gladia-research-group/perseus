@@ -1,0 +1,45 @@
+[bts-all] K=1: 75 rotation keys, 68 extra (merge true, stc_ps 6); MemPlan context 64.8 MB, ks_work 1664.0 MB, bconv_work 128.0 MB, scratch 512.0 MB, ct_pool 32.0 MB, keys 5606.3 MB, keygen 32.0 MB, secret 64.0 MB, encrypt 0.0 MB, decrypt 3.0 MB, ks.plans 3.8 MB, ks.regen_a 128.0 MB, ops 13.8 MB, rescale 257.4 MB, relin.rr 1.1 MB, tables 3395.4 MB, bts.work 896.0 MB, tails 0.0 MB, tables 825.7 MB, bts.work 448.0 MB, tables 225.7 MB, bts.work 384.0 MB, bts.batch 32.0 MB, bench.cts 96.0 MB, total 14813.1 MB
+[bts-all] keygen 79 keys in 1.3 s (+68 extra)
+[bts-all] K=1 setup 3.7 s; arena used 15.50 of 15.53 GB
+[bts-all] route stcf K=1: eager 9.48 / batched 9.36 / graph 9.29 ms/ct; gather+scatter 0.012 ms/call; capture 9.6 ms host; out level 26 deg 2; mismatches 0 of 75366400
+[bts-all] route 256 K=1: eager 7.91 / batched 7.92 / graph 7.86 ms/ct; gather+scatter 0.014 ms/call; capture 8.3 ms host; out level 24 deg 2; mismatches 0 of 81395712
+[bts-all] route 512 K=1: eager 8.73 / batched 8.74 / graph 8.69 ms/ct; gather+scatter 0.014 ms/call; capture 9.7 ms host; out level 24 deg 2; mismatches 0 of 81395712
+[bts-all] K=1: 3 graphs, 2 constant slots leased; stats GraphStats { captures: 3, replays: 66, invalidations: 0, capture_ms: 27.627505 }
+[bts-all] K=2: 75 rotation keys, 68 extra (merge true, stc_ps 6); MemPlan context 64.8 MB, ks_work 1664.0 MB, bconv_work 128.0 MB, scratch 512.0 MB, ct_pool 32.0 MB, keys 5606.3 MB, keygen 32.0 MB, secret 64.0 MB, encrypt 0.0 MB, decrypt 3.0 MB, ks.plans 3.8 MB, ks.regen_a 128.0 MB, ops 13.8 MB, rescale 257.4 MB, relin.rr 1.1 MB, tables 3395.6 MB, bts.work 1792.0 MB, tails 0.0 MB, tables 825.8 MB, bts.work 896.0 MB, tables 225.8 MB, bts.work 768.0 MB, bts.batch 64.0 MB, bench.cts 160.0 MB, total 16637.4 MB
+[bts-all] keygen 79 keys in 1.4 s (+68 extra)
+[bts-all] K=2 setup 3.5 s; arena used 17.41 of 17.45 GB
+[bts-all] route stcf K=2: eager 8.15 / batched 8.15 / graph 8.12 ms/ct; gather+scatter 0.023 ms/call; capture 16.8 ms host; out level 26 deg 2; mismatches 0 of 150732800
+[bts-all] route 256 K=2: eager 7.24 / batched 7.26 / graph 7.20 ms/ct; gather+scatter 0.023 ms/call; capture 14.9 ms host; out level 24 deg 2; mismatches 0 of 162791424
+[bts-all] route 512 K=2: eager 7.86 / batched 7.88 / graph 7.81 ms/ct; gather+scatter 0.023 ms/call; capture 16.2 ms host; out level 24 deg 2; mismatches 0 of 162791424
+[bts-all] K=2: 3 graphs, 2 constant slots leased; stats GraphStats { captures: 3, replays: 66, invalidations: 0, capture_ms: 47.843135000000004 }
+
+[bts-all] MemPlan prediction vs carved (bytes), per (route, K):
+| route | K | section | predicted | carved | |
+|---|---|---|---|---|---|
+| dense+stcf | 1 | tables | 3560313856 | 3560313856 | == |
+| dense+stcf | 1 | bts.work | 939524096 | 939524096 | == |
+| sparse | 1 | tails | 0 | 0 | == |
+| 512 | 1 | tables | 865850368 | 865850368 | == |
+| 512 | 1 | bts.work | 469762048 | 469762048 | == |
+| 256 | 1 | tables | 236677888 | 236677888 | == |
+| 256 | 1 | bts.work | 402653184 | 402653184 | == |
+| all | 1 | bts.batch | 33554432 | 33554432 | == |
+| dense+stcf | 2 | tables | 3560501248 | 3560501248 | == |
+| dense+stcf | 2 | bts.work | 1879048192 | 1879048192 | == |
+| sparse | 2 | tails | 0 | 0 | == |
+| 512 | 2 | tables | 865923840 | 865923840 | == |
+| 512 | 2 | bts.work | 939524096 | 939524096 | == |
+| 256 | 2 | tables | 236745984 | 236745984 | == |
+| 256 | 2 | bts.work | 805306368 | 805306368 | == |
+| all | 2 | bts.batch | 67108864 | 67108864 | == |
+
+[bts-all] route x K (device ms per ciphertext; median of 20 after 2 warm-ups):
+| route | K | eager | batched (gather) | graph replay | gather+scatter ms/call | capture+instantiate host ms | mismatches | old K=1 |
+|---|---|---|---|---|---|---|---|---|
+| stcf | 1 | 9.48 | 9.36 | 9.29 | 0.012 | 9.6 | 0 of 75366400 | 28.8 |
+| 256 | 1 | 7.91 | 7.92 | 7.86 | 0.014 | 8.3 | 0 of 81395712 | - |
+| 512 | 1 | 8.73 | 8.74 | 8.69 | 0.014 | 9.7 | 0 of 81395712 | 18.6 |
+| stcf | 2 | 8.15 | 8.15 | 8.12 | 0.023 | 16.8 | 0 of 150732800 | 28.8 |
+| 256 | 2 | 7.24 | 7.26 | 7.20 | 0.023 | 14.9 | 0 of 162791424 | - |
+| 512 | 2 | 7.86 | 7.88 | 7.81 | 0.023 | 16.2 | 0 of 162791424 | 18.6 |
+[bts-all] verdict: mismatches 0, MemPlan differences 0

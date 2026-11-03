@@ -1,0 +1,85 @@
+[2026-11-03 00:18:37] preflight
+[2026-11-03 00:18:37] preflight: NOSANDBOX=1, the A/B outside the harness's sandbox (gpu/ab/sandbox.sh): NOT harness runs
+[2026-11-03 00:18:37] preflight ok (A/B): NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 595.91.07, nvcc 13.0
+[2026-11-03 00:18:37] setup in /root/perseus-entry
+[2026-11-03 00:19:12] entry at 224c2866, on record 7
+[2026-11-03 00:19:20] build .
+[2026-11-03 00:20:26] build ../perseus-client
+[2026-11-03 00:21:08] build ../perseus-spchain-client
+[2026-11-03 00:22:05] build ../perseus-record
+[2026-11-03 00:23:24] A/B runner at /root/perseus-entry/ab/speedrun (sandbox stand-in, NOT the harness's isolation)
+[2026-11-03 00:23:24] setup done
+[2026-11-03 00:23:24] step setup done; results in /root/perseus-entry/out-ab
+GO_SETUP_EXIT=0
+[2026-11-03 00:23:45] pc-bench bts --all (n32sp, served switches), EvalMod shipped
+[2026-11-03 00:23:58] pc-bench bts-prec dense (n32), EvalMod shipped
+[2026-11-03 00:24:01] pc-bench bts --all (n32sp, served switches), EvalMod even
+[2026-11-03 00:24:15] pc-bench bts-prec dense (n32), EvalMod even
+[2026-11-03 00:24:18] bts done: compare /root/perseus-entry/out-ab/bts_all_n32sp_{shipped,even}.log (evalmod ms) and bts_prec_dense_{shipped,even}.log (bits)
+[2026-11-03 00:24:18] step bts done; results in /root/perseus-entry/out-ab
+GO_BTS_EXIT=0
+GO_STCF_PREC_0_EXIT=0
+GO_STCF_PREC_1_EXIT=0
+STAGE_A_DONE
+[2026-11-03 00:25:56] decode pair 1/1: record (prompts 0..3)
+[2026-11-03 00:27:58] decode pair 1/1: entry (prompts 0..3)
+[2026-11-03 00:29:54] decode peak GPU memory  66601 MiB
+[2026-11-03 00:29:54] score_decode: runs refused (score.py exit 2)
+[2026-11-03 00:29:54] step decode done; results in /root/perseus-entry/out-ab
+GO_PAIR1_EXIT=0
+KL_RUN 20261103-002557-9757 medias ['2.59e-05', '1.16e-05', '5.45e-05', '1.88e-05'] pico 1.57e-04
+KL_RUN 20261103-002758-12748 medias ['3.21e-05', '1.42e-05', '4.49e-05', '2.11e-05'] pico 1.34e-04
+STAGE_B_DONE
+[2026-11-03 00:30:12] decode pair 1/6: record (prompts 0..3)
+KL_RUN 20261103-002557-9757 medias ['2.59e-05', '1.16e-05', '5.45e-05', '1.88e-05'] pico 1.57e-04
+KL_RUN 20261103-002758-12748 medias ['3.21e-05', '1.42e-05', '4.49e-05', '2.11e-05'] pico 1.34e-04
+[2026-11-03 00:32:13] decode pair 1/6: entry (prompts 0..3)
+KL_RUN 20261103-003012-15649 medias ['2.84e-05', '1.19e-05', '5.11e-05', '1.83e-05'] pico 1.46e-04
+[2026-11-03 00:34:09] decode pair 2/6: entry (prompts 4..7)
+KL_RUN 20261103-003213-18631 medias ['2.98e-05', '1.33e-05', '5.16e-05', '1.52e-05'] pico 1.55e-04
+[2026-11-03 00:36:04] decode pair 2/6: record (prompts 4..7)
+KL_RUN 20261103-003409-21445 medias ['2.72e-05', '9.03e-06', '1.28e-05', '3.15e-05'] pico 1.42e-04
+[2026-11-03 00:38:03] decode pair 3/6: record (prompts 8..11)
+KL_RUN 20261103-003604-24258 medias ['1.54e-05', '8.57e-06', '1.02e-05', '2.68e-05'] pico 1.24e-04
+[2026-11-03 00:40:06] decode pair 3/6: entry (prompts 8..11)
+KL_RUN 20261103-003803-27154 medias ['2.44e-05', '2.93e-05', '2.15e-05', '1.37e-05'] pico 2.02e-04
+KL_RUN 20261103-004006-30160 medias ['2.61e-05', '2.73e-05', '2.44e-05', '1.49e-05'] pico 2.18e-04
+[2026-11-03 00:42:02] decode pair 4/6: entry (prompts 12..15)
+[2026-11-03 00:44:00] decode pair 4/6: record (prompts 12..15)
+KL_RUN 20261103-004202-33016 medias ['2.89e-05', '1.68e-05', '2.16e-05', '1.95e-05'] pico 1.53e-04
+[2026-11-03 00:46:02] decode pair 5/6: record (prompts 16..19)
+KL_RUN 20261103-004400-35903 medias ['3.17e-05', '2.13e-05', '2.37e-05', '1.78e-05'] pico 1.71e-04
+[2026-11-03 00:48:00] decode pair 5/6: entry (prompts 16..19)
+KL_RUN 20261103-004602-38863 medias ['1.27e-05', '1.63e-05', '2.12e-05', '2.97e-05'] pico 6.04e-05
+[2026-11-03 00:49:54] decode pair 6/6: entry (prompts 20..23)
+KL_RUN 20261103-004800-41756 medias ['1.35e-05', '2.87e-05', '2.31e-05', '3.54e-05'] pico 8.17e-05
+[2026-11-03 00:51:51] decode pair 6/6: record (prompts 20..23)
+KL_RUN 20261103-004954-44570 medias ['1.23e-05', '1.07e-05', '7.33e-05', '1.44e-05'] pico 1.61e-04
+[2026-11-03 00:53:53] decode peak GPU memory  67160 MiB
+[2026-11-03 00:53:53] score_decode: a new record that passes (score.py exit 0)
+[2026-11-03 00:53:53] step decode done; results in /root/perseus-entry/out-ab
+KL_RUN 20261103-002557-9757 medias ['2.59e-05', '1.16e-05', '5.45e-05', '1.88e-05'] pico 1.57e-04
+KL_RUN 20261103-002758-12748 medias ['3.21e-05', '1.42e-05', '4.49e-05', '2.11e-05'] pico 1.34e-04
+KL_RUN 20261103-003012-15649 medias ['2.84e-05', '1.19e-05', '5.11e-05', '1.83e-05'] pico 1.46e-04
+KL_RUN 20261103-003213-18631 medias ['2.98e-05', '1.33e-05', '5.16e-05', '1.52e-05'] pico 1.55e-04
+KL_RUN 20261103-003409-21445 medias ['2.72e-05', '9.03e-06', '1.28e-05', '3.15e-05'] pico 1.42e-04
+KL_RUN 20261103-003604-24258 medias ['1.54e-05', '8.57e-06', '1.02e-05', '2.68e-05'] pico 1.24e-04
+KL_RUN 20261103-003803-27154 medias ['2.44e-05', '2.93e-05', '2.15e-05', '1.37e-05'] pico 2.02e-04
+KL_RUN 20261103-004006-30160 medias ['2.61e-05', '2.73e-05', '2.44e-05', '1.49e-05'] pico 2.18e-04
+KL_RUN 20261103-004202-33016 medias ['2.89e-05', '1.68e-05', '2.16e-05', '1.95e-05'] pico 1.53e-04
+KL_RUN 20261103-004400-35903 medias ['3.17e-05', '2.13e-05', '2.37e-05', '1.78e-05'] pico 1.71e-04
+KL_RUN 20261103-004602-38863 medias ['1.27e-05', '1.63e-05', '2.12e-05', '2.97e-05'] pico 6.04e-05
+KL_RUN 20261103-004800-41756 medias ['1.35e-05', '2.87e-05', '2.31e-05', '3.54e-05'] pico 8.17e-05
+KL_RUN 20261103-004954-44570 medias ['1.23e-05', '1.07e-05', '7.33e-05', '1.44e-05'] pico 1.61e-04
+KL_RUN 20261103-005152-47451 medias ['1.32e-05', '1.06e-05', '6.19e-05', '1.43e-05'] pico 1.88e-04
+GO_DECODE_EXIT=0
+STAGE_C_DONE
+[2026-11-03 00:56:26] prefill pair 1/2: record (prompts 0..3)
+[2026-11-03 00:59:17] prefill pair 1/2: entry (prompts 0..3)
+[2026-11-03 01:01:09] prefill pair 2/2: entry (prompts 4..7)
+[2026-11-03 01:03:01] prefill pair 2/2: record (prompts 4..7)
+[2026-11-03 01:04:50] prefill peak GPU memory  58713 MiB
+[2026-11-03 01:04:50] score_prefill: does NOT beat the record / fails a check (score.py exit 1)
+[2026-11-03 01:04:50] step prefill done; results in /root/perseus-entry/out-ab
+GO_PREFILL_EXIT=0
+STAGE_D_DONE
