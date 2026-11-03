@@ -27,7 +27,7 @@ FINALS = [
     {"name": "GPT-2 decode", "kind": "decode",
      "plans": [f"bootstrap_placements/gpt2_decode_ctx512_w{b}" for b in (16, 128, 256, 384, 512)], "flags": "--argmax"},
     {"name": "Llama decode", "kind": "decode",
-     "plans": [f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}" for b in (128, 256, 384, 512)], "flags": ""},
+     "plans": [f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}" for b in (16, 128, 256, 384, 512)], "flags": ""},
 ]
 
 
