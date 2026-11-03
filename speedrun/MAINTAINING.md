@@ -25,8 +25,9 @@ The machine provides what this folder cannot:
   [`harness/perseus_core_client.py`](harness/perseus_core_client.py) for records 1-3),
   with GPT-2's weights, and the current record if it is another commit:
   `EXPORT=1 bash speedrun/runner/build.sh https://github.com/gladia-research-group/perseus <commit> <client build>`.
-  Today both tracks' record is FlippingToTokenPerSecond, `7f84aa1` (Prefill-128's record 6, Decode-8's record 7),
-  with the alternating-chain client at `ea62bcc`. Rebuild a track's record arm whenever its record changes.
+  Today Prefill-128's record is record 6, FlippingToTokenPerSecond, `7f84aa1`, and Decode-8's is record 8,
+  CentredEvenEvalMod, `558d59a`, both with the alternating-chain client at `ea62bcc`. Rebuild a track's record arm
+  whenever its record changes.
 
 ## When a PR arrives
 

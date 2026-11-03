@@ -47,7 +47,7 @@ You need Linux, `bwrap`, a systemd user session, a GPU with 48 GB or more, and `
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="speedrun/records/progress-dark.svg">
-    <img src="speedrun/records/progress-light.svg" width="100%" alt="Record progression of both GPT-2 tracks. Prefill-128: 35.78 s (record 0), 22.22 s (record 1), 15.11 s (record 2), 12.20 s (record 3), 10.12 s (record 4), 7.07 s (record 5), 6.37 s (record 6). Decode-8: 3.993 s/token (record 0), 3.384 s/token (record 1), 3.031 s/token (record 2), 2.325 s/token (record 3), 1.798 s/token (record 4), 1.213 s/token (record 5), 1.199 s/token (record 6), 0.968 s/token (record 7). Dotted lines: 1 token/s, and GPT-2 unencrypted on the same GPU, 0.77 ms and 0.65 ms/token.">
+    <img src="speedrun/records/progress-light.svg" width="100%" alt="Record progression of both GPT-2 tracks. Prefill-128: 35.78 s (record 0), 22.22 s (record 1), 15.11 s (record 2), 12.20 s (record 3), 10.12 s (record 4), 7.07 s (record 5), 6.37 s (record 6). Decode-8: 3.993 s/token (record 0), 3.384 s/token (record 1), 3.031 s/token (record 2), 2.325 s/token (record 3), 1.798 s/token (record 4), 1.213 s/token (record 5), 1.199 s/token (record 6), 0.968 s/token (record 7), 0.922 s/token (record 8). Dotted lines: 1 token/s, and GPT-2 unencrypted on the same GPU, 0.77 ms and 0.65 ms/token.">
   </picture>
 </p>
 
@@ -93,8 +93,11 @@ unencrypted on the same GPU (at the bottom, not to scale).
 | 5 | 1.213 | LeanKeySwitch: leaner key switch and bootstraps, shorter argmax, leaner LayerNorms | 2026‑10‑31 | [`811eadc`](https://github.com/gladia-research-group/perseus/tree/811eadc02d8938ca825e508525f8ece56f4a7f6c) · [log](speedrun/records/2026-10-31_LeanKeySwitch) | [@alexzilligmm](https://github.com/alexzilligmm) |
 | 6 | 1.199 | AlternatingChain: alternating one- and two-prime levels, fewer refreshes | 2026‑11‑01 | [`ea62bcc`](https://github.com/gladia-research-group/perseus/tree/ea62bcc3bd7f052d8005e9039c74cc476f19f364) · [log](speedrun/records/2026-11-01_AlternatingChain) | [@erodola](https://github.com/erodola) |
 | 7 | 0.968 | FlippingToTokenPerSecond: lighter configs on the alternating chain, deeper raise drops, fused one-prime rescales | 2026‑11‑02 | [`7f84aa1`](https://github.com/gladia-research-group/perseus/tree/7f84aa1fc0bfbb6c0581c1b8c89a083eb6f7bb20) · [log](speedrun/records/2026-11-02_FlippingToTokenPerSecond) | [@alexzilligmm](https://github.com/alexzilligmm) |
+| 8 | 0.922 | CentredEvenEvalMod: even EvalMod series, centred raise | 2026‑11‑03 | [`558d59a`](https://github.com/gladia-research-group/perseus/tree/558d59afef66fc6012b7262bb9cab9523b6ca50e) · [log](speedrun/records/2026-11-03_CentredEvenEvalMod) | [@z0cal](https://github.com/z0cal) |
 |  | $`\color{gray}\textsf{0.00065}`$ | $`\color{gray}\textsf{Unencrypted GPT-2}`$ | $`\color{gray}\textsf{2026-10-24}`$ | [code](speedrun/records/plaintext.py) · [log](speedrun/records/plaintext.json) |  |
 
+- **Record 8, CentredEvenEvalMod**: the bootstraps' modular reduction runs on a series of half the degree, one level
+  shallower, which works because the raise now centres the coefficients and keeps their overflow small.
 - **Record 7, FlippingToTokenPerSecond**: under a second per token: lighter configs replanned on the alternating chain
   (87 refreshes per token instead of 99), refreshes that end lower in the chain, and one-prime rescales fused into
   the products and key switches.
@@ -169,8 +172,9 @@ Records that change it:
 ### Track 2: Decode-8
 
 - Server: Perseus's served decode, [`perseus.serve.gpt2_decode`](python/perseus/serve/gpt2_decode.py)
-- Plan: [`bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7`](bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7), on the
-  alternating chain `n32sp`, made by [`speedrun/make_n32sp_decode_plan_gn.sh`](speedrun/make_n32sp_decode_plan_gn.sh) (its `PLAN_CMD.txt`)
+- Plan: [`bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7_z5`](bootstrap_placements/gpt2_decode_python_n32sp_kc16r_gnabd7_z5), on the
+  alternating chain `n32sp`, made by [`speedrun/make_n32sp_decode_plan_gn.sh`](speedrun/make_n32sp_decode_plan_gn.sh) with `PC_EM_EVEN=1`
+  on its runtime line (its `PLAN_CMD.txt`)
 - In one process, with per-token times: [`scripts/repro/gpt2_decode.sh`](scripts/repro/gpt2_decode.sh), through
   [`run_decode.py`](python/perseus/examples/gpt2/run_decode.py)
 - [`model.py`](python/perseus/examples/gpt2/model.py) holds the per-block K/V caches and the decode step: the 12 blocks of
