@@ -13,15 +13,15 @@ reaches, plus a record of how it was produced under `meta`. The runtime reads th
 | directory | model | parameters | notes |
 |---|---|---|---|
 | `gpt2_base_n32` | GPT-2 | 32-bit | GELU as a Chebyshev series; its `cutmax` section drives the encrypted argmax |
-| `gpt2_base_n32_ctx512s`, `gpt2_base_n32_pf_cms` | GPT-2 | 32-bit | the default 512-token decode and 128-token prefill, softmax centred on key 0; `cutmax` with slot-mean refreshes, the folded Newton step and one conjugate, `ln_f` folded into the LM head; each LayerNorm's two statistics on one complex ladder (`zladder`) |
+| `gpt2_base_n32_ctx512s`, `gpt2_base_n32_pf_cms` | GPT-2 | 32-bit | the default 512-token decode and 128-token prefill, softmax centred on key 0; `cutmax` with slot-mean refreshes, the folded Newton step and one conjugate, `ln_f` folded into the LM head; each LayerNorm's two statistics on one complex ladder (`zladder`). The prefill's softmax takes its active mask into the exp series (`exp_mask_fold`), and its GELU, exp and LayerNorm seed series are refitted by least squares on each block's real inputs at the lowest degree that keeps the error class |
 | `gpt2_base_n32_cm`, `gpt2_base_n32_ctx1024` | GPT-2 | 32-bit | the default decode up to 32 cached keys, and past 512 |
-| `llama31_8b_n32_ctx512_silus`, `llama31_8b_n32_cheb1e-5_kc256s` | Llama-3-8B | 32-bit | the default 512-token decode and 128-token prefill, softmax centred on key 0 |
+| `llama31_8b_n32_ctx512_silus`, `llama31_8b_n32_cheb1e-5_kc256s` | Llama-3-8B | 32-bit | the default 512-token decode and 128-token prefill, softmax centred on key 0. The prefill's softmax takes its mask into the exp series (`exp_mask_fold`); its SiLU sites run one series each from `single_cheb_coeffs`, refitted with the norm seeds as for GPT-2 |
 | `gpt2_base` | GPT-2 | 64-bit | the same fit, GELU as a plain polynomial |
 | `gpt2_heat`, `gpt2_heat_n32` | GPT-2 fine-tuned for encryption with HEAT | both | |
 | `gpt2_squeeze` | GPT-2 | 64-bit | fewer iterations per function |
-| `vit_base`, `vit_base_n32` | ViT-B/16 | both | `vit_base_224` is the default plan's (each LayerNorm's two statistics on one complex ladder, `zladder`), `vit_base_112` is for 112-pixel images |
+| `vit_base`, `vit_base_n32` | ViT-B/16 | both | `vit_base_224` is the default plan's (each LayerNorm's two statistics on one complex ladder, `zladder`; `exp_mask_fold` and the refitted series as GPT-2's prefill), `vit_base_112` is for 112-pixel images |
 | `vit_heat`, `vit_squeeze` | ViT-B/16 | 64-bit | as for GPT-2 |
-| `bert_base`, `bert_base_n32` | BERT-base | both | fitted on SST-2; `bert_base_n32_t128` is the default plan's (`zladder` as ViT) |
+| `bert_base`, `bert_base_n32` | BERT-base | both | fitted on SST-2; `bert_base_n32_t128` is the default plan's (`zladder`, `exp_mask_fold` and the refitted series as ViT) |
 | `bert_heat`, `bert_squeeze` | BERT-base | 64-bit | as for GPT-2 |
 | `paper/` | GPT-2, ViT | 64-bit | the exact configs behind the published numbers, kept so those results stay reproducible |
 
