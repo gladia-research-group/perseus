@@ -149,7 +149,9 @@ class CapFhe(FakeFhe):
         self.stc_entry = 46 if cfg["quirks.fakecap_stc_entry"] is None else cfg["quirks.fakecap_stc_entry"]
         self._stc_first_cfg = ((cfg["bts.stc_first"] or 0) > 0 and not cfg["bts.stc_first_staged_only"]
                                and "dense" in (cfg["bts.stc_first_routes"] or ["dense"]))
-        self._sparse_exact = bool(cfg["quirks.fakecap_sparse_exact"])
+        # a sparse refresh returns the s-periodic projection of its input, as the device does; FAKECAP_SPARSE_EXACT=0
+        # passes the input through unchanged
+        self._sparse_exact = cfg["quirks.fakecap_sparse_exact"] is not False
         self._check_field = bool(cfg["exec.debug.fakecap_check_field"])
         self.stats = True
         self._pend, self._batch = [], cfg["quirks.fakecap_batch"] or 1
@@ -292,8 +294,10 @@ class CapFhe(FakeFhe):
         """Refresh in place on the auto-routed slot count; returns the route's args for the graph."""
         s = self.auto_route(ct)
         if s and self._sparse_exact and not CapCt.novec:       # a sparse route returns the s-periodic projection
-            v = np.asarray(ct.vec).reshape(-1, s).mean(0)
-            ct.vec = np.tile(v, self.slots // s)
+            x = np.asarray(ct.vec).reshape(-1, s)
+            # an input s-periodic to rounding (1e-9 of its largest value) is kept bit for bit
+            if np.abs(x - x[0]).max() > 1e-9 * max(np.abs(x).max(), 1e-300):
+                ct.vec = np.tile(x.mean(0), self.slots // s)
         stc = s == 0 and self.stc_first()
         # a deliberate refresh under a raise variant (PF_SM_R_RAISE, CapFhe.raise_drop) lands that much deeper
         drop = int(getattr(self, "raise_drop", 0) or 0) if s == 0 else 0
