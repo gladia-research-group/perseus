@@ -946,7 +946,7 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
                                   leaf_terms="budget")
     else:
         z = eval_chebyshev(ops, ct, cfg.cheb_coeffs, a, b)
-    refresh = _gs_num_refresh(ops, cfg)
+    refresh = _gs_num_refresh(ops, cfg) and _gs_num_first(cfg) == 0      # only when round 0 is folded
     for i in range(cfg.log2delta1):
         if refresh and i == cfg.log2delta1 - 1:
             z = ops.bootstrap(z)            # SoftmaxCfg.gs_num_refresh: before the last squaring
@@ -959,6 +959,11 @@ def _gs_num_refresh(ops, cfg: SoftmaxCfg) -> bool:
     """SoftmaxCfg.gs_num_refresh: each round's numerator refreshed before its last squaring (gs_num only)."""
     return bool(int(getattr(cfg, "gs_num", 0) or 0)) and bool(int(getattr(cfg, "gs_num_refresh", 0) or 0)) \
         and ops.complex_payload and getattr(ops, "sm_cheb_gs", False)
+
+
+def _gs_num_first(cfg: SoftmaxCfg) -> int:
+    """SoftmaxCfg.gs_num_first: the first reciprocal round gs_num folds (earlier rounds keep their product)."""
+    return int(getattr(cfg, "gs_num_first", 0) or 0)
 
 
 def first_iters(cfg: SoftmaxCfg, lean: bool) -> int:
@@ -979,10 +984,11 @@ def _softmax_recip(rt, z, cfg: SoftmaxCfg, kc: int):
     pair = _pair(rt, cfg, kc)
     # SoftmaxCfg.gs_num: each round's scores ride the reciprocal's packed recursion (poly.goldschmidt_recip num=):
     # no final product, and between rounds' starts the state is one ciphertext, so a refresh can sit inside a round
-    fold_num = bool(int(getattr(cfg, "gs_num", 0) or 0))
-    if fold_num and not (ops.complex_payload and getattr(ops, "sm_cheb_gs", False)):
+    gs_num = bool(int(getattr(cfg, "gs_num", 0) or 0))
+    if gs_num and not (ops.complex_payload and getattr(ops, "sm_cheb_gs", False)):
         raise ValueError("gs_num needs a complex payload and SM_CHEB_GS=1")
     for k, (alpha, beta, iters, scale, cheb) in enumerate(_recip_rounds_ops(ops, cfg, kc)):
+        fold_num = gs_num and k >= _gs_num_first(cfg)      # SoftmaxCfg.gs_num_first: earlier rounds keep the product
         if k:
             y = im_cleanse(ops, y)
             if fold_num and _gs_num_refresh(ops, cfg):

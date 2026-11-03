@@ -100,6 +100,13 @@ class SoftmaxCfg:
     # sum or the sink key), which the next round and P.V sum over the keys (512-key decode: KL 3.5e-3 on GPT-2,
     # 3.9e-3 on Llama, against ~5e-6 without gs_num)
     gs_num_refresh: int = 0
+    # gs_num_first (with gs_num): the first reciprocal round folded; earlier rounds keep their product. 1 = the refine
+    # rounds only: round 0's recursion is the longest (the first division, SM_GS_FIRST) and with gs_num_refresh it does
+    # not fit between its numerator's refresh (the dense StC-first landing at a 512-key cache, SM_PERIODIC=2) and the
+    # next round's (the StC-first entry): GPT-2 decode, round 0 spans 22-26 levels against the 22 of that window (blocks
+    # 3, 4: +2; 6, 9, 10: +4), every refine round 16-20. Its numerator cannot be refreshed inside its recursion, so
+    # round 0 runs as without gs_num (no per-key values in its recursion state: refreshable anywhere)
+    gs_num_first: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -272,7 +279,7 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
         key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
         pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)),
-        gs_num_refresh=int(j.get("gs_num_refresh", 0)))
+        gs_num_refresh=int(j.get("gs_num_refresh", 0)), gs_num_first=int(j.get("gs_num_first", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:
