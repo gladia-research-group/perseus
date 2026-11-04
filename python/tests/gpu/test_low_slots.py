@@ -78,6 +78,23 @@ def test_mult_sum_many_equals_mult_sum(setup):
     assert _pc.export_ct(s, long[1]) == _pc.export_ct(s, s.fhe.mult_sum(low, full))
 
 
+def test_compressed_export(setup):
+    """export_ct(bits=32) of a product at the bottom (2 rows): half the frame, decrypting to within ~1e-4 of it."""
+    s, client = setup
+    rng = np.random.default_rng(4)
+    xv, xf = frames(client, rng, 3)
+    yv, yf = frames(client, rng, 3)
+    p = s.fhe.mult_sum([_pc.import_ct(s, f, low=True) for f in xf], [_pc.import_ct(s, f) for f in yf])
+    full, small = _pc.export_ct(s, p), _pc.export_ct(s, p, bits=32)
+    assert len(small) < 0.51 * len(full)
+    a, b = client.decrypt(full)[0], client.decrypt(small)[0]
+    # the rounding of c1 is multiplied by the secret: ~2^-13 of the slots' scale at 32 bits
+    assert np.abs(a - b).max() < 1e-3
+    assert np.abs(b - (xv * yv).sum(0)).max() < 1e-3
+    with pytest.raises(Exception):
+        _pc.export_ct(s, _pc.import_ct(s, xf[0]), bits=32)        # 4 rows: the modulus is too wide for 32 bits
+
+
 def test_other_ops_refuse_low(setup):
     s, client = setup
     rng = np.random.default_rng(1)

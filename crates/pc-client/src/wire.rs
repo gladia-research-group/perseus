@@ -263,9 +263,61 @@ pub struct CtHeader {
     /// Q rows per part (ids `0..rows`; rows = top limb + 1).
     pub rows: usize,
     pub meta: WireMeta,
+    /// Compressed frame: each coefficient (coefficient form, the CRT of the `rows` residues) as round(x 2^bits / Q),
+    /// one word per coefficient per part (`pack_coeffs`); None = the eval-form residues of every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u32>,
 }
 
-/// A batch of `k` ciphertexts, eval form, `data` = `[c][part][row][N]`.
+/// Compress coefficient-form residues (`rows[r][i]` mod `q[r]`) to one `bits`-bit word per coefficient:
+/// round(x 2^bits / Q) mod 2^bits, x the CRT of the residues in [0, Q). Q must stay below 2^(128 - bits).
+pub fn pack_coeffs(q: &[u64], rows: &[&[u64]], bits: u32) -> Result<Vec<u32>> {
+    let big: u128 = q.iter().map(|&p| p as u128).product();
+    if bits == 0 || bits > 32 || q.iter().map(|&p| 64 - p.leading_zeros()).sum::<u32>() + bits > 127 {
+        return Err(Error::Wire(format!("pack_coeffs: {bits} bits over a {}-prime modulus", q.len())));
+    }
+    let n = rows[0].len();
+    // Garner: x = sum_r v_r * (Q / q_r) * ((Q / q_r)^-1 mod q_r), reduced mod Q
+    let parts: Vec<(u128, u64)> = q
+        .iter()
+        .map(|&p| {
+            let m = big / p as u128;
+            (m, inv_mod((m % p as u128) as u64, p))
+        })
+        .collect();
+    let mask = if bits == 32 { u32::MAX as u128 } else { (1u128 << bits) - 1 };
+    Ok((0..n)
+        .map(|i| {
+            let mut x = 0u128;
+            for (r, (&p, &(m, inv))) in q.iter().zip(&parts).enumerate() {
+                let v = ((rows[r][i] % p) as u128 * inv as u128 % p as u128) * m % big;
+                x = (x + v) % big;
+            }
+            ((((x << bits) + big / 2) / big) & mask) as u32
+        })
+        .collect())
+}
+
+/// `pack_coeffs`' inverse up to the rounding: the residues mod each `q[r]` of round(y Q / 2^bits).
+pub fn unpack_coeffs(q: &[u64], words: &[u32], bits: u32) -> Vec<Vec<u64>> {
+    let big: u128 = q.iter().map(|&p| p as u128).product();
+    let xs: Vec<u128> = words.iter().map(|&y| ((y as u128 * big) + (1u128 << (bits - 1))) >> bits).collect();
+    q.iter().map(|&p| xs.iter().map(|&x| (x % big % p as u128) as u64).collect()).collect()
+}
+
+fn inv_mod(a: u64, p: u64) -> u64 {
+    let (mut r, mut b, mut e) = (1u128, a as u128 % p as u128, p - 2);
+    while e > 0 {
+        if e & 1 == 1 {
+            r = r * b % p as u128;
+        }
+        b = b * b % p as u128;
+        e >>= 1;
+    }
+    r as u64
+}
+
+/// A batch of `k` ciphertexts, eval form, `data` = `[c][part][row][N]` (or compressed: `CtHeader::bits`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CtWire {
     pub header: CtHeader,
@@ -274,7 +326,11 @@ pub struct CtWire {
 
 impl CtWire {
     pub fn words(h: &CtHeader) -> usize {
-        h.k * 2 * h.rows * h.n
+        if h.bits.is_some() {
+            h.k * 2 * h.n
+        } else {
+            h.k * 2 * h.rows * h.n
+        }
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(4 * self.data.len() + 512);
@@ -339,7 +395,7 @@ mod tests {
 
     #[test]
     fn ct_frame_roundtrip_and_corruption() {
-        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null } };
+        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None };
         let w = CtWire { data: (0..CtWire::words(&h) as u32).collect(), header: h };
         let mut b = w.to_bytes().unwrap();
         assert_eq!(CtWire::from_bytes(&b).unwrap(), w);

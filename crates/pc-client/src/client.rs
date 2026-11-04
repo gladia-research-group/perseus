@@ -341,7 +341,7 @@ impl Client {
                 }
             });
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone() }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None }, data })
     }
 
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
@@ -368,13 +368,32 @@ impl Client {
         }
         let n = h.n;
         let slots = if h.meta.slots == 0 { n / 2 } else { h.meta.slots as usize };
+        if h.bits.is_some() && h.rows != d {
+            return Err(Error::Wire(format!("compressed ciphertext of {} rows, the client decodes {d}", h.rows)));
+        }
         (0..h.k)
             .map(|c| {
+                // a compressed frame: back to eval-form residues of the decoded rows
+                let eval: Option<Vec<[Vec<u32>; 2]>> = h.bits.map(|bits| {
+                    let q = &self.ring.primes[..d];
+                    let parts: Vec<Vec<Vec<u64>>> = (0..2).map(|part| crate::wire::unpack_coeffs(q, &ct.data[(c * 2 + part) * n..(c * 2 + part + 1) * n], bits)).collect();
+                    (0..d)
+                        .map(|r| {
+                            let mut e = [parts[0][r].iter().map(|&x| x as u32).collect::<Vec<u32>>(), parts[1][r].iter().map(|&x| x as u32).collect::<Vec<u32>>()];
+                            self.ring.ntt[r].fwd(&mut e[0]);
+                            self.ring.ntt[r].fwd(&mut e[1]);
+                            e
+                        })
+                        .collect()
+                });
                 let rows: Vec<Vec<u64>> = (0..d)
                     .into_par_iter()
                     .map(|r| {
                         let p = self.ring.primes[r];
-                        let (c0, c1, s) = (ct.row(c, 0, r), ct.row(c, 1, r), &self.s_eval[r]);
+                        let (c0, c1, s) = match &eval {
+                            Some(e) => (&e[r][0][..], &e[r][1][..], &self.s_eval[r]),
+                            None => (ct.row(c, 0, r), ct.row(c, 1, r), &self.s_eval[r]),
+                        };
                         let mut m: Vec<u32> = (0..n).map(|i| ((c0[i] as u64 + mm(c1[i], s[i], p)) % p) as u32).collect();
                         self.ring.ntt[r].inv(&mut m);
                         m.into_iter().map(|x| x as u64).collect()
@@ -588,7 +607,7 @@ mod tests {
                     assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
                 }
                 Entry::SpruCs { k, rows, level, nf, .. } => {
-                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null } }, data: v };
+                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None }, data: v };
                     let d = c.decrypt(&w, Payload::Real).unwrap();
                     let block = c.spru_block.as_ref().unwrap();
                     for (u, du) in d.iter().enumerate() {

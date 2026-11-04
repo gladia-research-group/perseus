@@ -160,6 +160,28 @@ impl PyClient {
         Ok(out)
     }
 
+    /// `decrypt` of several frames in parallel (one rayon task per frame): their decoded slots, frame by frame.
+    fn decrypt_many<'py>(&self, py: Python<'py>, frames: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyList>> {
+        use rayon::prelude::*;
+        let (c, p) = (&self.c, self.payload);
+        let vals = nogil(py, || {
+            frames
+                .par_iter()
+                .map(|f| CtWire::from_bytes(f).and_then(|w| c.decrypt(&w, p)))
+                .collect::<pc_client::Result<Vec<_>>>()
+        })
+        .map_err(cerr)?;
+        let out = PyList::empty(py);
+        for v in vals {
+            let l = PyList::empty(py);
+            for x in &v {
+                l.append(np_c128(py, x)?)?;
+            }
+            out.append(l)?;
+        }
+        Ok(out)
+    }
+
     /// Header of a wire frame: {level, deg, nf, slots, k, rows}.
     #[staticmethod]
     fn frame_meta<'py>(py: Python<'py>, frame: &[u8]) -> PyResult<Bound<'py, PyDict>> {
@@ -239,7 +261,8 @@ fn contract_hash(config: &PyConfig) -> PyResult<String> {
 
 /// Wire frame of a session ciphertext (a pending rescale is realized on a copy first: the client decodes degree 1).
 #[pyfunction]
-fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> PyResult<Bound<'py, PyBytes>> {
+#[pyo3(signature = (session, ct, bits=None))]
+fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bits: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
     let dev = session.dev.clone();
     let meta = ct.ct_ref().meta;
     if meta.deg == 2 {
@@ -255,10 +278,34 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
         None
     };
     let c = tmp.as_ref().map_or(ct.ct_ref(), |t| t.ct_ref());
-    let st = dev.st.borrow();
     let top = dev.ctx.top_of(c.meta.level).map_err(gerr)?;
     let rows: Vec<usize> = (0..=top).collect();
     let n = dev.ctx.lay.n;
+    if let Some(b) = bits {
+        // compressed: coefficient form, round(x 2^b / Q) per coefficient (pc_client::wire::pack_coeffs)
+        if ct.ct_ref().meta.deg == 2 || c.buf.lay.nq != dev.ctx.lay.nq {
+            ct.check_full()?;
+        }
+        let limbs = {
+            let mut st = dev.st.borrow_mut();
+            let State { ex, .. } = &mut *st;
+            nogil(py, || pc_gpu::limbs::export_limbs(&dev.ctx, ex, c, 0)).map_err(gerr)?
+        };
+        let mut data = Vec::with_capacity(2 * n);
+        for part in 0..2 {
+            let rs: Vec<Vec<u64>> = limbs.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
+            let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
+            data.extend(pc_client::wire::pack_coeffs(&limbs.moduli, &refs, b).map_err(cerr)?);
+        }
+        let m = c.meta;
+        let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let w = CtWire {
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b) },
+            data,
+        };
+        return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
+    }
+    let st = dev.st.borrow();
     let data = nogil(py, || -> pc_gpu::Result<Vec<u32>> {
         let mut v = Vec::with_capacity(2 * rows.len() * n);
         for part in 0..2 {
@@ -270,7 +317,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag } },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
