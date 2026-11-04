@@ -271,6 +271,13 @@ pub struct CtHeader {
     /// are drawn from (`Prng::from_seed(seed, 0).uniform_below(q_r)`, as `Client::encrypt` draws them).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub seeded: bool,
+    /// Compressed frame: c1's bits when they differ from c0's (`bits`); below 32 bits the words are bit-packed
+    /// (`pack_bits`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits1: Option<u32>,
+    /// Encrypted under the client's sparse secret (`SecretKey::s_sparse`: the server switched it before export).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sparse: bool,
 }
 
 /// Compress coefficient-form residues (`rows[r][i]` mod `q[r]`) to one `bits`-bit word per coefficient:
@@ -329,6 +336,50 @@ pub fn unpack_coeffs(q: &[u64], words: &[u32], bits: u32) -> Vec<Vec<u64>> {
     q.iter().map(|&p| xs.iter().map(|&x| (x % big % p as u128) as u64).collect()).collect()
 }
 
+/// Words of `n` values of `bits` bits (bit-packed below 32).
+pub fn packed_words(n: usize, bits: u32) -> usize {
+    if bits >= 32 {
+        n
+    } else {
+        (n * bits as usize).div_ceil(32)
+    }
+}
+
+/// `bits`-bit values, LSB first, into `packed_words(len, bits)` words (as is at 32 bits).
+pub fn pack_bits(v: &[u32], bits: u32) -> Vec<u32> {
+    if bits >= 32 {
+        return v.to_vec();
+    }
+    let mut out = vec![0u32; packed_words(v.len(), bits)];
+    for (i, &x) in v.iter().enumerate() {
+        let (bit, x) = (i * bits as usize, x as u64 & ((1u64 << bits) - 1));
+        let (w, o) = (bit / 32, bit % 32);
+        out[w] |= (x << o) as u32;
+        if o + bits as usize > 32 {
+            out[w + 1] |= (x >> (32 - o)) as u32;
+        }
+    }
+    out
+}
+
+/// `pack_bits`' inverse: `n` values.
+pub fn unpack_bits(w: &[u32], n: usize, bits: u32) -> Vec<u32> {
+    if bits >= 32 {
+        return w[..n].to_vec();
+    }
+    (0..n)
+        .map(|i| {
+            let bit = i * bits as usize;
+            let (k, o) = (bit / 32, bit % 32);
+            let mut x = (w[k] as u64) >> o;
+            if o + bits as usize > 32 {
+                x |= (w[k + 1] as u64) << (32 - o);
+            }
+            (x & ((1u64 << bits) - 1)) as u32
+        })
+        .collect()
+}
+
 fn inv_mod(a: u64, p: u64) -> u64 {
     let (mut r, mut b, mut e) = (1u128, a as u128 % p as u128, p - 2);
     while e > 0 {
@@ -350,8 +401,9 @@ pub struct CtWire {
 
 impl CtWire {
     pub fn words(h: &CtHeader) -> usize {
-        if h.bits.is_some() {
-            h.k * 2 * h.n
+        if let Some(b0) = h.bits {
+            let b1 = h.bits1.unwrap_or(b0);
+            h.k * (packed_words(h.n, b0) + packed_words(h.n, b1))
         } else if h.seeded {
             h.k * h.rows * (h.n + 8)
         } else {
@@ -447,7 +499,7 @@ mod tests {
 
     #[test]
     fn ct_frame_roundtrip_and_corruption() {
-        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false };
+        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, bits1: None, sparse: false };
         let w = CtWire { data: (0..CtWire::words(&h) as u32).collect(), header: h };
         let mut b = w.to_bytes().unwrap();
         assert_eq!(CtWire::from_bytes(&b).unwrap(), w);

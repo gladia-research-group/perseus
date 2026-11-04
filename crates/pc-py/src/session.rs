@@ -80,6 +80,8 @@ pub struct PyKeySource {
     pub seed: Option<u64>,
     /// a client's secret (`ClientSecret.to_bytes()`): the device generates its keys from it (tests)
     pub secret: Option<Vec<u8>>,
+    /// the encapsulation keys without a bootstrap route: `export_ct(..., sparse=True)` switches to the sparse secret
+    pub sparse_out: bool,
 }
 
 #[pymethods]
@@ -91,12 +93,14 @@ impl PyKeySource {
     /// secret and keys (tests); None = OS entropy. `secret`: a client's secret (`ClientSecret.to_bytes()`) to
     /// generate from instead of a fresh one (tests comparing device keys with a client's).
     #[staticmethod]
-    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None))]
-    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>) -> PyResult<Self> {
+    /// `sparse_out`: the dense -> sparse encapsulation keys even without a bootstrap route (`export_ct(..., sparse=True)`).
+    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None, sparse_out=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>, sparse_out: bool) -> PyResult<Self> {
         if layout != "dense" && layout != "packed" {
             return Err(PyValueError::new_err(format!("KeySource.layout = {layout:?}: dense | packed")));
         }
-        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, seed, secret })
+        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, seed, secret, sparse_out })
     }
     #[getter]
     fn rot_steps(&self) -> Vec<i64> {
@@ -325,6 +329,8 @@ pub(crate) struct Groups {
     pub exact: BTreeMap<Vec<i64>, KeyGroup<'static>>,
     pub relin: KeyGroup<'static>,
     pub conj: Option<KeyGroup<'static>>,
+    /// The dense -> sparse encapsulation key (`KeySource(sparse_out=True)`).
+    pub d2s: Option<KeyGroup<'static>>,
     pub half: i64,
 }
 
@@ -818,7 +824,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
     let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { ks.band } }).collect();
     let steps: BTreeSet<i64> = steps.union(&full).copied().collect();
     // the StC-first route's raise needs the encapsulation keys too (a dense-only plan has no other route that does)
-    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
+    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: ks.sparse_out || !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
     let mut shapes: Vec<_> = spec.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     shapes.extend(extra.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s));
     if spru_cfg.is_some() {
@@ -1098,7 +1104,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("bts.levelks", 512 << 20);
     }
     let nrot = steps.len() + ks.conj as usize;
-    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + 2 * KeyGroup::bytes(1, true);
+    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + (2 + ks.sparse_out as usize) * KeyGroup::bytes(1, true);
     mp.reserve("ks.groups", gb);
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     // planned blocks push every per-call constant through the ring (scalar rows, raise adjusts) and a captured
@@ -1282,7 +1288,11 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             Some(c) => Some(KeyGroup::new(a, &ex.compute, n, &[c as &dyn KsKeyRef], stage).map_err(e)?),
             None => None,
         };
-        Groups { all, steps: steps.clone(), exact, relin, conj, half }
+        let d2s = match (ks.sparse_out, keys.bts.as_ref()) {
+            (true, Some(b)) => Some(KeyGroup::new(a, &ex.compute, n, &[&b.enc_dense_to_sparse as &dyn KsKeyRef], stage).map_err(e)?),
+            _ => None,
+        };
+        Groups { all, steps: steps.clone(), exact, relin, conj, d2s, half }
     };
     let mut ops = Ops::new(a, &device, &ex.compute, &ctx, ocfg).map_err(e)?;
     ops.rr = Some(pc_gpu::relin::RelinRescaler::new(a, &ex.compute, &ctx, k_max).map_err(e)?);

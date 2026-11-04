@@ -25,7 +25,7 @@ def setup():
     cfg.set("bts.auto_bts_level", 52)
     secret = _pc.ClientSecret.generate(seed=5)
     client = _pc.Client(secret, seed=6, complex=True)
-    ks = _pc.KeySource.generate([1], conj=False, seed=7, secret=secret.to_bytes())
+    ks = _pc.KeySource.generate([1], conj=False, seed=7, secret=secret.to_bytes(), sparse_out=True)
     s = _pc.Session(cfg, ks, size={"lowPool": NLOW, "lowRows": ROWS}, pool=64, pt_slots=8).complete_setup()
     yield s, client
     s.close()
@@ -111,6 +111,22 @@ def test_seeded_frames(setup):
     b = _pc.import_ct(s, client.encrypt(v[1], LEVEL, seeded=True), low=True)
     p = s.fhe.mult_sum([b], [a])
     assert np.abs(client.decrypt(_pc.export_ct(s, p))[0] - v[0] * v[1]).max() < 1e-6
+
+
+def test_sparse_export(setup):
+    """export_ct_many(sparse=True): switched to the client's sparse secret, c0 / c1 at their own bits (bit-packed):
+    24/30 bits matches the dense 32-bit error in 0.84 of its bytes; 20/26 (0.72 of them) stays within 2e-3."""
+    s, client = setup
+    rng = np.random.default_rng(6)
+    xv, xf = frames(client, rng, 3)
+    yv, yf = frames(client, rng, 3)
+    p = s.fhe.mult_sum([_pc.import_ct(s, f) for f in xf], [_pc.import_ct(s, f) for f in yf])
+    ref = client.decrypt(_pc.export_ct(s, p))[0]
+    dense = _pc.export_ct_many(s, [p], 32)[0]
+    for b0, b1, tol, size in ((24, 30, 2e-4, 0.85), (20, 26, 2e-3, 0.73)):
+        fr = _pc.export_ct_many(s, [p], b0, bits1=b1, sparse=True)[0]
+        assert len(fr) < size * len(dense)
+        assert np.abs(client.decrypt(fr)[0] - ref).max() < tol, (b0, b1)
 
 
 def test_other_ops_refuse_low(setup):

@@ -401,9 +401,21 @@ pub fn key_switch_inplace<W: DevWord, M: DevStrategy<W>>(
     k: usize,
     top: usize,
 ) -> Result<()> {
-    let ctx = cx.ctx;
-    let ex = &mut *cx.ex;
-    let plans: &KsPlans<'_> = cx.ks;
+    key_switch_with(cx.ctx, cx.ex, cx.ks, group, source, x, k, top)
+}
+
+/// `key_switch_inplace` outside a bootstrap: the switch of `x` (k ciphertexts at `top`) to the key `group` holds.
+#[allow(clippy::too_many_arguments)]
+pub fn key_switch_with<W: DevWord, M: DevStrategy<W>>(
+    ctx: &crate::Context<'_, W, M>,
+    ex: &mut crate::Executor<'_, W>,
+    plans: &KsPlans<'_>,
+    group: &KeyGroup<'_>,
+    source: KskSource,
+    x: &mut crate::poly::CtBuf<'_, pc_cuda::Compute, W>,
+    k: usize,
+    top: usize,
+) -> Result<()> {
     let lay = ctx.lay;
     ks::modup(ctx, &ex.compute, plans, &mut ex.ks, &mut ex.bconv_work, x, 0, k, 1, top)?;
     let v = View::of(x, 0);
