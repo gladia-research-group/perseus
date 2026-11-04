@@ -242,6 +242,9 @@ fn contract_hash(config: &PyConfig) -> PyResult<String> {
 fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> PyResult<Bound<'py, PyBytes>> {
     let dev = session.dev.clone();
     let meta = ct.ct_ref().meta;
+    if meta.deg == 2 {
+        ct.check_full()?;                                   // the realize copy reads through the full layout
+    }
     let tmp = if meta.deg == 2 {
         let mut t = PyCt::acquire(&dev, meta)?;
         let mut st = dev.st.borrow_mut();
@@ -273,9 +276,11 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
 }
 
-/// A session ciphertext from a wire frame (one ciphertext, this session's chain).
+/// A session ciphertext from a wire frame (one ciphertext, this session's chain). `low`: into a low slot (the
+/// session's `size={"lowPool", "lowRows"}`), an input of `mult_sum` and `export_ct` only.
 #[pyfunction]
-fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8]) -> PyResult<PyCt> {
+#[pyo3(signature = (session, frame, low=false))]
+fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool) -> PyResult<PyCt> {
     let dev = session.dev.clone();
     let w = CtWire::from_bytes(frame).map_err(cerr)?;
     let h = &w.header;
@@ -289,7 +294,7 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8]) -> PyResult<PyCt
     }
     let tag = if h.meta.tag.is_null() { Default::default() } else { serde_json::from_value(h.meta.tag.clone()).map_err(|e| PyValueError::new_err(format!("import_ct: tag {e}")))? };
     let meta = CtMeta { level: h.meta.level, deg: h.meta.deg, nf: h.meta.nf, slots: h.meta.slots, tag };
-    let mut out = PyCt::acquire(&dev, meta)?;
+    let mut out = if low { PyCt::acquire_low(&dev, meta, top)? } else { PyCt::acquire(&dev, meta)? };
     let rows: Vec<usize> = (0..h.rows).collect();
     let n = h.n;
     {

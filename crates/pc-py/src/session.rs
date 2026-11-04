@@ -120,6 +120,10 @@ pub(crate) struct Sizes {
     pub pool: usize,
     pub pt_slots: usize,
     pub encode_threads: usize,
+    /// Low slots (`size={"lowPool": count, "lowRows": rows}`): ciphertexts of top limb < rows imported with
+    /// `import_ct(..., low=True)`, each slot only `rows` Q rows long.
+    pub low_pool: usize,
+    pub low_rows: usize,
 }
 
 /// The model geometry the impl layer reads as `inf.size` (`Dims.from_inf`).
@@ -983,6 +987,9 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let mcfg = MemCfg { k_max, pool: vec![PoolClass { k: 1, count: sizes.pool }], events: 64, scratch_cts: 2 };
     let mut mplan = MemPlan::build::<W, M>(&chain, mcfg).map_err(e)?;
     let lay = mplan.lay;
+    if sizes.low_pool > 0 {
+        mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows));
+    }
     let nd = key_needs(cfg, ks, &chain, &plan, &pcmm, &ccmm)?;
     let spec_req = match origin {
         Origin::Generate => None,
@@ -1104,7 +1111,10 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let mut ex = Executor::<W>::new(&device, a, &mplan).map_err(e)?;
     ex.ks.carve_regen(a, &lay).map_err(e)?;
     let ctx = Context::<W, M>::new(a, &ex.copy, chain.clone(), &mplan).map_err(e)?;
-    let pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
+    let mut pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
+    if sizes.low_pool > 0 {
+        pool.add_low(a, &lay, sizes.low_pool, sizes.low_rows).map_err(e)?;
+    }
     let plans = KsPlans::new(a, &ex.compute, &ctx, k_max).map_err(e)?;
     let mut keys = KeySet::carve(a, &chain, &spec, layout).map_err(e)?;
     let mut prng = match ks.seed {
@@ -1401,7 +1411,7 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         exp_real: g("expanded", 3072),
         seq_len: g("seqLen", 1024),
     };
-    let sizes = Sizes { pool, pt_slots, encode_threads };
+    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0) };
     let cfg = config.0.clone();
     let ks = keys.clone();
     let plan = match programs {
@@ -1535,6 +1545,7 @@ impl PySession {
     /// CCMM service: `nf_ref` / `nf_split` from `token` (a fresh encryption at the bootstrap output level:
     /// ccmm.py `prepare`). Returns (nf_ref, nf_split).
     fn ccmm_prepare(&self, py: Python<'_>, token: PyRef<'_, crate::fhe::PyCt>) -> PyResult<(f64, f64)> {
+        token.check_full()?;
         let d = &*self.dev;
         let mut st = d.st.borrow_mut();
         let State { planned, ex, ops, plans, .. } = &mut *st;
@@ -1567,6 +1578,9 @@ impl PySession {
         use pc_core::ccmm_keys::NBIG;
         if a.len() != NBIG || b.len() != NBIG {
             return Err(PyValueError::new_err(format!("ccmm_probe: {} / {} operands, a matrix is {NBIG}", a.len(), b.len())));
+        }
+        for x in a.iter().chain(b.iter()) {
+            x.check_full()?;
         }
         let d = &self.dev;
         let n_out = {
@@ -1802,6 +1816,7 @@ impl PySession {
     /// Write `ct` into pinned KV unit `u` (setup: a cache state the programs read, e.g. the BOS prefix): device page,
     /// then the copy-out (asynchronous on the lanes).
     fn kv_put(&self, u: usize, ct: PyRef<'_, crate::fhe::PyCt>) -> PyResult<()> {
+        ct.check_full()?;
         use pc_program::kv::KvStore;
         let mut st = self.dev.st.borrow_mut();
         let State { planned, ex, .. } = &mut *st;
