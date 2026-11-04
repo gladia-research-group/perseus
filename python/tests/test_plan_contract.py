@@ -14,6 +14,7 @@ from perseus.plan.placer import emit
 
 BP = ASSETS / "bootstrap_placements"
 GRAPH = ASSETS / "graphs" / "gpt2_decode"
+LEGACY = ASSETS / "graphs" / "gpt2_decode_baselines"     # stamped before the typed Config: capture_env.json only
 
 
 def _shipped_stamps():
@@ -60,20 +61,20 @@ def test_mismatch_names_the_knob():
 
 def test_capture_stamp_is_the_load_bearing_config():
     # the block's own capture_env.json first, then the graph dir's (the planner's order)
-    st = contract.capture_stamp(GRAPH / "block_1")
-    legacy = json.loads((GRAPH / "block_1" / "capture_env.json").read_text())
+    st = contract.capture_stamp(LEGACY / "block_1")
+    legacy = json.loads((LEGACY / "block_1" / "capture_env.json").read_text())
     assert st == json.loads(_pc.Config.from_legacy_env(legacy["env"]).load_bearing().to_json())
     assert contract.config_of(st) == contract.config_of(legacy).load_bearing()
 
 
 def test_emit_and_stamp_file_write_the_config_key(tmp_path):
     doc = {"placements": [], "capture_env": {"env": {"LN_CHEB": "1"}}}
-    st = contract.capture_stamp(GRAPH)          # the graph dir's capture_env.json (what make_plan.sh stamps)
+    st = contract.capture_stamp(LEGACY)         # the graph dir's capture_env.json (what make_plan.sh stamps)
     emit.stamp(doc, st)
     assert "capture_env" not in doc and doc["config"] == st
     p = tmp_path / "block_0_placement.json"
-    p.write_text(json.dumps({"placements": [], "capture_env": json.loads((GRAPH / "capture_env.json").read_text())}))
-    contract.stamp_file(p, json.loads((GRAPH / "capture_env.json").read_text()))
+    p.write_text(json.dumps({"placements": [], "capture_env": json.loads((LEGACY / "capture_env.json").read_text())}))
+    contract.stamp_file(p, json.loads((LEGACY / "capture_env.json").read_text()))
     d = json.loads(p.read_text())
     assert "capture_env" not in d and d["config"] == st
     assert contract.read_stamp(p) == st

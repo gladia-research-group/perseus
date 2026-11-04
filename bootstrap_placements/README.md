@@ -16,7 +16,7 @@ default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one s
 
 | directory | model and task |
 |---|---|
-| `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys; block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back) |
+| `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys (the server, generation and the 16-token decode); block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back). The windows' runtime= line and recipe, on their config without the softmax's key lanes (`gpt2_base_n32_ctx512s_nokl`: one plan binds 0..31, past the lanes' 16 keys), recorded at position 0 and merged over positions 0, 8, 16 and 31 (`scripts/utils/merge_window_mags.py`; the window holds its first position, as each window's does) |
 | `gpt2_decode_ctx512_w16`, `_w128` ... `_w512` | GPT-2, decode with the encrypted argmax past 32 cached keys up to a 512-token context: a plan for the first 16 positions, then one per 128-position window (below) |
 | `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context, the default past 512 (below) |
 | `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `python/perseus/examples/gpt2/make_plan.sh` (`blocks` stage) on the min-cut placer |

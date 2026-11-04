@@ -70,7 +70,7 @@ def test_plan_runtime_matches_the_env_dicts():
         for k, v in want.items():
             assert got.get(k) == v or (got.get(k) is None and v == env.RUNTIME_LEGACY.get(k)), (plan, k)
     assert config.plan_configs("bootstrap_placements/gpt2_decode") == \
-        "configs/model/approximation/gpt2_base_n32_cm/configs.json"
+        "configs/model/approximation/gpt2_base_n32_ctx512s_nokl/configs.json"
 
 
 def test_capture_env_stamps_bridge():
