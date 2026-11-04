@@ -56,7 +56,8 @@ def _run(cfg, kc, seed=5, general=False, cleanse=False):
                                                 (40, True, True), (200, True, True)])
 def test_gs_num_matches_product(monkeypatch, layer, kc, general, cleanse):
     monkeypatch.setenv("SM_CHEB_GS", "1")
-    base = config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"]
+    # the shipped entry with the gs_num switches off (the shipped GPT-2 decode config turns them on)
+    base = dataclasses.replace(config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"], gs_num=0, gs_num_refresh=0, gs_num_first=0)
     p0, v0, n0 = _run(base, kc, general=general, cleanse=cleanse)
     p1, v1, n1 = _run(dataclasses.replace(base, gs_num=1), kc, general=general, cleanse=cleanse)
     assert n1 < n0, (n0, n1)          # gs_num took effect: a product per reciprocal round folded into the recursion

@@ -59,7 +59,8 @@ def _run(cfg, kc, seed=5, general=False, cleanse=False):
 @pytest.mark.parametrize("kc,general,cleanse", [(5, False, False), (40, True, True), (200, True, True)])
 def test_refresh_keeps_values_and_counts_rounds(monkeypatch, layer, kc, general, cleanse):
     monkeypatch.setenv("SM_CHEB_GS", "1")
-    base = config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"]
+    # the shipped entry with the gs_num switches off (the shipped GPT-2 decode config turns them on)
+    base = dataclasses.replace(config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"], gs_num=0, gs_num_refresh=0, gs_num_first=0)
     num = dataclasses.replace(base, gs_num=1)
     p0, v0, n0, _ = _run(num, kc, general=general, cleanse=cleanse)
     p1, v1, n1, rounds = _run(dataclasses.replace(num, gs_num_refresh=1), kc, general=general, cleanse=cleanse)
@@ -87,5 +88,5 @@ def test_round_square_found_behind_the_refresh():
 def test_config_field_parses():
     j = {"gs_num": 1, "gs_num_refresh": 1}
     base = config.load_configs(str(CFG)).softmax["transformer.h.4.attn"]
-    assert base.gs_num_refresh == 0
+    assert base.gs_num_refresh == 1      # the shipped GPT-2 decode config sets it
     assert dataclasses.replace(base, **j).gs_num_refresh == 1

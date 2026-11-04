@@ -61,7 +61,8 @@ def _merged_probs(cfg, kc, G, seed=3):
 @pytest.mark.parametrize("kc,G", [(3, 2), (16, 2), (9, 4)])
 def test_gs_num_on_the_merged_gqa_softmax(monkeypatch, layer, kc, G):
     monkeypatch.setenv("SM_CHEB_GS", "1")
-    base = config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"]
+    # the shipped entry with the gs_num switches off (the shipped GPT-2 decode config turns them on)
+    base = dataclasses.replace(config.load_configs(str(CFG)).softmax[f"transformer.h.{layer}.attn"], gs_num=0, gs_num_refresh=0, gs_num_first=0)
     p0, n0 = _merged_probs(base, kc, G)
     p1, n1 = _merged_probs(dataclasses.replace(base, gs_num=1), kc, G)
     np.testing.assert_allclose(p1.vec, p0.vec, rtol=1e-9, atol=1e-12 * np.abs(p0.vec).max())

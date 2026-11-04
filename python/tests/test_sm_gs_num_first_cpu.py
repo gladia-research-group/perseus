@@ -46,5 +46,5 @@ def test_first_past_the_rounds_is_the_product(monkeypatch):
 
 
 def test_config_key_parses():
-    assert _cfg(4).gs_num_first == 0
+    assert _cfg(4).gs_num_first == 1      # the shipped GPT-2 decode config sets it
     assert _cfg(4, gs_num_first=1).gs_num_first == 1
