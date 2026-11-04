@@ -46,6 +46,8 @@ pub struct Client {
     secret: ClientSecret,
     /// `s` in eval form at every prime id (Q then P).
     s_eval: Vec<Vec<u32>>,
+    /// The sparse secret's eval rows (frames the server switched to it: `CtHeader::sparse`).
+    s_sparse_eval: Vec<Vec<u32>>,
     gauss: DiscreteGaussian,
     /// The SPRU block key of the last keygen that asked for one (relation checks).
     spru_block: Option<Vec<i8>>,
@@ -69,6 +71,7 @@ impl Client {
         }
         let ring = Ring::new(&chain)?;
         let s_eval = ring.eval_all(&secret.sk.s.iter().map(|&x| x as i64).collect::<Vec<_>>());
+        let s_sparse_eval = ring.eval_all(&secret.sk.s_sparse.iter().map(|&x| x as i64).collect::<Vec<_>>());
         Ok(Client {
             name: name.to_string(),
             params_hash: params_hash(&chain),
@@ -78,6 +81,7 @@ impl Client {
             chain,
             secret,
             s_eval,
+            s_sparse_eval,
             gauss: DiscreteGaussian::new(DiscreteGaussian::SIGMA)?,
             spru_block: None,
         })
@@ -362,7 +366,7 @@ impl Client {
             }
             data = out;
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, bits1: None, sparse: false }, data })
     }
 
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
@@ -398,9 +402,14 @@ impl Client {
         (0..h.k)
             .map(|c| {
                 // a compressed frame: back to eval-form residues of the decoded rows
-                let eval: Option<Vec<[Vec<u32>; 2]>> = h.bits.map(|bits| {
+                let eval: Option<Vec<[Vec<u32>; 2]>> = h.bits.map(|b0| {
                     let q = &self.ring.primes[..d];
-                    let parts: Vec<Vec<Vec<u64>>> = (0..2).map(|part| crate::wire::unpack_coeffs(q, &ct.data[(c * 2 + part) * n..(c * 2 + part + 1) * n], bits)).collect();
+                    let b1 = h.bits1.unwrap_or(b0);
+                    let (w0, w1) = (crate::wire::packed_words(n, b0), crate::wire::packed_words(n, b1));
+                    let base = c * (w0 + w1);
+                    let v0 = crate::wire::unpack_bits(&ct.data[base..base + w0], n, b0);
+                    let v1 = crate::wire::unpack_bits(&ct.data[base + w0..base + w0 + w1], n, b1);
+                    let parts: Vec<Vec<Vec<u64>>> = vec![crate::wire::unpack_coeffs(q, &v0, b0), crate::wire::unpack_coeffs(q, &v1, b1)];
                     (0..d)
                         .map(|r| {
                             let mut e = [parts[0][r].iter().map(|&x| x as u32).collect::<Vec<u32>>(), parts[1][r].iter().map(|&x| x as u32).collect::<Vec<u32>>()];
@@ -414,9 +423,10 @@ impl Client {
                     .into_par_iter()
                     .map(|r| {
                         let p = self.ring.primes[r];
+                        let sk = if h.sparse { &self.s_sparse_eval[r] } else { &self.s_eval[r] };
                         let (c0, c1, s) = match &eval {
-                            Some(e) => (&e[r][0][..], &e[r][1][..], &self.s_eval[r]),
-                            None => (ct.row(c, 0, r), ct.row(c, 1, r), &self.s_eval[r]),
+                            Some(e) => (&e[r][0][..], &e[r][1][..], sk),
+                            None => (ct.row(c, 0, r), ct.row(c, 1, r), sk),
                         };
                         let mut m: Vec<u32> = (0..n).map(|i| ((c0[i] as u64 + mm(c1[i], s[i], p)) % p) as u32).collect();
                         self.ring.ntt[r].inv(&mut m);
@@ -631,7 +641,7 @@ mod tests {
                     assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
                 }
                 Entry::SpruCs { k, rows, level, nf, .. } => {
-                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false }, data: v };
+                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false, bits1: None, sparse: false }, data: v };
                     let d = c.decrypt(&w, Payload::Real).unwrap();
                     let block = c.spru_block.as_ref().unwrap();
                     for (u, du) in d.iter().enumerate() {

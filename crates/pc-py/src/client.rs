@@ -302,7 +302,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let w = CtWire {
-            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false },
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, bits1: None, sparse: false },
             data,
         };
         return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
@@ -319,16 +319,19 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, bits1: None, sparse: false },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
 }
 
 /// `export_ct(..., bits=b)` of several ciphertexts: the coefficient exports run back to back on the device, the
-/// compression and framing in parallel on the host.
+/// compression and framing in parallel on the host. `bits1`: c1's bits (default `bits`; below 32 bit-packed).
+/// `sparse`: each ciphertext first switched to the client's sparse secret (`KeySource(sparse_out=True)`, bottom level):
+/// c1's rounding then meets a 32-coefficient secret, so both parts compress further.
 #[pyfunction]
-fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32) -> PyResult<Bound<'py, PyList>> {
+#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false))]
+fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool) -> PyResult<Bound<'py, PyList>> {
     use rayon::prelude::*;
     let dev = session.dev.clone();
     let n = dev.ctx.lay.n;
@@ -338,11 +341,24 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
         if meta.deg == 2 || ct.ct_ref().buf.lay.nq != dev.ctx.lay.nq {
             ct.check_full()?;
         }
-        let tmp = if meta.deg == 2 {
+        let tmp = if meta.deg == 2 || sparse {
             let mut t = PyCt::acquire(&dev, meta)?;
             let mut st = dev.st.borrow_mut();
-            let State { ops, ex, .. } = &mut *st;
-            ops.realize_to(&dev.ctx, ex, &dev.sh, t.ct_mut_ref()?, ct.ct_ref()).map_err(gerr)?;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            if meta.deg == 2 {
+                ops.realize_to(&dev.ctx, ex, &dev.sh, t.ct_mut_ref()?, ct.ct_ref()).map_err(gerr)?;
+            } else {
+                pc_program::replay::copy_ct(&dev.ctx, &ex.compute, t.ct_mut_ref()?, ct.ct_ref()).map_err(|x| PyRuntimeError::new_err(x.to_string()))?;
+            }
+            if sparse {
+                let g = groups.d2s.as_ref().ok_or_else(|| PyValueError::new_err("export_ct_many(sparse=True) needs KeySource(sparse_out=True)"))?;
+                let tc = t.ct_mut_ref()?;
+                let top = tc.top(dev.ctx.shape).map_err(gerr)?;
+                if top + 1 != dev.ctx.chain.level_unit {
+                    return Err(PyValueError::new_err(format!("sparse export: the ciphertext must sit at the bottom level ({} rows, top {top})", dev.ctx.chain.level_unit)));
+                }
+                pc_gpu::bts::raise::key_switch_with(&dev.ctx, ex, plans, g, dev.source, &mut tc.buf, 1, top).map_err(gerr)?;
+            }
             Some(t)
         } else {
             None
@@ -359,13 +375,13 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
             .par_iter()
             .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
                 let mut data = Vec::with_capacity(2 * n);
-                for part in 0..2 {
+                for (part, b) in [(0, bits), (1, bits1.unwrap_or(bits))] {
                     let rs: Vec<Vec<u64>> = l.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
                     let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
-                    data.extend(pc_client::wire::pack_coeffs(&l.moduli, &refs, bits)?);
+                    data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&l.moduli, &refs, b)?, b));
                 }
                 let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false };
+                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false, bits1, sparse };
                 CtWire { header, data }.to_bytes()
             })
             .collect::<pc_client::Result<Vec<_>>>()
