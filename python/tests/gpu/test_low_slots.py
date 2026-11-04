@@ -91,6 +91,8 @@ def test_compressed_export(setup):
     # the rounding of c1 is multiplied by the secret: ~2^-13 of the slots' scale at 32 bits
     assert np.abs(a - b).max() < 1e-3
     assert np.abs(b - (xv * yv).sum(0)).max() < 1e-3
+    q = s.fhe.mult_sum([_pc.import_ct(s, f) for f in xf[:2]], [_pc.import_ct(s, f) for f in yf[:2]])
+    assert _pc.export_ct_many(s, [p, q], 32) == [_pc.export_ct(s, p, bits=32), _pc.export_ct(s, q, bits=32)]
     with pytest.raises(Exception):
         _pc.export_ct(s, _pc.import_ct(s, xf[0]), bits=32)        # 4 rows: the modulus is too wide for 32 bits
 
