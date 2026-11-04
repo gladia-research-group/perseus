@@ -6,8 +6,7 @@ capture, block_<b>/graph.json) whose nodes take, by ciphertext name and op type,
   * every capture given (--win and --all), for any other node (values that follow the token: LayerNorm / linear /
     activation inputs, the more tokens sampled the safer).
 A node no capture has (a scope carrying the cache shape) keeps the recording's statistics; the code's own refreshes
-(deliberate_bootstrap), the cut's (auto_bootstrap) and the hints keep them too (the planner prices a code refresh
-from the value it refreshes under PLAN_DELIB_PRICE_INPUT=1).
+(deliberate_bootstrap), the cut's (auto_bootstrap) and the hints keep them too.
 --lo: output_max_abs_lo / output_max_coeff_lo = the smallest over the same captures (the planner prices a refresh's
 precision there). --periods CAP...: pack_period_max = the largest slot period those captures recorded, where it
 exceeds the recording's (the softmax's period grows with the cache: PLAN_STEP_ROUTE_PRICING prices a refresh on the

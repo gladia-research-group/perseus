@@ -1,5 +1,8 @@
 #!/bin/bash
 # make_plan.sh — plan the bootstraps of a graph captured by the primitives port (CPU only).
+# To reproduce a shipped plan use scripts/make_plans.sh <plan> (or python/tests/test_paper_plans.py <plan>): it exports
+# the plan's PLAN_CMD.txt recipe= line, runs its stages and its rd= pass. Run bare, this script falls back to the
+# built-in recipe below, which no shipped plan uses as is.
 #   bash python/perseus/examples/gpt2/make_plan.sh graphs/gpt2_decode gpt2_decode
 #   bash python/perseus/examples/gpt2/make_plan.sh graphs/gpt2_decode gpt2_decode argmax
 #   bash python/perseus/examples/gpt2/make_plan.sh graphs/gpt2_decode gpt2_decode feedback

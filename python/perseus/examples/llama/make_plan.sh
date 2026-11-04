@@ -3,6 +3,9 @@
 # GPT-2 arm (bootstrap_placements/gpt2_decode: SparseB on the sparse route (256 slots: Llama's tH), SPRU on the 1-slot route,
 # the exact post-raise scaling, the real dense route, raise drops 1,3,5):
 #   bash python/perseus/examples/llama/make_plan.sh graphs/llama31_8b_decode llama31_8b_decode
+# To reproduce a shipped plan use scripts/make_plans.sh <plan> (or python/tests/test_paper_plans.py <plan>): it exports
+# the plan's PLAN_CMD.txt recipe= line, runs its stages and its rd= pass. Run bare, this script falls back to the
+# built-in recipe below, which no shipped plan uses as is.
 # RUNTIME_EXTRA="KEY=VALUE ..." appends switches the capture ran with to the plan's runtime= line (the run
 # applies them), e.g. LLAMA_LINEAR_BOTTOM=1.
 # The blocks are 0..n_layers-1 plus the tail (final RMSNorm + LM head); the planner's driver is the GPT-2 port's

@@ -17,8 +17,8 @@
 #       --win <the window's captures> --all <the same> --lo --periods <the same>
 #   window positions: w16 1, 8, 15; w128 16, 64, 127; w256 128, 192, 255; w384 256, 320, 383; w512 384, 448, 511
 #   (w0.npy: OpenWebText window 0, 512 tokens; the shipped captures past w16 ran the config without the
-#   softmax's key_lanes / pair_heads, which act only while one group fits the key window). Then the plan's recipe=
-#   line (python/perseus/examples/llama/make_plan.sh) and its rd= line (scripts/utils/rd_pass.sh).
+#   softmax's key_lanes / pair_heads, which act only while one group fits the key window). Then
+#   bash scripts/make_plans.sh llama31_8b_decode_ctx512_w<B> (its recipe= line, stages and rd= pass).
 # llama31_8b_decode, llama31_8b_prefill128: the commands in the header of python/perseus/examples/llama/make_plan.sh.
 llama31_8b_decode              153 MB  the Llama decode plan's recording (position 1 on llama31_8b_n32_ctx512)
 llama31_8b_decode_ctx512_w16   265 MB  the Llama decode window plan's recording, positions 1-15
