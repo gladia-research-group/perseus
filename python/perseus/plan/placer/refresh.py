@@ -140,12 +140,21 @@ class RefreshPlanner:
             self._cache[("shipped", v)] = got
         return got
 
-    def _build(self, v: str, force_shipped: bool = False) -> RefreshSpec:
+    def spec_dense(self, v: str) -> RefreshSpec:
+        """`spec` priced on the dense route only (no sparse candidate): a code's own refresh of a cache-following step,
+        which the long positions run dense StC-first (planner.cache_route_deliberates)."""
+        got = self._cache.get(("dense", v))
+        if got is None:
+            got = self._build(v, force_dense=True)
+            self._cache[("dense", v)] = got
+        return got
+
+    def _build(self, v: str, force_shipped: bool = False, force_dense: bool = False) -> RefreshSpec:
         p = self.graph.producer_of.get(v)
         if p is None and not is_kv_cache_read(v):
             return RefreshSpec(v, False, True, float("inf"),
                                reason="fresh graph input — never refreshable")
-        route = self.route_for(v)
+        route = None if force_dense else self.route_for(v)
         pol = self.policy
         kappa = mag_safety_of(p.step if p is not None else None, pol.mag_safety)
         if kappa != pol.mag_safety:

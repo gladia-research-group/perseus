@@ -707,6 +707,20 @@ def _search_raise_drops(g: Graph, sim: SimResult, placer, refresh, cfg: PlanConf
     return drops, dict(skipped), placer._sim()
 
 
+def priced_deliberates(g: Graph, step_landing: str) -> tuple[str, ...]:
+    """The code's own refreshes the planner gives a correction factor: those of a cache-following step (plan.step_landing)
+    planned on the dense StC-first route (cache_route_deliberates). A deliberate refresh otherwise runs at its route's
+    default CF, which the StC-first route sizes for the K/V push's slots (FIDESLIB_BTS_STC_FIRST_CF); priced like a
+    placed dense site instead (refresh.spec_dense), on its captured magnitudes. External finishes and K/V pushes keep the
+    default."""
+    from .refresh import _step_landing_floor
+    if not step_landing:
+        return ()
+    return tuple(n.output for n in g.nodes
+                 if n.is_deliberate_bts and n.output and n.stc_first and not n.external
+                 and _step_landing_floor(step_landing, n.step) is not None)
+
+
 def cache_route_deliberates(g: Graph, step_landing: str, raw: tuple[float, int]) -> tuple[Graph, int]:
     """A code's own (deliberate) refresh in a cache-following step (plan.step_landing, PLAN_STEP_LANDING: SM_PERIODIC=2,
     a per-key value's period grows with the cache) is planned on the dense StC-first route: its landing `raw` (the
@@ -933,6 +947,9 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         real_route=cfg.real_route,
         raise_drop_base=dict(cfg.raise_drop_base),
     )
+    # the code's own refreshes of cache-following steps take a priced CF (emit: `deliberate_priced`); the compile keeps
+    # a plan CF on a deliberate site, which otherwise runs at its route's default
+    refresh.deliberate_priced = priced_deliberates(g, shadow.plan.get("plan.step_landing") or "")
 
     # compile the step substrings into per-var hint_force=False pins, so the pin
     # plumbing (Placer, the rescale_opt trial placers, emit) carries the veto and

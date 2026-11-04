@@ -91,7 +91,9 @@ impl<'a> Lower<'a> {
         if let Some(cap) = captured {
             // a deliberate refresh: the route whose landing the capture recorded (the code's scope chose it)
             route = match self.env.route_for_landing(self.sh, &in_meta, cap) {
-                Some(r) => r,
+                // the plan's CF for the site when it priced one (a code refresh of a cache-following step:
+                // planner.priced_deliberates), else the route's default
+                Some(r) => pc_shadow::route::Route { cf: p.correction_factor.get(site_var).copied().or(r.cf), ..r },
                 // a dense refresh captured on StC-first whose input now sits past the entry: the shipped order, at
                 // that order's default CF (the StC-first route's own default is tuned for slot values), landing at
                 // the fallback the planner prices
