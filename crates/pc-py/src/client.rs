@@ -162,6 +162,35 @@ impl PyClient {
         Ok(out)
     }
 
+    /// `encrypt` of several slot vectors in parallel (one rayon task each, each on its own stream seeded from this
+    /// client's): their frames, in order. `seeded` as `encrypt`'s.
+    #[pyo3(signature = (values, level, seeded=false))]
+    fn encrypt_many<'py>(&mut self, py: Python<'py>, values: Vec<Bound<'_, PyAny>>, level: u32, seeded: bool) -> PyResult<Bound<'py, PyList>> {
+        use rayon::prelude::*;
+        let vs = values.iter().map(|v| values_of(py, v)).collect::<PyResult<Vec<_>>>()?;
+        let meta = self.c.fresh_meta(level, 1).map_err(cerr)?;
+        if let Some(v) = vs.iter().find(|v| v.len() > meta.slots as usize) {
+            return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
+        }
+        let keys: Vec<[u32; 8]> = (0..vs.len()).map(|_| self.prng.ksk_seed().0).collect();
+        let (c, p) = (&self.c, self.payload);
+        let frames = nogil(py, || {
+            vs.par_iter()
+                .zip(&keys)
+                .map(|(v, &k)| {
+                    let mut g = pc_core::keys::Prng::from_seed(k, 0);
+                    c.encrypt_as(std::slice::from_ref(v), &meta, p, &mut g, seeded).and_then(|w| w.to_bytes())
+                })
+                .collect::<pc_client::Result<Vec<_>>>()
+        })
+        .map_err(cerr)?;
+        let out = PyList::empty(py);
+        for f in frames {
+            out.append(PyBytes::new(py, &f))?;
+        }
+        Ok(out)
+    }
+
     /// `decrypt` of several frames in parallel (one rayon task per frame): their decoded slots, frame by frame.
     fn decrypt_many<'py>(&self, py: Python<'py>, frames: Vec<Vec<u8>>) -> PyResult<Bound<'py, PyList>> {
         use rayon::prelude::*;
