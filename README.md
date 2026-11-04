@@ -159,8 +159,8 @@ GPU.
     of HuggingFace weights, the model download.
   - `client/`, `serve/` the client that holds the secret key and the server that runs on its key bundle.
   - `configs/model/approximation/` the fitted approximations of every model.
-- `graphs/` the recorded forward passes the plans are computed from (the Llama ones ship as a
-  release artifact, `graphs/RELEASE.txt`).
+- `graphs/` the recorded forward passes the plans are computed from (the Llama ones are not in the
+  repository: `graphs/LLAMA.txt` lists them and how to record them).
 - `bootstrap_placements/` one directory per plan, each with the recipe that regenerates it and
   the runtime switches it was made for (`PLAN_CMD.txt`).
 - `scripts/repro/` one script per result; `scripts/make_plans.sh` replays every plan's recipe;

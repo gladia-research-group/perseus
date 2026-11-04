@@ -1,0 +1,29 @@
+# The Llama recordings the Llama plans are computed from: not in the repository (several GB), recorded with the
+# commands below (CPU only, on the numpy twin; the weights from HuggingFace). Only re-planning reads them
+# (scripts/make_plans.sh, python/tests/test_paper_plans.py); the plans they made are in bootstrap_placements/ (same
+# names). RT = the plan's runtime= line as --set switches, CFG = its configs= line:
+#   PLAN=bootstrap_placements/<name>; CFG=python/perseus/$(sed -n 's/^configs=//p' $PLAN/PLAN_CMD.txt)
+#   RT="--set CORRECTION_FACTOR=6 $(sed -n 's/^runtime=//p' $PLAN/PLAN_CMD.txt | sed 's/\([^ ]*\)/--set \1/g')"
+#
+# llama31_8b_decode_ctx512_w<B> (the 512-context decode windows): the structure recording at position 1, captures at
+# the window's positions, merged on the window (scripts/utils/merge_window_mags.py):
+#   python -c "import numpy as np; from perseus.examples.llama import hf; np.save('w0.npy', hf.text_windows(1, 512)[0])"
+#   python -m perseus.examples.llama.run_decode --fake --tokens 1 --window w0.npy --window-tokens 512 \
+#       --capture graphs/_p1 --structure-only --configs $CFG $RT
+#   python -m perseus.examples.llama.capture_mags graphs/_p1 --window w0.npy --configs $CFG $RT
+#   FHE_GRAPH_CAPTURE_TOKEN=<P> python -m perseus.examples.llama.run_decode --fake --tokens <P> --plain-prefix <P> \
+#       --window w0.npy --window-tokens 512 --capture graphs/_p<P> --configs $CFG $RT
+#   python scripts/utils/merge_window_mags.py graphs/_p1 graphs/llama31_8b_decode_ctx512_w<B> \
+#       --win <the window's captures> --all <the same> --lo --periods <the same>
+#   window positions: w16 1, 8, 15; w128 16, 64, 127; w256 128, 192, 255; w384 256, 320, 383; w512 384, 448, 511
+#   (w0.npy: OpenWebText window 0, 512 tokens; the shipped captures past w16 ran the config without the
+#   softmax's key_lanes / pair_heads, which act only while one group fits the key window). Then the plan's recipe=
+#   line (python/perseus/examples/llama/make_plan.sh) and its rd= line (scripts/utils/rd_pass.sh).
+# llama31_8b_decode, llama31_8b_prefill128: the commands in the header of python/perseus/examples/llama/make_plan.sh.
+llama31_8b_decode              153 MB  the Llama decode plan's recording (position 1 on llama31_8b_n32_ctx512)
+llama31_8b_decode_ctx512_w16   265 MB  the Llama decode window plan's recording, positions 1-15
+llama31_8b_decode_ctx512_w128  265 MB  the same, positions 16-127
+llama31_8b_decode_ctx512_w256  265 MB  the same, positions 128-255
+llama31_8b_decode_ctx512_w384  265 MB  the same, positions 256-383
+llama31_8b_decode_ctx512_w512  265 MB  the same, positions 384-511
+llama31_8b_prefill128          186 MB  the 128-token Llama prefill plan's recording (fake capture under its runtime= line)

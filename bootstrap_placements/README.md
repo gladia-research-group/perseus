@@ -6,8 +6,8 @@ recipe that regenerates it: the recorded forward pass it was computed from (`gra
 `graphs/`, same name as the plan), the planner settings (`recipe=`), the runtime switches the plan
 was cut for (`runtime=`, applied by `--plan`) and the approximation configs (`configs=`).
 `python/tests/test_paper_plans.py` replans every directory below from those lines and checks that the
-result is identical to the committed files. The Llama recordings ship as a release artifact
-(`graphs/RELEASE.txt`).
+result is identical to the committed files. The Llama recordings are not in the repository (`graphs/LLAMA.txt` lists
+them and how to record them).
 
 ## Result plans
 
@@ -130,7 +130,7 @@ RTX PRO 6000): top-1 994/1024 against the plaintext model, the encrypted argmax 
 per token at 120-127 keys, 3.49 at 480-511, 3.63 at 992-1023; setup 34 min (recording 1,024 positions).
 
 `llama31_8b_decode` decodes up to a 512-token context on `llama31_8b_n32_ctx512` (the softmax fitted on every query
-position up to 512 keys), captured at position 1 the same way (its recording ships in the release artifact); its
+position up to 512 keys), captured at position 1 the same way (its recording is not in the repository, `graphs/LLAMA.txt`); its
 runtime adds only switches that move no level (the fused EvalMod conversion, SparseB K = 16, refresh pairs): the
 raise-drop search, checked on the position-1 recording, leaves sites without headroom once the softmax routes turn
 multi-stage. 511 positions of a 512-token window (`scripts/repro/llama_decode.sh --plan
