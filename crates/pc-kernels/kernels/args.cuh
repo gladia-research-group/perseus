@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 22u
+#define PC_KERNELS_ABI 23u
 #define PC_RING_ABI 8u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -316,6 +316,17 @@ struct TensorYArgs {
     int32_t sub, pad;
 };
 static_assert(sizeof(TensorYArgs) == 240, "TensorYArgs layout");
+// tensor_sum (ABI 23): (c0, c1, d2) (= | +=) sum_{j < npairs} (a_j0 b_j0, a_j0 b_j1 + a_j1 b_j0, a_j1 b_j1) over up to
+// PC_TSUM_MAX pairs passed by value (every operand with its own strides); acc as tensor's (acc & 2: d2 too). The
+// caller bounds npairs: 2 npairs (max p - 1)^2 < 2^(2 BITS) (the lazy sum of the c1 term).
+#define PC_TSUM_MAX 16
+struct TensorSumArgs {
+    PolyRef out, d2;
+    PolyRef a[PC_TSUM_MAX], b[PC_TSUM_MAX];
+    const PrimeConst* pr;
+    int32_t npairs, acc, n, K;
+};
+static_assert(sizeof(TensorSumArgs) == 2 * 24 + 2 * PC_TSUM_MAX * 24 + 8 + 16, "TensorSumArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
 struct MdEpiArgs {
@@ -935,8 +946,10 @@ struct KernelTable {
     // ABI 20: bconv for jobs of more than 16 sources (u32 words: up to 48), the same formula
     int (*bconv_wide)(const BconvArgs*, cudaStream_t);
     int (*tfhe)(const TfheArgs*, cudaStream_t);
+    // ABI 23: tensor over up to PC_TSUM_MAX pairs
+    int (*tensor_sum)(const TensorSumArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 45 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 46 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms
