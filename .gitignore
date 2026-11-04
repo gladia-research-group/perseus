@@ -56,5 +56,5 @@ bootstrap_placements/_*/
 !python/**/*.json
 !crates/**/*.json
 
-# Llama captures ship as a release artifact (graphs/RELEASE.txt), not in the repository
+# Llama recordings: not in the repository, recorded by the user (graphs/LLAMA.txt)
 graphs/llama31_8b_*
