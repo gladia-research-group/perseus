@@ -16,9 +16,6 @@ PLANS: dict[str, dict[int | None, str]] = {
     # StC-first dense refreshes, their inputs capped at its entry level (46)
     "vit": {None: "bootstrap_placements/vit_b16_224"},
     "llama_prefill": {128: "bootstrap_placements/llama31_8b_prefill128"},
-    # the decode plan cut for K / V handed over by the 128-token prefill, its softmax refreshes one CF lower (past
-    # 128 entries they run the 8192-slot route, where the priced CF sits above the band)
-    "llama_handoff_decode": {None: "bootstrap_placements/llama31_8b_handoff_decode"},
 }
 
 # model -> [(bound, plan dir)]: up to a 512-token context, a plan per position window (`--plan-windows`: a window's plan

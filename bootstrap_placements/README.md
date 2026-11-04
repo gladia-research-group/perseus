@@ -25,7 +25,6 @@ default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one s
 | `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context in one plan (below) |
 | `llama31_8b_decode_ctx512_w16`, `_w128` ... `_w512` | Llama-3.1-8B, decode up to a 512-token context: a plan for the first 16 positions, then one per 128-position window (below) |
 | `llama31_8b_prefill128` | Llama-3.1-8B, 128-token prefill: one planner run (python/perseus/examples/llama/make_plan.sh, `prefill` stage) on the fake recording made under its runtime= line |
-| `llama31_8b_handoff_decode` | Llama-3.1-8B, decode on the K / V handed over by `llama31_8b_prefill128` (`run_handoff`): cut for the hand-off's cache level (`KV_ENTRY_LEVEL=38`), on the refresh sites of the same recipe's plain decode plan (`PLAN_KEEP_PLACEMENTS`, see its `sites=` line), every softmax refresh one scaling step lower (`PLAN_SITE_CF=softmax:-1`) |
 
 ## Placement study (`python/`)
 

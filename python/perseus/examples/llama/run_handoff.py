@@ -2,8 +2,10 @@
 decoded positions, logits gated against the fp32 model.
 
     .venv/bin/python -m perseus.examples.llama.run_handoff --tokens 127 --decode 8 \
-        --prefill-plan bootstrap_placements/llama31_8b_prefill128 \
-        --decode-plan bootstrap_placements/llama31_8b_handoff_decode
+        --prefill-plan bootstrap_placements/llama31_8b_prefill128 --decode-plan <a decode plan cut for the hand-off>
+
+No hand-off decode plan ships: one is cut for the hand-off's cache level (python/perseus/examples/llama/make_plan.sh
+with KV_ENTRY_LEVEL and PLAN_KEEP_PLACEMENTS) on the prefill's chain. --handoff-only checks the hand-off itself.
 """
 from __future__ import annotations
 
@@ -188,8 +190,8 @@ def _planned(a, toks, gt, store, dims, over, cfgs_path, dcfgs_path, log=print):
     run.routes_for = routes_for
     run.dense_fallback = False
     # the handed K / V states sit deeper than the decode's own cache writes (34): the decode plan must be cut for the
-    # hand-off's level (make_plan.sh KV_ENTRY_LEVEL + PLAN_KEEP_PLACEMENTS: llama31_8b_handoff_decode for
-    # llama31_8b_prefill128); the class compile checks every pin strictly
+    # hand-off's level (make_plan.sh KV_ENTRY_LEVEL + PLAN_KEEP_PLACEMENTS); the class compile checks every pin
+    # strictly
     run.extra_pt_slots = 1024
     run.pool = 256                      # the hand-off's eager ciphertexts (one layer's at a time)
     run.cfg = decode_config(resolve(a.decode_plan))
@@ -304,7 +306,10 @@ def main(argv=None):
     if a.prefill_plan is None and a.decode_plan is None and not (a.fake or a.old_path):
         # BOS + tokens = the prefill's T
         a.prefill_plan = default_plan("llama_prefill", a.tokens + 1)
-        a.decode_plan = default_plan("llama_handoff_decode") if a.prefill_plan else None
+    if a.prefill_plan and a.decode_plan is None and not a.handoff_only:
+        print("no hand-off decode plan ships: pass --decode-plan (a plan cut for the hand-off's cache level), or "
+              "--handoff-only", file=sys.stderr)
+        return 2
     os.environ["KV_ARENA_GB"] = os.environ.get("LLAMA_KV_ARENA_GB", "72")
     busy = None if a.fake else gpu_busy(a.device)
     if busy and not a.force:

@@ -1024,7 +1024,7 @@ section! {
         #[doc = "Shipped plans: recipe= 2."]
         ilp_time_limit: Str = "PLAN_ILP_TIME_LIMIT", "(unset)";
         #[doc = "`PLAN_KEEP_PLACEMENTS`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell); examples/llama/make_plan.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= dsw48_ho36, dsw48_ho38."]
+        #[doc = "Shipped plans: none."]
         keep_placements: Str = "PLAN_KEEP_PLACEMENTS", "(unset)";
         #[doc = "`PLAN_KEEP_PLACEMENTS_EXACT`. Default '0'. Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
@@ -1036,7 +1036,7 @@ section! {
         #[doc = "Shipped plans: none."]
         kv_entry_deg: Int = "KV_ENTRY_DEG", "(unset) (2)";
         #[doc = "`KV_ENTRY_LEVEL`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell); examples/llama/make_plan.sh::(shell)."]
-        #[doc = "Shipped plans: recipe= dsw48_ho36, dsw48_ho38."]
+        #[doc = "Shipped plans: none."]
         kv_entry_level: Int = "KV_ENTRY_LEVEL", "(unset)";
         #[doc = "`PLAN_LATENCY_TABLE`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: none."]
@@ -1156,7 +1156,7 @@ section! {
         #[doc = "Shipped plans: none."]
         site_bts_out_file: Str = "PLAN_SITE_BTS_OUT_FILE", "(unset)";
         #[doc = "`PLAN_SITE_CF`. Default None. Read at plan/placer/emit.py::assemble -> `refresh.shadow.plan`."]
-        #[doc = "Shipped plans: recipe= llama31_8b_handoff_decode."]
+        #[doc = "Shipped plans: none."]
         site_cf: Str = "PLAN_SITE_CF", "None";
         #[doc = "`PLAN_SLIM_CUBIC`. Default (unset). Read at plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 5."]

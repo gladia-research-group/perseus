@@ -63,8 +63,6 @@ GATE: dict[str, tuple | None] = {
     **dict.fromkeys(LLAMA_WINDOWS),
     # one planner run on the fake recording: the llama make_plan.sh prefill stage (its recipe= line)
     "llama31_8b_prefill128": (None, "", None, ("prefill",)),
-    # the decode cut for the prefill's K / V (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS, PLAN_SITE_CF in its recipe= line)
-    "llama31_8b_handoff_decode": None,
 }
 # plans this planner does not regenerate, and why
 RETIRED: dict[str, str] = {}
@@ -73,7 +71,7 @@ TABLE = ("llama31_8b_prefill128", *LLAMA_WINDOWS, "gpt2_prefill128", *GPT2_WINDO
          "gpt2_decode", "bert_sst2_128", "vit_b16_224")
 # PLAN_KEEP_PLACEMENTS dirs that are not shipped: name -> the recipe changes that make them from the plan's own recipe
 # (KV_ENTRY_LEVEL, PLAN_KEEP_PLACEMENTS and PLAN_SITE_CF dropped; PLAN_CMD.txt `sites=`), replanned first
-KEEP_SITES = {"llama31_8b_handoff_decode": "PLAN_REFRESH_ENV_CAP=48"}
+KEEP_SITES: dict[str, str] = {}
 _KEEP_DROP = ("KV_ENTRY_LEVEL", "PLAN_KEEP_PLACEMENTS", "PLAN_SITE_CF")
 # stages a separate tool plans from a graph that is not shipped (speedrun/make_tail_plan.sh): not regenerated here
 TAIL_STAGES: dict[str, tuple[str, ...]] = {}

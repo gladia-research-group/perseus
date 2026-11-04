@@ -158,11 +158,6 @@ fn llama_prefill() {
     gate("llama31_8b_prefill128", "llama31_8b_prefill128");
 }
 
-#[test]
-fn llama_handoff_decode() {
-    gate("llama31_8b_handoff_decode", "llama31_8b_handoff_decode");
-}
-
 /// Informational: the two schedules side by side (launches, bootstrap launches, arena), every block compiled
 /// and checked under each.
 #[test]
