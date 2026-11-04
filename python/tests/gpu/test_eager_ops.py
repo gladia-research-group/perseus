@@ -146,6 +146,21 @@ def test_fused_sums(fhe, rng):
     assert rel(dec(fhe, acc), xs[0] + xs[1] * xs[3] + xs[2] * xs[4]) < 1e-5   # acc at degree 2 after the adds
 
 
+@pytest.mark.parametrize("level", [10, 40])
+def test_mult_sum(fhe, rng, level):
+    """sum_j a_j * b_j relinearized once: 1, 2 (one launch), 3 (odd tail) and 40 pairs (d2 accumulated across launches)."""
+    for n in (1, 2, 3, 40):
+        xs, ys = [cvec(rng) for _ in range(n)], [cvec(rng) for _ in range(n)]
+        a, b = [enc(fhe, x, level) for x in xs], [enc(fhe, y, level) for y in ys]
+        want = sum(x * y for x, y in zip(xs, ys))
+        p = fhe.mult_sum(a, b)
+        assert p.deg == 2
+        assert rel(dec(fhe, p), want) < TOL, n
+        del a, b, p
+    with pytest.raises(Exception):
+        fhe.mult_sum([enc(fhe, xs[0], level)], [enc(fhe, ys[0], level + 2)])
+
+
 def test_plaintext_caches(fhe, rng):
     x, w = cvec(rng), rng.standard_normal(N)
     a, b = enc(fhe, x, 8), enc(fhe, x, 20)
