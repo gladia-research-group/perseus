@@ -12,6 +12,7 @@ from __future__ import annotations
 
 SQ = ".sq"
 NUM = ".num"
+KRED = ".kred"
 
 
 def tag_round_squares(nodes: list[dict]) -> int:
@@ -82,5 +83,28 @@ def tag_numerators(nodes: list[dict], below: float | None = None) -> int:
             continue
         if not st.endswith(SQ):
             n["step"] = st + NUM
+            k += 1
+    return k
+
+
+def tag_key_reduced(nodes: list[dict]) -> int:
+    """FORBID_STEPS `.kred`: the attention output, from the P.V product on (attention.softmax_v: the product of the
+    packed probabilities with the summed V lanes, its key reduction and every later value of the `*.softmax_v` step),
+    becomes `<step>.kred`. Up to the product the probabilities repeat every head period and refresh on a sparse
+    route; from it on the value carries V's per-slot data and refreshes dense, ~20x less precisely (Llama decode
+    under gs_num: rel 1e-3 at the dense refresh after the key reduction vs 4e-5 on the sparse refresh of P the plans
+    off gs_num place, KL 6-15x), and gs_num's saved level lets the count-only cut take that one dense refresh. The
+    product is the step's first product of two ciphertexts. Returns how many values were tagged."""
+    prod = {n["output"]: n for n in nodes if n.get("output")}
+    k = 0
+    hot: set = set()
+    for n in nodes:
+        st = n.get("step", "")
+        if not st.endswith(".softmax_v") or not n.get("output"):
+            continue
+        pv = n.get("op_type") == "mult" and len(n.get("inputs", ())) == 2 and all(i in prod for i in n["inputs"])
+        if pv or any(i in hot for i in n.get("inputs", ())):
+            hot.add(n["output"])
+            n["step"] = st + KRED
             k += 1
     return k

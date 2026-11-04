@@ -841,6 +841,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         n_sq = round_sq.tag_round_squares(nodes)
         if cfg.verbose:
             log.info(f"[plan] {n_sq} reciprocal round square(s) kept off refreshes (.sq)")
+    if round_sq.KRED in cfg.forbid_steps:   # the attention output past its key reduction (round_sq)
+        n_kred = round_sq.tag_key_reduced(nodes)
+        if cfg.verbose:
+            log.info(f"[plan] {n_kred} attention value(s) past the key reduction kept off refreshes (.kred)")
     if cfg.pcmm_prediv_cap is not None:
         nodes = pcmm_prediv_caps(nodes, cfg.pcmm_prediv_cap, pcmm_stamps())
     g0 = Graph.from_nodes(nodes, level_unit=cfg.level_unit)
