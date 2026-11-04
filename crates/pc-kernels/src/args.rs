@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 18;
+pub const ABI: u32 = 19;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -309,7 +309,7 @@ pub struct TensorSumArgs {
 
 /// Outputs and pairs per `tensor_multi` launch (`PC_TMULTI_OUT`, `PC_TMULTI_PAIRS`).
 pub const TMULTI_OUT: usize = 4;
-pub const TMULTI_PAIRS: usize = 8;
+pub const TMULTI_PAIRS: usize = 32;
 
 /// ABI 18: `nout` tensor sums in one launch, output o = sum_j a[o][j] * b[o][j] (c0, c1 into out[o], d2 into part 1 of
 /// d2[o]); an operand equal to the previous output's at the same j is loaded once. `acc` and the bound as `TensorSumArgs`.

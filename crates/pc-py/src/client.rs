@@ -325,6 +325,59 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
 }
 
+/// `export_ct(..., bits=b)` of several ciphertexts: the coefficient exports run back to back on the device, the
+/// compression and framing in parallel on the host.
+#[pyfunction]
+fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32) -> PyResult<Bound<'py, PyList>> {
+    use rayon::prelude::*;
+    let dev = session.dev.clone();
+    let n = dev.ctx.lay.n;
+    let mut limbs = Vec::with_capacity(cts.len());
+    for ct in &cts {
+        let meta = ct.ct_ref().meta;
+        if meta.deg == 2 || ct.ct_ref().buf.lay.nq != dev.ctx.lay.nq {
+            ct.check_full()?;
+        }
+        let tmp = if meta.deg == 2 {
+            let mut t = PyCt::acquire(&dev, meta)?;
+            let mut st = dev.st.borrow_mut();
+            let State { ops, ex, .. } = &mut *st;
+            ops.realize_to(&dev.ctx, ex, &dev.sh, t.ct_mut_ref()?, ct.ct_ref()).map_err(gerr)?;
+            Some(t)
+        } else {
+            None
+        };
+        let c = tmp.as_ref().map_or(ct.ct_ref(), |t| t.ct_ref());
+        let mut st = dev.st.borrow_mut();
+        let State { ex, .. } = &mut *st;
+        let l = nogil(py, || pc_gpu::limbs::export_limbs(&dev.ctx, ex, c, 0)).map_err(gerr)?;
+        limbs.push((l, c.meta));
+    }
+    let hash = pc_client::spec::params_hash(&dev.ctx.chain);
+    let frames = nogil(py, || {
+        limbs
+            .par_iter()
+            .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
+                let mut data = Vec::with_capacity(2 * n);
+                for part in 0..2 {
+                    let rs: Vec<Vec<u64>> = l.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
+                    let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
+                    data.extend(pc_client::wire::pack_coeffs(&l.moduli, &refs, bits)?);
+                }
+                let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
+                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false };
+                CtWire { header, data }.to_bytes()
+            })
+            .collect::<pc_client::Result<Vec<_>>>()
+    })
+    .map_err(cerr)?;
+    let out = PyList::empty(py);
+    for f in frames {
+        out.append(PyBytes::new(py, &f))?;
+    }
+    Ok(out)
+}
+
 /// A session ciphertext from a wire frame (one ciphertext, this session's chain). `low`: into a low slot (the
 /// session's `size={"lowPool", "lowRows"}`), an input of `mult_sum` and `export_ct` only.
 #[pyfunction]
@@ -368,5 +421,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(contract_hash, m)?)?;
     m.add_function(wrap_pyfunction!(export_ct, m)?)?;
     m.add_function(wrap_pyfunction!(import_ct, m)?)?;
+    m.add_function(wrap_pyfunction!(export_ct_many, m)?)?;
     Ok(())
 }

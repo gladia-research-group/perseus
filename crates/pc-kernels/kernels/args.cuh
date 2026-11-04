@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 18u
+#define PC_KERNELS_ABI 19u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -305,11 +305,11 @@ struct TensorSumArgs {
 };
 static_assert(sizeof(TensorSumArgs) == 2 * 24 + 2 * PC_TSUM_MAX * 24 + 8 + 16, "TensorSumArgs layout");
 
-// tensor_multi (ABI 18): nout tensor sums in one launch, output o = sum_{j < npairs} a[o][j] * b[o][j] (c0, c1 into
+// tensor_multi (ABI 18; 32 pairs since ABI 19): nout tensor sums in one launch, output o = sum_{j < npairs} a[o][j] * b[o][j] (c0, c1 into
 // out[o], d2 into part 1 of d2[o]; acc as tensor_sum's). An operand equal to the previous output's at the same j (same
 // PolyRef) is loaded once: outputs that share a query (or a corpus) read it once per launch. Bound as tensor_sum's.
 #define PC_TMULTI_OUT 4
-#define PC_TMULTI_PAIRS 8
+#define PC_TMULTI_PAIRS 32
 struct TensorMultiArgs {
     PolyRef out[PC_TMULTI_OUT], d2[PC_TMULTI_OUT];
     PolyRef a[PC_TMULTI_OUT][PC_TMULTI_PAIRS], b[PC_TMULTI_OUT][PC_TMULTI_PAIRS];
