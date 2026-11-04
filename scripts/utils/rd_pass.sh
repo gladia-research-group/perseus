@@ -2,9 +2,11 @@
 # rd_pass.sh PLAN: the planner's raise-drop search once more on a finished plan's program (CPU only). Every stage keeps
 # PLAN's program (PLAN_KEEP_PLACEMENTS_EXACT: its placements, fired hints and realize anchors, on the min-cut placer)
 # and the search runs on the final program, where the slack the realize-anchor trials leave shows: refreshes land
-# lower, none moves and no stage exit changes (checked). The stages are the graph's blocks but the argmax (block_13,
-# planned on its own without raise drops), then block 0's feedback variant when PLAN has one. PLAN_CMD.txt gains an
+# lower, none moves and no stage exit changes (checked). The stages are the graph's blocks but the argmax (the CutMax
+# stage, GPT-2's block_13, planned on its own without raise drops: found by its steps, as a deeper model's block_13 is
+# a block whose exit the next block enters at), then block 0's feedback variant when PLAN has one. PLAN_CMD.txt gains an
 # rd= line; python/tests/test_paper_plans.py runs the pass after a plan's regeneration when the line is there.
+# RD_PASS_STAGES=1: print the stages the pass would plan and stop.
 #   bash scripts/utils/rd_pass.sh gpt2_decode_ctx512_w512        -> bootstrap_placements/gpt2_decode_ctx512_w512 in place
 # Optional, both landed on a copy of the graph before the pass (where the runtime then lands those refreshes):
 #   KV_PUSH_RAISE=b:d,...     the K/V push refresh of block b raised d levels below its captured landing (the runtime
@@ -26,9 +28,13 @@ trap 'rm -rf "$TMP" "bootstrap_placements/$OUT"' EXIT
 # the graph the pass reads: links to GR's blocks, or edited copies of the blocks whose deliberate refreshes it lands
 for b in "$GR"/block_*; do
     n=$(basename "$b")
-    [ "$n" = block_13 ] && continue
-    ln -s "$PWD/$b" "$TMP/$n"
+    [[ "$(head -c 4096 "$b/graph.json")" == *'"step": "cutmax"'* ]] && continue
+    ln -s "$(realpath "$b")" "$TMP/$n"
 done
+if [ "${RD_PASS_STAGES:-0}" = 1 ]; then
+    ls "$TMP"
+    exit 0
+fi
 cp "$GR/capture_env.json" "$TMP/"
 if [ -n "${KV_PUSH_RAISE:-}${PF_PCMM_RAISE_OUT:-}" ]; then
     "$PYTHON" - "$TMP" "${KV_PUSH_RAISE:-}" <<'PY'
