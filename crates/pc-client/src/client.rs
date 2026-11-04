@@ -312,6 +312,11 @@ impl Client {
     /// Secret-key encryption of `values.len()` slot vectors (each zero-padded to `meta.slots`) at `meta`:
     /// `c0 = -a s + e + m`, `c1 = a` (a uniform), eval form over Q ids `0..=top`.
     pub fn encrypt(&self, values: &[Vec<Complex>], meta: &WireMeta, payload: Payload, prng: &mut Prng) -> Result<CtWire> {
+        self.encrypt_as(values, meta, payload, prng, false)
+    }
+
+    /// `encrypt`, the frame `seeded`: c1's rows replaced by the seeds they are drawn from (half the frame).
+    pub fn encrypt_as(&self, values: &[Vec<Complex>], meta: &WireMeta, payload: Payload, prng: &mut Prng, seeded: bool) -> Result<CtWire> {
         let n = self.chain.n;
         let top = self.top_of(meta.level)?;
         let rows = top + 1;
@@ -340,13 +345,32 @@ impl Client {
                     c0[i] = ((c0[i] as u64 + p - mm(c1[i], s[i], p)) % p) as u32;
                 }
             });
+            if seeded {
+                let c1 = &mut ct[rows * n..];
+                for (r, key) in keys.iter().enumerate() {
+                    c1[r * 8..r * 8 + 8].copy_from_slice(key);
+                }
+            }
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None }, data })
+        if seeded {
+            // per ciphertext: c0 rows, then the seeds (written at the start of its c1 rows above)
+            let mut out = Vec::with_capacity(k * rows * (n + 8));
+            for c in 0..k {
+                let ct = &data[c * 2 * rows * n..(c + 1) * 2 * rows * n];
+                out.extend_from_slice(&ct[..rows * n]);
+                out.extend_from_slice(&ct[rows * n..rows * n + rows * 8]);
+            }
+            data = out;
+        }
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded }, data })
     }
 
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
     /// 4 rows (2 when the ciphertext has fewer), exact centered CRT, FFT decode.
     pub fn decrypt(&self, ct: &CtWire, payload: Payload) -> Result<Vec<Vec<Complex>>> {
+        if ct.header.seeded {
+            return self.decrypt(&ct.expand_seeded(&self.chain.q)?, payload);
+        }
         let h = &ct.header;
         if h.params_hash != self.params_hash || h.n != self.chain.n {
             return Err(Error::Wire(format!("ciphertext for params {} (n {}), this client runs {} (n {})", h.params_hash, h.n, self.params_hash, self.chain.n)));
@@ -607,7 +631,7 @@ mod tests {
                     assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
                 }
                 Entry::SpruCs { k, rows, level, nf, .. } => {
-                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None }, data: v };
+                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false }, data: v };
                     let d = c.decrypt(&w, Payload::Real).unwrap();
                     let block = c.spru_block.as_ref().unwrap();
                     for (u, du) in d.iter().enumerate() {

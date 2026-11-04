@@ -130,8 +130,10 @@ impl PyClient {
 
     /// Wire frame (bytes) of a fresh encryption of `values` (a slot vector, zero-padded) at `level` (scale: the
     /// level's sf^deg unless `nf`; `slots`: live slots, default every slot).
-    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None))]
-    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
+    /// `seeded`: c1 sent as the seeds it is drawn from (half the frame; the server's `import_ct` expands it).
+    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool) -> PyResult<Bound<'py, PyBytes>> {
         let v = values_of(py, values)?;
         let mut meta = self.c.fresh_meta(level, deg).map_err(cerr)?;
         if let Some(x) = nf {
@@ -144,7 +146,7 @@ impl PyClient {
             return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
         }
         let (c, g, p) = (&self.c, &mut self.prng, self.payload);
-        let w = nogil(py, || c.encrypt(&[v], &meta, p, g).and_then(|w| w.to_bytes())).map_err(cerr)?;
+        let w = nogil(py, || c.encrypt_as(&[v], &meta, p, g, seeded).and_then(|w| w.to_bytes())).map_err(cerr)?;
         Ok(PyBytes::new(py, &w))
     }
 
@@ -300,7 +302,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let w = CtWire {
-            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b) },
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false },
             data,
         };
         return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
@@ -317,7 +319,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
@@ -330,6 +332,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
 fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool) -> PyResult<PyCt> {
     let dev = session.dev.clone();
     let w = CtWire::from_bytes(frame).map_err(cerr)?;
+    let w = if w.header.seeded { w.expand_seeded(&dev.ctx.chain.q).map_err(cerr)? } else { w };
     let h = &w.header;
     let ph = pc_client::spec::params_hash(&dev.ctx.chain);
     if h.params_hash != ph || h.n != dev.ctx.lay.n || h.k != 1 {
