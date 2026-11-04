@@ -95,6 +95,22 @@ def test_compressed_export(setup):
         _pc.export_ct(s, _pc.import_ct(s, xf[0]), bits=32)        # 4 rows: the modulus is too wide for 32 bits
 
 
+def test_seeded_frames(setup):
+    """Client.encrypt(seeded=True): half the frame; the client decrypts it, the server imports it (c1 expanded from
+    its seeds) into full and low slots, and products of imported seeded frames match numpy."""
+    s, client = setup
+    rng = np.random.default_rng(5)
+    v = (rng.standard_normal((2, 1 << 15)) + 1j * rng.standard_normal((2, 1 << 15))) / 8
+    full, seeded = client.encrypt(v[0], LEVEL), client.encrypt(v[0], LEVEL, seeded=True)
+    assert len(seeded) < 0.51 * len(full)
+    assert np.abs(client.decrypt(seeded)[0] - v[0]).max() < 1e-6
+    a = _pc.import_ct(s, seeded)
+    assert np.abs(client.decrypt(_pc.export_ct(s, a))[0] - v[0]).max() < 1e-6
+    b = _pc.import_ct(s, client.encrypt(v[1], LEVEL, seeded=True), low=True)
+    p = s.fhe.mult_sum([b], [a])
+    assert np.abs(client.decrypt(_pc.export_ct(s, p))[0] - v[0] * v[1]).max() < 1e-6
+
+
 def test_other_ops_refuse_low(setup):
     s, client = setup
     rng = np.random.default_rng(1)
