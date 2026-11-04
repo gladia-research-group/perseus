@@ -3,6 +3,7 @@
 use crate::arith::{automorph_slot, ptidx, Hw};
 use crate::launch;
 use crate::raw::{at, el, par_for, rs_len, rs_row};
+use crate::simd::w as v;
 use pc_kernels::args::*;
 
 type S = CudaStream;
@@ -152,50 +153,55 @@ pub extern "C" fn pt_dot<W: Hw>(a: *const PtDotArgs, s: S) -> i32 {
     })
 }
 
+/// Words per tensor task: a row splits into N / TENSOR_CH tasks, so a launch over few rows still fills the pool.
+const TENSOR_CH: usize = 2048;
+const _: () = assert!(N % TENSOR_CH == 0);
+
 pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
     launch(a, s, |_| 0, |a| {
         let n = a.n as usize;
-        par_for(a.k as usize * n, a, |a, t| {
-            let (c, row) = (t / n, t % n);
+        let nch = N / TENSOR_CH;
+        par_for(a.k as usize * n * nch, a, |a, t| {
+            let (c, row, lo) = (t / (n * nch), (t / nch) % n, (t % nch) * TENSOR_CH);
             let q = prime(a.pr, row);
             let p = W::from_u64(q.p);
             let np = (a.npairs as usize).min(2);
-            let src = |j: usize| if j == 0 { (&a.a0, &a.b0) } else { (&a.a1, &a.b1) };
-            let (o0, o1, d2) = (at::<W>(&a.out, c, 0, row), at::<W>(&a.out, c, 1, row), at::<W>(&a.d2, c, 1, row));
-            // SAFETY: coefficient row of ciphertext c when the output is requested
-            let coef = (!a.coef.is_null()).then(|| unsafe { (a.coef as *mut W).add(c * a.coef_ct_stride as usize + row * N) });
-            for i in 0..N {
-                let (mut s0, mut s1, mut s2) = (W::Acc::default(), W::Acc::default(), W::Acc::default());
-                for j in 0..np {
-                    let (x, y) = src(j);
-                    let (x0, x1) = (rd(at::<W>(x, c, 0, row), i), rd(at::<W>(x, c, 1, row), i));
-                    let (y0, y1) = (rd(at::<W>(y, c, 0, row), i), rd(at::<W>(y, c, 1, row), i));
-                    s0 += W::wmul(x0, y0);
-                    s1 += W::wmul(x0, y1) + W::wmul(x1, y0);
-                    s2 += W::wmul(x1, y1);
+            let row_of = |r: &PolyRef, part: usize| {
+                // SAFETY: TENSOR_CH words of a row of ciphertext c inside the launch's buffers
+                unsafe { std::slice::from_raw_parts_mut(at::<W>(r, c, part, row).add(lo), TENSOR_CH) }
+            };
+            let (mut s0, mut s1, mut s2) = ([W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH]);
+            for j in 0..np {
+                let (x, y) = if j == 0 { (&a.a0, &a.b0) } else { (&a.a1, &a.b1) };
+                let (x0, x1, y0, y1) = (row_of(x, 0), row_of(x, 1), row_of(y, 0), row_of(y, 1));
+                v::mac2::<W>(&mut s0, &mut s1, x0, y0, y1);
+                v::mac2::<W>(&mut s1, &mut s2, x1, y0, y1);
+            }
+            // every input word of the chunk is read: out may alias an input from here on
+            let (mut r0, mut r1, mut r2) = ([W::default(); TENSOR_CH], [W::default(); TENSOR_CH], [W::default(); TENSOR_CH]);
+            v::reduce::<W>(&s0, q, &mut r0);
+            v::reduce::<W>(&s1, q, &mut r1);
+            v::reduce::<W>(&s2, q, &mut r2);
+            let (o0, o1, d2) = (row_of(&a.out, 0), row_of(&a.out, 1), row_of(&a.d2, 1));
+            if a.acc != 0 {
+                v::add_rows::<W>(&mut r0, o0, p);
+                v::add_rows::<W>(&mut r1, o1, p);
+            }
+            if a.acc & 2 != 0 {
+                v::add_rows::<W>(&mut r2, d2, p);
+            }
+            if a.dbl != 0 {
+                for r in [&mut r0, &mut r1, &mut r2] {
+                    r.iter_mut().for_each(|x| *x = W::add(*x, *x, p));
                 }
-                let (mut r0, mut r1, mut r2) = (W::reduce(s0, q), W::reduce(s1, q), W::reduce(s2, q));
-                if a.acc != 0 {
-                    r0 = W::add(r0, rd(o0, i), p);
-                    r1 = W::add(r1, rd(o1, i), p);
-                }
-                if a.acc & 2 != 0 {
-                    r2 = W::add(r2, rd(d2, i), p);
-                }
-                if a.dbl != 0 {
-                    r0 = W::add(r0, r0, p);
-                    r1 = W::add(r1, r1, p);
-                    r2 = W::add(r2, r2, p);
-                }
-                // SAFETY: word i of the output rows (stores in the device's order)
-                unsafe {
-                    *o0.add(i) = r0;
-                    *o1.add(i) = r1;
-                    *d2.add(i) = r2;
-                    if let Some(cf) = coef {
-                        *cf.add(i) = r2;
-                    }
-                }
+            }
+            o0.copy_from_slice(&r0);
+            o1.copy_from_slice(&r1);
+            d2.copy_from_slice(&r2);
+            if !a.coef.is_null() {
+                // SAFETY: coefficient row of ciphertext c when the output is requested
+                let cf = unsafe { std::slice::from_raw_parts_mut((a.coef as *mut W).add(c * a.coef_ct_stride as usize + row * N + lo), TENSOR_CH) };
+                cf.copy_from_slice(&r2);
             }
         })
     })
