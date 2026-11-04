@@ -137,6 +137,7 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         rescale_fwd: rescale::rescale_fwd::<W>,
         tfhe: tfhe::tfhe,
         tensor_sum: elem::tensor_sum::<W>,
+        tensor_multi: elem::tensor_multi::<W>,
     }
 }
 

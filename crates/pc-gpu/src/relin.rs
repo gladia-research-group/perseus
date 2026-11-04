@@ -60,17 +60,32 @@ pub fn relin_staged<W: DevWord, M: DevStrategy<W>>(
     ct: &mut Ct<'_, W>,
     top: usize,
 ) -> Result<()> {
+    let d2 = View::of(&ex.ks.ext, 0).part::<W>(1);
+    relin_staged_from(ctx, ex, kc, key, ct, top, d2)
+}
+
+/// `relin_staged` with d2 read from `d2` (evaluation rows 0..=top of k polynomials, ciphertext-layout strides) instead
+/// of part 1 of the key-switching workspace.
+pub fn relin_staged_from<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    key: &KeyGroup<'_>,
+    ct: &mut Ct<'_, W>,
+    top: usize,
+    d2: View,
+) -> Result<()> {
     let k = ct.k();
     if key.galois.first() != Some(&1) {
         return Err(shape("relin", "key group 0 is not the relinearization key (galois 1)"));
     }
     let lay = ctx.lay;
     let ext = View::of(&ex.ks.ext, 0);
-    ks::modup_from(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, ext.part::<W>(1), k, top)?;
+    ks::modup_from(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, d2, k, top)?;
     let io = DotIo {
-        c1: ext.part::<W>(1).base,
+        c1: d2.base,
         c0: std::ptr::null(),
-        ct_stride: lay.ct_words() as u64,
+        ct_stride: d2.ct_stride,
         out: ext.base,
         part_stride: lay.poly_words() as u64,
         out_ct_stride: lay.ct_words() as u64,

@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorSumArgs, WsumArgs, TSUM_MAX};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSumArgs, WsumArgs, TMULTI_OUT, TMULTI_PAIRS, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -1016,6 +1016,73 @@ impl<'a, W: DevWord> Ops<'a, W> {
         self.tensor_pairs(ctx, &ex.compute, out.buf.w(), d2, a, b, top, k)?;
         crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
         out.meta = r.out;
+        Ok(())
+    }
+
+    /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (single ciphertexts, every
+    /// group of the same length and level). The tensors run `TMULTI_OUT` outputs per launch, so an operand the groups
+    /// share at the same j (a query, a corpus ciphertext) is read once; each group's d2 accumulates in part 1 of its
+    /// `d2s[g]` (scratch ciphertexts) and is relinearized from there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_sum_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, outs: &mut [&mut Ct<'_, W>], d2s: &mut [&mut Ct<'_, W>], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>]) -> Result<()> {
+        let g = outs.len();
+        if g == 0 || d2s.len() != g || a.len() != g || b.len() != g {
+            return Err(shape("mult_sum_many", format!("{g} outputs, {} scratch, {} / {} operand groups", d2s.len(), a.len(), b.len())));
+        }
+        let np = a[0].len();
+        let mut recipe = None;
+        for i in 0..g {
+            if a[i].len() != np || b[i].len() != np {
+                return Err(shape("mult_sum_many", "every group needs the same number of pairs"));
+            }
+            let (top, r) = self.sum_recipe(ctx, sh, &a[i], &b[i], "mult_sum_many")?;
+            if recipe.as_ref().is_some_and(|(t, x): &(usize, Recipe)| *t != top || x.out != r.out) {
+                return Err(shape("mult_sum_many", "every group at the same level"));
+            }
+            recipe = Some((top, r));
+        }
+        let (top, r) = recipe.expect("one group");
+        if outs.iter().map(|o| o.k()).chain(d2s.iter().map(|d| d.k())).chain(a.iter().chain(b).flatten().map(|x| x.k())).any(|k| k != 1) {
+            return Err(shape("mult_sum_many", "single ciphertexts only (k = 1)"));
+        }
+        let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
+        let bits = 8 * std::mem::size_of::<W>() as u32;
+        let per = if bits >= 64 { TMULTI_PAIRS } else { ((((1u128 << (2 * bits)) - 1) / (2 * pm * pm)) as usize).clamp(1, TMULTI_PAIRS) };
+        for o0 in (0..g).step_by(TMULTI_OUT) {
+            let no = (g - o0).min(TMULTI_OUT);
+            for (ci, j0) in (0..np).step_by(per).enumerate() {
+                let nj = (np - j0).min(per);
+                let mut args = TensorMultiArgs {
+                    out: [PolyRef::default(); TMULTI_OUT],
+                    d2: [PolyRef::default(); TMULTI_OUT],
+                    a: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
+                    b: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
+                    pr: ctx.pr(),
+                    nout: no as i32,
+                    npairs: nj as i32,
+                    acc: if ci > 0 { 3 } else { 0 },
+                    n: (top + 1) as i32,
+                    k: 1,
+                    pad: 0,
+                };
+                for o in 0..no {
+                    args.out[o] = outs[o0 + o].buf.w();
+                    args.d2[o] = d2s[o0 + o].buf.w();
+                    for j in 0..nj {
+                        args.a[o][j] = a[o0 + o][j0 + j].buf.r();
+                        args.b[o][j] = b[o0 + o][j0 + j].buf.r();
+                    }
+                }
+                // SAFETY: per (row, word) the kernel reads every operand before writing its outputs; outputs and scratch
+                // are distinct pool slots (not operands); rows 0..=top, each operand with its own strides
+                launch_result("tensor_multi", unsafe { (ctx.table.tensor_multi)(&args, ex.compute.raw()) })?;
+            }
+        }
+        for (o, d) in outs.iter_mut().zip(d2s.iter()) {
+            let src = crate::ks::View::of(&d.buf, 0).part::<W>(1);
+            crate::relin::relin_staged_from(ctx, ex, kc, key, o, top, src)?;
+            o.meta = r.out;
+        }
         Ok(())
     }
 

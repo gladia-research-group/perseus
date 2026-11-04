@@ -887,6 +887,36 @@ impl PyFhe {
         Ok(o)
     }
 
+    /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (groups of one length and
+    /// level; an operand the groups share at the same j is read once per launch). Low-slot operands are admitted.
+    fn mult_sum_many(&mut self, py: Python<'_>, a: Vec<Vec<PyRef<'_, PyCt>>>, b: Vec<Vec<PyRef<'_, PyCt>>>) -> PyResult<Vec<PyCt>> {
+        if a.is_empty() || a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.is_empty() || x.len() != y.len()) {
+            return Err(PyValueError::new_err("mult_sum_many: matching, non-empty operand groups"));
+        }
+        for x in a.iter().chain(&b).flatten() {
+            self.same_session_low(x)?;
+        }
+        let mut outs = a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()?;
+        let mut d2s = a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()?;
+        {
+            let d = &*self.dev;
+            let mut om = outs.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;
+            let mut dm = d2s.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let ar: Vec<Vec<&Ct<'static, W>>> = a.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            let br: Vec<Vec<&Ct<'static, W>>> = b.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            ops.mult_sum_many(&d.ctx, ex, kc, &d.sh, &groups.relin, &mut om, &mut dm, &ar, &br).map_err(gerr)?;
+        }
+        drop(d2s);
+        for o in outs.iter_mut() {
+            self.reactive(py, o)?;
+        }
+        Ok(outs)
+    }
+
     /// `sum_j ts[j] * cs[j]`: one fused weighted sum when every term shares level and degree 1, else the loop.
     fn mult_scalar_sum(&mut self, py: Python<'_>, ts: Vec<PyRef<'_, PyCt>>, cs: Vec<f64>) -> PyResult<PyCt> {
         if ts.is_empty() || ts.len() != cs.len() {

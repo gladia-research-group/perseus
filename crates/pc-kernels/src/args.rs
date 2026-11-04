@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 17;
+pub const ABI: u32 = 18;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -305,6 +305,28 @@ pub struct TensorSumArgs {
     pub acc: i32,
     pub n: i32,
     pub k: i32,
+}
+
+/// Outputs and pairs per `tensor_multi` launch (`PC_TMULTI_OUT`, `PC_TMULTI_PAIRS`).
+pub const TMULTI_OUT: usize = 4;
+pub const TMULTI_PAIRS: usize = 8;
+
+/// ABI 18: `nout` tensor sums in one launch, output o = sum_j a[o][j] * b[o][j] (c0, c1 into out[o], d2 into part 1 of
+/// d2[o]); an operand equal to the previous output's at the same j is loaded once. `acc` and the bound as `TensorSumArgs`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TensorMultiArgs {
+    pub out: [PolyRef; TMULTI_OUT],
+    pub d2: [PolyRef; TMULTI_OUT],
+    pub a: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
+    pub b: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
+    pub pr: *const PrimeConst,
+    pub nout: i32,
+    pub npairs: i32,
+    pub acc: i32,
+    pub n: i32,
+    pub k: i32,
+    pub pad: i32,
 }
 
 #[repr(C)]
@@ -877,6 +899,7 @@ pub struct KernelTable {
     pub rescale_fwd: Launch<RescaleNttArgs>,
     pub tfhe: Launch<TfheArgs>,
     pub tensor_sum: Launch<TensorSumArgs>,
+    pub tensor_multi: Launch<TensorMultiArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -897,6 +920,7 @@ const _: () = {
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<TensorSumArgs>() == 2 * 24 + 2 * TSUM_MAX * 24 + 8 + 16);
+    assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 2 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
@@ -922,7 +946,7 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 42 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 43 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<TfheArgs>() == 32 + 6 * 8 + 16 + 64);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);

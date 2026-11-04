@@ -111,6 +111,77 @@ __global__ void tensor_sum(TensorSumArgs A) {
     store4<W>(o2, r2[0], r2[1], r2[2], r2[3]);
 }
 
+__device__ __forceinline__ bool same_ref(const PolyRef& x, const PolyRef& y) {
+    return x.base == y.base && x.ct_stride == y.ct_stride && x.part_stride == y.part_stride;
+}
+
+template <class W, class MM>
+__global__ void tensor_multi(TensorMultiArgs A) {
+    using Wd = WideOf<W>;
+    const int row = blockIdx.y, c = blockIdx.z;
+    const PrimeConst& q = A.pr[row];
+    const W p = (W)q.p;
+    const int i = (blockIdx.x * BX + threadIdx.x) * 4;
+    Wd s[PC_TMULTI_OUT][3][4];
+#pragma unroll
+    for (int o = 0; o < PC_TMULTI_OUT; ++o)
+#pragma unroll
+        for (int t = 0; t < 3; ++t)
+#pragma unroll
+            for (int w = 0; w < 4; ++w) s[o][t][w] = 0;
+    for (int j = 0; j < A.npairs; ++j) {
+        V4<W> x0, x1, y0, y1;
+#pragma unroll
+        for (int o = 0; o < PC_TMULTI_OUT; ++o) {
+            if (o >= A.nout) break;
+            if (o == 0 || !same_ref(A.a[o][j], A.a[o - 1][j])) {
+                x0 = load4<W>(at<W>(A.a[o][j], c, 0, row) + i);
+                x1 = load4<W>(at<W>(A.a[o][j], c, 1, row) + i);
+            }
+            if (o == 0 || !same_ref(A.b[o][j], A.b[o - 1][j])) {
+                y0 = load4<W>(at<W>(A.b[o][j], c, 0, row) + i);
+                y1 = load4<W>(at<W>(A.b[o][j], c, 1, row) + i);
+            }
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                s[o][0][w] += (Wd)x0.v[w] * y0.v[w];
+                s[o][1][w] += (Wd)x0.v[w] * y1.v[w] + (Wd)x1.v[w] * y0.v[w];
+                s[o][2][w] += (Wd)x1.v[w] * y1.v[w];
+            }
+        }
+    }
+#pragma unroll
+    for (int o = 0; o < PC_TMULTI_OUT; ++o) {
+        if (o >= A.nout) break;
+        W r0[4], r1[4], r2[4];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            r0[w] = MM::reduce(s[o][0][w], q);
+            r1[w] = MM::reduce(s[o][1][w], q);
+            r2[w] = MM::reduce(s[o][2][w], q);
+        }
+        W* o0 = at<W>(A.out[o], c, 0, row) + i;
+        W* o1 = at<W>(A.out[o], c, 1, row) + i;
+        W* o2 = at<W>(A.d2[o], c, 1, row) + i;
+        if (A.acc) {
+            const V4<W> d0 = load4<W>(o0), d1 = load4<W>(o1);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                r0[w] = add<W>(r0[w], d0.v[w], p);
+                r1[w] = add<W>(r1[w], d1.v[w], p);
+            }
+        }
+        if (A.acc & 2) {
+            const V4<W> d = load4<W>(o2);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) r2[w] = add<W>(r2[w], d.v[w], p);
+        }
+        store4<W>(o0, r0[0], r0[1], r0[2], r0[3]);
+        store4<W>(o1, r1[0], r1[1], r1[2], r1[3]);
+        store4<W>(o2, r2[0], r2[1], r2[2], r2[3]);
+    }
+}
+
 template <class W>
 __global__ void md_epilogue(MdEpiArgs A) {
     const int row = blockIdx.y, c = blockIdx.z >> 1, part = blockIdx.z & 1;
@@ -236,6 +307,12 @@ template <class W, class MM>
 int tensor_sum_l(const TensorSumArgs* a, cudaStream_t s) {
     if (a->npairs < 1 || a->npairs > PC_TSUM_MAX) return -1;
     tensor_sum<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W, class MM>
+int tensor_multi_l(const TensorMultiArgs* a, cudaStream_t s) {
+    if (a->nout < 1 || a->nout > PC_TMULTI_OUT || a->npairs < 1 || a->npairs > PC_TMULTI_PAIRS) return -1;
+    tensor_multi<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W>
