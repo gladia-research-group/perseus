@@ -207,6 +207,43 @@ pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
     })
 }
 
+pub extern "C" fn tensor_sum<W: Hw>(a: *const TensorSumArgs, s: S) -> i32 {
+    launch(a, s, |a| if a.npairs < 1 || a.npairs as usize > TSUM_MAX { -1 } else { 0 }, |a| {
+        let n = a.n as usize;
+        let nch = N / TENSOR_CH;
+        par_for(a.k as usize * n * nch, a, |a, t| {
+            let (c, row, lo) = (t / (n * nch), (t / nch) % n, (t % nch) * TENSOR_CH);
+            let q = prime(a.pr, row);
+            let p = W::from_u64(q.p);
+            let row_of = |r: &PolyRef, part: usize| {
+                // SAFETY: TENSOR_CH words of a row of ciphertext c inside the launch's buffers
+                unsafe { std::slice::from_raw_parts_mut(at::<W>(r, c, part, row).add(lo), TENSOR_CH) }
+            };
+            let (mut s0, mut s1, mut s2) = ([W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH]);
+            for j in 0..a.npairs as usize {
+                let (x0, x1, y0, y1) = (row_of(&a.a[j], 0), row_of(&a.a[j], 1), row_of(&a.b[j], 0), row_of(&a.b[j], 1));
+                v::mac2::<W>(&mut s0, &mut s1, x0, y0, y1);
+                v::mac2::<W>(&mut s1, &mut s2, x1, y0, y1);
+            }
+            let (mut r0, mut r1, mut r2) = ([W::default(); TENSOR_CH], [W::default(); TENSOR_CH], [W::default(); TENSOR_CH]);
+            v::reduce::<W>(&s0, q, &mut r0);
+            v::reduce::<W>(&s1, q, &mut r1);
+            v::reduce::<W>(&s2, q, &mut r2);
+            let (o0, o1, d2) = (row_of(&a.out, 0), row_of(&a.out, 1), row_of(&a.d2, 1));
+            if a.acc != 0 {
+                v::add_rows::<W>(&mut r0, o0, p);
+                v::add_rows::<W>(&mut r1, o1, p);
+            }
+            if a.acc & 2 != 0 {
+                v::add_rows::<W>(&mut r2, d2, p);
+            }
+            o0.copy_from_slice(&r0);
+            o1.copy_from_slice(&r1);
+            d2.copy_from_slice(&r2);
+        })
+    })
+}
+
 pub extern "C" fn md_epilogue<W: Hw>(a: *const MdEpiArgs, s: S) -> i32 {
     launch(a, s, |_| 0, |a| {
         let n = a.n as usize;

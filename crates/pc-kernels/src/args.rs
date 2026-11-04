@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 16;
+pub const ABI: u32 = 17;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -286,6 +286,25 @@ pub struct TensorArgs {
     /// ABI 13: 1 doubles the three outputs.
     pub dbl: i32,
     pub pad: i32,
+}
+
+/// Pairs per `tensor_sum` launch (`PC_TSUM_MAX`).
+pub const TSUM_MAX: usize = 16;
+
+/// ABI 17: `sum_j a_j * b_j` (tensor) over up to `TSUM_MAX` pairs by value, each operand with its own strides; `acc` as
+/// `TensorArgs` (`acc & 2`: d2 too). The caller bounds npairs: 2 npairs (max p - 1)^2 < 2^(2 BITS).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TensorSumArgs {
+    pub out: PolyRef,
+    pub d2: PolyRef,
+    pub a: [PolyRef; TSUM_MAX],
+    pub b: [PolyRef; TSUM_MAX],
+    pub pr: *const PrimeConst,
+    pub npairs: i32,
+    pub acc: i32,
+    pub n: i32,
+    pub k: i32,
 }
 
 #[repr(C)]
@@ -857,6 +876,7 @@ pub struct KernelTable {
     pub mul_add: Launch<MulAddArgs>,
     pub rescale_fwd: Launch<RescaleNttArgs>,
     pub tfhe: Launch<TfheArgs>,
+    pub tensor_sum: Launch<TensorSumArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -876,6 +896,7 @@ const _: () = {
     assert!(size_of::<KskExpandArgs>() == 48);
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 192);
+    assert!(size_of::<TensorSumArgs>() == 2 * 24 + 2 * TSUM_MAX * 24 + 8 + 16);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
@@ -901,7 +922,7 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 41 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 42 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<TfheArgs>() == 32 + 6 * 8 + 16 + 64);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);

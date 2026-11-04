@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, WsumArgs};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorSumArgs, WsumArgs, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -1031,12 +1031,33 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Ok((self.top(ctx.shape, &a[0].meta)?, r))
     }
 
-    /// Two pairs per launch; every launch after the first accumulates c0, c1 and d2 (acc = 3).
+    /// `tensor_sum` launches of up to `TSUM_MAX` pairs (fewer when the lazy c1 sum would overflow the double word:
+    /// 2 npairs (max p - 1)^2 < 2^(2 BITS)); every launch after the first accumulates c0, c1 and d2 (acc = 3).
     #[allow(clippy::too_many_arguments)]
     fn tensor_pairs<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, out: PolyRef, d2: PolyRef, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>], top: usize, k: usize) -> Result<()> {
+        let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
+        let bits = 8 * std::mem::size_of::<W>() as u32;
+        let per = if bits >= 64 { TSUM_MAX } else { ((((1u128 << (2 * bits)) - 1) / (2 * pm * pm)) as usize).clamp(1, TSUM_MAX) };
         let pairs: Vec<(PolyRef, PolyRef)> = a.iter().zip(b).map(|(x, y)| (x.buf.r(), y.buf.r())).collect();
-        for (i, ch) in pairs.chunks(2).enumerate() {
-            self.tensor_launch(ctx, s, out, d2, ch, if i > 0 { 3 } else { 0 }, top, k)?;
+        for (i, ch) in pairs.chunks(per).enumerate() {
+            let mut args = TensorSumArgs {
+                out,
+                d2,
+                a: [PolyRef::default(); TSUM_MAX],
+                b: [PolyRef::default(); TSUM_MAX],
+                pr: ctx.pr(),
+                npairs: ch.len() as i32,
+                acc: if i > 0 { 3 } else { 0 },
+                n: (top + 1) as i32,
+                k: k as i32,
+            };
+            for (j, &(x, y)) in ch.iter().enumerate() {
+                args.a[j] = x;
+                args.b[j] = y;
+            }
+            // SAFETY: per (ct, row, word) the kernel reads every pair before writing out parts 0/1 and d2 part 1, so out
+            // aliasing an operand is element-wise safe; rows 0..=top of k cts, each operand with its own strides
+            launch_result("tensor_sum", unsafe { (ctx.table.tensor_sum)(&args, s.raw()) })?;
         }
         Ok(())
     }
