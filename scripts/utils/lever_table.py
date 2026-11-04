@@ -133,6 +133,9 @@ def levers(f: dict) -> dict[str, str]:
         "Pairs above StC-first's CF (PC_BTS_PAIR_CF_MAX)": rt("PC_BTS_PAIR_CF_MAX") or "off",
         "Activation constant folded (PF_ACT_FOLD)": on(rt("PF_ACT_FOLD") == "1") if pre else "-",
         "Exp mask folded into the series": config_count(cmds[0]["configs"], "softmax", "exp_mask_fold"),
+        "Scores folded into the Goldschmidt recursion (gs_num)": config_count(cmds[0]["configs"], "softmax", "gs_num"),
+        "gs_num: numerator refreshed before its last squaring": config_count(cmds[0]["configs"], "softmax",
+                                                                         "gs_num_refresh"),
         "Softmax: Chebyshev-scaled Goldschmidt": on(rt("SM_CHEB_GS") == "1"),
         "Softmax head sum cleanse": on(rt("SM_HRS_CLEANSE") == "1"),
         "Activation: one Chebyshev series": (on(True, "SiLU, driver") if rt("PF_SILU_SINGLE") == "1"
