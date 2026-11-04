@@ -826,6 +826,31 @@ impl PyFhe {
         Ok(true)
     }
 
+    /// `sum_j a[j] * b[j]` over ciphertext pairs, relinearized once (every operand at one level, degree 1), then the
+    /// reactive refresh check.
+    fn mult_sum(&mut self, py: Python<'_>, a: Vec<PyRef<'_, PyCt>>, b: Vec<PyRef<'_, PyCt>>) -> PyResult<PyCt> {
+        if a.is_empty() || a.len() != b.len() {
+            return Err(PyValueError::new_err(format!("mult_sum: {} and {} operands", a.len(), b.len())));
+        }
+        for x in a.iter().chain(&b) {
+            self.same_session(x)?;
+        }
+        let d = &*self.dev;
+        let mut o = self.new_ct(a[0].meta())?;
+        {
+            let om = o.ct_mut()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let ar: Vec<&Ct<'static, W>> = a.iter().map(|x| x.ct()).collect();
+            let br: Vec<&Ct<'static, W>> = b.iter().map(|x| x.ct()).collect();
+            ops.mult_sum(&d.ctx, ex, kc, &d.sh, &groups.relin, om, &ar, &br).map_err(gerr)?;
+        }
+        self.reactive(py, &mut o)?;
+        Ok(o)
+    }
+
     /// `sum_j ts[j] * cs[j]`: one fused weighted sum when every term shares level and degree 1, else the loop.
     fn mult_scalar_sum(&mut self, py: Python<'_>, ts: Vec<PyRef<'_, PyCt>>, cs: Vec<f64>) -> PyResult<PyCt> {
         if ts.is_empty() || ts.len() != cs.len() {

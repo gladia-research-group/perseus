@@ -179,6 +179,9 @@ pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
                     r0 = W::add(r0, rd(o0, i), p);
                     r1 = W::add(r1, rd(o1, i), p);
                 }
+                if a.acc & 2 != 0 {
+                    r2 = W::add(r2, rd(d2, i), p);
+                }
                 if a.dbl != 0 {
                     r0 = W::add(r0, r0, p);
                     r1 = W::add(r1, r1, p);

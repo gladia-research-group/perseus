@@ -282,6 +282,7 @@ static_assert(sizeof(CtsArgs) == 192, "CtsArgs layout");
 // Q rows [0, n) of K ciphertexts (row index == prime id), PolyRef layout.
 // tensor: (c0, c1, d2) (= | +=) sum_{j < npairs} (a0 b0, a0 b1 + a1 b0, a1 b1); d2 written to part 1 of `d2`, and to
 // coef (when non-null) at coef + c*coef_ct_stride + row*N. ABI 13: dbl doubles all three (c0, c1 after the +=).
+// acc != 0: c0, c1 +=; acc & 2: d2 += as well (a sum of tensors relinearized once).
 struct TensorArgs {
     PolyRef out, d2, a0, b0, a1, b1;
     void* coef;

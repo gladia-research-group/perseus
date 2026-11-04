@@ -978,7 +978,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let top = self.top(ctx.shape, &t.meta)?;
         let bref = bp.map_or(b.buf.r(), |x| x.0);
         let x = out.c.buf.r();
-        self.tensor_launch(ctx, s, out, &[(x, bref)], false, top)?;
+        self.tensor_launch(ctx, s, out.c.buf.w(), Self::d2_of(out)?, &[(x, bref)], 0, top, out.c.k())?;
         Self::finish(out.c, &r, &t)
     }
 
@@ -989,40 +989,73 @@ impl<'a, W: DevWord> Ops<'a, W> {
         let t = self.prep_a(ctx, s, out.c, Some(a), &r.pre)?;
         let top = self.top(ctx.shape, &t.meta)?;
         let x = out.c.buf.r();
-        self.tensor_launch(ctx, s, out, &[(x, x)], false, top)?;
+        self.tensor_launch(ctx, s, out.c.buf.w(), Self::d2_of(out)?, &[(x, x)], 0, top, out.c.k())?;
         Self::finish(out.c, &r, &t)
     }
 
     /// Sum of tensors `sum_j a_j * b_j` (the tensor half of `mult_add_many` over ciphertext pairs, one relin later):
     /// every pair must share the bookkeeping (no preludes), `out.c.meta` = the product's.
     pub fn tensor_sum<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, sh: &Shadow, out: &mut Triple<'_, '_, W>, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>]) -> Result<()> {
-        lens("tensor_sum", a.len(), &[b.len()])?;
-        if a.is_empty() {
-            return Err(shape("tensor_sum", "no pairs"));
-        }
-        let r = sh.mult(&a[0].meta, &b[0].meta)?;
-        if !r.pre.is_empty() || a.iter().zip(b).any(|(x, y)| x.meta.level != a[0].meta.level || y.meta.level != a[0].meta.level || x.meta.deg != 1 || y.meta.deg != 1) {
-            return Err(shape("tensor_sum", "pairs must share level and degree 1 (no preludes); use tensor + add"));
-        }
-        let top = self.top(ctx.shape, &a[0].meta)?;
-        let pairs: Vec<(PolyRef, PolyRef)> = a.iter().zip(b).map(|(x, y)| (x.buf.r(), y.buf.r())).collect();
-        for (i, ch) in pairs.chunks(2).enumerate() {
-            self.tensor_launch(ctx, &ex.compute, out, ch, i > 0, top)?;
-        }
+        let (top, r) = self.sum_recipe(ctx, sh, a, b, "tensor_sum")?;
+        let d2 = Self::d2_of(out)?;
+        self.tensor_pairs(ctx, &ex.compute, out.c.buf.w(), d2, a, b, top, out.c.k())?;
         out.c.meta = r.out;
         Ok(())
     }
 
-    fn tensor_launch<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, out: &mut Triple<'_, '_, W>, pairs: &[(PolyRef, PolyRef)], acc: bool, top: usize) -> Result<()> {
+    /// `sum_j a_j * b_j` relinearized once (degree 2, rescale pending): the tensors accumulate (d2 too) in the
+    /// key-switching workspace, then one `relin::relin_staged`. Pairs as `tensor_sum`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_sum<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, out: &mut Ct<'_, W>, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>]) -> Result<()> {
+        let (top, r) = self.sum_recipe(ctx, sh, a, b, "mult_sum")?;
+        let k = out.k();
+        if k > ex.ks.k_max || a.iter().chain(b).any(|x| x.k() != k) {
+            return Err(shape("mult_sum", format!("batch of {k} (k_max {}) with every operand of the same k", ex.ks.k_max)));
+        }
+        let d2 = crate::ks::View::of(&ex.ks.ext, 0).r();
+        self.tensor_pairs(ctx, &ex.compute, out.buf.w(), d2, a, b, top, k)?;
+        crate::relin::relin_staged(ctx, ex, kc, key, out, top)?;
+        out.meta = r.out;
+        Ok(())
+    }
+
+    fn sum_recipe<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, sh: &Shadow, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>], what: &'static str) -> Result<(usize, Recipe)> {
+        lens(what, a.len(), &[b.len()])?;
+        if a.is_empty() {
+            return Err(shape(what, "no pairs"));
+        }
+        let r = sh.mult(&a[0].meta, &b[0].meta)?;
+        if !r.pre.is_empty() || a.iter().zip(b).any(|(x, y)| x.meta.level != a[0].meta.level || y.meta.level != a[0].meta.level || x.meta.deg != 1 || y.meta.deg != 1) {
+            return Err(shape(what, "pairs must share level and degree 1 (no preludes); use tensor + add"));
+        }
+        Ok((self.top(ctx.shape, &a[0].meta)?, r))
+    }
+
+    /// Two pairs per launch; every launch after the first accumulates c0, c1 and d2 (acc = 3).
+    #[allow(clippy::too_many_arguments)]
+    fn tensor_pairs<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, out: PolyRef, d2: PolyRef, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>], top: usize, k: usize) -> Result<()> {
+        let pairs: Vec<(PolyRef, PolyRef)> = a.iter().zip(b).map(|(x, y)| (x.buf.r(), y.buf.r())).collect();
+        for (i, ch) in pairs.chunks(2).enumerate() {
+            self.tensor_launch(ctx, s, out, d2, ch, if i > 0 { 3 } else { 0 }, top, k)?;
+        }
+        Ok(())
+    }
+
+    fn d2_of(out: &mut Triple<'_, '_, W>) -> Result<PolyRef> {
         let k = out.c.k();
         if out.d2.k < k {
             return Err(shape("tensor d2", format!("d2 buffer holds {} cts, the batch {k}", out.d2.k)));
         }
+        Ok(out.d2.w())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tensor_launch<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, out: PolyRef, d2: PolyRef, pairs: &[(PolyRef, PolyRef)], acc: i32, top: usize, k: usize) -> Result<()> {
         let (a0, b0) = pairs[0];
         let (a1, b1) = pairs.get(1).copied().unwrap_or(pairs[0]);
         let args = TensorArgs {
-            out: out.c.buf.w(),
-            d2: out.d2.w(),
+            out,
+            d2,
             a0,
             b0,
             a1,
@@ -1031,7 +1064,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
             coef_ct_stride: 0,
             pr: ctx.pr(),
             npairs: pairs.len() as i32,
-            acc: acc as i32,
+            acc,
             n: (top + 1) as i32,
             k: k as i32,
             dbl: 0,
