@@ -20520,10 +20520,10 @@
       "table_measured": true,
       "num_sites": 7,
       "predicted_rel_err": {
-        "median": 0.0027671133314084314,
-        "p90": 0.006868025346320306,
-        "p99": 0.006868025346320306,
-        "max": 0.006868025346320306
+        "median": 0.002767113331408431,
+        "p90": 0.006868025346320308,
+        "p99": 0.006868025346320308,
+        "max": 0.006868025346320308
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -20547,7 +20547,7 @@
       "worst_sites": [
         {
           "var": "sc_blk2_2",
-          "rel_err": 0.006868025346320306,
+          "rel_err": 0.006868025346320308,
           "max_abs": 0.575591102894153,
           "pack_period": null,
           "step": "blk2"
@@ -20561,35 +20561,35 @@
         },
         {
           "var": "sc_blk2_ln2_3",
-          "rel_err": 0.002774191149452245,
+          "rel_err": 0.002774191149452243,
           "max_abs": 5.098213567809523,
           "pack_period": 32768,
           "step": "blk2.ln_2"
         },
         {
           "var": "sc_blk2_gateup_2125",
-          "rel_err": 0.0027671133314084314,
-          "max_abs": 0.20655652143260225,
+          "rel_err": 0.002767113331408431,
+          "max_abs": 0.20655652143260222,
           "pack_period": 32768,
           "step": "blk2.gate_up"
         },
         {
           "var": "sc_blk2_softmax_38",
-          "rel_err": 9.644106616823077e-05,
-          "max_abs": 0.009771884651712448,
+          "rel_err": 9.644106616823079e-05,
+          "max_abs": 0.009771884651712444,
           "pack_period": 256,
           "step": "blk2.softmax"
         },
         {
           "var": "sc_blk2_ln1_97",
-          "rel_err": 1.1264207827604185e-05,
-          "max_abs": 1.0148976314958045,
+          "rel_err": 1.1264207827604184e-05,
+          "max_abs": 1.0148976314958047,
           "pack_period": 1,
           "step": "blk2.ln_1"
         },
         {
           "var": "sc_blk2_softmaxv_4",
-          "rel_err": 7.595344565977823e-07,
+          "rel_err": 7.595344565977826e-07,
           "max_abs": 0.9920442432839924,
           "pack_period": 256,
           "step": "blk2.softmax_v"
