@@ -16,7 +16,7 @@ _pc = pytest.importorskip("perseus._pc")
 
 LEVEL = 50                     # q0 + one level: 4 Q rows
 ROWS = 4
-NLOW = 24
+NLOW = 32
 
 
 @pytest.fixture(scope="module")
@@ -26,7 +26,7 @@ def setup():
     secret = _pc.ClientSecret.generate(seed=5)
     client = _pc.Client(secret, seed=6, complex=True)
     ks = _pc.KeySource.generate([1], conj=False, seed=7, secret=secret.to_bytes())
-    s = _pc.Session(cfg, ks, size={"lowPool": NLOW, "lowRows": ROWS}, pool=48, pt_slots=8).complete_setup()
+    s = _pc.Session(cfg, ks, size={"lowPool": NLOW, "lowRows": ROWS}, pool=64, pt_slots=8).complete_setup()
     yield s, client
     s.close()
 
@@ -57,6 +57,27 @@ def test_mult_sum_low_equals_full(setup):
         del xl, yl
 
 
+def test_mult_sum_many_equals_mult_sum(setup):
+    """Groups sharing b (giant steps over one query) or a (queries over one corpus), 5 groups (two output launches),
+    20 pairs (three pair launches), low and full operands: every output exports the bytes of its own mult_sum."""
+    s, client = setup
+    rng = np.random.default_rng(3)
+    _, fa = frames(client, rng, 20)
+    _, fb = frames(client, rng, 5)
+    full = [_pc.import_ct(s, f) for f in fa[:20]]
+    low = [_pc.import_ct(s, f, low=True) for f in fa[:20]]
+    q = [_pc.import_ct(s, f) for f in fb]
+    shared_b = ([low[i:i + 4] for i in range(0, 20, 4)], [q[:4]] * 5)
+    shared_a = ([full[:4]] * 5, [[q[g]] * 4 for g in range(5)])
+    for ga, gb in (shared_b, shared_a):
+        got = s.fhe.mult_sum_many(ga, gb)
+        for o, x, y in zip(got, ga, gb):
+            assert _pc.export_ct(s, o) == _pc.export_ct(s, s.fhe.mult_sum(x, y))
+    long = s.fhe.mult_sum_many([full, low], [low, full])
+    assert _pc.export_ct(s, long[0]) == _pc.export_ct(s, s.fhe.mult_sum(full, low))
+    assert _pc.export_ct(s, long[1]) == _pc.export_ct(s, s.fhe.mult_sum(low, full))
+
+
 def test_other_ops_refuse_low(setup):
     s, client = setup
     rng = np.random.default_rng(1)
@@ -74,7 +95,7 @@ def test_low_slots_are_small(setup):
     s, client = setup
     rep = s.mem_report
     low = float(rep.split("ct_low ")[1].split(" MB")[0])
-    full = float(rep.split("ct_pool ")[1].split(" MB")[0]) / 48
+    full = float(rep.split("ct_pool ")[1].split(" MB")[0]) / 64
     assert low / NLOW <= full * (ROWS + 1) / 53, rep
     rng = np.random.default_rng(2)
     _, fs = frames(client, rng, NLOW)
