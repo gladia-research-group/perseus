@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "perseus"
 requires-python = ">=3.12"
 dynamic = ["version"]
-description = "GPU FHE inference for transformer LMs under CKKS: Rust + CUDA runtime, Python models, calibration and bootstrap planning"
+description = "A full-stack system for homomorphic model inference"
 readme = "README.md"
 license = { file = "LICENSE" }
 dependencies = ["numpy", "networkx>=3"]
@@ -41,6 +41,7 @@ dev = ["pytest>=8", "ruff>=0.6", "maturin>=1.7", "scipy>=1.17", "nbformat", "nbc
 Homepage = "https://github.com/gladia-research-group/perseus"
 Repository = "https://github.com/gladia-research-group/perseus"
 Issues = "https://github.com/gladia-research-group/perseus/issues"
+Paper = "https://arxiv.org/abs/2611.04488"
 
 [project.scripts]
 perseus-export = "perseus.export:main"
