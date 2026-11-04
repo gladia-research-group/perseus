@@ -31303,7 +31303,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.1.attn": {
    "mid_x": -3.417387008666992,
@@ -33417,7 +33420,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.10.attn": {
    "mid_x": -25.606316949636245,
@@ -34011,7 +34017,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.11.attn": {
    "mid_x": -5.247037887573242,
@@ -37154,7 +37163,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.2.attn": {
    "mid_x": -75.41293064639952,
@@ -38265,7 +38277,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.3.attn": {
    "mid_x": -48.024409784986254,
@@ -38859,7 +38874,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.4.attn": {
    "mid_x": -98.95399228510504,
@@ -41004,7 +41022,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.5.attn": {
    "mid_x": -25.463814157265496,
@@ -42115,7 +42136,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.6.attn": {
    "mid_x": -23.032258012492093,
@@ -42709,7 +42733,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.7.attn": {
    "mid_x": -19.675015407798448,
@@ -43820,7 +43847,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.8.attn": {
    "mid_x": -20.457471108434834,
@@ -44931,7 +44961,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   },
   "transformer.h.9.attn": {
    "mid_x": -19.975172296106003,
@@ -45525,7 +45558,10 @@
    ],
    "exp_mask_fold": 1,
    "key_lanes": 16,
-   "pair_heads": 1
+   "pair_heads": 1,
+   "gs_num": 1,
+   "gs_num_refresh": 1,
+   "gs_num_first": 1
   }
  },
  "cutmax": {

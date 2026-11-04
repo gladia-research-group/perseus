@@ -929,10 +929,10 @@
       "table_measured": true,
       "num_sites": 5,
       "predicted_rel_err": {
-        "median": 0.001224530999327214,
-        "p90": 0.00226063800221044,
-        "p99": 0.00226063800221044,
-        "max": 0.00226063800221044
+        "median": 0.0012245309993271774,
+        "p90": 0.0022606380022104364,
+        "p99": 0.0022606380022104364,
+        "max": 0.0022606380022104364
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -953,36 +953,36 @@
       "worst_sites": [
         {
           "var": "sc_cutmax_51",
-          "rel_err": 0.00226063800221044,
-          "max_abs": 0.7306318108879596,
+          "rel_err": 0.0022606380022104364,
+          "max_abs": 0.7306318108879607,
           "pack_period": null,
           "step": "cutmax"
         },
         {
           "var": "sc_cutmax_270",
-          "rel_err": 0.002179411490864138,
-          "max_abs": 149.09233574734293,
+          "rel_err": 0.002179411490864372,
+          "max_abs": 149.09233574735094,
           "pack_period": null,
           "step": "cutmax"
         },
         {
           "var": "sc_cutmax_132",
-          "rel_err": 0.001224530999327214,
-          "max_abs": 13.605510559110659,
+          "rel_err": 0.0012245309993271774,
+          "max_abs": 13.60551055911107,
           "pack_period": null,
           "step": "cutmax"
         },
         {
           "var": "sc_cutmax_328",
-          "rel_err": 1.2322282707130128e-05,
-          "max_abs": 2.146573456510107,
+          "rel_err": 1.2322282707129886e-05,
+          "max_abs": 2.1465734565100556,
           "pack_period": 1,
           "step": "cutmax"
         },
         {
           "var": "sc_cutmax_190",
-          "rel_err": 9.725131377555e-06,
-          "max_abs": 19.33326779910777,
+          "rel_err": 9.725131377554983e-06,
+          "max_abs": 19.333267799107382,
           "pack_period": 1,
           "step": "cutmax"
         }

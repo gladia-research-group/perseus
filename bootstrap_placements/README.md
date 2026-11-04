@@ -142,6 +142,7 @@ past its main plan's 32 keys): a plan for the first 16 positions (`_w16`, the at
 window), then one per 128-position window, `_w<B>` serving the positions below B (`--plan-windows`), each planned on
 the magnitudes of its window's positions only. A model's five plans share one runtime= line on the hybrid chain
 `n32sph`, one config (`gpt2_base_n32_ctx512s`, `llama31_8b_n32_ctx512_silus`) and recipe (the dense refreshes capped
-at the StC-first entry, the strict envelope, no refresh on a reciprocal round's square), so one session serves
-them: 139 refreshes per GPT-2 token (11 of them in the encrypted argmax), 301 per Llama token. `PP=500` runs either
+at the StC-first entry, the strict envelope, no refresh on the softmax's per-key numerators or its reciprocal
+rounds' squares), so one session serves them: 133 refreshes per GPT-2 token (11 of them in the encrypted argmax),
+301 per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.
