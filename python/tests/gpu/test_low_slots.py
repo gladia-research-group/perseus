@@ -1,0 +1,86 @@
+"""Low ciphertext slots (`size={"lowPool", "lowRows"}`, `import_ct(..., low=True)`).
+
+A low slot holds only Q rows 0..lowRows-1 of one ciphertext. Gates: `mult_sum` over low operands exports the same
+bytes as over the same frames in full slots; every other op refuses a low ciphertext; the slots are their size.
+
+    tools/gpu.sh out/low_slots.log .venv/bin/python -m pytest -m gpu python/tests/gpu/test_low_slots.py -q -s
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+pytestmark = pytest.mark.gpu
+
+_pc = pytest.importorskip("perseus._pc")
+
+LEVEL = 50                     # q0 + one level: 4 Q rows
+ROWS = 4
+NLOW = 24
+
+
+@pytest.fixture(scope="module")
+def setup():
+    cfg = _pc.Config.preset("n32_gpt2_decode")
+    cfg.set("bts.auto_bts_level", 52)
+    secret = _pc.ClientSecret.generate(seed=5)
+    client = _pc.Client(secret, seed=6, complex=True)
+    ks = _pc.KeySource.generate([1], conj=False, seed=7, secret=secret.to_bytes())
+    s = _pc.Session(cfg, ks, size={"lowPool": NLOW, "lowRows": ROWS}, pool=48, pt_slots=8).complete_setup()
+    yield s, client
+    s.close()
+
+
+def frames(client, rng, n):
+    v = (rng.standard_normal((n, 1 << 15)) + 1j * rng.standard_normal((n, 1 << 15))) / 8
+    return v, [client.encrypt(x, LEVEL) for x in v]
+
+
+def test_mult_sum_low_equals_full(setup):
+    s, client = setup
+    rng = np.random.default_rng(0)
+    for n in (1, 2, 5, 10):
+        xv, xf = frames(client, rng, n)
+        yv, yf = frames(client, rng, n)
+        full = _pc.export_ct(s, s.fhe.mult_sum([_pc.import_ct(s, f) for f in xf], [_pc.import_ct(s, f) for f in yf]))
+        xl = [_pc.import_ct(s, f, low=True) for f in xf]
+        yl = [_pc.import_ct(s, f, low=True) for f in yf]
+        assert all(c.low for c in xl + yl)
+        low = _pc.export_ct(s, s.fhe.mult_sum(xl, yl))
+        assert low == full, n
+        got = client.decrypt(low)[0]
+        assert np.abs(got - (xv * yv).sum(0)).max() < 1e-6
+        # mixed: low operands with a full one
+        mixed = _pc.export_ct(s, s.fhe.mult_sum(xl, [_pc.import_ct(s, f) for f in yf]))
+        assert mixed == full, n
+        np.testing.assert_array_equal(client.decrypt(_pc.export_ct(s, xl[0]))[0], client.decrypt(xf[0])[0])
+        del xl, yl
+
+
+def test_other_ops_refuse_low(setup):
+    s, client = setup
+    rng = np.random.default_rng(1)
+    _, (f,) = frames(client, rng, 1)
+    a, b = _pc.import_ct(s, f, low=True), _pc.import_ct(s, f)
+    f_ = s.fhe
+    for op in (lambda: f_.rotate(a, 1), lambda: f_.add(a, b), lambda: f_.add(b, a), lambda: f_.mult(a, b),
+               lambda: f_.mult(a, 2.0), lambda: f_.rotate_hoisted(a, [1]), lambda: f_.drop_to_level(a, LEVEL + 1),
+               lambda: f_.mult_pt(a, np.ones(1 << 15)), lambda: f_.export_limbs(a), lambda: f_.inplace_add(b, a)):
+        with pytest.raises(ValueError, match="low-slot"):
+            op()
+
+
+def test_low_slots_are_small(setup):
+    s, client = setup
+    rep = s.mem_report
+    low = float(rep.split("ct_low ")[1].split(" MB")[0])
+    full = float(rep.split("ct_pool ")[1].split(" MB")[0]) / 48
+    assert low / NLOW <= full * (ROWS + 1) / 53, rep
+    rng = np.random.default_rng(2)
+    _, fs = frames(client, rng, NLOW)
+    held = [_pc.import_ct(s, f, low=True) for f in fs]
+    with pytest.raises(Exception, match="low slot"):
+        _pc.import_ct(s, fs[0], low=True)
+    del held
+    with pytest.raises(Exception, match="low slot"):
+        _pc.import_ct(s, client.encrypt(np.zeros(1 << 15), LEVEL - 2), low=True)   # 6 rows do not fit 4

@@ -277,6 +277,9 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
     checked_imports()?;
     let dev = session.dev.clone();
     let meta = ct.ct_ref().meta;
+    if meta.deg == 2 {
+        ct.check_full()?;                                   // the realize copy reads through the full layout
+    }
     let tmp = if meta.deg == 2 {
         let mut t = PyCt::acquire(&dev, meta)?;
         let mut st = dev.st.borrow_mut();
@@ -315,9 +318,11 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>) -> 
 
 /// A session ciphertext from a wire frame (one ciphertext, this session's chain; bytes or a memoryview, unchanged until
 /// the next `export_ct`). The frame's checksum is verified on a thread while the caller goes on; the next `export_ct`
-/// fails if it did not match.
+/// fails if it did not match. `low`: into a low slot (the session's `size={"lowPool", "lowRows"}`), an input of
+/// `mult_sum` and `export_ct` only.
 #[pyfunction]
-fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> PyResult<PyCt> {
+#[pyo3(signature = (session, frame, low=false))]
+fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>, low: bool) -> PyResult<PyCt> {
     let dev = session.dev.clone();
     // any contiguous bytes-like frame (bytes, or a memoryview into a payload holding several), read where it lies
     let fb = PyBuffer::<u8>::get(frame)?;
@@ -339,7 +344,7 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>) -> P
     }
     let tag = if h.meta.tag.is_null() { Default::default() } else { serde_json::from_value(h.meta.tag.clone()).map_err(|e| PyValueError::new_err(format!("import_ct: tag {e}")))? };
     let meta = CtMeta { level: h.meta.level, deg: h.meta.deg, nf: h.meta.nf, slots: h.meta.slots, tag };
-    let mut out = PyCt::acquire(&dev, meta)?;
+    let mut out = if low { PyCt::acquire_low(&dev, meta, top)? } else { PyCt::acquire(&dev, meta)? };
     let part_bytes = 4 * h.rows * h.n;
     {
         let st = dev.st.borrow();
