@@ -369,6 +369,45 @@ impl Client {
         Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, bits1: None, sparse: false }, data })
     }
 
+    /// Public-key encryption of `values` (one ciphertext each) with the key `pk` = (pk0, pk1) eval rows `[part][row][N]`
+    /// over the first `pk_rows` Q ids (`Entry::PublicKey`): (pk0 u + m + e0, pk1 u + e1), u ternary. For a party without
+    /// the secret (a user encrypting under the master public key).
+    pub fn encrypt_public(&self, values: &[Vec<Complex>], meta: &WireMeta, payload: Payload, prng: &mut Prng, pk: &[u32], pk_rows: usize) -> Result<CtWire> {
+        let n = self.chain.n;
+        let top = self.top_of(meta.level)?;
+        let rows = top + 1;
+        if pk_rows < rows || pk.len() != 2 * pk_rows * n {
+            return Err(Error::Params(format!("public key of {pk_rows} rows ({} words) for a {rows}-row ciphertext", pk.len())));
+        }
+        let slots = if meta.slots == 0 { n / 2 } else { meta.slots as usize };
+        let k = values.len();
+        let mut data = vec![0u32; k * 2 * rows * n];
+        for (c, v) in values.iter().enumerate() {
+            let m = self.enc.encode_slots(v, slots, top, payload, meta.nf)?;
+            let u = pc_core::keys::sample_ternary(prng, n);
+            let (e0, e1) = (self.gauss.sample_vec(prng, n), self.gauss.sample_vec(prng, n));
+            let ct = &mut data[c * 2 * rows * n..(c + 1) * 2 * rows * n];
+            let (p0, p1) = ct.split_at_mut(rows * n);
+            p0.par_chunks_mut(n).zip(p1.par_chunks_mut(n)).enumerate().for_each(|(r, (c0, c1))| {
+                let p = self.ring.primes[r];
+                let mut ue: Vec<u32> = u.iter().map(|&x| (x as i64).rem_euclid(p as i64) as u32).collect();
+                self.ring.ntt[r].fwd(&mut ue);
+                for i in 0..n {
+                    c0[i] = ((m[r][i] % p + e0[i].rem_euclid(p as i64) as u64) % p) as u32;
+                    c1[i] = e1[i].rem_euclid(p as i64) as u32;
+                }
+                self.ring.ntt[r].fwd(c0);
+                self.ring.ntt[r].fwd(c1);
+                let (k0, k1) = (&pk[r * n..(r + 1) * n], &pk[(pk_rows + r) * n..(pk_rows + r + 1) * n]);
+                for i in 0..n {
+                    c0[i] = ((c0[i] as u64 + mm(k0[i], ue[i], p)) % p) as u32;
+                    c1[i] = ((c1[i] as u64 + mm(k1[i], ue[i], p)) % p) as u32;
+                }
+            });
+        }
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded: false, bits1: None, sparse: false }, data })
+    }
+
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
     /// 4 rows (2 when the ciphertext has fewer), exact centered CRT, FFT decode.
     pub fn decrypt(&self, ct: &CtWire, payload: Payload) -> Result<Vec<Vec<Complex>>> {

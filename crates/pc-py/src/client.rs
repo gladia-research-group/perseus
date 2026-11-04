@@ -53,6 +53,8 @@ impl PyClientSecret {
 pub struct PyClient {
     c: Client,
     prng: Prng,
+    /// a master public key (`load_public_key`): `encrypt(..., public=True)`
+    pk: Option<(Vec<u32>, usize)>,
     payload: Payload,
 }
 
@@ -87,7 +89,7 @@ impl PyClient {
     #[pyo3(signature = (secret, chain="n32", complex=true, seed=None))]
     fn new(secret: &PyClientSecret, chain: &str, complex: bool, seed: Option<u64>) -> PyResult<Self> {
         let s = ClientSecret::from_bytes(&secret.0).map_err(cerr)?;
-        Ok(PyClient { c: Client::new(chain, s).map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real } })
+        Ok(PyClient { c: Client::new(chain, s).map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real }, pk: None })
     }
 
     #[getter]
@@ -130,10 +132,26 @@ impl PyClient {
 
     /// Wire frame (bytes) of a fresh encryption of `values` (a slot vector, zero-padded) at `level` (scale: the
     /// level's sf^deg unless `nf`; `slots`: live slots, default every slot).
+    /// The public key of the key bundle at `bundle` (its `public_key` entry): `encrypt(..., public=True)` encrypts under
+    /// it, so a party without that key's secret (a user, under the master key) can send ciphertexts the server computes on.
+    fn load_public_key(&mut self, bundle: std::path::PathBuf) -> PyResult<()> {
+        let mut rd = pc_client::BundleReader::open(&bundle).map_err(cerr)?;
+        let (i, rows) = rd
+            .header
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| if let pc_client::Entry::PublicKey { rows, .. } = e { Some((i, *rows)) } else { None })
+            .ok_or_else(|| PyValueError::new_err("key bundle without a public key"))?;
+        self.pk = Some((rd.read(i).map_err(cerr)?, rows));
+        Ok(())
+    }
+
     /// `seeded`: c1 sent as the seeds it is drawn from (half the frame; the server's `import_ct` expands it).
-    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false))]
+    /// `public`: under the loaded public key (`load_public_key`) instead of this client's secret.
+    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false, public=false))]
     #[allow(clippy::too_many_arguments)]
-    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool) -> PyResult<Bound<'py, PyBytes>> {
+    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool, public: bool) -> PyResult<Bound<'py, PyBytes>> {
         let v = values_of(py, values)?;
         let mut meta = self.c.fresh_meta(level, deg).map_err(cerr)?;
         if let Some(x) = nf {
@@ -146,7 +164,12 @@ impl PyClient {
             return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
         }
         let (c, g, p) = (&self.c, &mut self.prng, self.payload);
-        let w = nogil(py, || c.encrypt_as(&[v], &meta, p, g, seeded).and_then(|w| w.to_bytes())).map_err(cerr)?;
+        let w = if public {
+            let (pk, rows) = self.pk.as_ref().ok_or_else(|| PyValueError::new_err("encrypt(public=True): load_public_key first"))?;
+            nogil(py, || c.encrypt_public(&[v], &meta, p, g, pk, *rows).and_then(|w| w.to_bytes())).map_err(cerr)?
+        } else {
+            nogil(py, || c.encrypt_as(&[v], &meta, p, g, seeded).and_then(|w| w.to_bytes())).map_err(cerr)?
+        };
         Ok(PyBytes::new(py, &w))
     }
 
@@ -359,8 +382,11 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
 /// `sparse`: each ciphertext first switched to the client's sparse secret (`KeySource(sparse_out=True)`, bottom level):
 /// c1's rounding then meets a 32-coefficient secret, so both parts compress further.
 #[pyfunction]
-#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false))]
-fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool) -> PyResult<Bound<'py, PyList>> {
+/// `user`: switched to that user's key instead (`Session.add_user`): the frames decrypt with the user's secret only.
+#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false, user=None))]
+#[allow(clippy::too_many_arguments)]
+fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool, user: Option<String>) -> PyResult<Bound<'py, PyList>> {
+    let sparse = sparse || user.is_some();
     use rayon::prelude::*;
     let dev = session.dev.clone();
     let n = dev.ctx.lay.n;
@@ -373,14 +399,21 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
         let tmp = if meta.deg == 2 || sparse {
             let mut t = PyCt::acquire(&dev, meta)?;
             let mut st = dev.st.borrow_mut();
-            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let State { ops, ex, plans, groups, users, .. } = &mut *st;
             if meta.deg == 2 {
                 ops.realize_to(&dev.ctx, ex, &dev.sh, t.ct_mut_ref()?, ct.ct_ref()).map_err(gerr)?;
             } else {
                 pc_program::replay::copy_ct(&dev.ctx, &ex.compute, t.ct_mut_ref()?, ct.ct_ref()).map_err(|x| PyRuntimeError::new_err(x.to_string()))?;
             }
             if sparse {
-                let g = groups.d2s.as_ref().ok_or_else(|| PyValueError::new_err("export_ct_many(sparse=True) needs KeySource(sparse_out=True)"))?;
+                let g = match &user {
+                    Some(name) => {
+                        let u = users.as_ref().ok_or_else(|| PyValueError::new_err("Session without user key slots"))?;
+                        let slot = *u.names.get(name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("no user {name:?}")))?;
+                        &u.groups[slot]
+                    }
+                    None => groups.d2s.as_ref().ok_or_else(|| PyValueError::new_err("export_ct_many(sparse=True) needs KeySource(sparse_out=True)"))?,
+                };
                 let tc = t.ct_mut_ref()?;
                 let top = tc.top(dev.ctx.shape).map_err(gerr)?;
                 if top + 1 != dev.ctx.chain.level_unit {
