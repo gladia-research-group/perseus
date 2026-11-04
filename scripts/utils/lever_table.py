@@ -139,6 +139,10 @@ def levers(f: dict) -> dict[str, str]:
         "gs_num: numerator refreshed before its last squaring": ("n/a (decode softmax only)" if pre else
                                                                  config_count(cmds[0]["configs"], "softmax",
                                                                               "gs_num_refresh")),
+        # paired with gs_num (decode only): the gs_num softmax's saved level lets the count-only cut take one dense
+        # refresh after the key sum; on the prefills (no gs_num path) the rule replans with no excess to fix
+        "No refresh from the attention's P.V product on (FORBID_STEPS .kred)":
+            ("n/a (paired with gs_num, decode only)" if pre else on(".kred" in (rc("FORBID_STEPS") or "").split(","))),
         "Softmax: Chebyshev-scaled Goldschmidt": on(rt("SM_CHEB_GS") == "1"),
         "Softmax head sum cleanse": on(rt("SM_HRS_CLEANSE") == "1"),
         "Activation: one Chebyshev series": (on(True, "SiLU, driver") if rt("PF_SILU_SINGLE") == "1"

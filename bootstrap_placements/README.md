@@ -142,6 +142,8 @@ window), then one per 128-position window, `_w<B>` serving the positions below B
 the magnitudes of its window's positions only. A model's five plans share one runtime= line on the hybrid chain
 `n32sph`, one config (`gpt2_base_n32_ctx512s`, `llama31_8b_n32_ctx512_silus`) and recipe (the dense refreshes capped
 at the StC-first entry, the strict envelope, no refresh on the softmax's per-key numerators or its reciprocal
-rounds' squares), so one session serves them: 133 refreshes per GPT-2 token (11 of them in the encrypted argmax),
-270 per Llama token. `PP=500` runs either
+rounds' squares, nor on the attention output from its P.V product on: the probabilities refresh on the sparse route
+before it), so one session serves them: 133 refreshes per GPT-2 token (11 of them in the encrypted argmax),
+279 per Llama token. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
+precision for +4.4 % per GPT-2 token and +1.3 % per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.
