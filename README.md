@@ -39,7 +39,7 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-overview-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-overview-light.png">
-      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.76 s (50.6 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.62 s per token at a 512-token context (56.7 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB)." width="707">
+      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB)." width="707">
     </picture>
   </a>
 </p>
@@ -66,7 +66,7 @@ ours where the code is released.
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-light.png">
-      <img src="assets/paper-tables-llama-light.png" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 53.6 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 6.76 at 512 on RTX PRO 6000, open source." width="707">
+      <img src="assets/paper-tables-llama-light.png" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 53.6 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 6.86 at 512 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>
@@ -74,7 +74,7 @@ ours where the code is released.
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-gpt2-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-gpt2-light.png">
-      <img src="assets/paper-tables-gpt2-light.png" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 6.04 s, decode 1.62 s per token at context 512, on RTX PRO 6000, open source." width="707">
+      <img src="assets/paper-tables-gpt2-light.png" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 6.04 s, decode 1.70 s per token at context 512, on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
   <br>
@@ -218,7 +218,7 @@ be skipped.
 You need the following.
 - Linux, an NVIDIA GPU of compute capability 12.0 (Blackwell; the kernels are built for `sm_120`)
   and CUDA 13.2 (`CUDA_HOME`, default `/usr/local/cuda-13.2`).
-- A GPU with enough memory for the run. Decoding peaks at 56.7 GiB with GPT-2 and 50.6 GiB with
+- A GPU with enough memory for the run. Decoding peaks at 63.1 GiB with GPT-2 and 52.4 GiB with
   Llama-3-8B, and the Llama-3-8B prefill needs the most, 85.1 GiB (the first table lists every peak,
   measured on a 96 GB GPU).
 - The Rust toolchain (`rustup`; `rust-toolchain.toml` pins the version) and Python 3.12.

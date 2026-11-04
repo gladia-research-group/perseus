@@ -18,12 +18,13 @@
 \setlength{\dashlinedash}{3pt}\setlength{\dashlinegap}{3pt}
 % Perseus' numbers on the Rust + CUDA runtime (the shipped default plans, 2026-11-04: medians of 2 paired rounds on
 % one isolated GPU; decode at a 512-token context, positions 500-511 after a 500-position plaintext prefix)
-\newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.76}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.62}
+\newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.86}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.70}
 \newcommand{\vitimg}{17.7}\newcommand{\bertin}{7.36}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
-% the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), Llama's the
-% GPU's peak used memory over the run (its runner reports no free memory)
-\newcommand{\llamapfmem}{85.1}\newcommand{\llamadecmem}{50.6}\newcommand{\gptpfmem}{59.3}\newcommand{\gptdecmem}{56.7}
+% the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
+% optional position cache (PC_PT_CACHE=0), Llama's the GPU's peak used memory over the run (its runner reports no free
+% memory)
+\newcommand{\llamapfmem}{85.1}\newcommand{\llamadecmem}{52.4}\newcommand{\gptpfmem}{59.3}\newcommand{\gptdecmem}{63.1}
 \newcommand{\vitmem}{68.1}\newcommand{\bertmem}{57.9}
 \newcommand{\oursrow}{\rowcolor{ours}}
 \newcommand{\oc}{\cellcolor{ours}}
@@ -53,7 +54,7 @@ ViT-B/16 & one $224\times224$ image & \vitmem\ GiB & \textbf{\vitimg\ s} \\
 BERT-base & 128-token input & \bertmem\ GiB & \textbf{\bertin\ s} \\
 \bottomrule
 \end{tabularx}
-\tcap{End to end on one NVIDIA RTX PRO 6000 (96 GB), 128-bit security. $^\dagger$Peak memory when decoding 16 tokens.
+\tcap{End to end on one NVIDIA RTX PRO 6000 (96 GB), 128-bit security. $^\dagger$Peak memory when decoding 16 tokens, the optional position cache off.
 Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU.}
 \end{tbl}
 
