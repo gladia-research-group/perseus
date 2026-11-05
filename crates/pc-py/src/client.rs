@@ -56,6 +56,8 @@ pub struct PyClient {
     /// a master public key (`load_public_key`): `encrypt(..., public=True)`
     pk: Option<(Vec<u32>, usize)>,
     payload: Payload,
+    /// precomputed encryption parts by (level, regen) (`precompute`), used first by `encrypt(..., seeded=True)`
+    pre: std::collections::HashMap<(u32, bool), Vec<pc_client::PreEnc>>,
 }
 
 fn values_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<Complex>> {
@@ -74,6 +76,12 @@ fn np_c128<'py>(py: Python<'py>, v: &[Complex]) -> PyResult<Bound<'py, PyAny>> {
     Ok(a)
 }
 
+fn np_f64<'py>(py: Python<'py>, v: &[f64]) -> PyResult<Bound<'py, PyAny>> {
+    let a = py.import("numpy")?.call_method1("empty", (v.len(), "float64"))?;
+    PyBuffer::<f64>::get(&a)?.copy_from_slice(py, v)?;
+    Ok(a)
+}
+
 fn meta_dict<'py>(py: Python<'py>, m: &WireMeta) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("level", m.level)?;
@@ -83,13 +91,27 @@ fn meta_dict<'py>(py: Python<'py>, m: &WireMeta) -> PyResult<Bound<'py, PyDict>>
     Ok(d)
 }
 
+impl PyClient {
+    /// A fresh encryption's metadata at `level`; with `nf` the scale is the caller's, so `level` may be off the
+    /// composite grid (a ciphertext of any top limb, e.g. 3 rows on n32, which has no scaling factor of its own).
+    fn meta_at(&self, level: u32, deg: u8, nf: Option<f64>) -> PyResult<WireMeta> {
+        match nf {
+            Some(x) => {
+                self.c.top_of(level).map_err(cerr)?;
+                Ok(WireMeta { level, deg, nf: x, slots: (self.c.chain.n / 2) as u32, tag: serde_json::Value::Null })
+            }
+            None => self.c.fresh_meta(level, deg).map_err(cerr),
+        }
+    }
+}
+
 #[pymethods]
 impl PyClient {
     #[new]
     #[pyo3(signature = (secret, chain="n32", complex=true, seed=None))]
     fn new(secret: &PyClientSecret, chain: &str, complex: bool, seed: Option<u64>) -> PyResult<Self> {
         let s = ClientSecret::from_bytes(&secret.0).map_err(cerr)?;
-        Ok(PyClient { c: Client::new(chain, s).map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real }, pk: None })
+        Ok(PyClient { c: Client::new(chain, s).map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real }, pk: None, pre: Default::default() })
     }
 
     #[getter]
@@ -148,28 +170,61 @@ impl PyClient {
     }
 
     /// `seeded`: c1 sent as the seeds it is drawn from (half the frame; the server's `import_ct` expands it).
-    /// `public`: under the loaded public key (`load_public_key`) instead of this client's secret.
-    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false, public=false))]
+    /// `public`: under the loaded public key (`load_public_key`) instead of this client's secret. `regen` (with `seeded`):
+    /// c1 from the random-access expander, so the server can keep the seeds (`import_ct(..., regen=True)`).
+    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false, public=false, regen=false))]
     #[allow(clippy::too_many_arguments)]
-    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool, public: bool) -> PyResult<Bound<'py, PyBytes>> {
+    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool, public: bool, regen: bool) -> PyResult<Bound<'py, PyBytes>> {
         let v = values_of(py, values)?;
-        let mut meta = self.c.fresh_meta(level, deg).map_err(cerr)?;
-        if let Some(x) = nf {
-            meta.nf = x;
-        }
+        let mut meta = self.meta_at(level, deg, nf)?;
         if let Some(x) = slots {
             meta.slots = x;
         }
         if v.len() > meta.slots as usize {
             return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
         }
+        if seeded && !public {
+            if let Some(pre) = self.pre.get_mut(&(level, regen)).and_then(|v| v.pop()) {
+                let (c, p) = (&self.c, self.payload);
+                let w = nogil(py, || c.encrypt_pre(&v, &meta, p, pre).and_then(|w| w.to_bytes())).map_err(cerr)?;
+                return Ok(PyBytes::new(py, &w));
+            }
+        }
         let (c, g, p) = (&self.c, &mut self.prng, self.payload);
         let w = if public {
             let (pk, rows) = self.pk.as_ref().ok_or_else(|| PyValueError::new_err("encrypt(public=True): load_public_key first"))?;
             nogil(py, || c.encrypt_public(&[v], &meta, p, g, pk, *rows).and_then(|w| w.to_bytes())).map_err(cerr)?
         } else {
-            nogil(py, || c.encrypt_as(&[v], &meta, p, g, seeded).and_then(|w| w.to_bytes())).map_err(cerr)?
+            nogil(py, || c.encrypt_as(&[v], &meta, p, g, seeded, regen).and_then(|w| w.to_bytes())).map_err(cerr)?
         };
+        Ok(PyBytes::new(py, &w))
+    }
+
+    /// Prepare `count` seeded encryptions at `level` ahead of time (the noise and c1 s parts; parallel, each on a stream
+    /// seeded from this client's): `encrypt(..., level, seeded=True, regen=regen)` then only encodes and adds. Returns
+    /// how many are ready at that level.
+    #[pyo3(signature = (level, count, regen=false))]
+    fn precompute(&mut self, py: Python<'_>, level: u32, count: usize, regen: bool) -> PyResult<usize> {
+        use rayon::prelude::*;
+        let keys: Vec<[u32; 8]> = (0..count).map(|_| self.prng.ksk_seed().0).collect();
+        let c = &self.c;
+        let made = nogil(py, || keys.par_iter().map(|&k| c.precompute(level, &mut pc_core::keys::Prng::from_seed(k, 0), regen)).collect::<pc_client::Result<Vec<_>>>()).map_err(cerr)?;
+        let q = self.pre.entry((level, regen)).or_default();
+        q.extend(made);
+        Ok(q.len())
+    }
+
+    /// A seeded frame of the plaintext whose coefficients are `coeffs` (n reals, at the level's scale unless `nf`), no
+    /// slot FFT (e.g. selection weights given as coefficients); a precomputed part (`precompute`) when one is ready.
+    #[pyo3(signature = (coeffs, level, nf=None, regen=false))]
+    fn encrypt_coeffs<'py>(&mut self, py: Python<'py>, coeffs: Vec<f64>, level: u32, nf: Option<f64>, regen: bool) -> PyResult<Bound<'py, PyBytes>> {
+        let meta = self.meta_at(level, 1, nf)?;
+        let pre = match self.pre.get_mut(&(level, regen)).and_then(|v| v.pop()) {
+            Some(p) => p,
+            None => self.c.precompute(level, &mut self.prng, regen).map_err(cerr)?,
+        };
+        let c = &self.c;
+        let w = nogil(py, || c.encrypt_pre_coeffs(&coeffs, &meta, pre).and_then(|w| w.to_bytes())).map_err(cerr)?;
         Ok(PyBytes::new(py, &w))
     }
 
@@ -185,13 +240,26 @@ impl PyClient {
         Ok(out)
     }
 
+    /// The plaintext coefficients over the frame's scale (float64 arrays, one per ciphertext of the frame), no slot
+    /// FFT: e.g. integer data carried as coefficients.
+    fn decrypt_coeffs<'py>(&self, py: Python<'py>, frame: &[u8]) -> PyResult<Bound<'py, PyList>> {
+        let w = CtWire::from_bytes(frame).map_err(cerr)?;
+        let c = &self.c;
+        let vals = nogil(py, || c.decrypt_coeffs(&w)).map_err(cerr)?;
+        let out = PyList::empty(py);
+        for v in vals {
+            out.append(np_f64(py, &v)?)?;
+        }
+        Ok(out)
+    }
+
     /// `encrypt` of several slot vectors in parallel (one rayon task each, each on its own stream seeded from this
-    /// client's): their frames, in order. `seeded` as `encrypt`'s.
-    #[pyo3(signature = (values, level, seeded=false))]
-    fn encrypt_many<'py>(&mut self, py: Python<'py>, values: Vec<Bound<'_, PyAny>>, level: u32, seeded: bool) -> PyResult<Bound<'py, PyList>> {
+    /// client's): their frames, in order. `nf`, `seeded`, `regen` as `encrypt`'s.
+    #[pyo3(signature = (values, level, nf=None, seeded=false, regen=false))]
+    fn encrypt_many<'py>(&mut self, py: Python<'py>, values: Vec<Bound<'_, PyAny>>, level: u32, nf: Option<f64>, seeded: bool, regen: bool) -> PyResult<Bound<'py, PyList>> {
         use rayon::prelude::*;
         let vs = values.iter().map(|v| values_of(py, v)).collect::<PyResult<Vec<_>>>()?;
-        let meta = self.c.fresh_meta(level, 1).map_err(cerr)?;
+        let meta = self.meta_at(level, 1, nf)?;
         if let Some(v) = vs.iter().find(|v| v.len() > meta.slots as usize) {
             return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
         }
@@ -202,7 +270,7 @@ impl PyClient {
                 .zip(&keys)
                 .map(|(v, &k)| {
                     let mut g = pc_core::keys::Prng::from_seed(k, 0);
-                    c.encrypt_as(std::slice::from_ref(v), &meta, p, &mut g, seeded).and_then(|w| w.to_bytes())
+                    c.encrypt_as(std::slice::from_ref(v), &meta, p, &mut g, seeded, regen).and_then(|w| w.to_bytes())
                 })
                 .collect::<pc_client::Result<Vec<_>>>()
         })
@@ -318,6 +386,9 @@ fn contract_hash(config: &PyConfig) -> PyResult<String> {
 #[pyo3(signature = (session, ct, bits=None))]
 fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bits: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
     let dev = session.dev.clone();
+    if ct.ct_ref().buf.seeds {
+        return Err(PyValueError::new_err("export_ct: a seeded ciphertext (import_ct(..., regen=True)) is an input of mult_sum_many only"));
+    }
     let meta = ct.ct_ref().meta;
     if meta.deg == 2 {
         ct.check_full()?;                                   // the realize copy reads through the full layout
@@ -349,12 +420,12 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         for part in 0..2 {
             let rs: Vec<Vec<u64>> = limbs.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
             let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
-            data.extend(pc_client::wire::pack_coeffs(&limbs.moduli, &refs, b).map_err(cerr)?);
+            data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&limbs.moduli, &refs, b).map_err(cerr)?, b));
         }
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let w = CtWire {
-            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, bits1: None, sparse: false },
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, regen: false, bits1: None, sparse: false },
             data,
         };
         return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
@@ -371,7 +442,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, bits1: None, sparse: false },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, regen: false, bits1: None, sparse: false },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
@@ -392,6 +463,9 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
     let n = dev.ctx.lay.n;
     let mut limbs = Vec::with_capacity(cts.len());
     for ct in &cts {
+        if ct.ct_ref().buf.seeds {
+            return Err(PyValueError::new_err("export_ct_many: a seeded ciphertext (import_ct(..., regen=True)) is an input of mult_sum_many only"));
+        }
         let meta = ct.ct_ref().meta;
         if meta.deg == 2 || ct.ct_ref().buf.lay.nq != dev.ctx.lay.nq {
             ct.check_full()?;
@@ -443,7 +517,7 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
                     data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&l.moduli, &refs, b)?, b));
                 }
                 let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false, bits1, sparse };
+                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false, regen: false, bits1, sparse };
                 CtWire { header, data }.to_bytes()
             })
             .collect::<pc_client::Result<Vec<_>>>()
@@ -457,13 +531,18 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
 }
 
 /// A session ciphertext from a wire frame (one ciphertext, this session's chain). `low`: into a low slot (the
-/// session's `size={"lowPool", "lowRows"}`), an input of `mult_sum` and `export_ct` only.
+/// session's `size={"lowPool", "lowRows"}`), an input of `mult_sum` and `export_ct` only. `regen` (with `low`): a
+/// `regen` frame kept as c0 and its seeds in a seeded low slot (`size={"lowSeeded"}`), half a low slot (c0 packed on
+/// upload when `size={"lowPacked": 1}`); an input of `mult_sum_many` (first operands) only, which draws c1 from the seeds.
 #[pyfunction]
-#[pyo3(signature = (session, frame, low=false))]
-fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool) -> PyResult<PyCt> {
+#[pyo3(signature = (session, frame, low=false, regen=false))]
+fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen: bool) -> PyResult<PyCt> {
     let dev = session.dev.clone();
     let w = CtWire::from_bytes(frame).map_err(cerr)?;
-    let w = if w.header.seeded { w.expand_seeded(&dev.ctx.chain.q).map_err(cerr)? } else { w };
+    if regen && !(low && w.header.seeded && w.header.regen) {
+        return Err(PyValueError::new_err("import_ct(regen=True): a low import of a seeded regen frame (encrypt(..., seeded=True, regen=True))"));
+    }
+    let w = if w.header.seeded && !regen { w.expand_seeded(&dev.ctx.chain.q).map_err(cerr)? } else { w };
     let h = &w.header;
     let ph = pc_client::spec::params_hash(&dev.ctx.chain);
     if h.params_hash != ph || h.n != dev.ctx.lay.n || h.k != 1 {
@@ -475,13 +554,29 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool) -> Py
     }
     let tag = if h.meta.tag.is_null() { Default::default() } else { serde_json::from_value(h.meta.tag.clone()).map_err(|e| PyValueError::new_err(format!("import_ct: tag {e}")))? };
     let meta = CtMeta { level: h.meta.level, deg: h.meta.deg, nf: h.meta.nf, slots: h.meta.slots, tag };
-    let mut out = if low { PyCt::acquire_low(&dev, meta, top)? } else { PyCt::acquire(&dev, meta)? };
+    let mut out = if low { PyCt::acquire_low(&dev, meta, top, regen)? } else { PyCt::acquire(&dev, meta)? };
     let rows: Vec<usize> = (0..h.rows).collect();
     let n = h.n;
     {
         let st = dev.st.borrow();
         let c = out.ct_mut_ref()?;
         nogil(py, || -> pc_gpu::Result<()> {
+            if regen {
+                // seeded frame: c0's rows, then the rows' 8-word seeds; a packed slot takes c0 packed here
+                if c.buf.packed {
+                    let pw = pc_kernels::pack_row_words(n);
+                    let mut packed = vec![0u32; h.rows * pw];
+                    for (src, dst) in w.data[..h.rows * n].chunks_exact(n).zip(packed.chunks_exact_mut(pw)) {
+                        if !pc_kernels::pack_row(src, dst) {
+                            return Err(pc_gpu::Error::Shape { what: "import_ct", msg: format!("a residue of {} bits or more into a packed slot", pc_kernels::PACK_BITS) });
+                        }
+                    }
+                    c.buf.upload_packed(&st.ex.compute, &packed)?;
+                } else {
+                    c.buf.upload_rows(&st.ex.compute, 0, 0, &rows, &w.data[..h.rows * n])?;
+                }
+                return c.buf.upload_seeds(&st.ex.compute, &w.data[h.rows * n..h.rows * (n + 8)]);
+            }
             for part in 0..2 {
                 c.buf.upload_rows(&st.ex.compute, 0, part, &rows, &w.data[part * h.rows * n..(part + 1) * h.rows * n])?;
             }

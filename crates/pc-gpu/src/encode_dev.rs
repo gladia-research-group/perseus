@@ -146,10 +146,20 @@ impl<'a, W: DevWord> DevEncoder<'a, W> {
             (EncoderKind::DeviceFft, Payload2::Slots { values, slots, payload }) => self.device_fft(ctx, s, ring, values, slots, payload, &at, out)?,
             (EncoderKind::HostFft, Payload2::Slots { .. }) | (EncoderKind::CoeffRows, Payload2::Coeffs(_)) => {
                 let rows = self.host_rows(what, &at)?;
-                self.upload_rows(s, &rows, at.top, out)?;
+                return self.encode_rows(ctx, s, &rows, &at, out);
             }
             (k, _) => return Err(shape("encode", format!("{k:?} does not take this payload"))),
         }
+        if at.form == PtForm::Eval {
+            ntt::transform_rows(ctx, s, Dir::Forward, out, &self.lists[at.top])?;
+        }
+        Ok(())
+    }
+
+    /// `encode` of host-encoded rows (`host_rows`): uploaded, then transformed to `at.form`.
+    pub fn encode_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, rows: &[Vec<u64>], at: &EncodeAt, out: &mut DBuf<'_, Compute, W>) -> Result<()> {
+        self.check(at, out)?;
+        self.upload_rows(s, rows, at.top, out)?;
         if at.form == PtForm::Eval {
             ntt::transform_rows(ctx, s, Dir::Forward, out, &self.lists[at.top])?;
         }
@@ -175,9 +185,9 @@ impl<'a, W: DevWord> DevEncoder<'a, W> {
             }
         }
         // SAFETY: the pinned buffer is not rewritten before pin_w_ev (recorded after this copy) completes; the copy
-        // covers the whole buffer, rows above `top` land in `out` only when it is large enough
+        // covers the live rows 0..=top
         if out.len() >= self.pin_w.len() {
-            unsafe { out.upload_pinned_async(s, 0, &self.pin_w)? };
+            unsafe { out.upload_pinned_range_async(s, 0, &self.pin_w, 0, (top + 1) * n)? };
         } else {
             // a buffer holding exactly rows 0..=top: synchronous copy of the live part
             let words = (top + 1) * n;

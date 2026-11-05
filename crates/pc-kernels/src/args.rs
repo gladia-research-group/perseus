@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 19;
+pub const ABI: u32 = 22;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -320,13 +320,69 @@ pub struct TensorMultiArgs {
     pub d2: [PolyRef; TMULTI_OUT],
     pub a: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
     pub b: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
+    /// `seeded == 2`: a[o][j]'s c1 rows, drawn beforehand by `cts_expand` (part 0); unused otherwise.
+    pub x1: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
     pub pr: *const PrimeConst,
     pub nout: i32,
     pub npairs: i32,
     pub acc: i32,
     pub n: i32,
     pub k: i32,
-    pub pad: i32,
+    /// 1: every `a` operand is seeded (part 1 holds its rows' c1 seeds; the kernel draws c1). 2 (ABI 21): seeded, c1
+    /// read from `x1`. | 4 (ABI 22): seeded with c0 packed (`pack_row`, rows `pack_row_words(N)` apart).
+    pub seeded: i32,
+}
+
+/// Bits per coefficient of a packed seeded c0 row (`PC_PACK_BITS`): primes below 2^PACK_BITS only.
+pub const PACK_BITS: u32 = 28;
+
+/// Words of one packed row of `n` coefficients (padded to a whole word).
+pub fn pack_row_words(n: usize) -> usize {
+    (n * PACK_BITS as usize).div_ceil(32)
+}
+
+/// Pack a row of residues below 2^PACK_BITS: coefficient i at bits [PACK_BITS i, PACK_BITS (i + 1)) of one little-endian
+/// bit stream (`dst`: `pack_row_words(src.len())` words). False if a residue does not fit.
+pub fn pack_row(src: &[u32], dst: &mut [u32]) -> bool {
+    dst.fill(0);
+    for (i, &x) in src.iter().enumerate() {
+        if x >> PACK_BITS != 0 {
+            return false;
+        }
+        let b = i * PACK_BITS as usize;
+        let (w, s) = (b / 32, b % 32);
+        dst[w] |= x << s;
+        if s + PACK_BITS as usize > 32 {
+            dst[w + 1] |= x >> (32 - s);
+        }
+    }
+    true
+}
+
+/// Coefficients `start..start + out.len()` of a packed row (`pack_row`).
+pub fn unpack_range(row: &[u32], start: usize, out: &mut [u32]) {
+    let mask = (1u64 << PACK_BITS) - 1;
+    for (k, o) in out.iter_mut().enumerate() {
+        let b = (start + k) * PACK_BITS as usize;
+        let (w, s) = (b / 32, b % 32);
+        let hi = if s + PACK_BITS as usize > 32 { row[w + 1] as u64 } else { 0 };
+        *o = (((row[w] as u64 | hi << 32) >> s) & mask) as u32;
+    }
+}
+
+/// Seeded operands per `cts_expand` launch (`PC_CTS_EXPAND_MAX`): one `tensor_multi` launch's.
+pub const CTS_EXPAND_MAX: usize = TMULTI_OUT * TMULTI_PAIRS;
+
+/// ABI 21: c1 rows 0..n of `nops` seeded ciphertexts (`src[u]` part 1: 8 seed words per row) drawn into `dst`, operand
+/// u row r at `dst + (u n + r) N` words (`pc_core::keys::cts_expand_row`). u32 words only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CtsExpandArgs {
+    pub src: [PolyRef; CTS_EXPAND_MAX],
+    pub dst: *mut c_void,
+    pub pr: *const PrimeConst,
+    pub nops: i32,
+    pub n: i32,
 }
 
 #[repr(C)]
@@ -900,6 +956,7 @@ pub struct KernelTable {
     pub tfhe: Launch<TfheArgs>,
     pub tensor_sum: Launch<TensorSumArgs>,
     pub tensor_multi: Launch<TensorMultiArgs>,
+    pub cts_expand: Launch<CtsExpandArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -920,7 +977,8 @@ const _: () = {
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<TensorSumArgs>() == 2 * 24 + 2 * TSUM_MAX * 24 + 8 + 16);
-    assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 2 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
+    assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 3 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
+    assert!(size_of::<CtsExpandArgs>() == CTS_EXPAND_MAX * 24 + 24);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
@@ -946,7 +1004,7 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 43 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 44 * 8);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<TfheArgs>() == 32 + 6 * 8 + 16 + 64);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);
@@ -970,5 +1028,20 @@ mod tests {
         let mu = ((d.mu_hi as u128) << 64) | d.mu_lo as u128;
         assert_eq!(mu, u128::MAX / q as u128);
         assert_eq!(q.wrapping_mul(d.mont_pinv.wrapping_neg()), 1);
+    }
+    #[test]
+    fn pack_row_roundtrip() {
+        use super::{pack_row, pack_row_words, unpack_range, PACK_BITS};
+        let n = 1 << 10;
+        let src: Vec<u32> = (0..n as u64).map(|i| ((i * 0x9E37_79B9_7F4A_7C15) >> 36) as u32).collect();
+        let mut packed = vec![0u32; pack_row_words(n)];
+        assert!(pack_row(&src, &mut packed));
+        assert_eq!(packed.len(), n * PACK_BITS as usize / 32);
+        for lo in (0..n).step_by(16) {
+            let mut out = [0u32; 16];
+            unpack_range(&packed, lo, &mut out);
+            assert_eq!(&out[..], &src[lo..lo + 16]);
+        }
+        assert!(!pack_row(&[1 << PACK_BITS], &mut [0u32; 1]));
     }
 }

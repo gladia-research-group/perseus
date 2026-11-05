@@ -128,6 +128,12 @@ pub(crate) struct Sizes {
     /// `import_ct(..., low=True)`, each slot only `rows` Q rows long.
     pub low_pool: usize,
     pub low_rows: usize,
+    /// Seeded low slots (`size={"lowSeeded": count}`, of `lowRows` rows): c0 and its rows' c1 seeds, half a low slot;
+    /// `import_ct(..., low=True, regen=True)` fills them and `mult_sum_many` draws c1 from the seeds.
+    pub low_seeded: usize,
+    /// Seeded low slots with c0 packed at `pc_kernels::PACK_BITS` bits per coefficient (`size={"lowPacked": 1}`): 7/8
+    /// of c0's words; every prime of their rows must be below 2^PACK_BITS.
+    pub low_packed: bool,
     /// Per-user result keys (`size={"userKeys": count}`): bottom-level master -> user switching keys, filled at run
     /// time (`Session.add_user`) and used by `export_ct_many(..., user=)`.
     pub user_keys: usize,
@@ -1007,7 +1013,18 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let mut mplan = MemPlan::build::<W, M>(&chain, mcfg).map_err(e)?;
     let lay = mplan.lay;
     if sizes.low_pool > 0 {
-        mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows));
+        mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows, false, false));
+    }
+    // seeded slots' c1 drawn by its own pass before each tensor launch; PC_CTS_EXPAND=0: inside the tensor (A/B)
+    let cts_expand = sizes.low_seeded > 0 && !std::env::var("PC_CTS_EXPAND").is_ok_and(|v| v == "0");
+    if sizes.low_packed && chain.q.iter().take(sizes.low_rows).any(|&p| p >> pc_kernels::PACK_BITS != 0) {
+        return Err(PyValueError::new_err(format!("size lowPacked: the primes of rows 0..{} need more than {} bits", sizes.low_rows, pc_kernels::PACK_BITS)));
+    }
+    if sizes.low_seeded > 0 {
+        mplan.reserve("ct_low_seeded", CtPool::<W>::low_bytes(&lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed));
+    }
+    if cts_expand {
+        mplan.reserve("cts_expand", Executor::<W>::cts_expand_bytes(&lay, sizes.low_rows));
     }
     let nd = key_needs(cfg, ks, &chain, &plan, &pcmm, &ccmm)?;
     let spec_req = match origin {
@@ -1133,10 +1150,16 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let a: &'static Arena = unsafe { &*(arena.as_ref() as *const Arena) };
     let mut ex = Executor::<W>::new(&device, a, &mplan).map_err(e)?;
     ex.ks.carve_regen(a, &lay).map_err(e)?;
+    if cts_expand {
+        ex.carve_cts_expand(a, &lay, sizes.low_rows).map_err(e)?;
+    }
     let ctx = Context::<W, M>::new(a, &ex.copy, chain.clone(), &mplan).map_err(e)?;
     let mut pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
     if sizes.low_pool > 0 {
-        pool.add_low(a, &lay, sizes.low_pool, sizes.low_rows).map_err(e)?;
+        pool.add_low(a, &lay, sizes.low_pool, sizes.low_rows, false, false).map_err(e)?;
+    }
+    if sizes.low_seeded > 0 {
+        pool.add_low(a, &lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed).map_err(e)?;
     }
     let plans = KsPlans::new(a, &ex.compute, &ctx, k_max).map_err(e)?;
     let mut keys = KeySet::carve(a, &chain, &spec, layout).map_err(e)?;
@@ -1177,8 +1200,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let stage = ex.ks.stage_ptrs();
     let groups = {
         let mut rot_refs: Vec<&dyn KsKeyRef> = keys.rots.values().map(|k| k as &dyn KsKeyRef).collect();
+        // conj joins the shared group when it shares the rotations' digit layout (banded rotations do not); `conjugate`
+        // reads its own group either way
         if let Some(c) = keys.conj.as_ref() {
-            rot_refs.push(c);
+            if rot_refs.first().is_none_or(|r| r.digit_stride() == KsKeyRef::digit_stride(c) && r.dnum() == KsKeyRef::dnum(c)) {
+                rot_refs.push(c);
+            }
         }
         let all = if rot_refs.is_empty() { None } else { Some(KeyGroup::new(a, &ex.compute, n, &rot_refs, stage).map_err(e)?) };
         let mut exact = BTreeMap::new();
@@ -1450,7 +1477,7 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         exp_real: g("expanded", 3072),
         seq_len: g("seqLen", 1024),
     };
-    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), user_keys: g("userKeys", 0) };
+    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0) };
     let cfg = config.0.clone();
     let ks = keys.clone();
     let plan = match programs {

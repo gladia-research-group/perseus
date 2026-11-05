@@ -461,6 +461,38 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
         Ok(())
     }
 
+    /// `encode_with(CoeffRows)` of `coeffs[i]` into `keys[i]` (at their levels' scaling factors): the host rows
+    /// encoded in parallel on the store's workers, then uploaded and transformed on the compute lane.
+    pub fn encode_coeffs_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, sh: &Shadow, keys: &[PtKey], coeffs: &[Vec<f64>]) -> Result<()> {
+        if keys.len() != coeffs.len() {
+            return Err(shape("encode_coeffs_many", format!("{} keys, {} rows", keys.len(), coeffs.len())));
+        }
+        let st = sh.tables.as_ref().ok_or_else(|| shape("encode", "the Shadow has no scale tables"))?;
+        let ats = keys
+            .iter()
+            .map(|k| {
+                let top = self.top(sh, k.level)?;
+                Ok(EncodeAt { top, scale: st.sf(top as i32)?, deg: 1, form: k.form })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (host, primes) = (&self.host, &self.primes);
+        let rows = self.pool.install(|| coeffs.par_iter().zip(&ats).map(|(c, at)| host_rows(host, primes, Payload2::Coeffs(c), at)).collect::<Result<Vec<_>>>())?;
+        for ((key, at), r) in keys.iter().zip(&ats).zip(&rows) {
+            let i = self.slot_for(key, at.top)?;
+            let mut b = self.take_compute_buf(i, &ex.compute)?;
+            let res = self.enc.encode_rows(ctx, &ex.compute, r, at, &mut b);
+            self.clock += 1;
+            let slot = &mut self.slots[i];
+            slot.state = State::Resident(b);
+            res?;
+            slot.meta = PtMeta { level: key.level, deg: 1, nf: at.scale, tag: Default::default() };
+            slot.key = Some(key.clone());
+            slot.last_use = self.clock;
+            self.index.insert(key.clone(), i);
+        }
+        Ok(())
+    }
+
     // ── named slot plaintexts and cached products ────────────────────────────────────────────────────────────────
 
     /// `set_slot_pt`: keep `values` as the named plaintext, encoded (at `level`, or the level a product needs) on use.

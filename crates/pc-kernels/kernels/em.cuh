@@ -3,6 +3,7 @@
 // MulTableArgs, MulAddArgs). The composite rescale lives in rescale.cuh.
 #pragma once
 #include "arith.cuh"
+#include "chacha.cuh"
 
 namespace pc {
 namespace em {
@@ -115,8 +116,22 @@ __device__ __forceinline__ bool same_ref(const PolyRef& x, const PolyRef& y) {
     return x.base == y.base && x.ct_stride == y.ct_stride && x.part_stride == y.part_stride;
 }
 
-template <class W, class MM>
-__global__ void tensor_multi(TensorMultiArgs A) {
+// Coefficients i..i + 3 (i % 4 == 0) of a packed row (args.cuh, seeded | 4): their 112 bits start at bit 112 i / 4, in
+// words 7 i / 8 .. + 3 from bit 0 or 16.
+static_assert(PC_PACK_BITS == 28, "unpack4 reads 4 x 28 bits");
+__device__ __forceinline__ V4<uint32_t> unpack4(const uint32_t* row, int i) {
+    const int t = i >> 2;
+    const uint32_t* w = row + ((7 * t) >> 1);
+    const uint32_t s = (t & 1) * 16, w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+    const uint32_t v0 = __funnelshift_r(w0, w1, s), v1 = __funnelshift_r(w1, w2, s), v2 = __funnelshift_r(w2, w3, s), v3 = w3 >> s;
+    constexpr uint32_t M = (1u << PC_PACK_BITS) - 1;
+    return V4<uint32_t>{{v0 & M, __funnelshift_r(v0, v1, 28) & M, __funnelshift_r(v1, v2, 24) & M, __funnelshift_r(v2, v3, 20) & M}};
+}
+
+// PACKED: seeded | 4 (its own instantiation: the other modes keep their code). At u32, 2 blocks per SM (128 registers,
+// a few spilled): the kernel is bound by the loads in flight, ~20% faster than one block of 168 registers.
+template <class W, class MM, bool PACKED>
+__global__ void __launch_bounds__(BX, sizeof(W) == 4 ? 2 : 1) tensor_multi(TensorMultiArgs A) {
     using Wd = WideOf<W>;
     const int row = blockIdx.y, c = blockIdx.z;
     const PrimeConst& q = A.pr[row];
@@ -135,8 +150,32 @@ __global__ void tensor_multi(TensorMultiArgs A) {
         for (int o = 0; o < PC_TMULTI_OUT; ++o) {
             if (o >= A.nout) break;
             if (o == 0 || !same_ref(A.a[o][j], A.a[o - 1][j])) {
-                x0 = load4<W>(at<W>(A.a[o][j], c, 0, row) + i);
-                x1 = load4<W>(at<W>(A.a[o][j], c, 1, row) + i);
+                if constexpr (sizeof(W) == 4) {
+                    if constexpr (PACKED) {
+                        const V4<uint32_t> u = unpack4((const uint32_t*)at<W>(A.a[o][j], c, 0, 0) + (size_t)row * PC_PACK_ROW_WORDS, i);
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) x0.v[w] = u.v[w];
+                    } else {
+                        x0 = load4<W>(at<W>(A.a[o][j], c, 0, row) + i);
+                    }
+                    if ((A.seeded & 3) == 2) {
+                        x1 = load4<W>(at<W>(A.x1[o][j], 0, 0, row) + i);  // drawn by cts_expand
+                    } else if (A.seeded & 3) {
+                        // c1 drawn from the row's seed (part 1: 8 words per row); the host admits seeded at u32 only
+                        const uint32_t* sd = (const uint32_t*)at<W>(A.a[o][j], c, 1, 0) + 8 * row;
+                        uint32_t key[8], v[4];
+#pragma unroll
+                        for (int w = 0; w < 8; ++w) key[w] = sd[w];
+                        chacha::cts_expand4(key, threadIdx.x & 31u, (uint32_t)p, (uint32_t)i, v);
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) x1.v[w] = v[w];
+                    } else {
+                        x1 = load4<W>(at<W>(A.a[o][j], c, 1, row) + i);
+                    }
+                } else {
+                    x0 = load4<W>(at<W>(A.a[o][j], c, 0, row) + i);
+                    x1 = load4<W>(at<W>(A.a[o][j], c, 1, row) + i);
+                }
             }
             if (o == 0 || !same_ref(A.b[o][j], A.b[o - 1][j])) {
                 y0 = load4<W>(at<W>(A.b[o][j], c, 0, row) + i);
@@ -280,6 +319,21 @@ __global__ void mul_table(MulTableArgs A) {
     store4<W>(at<W>(A.out, cc, part, row) + i, MM::mul(x.v[0], t.v[0], q), MM::mul(x.v[1], t.v[1], q), MM::mul(x.v[2], t.v[2], q), MM::mul(x.v[3], t.v[3], q));
 }
 
+// One thread per 16-word block of a c1 row: grid (N / (16 BXE), n, nops).
+constexpr int BXE = 128;
+__global__ void cts_expand(CtsExpandArgs A) {
+    const int row = blockIdx.y, u = blockIdx.z;
+    const uint32_t b = blockIdx.x * BXE + threadIdx.x;
+    const uint32_t* sd = (const uint32_t*)at<uint32_t>(A.src[u], 0, 1, 0) + 8 * row;
+    uint32_t key[8], v[16];
+#pragma unroll
+    for (int w = 0; w < 8; ++w) key[w] = sd[w];
+    chacha::regen_block16(key, b, 0u, (uint32_t)A.pr[row].p, (uint32_t)N >> 4, chacha::TAG_CTSA, v, chacha::CTS_T_MAX);
+    uint4* d = (uint4*)((uint32_t*)A.dst + ((size_t)u * A.n + row) * N + 16 * (size_t)b);
+#pragma unroll
+    for (int w = 0; w < 4; ++w) d[w] = make_uint4(v[4 * w], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
+}
+
 template <class W, class MM>
 __global__ void mul_add(MulAddArgs B) {
     const MulTableArgs& A = B.m;
@@ -312,7 +366,18 @@ int tensor_sum_l(const TensorSumArgs* a, cudaStream_t s) {
 template <class W, class MM>
 int tensor_multi_l(const TensorMultiArgs* a, cudaStream_t s) {
     if (a->nout < 1 || a->nout > PC_TMULTI_OUT || a->npairs < 1 || a->npairs > PC_TMULTI_PAIRS) return -1;
-    tensor_multi<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
+    if (a->seeded & 4) {
+        if (sizeof(W) != 4) return -1;
+        tensor_multi<W, MM, true><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
+    } else {
+        tensor_multi<W, MM, false><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
+    }
+    return (int)cudaGetLastError();
+}
+template <class W>
+int cts_expand_l(const CtsExpandArgs* a, cudaStream_t s) {
+    if (sizeof(W) != 4 || a->nops < 1 || a->nops > PC_CTS_EXPAND_MAX) return -1;
+    cts_expand<<<dim3(N / (16 * BXE), a->n, a->nops), BXE, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W>

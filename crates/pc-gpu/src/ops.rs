@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSumArgs, WsumArgs, TMULTI_OUT, TMULTI_PAIRS, TSUM_MAX};
+use pc_kernels::{AddConstArgs, CtsExpandArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSumArgs, WsumArgs, CTS_EXPAND_MAX, TMULTI_OUT, TMULTI_PAIRS, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -1008,6 +1008,9 @@ impl<'a, W: DevWord> Ops<'a, W> {
     #[allow(clippy::too_many_arguments)]
     pub fn mult_sum<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, out: &mut Ct<'_, W>, a: &[&Ct<'_, W>], b: &[&Ct<'_, W>]) -> Result<()> {
         let (top, r) = self.sum_recipe(ctx, sh, a, b, "mult_sum")?;
+        if a.iter().chain(b).any(|x| x.buf.seeds) {
+            return Err(shape("mult_sum", "seeded operands are read by mult_sum_many only"));
+        }
         let k = out.k();
         if k > ex.ks.k_max || a.iter().chain(b).any(|x| x.k() != k) {
             return Err(shape("mult_sum", format!("batch of {k} (k_max {}) with every operand of the same k", ex.ks.k_max)));
@@ -1042,12 +1045,26 @@ impl<'a, W: DevWord> Ops<'a, W> {
             recipe = Some((top, r));
         }
         let (top, r) = recipe.expect("one group");
+        let (seeded, packed) = (a[0][0].buf.seeds, a[0][0].buf.packed);
+        if a.iter().flatten().any(|x| x.buf.seeds != seeded || x.buf.packed != packed) || b.iter().flatten().any(|x| x.buf.seeds) {
+            return Err(shape("mult_sum_many", "seeded (packed) operands: every first operand or none, no second operand"));
+        }
+        if seeded && std::mem::size_of::<W>() != 4 {
+            return Err(shape("mult_sum_many", "seeded operands need 32-bit words"));
+        }
         if outs.iter().map(|o| o.k()).chain(d2s.iter().map(|d| d.k())).chain(a.iter().chain(b).flatten().map(|x| x.k())).any(|k| k != 1) {
             return Err(shape("mult_sum_many", "single ciphertexts only (k = 1)"));
         }
         let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
         let bits = 8 * std::mem::size_of::<W>() as u32;
         let per = if bits >= 64 { TMULTI_PAIRS } else { ((((1u128 << (2 * bits)) - 1) / (2 * pm * pm)) as usize).clamp(1, TMULTI_PAIRS) };
+        // seeded: each launch's distinct first operands get their c1 rows drawn into the executor's workspace first
+        // (cts_expand, seeded = 2); without one (or too few rows) the tensor draws them (seeded = 1)
+        let rows = top + 1;
+        let expand = match &mut ex.cts_expand {
+            Some((buf, r)) if seeded && *r >= rows => Some(buf.dptr_mut()),
+            _ => None,
+        };
         for o0 in (0..g).step_by(TMULTI_OUT) {
             let no = (g - o0).min(TMULTI_OUT);
             for (ci, j0) in (0..np).step_by(per).enumerate() {
@@ -1057,21 +1074,40 @@ impl<'a, W: DevWord> Ops<'a, W> {
                     d2: [PolyRef::default(); TMULTI_OUT],
                     a: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
                     b: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
+                    x1: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
                     pr: ctx.pr(),
                     nout: no as i32,
                     npairs: nj as i32,
                     acc: if ci > 0 { 3 } else { 0 },
-                    n: (top + 1) as i32,
+                    n: rows as i32,
                     k: 1,
-                    pad: 0,
+                    seeded: if expand.is_some() { 2 } else { seeded as i32 } | if packed { 4 } else { 0 },
                 };
+                let mut ex_args = CtsExpandArgs { src: [PolyRef::default(); CTS_EXPAND_MAX], dst: std::ptr::null_mut(), pr: ctx.pr(), nops: 0, n: rows as i32 };
                 for o in 0..no {
                     args.out[o] = outs[o0 + o].buf.w();
                     args.d2[o] = d2s[o0 + o].buf.w();
                     for j in 0..nj {
                         args.a[o][j] = a[o0 + o][j0 + j].buf.r();
                         args.b[o][j] = b[o0 + o][j0 + j].buf.r();
+                        if let Some(dst) = expand {
+                            let src = args.a[o][j];
+                            let n = ex_args.nops as usize;
+                            let u = ex_args.src[..n].iter().position(|x| x.base == src.base).unwrap_or_else(|| {
+                                ex_args.src[n] = src;
+                                ex_args.nops += 1;
+                                n
+                            });
+                            // operand u's rows at dst + (u rows + r) N (ct_stride / part_stride unused: one part)
+                            args.x1[o][j] = PolyRef { base: dst.wrapping_add(u * rows * self.lay.n) as *mut std::ffi::c_void, ct_stride: 0, part_stride: 0 };
+                        }
                     }
+                }
+                if let Some(dst) = expand {
+                    ex_args.dst = dst as *mut std::ffi::c_void;
+                    // SAFETY: rows 0..rows of nops seeded slots (their seeds) into the workspace, which holds CTS_EXPAND_MAX
+                    // operands of `rows` rows and is read only by the tensor_multi below (same lane)
+                    launch_result("cts_expand", unsafe { (ctx.table.cts_expand)(&ex_args, ex.compute.raw()) })?;
                 }
                 // SAFETY: per (row, word) the kernel reads every operand before writing its outputs; outputs and scratch
                 // are distinct pool slots (not operands); rows 0..=top, each operand with its own strides
@@ -1379,6 +1415,16 @@ impl<'a, W: DevWord> Ops<'a, W> {
             let top = self.top(ctx.shape, &c.meta)?;
             self.rescaler.rescale(ctx, &ex.compute, &mut c.buf, top, None)?;
             c.meta = r.out;
+        }
+        Ok(())
+    }
+    /// Divide by the top prime alone and drop it (one level of the chain, on or off its composite grid): a pending
+    /// rescale is paid by that one prime (degree 1), a degree-1 ciphertext just carries the smaller scale.
+    pub fn rescale_one<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, x: &mut [Ct<'_, W>]) -> Result<()> {
+        for c in x.iter_mut() {
+            let top = self.top(ctx.shape, &c.meta)?;
+            self.rescaler.rescale_one(ctx, &ex.compute, &mut c.buf, top)?;
+            c.meta = CtMeta { level: c.meta.level + 1, deg: 1, nf: c.meta.nf / ctx.chain.q[top] as f64, ..c.meta };
         }
         Ok(())
     }

@@ -245,7 +245,9 @@ pub extern "C" fn tensor_sum<W: Hw>(a: *const TensorSumArgs, s: S) -> i32 {
 }
 
 pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
-    let bad = |a: &TensorMultiArgs| a.nout < 1 || a.nout as usize > TMULTI_OUT || a.npairs < 1 || a.npairs as usize > TMULTI_PAIRS;
+    let bad = |a: &TensorMultiArgs| {
+        a.nout < 1 || a.nout as usize > TMULTI_OUT || a.npairs < 1 || a.npairs as usize > TMULTI_PAIRS || (a.seeded & 4 != 0 && std::mem::size_of::<W>() != 4)
+    };
     launch(a, s, |a| if bad(a) { -1 } else { 0 }, |a| {
         let n = a.n as usize;
         let nch = N / TENSOR_CH;
@@ -257,10 +259,37 @@ pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
                 // SAFETY: TENSOR_CH words of a row of ciphertext c inside the launch's buffers
                 unsafe { std::slice::from_raw_parts_mut(at::<W>(r, c, part, row).add(lo), TENSOR_CH) }
             };
+            // a seeded first operand: its c1 words drawn from the row's seed (part 1, 8 words per row), its c0 words
+            // unpacked when packed (seeded | 4)
+            let mut gen = [W::default(); TENSOR_CH];
+            let mut gen0 = [W::default(); TENSOR_CH];
+            let mut drawn = [0u32; TENSOR_CH];
             for o in 0..a.nout as usize {
                 let (mut s0, mut s1, mut s2) = ([W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH]);
                 for j in 0..a.npairs as usize {
-                    let (x0, x1, y0, y1) = (row_of(&a.a[o][j], 0), row_of(&a.a[o][j], 1), row_of(&a.b[o][j], 0), row_of(&a.b[o][j], 1));
+                    let (y0, y1) = (row_of(&a.b[o][j], 0), row_of(&a.b[o][j], 1));
+                    let x0: &[W] = if a.seeded & 4 != 0 {
+                        let w = pack_row_words(N);
+                        // SAFETY: a packed seeded slot holds its c0 rows pack_row_words(N) words apart (CtBuf::new_seeded)
+                        let packed = unsafe { std::slice::from_raw_parts(at::<u32>(&a.a[o][j], c, 0, 0).add(row * w), w) };
+                        unpack_range(packed, lo, &mut drawn);
+                        gen0.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
+                        &gen0
+                    } else {
+                        row_of(&a.a[o][j], 0)
+                    };
+                    let x1: &[W] = if a.seeded & 3 == 2 {
+                        row_of(&a.x1[o][j], 0)
+                    } else if a.seeded & 3 != 0 {
+                        // SAFETY: a seeded slot holds 8 seed words per row right after c0's rows (CtBuf::new_seeded)
+                        let sd = unsafe { std::slice::from_raw_parts(at::<W>(&a.a[o][j], c, 1, 0).add(8 * row), 8) };
+                        let seed: [u32; 8] = std::array::from_fn(|w| sd[w].u64() as u32);
+                        pc_core::keys::cts_expand_range(&seed, q.p as u32, N, lo, &mut drawn);
+                        gen.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
+                        &gen
+                    } else {
+                        row_of(&a.a[o][j], 1)
+                    };
                     v::mac2::<W>(&mut s0, &mut s1, x0, y0, y1);
                     v::mac2::<W>(&mut s1, &mut s2, x1, y0, y1);
                 }
@@ -280,6 +309,21 @@ pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
                 o1.copy_from_slice(&r1);
                 d2.copy_from_slice(&r2);
             }
+        })
+    })
+}
+
+pub extern "C" fn cts_expand<W: Hw>(a: *const CtsExpandArgs, s: S) -> i32 {
+    let bad = |a: &CtsExpandArgs| std::mem::size_of::<W>() != 4 || a.nops < 1 || a.nops as usize > CTS_EXPAND_MAX;
+    launch(a, s, |a| if bad(a) { -1 } else { 0 }, |a| {
+        let n = a.n as usize;
+        par_for(a.nops as usize * n, a, |a, t| {
+            let (u, row) = (t / n, t % n);
+            // SAFETY: a seeded slot holds 8 seed words per row right after c0's rows (CtBuf::new_seeded); dst row (u, row)
+            // of the launch's scratch (u32 words)
+            let sd = unsafe { std::slice::from_raw_parts(at::<u32>(&a.src[u], 0, 1, 0).add(8 * row), 8) };
+            let out = unsafe { std::slice::from_raw_parts_mut((a.dst as *mut u32).add((u * n + row) * N), N) };
+            pc_core::keys::cts_expand_row(sd.try_into().expect("8 seed words"), prime(a.pr, row).p as u32, out);
         })
     })
 }
