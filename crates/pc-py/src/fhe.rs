@@ -949,6 +949,44 @@ impl PyFhe {
         Ok(o)
     }
 
+    /// A pending rescale given up: degree-2 `a` read as degree 1 at its own (product) scale, no prime dropped. For
+    /// products at the bottom level, where no prime is left: the values must stay below q / 2 at that scale.
+    fn settle(&self, a: PyRef<'_, PyCt>) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        if a.meta().deg != 2 {
+            return Err(PyValueError::new_err(format!("settle: a degree-2 ciphertext (degree {})", a.meta().deg)));
+        }
+        let mut o = self.copy_ct(&a)?;
+        o.ct_mut()?.meta.deg = 1;
+        Ok(o)
+    }
+
+    /// `a * X^k`: an exact negacyclic shift of the plaintext's coefficients (X^N = -1), level and scale kept. The
+    /// monomial is a plaintext of the session's store (one per k and level).
+    fn mult_monomial(&mut self, a: PyRef<'_, PyCt>, k: i64) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        let d = self.dev.clone();
+        let n = d.n() as i64;
+        let k = k.rem_euclid(2 * n);
+        let (pos, sign) = if k < n { (k as usize, 1.0) } else { ((k - n) as usize, -1.0) };
+        let key = PtKey::new(format!("__mono{k}"), self.pt_meta(&a.meta()).level, PtForm::Eval);
+        let mut o = self.new_ct(a.meta())?;
+        let om = o.ct_mut()?;
+        let mut st = d.st.borrow_mut();
+        let State { pts: store, ex, ops, .. } = &mut *st;
+        if store.get(&d.ctx, ex, &key).is_err() {
+            // the store scales coefficients by the level's factor: encode once to read it, then at 1 / factor
+            let mut c = vec![0.0; n as usize];
+            c[pos] = sign;
+            store.encode_with(&d.ctx, ex, ops, &d.sh, EncoderKind::CoeffRows, key.clone(), Payload2::Coeffs(&c), 1).map_err(gerr)?;
+            c[pos] = sign / store.get(&d.ctx, ex, &key).map_err(gerr)?.meta.nf;
+            store.encode_with(&d.ctx, ex, ops, &d.sh, EncoderKind::CoeffRows, key.clone(), Payload2::Coeffs(&c), 1).map_err(gerr)?;
+        }
+        let pt = store.get(&d.ctx, ex, &key).map_err(gerr)?;
+        ops.mult_pt_exact(&d.ctx, ex, om, a.ct()?, &pt).map_err(gerr)?;
+        Ok(o)
+    }
+
     // ── rotations ─────────────────────────────────────────────────────────────────────────────────────────────────
 
     /// Rotation by `k` slots (left: `np.roll(x, -k)`).

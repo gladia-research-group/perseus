@@ -1413,6 +1413,16 @@ impl<'a, W: DevWord> Ops<'a, W> {
         }
         Self::finish(out, &r, &t)
     }
+    /// `out = a * pt` with `a`'s meta kept, for a plaintext of integer coefficients at scale 1 (a monomial: an exact
+    /// negacyclic shift of the coefficients, no rescale owed).
+    pub fn mult_pt_exact<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, out: &mut Ct<'_, W>, a: &Ct<'_, W>, pt: &Pt<'_>) -> Result<()> {
+        Self::check_k("mult_pt_exact", out.k(), a.k())?;
+        let top = self.top(ctx.shape, &a.meta)?;
+        Self::mul_table(ctx, &ex.compute, out.buf.w(), a.buf.r(), pt.poly().base, top + 1, out.k())?;
+        out.meta = a.meta;
+        Ok(())
+    }
+
     /// `drop_to_level(t)`: `max(cur, t)`, degree and scale kept; rows above the new top become dead (no data moves).
     pub fn drop_to_level(&self, sh: &Shadow, x: &mut [Ct<'_, W>], level: u32) {
         for c in x.iter_mut() {
