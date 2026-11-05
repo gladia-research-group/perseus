@@ -81,9 +81,9 @@ impl PyCt {
         Ok(())
     }
     /// A low slot (`size={"lowPool", "lowRows"}`) for a ciphertext with metadata `meta` and top limb `top`.
-    pub(crate) fn acquire_low(dev: &Rc<Dev>, meta: CtMeta, top: usize) -> PyResult<PyCt> {
+    pub(crate) fn acquire_low(dev: &Rc<Dev>, meta: CtMeta, top: usize, seeded: bool) -> PyResult<PyCt> {
         dev.check_frozen()?;
-        let slot = dev.pool().acquire_low(meta, top).map_err(gerr)?;
+        let slot = dev.pool().acquire_low(meta, top, seeded).map_err(gerr)?;
         Ok(PyCt { slot, dev: dev.clone() })
     }
 }
@@ -599,31 +599,37 @@ impl PyFhe {
                 };
                 store.encode_with(&d.ctx, ex, ops, &d.sh, kind, key.clone(), what, 1).map_err(gerr)?;
             }
-            match out.as_mut() {
-                None => out = Some(self.pt_op(c, &key, false)?),
-                Some(acc) => {
-                    // fused accumulation when the term needs no adjustment, else the loop (Ops::mult_add_many
-                    // refuses terms with preludes)
-                    let fast = {
-                        let r = d.sh.mult_pt(&c.meta(), &PtMeta { level: pm.level, deg: 1, nf: 0.0, tag: Default::default() }).map_err(|e| gerr(e.into()))?;
-                        r.pre.is_empty() && d.sh.add(&acc.meta(), &r.out).map_err(|e| gerr(e.into()))?.pre.is_empty()
-                    };
-                    if fast {
-                        let am = acc.ct_mut()?;
-                        let mut st = d.st.borrow_mut();
-                        let State { pts: store, ex, ops, .. } = &mut *st;
-                        let pt = store.get(&d.ctx, ex, &key).map_err(gerr)?;
-                        ops.mult_add_many(&d.ctx, ex, &d.sh, am, &[c.ct()?], &[pt]).map_err(gerr)?;
-                    } else {
-                        let t = self.pt_op(c, &key, false)?;
-                        self.add_inplace_ct(acc, &t)?;
-                    }
-                }
-            }
+            self.sum_term(&mut out, c, &key)?;
         }
         let mut o = out.ok_or_else(|| rt_err("empty sum"))?;
         self.reactive(py, &mut o)?;
         Ok(o)
+    }
+
+    /// `out += c * pt[key]` (the first term's product when `out` is empty).
+    fn sum_term(&self, out: &mut Option<PyCt>, c: &PyCt, key: &PtKey) -> PyResult<()> {
+        let d = &*self.dev;
+        let Some(acc) = out.as_mut() else {
+            *out = Some(self.pt_op(c, key, false)?);
+            return Ok(());
+        };
+        // fused accumulation when the term needs no adjustment, else the loop (Ops::mult_add_many refuses terms with
+        // preludes)
+        let fast = {
+            let r = d.sh.mult_pt(&c.meta(), &PtMeta { level: key.level, deg: 1, nf: 0.0, tag: Default::default() }).map_err(|e| gerr(e.into()))?;
+            r.pre.is_empty() && d.sh.add(&acc.meta(), &r.out).map_err(|e| gerr(e.into()))?.pre.is_empty()
+        };
+        if fast {
+            let am = acc.ct_mut()?;
+            let mut st = d.st.borrow_mut();
+            let State { pts: store, ex, ops, .. } = &mut *st;
+            let pt = store.get(&d.ctx, ex, key).map_err(gerr)?;
+            ops.mult_add_many(&d.ctx, ex, &d.sh, am, &[c.ct()?], &[pt]).map_err(gerr)?;
+        } else {
+            let t = self.pt_op(c, key, false)?;
+            self.add_inplace_ct(acc, &t)?;
+        }
+        Ok(())
     }
 }
 
@@ -1078,6 +1084,30 @@ impl PyFhe {
         ops.realize(&d.ctx, ex, &d.sh, std::slice::from_mut(c)).map_err(gerr)
     }
 
+    /// In place: divide by the top prime alone and drop it, off the composite grid if need be (level + 1, degree 1,
+    /// scale / that prime): one prime of a pending rescale, or a degree-1 ciphertext's scale lowered by it.
+    fn rescale_one(&self, a: &Bound<'_, PyCt>) -> PyResult<()> {
+        let mut am = a.borrow_mut();
+        self.same_session(&am)?;
+        let d = &*self.dev;
+        let c = am.ct_mut()?;
+        let mut st = d.st.borrow_mut();
+        let State { ops, ex, .. } = &mut *st;
+        ops.rescale_one(&d.ctx, ex, std::slice::from_mut(c)).map_err(gerr)
+    }
+
+    /// A copy of `a`'s live rows in a low slot (`size={"lowPool", "lowRows"}`): a ciphertext only `mult_sum_many` reads
+    /// next (baby steps, score parts, weights at the bottom levels) held in its rows alone.
+    fn to_low(&self, a: PyRef<'_, PyCt>) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        let d = &self.dev;
+        let top = d.ctx.top_of(a.meta().level).map_err(gerr)?;
+        let mut o = PyCt::acquire_low(d, a.meta(), top, false)?;
+        let st = d.st.borrow();
+        pc_program::replay::copy_ct(&d.ctx, &st.ex.compute, o.ct_mut_ref()?, a.ct()?).map_err(|x| rt_err(x.to_string()))?;
+        Ok(o)
+    }
+
     /// In place: drop to `level` if above it (value-preserving modulus reduction; no data moves).
     fn drop_to_level(&self, a: &Bound<'_, PyCt>, level: u32) -> PyResult<()> {
         let mut am = a.borrow_mut();
@@ -1331,6 +1361,35 @@ impl PyFhe {
         let r = self.rows_f64(py, rows)?;
         let terms = r.into_iter().take(cts.len()).map(Payload2Owned::Coeffs).collect();
         self.sum_terms(py, &cts, terms)
+    }
+
+    /// Encode coefficient rows (as `mult_coeff_sum`'s) once into the plaintext store, row i as `name#i` at `level`
+    /// (an earlier batch of that name rewritten in place), for `mult_coeff_sum_stored`; returns the row count. The
+    /// store needs a slot per row (`Session(pt_slots=...)`).
+    fn store_coeff_pts(&mut self, py: Python<'_>, name: &str, rows: &Bound<'_, PyAny>, level: u32) -> PyResult<usize> {
+        let r = self.rows_f64(py, rows)?;
+        let keys: Vec<PtKey> = (0..r.len()).map(|i| PtKey::new(format!("{name}#{i}"), level, PtForm::Eval)).collect();
+        let d = self.dev.clone();
+        let mut st = d.st.borrow_mut();
+        let State { pts, ex, .. } = &mut *st;
+        nogil(py, || pts.encode_coeffs_many(&d.ctx, ex, &d.sh, &keys, &r)).map_err(gerr)?;
+        Ok(keys.len())
+    }
+    /// `mult_coeff_sum` over the rows `store_coeff_pts` keeps as `name`: term i is `cts[i]` times row i, stored at the
+    /// ciphertexts' plaintext level.
+    fn mult_coeff_sum_stored(&mut self, py: Python<'_>, cts: Vec<PyRef<'_, PyCt>>, name: &str) -> PyResult<PyCt> {
+        let mut out: Option<PyCt> = None;
+        for (i, c) in cts.iter().enumerate() {
+            self.same_session(c)?;
+            let key = PtKey::new(format!("{name}#{i}"), self.pt_meta(&c.meta()).level, PtForm::Eval);
+            if !self.dev.st.borrow().pts.has(&key) {
+                return Err(PyKeyError::new_err(format!("no stored plaintext '{}' at level {} (store_coeff_pts)", key.name, key.level)));
+            }
+            self.sum_term(&mut out, c, &key)?;
+        }
+        let mut o = out.ok_or_else(|| rt_err("empty sum"))?;
+        self.reactive(py, &mut o)?;
+        Ok(o)
     }
 
     // ── data plane ────────────────────────────────────────────────────────────────────────────────────────────────

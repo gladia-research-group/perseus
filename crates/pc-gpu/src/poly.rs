@@ -56,23 +56,46 @@ pub struct CtBuf<'a, S: Lane, W: pc_cuda::Pod> {
     pub buf: DBuf<'a, S, W>,
     pub k: usize,
     pub lay: Layout,
+    /// A seeded ciphertext (`new_seeded`): part 1 holds its rows' 8-word c1 seeds (`pc_core::keys::cts_expand_row`),
+    /// not c1; only the kernels that draw c1 from them read it.
+    pub seeds: bool,
+    /// A seeded ciphertext with c0 packed (`pc_kernels::pack_row`, rows `pack_row_words(n)` apart): only
+    /// `mult_sum_many` reads it.
+    pub packed: bool,
 }
 
 impl<'a, S: Lane, W: pc_cuda::Pod> CtBuf<'a, S, W> {
     /// Carve `k` ciphertexts from the arena (setup only).
     pub fn new(arena: &'a Arena, what: &'static str, lay: Layout, k: usize) -> Result<Self> {
-        Ok(CtBuf { buf: arena.alloc::<S, W>(what, k * lay.ct_words())?, k, lay })
+        Ok(CtBuf { buf: arena.alloc::<S, W>(what, k * lay.ct_words())?, k, lay, seeds: false, packed: false })
+    }
+    /// Carve one seeded ciphertext: c0's rows (packed: `pack_row_words(n)` each), then 8 seed words per row where c1
+    /// would start (setup only).
+    pub fn new_seeded(arena: &'a Arena, what: &'static str, lay: Layout, packed: bool) -> Result<Self> {
+        Ok(CtBuf { buf: arena.alloc::<S, W>(what, Self::words_seeded(&lay, packed))?, k: 1, lay, seeds: true, packed })
     }
     /// Words a `k`-ciphertext buffer takes (MemPlan).
     pub fn words(lay: &Layout, k: usize) -> usize {
         k * lay.ct_words()
+    }
+    /// Words of one seeded ciphertext (`new_seeded`).
+    pub fn words_seeded(lay: &Layout, packed: bool) -> usize {
+        Self::c0_words(lay, packed) + 8 * lay.rows()
+    }
+    /// Words of a seeded ciphertext's c0 (where its seeds start).
+    fn c0_words(lay: &Layout, packed: bool) -> usize {
+        lay.rows() * if packed { pc_kernels::pack_row_words(lay.n) } else { lay.n }
+    }
+    /// Part 1 of the views: c1, or a seeded ciphertext's seeds.
+    fn part_words(&self) -> usize {
+        if self.seeds { Self::c0_words(&self.lay, self.packed) } else { self.lay.poly_words() }
     }
     /// Read view (the kernel only reads through it).
     pub fn r(&self) -> PolyRef {
         PolyRef {
             base: self.buf.dptr() as *mut std::ffi::c_void,
             ct_stride: self.lay.ct_words() as u64,
-            part_stride: self.lay.poly_words() as u64,
+            part_stride: self.part_words() as u64,
         }
     }
     /// Write view (needs `&mut`: exclusive).
@@ -80,14 +103,14 @@ impl<'a, S: Lane, W: pc_cuda::Pod> CtBuf<'a, S, W> {
         PolyRef {
             base: self.buf.vptr_mut(),
             ct_stride: self.lay.ct_words() as u64,
-            part_stride: self.lay.poly_words() as u64,
+            part_stride: self.part_words() as u64,
         }
     }
     pub fn offset(&self, c: usize, part: usize, row: usize) -> usize {
         self.lay.offset(c, part, row)
     }
     fn check_row(&self, c: usize, part: usize, rows: &[usize]) -> Result<()> {
-        if c >= self.k || part > 1 || rows.iter().any(|&r| r >= self.lay.rows()) {
+        if c >= self.k || part > 1 || (self.seeds && part == 1) || self.packed || rows.iter().any(|&r| r >= self.lay.rows()) {
             return Err(shape("CtBuf rows", format!("c {c} (k {}), part {part}, rows {rows:?} (layout {:?})", self.k, self.lay)));
         }
         Ok(())
@@ -105,6 +128,20 @@ impl<'a, S: Lane, W: pc_cuda::Pod> CtBuf<'a, S, W> {
         }
         Ok(())
     }
+    /// Upload a seeded ciphertext's c1 seeds (8 words per row, rows `0..seeds.len() / 8`).
+    pub fn upload_seeds(&mut self, s: &Stream<S>, seeds: &[W]) -> Result<()> {
+        if !self.seeds || seeds.len() % 8 != 0 || seeds.len() / 8 > self.lay.rows() {
+            return Err(shape("CtBuf::upload_seeds", format!("{} words into a {}seeded buffer of {} rows", seeds.len(), if self.seeds { "" } else { "non-" }, self.lay.rows())));
+        }
+        Ok(self.buf.upload_at(s, self.part_words(), seeds)?)
+    }
+    /// Upload a packed seeded ciphertext's c0 (`pc_kernels::pack_row` rows, `pack_row_words(n)` words each).
+    pub fn upload_packed(&mut self, s: &Stream<S>, rows: &[W]) -> Result<()> {
+        if !self.packed || rows.len() % pc_kernels::pack_row_words(self.lay.n) != 0 || rows.len() > self.part_words() {
+            return Err(shape("CtBuf::upload_packed", format!("{} words into a {}packed buffer of {} rows", rows.len(), if self.packed { "" } else { "non-" }, self.lay.rows())));
+        }
+        Ok(self.buf.upload_at(s, 0, rows)?)
+    }
     /// Host copy `[rows][n]` of rows `rows` of one polynomial (syncs the lane).
     pub fn download_rows(&self, s: &Stream<S>, c: usize, part: usize, rows: &[usize]) -> Result<Vec<W>> {
         self.check_row(c, part, rows)?;
@@ -121,6 +158,6 @@ impl<'a, S: Lane, W: pc_cuda::Pod> OnLane for CtBuf<'a, S, W> {
     type Lane = S;
     type On<U: Lane> = CtBuf<'a, U, W>;
     unsafe fn relane<U: Lane>(self) -> CtBuf<'a, U, W> {
-        CtBuf { buf: self.buf.relane::<U>(), k: self.k, lay: self.lay }
+        CtBuf { buf: self.buf.relane::<U>(), k: self.k, lay: self.lay, seeds: self.seeds, packed: self.packed }
     }
 }

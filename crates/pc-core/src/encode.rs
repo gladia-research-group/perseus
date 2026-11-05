@@ -190,7 +190,8 @@ impl Encoder {
         }
         Ok(self.q[..=limb_top]
             .par_iter()
-            .map(|&qi| c.iter().map(|&x| x.rem_euclid(qi as i128) as u64).collect())
+            // 64-bit remainders where the coefficient fits (the i128 division is the encode's cost)
+            .map(|&qi| c.iter().map(|&x| i64::try_from(x).map_or_else(|_| x.rem_euclid(qi as i128) as u64, |v| v.rem_euclid(qi as i64) as u64)).collect())
             .collect())
     }
 
@@ -268,8 +269,12 @@ impl Encoder {
 
     /// Decode `slots` values from coefficient-domain rows (only the bottom composite pair is read).
     pub fn decode_slots(&self, rows: &[Vec<u64>], slots: usize, payload: Payload, scale: f64) -> Result<Vec<Complex>> {
+        self.decode_centered(&self.crt_bottom(rows)?, slots, payload, scale)
+    }
+
+    /// `decode_slots` from the plaintext's centred coefficients.
+    pub fn decode_centered(&self, c: &[i128], slots: usize, payload: Payload, scale: f64) -> Result<Vec<Complex>> {
         self.check_slots(slots)?;
-        let c = self.crt_bottom(rows)?;
         if c.len() != self.n {
             return Err(Error::Encode(format!("rows have {} coefficients, ring dimension is {}", c.len(), self.n)));
         }
