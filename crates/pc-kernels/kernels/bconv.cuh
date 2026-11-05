@@ -99,7 +99,7 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
     }
     __syncthreads();
     // the predecessor's rows (the INTT's) are read from here on; the job tables above are setup constants
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    pdl_wait();
     const int idx = blockIdx.x * BX + threadIdx.x;
     W y[NY];
     double v = 0.0;
@@ -184,7 +184,7 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
 template <class W, class MM>
 __device__ __forceinline__ void bconv_dispatch(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    pdl_trigger();
     const BconvJob J = jobs[blockIdx.z];
     if (J.exact && J.nsrc == 15) bconv_body<W, MM, 15, 1>(J, src, dst, pool, pr);  // P and the two tops of the lean chain
     else if (!J.exact && J.nsrc == 13) bconv_body<W, MM, 13, 0>(J, src, dst, pool, pr);
@@ -210,13 +210,13 @@ __global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ s
 template <class W, class MM, int NS>
 __global__ void __launch_bounds__(BX) bconv_exact_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                          const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    pdl_trigger();
     bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
 }
 template <class W, class MM, int NS>
 __global__ void __launch_bounds__(BX, 12) bconv_exact_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                                const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    pdl_trigger();
     bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
 }
 

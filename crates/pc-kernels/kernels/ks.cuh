@@ -360,7 +360,7 @@ __global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
                     uint64_t pol;
                     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
                     const char* q16 = (const char*)((uintptr_t)(p + 128 * lane) & ~(uintptr_t)15);
-                    if (p) asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], 128, %1;" ::"l"(q16), "l"(pol) : "memory");
+                    if (p) prefetch_l2_line(q16, pol);
                 } else if (p)
                     asm volatile("prefetch.global.L2 [%0];" ::"l"(p + 128 * (lane & 7)));
             }
@@ -734,7 +734,7 @@ __global__ void __launch_bounds__(256, 3) ks_dot_rseg(KsRegenArgs G) {
                     uint64_t pol;
                     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
                     const char* q16 = (const char*)((uintptr_t)(bp + 128 * lane) & ~(uintptr_t)15);
-                    asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], 128, %1;" ::"l"(q16), "l"(pol) : "memory");
+                    prefetch_l2_line(q16, pol);
                 }
             } else if (lane < 16) {
                 const size_t seg = (size_t)t * N + R * 256;

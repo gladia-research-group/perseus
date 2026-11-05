@@ -182,9 +182,7 @@ __device__ __forceinline__ V4<W> load4_sum(const W* a, int n, uint64_t stride, W
 
 // Programmatic dependent launch of a transform's second pass: the first pass lets it launch at once (its blocks fill
 // the slots the first pass frees and set up), the second pass waits for the first grid's completion (and its memory)
-// before its first data access. Both are no-ops in a kernel launched without the attribute.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+// before its first data access (pc::pdl_trigger / pc::pdl_wait).
 template <class... P, class... A>
 void launch_pdl(void (*k)(P...), dim3 g, cudaStream_t s, A... a) {
     cudaLaunchConfig_t cfg = {};
