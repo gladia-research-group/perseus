@@ -81,14 +81,14 @@ __global__ void rescale_combine(RescaleCombineArgs A) {
 // rescale_coef's two sources of every coefficient (ndrop 2), into tmp rows top (y_a, scaled by ca) and top - 1 (y')
 template <class W, class MM>
 __global__ void rescale_prep(RescaleArgs A) {
-    ntt::pdl_trigger();
+    pdl_trigger();
     const int c = blockIdx.z >> 1, part = blockIdx.z & 1;
     const int i = blockIdx.x * BX + threadIdx.x;
     const int a = A.top, b = A.top - 1;
     const PrimeConst& pa = A.pr[a];
     const PrimeConst& pb = A.pr[b];
     const W qb = (W)pb.p;
-    ntt::pdl_wait();
+    pdl_wait();
     W ya = at<W>(A.x, c, part, a)[i];
     W yb = at<W>(A.x, c, part, b)[i];
     if (A.ca != 1) {
@@ -104,7 +104,7 @@ __global__ void rescale_prep(RescaleArgs A) {
 template <class W, class MM, int L>
 __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     __shared__ W s[256 * 16];
-    ntt::pdl_trigger();
+    pdl_trigger();
     const int row = blockIdx.y;
     const int r = T.rprime[row];
     W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     const W qam = ((const W*)A.qam)[r], qbm = ((const W*)A.qbm)[r];
     const int c = threadIdx.x & 15, g = threadIdx.x >> 4;
     W x[16];
-    ntt::pdl_wait();
+    pdl_wait();
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
         const int o = (g + 16 * j) * 256 + c;

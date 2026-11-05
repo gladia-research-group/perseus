@@ -248,4 +248,29 @@ __device__ __forceinline__ W* at(const PolyRef& r, int c, int part, int row) {
     return (W*)r.base + c * r.ct_stride + part * r.part_stride + (size_t)row * N;
 }
 __device__ __forceinline__ int rs_row(const RowSet& rs, int y) { return y < rs.nq ? y : rs.qmax + (y - rs.nq); }
+// Programmatic dependent launch (sm_90+; below it the launch attribute is plain stream order and these are no-ops):
+// let the next grid in the stream launch, or wait for the previous one's completion and memory. Both are no-ops in a
+// kernel launched without the attribute.
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+// One 128-byte line (16-byte aligned) into L2 under the cache policy `pol` (a bulk prefetch, sm_90+; below it a plain
+// L2 prefetch of the line, without the policy).
+__device__ __forceinline__ void prefetch_l2_line(const char* q16, uint64_t pol) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], 128, %1;" ::"l"(q16), "l"(pol) : "memory");
+#else
+    (void)pol;
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(q16));
+#endif
+}
+
 }  // namespace pc
