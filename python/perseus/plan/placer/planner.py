@@ -1020,12 +1020,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         PlacerCls = partial(IlpPlacer, time_limit=cfg.ilp_time_limit, mip_gap=cfg.ilp_gap,
                             objective=cfg.ilp_objective,
                             cap_exit=bool(final_block and cfg.ilp_cap_exit), tiebreak=cfg.ilp_tiebreak)
-    # forced: sites refreshed whatever the levels say. force_place is the exit refresh
-    # of plan_graph_dir's terminal-exit retry; the exact path adds the keep_placements
-    # sites and the force_step_refresh keep-anchors below. The exact placers and the
-    # re-cut trials start from them, and the cut still adds whatever else it needs;
-    # every forced site goes through P2. The baseline placers take no seed: for them a
-    # forced site is only exempt from the prune.
+    # Refreshes placed whatever the levels need: the caller's force_place (plan_graph_dir's terminal-exit retry) and,
+    # on the exact placers, the keep_placements sites and the force_step_refresh anchors. Every cut of this block
+    # (the first, the re-cut trials) is seeded with them and the prune keeps them; P2 checks them like any other.
+    # Baseline placers are not seeded: for them the set only shields sites from the prune.
     forced = set(force_place or ())
     if exact:
         if cfg.keep_placements:
@@ -1094,97 +1092,55 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                              **placer_kwargs)
         sim = placer.run()
 
-    def trial_placer(realized: set) -> Placer:
-        """A re-cut trial (rescale_opt, shared_realize, ks_realize): the first placer's configuration, quiet, with
-        `realized` as its realize anchors, started from the same forced sites. A trial replaces the incumbent when
-        it needs no more bootstraps, so one that did not start from the forced sites (the retry's exit refresh, the
-        keep-anchors, the kept placements) would drop every one the block's own levels do not need, and win for it."""
-        return PlacerCls(**{**placer_kwargs, "verbose": False}, placed=set(forced), realized=set(realized),
-                         hint_force=hint_force)
+    def bootstraps(s: SimResult, p: Placer) -> int:
+        return len(p.placed) + sum(1 for f in s.hint_fired.values() if f)
 
     rescale_anchors: set = set()
-    if cfg.rescale_opt and exact:
-        hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
 
-        def _count(s: SimResult, p: Placer) -> int:
-            return len(p.placed) + sum(1 for f in s.hint_fired.values() if f)
-
-        best = _count(sim, placer)
-        base = best
-        for _ in range(4):
-            cands = _raise_candidates(g, sim, cfg.forbid_steps, hint_outs,
-                                      placer.placed) - rescale_anchors
-            if not cands:
+    def recut(candidates, rounds: int) -> tuple[int, int, int]:
+        """Grow the realize anchors by `candidates()` (new sites given the incumbent) for up to `rounds` rounds, each
+        a fresh cut seeded with `forced`; a cut that needs no more bootstraps than the incumbent replaces it (an
+        unseeded one could win by dropping forced sites the levels do not need). Returns (bootstraps before, after,
+        anchors added)."""
+        nonlocal rescale_anchors, sim, placer
+        before = best = bootstraps(sim, placer)
+        added = 0
+        for _ in range(rounds):
+            new = candidates() - rescale_anchors
+            if not new:
                 break
-            trial = rescale_anchors | cands
-            p2 = trial_placer(trial)
+            anchors = rescale_anchors | new
+            cut = PlacerCls(**{**placer_kwargs, "verbose": False}, placed=set(forced), realized=set(anchors),
+                            hint_force=hint_force)
             try:
-                s2 = p2.run()
+                res = cut.run()
             except PlanInfeasible:
                 break
-            c2 = _count(s2, p2)
-            if c2 <= best:
-                rescale_anchors, sim, placer, best = trial, s2, p2, c2
-            else:
+            n = bootstraps(res, cut)
+            if n > best:
                 break
-        if cfg.verbose:
-            log.info(f"[plan] rescale_opt: {len(rescale_anchors)} realize anchor(s), "
-                  f"bootstraps {base} -> {best}")
+            rescale_anchors, sim, placer, best = anchors, res, cut, n
+            added += len(new)
+        return before, best, added
 
-    if cfg.shared_realize and exact:
+    if exact and (cfg.rescale_opt or cfg.shared_realize or cfg.ks_realize):
         hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
-        best_sr = len(placer.placed) + sum(1 for f in sim.hint_fired.values() if f)
-        base_sr, n_sr = best_sr, 0
-        for _ in range(6):
-            cands = _shared_candidates(g, sim, hint_outs, placer.placed) - rescale_anchors
-            if not cands:
-                break
-            trial = rescale_anchors | cands
-            p2 = trial_placer(trial)
-            try:
-                s2 = p2.run()
-            except PlanInfeasible:
-                break
-            c2 = len(p2.placed) + sum(1 for f in s2.hint_fired.values() if f)
-            if c2 <= best_sr:
-                rescale_anchors, sim, placer, best_sr = trial, s2, p2, c2
-                n_sr += len(cands)
-            else:
-                break
-        if cfg.verbose:
-            log.info(f"[plan] shared_realize: {n_sr} shared-operand realize anchor(s), bootstraps {base_sr} -> {best_sr}")
-
-    if cfg.ks_realize and exact:
-        hint_outs = {n.output for n in g.nodes if n.hint_level is not None and n.output}
-
-        def _count_ks(s: SimResult, p: Placer) -> int:
-            return len(p.placed) + sum(1 for f in s.hint_fired.values() if f)
-
-        best_ks = _count_ks(sim, placer)
-        base_ks, n_ks = best_ks, 0
-        for _ in range(6):               # a ladder realized at its root makes its later steps deg-1: re-derive
-            cands = _ks_candidates(g, sim, hint_outs, placer.placed) - rescale_anchors
-            if not cands:
-                break
-            trial = rescale_anchors | cands
-            p2 = trial_placer(trial)
-            try:
-                s2 = p2.run()
-            except PlanInfeasible:
-                break
-            c2 = _count_ks(s2, p2)
-            if c2 <= best_ks:
-                rescale_anchors, sim, placer, best_ks = trial, s2, p2, c2
-                n_ks += len(cands)
-            else:
-                break
-        if cfg.verbose:
-            log.info(f"[plan] ks_realize: {n_ks} key-switch realize anchor(s), bootstraps {base_ks} -> {best_ks}")
+        if cfg.rescale_opt:
+            before, after, _ = recut(lambda: _raise_candidates(g, sim, cfg.forbid_steps, hint_outs, placer.placed), 4)
+            if cfg.verbose:
+                log.info(f"[plan] rescale_opt: {len(rescale_anchors)} realize anchor(s), bootstraps {before} -> {after}")
+        if cfg.shared_realize:
+            before, after, added = recut(lambda: _shared_candidates(g, sim, hint_outs, placer.placed), 6)
+            if cfg.verbose:
+                log.info(f"[plan] shared_realize: {added} shared-operand realize anchor(s), bootstraps {before} -> {after}")
+        if cfg.ks_realize:
+            # a ladder realized at its root makes its later steps deg-1: candidates are re-derived each round
+            before, after, added = recut(lambda: _ks_candidates(g, sim, hint_outs, placer.placed), 6)
+            if cfg.verbose:
+                log.info(f"[plan] ks_realize: {added} key-switch realize anchor(s), bootstraps {before} -> {after}")
 
     if cfg.prune:
-        # forced sites stay: the exit refresh of the terminal-exit retry is needed by the next block, and a
-        # keep-anchor or a kept placement is placed whether or not the levels need it, so the prune would remove
-        # it wherever they do not
+        # the prune drops refreshes the levels do not need, which is exactly what a forced site may be
         _strict = os.environ.get("PLAN_CHAIN_STRICT", "0") not in ("", "0")
         sim, n_pruned = _prune_redundant(placer, sim, tuple(cfg.prune_keep) + tuple(sorted(forced)),
                                          chain_cap=cfg.max_level if _strict else None, unit=int(cfg.level_unit) or 1)
