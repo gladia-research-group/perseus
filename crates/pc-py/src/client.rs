@@ -448,17 +448,66 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
 }
 
+/// The coefficient residues `export_ct_many(..., defer=True)` downloaded, framed by `frames()` (the compression, in
+/// parallel on the host, the GIL released): a plain host object, so another thread can frame them while the caller
+/// goes on with the session.
+#[pyclass(name = "PendingFrames", module = "perseus._pc")]
+pub struct PyPendingFrames {
+    limbs: Vec<(pc_gpu::limbs::Limbs<crate::session::W>, CtMeta)>,
+    hash: String,
+    n: usize,
+    bits: u32,
+    bits1: Option<u32>,
+    sparse: bool,
+}
+
+impl PyPendingFrames {
+    fn frame_all(&self) -> pc_client::Result<Vec<Vec<u8>>> {
+        use rayon::prelude::*;
+        self.limbs
+            .par_iter()
+            .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
+                let mut data = Vec::with_capacity(2 * self.n);
+                for (part, b) in [(0, self.bits), (1, self.bits1.unwrap_or(self.bits))] {
+                    let rs: Vec<Vec<u64>> = l.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
+                    let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
+                    data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&l.moduli, &refs, b)?, b));
+                }
+                let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
+                let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse };
+                CtWire { header, data }.to_bytes()
+            })
+            .collect()
+    }
+}
+
+#[pymethods]
+impl PyPendingFrames {
+    /// The wire frames, in the order of the exported ciphertexts.
+    fn frames<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let frames = nogil(py, || self.frame_all()).map_err(cerr)?;
+        let out = PyList::empty(py);
+        for f in frames {
+            out.append(PyBytes::new(py, &f))?;
+        }
+        Ok(out)
+    }
+    fn __len__(&self) -> usize {
+        self.limbs.len()
+    }
+}
+
 /// `export_ct(..., bits=b)` of several ciphertexts: the coefficient exports run back to back on the device, the
 /// compression and framing in parallel on the host. `bits1`: c1's bits (default `bits`; below 32 bit-packed).
 /// `sparse`: each ciphertext first switched to the client's sparse secret (`KeySource(sparse_out=True)`, bottom level):
 /// c1's rounding then meets a 32-coefficient secret, so both parts compress further.
-#[pyfunction]
 /// `user`: switched to that user's key instead (`Session.add_user`): the frames decrypt with the user's secret only.
-#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false, user=None))]
+/// `defer`: return the downloaded residues as `PendingFrames` instead, framed by its `frames()` (on any thread).
+#[pyfunction]
+#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false, user=None, defer=false))]
 #[allow(clippy::too_many_arguments)]
-fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool, user: Option<String>) -> PyResult<Bound<'py, PyList>> {
+fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool, user: Option<String>, defer: bool) -> PyResult<Bound<'py, PyAny>> {
     let sparse = sparse || user.is_some();
-    use rayon::prelude::*;
     let dev = session.dev.clone();
     let n = dev.ctx.lay.n;
     let mut limbs = Vec::with_capacity(cts.len());
@@ -505,29 +554,11 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
         let l = nogil(py, || pc_gpu::limbs::export_limbs(&dev.ctx, ex, c, 0)).map_err(gerr)?;
         limbs.push((l, c.meta));
     }
-    let hash = pc_client::spec::params_hash(&dev.ctx.chain);
-    let frames = nogil(py, || {
-        limbs
-            .par_iter()
-            .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
-                let mut data = Vec::with_capacity(2 * n);
-                for (part, b) in [(0, bits), (1, bits1.unwrap_or(bits))] {
-                    let rs: Vec<Vec<u64>> = l.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
-                    let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
-                    data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&l.moduli, &refs, b)?, b));
-                }
-                let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-                let header = CtHeader { params_hash: hash.clone(), n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(bits), seeded: false, regen: false, bits1, sparse };
-                CtWire { header, data }.to_bytes()
-            })
-            .collect::<pc_client::Result<Vec<_>>>()
-    })
-    .map_err(cerr)?;
-    let out = PyList::empty(py);
-    for f in frames {
-        out.append(PyBytes::new(py, &f))?;
+    let pending = PyPendingFrames { limbs, hash: pc_client::spec::params_hash(&dev.ctx.chain), n, bits, bits1, sparse };
+    if defer {
+        return Ok(Bound::new(py, pending)?.into_any());
     }
-    Ok(out)
+    Ok(pending.frames(py)?.into_any())
 }
 
 /// A session ciphertext from a wire frame (one ciphertext, this session's chain). `low`: into a low slot (the
@@ -590,6 +621,7 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyClientSecret>()?;
     m.add_class::<PyClient>()?;
+    m.add_class::<PyPendingFrames>()?;
     m.add_function(wrap_pyfunction!(bundle_info, m)?)?;
     m.add_function(wrap_pyfunction!(contract_hash, m)?)?;
     m.add_function(wrap_pyfunction!(export_ct, m)?)?;

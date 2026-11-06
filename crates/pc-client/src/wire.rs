@@ -493,6 +493,24 @@ mod tests {
     }
 
     #[test]
+    fn pack_coeffs_two_primes_wide() {
+        // the two-prime path against the exact rounding of the CRT value, above 32 bits
+        let q = [268369921u64, 268361729];
+        let big = q[0] as u128 * q[1] as u128;
+        let n = 4096;
+        let x: Vec<u128> = (0..n as u128).map(|i| (i * 0x9e37_79b9_7f4a_7c15 + i * i) % big).collect();
+        let rows: Vec<Vec<u64>> = q.iter().map(|&p| x.iter().map(|&v| (v % p as u128) as u64).collect()).collect();
+        let refs: Vec<&[u64]> = rows.iter().map(|r| r.as_slice()).collect();
+        for bits in [33u32, 41, 48, 56, 64] {
+            let got = pack_coeffs(&q, &refs, bits).unwrap();
+            let mask = u64::MAX as u128 >> (64 - bits);
+            for (g, &v) in got.iter().zip(&x) {
+                assert_eq!(*g as u128, (((v << bits) + big / 2) / big) & mask, "bits {bits}");
+            }
+        }
+    }
+
+    #[test]
     fn pack_bits_roundtrip() {
         let n = 1000;
         for bits in [1u32, 20, 26, 32, 33, 46, 57, 64] {
