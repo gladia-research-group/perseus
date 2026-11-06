@@ -216,9 +216,16 @@ impl PyClient {
 
     /// A seeded frame of the plaintext whose coefficients are `coeffs` (n reals, at the level's scale unless `nf`), no
     /// slot FFT (e.g. selection weights given as coefficients); a precomputed part (`precompute`) when one is ready.
-    #[pyo3(signature = (coeffs, level, nf=None, regen=false))]
-    fn encrypt_coeffs<'py>(&mut self, py: Python<'py>, coeffs: Vec<f64>, level: u32, nf: Option<f64>, regen: bool) -> PyResult<Bound<'py, PyBytes>> {
+    /// `public`: under the loaded public key instead (not seeded), as `encrypt`'s.
+    #[pyo3(signature = (coeffs, level, nf=None, regen=false, public=false))]
+    fn encrypt_coeffs<'py>(&mut self, py: Python<'py>, coeffs: Vec<f64>, level: u32, nf: Option<f64>, regen: bool, public: bool) -> PyResult<Bound<'py, PyBytes>> {
         let meta = self.meta_at(level, 1, nf)?;
+        if public {
+            let (pk, rows) = self.pk.as_ref().ok_or_else(|| PyValueError::new_err("encrypt_coeffs(public=True): load_public_key first"))?;
+            let (c, g) = (&self.c, &mut self.prng);
+            let w = nogil(py, || c.encrypt_public_coeffs(&coeffs, &meta, g, pk, *rows).and_then(|w| w.to_bytes())).map_err(cerr)?;
+            return Ok(PyBytes::new(py, &w));
+        }
         let pre = match self.pre.get_mut(&(level, regen)).and_then(|v| v.pop()) {
             Some(p) => p,
             None => self.c.precompute(level, &mut self.prng, regen).map_err(cerr)?,

@@ -94,3 +94,20 @@ def test_user_bundle_holds_one_key(setup):
     info = _pc.bundle_info(users["alice"][1])
     assert info["entries"] == {"ksk": 1}, info
     assert info["bytes"] < 4 << 20, info
+
+
+def test_public_coeffs():
+    """`encrypt_coeffs(..., public=True)` (e.g. a user's selection weights) decrypts under the master secret only."""
+    master = _pc.ClientSecret.generate(seed=1)
+    owner = _pc.Client(master, seed=2, complex=True)
+    tmp = tempfile.mkdtemp(prefix="users_pk_", dir=os.environ.get("PC_WORK_DIR"))
+    cfg = _pc.Config.preset("n32_gpt2_decode")
+    mb = os.path.join(tmp, "master.pckb")
+    owner.keygen(_pc.Session.key_manifest(cfg, _pc.KeySource.generate([1], conj=False, seed=3, secret=master.to_bytes())), mb, threads=8)
+    user = _pc.Client(_pc.ClientSecret.generate(seed=10), seed=20, complex=True)
+    user.load_public_key(mb)
+    w = np.zeros(2 * N)
+    w[np.random.default_rng(2).choice(2 * N, 8, replace=False)] = 1.0 / 64
+    fr = user.encrypt_coeffs(w, LEVEL, public=True)
+    assert np.abs(owner.decrypt_coeffs(fr)[0] - w).max() < 1e-6
+    assert np.abs(user.decrypt_coeffs(fr)[0] - w).max() > 1.0

@@ -453,15 +453,26 @@ impl Client {
     pub fn encrypt_public(&self, values: &[Vec<Complex>], meta: &WireMeta, payload: Payload, prng: &mut Prng, pk: &[u32], pk_rows: usize) -> Result<CtWire> {
         let n = self.chain.n;
         let top = self.top_of(meta.level)?;
-        let rows = top + 1;
+        let slots = if meta.slots == 0 { n / 2 } else { meta.slots as usize };
+        let ms = values.iter().map(|v| self.enc.encode_slots(v, slots, top, payload, meta.nf)).collect::<std::result::Result<Vec<_>, _>>()?;
+        self.encrypt_public_rows(ms, meta, prng, pk, pk_rows)
+    }
+
+    /// `encrypt_public` of a plaintext given by its coefficients (`n` reals at scale `meta.nf`, no slot FFT).
+    pub fn encrypt_public_coeffs(&self, coeffs: &[f64], meta: &WireMeta, prng: &mut Prng, pk: &[u32], pk_rows: usize) -> Result<CtWire> {
+        let m = self.enc.encode_coeff_rows(coeffs, self.top_of(meta.level)?, meta.nf)?;
+        self.encrypt_public_rows(vec![m], meta, prng, pk, pk_rows)
+    }
+
+    fn encrypt_public_rows(&self, ms: Vec<Vec<Vec<u64>>>, meta: &WireMeta, prng: &mut Prng, pk: &[u32], pk_rows: usize) -> Result<CtWire> {
+        let n = self.chain.n;
+        let rows = self.top_of(meta.level)? + 1;
         if pk_rows < rows || pk.len() != 2 * pk_rows * n {
             return Err(Error::Params(format!("public key of {pk_rows} rows ({} words) for a {rows}-row ciphertext", pk.len())));
         }
-        let slots = if meta.slots == 0 { n / 2 } else { meta.slots as usize };
-        let k = values.len();
+        let k = ms.len();
         let mut data = vec![0u32; k * 2 * rows * n];
-        for (c, v) in values.iter().enumerate() {
-            let m = self.enc.encode_slots(v, slots, top, payload, meta.nf)?;
+        for (c, m) in ms.iter().enumerate() {
             let u = pc_core::keys::sample_ternary(prng, n);
             let (e0, e1) = (self.gauss.sample_vec(prng, n), self.gauss.sample_vec(prng, n));
             let ct = &mut data[c * 2 * rows * n..(c + 1) * 2 * rows * n];
