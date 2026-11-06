@@ -16,7 +16,7 @@ use crate::executor::Executor;
 use crate::ks::{self, md_epilogue, DotIo, DotRows, KeyGroup, KskSource, View};
 use crate::rotate::KsCfg;
 use pc_cuda::launch_result;
-use pc_kernels::TensorArgs;
+use pc_kernels::{EwArgs, PolyRef, TensorArgs};
 use pc_shadow::Shadow;
 
 /// (c0, c1) of `out` = the tensor's first two terms, d2 into `ex.ks.ext` part 1; Q rows 0..=top of k ciphertexts. `a`
@@ -112,6 +112,84 @@ pub fn relin_staged_from<W: DevWord, M: DevStrategy<W>>(
             md_epilogue(ctx, &ex.compute, View::of(&ct.buf, 0), View::of(&ex.ks.ext, 0), View::of(&ex.ks.conv, 0), k, top)
         }
     }
+}
+
+/// `relin_staged_from` of single ciphertexts at `top`, the d2 of `outs[u]` at `d2` + u `d2.ct_stride` words (rows
+/// 0..=top, `top + 1` rows apart). With cached keys the key switch runs `k_max` ciphertexts per launch (each batch's
+/// d2 copied into the coefficient workspace, `[c][row][N]` polys of the layout, for the ModUp's INTT), the epilogue
+/// one ciphertext at a time; with regenerated keys, one ciphertext at a time.
+pub fn relin_many<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    key: &KeyGroup<'_>,
+    outs: &mut [&mut Ct<'_, W>],
+    top: usize,
+    d2: View,
+) -> Result<()> {
+    let lay = ctx.lay;
+    let rows = (top + 1) * lay.n;
+    if d2.ct_stride != rows as u64 || outs.iter().any(|o| o.k() != 1) {
+        return Err(shape("relin_many", "single ciphertexts, d2 rows 0..=top packed"));
+    }
+    if key.galois.first() != Some(&1) {
+        return Err(shape("relin", "key group 0 is not the relinearization key (galois 1)"));
+    }
+    let at = |u: usize| View { base: (d2.base as *mut W).wrapping_add(u * rows) as *mut std::ffi::c_void, ..d2 };
+    if kc.source == KskSource::Regen {
+        for (u, o) in outs.iter_mut().enumerate() {
+            relin_staged_from(ctx, ex, kc, key, o, top, at(u))?;
+        }
+        return Ok(());
+    }
+    let km = ex.ks.k_max;
+    for (bi, batch) in outs.chunks_mut(km).enumerate() {
+        let k = batch.len();
+        let src = at(bi * km);
+        let coef = PolyRef { base: ex.bconv_work.vptr_mut(), ct_stride: lay.poly_words() as u64, part_stride: 0 };
+        let cp = EwArgs {
+            out: coef,
+            a: src.r(),
+            b: src.r(),
+            rs: lay.rs_q(top),
+            sc: std::ptr::null(),
+            scs: std::ptr::null(),
+            pr: ctx.pr(),
+            k: k as i32,
+            nparts: 1,
+            sub: 0,
+            zero_p: 0,
+        };
+        if ex.bconv_work.len() < k * lay.poly_words() {
+            return Err(shape("relin_many", "coefficient workspace too small"));
+        }
+        // SAFETY: k polys of rows 0..=top from the d2 rows ((top + 1) N words apart) into the coefficient workspace
+        // (poly_words apart, checked above; distinct buffers)
+        launch_result("ew_copy", unsafe { (ctx.table.ew_copy)(&cp, ex.compute.raw()) })?;
+        ks::modup_coef_ready(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, k, top)?;
+        let ext = View::of(&ex.ks.ext, 0);
+        let io = DotIo {
+            c1: src.base,
+            c0: std::ptr::null(),
+            ct_stride: src.ct_stride,
+            out: ext.base,
+            part_stride: lay.poly_words() as u64,
+            out_ct_stride: lay.ct_words() as u64,
+            out_rot_stride: 0,
+            c0_mode: 0,
+        };
+        let staged = key.needs_stage() || !key.has_a();
+        if staged {
+            let ndig = kc.plans.ndig(top)?;
+            ks::stage_key(ctx, &ex.compute, kc.plans, &mut ex.ks, key, 0, ndig, true)?;
+        }
+        ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, key, 0, 1, k, top, DotRows::All, io, staged)?;
+        ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
+        for (u, o) in batch.iter_mut().enumerate() {
+            md_epilogue(ctx, &ex.compute, View::of(&o.buf, 0), View::of(&ex.ks.ext, u), View::of(&ex.ks.conv, u), 1, top)?;
+        }
+    }
+    Ok(())
 }
 
 /// `out = a * b` relinearized (degree 2, rescale pending). The operands must need no Recipe prelude (same level,

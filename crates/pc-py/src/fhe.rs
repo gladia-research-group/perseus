@@ -893,8 +893,8 @@ impl PyFhe {
         Ok(o)
     }
 
-    /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (groups of one length and
-    /// level; an operand the groups share at the same j is read once per launch). Low-slot operands are admitted.
+    /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (groups of one level, any
+    /// lengths; an operand the groups share at the same j is read once per launch). Low-slot operands are admitted.
     fn mult_sum_many(&mut self, py: Python<'_>, a: Vec<Vec<PyRef<'_, PyCt>>>, b: Vec<Vec<PyRef<'_, PyCt>>>) -> PyResult<Vec<PyCt>> {
         if a.is_empty() || a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.is_empty() || x.len() != y.len()) {
             return Err(PyValueError::new_err("mult_sum_many: matching, non-empty operand groups"));
@@ -903,7 +903,9 @@ impl PyFhe {
             self.same_session_low(x)?;
         }
         let mut outs = a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()?;
-        let mut d2s = a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()?;
+        // seeded first operands: d2 in the executor's workspace (no scratch ciphertexts)
+        let ws = a[0][0].ct_low().buf.seeds && self.dev.st.borrow().ex.seeded_d2.is_some();
+        let mut d2s = if ws { Vec::new() } else { a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()? };
         {
             let d = &*self.dev;
             let mut om = outs.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;

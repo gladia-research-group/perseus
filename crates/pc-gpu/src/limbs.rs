@@ -63,6 +63,28 @@ pub fn export_limbs<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: 
     Ok(Limbs { c: out, moduli: ctx.chain.q[..=top].to_vec(), level: top, noise_level: x.meta.deg, noise_factor: x.meta.nf })
 }
 
+/// `export_limbs` without the wait: rows 0..=top of both parts of ciphertext `c` of `x` (coefficient form, through
+/// `ex.scratch`) queued for download into `dst[part]` (pinned, `(top + 1) N` words each). Returns `x`'s top limb.
+///
+/// # Safety
+/// `dst` must not be read, reused or dropped until the compute lane has passed the copies (sync an event recorded
+/// after this call).
+pub unsafe fn export_limbs_async<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, x: &Ct<'_, W>, c: usize, dst: [&mut pc_cuda::PinnedBuf<W>; 2]) -> Result<usize> {
+    let top = x.top(ctx.shape)?;
+    if c >= x.k() || dst.iter().any(|d| d.len() != (top + 1) * ctx.lay.n) {
+        return Err(shape("export_limbs_async", format!("ciphertext {c} of {} into buffers of {} words", x.k(), dst[0].len())));
+    }
+    let s = &ex.compute;
+    ew(ctx, s, Ew::Copy, View::of(&ex.scratch, 0), View::of(&x.buf, c), None, ctx.lay.rs_q(top), 1, 2)?;
+    ntt::transform_k(ctx, s, Dir::Inverse, &mut ex.scratch, Span::Q { top }, Parts::Both, 1)?;
+    for (part, d) in dst.into_iter().enumerate() {
+        // SAFETY: the caller keeps d untouched until the lane has passed the copy; rows 0..=top of part `part` of
+        // scratch ciphertext 0 are contiguous
+        unsafe { ex.scratch.buf.download_pinned_async(s, part * ctx.lay.poly_words(), d)? };
+    }
+    Ok(top)
+}
+
 /// Overwrite ciphertext `c` of `x` (at its current top) from coefficient residues (`export_limbs`' inverse; sets
 /// the degree and scale of the whole batch's meta from `l`).
 pub fn import_limbs<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, x: &mut Ct<'_, W>, c: usize, l: &Limbs<W>) -> Result<()> {
