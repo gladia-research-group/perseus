@@ -974,19 +974,17 @@ impl PyFhe {
         let d = self.dev.clone();
         let n = d.n() as i64;
         let k = k.rem_euclid(2 * n);
-        let (pos, sign) = if k < n { (k as usize, 1.0) } else { ((k - n) as usize, -1.0) };
+        let (pos, sign) = if k < n { (k as usize, 1) } else { ((k - n) as usize, -1) };
         let key = PtKey::new(format!("__mono{k}"), self.pt_meta(&a.meta()).level, PtForm::Eval);
         let mut o = self.new_ct(a.meta())?;
         let om = o.ct_mut()?;
         let mut st = d.st.borrow_mut();
         let State { pts: store, ex, ops, .. } = &mut *st;
         if store.get(&d.ctx, ex, &key).is_err() {
-            // the store scales coefficients by the level's factor: encode once to read it, then at 1 / factor
-            let mut c = vec![0.0; n as usize];
+            // the exact monomial at unit scale (any level, on the composite grid or off it)
+            let mut c = vec![0i64; n as usize];
             c[pos] = sign;
-            store.encode_with(&d.ctx, ex, ops, &d.sh, EncoderKind::CoeffRows, key.clone(), Payload2::Coeffs(&c), 1).map_err(gerr)?;
-            c[pos] = sign / store.get(&d.ctx, ex, &key).map_err(gerr)?.meta.nf;
-            store.encode_with(&d.ctx, ex, ops, &d.sh, EncoderKind::CoeffRows, key.clone(), Payload2::Coeffs(&c), 1).map_err(gerr)?;
+            store.encode_ints_many(&d.ctx, ex, &d.sh, std::slice::from_ref(&key), &[&c], Some(1.0)).map_err(gerr)?;
         }
         let pt = store.get(&d.ctx, ex, &key).map_err(gerr)?;
         ops.mult_pt_exact(&d.ctx, ex, om, a.ct()?, &pt).map_err(gerr)?;
@@ -1373,6 +1371,25 @@ impl PyFhe {
         let mut st = d.st.borrow_mut();
         let State { pts, ex, .. } = &mut *st;
         nogil(py, || pts.encode_coeffs_many(&d.ctx, ex, &d.sh, &keys, &r)).map_err(gerr)?;
+        Ok(keys.len())
+    }
+    /// `store_coeff_pts` of exact integer coefficients (int64 rows: the plaintexts' coefficients at the level's scaling
+    /// factor, no rounding), rows `start..` of `name`: e.g. a batch at a time as the rows become ready.
+    #[pyo3(signature = (name, ints, level, start=0))]
+    fn store_int_pts(&mut self, py: Python<'_>, name: &str, ints: &Bound<'_, PyAny>, level: u32, start: usize) -> PyResult<usize> {
+        let np = self.numpy(py)?;
+        let arr = np.call_method1("ascontiguousarray", (ints, "int64"))?;
+        let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+        if shape.len() != 2 {
+            return Err(PyValueError::new_err(format!("expected a 2-D array, got shape {shape:?}")));
+        }
+        let v = PyBuffer::<i64>::get(&arr)?.to_vec(py)?;
+        let rows: Vec<&[i64]> = v.chunks(shape[1].max(1)).collect();
+        let keys: Vec<PtKey> = (start..start + rows.len()).map(|i| PtKey::new(format!("{name}#{i}"), level, PtForm::Eval)).collect();
+        let d = self.dev.clone();
+        let mut st = d.st.borrow_mut();
+        let State { pts, ex, .. } = &mut *st;
+        nogil(py, || pts.encode_ints_many(&d.ctx, ex, &d.sh, &keys, &rows, None)).map_err(gerr)?;
         Ok(keys.len())
     }
     /// `mult_coeff_sum` over the rows `store_coeff_pts` keeps as `name`: term i is `cts[i]` times row i, stored at the
