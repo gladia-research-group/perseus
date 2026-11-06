@@ -1015,16 +1015,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     if sizes.low_pool > 0 {
         mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows, false, false));
     }
-    // seeded slots' c1 drawn by its own pass before each tensor launch; PC_CTS_EXPAND=0: inside the tensor (A/B)
-    let cts_expand = sizes.low_seeded > 0 && !std::env::var("PC_CTS_EXPAND").is_ok_and(|v| v == "0");
     if sizes.low_packed && chain.q.iter().take(sizes.low_rows).any(|&p| p >> pc_kernels::PACK_BITS != 0) {
         return Err(PyValueError::new_err(format!("size lowPacked: the primes of rows 0..{} need more than {} bits", sizes.low_rows, pc_kernels::PACK_BITS)));
     }
     if sizes.low_seeded > 0 {
         mplan.reserve("ct_low_seeded", CtPool::<W>::low_bytes(&lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed));
-    }
-    if cts_expand {
-        mplan.reserve("cts_expand", Executor::<W>::cts_expand_bytes(&lay, sizes.low_rows));
+        mplan.reserve("seeded_d2", Executor::<W>::seeded_d2_bytes(&lay, sizes.low_rows));
     }
     let nd = key_needs(cfg, ks, &chain, &plan, &pcmm, &ccmm)?;
     let spec_req = match origin {
@@ -1150,8 +1146,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let a: &'static Arena = unsafe { &*(arena.as_ref() as *const Arena) };
     let mut ex = Executor::<W>::new(&device, a, &mplan).map_err(e)?;
     ex.ks.carve_regen(a, &lay).map_err(e)?;
-    if cts_expand {
-        ex.carve_cts_expand(a, &lay, sizes.low_rows).map_err(e)?;
+    if sizes.low_seeded > 0 {
+        ex.carve_seeded_d2(a, &lay, sizes.low_rows).map_err(e)?;
     }
     let ctx = Context::<W, M>::new(a, &ex.copy, chain.clone(), &mplan).map_err(e)?;
     let mut pool = CtPool::<W>::new(a, &mplan).map_err(e)?;

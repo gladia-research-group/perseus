@@ -454,6 +454,8 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
 #[pyclass(name = "PendingFrames", module = "perseus._pc")]
 pub struct PyPendingFrames {
     limbs: Vec<(pc_gpu::limbs::Limbs<crate::session::W>, CtMeta)>,
+    /// Residues still in flight (`export_ct_many(..., defer=True)`): pinned rows of each ciphertext, read after `done`.
+    inflight: Option<Inflight>,
     hash: String,
     n: usize,
     bits: u32,
@@ -461,11 +463,67 @@ pub struct PyPendingFrames {
     sparse: bool,
 }
 
+/// Pinned row buffers of deferred exports, reused across calls (allocating pinned memory per call would cost more
+/// than the copies).
+struct Pinned(pc_cuda::PinnedBuf<crate::session::W>);
+// SAFETY: plain host memory; a buffer is only read after the event covering its copy has completed, and handed out
+// to one owner at a time
+unsafe impl Send for Pinned {}
+static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new());
+
+fn pinned(dev: &pc_cuda::Device, len: usize) -> PyResult<Pinned> {
+    let mut pool = PINNED.lock().map_err(|_| PyRuntimeError::new_err("pinned pool poisoned"))?;
+    match pool.iter().position(|b| b.0.len() == len) {
+        Some(i) => Ok(pool.swap_remove(i)),
+        None => Ok(Pinned(pc_cuda::PinnedBuf::new(dev, len).map_err(|e| PyRuntimeError::new_err(e.to_string()))?)),
+    }
+}
+
+struct Inflight {
+    done: pc_cuda::Event,
+    /// Per ciphertext: (parts 0 and 1, top limb, meta).
+    rows: Vec<([Pinned; 2], usize, CtMeta)>,
+    moduli: Vec<u64>,
+}
+// SAFETY: the event is only synchronized (thread-safe in CUDA); the buffers as `Pinned`
+unsafe impl Send for Inflight {}
+unsafe impl Sync for Inflight {}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        // the copies must have landed before the buffers are reused (errors: the buffers are leaked instead)
+        if self.done.sync().is_err() {
+            std::mem::forget(std::mem::take(&mut self.rows));
+            return;
+        }
+        if let Ok(mut pool) = PINNED.lock() {
+            for (b, _, _) in self.rows.drain(..) {
+                pool.extend(b);
+            }
+        }
+    }
+}
+
 impl PyPendingFrames {
     fn frame_all(&self) -> pc_client::Result<Vec<Vec<u8>>> {
         use rayon::prelude::*;
+        let landed: Vec<(pc_gpu::limbs::Limbs<crate::session::W>, CtMeta)> = match &self.inflight {
+            None => Vec::new(),
+            Some(f) => {
+                f.done.sync().map_err(|e| pc_client::Error::Wire(e.to_string()))?;
+                f.rows
+                    .iter()
+                    .map(|(b, top, m)| {
+                        let c = [0, 1].map(|p| b[p].0.as_slice().chunks(self.n).map(|r| r.to_vec()).collect::<Vec<_>>());
+                        let l = pc_gpu::limbs::Limbs { c, moduli: f.moduli[..=*top].to_vec(), level: *top, noise_level: m.deg, noise_factor: m.nf };
+                        (l, *m)
+                    })
+                    .collect()
+            }
+        };
         self.limbs
             .par_iter()
+            .chain(landed.par_iter())
             .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
                 let mut data = Vec::with_capacity(2 * self.n);
                 for (part, b) in [(0, self.bits), (1, self.bits1.unwrap_or(self.bits))] {
@@ -493,7 +551,7 @@ impl PyPendingFrames {
         Ok(out)
     }
     fn __len__(&self) -> usize {
-        self.limbs.len()
+        self.limbs.len() + self.inflight.as_ref().map_or(0, |f| f.rows.len())
     }
 }
 
@@ -511,6 +569,7 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
     let dev = session.dev.clone();
     let n = dev.ctx.lay.n;
     let mut limbs = Vec::with_capacity(cts.len());
+    let mut rows = Vec::new();
     for ct in &cts {
         if ct.ct_ref().buf.seeds {
             return Err(PyValueError::new_err("export_ct_many: a seeded ciphertext (import_ct(..., regen=True)) is an input of mult_sum_many only"));
@@ -551,10 +610,27 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
         let c = tmp.as_ref().map_or(ct.ct_ref(), |t| t.ct_ref());
         let mut st = dev.st.borrow_mut();
         let State { ex, .. } = &mut *st;
+        if defer {
+            // downloads queued into pinned rows: the host goes on issuing work while they wait their turn
+            let words = (c.top(dev.ctx.shape).map_err(gerr)? + 1) * n;
+            let mut b = [pinned(&dev.device, words)?, pinned(&dev.device, words)?];
+            let [b0, b1] = &mut b;
+            // SAFETY: the buffers move into the Inflight below, read only after its event (recorded after every copy)
+            let top = unsafe { pc_gpu::limbs::export_limbs_async(&dev.ctx, ex, c, 0, [&mut b0.0, &mut b1.0]) }.map_err(gerr)?;
+            rows.push((b, top, c.meta));
+            continue;
+        }
         let l = nogil(py, || pc_gpu::limbs::export_limbs(&dev.ctx, ex, c, 0)).map_err(gerr)?;
         limbs.push((l, c.meta));
     }
-    let pending = PyPendingFrames { limbs, hash: pc_client::spec::params_hash(&dev.ctx.chain), n, bits, bits1, sparse };
+    let inflight = if defer {
+        let done = pc_cuda::Event::new(&dev.device).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        done.record(&dev.st.borrow().ex.compute).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Some(Inflight { done, rows, moduli: dev.ctx.chain.q.clone() })
+    } else {
+        None
+    };
+    let pending = PyPendingFrames { limbs, inflight, hash: pc_client::spec::params_hash(&dev.ctx.chain), n, bits, bits1, sparse };
     if defer {
         return Ok(Bound::new(py, pending)?.into_any());
     }

@@ -245,9 +245,7 @@ pub extern "C" fn tensor_sum<W: Hw>(a: *const TensorSumArgs, s: S) -> i32 {
 }
 
 pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
-    let bad = |a: &TensorMultiArgs| {
-        a.nout < 1 || a.nout as usize > TMULTI_OUT || a.npairs < 1 || a.npairs as usize > TMULTI_PAIRS || (a.seeded & 4 != 0 && std::mem::size_of::<W>() != 4)
-    };
+    let bad = |a: &TensorMultiArgs| a.nout < 1 || a.nout as usize > TMULTI_OUT || a.npairs < 1 || a.npairs as usize > TMULTI_PAIRS;
     launch(a, s, |a| if bad(a) { -1 } else { 0 }, |a| {
         let n = a.n as usize;
         let nch = N / TENSOR_CH;
@@ -259,39 +257,12 @@ pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
                 // SAFETY: TENSOR_CH words of a row of ciphertext c inside the launch's buffers
                 unsafe { std::slice::from_raw_parts_mut(at::<W>(r, c, part, row).add(lo), TENSOR_CH) }
             };
-            // a seeded first operand: its c1 words drawn from the row's seed (part 1, 8 words per row), its c0 words
-            // unpacked when packed (seeded | 4)
-            let mut gen = [W::default(); TENSOR_CH];
-            let mut gen0 = [W::default(); TENSOR_CH];
-            let mut drawn = [0u32; TENSOR_CH];
             for o in 0..a.nout as usize {
                 let (mut s0, mut s1, mut s2) = ([W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH]);
                 for j in 0..a.npairs as usize {
                     let (y0, y1) = (row_of(&a.b[o][j], 0), row_of(&a.b[o][j], 1));
-                    let x0: &[W] = if a.seeded & 4 != 0 {
-                        let w = pack_row_words(N);
-                        // SAFETY: a packed seeded slot holds its c0 rows pack_row_words(N) words apart (CtBuf::new_seeded)
-                        let packed = unsafe { std::slice::from_raw_parts(at::<u32>(&a.a[o][j], c, 0, 0).add(row * w), w) };
-                        unpack_range(packed, lo, &mut drawn);
-                        gen0.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
-                        &gen0
-                    } else {
-                        row_of(&a.a[o][j], 0)
-                    };
-                    let x1: &[W] = if a.seeded & 3 == 2 {
-                        row_of(&a.x1[o][j], 0)
-                    } else if a.seeded & 3 != 0 {
-                        // SAFETY: a seeded slot holds 8 seed words per row right after c0's rows (CtBuf::new_seeded)
-                        let sd = unsafe { std::slice::from_raw_parts(at::<W>(&a.a[o][j], c, 1, 0).add(8 * row), 8) };
-                        let seed: [u32; 8] = std::array::from_fn(|w| sd[w].u64() as u32);
-                        pc_core::keys::cts_expand_range(&seed, q.p as u32, N, lo, &mut drawn);
-                        gen.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
-                        &gen
-                    } else {
-                        row_of(&a.a[o][j], 1)
-                    };
-                    v::mac2::<W>(&mut s0, &mut s1, x0, y0, y1);
-                    v::mac2::<W>(&mut s1, &mut s2, x1, y0, y1);
+                    v::mac2::<W>(&mut s0, &mut s1, row_of(&a.a[o][j], 0), y0, y1);
+                    v::mac2::<W>(&mut s1, &mut s2, row_of(&a.a[o][j], 1), y0, y1);
                 }
                 let (mut r0, mut r1, mut r2) = ([W::default(); TENSOR_CH], [W::default(); TENSOR_CH], [W::default(); TENSOR_CH]);
                 v::reduce::<W>(&s0, q, &mut r0);
@@ -313,17 +284,62 @@ pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
     })
 }
 
-pub extern "C" fn cts_expand<W: Hw>(a: *const CtsExpandArgs, s: S) -> i32 {
-    let bad = |a: &CtsExpandArgs| std::mem::size_of::<W>() != 4 || a.nops < 1 || a.nops as usize > CTS_EXPAND_MAX;
+pub extern "C" fn tensor_seeded<W: Hw>(a: *const TensorSeededArgs, s: S) -> i32 {
+    let bad = |a: &TensorSeededArgs| {
+        std::mem::size_of::<W>() != 4 || a.nout < 1 || a.nout as usize > TSEED_OUT || a.npairs < 1 || a.npairs as usize > TSEED_PAIRS
+    };
     launch(a, s, |a| if bad(a) { -1 } else { 0 }, |a| {
         let n = a.n as usize;
-        par_for(a.nops as usize * n, a, |a, t| {
-            let (u, row) = (t / n, t % n);
-            // SAFETY: a seeded slot holds 8 seed words per row right after c0's rows (CtBuf::new_seeded); dst row (u, row)
-            // of the launch's scratch (u32 words)
-            let sd = unsafe { std::slice::from_raw_parts(at::<u32>(&a.src[u], 0, 1, 0).add(8 * row), 8) };
-            let out = unsafe { std::slice::from_raw_parts_mut((a.dst as *mut u32).add((u * n + row) * N), N) };
-            pc_core::keys::cts_expand_row(sd.try_into().expect("8 seed words"), prime(a.pr, row).p as u32, out);
+        let nch = N / TENSOR_CH;
+        par_for(n * nch, a, |a, t| {
+            let (row, lo) = (t / nch, (t % nch) * TENSOR_CH);
+            let q = prime(a.pr, row);
+            let p = W::from_u64(q.p);
+            let row_of = |r: &PolyRef, part: usize| {
+                // SAFETY: TENSOR_CH words of a row inside the launch's buffers
+                unsafe { std::slice::from_raw_parts_mut(at::<W>(r, 0, part, row).add(lo), TENSOR_CH) }
+            };
+            // the seeded first operand's c0 words (unpacked when packed) and its c1 words drawn from the row's seed
+            let mut x0 = [W::default(); TENSOR_CH];
+            let mut x1 = [W::default(); TENSOR_CH];
+            let mut drawn = [0u32; TENSOR_CH];
+            for o in 0..a.nout as usize {
+                let (mut s0, mut s1, mut s2) = ([W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH], [W::Acc::default(); TENSOR_CH]);
+                for j in 0..a.npairs as usize {
+                    let (y0, y1) = (row_of(&a.b[j], 0), row_of(&a.b[j], 1));
+                    let base = a.a[o][j] as *const u32;
+                    if a.packed != 0 {
+                        let w = pack_row_words(N);
+                        // SAFETY: a packed seeded slot holds its c0 rows pack_row_words(N) words apart (CtBuf::new_seeded)
+                        unpack_range(unsafe { std::slice::from_raw_parts(base.add(row * w), w) }, lo, &mut drawn);
+                    } else {
+                        // SAFETY: an unpacked seeded slot holds its c0 rows N words apart
+                        drawn.copy_from_slice(unsafe { std::slice::from_raw_parts(base.add(row * N + lo), TENSOR_CH) });
+                    }
+                    x0.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
+                    // SAFETY: a seeded slot holds 8 seed words per row at seed_off words from its c0 (CtBuf::new_seeded)
+                    let sd = unsafe { std::slice::from_raw_parts(base.add(a.seed_off as usize + 8 * row), 8) };
+                    pc_core::keys::cts_expand_range(sd.try_into().expect("8 seed words"), q.p as u32, N, lo, &mut drawn);
+                    x1.iter_mut().zip(&drawn).for_each(|(g, &d)| *g = W::from_u64(d as u64));
+                    v::mac2::<W>(&mut s0, &mut s1, &x0, y0, y1);
+                    v::mac2::<W>(&mut s1, &mut s2, &x1, y0, y1);
+                }
+                let (mut r0, mut r1, mut r2) = ([W::default(); TENSOR_CH], [W::default(); TENSOR_CH], [W::default(); TENSOR_CH]);
+                v::reduce::<W>(&s0, q, &mut r0);
+                v::reduce::<W>(&s1, q, &mut r1);
+                v::reduce::<W>(&s2, q, &mut r2);
+                let (o0, o1, d2) = (row_of(&a.out[o], 0), row_of(&a.out[o], 1), row_of(&a.d2[o], 1));
+                if a.acc != 0 {
+                    v::add_rows::<W>(&mut r0, o0, p);
+                    v::add_rows::<W>(&mut r1, o1, p);
+                }
+                if a.acc & 2 != 0 {
+                    v::add_rows::<W>(&mut r2, d2, p);
+                }
+                o0.copy_from_slice(&r0);
+                o1.copy_from_slice(&r1);
+                d2.copy_from_slice(&r2);
+            }
         })
     })
 }

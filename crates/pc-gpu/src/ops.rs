@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, CtsExpandArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSumArgs, WsumArgs, CTS_EXPAND_MAX, TMULTI_OUT, TMULTI_PAIRS, TSUM_MAX};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSeededArgs, TensorSumArgs, WsumArgs, TMULTI_OUT, TMULTI_PAIRS, TSEED_OUT, TSEED_PAIRS, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -1023,21 +1023,19 @@ impl<'a, W: DevWord> Ops<'a, W> {
     }
 
     /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (single ciphertexts, every
-    /// group of the same length and level). The tensors run `TMULTI_OUT` outputs per launch, so an operand the groups
-    /// share at the same j (a query, a corpus ciphertext) is read once; each group's d2 accumulates in part 1 of its
-    /// `d2s[g]` (scratch ciphertexts) and is relinearized from there.
+    /// group at the same level; groups may differ in length). The tensors run several outputs per launch, so an operand
+    /// the groups share at the same j (a query, a corpus ciphertext) is read once; each group's d2 accumulates in part 1
+    /// of its `d2s[g]` (scratch ciphertexts) and is relinearized from there. Seeded first operands (every one or none)
+    /// have their c1 drawn in the tensor (`tensor_seeded`): up to `TSEED_OUT` consecutive groups per launch that share
+    /// their second operands over the launch's pairs.
     #[allow(clippy::too_many_arguments)]
     pub fn mult_sum_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, outs: &mut [&mut Ct<'_, W>], d2s: &mut [&mut Ct<'_, W>], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>]) -> Result<()> {
         let g = outs.len();
-        if g == 0 || d2s.len() != g || a.len() != g || b.len() != g {
-            return Err(shape("mult_sum_many", format!("{g} outputs, {} scratch, {} / {} operand groups", d2s.len(), a.len(), b.len())));
+        if g == 0 || a.len() != g || b.len() != g {
+            return Err(shape("mult_sum_many", format!("{g} outputs, {} / {} operand groups", a.len(), b.len())));
         }
-        let np = a[0].len();
         let mut recipe = None;
         for i in 0..g {
-            if a[i].len() != np || b[i].len() != np {
-                return Err(shape("mult_sum_many", "every group needs the same number of pairs"));
-            }
             let (top, r) = self.sum_recipe(ctx, sh, &a[i], &b[i], "mult_sum_many")?;
             if recipe.as_ref().is_some_and(|(t, x): &(usize, Recipe)| *t != top || x.out != r.out) {
                 return Err(shape("mult_sum_many", "every group at the same level"));
@@ -1052,72 +1050,146 @@ impl<'a, W: DevWord> Ops<'a, W> {
         if seeded && std::mem::size_of::<W>() != 4 {
             return Err(shape("mult_sum_many", "seeded operands need 32-bit words"));
         }
+        // every seeded slot of a session has the same layout: its seeds at one offset from its c0
+        let seed_off = a[0][0].buf.r().part_stride;
+        if seeded && a.iter().flatten().any(|x| x.buf.r().part_stride != seed_off) {
+            return Err(shape("mult_sum_many", "seeded operands of one layout"));
+        }
         if outs.iter().map(|o| o.k()).chain(d2s.iter().map(|d| d.k())).chain(a.iter().chain(b).flatten().map(|x| x.k())).any(|k| k != 1) {
             return Err(shape("mult_sum_many", "single ciphertexts only (k = 1)"));
         }
-        let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
-        let bits = 8 * std::mem::size_of::<W>() as u32;
-        let per = if bits >= 64 { TMULTI_PAIRS } else { ((((1u128 << (2 * bits)) - 1) / (2 * pm * pm)) as usize).clamp(1, TMULTI_PAIRS) };
-        // seeded: each launch's distinct first operands get their c1 rows drawn into the executor's workspace first
-        // (cts_expand, seeded = 2); without one (or too few rows) the tensor draws them (seeded = 1)
         let rows = top + 1;
-        let expand = match &mut ex.cts_expand {
-            Some((buf, r)) if seeded && *r >= rows => Some(buf.dptr_mut()),
+        // seeded: d2 in the executor's workspace, a wave of TSEED_OUT outputs at a time; else the caller's scratch
+        let ws = match &ex.seeded_d2 {
+            Some((buf, r)) if seeded && *r >= rows => Some(buf.dptr() as *mut W),
             _ => None,
         };
-        for o0 in (0..g).step_by(TMULTI_OUT) {
-            let no = (g - o0).min(TMULTI_OUT);
-            for (ci, j0) in (0..np).step_by(per).enumerate() {
-                let nj = (np - j0).min(per);
-                let mut args = TensorMultiArgs {
-                    out: [PolyRef::default(); TMULTI_OUT],
-                    d2: [PolyRef::default(); TMULTI_OUT],
-                    a: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
-                    b: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
-                    x1: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
-                    pr: ctx.pr(),
-                    nout: no as i32,
-                    npairs: nj as i32,
-                    acc: if ci > 0 { 3 } else { 0 },
-                    n: rows as i32,
-                    k: 1,
-                    seeded: if expand.is_some() { 2 } else { seeded as i32 } | if packed { 4 } else { 0 },
-                };
-                let mut ex_args = CtsExpandArgs { src: [PolyRef::default(); CTS_EXPAND_MAX], dst: std::ptr::null_mut(), pr: ctx.pr(), nops: 0, n: rows as i32 };
-                for o in 0..no {
-                    args.out[o] = outs[o0 + o].buf.w();
-                    args.d2[o] = d2s[o0 + o].buf.w();
-                    for j in 0..nj {
-                        args.a[o][j] = a[o0 + o][j0 + j].buf.r();
-                        args.b[o][j] = b[o0 + o][j0 + j].buf.r();
-                        if let Some(dst) = expand {
-                            let src = args.a[o][j];
-                            let n = ex_args.nops as usize;
-                            let u = ex_args.src[..n].iter().position(|x| x.base == src.base).unwrap_or_else(|| {
-                                ex_args.src[n] = src;
-                                ex_args.nops += 1;
-                                n
-                            });
-                            // operand u's rows at dst + (u rows + r) N (ct_stride / part_stride unused: one part)
-                            args.x1[o][j] = PolyRef { base: dst.wrapping_add(u * rows * self.lay.n) as *mut std::ffi::c_void, ct_stride: 0, part_stride: 0 };
-                        }
-                    }
+        if ws.is_none() && d2s.len() != g {
+            return Err(shape("mult_sum_many", format!("{g} outputs, {} scratch", d2s.len())));
+        }
+        let wave = if ws.is_some() { TSEED_OUT } else { g };
+        for w0 in (0..g).step_by(wave) {
+            let w1 = (w0 + wave).min(g);
+            let d2: Vec<PolyRef> = (0..w1)
+                .map(|o| match ws {
+                    Some(p) if o >= w0 => PolyRef { base: p.wrapping_add((o - w0) * rows * self.lay.n) as *mut std::ffi::c_void, ct_stride: 0, part_stride: 0 },
+                    Some(_) => PolyRef::default(),
+                    None => d2s[o].buf.w(),
+                })
+                .collect();
+            self.tensor_wave(ctx, ex, &mut outs[..], &d2, a, b, w0..w1, (seeded, packed, seed_off), top)?;
+            if ws.is_some() {
+                let src = crate::ks::View { base: d2[w0].base, ct_stride: (rows * self.lay.n) as u64, part_stride: 0 };
+                crate::relin::relin_many(ctx, ex, kc, key, &mut outs[w0..w1], top, src)?;
+            }
+            for o in w0..w1 {
+                if ws.is_none() {
+                    let src = crate::ks::View::of(&d2s[o].buf, 0).part::<W>(1);
+                    crate::relin::relin_staged_from(ctx, ex, kc, key, outs[o], top, src)?;
                 }
-                if let Some(dst) = expand {
-                    ex_args.dst = dst as *mut std::ffi::c_void;
-                    // SAFETY: rows 0..rows of nops seeded slots (their seeds) into the workspace, which holds CTS_EXPAND_MAX
-                    // operands of `rows` rows and is read only by the tensor_multi below (same lane)
-                    launch_result("cts_expand", unsafe { (ctx.table.cts_expand)(&ex_args, ex.compute.raw()) })?;
-                }
-                // SAFETY: per (row, word) the kernel reads every operand before writing its outputs; outputs and scratch
-                // are distinct pool slots (not operands); rows 0..=top, each operand with its own strides
-                launch_result("tensor_multi", unsafe { (ctx.table.tensor_multi)(&args, ex.compute.raw()) })?;
+                outs[o].meta = r.out;
             }
         }
-        for (o, d) in outs.iter_mut().zip(d2s.iter()) {
-            let src = crate::ks::View::of(&d.buf, 0).part::<W>(1);
-            crate::relin::relin_staged_from(ctx, ex, kc, key, o, top, src)?;
-            o.meta = r.out;
+        Ok(())
+    }
+
+    /// `mult_sum_many`'s tensors of outputs `wave` (d2 at `d2[o]`, part 1): launches over pairs j0..j0 + per, runs
+    /// of consecutive outputs still that long, as many pairs left (up to per), all accumulating or none, sharing their
+    /// second operands when seeded.
+    #[allow(clippy::too_many_arguments)]
+    fn tensor_wave<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, outs: &mut [&mut Ct<'_, W>], d2: &[PolyRef], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>], wave: std::ops::Range<usize>, (seeded, packed, seed_off): (bool, bool, u64), top: usize) -> Result<()> {
+        let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
+        let bits = 8 * std::mem::size_of::<W>() as u32;
+        let (max_out, max_pairs) = if seeded { (TSEED_OUT, TSEED_PAIRS) } else { (TMULTI_OUT, TMULTI_PAIRS) };
+        let per = if bits >= 64 { max_pairs } else { ((((1u128 << (2 * bits)) - 1) / (2 * pm * pm)) as usize).clamp(1, max_pairs) };
+        let rows = top + 1;
+        let same = |x: PolyRef, y: PolyRef| x.base == y.base && x.ct_stride == y.ct_stride && x.part_stride == y.part_stride;
+        let g = wave.end;
+        let mut started = vec![false; g];
+        let np_max = a[wave.clone()].iter().map(|x| x.len()).max().unwrap_or(0);
+        for j0 in (0..np_max).step_by(per) {
+            let mut o0 = wave.start;
+            while o0 < g {
+                if a[o0].len() <= j0 {
+                    o0 += 1;
+                    continue;
+                }
+                let nj = (a[o0].len() - j0).min(per);
+                let mut run = vec![o0];
+                let mut o = o0 + 1;
+                while o < g && run.len() < max_out {
+                    if a[o].len() > j0 {
+                        let fits = (a[o].len() - j0).min(per) == nj
+                            && started[o] == started[o0]
+                            && (!seeded || (j0..j0 + nj).all(|j| same(b[o][j].buf.r(), b[o0][j].buf.r())));
+                        if !fits {
+                            break;
+                        }
+                        run.push(o);
+                    }
+                    o += 1;
+                }
+                let acc = if started[o0] { 3 } else { 0 };
+                if seeded {
+                    let mut args = TensorSeededArgs {
+                        out: [PolyRef::default(); TSEED_OUT],
+                        d2: [PolyRef::default(); TSEED_OUT],
+                        b: [PolyRef::default(); TSEED_PAIRS],
+                        a: [[std::ptr::null(); TSEED_PAIRS]; TSEED_OUT],
+                        pr: ctx.pr(),
+                        seed_off,
+                        nout: run.len() as i32,
+                        npairs: nj as i32,
+                        acc,
+                        n: rows as i32,
+                        packed: packed as i32,
+                        pad: 0,
+                    };
+                    for j in 0..nj {
+                        args.b[j] = b[o0][j0 + j].buf.r();
+                    }
+                    for (u, &o) in run.iter().enumerate() {
+                        args.out[u] = outs[o].buf.w();
+                        args.d2[u] = d2[o];
+                        for j in 0..nj {
+                            args.a[u][j] = a[o][j0 + j].buf.r().base as *const std::ffi::c_void;
+                        }
+                    }
+                    // SAFETY: per (row, word) the kernel reads every operand before writing its outputs; outputs and
+                    // scratch are distinct pool slots (not operands); rows 0..=top of seeded slots (c0, then the seeds at
+                    // seed_off) and of b's own strides
+                    launch_result("tensor_seeded", unsafe { (ctx.table.tensor_seeded)(&args, ex.compute.raw()) })?;
+                } else {
+                    let mut args = TensorMultiArgs {
+                        out: [PolyRef::default(); TMULTI_OUT],
+                        d2: [PolyRef::default(); TMULTI_OUT],
+                        a: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
+                        b: [[PolyRef::default(); TMULTI_PAIRS]; TMULTI_OUT],
+                        pr: ctx.pr(),
+                        nout: run.len() as i32,
+                        npairs: nj as i32,
+                        acc,
+                        n: rows as i32,
+                        k: 1,
+                        pad: 0,
+                    };
+                    for (u, &o) in run.iter().enumerate() {
+                        args.out[u] = outs[o].buf.w();
+                        args.d2[u] = d2[o];
+                        for j in 0..nj {
+                            args.a[u][j] = a[o][j0 + j].buf.r();
+                            args.b[u][j] = b[o][j0 + j].buf.r();
+                        }
+                    }
+                    // SAFETY: per (row, word) the kernel reads every operand before writing its outputs; outputs and
+                    // scratch are distinct pool slots (not operands); rows 0..=top, each operand with its own strides
+                    launch_result("tensor_multi", unsafe { (ctx.table.tensor_multi)(&args, ex.compute.raw()) })?;
+                }
+                for &o in &run {
+                    started[o] = true;
+                }
+                o0 = o;
+            }
         }
         Ok(())
     }

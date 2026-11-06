@@ -219,11 +219,5 @@ __device__ __forceinline__ void regen_slots4(const uint32_t* seed, uint32_t lane
         for (int w = 0; w < 4; ++w) out[w] = expand_slot<W, MM>(seed, base4 + w, w13, c, tag);
     }
 }
-// Four consecutive slots (slot0 % 4 == 0) of a regenerable c1 row: pc_core::keys::cts_expand (ChaCha12, w13 = 0,
-// w14 = p, "CTSA", CTS_T_MAX attempts), the plain residue (the frame's form). Lane-group cooperative: the 4 lanes of
-// a group hold one block's 16 consecutive slots, and every lane of the warp calls it together.
-__device__ __forceinline__ void cts_expand4(const uint32_t* seed, uint32_t lane, uint32_t p, uint32_t slot0, uint32_t out[4]) {
-    regen4(seed, lane, slot0 >> 4, 0u, p, (uint32_t)N >> 4, TAG_CTSA, out, CTS_T_MAX);
-}
 }  // namespace chacha
 }  // namespace pc

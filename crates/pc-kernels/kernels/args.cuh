@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 22u
+#define PC_KERNELS_ABI 23u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -308,38 +308,38 @@ static_assert(sizeof(TensorSumArgs) == 2 * 24 + 2 * PC_TSUM_MAX * 24 + 8 + 16, "
 // tensor_multi (ABI 18; 32 pairs since ABI 19): nout tensor sums in one launch, output o = sum_{j < npairs} a[o][j] * b[o][j] (c0, c1 into
 // out[o], d2 into part 1 of d2[o]; acc as tensor_sum's). An operand equal to the previous output's at the same j (same
 // PolyRef) is loaded once: outputs that share a query (or a corpus) read it once per launch. Bound as tensor_sum's.
-// seeded (ABI 20): every a[o][j] is a seeded ciphertext (part 1 = its rows' 8-word seeds at row * 8): its c1 word
-// (row, slot) is drawn there, chacha.cuh `cts_expand` (pc_core::keys::cts_expand).
-// seeded 2 (ABI 21): every a[o][j] is seeded and its c1 rows were drawn beforehand (cts_expand below): x1[o][j], part 0
-// (rows at row * N). Unused otherwise. The struct is passed by value (9.4 KB: kernel parameters up to 32764 bytes,
-// CUDA 12.1+ on sm_70+).
-// seeded | 4 (ABI 22): every a[o][j] is seeded with c0 packed: row r at r * PC_PACK_ROW_WORDS words, PC_PACK_BITS bits
-// per coefficient as one little-endian bit stream per row (coefficient i at bits [28 i, 28 i + 28)); the seeds follow at
-// part_stride as before. seeded & 3 is the c1 mode above.
-#define PC_PACK_BITS 28
-#define PC_PACK_ROW_WORDS ((PC_N * PC_PACK_BITS + 31) / 32)
+// The struct is passed by value (kernel parameters up to 32764 bytes, CUDA 12.1+ on sm_70+).
 #define PC_TMULTI_OUT 4
 #define PC_TMULTI_PAIRS 32
 struct TensorMultiArgs {
     PolyRef out[PC_TMULTI_OUT], d2[PC_TMULTI_OUT];
-    PolyRef a[PC_TMULTI_OUT][PC_TMULTI_PAIRS], b[PC_TMULTI_OUT][PC_TMULTI_PAIRS], x1[PC_TMULTI_OUT][PC_TMULTI_PAIRS];
+    PolyRef a[PC_TMULTI_OUT][PC_TMULTI_PAIRS], b[PC_TMULTI_OUT][PC_TMULTI_PAIRS];
     const PrimeConst* pr;
-    int32_t nout, npairs, acc, n, K, seeded;
+    int32_t nout, npairs, acc, n, K, pad;
 };
-static_assert(sizeof(TensorMultiArgs) == (2 * PC_TMULTI_OUT + 3 * PC_TMULTI_OUT * PC_TMULTI_PAIRS) * 24 + 8 + 24,
+static_assert(sizeof(TensorMultiArgs) == (2 * PC_TMULTI_OUT + 2 * PC_TMULTI_OUT * PC_TMULTI_PAIRS) * 24 + 8 + 24,
               "TensorMultiArgs layout");
 
-// cts_expand (ABI 21): the c1 rows 0..n of nops seeded ciphertexts (src[u] part 1: 8 seed words per row) drawn into
-// dst, operand u row r at dst + (u * n + r) * N words: pc_core::keys::cts_expand_row (ChaCha12, w13 = 0, w14 = p,
-// "CTSA", CTS_T_MAX attempts, plain residue). One thread per 16-word block. u32 words only (-1 otherwise).
-#define PC_CTS_EXPAND_MAX (PC_TMULTI_OUT * PC_TMULTI_PAIRS)
-struct CtsExpandArgs {
-    PolyRef src[PC_CTS_EXPAND_MAX];
-    void* dst;
+// tensor_seeded (ABI 23): tensor_multi over seeded first operands that share their second ones, single ciphertexts:
+// output o = sum_{j < npairs} a[o][j] * b[j] (c0, c1 into out[o], d2 into part 1 of d2[o]; acc as tensor_sum's). a[o][j]
+// is a seeded ciphertext's c0, row r at r * N words (packed: r * PC_PACK_ROW_WORDS, PC_PACK_BITS bits per coefficient
+// as one little-endian bit stream per row, coefficient i at bits [28 i, 28 i + 28)); its rows' 8-word seeds follow at
+// a[o][j] + seed_off + 8 r, and its c1 word (row, slot) is drawn in the kernel (pc_core::keys::cts_expand: ChaCha12,
+// w13 = 0, w14 = p, "CTSA", CTS_T_MAX attempts, the plain residue). Bound as tensor_sum's. u32 words only (-1 otherwise).
+#define PC_PACK_BITS 28
+#define PC_PACK_ROW_WORDS ((PC_N * PC_PACK_BITS + 31) / 32)
+#define PC_TSEED_OUT 16
+#define PC_TSEED_PAIRS 128
+struct TensorSeededArgs {
+    PolyRef out[PC_TSEED_OUT], d2[PC_TSEED_OUT];
+    PolyRef b[PC_TSEED_PAIRS];
+    const void* a[PC_TSEED_OUT][PC_TSEED_PAIRS];
     const PrimeConst* pr;
-    int32_t nops, n;
+    uint64_t seed_off;
+    int32_t nout, npairs, acc, n, packed, pad;
 };
-static_assert(sizeof(CtsExpandArgs) == PC_CTS_EXPAND_MAX * 24 + 24, "CtsExpandArgs layout");
+static_assert(sizeof(TensorSeededArgs) == (2 * PC_TSEED_OUT + PC_TSEED_PAIRS) * 24 + PC_TSEED_OUT * PC_TSEED_PAIRS * 8 + 16 + 24,
+              "TensorSeededArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
 struct MdEpiArgs {
@@ -928,7 +928,7 @@ struct KernelTable {
     int (*tfhe)(const TfheArgs*, cudaStream_t);
     int (*tensor_sum)(const TensorSumArgs*, cudaStream_t);
     int (*tensor_multi)(const TensorMultiArgs*, cudaStream_t);
-    int (*cts_expand)(const CtsExpandArgs*, cudaStream_t);
+    int (*tensor_seeded)(const TensorSeededArgs*, cudaStream_t);
 };
 static_assert(sizeof(KernelTable) == 16 + 44 * 8, "KernelTable layout");
 

@@ -20,9 +20,9 @@ pub struct Executor<'a, W: DevWord> {
     pub bconv_work: DBuf<'a, Compute, W>,
     /// `scratch_cts * k_max` ciphertexts of the context layout.
     pub scratch: CtBuf<'a, Compute, W>,
-    /// Seeded operands' c1 rows of one `tensor_multi` launch (`carve_cts_expand`; MemPlan section "cts_expand"):
-    /// `mult_sum_many` draws them there first (`cts_expand`) instead of inside the tensor. None: in the tensor.
-    pub cts_expand: Option<(DBuf<'a, Compute, W>, usize)>,
+    /// The d2 rows of one wave of `mult_sum_many` outputs over seeded operands (`carve_seeded_d2`; MemPlan section
+    /// "seeded_d2"): `TSEED_OUT` outputs of `rows` rows. None: scratch ciphertexts from the caller.
+    pub seeded_d2: Option<(DBuf<'a, Compute, W>, usize)>,
 }
 
 impl<'a, W: DevWord> Executor<'a, W> {
@@ -36,17 +36,17 @@ impl<'a, W: DevWord> Executor<'a, W> {
             ks: crate::ks::KsWork::new(arena, plan.lay, plan.cfg.k_max, plan.ks_dnum)?,
             bconv_work: arena.alloc("bconv_work", plan.bconv_work / wb)?,
             scratch: CtBuf::new(arena, "scratch", plan.lay, plan.cfg.scratch_cts * plan.cfg.k_max)?,
-            cts_expand: None,
+            seeded_d2: None,
         })
     }
 
-    /// Bytes of the `cts_expand` workspace for seeded operands of up to `rows` rows.
-    pub fn cts_expand_bytes(lay: &Layout, rows: usize) -> usize {
-        Arena::bytes_for::<W>(pc_kernels::CTS_EXPAND_MAX * rows * lay.n)
+    /// Bytes of the `seeded_d2` workspace for seeded operands of up to `rows` rows.
+    pub fn seeded_d2_bytes(lay: &Layout, rows: usize) -> usize {
+        Arena::bytes_for::<W>(pc_kernels::TSEED_OUT * rows * lay.n)
     }
-    /// Carve the `cts_expand` workspace (setup only).
-    pub fn carve_cts_expand(&mut self, arena: &'a Arena, lay: &Layout, rows: usize) -> Result<()> {
-        self.cts_expand = Some((arena.alloc("cts_expand", pc_kernels::CTS_EXPAND_MAX * rows * lay.n)?, rows));
+    /// Carve the `seeded_d2` workspace (setup only).
+    pub fn carve_seeded_d2(&mut self, arena: &'a Arena, lay: &Layout, rows: usize) -> Result<()> {
+        self.seeded_d2 = Some((arena.alloc("seeded_d2", pc_kernels::TSEED_OUT * rows * lay.n)?, rows));
         Ok(())
     }
 

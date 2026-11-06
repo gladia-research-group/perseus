@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 22;
+pub const ABI: u32 = 23;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -320,17 +320,38 @@ pub struct TensorMultiArgs {
     pub d2: [PolyRef; TMULTI_OUT],
     pub a: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
     pub b: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
-    /// `seeded == 2`: a[o][j]'s c1 rows, drawn beforehand by `cts_expand` (part 0); unused otherwise.
-    pub x1: [[PolyRef; TMULTI_PAIRS]; TMULTI_OUT],
     pub pr: *const PrimeConst,
     pub nout: i32,
     pub npairs: i32,
     pub acc: i32,
     pub n: i32,
     pub k: i32,
-    /// 1: every `a` operand is seeded (part 1 holds its rows' c1 seeds; the kernel draws c1). 2 (ABI 21): seeded, c1
-    /// read from `x1`. | 4 (ABI 22): seeded with c0 packed (`pack_row`, rows `pack_row_words(N)` apart).
-    pub seeded: i32,
+    pub pad: i32,
+}
+
+/// Outputs and pairs per `tensor_seeded` launch (`PC_TSEED_OUT`, `PC_TSEED_PAIRS`).
+pub const TSEED_OUT: usize = 16;
+pub const TSEED_PAIRS: usize = 128;
+
+/// ABI 23: `tensor_multi` over seeded first operands sharing their second ones (single ciphertexts): output o =
+/// sum_j a[o][j] * b[j]. `a[o][j]`: a seeded ciphertext's c0 (rows N words apart; packed: `pack_row`, rows
+/// `pack_row_words(N)` apart), its rows' seeds at `a + seed_off` (8 words per row); the kernel draws c1
+/// (`pc_core::keys::cts_expand`). `acc` and the bound as `TensorSumArgs`. u32 words only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TensorSeededArgs {
+    pub out: [PolyRef; TSEED_OUT],
+    pub d2: [PolyRef; TSEED_OUT],
+    pub b: [PolyRef; TSEED_PAIRS],
+    pub a: [[*const c_void; TSEED_PAIRS]; TSEED_OUT],
+    pub pr: *const PrimeConst,
+    pub seed_off: u64,
+    pub nout: i32,
+    pub npairs: i32,
+    pub acc: i32,
+    pub n: i32,
+    pub packed: i32,
+    pub pad: i32,
 }
 
 /// Bits per coefficient of a packed seeded c0 row (`PC_PACK_BITS`): primes below 2^PACK_BITS only.
@@ -368,21 +389,6 @@ pub fn unpack_range(row: &[u32], start: usize, out: &mut [u32]) {
         let hi = if s + PACK_BITS as usize > 32 { row[w + 1] as u64 } else { 0 };
         *o = (((row[w] as u64 | hi << 32) >> s) & mask) as u32;
     }
-}
-
-/// Seeded operands per `cts_expand` launch (`PC_CTS_EXPAND_MAX`): one `tensor_multi` launch's.
-pub const CTS_EXPAND_MAX: usize = TMULTI_OUT * TMULTI_PAIRS;
-
-/// ABI 21: c1 rows 0..n of `nops` seeded ciphertexts (`src[u]` part 1: 8 seed words per row) drawn into `dst`, operand
-/// u row r at `dst + (u n + r) N` words (`pc_core::keys::cts_expand_row`). u32 words only.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct CtsExpandArgs {
-    pub src: [PolyRef; CTS_EXPAND_MAX],
-    pub dst: *mut c_void,
-    pub pr: *const PrimeConst,
-    pub nops: i32,
-    pub n: i32,
 }
 
 #[repr(C)]
@@ -956,7 +962,7 @@ pub struct KernelTable {
     pub tfhe: Launch<TfheArgs>,
     pub tensor_sum: Launch<TensorSumArgs>,
     pub tensor_multi: Launch<TensorMultiArgs>,
-    pub cts_expand: Launch<CtsExpandArgs>,
+    pub tensor_seeded: Launch<TensorSeededArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -977,8 +983,8 @@ const _: () = {
     assert!(size_of::<CtsArgs>() == 192);
     assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<TensorSumArgs>() == 2 * 24 + 2 * TSUM_MAX * 24 + 8 + 16);
-    assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 3 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
-    assert!(size_of::<CtsExpandArgs>() == CTS_EXPAND_MAX * 24 + 24);
+    assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 2 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
+    assert!(size_of::<TensorSeededArgs>() == (2 * TSEED_OUT + TSEED_PAIRS) * 24 + TSEED_OUT * TSEED_PAIRS * 8 + 16 + 24);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);

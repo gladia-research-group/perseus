@@ -78,7 +78,7 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::tfhe::launch,
         &pc::em::tensor_sum_l<W, MM>,
         &pc::em::tensor_multi_l<W, MM>,
-        &pc::em::cts_expand_l<W>,
+        &pc::em::tensor_seeded_l<W, MM>,
     };
     return &T;
 }
