@@ -13,6 +13,8 @@ namespace pc {
 namespace chacha {
 constexpr uint32_t TAG_KSKA = 0x4b534b41u;  // "KSKA"
 constexpr uint32_t TAG_ENCA = 0x454e4341u;  // "ENCA"
+constexpr uint32_t TAG_CTSA = 0x43545341u;  // "CTSA": regenerable ciphertext rows (pc_core::keys::CTS_DOMAIN)
+constexpr uint32_t CTS_T_MAX = 32u;         // pc_core::keys::CTS_T_MAX
 
 __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 __device__ __forceinline__ void qr(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
@@ -21,7 +23,8 @@ __device__ __forceinline__ void qr(uint32_t& a, uint32_t& b, uint32_t& c, uint32
     a += b; d ^= a; d = rotl32(d, 8);
     c += d; b ^= c; b = rotl32(b, 7);
 }
-__device__ __forceinline__ void chacha12(const uint32_t* key, uint32_t ctr, uint32_t w13, uint32_t w14, uint32_t w15,
+template <int ROUNDS>
+__device__ __forceinline__ void chacha_r(const uint32_t* key, uint32_t ctr, uint32_t w13, uint32_t w14, uint32_t w15,
                                          uint32_t out[16]) {
     const uint32_t s[16] = {0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u, key[0], key[1], key[2], key[3],
                             key[4],      key[5],      key[6],      key[7],      ctr,    w13,    w14,    w15};
@@ -29,7 +32,7 @@ __device__ __forceinline__ void chacha12(const uint32_t* key, uint32_t ctr, uint
 #pragma unroll
     for (int i = 0; i < 16; ++i) x[i] = s[i];
 #pragma unroll
-    for (int r = 0; r < 12; r += 2) {
+    for (int r = 0; r < ROUNDS; r += 2) {
         qr(x[0], x[4], x[8], x[12]);
         qr(x[1], x[5], x[9], x[13]);
         qr(x[2], x[6], x[10], x[14]);
@@ -42,6 +45,11 @@ __device__ __forceinline__ void chacha12(const uint32_t* key, uint32_t ctr, uint
 #pragma unroll
     for (int i = 0; i < 16; ++i) out[i] = x[i] + s[i];
 }
+__device__ __forceinline__ void chacha12(const uint32_t* key, uint32_t ctr, uint32_t w13, uint32_t w14, uint32_t w15,
+                                         uint32_t out[16]) {
+    chacha_r<12>(key, ctr, w13, w14, w15, out);
+}
+
 
 template <class W>
 constexpr int PER_BLOCK = 64 / (int)sizeof(W);  // values per 64-byte ChaCha block
@@ -124,9 +132,10 @@ __device__ __forceinline__ void chacha_coop4(uint32_t gmask, uint32_t k, uint32_
     oa = a + A; ob = b + key0; oc = c + key4; od = d + D;
 }
 
-// 4 regenerated words (slots 4k'..4k'+3 of the group's block = this lane's slots), rejection-escalated; u32 only
+// 4 regenerated words (slots 4k'..4k'+3 of the group's block = this lane's slots), rejection-escalated (t_max
+// attempts: 16 for the frozen KSKA lane, CTS_T_MAX for ciphertext rows); u32 only
 __device__ __forceinline__ void regen4(const uint32_t* seed, uint32_t lane, uint32_t b0, uint32_t w13, uint32_t p,
-                                       uint32_t n16, uint32_t tag, uint32_t out[4]) {
+                                       uint32_t n16, uint32_t tag, uint32_t out[4], uint32_t t_max = 16u) {
     const uint32_t k = lane & 3u;
     const uint32_t gmask = 0xFu << (lane & ~3u);
     const uint32_t key0 = seed[k], key4 = seed[4 + k];
@@ -138,7 +147,7 @@ __device__ __forceinline__ void regen4(const uint32_t* seed, uint32_t lane, uint
     gneed |= __shfl_xor_sync(gmask, gneed, 1, 4);
     gneed |= __shfl_xor_sync(gmask, gneed, 2, 4);
     if (gneed) {
-        for (uint32_t t = 1; t < 16u; ++t) {
+        for (uint32_t t = 1; t < t_max; ++t) {
             uint32_t ea, eb, ec, ed;
             chacha_coop4(gmask, k, key0, key4, b0 + t * n16, w13, p, tag, ea, eb, ec, ed);
             if (need & 1u) { ca = ea; if (ea < m_p) need &= ~1u; }
@@ -168,15 +177,15 @@ __device__ __forceinline__ void regen4(const uint32_t* seed, uint32_t lane, uint
 
 // ---------------------------------------------------------------- per-thread u32 blocks
 // The 16 words of block b0 of digit d expanded by one thread: four independent quarter-rounds per step, no shuffles,
-// rejection with the block stride n16 and the final reduction of regen4 (the same words).
+// rejection with the block stride n16 and the final reduction of regen4 (the same words; t_max as regen4's).
 __device__ __forceinline__ void regen_block16(const uint32_t (&key)[8], uint32_t b0, uint32_t d, uint32_t p, uint32_t n16,
-                                              uint32_t tag, uint32_t (&v)[16]) {
+                                              uint32_t tag, uint32_t (&v)[16], uint32_t t_max = 16u) {
     chacha12(key, b0, d, p, tag, v);
     const uint32_t m_p = (0xFFFFFFFFu / p) * p;
     uint32_t need = 0;
 #pragma unroll
     for (int i = 0; i < 16; ++i) need |= (v[i] >= m_p ? 1u : 0u) << i;
-    for (uint32_t t = 1; need && t < 16u; ++t) {
+    for (uint32_t t = 1; need && t < t_max; ++t) {
         uint32_t e[16];
         chacha12(key, b0 + t * n16, d, p, tag, e);
 #pragma unroll

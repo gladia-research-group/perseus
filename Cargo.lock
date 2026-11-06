@@ -227,6 +227,7 @@ dependencies = [
  "pc-shadow",
  "pc-tfhe",
  "pyo3",
+ "rayon",
  "serde_json",
 ]
 

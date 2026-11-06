@@ -3,7 +3,7 @@
 use crate::context::DevWord;
 use crate::error::Result;
 use crate::mem::MemPlan;
-use crate::poly::CtBuf;
+use crate::poly::{CtBuf, Layout};
 use pc_cuda::{lane, Arena, Compute, DBuf, Device, EventPool, PoolEvent, Side, Stream};
 
 pub struct Executor<'a, W: DevWord> {
@@ -20,6 +20,9 @@ pub struct Executor<'a, W: DevWord> {
     pub bconv_work: DBuf<'a, Compute, W>,
     /// `scratch_cts * k_max` ciphertexts of the context layout.
     pub scratch: CtBuf<'a, Compute, W>,
+    /// The d2 rows of one wave of `mult_sum_many` outputs over seeded operands (`carve_seeded_d2`; MemPlan section
+    /// "seeded_d2"): `TSEED_OUT` outputs of `rows` rows. None: scratch ciphertexts from the caller.
+    pub seeded_d2: Option<(DBuf<'a, Compute, W>, usize)>,
 }
 
 impl<'a, W: DevWord> Executor<'a, W> {
@@ -33,7 +36,18 @@ impl<'a, W: DevWord> Executor<'a, W> {
             ks: crate::ks::KsWork::new(arena, plan.lay, plan.cfg.k_max, plan.ks_dnum)?,
             bconv_work: arena.alloc("bconv_work", plan.bconv_work / wb)?,
             scratch: CtBuf::new(arena, "scratch", plan.lay, plan.cfg.scratch_cts * plan.cfg.k_max)?,
+            seeded_d2: None,
         })
+    }
+
+    /// Bytes of the `seeded_d2` workspace for seeded operands of up to `rows` rows.
+    pub fn seeded_d2_bytes(lay: &Layout, rows: usize) -> usize {
+        Arena::bytes_for::<W>(pc_kernels::TSEED_OUT * rows * lay.n)
+    }
+    /// Carve the `seeded_d2` workspace (setup only).
+    pub fn carve_seeded_d2(&mut self, arena: &'a Arena, lay: &Layout, rows: usize) -> Result<()> {
+        self.seeded_d2 = Some((arena.alloc("seeded_d2", pc_kernels::TSEED_OUT * rows * lay.n)?, rows));
+        Ok(())
     }
 
     /// An event recorded at the current tail of the compute lane (hand it to another lane's `wait`, or `sync` it).

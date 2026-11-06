@@ -80,6 +80,8 @@ pub struct PyKeySource {
     pub seed: Option<u64>,
     /// a client's secret (`ClientSecret.to_bytes()`): the device generates its keys from it (tests)
     pub secret: Option<Vec<u8>>,
+    /// the encapsulation keys without a bootstrap route: `export_ct(..., sparse=True)` switches to the sparse secret
+    pub sparse_out: bool,
 }
 
 #[pymethods]
@@ -91,12 +93,14 @@ impl PyKeySource {
     /// secret and keys (tests); None = OS entropy. `secret`: a client's secret (`ClientSecret.to_bytes()`) to
     /// generate from instead of a fresh one (tests comparing device keys with a client's).
     #[staticmethod]
-    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None))]
-    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>) -> PyResult<Self> {
+    /// `sparse_out`: the dense -> sparse encapsulation keys even without a bootstrap route (`export_ct(..., sparse=True)`).
+    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None, sparse_out=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>, sparse_out: bool) -> PyResult<Self> {
         if layout != "dense" && layout != "packed" {
             return Err(PyValueError::new_err(format!("KeySource.layout = {layout:?}: dense | packed")));
         }
-        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, seed, secret })
+        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, seed, secret, sparse_out })
     }
     #[getter]
     fn rot_steps(&self) -> Vec<i64> {
@@ -120,6 +124,19 @@ pub(crate) struct Sizes {
     pub pool: usize,
     pub pt_slots: usize,
     pub encode_threads: usize,
+    /// Low slots (`size={"lowPool": count, "lowRows": rows}`): ciphertexts of top limb < rows imported with
+    /// `import_ct(..., low=True)`, each slot only `rows` Q rows long.
+    pub low_pool: usize,
+    pub low_rows: usize,
+    /// Seeded low slots (`size={"lowSeeded": count}`, of `lowRows` rows): c0 and its rows' c1 seeds, half a low slot;
+    /// `import_ct(..., low=True, regen=True)` fills them and `mult_sum_many` draws c1 from the seeds.
+    pub low_seeded: usize,
+    /// Seeded low slots with c0 packed at `pc_kernels::PACK_BITS` bits per coefficient (`size={"lowPacked": 1}`): 7/8
+    /// of c0's words; every prime of their rows must be below 2^PACK_BITS.
+    pub low_packed: bool,
+    /// Per-user result keys (`size={"userKeys": count}`): bottom-level master -> user switching keys, filled at run
+    /// time (`Session.add_user`) and used by `export_ct_many(..., user=)`.
+    pub user_keys: usize,
 }
 
 /// The model geometry the impl layer reads as `inf.size` (`Dims.from_inf`).
@@ -287,6 +304,16 @@ pub(crate) struct State {
     pub cached: HashMap<String, Named>,
     pub enc_hits: u64,
     pub enc_misses: u64,
+    /// per-user result keys (`size={"userKeys"}`)
+    pub users: Option<Users>,
+}
+
+/// Per-user master -> user switching keys: carved slots, their key groups, the names holding them.
+pub(crate) struct Users {
+    pub slots: Vec<pc_gpu::keys::DevKsk<'static, W>>,
+    pub groups: Vec<KeyGroup<'static>>,
+    pub names: HashMap<String, usize>,
+    pub free: Vec<usize>,
 }
 
 /// What only a session holding the secret has.
@@ -314,6 +341,8 @@ pub(crate) struct Groups {
     pub exact: BTreeMap<Vec<i64>, KeyGroup<'static>>,
     pub relin: KeyGroup<'static>,
     pub conj: Option<KeyGroup<'static>>,
+    /// The dense -> sparse encapsulation key (`KeySource(sparse_out=True)`).
+    pub d2s: Option<KeyGroup<'static>>,
     pub half: i64,
 }
 
@@ -745,7 +774,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
     let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { ks.band } }).collect();
     let steps: BTreeSet<i64> = steps.union(&full).copied().collect();
     // the StC-first route's raise needs the encapsulation keys too (a dense-only plan has no other route that does)
-    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
+    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: ks.sparse_out || !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
     let mut shapes: Vec<_> = spec.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     if spru_cfg.is_some() {
         shapes.push(KskShape::bottom(chain).map_err(e)?);
@@ -983,6 +1012,16 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let mcfg = MemCfg { k_max, pool: vec![PoolClass { k: 1, count: sizes.pool }], events: 64, scratch_cts: 2 };
     let mut mplan = MemPlan::build::<W, M>(&chain, mcfg).map_err(e)?;
     let lay = mplan.lay;
+    if sizes.low_pool > 0 {
+        mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows, false, false));
+    }
+    if sizes.low_packed && chain.q.iter().take(sizes.low_rows).any(|&p| p >> pc_kernels::PACK_BITS != 0) {
+        return Err(PyValueError::new_err(format!("size lowPacked: the primes of rows 0..{} need more than {} bits", sizes.low_rows, pc_kernels::PACK_BITS)));
+    }
+    if sizes.low_seeded > 0 {
+        mplan.reserve("ct_low_seeded", CtPool::<W>::low_bytes(&lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed));
+        mplan.reserve("seeded_d2", Executor::<W>::seeded_d2_bytes(&lay, sizes.low_rows));
+    }
     let nd = key_needs(cfg, ks, &chain, &plan, &pcmm, &ccmm)?;
     let spec_req = match origin {
         Origin::Generate => None,
@@ -996,8 +1035,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     }
     let nrot = steps.len() + ks.conj as usize;
-    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + 2 * KeyGroup::bytes(1, true);
+    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + (2 + ks.sparse_out as usize) * KeyGroup::bytes(1, true);
     mp.reserve("ks.groups", gb);
+    if sizes.user_keys > 0 {
+        let sh = pc_gpu::keys::KskShape::bottom(&chain).map_err(e)?;
+        mp.reserve("user_keys", sizes.user_keys * (sh.bytes::<W>(chain.n, layout) + KeyGroup::bytes(1, true)));
+    }
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     // planned blocks push every per-call constant through the ring (scalar rows, raise adjusts) and a captured
     // graph keeps the slots it leased: room for every block's
@@ -1103,8 +1146,17 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let a: &'static Arena = unsafe { &*(arena.as_ref() as *const Arena) };
     let mut ex = Executor::<W>::new(&device, a, &mplan).map_err(e)?;
     ex.ks.carve_regen(a, &lay).map_err(e)?;
+    if sizes.low_seeded > 0 {
+        ex.carve_seeded_d2(a, &lay, sizes.low_rows).map_err(e)?;
+    }
     let ctx = Context::<W, M>::new(a, &ex.copy, chain.clone(), &mplan).map_err(e)?;
-    let pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
+    let mut pool = CtPool::<W>::new(a, &mplan).map_err(e)?;
+    if sizes.low_pool > 0 {
+        pool.add_low(a, &lay, sizes.low_pool, sizes.low_rows, false, false).map_err(e)?;
+    }
+    if sizes.low_seeded > 0 {
+        pool.add_low(a, &lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed).map_err(e)?;
+    }
     let plans = KsPlans::new(a, &ex.compute, &ctx, k_max).map_err(e)?;
     let mut keys = KeySet::carve(a, &chain, &spec, layout).map_err(e)?;
     let mut prng = match ks.seed {
@@ -1144,8 +1196,12 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let stage = ex.ks.stage_ptrs();
     let groups = {
         let mut rot_refs: Vec<&dyn KsKeyRef> = keys.rots.values().map(|k| k as &dyn KsKeyRef).collect();
+        // conj joins the shared group when it shares the rotations' digit layout (banded rotations do not); `conjugate`
+        // reads its own group either way
         if let Some(c) = keys.conj.as_ref() {
-            rot_refs.push(c);
+            if rot_refs.first().is_none_or(|r| r.digit_stride() == KsKeyRef::digit_stride(c) && r.dnum() == KsKeyRef::dnum(c)) {
+                rot_refs.push(c);
+            }
         }
         let all = if rot_refs.is_empty() { None } else { Some(KeyGroup::new(a, &ex.compute, n, &rot_refs, stage).map_err(e)?) };
         let mut exact = BTreeMap::new();
@@ -1165,7 +1221,22 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             Some(c) => Some(KeyGroup::new(a, &ex.compute, n, &[c as &dyn KsKeyRef], stage).map_err(e)?),
             None => None,
         };
-        Groups { all, steps: steps.clone(), exact, relin, conj, half }
+        let d2s = match (ks.sparse_out, keys.bts.as_ref()) {
+            (true, Some(b)) => Some(KeyGroup::new(a, &ex.compute, n, &[&b.enc_dense_to_sparse as &dyn KsKeyRef], stage).map_err(e)?),
+            _ => None,
+        };
+        Groups { all, steps: steps.clone(), exact, relin, conj, d2s, half }
+    };
+    let users = if sizes.user_keys > 0 {
+        let sh = pc_gpu::keys::KskShape::bottom(&chain).map_err(e)?;
+        let slots = (0..sizes.user_keys)
+            .map(|_| pc_gpu::keys::DevKsk::carve(a, pc_gpu::keys::KeyRole::EncDenseToSparse, sh, layout, n))
+            .collect::<pc_gpu::Result<Vec<_>>>()
+            .map_err(e)?;
+        let groups = slots.iter().map(|k| KeyGroup::new(a, &ex.compute, n, &[k as &dyn KsKeyRef], stage)).collect::<pc_gpu::Result<Vec<_>>>().map_err(e)?;
+        Some(Users { slots, groups, names: HashMap::new(), free: (0..sizes.user_keys).rev().collect() })
+    } else {
+        None
     };
     let ops = Ops::new(a, &device, &ex.compute, &ctx, ocfg).map_err(e)?;
     let pt_events = Box::new(EventPool::new(&device, 64).map_err(|x| e(x.into()))?);
@@ -1356,6 +1427,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         cached: HashMap::new(),
         enc_hits: 0,
         enc_misses: 0,
+        users,
     };
     Ok(Dev {
         st: RefCell::new(state),
@@ -1401,7 +1473,7 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         exp_real: g("expanded", 3072),
         seq_len: g("seqLen", 1024),
     };
-    let sizes = Sizes { pool, pt_slots, encode_threads };
+    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0) };
     let cfg = config.0.clone();
     let ks = keys.clone();
     let plan = match programs {
@@ -1535,6 +1607,7 @@ impl PySession {
     /// CCMM service: `nf_ref` / `nf_split` from `token` (a fresh encryption at the bootstrap output level:
     /// ccmm.py `prepare`). Returns (nf_ref, nf_split).
     fn ccmm_prepare(&self, py: Python<'_>, token: PyRef<'_, crate::fhe::PyCt>) -> PyResult<(f64, f64)> {
+        token.check_full()?;
         let d = &*self.dev;
         let mut st = d.st.borrow_mut();
         let State { planned, ex, ops, plans, .. } = &mut *st;
@@ -1567,6 +1640,9 @@ impl PySession {
         use pc_core::ccmm_keys::NBIG;
         if a.len() != NBIG || b.len() != NBIG {
             return Err(PyValueError::new_err(format!("ccmm_probe: {} / {} operands, a matrix is {NBIG}", a.len(), b.len())));
+        }
+        for x in a.iter().chain(b.iter()) {
+            x.check_full()?;
         }
         let d = &self.dev;
         let n_out = {
@@ -1799,9 +1875,61 @@ impl PySession {
         Ok(d.unbind())
     }
 
+    /// Register `name`'s result key: the master -> user switching key (`Role::EncDenseToSparse` made with the user's
+    /// secret in the sparse place) of the key bundle at `bundle`, into a free `userKeys` slot.
+    fn add_user(&self, name: &str, bundle: std::path::PathBuf) -> PyResult<()> {
+        use pc_client::{Entry, Role as R};
+        let d = &*self.dev;
+        let mut rd = pc_client::BundleReader::open(&bundle).map_err(cerr)?;
+        let h = rd.header.clone();
+        if h.params_hash != pc_client::spec::params_hash(&d.ctx.chain) {
+            return Err(PyValueError::new_err(format!("user key bundle for params {}, this session runs {}", h.params_hash, pc_client::spec::params_hash(&d.ctx.chain))));
+        }
+        let (i, key, seed) = h
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, x)| match x {
+                Entry::Ksk { key, seed, .. } if key.role == R::EncDenseToSparse => Some((i, *key, *seed)),
+                _ => None,
+            })
+            .ok_or_else(|| PyValueError::new_err("user key bundle without a master -> user (enc_dense_to_sparse) key"))?;
+        let words = rd.read(i).map_err(cerr)?;
+        let mut st = self.dev.st.borrow_mut();
+        let State { users, ex, .. } = &mut *st;
+        let u = users.as_mut().ok_or_else(|| PyValueError::new_err("Session without user key slots (size={\"userKeys\": n})"))?;
+        if u.names.contains_key(name) {
+            return Err(PyValueError::new_err(format!("user {name:?} is registered: remove_user first")));
+        }
+        let slot = *u.free.last().ok_or_else(|| PyValueError::new_err("every user key slot is taken"))?;
+        let k = &mut u.slots[slot];
+        if shape_req(&k.shape) != key.shape {
+            return Err(PyValueError::new_err(format!("user key of shape {:?}, the slots hold {:?}", key.shape, k.shape)));
+        }
+        pc_gpu::keys::import_packed(k, &ex.compute, &d.ctx.chain, pc_core::keys::KskSeed(seed), h.bits, h.row_words, &words).map_err(gerr)?;
+        u.free.pop();
+        u.names.insert(name.to_string(), slot);
+        Ok(())
+    }
+
+    /// Revoke `name`: its slot is freed (the next `add_user` overwrites the key).
+    fn remove_user(&self, name: &str) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let u = st.users.as_mut().ok_or_else(|| PyValueError::new_err("Session without user key slots"))?;
+        let slot = u.names.remove(name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("no user {name:?}")))?;
+        u.free.push(slot);
+        Ok(())
+    }
+
+    /// Registered users.
+    fn users(&self) -> Vec<String> {
+        self.dev.st.borrow().users.as_ref().map(|u| u.names.keys().cloned().collect()).unwrap_or_default()
+    }
+
     /// Write `ct` into pinned KV unit `u` (setup: a cache state the programs read, e.g. the BOS prefix): device page,
     /// then the copy-out (asynchronous on the lanes).
     fn kv_put(&self, u: usize, ct: PyRef<'_, crate::fhe::PyCt>) -> PyResult<()> {
+        ct.check_full()?;
         use pc_program::kv::KvStore;
         let mut st = self.dev.st.borrow_mut();
         let State { planned, ex, .. } = &mut *st;

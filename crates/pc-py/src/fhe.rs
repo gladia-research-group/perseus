@@ -43,14 +43,21 @@ pub struct PyCt {
 }
 
 impl PyCt {
-    fn ct(&self) -> &Ct<'static, W> {
+    /// The ciphertext an op reads (a low slot is refused: `check_full`).
+    fn ct(&self) -> PyResult<&Ct<'static, W>> {
+        self.check_full()?;
+        Ok(&self.slot)
+    }
+    /// The ciphertext, low slots included (the ops that read only its live rows through its own layout).
+    fn ct_low(&self) -> &Ct<'static, W> {
         &self.slot
     }
     pub(crate) fn ct_ref(&self) -> &Ct<'static, W> {
         &self.slot
     }
+    /// Write access, low slots included (`import_ct` fills them).
     pub(crate) fn ct_mut_ref(&mut self) -> PyResult<&mut Ct<'static, W>> {
-        self.ct_mut()
+        self.slot.get_mut().ok_or_else(|| rt_err("Ct: shared slot (internal)"))
     }
     /// A pool ciphertext of the session with metadata `meta` (contents unspecified).
     pub(crate) fn acquire(dev: &Rc<Dev>, meta: CtMeta) -> PyResult<PyCt> {
@@ -59,10 +66,25 @@ impl PyCt {
         Ok(PyCt { slot, dev: dev.clone() })
     }
     fn ct_mut(&mut self) -> PyResult<&mut Ct<'static, W>> {
+        self.check_full()?;
         self.slot.get_mut().ok_or_else(|| rt_err("Ct: shared slot (internal)"))
     }
     fn meta(&self) -> CtMeta {
         self.slot.meta
+    }
+    /// Refuses a low-slot ciphertext: it is only an input of `mult_sum` and `export_ct` (its slot holds only its own
+    /// rows, and the other ops write or read rows past them).
+    pub(crate) fn check_full(&self) -> PyResult<()> {
+        if self.slot.is_low() {
+            return Err(PyValueError::new_err("a low-slot ciphertext (import_ct(low=True)) is only an input of mult_sum and export_ct"));
+        }
+        Ok(())
+    }
+    /// A low slot (`size={"lowPool", "lowRows"}`) for a ciphertext with metadata `meta` and top limb `top`.
+    pub(crate) fn acquire_low(dev: &Rc<Dev>, meta: CtMeta, top: usize, seeded: bool) -> PyResult<PyCt> {
+        dev.check_frozen()?;
+        let slot = dev.pool().acquire_low(meta, top, seeded).map_err(gerr)?;
+        Ok(PyCt { slot, dev: dev.clone() })
     }
 }
 
@@ -77,6 +99,11 @@ impl PyCt {
     #[getter]
     fn deg(&self) -> u8 {
         self.meta().deg
+    }
+    /// Held in a low slot (`import_ct(..., low=True)`).
+    #[getter]
+    fn low(&self) -> bool {
+        self.slot.is_low()
     }
     #[getter]
     fn noise_deg(&self) -> u8 {
@@ -218,6 +245,12 @@ impl PyFhe {
     }
 
     fn same_session(&self, c: &PyCt) -> PyResult<()> {
+        self.same_session_low(c)?;
+        c.check_full()
+    }
+
+    /// `same_session` admitting low-slot ciphertexts (the ops that only read their operands' live rows).
+    fn same_session_low(&self, c: &PyCt) -> PyResult<()> {
         if !Rc::ptr_eq(&self.dev, &c.dev) {
             return Err(PyValueError::new_err("ciphertext belongs to another Session"));
         }
@@ -321,14 +354,17 @@ impl PyFhe {
                 let mut st = d.st.borrow_mut();
                 let State { ops, ex, .. } = &mut *st;
                 let words = tm.buf.buf.len();
-                tm.buf.buf.copy_from(&ex.compute, &x.ct().buf.buf, words).map_err(cuda)?;
+                tm.buf.buf.copy_from(&ex.compute, &x.ct()?.buf.buf, words).map_err(cuda)?;
                 ops.realize(&d.ctx, ex, &d.sh, std::slice::from_mut(tm)).map_err(gerr)?;
             }
             Some(t)
         } else {
             None
         };
-        let c: &Ct<'static, W> = tmp.as_ref().map_or(x.ct(), |t| t.ct());
+        let c: &Ct<'static, W> = match tmp.as_ref() {
+            Some(t) => t.ct()?,
+            None => x.ct()?,
+        };
         let mut st = d.st.borrow_mut();
         let State { ex, secret, pts, .. } = &mut *st;
         let crate::session::SecretSide { dec2, dec3, dec4, .. } = secret
@@ -403,7 +439,7 @@ impl PyFhe {
         let mut o = self.new_ct(a.meta())?;
         let om = o.ct_mut()?;
         let words = om.buf.buf.len();
-        om.buf.buf.copy_from(&self.dev.st.borrow().ex.compute, &a.ct().buf.buf, words).map_err(cuda)?;
+        om.buf.buf.copy_from(&self.dev.st.borrow().ex.compute, &a.ct()?.buf.buf, words).map_err(cuda)?;
         om.meta = a.meta();
         Ok(o)
     }
@@ -432,9 +468,9 @@ impl PyFhe {
         let State { pts, ex, ops, .. } = &mut *st;
         let pt = pts.get(&d.ctx, ex, key).map_err(gerr)?;
         let r = if add {
-            ops.add_pt(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[pt])
+            ops.add_pt(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[pt])
         } else {
-            ops.mult_pt(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[pt])
+            ops.mult_pt(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[pt])
         };
         r.map_err(gerr)?;
         Ok(o)
@@ -494,9 +530,9 @@ impl PyFhe {
         let State { ops, ex, plans, groups, .. } = &mut *st;
         let kc = KsCfg { plans, source };
         if std::ptr::eq(a, b) {
-            ops.square(&d.ctx, ex, kc, &d.sh, &groups.relin, om, a.ct()).map_err(gerr)?;
+            ops.square(&d.ctx, ex, kc, &d.sh, &groups.relin, om, a.ct()?).map_err(gerr)?;
         } else {
-            ops.mult(&d.ctx, ex, kc, &d.sh, &groups.relin, om, a.ct(), b.ct()).map_err(gerr)?;
+            ops.mult(&d.ctx, ex, kc, &d.sh, &groups.relin, om, a.ct()?, b.ct()?).map_err(gerr)?;
         }
         Ok(o)
     }
@@ -507,7 +543,7 @@ impl PyFhe {
         let om = o.ct_mut()?;
         let mut st = d.st.borrow_mut();
         let State { ops, ex, .. } = &mut *st;
-        ops.mult_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[c]).map_err(gerr)?;
+        ops.mult_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[c]).map_err(gerr)?;
         Ok(o)
     }
 
@@ -516,7 +552,7 @@ impl PyFhe {
         let am = a.ct_mut()?;
         let mut st = d.st.borrow_mut();
         let State { ops, ex, .. } = &mut *st;
-        ops.add_inplace(&d.ctx, ex, &d.sh, std::slice::from_mut(am), &[b.ct()]).map_err(gerr)
+        ops.add_inplace(&d.ctx, ex, &d.sh, std::slice::from_mut(am), &[b.ct()?]).map_err(gerr)
     }
 
     fn check_steps(&self, steps: &[i64]) -> PyResult<()> {
@@ -540,7 +576,7 @@ impl PyFhe {
         let State { ex, plans, groups, .. } = &mut *st;
         let kc = KsCfg { plans, source };
         let g = groups.group(&[k]).ok_or_else(|| PyKeyError::new_err(format!("no rotation key for {k}")))?;
-        rotate::rotate(&d.ctx, ex, kc, &d.sh, g, a.ct(), k, om).map_err(gerr)?;
+        rotate::rotate(&d.ctx, ex, kc, &d.sh, g, a.ct()?, k, om).map_err(gerr)?;
         Ok(o)
     }
 
@@ -563,31 +599,37 @@ impl PyFhe {
                 };
                 store.encode_with(&d.ctx, ex, ops, &d.sh, kind, key.clone(), what, 1).map_err(gerr)?;
             }
-            match out.as_mut() {
-                None => out = Some(self.pt_op(c, &key, false)?),
-                Some(acc) => {
-                    // fused accumulation when the term needs no adjustment, else the loop (Ops::mult_add_many
-                    // refuses terms with preludes)
-                    let fast = {
-                        let r = d.sh.mult_pt(&c.meta(), &PtMeta { level: pm.level, deg: 1, nf: 0.0, tag: Default::default() }).map_err(|e| gerr(e.into()))?;
-                        r.pre.is_empty() && d.sh.add(&acc.meta(), &r.out).map_err(|e| gerr(e.into()))?.pre.is_empty()
-                    };
-                    if fast {
-                        let am = acc.ct_mut()?;
-                        let mut st = d.st.borrow_mut();
-                        let State { pts: store, ex, ops, .. } = &mut *st;
-                        let pt = store.get(&d.ctx, ex, &key).map_err(gerr)?;
-                        ops.mult_add_many(&d.ctx, ex, &d.sh, am, &[c.ct()], &[pt]).map_err(gerr)?;
-                    } else {
-                        let t = self.pt_op(c, &key, false)?;
-                        self.add_inplace_ct(acc, &t)?;
-                    }
-                }
-            }
+            self.sum_term(&mut out, c, &key)?;
         }
         let mut o = out.ok_or_else(|| rt_err("empty sum"))?;
         self.reactive(py, &mut o)?;
         Ok(o)
+    }
+
+    /// `out += c * pt[key]` (the first term's product when `out` is empty).
+    fn sum_term(&self, out: &mut Option<PyCt>, c: &PyCt, key: &PtKey) -> PyResult<()> {
+        let d = &*self.dev;
+        let Some(acc) = out.as_mut() else {
+            *out = Some(self.pt_op(c, key, false)?);
+            return Ok(());
+        };
+        // fused accumulation when the term needs no adjustment, else the loop (Ops::mult_add_many refuses terms with
+        // preludes)
+        let fast = {
+            let r = d.sh.mult_pt(&c.meta(), &PtMeta { level: key.level, deg: 1, nf: 0.0, tag: Default::default() }).map_err(|e| gerr(e.into()))?;
+            r.pre.is_empty() && d.sh.add(&acc.meta(), &r.out).map_err(|e| gerr(e.into()))?.pre.is_empty()
+        };
+        if fast {
+            let am = acc.ct_mut()?;
+            let mut st = d.st.borrow_mut();
+            let State { pts: store, ex, ops, .. } = &mut *st;
+            let pt = store.get(&d.ctx, ex, key).map_err(gerr)?;
+            ops.mult_add_many(&d.ctx, ex, &d.sh, am, &[c.ct()?], &[pt]).map_err(gerr)?;
+        } else {
+            let t = self.pt_op(c, key, false)?;
+            self.add_inplace_ct(acc, &t)?;
+        }
+        Ok(())
     }
 }
 
@@ -726,9 +768,9 @@ impl PyFhe {
         match as_ct(b) {
             Some(b) => {
                 self.same_session(&b)?;
-                ops.add(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[b.ct()]).map_err(gerr)?
+                ops.add(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[b.ct()?]).map_err(gerr)?
             }
-            None => ops.add_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[b.extract::<f64>()?]).map_err(gerr)?,
+            None => ops.add_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[b.extract::<f64>()?]).map_err(gerr)?,
         }
         Ok(o)
     }
@@ -744,9 +786,9 @@ impl PyFhe {
         match as_ct(b) {
             Some(b) => {
                 self.same_session(&b)?;
-                ops.sub(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[b.ct()]).map_err(gerr)?
+                ops.sub(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[b.ct()?]).map_err(gerr)?
             }
-            None => ops.add_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()], &[-b.extract::<f64>()?]).map_err(gerr)?,
+            None => ops.add_scalar(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?], &[-b.extract::<f64>()?]).map_err(gerr)?,
         }
         Ok(o)
     }
@@ -779,7 +821,7 @@ impl PyFhe {
         let om = o.ct_mut()?;
         let mut st = d.st.borrow_mut();
         let State { ops, ex, .. } = &mut *st;
-        ops.negate(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()]).map_err(gerr)?;
+        ops.negate(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?]).map_err(gerr)?;
         Ok(o)
     }
 
@@ -791,7 +833,7 @@ impl PyFhe {
         let om = o.ct_mut()?;
         let mut st = d.st.borrow_mut();
         let State { ops, ex, .. } = &mut *st;
-        ops.mult_i(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()]).map_err(gerr)?;
+        ops.mult_i(&d.ctx, ex, &d.sh, std::slice::from_mut(om), &[a.ct()?]).map_err(gerr)?;
         Ok(o)
     }
 
@@ -826,6 +868,63 @@ impl PyFhe {
         Ok(true)
     }
 
+    /// `sum_j a[j] * b[j]` over ciphertext pairs, relinearized once (every operand at one level, degree 1), then the
+    /// reactive refresh check.
+    fn mult_sum(&mut self, py: Python<'_>, a: Vec<PyRef<'_, PyCt>>, b: Vec<PyRef<'_, PyCt>>) -> PyResult<PyCt> {
+        if a.is_empty() || a.len() != b.len() {
+            return Err(PyValueError::new_err(format!("mult_sum: {} and {} operands", a.len(), b.len())));
+        }
+        for x in a.iter().chain(&b) {
+            self.same_session_low(x)?;
+        }
+        let d = &*self.dev;
+        let mut o = self.new_ct(a[0].meta())?;
+        {
+            let om = o.ct_mut()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let ar: Vec<&Ct<'static, W>> = a.iter().map(|x| x.ct_low()).collect();
+            let br: Vec<&Ct<'static, W>> = b.iter().map(|x| x.ct_low()).collect();
+            ops.mult_sum(&d.ctx, ex, kc, &d.sh, &groups.relin, om, &ar, &br).map_err(gerr)?;
+        }
+        self.reactive(py, &mut o)?;
+        Ok(o)
+    }
+
+    /// Several `mult_sum`s in one pass: output g = `sum_j a[g][j] * b[g][j]` relinearized once (groups of one level, any
+    /// lengths; an operand the groups share at the same j is read once per launch). Low-slot operands are admitted.
+    fn mult_sum_many(&mut self, py: Python<'_>, a: Vec<Vec<PyRef<'_, PyCt>>>, b: Vec<Vec<PyRef<'_, PyCt>>>) -> PyResult<Vec<PyCt>> {
+        if a.is_empty() || a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.is_empty() || x.len() != y.len()) {
+            return Err(PyValueError::new_err("mult_sum_many: matching, non-empty operand groups"));
+        }
+        for x in a.iter().chain(&b).flatten() {
+            self.same_session_low(x)?;
+        }
+        let mut outs = a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()?;
+        // seeded first operands: d2 in the executor's workspace (no scratch ciphertexts)
+        let ws = a[0][0].ct_low().buf.seeds && self.dev.st.borrow().ex.seeded_d2.is_some();
+        let mut d2s = if ws { Vec::new() } else { a.iter().map(|g| self.new_ct(g[0].meta())).collect::<PyResult<Vec<_>>>()? };
+        {
+            let d = &*self.dev;
+            let mut om = outs.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;
+            let mut dm = d2s.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let ar: Vec<Vec<&Ct<'static, W>>> = a.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            let br: Vec<Vec<&Ct<'static, W>>> = b.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            ops.mult_sum_many(&d.ctx, ex, kc, &d.sh, &groups.relin, &mut om, &mut dm, &ar, &br).map_err(gerr)?;
+        }
+        drop(d2s);
+        for o in outs.iter_mut() {
+            self.reactive(py, o)?;
+        }
+        Ok(outs)
+    }
+
     /// `sum_j ts[j] * cs[j]`: one fused weighted sum when every term shares level and degree 1, else the loop.
     fn mult_scalar_sum(&mut self, py: Python<'_>, ts: Vec<PyRef<'_, PyCt>>, cs: Vec<f64>) -> PyResult<PyCt> {
         if ts.is_empty() || ts.len() != cs.len() {
@@ -842,7 +941,7 @@ impl PyFhe {
                 let om = o.ct_mut()?;
                 let mut st = d.st.borrow_mut();
                 let State { ops, ex, .. } = &mut *st;
-                let refs: Vec<&Ct<'static, W>> = ts.iter().map(|t| t.ct()).collect();
+                let refs = ts.iter().map(|t| t.ct()).collect::<PyResult<Vec<&Ct<'static, W>>>>()?;
                 ops.mult_scalar_sum(&d.ctx, ex, &d.sh, om, &refs, &cs).map_err(gerr)?;
             }
             o
@@ -855,6 +954,42 @@ impl PyFhe {
             r
         };
         self.reactive(py, &mut o)?;
+        Ok(o)
+    }
+
+    /// A pending rescale given up: degree-2 `a` read as degree 1 at its own (product) scale, no prime dropped. For
+    /// products at the bottom level, where no prime is left: the values must stay below q / 2 at that scale.
+    fn settle(&self, a: PyRef<'_, PyCt>) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        if a.meta().deg != 2 {
+            return Err(PyValueError::new_err(format!("settle: a degree-2 ciphertext (degree {})", a.meta().deg)));
+        }
+        let mut o = self.copy_ct(&a)?;
+        o.ct_mut()?.meta.deg = 1;
+        Ok(o)
+    }
+
+    /// `a * X^k`: an exact negacyclic shift of the plaintext's coefficients (X^N = -1), level and scale kept. The
+    /// monomial is a plaintext of the session's store (one per k and level).
+    fn mult_monomial(&mut self, a: PyRef<'_, PyCt>, k: i64) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        let d = self.dev.clone();
+        let n = d.n() as i64;
+        let k = k.rem_euclid(2 * n);
+        let (pos, sign) = if k < n { (k as usize, 1) } else { ((k - n) as usize, -1) };
+        let key = PtKey::new(format!("__mono{k}"), self.pt_meta(&a.meta()).level, PtForm::Eval);
+        let mut o = self.new_ct(a.meta())?;
+        let om = o.ct_mut()?;
+        let mut st = d.st.borrow_mut();
+        let State { pts: store, ex, ops, .. } = &mut *st;
+        if store.get(&d.ctx, ex, &key).is_err() {
+            // the exact monomial at unit scale (any level, on the composite grid or off it)
+            let mut c = vec![0i64; n as usize];
+            c[pos] = sign;
+            store.encode_ints_many(&d.ctx, ex, &d.sh, std::slice::from_ref(&key), &[&c], Some(1.0)).map_err(gerr)?;
+        }
+        let pt = store.get(&d.ctx, ex, &key).map_err(gerr)?;
+        ops.mult_pt_exact(&d.ctx, ex, om, a.ct()?, &pt).map_err(gerr)?;
         Ok(o)
     }
 
@@ -874,7 +1009,7 @@ impl PyFhe {
         let source = d.source;
         let State { ex, plans, groups, .. } = &mut *st;
         let g = groups.conj.as_ref().ok_or_else(|| PyKeyError::new_err("no conjugation key (KeySource conj=True)"))?;
-        rotate::conjugate(&d.ctx, ex, KsCfg { plans, source }, &d.sh, g, a.ct(), om).map_err(gerr)?;
+        rotate::conjugate(&d.ctx, ex, KsCfg { plans, source }, &d.sh, g, a.ct()?, om).map_err(gerr)?;
         Ok(o)
     }
 
@@ -894,11 +1029,11 @@ impl PyFhe {
             if nz.is_empty() {
                 for (r, &s) in refs.iter_mut().zip(&steps) {
                     let g = groups.relin_or_all();
-                    rotate::rotate(&d.ctx, ex, kc, &d.sh, g, a.ct(), s, &mut **r).map_err(gerr)?;
+                    rotate::rotate(&d.ctx, ex, kc, &d.sh, g, a.ct()?, s, &mut **r).map_err(gerr)?;
                 }
             } else {
                 let g = groups.group(&nz).ok_or_else(|| PyKeyError::new_err(format!("no rotation keys for {nz:?}")))?;
-                rotate::rotate_hoisted(&d.ctx, ex, kc, &d.sh, g, a.ct(), &steps, &mut refs).map_err(gerr)?;
+                rotate::rotate_hoisted(&d.ctx, ex, kc, &d.sh, g, a.ct()?, &steps, &mut refs).map_err(gerr)?;
             }
         }
         Ok(outs)
@@ -915,7 +1050,7 @@ impl PyFhe {
         let source = d.source;
         let State { ex, plans, groups, .. } = &mut *st;
         let g = groups.group(&steps).ok_or_else(|| PyKeyError::new_err(format!("no rotation keys for {steps:?}")))?;
-        rotate::rotate_sum(&d.ctx, ex, KsCfg { plans, source }, &d.sh, g, a.ct(), &steps, om).map_err(gerr)?;
+        rotate::rotate_sum(&d.ctx, ex, KsCfg { plans, source }, &d.sh, g, a.ct()?, &steps, om).map_err(gerr)?;
         Ok(o)
     }
 
@@ -932,7 +1067,7 @@ impl PyFhe {
         let source = d.source;
         let State { ex, plans, groups, .. } = &mut *st;
         let keys: &dyn RotKeys = groups;
-        rotate::rotate_and_sum(&d.ctx, ex, KsCfg { plans, source }, &d.sh, keys, a.ct(), start, stop, d.radix_bits, om, tm).map_err(gerr)?;
+        rotate::rotate_and_sum(&d.ctx, ex, KsCfg { plans, source }, &d.sh, keys, a.ct()?, start, stop, d.radix_bits, om, tm).map_err(gerr)?;
         Ok(o)
     }
 
@@ -947,6 +1082,30 @@ impl PyFhe {
         let mut st = d.st.borrow_mut();
         let State { ops, ex, .. } = &mut *st;
         ops.realize(&d.ctx, ex, &d.sh, std::slice::from_mut(c)).map_err(gerr)
+    }
+
+    /// In place: divide by the top prime alone and drop it, off the composite grid if need be (level + 1, degree 1,
+    /// scale / that prime): one prime of a pending rescale, or a degree-1 ciphertext's scale lowered by it.
+    fn rescale_one(&self, a: &Bound<'_, PyCt>) -> PyResult<()> {
+        let mut am = a.borrow_mut();
+        self.same_session(&am)?;
+        let d = &*self.dev;
+        let c = am.ct_mut()?;
+        let mut st = d.st.borrow_mut();
+        let State { ops, ex, .. } = &mut *st;
+        ops.rescale_one(&d.ctx, ex, std::slice::from_mut(c)).map_err(gerr)
+    }
+
+    /// A copy of `a`'s live rows in a low slot (`size={"lowPool", "lowRows"}`): a ciphertext only `mult_sum_many` reads
+    /// next (baby steps, score parts, weights at the bottom levels) held in its rows alone.
+    fn to_low(&self, a: PyRef<'_, PyCt>) -> PyResult<PyCt> {
+        self.same_session(&a)?;
+        let d = &self.dev;
+        let top = d.ctx.top_of(a.meta().level).map_err(gerr)?;
+        let mut o = PyCt::acquire_low(d, a.meta(), top, false)?;
+        let st = d.st.borrow();
+        pc_program::replay::copy_ct(&d.ctx, &st.ex.compute, o.ct_mut_ref()?, a.ct()?).map_err(|x| rt_err(x.to_string()))?;
+        Ok(o)
     }
 
     /// In place: drop to `level` if above it (value-preserving modulus reduction; no data moves).
@@ -1204,6 +1363,54 @@ impl PyFhe {
         self.sum_terms(py, &cts, terms)
     }
 
+    /// Encode coefficient rows (as `mult_coeff_sum`'s) once into the plaintext store, row i as `name#i` at `level`
+    /// (an earlier batch of that name rewritten in place), for `mult_coeff_sum_stored`; returns the row count. The
+    /// store needs a slot per row (`Session(pt_slots=...)`).
+    fn store_coeff_pts(&mut self, py: Python<'_>, name: &str, rows: &Bound<'_, PyAny>, level: u32) -> PyResult<usize> {
+        let r = self.rows_f64(py, rows)?;
+        let keys: Vec<PtKey> = (0..r.len()).map(|i| PtKey::new(format!("{name}#{i}"), level, PtForm::Eval)).collect();
+        let d = self.dev.clone();
+        let mut st = d.st.borrow_mut();
+        let State { pts, ex, .. } = &mut *st;
+        nogil(py, || pts.encode_coeffs_many(&d.ctx, ex, &d.sh, &keys, &r)).map_err(gerr)?;
+        Ok(keys.len())
+    }
+    /// `store_coeff_pts` of exact integer coefficients (int64 rows: the plaintexts' coefficients at the level's scaling
+    /// factor, no rounding), rows `start..` of `name`: e.g. a batch at a time as the rows become ready.
+    #[pyo3(signature = (name, ints, level, start=0))]
+    fn store_int_pts(&mut self, py: Python<'_>, name: &str, ints: &Bound<'_, PyAny>, level: u32, start: usize) -> PyResult<usize> {
+        let np = self.numpy(py)?;
+        let arr = np.call_method1("ascontiguousarray", (ints, "int64"))?;
+        let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+        if shape.len() != 2 {
+            return Err(PyValueError::new_err(format!("expected a 2-D array, got shape {shape:?}")));
+        }
+        let v = PyBuffer::<i64>::get(&arr)?.to_vec(py)?;
+        let rows: Vec<&[i64]> = v.chunks(shape[1].max(1)).collect();
+        let keys: Vec<PtKey> = (start..start + rows.len()).map(|i| PtKey::new(format!("{name}#{i}"), level, PtForm::Eval)).collect();
+        let d = self.dev.clone();
+        let mut st = d.st.borrow_mut();
+        let State { pts, ex, .. } = &mut *st;
+        nogil(py, || pts.encode_ints_many(&d.ctx, ex, &d.sh, &keys, &rows, None)).map_err(gerr)?;
+        Ok(keys.len())
+    }
+    /// `mult_coeff_sum` over the rows `store_coeff_pts` keeps as `name`: term i is `cts[i]` times row i, stored at the
+    /// ciphertexts' plaintext level.
+    fn mult_coeff_sum_stored(&mut self, py: Python<'_>, cts: Vec<PyRef<'_, PyCt>>, name: &str) -> PyResult<PyCt> {
+        let mut out: Option<PyCt> = None;
+        for (i, c) in cts.iter().enumerate() {
+            self.same_session(c)?;
+            let key = PtKey::new(format!("{name}#{i}"), self.pt_meta(&c.meta()).level, PtForm::Eval);
+            if !self.dev.st.borrow().pts.has(&key) {
+                return Err(PyKeyError::new_err(format!("no stored plaintext '{}' at level {} (store_coeff_pts)", key.name, key.level)));
+            }
+            self.sum_term(&mut out, c, &key)?;
+        }
+        let mut o = out.ok_or_else(|| rt_err("empty sum"))?;
+        self.reactive(py, &mut o)?;
+        Ok(o)
+    }
+
     // ── data plane ────────────────────────────────────────────────────────────────────────────────────────────────
 
     /// Fresh encryption of `values` (slot vector) at `level` (degree `deg`). Tests and public-value inputs.
@@ -1273,7 +1480,8 @@ impl PyFhe {
             let d = &*self.dev;
             let mut st = d.st.borrow_mut();
             let State { ex, .. } = &mut *st;
-            nogil(py, || pc_gpu::limbs::export_limbs(&d.ctx, ex, a.ct(), 0)).map_err(gerr)?
+            let c = a.ct()?;
+            nogil(py, || pc_gpu::limbs::export_limbs(&d.ctx, ex, c, 0)).map_err(gerr)?
         };
         let out = PyDict::new(py);
         out.set_item("c0", self.np_u64_2d(py, &l.c[0])?)?;

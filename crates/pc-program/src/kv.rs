@@ -158,7 +158,7 @@ impl<'a, 'e, W: DevWord> PinnedKv<'a, 'e, W> {
             }
         }
         match std::mem::replace(&mut self.pages[p], Page::Moving) {
-            Page::Compute(c, _) => Ok(CtBuf { buf: c.buf.buf.handoff(&ex.compute, &ex.copy, &self.hand)?, k: 1, lay: self.lay }),
+            Page::Compute(c, _) => Ok(CtBuf { buf: c.buf.buf.handoff(&ex.compute, &ex.copy, &self.hand)?, k: 1, lay: self.lay, seeds: false, packed: false }),
             Page::Parked(b, _) => Ok(b),
             // a reload nobody joined: Copy is its producer lane, stream order covers it
             Page::Loading(r, _) => Ok(r.join_as_is(&ex.copy)?),
@@ -195,13 +195,13 @@ impl<'a, 'e, W: DevWord> KvStore<'a, W> for PinnedKv<'a, 'e, W> {
         let page = match std::mem::replace(&mut self.pages[p], Page::Moving) {
             Page::Loading(r, l) if l == i => Page::Compute(Ct::new(self.metas[i], r.join(&ex.compute)?), Some(i)),
             Page::Compute(c, l) if l == Some(i) => Page::Compute(c, l),
-            Page::Parked(b, l) if l == i => Page::Compute(Ct::new(self.metas[i], CtBuf { buf: b.buf.handoff(&ex.copy, &ex.compute, &self.hand)?, k: 1, lay }), Some(i)),
+            Page::Parked(b, l) if l == i => Page::Compute(Ct::new(self.metas[i], CtBuf { buf: b.buf.handoff(&ex.copy, &ex.compute, &self.hand)?, k: 1, lay, seeds: false, packed: false }), Some(i)),
             other if self.state[i] == LayerState::Empty => {
                 // a fresh layer: the compute fills the page (it must not hold a layer still storing)
                 self.pages[p] = other;
                 let b = self.to_copy(p, ex, i)?;
                 self.state[i] = LayerState::OnDevice;
-                Page::Compute(Ct::new(CtMeta::new(0, 1), CtBuf { buf: b.buf.handoff(&ex.copy, &ex.compute, &self.hand)?, k: 1, lay }), Some(i))
+                Page::Compute(Ct::new(CtMeta::new(0, 1), CtBuf { buf: b.buf.handoff(&ex.copy, &ex.compute, &self.hand)?, k: 1, lay, seeds: false, packed: false }), Some(i))
             }
             other => {
                 self.pages[p] = other;

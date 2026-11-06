@@ -461,6 +461,81 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
         Ok(())
     }
 
+    /// `encode_with(CoeffRows)` of `coeffs[i]` into `keys[i]` (at their levels' scaling factors): the host rows
+    /// encoded in parallel on the store's workers, then uploaded and transformed on the compute lane.
+    pub fn encode_coeffs_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, sh: &Shadow, keys: &[PtKey], coeffs: &[Vec<f64>]) -> Result<()> {
+        if keys.len() != coeffs.len() {
+            return Err(shape("encode_coeffs_many", format!("{} keys, {} rows", keys.len(), coeffs.len())));
+        }
+        let ats = self.coeff_ats(sh, keys, None)?;
+        let (host, primes) = (&self.host, &self.primes);
+        let rows = self.pool.install(|| coeffs.par_iter().zip(&ats).map(|(c, at)| host_rows(host, primes, Payload2::Coeffs(c), at)).collect::<Result<Vec<_>>>())?;
+        self.insert_host_rows(ctx, ex, keys, &ats, &rows)
+    }
+
+    /// `encode_coeffs_many` of exact integer coefficients (`ints[i][j]` is coefficient j of `keys[i]`'s plaintext,
+    /// which carries `scale`, by default its level's scaling factor): residues only, no rounding.
+    pub fn encode_ints_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, sh: &Shadow, keys: &[PtKey], ints: &[&[i64]], scale: Option<f64>) -> Result<()> {
+        if keys.len() != ints.len() || ints.iter().any(|r| r.len() != self.lay.n) {
+            return Err(shape("encode_ints_many", format!("{} keys, {} rows (of {} coefficients each)", keys.len(), ints.len(), self.lay.n)));
+        }
+        let ats = self.coeff_ats(sh, keys, scale)?;
+        // residues by a precomputed reciprocal (|x| < 2^63, primes below 2^32): no division per coefficient
+        let primes: Vec<(u64, u64)> = self.primes.iter().map(|&p| (p, u64::MAX / p)).collect();
+        let red = |x: i64, (p, m): (u64, u64)| -> u64 {
+            let y = x.unsigned_abs();
+            let mut r = y.wrapping_sub((((y as u128 * m as u128) >> 64) as u64).wrapping_mul(p));
+            while r >= p {
+                r -= p;
+            }
+            if x < 0 && r != 0 { p - r } else { r }
+        };
+        let rows: Vec<Vec<Vec<u64>>> = self.pool.install(|| {
+            ints.par_iter()
+                .zip(&ats)
+                .map(|(c, at)| primes[..=at.top].iter().map(|&pm| c.iter().map(|&x| red(x, pm)).collect()).collect())
+                .collect()
+        });
+        self.insert_host_rows(ctx, ex, keys, &ats, &rows)
+    }
+
+    /// Each key at `scale` (by default its level's scaling factor), degree 1.
+    fn coeff_ats(&self, sh: &Shadow, keys: &[PtKey], scale: Option<f64>) -> Result<Vec<EncodeAt>> {
+        let st = sh.tables.as_ref().ok_or_else(|| shape("encode", "the Shadow has no scale tables"))?;
+        keys.iter()
+            .map(|k| {
+                let top = self.top(sh, k.level)?;
+                Ok(EncodeAt { top, scale: match scale { Some(s) => s, None => st.sf(top as i32)? }, deg: 1, form: k.form })
+            })
+            .collect()
+    }
+
+    /// Upload host-encoded rows (`host_rows`) into the slots of `keys` and transform them on the compute lane (staged
+    /// together: `DevEncoder::encode_rows_many`).
+    fn insert_host_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, keys: &[PtKey], ats: &[EncodeAt], rows: &[Vec<Vec<u64>>]) -> Result<()> {
+        // every key's slot first (claimed, so the next key cannot take it), then one staged upload
+        let mut taken = Vec::with_capacity(keys.len());
+        for (key, at) in keys.iter().zip(ats) {
+            let i = self.slot_for(key, at.top)?;
+            let b = self.take_compute_buf(i, &ex.compute)?;
+            self.clock += 1;
+            let slot = &mut self.slots[i];
+            slot.meta = PtMeta { level: key.level, deg: 1, nf: at.scale, tag: Default::default() };
+            slot.key = Some(key.clone());
+            slot.last_use = self.clock;
+            self.index.insert(key.clone(), i);
+            taken.push((i, b));
+        }
+        let res = {
+            let mut items: Vec<_> = taken.iter_mut().zip(ats).zip(rows).map(|(((_, b), at), r)| (r.as_slice(), *at, b)).collect();
+            self.enc.encode_rows_many(ctx, &ex.compute, &mut items)
+        };
+        for (i, b) in taken {
+            self.slots[i].state = State::Resident(b);
+        }
+        res
+    }
+
     // ── named slot plaintexts and cached products ────────────────────────────────────────────────────────────────
 
     /// `set_slot_pt`: keep `values` as the named plaintext, encoded (at `level`, or the level a product needs) on use.

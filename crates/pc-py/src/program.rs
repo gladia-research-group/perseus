@@ -495,6 +495,7 @@ impl PyProgram {
                 cts.push(None);
             } else {
                 let c: PyRef<'_, crate::fhe::PyCt> = x.extract()?;
+                c.check_full()?;
                 kinds.push((2, 0));
                 cts.push(Some(c));
             }

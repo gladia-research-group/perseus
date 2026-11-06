@@ -136,6 +136,9 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         mul_add: elem::mul_add::<W>,
         rescale_fwd: rescale::rescale_fwd::<W>,
         tfhe: tfhe::tfhe,
+        tensor_sum: elem::tensor_sum::<W>,
+        tensor_multi: elem::tensor_multi::<W>,
+        tensor_seeded: elem::tensor_seeded::<W>,
     }
 }
 

@@ -356,6 +356,58 @@ pub fn ksk_expand_row(seed: &KskSeed, digit: u32, modulus: u64, word_bits: u32, 
     }
 }
 
+/// "CTSA": domain word s\[15\] of a regenerable ciphertext's c1 (a fresh 8-word seed per row, `Client::encrypt_as`
+/// with `regen`), kept apart from the KSK lanes.
+pub const CTS_DOMAIN: u32 = 0x4354_5341;
+/// ChaCha12, as the KSKA lane (the device shares its cooperative expander, chacha.cuh `regen4`).
+pub const CTS_ROUNDS: u32 = 12;
+/// Attempts per coefficient: the fallback `v % p` has probability < 2^-150 per coefficient at n32's 27-bit primes
+/// (16 attempts would leave 2^-75, too close for a corpus of ~2^40 coefficients).
+pub const CTS_T_MAX: u32 = 32;
+
+/// One eval-form coefficient of a regenerable c1 row (seed, limb modulus p, slot): the KSKA layout (attempt t reads
+/// word (slot & 15) of block (slot >> 4) + t (n >> 4), accept v < floor(2^32 / p) p) with s\[13\] = 0, s\[14\] = p,
+/// s\[15\] = "CTSA". Random access, so a kernel can draw c1 where it reads it.
+pub fn cts_expand(seed: &[u32; 8], modulus: u32, slot: u32, n: usize) -> u32 {
+    let n16 = (n as u32) >> 4;
+    let (b0, w) = (slot >> 4, (slot & 15) as usize);
+    let mp = (u32::MAX / modulus) * modulus;
+    let mut v = 0;
+    for t in 0..CTS_T_MAX {
+        v = chacha_block(seed, b0.wrapping_add(t.wrapping_mul(n16)), 0, modulus, CTS_DOMAIN, CTS_ROUNDS)[w];
+        if v < mp {
+            break;
+        }
+    }
+    v % modulus
+}
+
+/// A whole row of `cts_expand` (`out.len()` = n): one base block per 16 slots, escalation blocks only for rejected words.
+pub fn cts_expand_row(seed: &[u32; 8], modulus: u32, out: &mut [u32]) {
+    let n = out.len();
+    cts_expand_range(seed, modulus, n, 0, out);
+}
+
+/// Slots `start..start + out.len()` of a row of ring dimension `n` (`start` and the length multiples of 16).
+pub fn cts_expand_range(seed: &[u32; 8], modulus: u32, n: usize, start: usize, out: &mut [u32]) {
+    debug_assert!(start % 16 == 0 && out.len() % 16 == 0 && start + out.len() <= n);
+    let n16 = (n as u32) >> 4;
+    let mp = (u32::MAX / modulus) * modulus;
+    for (i, chunk) in out.chunks_exact_mut(16).enumerate() {
+        let b0 = (start / 16 + i) as u32;
+        let base = chacha_block(seed, b0, 0, modulus, CTS_DOMAIN, CTS_ROUNDS);
+        for (w, o) in chunk.iter_mut().enumerate() {
+            let mut v = base[w];
+            let mut t = 1;
+            while v >= mp && t < CTS_T_MAX {
+                v = chacha_block(seed, b0.wrapping_add(t * n16), 0, modulus, CTS_DOMAIN, CTS_ROUNDS)[w];
+                t += 1;
+            }
+            *o = v % modulus;
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Key material
 // ------------------------------------------------------------------------------------------------------------------
