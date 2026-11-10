@@ -116,6 +116,20 @@ pub struct ConstRing<'a, W: DevWord> {
     /// per chunk: the event recorded after its latest copy and that copy's lap (None: no copy in flight)
     chunk_ev: Vec<Event>,
     chunk_lap: Vec<Option<u64>>,
+    /// per unit: the push that wrote it last
+    owner: Vec<u64>,
+    pushes: u64,
+    /// `const_memo`: a push's words -> (its first unit, its id, the stream it was uploaded on)
+    memo: std::collections::HashMap<Box<[W]>, (usize, u64, pc_cuda::RawStream)>,
+    scratch: Vec<W>,
+}
+
+/// A push whose words are still on the device from an earlier push on the same stream returns that address: no
+/// copy, no event (the constants of a program repeat every token). Exact: the kernel reads the same words.
+/// PC_CONST_MEMO=0 turns it off (read once).
+pub fn const_memo() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_CONST_MEMO").map_or(true, |v| v != "0"))
 }
 
 /// Chunks of a constant ring (events the host may wait on).
@@ -157,6 +171,10 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
             chunk_units,
             chunk_lap: vec![None; chunk_ev.len()],
             chunk_ev,
+            owner: vec![0; units],
+            pushes: 0,
+            memo: Default::default(),
+            scratch: Vec::new(),
         })
     }
 
@@ -183,6 +201,31 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
 
     /// Upload `words` words written by `fill` (it gets exactly that many) and return their device base pointer.
     pub fn push(&mut self, s: &Stream<Compute>, words: usize, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
+        // a leased push is its graph's own (units out of the rotation until `release`): never shared
+        if self.lease.is_some() || !const_memo() {
+            return self.push_new(s, words, fill);
+        }
+        let n = words.div_ceil(self.unit_words).max(1);
+        let mut w = std::mem::take(&mut self.scratch);
+        w.clear();
+        w.resize(words, W::ZERO);
+        fill(&mut w);
+        let hit = self.memo.get(&w[..]).copied().filter(|&(u, id, on)| on == s.raw() && self.owner[u..u + n].iter().all(|&o| o == id));
+        let p = match hit {
+            // SAFETY: the push's units, inside the ring
+            Some((u, ..)) => Ok(unsafe { self.dev.dptr().add(u * self.unit_words) }),
+            None => self.push_new(s, words, |h| h.copy_from_slice(&w)).inspect(|_| {
+                if self.memo.len() >= self.units {
+                    self.memo.clear();
+                }
+                self.memo.insert(w[..].into(), (self.next - n, self.pushes, s.raw()));
+            }),
+        };
+        self.scratch = w;
+        p
+    }
+
+    fn push_new(&mut self, s: &Stream<Compute>, words: usize, fill: impl FnOnce(&mut [W])) -> Result<*const W> {
         let n = words.div_ceil(self.unit_words).max(1);
         let (u, wrapped) = self.find(n).ok_or_else(|| Error::Mem {
             knob: "OpsCfg::const_slots",
@@ -193,6 +236,8 @@ impl<'a, W: DevWord> ConstRing<'a, W> {
             self.lap += 1;
         }
         self.next = u + n;
+        self.pushes += 1;
+        self.owner[u..u + n].fill(self.pushes);
         let (c0, c1) = (u / self.chunk_units, (u + n - 1) / self.chunk_units);
         if self.lease.is_none() {
             // the copies out of these pinned units a lap ago must have run before the host rewrites them (a lease
