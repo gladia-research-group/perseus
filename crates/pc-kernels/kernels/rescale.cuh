@@ -131,6 +131,70 @@ __global__ void __launch_bounds__(256) cols_rs(NttArgs T, RescaleArgs A) {
     ntt::fwd_cols_core<W, L>(x, base, s, (const W*)T.fw + (size_t)r * N, (const W*)T.fws + (size_t)r * N, q, c, g);
 }
 
+// cols_rs at u32 with the column pass of ntt_fwd_cols_d: the prime's twiddle pairs 1..255 staged in shared memory
+// before the wait on rescale_prep, ALU addressing (the same words)
+template <class MM, int L>
+__global__ void __launch_bounds__(256) cols_rs_d(NttArgs T, RescaleArgs A) {
+    using W = uint32_t;
+    __shared__ W s[256 * 16];
+    __shared__ uint2 st[256];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const int r = T.rprime[row];
+    st[threadIdx.x] = ntt::tw2((const W*)T.fw + (size_t)r * N, (const W*)T.fws + (size_t)r * N, threadIdx.x);
+    W* const base = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
+    const W* ya = base + (size_t)(A.top - r) * N;
+    const W* yp = base + (size_t)(A.top - 1 - r) * N;
+    const PrimeConst& pq = A.pr[r];
+    const W q = (W)pq.p;
+    const W p2 = ntt::kp<W>(q, 2);
+    const W p8 = L == 2 ? ntt::kp<W>(q, 8) : (W)0;
+    const W ha = (W)A.pr[A.top].p >> 1, hb = (W)A.pr[A.top - 1].p >> 1;
+    const W av = ((const W*)A.A)[r], as = ((const W*)A.As)[r], bv = ((const W*)A.B)[r], bs = ((const W*)A.Bs)[r];
+    const W qam = ((const W*)A.qam)[r], qbm = ((const W*)A.qbm)[r];
+    const uint32_t c = threadIdx.x & 15, g = threadIdx.x >> 4;
+    W x[16];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const uint32_t o = ((g + 16 * j) * 256 + c) << 2;
+        const W u = *ntt::boff(ya, o), v = *ntt::boff(yp, o);
+        W la = reduce_small<W, MM>(u, pq);
+        if (u > ha) la = sub<W>(la, qam, q);
+        W lb = reduce_small<W, MM>(v, pq);
+        if (v > hb) lb = sub<W>(lb, qbm, q);
+        x[j] = add<W>(mul_shoup<W>(la, av, as, q), mul_shoup<W>(lb, bv, bs, q), q);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int sg = 0; sg < 4; ++sg) {
+        const int h = 8 >> sg, m = 1 << sg;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + j / (2 * h)];
+                ntt::ct_lz<W, L>(x[j], x[j + h], t.x, t.y, q, p2, p8, sg + 1);
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) s[(g + 16 * j) * 16 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 16; ++u) x[u] = s[(16 * g + u) * 16 + c];
+#pragma unroll
+    for (int sg = 0; sg < 4; ++sg) {
+        const int h = 8 >> sg, m = 16 << sg;
+#pragma unroll
+        for (int u = 0; u < 16; ++u)
+            if ((u & h) == 0) {
+                const uint2 t = st[m + (m >> 4) * g + u / (2 * h)];
+                ntt::ct_lz<W, L>(x[u], x[u + h], t.x, t.y, q, p2, p8, sg + 5);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 16; ++u) *ntt::boff(base, ((16 * g + u) * 256 + c) << 2) = x[u];
+}
+
 template <class W, class MM>
 int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
     const RescaleArgs& R = a->rs;
@@ -158,6 +222,18 @@ int fwd_l(const RescaleNttArgs* a, cudaStream_t s) {
         const int m = min(ch, T.nrows - i);
         b.roff = T.roff + i;
         b.rprime = T.rprime + i;
+        if constexpr (sizeof(W) == 4) {
+            if (lz >= 1) {
+                if (lz >= 2) {
+                    ntt::launch_pdl(cols_rs_d<MM, 2>, dim3(16, m), s, b, R);
+                    ntt::launch_pdl_t(ntt::ntt_fwd_rows_d<2>, dim3(256 / ntt::ROWS_D, m), 32 * ntt::ROWS_D, s, b);
+                } else {
+                    ntt::launch_pdl(cols_rs_d<MM, 1>, dim3(16, m), s, b, R);
+                    ntt::launch_pdl_t(ntt::ntt_fwd_rows_d<1>, dim3(256 / ntt::ROWS_D, m), 32 * ntt::ROWS_D, s, b);
+                }
+                continue;
+            }
+        }
         if (lz >= 2) {
             ntt::launch_pdl(cols_rs<W, MM, 2>, dim3(16, m), s, b, R);
             ntt::launch_pdl(ntt::ntt_fwd_rows<W, 2>, dim3(32, m), s, b);

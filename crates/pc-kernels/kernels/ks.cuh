@@ -301,23 +301,25 @@ __device__ __forceinline__ uint32_t galois_inv(uint32_t k) {
 // automorphism maps the segment onto one segment (in the bit-reversed order a slot's segment decides its image's), so
 // the outputs are permuted inside the warp.
 // Each digit first asks L2 for the next digit's lines of the warp's segment (`b`, the ModUp digit or c1, a resident `a`),
-// so its loads hit L2 instead of DRAM. At most 80 registers: 3 blocks per SM (shared memory holds 3).
+// so its loads hit L2 instead of DRAM. At most 80 registers: 6 blocks of SEG_W = 4 warps per SM.
 // SUM (c0_mode & KS_SUM, ABI-free: a bit of c0_mode): the R rotations summed into rotation 0's output, out =
 // sum_r sigma_r(dot_r) (+ out with KS_ACC). A warp owns output segment S; rotation r's dot runs on the input segment
 // sigma_r^-1 maps onto S, its outputs permuted onto S and added: the R extended rotations are never stored.
+// Segments (warps) per block of the K = 1 segment dots: 4 (finer blocks, a shorter last wave than 8)
+constexpr int SEG_W = 4;
 template <class MM, bool PACKED, bool SUM>
-__global__ void __launch_bounds__(256, 3) ks_dot_seg(KsKeyArgs G) {
+__global__ void __launch_bounds__(32 * SEG_W, 24 / SEG_W) ks_dot_seg(KsKeyArgs G) {
     using W = uint32_t;
     using Wd = WideOf<W>;
-    __shared__ W sa[8][2][264];
-    __shared__ W so[8][264];
+    __shared__ W sa[SEG_W][2][264];
+    __shared__ W so[SEG_W][264];
     const KsArgs& A = G.ks;
     const KeyTab& T = G.key;
     const uint32_t t = A.rows[blockIdx.y];
     const PrimeConst& q = A.pr[t];
     const W p = (W)q.p;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const uint32_t S = blockIdx.x * 8 + wp;
+    const uint32_t S = blockIdx.x * SEG_W + wp;
     const int dt = (int)t < A.nq ? A.digit_of[t] : -1;
     const int slot = kskey::slot_of(T, (int)t, A.nq);
     const int nreg = min(A.ndig, T.nregen);
@@ -699,17 +701,17 @@ __global__ void __launch_bounds__(BX, 5) ks_dot_key_sum_c(KsKeyArgs G) {
 // per pass, through shared memory) instead of ks_dot_regen's 4-lane cooperative blocks (their shuffles). No
 // automorphism, so the outputs (or the fused ModDown epilogue) stay in slot order. The same words as ks_dot_regen.
 template <class MM, bool EPI, bool PACKED>
-__global__ void __launch_bounds__(256, 3) ks_dot_rseg(KsRegenArgs G) {
+__global__ void __launch_bounds__(32 * SEG_W, 24 / SEG_W) ks_dot_rseg(KsRegenArgs G) {
     using W = uint32_t;
     using Wd = WideOf<W>;
-    __shared__ W sa[8][2][264];
+    __shared__ W sa[SEG_W][2][264];
     const KsArgs& A = G.ks;
     const KeyTab& T = G.key;
     const uint32_t t = A.rows[blockIdx.y];
     const PrimeConst& q = A.pr[t];
     const W p = (W)q.p;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    const uint32_t R = blockIdx.x * 8 + wp;
+    const uint32_t R = blockIdx.x * SEG_W + wp;
     const uint32_t base = R * 256 + 8 * lane;
     const int dt = (int)t < A.nq ? A.digit_of[t] : -1;
     const size_t roff = (size_t)t * N + base;
@@ -838,7 +840,7 @@ int regen_k(const KsRegenArgs* a, cudaStream_t s) {
     const int K = a->ks.K;
     if constexpr (sizeof(W) == 4 && TAB != 0) {
         if (K == 1) {
-            ks_dot_rseg<MM, EPI, TAB == 2><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
+            ks_dot_rseg<MM, EPI, TAB == 2><<<dim3(N / (256 * SEG_W), a->ks.nrows), 32 * SEG_W, 0, s>>>(*a);
             return (int)cudaGetLastError();
         }
     }
@@ -868,8 +870,8 @@ int key_k(const KsKeyArgs* a, cudaStream_t s) {
     const int K = a->ks.K;
     if constexpr (sizeof(W) == 4) {
         if (K == 1) {
-            if (a->ks.c0_mode & KS_SUM) ks_dot_seg<MM, PACKED, true><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
-            else ks_dot_seg<MM, PACKED, false><<<dim3(N / 2048, a->ks.nrows), 256, 0, s>>>(*a);
+            if (a->ks.c0_mode & KS_SUM) ks_dot_seg<MM, PACKED, true><<<dim3(N / (256 * SEG_W), a->ks.nrows), 32 * SEG_W, 0, s>>>(*a);
+            else ks_dot_seg<MM, PACKED, false><<<dim3(N / (256 * SEG_W), a->ks.nrows), 32 * SEG_W, 0, s>>>(*a);
             return (int)cudaGetLastError();
         }
     }
