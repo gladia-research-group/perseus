@@ -460,7 +460,11 @@ impl<'a, W: DevWord> Bound<'a, W> {
         let lay = env.lay;
         let n_slots = p.mem.slot_bytes.len();
         let slot_of = |v: u32| -> Result<u32> {
-            p.vars.get(v as usize).and_then(|x| x.slot).ok_or_else(|| berr(block, format!("var {v} has no slot (alloc not run?)")))
+            let s = p.vars.get(v as usize).and_then(|x| x.slot).ok_or_else(|| berr(block, format!("var {v} has no slot (alloc not run?)")))?;
+            if s as usize >= n_slots {
+                return Err(berr(block, format!("var {v} in slot {s} of {n_slots}")));
+            }
+            Ok(s)
         };
         // key groups
         let (need_relin, need_conj, lists) = key_needs(p);

@@ -398,6 +398,9 @@ impl Client {
         }
         let n = h.n;
         let slots = if h.meta.slots == 0 { n / 2 } else { h.meta.slots as usize };
+        if !slots.is_power_of_two() || slots > n / 2 {
+            return Err(Error::Wire(format!("ciphertext of {slots} slots in a ring of {n}")));
+        }
         (0..h.k)
             .map(|c| {
                 let rows: Vec<Vec<u64>> = (0..d)

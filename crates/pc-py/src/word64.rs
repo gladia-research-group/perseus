@@ -224,7 +224,8 @@ pub(crate) struct Dev {
 impl Drop for Dev {
     fn drop(&mut self) {
         // nothing in flight may still read or write the arena when it is freed
-        let _ = self.st.get_mut().ex.compute.sync();
+        let ex = &self.st.get_mut().ex;
+        let _ = (ex.compute.sync(), ex.aux.sync(), ex.side.sync(), ex.copy.sync());
     }
 }
 

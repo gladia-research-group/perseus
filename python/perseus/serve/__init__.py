@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import stat
 import struct
 
 CHUNK = 1 << 24
+# The largest message `recv` holds in memory (headers and ciphertext frames; a key bundle streams to a file).
+MAX_MESSAGE = 1 << 34
 
 
 class ProtocolError(RuntimeError):
@@ -35,6 +39,8 @@ class Conn:
         self.sent = self.received = 0
 
     def _read(self, n: int) -> bytes:
+        if n > MAX_MESSAGE:
+            raise ProtocolError(f"peer declares {n} bytes, above the {MAX_MESSAGE} of a message held in memory")
         buf = bytearray(n)
         view, got = memoryview(buf), 0
         while got < n:
@@ -57,9 +63,10 @@ class Conn:
     def recv(self, expect: str | None = None):
         total, hl = struct.unpack("<QI", self._read(12))
         header = json.loads(self._read(hl))
-        blobs = [self._read(n) for n in header.pop("blobs")]
-        if total != 4 + hl + sum(len(b) for b in blobs):
-            raise ProtocolError(f"message length {total} does not match its header")
+        sizes = header.pop("blobs")
+        if total != 4 + hl + sum(sizes) or total > MAX_MESSAGE:
+            raise ProtocolError(f"message length {total} does not match its header, or is above {MAX_MESSAGE}")
+        blobs = [self._read(n) for n in sizes]
         kind = header.pop("kind")
         if kind == "error":
             raise ProtocolError(f"peer error: {header.get('message')}")
@@ -88,7 +95,9 @@ class Conn:
         if kind != expect or len(sizes) != 1 or total != 4 + hl + sizes[0]:
             raise ProtocolError(f"expected a one-blob '{expect}' message, got '{kind}' {sizes}")
         left = sizes[0]
-        with open(path, "wb") as f:
+        if left > shutil.disk_usage(os.path.dirname(path)).free // 2:
+            raise ProtocolError(f"'{kind}' of {left} bytes is more than half the free space under {path}")
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as f:
             while left:
                 chunk = self.sock.recv(min(left, CHUNK))
                 if not chunk:
@@ -103,6 +112,17 @@ class Conn:
             self.sock.close()
         except OSError:
             pass
+
+
+def private_dir(path: str) -> str:
+    """`path` as this user's own directory, mode 0700: a work directory under a shared /tmp must not be one
+    another user made, or a link to somewhere else."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PermissionError(f"work directory {path} is not this user's own directory")
+    os.chmod(path, 0o700)
+    return path
 
 
 def listen(addr: str) -> socket.socket:

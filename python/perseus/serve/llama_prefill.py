@@ -20,6 +20,12 @@ import time
 
 import numpy as np
 
+from . import private_dir
+
+
+def _work_dir():
+    return private_dir(os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), "m12_llama"))
+
 
 def _pack(model, toks):
     """Block 0's input slot vectors of a prompt (BOS + tokens), packed as page 0 of `prefill_paged`, and the chunks."""
@@ -58,7 +64,7 @@ def _server(addr, a, model, toks, gt, ref, results=None):
     cfg["exec.use_graphs"] = bool(a.graphs)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     ptoks = [int(toks[0])] * len(toks)
-    work = os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), "m12_llama")
+    work = _work_dir()
 
     class Served(LlamaPlannedPrefill):
         bundle, ask = None, None
@@ -152,11 +158,14 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     cfg["exec.use_graphs"] = bool(a.graphs)
     t0 = time.time()
     cl = Client(ClientSecret.generate(), complex=True)
-    remote = Remote(addr, cl, os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), "m12_llama", "client"))
+    remote = Remote(addr, cl, os.path.join(_work_dir(), "client"))
+
+    asked = []
 
     def ask(h, frames):
-        if h.get("what") != "ccmm_calibrate":
-            raise RuntimeError(f"unknown server request {h.get('what')!r}")
+        if h.get("what") != "ccmm_calibrate" or asked:
+            raise RuntimeError(f"unknown or repeated server request {h.get('what')!r}")
+        asked.append(h["what"])
         A, B = _probes()
         f = float(h["f"])
         got = CC.to_mats([cl.decrypt(x)[0] for x in frames])[:, :, :16]

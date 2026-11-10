@@ -335,13 +335,14 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
             }
             for ((it, at), &r) in chunk.iter().zip(&ats).zip(&idx) {
                 let i = self.slot_for(&it.key, at.top)?;
+                let ev = self.events.get()?;
                 let buf = self.take_compute_buf(i, &ex.compute)?;
                 let mut cb = buf.handoff(&ex.compute, &ex.copy, &self.hand_ev)?;
                 // SAFETY: the pinned buffer is rewritten only after ring_ev[r] (recorded right after) completed
                 unsafe { cb.upload_pinned_async(&ex.copy, 0, &self.ring[r])? };
                 self.ring_ev[r].record(&ex.copy)?;
                 self.ring_used[r] = true;
-                let ready = Ready::record(cb, &ex.copy, self.events.get()?)?;
+                let ready = Ready::record(cb, &ex.copy, ev)?;
                 self.clock += 1;
                 let slot = &mut self.slots[i];
                 slot.state = State::Pending(ready, at.form == PtForm::Eval);

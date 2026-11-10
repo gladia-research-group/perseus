@@ -20,6 +20,8 @@ import time
 
 import numpy as np
 
+from . import private_dir
+
 PRESET = "n32_gpt2_decode"
 
 
@@ -208,6 +210,7 @@ def main(argv=None):
     ap.add_argument("--work-dir", default=os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), "m12_served"))
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
+    a.work_dir = private_dir(a.work_dir)
     return server_main(a) if a.role == "server" else client_main(a)
 
 

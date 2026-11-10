@@ -92,8 +92,8 @@ impl Arena {
     pub fn alloc<S: Lane, T: Pod>(&self, what: &'static str, n: usize) -> Result<DBuf<'_, S, T>> {
         assert!(!self.frozen.get(), "arena is frozen: allocation of {what} in the hot loop");
         let off = self.used.get().div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
-        let need = n * std::mem::size_of::<T>();
-        if off + need > self.cap {
+        let need = n.saturating_mul(std::mem::size_of::<T>());
+        if off.saturating_add(need) > self.cap {
             return Err(Error::ArenaFull { what, need, used: off, cap: self.cap });
         }
         self.used.set(off + need);
@@ -179,7 +179,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// Synchronous upload at element offset `off` (setup / tests): ordered on the lane, returns after the copy
     /// completed (syncs this lane's stream; the source is pageable host memory).
     pub fn upload_at(&mut self, s: &Stream<S>, off: usize, data: &[T]) -> Result<()> {
-        bounds("upload", off + data.len(), self.len)?;
+        bounds("upload", off.saturating_add(data.len()), self.len)?;
         // SAFETY: range checked above; host slice live for the call, and the stream is synced before returning
         unsafe {
             check(
@@ -205,7 +205,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         if bytes.len() % sz != 0 {
             return Err(Error::Bounds { what: "upload_bytes_at (bytes of a partial element)", len: bytes.len(), cap: bytes.len() / sz * sz });
         }
-        bounds("upload", off + bytes.len() / sz, self.len)?;
+        bounds("upload", off.saturating_add(bytes.len() / sz), self.len)?;
         // SAFETY: range checked above (whole elements); host slice live for the call, and the stream is synced before
         // returning; the copy is bytewise, so the host alignment does not matter
         unsafe {
@@ -219,7 +219,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
 
     /// Host copy of elements `[off, off + n)`, ordered after everything issued on the lane (syncs the lane).
     pub fn download_range(&self, s: &Stream<S>, off: usize, n: usize) -> Result<Vec<T>> {
-        bounds("download", off + n, self.len)?;
+        bounds("download", off.saturating_add(n), self.len)?;
         let mut v: Vec<T> = Vec::with_capacity(n);
         // SAFETY: range checked; the copy writes n elements into the reserved capacity, completed by the sync
         // before set_len (T: Pod, any bit pattern valid)
@@ -249,7 +249,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         if out.len() % sz != 0 {
             return Err(Error::Bounds { what: "download_bytes_into (bytes of a partial element)", len: out.len(), cap: out.len() / sz * sz });
         }
-        bounds("download", off + out.len() / sz, self.len)?;
+        bounds("download", off.saturating_add(out.len() / sz), self.len)?;
         // SAFETY: range checked (whole elements); `out` is exclusively borrowed for the call and the copy completes
         // at the sync before returning; the copy is bytewise, so the host alignment does not matter
         unsafe {
@@ -267,7 +267,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// `src` must stay alive and unmodified until the stream has passed this copy (join/wait the `Ready` that
     /// covers it before reusing the pinned slot).
     pub unsafe fn upload_pinned_async(&mut self, s: &Stream<S>, off: usize, src: &PinnedBuf<T>) -> Result<()> {
-        bounds("upload_pinned_async", off + src.len(), self.len)?;
+        bounds("upload_pinned_async", off.saturating_add(src.len()), self.len)?;
         check(
             ffi::cudaMemcpyAsync(
                 self.ptr.add(off) as *mut c_void,
@@ -285,8 +285,8 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// # Safety
     /// As `upload_pinned_async`, for that range of `src`.
     pub unsafe fn upload_pinned_range_async(&mut self, s: &Stream<S>, off: usize, src: &PinnedBuf<T>, src_off: usize, n: usize) -> Result<()> {
-        bounds("upload_pinned_range_async", off + n, self.len)?;
-        bounds("upload_pinned_range_async (source)", src_off + n, src.len())?;
+        bounds("upload_pinned_range_async", off.saturating_add(n), self.len)?;
+        bounds("upload_pinned_range_async (source)", src_off.saturating_add(n), src.len())?;
         check(
             ffi::cudaMemcpyAsync(
                 self.ptr.add(off) as *mut c_void,
@@ -304,7 +304,7 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
     /// # Safety
     /// `dst` must not be read or dropped until the stream has passed this copy.
     pub unsafe fn download_pinned_async(&self, s: &Stream<S>, off: usize, dst: &mut PinnedBuf<T>) -> Result<()> {
-        bounds("download_pinned_async", off + dst.len(), self.len)?;
+        bounds("download_pinned_async", off.saturating_add(dst.len()), self.len)?;
         check(
             ffi::cudaMemcpyAsync(
                 dst.as_mut_ptr() as *mut c_void,

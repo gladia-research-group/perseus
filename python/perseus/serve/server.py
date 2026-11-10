@@ -15,12 +15,12 @@ import os
 import time
 import traceback
 
-from . import accept, listen
+from . import accept, listen, private_dir
 
 
 def serve_one(addr: str, handler, work_dir: str, log=print) -> dict:
     """Serve one client session on `addr` to its bye; returns the transport counters."""
-    os.makedirs(work_dir, exist_ok=True)
+    private_dir(work_dir)
     srv = listen(addr)
     log(f"[serve] listening on {addr}")
     conn = accept(srv)

@@ -59,7 +59,8 @@ def fit_silu(gmax, safety, d1, d2):
 def fit_norm(ms, absmax, eps, a):
     """ms, absmax: per-token mean(x^2) and max|x| over positions >= 1."""
     import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "utils"))
+    from perseus._paths import ASSETS
+    sys.path.insert(0, str(ASSETS / "scripts" / "utils"))
     from refit_norm_cheb import fit_site
     c = a.center_target / float(absmax.max() * a.norm_absmax_margin)
     c2 = c * c
@@ -139,7 +140,8 @@ def fit_softmax_llama(rows, row_q, T, knobs, safety=2.0, target=1e-5, max_iters=
 
 def softmax_knobs():
     from omegaconf import OmegaConf
-    p = os.path.join(os.path.dirname(__file__), "..", "..", "perseus", "configs", "approximation", "gpt2.yaml")
+    from perseus._paths import PKG
+    p = PKG / "configs" / "approximation" / "gpt2.yaml"
     return OmegaConf.load(p).softmax
 
 

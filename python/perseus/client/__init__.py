@@ -38,7 +38,7 @@ class Remote:
     def __init__(self, addr: str, client: Client, work_dir: str, log=print):
         from perseus import serve
         self.client, self.work_dir, self.log = client, work_dir, log
-        os.makedirs(work_dir, exist_ok=True)
+        serve.private_dir(work_dir)
         self.conn = serve.connect(addr)
         self.spec = None
         self.stats = {}

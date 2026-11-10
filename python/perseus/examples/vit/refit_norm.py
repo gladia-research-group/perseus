@@ -15,7 +15,8 @@ import numpy as np
 
 
 def _fit_module():
-    path = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "utils", "refit_norm_cheb.py")
+    from perseus._paths import ASSETS
+    path = ASSETS / "scripts" / "utils" / "refit_norm_cheb.py"
     spec = importlib.util.spec_from_file_location("refit_norm_cheb", path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)

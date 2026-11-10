@@ -140,8 +140,15 @@ pub struct SpruReq {
 }
 
 impl SpruReq {
+    /// Fewest blocks a client generates a block key for (the shipped route's h): the key has (h - 1) log2(N / h)
+    /// bits of entropy, so a server asking for fewer could search it and recover the dense secret from the atob key.
+    pub const H_MIN: usize = 64;
+
     pub fn check(&self, ring_n: usize) -> Result<()> {
-        let ok = self.h >= 2 && self.h.is_power_of_two() && self.n == 2 && ring_n % self.h == 0 && (ring_n / self.h) % (2 * self.n) == 0;
+        if self.h < Self::H_MIN {
+            return Err(Error::Spec(format!("SPRU h = {} is below the {} blocks the block key's security needs", self.h, Self::H_MIN)));
+        }
+        let ok = self.h.is_power_of_two() && self.n == 2 && ring_n % self.h == 0 && (ring_n / self.h) % (2 * self.n) == 0;
         if !ok {
             return Err(Error::Spec(format!("SPRU h = {} must be a power of two dividing N/{}", self.h, 2 * self.n)));
         }

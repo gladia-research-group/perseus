@@ -361,10 +361,16 @@ pub fn ksk_expand_row(seed: &KskSeed, digit: u32, modulus: u64, word_bits: u32, 
 // ------------------------------------------------------------------------------------------------------------------
 
 /// The secret: dense uniform-ternary `s` (main key) and the sparse encapsulation key (HWT h = 32).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretKey {
     pub s: Vec<i8>,
     pub s_sparse: Vec<i8>,
+}
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(..)")
+    }
 }
 
 impl SecretKey {

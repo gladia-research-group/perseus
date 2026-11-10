@@ -361,7 +361,8 @@ pub(crate) struct Dev {
 impl Drop for Dev {
     fn drop(&mut self) {
         // nothing in flight may still read or write the arena when it is freed
-        let _ = self.st.get_mut().ex.compute.sync();
+        let ex = &self.st.get_mut().ex;
+        let _ = (ex.compute.sync(), ex.aux.sync(), ex.side.sync(), ex.copy.sync());
     }
 }
 
@@ -872,6 +873,9 @@ impl BundleParts {
         if k != cs.k() || rows != ctx.lay.nq || (nf / cs.meta.nf - 1.0).abs() > 1e-12 {
             return Err(PyValueError::new_err(format!("key bundle: SPRU key ciphertexts {k} x {rows} rows at scale {nf:e}; the route takes {} x {} at {:e}", cs.k(), ctx.lay.nq, cs.meta.nf)));
         }
+        if cs_words.len() != k * 2 * rows * n {
+            return Err(PyValueError::new_err(format!("key bundle: SPRU key ciphertexts of {} words", cs_words.len())));
+        }
         let ids: Vec<usize> = (0..rows).collect();
         for c in 0..k {
             for part in 0..2 {
@@ -935,20 +939,22 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
             }
             Entry::SpruCs { k, rows, nf, .. } => parts.spru_cs = Some((*k, *rows, *nf, words)),
             Entry::Pcmm { t, primes, split, fwd, back, pack, .. } => {
-                let (f, rest) = words.split_at(*fwd);
-                let (b, p) = rest.split_at(*back);
+                let sizes = || PyValueError::new_err(format!("key bundle: pcmm t = {t} sizes"));
+                let (f, rest) = words.split_at_checked(*fwd).ok_or_else(sizes)?;
+                let (b, p) = rest.split_at_checked(*back).ok_or_else(sizes)?;
                 if p.len() != *pack {
-                    return Err(PyValueError::new_err(format!("key bundle: pcmm t = {t} sizes")));
+                    return Err(sizes());
                 }
                 let shape = pc_core::pcmm_keys::Shape::new(*t).map_err(|x| e(x.into()))?;
                 parts.pcmm.push(pc_core::pcmm_keys::PcmmKeys { shape, primes: *primes, split: *split, fwd: f.to_vec(), back: b.to_vec(), pack: p.to_vec() });
             }
             Entry::Ccmm { primes, fwd, back, autos, rlk, .. } => {
-                let (f, r1) = words.split_at(*fwd);
-                let (b, r2) = r1.split_at(*back);
-                let (au, rl) = r2.split_at(*autos);
+                let sizes = || PyValueError::new_err("key bundle: ccmm sizes");
+                let (f, r1) = words.split_at_checked(*fwd).ok_or_else(sizes)?;
+                let (b, r2) = r1.split_at_checked(*back).ok_or_else(sizes)?;
+                let (au, rl) = r2.split_at_checked(*autos).ok_or_else(sizes)?;
                 if rl.len() != *rlk {
-                    return Err(PyValueError::new_err("key bundle: ccmm sizes"));
+                    return Err(sizes());
                 }
                 parts.ccmm = Some(pc_core::ccmm_keys::CcmmKeys::from_arrays(primes, f.to_vec(), b.to_vec(), au.to_vec(), rl.to_vec()).map_err(|x| e(x.into()))?);
             }
@@ -1245,6 +1251,9 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     if let (Some(pk), Some(b)) = (enc.pk.as_mut(), bundle.as_mut()) {
         let words = b.pk.take().ok_or_else(|| PyValueError::new_err("key bundle: no public key (the server encrypts public values with it)"))?;
         let nq = chain.q.len();
+        if words.len() != 2 * nq * n {
+            return Err(PyValueError::new_err(format!("key bundle: public key of {} words", words.len())));
+        }
         let rows: Vec<usize> = (0..nq).collect();
         for part in 0..2 {
             pk.buf.upload_rows(&ex.compute, 0, part, &rows, &words[part * nq * n..(part + 1) * nq * n]).map_err(e)?;
@@ -1748,6 +1757,9 @@ impl PySession {
         let mut st = self.dev.st.borrow_mut();
         let pl = st.planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
         let want = pl.streams.rows.get(name).copied().ok_or_else(|| PyValueError::new_err(format!("stream_weights: {name} not declared in Session(streams=...)")))?;
+        if pl.streams.pinned.contains_key(name) {
+            return Err(PyValueError::new_err(format!("stream_weights: {name} is already registered")));
+        }
         let n = self.dev.n();
         if buf.item_count() != want * n || !buf.is_c_contiguous() {
             return Err(PyValueError::new_err(format!("stream_weights {name}: {} floats (C-contiguous {}), declared {want} rows of {n}", buf.item_count(), buf.is_c_contiguous())));

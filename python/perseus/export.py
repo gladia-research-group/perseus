@@ -207,7 +207,7 @@ def load_trained_backbone(model, checkpoint):
     import torch
 
     path = _resolve_checkpoint(checkpoint)
-    ck = torch.load(path, map_location="cpu", weights_only=False)
+    ck = torch.load(path, map_location="cpu", weights_only=True)
     sd = ck.get("model_state_dict", ck)
     ref = model.state_dict()
     square = SQUARE_LINEAR.get(model.config.model_type, ())

@@ -35,7 +35,7 @@ pub fn write_words<Wr: Write>(w: &mut Wr, words: &[u32]) -> Result<()> {
 }
 
 pub fn read_words<R: Read>(r: &mut R, n: usize) -> Result<Vec<u32>> {
-    let mut bytes = vec![0u8; n * 4];
+    let mut bytes = vec![0u8; n.checked_mul(4).ok_or_else(|| Error::Wire(format!("{n} words")))?];
     r.read_exact(&mut bytes)?;
     Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
@@ -211,7 +211,7 @@ impl<R: Read + Seek> BundleReader<R> {
         let mut offsets = Vec::with_capacity(header.entries.len());
         for e in &header.entries {
             offsets.push(off);
-            off += 4 * e.words() as u64 + 8;
+            off = (e.words() as u64).checked_mul(4).and_then(|b| off.checked_add(b + 8)).ok_or_else(|| Error::Wire(format!("entry of {} words", e.words())))?;
         }
         let end = r.seek(SeekFrom::End(0))?;
         if end != off {

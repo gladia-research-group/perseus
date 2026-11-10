@@ -74,7 +74,8 @@ def ln_fit(lo, hi, scale, target, max_deg=31, max_nr=7):
 
 
 def main(argv=None):
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts", "utils"))
+    from perseus._paths import ASSETS
+    sys.path.insert(0, str(ASSETS / "scripts" / "utils"))
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default=BASE)
     ap.add_argument("--out", required=True)
