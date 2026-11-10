@@ -144,9 +144,10 @@ def client_main(a):
     gt = oracle_io.read_lm_head_steps(oc)
     d = Dims.gpt2()
     vocab = weights.vocab_size(weights.RawStore(a.weights))
-    contract = contract_hash(_config(a.plan, a.chain))
+    cfg = _config(a.plan, a.chain)
+    contract = contract_hash(cfg)
     t0 = time.time()
-    cl = Client(ClientSecret.generate(), complex=True)
+    cl = Client(ClientSecret.generate(), chain=cfg["chain.preset"] or "n32", complex=True)
     remote = Remote(a.addr, cl, os.path.join(a.work_dir, "client"))
     man = remote.handshake(contract, tokens=len(rows), argmax=a.argmax)
     level = man["input"]["level"]

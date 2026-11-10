@@ -91,7 +91,7 @@ def _server(addr, a, model, toks, gt, ref, results=None):
             c_unit, err = float(ah["c_unit"]), float(ah["err"])
             sess.ccmm_set(c_unit, *self.ccmm_kappa)
             land = (int(ys[0].level), int(ys[0].deg))
-            fake_land = int(os.environ.get("PF_CCMM_FAKE_LAND", "28"))
+            fake_land = CC.fake_landing(getattr(getattr(self.model, "inf", None), "fhe", None))
             self.ccmm_cal = {"c_unit": c_unit, "nf_ref": nf_ref, "nf_split": nf_split, "probe_rel_err": err, "land": land, "s": time.time() - t0}
             self.log(f"[ccmm] calibrated by the client: c_unit {c_unit:.6g} (probe rel. err {err:.2e}), landing {land}, {time.time() - t0:.1f} s")
             if land[0] != fake_land:
@@ -154,10 +154,11 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     from perseus.examples.llama.prefill import plain_logits, report
     from perseus.impl import ccmm as CC
     from perseus.impl.blocked import decrypt_blocked
+    from perseus.impl.prefill import Chunks
     cfg = RP._plan_config(a.plan)
     cfg["exec.use_graphs"] = bool(a.graphs)
     t0 = time.time()
-    cl = Client(ClientSecret.generate(), complex=True)
+    cl = Client(ClientSecret.generate(), chain=cfg["chain.preset"] or "n32", complex=True)
     remote = Remote(addr, cl, os.path.join(_work_dir(), "client"))
 
     asked = []
@@ -204,14 +205,16 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     hid = decrypt_blocked(shim, [vals[g * Bk.K:(g + 1) * Bk.K] for g in range(len(vals) // Bk.K)], ch, Bk,
                           model.rt.dims.dim)[:a.tokens]
     dec_s = time.time() - td
-    rows_, s = report(plain_logits(model, hid), gt[1:a.tokens + 1])
+    # PF_LAST_QUERY: the last position alone is computed past the last block's K / V (as run_prefill reports)
+    lo = len(hid) - 1 if model.last_position(Chunks(len(hid), model.blocks.t)) is not None else 0
+    rows_, s = report(plain_logits(model, hid[lo:]), gt[1 + lo:1 + len(hid)])
     remote.close()
     summ = {"T": a.tokens, "server_wall": h["wall"], "server_host_s": h["host_s"], "served": h["served"],
             "import_s": h["import_s"], "export_s": h["export_s"], "encrypt_s": enc_s, "roundtrip_s": rt_s,
             "decrypt_s": dec_s, **s, "keygen": kg, "client_wall_s": time.time() - t0}
     print("[client] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows_), flush=True)
     print(f"[client] SUMMARY T={a.tokens} server wall={h['wall']:.2f}s per_token={h['wall'] / a.tokens:.3f}s "
-          f"top1={s.get('top1')}/{a.tokens} medianKL={s.get('medianKL', float('nan')):.4g} maxKL={s.get('maxKL', float('nan')):.4g} "
+          f"top1={s.get('top1')}/{s['n']} medianKL={s.get('medianKL', float('nan')):.4g} maxKL={s.get('maxKL', float('nan')):.4g} "
           f"encrypt {enc_s:.2f}s roundtrip {rt_s:.2f}s decrypt+head {dec_s:.2f}s", flush=True)
     if out_path:
         with open(out_path, "w") as f:
