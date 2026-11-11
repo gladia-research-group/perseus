@@ -154,6 +154,7 @@ fn test_spec() -> KeySetSpec {
         conj: true,
         rots: vec![RotSpec { step: 1, q_top: None }, RotSpec { step: -3, q_top: None }, RotSpec { step: 5, q_top: Some(21) }],
         encaps: true,
+        lean: None,
     }
 }
 

@@ -1,6 +1,7 @@
 // Batched fast base conversion (bconv.cuh, BconvArgs): per job, y_i = x_i pre_i mod s_i, out_t = sum_i y_i M[i][t]
 // mod t, the exact jobs' correction from the FMA double estimate in source order (one fused multiply-add per source,
-// as the device's __fma_rn chain). One task per (job, block of coefficients); rows through the vector primitives.
+// as the device's __fma_rn chain), or from the integer one (exact == 2). One task per (job, block of coefficients);
+// rows through the vector primitives.
 use crate::arith::Hw;
 use crate::launch;
 use crate::raw::{buf, el, par_for};
@@ -42,7 +43,23 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                 }
                 let rb = (base + rbw * std::mem::size_of::<W>()) as *const f64;
                 let mut vd = buf::<f64>(BLK);
-                for i in 0..ns {
+                u.fill(0);
+                for i in 0..if j.exact == 2 { ns } else { 0 } {
+                    // SAFETY: ns 64-bit reciprocals in the pool
+                    let rc = unsafe { *(rb as *const u64).add(i) };
+                    let yi = &y[i * BLK..(i + 1) * BLK];
+                    if W::BITS < 64 {
+                        for (f, &yv) in u.iter_mut().zip(yi) {
+                            *f += yv.u64() * rc;
+                        }
+                    } else {
+                        let sh = 68 - pr(pool(sprime + i).u64() as usize).p.leading_zeros();
+                        for (f, &yv) in u.iter_mut().zip(yi) {
+                            *f += ((yv.u64() as u128 * rc as u128) >> sh) as u64;
+                        }
+                    }
+                }
+                for i in 0..if j.exact == 2 { 0 } else { ns } {
                     // SAFETY: ns doubles in the pool
                     let r = unsafe { *rb.add(i) };
                     let yi = &y[i * BLK..(i + 1) * BLK];
@@ -56,11 +73,16 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                     }
                 }
                 for (uc, &d) in u.iter_mut().zip(vd.iter()) {
-                    *uc = (d + 0.5).floor() as u64;
+                    *uc = if j.exact == 2 { (*uc + (1 << 58)) >> 59 } else { (d + 0.5).floor() as u64 };
                 }
                 bmod_off = (rbw * std::mem::size_of::<W>() + ns * 8) / std::mem::size_of::<W>();
             }
             let mut r = buf::<W>(BLK);
+            if j.exact == 2 {
+                for (rc, &uc) in r.iter_mut().zip(u.iter()) {
+                    *rc = W::from_u64(uc);
+                }
+            }
             for tt in 0..nt {
                 let q = pr(pool(tprime + tt).u64() as usize);
                 let p = W::from_u64(q.p);
@@ -70,8 +92,11 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                 }
                 // SAFETY: target row inside the launch's output
                 let o = unsafe { std::slice::from_raw_parts_mut((a.dst as *mut W).add((j.dst_off as usize + pool(trow + tt).u64() as usize) * N + c0), BLK) };
+                if j.exact == 2 {
+                    v::mac_s::<W>(&mut acc, &r, el::<W>(a.pool, bmod_off + tt));
+                }
                 v::reduce::<W>(&acc, q, o);
-                if j.exact != 0 {
+                if j.exact == 1 {
                     let bm = el::<W>(a.pool, bmod_off + tt);
                     for (c, oc) in o.iter_mut().enumerate() {
                         r[c] = W::reduce(W::wmul(W::from_u64(u[c]), bm), q);

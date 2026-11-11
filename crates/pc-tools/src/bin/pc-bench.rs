@@ -256,7 +256,7 @@ fn run_t<W: pc_gpu::context::DevWord, M: pc_gpu::context::DevStrategy<W>>(a: Arg
             }
         }
     }
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
     println!("[pc-bench] host plan {:.1} s: {} rotation keys, EvalMod buffers {}", t0.elapsed().as_secs_f64(), steps.len(), plan.variants[0].em_slots);
     let dev = Device::open()?;
     let cfg = MemCfg { k_max: kmax, pool: vec![PoolClass { k: 1, count: 1 }], events: 64, scratch_cts: 2 };

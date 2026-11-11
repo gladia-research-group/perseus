@@ -77,11 +77,24 @@ pub struct PyKeySource {
     pub conj: bool,
     pub layout: String,
     pub band: Option<usize>,
+    /// rotation steps whose keys are banded to `low_band` instead of `band` (their own session-wide table)
+    pub low_steps: Vec<i64>,
+    pub low_band: Option<usize>,
     pub seed: Option<u64>,
     /// a client's secret (`ClientSecret.to_bytes()`): the device generates its keys from it (tests)
     pub secret: Option<Vec<u8>>,
     /// the encapsulation keys without a bootstrap route: `export_ct(..., sparse=True)` switches to the sparse secret
     pub sparse_out: bool,
+    /// an eager set for ciphertexts at or below `band` (`KeySetSpec::lean`): relin / conj banded too, no
+    /// sparse -> dense key, no public key in the bundle (the session cannot encrypt)
+    pub lean: bool,
+}
+
+impl PyKeySource {
+    /// `low_steps` normalized mod N/2.
+    pub(crate) fn low_set(&self, half: i64) -> BTreeSet<i64> {
+        self.low_steps.iter().map(|s| s.rem_euclid(half)).filter(|&s| s != 0).collect()
+    }
 }
 
 #[pymethods]
@@ -94,13 +107,23 @@ impl PyKeySource {
     /// generate from instead of a fresh one (tests comparing device keys with a client's).
     #[staticmethod]
     /// `sparse_out`: the dense -> sparse encapsulation keys even without a bootstrap route (`export_ct(..., sparse=True)`).
-    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None, sparse_out=false))]
+    /// `lean`: every key banded to `band` (relin and conj too), only the dense -> sparse encapsulation key, no public
+    /// key: an eager session over ciphertexts at or below `band` that never bootstraps nor encrypts.
+    /// `low_steps`, `low_band`: the steps of `rot_steps` rotated only at or below the lower top limb `low_band`,
+    /// their keys banded there (a `LowP` chain: over that tier's special primes).
+    #[pyo3(signature = (rot_steps, groups=Vec::new(), conj=true, layout="dense", band=None, seed=None, secret=None, sparse_out=false, lean=false, low_steps=Vec::new(), low_band=None))]
     #[allow(clippy::too_many_arguments)]
-    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>, sparse_out: bool) -> PyResult<Self> {
+    fn generate(rot_steps: Vec<i64>, groups: Vec<Vec<i64>>, conj: bool, layout: &str, band: Option<usize>, seed: Option<u64>, secret: Option<Vec<u8>>, sparse_out: bool, lean: bool, low_steps: Vec<i64>, low_band: Option<usize>) -> PyResult<Self> {
         if layout != "dense" && layout != "packed" {
             return Err(PyValueError::new_err(format!("KeySource.layout = {layout:?}: dense | packed")));
         }
-        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, seed, secret, sparse_out })
+        if lean && band.is_none() {
+            return Err(PyValueError::new_err("KeySource(lean=True) needs a band"));
+        }
+        if low_steps.is_empty() != low_band.is_none() || low_band.zip(band).is_some_and(|(l, b)| l >= b) {
+            return Err(PyValueError::new_err("KeySource: low_steps come with a low_band below band"));
+        }
+        Ok(PyKeySource { rot_steps, groups, conj, layout: layout.to_string(), band, low_steps, low_band, seed, secret, sparse_out, lean })
     }
     #[getter]
     fn rot_steps(&self) -> Vec<i64> {
@@ -128,6 +151,10 @@ pub(crate) struct Sizes {
     /// `import_ct(..., low=True)`, each slot only `rows` Q rows long.
     pub low_pool: usize,
     pub low_rows: usize,
+    /// A second class of low slots (`size={"lowPool2": count, "lowRows2": rows}`), e.g. taller than the first
+    /// class for `Fhe.mod_raise(..., low=True)`; a low ciphertext takes the smallest free class that holds its rows.
+    pub low_pool2: usize,
+    pub low_rows2: usize,
     /// Seeded low slots (`size={"lowSeeded": count}`, of `lowRows` rows): c0 and its rows' c1 seeds, half a low slot;
     /// `import_ct(..., low=True, regen=True)` fills them and `mult_sum_many` draws c1 from the seeds.
     pub low_seeded: usize,
@@ -137,6 +164,9 @@ pub(crate) struct Sizes {
     /// Per-user result keys (`size={"userKeys": count}`): bottom-level master -> user switching keys, filled at run
     /// time (`Session.add_user`) and used by `export_ct_many(..., user=)`.
     pub user_keys: usize,
+    /// Ciphertexts per key-switching launch (`size={"kMax": k}`, default 8): the K-batching bound sizing the
+    /// key-switching workspace, the plans and the row tables (`MemCfg::k_max`).
+    pub k_max: usize,
 }
 
 /// The model geometry the impl layer reads as `inf.size` (`Dims.from_inf`).
@@ -338,6 +368,9 @@ pub(crate) struct Named {
 pub(crate) struct Groups {
     pub all: Option<KeyGroup<'static>>,
     pub steps: BTreeSet<i64>,
+    /// `KeySource.low_steps` and their keys' table (banded lower than the others: a table of their own).
+    pub low: Option<KeyGroup<'static>>,
+    pub low_steps: BTreeSet<i64>,
     pub exact: BTreeMap<Vec<i64>, KeyGroup<'static>>,
     pub relin: KeyGroup<'static>,
     pub conj: Option<KeyGroup<'static>>,
@@ -358,10 +391,13 @@ impl RotKeys for Groups {
         if let Some(g) = self.exact.get(steps) {
             return Some(g);
         }
-        if steps.iter().all(|&s| self.has_step(s)) {
-            return self.all.as_ref();
+        // the low-banded steps have their own table (step 0 goes with either)
+        let low = |s: &&i64| self.low_steps.contains(&s.rem_euclid(self.half));
+        match steps.iter().filter(low).count() {
+            0 if steps.iter().all(|&s| self.has_step(s)) => self.all.as_ref(),
+            k if k > 0 && k == steps.iter().filter(|s| s.rem_euclid(self.half) != 0).count() => self.low.as_ref(),
+            _ => None,
         }
-        None
     }
 }
 
@@ -771,10 +807,16 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
         needs = Some(rn);
     }
     steps.remove(&0);
-    let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { ks.band } }).collect();
+    let low = ks.low_set(half);
+    let band = |step: &i64| if low.contains(step) { ks.low_band } else { ks.band };
+    let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { band(&step) } }).collect();
     let steps: BTreeSet<i64> = steps.union(&full).copied().collect();
     // the StC-first route's raise needs the encapsulation keys too (a dense-only plan has no other route that does)
-    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: ks.sparse_out || !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
+    if ks.lean && (plan.is_some() || pcmm.is_some() || ccmm.is_some()) {
+        return Err(PyValueError::new_err("KeySource(lean=True): an eager session (no programs, PCMM or CCMM)"));
+    }
+    let lean = if ks.lean { ks.band } else { None };
+    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: ks.sparse_out || !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some(), lean };
     let mut shapes: Vec<_> = spec.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     if spru_cfg.is_some() {
         shapes.push(KskShape::bottom(chain).map_err(e)?);
@@ -816,7 +858,7 @@ fn manifest(cfg: &pc_config::Config, chain: &Chain, nd: &Needs, pcmm: &Option<cr
         spru,
         pcmm_t: pcmm.as_ref().map(|p| p.ts()).unwrap_or_default(),
         ccmm,
-        public_key: true,
+        public_key: nd.spec.lean.is_none(),
     })
 }
 
@@ -864,13 +906,9 @@ impl BundleParts {
     }
 }
 
-/// Import a client's key bundle: header against the request (chain, params, contract, exactly the requested keys),
-/// every key-set key into its carved slot (`import_packed`), the rest kept for the routes and services.
-fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain, s: &pc_cuda::Stream<pc_cuda::Compute>, keys: &mut KeySet<'static, W>) -> PyResult<BundleParts> {
-    use pc_client::{Entry, Role as R};
-    let e = gerr;
-    let mut rd = pc_client::BundleReader::open(path).map_err(cerr)?;
-    let h = rd.header.clone();
+/// A bundle's header against a session's key request: chain, params, plan contract, exactly the requested keys.
+fn check_bundle(h: &pc_client::wire::BundleHeader, req: &pc_client::KeySpec, chain: &Chain) -> PyResult<()> {
+    use pc_client::Entry;
     if h.chain != req.chain || h.params_hash != req.params_hash || h.n != chain.n {
         return Err(PyValueError::new_err(format!("key bundle for chain {} ({}, n {}); this session runs {} ({})", h.chain, h.params_hash, h.n, req.chain, req.params_hash)));
     }
@@ -883,6 +921,38 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
         let extra: Vec<_> = have.iter().filter(|k| !req.keys.contains(k)).take(4).collect();
         return Err(PyValueError::new_err(format!("key bundle keys differ from the session's request ({} vs {}): missing {miss:?}, unexpected {extra:?}", have.len(), req.keys.len())));
     }
+    Ok(())
+}
+
+/// The carved slot of key-set key `key` (a bundle entry), its shape checked.
+fn ksk_slot<'k>(keys: &'k mut KeySet<'static, W>, key: &pc_client::KeyReq, half: i64) -> PyResult<&'k mut pc_gpu::keys::DevKsk<'static, W>> {
+    use pc_client::Role as R;
+    let slot = match key.role {
+        R::Relin => keys.relin.as_mut(),
+        R::Conj => keys.conj.as_mut(),
+        R::Rot { step, .. } => keys.rots.get_mut(&step.rem_euclid(half)),
+        R::EncDenseToSparse => match keys.bts.as_mut() {
+            Some(b) => Some(&mut b.enc_dense_to_sparse),
+            None => keys.export.as_mut(),
+        },
+        R::EncSparseToDense => keys.bts.as_mut().map(|b| &mut b.enc_sparse_to_dense),
+        R::SpruAtob | R::Auto { .. } => None,
+    };
+    let k = slot.ok_or_else(|| PyValueError::new_err(format!("key bundle: no carved key for {:?}", key.role)))?;
+    if shape_req(&k.shape) != key.shape {
+        return Err(PyValueError::new_err(format!("key bundle: {:?} of shape {:?}, the session carved {:?}", key.role, key.shape, k.shape)));
+    }
+    Ok(k)
+}
+
+/// Import a client's key bundle: header against the request (chain, params, contract, exactly the requested keys),
+/// every key-set key into its carved slot (`import_packed`), the rest kept for the routes and services.
+fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain, s: &pc_cuda::Stream<pc_cuda::Compute>, keys: &mut KeySet<'static, W>) -> PyResult<BundleParts> {
+    use pc_client::{Entry, Role as R};
+    let e = gerr;
+    let mut rd = pc_client::BundleReader::open(path).map_err(cerr)?;
+    let h = rd.header.clone();
+    check_bundle(&h, req, chain)?;
     let mut parts = BundleParts { spru_atob: None, spru_auto: None, spru_cs: None, pcmm: vec![], ccmm: None, pk: None, bits: h.bits, row_words: h.row_words };
     let half = (chain.n / 2) as i64;
     for (i, ent) in h.entries.iter().enumerate() {
@@ -890,12 +960,7 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
         match ent {
             Entry::Ksk { key, seed, .. } => {
                 let seed = pc_core::keys::KskSeed(*seed);
-                let slot = match key.role {
-                    R::Relin => keys.relin.as_mut(),
-                    R::Conj => keys.conj.as_mut(),
-                    R::Rot { step, .. } => keys.rots.get_mut(&step.rem_euclid(half)),
-                    R::EncDenseToSparse => keys.bts.as_mut().map(|b| &mut b.enc_dense_to_sparse),
-                    R::EncSparseToDense => keys.bts.as_mut().map(|b| &mut b.enc_sparse_to_dense),
+                match key.role {
                     R::SpruAtob => {
                         parts.spru_atob = Some((seed, words));
                         continue;
@@ -904,11 +969,9 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
                         parts.spru_auto = Some((seed, words));
                         continue;
                     }
-                };
-                let k = slot.ok_or_else(|| PyValueError::new_err(format!("key bundle: no carved key for {:?}", key.role)))?;
-                if shape_req(&k.shape) != key.shape {
-                    return Err(PyValueError::new_err(format!("key bundle: {:?} of shape {:?}, the session carved {:?}", key.role, key.shape, k.shape)));
+                    _ => {}
                 }
+                let k = ksk_slot(keys, key, half)?;
                 pc_gpu::keys::import_packed(k, s, chain, seed, h.bits, h.row_words, &words).map_err(e)?;
             }
             Entry::SpruCs { k, rows, nf, .. } => parts.spru_cs = Some((*k, *rows, *nf, words)),
@@ -997,6 +1060,47 @@ fn reg_layouts(lay: pc_gpu::Layout, ps: &PlanSpec) -> PyResult<Vec<pc_gpu::Layou
         .collect()
 }
 
+/// The key-switching tables of key set `keys` (`Groups`): the shared rotation group, `KeySource.groups`' exact ones,
+/// relinearization, conjugation, the dense -> sparse export key. Pointers only: valid before the keys are filled.
+fn build_groups(a: &'static Arena, s: &pc_cuda::Stream<pc_cuda::Compute>, n: usize, ks: &PyKeySource, keys: &KeySet<'static, W>, steps: &BTreeSet<i64>, stage: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>) -> PyResult<Groups> {
+    let e = gerr;
+    let half = (n / 2) as i64;
+    let low_steps = ks.low_set(half);
+    let mut rot_refs: Vec<&dyn KsKeyRef> = keys.rots.iter().filter(|(s, _)| !low_steps.contains(s)).map(|(_, k)| k as &dyn KsKeyRef).collect();
+    let low_refs: Vec<&dyn KsKeyRef> = keys.rots.iter().filter(|(s, _)| low_steps.contains(s)).map(|(_, k)| k as &dyn KsKeyRef).collect();
+    let low = if low_refs.is_empty() { None } else { Some(KeyGroup::new(a, s, n, &low_refs, stage).map_err(e)?) };
+    // conj joins the shared group when it shares the rotations' digit layout (banded rotations do not); `conjugate`
+    // reads its own group either way
+    if let Some(c) = keys.conj.as_ref() {
+        if rot_refs.first().is_none_or(|r| r.digit_stride() == KsKeyRef::digit_stride(c) && r.dnum() == KsKeyRef::dnum(c)) {
+            rot_refs.push(c);
+        }
+    }
+    let all = if rot_refs.is_empty() { None } else { Some(KeyGroup::new(a, s, n, &rot_refs, stage).map_err(e)?) };
+    let mut exact = BTreeMap::new();
+    for g in &ks.groups {
+        let refs = g
+            .iter()
+            .filter(|s| s.rem_euclid(half) != 0)
+            .map(|&s| keys.rot(s).map(|k| k as &dyn KsKeyRef))
+            .collect::<pc_gpu::Result<Vec<_>>>()
+            .map_err(e)?;
+        if !refs.is_empty() {
+            exact.insert(g.clone(), KeyGroup::new(a, s, n, &refs, stage).map_err(e)?);
+        }
+    }
+    let relin = KeyGroup::new(a, s, n, &[keys.relin().map_err(e)? as &dyn KsKeyRef], stage).map_err(e)?;
+    let conj = match keys.conj.as_ref() {
+        Some(c) => Some(KeyGroup::new(a, s, n, &[c as &dyn KsKeyRef], stage).map_err(e)?),
+        None => None,
+    };
+    let d2s = match (ks.sparse_out, keys.bts.as_ref().map(|b| &b.enc_dense_to_sparse).or(keys.export.as_ref())) {
+        (true, Some(k)) => Some(KeyGroup::new(a, s, n, &[k as &dyn KsKeyRef], stage).map_err(e)?),
+        _ => None,
+    };
+    Ok(Groups { all, steps: steps.clone(), low, low_steps, exact, relin, conj, d2s, half })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Sizes, geometry: Geometry, debug_refresh: bool, plan: Option<PlanSpec>, pcmm: Option<crate::pcmm::PcmmPlan>, ccmm: Option<crate::matmul::CcmmPlan>, tfhe: Option<crate::tfhe::TfhePlan>) -> PyResult<Dev> {
     let t0 = std::time::Instant::now();
@@ -1007,13 +1111,15 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let device = Device::open().map_err(|x| e(x.into()))?;
     let chain = crate::shadow::chain_of(cfg)?;
     let n = chain.n;
-    let half = (n / 2) as i64;
-    let k_max = 8;
+    let k_max = sizes.k_max.max(1);
     let mcfg = MemCfg { k_max, pool: vec![PoolClass { k: 1, count: sizes.pool }], events: 64, scratch_cts: 2 };
     let mut mplan = MemPlan::build::<W, M>(&chain, mcfg).map_err(e)?;
     let lay = mplan.lay;
     if sizes.low_pool > 0 {
         mplan.reserve("ct_low", CtPool::<W>::low_bytes(&lay, sizes.low_pool, sizes.low_rows, false, false));
+    }
+    if sizes.low_pool2 > 0 {
+        mplan.reserve("ct_low2", CtPool::<W>::low_bytes(&lay, sizes.low_pool2, sizes.low_rows2, false, false));
     }
     if sizes.low_packed && chain.q.iter().take(sizes.low_rows).any(|&p| p >> pc_kernels::PACK_BITS != 0) {
         return Err(PyValueError::new_err(format!("size lowPacked: the primes of rows 0..{} need more than {} bits", sizes.low_rows, pc_kernels::PACK_BITS)));
@@ -1035,7 +1141,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     }
     let nrot = steps.len() + ks.conj as usize;
-    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + (2 + ks.sparse_out as usize) * KeyGroup::bytes(1, true);
+    let gb: usize = ks.groups.iter().map(|g| KeyGroup::bytes(g.len().max(1), true)).sum::<usize>() + KeyGroup::bytes(nrot.max(1), true) + KeyGroup::bytes(ks.low_steps.len().max(1), true) + (2 + ks.sparse_out as usize) * KeyGroup::bytes(1, true);
     mp.reserve("ks.groups", gb);
     if sizes.user_keys > 0 {
         let sh = pc_gpu::keys::KskShape::bottom(&chain).map_err(e)?;
@@ -1154,6 +1260,9 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     if sizes.low_pool > 0 {
         pool.add_low(a, &lay, sizes.low_pool, sizes.low_rows, false, false).map_err(e)?;
     }
+    if sizes.low_pool2 > 0 {
+        pool.add_low(a, &lay, sizes.low_pool2, sizes.low_rows2, false, false).map_err(e)?;
+    }
     if sizes.low_seeded > 0 {
         pool.add_low(a, &lay, sizes.low_seeded, sizes.low_rows, true, sizes.low_packed).map_err(e)?;
     }
@@ -1194,39 +1303,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     };
     let keygen_s = tk.elapsed().as_secs_f64();
     let stage = ex.ks.stage_ptrs();
-    let groups = {
-        let mut rot_refs: Vec<&dyn KsKeyRef> = keys.rots.values().map(|k| k as &dyn KsKeyRef).collect();
-        // conj joins the shared group when it shares the rotations' digit layout (banded rotations do not); `conjugate`
-        // reads its own group either way
-        if let Some(c) = keys.conj.as_ref() {
-            if rot_refs.first().is_none_or(|r| r.digit_stride() == KsKeyRef::digit_stride(c) && r.dnum() == KsKeyRef::dnum(c)) {
-                rot_refs.push(c);
-            }
-        }
-        let all = if rot_refs.is_empty() { None } else { Some(KeyGroup::new(a, &ex.compute, n, &rot_refs, stage).map_err(e)?) };
-        let mut exact = BTreeMap::new();
-        for g in &ks.groups {
-            let refs = g
-                .iter()
-                .filter(|s| s.rem_euclid(half) != 0)
-                .map(|&s| keys.rot(s).map(|k| k as &dyn KsKeyRef))
-                .collect::<pc_gpu::Result<Vec<_>>>()
-                .map_err(e)?;
-            if !refs.is_empty() {
-                exact.insert(g.clone(), KeyGroup::new(a, &ex.compute, n, &refs, stage).map_err(e)?);
-            }
-        }
-        let relin = KeyGroup::new(a, &ex.compute, n, &[keys.relin().map_err(e)? as &dyn KsKeyRef], stage).map_err(e)?;
-        let conj = match keys.conj.as_ref() {
-            Some(c) => Some(KeyGroup::new(a, &ex.compute, n, &[c as &dyn KsKeyRef], stage).map_err(e)?),
-            None => None,
-        };
-        let d2s = match (ks.sparse_out, keys.bts.as_ref()) {
-            (true, Some(b)) => Some(KeyGroup::new(a, &ex.compute, n, &[&b.enc_dense_to_sparse as &dyn KsKeyRef], stage).map_err(e)?),
-            _ => None,
-        };
-        Groups { all, steps: steps.clone(), exact, relin, conj, d2s, half }
-    };
+    let groups = build_groups(a, &ex.compute, n, ks, &keys, &steps, stage)?;
     let users = if sizes.user_keys > 0 {
         let sh = pc_gpu::keys::KskShape::bottom(&chain).map_err(e)?;
         let slots = (0..sizes.user_keys)
@@ -1244,6 +1321,10 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let ev: &'static EventPool = unsafe { &*(pt_events.as_ref() as *const EventPool) };
     let pts = PtStore::new(a, &device, &ex.compute, &ctx, ev, pcfg).map_err(e)?;
     let mut enc = Encryptor::new(a, &ex.compute, lay, secret.is_none(), &mut prng).map_err(e)?;
+    if ks.lean {
+        // a lean bundle carries no public key: the session never encrypts (encrypt_pk refuses)
+        enc.pk = None;
+    }
     if let (Some(pk), Some(b)) = (enc.pk.as_mut(), bundle.as_mut()) {
         let words = b.pk.take().ok_or_else(|| PyValueError::new_err("key bundle: no public key (the server encrypts public values with it)"))?;
         let nq = chain.q.len();
@@ -1473,7 +1554,7 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         exp_real: g("expanded", 3072),
         seq_len: g("seqLen", 1024),
     };
-    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0) };
+    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_pool2: g("lowPool2", 0), low_rows2: g("lowRows2", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0), k_max: g("kMax", 8) };
     let cfg = config.0.clone();
     let ks = keys.clone();
     let plan = match programs {

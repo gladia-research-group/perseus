@@ -66,6 +66,23 @@ pub struct ChainSpec {
     /// The lean bottom (composite chains): the base chain of the other fields with its bottom StC levels on single
     /// primes and the key-switching digits re-partitioned.
     pub lean: Option<Lean>,
+    /// Fewer special primes at the bottom (`LowP`): key switching at limb tops `<= top` over P' = the first `kp`
+    /// special primes, and every key banded there (`KeyShape::banded`) made over P' only.
+    pub low_p: Option<LowP>,
+}
+
+/// Key switching at limb tops `<= top` over the first `kp` special primes P' (`Chain::p_sparse` becomes `kp`, the
+/// bottom-shape keys use it too): the keys banded at or below `top` lose their other special rows and every switch
+/// there its ModUp / ModDown work on them. The ModDown noise scales as digit / P', so P' must cover the live part of
+/// every digit at `top` (checked). Preset suffix `/lp<kp>b<top>` (e.g. `n32/lp4b3`). For sessions that key switch at
+/// those tops eagerly (no refresh runs there); log QP (the HE-standard bound) is unchanged, each banded key's modulus
+/// Q_band x P' smaller. `under`: a second tier `(top, kp)` below the first (lower top, fewer special primes; a second
+/// suffix, e.g. `n32/lp4b3/lp2b1`): its special set becomes P' and the first tier keeps its own (`Chain::low`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LowP {
+    pub top: u32,
+    pub kp: u32,
+    pub under: Option<(u32, u32)>,
 }
 
 /// `thin` single primes kept above q0 in place of as many composite levels (the StC-first input stages run on them,
@@ -97,6 +114,7 @@ impl ChainSpec {
             word: WordId::U32,
             sizes_per_level: None,
             lean: None,
+            low_p: None,
         }
     }
     /// n32 with its bottom StC levels on 3 single primes (n32's primes 2..=4; primes 5..=7 dropped) and dnum 4: 51
@@ -119,9 +137,23 @@ impl ChainSpec {
             word: WordId::U64,
             sizes_per_level: None,
             lean: None,
+            low_p: None,
         }
     }
+    /// A preset by name, optionally with one or two `/lp<kp>b<top>` suffixes (`LowP` and its `under` tier).
     pub fn preset(name: &str) -> Result<Self> {
+        if let Some((base, opt)) = name.split_once('/') {
+            let bad = || Error::Params(format!("chain preset '{name}': suffix '/{opt}' is not lp<kp>b<top>[/lp<kp>b<top>]"));
+            let tier = |x: &str| -> Result<(u32, u32)> {
+                let (kp, top) = x.strip_prefix("lp").and_then(|x| x.split_once('b')).ok_or_else(bad)?;
+                Ok((top.parse().map_err(|_| bad())?, kp.parse().map_err(|_| bad())?))
+            };
+            let (first, under) = match opt.split_once('/') {
+                Some((a, b)) => (tier(a)?, Some(tier(b)?)),
+                None => (tier(opt)?, None),
+            };
+            return Ok(ChainSpec { low_p: Some(LowP { top: first.0, kp: first.1, under }), ..Self::preset(base)? });
+        }
         match name {
             "n32" => Ok(Self::n32()),
             "n64" => Ok(Self::n64()),
@@ -159,8 +191,11 @@ pub struct Chain {
     pub log_qp: u32,
     /// Primes per CKKS level, bottom (q0) first: `level_unit` everywhere but at a lean chain's bottom.
     pub groups: Vec<usize>,
-    /// Special primes the bottom-shape keys use (the first ones of P): all of P but on a lean chain.
+    /// Special primes the bottom-shape keys use (the first ones of P): all of P but on a lean chain (or `LowP`).
     pub p_sparse: usize,
+    /// `LowP` tiers `(top, special primes)`, lowest first: a key switch at a limb top `<= top` runs over the first
+    /// that many special primes (the lowest tier's are P', `p_sparse`).
+    pub low: Vec<(usize, usize)>,
 }
 
 /// OpenFHE AUXMODSIZE by native word.
@@ -243,6 +278,10 @@ fn estimate_log_p(
 impl Chain {
     /// ParamsGenCKKSRNSInternal (+ the HYBRID prime/partition part of PrecomputeCRTTables).
     pub fn generate(spec: &ChainSpec) -> Result<Chain> {
+        if let Some(lp) = spec.low_p {
+            let base = Chain::generate(&ChainSpec { low_p: None, ..spec.clone() })?;
+            return base.low(spec, lp);
+        }
         if let Some(lean) = spec.lean {
             let base = Chain::generate(&ChainSpec { lean: None, ..spec.clone() })?;
             return base.lean(spec, lean);
@@ -423,7 +462,35 @@ impl Chain {
             log_qp,
             groups: vec![d as usize; spec.num_levels as usize],
             p_sparse: size_p,
+            low: Vec::new(),
         })
+    }
+
+    /// `LowP` on a generated chain: the first `kp` special primes (no more than the bottom-shape keys already use)
+    /// for limb tops `<= top`, which must cover the live part of every digit there; the same for the `under` tier
+    /// below it. P' = the lowest tier's.
+    fn low(self, spec: &ChainSpec, lp: LowP) -> Result<Chain> {
+        let mut tiers = vec![(lp.top as usize, lp.kp as usize)];
+        if let Some((top, kp)) = lp.under {
+            if top >= lp.top || kp >= lp.kp {
+                return Err(Error::Params(format!("low P: the second tier ({kp} special primes at tops <= {top}) must sit below the first ({} at <= {})", lp.kp, lp.top)));
+            }
+            tiers.insert(0, (top as usize, kp as usize));
+        }
+        let lg = |xs: &[u64]| xs.iter().map(|&x| (x as f64).log2()).sum::<f64>();
+        for &(top, kp) in &tiers {
+            if kp == 0 || kp > self.p_sparse || top >= self.q.len() {
+                return Err(Error::Params(format!("low P: {kp} special primes (1..={}) at limb tops <= {top} (< {})", self.p_sparse, self.q.len())));
+            }
+            let live = self.digits.iter().map(|dg| lg(&dg.iter().filter(|&&i| i <= top).map(|&i| self.q[i]).collect::<Vec<_>>())).fold(0.0, f64::max);
+            let pb = lg(&self.p[..kp]);
+            // the switch's noise grows with digit / P': a tenth of a bit short is 7 % more (n32: p0 p1 = 55.95 bits
+            // under q0 q1 = 55.98)
+            if pb + 0.1 < live {
+                return Err(Error::Params(format!("low P: {kp} special primes ({pb:.1} bits) below the live digit at top {top} ({live:.1} bits)")));
+            }
+        }
+        Ok(Chain { spec: spec.clone(), p_sparse: tiers[0].1, low: tiers, ..self })
     }
 
     /// The lean chain of `spec` from its base chain (`Lean`): Q = q0, the first `thin` primes above it, then the base
@@ -508,6 +575,28 @@ impl Chain {
     }
     pub fn inv_roots(&self) -> Vec<u64> {
         self.primes().iter().zip(self.roots()).map(|(&p, r)| crate::modmul::invmod(r, p)).collect()
+    }
+    /// Special primes a key switch at limb top `top` runs over: its `LowP` tier's, P' (`p_sparse`) at the bottom
+    /// composite level, all of P elsewhere.
+    pub fn specials_at(&self, top: usize) -> usize {
+        if let Some(kp) = self.band_specials(top) {
+            kp
+        } else if top + 1 == self.level_unit {
+            self.p_sparse
+        } else {
+            self.p.len()
+        }
+    }
+    /// Special primes of the `LowP` tier a limb top falls in (the keys banded there are made over them only).
+    pub fn band_specials(&self, top: usize) -> Option<usize> {
+        self.low.iter().find(|&&(t, _)| top <= t).map(|&(_, kp)| kp)
+    }
+    /// The special-set sizes below all of P a key or a key switch may use: P' and the upper `LowP` tier's.
+    pub fn special_sets(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = std::iter::once(self.p_sparse).chain(self.low.iter().map(|l| l.1)).filter(|&k| k < self.p.len()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
     pub fn special_ids(&self) -> Vec<usize> {
         (self.q.len()..self.q.len() + self.p.len()).collect()

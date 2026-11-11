@@ -30,7 +30,9 @@ impl KeyShape {
             return Err(Error::Spec(format!("band top {q_top} >= Q primes {}", chain.q.len())));
         }
         let ndig = chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= q_top)).count();
-        Ok(KeyShape { q_top, ndig, nq: chain.q.len(), kp: chain.p.len() })
+        // a band at or below the `LowP` tops is made over its tier's special primes only (`Chain::band_specials`)
+        let kp = chain.band_specials(q_top).unwrap_or(chain.p.len());
+        Ok(KeyShape { q_top, ndig, nq: chain.q.len(), kp })
     }
     /// The bottom composite level only (digit 0, `level_unit` Q rows) over P' (`Chain::p_sparse`): the keys to the
     /// sparse secrets, whose modulus is q0 x P'.

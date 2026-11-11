@@ -301,7 +301,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, sizes: Sizes, geometry: Geom
         steps.extend(g.iter().map(|s| s.rem_euclid(half)));
     }
     steps.remove(&0);
-    let spec = KeySetSpec { relin: true, conj: ks.conj, rots: steps.iter().map(|&step| RotSpec { step, q_top: ks.band }).collect(), encaps: false };
+    let spec = KeySetSpec { relin: true, conj: ks.conj, rots: steps.iter().map(|&step| RotSpec { step, q_top: ks.band }).collect(), encaps: false, lean: None };
     let shapes: Vec<_> = spec.keys(&chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     plan.reserve("ks.plans", KsPlans::bytes::<W>(&chain, k_max).map_err(e)?);
     plan.reserve("keys", spec.bytes::<W>(&chain, layout).map_err(e)?);

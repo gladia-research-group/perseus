@@ -8,6 +8,13 @@ namespace bconv {
 constexpr int BX = 128;  // coefficients per block
 constexpr int TG = 32;   // targets per block (blockIdx.y)
 
+// y / b in 59 fractional bits, never above it (rc as BconvJob lays it out for exact == 2)
+template <class W>
+__device__ __forceinline__ uint64_t frac59(W y, uint64_t rc, uint64_t b) {
+    if (sizeof(W) < 8) return (uint64_t)y * rc;
+    return (uint64_t)(((unsigned __int128)y * rc) >> (68 - __clzll(b)));
+}
+
 template <class W, class MM>
 __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst,
                                                    const BconvJob* __restrict__ jobs, const W* __restrict__ pool,
@@ -51,7 +58,17 @@ __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W*
     }
     uint64_t u = 0;
     const W* bmod = nullptr;
-    if (J.exact) {
+    if (J.exact == 2) {
+        const W* rcw = M + ns * J.ntgt;
+        while ((uintptr_t)rcw & 7) ++rcw;
+        const uint64_t* rc = (const uint64_t*)rcw;
+        uint64_t f = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            if (i < ns) f += frac59<W>(y[i], rc[i], pr[sprime[i]].p);
+        u = (f + (1ull << 58)) >> 59;
+        bmod = (const W*)(rc + ns);
+    } else if (J.exact) {
         const W* rbw = M + ns * J.ntgt;
         while ((uintptr_t)rbw & 7) ++rbw;  // 8-byte aligned doubles
         const double* rb = (const double*)rbw;
@@ -81,8 +98,8 @@ __global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W*
             if (k + q4 < nt) {
                 const PrimeConst& q = pr[stp[k + q4]];
                 const W p = (W)q.p;
-                W r = MM::reduce(acc[q4], q);
-                if (J.exact) {
+                W r = MM::reduce(J.exact == 2 ? acc[q4] + (Wd)u * bmod[t0 + k + q4] : acc[q4], q);
+                if (J.exact == 1) {
                     const W sv = MM::reduce((Wd)u * bmod[t0 + k + q4], q);
                     r = sub<W>(r, sv, p);
                 }

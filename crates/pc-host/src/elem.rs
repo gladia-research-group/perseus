@@ -106,6 +106,42 @@ pub extern "C" fn ew_copy<W: Hw>(a: *const EwArgs, s: S) -> i32 {
     })
 }
 
+pub extern "C" fn ew_many<W: Hw>(a: *const EwManyArgs, s: S) -> i32 {
+    launch(a, s, |a| if a.n < 1 || a.n as usize > EWM_MAX { -1 } else { 0 }, |a| {
+        let rows = a.nrows as usize;
+        par_for(a.n as usize * rows, a, |a, t| {
+            let (j, row) = (t / rows, t % rows);
+            let p = W::from_u64(prime(a.pr, row).p);
+            let at = |b: *const std::ffi::c_void| (b as *const W).wrapping_add(row * N);
+            let (x, y, z, o) = (at(a.a[j]), at(a.b[j]), at(a.c[j]), at(a.out[j]) as *mut W);
+            row_map(o, |i| {
+                let mut v = rd(x, i);
+                if !a.b[j].is_null() {
+                    v = W::add(v, rd(y, i), p);
+                }
+                if !a.c[j].is_null() {
+                    v = W::add(v, rd(z, i), p);
+                }
+                v
+            });
+        })
+    })
+}
+
+pub extern "C" fn submul_many<W: Hw>(a: *const SubMulManyArgs, s: S) -> i32 {
+    launch(a, s, |a| if a.n < 1 || a.n as usize > EWM_MAX { -1 } else { 0 }, |a| {
+        let rows = a.nrows as usize;
+        par_for(a.n as usize * rows, a, |a, t| {
+            let (j, row) = (t / rows, t % rows);
+            let q = prime(a.pr, row);
+            let p = W::from_u64(q.p);
+            let at = |b: *const std::ffi::c_void| (b as *const W).wrapping_add(row * N);
+            let (x, y, tb, o) = (at(a.a[j]), at(a.b[j]), at(a.t), at(a.out[j]) as *mut W);
+            row_map(o, |i| W::mul(W::sub(rd(x, i), rd(y, i), p), rd(tb, i), q));
+        })
+    })
+}
+
 pub extern "C" fn pt_dot<W: Hw>(a: *const PtDotArgs, s: S) -> i32 {
     launch(a, s, |a| if a.k > 8 { -1 } else { 0 }, |a| {
         par_for(rs_len(&a.rs), a, |a, y| {
@@ -286,7 +322,8 @@ pub extern "C" fn tensor_multi<W: Hw>(a: *const TensorMultiArgs, s: S) -> i32 {
 
 pub extern "C" fn tensor_seeded<W: Hw>(a: *const TensorSeededArgs, s: S) -> i32 {
     let bad = |a: &TensorSeededArgs| {
-        std::mem::size_of::<W>() != 4 || a.nout < 1 || a.nout as usize > TSEED_OUT || a.npairs < 1 || a.npairs as usize > TSEED_PAIRS
+        // one second-operand set only on the host
+        std::mem::size_of::<W>() != 4 || a.nq != 1 || a.nout < 1 || a.nout as usize > TSEED_OUT || a.npairs < 1 || a.npairs as usize > TSEED_PAIRS
     };
     launch(a, s, |a| if bad(a) { -1 } else { 0 }, |a| {
         let n = a.n as usize;

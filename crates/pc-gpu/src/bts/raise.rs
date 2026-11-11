@@ -453,6 +453,42 @@ impl<'a> EncapsKeys<'a> {
     }
 }
 
+/// The bare raise of k ciphertexts (evaluation form, both parts) whose live rows are Q rows `0..d` (the composite
+/// bottom q0 = q_0 ... q_{d-1}): rows `d..=top` are filled with the centred Garner lift of each coefficient (the
+/// `mod_raise` kernel, no scaling, no key switch), so the phase becomes the input's phase + q0 I for a small integer
+/// polynomial I (|I| about the secret's l1 norm / 2, plus d / 2). The caller sets the metadata (level of `top`, the
+/// input's scale).
+pub fn raise_rows<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &Stream<pc_cuda::Compute>, x: &mut crate::poly::CtBuf<'_, pc_cuda::Compute, W>, k: usize, d: usize, top: usize) -> Result<()> {
+    let q = &ctx.chain.q;
+    if !(1..=4).contains(&d) || top < d || top >= q.len() || top >= 64 {
+        return Err(shape("raise_rows", format!("{d} bottom rows raised to top limb {top} (d in 1..=4, d <= top < {})", q.len().min(64))));
+    }
+    // SAFETY: plain data, zero is valid
+    let mut ra: ModRaiseArgs = unsafe { std::mem::zeroed() };
+    for kk in 0..d {
+        let qk = q[kk];
+        let hat_k = (0..d).filter(|&j| j != kk).fold(1u64, |h, j| mulmod(h, q[j] % qk, qk));
+        ra.qhatinv[kk] = invmod(hat_k, qk);
+        for (i, &qi) in q.iter().enumerate().take(top + 1) {
+            ra.qhat[kk][i] = (0..d).filter(|&j| j != kk).fold(1u64, |v, j| mulmod(v, q[j] % qi, qi));
+        }
+    }
+    ra.d = d as i32;
+    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::Q { top: d - 1 }, Parts::Both, k)?;
+    let v = View::of(x, 0);
+    ra.x = v.base;
+    ra.pr = ctx.pr();
+    ra.ct_stride = v.ct_stride;
+    ra.part_stride = v.part_stride;
+    ra.k = k as i32;
+    ra.r0 = d as i32;
+    ra.r1 = (top + 1) as i32;
+    ra.nparts = 2;
+    // SAFETY: rows [0, top] of k cts of a context-layout buffer (top < |Q|); the kernel reads rows 0..d and writes d..=top
+    launch_result("mod_raise", unsafe { (ctx.table.mod_raise)(&ra, s.raw()) })?;
+    ntt::transform_k(ctx, s, Dir::Forward, x, Span::Q { top }, Parts::Both, k)
+}
+
 /// What the raise leaves (FIDESlib coordinates).
 pub fn raised_meta<W: DevWord>(plan: &RaisePlan<'_, W>) -> FMeta {
     FMeta { top: plan.top as i32, nl: 1, nf: plan.target_sf * (plan.t as f64).exp2() }

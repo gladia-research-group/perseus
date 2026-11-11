@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSeededArgs, TensorSumArgs, WsumArgs, TMULTI_OUT, TMULTI_PAIRS, TSEED_OUT, TSEED_PAIRS, TSUM_MAX};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSeededArgs, TensorSumArgs, WsumArgs, TMULTI_OUT, TMULTI_PAIRS, TSEED_OUT, TSEED_PAIRS, TSEED_Q, TSEED_QOUT, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
@@ -1077,7 +1077,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
                     None => d2s[o].buf.w(),
                 })
                 .collect();
-            self.tensor_wave(ctx, ex, &mut outs[..], &d2, a, b, w0..w1, (seeded, packed, seed_off), top)?;
+            let ow: Vec<PolyRef> = outs.iter_mut().map(|o| o.buf.w()).collect();
+            self.tensor_wave(ctx, ex, &ow, &d2, a, b, w0..w1, (seeded, packed, seed_off), top)?;
             if ws.is_some() {
                 let src = crate::ks::View { base: d2[w0].base, ct_stride: (rows * self.lay.n) as u64, part_stride: 0 };
                 crate::relin::relin_many(ctx, ex, kc, key, &mut outs[w0..w1], top, src)?;
@@ -1093,11 +1094,91 @@ impl<'a, W: DevWord> Ops<'a, W> {
         Ok(())
     }
 
+    /// `mult_sum_many` of unseeded operands with every output then read at degree 1 (`settle`), divided by its `drops`
+    /// top primes one at a time (`rescale_one`) and, with `raise` = a level, raised back to it (`raise_rows`): the same
+    /// words as those ops output by output. Batches of up to `k_max` outputs (half the executor scratch) share each
+    /// step: the tensors write into the scratch, one relinearization, the rescales and the raise run there over the
+    /// batch, one copy lands the live rows in `outs` (single ciphertexts, low slots admitted).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mult_sum_settle<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &mut Executor<'_, W>, kc: crate::rotate::KsCfg<'_, '_>, sh: &Shadow, key: &crate::ks::KeyGroup<'_>, outs: &mut [&mut Ct<'_, W>], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>], drops: usize, raise: Option<u32>) -> Result<()> {
+        use crate::ks::View;
+        let g = outs.len();
+        if g == 0 || a.len() != g || b.len() != g {
+            return Err(shape("mult_sum_settle", format!("{g} outputs, {} / {} operand groups", a.len(), b.len())));
+        }
+        let mut recipe = None;
+        for i in 0..g {
+            let (top, r) = self.sum_recipe(ctx, sh, &a[i], &b[i], "mult_sum_settle")?;
+            if recipe.as_ref().is_some_and(|(t, x): &(usize, Recipe)| *t != top || x.out != r.out) {
+                return Err(shape("mult_sum_settle", "every group at the same level"));
+            }
+            recipe = Some((top, r));
+        }
+        let (top, r) = recipe.expect("one group");
+        if a.iter().chain(b).flatten().any(|x| x.buf.seeds || x.k() != 1) {
+            return Err(shape("mult_sum_settle", "unseeded single ciphertexts"));
+        }
+        if drops > top {
+            return Err(shape("mult_sum_settle", format!("{drops} primes dropped from top limb {top}")));
+        }
+        let mut meta = CtMeta { deg: 1, ..r.out };
+        for j in 0..drops {
+            meta = CtMeta { level: meta.level + 1, nf: meta.nf / ctx.chain.q[top - j] as f64, ..meta };
+        }
+        let low = top - drops;
+        let end = match raise {
+            Some(l) => {
+                meta.level = l;
+                ctx.top_of(l)?
+            }
+            None => low,
+        };
+        if end < low || outs.iter().any(|o| o.k() != 1 || o.buf.lay.nq <= end) {
+            return Err(shape("mult_sum_settle", format!("single outputs holding {} rows", end + 1)));
+        }
+        let (cw, pw) = (self.lay.ct_words(), self.lay.poly_words());
+        let km = ex.ks.k_max.min(kc.plans.k_max).min(ctx.k_max).min(ex.scratch.k / 2).max(1);
+        let s0 = View::of(&ex.scratch, 0).base as *mut W;
+        let at = |c: usize, p: usize| s0.wrapping_add(c * cw + p * pw) as *mut c_void;
+        // the batch's (c0, c1) in scratch[0, k), its d2 in part 0 of scratch[km, km + k)
+        let ow: Vec<PolyRef> = (0..g).map(|o| PolyRef { base: at(o % km, 0), ct_stride: cw as u64, part_stride: pw as u64 }).collect();
+        let d2: Vec<PolyRef> = (0..g).map(|o| PolyRef { base: at(km + o % km, 0), ct_stride: 0, part_stride: 0 }).collect();
+        let nul = std::ptr::null::<c_void>();
+        for w0 in (0..g).step_by(km) {
+            let w1 = (w0 + km).min(g);
+            let k = w1 - w0;
+            self.tensor_wave(ctx, ex, &ow, &d2, a, b, w0..w1, (false, false, 0), top)?;
+            let src = View { base: at(km, 0), ct_stride: cw as u64, part_stride: pw as u64 };
+            let dst = View::of(&ex.scratch, 0);
+            crate::relin::relin_staged_view(ctx, ex, kc, key, dst, k, top, src)?;
+            // the rescaler reads the batch size off the buffer
+            let whole = std::mem::replace(&mut ex.scratch.k, k);
+            let mut done = Ok(());
+            for j in 0..drops {
+                done = self.rescaler.rescale_one(ctx, &ex.compute, &mut ex.scratch, top - j);
+                if done.is_err() {
+                    break;
+                }
+            }
+            ex.scratch.k = whole;
+            done?;
+            if end > low {
+                crate::bts::raise::raise_rows(ctx, &ex.compute, &mut ex.scratch, k, low + 1, end)?;
+            }
+            let polys: Vec<_> = (0..2 * k).map(|i| [View::of(&outs[w0 + i / 2].buf, 0).part::<W>(i % 2).base as *const c_void, at(i / 2, i % 2) as *const c_void, nul, nul]).collect();
+            crate::ks::ew_many(ctx, &ex.compute, &polys, end + 1)?;
+        }
+        for o in outs.iter_mut() {
+            o.meta = meta;
+        }
+        Ok(())
+    }
+
     /// `mult_sum_many`'s tensors of outputs `wave` (d2 at `d2[o]`, part 1): launches over pairs j0..j0 + per, runs
     /// of consecutive outputs still that long, as many pairs left (up to per), all accumulating or none, sharing their
     /// second operands when seeded.
     #[allow(clippy::too_many_arguments)]
-    fn tensor_wave<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, outs: &mut [&mut Ct<'_, W>], d2: &[PolyRef], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>], wave: std::ops::Range<usize>, (seeded, packed, seed_off): (bool, bool, u64), top: usize) -> Result<()> {
+    fn tensor_wave<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, outs: &[PolyRef], d2: &[PolyRef], a: &[Vec<&Ct<'_, W>>], b: &[Vec<&Ct<'_, W>>], wave: std::ops::Range<usize>, (seeded, packed, seed_off): (bool, bool, u64), top: usize) -> Result<()> {
         let pm = self.primes[..=top].iter().copied().max().unwrap_or(2) as u128 - 1;
         let bits = 8 * std::mem::size_of::<W>() as u32;
         let (max_out, max_pairs) = if seeded { (TSEED_OUT, TSEED_PAIRS) } else { (TMULTI_OUT, TMULTI_PAIRS) };
@@ -1132,8 +1213,8 @@ impl<'a, W: DevWord> Ops<'a, W> {
                 let acc = if started[o0] { 3 } else { 0 };
                 if seeded {
                     let mut args = TensorSeededArgs {
-                        out: [PolyRef::default(); TSEED_OUT],
-                        d2: [PolyRef::default(); TSEED_OUT],
+                        out: [PolyRef::default(); TSEED_QOUT],
+                        d2: [PolyRef::default(); TSEED_QOUT],
                         b: [PolyRef::default(); TSEED_PAIRS],
                         a: [[std::ptr::null(); TSEED_PAIRS]; TSEED_OUT],
                         pr: ctx.pr(),
@@ -1144,12 +1225,17 @@ impl<'a, W: DevWord> Ops<'a, W> {
                         n: rows as i32,
                         packed: packed as i32,
                         pad: 0,
+                        bq: [[std::ptr::null(); TSEED_PAIRS]; TSEED_Q - 1],
+                        nq: 1,
+                        cout: 0,
+                        swords: 0,
+                        qpad: 0,
                     };
                     for j in 0..nj {
                         args.b[j] = b[o0][j0 + j].buf.r();
                     }
                     for (u, &o) in run.iter().enumerate() {
-                        args.out[u] = outs[o].buf.w();
+                        args.out[u] = outs[o];
                         args.d2[u] = d2[o];
                         for j in 0..nj {
                             args.a[u][j] = a[o][j0 + j].buf.r().base as *const std::ffi::c_void;
@@ -1174,7 +1260,7 @@ impl<'a, W: DevWord> Ops<'a, W> {
                         pad: 0,
                     };
                     for (u, &o) in run.iter().enumerate() {
-                        args.out[u] = outs[o].buf.w();
+                        args.out[u] = outs[o];
                         args.d2[u] = d2[o];
                         for j in 0..nj {
                             args.a[u][j] = a[o][j0 + j].buf.r();

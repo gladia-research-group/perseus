@@ -266,26 +266,29 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
     let src = st.ctx.up(&src_h);
     // job 0: src rows 0..3 -> 5 targets (primes 3..8) at dst rows 0..5, plain
     // job 1: src rows 4..8 (src_off 4) -> 4 targets (primes 0..4) at dst rows 5..9 (dst_off 5), exact
+    // job 2: src rows 1..4 (src_off 1) -> 3 targets (primes 5..8) at dst rows 9..12 (dst_off 9), exact from integers
     struct J {
         src_off: usize,
         dst_off: usize,
         sp: Vec<usize>,
         tp: Vec<usize>,
-        exact: bool,
+        exact: u32,
     }
     let jobs_h = [
-        J { src_off: 0, dst_off: 0, sp: vec![0, 1, 2], tp: vec![3, 4, 5, 6, 7], exact: false },
-        J { src_off: 4, dst_off: 5, sp: vec![4, 5, 6, 7], tp: vec![0, 1, 2, 3], exact: true },
+        J { src_off: 0, dst_off: 0, sp: vec![0, 1, 2], tp: vec![3, 4, 5, 6, 7], exact: 0 },
+        J { src_off: 4, dst_off: 5, sp: vec![4, 5, 6, 7], tp: vec![0, 1, 2, 3], exact: 1 },
+        J { src_off: 1, dst_off: 9, sp: vec![1, 2, 3], tp: vec![5, 6, 7], exact: 2 },
     ];
     let mut pool: Vec<u64> = Vec::new();
     let mut jobs = Vec::new();
-    let mut want = vec![0u64; 9 * N];
+    let mut want = vec![0u64; 12 * N];
     for j in &jobs_h {
         let (ns, nt) = (j.sp.len(), j.tp.len());
         let off = pool.len();
         let pre: Vec<u64> = j.sp.iter().map(|&s| st.rng.below(st.p(s))).collect();
         let m: Vec<Vec<u64>> = j.sp.iter().map(|_| j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect()).collect();
         let rb: Vec<f64> = j.sp.iter().map(|&s| 1.0 / st.p(s) as f64).collect();
+        let rc: Vec<u64> = j.sp.iter().map(|&s| if wb == 8 { ((1u128 << (127 - st.p(s).leading_zeros())) / st.p(s) as u128) as u64 } else { (1u64 << 59) / st.p(s) }).collect();
         let bmod: Vec<u64> = j.tp.iter().map(|&t| st.rng.below(st.p(t))).collect();
         pool.extend((0..ns).map(|i| i as u64));
         pool.extend(j.sp.iter().map(|&s| s as u64));
@@ -295,12 +298,12 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
         for row in &m {
             pool.extend(row);
         }
-        if j.exact {
+        if j.exact != 0 {
             while (pool.len() * wb) % 8 != 0 {
                 pool.push(0);
             }
-            for &x in &rb {
-                let bits = x.to_bits();
+            for (&x, &c) in rb.iter().zip(&rc) {
+                let bits = if j.exact == 2 { c } else { x.to_bits() };
                 match wb {
                     8 => pool.push(bits),
                     4 => pool.extend([bits & 0xFFFF_FFFF, bits >> 32]),
@@ -315,7 +318,7 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
             nsrc: ns as u32,
             ntgt: nt as u32,
             pool_off: off as u32,
-            exact: j.exact as u32,
+            exact: j.exact,
             pad: [0; 2],
         });
         for idx in 0..N {
@@ -323,18 +326,24 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
                 .map(|i| mulmod(src_h[(j.src_off + i) * N + idx], pre[i], st.p(j.sp[i])))
                 .collect();
             let mut v = 0.0f64;
-            if j.exact {
+            if j.exact == 1 {
                 for i in 0..ns {
                     v = (y[i] as f64).mul_add(rb[i], v);
                 }
             }
-            let u = (v + 0.5).floor() as u64;
+            let mut u = (v + 0.5).floor() as u64;
+            if j.exact == 2 {
+                let f: u64 = (0..ns).map(|i| if wb == 8 { ((y[i] as u128 * rc[i] as u128) >> (68 - st.p(j.sp[i]).leading_zeros())) as u64 } else { y[i] * rc[i] }).sum();
+                u = (f + (1 << 58)) >> 59;
+            }
             for (k, &t) in j.tp.iter().enumerate() {
                 let p = st.p(t);
                 let acc: u128 = (0..ns).map(|i| y[i] as u128 * m[i][k] as u128).sum();
                 let mut r = (acc % p as u128) as u64;
-                if j.exact {
-                    r = submod(r, mulmod(u % p, bmod[k], p), p);
+                match j.exact {
+                    1 => r = submod(r, mulmod(u % p, bmod[k], p), p),
+                    2 => r = ((r as u128 + u as u128 * bmod[k] as u128) % p as u128) as u64,
+                    _ => {}
                 }
                 want[(j.dst_off + k) * N + idx] = r;
             }
@@ -346,19 +355,19 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
         .flat_map(|j| [j.src_off, j.dst_off, j.nsrc, j.ntgt, j.pool_off, j.exact, 0, 0])
         .collect();
     let jobs_d = st.ctx.up32(&job_words);
-    let dst = st.ctx.zeros(9 * N);
+    let dst = st.ctx.zeros(12 * N);
     let a = BconvArgs {
         src: src.c(),
         dst: dst.p(),
         jobs: jobs_d.c() as *const BconvJob,
         pool: pool_d.c(),
         pr: st.pr(),
-        njobs: 2,
+        njobs: 3,
         max_tgt: 5,
     };
     ck(unsafe { (st.t.bconv)(&a, st.s()) });
     let got = dst.read(&st.ctx);
-    vec![cmp("bconv (plain + exact HPS) vs host", &got, &want)]
+    vec![cmp("bconv (plain + exact HPS, both estimates) vs host", &got, &want)]
 }
 
 // ================================================================================================ element-wise
