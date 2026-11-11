@@ -58,8 +58,8 @@ pub struct PyClient {
     /// a master public key (`load_public_key`): `encrypt(..., public=True)`
     pk: Option<(Vec<u32>, usize)>,
     payload: Payload,
-    /// precomputed encryption parts by (level, regen) (`precompute`), used first by `encrypt(..., seeded=True)`
-    pre: std::collections::HashMap<(u32, bool), Vec<pc_client::PreEnc>>,
+    /// precomputed encryption parts by (level, regen, coeff) (`precompute`), used first by `encrypt(..., seeded=True)`
+    pre: std::collections::HashMap<(u32, bool, bool), Vec<pc_client::PreEnc>>,
 }
 
 fn values_of(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<Complex>> {
@@ -94,6 +94,13 @@ fn meta_dict<'py>(py: Python<'py>, m: &WireMeta) -> PyResult<Bound<'py, PyDict>>
 }
 
 impl PyClient {
+    /// A precomputed part at `level` in the asked form when one is ready (`precompute`), else made now.
+    fn pre_of(&mut self, level: u32, regen: bool, coeff: bool) -> PyResult<pc_client::PreEnc> {
+        match self.pre.get_mut(&(level, regen, coeff)).and_then(|v| v.pop()) {
+            Some(p) => Ok(p),
+            None => self.c.precompute_as(level, &mut self.prng, regen, coeff).map_err(cerr),
+        }
+    }
     /// A fresh encryption's metadata at `level`; with `nf` the scale is the caller's, so `level` may be off the
     /// composite grid (a ciphertext of any top limb, e.g. 3 rows on n32, which has no scaling factor of its own).
     fn meta_at(&self, level: u32, deg: u8, nf: Option<f64>) -> PyResult<WireMeta> {
@@ -173,10 +180,12 @@ impl PyClient {
 
     /// `seeded`: c1 sent as the seeds it is drawn from (half the frame; the server's `import_ct` expands it).
     /// `public`: under the loaded public key (`load_public_key`) instead of this client's secret. `regen` (with `seeded`):
-    /// c1 from the random-access expander, so the server can keep the seeds (`import_ct(..., regen=True)`).
-    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false, public=false, regen=false))]
+    /// c1 from the random-access expander, so the server can keep the seeds (`import_ct(..., regen=True)`). `drop`
+    /// (with `seeded` alone): the short-c0 frame, c0 in coefficient form without its low `drop` bits (noise below
+    /// 2^(drop - 1) added; `import_ct` transforms it).
+    #[pyo3(signature = (values, level, deg=1, nf=None, slots=None, seeded=false, public=false, regen=false, drop=None))]
     #[allow(clippy::too_many_arguments)]
-    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool, public: bool, regen: bool) -> PyResult<Bound<'py, PyBytes>> {
+    fn encrypt<'py>(&mut self, py: Python<'py>, values: &Bound<'_, PyAny>, level: u32, deg: u8, nf: Option<f64>, slots: Option<u32>, seeded: bool, public: bool, regen: bool, drop: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
         let v = values_of(py, values)?;
         let mut meta = self.meta_at(level, deg, nf)?;
         if let Some(x) = slots {
@@ -185,10 +194,19 @@ impl PyClient {
         if v.len() > meta.slots as usize {
             return Err(PyValueError::new_err(format!("{} values exceed {} slots", v.len(), meta.slots)));
         }
+        if drop.is_some() {
+            if !seeded || public || regen || deg != 1 {
+                return Err(PyValueError::new_err("encrypt(drop=..): a seeded frame under this client's secret (no regen), deg 1"));
+            }
+            let pre = self.pre_of(level, false, true)?;
+            let (c, p) = (&self.c, self.payload);
+            let w = nogil(py, || c.encrypt_pre(&v, &meta, p, pre, drop).and_then(|w| w.to_bytes())).map_err(cerr)?;
+            return Ok(PyBytes::new(py, &w));
+        }
         if seeded && !public {
-            if let Some(pre) = self.pre.get_mut(&(level, regen)).and_then(|v| v.pop()) {
+            if let Some(pre) = self.pre.get_mut(&(level, regen, false)).and_then(|v| v.pop()) {
                 let (c, p) = (&self.c, self.payload);
-                let w = nogil(py, || c.encrypt_pre(&v, &meta, p, pre).and_then(|w| w.to_bytes())).map_err(cerr)?;
+                let w = nogil(py, || c.encrypt_pre(&v, &meta, p, pre, None).and_then(|w| w.to_bytes())).map_err(cerr)?;
                 return Ok(PyBytes::new(py, &w));
             }
         }
@@ -204,36 +222,39 @@ impl PyClient {
 
     /// Prepare `count` seeded encryptions at `level` ahead of time (the noise and c1 s parts; parallel, each on a stream
     /// seeded from this client's): `encrypt(..., level, seeded=True, regen=regen)` then only encodes and adds. Returns
-    /// how many are ready at that level.
-    #[pyo3(signature = (level, count, regen=false))]
-    fn precompute(&mut self, py: Python<'_>, level: u32, count: usize, regen: bool) -> PyResult<usize> {
+    /// how many are ready at that level. `coeff`: parts in coefficient form, the short-c0 frames' (`encrypt(..,
+    /// drop=..)`, which then runs no transform).
+    #[pyo3(signature = (level, count, regen=false, coeff=false))]
+    fn precompute(&mut self, py: Python<'_>, level: u32, count: usize, regen: bool, coeff: bool) -> PyResult<usize> {
         use rayon::prelude::*;
         let keys: Vec<[u32; 8]> = (0..count).map(|_| self.prng.ksk_seed().0).collect();
         let c = &self.c;
-        let made = nogil(py, || keys.par_iter().map(|&k| c.precompute(level, &mut pc_core::keys::Prng::from_seed(k, 0), regen)).collect::<pc_client::Result<Vec<_>>>()).map_err(cerr)?;
-        let q = self.pre.entry((level, regen)).or_default();
+        let made = nogil(py, || keys.par_iter().map(|&k| c.precompute_as(level, &mut pc_core::keys::Prng::from_seed(k, 0), regen, coeff)).collect::<pc_client::Result<Vec<_>>>()).map_err(cerr)?;
+        let q = self.pre.entry((level, regen, coeff)).or_default();
         q.extend(made);
         Ok(q.len())
     }
 
     /// A seeded frame of the plaintext whose coefficients are `coeffs` (n reals, at the level's scale unless `nf`), no
     /// slot FFT (e.g. selection weights given as coefficients); a precomputed part (`precompute`) when one is ready.
-    /// `public`: under the loaded public key instead (not seeded), as `encrypt`'s.
-    #[pyo3(signature = (coeffs, level, nf=None, regen=false, public=false))]
-    fn encrypt_coeffs<'py>(&mut self, py: Python<'py>, coeffs: Vec<f64>, level: u32, nf: Option<f64>, regen: bool, public: bool) -> PyResult<Bound<'py, PyBytes>> {
+    /// `public`: under the loaded public key instead (not seeded), as `encrypt`'s. `drop`: the short-c0 frame, as
+    /// `encrypt`'s.
+    #[pyo3(signature = (coeffs, level, nf=None, regen=false, public=false, drop=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn encrypt_coeffs<'py>(&mut self, py: Python<'py>, coeffs: Vec<f64>, level: u32, nf: Option<f64>, regen: bool, public: bool, drop: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
         let meta = self.meta_at(level, 1, nf)?;
+        if drop.is_some() && (public || regen) {
+            return Err(PyValueError::new_err("encrypt_coeffs(drop=..): under this client's secret, no regen"));
+        }
         if public {
             let (pk, rows) = self.pk.as_ref().ok_or_else(|| PyValueError::new_err("encrypt_coeffs(public=True): load_public_key first"))?;
             let (c, g) = (&self.c, &mut self.prng);
             let w = nogil(py, || c.encrypt_public_coeffs(&coeffs, &meta, g, pk, *rows).and_then(|w| w.to_bytes())).map_err(cerr)?;
             return Ok(PyBytes::new(py, &w));
         }
-        let pre = match self.pre.get_mut(&(level, regen)).and_then(|v| v.pop()) {
-            Some(p) => p,
-            None => self.c.precompute(level, &mut self.prng, regen).map_err(cerr)?,
-        };
+        let pre = self.pre_of(level, regen, drop.is_some())?;
         let c = &self.c;
-        let w = nogil(py, || c.encrypt_pre_coeffs(&coeffs, &meta, pre).and_then(|w| w.to_bytes())).map_err(cerr)?;
+        let w = nogil(py, || c.encrypt_pre_coeffs(&coeffs, &meta, pre, drop).and_then(|w| w.to_bytes())).map_err(cerr)?;
         Ok(PyBytes::new(py, &w))
     }
 
@@ -433,7 +454,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let w = CtWire {
-            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, regen: false, bits1: None, sparse: false },
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false },
             data,
         };
         return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
@@ -450,7 +471,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, regen: false, bits1: None, sparse: false },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
@@ -528,7 +549,7 @@ impl PyPendingFrames {
                 pc_client::wire::pack_frame_part(moduli, &rows[part], b, &mut data)?;
             }
             let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-            let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse };
+            let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse, drop: None, coeff0: false };
             CtWire { header, data }.to_bytes()
         };
         // one ciphertext: on the calling thread (frames of separate calls never queue behind each other in the pool)
@@ -649,7 +670,13 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
     if regen && !(low && w.header.seeded && w.header.regen) {
         return Err(PyValueError::new_err("import_ct(regen=True): a low import of a seeded regen frame (encrypt(..., seeded=True, regen=True))"));
     }
-    let w = if w.header.seeded && !regen { w.expand_seeded(&dev.ctx.chain.q).map_err(cerr)? } else { w };
+    if w.header.drop.is_some() && regen {
+        return Err(PyValueError::new_err("import_ct(regen=True): a short-c0 frame (encrypt(..., drop=..)) has no seeded slot form"));
+    }
+    let w = if w.header.seeded && !regen { nogil(py, || w.expand_seeded(&dev.ctx.chain.q)).map_err(cerr)? } else { w };
+    if w.header.coeff0 && low {
+        return Err(PyValueError::new_err("import_ct(low=True): a short-c0 frame imports into a pool ciphertext"));
+    }
     let h = &w.header;
     let ph = pc_client::spec::params_hash(&dev.ctx.chain);
     if h.params_hash != ph || h.n != dev.ctx.lay.n || h.k != 1 {
@@ -687,11 +714,24 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
             for part in 0..2 {
                 c.buf.upload_rows(&st.ex.compute, 0, part, &rows, &w.data[part * h.rows * n..(part + 1) * h.rows * n])?;
             }
+            if h.coeff0 {
+                pc_gpu::ntt::transform(&dev.ctx, &st.ex.compute, pc_gpu::ntt::Dir::Forward, &mut c.buf, pc_gpu::ntt::Span::Q { top }, pc_gpu::ntt::Parts::C0)?;
+            }
             Ok(())
         })
         .map_err(gerr)?;
     }
     Ok(out)
+}
+
+/// A seeded frame (`encrypt(..., seeded=True)`, `regen` or not) with its c1 rows regenerated on the host from its seeds:
+/// the unseeded frame `import_ct` then only uploads. `primes`: the chain's Q primes from the bottom (at least the
+/// frame's rows, e.g. `export_limbs(x)["moduli"]` of a ciphertext at its level). Releases the GIL (a worker thread can
+/// expand an arriving frame while the device runs).
+#[pyfunction]
+fn expand_frame<'py>(py: Python<'py>, frame: &[u8], primes: Vec<u64>) -> PyResult<Bound<'py, PyBytes>> {
+    let out = nogil(py, || CtWire::from_bytes(frame).and_then(|w| w.expand_seeded(&primes)).and_then(|w| w.to_bytes())).map_err(cerr)?;
+    Ok(PyBytes::new(py, &out))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -702,6 +742,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(contract_hash, m)?)?;
     m.add_function(wrap_pyfunction!(export_ct, m)?)?;
     m.add_function(wrap_pyfunction!(import_ct, m)?)?;
+    m.add_function(wrap_pyfunction!(expand_frame, m)?)?;
     m.add_function(wrap_pyfunction!(export_ct_many, m)?)?;
     Ok(())
 }
