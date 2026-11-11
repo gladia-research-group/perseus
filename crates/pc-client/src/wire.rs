@@ -281,6 +281,14 @@ pub struct CtHeader {
     /// Encrypted under the client's sparse secret (`SecretKey::s_sparse`: the server switched it before export).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sparse: bool,
+    /// Seeded frame with a short c0 (`Client::encrypt_pre(.., drop)`): c0 in coefficient form, each coefficient the CRT
+    /// x in [0, Q) of its `rows` residues without its low `drop` bits, (x + 2^(drop - 1)) >> drop, bit-packed at `bits`
+    /// bits (`pack_dropped`); the seeds follow. A rounding of the ciphertext: it adds noise below 2^(drop - 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop: Option<u32>,
+    /// c0's rows are coefficient form (a `drop` frame expanded): `import_ct` runs their forward transform.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coeff0: bool,
 }
 
 /// x mod p for any x, m = floor(2^64 / p): the quotient estimate is short by at most one.
@@ -462,6 +470,92 @@ pub fn pack_frame_part<T: Copy + Into<u64>>(q: &[u64], rows: &[&[T]], bits: u32,
     Ok(())
 }
 
+/// Bits of a coefficient without its low `drop` bits (`CtHeader::drop`) over the primes `q`: those of the largest
+/// (x + 2^(drop - 1)) >> drop, x < Q. Up to 4 primes below 2^30.
+pub fn dropped_bits(q: &[u64], drop: u32) -> Result<u32> {
+    let big: u128 = q.iter().map(|&p| p as u128).product();
+    if q.is_empty() || q.len() > 4 || q.iter().any(|&p| p >> 30 != 0) || drop >= 128 - big.leading_zeros() {
+        return Err(Error::Wire(format!("{drop} bits dropped over a {}-prime modulus", q.len())));
+    }
+    Ok(128 - ((big - 1 + ((1u128 << drop) >> 1)) >> drop).leading_zeros().min(127))
+}
+
+/// Coefficient-form residues (`rows[r][i]` mod `q[r]`) as `CtHeader::drop` words appended to `out`: x by mixed radix
+/// (x = t0 + q0 (t1 + q1 (t2 + ..)), t_j < q_j from Shoup products), rounded, `dropped_bits` bits each.
+pub fn pack_dropped(q: &[u64], rows: &[&[u32]], drop: u32, out: &mut Vec<u32>) -> Result<u32> {
+    use crate::ntt::{mul_shoup, shoup};
+    let bits = dropped_bits(q, drop)?;
+    let k = q.len();
+    if rows.len() != k || rows.iter().any(|r| r.len() != rows[0].len()) {
+        return Err(Error::Wire(format!("pack_dropped: {} rows over a {k}-prime modulus", rows.len())));
+    }
+    // step (i, j), i < j: t_j <- (t_j + lift - t_i) q_i^-1 mod q_j, lift the multiple of q_j from q_i up
+    let mut inv = [[(0u32, 0u32, 0u32); 4]; 4];
+    for j in 0..k {
+        for i in 0..j {
+            let w = inv_mod(q[i] % q[j], q[j]) as u32;
+            inv[i][j] = (w, shoup(w, q[j] as u32), (q[i].div_ceil(q[j]) * q[j]) as u32);
+        }
+    }
+    let half = (1u128 << drop) >> 1;
+    let n = rows[0].len();
+    out.reserve(packed_words(n, bits));
+    let mut acc = BitAcc::default();
+    for i in 0..n {
+        let mut t = [0u32; 4];
+        for j in 0..k {
+            let mut u = rows[j][i];
+            for (&ti, a) in t[..j].iter().zip(&inv[..j]) {
+                let (w, ws, lift) = a[j];
+                u = mul_shoup(u + lift - ti, w, ws, q[j] as u32);
+            }
+            t[j] = u;
+        }
+        let mut x = t[k - 1] as u128;
+        for j in (0..k - 1).rev() {
+            x = x * q[j] as u128 + t[j] as u128;
+        }
+        let (mut y, mut b) = ((x + half) >> drop, bits);
+        while b > 32 {
+            acc.push(y as u32 as u64, 32, out);
+            y >>= 32;
+            b -= 32;
+        }
+        acc.push(y as u64, b, out);
+    }
+    acc.finish(out);
+    Ok(bits)
+}
+
+/// `pack_dropped`'s inverse up to the rounding: the residues of y 2^drop, `rows` = `[row][n]` coefficient form.
+pub fn unpack_dropped(q: &[u64], words: &[u32], drop: u32, rows: &mut [u32]) {
+    let bits = dropped_bits(q, drop).expect("checked by the caller");
+    let n = rows.len() / q.len();
+    // per prime: floor(2^64 / p), 2^64 mod p
+    let c: Vec<(u64, u64, u64)> = q.iter().map(|&p| (p, ((1u128 << 64) / p as u128) as u64, ((1u128 << 64) % p as u128) as u64)).collect();
+    let (mut acc, mut nb, mut k) = (0u64, 0u32, 0usize);
+    for i in 0..n {
+        let (mut y, mut got) = (0u128, 0u32);
+        while got < bits {
+            let b = (bits - got).min(32);
+            if nb < b {
+                acc |= (words[k] as u64) << nb;
+                k += 1;
+                nb += 32;
+            }
+            y |= ((acc & (u64::MAX >> (64 - b))) as u128) << got;
+            acc >>= b;
+            nb -= b;
+            got += b;
+        }
+        let x = y << drop;
+        let (lo, hi) = (x as u64, (x >> 64) as u64);
+        for (r, &(p, m, top)) in c.iter().enumerate() {
+            rows[r * n + i] = if hi == 0 { red(lo, p, m) } else { red(red(hi, p, m) * top + red(lo, p, m), p, m) } as u32;
+        }
+    }
+}
+
 /// `pack_bits`' inverse: `n` values.
 pub fn unpack_bits(w: &[u32], n: usize, bits: u32) -> Vec<u64> {
     let mask = u64::MAX >> (64 - bits);
@@ -506,7 +600,9 @@ pub struct CtWire {
 
 impl CtWire {
     pub fn words(h: &CtHeader) -> usize {
-        if let Some(b0) = h.bits {
+        if h.drop.is_some() {
+            h.k * (packed_words(h.n, h.bits.unwrap_or(0)) + h.rows * 8)
+        } else if let Some(b0) = h.bits {
             let b1 = h.bits1.unwrap_or(b0);
             h.k * (packed_words(h.n, b0) + packed_words(h.n, b1))
         } else if h.seeded {
@@ -542,6 +638,9 @@ impl CtWire {
         if header.n == 0 || header.k == 0 || header.rows == 0 || header.n > 1 << 17 || header.k > 64 || header.rows > 128 {
             return Err(Error::Wire(format!("ciphertext header out of range: {header:?}")));
         }
+        if header.drop.is_some() && !(header.seeded && !header.regen && header.bits.is_some_and(|b| (1..=126).contains(&b)) && header.rows <= 4) {
+            return Err(Error::Wire(format!("short-c0 frame header out of range: {header:?}")));
+        }
         let data = read_words(r, Self::words(&header))?;
         let mut c = [0u8; 8];
         r.read_exact(&mut c)?;
@@ -561,13 +660,22 @@ impl CtWire {
         if primes.len() < rows {
             return Err(Error::Wire(format!("seeded frame of {rows} rows, {} primes", primes.len())));
         }
+        let short = match (h.drop, h.bits) {
+            (Some(d), Some(b)) if dropped_bits(&primes[..rows], d)? == b => Some((d, packed_words(n, b))),
+            (Some(d), b) => return Err(Error::Wire(format!("short-c0 frame of {b:?} bits, {d} dropped over {rows} rows"))),
+            _ => None,
+        };
+        let per = short.map_or(rows * n, |(_, w)| w) + rows * 8;
         let mut data = vec![0u32; h.k * 2 * rows * n];
         for c in 0..h.k {
-            let src = &self.data[c * rows * (n + 8)..(c + 1) * rows * (n + 8)];
-            let (c0, seeds) = src.split_at(rows * n);
+            let src = &self.data[c * per..(c + 1) * per];
+            let (c0, seeds) = src.split_at(per - rows * 8);
             let dst = &mut data[c * 2 * rows * n..(c + 1) * 2 * rows * n];
             let (d0, d1) = dst.split_at_mut(rows * n);
-            d0.copy_from_slice(c0);
+            match short {
+                Some((d, _)) => unpack_dropped(&primes[..rows], c0, d, d0),
+                None => d0.copy_from_slice(c0),
+            }
             d1.par_chunks_mut(n).enumerate().for_each(|(r, row)| {
                 let key: [u32; 8] = seeds[r * 8..r * 8 + 8].try_into().expect("8 words");
                 if h.regen {
@@ -578,7 +686,7 @@ impl CtWire {
                 }
             });
         }
-        Ok(CtWire { header: CtHeader { seeded: false, regen: false, ..h.clone() }, data })
+        Ok(CtWire { header: CtHeader { seeded: false, regen: false, bits: if short.is_some() { None } else { h.bits }, drop: None, coeff0: short.is_some(), ..h.clone() }, data })
     }
     /// Row `row` of part `part` of ciphertext `c`.
     pub fn row(&self, c: usize, part: usize, row: usize) -> &[u32] {
@@ -710,6 +818,62 @@ mod tests {
         }
     }
 
+    /// `pack_dropped` / `unpack_dropped`: every residue is that of the rounded coefficient, at the bits `dropped_bits` says.
+    #[test]
+    fn dropped_roundtrip() {
+        let primes = [268042241u64, 265420801, 156499969, 95027201];
+        let n = 257usize;
+        for k in [1usize, 2, 3, 4] {
+            let q = &primes[..k];
+            let big: u128 = q.iter().map(|&p| p as u128).product();
+            let mut xs: Vec<u128> = (0..n as u128).map(|i| (i + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835) % big).collect();
+            xs[0] = 0;
+            xs[1] = big - 1;
+            let rows: Vec<Vec<u32>> = q.iter().map(|&p| xs.iter().map(|&x| (x % p as u128) as u32).collect()).collect();
+            let refs: Vec<&[u32]> = rows.iter().map(|r| r.as_slice()).collect();
+            for drop in [0u32, 1, 9, 24, 27 * k as u32 - 2] {
+                let mut w = Vec::new();
+                let bits = pack_dropped(q, &refs, drop, &mut w).unwrap();
+                assert_eq!((bits, w.len()), (dropped_bits(q, drop).unwrap(), packed_words(n, bits)), "{k} primes, {drop} dropped");
+                let mut back = vec![0u32; k * n];
+                unpack_dropped(q, &w, drop, &mut back);
+                for (r, &p) in q.iter().enumerate() {
+                    for (i, &x) in xs.iter().enumerate() {
+                        let y = (x + ((1u128 << drop) >> 1)) >> drop;
+                        assert_eq!(back[r * n + i] as u128, (y << drop) % p as u128, "{k} primes, {drop} dropped, row {r}, coefficient {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cost of a short-c0 frame's c0 over the four 27..28-bit primes, client side and server side:
+    /// `cargo test --release -p pc-client dropped_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dropped_cost() {
+        let primes = [268042241u64, 265420801, 156499969, 95027201];
+        let n = 1usize << 16;
+        for (k, drop) in [(2usize, 10u32), (4, 24)] {
+            let q = &primes[..k];
+            let rows: Vec<Vec<u32>> = q.iter().map(|&p| (0..n as u64).map(|i| (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) % p) as u32).collect()).collect();
+            let refs: Vec<&[u32]> = rows.iter().map(|r| r.as_slice()).collect();
+            let (mut w, mut back) = (Vec::new(), vec![0u32; k * n]);
+            let reps = 50;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                w.clear();
+                pack_dropped(q, &refs, drop, &mut w).unwrap();
+            }
+            let tp = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                unpack_dropped(q, &w, drop, &mut back);
+            }
+            println!("{k} rows, {drop} dropped ({} bits): pack {tp:.3} ms, unpack {:.3} ms", dropped_bits(q, drop).unwrap(), t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+        }
+    }
+
     /// Cost of one compressed frame's packing (16 / 22 bits over two 28-bit primes), alone and eight at once:
     /// `cargo test --release -p pc-client frame_pack_cost -- --ignored --nocapture`.
     #[test]
@@ -788,7 +952,7 @@ mod tests {
 
     #[test]
     fn ct_frame_roundtrip_and_corruption() {
-        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false };
+        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false };
         let w = CtWire { data: (0..CtWire::words(&h) as u32).collect(), header: h };
         let mut b = w.to_bytes().unwrap();
         assert_eq!(CtWire::from_bytes(&b).unwrap(), w);
