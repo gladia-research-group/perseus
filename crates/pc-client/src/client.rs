@@ -37,10 +37,11 @@ pub struct KeyGenStats {
 }
 
 /// The message-independent part of one seeded encryption (`Client::precompute`): the c1 row seeds and per row
-/// NTT(e) - c1 s, eval form, `[row][N]`.
+/// NTT(e) - c1 s, eval form, `[row][N]` (`coeff`: coefficient form, e - INTT(c1 s), a short-c0 frame's).
 pub struct PreEnc {
     pub level: u32,
     pub regen: bool,
+    pub coeff: bool,
     keys: Vec<[u32; 8]>,
     base: Vec<u32>,
 }
@@ -386,12 +387,18 @@ impl Client {
             }
             data = out;
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, regen: seeded && regen, bits1: None, sparse: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, regen: seeded && regen, bits1: None, sparse: false, drop: None, coeff0: false }, data })
     }
 
     /// The message-independent part of one seeded encryption at `level` (drawn from `prng` in `encrypt_as`'s order: e,
     /// then the row seeds): per row NTT(e) - c1 s, so `encrypt_pre` is an encode, one NTT per row and an add.
     pub fn precompute(&self, level: u32, prng: &mut Prng, regen: bool) -> Result<PreEnc> {
+        self.precompute_as(level, prng, regen, false)
+    }
+
+    /// `precompute`, the part in coefficient form when `coeff` (the same draws): a short-c0 frame's
+    /// (`encrypt_pre(.., drop)`) is then an encode and an add, no transform.
+    pub fn precompute_as(&self, level: u32, prng: &mut Prng, regen: bool, coeff: bool) -> Result<PreEnc> {
         let n = self.chain.n;
         let top = self.top_of(level)?;
         let e = self.gauss.sample_vec(prng, n);
@@ -406,51 +413,81 @@ impl Client {
                 let mut g = Prng::from_seed(keys[r], 0);
                 g.fill_below(p, &mut c1);
             }
+            let s = &self.s_eval[r];
+            if coeff {
+                for i in 0..n {
+                    b[i] = mm(c1[i], s[i], p) as u32;
+                }
+                self.ring.ntt[r].inv(b);
+                for i in 0..n {
+                    b[i] = ((e[i].rem_euclid(p as i64) as u64 + p - b[i] as u64) % p) as u32;
+                }
+                return;
+            }
             for i in 0..n {
                 b[i] = e[i].rem_euclid(p as i64) as u32;
             }
             self.ring.ntt[r].fwd(b);
-            let s = &self.s_eval[r];
             for i in 0..n {
                 b[i] = ((b[i] as u64 + p - mm(c1[i], s[i], p)) % p) as u32;
             }
         });
-        Ok(PreEnc { level, regen, keys, base })
+        Ok(PreEnc { level, regen, coeff, keys, base })
     }
 
     /// The seeded frame of `encrypt_as(.., seeded = true, pre.regen)` from a precomputed part (the same frame for the
-    /// same draws): c0 = NTT(m) + (NTT(e) - c1 s).
-    pub fn encrypt_pre(&self, values: &[Complex], meta: &WireMeta, payload: Payload, pre: PreEnc) -> Result<CtWire> {
+    /// same draws): c0 = NTT(m) + (NTT(e) - c1 s). `drop`: the short-c0 frame instead (`CtHeader::drop`), c0 = m + (e -
+    /// INTT(c1 s)) in coefficient form without its low `drop` bits (not a `regen` part's).
+    pub fn encrypt_pre(&self, values: &[Complex], meta: &WireMeta, payload: Payload, pre: PreEnc, drop: Option<u32>) -> Result<CtWire> {
         let n = self.chain.n;
         let slots = if meta.slots == 0 { n / 2 } else { meta.slots as usize };
         let m = self.enc.encode_slots(values, slots, self.top_of(meta.level)?, payload, meta.nf)?;
-        self.encrypt_rows(m, meta, pre)
+        self.encrypt_rows(m, meta, pre, drop)
     }
 
     /// `encrypt_pre` of a plaintext given by its coefficients (`n` reals at scale `meta.nf`, no slot FFT).
-    pub fn encrypt_pre_coeffs(&self, coeffs: &[f64], meta: &WireMeta, pre: PreEnc) -> Result<CtWire> {
+    pub fn encrypt_pre_coeffs(&self, coeffs: &[f64], meta: &WireMeta, pre: PreEnc, drop: Option<u32>) -> Result<CtWire> {
         let m = self.enc.encode_coeff_rows(coeffs, self.top_of(meta.level)?, meta.nf)?;
-        self.encrypt_rows(m, meta, pre)
+        self.encrypt_rows(m, meta, pre, drop)
     }
 
-    fn encrypt_rows(&self, m: Vec<Vec<u64>>, meta: &WireMeta, pre: PreEnc) -> Result<CtWire> {
+    fn encrypt_rows(&self, m: Vec<Vec<u64>>, meta: &WireMeta, pre: PreEnc, drop: Option<u32>) -> Result<CtWire> {
         let n = self.chain.n;
         let top = self.top_of(meta.level)?;
         if meta.level != pre.level {
             return Err(Error::Params(format!("encrypt_pre: precomputed at level {}, frame at {}", pre.level, meta.level)));
         }
+        if drop.is_some() && pre.regen {
+            return Err(Error::Params("encrypt_pre: a short-c0 frame of a regen part".into()));
+        }
         let rows = top + 1;
         let mut data = pre.base;
+        // the sum in the frame's form: the message transformed to an eval part, an eval part brought back to a short frame
+        let short = drop.is_some();
         data.par_chunks_mut(n).enumerate().for_each(|(r, b)| {
             let p = self.ring.primes[r];
             let mut c0: Vec<u32> = m[r].iter().map(|&x| (x % p) as u32).collect();
-            self.ring.ntt[r].fwd(&mut c0);
+            if short && !pre.coeff {
+                self.ring.ntt[r].inv(b);
+            } else if !short && pre.coeff {
+                self.ring.ntt[r].fwd(b);
+            }
+            if !short {
+                self.ring.ntt[r].fwd(&mut c0);
+            }
             for i in 0..n {
                 b[i] = ((c0[i] as u64 + b[i] as u64) % p) as u32;
             }
         });
+        if let Some(d) = drop {
+            let rs: Vec<&[u32]> = data.chunks(n).collect();
+            let mut out = Vec::new();
+            let bits = crate::wire::pack_dropped(&self.ring.primes[..rows], &rs, d, &mut out)?;
+            out.extend(pre.keys.iter().flatten());
+            return Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: Some(bits), seeded: true, regen: false, bits1: None, sparse: false, drop, coeff0: false }, data: out });
+        }
         data.extend(pre.keys.iter().flatten());
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: None, seeded: true, regen: pre.regen, bits1: None, sparse: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: None, seeded: true, regen: pre.regen, bits1: None, sparse: false, drop: None, coeff0: false }, data })
     }
 
     /// Public-key encryption of `values` (one ciphertext each) with the key `pk` = (pk0, pk1) eval rows `[part][row][N]`
@@ -500,7 +537,7 @@ impl Client {
                 }
             });
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded: false, regen: false, bits1: None, sparse: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false }, data })
     }
 
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
@@ -508,6 +545,9 @@ impl Client {
     pub fn decrypt(&self, ct: &CtWire, payload: Payload) -> Result<Vec<Vec<Complex>>> {
         if ct.header.seeded {
             return self.decrypt(&ct.expand_seeded(&self.chain.q)?, payload);
+        }
+        if ct.header.coeff0 {
+            return self.decrypt(&self.eval_c0(ct), payload);
         }
         let (d, slots) = self.decoded_rows(ct)?;
         let h = &ct.header;
@@ -527,6 +567,9 @@ impl Client {
         if ct.header.seeded {
             return self.decrypt_coeffs(&ct.expand_seeded(&self.chain.q)?);
         }
+        if ct.header.coeff0 {
+            return self.decrypt_coeffs(&self.eval_c0(ct));
+        }
         let (d, _) = self.decoded_rows(ct)?;
         let h = &ct.header;
         (0..h.k)
@@ -539,6 +582,16 @@ impl Client {
                 Ok(x.into_iter().map(|v| v as f64 / h.meta.nf).collect())
             })
             .collect()
+    }
+
+    /// A `coeff0` frame (a short-c0 frame expanded) with c0's rows transformed: the plain eval frame.
+    fn eval_c0(&self, ct: &CtWire) -> CtWire {
+        let (n, rows) = (ct.header.n, ct.header.rows);
+        let mut out = CtWire { header: CtHeader { coeff0: false, ..ct.header.clone() }, data: ct.data.clone() };
+        for c in out.data.chunks_mut(2 * rows * n) {
+            c[..rows * n].par_chunks_mut(n).enumerate().for_each(|(r, row)| self.ring.ntt[r].fwd(row));
+        }
+        out
     }
 
     /// Checks an unseeded frame against this client; the rows `d` its decode reads and its slot count.
@@ -924,7 +977,7 @@ mod tests {
                     assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
                 }
                 Entry::SpruCs { k, rows, level, nf, .. } => {
-                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false }, data: v };
+                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false }, data: v };
                     let d = c.decrypt(&w, Payload::Real).unwrap();
                     let block = c.spru_block.as_ref().unwrap();
                     for (u, du) in d.iter().enumerate() {
@@ -961,6 +1014,37 @@ mod tests {
             let ct = c.encrypt(&[v.clone()], &meta, Payload::Complex, &mut g).unwrap();
             let back = CtWire::from_bytes(&ct.to_bytes().unwrap()).unwrap();
             let d = c.decrypt(&back, Payload::Complex).unwrap();
+            let err = d[0].iter().zip(&v).map(|(a, b)| (a.re - b.re).abs().max((a.im - b.im).abs())).fold(0.0, f64::max);
+            assert!(err < 2f64.powi(-36), "level {level}: {err:e}");
+        }
+    }
+
+    /// Short-c0 frames from either form of the precomputed part: the plain frame's values up to the dropped bits'
+    /// rounding, at the short size.
+    #[test]
+    fn short_frame() {
+        let c = client(3);
+        let mut g = Prng::from_seed([5; 8], 0);
+        let n = c.chain.n;
+        for level in [50u32, 52] {
+            let meta = c.fresh_meta(level, 1).unwrap();
+            let rows = c.top_of(level).unwrap() + 1;
+            let v: Vec<Complex> = (0..n / 2).map(|i| Complex::new(((i * 37) % 101) as f64 / 50.0 - 1.0, ((i * 11) % 7) as f64 / 7.0)).collect();
+            for (coeff, drop) in [(true, 6u32), (false, 12)] {
+                let pre = c.precompute_as(level, &mut g, false, coeff).unwrap();
+                let ct = c.encrypt_pre(&v, &meta, Payload::Complex, pre, Some(drop)).unwrap();
+                let bits = crate::wire::dropped_bits(&c.chain.q[..rows], drop).unwrap();
+                assert_eq!(ct.data.len(), crate::wire::packed_words(n, bits) + 8 * rows);
+                let back = CtWire::from_bytes(&ct.to_bytes().unwrap()).unwrap();
+                let d = c.decrypt(&back, Payload::Complex).unwrap();
+                let err = d[0].iter().zip(&v).map(|(a, b)| (a.re - b.re).abs().max((a.im - b.im).abs())).fold(0.0, f64::max);
+                // the rounding (below 2^(drop - 1) per coefficient) through the decode's n-term sum, over the scale
+                let bound = 2f64.powi(-36) + 2f64.powi(drop as i32 - 1) * (n as f64).sqrt() * 6.0 / meta.nf;
+                assert!(err < bound, "level {level}, {drop} dropped: {err:e} (bound {bound:e})");
+            }
+            // a coefficient-form part into a plain frame
+            let pre = c.precompute_as(level, &mut g, false, true).unwrap();
+            let d = c.decrypt(&c.encrypt_pre(&v, &meta, Payload::Complex, pre, None).unwrap(), Payload::Complex).unwrap();
             let err = d[0].iter().zip(&v).map(|(a, b)| (a.re - b.re).abs().max((a.im - b.im).abs())).fold(0.0, f64::max);
             assert!(err < 2f64.powi(-36), "level {level}: {err:e}");
         }
@@ -1079,7 +1163,7 @@ mod sparse_decrypt_tests {
             });
             let w0 = crate::wire::packed_words(n, 12);
             let frame = CtWire {
-                header: CtHeader { params_hash: c.params_hash.clone(), n, k: 1, rows: 2, meta: WireMeta { level: 52, deg: 1, nf: 2f64.powi(50), slots: (n / 2) as u32, tag: serde_json::Value::Null }, bits: Some(12), seeded: false, regen: false, bits1: Some(18), sparse: true },
+                header: CtHeader { params_hash: c.params_hash.clone(), n, k: 1, rows: 2, meta: WireMeta { level: 52, deg: 1, nf: 2f64.powi(50), slots: (n / 2) as u32, tag: serde_json::Value::Null }, bits: Some(12), seeded: false, regen: false, bits1: Some(18), sparse: true, drop: None, coeff0: false },
                 data: words[..w0].iter().chain(&words).copied().collect(),
             };
             time("decrypt (whole frame)", &mut || {
