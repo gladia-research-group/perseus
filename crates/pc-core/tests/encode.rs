@@ -128,3 +128,89 @@ fn fft_special_inverts() {
     println!("fft roundtrip 32768: max abs err {e:e}");
     assert!(e < 1e-14, "{e:e}");
 }
+
+/// The transforms against OpenFHE's loops (`DiscreteFourierTransform::FFTSpecial` / `FFTSpecialInv` over m_rotGroup
+/// and m_ksiPows), bit for bit, at every size.
+#[test]
+fn fft_special_is_openfhe() {
+    let chain = Chain::generate(&ChainSpec::n32()).unwrap();
+    let enc = Encoder::new(&chain);
+    let m = 2 * chain.n;
+    let rot: Vec<usize> = std::iter::successors(Some(1usize), |&x| Some(x * 5 % m)).take(chain.n / 2).collect();
+    let ksi: Vec<Complex> = (0..=m)
+        .map(|j| {
+            let a = 2.0 * std::f64::consts::PI * (j % m) as f64 / m as f64;
+            Complex::new(a.cos(), a.sin())
+        })
+        .collect();
+    let reverse = |v: &mut [Complex]| {
+        let bits = v.len().trailing_zeros();
+        for i in 0..v.len() {
+            let j = if bits == 0 { 0 } else { i.reverse_bits() >> (usize::BITS - bits) };
+            if i < j {
+                v.swap(i, j);
+            }
+        }
+    };
+    let mut rng = Rng(17);
+    for size in (0..16).map(|b| 1usize << b) {
+        let v: Vec<Complex> = (0..size).map(|_| Complex::new(rng.unit(), rng.unit())).collect();
+        let (mut fwd, mut inv) = (v.clone(), v.clone());
+        reverse(&mut fwd);
+        let mut len = 2;
+        while len <= size {
+            let (lenh, lenq) = (len >> 1, len << 2);
+            for i in (0..size).step_by(len) {
+                for j in 0..lenh {
+                    let (x, y) = (fwd[i + j], fwd[i + j + lenh] * ksi[(rot[j] % lenq) * (m / lenq)]);
+                    (fwd[i + j], fwd[i + j + lenh]) = (x + y, x - y);
+                }
+            }
+            len <<= 1;
+        }
+        let mut len = size;
+        while len >= 2 {
+            let (lenh, lenq) = (len >> 1, len << 2);
+            for i in (0..size).step_by(len) {
+                for j in 0..lenh {
+                    let (x, y) = (inv[i + j] + inv[i + j + lenh], (inv[i + j] - inv[i + j + lenh]) * ksi[(lenq - rot[j] % lenq) * (m / lenq)]);
+                    (inv[i + j], inv[i + j + lenh]) = (x, y);
+                }
+            }
+            len >>= 1;
+        }
+        reverse(&mut inv);
+        inv.iter_mut().for_each(|x| *x = *x / size as f64);
+        let (mut a, mut b) = (v.clone(), v);
+        enc.fft_special(&mut a);
+        enc.fft_special_inv(&mut b);
+        assert!(a == fwd && b == inv, "size {size}");
+    }
+}
+
+/// `cargo test --release -p pc-core --test encode fft_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fft_cost() {
+    let chain = Chain::generate(&ChainSpec::n32()).unwrap();
+    let enc = Encoder::new(&chain);
+    let mut rng = Rng(19);
+    let v: Vec<Complex> = (0..chain.n / 2).map(|_| Complex::new(rng.unit(), rng.unit())).collect();
+    let c: Vec<i128> = (0..chain.n).map(|_| (rng.unit() * 2f64.powi(55)) as i128).collect();
+    let time = |name: &str, f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        (0..200).for_each(|_| f());
+        eprintln!("{name}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / 200.0);
+    };
+    let mut w = v.clone();
+    time("copy", &mut || w.copy_from_slice(&v));
+    time("copy + fft_special", &mut || {
+        w.copy_from_slice(&v);
+        enc.fft_special(&mut w)
+    });
+    time("copy + fft_special_inv", &mut || {
+        w.copy_from_slice(&v);
+        enc.fft_special_inv(&mut w)
+    });
+    time("decode_centered", &mut || drop(std::hint::black_box(enc.decode_centered(&c, chain.n / 2, Payload::Complex, 2f64.powi(40)).unwrap())));
+}
