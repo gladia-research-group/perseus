@@ -117,6 +117,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pc-client-py"
+version = "0.1.0"
+dependencies = [
+ "pc-client",
+ "pc-config",
+ "pc-core",
+ "pyo3",
+ "rayon",
+ "serde_json",
+]
+
+[[package]]
 name = "pc-config"
 version = "0.1.0"
 dependencies = [
