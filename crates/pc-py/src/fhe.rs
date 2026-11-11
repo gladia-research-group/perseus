@@ -244,6 +244,15 @@ impl PyFhe {
         Ok(PyCt { slot, dev: self.dev.clone() })
     }
 
+    /// An output slot for `meta`: a pool slot, or (`low`) a low slot that holds its top limb.
+    fn out_ct(&self, meta: CtMeta, low: bool) -> PyResult<PyCt> {
+        if low {
+            PyCt::acquire_low(&self.dev, meta, self.dev.ctx.top_of(meta.level).map_err(gerr)?, false)
+        } else {
+            self.new_ct(meta)
+        }
+    }
+
     fn same_session(&self, c: &PyCt) -> PyResult<()> {
         self.same_session_low(c)?;
         c.check_full()
@@ -435,12 +444,12 @@ impl PyFhe {
 
     // ── op helpers ────────────────────────────────────────────────────────────────────────────────────────────────
 
+    /// A copy of `a`'s live rows (Q rows 0..=top of both parts; a slot is sized for the whole chain, so a whole-slot
+    /// copy of a bottom ciphertext moved ~15x its data).
     fn copy_ct(&self, a: &PyCt) -> PyResult<PyCt> {
         let mut o = self.new_ct(a.meta())?;
-        let om = o.ct_mut()?;
-        let words = om.buf.buf.len();
-        om.buf.buf.copy_from(&self.dev.st.borrow().ex.compute, &a.ct()?.buf.buf, words).map_err(cuda)?;
-        om.meta = a.meta();
+        let st = self.dev.st.borrow();
+        pc_program::replay::copy_ct(&self.dev.ctx, &st.ex.compute, o.ct_mut()?, a.ct()?).map_err(|x| rt_err(x.to_string()))?;
         Ok(o)
     }
 
@@ -925,6 +934,33 @@ impl PyFhe {
         Ok(outs)
     }
 
+    /// `mult_sum_many` (unseeded operands) with every output then settled, rescaled by its `drops` top primes one at a
+    /// time and, with `raised` = a level, mod-raised to it: the same words as `settle`, `rescale_one` and `mod_raise`
+    /// output by output, each step shared by a batch of outputs. `low`: the outputs in low slots.
+    #[pyo3(signature = (a, b, drops, raised=None, low=false))]
+    fn mult_sum_settle(&mut self, a: Vec<Vec<PyRef<'_, PyCt>>>, b: Vec<Vec<PyRef<'_, PyCt>>>, drops: usize, raised: Option<u32>, low: bool) -> PyResult<Vec<PyCt>> {
+        if a.is_empty() || a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.is_empty() || x.len() != y.len()) {
+            return Err(PyValueError::new_err("mult_sum_settle: matching, non-empty operand groups"));
+        }
+        for x in a.iter().chain(&b).flatten() {
+            self.same_session_low(x)?;
+        }
+        let level = raised.unwrap_or(a[0][0].meta().level + drops as u32);
+        let mut outs = a.iter().map(|g| self.out_ct(CtMeta { level, ..g[0].meta() }, low)).collect::<PyResult<Vec<_>>>()?;
+        {
+            let d = &*self.dev;
+            let mut om = outs.iter_mut().map(|o| o.ct_mut_ref()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ops, ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let ar: Vec<Vec<&Ct<'static, W>>> = a.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            let br: Vec<Vec<&Ct<'static, W>>> = b.iter().map(|g| g.iter().map(|x| x.ct_low()).collect()).collect();
+            ops.mult_sum_settle(&d.ctx, ex, kc, &d.sh, &groups.relin, &mut om, &ar, &br, drops, raised).map_err(gerr)?;
+        }
+        Ok(outs)
+    }
+
     /// `sum_j ts[j] * cs[j]`: one fused weighted sum when every term shares level and degree 1, else the loop.
     fn mult_scalar_sum(&mut self, py: Python<'_>, ts: Vec<PyRef<'_, PyCt>>, cs: Vec<f64>) -> PyResult<PyCt> {
         if ts.is_empty() || ts.len() != cs.len() {
@@ -998,6 +1034,109 @@ impl PyFhe {
     /// Rotation by `k` slots (left: `np.roll(x, -k)`).
     fn rotate(&self, a: PyRef<'_, PyCt>, k: i64) -> PyResult<PyCt> {
         self.rotate_ct(&a, k)
+    }
+
+    /// `[rotate(x, k) for x in cts]` (one level), `batch` ciphertexts per key switch (default and at most the session's
+    /// kMax): one ModUp, one dot launch reading the key once and one ModDown per batch, bit-identical to `rotate` one by
+    /// one.
+    #[pyo3(signature = (cts, k, batch=None))]
+    fn rotate_many(&mut self, cts: Vec<PyRef<'_, PyCt>>, k: i64, batch: Option<usize>) -> PyResult<Vec<PyCt>> {
+        for x in &cts {
+            self.same_session(x)?;
+        }
+        if cts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.check_steps(&[k])?;
+        let m = cts[0].meta();
+        if cts.iter().any(|x| x.meta() != m) {
+            return Err(PyValueError::new_err("rotate_many: ciphertexts of one level and scale"));
+        }
+        let mut outs = cts.iter().map(|_| self.new_ct(m)).collect::<PyResult<Vec<_>>>()?;
+        {
+            let d = &*self.dev;
+            let xr = cts.iter().map(|x| x.ct()).collect::<PyResult<Vec<_>>>()?;
+            let mut om = outs.iter_mut().map(|o| o.ct_mut()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let g = groups.group(&[k]).ok_or_else(|| PyKeyError::new_err(format!("no rotation key for {k}")))?;
+            rotate::rotate_many(&d.ctx, ex, kc, &d.sh, g, &xr, k, &mut om, batch.unwrap_or(usize::MAX)).map_err(gerr)?;
+        }
+        Ok(outs)
+    }
+
+    /// A tree of rotations of `a`: `[a]`, then round by round the list so far followed by its rotation by each of the
+    /// round's steps (so offsets `offs = offs + [o + r for r in round for o in offs]` from `[0]`). One ModUp per
+    /// `batch` ciphertexts of a round shared by the round's steps, no copies between the rounds; every ciphertext
+    /// bit-identical to `rotate`. `low`: the results in low slots.
+    #[pyo3(signature = (a, rounds, low=false, batch=None))]
+    fn rotate_tree(&mut self, a: PyRef<'_, PyCt>, rounds: Vec<Vec<i64>>, low: bool, batch: Option<usize>) -> PyResult<Vec<PyCt>> {
+        self.same_session(&a)?;
+        for r in &rounds {
+            self.check_steps(r)?;
+        }
+        let count = rounds.iter().map(|r| r.len() + 1).product::<usize>();
+        let mut outs = (0..count).map(|_| self.out_ct(a.meta(), low)).collect::<PyResult<Vec<_>>>()?;
+        {
+            let d = &*self.dev;
+            let mut om = outs.iter_mut().map(|o| o.ct_mut_ref()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { ex, plans, groups, .. } = &mut *st;
+            let kc = KsCfg { plans, source };
+            let rk = rounds
+                .iter()
+                .map(|r| r.iter().map(|&k| Ok((groups.group(&[k]).ok_or_else(|| PyKeyError::new_err(format!("no rotation key for {k}")))?, k))).collect::<PyResult<Vec<_>>>())
+                .collect::<PyResult<Vec<_>>>()?;
+            rotate::rotate_tree(&d.ctx, ex, kc, &d.sh, &rk, a.ct()?, &mut om, batch.unwrap_or(usize::MAX)).map_err(gerr)?;
+        }
+        Ok(outs)
+    }
+
+    /// One round of an expansion by rotations on `cts` (one level; low slots allowed): with `y = rotate(x, step)`
+    /// where `rot` (else `y = x`), `([x + y], [mult_monomial(x - y, mono) where diff else None])`. `batch` rotations
+    /// per key switch, the sums and differences one launch each per batch; every ciphertext bit-identical to the ops
+    /// one by one. `low`: the results in low slots.
+    #[pyo3(signature = (cts, step, mono, rot, diff, low=false, batch=None))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn expand_round(&mut self, cts: Vec<PyRef<'_, PyCt>>, step: i64, mono: i64, rot: Vec<bool>, diff: Vec<bool>, low: bool, batch: Option<usize>) -> PyResult<(Vec<PyCt>, Vec<Option<PyCt>>)> {
+        for x in &cts {
+            self.same_session_low(x)?;
+        }
+        if cts.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if rot.len() != cts.len() || diff.len() != cts.len() {
+            return Err(PyValueError::new_err("expand_round: one rot and one diff flag per ciphertext"));
+        }
+        self.check_steps(&[step])?;
+        let d = self.dev.clone();
+        let n = d.n() as i64;
+        let k = mono.rem_euclid(2 * n);
+        let (pos, sign) = if k < n { (k as usize, 1) } else { ((k - n) as usize, -1) };
+        let key = PtKey::new(format!("__mono{k}"), self.pt_meta(&cts[0].meta()).level, PtForm::Eval);
+        let mut sums = cts.iter().map(|x| self.out_ct(x.meta(), low)).collect::<PyResult<Vec<_>>>()?;
+        let mut diffs = cts.iter().zip(&diff).map(|(x, &t)| if t { self.out_ct(x.meta(), low).map(Some) } else { Ok(None) }).collect::<PyResult<Vec<_>>>()?;
+        {
+            let xs: Vec<_> = cts.iter().map(|x| x.ct_low()).collect();
+            let mut sm = sums.iter_mut().map(|o| o.ct_mut_ref()).collect::<PyResult<Vec<_>>>()?;
+            let mut dm = diffs.iter_mut().map(|o| o.as_mut().map(|o| o.ct_mut_ref()).transpose()).collect::<PyResult<Vec<_>>>()?;
+            let mut st = d.st.borrow_mut();
+            let source = d.source;
+            let State { pts: store, ex, plans, groups, .. } = &mut *st;
+            if store.get(&d.ctx, ex, &key).is_err() {
+                // the exact monomial at unit scale (as `mult_monomial`)
+                let mut c = vec![0i64; n as usize];
+                c[pos] = sign;
+                store.encode_ints_many(&d.ctx, ex, &d.sh, std::slice::from_ref(&key), &[&c], Some(1.0)).map_err(gerr)?;
+            }
+            let t = store.get(&d.ctx, ex, &key).map_err(gerr)?.rows;
+            let g = groups.group(&[step]).ok_or_else(|| PyKeyError::new_err(format!("no rotation key for {step}")))?;
+            rotate::expand_round(&d.ctx, ex, KsCfg { plans, source }, &d.sh, g, step, t, &xs, &rot, &mut sm, &mut dm, batch.unwrap_or(usize::MAX)).map_err(gerr)?;
+        }
+        Ok((sums, diffs))
     }
 
     fn conjugate(&self, a: PyRef<'_, PyCt>) -> PyResult<PyCt> {
@@ -1106,6 +1245,39 @@ impl PyFhe {
         let st = d.st.borrow();
         pc_program::replay::copy_ct(&d.ctx, &st.ex.compute, o.ct_mut_ref()?, a.ct()?).map_err(|x| rt_err(x.to_string()))?;
         Ok(o)
+    }
+
+    /// `a` (full or low slot) at a level whose live rows are the composite bottom q0 (level 52 on n32) raised to
+    /// `level` without scaling: rows above q0 hold the centred lift of each coefficient (the bootstrap's `mod_raise`
+    /// kernel alone), the scale and degree are `a`'s, and the phase becomes a's phase + q0 I for a small integer
+    /// polynomial I. A product with a ciphertext encrypting multiples of Q_level / q0, rescaled back to q0, cancels
+    /// q0 I: an exact product at the bottom. `low`: the
+    /// result in a low slot that holds `level`'s rows (`size={"lowPool2", "lowRows2"}`).
+    #[pyo3(signature = (a, level, low=false))]
+    fn mod_raise(&self, a: PyRef<'_, PyCt>, level: u32, low: bool) -> PyResult<PyCt> {
+        self.same_session_low(&a)?;
+        let d = &self.dev;
+        let m = a.meta();
+        let from = d.ctx.top_of(m.level).map_err(gerr)?;
+        let top = d.ctx.top_of(level).map_err(gerr)?;
+        if top <= from {
+            return Err(PyValueError::new_err(format!("mod_raise: level {level} is not above the input's level {}", m.level)));
+        }
+        let mut o = PyCt::acquire(d, m)?;
+        {
+            let st = d.st.borrow();
+            let c = o.ct_mut_ref()?;
+            pc_program::replay::copy_ct(&d.ctx, &st.ex.compute, c, a.ct_low()).map_err(|x| rt_err(x.to_string()))?;
+            pc_gpu::bts::raise::raise_rows(&d.ctx, &st.ex.compute, &mut c.buf, 1, from + 1, top).map_err(gerr)?;
+            c.meta.level = level;
+        }
+        if !low {
+            return Ok(o);
+        }
+        let mut l = PyCt::acquire_low(d, o.meta(), top, false)?;
+        let st = d.st.borrow();
+        pc_program::replay::copy_ct(&d.ctx, &st.ex.compute, l.ct_mut_ref()?, o.ct_ref()).map_err(|x| rt_err(x.to_string()))?;
+        Ok(l)
     }
 
     /// In place: drop to `level` if above it (value-preserving modulus reduction; no data moves).

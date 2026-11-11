@@ -205,7 +205,7 @@ pub fn run(o: &Opts) -> Res<bool> {
     }
     let cfg = SpruCfg::new(o.h);
     let steps = cfg.rot_steps(n);
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&step| RotSpec { step, q_top: None }).collect(), encaps: false };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&step| RotSpec { step, q_top: None }).collect(), encaps: false, lean: None };
     let layout = KskLayout::Dense;
 
     let dev = Device::open()?;

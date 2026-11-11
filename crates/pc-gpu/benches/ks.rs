@@ -122,7 +122,7 @@ fn main() -> Res<()> {
     plan.reserve("ks.groups", (steps.len() + lg3.len() + 4) * KeyGroup::bytes(24, true));
     plan.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, dnum));
     // the same rotations + relin as PackedSeeded keys (generated on the device)
-    let spec = KeySetSpec { relin: true, conj: false, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: false };
+    let spec = KeySetSpec { relin: true, conj: false, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: false, lean: None };
     let packed_layout = KskLayout::packed_for::<W>(&chain)?;
     let shapes: Vec<_> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
     plan.reserve("keys.packed", spec.bytes::<W>(&chain, packed_layout)?);

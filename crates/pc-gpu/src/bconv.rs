@@ -24,6 +24,9 @@ pub struct JobSpec {
     pub exact: bool,
     /// The source rows hold `x_i pre_i` already (`pre_scales`: folded into the INTT's last pass).
     pub prescaled: bool,
+    /// The integer-estimate exact conversion of the low-P stack: refused (main's exact path, `exact_round`, serves the
+    /// `LowP` tiers); kept so job tables built elsewhere state it.
+    pub fixed: bool,
 }
 
 /// `pre_i = (B / b_i)^-1 mod b_i` of the sources `bp` (`B` their product).
@@ -96,6 +99,9 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
                 push(&mut pool, (0..ns).filter(|&k| k != i).fold(1u64, |v, k| mulmod(v, bp[k] % t, t)));
             }
         }
+        if j.fixed {
+            return Err(shape("bconv job", "integer-estimate (fixed) conversions are not built: exact jobs take the double estimate"));
+        }
         if j.exact {
             // rb_i = 1/b_i as f64, 8/sizeof(W) little-endian words each, the first 8-byte aligned in the pool
             while (pool.len() * wb) % 8 != 0 {
@@ -110,7 +116,8 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             }
             for &(_, tp) in &j.tgt {
                 let t = primes[tp as usize];
-                push(&mut pool, bp.iter().fold(1u64, |m, &b| mulmod(m, b % t, t)));
+                let bm = bp.iter().fold(1u64, |m, &b| mulmod(m, b % t, t));
+                push(&mut pool, bm);
             }
         }
         max_tgt = max_tgt.max(j.tgt.len());

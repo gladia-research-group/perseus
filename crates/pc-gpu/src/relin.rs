@@ -76,6 +76,21 @@ pub fn relin_staged_from<W: DevWord, M: DevStrategy<W>>(
     d2: View,
 ) -> Result<()> {
     let k = ct.k();
+    relin_staged_view(ctx, ex, kc, key, View::of(&ct.buf, 0), k, top, d2)
+}
+
+/// `relin_staged_from` into a view of k ciphertexts of the context layout (`dst`) instead of a `Ct`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relin_staged_view<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    key: &KeyGroup<'_>,
+    dst: View,
+    k: usize,
+    top: usize,
+    d2: View,
+) -> Result<()> {
     if key.galois.first() != Some(&1) {
         return Err(shape("relin", "key group 0 is not the relinearization key (galois 1)"));
     }
@@ -98,7 +113,7 @@ pub fn relin_staged_from<W: DevWord, M: DevStrategy<W>>(
             ks::stage_key(ctx, &ex.compute, kc.plans, &mut ex.ks, key, 0, ndig, false)?;
             ks::dot_regen(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, DotRows::P, io, None)?;
             ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
-            let epi = (View::of(&ct.buf, 0), View::of(&ex.ks.conv, 0));
+            let epi = (dst, View::of(&ex.ks.conv, 0));
             ks::dot_regen(ctx, &ex.compute, kc.plans, &ex.ks, key, k, top, DotRows::Q, io, Some(epi))
         }
         KskSource::Cached => {
@@ -109,7 +124,7 @@ pub fn relin_staged_from<W: DevWord, M: DevStrategy<W>>(
             }
             ks::dot(ctx, &ex.compute, kc.plans, &ex.ks, key, 0, 1, k, top, DotRows::All, io, staged)?;
             ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, k, top)?;
-            md_epilogue(ctx, &ex.compute, View::of(&ct.buf, 0), View::of(&ex.ks.ext, 0), View::of(&ex.ks.conv, 0), k, top)
+            md_epilogue(ctx, &ex.compute, dst, View::of(&ex.ks.ext, 0), View::of(&ex.ks.conv, 0), k, top)
         }
     }
 }

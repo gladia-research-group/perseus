@@ -68,7 +68,7 @@ fn run(args: &[String]) -> Res<()> {
     }
     let chain = Chain::generate(&cspec)?;
     let n = chain.n;
-    let spec = KeySetSpec { relin: true, conj: false, rots: vec![RotSpec { step: 1, q_top: None }], encaps: false };
+    let spec = KeySetSpec { relin: true, conj: false, rots: vec![RotSpec { step: 1, q_top: None }], encaps: false, lean: None };
     let dev = Device::open()?;
     let mcfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, mcfg)?;

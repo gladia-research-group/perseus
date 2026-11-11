@@ -98,7 +98,7 @@ fn run(args: &[String]) -> Res<bool> {
     geoms.extend(plan.input.iter().map(|h| h.geom));
     geoms.extend(plan.sources.iter().flatten().map(|s| s.geom));
     let steps: BTreeSet<i64> = crate::bts_stc_first::rot_steps(&geoms, n);
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
     let dev = Device::open()?;
     let blt = pc_cuda::blas::Lt::new(&dev)?;
     let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
