@@ -309,7 +309,7 @@ impl Client {
         p0.par_chunks_mut(n).zip(p1.par_chunks_mut(n)).enumerate().for_each(|(r, (c0, c1))| {
             let p = self.ring.primes[r];
             let mut g = Prng::from_seed(keys[r], 0);
-            c1.iter_mut().for_each(|x| *x = g.uniform_below(p) as u32);
+            g.fill_below(p, c1);
             c0.iter_mut().zip(&e).for_each(|(x, &v)| *x = v.rem_euclid(p as i64) as u32);
             self.ring.ntt[r].fwd(c0);
             let s = &self.s_eval[r];
@@ -352,7 +352,7 @@ impl Client {
                     pc_core::keys::cts_expand_row(&keys[r], p as u32, c1);
                 } else {
                     let mut g = Prng::from_seed(keys[r], 0);
-                    c1.iter_mut().for_each(|x| *x = g.uniform_below(p) as u32);
+                    g.fill_below(p, c1);
                 }
                 for i in 0..n {
                     c0[i] = ((m[r][i] % p + e[i].rem_euclid(p as i64) as u64) % p) as u32;
@@ -398,7 +398,7 @@ impl Client {
                 pc_core::keys::cts_expand_row(&keys[r], p as u32, &mut c1);
             } else {
                 let mut g = Prng::from_seed(keys[r], 0);
-                c1.iter_mut().for_each(|x| *x = g.uniform_below(p) as u32);
+                g.fill_below(p, &mut c1);
             }
             for i in 0..n {
                 b[i] = e[i].rem_euclid(p as i64) as u32;

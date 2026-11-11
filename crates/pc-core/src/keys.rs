@@ -48,6 +48,67 @@ pub fn chacha_block(key: &[u32; 8], w12: u32, w13: u32, w14: u32, w15: u32, roun
     x
 }
 
+/// `chacha_block` of the eight 64-bit counters `ctr..ctr + 8` (words 12..13), word by word: `[w][j]` = word w of
+/// block j. The lanes run as vectors (AVX2 where the CPU has it).
+pub fn chacha_blocks8(key: &[u32; 8], ctr: u64, w14: u32, w15: u32, rounds: u32) -> [[u32; 8]; 16] {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 detected
+        return unsafe { chacha_blocks8_avx2(key, ctr, w14, w15, rounds) };
+    }
+    chacha_blocks8_lanes(key, ctr, w14, w15, rounds)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn chacha_blocks8_avx2(key: &[u32; 8], ctr: u64, w14: u32, w15: u32, rounds: u32) -> [[u32; 8]; 16] {
+    chacha_blocks8_lanes(key, ctr, w14, w15, rounds)
+}
+
+#[inline(always)]
+fn chacha_blocks8_lanes(key: &[u32; 8], ctr: u64, w14: u32, w15: u32, rounds: u32) -> [[u32; 8]; 16] {
+    #[inline(always)]
+    fn qr8(x: &mut [[u32; 8]; 16], a: usize, b: usize, c: usize, d: usize) {
+        for (r, s) in [(16, (a, b, d)), (12, (c, d, b)), (8, (a, b, d)), (7, (c, d, b))] {
+            // x[s.0] += x[s.1]; x[s.2] = (x[s.2] ^ x[s.0]) <<< r
+            for j in 0..8 {
+                x[s.0][j] = x[s.0][j].wrapping_add(x[s.1][j]);
+                x[s.2][j] = (x[s.2][j] ^ x[s.0][j]).rotate_left(r);
+            }
+        }
+    }
+    let mut s = [[0u32; 8]; 16];
+    for (w, row) in s.iter_mut().enumerate() {
+        *row = [match w {
+            0..=3 => CHACHA_CONST[w],
+            4..=11 => key[w - 4],
+            14 => w14,
+            _ => w15,
+        }; 8];
+    }
+    for j in 0..8 {
+        let c = ctr.wrapping_add(j as u64);
+        (s[12][j], s[13][j]) = (c as u32, (c >> 32) as u32);
+    }
+    let mut x = s;
+    for _ in 0..rounds / 2 {
+        qr8(&mut x, 0, 4, 8, 12);
+        qr8(&mut x, 1, 5, 9, 13);
+        qr8(&mut x, 2, 6, 10, 14);
+        qr8(&mut x, 3, 7, 11, 15);
+        qr8(&mut x, 0, 5, 10, 15);
+        qr8(&mut x, 1, 6, 11, 12);
+        qr8(&mut x, 2, 7, 8, 13);
+        qr8(&mut x, 3, 4, 9, 14);
+    }
+    for w in 0..16 {
+        for j in 0..8 {
+            x[w][j] = x[w][j].wrapping_add(s[w][j]);
+        }
+    }
+    x
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Sampler DRBG
 // ------------------------------------------------------------------------------------------------------------------
@@ -107,6 +168,40 @@ impl Prng {
             let v = self.next_u64();
             if v >= rem {
                 return v % q;
+            }
+        }
+    }
+
+    /// `out[i] = self.uniform_below(q) as u32` in order (q in 2..=2^32), the same draws: eight blocks at a time while
+    /// 64 values or more remain (every candidate of the batch is then consumed), the reductions by a reciprocal.
+    pub fn fill_below(&mut self, q: u64, out: &mut [u32]) {
+        assert!((2..=1 << 32).contains(&q), "fill_below: q = {q}");
+        let rem = (u64::MAX % q + 1) % q;
+        let m = ((1u128 << 64) / q as u128) as u64;
+        let red = |v: u64| {
+            let r = v.wrapping_sub(((v as u128 * m as u128) >> 64) as u64 * q);
+            (if r >= q { r - q } else { r }) as u32
+        };
+        let mut i = 0;
+        while i < out.len() {
+            if self.pos == 16 && out.len() - i >= 64 {
+                let x = chacha_blocks8(&self.key, self.ctr, self.stream, DRBG_TAG, 20);
+                self.ctr = self.ctr.wrapping_add(8);
+                for j in 0..8 {
+                    for k in 0..8 {
+                        let v = x[2 * k][j] as u64 | (x[2 * k + 1][j] as u64) << 32;
+                        if v >= rem {
+                            out[i] = red(v);
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            let v = self.next_u64();
+            if v >= rem {
+                out[i] = red(v);
+                i += 1;
             }
         }
     }
@@ -481,4 +576,52 @@ pub struct BootstrapKeys {
     /// conjugation (g = 2N - 1)
     pub conj: KskMaterial,
     pub rots: BTreeMap<u64, KskMaterial>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_below_matches_uniform_below() {
+        for (q, n, skip) in [(268042241u64, 5000usize, 0usize), (265420801, 64, 0), (95027201, 63, 0), (3, 1000, 3), (1 << 32, 777, 16), (4294828033, 200, 1), (268042241, 0, 0)] {
+            let (mut a, mut b) = (Prng::from_seed([5; 8], 7), Prng::from_seed([5; 8], 7));
+            for _ in 0..skip {
+                assert_eq!(a.next_u32(), b.next_u32());
+            }
+            let want: Vec<u32> = (0..n).map(|_| a.uniform_below(q) as u32).collect();
+            let mut got = vec![0u32; n];
+            b.fill_below(q, &mut got);
+            assert_eq!(got, want, "q {q}, {n} values after {skip} words");
+            assert_eq!(a.next_u64(), b.next_u64(), "stream position, q {q}");
+        }
+        let key = [0x1234_5678u32, 2, 3, 4, 5, 6, 7, 0xffff_ffff];
+        let x = chacha_blocks8(&key, u32::MAX as u64 - 3, 11, DRBG_TAG, 20);
+        for j in 0..8 {
+            let c = u32::MAX as u64 - 3 + j as u64;
+            let b = chacha_block(&key, c as u32, (c >> 32) as u32, 11, DRBG_TAG, 20);
+            assert!((0..16).all(|w| x[w][j] == b[w]), "block {j}");
+        }
+    }
+
+    /// `cargo test --release -p pc-core fill_below_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fill_below_cost() {
+        let (q, n) = (268042241u64, 1usize << 16);
+        let mut out = vec![0u32; n];
+        for (name, fast) in [("uniform_below", false), ("fill_below", true)] {
+            let t = std::time::Instant::now();
+            for r in 0..20 {
+                let mut g = Prng::from_seed([r; 8], 0);
+                if fast {
+                    g.fill_below(q, &mut out);
+                } else {
+                    out.iter_mut().for_each(|x| *x = g.uniform_below(q) as u32);
+                }
+                std::hint::black_box(&out);
+            }
+            println!("{name}: {:.3} ms per row", t.elapsed().as_secs_f64() * 1e3 / 20.0);
+        }
+    }
 }

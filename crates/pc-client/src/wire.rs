@@ -283,6 +283,58 @@ pub struct CtHeader {
     pub sparse: bool,
 }
 
+/// x mod p for any x, m = floor(2^64 / p): the quotient estimate is short by at most one.
+#[inline(always)]
+fn red(x: u64, p: u64, m: u64) -> u64 {
+    let r = x.wrapping_sub(((x as u128 * m as u128) >> 64) as u64 * p);
+    if r >= p { r - p } else { r }
+}
+
+/// `pack_coeffs` over two primes, Q < 2^63: Garner in 64 bits (x = v0 + q0 ((v1 - v0) q0^-1 mod q1), the product by
+/// q0^-1 with its Shoup word, which also reduces the difference) and, up to 32 bits, the rounding through an f64
+/// product (x < 2^63: within one unit of the exact rounding, as lossy as the rounding itself); wider words round
+/// exactly.
+struct Garner2 {
+    q: [u64; 2],
+    /// floor(2^64 / q_r): residues that arrive unreduced
+    m: [u64; 2],
+    /// q0^-1 mod q1 and floor(2^64 inv / q1)
+    inv: [u64; 2],
+    /// the multiple of q1 from q0 up: v1 + lift - v0 >= 0
+    lift: u64,
+    big: u128,
+    scale: f64,
+    bits: u32,
+    mask: u64,
+}
+
+impl Garner2 {
+    fn new(q0: u64, q1: u64, bits: u32) -> Self {
+        let big = q0 as u128 * q1 as u128;
+        let inv = inv_mod(q0 % q1, q1);
+        Garner2 { q: [q0, q1], m: [q0, q1].map(|p| ((1u128 << 64) / p as u128) as u64), inv: [inv, (((inv as u128) << 64) / q1 as u128) as u64], lift: q0.div_ceil(q1) * q1, big, scale: (1u128 << bits) as f64 / big as f64, bits, mask: u64::MAX >> (64 - bits) }
+    }
+    /// The word of residues `a` mod q0, `b` mod q1 (either unreduced).
+    #[inline(always)]
+    fn word(&self, a: u64, b: u64) -> u64 {
+        let [q0, q1] = self.q;
+        let v0 = if a < q0 { a } else { red(a, q0, self.m[0]) };
+        // q0, q1 < 2^62 (their product is below 2^63): the difference stays in 64 bits
+        let d = if b >> 62 == 0 { b } else { red(b, q1, self.m[1]) } + self.lift - v0;
+        let t = d.wrapping_mul(self.inv[0]).wrapping_sub((((d as u128 * self.inv[1] as u128) >> 64) as u64).wrapping_mul(q1));
+        let x = v0 + q0 * if t >= q1 { t - q1 } else { t };
+        if self.bits <= 32 {
+            // f64::round (halves away from zero) of a non-negative value below 2^33, without the libm call
+            let z = x as i64 as f64 * self.scale;
+            // SAFETY: 0 <= z < 2^33
+            let f = unsafe { z.to_int_unchecked::<i64>() };
+            (f + (z - f as f64 >= 0.5) as i64) as u64 & self.mask
+        } else {
+            ((((x as u128) << self.bits) + self.big / 2) / self.big) as u64 & self.mask
+        }
+    }
+}
+
 /// Compress coefficient-form residues (`rows[r][i]` mod `q[r]`) to one `bits`-bit word (<= 64) per coefficient:
 /// round(x 2^bits / Q) mod 2^bits, x the CRT of the residues in [0, Q). Q must stay below 2^(128 - bits).
 pub fn pack_coeffs(q: &[u64], rows: &[&[u64]], bits: u32) -> Result<Vec<u64>> {
@@ -292,22 +344,13 @@ pub fn pack_coeffs(q: &[u64], rows: &[&[u64]], bits: u32) -> Result<Vec<u64>> {
     }
     let n = rows[0].len();
     if q.len() == 2 && big < 1u128 << 63 {
-        // two primes, Q < 2^63: Garner in 64 bits (x = v0 + q0 ((v1 - v0) q0^-1 mod q1)) and, up to 32 bits, the rounding
-        // through an f64 product (x < 2^63: within one unit of the exact rounding, as lossy as the rounding itself);
-        // wider words round exactly
         use rayon::prelude::*;
-        let (q0, q1) = (q[0], q[1]);
-        let inv = inv_mod(q0 % q1, q1) as u128;
-        let scale = (1u128 << bits) as f64 / big as f64;
-        let mask = u64::MAX >> (64 - bits);
+        let g = Garner2::new(q[0], q[1], bits);
         let mut out = vec![0u64; n];
         out.par_chunks_mut(4096).enumerate().for_each(|(ci, o)| {
-            for (k, y) in o.iter_mut().enumerate() {
-                let i = ci * 4096 + k;
-                let (v0, v1) = (rows[0][i] % q0, rows[1][i] % q1);
-                let d = (v1 + q1 - v0 % q1) % q1;
-                let x = v0 + q0 * ((d as u128 * inv % q1 as u128) as u64);
-                *y = if bits <= 32 { ((x as f64) * scale).round() as u64 & mask } else { ((((x as u128) << bits) + big / 2) / big) as u64 & mask };
+            let (r0, r1) = (&rows[0][ci * 4096..][..o.len()], &rows[1][ci * 4096..][..o.len()]);
+            for ((y, &a), &b) in o.iter_mut().zip(r0).zip(r1) {
+                *y = g.word(a, b);
             }
         });
         return Ok(out);
@@ -347,9 +390,17 @@ pub fn packed_words(n: usize, bits: u32) -> usize {
 
 /// `bits`-bit values (<= 64), LSB first, into `packed_words(len, bits)` words.
 pub fn pack_bits(v: &[u64], bits: u32) -> Vec<u32> {
+    let mask = u64::MAX >> (64 - bits);
+    if bits <= 32 {
+        let mut out = Vec::with_capacity(packed_words(v.len(), bits));
+        let mut acc = BitAcc::default();
+        v.iter().for_each(|&x| acc.push(x & mask, bits, &mut out));
+        acc.finish(&mut out);
+        return out;
+    }
     let mut out = vec![0u32; packed_words(v.len(), bits)];
     for (i, &x) in v.iter().enumerate() {
-        let (bit, x) = (i * bits as usize, (x & (u64::MAX >> (64 - bits))) as u128);
+        let (bit, x) = (i * bits as usize, (x & mask) as u128);
         let (w, o) = (bit / 32, bit % 32);
         let x = x << o;
         for (k, word) in out[w..].iter_mut().take((o + bits as usize).div_ceil(32)).enumerate() {
@@ -359,14 +410,77 @@ pub fn pack_bits(v: &[u64], bits: u32) -> Vec<u32> {
     out
 }
 
+/// `pack_bits`' running word, values of up to 32 bits: under 32 bits pending between pushes.
+#[derive(Default)]
+struct BitAcc {
+    acc: u64,
+    nb: u32,
+}
+
+impl BitAcc {
+    #[inline(always)]
+    fn push(&mut self, x: u64, bits: u32, out: &mut Vec<u32>) {
+        self.acc |= x << self.nb;
+        self.nb += bits;
+        if self.nb >= 32 {
+            out.push(self.acc as u32);
+            self.acc >>= 32;
+            self.nb -= 32;
+        }
+    }
+    fn finish(self, out: &mut Vec<u32>) {
+        if self.nb > 0 {
+            out.push(self.acc as u32);
+        }
+    }
+}
+
+/// `pack_bits(&pack_coeffs(q, rows, bits)?, bits)` appended to `out`, the rows of any word: one pass on the calling
+/// thread over two primes (Q < 2^63) up to 32 bits (a frame's parts: several frames pack side by side).
+pub fn pack_frame_part<T: Copy + Into<u64>>(q: &[u64], rows: &[&[T]], bits: u32, out: &mut Vec<u32>) -> Result<()> {
+    if rows.len() != q.len() || rows.iter().any(|r| r.len() != rows[0].len()) {
+        return Err(Error::Wire(format!("pack_frame_part: {} rows over a {}-prime modulus", rows.len(), q.len())));
+    }
+    if q.len() == 2 && (1..=32).contains(&bits) && (q[0] as u128 * q[1] as u128) < 1u128 << 63 {
+        let g = Garner2::new(q[0], q[1], bits);
+        out.reserve(packed_words(rows[0].len(), bits));
+        // the words a block at a time (independent of each other), then their bits
+        let mut acc = BitAcc::default();
+        let mut w = [0u64; 256];
+        for (r0, r1) in rows[0].chunks(256).zip(rows[1].chunks(256)) {
+            for ((y, &a), &b) in w.iter_mut().zip(r0).zip(r1) {
+                *y = g.word(a.into(), b.into());
+            }
+            w[..r0.len()].iter().for_each(|&y| acc.push(y, bits, out));
+        }
+        acc.finish(out);
+        return Ok(());
+    }
+    let wide: Vec<Vec<u64>> = rows.iter().map(|r| r.iter().map(|&x| x.into()).collect()).collect();
+    let refs: Vec<&[u64]> = wide.iter().map(|r| r.as_slice()).collect();
+    out.extend(pack_bits(&pack_coeffs(q, &refs, bits)?, bits));
+    Ok(())
+}
+
 /// `pack_bits`' inverse: `n` values.
 pub fn unpack_bits(w: &[u32], n: usize, bits: u32) -> Vec<u64> {
+    let mask = u64::MAX >> (64 - bits);
+    if bits <= 32 && w.len() >= packed_words(n, bits) {
+        // a value's two words as one, shifted: no state carried from value to value
+        return (0..n)
+            .map(|i| {
+                let (k, o) = (i * bits as usize / 32, i * bits as usize % 32);
+                let hi = w.get(k + 1).copied().unwrap_or(0);
+                ((w[k] as u64 | (hi as u64) << 32) >> o) & mask
+            })
+            .collect();
+    }
     (0..n)
         .map(|i| {
             let bit = i * bits as usize;
             let (k, o) = (bit / 32, bit % 32);
             let x = w[k..].iter().take((o + bits as usize).div_ceil(32)).enumerate().fold(0u128, |a, (j, &y)| a | (y as u128) << (32 * j));
-            (x >> o) as u64 & (u64::MAX >> (64 - bits))
+            (x >> o) as u64 & mask
         })
         .collect()
 }
@@ -460,7 +574,7 @@ impl CtWire {
                     pc_core::keys::cts_expand_row(&key, primes[r] as u32, row);
                 } else {
                     let mut g = pc_core::keys::Prng::from_seed(key, 0);
-                    row.iter_mut().for_each(|x| *x = g.uniform_below(primes[r]) as u32);
+                    g.fill_below(primes[r], row);
                 }
             });
         }
@@ -508,6 +622,157 @@ mod tests {
                 assert_eq!(*g as u128, (((v << bits) + big / 2) / big) & mask, "bits {bits}");
             }
         }
+    }
+
+    /// The packers before the reciprocal reductions and the running word: the reference of `pack_matches_reference`.
+    fn pack_coeffs_ref(q: &[u64], rows: &[&[u64]], bits: u32) -> Vec<u64> {
+        let (q0, q1) = (q[0], q[1]);
+        let big = q0 as u128 * q1 as u128;
+        let inv = inv_mod(q0 % q1, q1) as u128;
+        let scale = (1u128 << bits) as f64 / big as f64;
+        let mask = u64::MAX >> (64 - bits);
+        (0..rows[0].len())
+            .map(|i| {
+                let (v0, v1) = (rows[0][i] % q0, rows[1][i] % q1);
+                let d = (v1 + q1 - v0 % q1) % q1;
+                let x = v0 + q0 * ((d as u128 * inv % q1 as u128) as u64);
+                if bits <= 32 { ((x as f64) * scale).round() as u64 & mask } else { ((((x as u128) << bits) + big / 2) / big) as u64 & mask }
+            })
+            .collect()
+    }
+    fn pack_bits_ref(v: &[u64], bits: u32) -> Vec<u32> {
+        let mut out = vec![0u32; packed_words(v.len(), bits)];
+        for (i, &x) in v.iter().enumerate() {
+            let (bit, x) = (i * bits as usize, (x & (u64::MAX >> (64 - bits))) as u128);
+            let (w, o) = (bit / 32, bit % 32);
+            let x = x << o;
+            for (k, word) in out[w..].iter_mut().take((o + bits as usize).div_ceil(32)).enumerate() {
+                *word |= (x >> (32 * k)) as u32;
+            }
+        }
+        out
+    }
+    fn unpack_bits_ref(w: &[u32], n: usize, bits: u32) -> Vec<u64> {
+        (0..n)
+            .map(|i| {
+                let bit = i * bits as usize;
+                let (k, o) = (bit / 32, bit % 32);
+                let x = w[k..].iter().take((o + bits as usize).div_ceil(32)).enumerate().fold(0u128, |a, (j, &y)| a | (y as u128) << (32 * j));
+                (x >> o) as u64 & (u64::MAX >> (64 - bits))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pack_matches_reference() {
+        // word for word: random and unreduced residues, and CRT values at the rounding's half points
+        for q in [[268042241u64, 265420801], [268369921, 268361729], [4294828033, 2147352577]] {
+            let big = q[0] as u128 * q[1] as u128;
+            let n = 20000usize;
+            for bits in [1u32, 12, 16, 18, 22, 28, 31, 32, 33, 48] {
+                let mut x: Vec<u128> = (0..n as u128).map(|i| (i * 0x9e37_79b9_7f4a_7c15 + i * i * 0x2545_f491_4f6c_dd1d) % big).collect();
+                for (k, v) in x.iter_mut().enumerate().take(4000) {
+                    // around (j + 1/2) Q / 2^bits
+                    let j = (k as u128 * 0x9e37_79b9) & ((1u128 << bits) - 1);
+                    *v = ((((2 * j + 1) * big) >> (bits + 1)) + big + (k % 5) as u128 - 2) % big;
+                }
+                let mut rows: Vec<Vec<u64>> = q.iter().map(|&p| x.iter().map(|&v| (v % p as u128) as u64).collect()).collect();
+                for i in 4000..5000 {
+                    rows[0][i] = u64::MAX - ((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 3);
+                    rows[1][i] = (i as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+                }
+                let refs: Vec<&[u64]> = rows.iter().map(|r| r.as_slice()).collect();
+                let want = pack_coeffs_ref(&q, &refs, bits);
+                assert_eq!(pack_coeffs(&q, &refs, bits).unwrap(), want, "pack_coeffs {bits} bits, q {q:?}");
+                let packed = pack_bits_ref(&want, bits);
+                assert_eq!(pack_bits(&want, bits), packed, "pack_bits {bits} bits");
+                assert_eq!(unpack_bits(&packed, n, bits), unpack_bits_ref(&packed, n, bits), "unpack_bits {bits} bits");
+                let mut part = vec![7u32];
+                pack_frame_part(&q, &refs, bits, &mut part).unwrap();
+                assert_eq!(part[1..], packed[..], "pack_frame_part {bits} bits, q {q:?}");
+                // a part of 32-bit rows (the session's words)
+                let narrow: Vec<Vec<u32>> = rows.iter().map(|r| r.iter().map(|&v| v as u32).collect()).collect();
+                let wide: Vec<Vec<u64>> = narrow.iter().map(|r| r.iter().map(|&v| v as u64).collect()).collect();
+                let (nrefs, wrefs): (Vec<&[u32]>, Vec<&[u64]>) = (narrow.iter().map(|r| r.as_slice()).collect(), wide.iter().map(|r| r.as_slice()).collect());
+                let mut part = Vec::new();
+                pack_frame_part(&q, &nrefs, bits, &mut part).unwrap();
+                assert_eq!(part, pack_bits_ref(&pack_coeffs_ref(&q, &wrefs, bits), bits), "pack_frame_part of u32 rows, {bits} bits");
+            }
+        }
+        // an odd count's tail word
+        for n in [1usize, 3, 31, 33] {
+            let v: Vec<u64> = (0..n as u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+            for bits in [1u32, 7, 22, 32] {
+                let packed = pack_bits_ref(&v, bits);
+                assert_eq!(pack_bits(&v, bits), packed, "{n} values of {bits} bits");
+                assert_eq!(unpack_bits(&packed, n, bits), unpack_bits_ref(&packed, n, bits));
+            }
+        }
+    }
+
+    /// Cost of one compressed frame's packing (16 / 22 bits over two 28-bit primes), alone and eight at once:
+    /// `cargo test --release -p pc-client frame_pack_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn frame_pack_cost() {
+        let q = [268042241u64, 265420801];
+        let n = 1usize << 16;
+        let rows: Vec<Vec<u64>> = q.iter().map(|&p| (0..n as u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) % p).collect()).collect();
+        let refs: Vec<&[u64]> = rows.iter().map(|r| r.as_slice()).collect();
+        let frame = || {
+            for b in [16u32, 22] {
+                std::hint::black_box(pack_bits(&pack_coeffs(&q, &refs, b).unwrap(), b));
+            }
+        };
+        let narrow: Vec<Vec<u32>> = rows.iter().map(|r| r.iter().map(|&v| v as u32).collect()).collect();
+        let nrefs: Vec<&[u32]> = narrow.iter().map(|r| r.as_slice()).collect();
+        let part = || {
+            let mut data = Vec::with_capacity(2 * n);
+            for b in [16u32, 22] {
+                pack_frame_part(&q, &nrefs, b, &mut data).unwrap();
+            }
+            std::hint::black_box(data);
+        };
+        let reps = 20;
+        let time = |name: &str, f: &(dyn Fn() + Sync)| {
+            f();
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                f();
+            }
+            println!("{name}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+        };
+        time("pack_coeffs 16", &|| {
+            std::hint::black_box(pack_coeffs(&q, &refs, 16).unwrap());
+        });
+        let v = pack_coeffs(&q, &refs, 22).unwrap();
+        time("pack_bits 22", &|| {
+            std::hint::black_box(pack_bits(&v, 22));
+        });
+        time("frame", &frame);
+        time("8 frames at once", &|| {
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(frame);
+                }
+            });
+        });
+        time("frame (pack_frame_part)", &part);
+        let buf = std::sync::Mutex::new(Vec::with_capacity(2 * n));
+        time("frame (pack_frame_part, buffer kept)", &|| {
+            let mut data = buf.lock().unwrap();
+            data.clear();
+            for b in [16u32, 22] {
+                pack_frame_part(&q, &nrefs, b, &mut data).unwrap();
+            }
+        });
+        time("8 frames at once (pack_frame_part)", &|| {
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(part);
+                }
+            });
+        });
     }
 
     #[test]
