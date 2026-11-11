@@ -282,3 +282,58 @@ pub extern "C" fn ksk_expand<W: Hw>(a: *const KskExpandArgs, s: S) -> i32 {
         })
     })
 }
+
+fn pack_bad(sub: i32, nq: i32, nrows: i32, k: i32) -> i32 {
+    if (2..=16).contains(&sub) && sub & (sub - 1) == 0 && (0..=nrows).contains(&nq) && k >= 1 {
+        0
+    } else {
+        -1
+    }
+}
+
+/// pack_split: one task per (polynomial, row).
+pub extern "C" fn pack_split<W: Hw>(a: *const PackSplitArgs, s: S) -> i32 {
+    launch(a, s, |a| pack_bad(a.sub, a.nq, a.nrows, a.k), |a| {
+        let rows = a.nrows as usize;
+        par_for(a.k as usize * rows, a, |a, task| {
+            let (c, y, sub, nq) = (task / rows, task % rows, a.sub as usize, a.nq as usize);
+            let src = if y < nq { row::<W>(a.q, c * a.q_stride as usize + y * N) } else { row::<W>(a.p, c * a.p_stride as usize + (y - nq) * N) };
+            for j in 0..sub {
+                // SAFETY: row y of digit j of polynomial c (apart from the sources)
+                let o = unsafe { std::slice::from_raw_parts_mut((a.out as *mut W).add(c * a.out_stride as usize + (j * rows + y) * N), N) };
+                for (i, w) in o.iter_mut().enumerate() {
+                    *w = if i % sub == j { src[i] } else { W::default() };
+                }
+            }
+        })
+    })
+}
+
+/// pack_dot: one task per (polynomial, row), the digit loop lazily in the double word as the device.
+pub extern "C" fn pack_dot<W: Hw>(a: *const PackDotArgs, s: S) -> i32 {
+    launch(a, s, |a| pack_bad(a.sub, a.nq, a.nrows, a.k), |a| {
+        let rows = a.nrows as usize;
+        par_for(a.k as usize * rows, a, |a, task| {
+            let (c, y) = (task / rows, task % rows);
+            let t = el::<u32>(a.rows as _, y) as usize;
+            let q = prime(a.pr, t);
+            let (mut s0, mut s1) = (buf::<W::Acc>(N), buf::<W::Acc>(N));
+            for j in 0..a.sub as usize {
+                let off = (j * rows + y) * N;
+                v::mac2::<W>(&mut s0, &mut s1, row::<W>(a.dig, c * a.dig_stride as usize + off), row::<W>(a.kb, off), row::<W>(a.ka, off));
+            }
+            let (mut r0, mut r1) = (buf::<W>(N), buf::<W>(N));
+            v::reduce::<W>(&s0, q, &mut r0);
+            v::reduce::<W>(&s1, q, &mut r1);
+            if (y as i32) < a.nq {
+                v::shoup_row::<W>(&mut r0, row::<W>(a.c0, c * a.ct_stride as usize + t * N), el::<W>(a.pmod, t), el::<W>(a.pmods, t), W::from_u64(q.p), false);
+            }
+            let ob = c * a.out_ct_stride as usize + t * N;
+            // SAFETY: row t of polynomial c of the two outputs
+            unsafe {
+                std::slice::from_raw_parts_mut((a.out0 as *mut W).add(ob), N).copy_from_slice(&r0);
+                std::slice::from_raw_parts_mut((a.out1 as *mut W).add(ob), N).copy_from_slice(&r1);
+            }
+        })
+    })
+}

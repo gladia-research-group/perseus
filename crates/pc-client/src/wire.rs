@@ -92,12 +92,20 @@ pub enum Entry {
     Ccmm { primes: [u64; 5], fwd: usize, back: usize, autos: usize, rlk: usize, words: usize },
     /// Public key `(-a s + e, a)`: `[part][rows][N]`, eval form over Q ids `0..rows`.
     PublicKey { rows: usize, words: usize },
+    /// A pack key (`Client::pack_keygen`): `b`, `[sub][row][N]` u32 words (dense, eval form; rows = the bottom
+    /// level's Q ids then its special ids), `a` = `pack_a_row(seed, ..)`.
+    PackKsk { sub: usize, rows: usize, seed: [u32; 8], words: usize },
 }
 
 impl Entry {
     pub fn words(&self) -> usize {
         match self {
-            Entry::Ksk { words, .. } | Entry::SpruCs { words, .. } | Entry::Pcmm { words, .. } | Entry::Ccmm { words, .. } | Entry::PublicKey { words, .. } => *words,
+            Entry::Ksk { words, .. }
+            | Entry::SpruCs { words, .. }
+            | Entry::Pcmm { words, .. }
+            | Entry::Ccmm { words, .. }
+            | Entry::PublicKey { words, .. }
+            | Entry::PackKsk { words, .. } => *words,
         }
     }
 }
@@ -289,6 +297,15 @@ pub struct CtHeader {
     /// c0's rows are coefficient form (a `drop` frame expanded): `import_ct` runs their forward transform.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub coeff0: bool,
+    /// c1's rows (drawn from the seeds of a seeded frame) are coefficient form: a subring client's frame
+    /// (`Client::sub`), which the server lifts without a transform of the small ring (`lifted`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coeff1: bool,
+    /// Packed frame (`export_ct_many(..., pack=)`): c1 lies in the subring Z[X^sub1] and only its `n / sub1`
+    /// coefficients at the multiples of `sub1` are sent, at `bits1`; under the client's pack secret
+    /// (`ClientSecret::pack`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub1: Option<u32>,
 }
 
 /// x mod p for any x, m = floor(2^64 / p): the quotient estimate is short by at most one.
@@ -604,7 +621,7 @@ impl CtWire {
             h.k * (packed_words(h.n, h.bits.unwrap_or(0)) + h.rows * 8)
         } else if let Some(b0) = h.bits {
             let b1 = h.bits1.unwrap_or(b0);
-            h.k * (packed_words(h.n, b0) + packed_words(h.n, b1))
+            h.k * (packed_words(h.n, b0) + packed_words(h.n / h.sub1.unwrap_or(1).max(1) as usize, b1))
         } else if h.seeded {
             h.k * h.rows * (h.n + 8)
         } else {
@@ -637,6 +654,9 @@ impl CtWire {
         let header: CtHeader = serde_json::from_slice(&read_header(r, CT_MAGIC)?)?;
         if header.n == 0 || header.k == 0 || header.rows == 0 || header.n > 1 << 17 || header.k > 64 || header.rows > 128 {
             return Err(Error::Wire(format!("ciphertext header out of range: {header:?}")));
+        }
+        if header.sub1.is_some_and(|k| k < 2 || !k.is_power_of_two() || header.n % k as usize != 0) {
+            return Err(Error::Wire(format!("packed frame header out of range: {header:?}")));
         }
         if header.drop.is_some() && !(header.seeded && !header.regen && header.bits.is_some_and(|b| (1..=126).contains(&b)) && header.rows <= 4) {
             return Err(Error::Wire(format!("short-c0 frame header out of range: {header:?}")));
@@ -687,6 +707,26 @@ impl CtWire {
             });
         }
         Ok(CtWire { header: CtHeader { seeded: false, regen: false, bits: if short.is_some() { None } else { h.bits }, drop: None, coeff0: short.is_some(), ..h.clone() }, data })
+    }
+    /// A subring frame (`Client::sub`, expanded: both parts in coefficient form over `header.n` | `n` coefficients) in
+    /// the ring of `n` coefficients, coefficient i at i n / header.n (X -> X^(n / header.n), a ring map): the same
+    /// plaintext's lift under the lifted secret, its slots the small ring's repeated. Every slot live.
+    pub fn lifted(&self, n: usize) -> Result<CtWire> {
+        let h = &self.header;
+        if h.seeded || h.bits.is_some() || !(h.coeff0 && h.coeff1) {
+            return Err(Error::Wire("lifted: an expanded frame with both parts in coefficient form (a subring client's)".into()));
+        }
+        if h.n == 0 || n % h.n != 0 || !(n / h.n).is_power_of_two() {
+            return Err(Error::Wire(format!("lifted: a frame of {} coefficients into a ring of {n}", h.n)));
+        }
+        let k = n / h.n;
+        let mut data = vec![0u32; self.data.len() * k];
+        for (src, dst) in self.data.chunks(h.n).zip(data.chunks_mut(n)) {
+            for (i, &x) in src.iter().enumerate() {
+                dst[i * k] = x;
+            }
+        }
+        Ok(CtWire { header: CtHeader { n, meta: WireMeta { slots: (n / 2) as u32, ..h.meta.clone() }, ..h.clone() }, data })
     }
     /// Row `row` of part `part` of ciphertext `c`.
     pub fn row(&self, c: usize, part: usize, row: usize) -> &[u32] {
@@ -952,7 +992,7 @@ mod tests {
 
     #[test]
     fn ct_frame_roundtrip_and_corruption() {
-        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false };
+        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None };
         let w = CtWire { data: (0..CtWire::words(&h) as u32).collect(), header: h };
         let mut b = w.to_bytes().unwrap();
         assert_eq!(CtWire::from_bytes(&b).unwrap(), w);

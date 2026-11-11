@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 30;
+pub const ABI: u32 = 31;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -213,6 +213,47 @@ pub struct KsArgs {
     pub r: i32,
     pub ndig: i32,
     pub c0_mode: i32,
+    pub nq: i32,
+    pub nrows: i32,
+}
+
+/// `pack_split` (ABI 31): the `sub` coefficient classes of K coefficient-form polynomials over `nrows` rows (the
+/// first `nq` read at `q`, the rest at `p`); digit j of polynomial c at `out + c out_stride + (j nrows + y) N`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PackSplitArgs {
+    pub q: *const c_void,
+    pub p: *const c_void,
+    pub out: *mut c_void,
+    pub q_stride: u64,
+    pub p_stride: u64,
+    pub out_stride: u64,
+    pub k: i32,
+    pub sub: i32,
+    pub nq: i32,
+    pub nrows: i32,
+}
+
+/// `pack_dot` (ABI 31): the subring switch's inner product, s1 = sum_j D_j a_j, s0 = sum_j D_j b_j (+ pmod c0 on
+/// the Q rows); digits as `pack_split`'s output, keys `[digit][row][N]`, c0 and the outputs in prime-id rows.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PackDotArgs {
+    pub dig: *const c_void,
+    pub kb: *const c_void,
+    pub ka: *const c_void,
+    pub c0: *const c_void,
+    pub out0: *mut c_void,
+    pub out1: *mut c_void,
+    pub rows: *const u32,
+    pub pmod: *const c_void,
+    pub pmods: *const c_void,
+    pub pr: *const PrimeConst,
+    pub dig_stride: u64,
+    pub ct_stride: u64,
+    pub out_ct_stride: u64,
+    pub k: i32,
+    pub sub: i32,
     pub nq: i32,
     pub nrows: i32,
 }
@@ -1009,6 +1050,8 @@ pub struct KernelTable {
     pub tensor_seeded: Launch<TensorSeededArgs>,
     pub ew_many: Launch<EwManyArgs>,
     pub submul_many: Launch<SubMulManyArgs>,
+    pub pack_split: Launch<PackSplitArgs>,
+    pub pack_dot: Launch<PackDotArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -1056,7 +1099,9 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 46 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 48 * 8);
+    assert!(size_of::<PackSplitArgs>() == 64);
+    assert!(size_of::<PackDotArgs>() == 120);
     assert!(size_of::<EwManyArgs>() == 4 * EWM_MAX * 8 + 16);
     assert!(size_of::<SubMulManyArgs>() == 3 * EWM_MAX * 8 + 24);
     assert!(size_of::<MulAddArgs>() == 104);

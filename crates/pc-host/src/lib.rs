@@ -141,6 +141,8 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         tensor_seeded: elem::tensor_seeded::<W>,
         ew_many: elem::ew_many::<W>,
         submul_many: elem::submul_many::<W>,
+        pack_split: ks::pack_split::<W>,
+        pack_dot: ks::pack_dot::<W>,
     }
 }
 

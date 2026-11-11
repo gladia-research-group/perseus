@@ -30,14 +30,28 @@ pub struct PyClientSecret(pub Vec<u8>);
 #[pymethods]
 impl PyClientSecret {
     /// A fresh secret for chain `chain` (OS entropy, or `seed` for reproducible tests); `sparse_h`: the Hamming
-    /// weight of the sparse (export / encapsulation) secret, 32 by default.
+    /// weight of the sparse (export / encapsulation) secret, 32 by default. `n`: a subring upload client's secret
+    /// (`Client(..., sub=True)`) of that many coefficients instead of the chain's. `pack`: with a pack secret
+    /// (`with_pack`).
     #[staticmethod]
-    #[pyo3(signature = (chain="n32", seed=None, sparse_h=None))]
-    fn generate(chain: &str, seed: Option<u64>, sparse_h: Option<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (chain="n32", seed=None, sparse_h=None, n=None, pack=false))]
+    fn generate(chain: &str, seed: Option<u64>, sparse_h: Option<usize>, n: Option<usize>, pack: bool) -> PyResult<Self> {
         let c = pc_client::spec::chain_of(chain).map_err(cerr)?;
         let mut g = prng_of(seed)?;
         let h = sparse_h.unwrap_or(pc_core::keys::SecretKey::SPARSE_H);
-        Ok(PyClientSecret(ClientSecret::generate_h(&mut g, c.n, h).map_err(cerr)?.to_bytes()))
+        let s = ClientSecret::generate_h(&mut g, n.unwrap_or(c.n), h).map_err(cerr)?;
+        Ok(PyClientSecret(if pack { s.with_pack(&mut g) } else { s }.to_bytes()))
+    }
+    /// This secret with a fresh pack secret (dense ternary, independent of the others): what packed frames
+    /// (`Client.pack_keygen`, `export_ct_many(..., pack=)`) decrypt under.
+    #[pyo3(signature = (seed=None))]
+    fn with_pack(&self, seed: Option<u64>) -> PyResult<Self> {
+        let mut g = prng_of(seed)?;
+        Ok(PyClientSecret(ClientSecret::from_bytes(&self.0).map_err(cerr)?.with_pack(&mut g).to_bytes()))
+    }
+    #[getter]
+    fn has_pack(&self) -> PyResult<bool> {
+        Ok(ClientSecret::from_bytes(&self.0).map_err(cerr)?.pack.is_some())
     }
     #[staticmethod]
     fn from_bytes(b: Vec<u8>) -> PyResult<Self> {
@@ -50,7 +64,11 @@ impl PyClientSecret {
 }
 
 /// The client: keygen from a server's key request into a bundle file, encryption of slot vectors, decryption.
-/// `complex`: the payload (complex slots, or real: imaginary parts dropped).
+/// `complex`: the payload (complex slots, or real: imaginary parts dropped). `sub`: an upload client on the subring
+/// of the secret's size n | N (`ClientSecret.generate(n=)`): its frames (`encrypt(.., seeded=True, drop=..)`,
+/// `encrypt_coeffs(.., drop=..)` only) are n / N the size; `import_ct` lifts one to a ciphertext under that secret
+/// spread over the ring (slots: the frame's n / 2 repeated; coefficient i at i N / n), which a rotation by an entry
+/// step (`keygen(entry_steps=, entry_secret=)`) brings, rotated, to the main secret.
 #[pyclass(name = "Client", module = "perseus._pc", unsendable)]
 pub struct PyClient {
     c: Client,
@@ -117,10 +135,11 @@ impl PyClient {
 #[pymethods]
 impl PyClient {
     #[new]
-    #[pyo3(signature = (secret, chain="n32", complex=true, seed=None))]
-    fn new(secret: &PyClientSecret, chain: &str, complex: bool, seed: Option<u64>) -> PyResult<Self> {
+    #[pyo3(signature = (secret, chain="n32", complex=true, seed=None, sub=false))]
+    fn new(secret: &PyClientSecret, chain: &str, complex: bool, seed: Option<u64>, sub: bool) -> PyResult<Self> {
         let s = ClientSecret::from_bytes(&secret.0).map_err(cerr)?;
-        Ok(PyClient { c: Client::new(chain, s).map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real }, pk: None, pre: Default::default() })
+        let c = if sub { Client::sub(chain, s.sk.s.len(), s) } else { Client::new(chain, s) };
+        Ok(PyClient { c: c.map_err(cerr)?, prng: prng_of(seed)?, payload: if complex { Payload::Complex } else { Payload::Real }, pk: None, pre: Default::default() })
     }
 
     #[getter]
@@ -133,14 +152,24 @@ impl PyClient {
     }
 
     /// Generate every key of `spec` (a server's `Session.key_manifest` JSON) into the bundle file `path`, on a
-    /// rayon pool of `threads`. Returns the timings and sizes.
-    #[pyo3(signature = (spec, path, threads=8))]
-    fn keygen<'py>(&mut self, py: Python<'py>, spec: &str, path: std::path::PathBuf, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+    /// rayon pool of `threads`. Returns the timings and sizes. `entry_steps`, `entry_secret`: the rotation keys of
+    /// those steps made entry keys from a subring upload client's secret (`Client(..., sub=True)`): `rotate(x, step)`
+    /// of an imported subring frame is then the rotated plaintext under this client's secret, and those steps rotate
+    /// nothing else.
+    #[pyo3(signature = (spec, path, threads=8, entry_steps=Vec::new(), entry_secret=None))]
+    fn keygen<'py>(&mut self, py: Python<'py>, spec: &str, path: std::path::PathBuf, threads: usize, entry_steps: Vec<i64>, entry_secret: Option<&PyClientSecret>) -> PyResult<Bound<'py, PyDict>> {
         let spec = pc_client::KeySpec::from_json(spec).map_err(cerr)?;
+        if entry_steps.is_empty() != entry_secret.is_none() {
+            return Err(PyValueError::new_err("keygen: entry_steps come with the entry_secret"));
+        }
+        let u = match entry_secret {
+            Some(u) => ClientSecret::from_bytes(&u.0).map_err(cerr)?.sk.s,
+            None => Vec::new(),
+        };
         let (c, g) = (&mut self.c, &mut self.prng);
         let st = nogil(py, || -> pc_client::Result<pc_client::KeyGenStats> {
             let f = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(&path)?);
-            c.keygen(&spec, f, g, threads)
+            c.keygen_entry(&spec, f, g, threads, &entry_steps, &u)
         })
         .map_err(cerr)?;
         let d = PyDict::new(py);
@@ -256,6 +285,44 @@ impl PyClient {
         let c = &self.c;
         let w = nogil(py, || c.encrypt_pre_coeffs(&coeffs, &meta, pre, drop).and_then(|w| w.to_bytes())).map_err(cerr)?;
         Ok(PyBytes::new(py, &w))
+    }
+
+    /// The pack key of stride `sub` (this client's secret -> its pack secret, c1 in the subring Z[X^sub]; the secret
+    /// needs `ClientSecret.with_pack`) into the bundle file `path`: `b` only, `a` from a seed. Returns {seconds, bytes}.
+    #[pyo3(signature = (path, sub=8, threads=8))]
+    fn pack_keygen<'py>(&mut self, py: Python<'py>, path: std::path::PathBuf, sub: usize, threads: usize) -> PyResult<Bound<'py, PyDict>> {
+        let (c, g) = (&self.c, &mut self.prng);
+        let t0 = std::time::Instant::now();
+        let bytes = nogil(py, || -> pc_client::Result<u64> {
+            let seed: [u32; 8] = std::array::from_fn(|_| g.next_u32());
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build().map_err(|e| pc_client::Error::Params(e.to_string()))?;
+            let words = pool.install(|| c.pack_keygen(sub, &seed, g))?;
+            let e = pc_client::Entry::PackKsk { sub, rows: c.pack_ids().len(), seed, words: words.len() };
+            write_bundle(c, &path, e, &words)
+        })
+        .map_err(cerr)?;
+        let d = PyDict::new(py);
+        d.set_item("seconds", t0.elapsed().as_secs_f64())?;
+        d.set_item("bytes", bytes)?;
+        Ok(d)
+    }
+
+    /// Max |e| of the relation of the pack key in the bundle file `path` (b_j + a'_j t - P' s).
+    fn pack_key_error(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<i64> {
+        let c = &self.c;
+        nogil(py, || -> pc_client::Result<i64> {
+            let mut rd = pc_client::BundleReader::open(&path)?;
+            let (i, sub, seed) = rd
+                .header
+                .entries
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| if let pc_client::Entry::PackKsk { sub, seed, .. } = e { Some((i, *sub, *seed)) } else { None })
+                .ok_or_else(|| pc_client::Error::Spec("bundle without a pack key".into()))?;
+            let words = rd.read(i)?;
+            c.pack_relation_max_err(sub, &seed, &words)
+        })
+        .map_err(cerr)
     }
 
     /// Decoded slots (complex128 arrays, one per ciphertext of the frame) of a wire frame.
@@ -378,6 +445,17 @@ impl PyClient {
     }
 }
 
+/// A bundle file of one entry (no plan contract: a pack key).
+fn write_bundle(c: &Client, path: &std::path::Path, e: pc_client::Entry, words: &[u32]) -> pc_client::Result<u64> {
+    let n = c.chain.n;
+    let bits = c.chain.prime_bits().into_iter().max().unwrap_or(0);
+    let header = pc_client::BundleHeader { chain: c.name.clone(), params_hash: c.params_hash.clone(), contract: String::new(), n, bits, row_words: pc_client::wire::packed_row_words(n, bits), entries: vec![e] };
+    let f = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(path)?);
+    let mut w = pc_client::wire::BundleWriter::new(f, header)?;
+    w.put(words)?;
+    w.finish()
+}
+
 /// Bundle file summary: {bytes, entries: {kind: count}, bytes_by_kind: {kind: bytes}, contract, params_hash}.
 #[pyfunction]
 fn bundle_info<'py>(py: Python<'py>, path: std::path::PathBuf) -> PyResult<Bound<'py, PyDict>> {
@@ -391,6 +469,7 @@ fn bundle_info<'py>(py: Python<'py>, path: std::path::PathBuf) -> PyResult<Bound
             pc_client::Entry::Pcmm { .. } => "pcmm",
             pc_client::Entry::Ccmm { .. } => "ccmm",
             pc_client::Entry::PublicKey { .. } => "public_key",
+            pc_client::Entry::PackKsk { .. } => "pack_ksk",
         };
         let c: usize = cnt.get_item(k)?.map_or(Ok(0), |x| x.extract())?;
         cnt.set_item(k, c + 1)?;
@@ -454,7 +533,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let w = CtWire {
-            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false },
+            header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(b), seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None },
             data,
         };
         return Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?));
@@ -471,7 +550,7 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let m = c.meta;
     let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let w = CtWire {
-        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false },
+        header: CtHeader { params_hash: pc_client::spec::params_hash(&dev.ctx.chain), n, k: 1, rows: rows.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None },
         data,
     };
     Ok(PyBytes::new(py, &w.to_bytes().map_err(cerr)?))
@@ -490,6 +569,8 @@ pub struct PyPendingFrames {
     bits: u32,
     bits1: Option<u32>,
     sparse: bool,
+    /// packed frames (`export_ct_many(..., pack=)`): c1's subring stride
+    sub1: Option<u32>,
 }
 
 /// Pinned row buffers of deferred exports, reused across calls (allocating pinned memory per call would cost more
@@ -545,11 +626,18 @@ impl PyPendingFrames {
         }
         let frame = |(rows, moduli, m): &Rows<'_>| -> pc_client::Result<Vec<u8>> {
             let mut data = Vec::with_capacity(2 * self.n);
-            for (part, b) in [(0, self.bits), (1, self.bits1.unwrap_or(self.bits))] {
-                pc_client::wire::pack_frame_part(moduli, &rows[part], b, &mut data)?;
+            pc_client::wire::pack_frame_part(moduli, &rows[0], self.bits, &mut data)?;
+            let b1 = self.bits1.unwrap_or(self.bits);
+            match self.sub1 {
+                // c1 lies in the subring: its coefficients at the stride only
+                Some(k) => {
+                    let small: Vec<Vec<crate::session::W>> = rows[1].iter().map(|r| r.iter().step_by(k as usize).copied().collect()).collect();
+                    pc_client::wire::pack_frame_part(moduli, &small.iter().map(|r| r.as_slice()).collect::<Vec<_>>(), b1, &mut data)?
+                }
+                None => pc_client::wire::pack_frame_part(moduli, &rows[1], b1, &mut data)?,
             }
             let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-            let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse, drop: None, coeff0: false };
+            let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse, drop: None, coeff0: false, coeff1: false, sub1: self.sub1 };
             CtWire { header, data }.to_bytes()
         };
         // one ciphertext: on the calling thread (frames of separate calls never queue behind each other in the pool)
@@ -581,12 +669,18 @@ impl PyPendingFrames {
 /// `sparse`: each ciphertext first switched to the client's sparse secret (`KeySource(sparse_out=True)`, bottom level):
 /// c1's rounding then meets a 32-coefficient secret, so both parts compress further.
 /// `user`: switched to that user's key instead (`Session.add_user`): the frames decrypt with the user's secret only.
+/// `pack`: switched through that pack key instead (`Session.add_pack_key`, bottom level): c1 lies in the subring of
+/// the key's stride and only those coefficients are framed; the frames decrypt under the client's pack secret.
 /// `defer`: return the downloaded residues as `PendingFrames` instead, framed by its `frames()` (on any thread).
 #[pyfunction]
-#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false, user=None, defer=false))]
+#[pyo3(signature = (session, cts, bits, bits1=None, sparse=false, user=None, defer=false, pack=None))]
 #[allow(clippy::too_many_arguments)]
-fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool, user: Option<String>, defer: bool) -> PyResult<Bound<'py, PyAny>> {
+fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, PyCt>>, bits: u32, bits1: Option<u32>, sparse: bool, user: Option<String>, defer: bool, pack: Option<String>) -> PyResult<Bound<'py, PyAny>> {
     let sparse = sparse || user.is_some();
+    if sparse && pack.is_some() {
+        return Err(PyValueError::new_err("export_ct_many: pack= with sparse= / user= (one switch)"));
+    }
+    let mut sub1 = None;
     let dev = session.dev.clone();
     let n = dev.ctx.lay.n;
     let mut limbs = Vec::with_capacity(cts.len());
@@ -599,10 +693,10 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
         if meta.deg == 2 || ct.ct_ref().buf.lay.nq != dev.ctx.lay.nq {
             ct.check_full()?;
         }
-        let tmp = if meta.deg == 2 || sparse {
+        let tmp = if meta.deg == 2 || sparse || pack.is_some() {
             let mut t = PyCt::acquire(&dev, meta)?;
             let mut st = dev.st.borrow_mut();
-            let State { ops, ex, plans, groups, users, .. } = &mut *st;
+            let State { ops, ex, plans, groups, users, packs, .. } = &mut *st;
             if meta.deg == 2 {
                 ops.realize_to(&dev.ctx, ex, &dev.sh, t.ct_mut_ref()?, ct.ct_ref()).map_err(gerr)?;
             } else {
@@ -623,6 +717,17 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
                     return Err(PyValueError::new_err(format!("sparse export: the ciphertext must sit at the bottom level ({} rows, top {top})", dev.ctx.chain.level_unit)));
                 }
                 pc_gpu::bts::raise::key_switch_with(&dev.ctx, ex, plans, g, dev.source, &mut tc.buf, 1, top).map_err(gerr)?;
+            }
+            if let Some(name) = &pack {
+                let u = packs.as_ref().ok_or_else(|| PyValueError::new_err("Session without pack key slots (size={\"packKeys\": n})"))?;
+                let slot = *u.names.get(name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("no pack key {name:?}")))?;
+                let tc = t.ct_mut_ref()?;
+                let top = tc.top(dev.ctx.shape).map_err(gerr)?;
+                if top != u.plan.top {
+                    return Err(PyValueError::new_err(format!("packed export: the ciphertext must sit at the bottom level (top {}, got {top})", u.plan.top)));
+                }
+                pc_gpu::ks::pack_switch(&dev.ctx, ex, plans, &u.plan, &u.slots[slot], &mut tc.buf, 1).map_err(gerr)?;
+                sub1 = Some(u.plan.sub as u32);
             }
             Some(t)
         } else {
@@ -651,7 +756,7 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
     } else {
         None
     };
-    let pending = PyPendingFrames { limbs, inflight, hash: pc_client::spec::params_hash(&dev.ctx.chain), n, bits, bits1, sparse };
+    let pending = PyPendingFrames { limbs, inflight, hash: pc_client::spec::params_hash(&dev.ctx.chain), n, bits, bits1, sparse, sub1 };
     if defer {
         return Ok(Bound::new(py, pending)?.into_any());
     }
@@ -674,7 +779,9 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
         return Err(PyValueError::new_err("import_ct(regen=True): a short-c0 frame (encrypt(..., drop=..)) has no seeded slot form"));
     }
     let w = if w.header.seeded && !regen { nogil(py, || w.expand_seeded(&dev.ctx.chain.q)).map_err(cerr)? } else { w };
-    if w.header.coeff0 && low {
+    // a subring client's frame: spread over the ring
+    let w = if w.header.n != dev.ctx.lay.n && w.header.coeff1 && !regen { nogil(py, || w.lifted(dev.ctx.lay.n)).map_err(cerr)? } else { w };
+    if (w.header.coeff0 || w.header.coeff1) && low {
         return Err(PyValueError::new_err("import_ct(low=True): a short-c0 frame imports into a pool ciphertext"));
     }
     let h = &w.header;
@@ -714,8 +821,14 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
             for part in 0..2 {
                 c.buf.upload_rows(&st.ex.compute, 0, part, &rows, &w.data[part * h.rows * n..(part + 1) * h.rows * n])?;
             }
-            if h.coeff0 {
-                pc_gpu::ntt::transform(&dev.ctx, &st.ex.compute, pc_gpu::ntt::Dir::Forward, &mut c.buf, pc_gpu::ntt::Span::Q { top }, pc_gpu::ntt::Parts::C0)?;
+            let parts = match (h.coeff0, h.coeff1) {
+                (true, true) => Some(pc_gpu::ntt::Parts::Both),
+                (true, false) => Some(pc_gpu::ntt::Parts::C0),
+                (false, true) => Some(pc_gpu::ntt::Parts::C1),
+                _ => None,
+            };
+            if let Some(parts) = parts {
+                pc_gpu::ntt::transform(&dev.ctx, &st.ex.compute, pc_gpu::ntt::Dir::Forward, &mut c.buf, pc_gpu::ntt::Span::Q { top }, parts)?;
             }
             Ok(())
         })
@@ -727,10 +840,16 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &[u8], low: bool, regen
 /// A seeded frame (`encrypt(..., seeded=True)`, `regen` or not) with its c1 rows regenerated on the host from its seeds:
 /// the unseeded frame `import_ct` then only uploads. `primes`: the chain's Q primes from the bottom (at least the
 /// frame's rows, e.g. `export_limbs(x)["moduli"]` of a ciphertext at its level). Releases the GIL (a worker thread can
-/// expand an arriving frame while the device runs).
+/// expand an arriving frame while the device runs). `n`: the session's ring, for a subring client's frame, which is
+/// spread over it here too.
 #[pyfunction]
-fn expand_frame<'py>(py: Python<'py>, frame: &[u8], primes: Vec<u64>) -> PyResult<Bound<'py, PyBytes>> {
-    let out = nogil(py, || CtWire::from_bytes(frame).and_then(|w| w.expand_seeded(&primes)).and_then(|w| w.to_bytes())).map_err(cerr)?;
+#[pyo3(signature = (frame, primes, n=None))]
+fn expand_frame<'py>(py: Python<'py>, frame: &[u8], primes: Vec<u64>, n: Option<usize>) -> PyResult<Bound<'py, PyBytes>> {
+    let lift = |w: CtWire| match n {
+        Some(n) if w.header.n != n && w.header.coeff1 => w.lifted(n),
+        _ => Ok(w),
+    };
+    let out = nogil(py, || CtWire::from_bytes(frame).and_then(|w| w.expand_seeded(&primes)).and_then(lift).and_then(|w| w.to_bytes())).map_err(cerr)?;
     Ok(PyBytes::new(py, &out))
 }
 

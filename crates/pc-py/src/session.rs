@@ -164,6 +164,11 @@ pub(crate) struct Sizes {
     /// Per-user result keys (`size={"userKeys": count}`): bottom-level master -> user switching keys, filled at run
     /// time (`Session.add_user`) and used by `export_ct_many(..., user=)`.
     pub user_keys: usize,
+    /// Pack keys (`size={"packKeys": count, "packSub": stride}`, stride 8 by default): bottom-level keys to a
+    /// client's pack secret with c1 in the subring Z[X^stride], filled at run time (`Session.add_pack_key`) and used
+    /// by `export_ct_many(..., pack=)`.
+    pub pack_keys: usize,
+    pub pack_sub: usize,
     /// Ciphertexts per key-switching launch (`size={"kMax": k}`, default 8): the K-batching bound sizing the
     /// key-switching workspace, the plans and the row tables (`MemCfg::k_max`).
     pub k_max: usize,
@@ -336,6 +341,16 @@ pub(crate) struct State {
     pub enc_misses: u64,
     /// per-user result keys (`size={"userKeys"}`)
     pub users: Option<Users>,
+    /// pack keys (`size={"packKeys"}`)
+    pub packs: Option<Packs>,
+}
+
+/// The pack key slots and their switch's tables.
+pub(crate) struct Packs {
+    pub plan: pc_gpu::ks::PackPlan<'static>,
+    pub slots: Vec<pc_gpu::ks::PackKey<'static, W>>,
+    pub names: HashMap<String, usize>,
+    pub free: Vec<usize>,
 }
 
 /// Per-user master -> user switching keys: carved slots, their key groups, the names holding them.
@@ -999,6 +1014,9 @@ fn import_bundle(path: &std::path::Path, req: &pc_client::KeySpec, chain: &Chain
                 }
                 parts.pk = Some(words);
             }
+            Entry::PackKsk { .. } => {
+                return Err(PyValueError::new_err("key bundle: a pack key is not session material (Session.add_pack_key)"));
+            }
         }
     }
     let ts: Vec<usize> = parts.pcmm.iter().map(|k| k.shape.t).collect();
@@ -1146,6 +1164,10 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     if sizes.user_keys > 0 {
         let sh = pc_gpu::keys::KskShape::bottom(&chain).map_err(e)?;
         mp.reserve("user_keys", sizes.user_keys * (sh.bytes::<W>(chain.n, layout) + KeyGroup::bytes(1, true)));
+    }
+    if sizes.pack_keys > 0 {
+        use pc_gpu::ks::{PackKey, PackPlan};
+        mp.reserve("pack_keys", PackPlan::bytes(&chain, k_max, sizes.pack_sub) + sizes.pack_keys * PackKey::<W>::bytes(chain.n, sizes.pack_sub, PackPlan::ids(&chain).len()));
     }
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     // planned blocks push every per-call constant through the ring (scalar rows, raise adjusts) and a captured
@@ -1312,6 +1334,13 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             .map_err(e)?;
         let groups = slots.iter().map(|k| KeyGroup::new(a, &ex.compute, n, &[k as &dyn KsKeyRef], stage)).collect::<pc_gpu::Result<Vec<_>>>().map_err(e)?;
         Some(Users { slots, groups, names: HashMap::new(), free: (0..sizes.user_keys).rev().collect() })
+    } else {
+        None
+    };
+    let packs = if sizes.pack_keys > 0 {
+        let plan = pc_gpu::ks::PackPlan::new(a, &ex.compute, &ctx, &plans, sizes.pack_sub).map_err(e)?;
+        let slots = (0..sizes.pack_keys).map(|_| pc_gpu::ks::PackKey::carve(a, n, sizes.pack_sub, plan.ids.len())).collect::<pc_gpu::Result<Vec<_>>>().map_err(e)?;
+        Some(Packs { plan, slots, names: HashMap::new(), free: (0..sizes.pack_keys).rev().collect() })
     } else {
         None
     };
@@ -1509,6 +1538,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         enc_hits: 0,
         enc_misses: 0,
         users,
+        packs,
     };
     Ok(Dev {
         st: RefCell::new(state),
@@ -1554,7 +1584,7 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
         exp_real: g("expanded", 3072),
         seq_len: g("seqLen", 1024),
     };
-    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_pool2: g("lowPool2", 0), low_rows2: g("lowRows2", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0), k_max: g("kMax", 8) };
+    let sizes = Sizes { pool, pt_slots, encode_threads, low_pool: g("lowPool", 0), low_rows: g("lowRows", 0), low_pool2: g("lowPool2", 0), low_rows2: g("lowRows2", 0), low_seeded: g("lowSeeded", 0), low_packed: g("lowPacked", 0) != 0, user_keys: g("userKeys", 0), pack_keys: g("packKeys", 0), pack_sub: g("packSub", 8), k_max: g("kMax", 8) };
     let cfg = config.0.clone();
     let ks = keys.clone();
     let plan = match programs {
@@ -1998,6 +2028,53 @@ impl PySession {
         let mut st = self.dev.st.borrow_mut();
         let u = st.users.as_mut().ok_or_else(|| PyValueError::new_err("Session without user key slots"))?;
         let slot = u.names.remove(name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("no user {name:?}")))?;
+        u.free.push(slot);
+        Ok(())
+    }
+
+    /// Register pack key `name` (`Client.pack_keygen`: this session's current secret -> that client's pack secret, c1
+    /// in the subring) from the bundle at `bundle` into a free `packKeys` slot; `export_ct_many(..., pack=name)`
+    /// exports through it. The key's uniform half is drawn from the bundle's seed here.
+    fn add_pack_key(&self, py: Python<'_>, name: &str, bundle: std::path::PathBuf) -> PyResult<()> {
+        use pc_client::Entry;
+        let d = &*self.dev;
+        let mut rd = pc_client::BundleReader::open(&bundle).map_err(cerr)?;
+        let h = rd.header.clone();
+        if h.params_hash != pc_client::spec::params_hash(&d.ctx.chain) {
+            return Err(PyValueError::new_err(format!("pack key bundle for params {}, this session runs {}", h.params_hash, pc_client::spec::params_hash(&d.ctx.chain))));
+        }
+        let (i, sub, rows, seed) = h
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, x)| match x {
+                Entry::PackKsk { sub, rows, seed, .. } => Some((i, *sub, *rows, *seed)),
+                _ => None,
+            })
+            .ok_or_else(|| PyValueError::new_err("bundle without a pack key"))?;
+        let mut st = self.dev.st.borrow_mut();
+        let State { packs, ex, .. } = &mut *st;
+        let u = packs.as_mut().ok_or_else(|| PyValueError::new_err("Session without pack key slots (size={\"packKeys\": n})"))?;
+        if u.names.contains_key(name) {
+            return Err(PyValueError::new_err(format!("pack key {name:?} is registered: remove_pack_key first")));
+        }
+        let slot = *u.free.last().ok_or_else(|| PyValueError::new_err("every pack key slot is taken"))?;
+        if sub != u.plan.sub || rows != u.plan.ids.len() || pc_client::client::pack_row_ids(&d.ctx.chain) != u.plan.ids {
+            return Err(PyValueError::new_err(format!("pack key of stride {sub} over {rows} rows, the slots hold stride {} over {}", u.plan.sub, u.plan.ids.len())));
+        }
+        let (b, a) = nogil(py, || -> pc_client::Result<_> { Ok((rd.read(i)?, pc_client::client::pack_a_eval(&d.ctx.chain, sub, &seed)?)) }).map_err(cerr)?;
+        u.slots[slot].load(&ex.compute, &b, &a).map_err(gerr)?;
+        ex.compute.sync().map_err(|x| gerr(x.into()))?;
+        u.free.pop();
+        u.names.insert(name.to_string(), slot);
+        Ok(())
+    }
+
+    /// Revoke pack key `name`: its slot is freed.
+    fn remove_pack_key(&self, name: &str) -> PyResult<()> {
+        let mut st = self.dev.st.borrow_mut();
+        let u = st.packs.as_mut().ok_or_else(|| PyValueError::new_err("Session without pack key slots"))?;
+        let slot = u.names.remove(name).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("no pack key {name:?}")))?;
         u.free.push(slot);
         Ok(())
     }
