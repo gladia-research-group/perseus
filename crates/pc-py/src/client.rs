@@ -29,13 +29,15 @@ pub struct PyClientSecret(pub Vec<u8>);
 
 #[pymethods]
 impl PyClientSecret {
-    /// A fresh secret for chain `chain` (OS entropy, or `seed` for reproducible tests).
+    /// A fresh secret for chain `chain` (OS entropy, or `seed` for reproducible tests); `sparse_h`: the Hamming
+    /// weight of the sparse (export / encapsulation) secret, 32 by default.
     #[staticmethod]
-    #[pyo3(signature = (chain="n32", seed=None))]
-    fn generate(chain: &str, seed: Option<u64>) -> PyResult<Self> {
+    #[pyo3(signature = (chain="n32", seed=None, sparse_h=None))]
+    fn generate(chain: &str, seed: Option<u64>, sparse_h: Option<usize>) -> PyResult<Self> {
         let c = pc_client::spec::chain_of(chain).map_err(cerr)?;
         let mut g = prng_of(seed)?;
-        Ok(PyClientSecret(ClientSecret::generate(&mut g, c.n).map_err(cerr)?.to_bytes()))
+        let h = sparse_h.unwrap_or(pc_core::keys::SecretKey::SPARSE_H);
+        Ok(PyClientSecret(ClientSecret::generate_h(&mut g, c.n, h).map_err(cerr)?.to_bytes()))
     }
     #[staticmethod]
     fn from_bytes(b: Vec<u8>) -> PyResult<Self> {

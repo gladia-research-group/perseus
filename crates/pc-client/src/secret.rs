@@ -14,6 +14,11 @@ impl ClientSecret {
         Ok(ClientSecret { sk: SecretKey::sample(prng, n)? })
     }
 
+    /// `generate` with a sparse secret of Hamming weight `h`.
+    pub fn generate_h(prng: &mut Prng, n: usize, h: usize) -> Result<Self> {
+        Ok(ClientSecret { sk: SecretKey::sample_h(prng, n, h)? })
+    }
+
     /// `MAGIC | u32 n | s (n i8) | s_sparse (n i8)`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.sk.s.len();
