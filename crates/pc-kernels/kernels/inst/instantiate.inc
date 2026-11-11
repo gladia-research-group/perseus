@@ -79,6 +79,8 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::em::tensor_sum_l<W, MM>,
         &pc::em::tensor_multi_l<W, MM>,
         &pc::em::tensor_seeded_l<W, MM>,
+        &pc::elem::many_l<W>,
+        &pc::em::submul_many_l<W, MM>,
     };
     return &T;
 }

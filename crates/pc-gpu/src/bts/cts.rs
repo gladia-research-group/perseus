@@ -202,6 +202,7 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
                 src: src_rows.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(),
                 exact,
+                fixed: false,
             });
         }
     }
@@ -217,7 +218,7 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
 }
 
 pub(crate) fn md_plan_bytes<W: DevWord>(primes: &[u64], ncts: usize, nparts: usize, nsrc: usize, ntgt: usize, exact: bool) -> Result<usize> {
-    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact };
+    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact, fixed: false };
     let specs = vec![spec; ncts * nparts];
     let rl = |n: usize| Arena::bytes_for::<u32>(n) + Arena::bytes_for::<i32>(n);
     Ok(rl(ncts * nparts * nsrc) + rl(ncts * nparts * ntgt) + BconvPlan::bytes::<W>(primes, &specs)?)

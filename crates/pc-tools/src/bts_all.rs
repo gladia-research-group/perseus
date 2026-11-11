@@ -290,7 +290,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
         steps.extend(scfg.rot_steps(n));
     }
     steps.remove(&0);
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
 
     let dev = Device::open()?;
     let mcfg = MemCfg { k_max: 8.max(kb), pool: vec![PoolClass { k: 1, count: 1 }], events: 64, scratch_cts: 2 };

@@ -99,7 +99,7 @@ pub fn run<W: DevWord, M: DevStrategy<W>>(chain: Chain, o: &RigOpts) -> Res<RigO
     let cfg = MemCfg { k_max: kmax.max(2), pool: vec![PoolClass { k: 1, count: 1 }], events: 64, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
     let lay = mp.lay;
-    let spec = KeySetSpec { relin: true, conj: true, rots: STEPS.iter().map(|&s| RotSpec { step: s.rem_euclid(slots as i64), q_top: None }).collect(), encaps: false };
+    let spec = KeySetSpec { relin: true, conj: true, rots: STEPS.iter().map(|&s| RotSpec { step: s.rem_euclid(slots as i64), q_top: None }).collect(), encaps: false, lean: None };
     let shapes: Vec<_> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
     mp.reserve("keys", spec.bytes::<W>(&chain, KskLayout::Dense)?);
     mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));

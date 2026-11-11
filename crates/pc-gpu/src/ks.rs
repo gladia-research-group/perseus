@@ -345,6 +345,8 @@ pub struct KeyGroup<'a> {
     pub galois: Vec<u64>,
     seeds: Vec<Option<*const u32>>,
     has_a: bool,
+    /// Special primes of the keys (None: every special prime of the layout, a full key).
+    kp: Option<usize>,
     digit_stride: usize,
     dnum: usize,
     q_band: usize,
@@ -379,6 +381,7 @@ impl<'a> KeyGroup<'a> {
             None => (None, None),
         };
         let tabs = KeyTabs::new(arena, s, n, keys)?;
+        let kp = staging.first().copied().flatten().map(|x| x.srows - x.q_top - 1);
         Ok(KeyGroup {
             tabs,
             regen_digits: usize::MAX,
@@ -391,6 +394,7 @@ impl<'a> KeyGroup<'a> {
             galois,
             seeds: keys.iter().map(|k| k.seed_ptr()).collect(),
             has_a,
+            kp,
             digit_stride: ds,
             dnum,
             q_band: keys.iter().map(|k| k.q_band()).min().unwrap_or(0),
@@ -525,6 +529,9 @@ struct LevelPlan<'a> {
     ks_rows: ConstBuf<'a, u32>,
     /// ModDown conversion, jobs `[c < k_max][part]`: special rows -> Q rows 0..=top, ciphertext layout.
     moddown: BconvPlan<'a>,
+    /// The ModDown's INTT rows `[c < k_max][part][special]` of an extended buffer when the level switches over fewer
+    /// special primes than the layout holds (P', `Chain::specials_at`); None: every special row (`Span::P`).
+    md_intt: Option<RowList<'a>>,
 }
 
 /// Host specs of one level (shared by sizing and building).
@@ -538,16 +545,20 @@ struct LevelSpecs {
     mu_rows: usize,
     ks_rows: Vec<u32>,
     moddown: Vec<JobSpec>,
+    md_intt: Vec<(u32, i32)>,
 }
 
 fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSpecs {
     let rows = lay.rows();
     let dnum = chain.dnum();
     // the bottom level switches with the bottom-shape keys only (KskShape::bottom): over P'
+    // (and the `LowP` tops: `Chain::specials_at`)
     let mut specials: Vec<usize> = chain.special_ids();
-    if top + 1 == chain.level_unit {
-        specials.truncate(chain.p_sparse);
-    }
+    specials.truncate(chain.specials_at(top));
+    // a `LowP` tier's P' is about its digit, so the fast conversions' overflow multiples are no longer small against
+    // the switch's own noise (ModUp: up to digit-limbs x digit x e / P'; ModDown: up to |P'| x (1 + s), one-sided):
+    // its conversions are exact and centred (HPS, the integer estimate). Every other level keeps FIDESlib's.
+    let exact = chain.band_specials(top).is_some();
     // live digits: digit d keeps its limbs <= top (FIDESlib DECOMPmeta sizes cut at the level's limb count)
     let digs: Vec<Vec<usize>> =
         chain.digits.iter().map(|d| d.iter().copied().filter(|&t| t <= top).collect::<Vec<_>>()).filter(|d| !d.is_empty()).collect();
@@ -582,7 +593,8 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
                 dst_off,
                 src: dl.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: tg.iter().map(|&t| (t as u32, t as u32)).collect(),
-                exact: false,
+                exact,
+                fixed: exact,
             });
         }
     }
@@ -596,11 +608,18 @@ fn level_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> LevelSp
                 dst_off: base,
                 src: specials.iter().map(|&t| (t as u32, t as u32)).collect(),
                 tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
-                exact: false,
+                exact,
+                fixed: exact,
             });
         }
     }
-    LevelSpecs { kp: specials.len(), intt, intt_src, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown }
+    let mut md_intt = Vec::new();
+    if specials.len() < lay.kp {
+        for c in 0..2 * k_max {
+            md_intt.extend(specials.iter().map(|&t| ((c * rows + t) as u32, t as i32)));
+        }
+    }
+    LevelSpecs { kp: specials.len(), intt, intt_src, ndig: digs.len(), modup, modup_ntt, mu_rows, ks_rows, moddown, md_intt }
 }
 
 fn rowlist_bytes(n: usize) -> usize {
@@ -631,6 +650,9 @@ impl<'a> KsPlans<'a> {
             b += rowlist_bytes(sp.intt.len()) + Arena::bytes_for::<u32>(sp.intt_src.len()) + Arena::bytes_for::<u32>(sp.ks_rows.len());
             b += BconvPlan::bytes::<W>(&primes, &sp.modup)? + rowlist_bytes(sp.modup_ntt.len());
             b += BconvPlan::bytes::<W>(&primes, &sp.moddown)?;
+            if !sp.md_intt.is_empty() {
+                b += rowlist_bytes(sp.md_intt.len());
+            }
         }
         Ok(b)
     }
@@ -655,6 +677,7 @@ impl<'a> KsPlans<'a> {
                 mu_rows: sp.mu_rows,
                 ks_rows: ConstBuf::new(arena, "ks.plans", s, &sp.ks_rows)?,
                 moddown: BconvPlan::new::<S, W>(arena, s, &primes, &sp.moddown)?,
+                md_intt: if sp.md_intt.is_empty() { None } else { Some(RowList::new(arena, s, &sp.md_intt)?) },
             });
         }
         let digit_of: Vec<i32> = (0..lay.rows()).map(|t| chain.digit_of(t).map(|d| d as i32).unwrap_or(-1)).collect();
@@ -725,8 +748,8 @@ pub(crate) fn check_cts<W: DevWord>(b: &CtBuf<'_, Compute, W>, first: usize, k: 
 pub(crate) enum Ew {
     Add,
     Copy,
-    /// out = (a - b) P^-1 (ModDown epilogue)
-    SubMulPinv,
+    /// out = (a - b) P^-1 (ModDown epilogue of a key switch at limb top `.0`: P or P', `p_inv_at`)
+    SubMulPinv(usize),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -744,12 +767,45 @@ pub(crate) fn ew<W: DevWord, M: DevStrategy<W>>(
     let (f, name, sc, scs) = match kind {
         Ew::Add => (ctx.table.ew_add, "ew_add", std::ptr::null(), std::ptr::null()),
         Ew::Copy => (ctx.table.ew_copy, "ew_copy", std::ptr::null(), std::ptr::null()),
-        Ew::SubMulPinv => (ctx.table.ew_sub_mul, "ew_sub_mul", ctx.ks.p_inv_mod_q.v.vptr(), ctx.ks.p_inv_mod_q.s.vptr()),
+        Ew::SubMulPinv(top) => {
+            let [v, sv] = p_inv_at(ctx, top);
+            (ctx.table.ew_sub_mul, "ew_sub_mul", v, sv)
+        }
     };
     let args = EwArgs { out: out.r(), a: a.r(), b: b.unwrap_or(a).r(), rs, sc, scs, pr: ctx.pr(), k: k as i32, nparts: nparts as i32, sub: 0, zero_p: 0 };
     // SAFETY: views are inside live compute-lane buffers of the context's layout (callers check the ciphertext
     // ranges); out aliasing a or b is element-wise safe
     launch_result(name, unsafe { f(&args, s.raw()) })?;
+    Ok(())
+}
+
+/// `out[i] = a[i] (+ b[i]) (+ c[i])` over Q rows `0..nrows` of polynomials given by pointer (`ew_many`; a null b / c
+/// is skipped, out may alias its own sources): one launch per `EWM_MAX` polynomials.
+pub(crate) fn ew_many<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, polys: &[[*const c_void; 4]], nrows: usize) -> Result<()> {
+    for ch in polys.chunks(pc_kernels::EWM_MAX) {
+        let nul = [std::ptr::null::<c_void>(); pc_kernels::EWM_MAX];
+        let mut a = pc_kernels::EwManyArgs { out: [std::ptr::null_mut(); pc_kernels::EWM_MAX], a: nul, b: nul, c: nul, pr: ctx.pr(), n: ch.len() as i32, nrows: nrows as i32 };
+        for (i, p) in ch.iter().enumerate() {
+            (a.out[i], a.a[i], a.b[i], a.c[i]) = (p[0] as *mut c_void, p[1], p[2], p[3]);
+        }
+        // SAFETY: rows 0..nrows of polynomials inside live compute-lane buffers (the callers' views)
+        launch_result("ew_many", unsafe { (ctx.table.ew_many)(&a, s.raw()) })?;
+    }
+    Ok(())
+}
+
+/// `out[i] = (a[i] - b[i]) * t` over Q rows `0..nrows` of polynomials `[out, a, b]` given by pointer (`submul_many`;
+/// `t` = one table of `nrows` rows, out may alias a or b): one launch per `EWM_MAX` polynomials.
+pub(crate) fn submul_many<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, polys: &[[*const c_void; 3]], t: *const c_void, nrows: usize) -> Result<()> {
+    for ch in polys.chunks(pc_kernels::EWM_MAX) {
+        let nul = [std::ptr::null::<c_void>(); pc_kernels::EWM_MAX];
+        let mut a = pc_kernels::SubMulManyArgs { out: [std::ptr::null_mut(); pc_kernels::EWM_MAX], a: nul, b: nul, t, pr: ctx.pr(), n: ch.len() as i32, nrows: nrows as i32 };
+        for (i, p) in ch.iter().enumerate() {
+            (a.out[i], a.a[i], a.b[i]) = (p[0] as *mut c_void, p[1], p[2]);
+        }
+        // SAFETY: rows 0..nrows of polynomials inside live compute-lane buffers (the callers' views) and of the table
+        launch_result("submul_many", unsafe { (ctx.table.submul_many)(&a, s.raw()) })?;
+    }
     Ok(())
 }
 
@@ -862,13 +918,34 @@ fn dot_rows(lv: &LevelPlan<'_>, top: usize, rows: DotRows) -> Result<(*const u32
     })
 }
 
-/// `P mod q` and `P^-1 mod q` (value, Shoup) of a level's special set: P, or P' at the bottom of a lean chain.
+/// `P mod q` and `P^-1 mod q` (value, Shoup) of a level's special set: P, P' at the bottom of a lean chain, or a
+/// `LowP` tier's.
 fn level_scalars<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, lv: &LevelPlan<'_>) -> [*const c_void; 4] {
-    let k = &ctx.ks;
-    if lv.kp < ctx.lay.kp {
-        [k.ps_mod_q.v.vptr(), k.ps_mod_q.s.vptr(), k.ps_inv_mod_q.v.vptr(), k.ps_inv_mod_q.s.vptr()]
-    } else {
-        [k.p_mod_q.v.vptr(), k.p_mod_q.s.vptr(), k.p_inv_mod_q.v.vptr(), k.p_inv_mod_q.s.vptr()]
+    let (m, mi) = ctx.ks.set(&ctx.chain, lv.kp);
+    [m.v.vptr(), m.s.vptr(), mi.v.vptr(), mi.s.vptr()]
+}
+
+/// `P^-1 mod q` (value, Shoup) of the special set a key switch at `top` runs over (`Chain::specials_at`).
+pub(crate) fn p_inv_at<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, top: usize) -> [*const c_void; 2] {
+    let (_, mi) = ctx.ks.set(&ctx.chain, ctx.chain.specials_at(top));
+    [mi.v.vptr(), mi.s.vptr()]
+}
+
+/// A key group read at `top` must be over the special primes the level switches over (a `LowP` chain: the keys
+/// banded at its tops are over P', every other key over P).
+fn check_key_kp<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, group: &KeyGroup<'_>, lv: &LevelPlan<'_>, what: &'static str) -> Result<()> {
+    if !ctx.chain.low.is_empty() && group.kp.unwrap_or(ctx.lay.kp) != lv.kp {
+        return Err(shape(what, format!("key over {} special primes, the level switches over {}", group.kp.unwrap_or(ctx.lay.kp), lv.kp)));
+    }
+    Ok(())
+}
+
+/// The ModDown's INTT of the special rows of the first `k` ciphertexts of `x` (both parts): the level's own rows.
+fn md_intt<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, lv: &LevelPlan<'_>, x: &mut CtBuf<'_, Compute, W>, k: usize) -> Result<()> {
+    match &lv.md_intt {
+        // entries [poly < 2k][special]: within the first k ciphertexts (`check_cts` by the callers)
+        Some(list) => ntt::transform_rows_within(ctx, s, Dir::Inverse, &mut x.buf, list, 2 * k * lv.kp, 2 * k * ctx.lay.rows()),
+        None => ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k),
     }
 }
 
@@ -892,9 +969,43 @@ pub fn dot<W: DevWord, M: DevStrategy<W>>(
     plans.check_k(k)?;
     if staged {
         if let Some(t) = &group.tabs {
-            return dot_key(ctx, s, plans, ks, group, t, r0, r, k, top, rows, io);
+            return dot_key(ctx, s, plans, ks, group, t, r0, r, k, top, rows, io, 0);
         }
     }
+    if k > DOT_KMAX {
+        // launches of DOT_KMAX ciphertexts (a k_max above the kernel's K)
+        let lay = ctx.lay;
+        let mu = plans.dnum * lay.poly_words();
+        let mut c = 0;
+        while c < k {
+            let kk = (k - c).min(DOT_KMAX);
+            let at = |p: *const c_void, stride: u64| (p as *const W).wrapping_add(c * stride as usize) as *const c_void;
+            let sub = DotIo { c1: at(io.c1, io.ct_stride), c0: if io.c0.is_null() { io.c0 } else { at(io.c0, io.ct_stride) }, out: at(io.out, io.out_ct_stride) as *mut c_void, ..io };
+            dot_from(ctx, s, plans, ks, group, r0, r, kk, top, rows, sub, staged, c * mu)?;
+            c += kk;
+        }
+        return Ok(());
+    }
+    dot_from(ctx, s, plans, ks, group, r0, r, k, top, rows, io, staged, 0)
+}
+
+/// `dot`'s single launch (k <= DOT_KMAX), the ModUp digits read from word `mu_off` of `ks.digits` on.
+#[allow(clippy::too_many_arguments)]
+fn dot_from<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    ks: &KsWork<'_, W>,
+    group: &KeyGroup<'_>,
+    r0: usize,
+    r: usize,
+    k: usize,
+    top: usize,
+    rows: DotRows,
+    io: DotIo,
+    staged: bool,
+    mu_off: usize,
+) -> Result<()> {
     if k > DOT_KMAX || r == 0 || r0 + r > group.len() || (staged && r != 1) || (!staged && (r0..r0 + r).any(|j| group.staged_b(j))) {
         return Err(shape("ks dot", format!("k {k} (<= {DOT_KMAX}), keys [{r0}, {}) of {} (regen: one key per dot)", r0 + r, group.len())));
     }
@@ -905,6 +1016,7 @@ pub fn dot<W: DevWord, M: DevStrategy<W>>(
     if group.dnum < lv.ndig {
         return Err(shape("ks dot", format!("key has {} digits, level needs {}", group.dnum, lv.ndig)));
     }
+    check_key_kp(ctx, group, lv, "ks dot")?;
     let ka = if staged {
         group.ka_regen.as_ref().ok_or_else(|| shape("ks dot", "staged key: group built without KsWork::stage_ptrs"))?.dptr_at(r0)?
     } else {
@@ -918,7 +1030,7 @@ pub fn dot<W: DevWord, M: DevStrategy<W>>(
     let [pm, pms, _, _] = level_scalars(ctx, lv);
     let a = KsArgs {
         c1: io.c1,
-        modup: ks.digits.vptr(),
+        modup: (ks.digits.vptr() as *const W).wrapping_add(mu_off) as *const c_void,
         c0: io.c0,
         out0: io.out,
         out1: (io.out as *mut W).wrapping_add(io.part_stride as usize) as *mut c_void,
@@ -954,7 +1066,8 @@ pub fn dot<W: DevWord, M: DevStrategy<W>>(
 }
 
 /// Keys `[r0, r0 + r)` of `group` read in place (`ks_dot_key`: `a` regenerated from the seed, `b` dense / packed /
-/// banded as stored): launches of at most `KEY_KMAX` ciphertexts over runs of keys sharing a stored form.
+/// banded as stored): launches of at most `KEY_KMAX` ciphertexts over runs of keys sharing a stored form. The ModUp
+/// digits are read from ciphertext `c_first` of `ks.digits` on.
 #[allow(clippy::too_many_arguments)]
 fn dot_key<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,
@@ -969,6 +1082,7 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
     top: usize,
     rows: DotRows,
     io: DotIo,
+    c_first: usize,
 ) -> Result<()> {
     if r == 0 || r0 + r > group.len() {
         return Err(shape("ks dot_key", format!("keys [{r0}, {}) of {}", r0 + r, group.len())));
@@ -980,6 +1094,7 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
     if group.dnum < lv.ndig {
         return Err(shape("ks dot_key", format!("key has {} digits, level needs {}", group.dnum, lv.ndig)));
     }
+    check_key_kp(ctx, group, lv, "ks dot_key")?;
     let lay = ctx.lay;
     let (rows_ptr, nrows) = dot_rows(lv, top, rows)?;
     let [pm, pms, _, _] = level_scalars(ctx, lv);
@@ -999,7 +1114,7 @@ fn dot_key<W: DevWord, M: DevStrategy<W>>(
             let out = (at(io.out, io.out_ct_stride) as *const W).wrapping_add((j - r0) * io.out_rot_stride as usize) as *mut c_void;
             let a = KsArgs {
                 c1: at(io.c1, io.ct_stride),
-                modup: at(ks.digits.vptr(), mu_ct),
+                modup: (at(ks.digits.vptr(), mu_ct) as *const W).wrapping_add(c_first * mu_ct as usize) as *const c_void,
                 c0: if io.c0.is_null() { io.c0 } else { at(io.c0, io.ct_stride) },
                 out0: out,
                 out1: (out as *mut W).wrapping_add(io.part_stride as usize) as *mut c_void,
@@ -1057,6 +1172,7 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
         return Err(shape("ks dot_regen", "in-kernel regeneration is relinearization-only (no automorphism)"));
     }
     let lv = plans.level(top)?;
+    check_key_kp(ctx, group, lv, "ks dot_regen")?;
     let lay = ctx.lay;
     let (rows_ptr, nrows) = dot_rows(lv, top, rows)?;
     let [pm, pms, _, _] = level_scalars(ctx, lv);
@@ -1111,8 +1227,8 @@ pub fn dot_regen<W: DevWord, M: DevStrategy<W>>(
                 EpiArgs {
                     dst: at(dst.base, dst.ct_stride) as *mut c_void,
                     conv: at(conv.base, conv.ct_stride),
-                    binv: ctx.ks.p_inv_mod_q.v.vptr(),
-                    binvs: ctx.ks.p_inv_mod_q.s.vptr(),
+                    binv: p_inv_at(ctx, top)[0],
+                    binvs: p_inv_at(ctx, top)[1],
                     k: std::ptr::null(),
                     part_stride: dst.part_stride,
                     dbl: 0,
@@ -1146,7 +1262,7 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
     check_cts(x, 0, k, "ks moddown")?;
     check_cts(conv, 0, k, "ks moddown")?;
     let lv = plans.level(top)?;
-    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
+    md_intt(ctx, s, lv, x, k)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     ntt::transform_k(ctx, s, Dir::Forward, conv, Span::Q { top }, Parts::Both, k)?;
     Ok(())
@@ -1206,7 +1322,7 @@ pub fn moddown_to<W: DevWord, M: DevStrategy<W>>(
     check_cts(conv, 0, k, "ks moddown")?;
     check_md_out(ctx, out, mode, "ks moddown_to")?;
     let lv = plans.level(top)?;
-    ntt::transform_k(ctx, s, Dir::Inverse, x, Span::P, Parts::Both, k)?;
+    md_intt(ctx, s, lv, x, k)?;
     lv.moddown.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
     let [_, _, sc, scs] = level_scalars(ctx, lv);
     let (o, xv) = (out.base, x.buf.vptr());
@@ -1277,8 +1393,8 @@ pub(crate) fn md_epilogue<W: DevWord, M: DevStrategy<W>>(
         dst: dst.r(),
         x: x.r(),
         t: t.r(),
-        binv: ctx.ks.p_inv_mod_q.v.vptr(),
-        binvs: ctx.ks.p_inv_mod_q.s.vptr(),
+        binv: p_inv_at(ctx, top)[0],
+        binvs: p_inv_at(ctx, top)[1],
         k: std::ptr::null(),
         pr: ctx.pr(),
         dbl: 0,

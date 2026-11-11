@@ -79,7 +79,9 @@ impl KskShape {
             return Err(shape("rot_key_band", format!("band top {q_top} >= Q primes {}", chain.q.len())));
         }
         let ndig = chain.digits.iter().filter(|d| d.first().is_some_and(|&f| f <= q_top)).count();
-        Ok(KskShape { q_top, ndig, nq: chain.q.len(), kp: chain.p.len() })
+        // a band at or below the `LowP` tops switches over its tier's special primes only (`Chain::band_specials`)
+        let kp = chain.band_specials(q_top).unwrap_or(chain.p.len());
+        Ok(KskShape { q_top, ndig, nq: chain.q.len(), kp })
     }
     /// The bottom composite level only (`level_unit` Q rows, digit 0) over P' (`Chain::p_sparse`): the keys to the
     /// sparse secrets (dense->sparse encapsulation, SPRU atob), whose modulus is q0 x P'.
@@ -323,6 +325,10 @@ pub struct KeySetSpec {
     pub rots: Vec<RotSpec>,
     /// The two encapsulation keys (sparse-secret bootstrap routes).
     pub encaps: bool,
+    /// An eager key set for ciphertexts of top limb <= this (no bootstrap): relin and conj banded like the rotations
+    /// (conj like the lowest-banded of them), and of the encapsulation keys only dense -> sparse (`KeySet::export`,
+    /// the sparse export).
+    pub lean: Option<usize>,
 }
 
 impl KeySetSpec {
@@ -339,7 +345,7 @@ impl KeySetSpec {
             m.insert(s.rem_euclid(h), None);
         }
         m.remove(&0);
-        KeySetSpec { relin: true, conj: true, rots: m.into_iter().map(|(step, q_top)| RotSpec { step, q_top }).collect(), encaps: true }
+        KeySetSpec { relin: true, conj: true, rots: m.into_iter().map(|(step, q_top)| RotSpec { step, q_top }).collect(), encaps: true, lean: None }
     }
 
     fn rot_shape(chain: &Chain, r: &RotSpec) -> Result<KskShape> {
@@ -352,19 +358,30 @@ impl KeySetSpec {
     /// Every key (role, shape), carve order.
     pub fn keys(&self, chain: &Chain) -> Result<Vec<(KeyRole, KskShape)>> {
         let full = KskShape::full(chain);
+        let top = match self.lean {
+            Some(t) => Self::rot_shape(chain, &RotSpec { step: 0, q_top: Some(t) })?,
+            None => full,
+        };
         let mut v = Vec::new();
         if self.relin {
-            v.push((KeyRole::Relin, full));
+            v.push((KeyRole::Relin, top));
         }
         if self.conj {
-            v.push((KeyRole::Conj, full));
+            // a lean set whose rotations sit at two bands conjugates at the lower one
+            let low = self.lean.and_then(|t| self.rots.iter().filter_map(|r| r.q_top).min().filter(|&m| m < t));
+            v.push((KeyRole::Conj, match low {
+                Some(m) => Self::rot_shape(chain, &RotSpec { step: 0, q_top: Some(m) })?,
+                None => top,
+            }));
         }
         for r in &self.rots {
             v.push((KeyRole::rot(r.step, chain.n)?, Self::rot_shape(chain, r)?));
         }
         if self.encaps {
             v.push((KeyRole::EncDenseToSparse, KskShape::bottom(chain)?));
-            v.push((KeyRole::EncSparseToDense, full));
+            if self.lean.is_none() {
+                v.push((KeyRole::EncSparseToDense, full));
+            }
         }
         Ok(v)
     }
@@ -383,6 +400,8 @@ pub struct KeySet<'a, W: DevWord> {
     /// Rotation keys by step normalized to `[0, N/2)` (`rot` normalizes the lookup).
     pub rots: BTreeMap<i64, DevKsk<'a, W>>,
     pub bts: Option<BtsKeys<'a, W>>,
+    /// The dense -> sparse key alone (a lean set, `KeySetSpec::lean`: the sparse export, no bootstrap).
+    pub export: Option<DevKsk<'a, W>>,
     n: usize,
 }
 
@@ -396,7 +415,7 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             }
         }
         let n = chain.n;
-        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, n };
+        let mut ks = KeySet { layout, relin: None, conj: None, rots: BTreeMap::new(), bts: None, export: None, n };
         let (mut d2s, mut s2d) = (None, None);
         for (role, sh) in spec.keys(chain)? {
             let k = DevKsk::carve(arena, role, sh, layout, n)?;
@@ -410,8 +429,9 @@ impl<'a, W: DevWord> KeySet<'a, W> {
                 KeyRole::EncSparseToDense => s2d = Some(k),
             }
         }
-        if let (Some(a), Some(b)) = (d2s, s2d) {
-            ks.bts = Some(BtsKeys { enc_dense_to_sparse: a, enc_sparse_to_dense: b });
+        match (d2s, s2d) {
+            (Some(a), Some(b)) => ks.bts = Some(BtsKeys { enc_dense_to_sparse: a, enc_sparse_to_dense: b }),
+            (a, _) => ks.export = a,
         }
         Ok(ks)
     }
@@ -436,7 +456,7 @@ impl<'a, W: DevWord> KeySet<'a, W> {
     }
     /// Every key, carve order.
     pub fn iter(&self) -> impl Iterator<Item = &DevKsk<'a, W>> {
-        self.relin.iter().chain(self.conj.iter()).chain(self.rots.values()).chain(self.bts.iter().flat_map(|b| [&b.enc_dense_to_sparse, &b.enc_sparse_to_dense]))
+        self.relin.iter().chain(self.conj.iter()).chain(self.rots.values()).chain(self.bts.iter().flat_map(|b| [&b.enc_dense_to_sparse, &b.enc_sparse_to_dense])).chain(self.export.iter())
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut DevKsk<'a, W>> {
         self.relin
@@ -444,6 +464,7 @@ impl<'a, W: DevWord> KeySet<'a, W> {
             .chain(self.conj.iter_mut())
             .chain(self.rots.values_mut())
             .chain(self.bts.iter_mut().flat_map(|b| [&mut b.enc_dense_to_sparse, &mut b.enc_sparse_to_dense]))
+            .chain(self.export.iter_mut())
     }
     pub fn len(&self) -> usize {
         self.iter().count()

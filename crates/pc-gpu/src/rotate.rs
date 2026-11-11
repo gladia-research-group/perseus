@@ -49,7 +49,7 @@ fn same_shape<W: DevWord>(x: &Ct<'_, W>, out: &Ct<'_, W>, what: &'static str) ->
     Ok(())
 }
 
-fn key_index(group: &KeyGroup<'_>, g: u64) -> Result<usize> {
+pub(crate) fn key_index(group: &KeyGroup<'_>, g: u64) -> Result<usize> {
     group.galois.iter().position(|&x| x == g).ok_or_else(|| shape("rotation key", format!("galois element {g} not in the key group {:?}", group.galois)))
 }
 
@@ -160,6 +160,258 @@ fn switch_auto<W: DevWord, M: DevStrategy<W>>(
     ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut out.buf, &mut ex.ks.conv, k, top)
 }
 
+/// Rotations of many single ciphertexts of one level by one step, `outs[i] = rot(xs[i], step)`: up to `batch` at a
+/// time (bounded by the key-switching batch and half the executor scratch) copied into the scratch, one ModUp, one dot
+/// launch reading the key once, one ModDown over the batch; bit-identical to `rotate` one by one.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_many<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    group: &KeyGroup<'_>,
+    xs: &[&Ct<'_, W>],
+    step: i64,
+    outs: &mut [&mut Ct<'_, W>],
+    batch: usize,
+) -> Result<()> {
+    let count = xs.len();
+    if outs.len() != count {
+        return Err(shape("rotate_many", format!("{count} inputs, {} outputs", outs.len())));
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    if xs.iter().any(|x| x.k() != 1 || x.meta != xs[0].meta || x.buf.lay != ctx.lay) || outs.iter().any(|o| o.k() != 1 || o.buf.lay != ctx.lay) {
+        return Err(shape("rotate_many", "single full-layout ciphertexts of one level"));
+    }
+    let lay = ctx.lay;
+    let top = top_of(ctx, xs[0])?;
+    let meta = sh.rotate(&xs[0].meta, step).out;
+    let g = pc_core::galois::rotation_galois(step, lay.n)?;
+    if g == 1 {
+        for (x, o) in xs.iter().zip(outs.iter_mut()) {
+            copy_q(ctx, ex, x, o, top)?;
+            o.meta = meta;
+        }
+        return Ok(());
+    }
+    let r = key_index(group, g)?;
+    let (cw, pw) = (lay.ct_words(), lay.poly_words());
+    let km = batch.min(ex.ks.k_max).min(kc.plans.k_max).min(ex.scratch.k / 2).max(1);
+    let rs = lay.rs_q(top);
+    let at = |v: View, c: usize| View { base: (v.base as *mut W).wrapping_add(c * cw) as *mut std::ffi::c_void, ..v };
+    let mut u0 = 0;
+    while u0 < count {
+        let k = km.min(count - u0);
+        // inputs into scratch[km, km + k); the dot's extended outputs into scratch[0, k), ModDowned in place
+        let s0 = View::of(&ex.scratch, 0);
+        for u in 0..k {
+            ks::ew(ctx, &ex.compute, Ew::Copy, at(s0, km + u), View::of(&xs[u0 + u].buf, 0), None, rs, 1, 2)?;
+        }
+        ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &ex.scratch, km, k, 1, top)?;
+        let inp = at(s0, km);
+        let io = DotIo {
+            c1: inp.part::<W>(1).base,
+            c0: inp.base,
+            ct_stride: cw as u64,
+            out: s0.base,
+            part_stride: pw as u64,
+            out_ct_stride: cw as u64,
+            out_rot_stride: 0,
+            c0_mode: 1,
+        };
+        dots(ctx, ex, kc, group, r, 1, k, top, io)?;
+        ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut ex.scratch, &mut ex.ks.conv, k, top)?;
+        for u in 0..k {
+            let o = &mut outs[u0 + u];
+            ks::ew(ctx, &ex.compute, Ew::Copy, View::of(&o.buf, 0), at(s0, u), None, rs, 1, 2)?;
+            o.meta = meta;
+        }
+        u0 += k;
+    }
+    Ok(())
+}
+
+/// A tree of rotations of `x` in one pass: `outs[0] = x`, then round by round the list so far followed by its rotation
+/// by each of the round's nonzero steps (`rounds[t][j]` = the step's key group and the step), so `outs` holds
+/// prod_t (1 + rounds[t].len()) ciphertexts. Up to `batch` inputs of a round at a time are gathered into the scratch
+/// for ONE ModUp shared by the round's steps; each step is one dot launch and one ModDown over the batch, scattered
+/// to the outputs (any slots that hold `x`'s rows). Every output is bit-identical to the plain rotations.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_tree<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    rounds: &[Vec<(&KeyGroup<'_>, i64)>],
+    x: &Ct<'_, W>,
+    outs: &mut [&mut Ct<'_, W>],
+    batch: usize,
+) -> Result<()> {
+    use std::ffi::c_void;
+    let lay = ctx.lay;
+    let top = top_of(ctx, x)?;
+    let count = rounds.iter().map(|r| r.len() + 1).product::<usize>();
+    if x.k() != 1 || x.buf.lay.nq <= top || outs.len() != count || outs.iter().any(|o| o.k() != 1 || o.buf.lay.nq <= top) {
+        return Err(shape("rotate_tree", format!("{} outputs for a tree of {count}, single ciphertexts holding {} rows", outs.len(), top + 1)));
+    }
+    let mut keys = Vec::with_capacity(rounds.len());
+    for round in rounds {
+        let mut ks = Vec::with_capacity(round.len());
+        for &(group, st) in round {
+            let g = pc_core::galois::rotation_galois(st, lay.n)?;
+            if g == 1 {
+                return Err(shape("rotate_tree", "a round's steps are nonzero"));
+            }
+            ks.push((group, key_index(group, g)?, st));
+        }
+        keys.push(ks);
+    }
+    let (cw, pw) = (lay.ct_words(), lay.poly_words());
+    let km = batch.min(ex.ks.k_max).min(kc.plans.k_max).min(ex.scratch.k / 2).max(1);
+    let nul = std::ptr::null::<c_void>();
+    let s0 = View::of(&ex.scratch, 0).base;
+    let off = |words: usize| (s0 as *mut W).wrapping_add(words) as *mut c_void;
+    let part = |c: &Ct<'_, W>, p: usize| View::of(&c.buf, 0).part::<W>(p).base as *const c_void;
+    ks::ew_many(ctx, &ex.compute, &[[part(outs[0], 0), part(x, 0), nul, nul], [part(outs[0], 1), part(x, 1), nul, nul]], top + 1)?;
+    outs[0].meta = x.meta;
+    let mut have = 1;
+    for round in &keys {
+        let mut q0 = 0;
+        while q0 < have {
+            let k = km.min(have - q0);
+            // the inputs into scratch[km, km + k); a step's extended dot into scratch[0, k), ModDowned in place
+            let polys: Vec<_> = (0..2 * k).map(|i| [off((km + i / 2) * cw + (i % 2) * pw) as *const c_void, part(outs[q0 + i / 2], i % 2), nul, nul]).collect();
+            ks::ew_many(ctx, &ex.compute, &polys, top + 1)?;
+            ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &ex.scratch, km, k, 1, top)?;
+            for (j, &(group, r, st)) in round.iter().enumerate() {
+                let io = DotIo {
+                    c1: off(km * cw + pw),
+                    c0: off(km * cw),
+                    ct_stride: cw as u64,
+                    out: s0,
+                    part_stride: pw as u64,
+                    out_ct_stride: cw as u64,
+                    out_rot_stride: 0,
+                    c0_mode: 1,
+                };
+                dots(ctx, ex, kc, group, r, 1, k, top, io)?;
+                ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut ex.scratch, &mut ex.ks.conv, k, top)?;
+                let o0 = (j + 1) * have + q0;
+                let polys: Vec<_> = (0..2 * k).map(|i| [part(outs[o0 + i / 2], i % 2), off((i / 2) * cw + (i % 2) * pw) as *const c_void, nul, nul]).collect();
+                ks::ew_many(ctx, &ex.compute, &polys, top + 1)?;
+                for u in 0..k {
+                    outs[o0 + u].meta = sh.rotate(&outs[q0 + u].meta, st).out;
+                }
+            }
+            q0 += k;
+        }
+        have *= round.len() + 1;
+    }
+    Ok(())
+}
+
+/// One round of an expansion by rotations (a ciphertext split into its rotation-sum and -difference halves, the
+/// differences shifted by a monomial) on the ciphertexts `xs` of one level: with
+/// `y_i = rot(x_i, step)` where `rot[i]` and `y_i = x_i` elsewhere, `sums[i] = x_i + y_i` and, where `diffs[i]` is
+/// given, `diffs[i] = (x_i - y_i) * t` (`t` = an evaluation-form table over rows 0..=top, the round's monomial). Up to
+/// `batch` rotated inputs are gathered into the scratch for ONE ModUp, dot launch and ModDown; the sums and the
+/// differences read the rotations there, one launch each per batch (any slots that hold the rows). Every output is
+/// bit-identical to `rotate`, `add`, `sub` and `mult_pt_exact` one by one.
+#[allow(clippy::too_many_arguments)]
+pub fn expand_round<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    ex: &mut Executor<'_, W>,
+    kc: KsCfg<'_, '_>,
+    sh: &Shadow,
+    group: &KeyGroup<'_>,
+    step: i64,
+    t: *const std::ffi::c_void,
+    xs: &[&Ct<'_, W>],
+    rot: &[bool],
+    sums: &mut [&mut Ct<'_, W>],
+    diffs: &mut [Option<&mut Ct<'_, W>>],
+    batch: usize,
+) -> Result<()> {
+    use std::ffi::c_void;
+    let (lay, n) = (ctx.lay, xs.len());
+    if n == 0 {
+        return Ok(());
+    }
+    if rot.len() != n || sums.len() != n || diffs.len() != n {
+        return Err(shape("expand_round", format!("{n} inputs, {} flags, {} sums, {} differences", rot.len(), sums.len(), diffs.len())));
+    }
+    let top = top_of(ctx, xs[0])?;
+    let holds = |c: &Ct<'_, W>| c.k() == 1 && c.buf.lay.nq > top;
+    for i in 0..n {
+        if top_of(ctx, xs[i])? != top || !holds(xs[i]) || !holds(sums[i]) || !diffs[i].as_deref().is_none_or(holds) {
+            return Err(shape("expand_round", format!("single ciphertexts of one level holding {} rows", top + 1)));
+        }
+        if diffs[i].is_some() && !rot[i] {
+            return Err(shape("expand_round", "a difference needs its input rotated"));
+        }
+    }
+    let g = pc_core::galois::rotation_galois(step, lay.n)?;
+    if g == 1 {
+        return Err(shape("expand_round", "the step is nonzero"));
+    }
+    let r = key_index(group, g)?;
+    let mut metas = Vec::with_capacity(n);
+    for i in 0..n {
+        let ym = if rot[i] { sh.rotate(&xs[i].meta, step).out } else { xs[i].meta };
+        let (a, d) = (sh.add(&xs[i].meta, &ym)?, sh.sub(&xs[i].meta, &ym)?);
+        if !a.pre.is_empty() || !d.pre.is_empty() {
+            return Err(shape("expand_round", "the sum needs an adjustment"));
+        }
+        metas.push((a.out, d.out));
+    }
+    let (cw, pw) = (lay.ct_words(), lay.poly_words());
+    let km = batch.min(ex.ks.k_max).min(kc.plans.k_max).min(ex.scratch.k / 2).max(1);
+    let nul = std::ptr::null::<c_void>();
+    let s0 = View::of(&ex.scratch, 0).base;
+    let off = |words: usize| (s0 as *mut W).wrapping_add(words) as *mut c_void;
+    let part = |c: &Ct<'_, W>, p: usize| View::of(&c.buf, 0).part::<W>(p).base as *const c_void;
+    // not rotated: x + x
+    let mut polys = Vec::new();
+    for i in (0..n).filter(|&i| !rot[i]) {
+        for p in 0..2 {
+            polys.push([part(sums[i], p), part(xs[i], p), part(xs[i], p), nul]);
+        }
+    }
+    ks::ew_many(ctx, &ex.compute, &polys, top + 1)?;
+    let live: Vec<usize> = (0..n).filter(|&i| rot[i]).collect();
+    for ch in live.chunks(km) {
+        let k = ch.len();
+        // the inputs into scratch[km, km + k); their rotations into scratch[0, k), ModDowned in place
+        let polys: Vec<_> = (0..2 * k).map(|i| [off((km + i / 2) * cw + (i % 2) * pw) as *const c_void, part(xs[ch[i / 2]], i % 2), nul, nul]).collect();
+        ks::ew_many(ctx, &ex.compute, &polys, top + 1)?;
+        ks::modup(ctx, &ex.compute, kc.plans, &mut ex.ks, &mut ex.bconv_work, &ex.scratch, km, k, 1, top)?;
+        let io = DotIo { c1: off(km * cw + pw), c0: off(km * cw), ct_stride: cw as u64, out: s0, part_stride: pw as u64, out_ct_stride: cw as u64, out_rot_stride: 0, c0_mode: 1 };
+        dots(ctx, ex, kc, group, r, 1, k, top, io)?;
+        ks::moddown_inplace(ctx, &ex.compute, kc.plans, &mut ex.scratch, &mut ex.ks.conv, k, top)?;
+        let (mut add, mut sub) = (Vec::with_capacity(2 * k), Vec::new());
+        for (u, &i) in ch.iter().enumerate() {
+            for p in 0..2 {
+                let y = off(u * cw + p * pw) as *const c_void;
+                add.push([part(sums[i], p), part(xs[i], p), y, nul]);
+                if let Some(d) = diffs[i].as_deref() {
+                    sub.push([part(d, p), part(xs[i], p), y]);
+                }
+            }
+        }
+        ks::ew_many(ctx, &ex.compute, &add, top + 1)?;
+        ks::submul_many(ctx, &ex.compute, &sub, t, top + 1)?;
+    }
+    for i in 0..n {
+        sums[i].meta = metas[i].0;
+        if let Some(d) = diffs[i].as_deref_mut() {
+            d.meta = metas[i].1;
+        }
+    }
+    Ok(())
+}
+
 /// Hoisted rotations: `outs[i] = rot(x, steps[i])` from one ModUp. `group` holds the nonzero steps' keys in order.
 #[allow(clippy::too_many_arguments)]
 pub fn rotate_hoisted<W: DevWord, M: DevStrategy<W>>(
@@ -205,7 +457,7 @@ pub fn rotate_hoisted<W: DevWord, M: DevStrategy<W>>(
         ks::moddown_conv(ctx, &ex.compute, kc.plans, &mut ex.ks.ext, &mut ex.ks.conv, m * k, top)?;
         for t in 0..m {
             let o = &mut *outs[live[j + t].0];
-            ew(ctx, &ex.compute, Ew::SubMulPinv, View::of(&o.buf, 0), View::of(&ex.ks.ext, t * k), Some(View::of(&ex.ks.conv, t * k)), ctx.lay.rs_q(top), k, 2)?;
+            ew(ctx, &ex.compute, Ew::SubMulPinv(top), View::of(&o.buf, 0), View::of(&ex.ks.ext, t * k), Some(View::of(&ex.ks.conv, t * k)), ctx.lay.rs_q(top), k, 2)?;
         }
         j += m;
     }
@@ -309,7 +561,7 @@ pub fn rotate_grid<W: DevWord, M: DevStrategy<W>>(
             for (c, s, o) in outs.iter_mut() {
                 if key[*s] == Some(r) {
                     let e = t * k + *c;
-                    ew(ctx, &ex.compute, Ew::SubMulPinv, View::of(&o.buf, 0), View::of(&ex.ks.ext, e), Some(View::of(&ex.ks.conv, e)), lay.rs_q(top), 1, 2)?;
+                    ew(ctx, &ex.compute, Ew::SubMulPinv(top), View::of(&o.buf, 0), View::of(&ex.ks.ext, e), Some(View::of(&ex.ks.conv, e)), lay.rs_q(top), 1, 2)?;
                 }
             }
         }

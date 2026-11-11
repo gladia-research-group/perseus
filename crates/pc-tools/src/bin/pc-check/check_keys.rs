@@ -220,6 +220,7 @@ fn run(dir: &str) -> Res<Tally> {
         conj: names.iter().any(|(_, r)| *r == KeyRole::Conj),
         rots: names.iter().filter_map(|(_, r)| if let KeyRole::Rot { step, .. } = r { Some(RotSpec { step: *step, q_top: None }) } else { None }).collect(),
         encaps: names.iter().any(|(_, r)| *r == KeyRole::EncDenseToSparse) && names.iter().any(|(_, r)| *r == KeyRole::EncSparseToDense),
+        lean: None,
     };
     let packed = KskLayout::packed_for::<W>(&chain)?;
     println!("[pc-check] keys: {} in the dump ({nrot} rotations); layout {packed:?}", names.len());

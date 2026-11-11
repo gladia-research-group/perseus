@@ -195,10 +195,11 @@ __device__ __forceinline__ V4<uint32_t> unpack4(const uint32_t* row, int i) {
     return V4<uint32_t>{{v0 & M, __funnelshift_r(v0, v1, 28) & M, __funnelshift_r(v1, v2, 24) & M, __funnelshift_r(v2, v3, 20) & M}};
 }
 
-// tensor_seeded at u32: a block is a TW-word tile of one row for nout outputs (TW / 4 threads per output, 4 words
-// each), in stages of SEED_JS pairs. A stage's c0 and b words are copied into shared memory asynchronously (cp.async)
-// while its c1 words are drawn there, one ChaCha block (16 words) per thread: nout TW / 16 blocks per pair =
-// blockDim.x per stage. Every output's products then read their operands from shared memory (b once per block).
+// tensor_seeded at u32: a block is a TW-word tile of one row for nq x nout outputs (TW / 4 threads per output, 4 words
+// each), in stages of SEED_JS pairs. A stage's c0 and b words are copied into shared memory asynchronously (cp.async).
+// The c1 words are drawn there, one ChaCha block (16 words) per thread: nout TW / 16 blocks per pair, so the block's
+// threads draw the c1 of nq stages at once, every nq-th stage. Every output's products then read their operands from
+// shared memory (a and b once per block).
 // 3 blocks per SM: 80 registers, no spills (4 blocks spill and run 1.6x slower)
 constexpr int SEED_JS = 4, SEED_MINB = 3;
 // uint4 u of an output's c1 tile: each group of 4 rotated by u / 8, so the 8 uint4 of a quarter warp's accesses (a
@@ -208,29 +209,29 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
 }
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory"); }
-// uint4 of a stage's shared memory: c1 (nout TW / 4 per pair), c0 (nout c0_q(TW) per pair), b (2 TW / 4 per pair)
+// uint4 of a block's shared memory: the c1 of nq stages (nout TW / 4 per pair), a stage's c0 (nout c0_q(TW) per pair)
+// and b (nq 2 TW / 4 per pair), the redraw list (its length, then a word per thread)
 template <bool PACKED>
 __host__ __device__ constexpr int c0_q(int tw) { return PACKED ? tw * PC_PACK_BITS / 128 : tw / 4; }
 template <bool PACKED, int TW>
-__host__ __device__ constexpr int seed_smem_q(int nout) { return SEED_JS * (nout * TW / 4 + nout * c0_q<PACKED>(TW) + 2 * TW / 4); }
+__host__ __device__ constexpr int seed_smem_q(int nout, int nq) {
+    return SEED_JS * (nq * nout * TW / 4 + nout * c0_q<PACKED>(TW) + nq * 2 * TW / 4) + (nq > 1 ? 1 + nq * nout * TW / 16 : 0);
+}
 
-// The c1 words of drawing thread t's ChaCha block (pair j0 + t / (nout TW / 16), output t / (TW / 16) % nout, block t %
-// (TW / 16) of the tile) into the stage's c1 tile: need == 0, the first draw (returns the mask of rejected words); else
-// the redraws of the words in need (chacha::regen_block16's words: each attempt's word stored over the last).
+// The c1 words of ChaCha block gb of this tile, from the row seed sd of a first operand, into its c1 tile d: need == 0,
+// the first draw (returns the mask of rejected words); else the redraws of the words in need (chacha::regen_block16's
+// words: each attempt's word stored over the last).
 template <int TW>
-__device__ __forceinline__ uint32_t seed_draw(const TensorSeededArgs& A, int row, int j0, int nout, int t, uint32_t p, uint4* xs, uint32_t need) {
-    constexpr int TPO = TW / 4, NB = TW / 16;
-    const int gj = t / (nout * NB), go = t / NB % nout, gb = t % NB;
-    const uint32_t* sd = (const uint32_t*)A.a[go][j0 + gj] + A.seed_off + 8 * row;
+__device__ __forceinline__ uint32_t seed_draw(const uint32_t* sd, int tile, int gb, uint32_t p, uint4* d, uint32_t need) {
+    constexpr int NB = TW / 16;
     uint32_t key[8], v[16];
 #pragma unroll
     for (int w = 0; w < 8; ++w) key[w] = sd[w];
-    const uint32_t b = (uint32_t)(blockIdx.x * NB + gb), m_p = (0xFFFFFFFFu / p) * p, rp = 0xFFFFFFFFu / p;
+    const uint32_t b = (uint32_t)(tile * NB + gb), m_p = (0xFFFFFFFFu / p) * p, rp = 0xFFFFFFFFu / p;
     const auto red = [&](uint32_t x) {
         x -= __umulhi(x, rp) * p;
         return x >= p ? x - p : x;
     };
-    uint4* d = xs + (gj * nout + go) * TPO;
     if (!need) {
         chacha::chacha12(key, b, 0u, p, chacha::TAG_CTSA, v);
 #pragma unroll
@@ -252,50 +253,83 @@ __device__ __forceinline__ uint32_t seed_draw(const TensorSeededArgs& A, int row
     return 0;
 }
 
-template <class MM, bool PACKED, int TW>
+// NQ (A.nq second-operand sets, ABI 25): thread (qi, co, l) of the block's chunk of nout first operands, output
+// qi A.nout + cb + co: first operands a[cb + co] (c0 read and c1 drawn once per block for every set), second
+// operands of set qi.
+// Grid (ABI 27): x the tiles of a ring slice, y the chunks, z the slices of every row, so a slice's second operands
+// stay cached across the chunks.
+// Redraws: a thread whose block has rejected words appends (thread, mask) to the block's list, and the list's first
+// threads draw again, each one entry: a warp or two instead of every warp with a rejected word in it.
+template <class MM, bool PACKED, int TW, bool LIST>
 __global__ void __launch_bounds__(256, SEED_MINB) tensor_seeded(TensorSeededArgs A) {
     constexpr int TPO = TW / 4, NB = TW / 16, C0Q = c0_q<PACKED>(TW);
     extern __shared__ uint4 sm[];
-    const int nout = A.nout, row = blockIdx.y, t = threadIdx.x, o = t / TPO, l = t % TPO;
-    uint4* xs = sm;                                  // [SEED_JS][nout TPO], seed_swz within an output
-    uint4* cs = xs + SEED_JS * nout * TPO;           // [SEED_JS][nout][C0Q]
-    uint4* ys = cs + SEED_JS * nout * C0Q;           // [SEED_JS][2][TPO]
+    const int nsl = (N / TW) / (int)gridDim.x, row = blockIdx.z / nsl, tile = (blockIdx.z % nsl) * (int)gridDim.x + blockIdx.x;
+    const int cmax = A.cout > 0 ? A.cout : A.nout, cb = blockIdx.y * cmax, nout = min(A.nout - cb, cmax);
+    const int nq = A.nq, t = threadIdx.x, o = t / TPO, l = t % TPO;
+    const int co = o % nout, qi = o / nout;          // qi >= nq: a short last chunk's spare threads
+    uint4* xs = sm;                                  // [nq SEED_JS][nout TPO], seed_swz within an output
+    uint4* cs = xs + nq * SEED_JS * nout * TPO;      // [SEED_JS][nout][C0Q]
+    uint4* ys = cs + SEED_JS * nout * C0Q;           // [SEED_JS][nq][2][TPO]
+    uint32_t* rd = (uint32_t*)(ys + SEED_JS * nq * 2 * TPO);
     const PrimeConst& q = A.pr[row];
     const uint32_t p = (uint32_t)q.p;
-    const int w0 = blockIdx.x * TW;
-    const int gj = t / (nout * NB);
+    const int w0 = tile * TW;
+    // this thread's ChaCha block: pair gj of the nq stages, first operand go, block gb of the tile
+    const int gj = t / (nout * NB), go = t / NB % nout, gb = t % NB;
     const size_t c0off = (size_t)row * (PACKED ? PC_PACK_ROW_WORDS : N) + (size_t)w0 * (PACKED ? PC_PACK_BITS : 32) / 32;
-    const int ncs = SEED_JS * nout * C0Q, ncp = ncs + SEED_JS * 2 * TPO;
+    const auto seed = [&](int g, int j) { return (const uint32_t*)A.a[cb + g][j] + A.seed_off + 8 * row; };
     uint64_t s[3][4];
 #pragma unroll
     for (int u = 0; u < 3; ++u)
 #pragma unroll
         for (int w = 0; w < 4; ++w) s[u][w] = 0;
-    for (int j0 = 0; j0 < A.npairs; j0 += SEED_JS) {
+    if constexpr (LIST) {
+        if (t == 0) rd[0] = 0;
+        __syncthreads();
+    }
+    for (int j0 = 0, ds = 0; j0 < A.npairs; j0 += SEED_JS, ds = ds + 1 < nq ? ds + 1 : 0) {
         if (j0) __syncthreads();
-        for (int k = t; k < ncp; k += blockDim.x) {
-            if (k < ncs) {
-                const int jj = k / (nout * C0Q), r = k % (nout * C0Q);
-                if (j0 + jj < A.npairs) cp_async16(cs + k, (const uint4*)((const uint32_t*)A.a[r / C0Q][j0 + jj] + c0off) + r % C0Q);
-            } else {
-                const int u = k - ncs, jj = u / (2 * TPO), part = u / TPO % 2;
-                if (j0 + jj < A.npairs) cp_async16(ys + u, (const uint4*)(at<uint32_t>(A.b[j0 + jj], 0, part, row) + w0) + u % TPO);
+        // copies: c0 of (pair jj, co) by the threads of the sets jj % nq, b part c % 2 of pair c / 2 by first operand c % nout's
+        if (qi < nq) {
+            if (l < C0Q) {
+                for (int jj = qi; jj < SEED_JS && j0 + jj < A.npairs; jj += nq) {
+                    cp_async16(cs + (jj * nout + co) * C0Q + l, (const uint4*)((const uint32_t*)A.a[cb + co][j0 + jj] + c0off) + l);
+                }
+            }
+            for (int c = co; c < 2 * SEED_JS && j0 + (c >> 1) < A.npairs; c += nout) {
+                PolyRef br = A.b[j0 + (c >> 1)];
+                if (qi) br.base = (void*)A.bq[qi - 1][j0 + (c >> 1)];
+                cp_async16(ys + ((c >> 1) * nq + qi) * 2 * TPO + (c & 1) * TPO + l, (const uint4*)(at<uint32_t>(br, 0, c & 1, row) + w0) + l);
             }
         }
-        if (j0 + gj < A.npairs) {
-            const uint32_t need = seed_draw<TW>(A, row, j0, nout, t, p, xs, 0u);
-            if (need) seed_draw<TW>(A, row, j0, nout, t, p, xs, need);
+        if (ds == 0) {
+            uint32_t need = 0;
+            if (gj < nq * SEED_JS && j0 + gj < A.npairs) need = seed_draw<TW>(seed(go, j0 + gj), tile, gb, p, xs + (gj * nout + go) * TPO, 0u);
+            if constexpr (!LIST) {                   // nq == 1, every stage draws: no list, its shared memory would cost a block per SM
+                if (need) seed_draw<TW>(seed(go, j0 + gj), tile, gb, p, xs + (gj * nout + go) * TPO, need);
+            } else {
+                if (need) rd[1 + atomicAdd(rd, 1u)] = (uint32_t)t | need << 16;
+                __syncthreads();
+                if ((uint32_t)t < rd[0]) {
+                    const uint32_t e = rd[1 + t];
+                    const int et = e & 0xFFFF, ej = et / (nout * NB), eo = et / NB % nout;
+                    seed_draw<TW>(seed(eo, j0 + ej), tile, et % NB, p, xs + (ej * nout + eo) * TPO, e >> 16);
+                }
+            }
         }
         cp_async_wait();
         __syncthreads();
+        if (LIST && t == 0) rd[0] = 0;               // read by now, appended to after the next stage's barrier
+        if (qi >= nq) continue;
 #pragma unroll
         for (int jj = 0; jj < SEED_JS; ++jj) {
             if (j0 + jj >= A.npairs) break;
-            const uint32_t* c0 = (const uint32_t*)(cs + (jj * nout + o) * C0Q);
+            const uint32_t* c0 = (const uint32_t*)(cs + (jj * nout + co) * C0Q);
             const V4<uint32_t> x0 = PACKED ? unpack4(c0, 4 * l) : load4<uint32_t>(c0 + 4 * l);
-            const uint4 x1 = xs[(jj * nout + o) * TPO + seed_swz(l)];
+            const uint4 x1 = xs[((ds * SEED_JS + jj) * nout + co) * TPO + seed_swz(l)];
             const uint32_t x1v[4] = {x1.x, x1.y, x1.z, x1.w};
-            const uint4 y0 = ys[(jj * 2) * TPO + l], y1 = ys[(jj * 2 + 1) * TPO + l];
+            const uint4 y0 = ys[((jj * nq + qi) * 2) * TPO + l], y1 = ys[((jj * nq + qi) * 2 + 1) * TPO + l];
             const uint32_t y0v[4] = {y0.x, y0.y, y0.z, y0.w}, y1v[4] = {y1.x, y1.y, y1.z, y1.w};
 #pragma unroll
             for (int w = 0; w < 4; ++w) {
@@ -305,7 +339,8 @@ __global__ void __launch_bounds__(256, SEED_MINB) tensor_seeded(TensorSeededArgs
             }
         }
     }
-    const int i = w0 + 4 * l;
+    if (qi >= nq) return;
+    const int i = w0 + 4 * l, og = qi * A.nout + cb + co;
     uint32_t r0[4], r1[4], r2[4];
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
@@ -313,9 +348,9 @@ __global__ void __launch_bounds__(256, SEED_MINB) tensor_seeded(TensorSeededArgs
         r1[w] = MM::reduce(s[1][w], q);
         r2[w] = MM::reduce(s[2][w], q);
     }
-    uint32_t* o0 = at<uint32_t>(A.out[o], 0, 0, row) + i;
-    uint32_t* o1 = at<uint32_t>(A.out[o], 0, 1, row) + i;
-    uint32_t* o2 = at<uint32_t>(A.d2[o], 0, 1, row) + i;
+    uint32_t* o0 = at<uint32_t>(A.out[og], 0, 0, row) + i;
+    uint32_t* o1 = at<uint32_t>(A.out[og], 0, 1, row) + i;
+    uint32_t* o2 = at<uint32_t>(A.d2[og], 0, 1, row) + i;
     if (A.acc) {
         const V4<uint32_t> d0 = load4<uint32_t>(o0), d1 = load4<uint32_t>(o1);
 #pragma unroll
@@ -451,6 +486,19 @@ __global__ void mul_add(MulAddArgs B) {
 }
 
 template <class W, class MM>
+__global__ void submul_many(SubMulManyArgs A) {
+    const int j = blockIdx.z;
+    const PrimeConst& q = A.pr[blockIdx.y];
+    const W p = (W)q.p;
+    const size_t i = (size_t)blockIdx.y * N + (blockIdx.x * BX + threadIdx.x) * 4;
+    const V4<W> x = load4<W>((const W*)A.a[j] + i), y = load4<W>((const W*)A.b[j] + i), t = load4<W>((const W*)A.t + i);
+    W r[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) r[w] = MM::mul(sub<W>(x.v[w], y.v[w], p), t.v[w], q);
+    store4<W>((W*)A.out[j] + i, r[0], r[1], r[2], r[3]);
+}
+
+template <class W, class MM>
 int tensor_l(const TensorArgs* a, cudaStream_t s) {
     tensor<W, MM><<<dim3(N / (4 * BX), a->n, a->K), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
@@ -469,7 +517,16 @@ int tensor_multi_l(const TensorMultiArgs* a, cudaStream_t s) {
 }
 template <class MM, bool PACKED, int TW>
 int tensor_seeded_tw(const TensorSeededArgs* a, cudaStream_t s) {
-    tensor_seeded<MM, PACKED, TW><<<dim3(N / TW, a->n), a->nout * TW / 4, seed_smem_q<PACKED, TW>(a->nout) * 16, s>>>(*a);
+    // chunks of cout first operands, the ring in slices of ts tiles (args.cuh)
+    const int cout = a->cout > 0 ? a->cout : a->nout, ts = a->swords >= TW && a->swords < N ? a->swords / TW : N / TW;
+    if (N / TW % ts) return -1;
+    const dim3 g(ts, (a->nout + cout - 1) / cout, a->n * (N / TW / ts));
+    const int t = a->nq * cout * TW / 4, sm = seed_smem_q<PACKED, TW>(cout, a->nq) * 16;
+    if (a->nq > 1) {
+        tensor_seeded<MM, PACKED, TW, true><<<g, t, sm, s>>>(*a);
+    } else {
+        tensor_seeded<MM, PACKED, TW, false><<<g, t, sm, s>>>(*a);
+    }
     return (int)cudaGetLastError();
 }
 template <class W, class MM>
@@ -477,9 +534,11 @@ int tensor_seeded_l(const TensorSeededArgs* a, cudaStream_t s) {
     if constexpr (sizeof(W) != 4) {
         return -1;
     } else {
-        if (a->nout < 1 || a->nout > PC_TSEED_OUT || a->npairs < 1 || a->npairs > PC_TSEED_PAIRS) return -1;
+        // a block's outputs: 256 threads of 64-word tiles
+        const int no = a->nq * (a->cout > 0 && a->cout < a->nout ? a->cout : a->nout);
+        if (a->nout < 1 || a->nout > PC_TSEED_OUT || a->nq < 1 || a->nq > PC_TSEED_Q || a->nq * a->nout > PC_TSEED_QOUT || no > 16 || a->npairs < 1 || a->npairs > PC_TSEED_PAIRS) return -1;
         // 64-word tiles (a warp from two outputs on; wider tiles measured no faster)
-        if (a->nout == 1) return a->packed ? tensor_seeded_tw<MM, true, 128>(a, s) : tensor_seeded_tw<MM, false, 128>(a, s);
+        if (no == 1) return a->packed ? tensor_seeded_tw<MM, true, 128>(a, s) : tensor_seeded_tw<MM, false, 128>(a, s);
         return a->packed ? tensor_seeded_tw<MM, true, 64>(a, s) : tensor_seeded_tw<MM, false, 64>(a, s);
     }
 }
@@ -519,6 +578,12 @@ template <class W, class MM>
 int mul_add_l(const MulAddArgs* a, cudaStream_t s) {
     if (a->sub < 0 || a->sub > 2) return -1;
     mul_add<W, MM><<<dim3(N / (4 * BX), a->m.n, 2 * a->m.K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W, class MM>
+int submul_many_l(const SubMulManyArgs* a, cudaStream_t s) {
+    if (a->n < 1 || a->n > PC_EWM_MAX) return -1;
+    submul_many<W, MM><<<dim3(N / (4 * BX), a->nrows, a->n), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W, class MM>

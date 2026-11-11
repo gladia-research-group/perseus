@@ -170,9 +170,9 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
             seed: key.seed_dev.dptr(),
             ids: ids.dptr(),
             digit_of: self.digit_of.dptr(),
-            // the key's own special set: P, or P' for a bottom-shape key of a lean chain
-            pmod: if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.v.vptr() } else { ctx.ks.p_mod_q.v.vptr() },
-            pmods: if sh.kp < ctx.lay.kp { ctx.ks.ps_mod_q.s.vptr() } else { ctx.ks.p_mod_q.s.vptr() },
+            // the key's own special set: P, P' (a bottom-shape key of a lean chain) or a `LowP` tier's
+            pmod: ctx.ks.set(&ctx.chain, sh.kp).0.v.vptr(),
+            pmods: ctx.ks.set(&ctx.chain, sh.kp).0.s.vptr(),
             pr: ctx.pr(),
             row_words,
             nrows: rows as i32,

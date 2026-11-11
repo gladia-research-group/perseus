@@ -114,8 +114,11 @@ pub struct Ring {
     pub p_mod_q: Vec<u32>,
     /// P' mod q_i (P' = the first `Chain::p_sparse` special primes: the bottom-shape keys' gadget).
     pub ps_mod_q: Vec<u32>,
-    /// Special primes in P (a key over fewer uses P').
+    /// The same for the upper `LowP` tier's special primes (`Chain::low`; P' without a second tier).
+    pub pm_mod_q: Vec<u32>,
+    /// Special primes in P and in P' (a key over neither count uses the upper `LowP` tier's).
     pub kp: usize,
+    pub kps: usize,
 }
 
 impl Ring {
@@ -125,15 +128,18 @@ impl Ring {
         let ntt = primes.par_iter().zip(roots.par_iter()).map(|(&p, &r)| Ntt::new(p, r, chain.n)).collect::<Result<Vec<_>>>()?;
         let prod = |ps: &[u64]| chain.q.iter().map(|&q| ps.iter().fold(1u64, |a, &pj| mulmod(a, pj % q, q)) as u32).collect();
         let (p_mod_q, ps_mod_q) = (prod(&chain.p), prod(&chain.p[..chain.p_sparse]));
-        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, kp: chain.p.len() })
+        let pm_mod_q = prod(&chain.p[..chain.low.last().map_or(chain.p_sparse, |l| l.1)]);
+        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, pm_mod_q, kp: chain.p.len(), kps: chain.p_sparse })
     }
 
-    /// The gadget factor (P or P' mod q) of a key over `kp` special primes.
+    /// The gadget factor (P, P' or the upper `LowP` tier's product, mod q) of a key over `kp` special primes.
     pub fn gadget(&self, kp: usize) -> &[u32] {
-        if kp < self.kp {
+        if kp == self.kp {
+            &self.p_mod_q
+        } else if kp == self.kps {
             &self.ps_mod_q
         } else {
-            &self.p_mod_q
+            &self.pm_mod_q
         }
     }
 

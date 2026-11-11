@@ -400,6 +400,23 @@ pub fn transform_rows<W: DevWord, M: DevStrategy<W>>(
     launch(ctx, s, dir, buf.vptr_mut(), list.roff.dptr(), list.rprime.dptr(), list.len())
 }
 
+/// `transform_rows_prefix` over a list whose first `nrows` entries stay within `span_limbs` limbs of `buf` (a list
+/// built for more ciphertexts than `buf` holds, run on a prefix that fits).
+pub fn transform_rows_within<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    dir: Dir,
+    buf: &mut DBuf<'_, Compute, W>,
+    list: &RowList<'_>,
+    nrows: usize,
+    span_limbs: usize,
+) -> Result<()> {
+    if nrows > list.len() || span_limbs * ctx.lay.n > buf.len() {
+        return Err(shape("ntt rows", format!("{nrows} of {} rows within {span_limbs} limbs, buffer holds {}", list.len(), buf.len() / ctx.lay.n)));
+    }
+    launch(ctx, s, dir, buf.vptr_mut(), list.roff.dptr(), list.rprime.dptr(), nrows)
+}
+
 /// `transform_rows` over the first `nrows` entries of `list` only (lists ordered by ciphertext serve every k).
 pub fn transform_rows_prefix<W: DevWord, M: DevStrategy<W>>(
     ctx: &Context<'_, W, M>,

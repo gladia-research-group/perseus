@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 23u
+#define PC_KERNELS_ABI 30u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -107,15 +107,19 @@ static_assert(sizeof(NttArgs) == 176, "NttArgs layout");
 // Batched fast base conversion (coefficient domain), one launch for many jobs (digits x ciphertexts):
 //   y_i = x_i * pre_i mod s_i (i < nsrc <= 16);  out_t = sum_i y_i * M[i][t] mod t;
 //   exact jobs: v = sum_i y_i * rb_i (double FMA, source order), u = floor(v + 0.5), out_t -= u * (B mod t).
+//   exact == 2 (ABI 30): the same u from integers, f = sum_i floor(y_i rc_i) in 59 fractional bits, u = (f + 2^58) >> 59,
+//     out_t += u * (-B mod t) in the lazy sum. u differs from the double one only within 2^-23 of a half.
 // The pool is an array of W words. Pool layout at pool_off (all counts in W words):
 //   src_row[nsrc], src_prime[nsrc], pre[nsrc], tgt_row[ntgt], tgt_prime[ntgt], M[nsrc][ntgt],
 //   (exact) rb[nsrc] as double (8/sizeof(W) words each, first one 8-byte aligned in the pool), bmod[ntgt].
-// Bound: nsrc * (max p - 1)^2 < 2^(2*BITS) (lazy accumulation in the double word).
+//   (exact == 2) rc[nsrc] as uint64_t in rb's place, floor(2^59 / b_i) (W under 64 bits) or floor(2^(64 + L_i) / b_i),
+//     L_i = floor(log2 b_i) (64-bit W: the product is shifted down by L_i + 5); bmod[ntgt] holds -B mod t.
+// Bound: nsrc * (max p - 1)^2 < 2^(2*BITS) (lazy accumulation in the double word; + 16 max p when exact == 2).
 struct BconvJob {
     uint32_t src_off, dst_off;  // limb offsets (units of N) into src / dst
     uint32_t nsrc, ntgt;
     uint32_t pool_off;          // W words
-    uint32_t exact;
+    uint32_t exact;             // 0 plain, 1 double estimate, 2 integer estimate
     uint32_t pad[2];
 };
 static_assert(sizeof(BconvJob) == 32, "BconvJob layout");
@@ -145,6 +149,31 @@ struct EwArgs {
     int32_t K, nparts, sub, zero_p;
 };
 static_assert(sizeof(EwArgs) == 128, "EwArgs layout");
+
+// ew_many: out[i] = a[i] (+ b[i]) (+ c[i]) for n polynomials given by pointer (Q rows 0..nrows, row r at + r*N words);
+// a null b / c is skipped; out may alias its own sources. Grid = (N/1024, nrows, n).
+constexpr int PC_EWM_MAX = 48;
+struct EwManyArgs {
+    void* out[PC_EWM_MAX];
+    const void* a[PC_EWM_MAX];
+    const void* b[PC_EWM_MAX];
+    const void* c[PC_EWM_MAX];
+    const PrimeConst* pr;
+    int32_t n, nrows;
+};
+static_assert(sizeof(EwManyArgs) == 4 * PC_EWM_MAX * 8 + 16, "EwManyArgs layout");
+
+// submul_many (ABI 29): out[i] = (a[i] - b[i]) * t[row] for n polynomials given by pointer (rows as ew_many; t one
+// table, row r at + r*N words, a general ModMul product as mul_table). Grid = (N/1024, nrows, n).
+struct SubMulManyArgs {
+    void* out[PC_EWM_MAX];
+    const void* a[PC_EWM_MAX];
+    const void* b[PC_EWM_MAX];
+    const void* t;
+    const PrimeConst* pr;
+    int32_t n, nrows;
+};
+static_assert(sizeof(SubMulManyArgs) == 3 * PC_EWM_MAX * 8 + 24, "SubMulManyArgs layout");
 
 // BSGS plaintext dot of an LT stage in the extended basis, K <= 8 ciphertexts sharing the plaintext reads:
 //   res[c][j][part] = sum_{i < bstep} rot[c][i][part] * pt[bstep*j + i]   (j < gstep; diagonals >= npts skipped)
@@ -330,15 +359,26 @@ static_assert(sizeof(TensorMultiArgs) == (2 * PC_TMULTI_OUT + 2 * PC_TMULTI_OUT 
 #define PC_PACK_ROW_WORDS ((PC_N * PC_PACK_BITS + 31) / 32)
 #define PC_TSEED_OUT 16
 #define PC_TSEED_PAIRS 128
+#define PC_TSEED_Q 4
+#define PC_TSEED_QOUT 64
 struct TensorSeededArgs {
-    PolyRef out[PC_TSEED_OUT], d2[PC_TSEED_OUT];
+    // ABI 26: up to PC_TSEED_QOUT outputs (nq sets x nout <= PC_TSEED_OUT first-operand groups)
+    PolyRef out[PC_TSEED_QOUT], d2[PC_TSEED_QOUT];
     PolyRef b[PC_TSEED_PAIRS];
     const void* a[PC_TSEED_OUT][PC_TSEED_PAIRS];
     const PrimeConst* pr;
     uint64_t seed_off;
     int32_t nout, npairs, acc, n, packed, pad;
+    // ABI 25: nq second-operand sets over the same first operands: set 0 is b, set q > 0 at bq[q - 1][j]
+    // (b[j]'s strides); output q nout + o = sum_j a[o][j] * set q's j-th; nq nout <= PC_TSEED_QOUT
+    const void* bq[PC_TSEED_Q - 1][PC_TSEED_PAIRS];
+    // ABI 27: scheduling only. cout > 0: the first-operand groups in chunks of cout (a block: one chunk's outputs of
+    // one tile), swords > 0: the ring in slices of swords words; blocks ordered tile < chunk < slice < row, so every
+    // chunk of a slice reads the second operands' slice while it is still cached
+    int32_t nq, cout, swords, qpad;
 };
-static_assert(sizeof(TensorSeededArgs) == (2 * PC_TSEED_OUT + PC_TSEED_PAIRS) * 24 + PC_TSEED_OUT * PC_TSEED_PAIRS * 8 + 16 + 24,
+static_assert(sizeof(TensorSeededArgs) == (2 * PC_TSEED_QOUT + PC_TSEED_PAIRS) * 24 + PC_TSEED_OUT * PC_TSEED_PAIRS * 8 + 16 + 24
+                  + (PC_TSEED_Q - 1) * PC_TSEED_PAIRS * 8 + 16,
               "TensorSeededArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
@@ -929,8 +969,10 @@ struct KernelTable {
     int (*tensor_sum)(const TensorSumArgs*, cudaStream_t);
     int (*tensor_multi)(const TensorMultiArgs*, cudaStream_t);
     int (*tensor_seeded)(const TensorSeededArgs*, cudaStream_t);
+    int (*ew_many)(const EwManyArgs*, cudaStream_t);
+    int (*submul_many)(const SubMulManyArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 44 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 46 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

@@ -6,7 +6,7 @@ use std::ffi::c_void;
 /// `cudaStream_t`
 pub type CudaStream = *mut c_void;
 
-pub const ABI: u32 = 23;
+pub const ABI: u32 = 30;
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
@@ -115,6 +115,37 @@ pub struct BconvArgs {
     pub pr: *const PrimeConst,
     pub njobs: i32,
     pub max_tgt: i32,
+}
+
+/// Polynomials per `ew_many` launch (PC_EWM_MAX).
+pub const EWM_MAX: usize = 48;
+
+/// `ew_many`: out[i] = a[i] (+ b[i]) (+ c[i]) over Q rows 0..nrows of n polynomials given by pointer (null b / c
+/// skipped).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct EwManyArgs {
+    pub out: [*mut c_void; EWM_MAX],
+    pub a: [*const c_void; EWM_MAX],
+    pub b: [*const c_void; EWM_MAX],
+    pub c: [*const c_void; EWM_MAX],
+    pub pr: *const PrimeConst,
+    pub n: i32,
+    pub nrows: i32,
+}
+
+/// `submul_many` (ABI 29): out[i] = (a[i] - b[i]) * t[row] over Q rows 0..nrows of n polynomials given by pointer (t
+/// one table of N-word rows, as `mul_table`'s).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SubMulManyArgs {
+    pub out: [*mut c_void; EWM_MAX],
+    pub a: [*const c_void; EWM_MAX],
+    pub b: [*const c_void; EWM_MAX],
+    pub t: *const c_void,
+    pub pr: *const PrimeConst,
+    pub n: i32,
+    pub nrows: i32,
 }
 
 #[repr(C)]
@@ -332,6 +363,10 @@ pub struct TensorMultiArgs {
 /// Outputs and pairs per `tensor_seeded` launch (`PC_TSEED_OUT`, `PC_TSEED_PAIRS`).
 pub const TSEED_OUT: usize = 16;
 pub const TSEED_PAIRS: usize = 128;
+/// Second-operand sets per `tensor_seeded` launch (`PC_TSEED_Q`).
+pub const TSEED_Q: usize = 4;
+/// Outputs per `tensor_seeded` launch over all sets (`PC_TSEED_QOUT`): nq nout, nout <= TSEED_OUT.
+pub const TSEED_QOUT: usize = 64;
 
 /// ABI 23: `tensor_multi` over seeded first operands sharing their second ones (single ciphertexts): output o =
 /// sum_j a[o][j] * b[j]. `a[o][j]`: a seeded ciphertext's c0 (rows N words apart; packed: `pack_row`, rows
@@ -340,8 +375,8 @@ pub const TSEED_PAIRS: usize = 128;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TensorSeededArgs {
-    pub out: [PolyRef; TSEED_OUT],
-    pub d2: [PolyRef; TSEED_OUT],
+    pub out: [PolyRef; TSEED_QOUT],
+    pub d2: [PolyRef; TSEED_QOUT],
     pub b: [PolyRef; TSEED_PAIRS],
     pub a: [[*const c_void; TSEED_PAIRS]; TSEED_OUT],
     pub pr: *const PrimeConst,
@@ -352,6 +387,15 @@ pub struct TensorSeededArgs {
     pub n: i32,
     pub packed: i32,
     pub pad: i32,
+    /// ABI 25: second-operand sets 1..nq (over the same first operands), b's strides; output q nout + o =
+    /// sum_j a\[o\]\[j\] * set q's j-th (set 0 is `b`); nq nout <= TSEED_QOUT (ABI 26).
+    pub bq: [[*const c_void; TSEED_PAIRS]; TSEED_Q - 1],
+    pub nq: i32,
+    /// ABI 27 (scheduling only): first-operand groups per chunk (0: one chunk), words per ring slice (0: whole ring);
+    /// blocks run tile < chunk < slice < row, so a slice's second operands stay cached across the chunks.
+    pub cout: i32,
+    pub swords: i32,
+    pub qpad: i32,
 }
 
 /// Bits per coefficient of a packed seeded c0 row (`PC_PACK_BITS`): primes below 2^PACK_BITS only.
@@ -963,6 +1007,8 @@ pub struct KernelTable {
     pub tensor_sum: Launch<TensorSumArgs>,
     pub tensor_multi: Launch<TensorMultiArgs>,
     pub tensor_seeded: Launch<TensorSeededArgs>,
+    pub ew_many: Launch<EwManyArgs>,
+    pub submul_many: Launch<SubMulManyArgs>,
 }
 
 // Sizes must equal the static_asserts in args.cuh.
@@ -984,7 +1030,7 @@ const _: () = {
     assert!(size_of::<TensorArgs>() == 192);
     assert!(size_of::<TensorSumArgs>() == 2 * 24 + 2 * TSUM_MAX * 24 + 8 + 16);
     assert!(size_of::<TensorMultiArgs>() == (2 * TMULTI_OUT + 2 * TMULTI_OUT * TMULTI_PAIRS) * 24 + 8 + 24);
-    assert!(size_of::<TensorSeededArgs>() == (2 * TSEED_OUT + TSEED_PAIRS) * 24 + TSEED_OUT * TSEED_PAIRS * 8 + 16 + 24);
+    assert!(size_of::<TensorSeededArgs>() == (2 * TSEED_QOUT + TSEED_PAIRS) * 24 + TSEED_OUT * TSEED_PAIRS * 8 + 16 + 24 + (TSEED_Q - 1) * TSEED_PAIRS * 8 + 16);
     assert!(size_of::<MdEpiArgs>() == 120);
     assert!(size_of::<WsumArgs>() == 256);
     assert!(size_of::<WsumKArgs>() == 264);
@@ -1010,7 +1056,9 @@ const _: () = {
     assert!(size_of::<PcmmArgs>() == 168);
     assert!(size_of::<CcmmArgs>() == 280);
     assert!(size_of::<SmallInt1Args>() == 56);
-    assert!(size_of::<KernelTable>() == 16 + 44 * 8);
+    assert!(size_of::<KernelTable>() == 16 + 46 * 8);
+    assert!(size_of::<EwManyArgs>() == 4 * EWM_MAX * 8 + 16);
+    assert!(size_of::<SubMulManyArgs>() == 3 * EWM_MAX * 8 + 24);
     assert!(size_of::<MulAddArgs>() == 104);
     assert!(size_of::<TfheArgs>() == 32 + 6 * 8 + 16 + 64);
     assert!(size_of::<CoeffArgs>() == 80 + 16 * COEFF_MAXT);

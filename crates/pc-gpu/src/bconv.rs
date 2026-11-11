@@ -20,6 +20,9 @@ pub struct JobSpec {
     pub tgt: Vec<(u32, u32)>,
     /// HPS-corrected (exact) conversion.
     pub exact: bool,
+    /// With `exact`: the correction's quotient from the kernel's integer estimate instead of FIDESlib's double one
+    /// (the same value but within 2^-23 of a half; no double arithmetic on the device).
+    pub fixed: bool,
 }
 
 /// Device job tables of a set of conversions.
@@ -78,8 +81,18 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             while (pool.len() * wb) % 8 != 0 {
                 pool.push(W::ZERO);
             }
+            if j.fixed {
+                let pmax = j.tgt.iter().map(|&(_, tp)| primes[tp as usize]).chain(bp.iter().copied()).max().unwrap_or(0) as u128;
+                if 8 * wb < 64 && (ns as u128 * pmax * pmax + 16 * pmax) >> (16 * wb) != 0 {
+                    return Err(shape("bconv job", format!("{ns} sources of {pmax} overflow the lazy sum")));
+                }
+            }
             for &b in &bp {
-                let bits = (1.0f64 / b as f64).to_bits();
+                let bits = match (j.fixed, wb) {
+                    (false, _) => (1.0f64 / b as f64).to_bits(),
+                    (true, 8) => ((1u128 << (127 - b.leading_zeros())) / b as u128) as u64,
+                    (true, _) => (1u64 << 59) / b,
+                };
                 for w in 0..8 / wb {
                     let part = if wb == 8 { bits } else { (bits >> (8 * wb * w)) & ((1u64 << (8 * wb)) - 1) };
                     push(&mut pool, part);
@@ -87,11 +100,12 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             }
             for &(_, tp) in &j.tgt {
                 let t = primes[tp as usize];
-                push(&mut pool, bp.iter().fold(1u64, |m, &b| mulmod(m, b % t, t)));
+                let bm = bp.iter().fold(1u64, |m, &b| mulmod(m, b % t, t));
+                push(&mut pool, if j.fixed { (t - bm) % t } else { bm });
             }
         }
         max_tgt = max_tgt.max(j.tgt.len());
-        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, 0, 0]);
+        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32 + (j.exact && j.fixed) as u32, 0, 0]);
     }
     Ok((pool, jobs, max_tgt))
 }

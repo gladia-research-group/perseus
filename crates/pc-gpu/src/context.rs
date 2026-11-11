@@ -83,14 +83,30 @@ fn shoup_pairs<W: DevWord>(primes: &[u64], vals: &[u64]) -> (Vec<W>, Vec<W>) {
         .unzip()
 }
 
-/// ModDown / ModUp scalars by prime id (Q ids; special ids hold 0): `P mod q_i`, `P^-1 mod q_i`, and the same for P'
-/// = the first `Chain::p_sparse` special primes (the bottom-shape keys' modulus; P itself but on a lean chain). The
-/// bconv job tables themselves depend on buffer offsets and are built by their users (`bconv::BconvPlan`).
+/// ModDown / ModUp scalars by prime id (Q ids; special ids hold 0): `P mod q_i`, `P^-1 mod q_i`, the same for P'
+/// = the first `Chain::p_sparse` special primes (the bottom-shape keys' modulus; P itself but on a lean chain) and for
+/// the upper `LowP` tier's set (P' again without a second tier). The bconv job tables themselves depend on buffer
+/// offsets and are built by their users (`bconv::BconvPlan`).
 pub struct KsScalars<'a, W: DevWord> {
     pub p_mod_q: ScalarTable<'a, W>,
     pub p_inv_mod_q: ScalarTable<'a, W>,
     pub ps_mod_q: ScalarTable<'a, W>,
     pub ps_inv_mod_q: ScalarTable<'a, W>,
+    pub pm_mod_q: ScalarTable<'a, W>,
+    pub pm_inv_mod_q: ScalarTable<'a, W>,
+}
+
+impl<'a, W: DevWord> KsScalars<'a, W> {
+    /// `(P mod q, P^-1 mod q)` of the set of the first `kp` special primes: all of P, P', or the upper `LowP` tier's.
+    pub fn set(&self, chain: &Chain, kp: usize) -> (&ScalarTable<'a, W>, &ScalarTable<'a, W>) {
+        if kp == chain.p.len() {
+            (&self.p_mod_q, &self.p_inv_mod_q)
+        } else if kp == chain.p_sparse {
+            (&self.ps_mod_q, &self.ps_inv_mod_q)
+        } else {
+            (&self.pm_mod_q, &self.pm_inv_mod_q)
+        }
+    }
 }
 
 /// Device context of a chain for words `W` and ModMul strategy `M`.
@@ -124,7 +140,7 @@ impl ConstCounts {
         let np = lay.rows();
         let mut w_tables = vec![np * lay.n; 4]; // fw fws iw iws
         w_tables.extend([np, np]); // ninv ninvs
-        w_tables.extend([np; 8]); // ks scalars (P and P': 2 tables x value/shoup each)
+        w_tables.extend([np; 12]); // ks scalars (P, P' and the upper `LowP` tier's: 2 tables x value/shoup each)
         ConstCounts { primes: np, w_tables, row_entries: RowTables::entries(lay, k_max) }
     }
     pub fn bytes<W>(&self) -> usize {
@@ -217,16 +233,23 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
         pmq.resize(lay.rows(), 0);
         pimq.resize(lay.rows(), 0);
         debug_assert!(nq <= pmq.len());
-        let ps = &chain.p[..chain.p_sparse];
-        let mut psmq: Vec<u64> = chain.q.iter().map(|&qi| ps.iter().fold(1u64 % qi, |a, &x| pc_core::modmul::mulmod(a, x % qi, qi))).collect();
-        let mut psimq: Vec<u64> = psmq.iter().zip(&chain.q).map(|(&x, &qi)| invmod(x, qi)).collect();
-        psmq.resize(lay.rows(), 0);
-        psimq.resize(lay.rows(), 0);
+        let sub = |kp: usize| {
+            let ps = &chain.p[..kp];
+            let mut m: Vec<u64> = chain.q.iter().map(|&qi| ps.iter().fold(1u64 % qi, |a, &x| pc_core::modmul::mulmod(a, x % qi, qi))).collect();
+            let mut mi: Vec<u64> = m.iter().zip(&chain.q).map(|(&x, &qi)| invmod(x, qi)).collect();
+            m.resize(lay.rows(), 0);
+            mi.resize(lay.rows(), 0);
+            (m, mi)
+        };
+        let (psmq, psimq) = sub(chain.p_sparse);
+        let (pmmq, pmimq) = sub(chain.low.last().map_or(chain.p_sparse, |l| l.1));
         let ks = KsScalars {
             p_mod_q: ScalarTable::new(arena, "ctx.ks.p_mod_q", s, &primes_v, &pmq)?,
             p_inv_mod_q: ScalarTable::new(arena, "ctx.ks.p_inv_mod_q", s, &primes_v, &pimq)?,
             ps_mod_q: ScalarTable::new(arena, "ctx.ks.ps_mod_q", s, &primes_v, &psmq)?,
             ps_inv_mod_q: ScalarTable::new(arena, "ctx.ks.ps_inv_mod_q", s, &primes_v, &psimq)?,
+            pm_mod_q: ScalarTable::new(arena, "ctx.ks.pm_mod_q", s, &primes_v, &pmmq)?,
+            pm_inv_mod_q: ScalarTable::new(arena, "ctx.ks.pm_inv_mod_q", s, &primes_v, &pmimq)?,
         };
         s.sync()?;
         Ok(Context { chain, scale, shape, lay, table, primes, ntt, rows, ks, k_max: plan.cfg.k_max, _m: PhantomData })
