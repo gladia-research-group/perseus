@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "perseus-client"
+requires-python = ">=3.12"
+dynamic = ["version"]
+description = "The Perseus CKKS client alone (keygen, encryption, decryption), no CUDA"
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "perseus_client"
