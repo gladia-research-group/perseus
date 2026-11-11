@@ -1,0 +1,18 @@
+[package]
+name = "pc-client-py"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "perseus: the client alone for Python (perseus_client: Config, ClientSecret, Client, eager key manifest), no CUDA"
+
+[lib]
+name = "perseus_client"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+pc-core = { path = "../pc-core" }
+pc-config = { path = "../pc-config" }
+pc-client = { path = "../pc-client" }
+serde_json = { workspace = true }
+rayon = { workspace = true }
