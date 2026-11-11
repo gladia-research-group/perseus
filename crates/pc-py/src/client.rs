@@ -425,9 +425,8 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
         };
         let mut data = Vec::with_capacity(2 * n);
         for part in 0..2 {
-            let rs: Vec<Vec<u64>> = limbs.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
-            let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
-            data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&limbs.moduli, &refs, b).map_err(cerr)?, b));
+            let refs: Vec<&[crate::session::W]> = limbs.c[part].iter().map(|r| r.as_slice()).collect();
+            pc_client::wire::pack_frame_part(&limbs.moduli, &refs, b, &mut data).map_err(cerr)?;
         }
         let m = c.meta;
         let tag = serde_json::to_value(m.tag).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -514,35 +513,27 @@ impl Drop for Inflight {
 impl PyPendingFrames {
     fn frame_all(&self) -> pc_client::Result<Vec<Vec<u8>>> {
         use rayon::prelude::*;
-        let landed: Vec<(pc_gpu::limbs::Limbs<crate::session::W>, CtMeta)> = match &self.inflight {
-            None => Vec::new(),
-            Some(f) => {
-                f.done.sync().map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-                f.rows
-                    .iter()
-                    .map(|(b, top, m)| {
-                        let c = [0, 1].map(|p| b[p].0.as_slice().chunks(self.n).map(|r| r.to_vec()).collect::<Vec<_>>());
-                        let l = pc_gpu::limbs::Limbs { c, moduli: f.moduli[..=*top].to_vec(), level: *top, noise_level: m.deg, noise_factor: m.nf };
-                        (l, *m)
-                    })
-                    .collect()
+        // per ciphertext: both parts' rows (the landed ones read where they landed), its moduli, its meta
+        type Rows<'a> = ([Vec<&'a [crate::session::W]>; 2], &'a [u64], &'a CtMeta);
+        let mut cts: Vec<Rows<'_>> = self.limbs.iter().map(|(l, m)| ([0, 1].map(|p| l.c[p].iter().map(|r| r.as_slice()).collect()), l.moduli.as_slice(), m)).collect();
+        if let Some(f) = &self.inflight {
+            f.done.sync().map_err(|e| pc_client::Error::Wire(e.to_string()))?;
+            cts.extend(f.rows.iter().map(|(b, top, m)| ([0, 1].map(|p| b[p].0.as_slice().chunks(self.n).collect()), &f.moduli[..=*top], m)));
+        }
+        let frame = |(rows, moduli, m): &Rows<'_>| -> pc_client::Result<Vec<u8>> {
+            let mut data = Vec::with_capacity(2 * self.n);
+            for (part, b) in [(0, self.bits), (1, self.bits1.unwrap_or(self.bits))] {
+                pc_client::wire::pack_frame_part(moduli, &rows[part], b, &mut data)?;
             }
+            let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
+            let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse };
+            CtWire { header, data }.to_bytes()
         };
-        self.limbs
-            .par_iter()
-            .chain(landed.par_iter())
-            .map(|(l, m)| -> pc_client::Result<Vec<u8>> {
-                let mut data = Vec::with_capacity(2 * self.n);
-                for (part, b) in [(0, self.bits), (1, self.bits1.unwrap_or(self.bits))] {
-                    let rs: Vec<Vec<u64>> = l.c[part].iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
-                    let refs: Vec<&[u64]> = rs.iter().map(|r| r.as_slice()).collect();
-                    data.extend(pc_client::wire::pack_bits(&pc_client::wire::pack_coeffs(&l.moduli, &refs, b)?, b));
-                }
-                let tag = serde_json::to_value(m.tag).map_err(|e| pc_client::Error::Wire(e.to_string()))?;
-                let header = CtHeader { params_hash: self.hash.clone(), n: self.n, k: 1, rows: l.moduli.len(), meta: WireMeta { level: m.level, deg: m.deg, nf: m.nf, slots: m.slots, tag }, bits: Some(self.bits), seeded: false, regen: false, bits1: self.bits1, sparse: self.sparse };
-                CtWire { header, data }.to_bytes()
-            })
-            .collect()
+        // one ciphertext: on the calling thread (frames of separate calls never queue behind each other in the pool)
+        if let [ct] = cts.as_slice() {
+            return Ok(vec![frame(ct)?]);
+        }
+        cts.par_iter().map(frame).collect()
     }
 }
 
