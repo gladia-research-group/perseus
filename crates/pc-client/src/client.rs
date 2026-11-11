@@ -60,7 +60,12 @@ pub struct Client {
     gauss: DiscreteGaussian,
     /// The SPRU block key of the last keygen that asked for one (relation checks).
     spru_block: Option<Vec<i8>>,
+    /// The sparse secret's eval rows at q0's two primes (`sparse_ntt`), made on first use.
+    sparse_eval: std::sync::OnceLock<[Vec<u32>; 2]>,
 }
+
+/// Sparse frames decrypt by shifts of c1 up to this many nonzero secret coefficients, by NTT products above.
+const SPARSE_SHIFT_H: usize = 32;
 
 /// mod-p product of two residues below 2^32.
 #[inline(always)]
@@ -93,6 +98,7 @@ impl Client {
             s_sparse_eval,
             gauss: DiscreteGaussian::new(DiscreteGaussian::SIGMA)?,
             spru_block: None,
+            sparse_eval: std::sync::OnceLock::new(),
         })
     }
 
@@ -600,26 +606,117 @@ impl Client {
             .collect()
     }
 
-    /// A compressed frame at q0 under the sparse secret, in coefficient form throughout: c0 + c1 s mod q0 with s's 32
-    /// nonzero coefficients as signed negacyclic shifts of c1 (no NTT, no CRT), centred.
+    /// A compressed frame at q0 under the sparse secret, centred: c0 + c1 s mod q0, by shifts of c1 (`sparse_shift`, a
+    /// weight-32 secret) or by NTT products (`sparse_ntt`, heavier secrets).
     fn sparse_centred(&self, ct: &CtWire, c: usize, b0: u32, b1: u32) -> Vec<i128> {
         let n = ct.header.n;
         let q = self.ring.primes[0] as u128 * self.ring.primes[1] as u128;
         let (w0, w1) = (crate::wire::packed_words(n, b0), crate::wire::packed_words(n, b1));
         let base = c * (w0 + w1);
+        // round(y q / 2^b) <= q for y < 2^b: q itself is 0
         let lift = |words: &[u32], b: u32| -> Vec<u64> {
-            crate::wire::unpack_bits(words, n, b).into_iter().map(|y| ((((y as u128 * q) + (1u128 << (b - 1))) >> b) % q) as u64).collect()
+            let q64 = q as u64;
+            crate::wire::unpack_bits(words, n, b)
+                .into_iter()
+                .map(|y| {
+                    let v = (((y as u128 * q) + (1u128 << (b - 1))) >> b) as u64;
+                    if v >= q64 { v - q64 } else { v }
+                })
+                .collect()
         };
         let x1 = lift(&ct.data[base + w0..base + w0 + w1], b1);
-        let mut m = lift(&ct.data[base..base + w0], b0);
-        let q = q as u64;
-        for (k, &sk) in self.secret.sk.s_sparse.iter().enumerate().filter(|(_, &s)| s != 0) {
-            for (i, mi) in m.iter_mut().enumerate() {
-                let (t, neg) = if i >= k { (x1[i - k], false) } else { (x1[i + n - k], true) };
-                *mi = if (sk > 0) != neg { let s = *mi + t; if s >= q { s - q } else { s } } else if *mi >= t { *mi - t } else { *mi + q - t };
-            }
+        let m = lift(&ct.data[base..base + w0], b0);
+        let h = self.secret.sk.s_sparse.iter().filter(|&&x| x != 0).count();
+        if (h as u128 + 1) * q < 1u128 << 63 {
+            self.sparse_shift_acc(m, &x1)
+        } else if h > SPARSE_SHIFT_H {
+            self.sparse_ntt(m, &x1)
+        } else {
+            self.sparse_shift(m, &x1)
         }
+    }
+
+    /// `sparse_shift` accumulated in i64 without reductions (exact while (h + 1) q0 < 2^63: h <= 127 at q0 < 2^56),
+    /// one pass of plain adds per nonzero coefficient over each output chunk (the wrapped and the unwrapped part of
+    /// the shift as two contiguous slices), reduced and centred once.
+    fn sparse_shift_acc(&self, m: Vec<u64>, x1: &[u64]) -> Vec<i128> {
+        let n = m.len();
+        let q = (self.ring.primes[0] * self.ring.primes[1]) as i64;
+        let nz: Vec<(usize, i8)> = self.secret.sk.s_sparse.iter().copied().enumerate().filter(|&(_, s)| s != 0).collect();
+        let chunk = n.div_ceil(32).max(1);
+        let mut out = vec![0i128; n];
+        out.par_chunks_mut(chunk).enumerate().for_each(|(ci, oc)| {
+            let (i0, len) = (ci * chunk, oc.len());
+            let mut acc: Vec<i64> = m[i0..i0 + len].iter().map(|&x| x as i64).collect();
+            for &(k, sk) in &nz {
+                // output i takes x1[i - k] for i >= k, -x1[i + n - k] below k
+                let split = k.clamp(i0, i0 + len) - i0;
+                let (a, b) = acc.split_at_mut(split);
+                if split > 0 {
+                    acc_add(a, &x1[i0 + n - k..i0 + n - k + split], sk > 0);
+                }
+                if split < len {
+                    acc_add(b, &x1[i0 + split - k..i0 + len - k], sk < 0);
+                }
+            }
+            for (o, &v) in oc.iter_mut().zip(&acc) {
+                let r = v.rem_euclid(q);
+                *o = if r > q / 2 { (r - q) as i128 } else { r as i128 };
+            }
+        });
+        out
+    }
+
+    /// c0 + c1 s mod q0 (q0 = the first two primes, `m` = c0 and `x1` = c1 lifted there) by signed negacyclic shifts
+    /// of c1, one per nonzero coefficient of the sparse secret; centred.
+    fn sparse_shift(&self, mut m: Vec<u64>, x1: &[u64]) -> Vec<i128> {
+        let n = m.len();
+        let q = self.ring.primes[0] * self.ring.primes[1];
+        let nz: Vec<(usize, i8)> = self.secret.sk.s_sparse.iter().copied().enumerate().filter(|&(_, s)| s != 0).collect();
+        // output rows in parallel chunks, every shift of c1 over a chunk's indices
+        let chunk = n.div_ceil(16).max(1);
+        m.par_chunks_mut(chunk).enumerate().for_each(|(ci, mc)| {
+            let i0 = ci * chunk;
+            for &(k, sk) in &nz {
+                for (di, mi) in mc.iter_mut().enumerate() {
+                    let i = i0 + di;
+                    let (t, neg) = if i >= k { (x1[i - k], false) } else { (x1[i + n - k], true) };
+                    *mi = if (sk > 0) != neg { let s = *mi + t; if s >= q { s - q } else { s } } else if *mi >= t { *mi - t } else { *mi + q - t };
+                }
+            }
+        });
         m.into_iter().map(|x| if x > q / 2 { x as i128 - q as i128 } else { x as i128 }).collect()
+    }
+
+    /// `sparse_shift` by NTT products at q0's two primes and a CRT (a cost independent of the secret's weight).
+    fn sparse_ntt(&self, m: Vec<u64>, x1: &[u64]) -> Vec<i128> {
+        let (p0, p1) = (self.ring.primes[0], self.ring.primes[1]);
+        let se = self.sparse_eval.get_or_init(|| {
+            let sp: Vec<i64> = self.secret.sk.s_sparse.iter().map(|&x| x as i64).collect();
+            [self.ring.eval_row(&sp, 0), self.ring.eval_row(&sp, 1)]
+        });
+        let r: Vec<Vec<u64>> = [0usize, 1]
+            .par_iter()
+            .map(|&id| {
+                let p = self.ring.primes[id];
+                let s = &se[id];
+                let mut c: Vec<u32> = x1.iter().map(|&x| (x % p) as u32).collect();
+                self.ring.ntt[id].fwd(&mut c);
+                c.iter_mut().zip(s).for_each(|(x, &y)| *x = mm(*x, y, p) as u32);
+                self.ring.ntt[id].inv(&mut c);
+                c.iter().zip(&m).map(|(&x, &y)| (x as u64 + y % p) % p).collect()
+            })
+            .collect();
+        let q = p0 * p1;
+        let inv = pc_core::modmul::invmod(p0 % p1, p1);
+        r[0].iter()
+            .zip(&r[1])
+            .map(|(&a, &b)| {
+                let t = ((b + p1 - a % p1) % p1) as u128 * inv as u128 % p1 as u128;
+                let x = (a as u128 + p0 as u128 * t) as u64;
+                if x > q / 2 { x as i128 - q as i128 } else { x as i128 }
+            })
+            .collect()
     }
 
     // ── checks ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -911,5 +1008,102 @@ mod bench {
         let rw = wire::packed_row_words(n, 28);
         let v = c.ksk_packed(&full, &s_all, &c.s_eval, false, &KskSeed([4; 8]), [5; 8], 28, rw);
         println!("full key {:.3} s ({} words)", t.elapsed().as_secs_f64(), v.len());
+    }
+}
+
+/// `acc[i] -= src[i]` (`neg`) or `+=`, as i64: AVX2 when the CPU has it (the loop vectorized 4 wide), else plain.
+fn acc_add(acc: &mut [i64], src: &[u64], neg: bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 is present (checked at run time)
+            unsafe { acc_add_avx2(acc, src, neg) };
+            return;
+        }
+    }
+    acc_add_plain(acc, src, neg);
+}
+
+#[inline(always)]
+fn acc_add_plain(acc: &mut [i64], src: &[u64], neg: bool) {
+    if neg {
+        acc.iter_mut().zip(src).for_each(|(o, &x)| *o = o.wrapping_sub(x as i64));
+    } else {
+        acc.iter_mut().zip(src).for_each(|(o, &x)| *o = o.wrapping_add(x as i64));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn acc_add_avx2(acc: &mut [i64], src: &[u64], neg: bool) {
+    acc_add_plain(acc, src, neg)
+}
+
+#[cfg(test)]
+mod sparse_decrypt_tests {
+    use super::*;
+
+    /// Per-stage client cost of one compressed sparse frame (12 / 18 bits): `cargo test --release -p pc-client
+    /// sparse_frame_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sparse_frame_cost() {
+        let mut g = Prng::from_seed([9; 8], 0);
+        let n = 1usize << 16;
+        for h in [32usize, 72] {
+            let c = Client::new("n32", ClientSecret::generate_h(&mut g, n, h).unwrap()).unwrap();
+            let q = c.ring.primes[0] * c.ring.primes[1];
+            let m: Vec<u64> = (0..n).map(|_| g.uniform_below(q)).collect();
+            let x1: Vec<u64> = (0..n).map(|_| g.uniform_below(q)).collect();
+            let words: Vec<u32> = (0..crate::wire::packed_words(n, 18)).map(|_| g.uniform_below(1 << 32) as u32).collect();
+            let reps = 20;
+            let time = |name: &str, f: &mut dyn FnMut()| {
+                f();
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    f();
+                }
+                println!("h {h} {name}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+            };
+            time("unpack_bits 18", &mut || {
+                std::hint::black_box(crate::wire::unpack_bits(&words, n, 18));
+            });
+            time("shift", &mut || {
+                std::hint::black_box(c.sparse_shift(m.clone(), &x1));
+            });
+            time("shift_acc", &mut || {
+                std::hint::black_box(c.sparse_shift_acc(m.clone(), &x1));
+            });
+            time("ntt", &mut || {
+                std::hint::black_box(c.sparse_ntt(m.clone(), &x1));
+            });
+            let w0 = crate::wire::packed_words(n, 12);
+            let frame = CtWire {
+                header: CtHeader { params_hash: c.params_hash.clone(), n, k: 1, rows: 2, meta: WireMeta { level: 52, deg: 1, nf: 2f64.powi(50), slots: (n / 2) as u32, tag: serde_json::Value::Null }, bits: Some(12), seeded: false, regen: false, bits1: Some(18), sparse: true },
+                data: words[..w0].iter().chain(&words).copied().collect(),
+            };
+            time("decrypt (whole frame)", &mut || {
+                std::hint::black_box(c.decrypt(&frame, Payload::Complex).unwrap());
+            });
+            let cc: Vec<i128> = c.sparse_ntt(m.clone(), &x1);
+            time("decode", &mut || {
+                std::hint::black_box(c.enc.decode_centered(&cc, n / 2, Payload::Complex, 2f64.powi(40)).unwrap());
+            });
+        }
+    }
+
+    #[test]
+    fn shift_and_ntt_agree() {
+        let mut g = Prng::from_seed([7; 8], 0);
+        for h in [32usize, 72, 256] {
+            let c = Client::new("n32", ClientSecret::generate_h(&mut g, 1 << 16, h).unwrap()).unwrap();
+            let q = c.ring.primes[0] * c.ring.primes[1];
+            let m: Vec<u64> = (0..1 << 16).map(|_| g.uniform_below(q)).collect();
+            let x1: Vec<u64> = (0..1 << 16).map(|_| g.uniform_below(q)).collect();
+            assert_eq!(c.sparse_shift(m.clone(), &x1), c.sparse_ntt(m.clone(), &x1), "h {h}");
+            if h < 128 {
+                assert_eq!(c.sparse_shift_acc(m.clone(), &x1), c.sparse_ntt(m, &x1), "acc h {h}");
+            }
+        }
     }
 }

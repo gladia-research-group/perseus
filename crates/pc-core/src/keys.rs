@@ -519,7 +519,12 @@ impl SecretKey {
     pub const SPARSE_H: usize = 32;
 
     pub fn sample(prng: &mut Prng, n: usize) -> Result<Self> {
-        Ok(SecretKey { s: sample_ternary(prng, n), s_sparse: sample_sparse_ternary(prng, n, Self::SPARSE_H)? })
+        Self::sample_h(prng, n, Self::SPARSE_H)
+    }
+    /// `sample` with a sparse secret of Hamming weight `h` (the default 32 keeps the dense -> sparse export key at
+    /// q0 x P below 128 bits' margin only; a larger h raises it, see `ClientSecret.generate(sparse_h=...)`).
+    pub fn sample_h(prng: &mut Prng, n: usize, h: usize) -> Result<Self> {
+        Ok(SecretKey { s: sample_ternary(prng, n), s_sparse: sample_sparse_ternary(prng, n, h)? })
     }
 }
 
