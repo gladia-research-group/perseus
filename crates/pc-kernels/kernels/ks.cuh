@@ -451,5 +451,60 @@ int expand_l(const KskExpandArgs* a, cudaStream_t s) {
     ksk_expand<W, MM><<<dim3(N / 128, a->nmod, a->dnum - a->d0), 128, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
+
+// Subring switch (ABI 31; PackSplitArgs / PackDotArgs). pack_split: digit j of a coefficient-form polynomial = its
+// coefficients at the exponents = j mod sub, the rest 0.
+template <class W>
+__global__ void __launch_bounds__(BX) pack_split(PackSplitArgs A) {
+    const int y = blockIdx.y, c = blockIdx.z;
+    const int idx = blockIdx.x * BX + threadIdx.x;
+    const W v = y < A.nq ? ((const W*)A.q)[c * A.q_stride + (size_t)y * N + idx]
+                         : ((const W*)A.p)[c * A.p_stride + (size_t)(y - A.nq) * N + idx];
+    W* o = (W*)A.out + c * A.out_stride + (size_t)y * N + idx;
+    const size_t js = (size_t)A.nrows * N;
+    const int cls = idx & (A.sub - 1);
+    for (int j = 0; j < A.sub; ++j) o[j * js] = j == cls ? v : (W)0;
+}
+
+// pack_dot: the digits against the pack key, lazily in the double word (sub <= 16 products), one reduction.
+template <class W, class MM>
+__global__ void __launch_bounds__(BX) pack_dot(PackDotArgs A) {
+    using Wd = WideOf<W>;
+    const int y = blockIdx.y, c = blockIdx.z;
+    const uint32_t t = A.rows[y];
+    const PrimeConst& q = A.pr[t];
+    const W p = (W)q.p;
+    const int idx = blockIdx.x * BX + threadIdx.x;
+    const size_t koff = (size_t)y * N + idx, js = (size_t)A.nrows * N;
+    const W* dg = (const W*)A.dig + c * A.dig_stride + koff;
+    const W* kb = (const W*)A.kb + koff;
+    const W* ka = (const W*)A.ka + koff;
+    Wd s0 = 0, s1 = 0;
+    for (int j = 0; j < A.sub; ++j) {
+        const W x = dg[j * js];
+        s0 += (Wd)x * __ldg(kb + j * js);
+        s1 += (Wd)x * __ldg(ka + j * js);
+    }
+    W r0 = MM::reduce(s0, q);
+    const W r1 = MM::reduce(s1, q);
+    const size_t roff = (size_t)t * N + idx;
+    if (y < A.nq) r0 = add<W>(r0, mul_shoup<W>(((const W*)A.c0)[c * A.ct_stride + roff], ((const W*)A.pmod)[t], ((const W*)A.pmods)[t], p), p);
+    ((W*)A.out0)[c * A.out_ct_stride + roff] = r0;
+    ((W*)A.out1)[c * A.out_ct_stride + roff] = r1;
+}
+
+inline bool pack_ok(int sub, int nq, int nrows, int K) { return sub >= 2 && sub <= 16 && !(sub & (sub - 1)) && nq >= 0 && nq <= nrows && K >= 1; }
+template <class W>
+int pack_split_l(const PackSplitArgs* a, cudaStream_t s) {
+    if (!pack_ok(a->sub, a->nq, a->nrows, a->K)) return -1;
+    pack_split<W><<<dim3(N / BX, a->nrows, a->K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W, class MM>
+int pack_dot_l(const PackDotArgs* a, cudaStream_t s) {
+    if (!pack_ok(a->sub, a->nq, a->nrows, a->K)) return -1;
+    pack_dot<W, MM><<<dim3(N / BX, a->nrows, a->K), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
 }  // namespace ks
 }  // namespace pc

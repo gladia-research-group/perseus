@@ -10,13 +10,16 @@ use pc_core::ccmm_keys::CcmmKeys;
 use pc_core::encode::{Complex, Encoder, Payload};
 use pc_core::galois;
 use pc_core::keys::{kska_expand_row, DiscreteGaussian, KskSeed, Prng};
-use pc_core::modmul::{invmod, mulmod};
+use pc_core::modmul::{invmod, mulmod, powmod};
 use pc_core::params::Chain;
 use pc_core::pcmm_keys::PcmmKeys;
 use pc_core::scale::ScaleTables;
 use rayon::prelude::*;
 use std::io::Write;
 use std::time::Instant;
+
+mod pack;
+pub use pack::{pack_a_eval, pack_a_row, pack_row_ids};
 
 /// Seconds and sizes of one `Client::keygen`.
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -51,6 +54,8 @@ pub struct Client {
     pub chain: Chain,
     pub ring: Ring,
     pub params_hash: String,
+    /// N / n of a subring client (`sub`), 1 otherwise.
+    pub stride: usize,
     enc: Encoder,
     scale: ScaleTables,
     secret: ClientSecret,
@@ -63,6 +68,8 @@ pub struct Client {
     spru_block: Option<Vec<i8>>,
     /// The sparse secret's eval rows at q0's two primes (`sparse_ntt`), made on first use.
     sparse_eval: std::sync::OnceLock<[Vec<u32>; 2]>,
+    /// The pack secret's small-ring tables (`pack_centred`), made on first use.
+    pack_tabs: std::sync::OnceLock<pack::PackTabs>,
 }
 
 /// Sparse frames decrypt by shifts of c1 up to this many nonzero secret coefficients, by NTT products above.
@@ -74,14 +81,40 @@ fn mm(a: u32, b: u32, p: u64) -> u64 {
     a as u64 * b as u64 % p
 }
 
+/// The smallest subring a client encrypts in (`Client::sub`): its dense ternary secret is analysed at degree 8192
+/// (over 260 bits at a 110-bit modulus, lattice estimator); smaller rings are not.
+pub const SUB_MIN_DEGREE: usize = 8192;
+
 impl Client {
     /// A client for chain preset `name` holding `secret` (n32: u32 words, primes below 2^31).
     pub fn new(name: &str, secret: ClientSecret) -> Result<Self> {
         let chain = crate::spec::chain_of(name)?;
+        let hash = params_hash(&chain);
+        Self::on(name, chain, hash, 1, secret)
+    }
+
+    /// A client on the subring Z[X^(N / n)] of chain `name` (n | N coefficients, `secret` of n): its frames
+    /// (short-c0 only, `encrypt_pre(.., drop)`) are ciphertexts of the ring of n coefficients over the chain's primes,
+    /// n / N the size, which the server lifts (`CtWire::lifted`) to ciphertexts under secret(X^(N / n)) and brings to
+    /// the main secret with an entry key (`keygen_entry`). A frame's slots are the first n / 2 of the lift's, which
+    /// repeat them; its coefficient i is the lift's i N / n. The seeds' c1 rows are coefficient form (`coeff1`).
+    pub fn sub(name: &str, n: usize, secret: ClientSecret) -> Result<Self> {
+        let full = crate::spec::chain_of(name)?;
+        if n < SUB_MIN_DEGREE || full.n % n != 0 || !n.is_power_of_two() {
+            return Err(Error::Params(format!("subring of {n} coefficients in a ring of {} (at least {SUB_MIN_DEGREE})", full.n)));
+        }
+        let k = full.n / n;
+        // psi^k is a primitive 2n-th root where psi is a primitive 2N-th one
+        let root = |ps: &[u64], rs: &[u64]| ps.iter().zip(rs).map(|(&p, &r)| powmod(r, k as u64, p)).collect();
+        let chain = Chain { n, q_roots: root(&full.q, &full.q_roots), p_roots: root(&full.p, &full.p_roots), ..full.clone() };
+        Self::on(name, chain, params_hash(&full), k, secret)
+    }
+
+    fn on(name: &str, chain: Chain, params_hash: String, stride: usize, secret: ClientSecret) -> Result<Self> {
         if chain.word_bits != 32 {
             return Err(Error::Params(format!("chain {name}: the client packs 32-bit words only (word {} bits)", chain.word_bits)));
         }
-        if secret.sk.s.len() != chain.n || secret.sk.s_sparse.len() != chain.n {
+        if secret.sk.s.len() != chain.n || secret.sk.s_sparse.len() != chain.n || secret.pack.as_ref().is_some_and(|t| t.len() != chain.n) {
             return Err(Error::Params(format!("secret of {} / {} coefficients for N = {}", secret.sk.s.len(), secret.sk.s_sparse.len(), chain.n)));
         }
         let ring = Ring::new(&chain)?;
@@ -89,7 +122,8 @@ impl Client {
         let s_sparse_eval = ring.eval_all(&secret.sk.s_sparse.iter().map(|&x| x as i64).collect::<Vec<_>>());
         Ok(Client {
             name: name.to_string(),
-            params_hash: params_hash(&chain),
+            params_hash,
+            stride,
             enc: Encoder::new(&chain),
             scale: ScaleTables::precompute(&chain)?,
             ring,
@@ -100,6 +134,7 @@ impl Client {
             gauss: DiscreteGaussian::new(DiscreteGaussian::SIGMA)?,
             spru_block: None,
             sparse_eval: std::sync::OnceLock::new(),
+            pack_tabs: std::sync::OnceLock::new(),
         })
     }
 
@@ -186,12 +221,42 @@ impl Client {
 
     /// Generate every key of `spec` and stream the bundle into `out`. `threads`: the rayon pool size.
     pub fn keygen<Wr: Write + Send>(&mut self, spec: &KeySpec, out: Wr, prng: &mut Prng, threads: usize) -> Result<KeyGenStats> {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build().map_err(|e| Error::Params(format!("rayon pool of {threads}: {e}")))?;
-        pool.install(|| self.keygen_in_pool(spec, out, prng))
+        self.keygen_entry(spec, out, prng, threads, &[], &[])
     }
 
-    fn keygen_in_pool<Wr: Write>(&mut self, spec: &KeySpec, out: Wr, prng: &mut Prng) -> Result<KeyGenStats> {
+    /// `keygen`, the rotation keys of the steps `entry` made entry keys from the subring secret `u` (`sub`'s, n | N
+    /// coefficients): b + a sigma_g^-1(s) = P u(X^(N / n)) + e, so the rotation by such a step of a lifted subring
+    /// frame (`CtWire::lifted`) is the rotated plaintext under this client's secret. Those steps rotate nothing else.
+    pub fn keygen_entry<Wr: Write + Send>(&mut self, spec: &KeySpec, out: Wr, prng: &mut Prng, threads: usize, entry: &[i64], u: &[i8]) -> Result<KeyGenStats> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build().map_err(|e| Error::Params(format!("rayon pool of {threads}: {e}")))?;
+        pool.install(|| self.keygen_in_pool(spec, out, prng, entry, u))
+    }
+
+    /// u(X^(N / n)) for a subring secret `u` of n | N coefficients.
+    fn lifted_secret(&self, u: &[i8]) -> Result<Vec<i8>> {
+        let n = self.chain.n;
+        if u.is_empty() || n % u.len() != 0 {
+            return Err(Error::Params(format!("subring secret of {} coefficients in a ring of {n}", u.len())));
+        }
+        let mut v = vec![0i8; n];
+        for (i, &x) in u.iter().enumerate() {
+            v[i * (n / u.len())] = x;
+        }
+        Ok(v)
+    }
+
+    /// Whether `role` is a rotation by one of the steps `entry` (mod N / 2).
+    fn is_entry(&self, role: &Role, entry: &[i64]) -> bool {
+        let half = (self.chain.n / 2) as i64;
+        matches!(role, Role::Rot { step, .. } if entry.iter().any(|e| e.rem_euclid(half) == step.rem_euclid(half)))
+    }
+
+    fn keygen_in_pool<Wr: Write>(&mut self, spec: &KeySpec, out: Wr, prng: &mut Prng, entry: &[i64], u: &[i8]) -> Result<KeyGenStats> {
         let t0 = Instant::now();
+        if self.stride != 1 {
+            return Err(Error::Spec("a subring client makes no keys (the main client's keygen_entry takes its secret)".into()));
+        }
+        let u_eval = if entry.is_empty() { None } else { Some(self.dense_rows(&self.lifted_secret(u)?)) };
         let chain = &self.chain;
         if spec.chain != self.name || spec.params_hash != self.params_hash {
             return Err(Error::Spec(format!("spec for chain {} ({}), this client runs {} ({})", spec.chain, spec.params_hash, self.name, self.params_hash)));
@@ -271,7 +336,8 @@ impl Client {
                     let g = k.role.galois(n).ok_or_else(|| Error::Spec(format!("{:?} without a Galois element", k.role)))?;
                     let ginv = galois::galois_inverse(g, n)?;
                     let s_new = Self::gathered(&self.s_eval, ginv, &ids, n)?;
-                    self.ksk_packed(&k.shape, &s_new, &self.s_eval, false, seed, *ek, bits, row_words)
+                    let s_old = u_eval.as_ref().filter(|_| self.is_entry(&k.role, entry)).unwrap_or(&self.s_eval);
+                    self.ksk_packed(&k.shape, &s_new, s_old, false, seed, *ek, bits, row_words)
                 }
                 Role::EncDenseToSparse => {
                     let sp = s_sparse.as_ref().ok_or_else(|| Error::Spec("sparse secret rows".into()))?;
@@ -338,6 +404,9 @@ impl Client {
     /// `encrypt`, the frame `seeded`: c1's rows replaced by the seeds they are drawn from (half the frame). `regen`:
     /// c1 drawn with the random-access expander (`cts_expand_row`), so the server can keep the seeds.
     pub fn encrypt_as(&self, values: &[Vec<Complex>], meta: &WireMeta, payload: Payload, prng: &mut Prng, seeded: bool, regen: bool) -> Result<CtWire> {
+        if self.stride != 1 {
+            return Err(Error::Params("a subring client sends short-c0 frames only (encrypt_pre(.., drop))".into()));
+        }
         let n = self.chain.n;
         let top = self.top_of(meta.level)?;
         let rows = top + 1;
@@ -387,7 +456,7 @@ impl Client {
             }
             data = out;
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, regen: seeded && regen, bits1: None, sparse: false, drop: None, coeff0: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded, regen: seeded && regen, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None }, data })
     }
 
     /// The message-independent part of one seeded encryption at `level` (drawn from `prng` in `encrypt_as`'s order: e,
@@ -412,6 +481,10 @@ impl Client {
             } else {
                 let mut g = Prng::from_seed(keys[r], 0);
                 g.fill_below(p, &mut c1);
+            }
+            if self.stride != 1 {
+                // a subring frame's c1 is the seed's row as coefficients (`CtHeader::coeff1`)
+                self.ring.ntt[r].fwd(&mut c1);
             }
             let s = &self.s_eval[r];
             if coeff {
@@ -460,6 +533,9 @@ impl Client {
         if drop.is_some() && pre.regen {
             return Err(Error::Params("encrypt_pre: a short-c0 frame of a regen part".into()));
         }
+        if drop.is_none() && self.stride != 1 {
+            return Err(Error::Params("a subring client sends short-c0 frames only (encrypt_pre(.., drop))".into()));
+        }
         let rows = top + 1;
         let mut data = pre.base;
         // the sum in the frame's form: the message transformed to an eval part, an eval part brought back to a short frame
@@ -484,10 +560,10 @@ impl Client {
             let mut out = Vec::new();
             let bits = crate::wire::pack_dropped(&self.ring.primes[..rows], &rs, d, &mut out)?;
             out.extend(pre.keys.iter().flatten());
-            return Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: Some(bits), seeded: true, regen: false, bits1: None, sparse: false, drop, coeff0: false }, data: out });
+            return Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: Some(bits), seeded: true, regen: false, bits1: None, sparse: false, drop, coeff0: false, coeff1: self.stride != 1, sub1: None }, data: out });
         }
         data.extend(pre.keys.iter().flatten());
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: None, seeded: true, regen: pre.regen, bits1: None, sparse: false, drop: None, coeff0: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k: 1, rows, meta: meta.clone(), bits: None, seeded: true, regen: pre.regen, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None }, data })
     }
 
     /// Public-key encryption of `values` (one ciphertext each) with the key `pk` = (pk0, pk1) eval rows `[part][row][N]`
@@ -537,7 +613,7 @@ impl Client {
                 }
             });
         }
-        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false }, data })
+        Ok(CtWire { header: CtHeader { params_hash: self.params_hash.clone(), n, k, rows, meta: meta.clone(), bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None }, data })
     }
 
     /// Decoded slots of every ciphertext of `ct` (`meta.slots` slots, scale `meta.nf`): `c0 + c1 s` over the bottom
@@ -546,7 +622,7 @@ impl Client {
         if ct.header.seeded {
             return self.decrypt(&ct.expand_seeded(&self.chain.q)?, payload);
         }
-        if ct.header.coeff0 {
+        if ct.header.coeff0 || ct.header.coeff1 {
             return self.decrypt(&self.eval_c0(ct), payload);
         }
         let (d, slots) = self.decoded_rows(ct)?;
@@ -554,6 +630,7 @@ impl Client {
         let n = h.n;
         (0..h.k)
             .map(|c| match (h.bits, h.sparse, d) {
+                (Some(b0), false, 2) if h.sub1.is_some() => Ok(self.enc.decode_centered(&self.pack_centred(ct, c, b0, h.bits1.unwrap_or(b0))?, slots, payload, h.meta.nf)?),
                 (Some(b0), true, 2) => Ok(self.enc.decode_centered(&self.sparse_centred(ct, c, b0, h.bits1.unwrap_or(b0)), slots, payload, h.meta.nf)?),
                 _ if d >= 3 => Ok(decode4(&self.enc, &self.chain.q[..d], &self.plain_rows(ct, c, d), slots, payload, h.meta.nf, n)),
                 _ => Ok(self.enc.decode_slots(&self.plain_rows(ct, c, d), slots, payload, h.meta.nf)?),
@@ -567,7 +644,7 @@ impl Client {
         if ct.header.seeded {
             return self.decrypt_coeffs(&ct.expand_seeded(&self.chain.q)?);
         }
-        if ct.header.coeff0 {
+        if ct.header.coeff0 || ct.header.coeff1 {
             return self.decrypt_coeffs(&self.eval_c0(ct));
         }
         let (d, _) = self.decoded_rows(ct)?;
@@ -575,6 +652,7 @@ impl Client {
         (0..h.k)
             .map(|c| {
                 let x = match (h.bits, h.sparse, d) {
+                    (Some(b0), false, 2) if h.sub1.is_some() => self.pack_centred(ct, c, b0, h.bits1.unwrap_or(b0))?,
                     (Some(b0), true, 2) => self.sparse_centred(ct, c, b0, h.bits1.unwrap_or(b0)),
                     _ if d >= 3 => crt_centred(&self.chain.q[..d], &self.plain_rows(ct, c, d), 0..h.n),
                     _ => self.enc.crt_bottom(&self.plain_rows(ct, c, d))?,
@@ -584,12 +662,17 @@ impl Client {
             .collect()
     }
 
-    /// A `coeff0` frame (a short-c0 frame expanded) with c0's rows transformed: the plain eval frame.
+    /// A `coeff0` / `coeff1` frame (a short-c0 frame expanded, a subring client's) with those parts' rows transformed:
+    /// the plain eval frame.
     fn eval_c0(&self, ct: &CtWire) -> CtWire {
         let (n, rows) = (ct.header.n, ct.header.rows);
-        let mut out = CtWire { header: CtHeader { coeff0: false, ..ct.header.clone() }, data: ct.data.clone() };
+        let mut out = CtWire { header: CtHeader { coeff0: false, coeff1: false, ..ct.header.clone() }, data: ct.data.clone() };
         for c in out.data.chunks_mut(2 * rows * n) {
-            c[..rows * n].par_chunks_mut(n).enumerate().for_each(|(r, row)| self.ring.ntt[r].fwd(row));
+            for (part, coeff) in [ct.header.coeff0, ct.header.coeff1].into_iter().enumerate() {
+                if coeff {
+                    c[part * rows * n..(part + 1) * rows * n].par_chunks_mut(n).enumerate().for_each(|(r, row)| self.ring.ntt[r].fwd(row));
+                }
+            }
         }
         out
     }
@@ -614,6 +697,9 @@ impl Client {
         let d = if h.rows >= 4 { 4 } else if h.rows == 3 && self.chain.lone_top().is_some() { 3 } else { unit };
         if h.rows < d {
             return Err(Error::Wire(format!("ciphertext of {} rows is below the bottom level ({d})", h.rows)));
+        }
+        if h.sub1.is_some() && !(h.bits.is_some() && !h.sparse && h.rows == 2) {
+            return Err(Error::Wire("packed frame: a compressed bottom-level frame under the pack secret".into()));
         }
         if h.bits.is_some() && h.rows != d {
             return Err(Error::Wire(format!("compressed ciphertext of {} rows, the client decodes {d}", h.rows)));
@@ -776,6 +862,11 @@ impl Client {
 
     /// Max |e| of the switch relation of one bundle key (`b` packed as in the bundle, `a` regenerated from the seed).
     pub fn ksk_relation_max_err(&self, key: &KeyReq, seed: &KskSeed, packed: &[u32], bits: u32, row_words: usize) -> Result<i64> {
+        self.ksk_relation_max_err_from(key, seed, packed, bits, row_words, None)
+    }
+
+    /// `ksk_relation_max_err` of a rotation key, `u`: as the entry key from that subring secret (`keygen_entry`).
+    pub fn ksk_relation_max_err_from(&self, key: &KeyReq, seed: &KskSeed, packed: &[u32], bits: u32, row_words: usize, u: Option<&[i8]>) -> Result<i64> {
         let n = self.chain.n;
         let ids = key.shape.row_ids();
         let rows = ids.len();
@@ -784,7 +875,11 @@ impl Client {
             Role::Relin => (s_all, self.s_eval.clone(), true),
             Role::Rot { .. } | Role::Conj | Role::Auto { .. } => {
                 let g = key.role.galois(n).ok_or_else(|| Error::Spec("automorphism key without a Galois element".into()))?;
-                (Self::gathered(&self.s_eval, galois::galois_inverse(g, n)?, &ids, n)?, self.s_eval.clone(), false)
+                let s_old = match u {
+                    Some(u) => self.dense_rows(&self.lifted_secret(u)?),
+                    None => self.s_eval.clone(),
+                };
+                (Self::gathered(&self.s_eval, galois::galois_inverse(g, n)?, &ids, n)?, s_old, false)
             }
             Role::EncDenseToSparse => (self.dense_rows(&self.secret.sk.s_sparse).into_iter().map(Some).collect(), self.s_eval.clone(), false),
             Role::EncSparseToDense => (s_all, self.dense_rows(&self.secret.sk.s_sparse), false),
@@ -977,7 +1072,7 @@ mod tests {
                     assert!(mx > 0 && mx <= 45, "{:?}: max |e| {mx}", key.role);
                 }
                 Entry::SpruCs { k, rows, level, nf, .. } => {
-                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false }, data: v };
+                    let w = CtWire { header: CtHeader { params_hash: c.params_hash.clone(), n: chain.n, k, rows, meta: WireMeta { level, deg: 1, nf, slots: (chain.n / 2) as u32, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false, drop: None, coeff0: false, coeff1: false, sub1: None }, data: v };
                     let d = c.decrypt(&w, Payload::Real).unwrap();
                     let block = c.spru_block.as_ref().unwrap();
                     for (u, du) in d.iter().enumerate() {
@@ -1048,6 +1143,80 @@ mod tests {
             let err = d[0].iter().zip(&v).map(|(a, b)| (a.re - b.re).abs().max((a.im - b.im).abs())).fold(0.0, f64::max);
             assert!(err < 2f64.powi(-36), "level {level}: {err:e}");
         }
+    }
+
+    /// A subring client's frames lifted to the ring: the slots repeated (the coefficients spread) under the lifted
+    /// secret, at 1/8 the size; an entry key holds its relation from the subring secret, not from the client's own.
+    #[test]
+    fn subring_frames_and_entry_keys() {
+        let mut g = Prng::from_seed([6; 8], 0);
+        let ns = 1usize << 13;
+        let usec = ClientSecret::generate(&mut g, ns).unwrap();
+        let u = usec.sk.s.clone();
+        let mut up = Client::sub("n32", ns, usec).unwrap();
+        let mut c = client(3);
+        let n = c.chain.n;
+        let k = n / ns;
+        assert_eq!(up.params_hash, c.params_hash);
+        let lift = Client::new("n32", ClientSecret { sk: pc_core::keys::SecretKey { s: c.lifted_secret(&u).unwrap(), s_sparse: c.secret.sk.s_sparse.clone() }, pack: None }).unwrap();
+        for (level, drop) in [(50u32, 12u32), (52, 8)] {
+            let meta = up.fresh_meta(level, 1).unwrap();
+            let rows = up.top_of(level).unwrap() + 1;
+            let bound = 2f64.powi(-36) + 2f64.powi(drop as i32 - 1) * (n as f64).sqrt() * 6.0 / meta.nf;
+            let v: Vec<Complex> = (0..ns / 2).map(|i| Complex::new(((i * 37) % 101) as f64 / 50.0 - 1.0, ((i * 11) % 7) as f64 / 7.0)).collect();
+            let pre = up.precompute_as(level, &mut g, false, true).unwrap();
+            let ct = up.encrypt_pre(&v, &meta, Payload::Complex, pre, Some(drop)).unwrap();
+            let bits = crate::wire::dropped_bits(&c.chain.q[..rows], drop).unwrap();
+            assert_eq!(ct.data.len(), crate::wire::packed_words(ns, bits) + 8 * rows);
+            let back = CtWire::from_bytes(&ct.to_bytes().unwrap()).unwrap();
+            let d = up.decrypt(&back, Payload::Complex).unwrap();
+            let err = d[0].iter().zip(&v).map(|(a, b)| (a.re - b.re).abs().max((a.im - b.im).abs())).fold(0.0, f64::max);
+            assert!(err < bound, "level {level}: {err:e} (bound {bound:e})");
+            let big = back.expand_seeded(&c.chain.q).unwrap().lifted(n).unwrap();
+            assert_eq!((big.header.n, big.header.meta.slots as usize), (n, n / 2));
+            let d = lift.decrypt(&big, Payload::Complex).unwrap();
+            let err = d[0].iter().enumerate().map(|(j, a)| (a.re - v[j % (ns / 2)].re).abs().max((a.im - v[j % (ns / 2)].im).abs())).fold(0.0, f64::max);
+            assert!(err < bound, "level {level}, lifted: {err:e} (bound {bound:e})");
+            assert!(c.decrypt(&big, Payload::Complex).unwrap()[0].iter().any(|a| a.re.abs() > 1e3), "the client's own secret must not open it");
+            // a plaintext given by its coefficients: coefficient i at i N / n
+            let co: Vec<f64> = (0..ns).map(|i| if i % 97 == 3 { 1.0 - (i % 5) as f64 / 8.0 } else { 0.0 }).collect();
+            let pre = up.precompute_as(level, &mut g, false, false).unwrap();
+            let ct = up.encrypt_pre_coeffs(&co, &meta, pre, Some(drop)).unwrap();
+            let big = ct.expand_seeded(&c.chain.q).unwrap().lifted(n).unwrap();
+            let d = lift.decrypt_coeffs(&big).unwrap();
+            let err = d[0].iter().enumerate().map(|(i, &x)| (x - if i % k == 0 { co[i / k] } else { 0.0 }).abs()).fold(0.0, f64::max);
+            assert!(err < 2f64.powi(drop as i32 + 3) / meta.nf, "level {level}, coefficients: {err:e}");
+            // a full frame is refused
+            let pre = up.precompute_as(level, &mut g, false, true).unwrap();
+            assert!(up.encrypt_pre(&v, &meta, Payload::Complex, pre, None).is_err());
+        }
+        assert!(up.encrypt(&[vec![Complex::new(1.0, 0.0)]], &up.fresh_meta(50, 1).unwrap(), Payload::Complex, &mut g).is_err());
+        let chain = c.chain.clone();
+        let keys = vec![
+            KeyReq { role: Role::rot(1, n).unwrap(), shape: KeyShape::full(&chain) },
+            KeyReq { role: Role::rot(7, n).unwrap(), shape: KeyShape::full(&chain) },
+            KeyReq { role: Role::rot(-3, n).unwrap(), shape: KeyShape::banded(&chain, 3).unwrap() },
+        ];
+        let spec = KeySpec { chain: "n32".into(), params_hash: c.params_hash.clone(), contract: "test".into(), keys, spru: None, pcmm_t: vec![], ccmm: false, public_key: false };
+        let dir = std::env::temp_dir().join(format!("pc_client_test_entry_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.pckb");
+        let f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let entry = [7i64, n as i64 / 2 - 3];
+        assert_eq!(c.keygen_entry(&spec, f, &mut g, 8, &entry, &u).unwrap().keys, 3);
+        let mut r = wire::BundleReader::open(&path).unwrap();
+        let (bits, rw) = (r.header.bits, r.header.row_words);
+        for i in 0..r.header.entries.len() {
+            let Entry::Ksk { key, seed, .. } = r.header.entries[i].clone() else { continue };
+            let v = r.read(i).unwrap();
+            let is_entry = c.is_entry(&key.role, &entry);
+            let own = c.ksk_relation_max_err(&key, &KskSeed(seed), &v, bits, rw).unwrap();
+            let from = c.ksk_relation_max_err_from(&key, &KskSeed(seed), &v, bits, rw, Some(&u)).unwrap();
+            let (good, bad) = if is_entry { (from, own) } else { (own, from) };
+            assert!(good > 0 && good <= 45 && bad > 1 << 20, "{:?}: max |e| {good} / {bad}", key.role);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(up.keygen(&spec, std::io::sink(), &mut g, 2).is_err());
     }
 }
 
@@ -1163,7 +1332,7 @@ mod sparse_decrypt_tests {
             });
             let w0 = crate::wire::packed_words(n, 12);
             let frame = CtWire {
-                header: CtHeader { params_hash: c.params_hash.clone(), n, k: 1, rows: 2, meta: WireMeta { level: 52, deg: 1, nf: 2f64.powi(50), slots: (n / 2) as u32, tag: serde_json::Value::Null }, bits: Some(12), seeded: false, regen: false, bits1: Some(18), sparse: true, drop: None, coeff0: false },
+                header: CtHeader { params_hash: c.params_hash.clone(), n, k: 1, rows: 2, meta: WireMeta { level: 52, deg: 1, nf: 2f64.powi(50), slots: (n / 2) as u32, tag: serde_json::Value::Null }, bits: Some(12), seeded: false, regen: false, bits1: Some(18), sparse: true, drop: None, coeff0: false, coeff1: false, sub1: None },
                 data: words[..w0].iter().chain(&words).copied().collect(),
             };
             time("decrypt (whole frame)", &mut || {

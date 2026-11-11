@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 30u
+#define PC_KERNELS_ABI 31u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -218,6 +218,39 @@ struct KsArgs {
     int32_t K, R, ndig, c0_mode, nq, nrows;
 };
 static_assert(sizeof(KsArgs) == 176, "KsArgs layout");
+
+// Subring switch (ABI 31) of K polynomials over nrows rows, the first nq Q rows and then special rows: c1 raised to
+// those rows splits into its sub coefficient classes (digit j: the exponents = j mod sub), and the key's `a` of
+// digit j is X^-j a_j(X^sub), so sum_j D_j a_j has exponents = 0 mod sub only.
+// pack_split (coefficient form): row y of polynomial c read at q + c*q_stride + y*N (y < nq) or
+// p + c*p_stride + (y - nq)*N; digit j written at out + c*out_stride + (j*nrows + y)*N (apart from the sources).
+struct PackSplitArgs {
+    const void* q;
+    const void* p;
+    void* out;
+    uint64_t q_stride, p_stride, out_stride;
+    int32_t K, sub, nq, nrows;
+};
+static_assert(sizeof(PackSplitArgs) == 64, "PackSplitArgs layout");
+
+// pack_dot (evaluation form): s1 = sum_j D_j a_j, s0 = sum_j D_j b_j (+ pmod c0 on the Q rows), row y at prime id
+// rows[y]. D as pack_split's out (dig, dig_stride); kb / ka [digit][row y][N]; c0 and the outputs in prime-id rows,
+// polynomial c at + c*ct_stride / + c*out_ct_stride.
+struct PackDotArgs {
+    const void* dig;
+    const void* kb;
+    const void* ka;
+    const void* c0;
+    void* out0;
+    void* out1;
+    const uint32_t* rows;
+    const void* pmod;
+    const void* pmods;
+    const PrimeConst* pr;
+    uint64_t dig_stride, ct_stride, out_ct_stride;
+    int32_t K, sub, nq, nrows;
+};
+static_assert(sizeof(PackDotArgs) == 120, "PackDotArgs layout");
 
 // Fused relin epilogue on Q rows: dst = f (dst + (dot - conv) binv) [+ k on part 0], f = 2 when dbl.
 struct EpiArgs {
@@ -971,8 +1004,10 @@ struct KernelTable {
     int (*tensor_seeded)(const TensorSeededArgs*, cudaStream_t);
     int (*ew_many)(const EwManyArgs*, cudaStream_t);
     int (*submul_many)(const SubMulManyArgs*, cudaStream_t);
+    int (*pack_split)(const PackSplitArgs*, cudaStream_t);
+    int (*pack_dot)(const PackDotArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 46 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 48 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

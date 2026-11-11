@@ -18,6 +18,9 @@ use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Lane, Stream};
 use pc_kernels::{EpiArgs, EwArgs, KsArgs, KsKeyArgs, KsRegenArgs, KskExpandArgs, MdEpiArgs, PolyRef, RowSet};
 use std::ffi::c_void;
 
+mod pack;
+pub use pack::{pack_switch, PackKey, PackPlan};
+
 /// Ciphertexts per `ks_dot` launch (kernel bound).
 pub const DOT_KMAX: usize = 8;
 /// Ciphertexts per `ks_dot_regen` launch (kernel bound).
