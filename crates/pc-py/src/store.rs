@@ -71,6 +71,51 @@ impl PyPtStore {
         Ok(n)
     }
 
+    /// `stage` for plaintexts whose values never change: `items` = [(name, level, values | None[, deg])]. The first
+    /// time a name is staged its values are copied into pinned host memory the session keeps (keyed by the name,
+    /// for every level); from then on the item may pass None, and the encode uploads from there asynchronously:
+    /// no host copy and no wait on the compute lane per plaintext. Returns the number encoded.
+    fn stage_pinned(&self, py: Python<'_>, items: Vec<Bound<'_, PyAny>>) -> PyResult<usize> {
+        let dev = &self.dev;
+        let payload = dev.payload();
+        let n_words = dev.n();
+        let mut parsed: Vec<(PtKey, u8)> = Vec::with_capacity(items.len());
+        for it in &items {
+            let t: Vec<Bound<'_, PyAny>> = it.extract()?;
+            if t.len() < 3 {
+                return Err(PyValueError::new_err("PtStore.stage_pinned item = (name, level, values | None[, deg])"));
+            }
+            let name: String = t[0].extract()?;
+            let level: u32 = t[1].extract()?;
+            let deg: u8 = if t.len() > 3 { t[3].extract()? } else { 1 };
+            if !dev.st.borrow().pt_pins.contains_key(&name) {
+                if t[2].is_none() {
+                    return Err(PyValueError::new_err(format!("PtStore.stage_pinned: '{name}' has no pinned values yet and the item passes None")));
+                }
+                let values = host_values(py, &t[2])?;
+                let slots = values.len().next_power_of_two().max(1);
+                if slots > n_words / 2 {
+                    return Err(PyValueError::new_err(format!("PtStore.stage_pinned: '{name}' has {} values, at most {}", values.len(), n_words / 2)));
+                }
+                let mut pin = pc_cuda::PinnedBuf::<f64>::new(&dev.device, n_words).map_err(|x| gerr(x.into()))?;
+                pc_gpu::encode_dev::DevEncoder::<W>::fill_slots(pin.as_mut_slice(), &values, slots, payload);
+                dev.st.borrow_mut().pt_pins.insert(name.clone(), pin);
+            }
+            parsed.push((PtKey::new(name, level, PtForm::Eval), deg));
+        }
+        let n = parsed.len();
+        nogil(py, || -> PyResult<()> {
+            let mut st = dev.st.borrow_mut();
+            let State { pts, ex, ops, pt_pins, .. } = &mut *st;
+            for (key, deg) in &parsed {
+                // SAFETY: the pinned values live in the session's `pt_pins` and are never written again
+                unsafe { pts.encode_pinned_into(&dev.ctx, ex, ops, &dev.sh, key.clone(), &pt_pins[&key.name], *deg) }.map_err(gerr)?;
+            }
+            Ok(())
+        })?;
+        Ok(n)
+    }
+
     /// The position cache. Encode `items` = [(name, level, values[, deg])] into their slots as `stage` does, and keep a
     /// copy of each encoding in the session's own device allocation (sized to the items); returns the copies' ids in
     /// item order, which `restore` takes. Once per session, at setup: a planned decode encodes every position's
