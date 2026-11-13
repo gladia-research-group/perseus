@@ -115,6 +115,43 @@ class Pt:
         return _pc.PtMeta(self.level, self.deg, 0.0, self.tag)
 
 
+_NOISE = {}
+
+
+def _bts_noise(fhe, ct, kind):
+    """FAKECAP_BTS_NOISE=eps: the device's refresh error on the twin, complex Gaussian noise of std eps x the refreshed
+    value's largest slot (FAKECAP_BTS_NOISE_FINISH: the PCMM / CCMM finishes' eps, default the same); off by default.
+    FAKECAP_BTS_NOISE_ONLY / _SKIP: comma lists of substrings of the step path the noise is limited to / kept off."""
+    if "eps" not in _NOISE:
+        e = float(os.environ.get("FAKECAP_BTS_NOISE") or 0.0)
+        _NOISE.update(eps=e, fin=float(os.environ.get("FAKECAP_BTS_NOISE_FINISH") or e),
+                      only=[x for x in (os.environ.get("FAKECAP_BTS_NOISE_ONLY") or "").split(",") if x],
+                      skip=[x for x in (os.environ.get("FAKECAP_BTS_NOISE_SKIP") or "").split(",") if x],
+                      rng=np.random.default_rng(int(os.environ.get("FAKECAP_BTS_NOISE_SEED") or 0)),
+                      log=[x for x in (os.environ.get("FAKECAP_BTS_LOG") or "").split(",") if x])
+    e = _NOISE["eps"] if kind in ("refresh", "plan") else _NOISE["fin"]
+    # FAKECAP_PLAN=<bound plan dir> (with --capture: the sites are named by the capture's vars): the refresh noise sits
+    # where the PLAN refreshes (its hint_fire and placements, CapFhe.record), not where the capture's thresholds fire;
+    # deliberate refreshes and finishes keep theirs. FAKECAP_PLAN_OFFSET: plan stage = capture stage + offset
+    if kind == "refresh" and getattr(fhe, "_plan_sites", None) is not None and getattr(fhe, "_plan_quiet", False):
+        return
+    v = getattr(ct, "vec", None)
+    if CapCt.novec or v is None or v.shape[0] <= 1:
+        return
+    path = fhe.path()
+    if _NOISE["log"] and any(x in path for x in _NOISE["log"]):   # FAKECAP_BTS_LOG: substrings; the refreshed max
+        print(f"[bts] {path} {kind} max {float(np.abs(v).max()):.6g} med {float(np.median(np.abs(v))):.3g}", flush=True)
+    if not e:
+        return
+    if (_NOISE["only"] and not any(x in path for x in _NOISE["only"])) or any(x in path for x in _NOISE["skip"]):
+        return
+    m = float(np.abs(v).max())
+    if m > 0.0:
+        r = _NOISE["rng"]
+        n = r.standard_normal(v.shape) + (1j * r.standard_normal(v.shape) if np.iscomplexobj(v) else 0.0)
+        ct.vec = v + (e * m) * n
+
+
 def parse_landings(spec):
     """route s -> (level, deg) of a refresh landing; 0 = dense (FAKECAP_LANDINGS)."""
     out = {}
@@ -225,6 +262,11 @@ class CapFhe(FakeFhe):
         if args:
             n["args"] = args
         self.nodes.append(n)
+        ps = getattr(self, "_plan_sites", None)
+        if ps is not None and out_ct is not None and (out in ps[0] or out in ps[1]) and op not in (
+                "auto_bootstrap", "deliberate_bootstrap"):
+            ps[2].add(out)
+            _bts_noise(self, out_ct, "plan")
 
     def flush_stats(self):
         """Pending nodes' magnitudes (magtape.node_stats), one FFT per batch."""
@@ -306,13 +348,16 @@ class CapFhe(FakeFhe):
         ct.meta = self.shadow.bootstrap(ct.meta, route).out.replace(tag=tag)
         self.n_bootstraps += 1
         self.total_bootstraps += 1
+        _bts_noise(self, ct, "refresh")
         return {"route": {"slots": s, "stc_first": stc}}
 
     def maybe_bootstrap(self, ct):
         if self.auto_bts_suppressed or ct.level < self._limit:
             return
         lin, nin = ct.level, self.var(ct)
+        self._plan_quiet = True
         args = self.inner_bootstrap(ct)
+        self._plan_quiet = False
         self.n_reactive += 1
         out = nin + "_auto_bootstrapped"
         self.name_ct(ct, out)
@@ -341,7 +386,9 @@ class CapFhe(FakeFhe):
         lin, nin = a.level, self.var(a)
         args = {"thr": int(thr), "acct": bool(account_pending_rescale)}
         if self.shadow.hint(a.meta, int(thr), bool(account_pending_rescale)).fired:
+            self._plan_quiet = True
             args.update(self.inner_bootstrap(a))
+            self._plan_quiet = False
             a.meta = self.shadow.realize(a.meta).out      # inner_bootstrap_planned's landing realize
         args["fired"] = "route" in args
         out = self.new_var(a)
@@ -375,6 +422,7 @@ class CapFhe(FakeFhe):
             land = self.shadow.finish_landing(op if op in ("pcmm", "ccmm") else "pcmm", drop)
         if land is not None:
             a.meta = a.meta.replace(level=int(land[0]), deg=int(land[1]))
+        _bts_noise(self, a, op or "finish")
         out = self.new_var(a)
         a.tag = Tag()
         args = {"external": desc or "finish", "n_inputs": len(inputs)}
@@ -803,6 +851,12 @@ class CapCore(_Core):
         fhe = inf.fhe
         fhe.gen += 1
         fhe.nodes, fhe.ct_counter, fhe.pt_counter = [], 0, 0
+        fhe._plan_sites = None
+        if os.environ.get("FAKECAP_PLAN"):
+            pb = int(b) + int(os.environ.get("FAKECAP_PLAN_OFFSET") or 0)
+            with open(os.path.join(os.environ["FAKECAP_PLAN"], f"block_{pb}_placement.json")) as f:
+                pl = json.load(f)
+            fhe._plan_sites = (set(pl["hint_fire"]), {x["target_var"] for x in pl["placements"]}, set())
         return True
 
     @staticmethod
@@ -811,6 +865,10 @@ class CapCore(_Core):
         if fhe.nodes is None:
             return
         fhe.flush_stats()
+        ps = getattr(fhe, "_plan_sites", None)
+        if ps is not None:
+            print(f"[plan-noise] stage {b}: {len(ps[2])} of the plan's {len(ps[0] | ps[1])} refresh sites met "
+                  f"({len(ps[0])} hints, {len(ps[1])} placements)", flush=True)
         top = CapCore.graph_dir()
         d = os.path.join(top, f"block_{b}")
         os.makedirs(d, exist_ok=True)

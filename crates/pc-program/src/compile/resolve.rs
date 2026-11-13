@@ -141,11 +141,16 @@ pub fn resolve(bg: &BlockGraph, pcmm_calib: &BTreeMap<String, f64>) -> Result<Re
     let mut inexact = 0usize;
     // deliberate nodes sharing an input set within one step are one external op's outputs (the PCMM records one
     // deliberate_bootstrap per output, all of the same input)
-    let mut delib_group: HashMap<(Vec<String>, String), usize> = HashMap::new();
-    let mut delib_count: HashMap<(Vec<String>, String), usize> = HashMap::new();
+    // finishes merge into one call by (cipher inputs, step, the external descriptor's linear): two linears may read the
+    // same inputs in one step (sana.fold's main part and a one-pair group's folded part)
+    let ext_linear = |out: &str| -> String {
+        bg.args(out).and_then(|a| a.get("external")).and_then(|e| e.get("linear")).and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    let mut delib_group: HashMap<(Vec<String>, String, String), usize> = HashMap::new();
+    let mut delib_count: HashMap<(Vec<String>, String, String), usize> = HashMap::new();
     for n in &g.nodes {
         if n.is_deliberate_bts() {
-            *delib_count.entry((n.cipher_inputs.clone(), n.step.clone())).or_default() += 1;
+            *delib_count.entry((n.cipher_inputs.clone(), n.step.clone(), ext_linear(&n.output))).or_default() += 1;
         }
     }
     let mut elided_by_merge = 0;
@@ -318,7 +323,7 @@ pub fn resolve(bg: &BlockGraph, pcmm_calib: &BTreeMap<String, f64>) -> Result<Re
                     .map(|e| e.to_string())
                     .or_else(|| args.and_then(|a| a.get("desc")).and_then(Value::as_str).map(str::to_string))
                     .or_else(|| calib_key(&n.step).filter(|k| pcmm_calib.contains_key(k)));
-                let key = (cins.clone(), n.step.clone());
+                let key = (cins.clone(), n.step.clone(), ext_linear(&n.output));
                 let siblings = delib_count.get(&key).copied().unwrap_or(1);
                 let finish = ext.is_some() || desc.is_some() || cins.len() > 1 || siblings > 1;
                 if finish {

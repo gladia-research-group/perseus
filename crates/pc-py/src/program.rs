@@ -58,6 +58,27 @@ pub(crate) fn base_name(n: &str) -> &str {
     n.split('~').next().unwrap_or(n)
 }
 
+/// The runtime Shadow config of each block of `plan_dir` ({label: config}; `only`: that label alone).
+fn shadow_cfgs(plan_dir: &str, only: Option<&str>) -> PyResult<BTreeMap<String, pc_shadow::ShadowConfig>> {
+    let pdir = pc_program::plan::PlanDir::open(plan_dir).map_err(perr)?;
+    let plan_cfg = pdir.plan_config().map_err(perr)?;
+    let mut out = BTreeMap::new();
+    for (b, v, path) in &pdir.blocks {
+        let label = match v {
+            Some(v) => format!("block_{b}_{v}"),
+            None => format!("block_{b}"),
+        };
+        if only.is_some_and(|o| o != label) {
+            continue;
+        }
+        let bp = pc_program::plan::BlockPlan::load(path).map_err(perr)?;
+        let cfg = pdir.config(&bp).map_err(perr)?;
+        let sh = pc_program::compile::runtime_shadow(&cfg, &plan_cfg, bp.file.rules.bootstrap_level).map_err(perr)?;
+        out.insert(label, sh.cfg.clone());
+    }
+    Ok(out)
+}
+
 #[pymethods]
 impl PyProgram {
     /// Compile every block of `plan_dir` against `graph_dir` (`compile_dir`: each block entered at the previous
@@ -102,19 +123,7 @@ impl PyProgram {
                 return Err(crate::ConfigError::new_err(format!("plan {plan_dir} was cut for another Config (session vs stamp): {}", bad.join("; "))));
             }
         }
-        let pdir = pc_program::plan::PlanDir::open(plan_dir).map_err(perr)?;
-        let plan_cfg = pdir.plan_config().map_err(perr)?;
-        let mut shadow_of: BTreeMap<String, pc_shadow::ShadowConfig> = BTreeMap::new();
-        for (b, v, path) in &pdir.blocks {
-            let label = match v {
-                Some(v) => format!("block_{b}_{v}"),
-                None => format!("block_{b}"),
-            };
-            let bp = pc_program::plan::BlockPlan::load(path).map_err(perr)?;
-            let cfg = pdir.config(&bp).map_err(perr)?;
-            let sh = pc_program::compile::runtime_shadow(&cfg, &plan_cfg, bp.file.rules.bootstrap_level).map_err(perr)?;
-            shadow_of.insert(label, sh.cfg.clone());
-        }
+        let shadow_of = shadow_cfgs(plan_dir, None)?;
         let out = PyDict::new(py);
         let mut errs = vec![];
         for (label, r) in dc.programs {
@@ -150,10 +159,17 @@ impl PyProgram {
         Ok(())
     }
 
-    /// A program saved by `save`.
+    /// A program saved by `save`. `plan_dir`: the plan it was compiled for, which gives it the runtime Shadow of its
+    /// block (the saved label, before any `relabel`) as `compile` does, so it binds; None: inspection only.
     #[staticmethod]
-    fn load(path: &str) -> PyResult<Self> {
-        Ok(PyProgram { prog: Program::load(Path::new(path)).map_err(perr)?, sh_cfg: None, bound: None })
+    #[pyo3(signature = (path, plan_dir=None))]
+    fn load(path: &str, plan_dir: Option<&str>) -> PyResult<Self> {
+        let prog = Program::load(Path::new(path)).map_err(perr)?;
+        let sh_cfg = match plan_dir {
+            Some(d) => Some(shadow_cfgs(d, Some(&prog.block))?.remove(&prog.block).ok_or_else(|| PyValueError::new_err(format!("Program.load: plan {d} has no {}", prog.block)))?),
+            None => None,
+        };
+        Ok(PyProgram { prog, sh_cfg, bound: None })
     }
     fn save(&self, path: &str) -> PyResult<()> {
         self.prog.save(Path::new(path)).map_err(perr)
@@ -210,6 +226,11 @@ impl PyProgram {
             }
         }
         n
+    }
+    /// The distinct PCMM linears its finishes name (op order).
+    #[getter]
+    fn pcmm_linears(&self) -> Vec<String> {
+        crate::pcmm::program_linears(&self.prog)
     }
     /// Term counts of the streamed-weight sums (`CoeffSum` ops), op order.
     #[getter]

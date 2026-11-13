@@ -136,6 +136,11 @@ class FheOps:
         # hint one unit below the down-projection's: a plan refreshes it there rather than after the mask, so the mask
         # never takes a value past the chain's refresh room (the env switch, as SM_HRS_CLEANSE)
         self.gelu_out_hint = os.environ.get("GELU_OUT_HINT", "0") not in ("", "0")
+        # PF_NEG_FREE=1: negate as two monomial products, -x = i (i x): exact, level-free and degree-preserving. The
+        # runtime's negate is FIDESlib's EvalNegate = multScalar(-1.0) (pc-shadow rules.rs negate): it spends the pending
+        # rescale and leaves degree 2, a level for nothing (the prefill join a - i b, the Goldschmidt / Newton 2 - E, the
+        # norm's centering)
+        self.neg_free = os.environ.get("PF_NEG_FREE", "0") not in ("", "0")
         # (SM_HRS_PACK and CUTMAX_PAIR need a complex payload; a real-slot session runs both unpacked)
         # CUTMAX_PAIR (default 1): two inverse-sigma cascade passes share one 1-slot refresh (examples/.../head.py)
         self.cutmax_pair = _on(cfg, "model.cutmax_pair", 1)
@@ -159,7 +164,10 @@ class FheOps:
             else self.fhe.mult(a, float(b))
 
     def square(self, a): return self.fhe.square(a)
-    def negate(self, a): return self.fhe.negate(a)
+    def negate(self, a):
+        if getattr(self, "neg_free", False) and hasattr(self.fhe, "mult_i"):
+            return self.fhe.mult_i(self.fhe.mult_i(a))
+        return self.fhe.negate(a)
     def rotate(self, a, k): return self.fhe.rotate(a, int(k))
 
     def rotate_and_sum(self, a, start, stop):

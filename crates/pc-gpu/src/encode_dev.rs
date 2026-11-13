@@ -221,6 +221,39 @@ impl<'a, W: DevWord> DevEncoder<'a, W> {
         unsafe { self.v.upload_pinned_async(s, 0, &self.pin)? };
         self.pin_ev.record(s)?;
         self.pin_used = true;
+        self.fft_v(ctx, s, ring, at, out)
+    }
+
+    /// The slot values of a plaintext as the device FFT takes them: N/2 (re, im) pairs, a shorter vector extended
+    /// periodically, the imaginary parts zeroed on a real payload.
+    pub fn fill_slots(h: &mut [f64], values: &[Complex], slots: usize, payload: Payload) {
+        for j in 0..h.len() / 2 {
+            let x = values.get(j % slots).copied().unwrap_or_default();
+            h[2 * j] = x.re;
+            h[2 * j + 1] = if payload == Payload::Real { 0.0 } else { x.im };
+        }
+    }
+
+    /// `encode` by the device FFT from slot values the caller keeps in pinned memory (`fill_slots`, N doubles): no
+    /// host copy and no wait on the lane.
+    ///
+    /// # Safety
+    /// `src` must stay alive and unwritten until the lane has passed this encode.
+    pub unsafe fn encode_pinned<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, ring: &mut ConstRing<'_, W>, src: &PinnedBuf<f64>, at: EncodeAt, out: &mut DBuf<'_, Compute, W>) -> Result<()> {
+        self.check(&at, out)?;
+        if src.len() != self.lay.n {
+            return Err(shape("encode", format!("{} pinned doubles, the device FFT takes {}", src.len(), self.lay.n)));
+        }
+        self.v.upload_pinned_async(s, 0, src)?;
+        self.fft_v(ctx, s, ring, &at, out)?;
+        if at.form == PtForm::Eval {
+            ntt::transform_rows(ctx, s, Dir::Forward, out, &self.lists[at.top])?;
+        }
+        Ok(())
+    }
+
+    /// The device FFT of the slot values in `v` into `out` (coefficient form).
+    fn fft_v<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, ring: &mut ConstRing<'_, W>, at: &EncodeAt, out: &mut DBuf<'_, Compute, W>) -> Result<()> {
         let df: Vec<u64> = self.primes[..=at.top]
             .iter()
             .map(|&p| if at.deg == 2 { (at.scale.round() as u128 % p as u128) as u64 } else { 1 % p })

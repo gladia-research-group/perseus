@@ -500,6 +500,33 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
         Ok(())
     }
 
+    /// `encode_into` by the device FFT from pinned slot values (`DevEncoder::fill_slots`).
+    ///
+    /// # Safety
+    /// As `DevEncoder::encode_pinned`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn encode_pinned_into<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, ex: &Executor<'_, W>, ops: &mut Ops<'_, W>, sh: &Shadow, key: PtKey, src: &PinnedBuf<f64>, deg: u8) -> Result<()> {
+        if self.cfg.eager != EncoderKind::DeviceFft {
+            return Err(shape("encode", "pinned staging encodes by the device FFT; this store's eager encoder is another"));
+        }
+        let st = sh.tables.as_ref().ok_or_else(|| shape("encode", "the Shadow has no scale tables"))?;
+        let top = self.top(sh, key.level)?;
+        let scale = st.sf(top as i32)?;
+        let at = EncodeAt { top, scale, deg, form: key.form };
+        let i = self.slot_for(&key, top)?;
+        let mut b = self.take_compute_buf(i, &ex.compute)?;
+        let r = self.enc.encode_pinned(ctx, &ex.compute, &mut ops.ring, src, at, &mut b);
+        self.clock += 1;
+        let slot = &mut self.slots[i];
+        slot.state = State::Resident(b);
+        r?;
+        slot.meta = PtMeta { level: key.level, deg, nf: scale.powi(deg as i32), tag: Default::default() };
+        slot.key = Some(key.clone());
+        slot.last_use = self.clock;
+        self.index.insert(key, i);
+        Ok(())
+    }
+
     // ── named slot plaintexts and cached products ────────────────────────────────────────────────────────────────
 
     /// `set_slot_pt`: keep `values` as the named plaintext, encoded (at `level`, or the level a product needs) on use.
