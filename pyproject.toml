@@ -47,6 +47,7 @@ Paper = "https://arxiv.org/abs/2611.04488"
 perseus-export = "perseus.export:main"
 perseus-calibrate = "perseus.calibrate.cli:main"
 perseus-plan = "perseus.plan.placer.__main__:main"
+perseus-t2i = "perseus.examples.sana.cli:main"
 
 [tool.maturin]
 manifest-path = "crates/pc-py/Cargo.toml"
