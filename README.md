@@ -28,6 +28,11 @@
   <a href="#citation">Citation</a>
 </p>
 
+> [!NOTE]
+> **News.** Perseus now supports flow matching. Gemma-2-2B and SANA-Sprint 0.6B turn a text prompt into a
+> 768 × 768 image fully encrypted, in 269 s on one GPU, with the `perseus-t2i` command
+> ([`examples/sana`](python/perseus/examples/sana)).
+
 Perseus runs transformers under fully homomorphic encryption on a single GPU, so the server computes
 on data it never sees in the clear. Models, packings, nonlinear approximations and bootstrap
 placement are plain Python; each block is compiled into a program that a Rust + CUDA CKKS runtime
