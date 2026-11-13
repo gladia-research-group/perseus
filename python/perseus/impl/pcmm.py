@@ -3,6 +3,7 @@ Sylph, arXiv 2601.18511): y = x W on the dense token layout via ring switch + in
 Needs FIDESLIB_BTS_STC_FIRST=2 and FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import os
@@ -234,8 +235,9 @@ def make_keys(sk, split_moduli, t):
 # ── weights ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def digit_planes(Wi, n_planes):
-    """Balanced base-256 digits of an integer matrix: (n_planes, ...) int8 with Wi = sum_u planes[u] 256^u."""
-    v = np.array(Wi, dtype=np.int64)
+    """Balanced base-256 digits of an integer matrix: (n_planes, ...) int8 with Wi = sum_u planes[u] 256^u. An int32
+    matrix stays int32 (half the memory traffic; exact while |Wi| < 2^31, which encode's scale bounds)."""
+    v = np.array(Wi, dtype=np.int32 if np.asarray(Wi).dtype == np.int32 else np.int64)
     out = np.empty((n_planes,) + v.shape, dtype=np.int8)
     for u in range(n_planes):
         out[u] = v.astype(np.int8)                 # the low byte read as int8 is the balanced digit
@@ -251,6 +253,30 @@ def from_planes(Wd):
     for u in reversed(range(Wd.shape[0])):
         acc = acc * 256 + Wd[u]
     return acc
+
+
+_DEFER = None           # (executor, [(PcmmLinear, future of its Wd)]) while deferred_planes is active
+
+
+@contextlib.contextmanager
+def deferred_planes(workers):
+    """PcmmLinear.encode inside the block returns at once with Wd None and its digit planes computed on `workers`
+    threads (numpy releases the GIL); leaving the block waits for them all and sets each linear's Wd. For a
+    recorder's twin (fakecap.CapCt.novec): its op stream reads a linear's shape, scale, shift and bias, never Wd."""
+    global _DEFER
+    from concurrent.futures import ThreadPoolExecutor
+    prev, ex = _DEFER, ThreadPoolExecutor(max(1, int(workers)), thread_name_prefix="pcmm-planes")
+    jobs = []
+    _DEFER = (ex, jobs)
+    try:
+        yield jobs
+    finally:
+        _DEFER = prev
+        try:
+            for lin, fut in jobs:
+                lin.Wd = fut.result()
+        finally:
+            ex.shutdown(wait=True)
 
 
 def weight_bits():
@@ -284,18 +310,26 @@ class PcmmLinear:
         top = min(2 ** (wbits - 1) - 1, 127 * (256 ** nb - 1) // 255)      # the balanced digits' reach
         ws = ws if ws is not None else 2.0 ** math.floor(math.log2(top / np.abs(W).max()))
         assert np.abs(W).max() * ws <= top, "pcmm: the weight scale overflows the digits"
-        Wt = np.rint(W.T * ws).astype(np.int64)
-        perm = sh.ch_of_row()
-        Wi = np.empty_like(Wt)
-        for o in range(n_out):
-            for c in range(n_in):
-                blk = Wt[o * sh.nch:(o + 1) * sh.nch, c * sh.nch:(c + 1) * sh.nch]
-                Wi[o * sh.nch:(o + 1) * sh.nch, c * sh.nch:(c + 1) * sh.nch] = blk[perm[:, None], perm[None, :]]
+
+        def planes():
+            # |W ws| <= top < 2^(8 nb): int32 holds it for nb <= 3
+            Wt = np.rint(W.T * ws).astype(np.int32 if nb <= 3 else np.int64)
+            perm = sh.ch_of_row()
+            Wi = np.empty_like(Wt)
+            for o in range(n_out):
+                for c in range(n_in):
+                    blk = Wt[o * sh.nch:(o + 1) * sh.nch, c * sh.nch:(c + 1) * sh.nch]
+                    Wi[o * sh.nch:(o + 1) * sh.nch, c * sh.nch:(c + 1) * sh.nch] = blk[perm[:, None], perm[None, :]]
+            return digit_planes(Wi, nb)
         bvec = None
         if bias is not None:
             bias = np.asarray(bias, dtype=np.float64) * scale
             bvec = [np.repeat(bias[m * sh.nch:(m + 1) * sh.nch], t) for m in range(n_out)]
-        return cls(n_in, n_out, digit_planes(Wi, (wbits + 7) // 8), ws, int(shift), bvec, name, int(t))
+        if _DEFER is not None:               # deferred_planes: the planes on its workers, Wd set when it exits
+            lin = cls(n_in, n_out, None, ws, int(shift), bvec, name, int(t))
+            _DEFER[1].append((lin, _DEFER[0].submit(planes)))
+            return lin
+        return cls(n_in, n_out, planes(), ws, int(shift), bvec, name, int(t))
 
 
 # ── band shifts ─────────────────────────────────────────────────────────────────────────────────────────────────────

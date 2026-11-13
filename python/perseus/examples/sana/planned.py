@@ -16,8 +16,51 @@ import time
 
 import numpy as np
 
-from perseus.impl.pcmm import session_specs
+from perseus.impl.pcmm import deferred_planes, session_specs
 from perseus.impl.prefill import PlannedPrefill
+
+
+def record_workers():
+    """PERSEUS_RECORD_WORKERS, else the process's CPUs less two (at most 32): the threads encoding PCMM weights
+    while a record runs."""
+    if os.environ.get("PERSEUS_RECORD_WORKERS"):
+        return int(os.environ["PERSEUS_RECORD_WORKERS"])
+    return max(1, min(32, len(os.sched_getaffinity(0)) - 2))
+
+
+# switches that change how a record runs, not what it records
+_KEY_SKIP = {"PERSEUS_RECORD_WORKERS", "PERSEUS_T2I_THREADS", "PERSEUS_T2I_PLANS", "CUDA_VISIBLE_DEVICES",
+             "OMP_NUM_THREADS"}
+
+
+def record_key(n_stages, files=()):
+    """What a record is a function of: the perseus package's Python and its runtime build, every environment switch
+    the package reads (by name, or by the SANA_ / PF_ / FIDESLIB_ / PC_ / PLAN_ / FAKECAP_ / CKKS_ prefixes), the
+    `files` (configs, PCMM calibration, the prompt's dumps) and the stage count."""
+    import re
+    import perseus
+    pkg = os.path.dirname(os.path.abspath(perseus.__file__))
+    h = hashlib.blake2b(digest_size=16)
+    names = set()
+    pat = re.compile(r"""(?:environ(?:\.get)?\(|environ\[|getenv\()\s*["']([A-Z][A-Z0-9_]+)["']""")
+    for root, dirs, fs in os.walk(pkg):
+        dirs[:] = sorted(x for x in dirs if x != "__pycache__")
+        for f in sorted(fs):
+            if f.endswith(".py") or (f.startswith("_pc.") and f.endswith(".so")):
+                p = os.path.join(root, f)
+                with open(p, "rb") as fh:
+                    b = fh.read()
+                h.update(os.path.relpath(p, pkg).encode() + hashlib.blake2b(b, digest_size=16).digest())
+                if f.endswith(".py"):
+                    names.update(pat.findall(b.decode("utf-8", "replace")))
+    pre = ("SANA_", "PF_", "FIDESLIB_", "PC_", "PLAN_", "FAKECAP_", "CKKS_")
+    env = sorted((k, v) for k, v in os.environ.items() if (k in names or k.startswith(pre)) and k not in _KEY_SKIP)
+    h.update(json.dumps(env).encode())
+    for p in files:
+        with open(p, "rb") as fh:
+            h.update(os.path.basename(p).encode() + hashlib.blake2b(fh.read(), digest_size=16).digest())
+    h.update(str(int(n_stages)).encode())
+    return h.hexdigest()
 
 
 def _key(v):
@@ -130,7 +173,9 @@ class SanaPlannedPrefill(PlannedPrefill):
         m.prefill_stages = stages
         fakecap.CapCt.novec = True
         try:
-            m.prefill()
+            # the PCMM weights' digit planes (most of a record's time) on worker threads, beside the op stream
+            with deferred_planes(record_workers()):
+                m.prefill()
         finally:
             del m.prefill_stages
             fakecap.CapCt.novec = False
@@ -145,6 +190,94 @@ class SanaPlannedPrefill(PlannedPrefill):
         self.recs = rec.blocks
         self.record_s = time.time() - t0
         return self.recs
+
+    # ── the record cache (a CLI's next launch loads the record instead of running the twin) ──
+    def record_cached(self, cache_dir, files=()):
+        """`record`, or the one saved in `cache_dir` when its key (`record_key`: the package's code, the switches,
+        `files`) matches; a fresh record is saved there for the next run. Returns True when it was loaded."""
+        key = record_key(self.n_stages, files)
+        if self.load_record(cache_dir, key):
+            return True
+        self.record()
+        self.save_record(cache_dir, key)
+        return False
+
+    def save_record(self, d, key):
+        """The record (each stage's stream, the stage inputs, the distinct plaintexts, the PCMM linears with their
+        digit planes) under directory d: written beside it, then swapped in."""
+        import copy
+        import pickle
+        import shutil
+        t0 = time.time()
+        tmp, old = f"{d}.tmp{os.getpid()}", f"{d}.old{os.getpid()}"
+        os.makedirs(tmp)
+
+        def blob(name, arrays):
+            out, off = [], 0
+            with open(os.path.join(tmp, name), "wb") as f:
+                for k, v in arrays:
+                    v = np.ascontiguousarray(v)
+                    v.tofile(f)
+                    out.append((k, v.dtype.str, v.shape, off))
+                    off += v.nbytes
+                    pad = -off % 64
+                    f.write(b"\0" * pad)
+                    off += pad
+            return out
+        pts = blob("pt.bin", self.pt_vals.items())
+        lins = self.model.lin._enc
+        wds = blob("wd.bin", ((nm, lin.Wd) for nm, lin in lins.items()))
+        bare = {}
+        for nm, lin in lins.items():
+            bare[nm] = copy.copy(lin)
+            bare[nm].Wd = None
+        meta = dict(version=1, key=key, n_stages=self.n_stages, record_s=self.record_s,
+                    recs={b: (r.nodes, r.pts, r.metas, r.out_names) for b, r in self.recs.items()},
+                    in_names=self.in_names, in_metas=self.in_metas, in_vals=self.in_vals, pts=pts, wds=wds, lins=bare)
+        with open(os.path.join(tmp, "meta.pkl"), "wb") as f:
+            pickle.dump(meta, f, protocol=5)
+        with open(os.path.join(tmp, "key.txt"), "w") as f:
+            f.write(key)
+        if os.path.exists(d):
+            os.rename(d, old)
+        os.rename(tmp, d)
+        shutil.rmtree(old, ignore_errors=True)
+        self.save_s = time.time() - t0
+
+    def load_record(self, d, key):
+        """The record saved by `save_record` under d if its key is `key` (else False, nothing changed)."""
+        import pickle
+        from perseus.impl.driver import BlockRec
+        try:
+            with open(os.path.join(d, "key.txt")) as f:
+                if f.read() != key:
+                    return False
+            t0 = time.time()
+            with open(os.path.join(d, "meta.pkl"), "rb") as f:
+                meta = pickle.load(f)
+        except (OSError, EOFError, pickle.UnpicklingError):
+            return False
+        if meta.get("key") != key or meta.get("n_stages") != self.n_stages:
+            return False
+
+        def views(name, entries):
+            buf = np.fromfile(os.path.join(d, name), dtype=np.uint8)
+            return {k: buf[off:off + int(np.prod(shape)) * np.dtype(dt).itemsize].view(dt).reshape(shape)
+                    for k, dt, shape, off in entries}
+        self.pt_vals = views("pt.bin", meta["pts"])
+        wd = views("wd.bin", meta["wds"])
+        for nm, lin in meta["lins"].items():
+            lin.Wd = wd[nm]
+        self.model.lin._enc = dict(meta["lins"])
+        self.recs = {}
+        for b, (nodes, pts, metas, out_names) in meta["recs"].items():
+            r = BlockRec(nodes, pts, {}, metas)
+            r.out_names = out_names
+            self.recs[b] = r
+        self.in_names, self.in_metas, self.in_vals = meta["in_names"], meta["in_metas"], meta["in_vals"]
+        self.recorded_s = meta["record_s"]
+        self.record_s = time.time() - t0
+        return True
 
     def prepare(self, rows=None):
         """`record` + the programs compiled stage by stage: stage b > 0 enters at stage b - 1's compiled exit. The

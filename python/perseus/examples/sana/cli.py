@@ -13,9 +13,10 @@ plaintext pipeline instead: a preview in seconds, any step count.
 
 What a plan fixes. An encrypted run executes a compiled plan, cut for one prompt length (the encrypted Gemma attention
 and SANA's cross-attention loop over the prompt's tokens) and one step count. A prompt of another length needs its
-own plan, built once (~2 h of CPU). The warm-up (the op stream recorded on the CPU twin, ~25 min; the programs, loaded
-from the plan or compiled, then kept in it; the session, ~1 min) happens once per process: -i serves many prompts
-from one warm-up, ~5.5 min each.
+own plan, built once (~2 h of CPU). The warm-up happens once per process (-i serves many prompts from one warm-up,
+~5 min each): the op stream recorded on the CPU twin (the PCMM weights encoded on worker threads beside it) and saved
+under $SANA_SCRATCH/cli_record/<plan>, which later launches load while the code, switches and inputs match
+(--no-record-cache records afresh); the programs, loaded from the plan or compiled, then kept in it; the session.
 """
 from __future__ import annotations
 
@@ -218,9 +219,10 @@ class Encrypted:
     """One plan's planned session: warm up once (record on the CPU twin, programs, session), then `generate` any
     prompt of the plan's length."""
 
-    def __init__(self, plan: dict, device: int, work_dir: Path, term: Term, wait: bool, save_programs: bool):
+    def __init__(self, plan: dict, device: int, work_dir: Path, term: Term, wait: bool, save_programs: bool,
+                 record_cache: Path | None = None):
         self.plan, self.device, self.work, self.term = plan, device, work_dir, term
-        self.wait, self.save_programs = wait, save_programs
+        self.wait, self.save_programs, self.record_cache = wait, save_programs, record_cache
 
     def _args(self):
         from types import SimpleNamespace
@@ -236,7 +238,9 @@ class Encrypted:
         return self.prepare_cpu().open_gpu()
 
     def prepare_cpu(self):
-        """The plan's model on the CPU twin, the op stream recorded (~25 min), the programs loaded or compiled."""
+        """The plan's model on the CPU twin, the op stream recorded (the PCMM weights encoded on worker threads
+        beside it), or loaded from the record cache when the code, switches and inputs match; the programs loaded or
+        compiled."""
         import numpy as np
         import torch
         T = self.term
@@ -283,8 +287,23 @@ class Encrypted:
             if i == n:
                 b.close()
         run.progress = tick
-        with T.quiet():
-            run.record()
+        t0 = time.time()
+        if self.record_cache is None:
+            with T.quiet():
+                run.record()
+        else:
+            files = [hf.data(a.configs), hf.scratch(a.dumps, f"p{a.prompt}.npz")]
+            if os.environ.get("PF_PCMM_CALIB_IN"):
+                files.append(os.environ["PF_PCMM_CALIB_IN"])
+            self.record_files = files
+            with T.quiet():
+                loaded = run.record_cached(str(self.record_cache), files)
+            if loaded:
+                T.say(f"  recording loaded from {self.record_cache} ({time.time() - t0:.0f} s; recorded in "
+                      f"{run.recorded_s:.0f} s)")
+            else:
+                T.say(f"  recorded in {run.record_s:.0f} s; saved to {self.record_cache} ({run.save_s:.0f} s) for "
+                      f"the next launch")
         with T.quiet():
             run.prepare()
         loaded = getattr(run, "n_loaded", 0)
@@ -397,6 +416,8 @@ def main(argv=None):
                     "CUDA_VISIBLE_DEVICES, else 0)")
     ap.add_argument("--wait", action="store_true", help="wait for the GPU to be free instead of refusing")
     ap.add_argument("--no-save-programs", action="store_true", help="do not keep compiled programs in the plan")
+    ap.add_argument("--no-record-cache", action="store_true", help="record on the CPU twin even when a saved record "
+                    "matches, and do not save one")
     ap.add_argument("--list", action="store_true", help="the plans and their measurements")
     a = ap.parse_args(argv)
 
@@ -453,8 +474,19 @@ def main(argv=None):
         T.say(f"perseus-t2i: plan {plan['name']} ({plan['steps']} steps, {plan['res']} px"
               + (f", {plan['s_per_image']:.0f} s/image, {plan['psnr_db']:.1f} dB on its prompt" if "s_per_image" in plan
                  else "") + f"); log {term.log_path}")
+        if prompt and "n_tok" in plan:                    # a prompt of another length: refused before the warm-up
+            from transformers import AutoTokenizer
+            with T.quiet():
+                tok = AutoTokenizer.from_pretrained(hf.snapshot(), subfolder="tokenizer")
+            lay = hf.prompt_layout(tok, prompt)
+            if lay.n_tok != plan["n_tok"]:
+                ids = lay.ids[lay.n_pub:lay.n_pub + lay.n_tok]
+                T.say(f"  ! this plan is cut for {plan['n_tok']}-token prompts; {prompt!r} has {lay.n_tok} ("
+                      + " | ".join(tok.decode([int(t)]) for t in ids) + f"). Rephrase it to {plan['n_tok']} tokens.")
+                return 2
         work = Path(hf.scratch("cli_work", plan["name"]))
-        enc = Encrypted(plan, a.device, work, T, a.wait, not a.no_save_programs)
+        cache = None if a.no_record_cache else Path(hf.scratch("cli_record", plan["name"]))
+        enc = Encrypted(plan, a.device, work, T, a.wait, not a.no_save_programs, cache)
         T.say("warming up (once per process): ...")
         enc.warm_up()
         T.say(f"  prompts of {enc.n_tok} tokens; decoder loading ...")
