@@ -235,12 +235,12 @@ def make_keys(sk, split_moduli, t):
 
 def digit_planes(Wi, n_planes):
     """Balanced base-256 digits of an integer matrix: (n_planes, ...) int8 with Wi = sum_u planes[u] 256^u."""
-    v = np.asarray(Wi, dtype=np.int64).copy()
+    v = np.array(Wi, dtype=np.int64)
     out = np.empty((n_planes,) + v.shape, dtype=np.int8)
     for u in range(n_planes):
-        r = ((v + 128) % 256) - 128
-        out[u] = r
-        v = (v - r) // 256
+        out[u] = v.astype(np.int8)                 # the low byte read as int8 is the balanced digit
+        v -= out[u]
+        v >>= 8
     if np.any(v):
         raise ValueError("digit_planes: the matrix needs more planes")
     return out
@@ -272,7 +272,9 @@ class PcmmLinear:
     t: int = 0                  # token lanes (0: the runtime's)
 
     @classmethod
-    def encode(cls, W, t, scale=1.0, bias=None, shift=0, name=None, wbits=None):
+    def encode(cls, W, t, scale=1.0, bias=None, shift=0, name=None, wbits=None, ws=None):
+        """`ws`: the weight scale (a power of two; default: the largest that keeps W in the digits' reach), for a linear
+        split into parts that must share one scale and stamp (sana.fold's folded outputs)."""
         sh = Shape(t)
         wbits = wbits or weight_bits()
         W = np.asarray(W, dtype=np.float64) * scale
@@ -280,7 +282,8 @@ class PcmmLinear:
         assert W.shape == (n_in * sh.nch, n_out * sh.nch), "W must be whole nch blocks"
         nb = (wbits + 7) // 8
         top = min(2 ** (wbits - 1) - 1, 127 * (256 ** nb - 1) // 255)      # the balanced digits' reach
-        ws = 2.0 ** math.floor(math.log2(top / np.abs(W).max()))
+        ws = ws if ws is not None else 2.0 ** math.floor(math.log2(top / np.abs(W).max()))
+        assert np.abs(W).max() * ws <= top, "pcmm: the weight scale overflows the digits"
         Wt = np.rint(W.T * ws).astype(np.int64)
         perm = sh.ch_of_row()
         Wi = np.empty_like(Wt)
@@ -370,10 +373,17 @@ _LANES = min(max(int(os.environ.get("PF_PCMM_LANES", "0") or 0), 2), 4) if os.en
 
 
 def _raise_of(lin, table=None):
+    """A linear's raise drop from `table` (PF_PCMM_RAISE's entries "name:d[:lo-hi]"). The name matches the linear's
+    last part ("qkv"), or with a model prefix its block part's letters too ("g.qkv": Gemma's g<k>.qkv, not SANA's
+    b<k>.qkv); the block number is the block part's (a step prefix "s<k>." skipped: SANA's s2.b<k>.qkv is block k)."""
     parts = (lin.name or "").split(".")
+    if len(parts) > 2 and parts[0][:1] == "s" and parts[0][1:].isdigit():
+        parts = parts[1:]
     blk = int(parts[0][1:]) if len(parts) > 1 and parts[0][1:].isdigit() else None
+    model = parts[0][:1] if len(parts) > 1 and parts[0][1:].isdigit() else None
     for e in (_RAISE if table is None else table):
-        if e[0] != parts[-1]:
+        want_model, _, tail = e[0].rpartition(".")
+        if tail != parts[-1] or (want_model and want_model != model):
             continue
         if len(e) > 2:
             lo, hi = (int(v) for v in e[2].split("-"))
@@ -385,12 +395,16 @@ def _raise_of(lin, table=None):
 
 def _drop_of(lin, m):
     """Output m's raise drop: PF_PCMM_RAISE_OUT's when it names (lin, m), PF_PCMM_RAISE_HI's for the second half when it
-    names lin, else PF_PCMM_RAISE's."""
+    names lin, else PF_PCMM_RAISE's. A linear split into parts (sana.fold) carries `m_orig` (its outputs' indices in the
+    unsplit linear) and `n_out_orig`: the tables keep naming the unsplit outputs."""
+    if getattr(lin, "m_orig", None) is not None:
+        m = lin.m_orig[m]
+    n_out = getattr(lin, "n_out_orig", lin.n_out)
     if _RAISE_OUT:
         hit = _raise_of(lin, [[e[0], e[2], *e[3:]] for e in _RAISE_OUT if int(e[1]) == m])
         if hit:
             return hit
-    if _RAISE_HI and m >= lin.n_out // 2:
+    if _RAISE_HI and m >= n_out // 2:
         hi = _raise_of(lin, _RAISE_HI)
         if hi:
             return hi
@@ -420,9 +434,26 @@ def engine(rt, t=None):
     return engines[t]
 
 
-def run(rt, xs, lin):
-    """lin on the dense blocks xs through the runtime's PCMM engine."""
-    return engine(rt, lin.t).apply(xs, lin)
+def run(rt, xs, lin, prepped=False):
+    """lin on the dense blocks xs through the runtime's PCMM engine (`prepped`: xs are `prep`'s outputs)."""
+    return engine(rt, lin.t).apply(xs, lin, prepped=prepped)
+
+
+def prep(rt, xs, t):
+    """The blocks as the engine reads them (rotated, refresh-hinted to its entry): for blocks that feed several calls
+    (sana.fold's split linears), so each is hinted once."""
+    return engine(rt, t).prep(xs)
+
+
+def hint_entry(rt, x, t):
+    """x refresh-hinted to the engine's entry level in place (a ciphertext rotated into several calls' inputs: the
+    copies inherit one refresh)."""
+    eng = engine(rt, t)
+    if eng.cap is None:
+        eng.cap = eng._measure_cap(rt.ops.rotate(x, -1))
+    rt.ops.bootstrap_hint(x, eng.cap, True)
+    eng.fhe.level_hint(x, eng.cap)
+    return x
 
 
 def session_specs(lins, t: int) -> list[tuple]:
@@ -502,16 +533,23 @@ class Pcmm:
         total = ops.level(x) + d.level              # constant on the chain
         return total - entry - ops.unit             # a pending rescale drops a level first
 
-    def apply(self, xs, lin: PcmmLinear):
-        """The n_out outputs of lin on the n_in blocks xs, bias-free; the inputs are left unchanged."""
+    def prep(self, xs):
+        """The inputs as apply reads them: rotated by -1 and refresh-hinted to the StC-first cap."""
         ops = self.ops
-        assert len(xs) == lin.n_in
         xr = [ops.rotate(x, -1) for x in xs]
         if self.cap is None:
             self.cap = self._measure_cap(xr[0])
         for x in xr:
             ops.bootstrap_hint(x, self.cap, True)
             self.fhe.level_hint(x, self.cap)
+        return xr
+
+    def apply(self, xs, lin: PcmmLinear, prepped=False):
+        """The n_out outputs of lin on the n_in blocks xs, bias-free; the inputs are left unchanged. `prepped`: xs are
+        prep's (shared by several calls: hinted once)."""
+        ops = self.ops
+        assert len(xs) == lin.n_in
+        xr = list(xs) if prepped else self.prep(xs)
         names = [self.fhe.var_name(x) for x in xr]
         levels = [ops.level(x) for x in xr]
         want = None
@@ -539,19 +577,22 @@ class Pcmm:
         from .fake import FakeCt
         t, nch = self.t, self.sh.nch
         inv = np.argsort(self.sh.ch_of_row())
-        X = [np.roll(np.asarray(x.vec, dtype=np.complex128), -1).reshape(nch, t) for x in xr]
-        Wi = from_planes(lin.Wd)
+        novec = xr[0].vec.shape[0] <= 1                # fakecap.CapCt.novec: a recorder's twin, the op stream only
+        if not novec:
+            X = [np.roll(np.asarray(x.vec, dtype=np.complex128), -1).reshape(nch, t) for x in xr]
+            Wi = from_planes(lin.Wd)
         outs = []
         for m in range(lin.n_out):
-            y = np.zeros((nch, t), dtype=np.complex128)
-            for c in range(lin.n_in):
+            y = np.zeros(1 if novec else (nch, t), dtype=np.complex128)
+            for c in range(0 if novec else lin.n_in):
                 blk = Wi[m * nch:(m + 1) * nch, c * nch:(c + 1) * nch].astype(np.float64)[inv[:, None], inv[None, :]]
                 y += blk @ X[c]
             o = FakeCt(np.roll(y.reshape(-1) / lin.w_scale, 1), self.land + 2 * _drop_of(lin, m), 1, xr[0].packing)
             if hasattr(xr[0], "ptag"):       # fakecap: outputs reuse the input handles (spares: input 0)
                 o.ptag = xr[m if m < lin.n_in else 0].ptag
             outs.append(o)
-        _record_calib(lin.name, [o.vec for o in outs])
+        if not novec:
+            _record_calib(lin.name, [o.vec for o in outs])
         return outs
 
     def _device(self, xr, lin):
