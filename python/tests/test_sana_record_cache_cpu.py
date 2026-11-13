@@ -69,5 +69,16 @@ def test_key(tmp_path, monkeypatch):
     monkeypatch.setenv("SANA_LA_QNORM", "key-test")
     assert record_key(87, [str(f)]) != k
     monkeypatch.delenv("SANA_LA_QNORM")             # (its value before the test comes back after it)
+    # a switch naming a file: keyed by the contents, not the path (another checkout of the same plan)
+    a, b = tmp_path / "a" / "pcmm_calib.json", tmp_path / "b" / "pcmm_calib.json"
+    for p in (a, b):
+        p.parent.mkdir()
+        p.write_text('{"b0.qkv": 3.0}')
+    monkeypatch.setenv("PF_PCMM_CALIB_IN", str(a))
+    ka = record_key(87, [str(f)])
+    monkeypatch.setenv("PF_PCMM_CALIB_IN", str(b))
+    assert record_key(87, [str(f)]) == ka
+    b.write_text('{"b0.qkv": 4.0}')
+    assert record_key(87, [str(f)]) != ka
     f.write_text('{"x": 1}')
-    assert record_key(87, [str(f)]) != k
+    assert record_key(87, [str(f)]) != ka

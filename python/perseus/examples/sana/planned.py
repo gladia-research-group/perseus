@@ -33,6 +33,18 @@ _KEY_SKIP = {"PERSEUS_RECORD_WORKERS", "PERSEUS_T2I_THREADS", "PERSEUS_T2I_PLANS
              "OMP_NUM_THREADS"}
 
 
+def _env_value(v):
+    """A switch's value as the record key reads it: a file path by the file's contents (the path names the checkout:
+    PF_PCMM_CALIB_IN is the plan's calibration), a directory path by nothing (what a record reads from it is keyed
+    by its files: SANA_SCRATCH, HF_HOME), anything else as it is."""
+    if os.sep in v and os.path.isfile(v):
+        with open(v, "rb") as fh:
+            return "file:" + hashlib.blake2b(fh.read(), digest_size=16).hexdigest()
+    if os.sep in v and os.path.isdir(v):
+        return "dir"
+    return v
+
+
 def record_key(n_stages, files=()):
     """What a record is a function of: the perseus package's Python and its runtime build, every environment switch
     the package reads (by name, or by the SANA_ / PF_ / FIDESLIB_ / PC_ / PLAN_ / FAKECAP_ / CKKS_ prefixes), the
@@ -54,7 +66,8 @@ def record_key(n_stages, files=()):
                 if f.endswith(".py"):
                     names.update(pat.findall(b.decode("utf-8", "replace")))
     pre = ("SANA_", "PF_", "FIDESLIB_", "PC_", "PLAN_", "FAKECAP_", "CKKS_")
-    env = sorted((k, v) for k, v in os.environ.items() if (k in names or k.startswith(pre)) and k not in _KEY_SKIP)
+    env = sorted((k, _env_value(v)) for k, v in os.environ.items()
+                 if (k in names or k.startswith(pre)) and k not in _KEY_SKIP)
     h.update(json.dumps(env).encode())
     for p in files:
         with open(p, "rb") as fh:
