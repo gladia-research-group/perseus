@@ -127,7 +127,7 @@ polynomial layers. \legend}
 \begin{tbl}
 \begin{tabularx}{\linewidth}{L{1.4}lrrL{0.6}c}
 \toprule
-\textbf{BERT} & model & tokens & s & GPU & open source \\
+\textbf{BERT} & model & tokens & s / sentence & GPU & open source \\
 \midrule
 THOR (Moon et al., 2025) & BERT-base & 128 & 602.0 & A100 & \semi \\
 POLARIS & BERT-Mini & -- & 83.0 & A100 & \no \\
@@ -135,7 +135,7 @@ Cerium (Jayashankar et al., 2025) & BERT-base & 128 & 43.6\nt{\S} & RTX PRO 6000
 \oursrow\textbf{Perseus (ours)} & BERT-base & 128 & \textbf{\bertin} & RTX PRO 6000 & \yes \\
 \bottomrule
 \end{tabularx}
-\tcap{Encrypted BERT inference of one input (SST-2 classification for Perseus). $^\S$Replicated from the released code on
+\tcap{Encrypted BERT inference of one sentence (SST-2 classification for Perseus). $^\S$Replicated from the released code on
 our GPU. \legend}
 \end{tbl}
 
