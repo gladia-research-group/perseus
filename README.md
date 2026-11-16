@@ -44,17 +44,17 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-overview-dark.png">
       <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-overview-light.png">
-      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB)." width="707">
+      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB). SANA-Sprint 0.6B, with its Gemma-2-2B text encoder, 269 s for one 768 × 768 image from a text prompt (78.0 GiB)." width="707">
     </picture>
   </a>
 </p>
 
 ## What's inside
 
-- **Python models, compiled.** GPT-2, Llama-3, BERT and ViT are Python programs on `perseus.impl`
-  (`python/perseus/examples/`), with readable packings, nonlinearities and layers. Each block is recorded
-  once on a CPU twin, compiled with its plan into a program, and replayed by the runtime with no Python on
-  the critical path, from one device arena sized at setup.
+- **Python models, compiled.** GPT-2, Llama-3, BERT, ViT and SANA-Sprint (with its Gemma-2 text encoder)
+  are Python programs on `perseus.impl` (`python/perseus/examples/`), with readable packings, nonlinearities
+  and layers. Each block is recorded once on a CPU twin, compiled with its plan into a program, and replayed
+  by the runtime with no Python on the critical path, from one device arena sized at setup.
 - **In-kernel key regeneration.** Half of every key-switching key is regenerated on the GPU from a
   ChaCha12 seed instead of being stored.
 - **Complex Cachemir packing.** Two real vectors per ciphertext, in the complex slots of CKKS.

@@ -20,6 +20,9 @@
 % one isolated GPU; decode at a 512-token context, positions 500-511 after a 500-position plaintext prefix)
 \newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.86}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.70}
 \newcommand{\vitimg}{17.7}\newcommand{\bertin}{7.36}
+% SANA-Sprint text to image (sana-t2i branch check, 2026-11-13, GPU 4 alone: forwards 2 and 3, 269.06 and 269.13 s, after
+% a 333 s first forward; lowest free 17.01 GiB)
+\newcommand{\sanaimg}{269}\newcommand{\sanamem}{78.0}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
 % optional position cache (PC_PT_CACHE=0), Llama's the GPU's peak used memory over the run (its runner reports no free
@@ -52,10 +55,12 @@ GPT-2 small & prefill, 128-token prompt & \gptpfmem\ GiB & \textbf{\gptpf\ s} \\
 GPT-2 small & decode, one token (512-token context) & \gptdecmem\ GiB\nt{\dagger} & \textbf{\gptdec\ s} \\
 ViT-B/16 & one $224\times224$ image & \vitmem\ GiB & \textbf{\vitimg\ s} \\
 BERT-base & 128-token input & \bertmem\ GiB & \textbf{\bertin\ s} \\
+SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \sanamem\ GiB & \textbf{\sanaimg\ s} \\
 \bottomrule
 \end{tabularx}
 \tcap{End to end on one NVIDIA RTX PRO 6000 (96 GB), 128-bit security. $^\dagger$Peak memory when decoding 16 tokens, the optional position cache off.
-Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU.}
+Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU.
+SANA-Sprint runs two steps with its Gemma-2-2B text encoder, both encrypted.}
 \end{tbl}
 
 % Unlike the paper (two Llama tables, prefill and decode), the README shows one, in the GPT-2 table's layout.
