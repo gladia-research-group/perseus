@@ -1,1 +1,1 @@
-from perseus.calibrate.approximations import cutmax, gelu, norm, softmax  # noqa: F401
+from perseus.calibrate.approximations import cutmax, gelu, norm, relu, softmax  # noqa: F401

@@ -449,7 +449,20 @@ pub type StepHook<'h, 'a, W, M> = dyn FnMut(usize, &mut Bound<'a, W>, &mut Rt<'_
 
 fn issue<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: &mut Bound<'a, W>, check: bool, info: &mut RunInfo, hook: Option<&mut StepHook<'_, 'a, W, M>>, sched: Option<&Sched>) -> Result<()> {
     let n = b.steps.len();
-    issue_range(rt, b, 0, n, check, info, hook, sched)
+    let tp = Instant::now();
+    issue_range(rt, b, 0, n, check, info, hook, sched)?;
+    if step_prof() {
+        rt.ex.compute.sync()?;
+        let mut g = PROF.lock().unwrap();
+        let now = Instant::now();
+        if let Some((c, t)) = g.0.take() {
+            g.1.entry(c).or_insert((0.0, 0)).0 += now.duration_since(t).as_secs_f64() * 1e3;
+        }
+        let line: Vec<String> = g.1.iter().map(|(k, v)| format!("{k}={}:{:.1}", v.1, v.0)).collect();
+        eprintln!("[stepprof] {} total_ms={:.1} | {}", b.label, tp.elapsed().as_secs_f64() * 1e3, line.join(" | "));
+        g.1.clear();
+    }
+    Ok(())
 }
 
 /// Swap the compute lane's executor / op layer with the side lane's (a side step issues through `rt` like any
@@ -471,6 +484,30 @@ fn join_side<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>) -> Re
 }
 
 #[allow(clippy::too_many_arguments)]
+static PROF: std::sync::Mutex<(Option<(String, Instant)>, std::collections::BTreeMap<String, (f64, u64)>)> = std::sync::Mutex::new((None, std::collections::BTreeMap::new()));
+
+fn step_prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PC_STEP_PROFILE").is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
+/// (class, count) of a step (a unit of `n` steps of one op) for PC_STEP_PROFILE.
+fn prof_class(op: &StepOp, n: usize, outs: impl Fn(u32) -> (usize, String)) -> (String, usize) {
+    match op {
+        StepOp::Finish { f } => {
+            let (k, d) = outs(*f);
+            (format!("finish.{}", d.replace(' ', "_").replace('|', "/")), k)
+        }
+        StepOp::Bootstrap { route, kind, .. } => (format!("bts.{kind:?}.{route:?}").replace(' ', ""), n),
+        StepOp::Rotate { .. } | StepOp::RotateSum { .. } | StepOp::Conjugate { .. } => ("rot".into(), n),
+        StepOp::Mult | StepOp::Square | StepOp::MultRescale { .. } | StepOp::MultSum { .. } => ("ctct".into(), n),
+        StepOp::MultPt(_) | StepOp::AddPt(_) | StepOp::AddConst(_) | StepOp::MultConst(_) => ("pt".into(), n),
+        StepOp::Rescale | StepOp::DropTo(_) => ("rescale".into(), n),
+        StepOp::CoeffSum { .. } => ("coeffsum".into(), n),
+        _ => ("add".into(), n),
+    }
+}
+
 fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: &mut Bound<'a, W>, lo: usize, hi: usize, check: bool, info: &mut RunInfo, mut hook: Option<&mut StepHook<'_, 'a, W, M>>, sched: Option<&Sched>) -> Result<()> {
     if b.slots.len() < b.n_slots {
         return Err(rerr(&b.label, format!("{} slots present, the block needs {} (a shared block outside Bound::with_slab)", b.slots.len(), b.n_slots)));
@@ -533,6 +570,22 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                     }
                 }
             }
+        }
+        if !in_unit && step_prof() {
+            // PC_STEP_PROFILE=1 (diagnostic): the compute lane drained at every change of op class, the time between
+            // two drains booked to the class issued in between ([stepprof] line per eager run)
+            let n = unit.map_or(1, |(_, e)| e - i);
+            let (cls, cnt) = prof_class(&b.steps[i].op, n, |f| b.finishes.get(f as usize).map_or((0, String::new()), |fs| (fs.outs.len(), fs.desc.to_string())));
+            let mut g = PROF.lock().unwrap();
+            if g.0.as_ref().map(|x| x.0.as_str()) != Some(cls.as_str()) {
+                rt.ex.compute.sync()?;
+                let now = Instant::now();
+                if let Some((c, t)) = g.0.take() {
+                    g.1.entry(c).or_insert((0.0, 0)).0 += now.duration_since(t).as_secs_f64() * 1e3;
+                }
+                g.0 = Some((cls.clone(), now));
+            }
+            g.1.entry(cls).or_insert((0.0, 0)).1 += cnt as u64;
         }
         if !in_unit {
             if lane == 1 {

@@ -1,0 +1,17 @@
+{
+ "default": "sana_t2i768",
+ "plans": {
+  "sana_t2i768": {
+   "validated": true,
+   "n_tok": 5,
+   "s_per_image": 269.0,
+   "psnr_db": 45.6,
+   "runtime_env": {
+    "SANA_PCMM_PINNED": "1",
+    "SANA_PT_PINNED": "1",
+    "SANA_PCMM_BATCH": "2"
+   },
+   "note": "2 steps at 768 px, 5-token prompts; GPU 4 (one GPU), warm forward"
+  }
+ }
+}

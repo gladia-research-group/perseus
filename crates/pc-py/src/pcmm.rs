@@ -4,7 +4,10 @@
 //! compiler merges them into one `Finish` op (descriptor: the v2 `args.external` dict, `{op: "pcmm", ...}`). The
 //! driver declares every linear at session setup (`Session(pcmm=[...])`: one resident `WeightBuf` per linear) and
 //! uploads the digit planes once (`Session.pcmm_upload`); the keys come from the host secret or the
-//! client's bundle (`PcmmKeys::generate`).
+//! client's bundle (`PcmmKeys::generate`). PC_PCMM_WEIGHTS_PER_PROGRAM=1: the buffers are pooled per shape, as many
+//! as the most linears of that shape one program finishes (`PcmmPlan::fit`), and the driver uploads a program's
+//! linears before it runs and evicts them after (`Session.pcmm_evict`): a pipeline of different stages holds one
+//! stage's weights, not every stage's.
 //!
 //! A finish = `linear()`: the inputs copied into the service's own ciphertexts, the product, one staged refresh per
 //! output, x 2^shift, the outputs copied into their slots at the raw landing the compile pinned. No host sync, no
@@ -18,9 +21,9 @@ use pc_gpu::{Ct, CtBuf, MemPlan};
 use pc_program::bind::FinishStep;
 use pc_program::replay::{copy_ct, FinishExec};
 use pc_shadow::CtMeta;
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// One linear the session serves: (name, t, n_in, n_out, weight planes, w_scale, shift), as the driver declares it.
 pub(crate) type LinSpec = (String, usize, usize, usize, usize, f64, u32);
@@ -79,6 +82,25 @@ pub(crate) struct PcmmPlan {
     pub batch_drops: bool,
     /// Most finish groups one finish of the served programs needs (service output ciphertexts of `batch` members).
     pub max_groups: usize,
+    /// PC_PCMM_WEIGHTS_PER_PROGRAM=1 (`fit`): weight buffers per `cfg.shapes` entry; None: one per linear
+    pub pool: Option<Vec<usize>>,
+}
+
+/// The distinct PCMM linears a program's finishes name (op order).
+pub(crate) fn program_linears(p: &pc_program::Program) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for op in &p.ops {
+        for m in op.members() {
+            if let pc_program::Kind::Finish { desc: Some(d), .. } = &m.kind {
+                if let Some(d) = Desc::parse(d) {
+                    if !out.contains(&d.linear) {
+                        out.push(d.linear);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 impl PcmmPlan {
@@ -105,7 +127,7 @@ impl PcmmPlan {
         let max_in = lins.iter().map(|l| l.shape.n_in).max().unwrap_or(0);
         let max_out = lins.iter().map(|l| l.shape.n_out).max().unwrap_or(0);
         let batch = batch.max(1);
-        Ok(PcmmPlan { cfg: PcmmCfg { shapes, ..PcmmCfg::default() }, lins, max_in, max_out, opts: LinearOpts { cf, ..LinearOpts::default() }, batch, batch_drops, max_groups: max_out })
+        Ok(PcmmPlan { cfg: PcmmCfg { shapes, ..PcmmCfg::default() }, lins, max_in, max_out, opts: LinearOpts { cf, ..LinearOpts::default() }, batch, batch_drops, max_groups: max_out, pool: None })
     }
 
     /// Size the service outputs for the finishes of `progs`: the most groups any of them splits into.
@@ -123,6 +145,25 @@ impl PcmmPlan {
             }
         }
         self.max_groups = if g == 0 { self.max_out } else { g };
+        if std::env::var("PC_PCMM_WEIGHTS_PER_PROGRAM").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+            let shapes = &self.cfg.shapes;
+            let shape_of: BTreeMap<&str, usize> =
+                self.lins.iter().filter_map(|l| shapes.iter().position(|s| *s == l.shape).map(|i| (l.name.as_str(), i))).collect();
+            let mut pool = vec![0; shapes.len()];
+            for p in progs {
+                let mut per = vec![0; shapes.len()];
+                for name in program_linears(p) {
+                    if let Some(&i) = shape_of.get(name.as_str()) {
+                        per[i] += 1;
+                    }
+                }
+                for (a, b) in pool.iter_mut().zip(per) {
+                    *a = (*a).max(b);
+                }
+            }
+            eprintln!("[session] pcmm weights pooled per program: {} buffers for {} linears", pool.iter().sum::<usize>(), self.lins.len());
+            self.pool = Some(pool);
+        }
         Ok(())
     }
 
@@ -137,7 +178,13 @@ impl PcmmPlan {
     pub fn reserve(&self, mp: &mut MemPlan, rows: usize) -> PyResult<()> {
         let e = crate::session::gerr;
         mp.reserve("pcmm", Pcmm::<W>::bytes(&self.cfg, rows).map_err(e)?);
-        let wb: usize = self.lins.iter().map(|l| WeightBuf::bytes(&l.shape)).collect::<pc_gpu::Result<Vec<_>>>().map_err(e)?.into_iter().sum();
+        let wb: usize = match &self.pool {
+            Some(pool) => self.cfg.shapes.iter().zip(pool).map(|(s, &k)| WeightBuf::bytes(s).map(|b| k * b)).collect::<pc_gpu::Result<Vec<_>>>(),
+            None => self.lins.iter().map(|l| WeightBuf::bytes(&l.shape)).collect::<pc_gpu::Result<Vec<_>>>(),
+        }
+        .map_err(e)?
+        .into_iter()
+        .sum();
         mp.reserve("pcmm.weights", wb);
         let ct = pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1));
         let out_ct = pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, self.batch));
@@ -146,10 +193,11 @@ impl PcmmPlan {
     }
 }
 
-/// One served linear: its scale / shift / shape and its resident digit planes.
+/// One served linear: its scale / shift / shape and the weight buffer holding its digit planes (`PcmmRt::bufs`;
+/// pooled: while uploaded).
 pub(crate) struct Served {
     pub lin: PcmmLinear,
-    pub w: WeightBuf<'static>,
+    pub buf: Option<usize>,
     pub uploaded: bool,
 }
 
@@ -158,6 +206,11 @@ pub(crate) struct Served {
 pub(crate) struct PcmmRt {
     pub pcmm: Pcmm<'static, 'static, W>,
     pub lins: BTreeMap<String, Served>,
+    /// the weight buffers, their shapes and the linear each holds (pooled: per shape, reassigned on upload)
+    pub bufs: Vec<WeightBuf<'static>>,
+    pub buf_shape: Vec<PcmmShape>,
+    pub owner: Vec<Option<String>>,
+    pub pooled: bool,
     pub ins: Vec<Ct<'static, W>>,
     pub outs: Vec<Ct<'static, W>>,
     pub opts: LinearOpts,
@@ -168,14 +221,17 @@ pub(crate) struct PcmmRt {
     pub groups: u64,
     pub outputs: u64,
     pub keygen_s: f64,
+    /// `upload(.., pin)`: the linears' digit planes in pinned host memory, kept for the session (the source of the
+    /// asynchronous uploads)
+    pub pins: HashMap<String, pc_cuda::PinnedBuf<u8>>,
     #[allow(dead_code)]
     lt: Box<pc_cuda::blas::Lt>,
 }
 
 impl PcmmRt {
     /// Setup (before freeze): the engine (GEMM plans autotuned) on `keys` (one key set per distinct t of
-    /// `plan.ts()`, made from the secret by the session or by the client), one weight buffer per linear, the service
-    /// ciphertexts.
+    /// `plan.ts()`, made from the secret by the session or by the client), one weight buffer per linear (pooled: the
+    /// plan's per-shape counts), the service ciphertexts.
     pub fn build(plan: PcmmPlan, arena: &'static pc_cuda::Arena, dev: &pc_cuda::Device, s: &pc_cuda::Stream<pc_cuda::Compute>, ctx: &pc_gpu::Context<'static, W, M>, keys: Vec<PcmmKeys>, keygen_s: f64) -> PyResult<PcmmRt> {
         let e = crate::session::gerr;
         let want = plan.ts();
@@ -186,33 +242,97 @@ impl PcmmRt {
         // SAFETY: the box is owned by the returned PcmmRt and declared after `pcmm`, so it is dropped after the plans
         // that borrow it; its heap address is stable
         let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&lt.inner as *const pc_cuda::blas::lt::Lt) };
+        let shapes = plan.cfg.shapes.clone();
         let pcmm = Pcmm::<W>::new(arena, dev, s, ctx, ltr, plan.cfg, &keys).map_err(e)?;
-        let mut lins = BTreeMap::new();
+        let (mut lins, mut bufs, mut buf_shape, mut owner) = (BTreeMap::new(), vec![], vec![], vec![]);
+        if let Some(pool) = &plan.pool {
+            for (sh, &k) in shapes.iter().zip(pool) {
+                for _ in 0..k {
+                    bufs.push(WeightBuf::carve(arena, sh).map_err(e)?);
+                    buf_shape.push(*sh);
+                    owner.push(None);
+                }
+            }
+        }
         for l in plan.lins {
-            let w = WeightBuf::carve(arena, &l.shape).map_err(e)?;
-            lins.insert(l.name.clone(), Served { lin: l, w, uploaded: false });
+            let buf = if plan.pool.is_some() {
+                None
+            } else {
+                bufs.push(WeightBuf::carve(arena, &l.shape).map_err(e)?);
+                buf_shape.push(l.shape);
+                owner.push(Some(l.name.clone()));
+                Some(bufs.len() - 1)
+            };
+            lins.insert(l.name.clone(), Served { lin: l, buf, uploaded: false });
         }
         let ct = |k: usize| -> PyResult<Ct<'static, W>> { Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "pcmm.cts", ctx.lay, k).map_err(e)?)) };
         let ins = (0..plan.max_in).map(|_| ct(1)).collect::<PyResult<Vec<_>>>()?;
         let outs = (0..plan.max_groups).map(|_| ct(plan.batch)).collect::<PyResult<Vec<_>>>()?;
-        Ok(PcmmRt { pcmm, lins, ins, outs, opts: plan.opts, batch: plan.batch, batch_drops: plan.batch_drops, calls: 0, groups: 0, outputs: 0, keygen_s, lt })
+        let pooled = plan.pool.is_some();
+        Ok(PcmmRt { pcmm, lins, bufs, buf_shape, owner, pooled, ins, outs, opts: plan.opts, batch: plan.batch, batch_drops: plan.batch_drops, calls: 0, groups: 0, outputs: 0, keygen_s, pins: HashMap::new(), lt })
     }
 
-    /// Upload one linear's digit planes `[nw][rows_out][rows_in]` int8 (synchronous; setup).
-    pub fn upload(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, planes: &[u8]) -> PyResult<()> {
-        let sv = self.lins.get_mut(name).ok_or_else(|| PyKeyError::new_err(format!("pcmm {name}: not declared at Session setup")))?;
+    /// Upload one linear's digit planes `[nw][rows_out][rows_in]` int8 (synchronous on the compute lane, so after the
+    /// finishes issued before it; pooled: into a free buffer of its shape).
+    ///
+    /// `pin` (the device): the planes are copied once into pinned host memory the service keeps, and the upload is
+    /// asynchronous on the compute lane (ordered as before, the host does not wait for the lane to drain); a later
+    /// upload of the same linear may pass no bytes.
+    pub fn upload(&mut self, s: &pc_cuda::Stream<pc_cuda::Compute>, name: &str, planes: &[u8], pin: Option<&pc_cuda::Device>) -> PyResult<()> {
+        let PcmmRt { lins, bufs, buf_shape, owner, pins, .. } = self;
+        let sv = lins.get_mut(name).ok_or_else(|| PyKeyError::new_err(format!("pcmm {name}: not declared at Session setup")))?;
         let want = sv.lin.shape.planes_len().map_err(crate::session::gerr)?;
-        if planes.len() != want {
+        if planes.len() != want && !(pin.is_some() && planes.is_empty() && pins.contains_key(name)) {
             return Err(PyValueError::new_err(format!("pcmm {name}: {} plane bytes, the shape {:?} needs {want}", planes.len(), sv.lin.shape)));
         }
-        // SAFETY: u8 and i8 have one size and every bit pattern is valid for both
-        let p = unsafe { std::slice::from_raw_parts(planes.as_ptr() as *const i8, planes.len()) };
-        sv.w.upload(s, p).map_err(crate::session::gerr)?;
+        let i = match sv.buf {
+            Some(i) => i,
+            None => {
+                let i = (0..bufs.len()).find(|&i| owner[i].is_none() && buf_shape[i] == sv.lin.shape).ok_or_else(|| {
+                    PyRuntimeError::new_err(format!("pcmm {name}: every weight buffer of shape {:?} holds another linear (Session.pcmm_evict first)", sv.lin.shape))
+                })?;
+                owner[i] = Some(name.to_string());
+                sv.buf = Some(i);
+                i
+            }
+        };
+        if let Some(dev) = pin {
+            if !pins.contains_key(name) {
+                let mut pb = pc_cuda::PinnedBuf::<u8>::new(dev, want).map_err(|x| crate::session::gerr(x.into()))?;
+                pb.as_mut_slice().copy_from_slice(planes);
+                pins.insert(name.to_string(), pb);
+            }
+            // SAFETY: the pinned planes live in `pins` for the service's life and are never written again
+            unsafe { bufs[i].buf.upload_pinned_async(s, 0, &pins[name]) }.map_err(|x| crate::session::gerr(x.into()))?;
+        } else {
+            // SAFETY: u8 and i8 have one size and every bit pattern is valid for both
+            let p = unsafe { std::slice::from_raw_parts(planes.as_ptr() as *const i8, planes.len()) };
+            bufs[i].upload(s, p).map_err(crate::session::gerr)?;
+        }
         sv.uploaded = true;
         Ok(())
     }
 
-    /// Linears declared but never uploaded.
+    /// Pooled: free the buffers of `names` (a later upload overwrites one after the finishes issued before it, the
+    /// compute lane's order). Returns how many were resident.
+    pub fn evict(&mut self, names: &[String]) -> PyResult<usize> {
+        if !self.pooled {
+            return Err(PyRuntimeError::new_err("pcmm_evict: this session keeps every linear resident (PC_PCMM_WEIGHTS_PER_PROGRAM=1 pools them)"));
+        }
+        let PcmmRt { lins, owner, .. } = self;
+        let mut n = 0;
+        for name in names {
+            let sv = lins.get_mut(name).ok_or_else(|| PyKeyError::new_err(format!("pcmm {name}: not declared at Session setup")))?;
+            if let Some(i) = sv.buf.take() {
+                owner[i] = None;
+                sv.uploaded = false;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Linears declared but not uploaded (pooled: not resident now).
     pub fn missing(&self) -> Vec<String> {
         self.lins.values().filter(|v| !v.uploaded).map(|v| v.lin.name.clone()).collect()
     }
@@ -231,12 +351,13 @@ fn ferr(f: &FinishStep, msg: impl Into<String>) -> pc_program::Error {
 impl<'r> FinishExec<'static, W, M> for PcmmExec<'r> {
     fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not a PCMM descriptor (this session serves PCMM finishes only)"))?;
-        let PcmmRt { pcmm, lins, ins, outs, opts, calls, batch, batch_drops, groups: n_groups, outputs: n_outputs, .. } = &mut *self.rt;
+        let PcmmRt { pcmm, lins, bufs, ins, outs, opts, calls, batch, batch_drops, groups: n_groups, outputs: n_outputs, .. } = &mut *self.rt;
         let sv = lins.get(&d.linear).ok_or_else(|| ferr(f, format!("linear {} not declared at Session setup (pcmm=)", d.linear)))?;
         let lin = &sv.lin;
-        if !sv.uploaded {
-            return Err(ferr(f, format!("linear {}: planes never uploaded (Session.pcmm_upload)", d.linear)));
-        }
+        let w = match (sv.uploaded, sv.buf) {
+            (true, Some(i)) => &bufs[i].buf,
+            _ => return Err(ferr(f, format!("linear {}: planes not uploaded (Session.pcmm_upload)", d.linear))),
+        };
         if (d.n_in, d.n_out, d.t, d.shift) != (lin.shape.n_in, lin.shape.n_out, lin.shape.t, lin.shift) {
             return Err(ferr(f, format!("graph descriptor (n_in {}, n_out {}, t {}, shift {}) vs the declared linear {:?} shift {}", d.n_in, d.n_out, d.t, d.shift, lin.shape, lin.shift)));
         }
@@ -261,9 +382,9 @@ impl<'r> FinishExec<'static, W, M> for PcmmExec<'r> {
         }
         let m0 = ins[0].meta;
         let r = if ins[..d.n_in].iter().all(|x| (x.meta.level, x.meta.deg, x.meta.nf) == (m0.level, m0.deg, m0.nf)) {
-            linear(cx, self.route, pcmm, lin, &sv.w.buf, &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts, None, None)
+            linear(cx, self.route, pcmm, lin, w, &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts, None, None)
         } else {
-            linear_per_input(cx, self.route, pcmm, lin, &sv.w.buf, &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts)
+            linear_per_input(cx, self.route, pcmm, lin, w, &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts)
         };
         let mut res: pc_program::Result<()> = r.map_err(Into::into);
         if res.is_ok() {

@@ -43,6 +43,8 @@ paper-workshop/
 !graphs/**/*.json
 # scratch plan directories from an A/B are named with a leading underscore
 bootstrap_placements/_*/
+# compiled GPU programs a planned run saves next to its plan (rebuilt on a digest mismatch)
+bootstrap_placements/*/programs/
 
 # Rust / CUDA build trees and profiler output
 /target

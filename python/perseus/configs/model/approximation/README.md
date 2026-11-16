@@ -24,6 +24,7 @@ reaches, plus a record of how it was produced under `meta`. The runtime reads th
 | `vit_heat`, `vit_squeeze` | ViT-B/16 | 64-bit | as for GPT-2 |
 | `bert_base`, `bert_base_n32` | BERT-base | both | fitted on SST-2; `bert_base_n32_t128` is the default plan's (`zladder`, `exp_mask_fold` and the refitted series as ViT) |
 | `bert_heat`, `bert_squeeze` | BERT-base | 64-bit | as for GPT-2 |
+| `sana_sprint_t2i` | SANA-Sprint 0.6B + Gemma-2-2B (text-to-image) | 32-bit | fitted by `examples/sana/fit.py` (its arguments under `meta`) on 64 prompts' ranges from `examples/sana/stats.py`, not `perseus-calibrate`: the ReLUs as one-sided composite signs with a polished last stage, the SiLUs as single odd series on unit inputs, the cross-attention scores centred; `pcmm_calib.json` beside it holds the PCMM linears' output bands (`examples/sana/run.py --text --fake --pcmm-calib`) |
 | `paper/` | GPT-2, ViT | 64-bit | the exact configs behind the published numbers, kept so those results stay reproducible |
 
 `recount_report.json`, where present, records how a config's iteration counts were derived.

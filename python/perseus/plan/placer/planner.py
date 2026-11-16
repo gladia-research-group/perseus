@@ -820,11 +820,14 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                force_place: set | None = None,
                hint_force: dict[str, bool] | None = None,
                diagnostics: PlanDiagnostics | None = None,
-               final_block: bool = False) -> dict:
+               final_block: bool = False,
+               entry_map: dict[str, tuple[int, int]] | None = None) -> dict:
     """Plan one block's graph.json; returns the plan document, written to disk verbatim.
 
     `diagnostics`, if given, is filled with what must stay OUT of that document (the
     cf_max clamp report); everything else about the plan is in the returned dict.
+    `entry_map` ({input position: (level, deg)}, `stage_exit_map` of the previous stage): each stage input enters at
+    its own level (position 0 the block input, c the input named pf_in<c>); `entry_level` / `entry_deg` for the rest.
     """
     raw = json.loads(Path(graph_file).read_text(encoding="utf-8"))
     num_nodes_raw = len(raw.get("nodes", []))
@@ -877,7 +880,19 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     def is_kv_entry(v: str) -> bool:
         return cfg.kv_entry_level is not None and v in g.inputs and v != entry_var and v.startswith("anon_")
 
+    # position 0 of an entry map is the stage's one unnamed input (prefill.name_inputs names the others pf_in<c>),
+    # whichever input the graph reads first
+    anon_ins = [v for v in g.inputs if v.startswith("anon_")]
+
+    def mapped_entry(v: str) -> tuple[int, int] | None:
+        if not entry_map or v not in g.inputs:
+            return None
+        key = v[len("pf_in"):] if v.startswith("pf_in") else ("0" if anon_ins == [v] else None)
+        return entry_map.get(key) if key is not None else None
+
     def seed_consumed(v: str) -> float:
+        if mapped_entry(v) is not None:
+            return mapped_entry(v)[0] - cfg.bootstrap_level
         if is_kv_entry(v):
             return cfg.kv_entry_level - cfg.bootstrap_level
         exp = parse_lvl_suffix(v)
@@ -897,6 +912,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         return cfg.source_level - cfg.bootstrap_level
 
     def seed_deg(v: str) -> int:
+        if mapped_entry(v) is not None:
+            return mapped_entry(v)[1]
         if is_kv_entry(v):
             return cfg.kv_entry_deg
         if "cache." in v or is_cache_side_input(v):
@@ -1517,9 +1534,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                 log.info(f"[plan]  CF {outside} lies OUTSIDE the measured table (cf {rng[0]}..{rng[1]}) "
                       f"— those sites are priced by the ANALYTIC fallback, not measurement. "
                       f"Extend the table with BTS_ACC_CFS before trusting them.")
+        pe = bq['predicted_rel_err']
         log.info(f"[plan] CF {bq['cf_histogram']}  out-levels {bq['out_level_histogram']}  "
-              f"pred rel_err median={bq['predicted_rel_err']['median']:.3g} "
-              f"p90={bq['predicted_rel_err']['p90']:.3g}"
+              + (f"pred rel_err median={pe['median']:.3g} p90={pe['p90']:.3g}" if pe['median'] is not None
+                 else "no refresh sites")
               + (f"   {bq['num_sites_missing_target']} MISS TARGET"
                  if bq['num_sites_missing_target'] else ""))
     return result
@@ -1558,6 +1576,58 @@ def _stage_outputs(gf: Path, level_unit: int) -> list[str]:
         read.update(n.cipher_inputs)
     return [n.output for n in g.nodes
             if n.output and not n.is_deliberate_bts and n.hint_level is None and n.output not in read]
+
+
+def stage_n_inputs(gf: Path) -> int:
+    """A stage's ciphertext inputs: the block input and the pf_in<c> (prefill.name_inputs)."""
+    raw = json.loads(Path(gf).read_text(encoding="utf-8"))
+    return 1 + len({v for n in raw.get("nodes", []) for v in n.get("inputs", []) if v.startswith("pf_in")})
+
+
+def stage_outputs_ordered(gf: Path, level_unit: int, n: int) -> tuple[list[str], dict[str, int]]:
+    """A stage's n outputs in the order the stage function returns them (the next stage's input positions), and the
+    pass-through copies among them ({output: source input position}; ops.copy = x + 0 of a stage input). The copies
+    are one run of the returned list, first when their sources lead the inputs (a text stage's noise rows) else last
+    (a SANA block's caption rows); the others are the last unread values in graph order (an unread value made early,
+    never returned, precedes them)."""
+    raw = json.loads(Path(gf).read_text(encoding="utf-8")).get("nodes", [])
+    prod = {nd["output"]: nd for nd in raw if nd.get("output")}
+    produced = set(prod)
+    anon = [v for v in dict.fromkeys(x for nd in raw for x in nd.get("inputs", []))
+            if v.startswith("anon_") and v not in produced]
+
+    def src(v: str) -> int | None:
+        nd = prod.get(v)
+        if not nd or not nd.get("inputs"):
+            return None
+        if not (nd["op_type"] == "copy" or (nd["op_type"] == "add" and (nd.get("args") or {}).get("scalar") == 0.0)):
+            return None
+        x = nd["inputs"][0]
+        if x.startswith("pf_in"):
+            return int(x[len("pf_in"):])
+        return 0 if anon == [x] else None
+
+    outs = _stage_outputs(gf, level_unit)
+    copies = {v: src(v) for v in outs if src(v) is not None}
+    rest = [v for v in outs if v not in copies]
+    k = n - len(copies)
+    if k < 0 or len(rest) < k:
+        raise ValueError(f"{gf}: {len(copies)} copies + {len(rest)} other outputs for {n} inputs")
+    rest = rest[len(rest) - k:]
+    cps = sorted(copies, key=copies.get)
+    # a stage that passes every input on (SANA's later-step embed: the model input is the carry too) returns its
+    # computed values first, as a block does
+    lead = cps and copies[cps[0]] == 0 and len(set(copies.values())) < stage_n_inputs(gf)
+    order = cps + rest if lead else rest + cps
+    return order, copies
+
+
+def stage_exit_map(s: dict, gf: Path, level_unit: int, n: int) -> dict[str, tuple[int, int]]:
+    """{position: (level, deg)} of a planned stage's n outputs (`stage_outputs_ordered`: the next stage's inputs): the
+    `entry_map` that stage enters with (PLAN_ENTRY_MAP)."""
+    levels, degs = s.get("final_named_levels") or {}, s.get("final_named_degs") or {}
+    outs, _ = stage_outputs_ordered(gf, level_unit, n)
+    return {str(i): (int(levels[v]), int(degs.get(v, 1))) for i, v in enumerate(outs) if v in levels}
 
 
 def _next_entry(s: dict, gf: Path, cfg: PlanConfig, strict: bool) -> tuple[int | None, int | None]:
@@ -1599,6 +1669,10 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
     strict = os.environ.get("PLAN_ENVELOPE_STRICT", "0") not in ("", "0")
     entry_level: int | None = cfg.first_entry_level
     entry_deg: int | None = cfg.first_entry_deg
+    # PLAN_ENTRY_MAP=<json {position: [level, deg]}>: the first block's inputs each at their own entry (stage_exit_map
+    # of the stage before it): a stage's pass-through copies keep their level without dragging the others to it
+    em = os.environ.get("PLAN_ENTRY_MAP")
+    entry_map = {k: (int(v[0]), int(v[1])) for k, v in json.loads(Path(em).read_text()).items()} if em else None
     blocks = sorted((d for d in graph_dir.glob("block_*") if d.is_dir()),
                     key=_block_index)
     prev: dict | None = None
@@ -1626,7 +1700,8 @@ def plan_graph_dir(graph_dir: Path | str, out_dir: Path | str,
         diag = PlanDiagnostics()
         try:
             result = plan_block(gf, cfg, entry_level=entry_level, entry_deg=entry_deg,
-                                table=table, diagnostics=diag, final_block=bd == blocks[-1])
+                                table=table, diagnostics=diag, final_block=bd == blocks[-1],
+                                entry_map=entry_map if prev is None else None)
         except PlanInfeasible:
             if prev is None or prev.get("retried") or not prev.get("exit_var"):
                 raise

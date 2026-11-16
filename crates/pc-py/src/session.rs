@@ -286,6 +286,8 @@ pub(crate) struct State {
     pub enc_hits: u64,
     pub enc_misses: u64,
     /// the plaintext position cache (`PtStore.cache` / `restore`): encodings and their metas, in its own arena
+    /// `PtStore.stage_pinned`: the slot values of each plaintext name, kept in pinned host memory for the session
+    pub pt_pins: std::collections::HashMap<String, pc_cuda::PinnedBuf<f64>>,
     pub pt_cache: Vec<(DBuf<'static, Compute, W>, PtMeta)>,
     /// declared after `pt_cache`, which borrows it
     #[allow(dead_code)]
@@ -721,10 +723,26 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             if ps.programs.iter().any(|p| p.batch_report.pairs > 0) && pair_max + 1 != sp.sf.cf_ref {
                 return Err(PyValueError::new_err(format!("refresh pairs up to CF {pair_max} on an StC-first route of reference CF {}", sp.sf.cf_ref)));
             }
-            // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for
+            // a captured graph reads the entries its refreshes used: the cache holds every key the programs ask for.
+            // PC_STC_CACHE_PER_PROGRAM=1 (eager only): the most keys one program asks for, the LRU refilling the
+            // entries a program's successor needs (a fill is a small_int + NTT on the compute lane): programs whose
+            // keys differ (the text and the image stages of a pipeline) no longer hold each other's entries
             let entry = pc_shadow::ChainShape::of(&chain).level_at(sp.entry_top as u32).ok_or_else(|| PyValueError::new_err("StC-first's entry is off the level grid"))?;
-            let keys = stc_first_keys(&ps.programs, n, entry, sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
+            let (cf0, cf_ref) = (sp.sf.cf_default.unwrap_or(13), sp.sf.cf_ref);
+            let per_program = std::env::var("PC_STC_CACHE_PER_PROGRAM").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+            if per_program && ps.use_graphs {
+                return Err(PyValueError::new_err("PC_STC_CACHE_PER_PROGRAM=1 with CUDA graphs: a captured graph needs every key resident (exec.use_graphs=0)"));
+            }
+            let all = stc_first_keys(&ps.programs, n, entry, cf0, cf_ref);
+            let keys = if per_program {
+                ps.programs.iter().map(|p| stc_first_keys(std::slice::from_ref(p), n, entry, cf0, cf_ref)).max().unwrap_or(0)
+            } else {
+                all
+            };
             sp.sf.cache_slots = sp.sf.cache_slots.max(keys);
+            if per_program {
+                eprintln!("[session] stc_first cache: {} entries (the most one program asks for; all programs: {all})", sp.sf.cache_slots);
+            }
             // merge_s2d: CtS stage 0 rotates with SparseRot keys only (its plain rotation keys only if another user asks)
             let skip0 = merge_s2d as usize;
             let mut geoms: Vec<_> = sp.dense.variants.iter().flat_map(|v| v.cts.iter().skip(skip0).chain(&v.stc)).chain(&sp.input).map(|h| h.geom).collect();
@@ -1423,6 +1441,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         cached: HashMap::new(),
         enc_hits: 0,
         enc_misses: 0,
+        pt_pins: std::collections::HashMap::new(),
         pt_cache: Vec::new(),
         pt_cache_arena: None,
     };
@@ -1506,6 +1525,9 @@ fn args(config: &PyConfig, keys: &PyKeySource, size: Option<HashMap<String, usiz
             let mut pp = crate::pcmm::PcmmPlan::new(&specs, pcmm_cf, batch, cfg.model.prefill.pcmm_batch_drops.unwrap_or(true))?;
             if let Some(ps) = &plan {
                 pp.fit(&ps.programs)?;
+                if pp.pool.is_some() && ps.use_graphs {
+                    return Err(PyValueError::new_err("PC_PCMM_WEIGHTS_PER_PROGRAM=1 with CUDA graphs: a captured finish bakes its weight buffer (exec.use_graphs=0)"));
+                }
             }
             Some(pp)
         }
@@ -1726,16 +1748,28 @@ impl PySession {
     }
 
     /// Upload the int8 digit planes `[nw][rows_out][rows_in]` (bytes) of PCMM linear `name` declared at setup
-    /// (`pcmm=`); resident from then on. Synchronous.
-    fn pcmm_upload(&self, py: Python<'_>, name: &str, planes: &[u8]) -> PyResult<()> {
+    /// (`pcmm=`); resident from then on. Synchronous; `pinned=True`: the session keeps the planes in pinned host
+    /// memory (copied on the linear's first upload; later uploads may pass b"") and the upload is asynchronous on the
+    /// compute lane, in the same order.
+    #[pyo3(signature = (name, planes, pinned=false))]
+    fn pcmm_upload(&self, py: Python<'_>, name: &str, planes: &[u8], pinned: bool) -> PyResult<()> {
         let mut st = self.dev.st.borrow_mut();
         let State { planned, ex, .. } = &mut *st;
         let pc = planned.as_mut().and_then(|p| p.pcmm.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
-        nogil(py, || pc.upload(&ex.compute, name, planes))
+        let dev = if pinned { Some(&self.dev.device) } else { None };
+        nogil(py, || pc.upload(&ex.compute, name, planes, dev))
+    }
+
+    /// Pooled weights (PC_PCMM_WEIGHTS_PER_PROGRAM=1): free the buffers of PCMM linears `names` for the next
+    /// program's uploads (after the finishes issued before, the compute lane's order). Returns how many were resident.
+    fn pcmm_evict(&self, py: Python<'_>, names: Vec<String>) -> PyResult<usize> {
+        let mut st = self.dev.st.borrow_mut();
+        let pc = st.planned.as_mut().and_then(|p| p.pcmm.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
+        nogil(py, || pc.evict(&names))
     }
 
     /// PCMM service counters: {calls, batch (group size, per-drop batching), groups, outputs, keygen_s, linears,
-    /// missing (declared, never uploaded)}.
+    /// missing (declared, not uploaded), pooled (weight buffers per program)}.
     fn pcmm_stats(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyDict>> {
         let st = self.dev.st.borrow();
         let pc = st.planned.as_ref().and_then(|p| p.pcmm.as_ref()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
@@ -1747,6 +1781,7 @@ impl PySession {
         d.set_item("keygen_s", pc.keygen_s)?;
         d.set_item("linears", pc.lins.len())?;
         d.set_item("missing", pc.missing())?;
+        d.set_item("pooled", pc.pooled)?;
         Ok(d.unbind())
     }
 

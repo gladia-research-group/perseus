@@ -223,9 +223,28 @@ def _region(N, t, R, k, val):
     return np.where((np.arange(N) // t) % R == k, val, 0.0)
 
 
-def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512):
-    """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks."""
+def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512, row0=None):
+    """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks.
+
+    `row0(g, k)`: the first channel row of block k's real channels for chunk pair g (default 0). A partly filled
+    block shared by several chunk pairs (the same ciphertext passed as Xs[g][k] for each of them, pair g's
+    B.real(k) channels on rows row0(g, k)...) is read through pair g's rows only: the centring masks select them (no
+    level: the masks the norm has anyway), so the statistic and the output of (g, k) are pair g's, zero on the other
+    rows; the caller adds the pairs' outputs of that block back into one ciphertext."""
     ops, N, t, dr = rt.ops, B.d.N, B.t, B.d.dim
+    r0 = (lambda g, k: int(row0(g, k))) if row0 is not None else (lambda g, k: 0)
+
+    def rows(g, k, vals):                    # lanes_mask on pair g's rows of block k
+        m = lanes_mask(N, B.real(k), t, vals)
+        return np.roll(m, r0(g, k) * t) if r0(g, k) else m
+
+    real2 = {}                               # 2 Re / 2 Im of a ciphertext, once (a shared block is read G times)
+
+    def half_of(X, half):
+        key = (id(X), half)
+        if key not in real2:
+            real2[key] = im_cleanse(ops, X if half == 0 else ops.mult_i(X))
+        return real2[key]
     # zladder (LayerNorm only): one complex ladder for the mean and the variance instead of two
     zl = not rms and bool(getattr(cfg, "zladder", 0)) and bool(cfg.cheb_coeffs) and ops.ln_cheb
     alpha = 0.5 / dr
@@ -241,9 +260,9 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
                 if B.real(k) == 0:
                     xs.append(None)
                     continue
-                x2 = im_cleanse(ops, X if half == 0 else ops.mult_i(X))
-                xs.append(rt.mult_mask(x2, ("bl.center", k, cs),
-                                       lambda k=k, cs=cs: lanes_mask(N, B.real(k), t, [0.5 * c_ for c_ in cs])))
+                x2 = half_of(X, half)
+                xs.append(rt.mult_mask(x2, ("bl.center", k, cs) + ((r0(g, k),) if r0(g, k) else ()),
+                                       lambda g=g, k=k, cs=cs: rows(g, k, [0.5 * c_ for c_ in cs])))
             live = [x for x in xs if x is not None]
             if rms:
                 sq = None
@@ -266,7 +285,11 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
                 zc = ops.conjugate(z)
                 re = ops.add(z, zc)
                 u = ops.sub(ops.mult(ops.mult_i(ops.sub(zc, z)), alpha), ops.square(re))
-                halves.append((g, half, cs, [None if x is None else ops.sub(x, re) for x in xs], u))
+                # a shared block (row0): the mean on pair g's rows only, the other pairs' rows stay zero
+                rek = [re if row0 is None or B.real(k) == B.nch else
+                       rt.mult_mask(re, ("bl.zmean", k, len(cs), r0(g, k)),
+                                    lambda g=g, k=k, n=len(cs): rows(g, k, [1.0] * n)) for k in range(len(xs))]
+                halves.append((g, half, cs, [None if x is None else ops.sub(x, rek[k]) for k, x in enumerate(xs)], u))
             else:
                 tot = live[0]
                 for x in live[1:]:
@@ -277,8 +300,8 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
                     if x is None:
                         cen.append(None)
                         continue
-                    mk = rt.mult_mask(mean, ("bl.mean", k, len(cs)),
-                                      lambda k=k, n=len(cs): lanes_mask(N, B.real(k), t, [-1.0 / dr] * n))
+                    mk = rt.mult_mask(mean, ("bl.mean", k, len(cs)) + ((r0(g, k),) if r0(g, k) else ()),
+                                      lambda g=g, k=k, n=len(cs): rows(g, k, [-1.0 / dr] * n))
                     c_ = ops.add(x, mk)
                     cen.append(c_)
                     s2 = ops.square(c_)
