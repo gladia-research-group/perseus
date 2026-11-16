@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama gpt2 vit bert core
+% pages: overview llama gpt2 vit bert sana core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -137,6 +137,19 @@ Cerium (Jayashankar et al., 2025) & BERT-base & 128 & 43.6\nt{\S} & RTX PRO 6000
 \end{tabularx}
 \tcap{Encrypted BERT inference of one sentence (SST-2 classification for Perseus). $^\S$Replicated from the released code on
 our GPU. \legend}
+\end{tbl}
+
+\begin{tbl}
+\begin{tabularx}{\linewidth}{Xlrrrlc}
+\toprule
+\textbf{Text to image} & model & image & steps & s / image & GPU & open source \\
+\midrule
+\oursrow\textbf{Perseus (ours)} & SANA-Sprint 0.6B & $768\times768$ & 2 & \textbf{\sanaimg} & RTX PRO 6000 & \yes \\
+\bottomrule
+\end{tabularx}
+\tcap{Encrypted generation of one image from a text prompt. Perseus encrypts the prompt's tokens end to end, through the
+Gemma-2-2B text encoder and both SANA-Sprint steps, and the client decodes the image from the decrypted latent.
+\legend}
 \end{tbl}
 
 % perseus-core primitives (2026-11-02, GPU 4 alone, PC_BENCH_CHAIN=n32a4; pc-bench built with --features pc-kernels/mont,

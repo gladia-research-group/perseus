@@ -98,6 +98,14 @@ ours where the code is released.
       <img src="assets/paper-tables-bert-light.png" alt="Encrypted BERT inference of one sentence, seconds per sentence. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 7.36 on RTX PRO 6000, open source." width="707">
     </picture>
   </a>
+  <br>
+  <a href="assets/paper-tables-sana-light.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-sana-dark.png">
+      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-sana-light.png">
+      <img src="assets/paper-tables-sana-light.png" alt="Encrypted generation of one image from a text prompt, seconds. Perseus, SANA-Sprint 0.6B with its Gemma-2-2B text encoder, 768 × 768, 2 steps, 269 on RTX PRO 6000, encrypted end to end, open source." width="707">
+    </picture>
+  </a>
 </p>
 
 Times exclude key generation, encryption and decryption; each model runs its default plan
