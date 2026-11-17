@@ -876,7 +876,9 @@ fn import_ct(py: Python<'_>, session: &PySession, frame: &Bound<'_, PyAny>, low:
     let frame: &[u8] = unsafe { std::slice::from_raw_parts(fb.buf_ptr() as *const u8, fb.len_bytes()) };
     let (h, data, sum) = ct_frame(frame)?;
     let h = &h;
-    if h.bits.is_some() {
+    // a subring client's frame (compressed, c1 in coefficient form) is lifted below; any other compressed frame is a
+    // client's to decrypt
+    if h.bits.is_some() && !(h.coeff1 && h.n != dev.ctx.lay.n) {
         return Err(PyValueError::new_err("import_ct: a compressed frame (export_ct bits=) is for a client to decrypt"));
     }
     if (h.coeff0 || h.coeff1) && low {

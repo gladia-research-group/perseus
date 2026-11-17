@@ -1264,7 +1264,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     }
     if sizes.pack_keys > 0 {
         use pc_gpu::ks::{PackKey, PackPlan};
-        mp.reserve("pack_keys", PackPlan::bytes(&chain, k_max, sizes.pack_sub) + sizes.pack_keys * PackKey::<W>::bytes(chain.n, sizes.pack_sub, PackPlan::ids(&chain).len()));
+        mp.reserve("pack_keys", PackPlan::bytes::<W>(&chain, &lay, k_max, sizes.pack_sub).map_err(e)? + sizes.pack_keys * PackKey::<W>::bytes(chain.n, sizes.pack_sub, PackPlan::ids(&chain).len()));
     }
     mp.reserve("ks.regen_a", KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     // planned blocks push every per-call constant through the ring (scalar rows, raise adjusts) and a captured

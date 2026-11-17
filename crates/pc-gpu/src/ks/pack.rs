@@ -25,6 +25,9 @@ pub struct PackPlan<'a> {
     rows: ConstBuf<'a, u32>,
     /// Forward rows of the split digits, `[c < k_max][digit][row]` (prefix by ciphertext).
     ntt: RowList<'a>,
+    /// The bottom level's ModUp from rows as the plain INTT leaves them (the level's own plan reads them pre-scaled,
+    /// its INTT folding the conversion's pre factors in; the split needs the coefficients themselves).
+    modup: crate::bconv::BconvPlan<'a>,
 }
 
 impl<'a> PackPlan<'a> {
@@ -32,9 +35,17 @@ impl<'a> PackPlan<'a> {
         let top = chain.level_unit - 1;
         (0..=top).chain(chain.special_ids().into_iter().take(chain.specials_at(top))).collect()
     }
-    pub fn bytes(chain: &pc_core::params::Chain, k_max: usize, sub: usize) -> usize {
+    pub fn bytes<W: DevWord>(chain: &pc_core::params::Chain, lay: &crate::poly::Layout, k_max: usize, sub: usize) -> Result<usize> {
         let rows = Self::ids(chain).len();
-        Arena::bytes_for::<u32>(rows) + super::rowlist_bytes(k_max * sub * rows)
+        let mu = crate::bconv::BconvPlan::bytes::<W>(&chain.primes(), &Self::modup_specs(chain, lay, k_max))?;
+        Ok(Arena::bytes_for::<u32>(rows) + super::rowlist_bytes(k_max * sub * rows) + mu)
+    }
+    fn modup_specs(chain: &pc_core::params::Chain, lay: &crate::poly::Layout, k_max: usize) -> Vec<crate::bconv::JobSpec> {
+        let mut mu = super::level_specs(chain, lay, chain.level_unit - 1, k_max, None).modup;
+        for j in &mut mu {
+            j.prescaled = false;
+        }
+        mu
     }
     pub fn new<W: DevWord, M: DevStrategy<W>, S: Lane>(arena: &'a Arena, s: &Stream<S>, ctx: &Context<'_, W, M>, plans: &KsPlans<'_>, sub: usize) -> Result<Self> {
         let (lay, top) = (ctx.lay, ctx.chain.level_unit - 1);
@@ -53,7 +64,8 @@ impl<'a> PackPlan<'a> {
             .map(|(c, i)| (((c * plans.dnum + 1) * lay.rows() + i) as u32, ids[i % nrows] as i32))
             .collect();
         let dev: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
-        Ok(PackPlan { sub, top, rows: ConstBuf::new(arena, "ks.pack", s, &dev)?, ntt: RowList::new(arena, s, &list)?, ids })
+        let modup = crate::bconv::BconvPlan::new::<S, W>(arena, s, &ctx.chain.primes(), &Self::modup_specs(&ctx.chain, &lay, plans.k_max))?;
+        Ok(PackPlan { sub, top, rows: ConstBuf::new(arena, "ks.pack", s, &dev)?, ntt: RowList::new(arena, s, &list)?, ids, modup })
     }
 }
 
@@ -98,7 +110,7 @@ pub fn pack_switch<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, ex: &
     let soff = lv.intt_src.dptr();
     let src = ntt::Src { base: v.part::<W>(1).base, soff, n: 1, stride: 0 };
     ntt::transform_rows_prefix_ex(ctx, s, Dir::Inverse, &mut ex.bconv_work, &lv.intt, k * (top + 1), Some(src), None)?;
-    lv.modup.run_prefix(ctx, s, &ex.bconv_work, 0, &mut ex.ks.digits, 0, k)?;
+    pp.modup.run_prefix(ctx, s, &ex.bconv_work, 0, &mut ex.ks.digits, 0, k)?;
     let digits = ex.ks.digits.vptr_mut() as *mut W;
     let dstride = (plans.dnum * pw) as u64;
     let split = PackSplitArgs {
