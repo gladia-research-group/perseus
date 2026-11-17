@@ -81,7 +81,12 @@ fn run<W: Hw>(r: &CtsRegenArgs, regen: bool) {
             if i == 0 {
                 for c in 0..k {
                     let (d0, d1) = (&mut v0[c * CH..(c + 1) * CH], &mut v1[c * CH..(c + 1) * CH]);
-                    if isq {
+                    if !a.x0.is_null() {
+                        // ABI 20: a key-switched identity, extended (every row as stored)
+                        let x0 = |part: usize| rowp::<W>(a.x0, c * a.ct_stride as usize + part * a.part_stride as usize + rowoff);
+                        d0.copy_from_slice(&x0(0)[o0..o0 + CH]);
+                        d1.copy_from_slice(&x0(1)[o0..o0 + CH]);
+                    } else if isq {
                         v::shoup_row::<W>(d0, &x(c, 0)[o0..o0 + CH], pm, pms, p, true);
                         v::shoup_row::<W>(d1, &x(c, 1)[o0..o0 + CH], pm, pms, p, true);
                     } else {

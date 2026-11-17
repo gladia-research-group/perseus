@@ -153,7 +153,18 @@ pub extern "C" fn pt_dot<W: Hw>(a: *const PtDotArgs, s: S) -> i32 {
 }
 
 pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
-    launch(a, s, |_| 0, |a| {
+    launch(a, s, |_| 0, |a| tensor_run::<W>(a, None))
+}
+
+/// tensor_y (ABI 19): the tensor, then (c0, c1) +-= y c[row] after the doubling (d2 unchanged).
+pub extern "C" fn tensor_y<W: Hw>(a: *const TensorYArgs, s: S) -> i32 {
+    launch(a, s, |b| if b.c.is_null() || b.cs.is_null() { -1 } else { 0 }, |b| tensor_run::<W>(&b.t, Some(b)))
+}
+
+fn tensor_run<W: Hw>(a: &TensorArgs, ya: Option<&TensorYArgs>) {
+    let sh = crate::raw::Shared(&ya);
+    let sh = &sh;
+    {
         let n = a.n as usize;
         par_for(a.k as usize * n, a, |a, t| {
             let (c, row) = (t / n, t % n);
@@ -179,10 +190,18 @@ pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
                     r0 = W::add(r0, rd(o0, i), p);
                     r1 = W::add(r1, rd(o1, i), p);
                 }
+                if a.acc_d2 != 0 {
+                    r2 = W::add(r2, rd(d2, i), p);
+                }
                 if a.dbl != 0 {
                     r0 = W::add(r0, r0, p);
                     r1 = W::add(r1, r1, p);
                     r2 = W::add(r2, r2, p);
+                }
+                if let Some(b) = *sh.get() {
+                    let (yc, ycs) = (el::<W>(b.c, row), el::<W>(b.cs, row));
+                    let (m0, m1) = (W::mul_shoup(rd(at::<W>(&b.y, c, 0, row), i), yc, ycs, p), W::mul_shoup(rd(at::<W>(&b.y, c, 1, row), i), yc, ycs, p));
+                    (r0, r1) = if b.sub != 0 { (W::sub(r0, m0, p), W::sub(r1, m1, p)) } else { (W::add(r0, m0, p), W::add(r1, m1, p)) };
                 }
                 // SAFETY: word i of the output rows (stores in the device's order)
                 unsafe {
@@ -195,7 +214,7 @@ pub extern "C" fn tensor<W: Hw>(a: *const TensorArgs, s: S) -> i32 {
                 }
             }
         })
-    })
+    }
 }
 
 pub extern "C" fn md_epilogue<W: Hw>(a: *const MdEpiArgs, s: S) -> i32 {
@@ -276,6 +295,39 @@ pub extern "C" fn wsum<W: Hw>(a: *const WsumArgs, s: S) -> i32 {
 
 pub extern "C" fn wsum_k<W: Hw>(a: *const WsumKArgs, s: S) -> i32 {
     launch(a, s, |a| if a.w.nsrc > 8 || a.k.is_null() { -1 } else { 0 }, |a| wsum_run::<W>(&a.w, a.k))
+}
+
+/// wsum_multi (ABI 19): out[m] = sum_j w[m][j][row] src_j (+ k[m][row] on part 0) for m < nout, rows [0, n[m]); each
+/// output equals its own wsum / wsum_k word for word.
+pub extern "C" fn wsum_multi<W: Hw>(a: *const WsumMultiArgs, s: S) -> i32 {
+    launch(a, s, |a| if a.nsrc < 1 || a.nsrc > 8 || a.nout < 1 || a.nout > 3 { -1 } else { 0 }, |a| {
+        let n = a.nmax as usize;
+        par_for(a.k_cts as usize * n, a, |a, t| {
+            let (c, row) = (t / n, t % n);
+            let p = W::from_u64(prime(a.pr, row).p);
+            for m in 0..a.nout as usize {
+                if row >= a.n[m] as usize {
+                    continue;
+                }
+                let kr = (!a.k[m].is_null()).then(|| W::red1(el::<W>(a.k[m], row), p));
+                for part in 0..2 {
+                    let mut acc = crate::raw::buf::<W>(N);
+                    acc.fill(W::default());
+                    for j in 0..a.nsrc as usize {
+                        let (w, ws) = (el::<W>(a.w[m], j * a.rowstride as usize + row), el::<W>(a.ws[m], j * a.rowstride as usize + row));
+                        let x = at::<W>(&a.src[j], c, part, row);
+                        for (i, r) in acc.iter_mut().enumerate() {
+                            *r = W::add(*r, W::mul_shoup(rd(x, i), w, ws, p), p);
+                        }
+                    }
+                    if let (0, Some(k)) = (part, kr) {
+                        acc.iter_mut().for_each(|r| *r = W::add(*r, k, p));
+                    }
+                    row_map(at::<W>(&a.out[m], c, part, row), |i| acc[i]);
+                }
+            }
+        })
+    })
 }
 
 pub extern "C" fn add_const<W: Hw>(a: *const AddConstArgs, s: S) -> i32 {
@@ -366,6 +418,33 @@ pub extern "C" fn automorph<W: Hw>(a: *const AutomorphArgs, s: S) -> i32 {
             } else {
                 row_map(o, |i| rd(x, sh.get()[i] as usize));
             }
+        })
+    })
+}
+
+/// mul_add_n (ABI 18): out = y + sum_j x_j t_j over nterm <= 8 terms (y.base null: no y); the same canonical words as
+/// the chain of mult_pt_add's (lazy or not). out may alias y or any x_j word for word.
+pub extern "C" fn mul_add_n<W: Hw>(a: *const MulAddNArgs, s: S) -> i32 {
+    launch(a, s, |a| if a.nterm < 1 || a.nterm > 8 { -1 } else { 0 }, |a| {
+        let n = a.n as usize;
+        par_for(2 * a.k as usize * n, a, |a, t| {
+            let (c, part, row) = split(t, n, 2);
+            let q = prime(a.pr, row);
+            let p = W::from_u64(q.p);
+            // SAFETY: table rows
+            let tb: Vec<*const W> = (0..a.nterm as usize).map(|j| unsafe { (a.t[j] as *const W).add(row * N) }).collect();
+            let xs: Vec<*mut W> = (0..a.nterm as usize).map(|j| at::<W>(&a.x[j], c, part, row)).collect();
+            let y = (!a.y.base.is_null()).then(|| at::<W>(&a.y, c, part, row));
+            row_map(at::<W>(&a.out, c, part, row), |i| {
+                let mut r = W::default();
+                for (x, t) in xs.iter().zip(&tb) {
+                    r = W::add(r, W::mul(rd(*x, i), rd(*t, i), q), p);
+                }
+                match y {
+                    Some(y) => W::add(rd(y, i), r, p),
+                    None => r,
+                }
+            });
         })
     })
 }

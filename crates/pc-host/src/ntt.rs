@@ -303,7 +303,7 @@ fn phased(a: &NttArgs, fwd: bool) {
                 src_sum(a, i, p, lo, &mut row[lo..lo + STRIP]);
             }
         }
-        let ninv = (!fwd).then(|| (el::<u32>(a.ninv, pid), el::<u32>(a.ninvs, pid)));
+        let ninv = (!fwd).then(|| ninv_of::<u32>(a, i, pid));
         let (w, ws) = tw(a, pid);
         // SAFETY: CPU features checked by the caller
         unsafe { strip(row, w, ws, p, fwd, ninv, c0) };
@@ -344,6 +344,16 @@ fn phased_ok<W: Hw>(a: &NttArgs) -> bool {
     W::BITS == 32 && a.lazy != 0 && wide()
 }
 
+/// The inverse's last-pass factor of launch row `i`: `es[i]` when set (ABI 17: N^-1 times the base conversion's pre
+/// factor of the row), else the prime's N^-1.
+fn ninv_of<W: Hw>(a: &NttArgs, i: usize, pid: usize) -> (W, W) {
+    if a.es.is_null() {
+        (el::<W>(a.ninv, pid), el::<W>(a.ninvs, pid))
+    } else {
+        (el::<W>(a.es, i), el::<W>(a.ess, i))
+    }
+}
+
 pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {
     launch(a, s, |a| if a.epi != 0 { -1 } else { 0 }, |a| {
         #[cfg(target_arch = "x86_64")]
@@ -355,7 +365,7 @@ pub extern "C" fn inv<W: Hw>(a: *const NttArgs, s: S) -> i32 {
             let (roff, pid) = unsafe { (*a.roff.add(i) as usize, *a.rprime.add(i) as usize) };
             let p = W::from_u64(el::<PrimeConst>(a.pr as *const std::ffi::c_void, pid).p);
             let (w, ws) = (table::<W>(a.iw, pid), table::<W>(a.iws, pid));
-            let (ni, nis) = (el::<W>(a.ninv, pid), el::<W>(a.ninvs, pid));
+            let (ni, nis) = ninv_of::<W>(a, i, pid);
             let mut x = crate::raw::buf::<W>(N);
             load(a, i, p, &mut x);
             match as_u32(&mut x) {

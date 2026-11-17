@@ -1,4 +1,5 @@
-// Batched fast base conversion (bconv.cuh, BconvArgs): per job, y_i = x_i pre_i mod s_i, out_t = sum_i y_i M[i][t]
+// Batched fast base conversion (bconv.cuh, BconvArgs): per job, y_i = x_i pre_i mod s_i (prescaled jobs: x_i as
+// stored), out_t = sum_i y_i M[i][t]
 // mod t, the exact jobs' correction from the FMA double estimate in source order (one fused multiply-add per source,
 // as the device's __fma_rn chain). One task per (job, block of coefficients); rows through the vector primitives.
 use crate::arith::Hw;
@@ -29,7 +30,11 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                 let q = pr(pool(sprime + i).u64() as usize);
                 // SAFETY: source row inside the launch's input
                 let x = unsafe { std::slice::from_raw_parts((a.src as *const W).add((j.src_off as usize + pool(srow + i).u64() as usize) * N + c0), BLK) };
-                v::mul_s::<W>(&mut y[i * BLK..(i + 1) * BLK], x, pool(pre + i), q, &mut acc);
+                if j.prescaled != 0 {
+                    y[i * BLK..(i + 1) * BLK].copy_from_slice(x);
+                } else {
+                    v::mul_s::<W>(&mut y[i * BLK..(i + 1) * BLK], x, pool(pre + i), q, &mut acc);
+                }
             }
             let mut u = buf::<u64>(BLK);
             let mut bmod_off = 0usize;
@@ -64,13 +69,24 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
             for tt in 0..nt {
                 let q = pr(pool(tprime + tt).u64() as usize);
                 let p = W::from_u64(q.p);
-                acc.fill(W::Acc::default());
-                for i in 0..ns {
-                    v::mac_s::<W>(&mut acc, &y[i * BLK..(i + 1) * BLK], pool(m + i * nt + tt));
-                }
                 // SAFETY: target row inside the launch's output
                 let o = unsafe { std::slice::from_raw_parts_mut((a.dst as *mut W).add((j.dst_off as usize + pool(trow + tt).u64() as usize) * N + c0), BLK) };
-                v::reduce::<W>(&acc, q, o);
+                // u32 words: at most 16 products per 64-bit accumulator (wide jobs, ABI 20: groups of 16 summed mod p)
+                let group = if W::BITS == 32 { 16 } else { ns.max(1) };
+                for g in (0..ns.max(1)).step_by(group) {
+                    acc.fill(W::Acc::default());
+                    for i in g..(g + group).min(ns) {
+                        v::mac_s::<W>(&mut acc, &y[i * BLK..(i + 1) * BLK], pool(m + i * nt + tt));
+                    }
+                    if g == 0 {
+                        v::reduce::<W>(&acc, q, o);
+                    } else {
+                        v::reduce::<W>(&acc, q, &mut r);
+                        for (oc, &rc) in o.iter_mut().zip(r.iter()) {
+                            *oc = W::add(*oc, rc, p);
+                        }
+                    }
+                }
                 if j.exact != 0 {
                     let bm = el::<W>(a.pool, bmod_off + tt);
                     for (c, oc) in o.iter_mut().enumerate() {

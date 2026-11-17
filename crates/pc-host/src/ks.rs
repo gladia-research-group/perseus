@@ -94,22 +94,29 @@ fn a_chunk<W: Hw>(seed: &[u32; 8], d: usize, p: u64, lo: usize, out: &mut [W]) {
     }
 }
 
+/// Ciphertext c's reduced dot (r0, r1) of slots [lo, lo + n) of row t, with c0's mode applied to r0.
+#[allow(clippy::too_many_arguments)]
+fn reduce_c0<W: Hw>(a: &KsArgs, t: usize, c: usize, lo: usize, n: usize, s0: &[W::Acc], s1: &[W::Acc], r0: &mut [W], r1: &mut [W]) {
+    let q = prime(a.pr, t);
+    let p = W::from_u64(q.p);
+    v::reduce::<W>(&s0[c * n..(c + 1) * n], q, r0);
+    v::reduce::<W>(&s1[c * n..(c + 1) * n], q, r1);
+    let c0 = || &row::<W>(a.c0, c * a.ct_stride as usize + t * N)[lo..lo + n];
+    match a.c0_mode & 3 {
+        1 if (t as i32) < a.nq => v::shoup_row::<W>(r0, c0(), el::<W>(a.pmod, t), el::<W>(a.pmods, t), p, false),
+        2 => v::add_rows::<W>(r0, c0(), p),
+        _ => {}
+    }
+}
+
 /// ks_dot's outputs of key r for slots [lo, lo + n) of row t: c0 modes, automorphism, accumulation.
 fn store_rot<W: Hw>(a: &KsArgs, t: usize, r: usize, lo: usize, n: usize, s0: &[W::Acc], s1: &[W::Acc]) {
     let q = prime(a.pr, t);
     let p = W::from_u64(q.p);
     let kexp = el::<u32>(a.autok as _, r);
-    let mode = a.c0_mode & 3;
     let (mut r0, mut r1) = (buf::<W>(n), buf::<W>(n));
     for c in 0..a.k as usize {
-        v::reduce::<W>(&s0[c * n..(c + 1) * n], q, &mut r0);
-        v::reduce::<W>(&s1[c * n..(c + 1) * n], q, &mut r1);
-        let c0 = || &row::<W>(a.c0, c * a.ct_stride as usize + t * N)[lo..lo + n];
-        match mode {
-            1 if (t as i32) < a.nq => v::shoup_row::<W>(&mut r0, c0(), el::<W>(a.pmod, t), el::<W>(a.pmods, t), p, false),
-            2 => v::add_rows::<W>(&mut r0, c0(), p),
-            _ => {}
-        }
+        reduce_c0::<W>(a, t, c, lo, n, s0, s1, &mut r0, &mut r1);
         let ob = c * a.out_ct_stride as usize + r * a.out_rot_stride as usize + t * N;
         let (o0, o1) = (a.out0 as *mut W, a.out1 as *mut W);
         let acc = a.c0_mode & KS_ACC != 0;
@@ -142,7 +149,8 @@ fn row_id(a: &KsArgs, y: usize) -> usize {
 }
 
 pub extern "C" fn ks_dot<W: Hw>(a: *const KsArgs, s: S) -> i32 {
-    launch(a, s, |a| if a.k > 8 { -1 } else { 0 }, |a| {
+    // the summed rotations (KS_SUM): ks_dot_key only, as the device
+    launch(a, s, |a| if a.c0_mode & KS_SUM != 0 { -3 } else if a.k > 8 { -1 } else { 0 }, |a| {
         let n = chunk::<W>();
         par_for(a.nrows as usize * (N / n), a, |a, task| {
             let (t, lo) = (row_id(a, task / (N / n)), task % (N / n) * n);
@@ -170,6 +178,9 @@ pub extern "C" fn ks_dot_key<W: Hw>(a: *const KsKeyArgs, s: S) -> i32 {
         }
     };
     launch(a, s, bad, |g| {
+        if g.ks.c0_mode & KS_SUM != 0 {
+            return key_sum::<W>(g);
+        }
         let n = chunk::<W>();
         par_for(g.ks.nrows as usize * (N / n), g, |g, task| {
             let (a, kt) = (&g.ks, &g.key);
@@ -191,6 +202,65 @@ pub extern "C" fn ks_dot_key<W: Hw>(a: *const KsKeyArgs, s: S) -> i32 {
                 store_rot::<W>(a, t, r, lo, n, &s0, &s1);
             }
         })
+    })
+}
+
+/// ks_dot_key's words of key r for slots [lo, lo + n) of row t.
+fn key_dot<W: Hw>(g: &KsKeyArgs, t: usize, r: usize, lo: usize, n: usize) -> (Buf<W::Acc>, Buf<W::Acc>) {
+    let (a, kt) = (&g.ks, &g.key);
+    let p = prime(a.pr, t).p;
+    let slot = slot_of(kt, t, a.nq as usize);
+    let kb = el::<*const std::ffi::c_void>(kt.kb as _, r);
+    let seed = seed_at(el::<*const u32>(kt.seed as _, r));
+    dot_chunk::<W>(a, t, lo, n, &mut |d, b, ar| {
+        if (d as i32) < kt.nregen {
+            a_chunk::<W>(&seed, d, p, lo, ar);
+        } else {
+            let ka = el::<*const std::ffi::c_void>(a.ka as _, r);
+            ar.copy_from_slice(&row::<W>(ka, d * a.key_digit_stride as usize + t * N + lo)[..n]);
+        }
+        b_chunk::<W>(kt, kb, d * kt.srows as usize + slot, lo, b);
+    })
+}
+
+/// KS_SUM (ks.cuh ks_dot_seg / ks_dot_key_sum): the R rotations summed into rotation 0's output, out = sum_r
+/// sigma_r(dot_r) (+ out with KS_ACC), each rotation's c0 mode applied before its automorphism. One task per row: the
+/// automorphisms mix a row's slots across chunks.
+fn key_sum<W: Hw>(g: &KsKeyArgs) {
+    par_for(g.ks.nrows as usize, g, |g, y| {
+        let a = &g.ks;
+        let t = row_id(a, y);
+        let p = W::from_u64(prime(a.pr, t).p);
+        let k = a.k as usize;
+        let (mut acc0, mut acc1) = (buf::<W>(k * N), buf::<W>(k * N));
+        acc0.fill(W::default());
+        acc1.fill(W::default());
+        let (mut r0, mut r1) = (buf::<W>(N), buf::<W>(N));
+        for r in 0..a.r as usize {
+            let (s0, s1) = key_dot::<W>(g, t, r, 0, N);
+            let kexp = el::<u32>(a.autok as _, r);
+            for c in 0..k {
+                reduce_c0::<W>(a, t, c, 0, N, &s0, &s1, &mut r0, &mut r1);
+                let (a0, a1) = (&mut acc0[c * N..(c + 1) * N], &mut acc1[c * N..(c + 1) * N]);
+                for i in 0..N {
+                    let o = if kexp == 1 { i } else { automorph_slot(kexp, i as u32, LOG_N) as usize };
+                    a0[o] = W::add(a0[o], r0[i], p);
+                    a1[o] = W::add(a1[o], r1[i], p);
+                }
+            }
+        }
+        for c in 0..k {
+            let ob = c * a.out_ct_stride as usize + t * N;
+            // SAFETY: row t of ciphertext c's rotation-0 output
+            let (o0, o1) = unsafe { (std::slice::from_raw_parts_mut((a.out0 as *mut W).add(ob), N), std::slice::from_raw_parts_mut((a.out1 as *mut W).add(ob), N)) };
+            for (o, x) in [(o0, &acc0[c * N..(c + 1) * N]), (o1, &acc1[c * N..(c + 1) * N])] {
+                if a.c0_mode & KS_ACC != 0 {
+                    v::add_rows::<W>(o, x, p);
+                } else {
+                    o.copy_from_slice(x);
+                }
+            }
+        }
     })
 }
 

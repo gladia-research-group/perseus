@@ -135,6 +135,10 @@ const fn build<W: Hw>(inst: Instance) -> KernelTable {
         coeff_sum: coeffrows::coeff_sum::<W>,
         mul_add: elem::mul_add::<W>,
         rescale_fwd: rescale::rescale_fwd::<W>,
+        mul_add_n: elem::mul_add_n::<W>,
+        tensor_y: elem::tensor_y::<W>,
+        wsum_multi: elem::wsum_multi::<W>,
+        bconv_wide: bconv::bconv::<W>,
         tfhe: tfhe::tfhe,
     }
 }
