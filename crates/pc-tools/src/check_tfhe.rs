@@ -118,9 +118,9 @@ fn run(args: &[String]) -> Res<bool> {
     req.reserve(&mut mp);
     mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
     mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1)));
+    mp.reserve("check.tfhe", 4 * (n_switch + 2 * 4096) + 512);
     if device {
         mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &switch_params(args, n)?, chunk.unwrap_or(n_switch)));
-        mp.reserve("check.tfhe", 4 * (n_switch + 2 * 4096) + 512);
         if args.iter().any(|a| a == "--native-max") {
             mp.reserve("check.native", 4 * (3 * n_switch * (2048 + 1) + 2 * n_switch + 3 * 2 * 4096) + 1024);
         }
