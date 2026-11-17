@@ -40,13 +40,8 @@ replays (its kernels descend from [FIDESlib32bits](https://github.com/gladia-res
 our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
 
 <p align="center">
-  <a href="assets/paper-tables-overview-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-overview-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-overview-light.png">
-      <img src="assets/paper-tables-overview-light.png" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB). SANA-Sprint 0.6B, with its Gemma-2-2B text encoder, 269 s for one 768 × 768 image from a text prompt (78.0 GiB)." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-overview-light.png#gh-light-mode-only"><img src="assets/paper-tables-overview-light.png#gh-light-mode-only" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB). SANA-Sprint 0.6B, with its Gemma-2-2B text encoder, 269 s for one 768 × 768 image from a text prompt (78.0 GiB)." width="707"></a>
+  <a href="assets/paper-tables-overview-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-overview-dark.png#gh-dark-mode-only" alt="Perseus, encrypted, end to end on one RTX PRO 6000 with 128-bit security, and the peak GPU memory of each run (Llama-3-8B streams its weights from host memory, GPT-2 small keeps its weights on the GPU). Llama-3-8B prefill of a 128-token prompt 53.6 s (85.1 GiB), decode of one token at a 512-token context 6.86 s (52.4 GiB when decoding 16 tokens). GPT-2 small prefill 6.04 s (59.3 GiB), decode 1.70 s per token at a 512-token context (63.1 GiB when decoding 16 tokens). ViT-B/16 17.7 s per image (68.1 GiB). BERT-base 7.36 s for 128 tokens (57.9 GiB). SANA-Sprint 0.6B, with its Gemma-2-2B text encoder, 269 s for one 768 × 768 image from a text prompt (78.0 GiB)." width="707"></a>
 </p>
 
 ## What's inside
@@ -67,45 +62,20 @@ One NVIDIA RTX PRO 6000, 128-bit security. Prior results on their own hardware, 
 ours where the code is released.
 
 <p align="center">
-  <a href="assets/paper-tables-llama-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-llama-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-llama-light.png">
-      <img src="assets/paper-tables-llama-light.png" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 53.6 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 6.86 at 512 on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-llama-light.png#gh-light-mode-only"><img src="assets/paper-tables-llama-light.png#gh-light-mode-only" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 53.6 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 6.86 at 512 on RTX PRO 6000, open source." width="707"></a>
+  <a href="assets/paper-tables-llama-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-llama-dark.png#gh-dark-mode-only" alt="Encrypted Llama-3-8B. Prefill of a 128-token prompt, seconds. MOAI 3592.0 on H200, NEXUS 829.0 on 4 A100, Euston 484.0, STIP 406.6 (composed timings, amortized over a batch); Odin 366.4 on H100; Cerium 347.5 (replicated on RTX PRO 6000); Sylph 116.0 (composed); Perseus 53.6 on RTX PRO 6000, open source. Decode of one token, seconds per token at a context size. AR-HE 1569.0 at 32, ROSETTA 311.0 at 512, Cachemir 97.0 at 512, Sylph 31.0 at 128 (all composed timings); Perseus 6.86 at 512 on RTX PRO 6000, open source." width="707"></a>
   <br>
-  <a href="assets/paper-tables-gpt2-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-gpt2-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-gpt2-light.png">
-      <img src="assets/paper-tables-gpt2-light.png" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 6.04 s, decode 1.70 s per token at context 512, on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-gpt2-light.png#gh-light-mode-only"><img src="assets/paper-tables-gpt2-light.png#gh-light-mode-only" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 6.04 s, decode 1.70 s per token at context 512, on RTX PRO 6000, open source." width="707"></a>
+  <a href="assets/paper-tables-gpt2-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-gpt2-dark.png#gh-dark-mode-only" alt="Encrypted GPT-2 small. AR-HE 128-token prefill 18520.0 s, decode 544.0 s per token at context 33. ROSETTA decode 78.6 s at 512 (composed). EncryptedLLM decode 68.0 s at 128. Perseus prefill 6.04 s, decode 1.70 s per token at context 512, on RTX PRO 6000, open source." width="707"></a>
   <br>
-  <a href="assets/paper-tables-vit-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-vit-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-vit-light.png">
-      <img src="assets/paper-tables-vit-light.png" alt="Encrypted ViT inference of one image, seconds. FIONA, ViT-S/16, 374.4 on a 48-core CPU (amortized over a batch of 32, retrained polynomial model); ATLAS, ViT-B/16, 2259.0 on RTX 4090; Perseus, ViT-B/16, 17.7 on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-vit-light.png#gh-light-mode-only"><img src="assets/paper-tables-vit-light.png#gh-light-mode-only" alt="Encrypted ViT inference of one image, seconds. FIONA, ViT-S/16, 374.4 on a 48-core CPU (amortized over a batch of 32, retrained polynomial model); ATLAS, ViT-B/16, 2259.0 on RTX 4090; Perseus, ViT-B/16, 17.7 on RTX PRO 6000, open source." width="707"></a>
+  <a href="assets/paper-tables-vit-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-vit-dark.png#gh-dark-mode-only" alt="Encrypted ViT inference of one image, seconds. FIONA, ViT-S/16, 374.4 on a 48-core CPU (amortized over a batch of 32, retrained polynomial model); ATLAS, ViT-B/16, 2259.0 on RTX 4090; Perseus, ViT-B/16, 17.7 on RTX PRO 6000, open source." width="707"></a>
   <br>
-  <a href="assets/paper-tables-bert-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-bert-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-bert-light.png">
-      <img src="assets/paper-tables-bert-light.png" alt="Encrypted BERT inference of one sentence, seconds per sentence. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 7.36 on RTX PRO 6000, open source." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-bert-light.png#gh-light-mode-only"><img src="assets/paper-tables-bert-light.png#gh-light-mode-only" alt="Encrypted BERT inference of one sentence, seconds per sentence. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 7.36 on RTX PRO 6000, open source." width="707"></a>
+  <a href="assets/paper-tables-bert-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-bert-dark.png#gh-dark-mode-only" alt="Encrypted BERT inference of one sentence, seconds per sentence. THOR, BERT-base, 128 tokens, 602.0 on A100; POLARIS, BERT-Mini, 83.0 on A100; Cerium, BERT-base, 128 tokens, 43.6 (replicated on RTX PRO 6000); Perseus, BERT-base, 128 tokens, 7.36 on RTX PRO 6000, open source." width="707"></a>
   <br>
-  <a href="assets/paper-tables-sana-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-sana-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-sana-light.png">
-      <img src="assets/paper-tables-sana-light.png" alt="Encrypted generation of one image from a text prompt, seconds. Perseus, SANA-Sprint 0.6B with its Gemma-2-2B text encoder, 768 × 768, 2 steps, 269 on RTX PRO 6000, encrypted end to end, open source." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-sana-light.png#gh-light-mode-only"><img src="assets/paper-tables-sana-light.png#gh-light-mode-only" alt="Encrypted generation of one image from a text prompt, seconds. Perseus, SANA-Sprint 0.6B with its Gemma-2-2B text encoder, 768 × 768, 2 steps, 269 on RTX PRO 6000, encrypted end to end, open source." width="707"></a>
+  <a href="assets/paper-tables-sana-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-sana-dark.png#gh-dark-mode-only" alt="Encrypted generation of one image from a text prompt, seconds. Perseus, SANA-Sprint 0.6B with its Gemma-2-2B text encoder, 768 × 768, 2 steps, 269 on RTX PRO 6000, encrypted end to end, open source." width="707"></a>
 </p>
 
 Times exclude key generation, encryption and decryption; each model runs its default plan
@@ -117,13 +87,8 @@ Times exclude key generation, encryption and decryption; each model runs its def
 primitives on one RTX PRO 6000, and the two commands under it reproduce the table.
 
 <p align="center">
-  <a href="assets/paper-tables-core-light.png">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/paper-tables-core-dark.png">
-      <source media="(prefers-color-scheme: light)" srcset="assets/paper-tables-core-light.png">
-      <img src="assets/paper-tables-core-light.png" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.014 and 0.054, multiplication by a scalar 0.017 and 0.037, by a plaintext 0.015 and 0.037, relinearized multiplication 0.356 and 0.415, rescale 0.047 and 0.065, rotation 0.284 and 0.358, forward and inverse NTT 0.057 and 0.089. Bootstraps, dense 12.2 and 12.8, StC first 10.5 and 10.7, sparse 512 slots 10.7 and 11.9, sparse 256 slots 10.0 and 11.4, one slot 5.8 and 6.9. Ring 2^16, 51 + 13 primes in 32-bit words, log QP 1734, dnum 4, 128-bit security." width="707">
-    </picture>
-  </a>
+  <a href="assets/paper-tables-core-light.png#gh-light-mode-only"><img src="assets/paper-tables-core-light.png#gh-light-mode-only" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.014 and 0.054, multiplication by a scalar 0.017 and 0.037, by a plaintext 0.015 and 0.037, relinearized multiplication 0.356 and 0.415, rescale 0.047 and 0.065, rotation 0.284 and 0.358, forward and inverse NTT 0.057 and 0.089. Bootstraps, dense 12.2 and 12.8, StC first 10.5 and 10.7, sparse 512 slots 10.7 and 11.9, sparse 256 slots 10.0 and 11.4, one slot 5.8 and 6.9. Ring 2^16, 51 + 13 primes in 32-bit words, log QP 1734, dnum 4, 128-bit security." width="707"></a>
+  <a href="assets/paper-tables-core-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-core-dark.png#gh-dark-mode-only" alt="perseus-core CKKS primitives on one RTX PRO 6000, device milliseconds per call for one ciphertext and per ciphertext in a batch of 8. Addition 0.014 and 0.054, multiplication by a scalar 0.017 and 0.037, by a plaintext 0.015 and 0.037, relinearized multiplication 0.356 and 0.415, rescale 0.047 and 0.065, rotation 0.284 and 0.358, forward and inverse NTT 0.057 and 0.089. Bootstraps, dense 12.2 and 12.8, StC first 10.5 and 10.7, sparse 512 slots 10.7 and 11.9, sparse 256 slots 10.0 and 11.4, one slot 5.8 and 6.9. Ring 2^16, 51 + 13 primes in 32-bit words, log QP 1734, dnum 4, 128-bit security." width="707"></a>
 </p>
 
 ```bash
