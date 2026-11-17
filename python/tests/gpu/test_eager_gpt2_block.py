@@ -48,7 +48,8 @@ def _block0(model, core, row):
     return np.asarray(core.decode_token_output(model.inf, y), dtype=np.float64)
 
 
-@pytest.mark.skipif(not (os.path.exists(WEIGHTS) and os.path.isdir(IO_DIR)), reason="GPT-2 weights / oracle io missing")
+@pytest.mark.skipif(not (os.path.exists(WEIGHTS) and os.path.exists(os.path.join(IO_DIR, "all_blocks_L00_T1.json"))),
+                    reason="GPT-2 weights / oracle io (all_blocks_L00_T1.json) missing")
 def test_eager_gpt2_block0(monkeypatch):
     from perseus.examples.gpt2 import env, oracle_io, weights
     from perseus.examples.gpt2.model import Gpt2Model
