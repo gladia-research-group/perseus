@@ -1280,19 +1280,21 @@ class StreamedPlannedRun:
     def _record_tapped(self, t, rows):
         """Record token t with the tap block's intermediate values snapshot (twin values on)."""
         fhe = self.rec.model.inf.fhe
-        new_var, tb = fhe.new_var, self.tap[1]
+        record, tb = fhe.record, self.tap[1]
         prefix = f"blk{tb}" if tb < self.n else "tail"
 
-        def snap(ct):
-            nm = new_var(ct)
-            if fhe.path().startswith(prefix) and getattr(ct, "vec", None) is not None and ct.vec.shape[0] > 1:
-                self.snaps[nm] = np.array(ct.vec)
-            return nm
-        fhe.new_var = snap
+        # every op output is recorded under its final name (scoped names bypass new_var)
+        def snap(op, ins, out, in_levels, out_ct=None, *a, **k):
+            path = fhe.path()
+            if ((path == prefix or path.startswith(prefix + ".")) and getattr(out_ct, "vec", None) is not None
+                    and out_ct.vec.shape[0] > 1):
+                self.snaps[out] = np.array(out_ct.vec)
+            return record(op, ins, out, in_levels, out_ct, *a, **k)
+        fhe.record = snap
         try:
-            return self.rec.token(t, rows[t])
+            return self.rec.token(t, rows[t], self.argmax_stage)
         finally:
-            fhe.new_var = new_var
+            fhe.record = record
 
     def _pick_taps(self, nodes, have):
         by_step = {}
