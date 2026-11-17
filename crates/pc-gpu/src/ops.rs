@@ -23,7 +23,7 @@ use crate::ct::Ct;
 use pc_core::encode::Complex;
 use pc_core::modmul::{addmod, mulmod, shoup, submod};
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, DBuf, Device, Event, Lane, PinnedBuf, Stream};
-use pc_kernels::{AddConstArgs, CtsExpandArgs, EwArgs, MulAddArgs, MulAddNArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSeededArgs, TensorSumArgs, WsumArgs, WsumKArgs, CTS_EXPAND_MAX, TMULTI_OUT, TMULTI_PAIRS, TSEED_OUT, TSEED_PAIRS, TSUM_MAX};
+use pc_kernels::{AddConstArgs, EwArgs, MulAddArgs, MulAddNArgs, MulTableArgs, PolyRef, RowSet, TensorArgs, TensorMultiArgs, TensorSeededArgs, TensorSumArgs, WsumArgs, WsumKArgs, TMULTI_OUT, TMULTI_PAIRS, TSEED_OUT, TSEED_PAIRS, TSUM_MAX};
 use pc_shadow::meta::top_limb;
 use pc_shadow::{tag, CtMeta, Operand, Prelude, PtMeta, Recipe, Shadow};
 use rayon::prelude::*;
