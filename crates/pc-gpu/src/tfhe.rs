@@ -1,12 +1,12 @@
 //! CKKS -> TFHE -> CKKS on the device: the switch of pc-tfhe (the bit-exact host reference) on a ciphertext at the
-//! StC-first split. `TfheSwitch::apply` takes the split (limbs 0..3, eval form), evaluates a LUT on the coefficients it
-//! is given (every other coefficient comes back an exact zero) and leaves the result in the same ciphertext in the
-//! split format, ready for the route's finish:
+//! StC-first split. `TfheSwitch::apply` takes the split (limbs 0..3, 0..2 on a lean chain; eval form), evaluates a
+//! LUT on the coefficients it is given (every other coefficient comes back an exact zero) and leaves the result in
+//! the same ciphertext in the split format, ready for the route's finish:
 //!
 //!   INTT, gather + exact rescale by p3, p2 (the PCMM's ops) -> RESCALE_P1 (mod p0) -> ring switch s -> s'(X^S)
 //!   (RS_DIGITS, NTT, MAC, INTT, + c0) -> RS_EXTRACT (LWEs of dimension N / S) -> LWE key switch (KS_DIGITS, four
 //!   int8 GEMMs, KS_RECOMBINE) -> bootstrap (PBS_MS, PBS_INIT, PBS_ROTATE, PBS_EXTRACT: mod p0) -> repack
-//!   (`DevRepack`) -> lift x p2 p3 into limbs 0..3, scatter, NTT.
+//!   (`DevRepack`) -> lift x p2 p3 into limbs 0..3 (x p2 into 0..2 on a lean chain), scatter, NTT.
 //!
 //! Ring-2^16 NTTs run on the PCMM launcher's NTT op with pc-tfhe's tables (the keys live in that NTT domain).
 use std::collections::HashMap;
@@ -558,8 +558,9 @@ impl<'a> TfheSwitch<'a> {
         if b == 0 || kl == 0 || !outs_ok || (kl > 1 && b > self.max) || (2 * nb * self.p.nu) % kl != 0 {
             return Err(shape("tfhe switch", format!("{b} coefficients, {kl} LUTs ({} outputs; several LUTs: one pass of <= {})", extra.len() + 1, self.max)));
         }
-        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != 3 {
-            return Err(shape("tfhe switch", format!("ciphertext at level {} (the split holds limbs 0..3)", x.meta.level)));
+        let top = crate::bts::stc_first::split_top(&ctx.chain);
+        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != top {
+            return Err(shape("tfhe switch", format!("ciphertext at level {} (the split holds limbs 0..{top})", x.meta.level)));
         }
         let (p0, p1) = (self.p0, self.p1);
         let q = &ctx.chain.q;
@@ -572,7 +573,7 @@ impl<'a> TfheSwitch<'a> {
         for i in 0..2 {
             inv_c[3 + i] = invmod(q[2] % q[i], q[i]) as u32;
         }
-        let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, ..PcmmArgs::default() };
+        let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, i4: top as i32 + 1, ..PcmmArgs::default() };
         let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [self.ninv[0], self.ninv[1], self.ninv[0], 0, 0, 0, 0, 0], ..Default::default() };
         let mut tm = Timings::default();
         let lap = |s: &Stream<Compute>, t: &mut Instant, acc: &mut f64| -> Result<()> {
@@ -586,7 +587,7 @@ impl<'a> TfheSwitch<'a> {
         let mut t = Instant::now();
 
         // the split to LWEs: coefficient form, mod q0 (staging part 0 = c1, part 1 = c0)
-        ntt::inverse(ctx, s, &mut x.buf, Span::Q { top: 3 }, Parts::Both)?;
+        ntt::inverse(ctx, s, &mut x.buf, Span::Q { top }, Parts::Both)?;
         let stage = self.stage.vptr_mut();
         Self::gp(ctx, s, &PcmmArgs { ct: x.buf.r(), i0: 0, x: stage, ..chain(pcmm_op::GATHER) })?;
         Self::gp(ctx, s, &PcmmArgs { y: stage, x: self.low.vptr_mut(), c: inv_c, ..chain(pcmm_op::IN_RESCALE) })?;
@@ -867,15 +868,16 @@ impl<'a> TfheSwitch<'a> {
         Ok(())
     }
 
-    /// The repack's packed sum into [part][limb][n] mod p0 p1, lifted x p2 p3 into the staging, scattered into `x`
-    /// (limbs 0..3), NTT.
+    /// The repack's packed sum into [part][limb][n] mod p0 p1, lifted x p2 p3 (x p2 on a lean chain) into the staging,
+    /// scattered into `x` (the split's limbs), NTT.
     fn finish_into<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, pa: &PcmmArgs, x: &mut Ct<'_, W>) -> Result<()> {
         let n = self.n;
         let q = &ctx.chain.q;
         let c4 = [q[0] as u32, q[1] as u32, q[2] as u32, q[3] as u32];
         let cmu = [mu(q[0]), mu(q[1]), mu(q[2]), mu(q[3])];
-        let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, ..PcmmArgs::default() };
-        let q23 = q[2] as u128 * q[3] as u128;
+        let top = crate::bts::stc_first::split_top(&ctx.chain);
+        let chain = |opc: i32| PcmmArgs { op: opc, n: n as i32, p: c4, mu: cmu, i4: top as i32 + 1, ..PcmmArgs::default() };
+        let q23 = q[2..=top].iter().fold(1u128, |a, &x| a * x as u128);
         let lift = [(q23 % q[0] as u128) as u32, (q23 % q[1] as u128) as u32];
         self.repack.finish(ctx.table, s, pa, self.tw_f.vptr(), self.tw_i.vptr())?;
         for sp in 0..2 {
@@ -885,7 +887,7 @@ impl<'a> TfheSwitch<'a> {
             Self::gp(ctx, s, &PcmmArgs { y: f, x: dst, c: [lift[0], lift[1], 0, 0, 0, 0, 0, 0], ..chain(pcmm_op::LIFT) })?;
         }
         Self::gp(ctx, s, &PcmmArgs { ct: x.buf.r(), i0: 0, y: self.stage.vptr(), ..chain(pcmm_op::SCATTER) })?;
-        ntt::forward(ctx, s, &mut x.buf, Span::Q { top: 3 }, Parts::Both)?;
+        ntt::forward(ctx, s, &mut x.buf, Span::Q { top }, Parts::Both)?;
         Ok(())
     }
 }
