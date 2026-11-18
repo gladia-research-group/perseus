@@ -16,6 +16,8 @@ PLANS: dict[str, dict[int | None, str]] = {
     # StC-first dense refreshes, their inputs capped at its entry level (46)
     "vit": {None: "bootstrap_placements/vit_b16_224"},
     "llama_prefill": {128: "bootstrap_placements/llama31_8b_prefill128"},
+    # one stage (run.py --one-stage), the folded ReLU
+    "resnet": {None: "bootstrap_placements/resnet20_folded"},
 }
 
 # model -> [(bound, plan dir)]: up to a 512-token context, a plan per position window (`--plan-windows`: a window's plan

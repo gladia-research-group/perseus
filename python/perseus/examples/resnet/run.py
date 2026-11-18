@@ -202,11 +202,11 @@ def _planned(a, sd, act, x, y, ref):
 
 def main(argv=None, results=None):
     ap = argparse.ArgumentParser()
-    mode = ap.add_mutually_exclusive_group(required=True)
+    mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--mirror", action="store_true", help="plaintext mirror (NumpyOps)")
     mode.add_argument("--eager", action="store_true", help="GPU, eager (needs --debug-refresh)")
     mode.add_argument("--fake", action="store_true", help="the CPU twin (perseus.impl.fakecap)")
-    mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir")
+    mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir (default: the default plan)")
     ap.add_argument("--capture", default=None, help="--fake: write the stage graphs here")
     ap.add_argument("--one-stage", action="store_true", help="twin / plan: the network as one stage")
     ap.add_argument("--twin-limit", type=int, default=50, help="the twin's reactive refresh ceiling")
@@ -231,6 +231,9 @@ def main(argv=None, results=None):
     ap.add_argument("--pool", type=int, default=None, help="ciphertext slots on the device (default: 256 eager, 32 planned)")
     ap.add_argument("--pt-slots", type=int, default=8)
     a = ap.parse_args(argv)
+    if not (a.mirror or a.eager or a.fake or a.plan):
+        from perseus.examples.defaults import default_plan
+        a.plan, a.one_stage = default_plan("resnet"), True
     if a.pool is None:
         a.pool = 256 if a.eager else 32
     from perseus._paths import resolve
