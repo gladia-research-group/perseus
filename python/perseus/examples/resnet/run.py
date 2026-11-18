@@ -72,7 +72,7 @@ def _onehot_check(a, lg, oh):
 def _mirror(a, sd, act, x, y, ref):
     from perseus.impl.ops import NumpyOps
     from .model import ResNet20
-    m = ResNet20(sd, act, scales=a.scales, argmax=a.tfhe_argmax)
+    m = ResNet20(sd, act, scales=a.scales, argmax=a.tfhe_argmax, conv_m=a.conv_m)
     ops = NumpyOps()
     outs = [m.forward(ops, m.encode(xi)) for xi in x]
     lg = np.stack([m.logits(o) for o in outs])
@@ -85,7 +85,7 @@ def _eager(a, sd, act, x, y, ref):
     from perseus import _pc
     from perseus.impl.ops import FheOps
     from .model import ResNet20
-    m = ResNet20(sd, act, scales=a.scales)
+    m = ResNet20(sd, act, scales=a.scales, conv_m=a.conv_m)
     cfg = _pc.Config.preset(a.preset)
     t0 = time.time()
     keys = _pc.KeySource.generate(m.rotations(), layout=a.key_layout, seed=0)
@@ -138,7 +138,9 @@ def _twin(a, net):
 
 def _fake(a, sd, act, x, y, ref):
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
+    net = ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax,
+                   conv_m=a.conv_m)
+    model = _twin(a, net)
     lgs, ohs = [], []
     for i, xi in enumerate(x[:1] if a.capture else x):
         t0 = time.time()
@@ -160,7 +162,9 @@ def _planned(a, sd, act, x, y, ref):
     from perseus.examples.bert.planned import plan_config
     from .impl import ResnetPlanned
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
+    net = ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax,
+                   conv_m=a.conv_m)
+    model = _twin(a, net)
     cfg = plan_config(a.plan, graphs=a.graphs)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
@@ -234,7 +238,7 @@ def main(argv=None, results=None):
     from .model import relu_exact
     sd = R.state_dict()
     x, y = R.cifar10(a.n, a.start)
-    a.scales = None
+    a.scales, a.conv_m = None, None
     if a.exact_relu:
         act, ref_relu = relu_exact, None
     else:
@@ -243,7 +247,9 @@ def main(argv=None, results=None):
         if a.configs is None and a.plan:
             from perseus.config import plan_configs
             a.configs = plan_configs(a.plan)
-        section = json.load(open(resolve(a.configs or DEFAULT_CONFIGS)))["relu"]
+        doc = json.load(open(resolve(a.configs or DEFAULT_CONFIGS)))
+        section = doc["relu"]
+        a.conv_m = doc.get("conv", {}).get("baby_steps")
         act, stages, B = relu_act(section)
         a.scales = B
         ref_relu = lambda t, site: torch.from_numpy(relu_apply(t.numpy(), B[site], stages))

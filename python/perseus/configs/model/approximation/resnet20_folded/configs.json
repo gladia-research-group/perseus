@@ -117,6 +117,9 @@
     },
     "eval": "folded"
   },
+  "conv": {
+    "baby_steps": 1
+  },
   "meta": {
     "model": "chenyaofo/cifar10_resnet20",
     "dataset": "cifar10/train",
