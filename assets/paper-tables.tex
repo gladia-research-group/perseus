@@ -23,6 +23,10 @@
 % SANA-Sprint text to image (sana-t2i branch check, 2026-11-13, GPU 4 alone: forwards 2 and 3, 269.06 and 269.13 s, after
 % a 333 s first forward; lowest free 17.01 GiB)
 \newcommand{\sanaimg}{269}\newcommand{\sanamem}{78.0}
+% ResNet-20 on CIFAR-10, the one-stage StC-first plan resnet20_stcf2 (main 69d1262a, 2026-11-18, GPU 3 alone: 2 runs
+% of 64 test images, medians 0.887 and 0.887 s, 64/64 argmax agreement with the float64 model; peak used 70.7 GiB by
+% nvidia-smi, free 24.27 GiB after setup)
+\newcommand{\resnetimg}{0.887}\newcommand{\resnetmem}{70.7}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
 % optional position cache (PC_PT_CACHE=0), Llama's the GPU's peak used memory over the run (its runner reports no free
@@ -55,6 +59,7 @@ GPT-2 small & prefill, 128-token prompt & \gptpfmem\ GiB & \textbf{\gptpf\ s} \\
 GPT-2 small & decode, one token (512-token context) & \gptdecmem\ GiB\nt{\dagger} & \textbf{\gptdec\ s} \\
 ViT-B/16 & one $224\times224$ image & \vitmem\ GiB & \textbf{\vitimg\ s} \\
 BERT-base & 128-token input & \bertmem\ GiB & \textbf{\bertin\ s} \\
+ResNet-20 & one $32\times32$ CIFAR-10 image & \resnetmem\ GiB & \textbf{\resnetimg\ s} \\
 SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \sanamem\ GiB & \textbf{\sanaimg\ s} \\
 \bottomrule
 \end{tabularx}
