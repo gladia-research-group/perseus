@@ -23,13 +23,14 @@ TFHE_SCALE = 0.5        # --tfhe: the ReLU inputs read x / (B TFHE_SCALE) (the s
 
 def relu_act(section):
     """(act(ops, cts, site), stages, {site: B}) from the configs.json "relu" section; the act reads inputs already
-    divided by their B (model.ResNet20 with scales=B)."""
-    from perseus.impl.relu import relu_config, relu_unit, unit_stages
+    divided by their B (model.ResNet20 with scales=B). "eval": "folded" evaluates by impl/relu.relu_folded."""
+    from perseus.impl.relu import relu_config, relu_folded, relu_unit, unit_stages
     stages, B = relu_config(section)
     coefs = unit_stages(stages)
+    unit = relu_folded if section.get("eval") == "folded" else relu_unit
 
     def act(ops, xs, site, gain=1.0, geom=None):
-        return [relu_unit(ops, x, coefs, gain) for x in xs]
+        return [unit(ops, x, coefs, gain) for x in xs]
     return act, stages, B
 
 
@@ -116,6 +117,10 @@ def _twin(a, net):
     from perseus.impl.layout import Dims
     from .impl import ResnetImpl
     over = dict(kv.split("=", 1) for kv in a.set)
+    if a.plan:      # the record runs under the plan's runtime switches, as its capture did (--set wins)
+        from perseus.config import _plan_cmd, _runtime_line
+        line = _plan_cmd(a.plan).get("runtime")
+        over = {**(_runtime_line(line) if line else {}), **over}
     over.setdefault("AUTO_BTS_LEVEL", str(a.twin_limit))     # the twin's ceiling, stamped in the capture's Config too
     env.export_env(None, chain="n32", CKKS_COMPLEX="1", **over)
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
@@ -156,7 +161,7 @@ def _planned(a, sd, act, x, y, ref):
     from .impl import ResnetPlanned
     from .model import ResNet20
     model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
-    cfg = plan_config(a.plan)
+    cfg = plan_config(a.plan, graphs=a.graphs)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
     run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=a.pt_rows, pool=a.pool,
@@ -207,6 +212,7 @@ def main(argv=None, results=None):
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--pt-rows", type=int, default=28)
     ap.add_argument("--compile-only", action="store_true")
+    ap.add_argument("--graphs", action="store_true", help="--plan: replay as CUDA graphs (the first image captures)")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--configs", default=None)
@@ -234,6 +240,9 @@ def main(argv=None, results=None):
     else:
         from perseus.calibrate.approximations.relu import relu_apply
         import torch
+        if a.configs is None and a.plan:
+            from perseus.config import plan_configs
+            a.configs = plan_configs(a.plan)
         section = json.load(open(resolve(a.configs or DEFAULT_CONFIGS)))["relu"]
         act, stages, B = relu_act(section)
         a.scales = B

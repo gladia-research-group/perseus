@@ -10,6 +10,8 @@ producing ReLU's gain), so the shortcut needs no product. The ReLU then reads it
 map (impl/relu.relu_unit); ReLU being positively homogeneous, the exact max is unchanged."""
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 
 from perseus.impl.conv import Geom, ConvSpec, conv2d, channel_sum, head_geoms
@@ -136,7 +138,10 @@ class ResNet20:
         return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"], geom=s2.go)
 
     def head_stage(self, ops, xs):
-        return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
+        # its own step label on the twin: a plan can give the head (no refresh after it) its own envelope
+        inf = getattr(ops, "inf", None)
+        with inf.step("head") if hasattr(inf, "step") else contextlib.nullcontext():
+            return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
 
     def stages(self):
         """[(label, fn(ops, cts) -> cts)]; `one_stage`: the whole network as one (the planner places every refresh, no
