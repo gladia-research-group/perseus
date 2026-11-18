@@ -218,9 +218,11 @@ def main(argv=None, results=None):
     ap.add_argument("--debug-refresh", action="store_true",
                     help="eager: refresh by decrypt + re-encrypt (the eager session has no bootstrap; NOT encrypted end to end)")
     ap.add_argument("--key-layout", choices=("dense", "packed"), default="packed")
-    ap.add_argument("--pool", type=int, default=256)
+    ap.add_argument("--pool", type=int, default=None, help="ciphertext slots on the device (default: 256 eager, 32 planned)")
     ap.add_argument("--pt-slots", type=int, default=8)
     a = ap.parse_args(argv)
+    if a.pool is None:
+        a.pool = 256 if a.eager else 32
     from perseus._paths import resolve
     from . import weights as R
     from .model import relu_exact
