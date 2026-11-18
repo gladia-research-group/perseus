@@ -46,10 +46,11 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
 
 ## What's inside
 
-- **Python models, compiled.** GPT-2, Llama-3, BERT, ViT and SANA-Sprint (with its Gemma-2 text encoder)
-  are Python programs on `perseus.impl` (`python/perseus/examples/`), with readable packings, nonlinearities
-  and layers. Each block is recorded once on a CPU twin, compiled with its plan into a program, and replayed
-  by the runtime with no Python on the critical path, from one device arena sized at setup.
+- **Python models, compiled.** GPT-2, Llama-3, BERT, ViT, ResNet-20 on CIFAR-10 and SANA-Sprint (with its
+  Gemma-2 text encoder) are Python programs on `perseus.impl` (`python/perseus/examples/`), with readable
+  packings, nonlinearities and layers. Each block is recorded once on a CPU twin, compiled with its plan into
+  a program, and replayed by the runtime with no Python on the critical path, from one device arena sized at
+  setup.
 - **In-kernel key regeneration.** Half of every key-switching key is regenerated on the GPU from a
   ChaCha12 seed instead of being stored.
 - **Complex Cachemir packing.** Two real vectors per ciphertext, in the complex slots of CKKS.
@@ -134,7 +135,7 @@ GPU.
   - `plan/` the planner, which reads a recorded forward pass, simulates how levels are spent,
     places the bootstraps and picks each one's type. It also holds our ports of the DaCapo,
     Orion and Fhelipe planners.
-  - `examples/{gpt2,llama,bert,vit}/` the four models on `perseus.impl`, with their runners
+  - `examples/{gpt2,llama,bert,vit,resnet,sana}/` the models on `perseus.impl`, with their runners
     and planning scripts (`make_plan.sh`); `defaults.py` the plan each runs by default.
   - `calibrate/`, `export.py`, `hub.py` the fitting of the polynomial approximations, the export
     of HuggingFace weights, the model download.
