@@ -2,7 +2,7 @@
 CIFAR-10 training images, the ladder fitted once, written as the configs.json "relu" section.
 
     python -m perseus.examples.resnet.calibrate --degs 15,15,27 --eps 0.0078125 [--n 2000] [--margin 1.2]
-    python -m perseus.examples.resnet.calibrate --degs 7,7,15 --eps 0.0078125 --margin 1.5 --n 10000 \
+    python -m perseus.examples.resnet.calibrate --degs 15,7,7 --eps 0.0078125 --margin 1.5 --n 10000 \
         --name resnet20_folded --eval folded --conv-baby-steps 1
 """
 from __future__ import annotations
