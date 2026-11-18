@@ -696,6 +696,10 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             (setup.merge_s2d, setup.stc_ps) = (merge_s2d, stc_ps);
             let mut sfs = StcFirstSetup::n32_shipped();
+            // FIDESLIB_BTS_STC_FIRST_CF: the route's default CF (a site's own Route::cf wins); 13 shipped
+            if let Some(cf) = cfg.bts.stc_first_cf {
+                sfs.cf_default = Some(cf as u32);
+            }
             sfs.cache_slots = ps.stc_cache.max(1);
             if pcmm.is_some() {
                 // a lean chain's PCMM inputs take their own fixed StC stages (no-op on a composite chain)
@@ -803,7 +807,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
     steps.remove(&0);
     let rots: Vec<RotSpec> = steps.union(&full).map(|&step| RotSpec { step, q_top: if full.contains(&step) { None } else { ks.band } }).collect();
     let steps: BTreeSet<i64> = steps.union(&full).copied().collect();
-    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() };
+    // the StC-first route's raise needs the encapsulation keys too (a dense-only plan has no other route that does)
+    let spec = KeySetSpec { relin: true, conj: ks.conj || plan.is_some(), rots, encaps: !sb_cfgs.is_empty() || dplan.is_some() || !cplans.is_empty() || splan.is_some() };
     let mut shapes: Vec<_> = spec.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s).collect();
     shapes.extend(extra.keys(chain).map_err(e)?.into_iter().map(|(_, s)| s));
     if spru_cfg.is_some() {
