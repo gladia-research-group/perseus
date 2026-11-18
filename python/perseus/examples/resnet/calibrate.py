@@ -2,6 +2,8 @@
 CIFAR-10 training images, the ladder fitted once, written as the configs.json "relu" section.
 
     python -m perseus.examples.resnet.calibrate --degs 15,15,27 --eps 0.0078125 [--n 2000] [--margin 1.2]
+    python -m perseus.examples.resnet.calibrate --degs 15,7,7 --eps 0.0078125 --margin 1.5 --n 10000 \
+        --name resnet20_folded --eval folded --conv-baby-steps 1
 """
 from __future__ import annotations
 
@@ -36,15 +38,25 @@ def main(argv=None):
     ap.add_argument("--margin", type=float, default=1.2)
     ap.add_argument("--n", type=int, default=2000, help="training images")
     ap.add_argument("--name", default="resnet20_cifar10")
+    ap.add_argument("--conv-baby-steps", type=int, default=None,
+                    help="the convs' baby steps over the channel offsets (the configs.json \"conv\" section)")
+    ap.add_argument("--eval", default=None, choices=("folded",),
+                    help="folded: every series by impl/relu.odd_series, the product by x in the last one")
     a = ap.parse_args(argv)
     sd = R.state_dict()
     x, _ = R.cifar10(a.n, split="train")
     cfg = OmegaConf.create({"degs": [int(d) for d in a.degs.split(",")], "eps": a.eps, "margin": a.margin})
     section = fit_relu_section(site_max(sd, x), cfg)
+    if a.eval:      # the product by x rides the last series: no level of its own
+        section["eval"] = a.eval
+        section["depth"] -= 1
     out = os.path.join(CONFIGS, a.name, "configs.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    json.dump({"relu": section, "meta": {"model": "chenyaofo/cifar10_resnet20", "dataset": "cifar10/train",
-                                         "n_images": a.n}}, open(out, "w"), indent=2)
+    doc = {"relu": section}
+    if a.conv_baby_steps:
+        doc["conv"] = {"baby_steps": a.conv_baby_steps}
+    doc["meta"] = {"model": "chenyaofo/cifar10_resnet20", "dataset": "cifar10/train", "n_images": a.n}
+    json.dump(doc, open(out, "w"), indent=2)
     print(f"[calibrate] {len(section['sites'])} sites, depth {section['depth']} -> {out}")
     return 0
 

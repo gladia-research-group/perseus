@@ -10,11 +10,20 @@ producing ReLU's gain), so the shortcut needs no product. The ReLU then reads it
 map (impl/relu.relu_unit); ReLU being positively homogeneous, the exact max is unchanged."""
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 
 from perseus.impl.conv import Geom, ConvSpec, conv2d, channel_sum, head_geoms
 
 from . import weights as R
+
+
+def _step(ops, label):
+    """A step label on the CPU twin (the planner's FORBID_STEPS / PLAN_REFRESH_ENV_CAP_STEPS read it); a no-op on the
+    other sessions."""
+    inf = getattr(ops, "inf", None)
+    return inf.step(label) if hasattr(inf, "step") else contextlib.nullcontext()
 
 
 def relu_exact(ops, xs, site, gain=1.0, geom=None):
@@ -23,10 +32,11 @@ def relu_exact(ops, xs, site, gain=1.0, geom=None):
 
 class ResNet20:
     def __init__(self, sd, act=relu_exact, slots=1 << 15, scales=None, refresh=False, one_stage=False, argmax=False,
-                 argmax_scale=1 / 16):
+                 argmax_scale=1 / 16, conv_m=None):
         """`refresh`: a deliberate bootstrap of every block / head stage's inputs on entry (the planner reads a stage's
         exit before a trailing refresh, so the refresh opens the next stage instead). `argmax`: a last stage that adds
-        the encrypted one-hot of the logits' argmax (`argmax_stage`; the differences read at `argmax_scale`)."""
+        the encrypted one-hot of the logits' argmax (`argmax_stage`; the differences read at `argmax_scale`). `conv_m`:
+        every conv's baby steps over the channel offsets (impl/conv.ConvSpec.m; None: ~sqrt of the offsets)."""
         self.argmax, self.argmax_scale = argmax, float(argmax_scale)
         stem, blks, (fw, fb) = R.blocks(sd)
         self.act, self.refresh, self.one_stage = act, refresh, one_stage
@@ -34,6 +44,9 @@ class ResNet20:
 
         def sc(Wb, s_in, s_out):
             return Wb[0] * (s_in / s_out), Wb[1] / s_out
+
+        def enc(W, b, gi, stride=1, name=None):
+            return ConvSpec.encode(W, b, gi, stride, m=None if conv_m is None else min(conv_m, gi.cpc), name=name)
         # the scale each producer's activation is carried at: the next block's a2 B when that block adds it unchanged
         prod = ["stem"] + [name + ".a2" for name, *_r in blks]
         carried = {p: B(p) for p in prod}
@@ -42,20 +55,20 @@ class ResNet20:
                 carried[p] = B(name + ".a2")
         self.gain = {p: B(p) / carried[p] for p in prod}
         self.g_in = Geom(3, 32, 1, slots)
-        self.stem = ConvSpec.encode(*sc(stem, 1.0, B("stem")), self.g_in, name="stem")
+        self.stem = enc(*sc(stem, 1.0, B("stem")), self.g_in, name="stem")
         s, g = carried["stem"], self.stem.go
         self.blocks = []
         for name, stride, c1, c2, short in blks:
             b1, b2 = B(name + ".a1"), B(name + ".a2")
-            s1 = ConvSpec.encode(*sc(c1, s, b1), g, stride, name=name + ".c1")
-            s2 = ConvSpec.encode(*sc(c2, b1, b2), s1.go, 1, name=name + ".c2")
-            sh = None if short is None else ConvSpec.encode(*sc(short, s, b2), g, stride, name=name + ".sc")
+            s1 = enc(*sc(c1, s, b1), g, stride, name=name + ".c1")
+            s2 = enc(*sc(c2, b1, b2), s1.go, 1, name=name + ".c2")
+            sh = None if short is None else enc(*sc(short, s, b2), g, stride, name=name + ".sc")
             assert sh is not None or s == b2, (name, s, b2)
             self.blocks.append((name, s1, s2, sh))
             s, g = carried[name + ".a2"], s2.go
         pooled, _ = head_geoms(g.C, len(fb), slots)
         # the pool sums g.H^2 pixels: its mean and the last activation's scale are folded into the head
-        self.head = ConvSpec.encode(fw[:, :, None, None] * (s / g.H ** 2), fb, pooled, name="fc")
+        self.head = enc(fw[:, :, None, None] * (s / g.H ** 2), fb, pooled, name="fc")
 
     def encode(self, img):
         """A normalized (3, 32, 32) image as the input slot vectors."""
@@ -125,18 +138,26 @@ class ResNet20:
 
     # ── stages ──
     def stem_stage(self, ops, xs):
-        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"], geom=self.stem.go)
+        y = conv2d(ops, xs, self.stem)
+        with _step(ops, "relu"):
+            return self.act(ops, y, "stem", self.gain["stem"], geom=self.stem.go)
 
     def block_stage(self, ops, xs, b):
         name, s1, s2, sh = self.blocks[b]
         xs = self._in(ops, xs)
-        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1", geom=s1.go)
+        y = conv2d(ops, xs, s1)
+        with _step(ops, "relu"):
+            h = self.act(ops, y, name + ".a1", geom=s1.go)
         y = conv2d(ops, h, s2)
         r = conv2d(ops, xs, sh) if sh is not None else xs
-        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"], geom=s2.go)
+        y = [ops.add(a, c) for a, c in zip(y, r)]
+        with _step(ops, "relu"):
+            return self.act(ops, y, name + ".a2", self.gain[name + ".a2"], geom=s2.go)
 
     def head_stage(self, ops, xs):
-        return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
+        # its own step: a plan can give the head (no refresh after it) its own envelope
+        with _step(ops, "head"):
+            return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
 
     def stages(self):
         """[(label, fn(ops, cts) -> cts)]; `one_stage`: the whole network as one (the planner places every refresh, no

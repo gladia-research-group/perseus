@@ -23,13 +23,14 @@ TFHE_SCALE = 0.5        # --tfhe: the ReLU inputs read x / (B TFHE_SCALE) (the s
 
 def relu_act(section):
     """(act(ops, cts, site), stages, {site: B}) from the configs.json "relu" section; the act reads inputs already
-    divided by their B (model.ResNet20 with scales=B)."""
-    from perseus.impl.relu import relu_config, relu_unit, unit_stages
+    divided by their B (model.ResNet20 with scales=B). "eval": "folded" evaluates by impl/relu.relu_folded."""
+    from perseus.impl.relu import relu_config, relu_folded, relu_unit, unit_stages
     stages, B = relu_config(section)
     coefs = unit_stages(stages)
+    unit = relu_folded if section.get("eval") == "folded" else relu_unit
 
     def act(ops, xs, site, gain=1.0, geom=None):
-        return [relu_unit(ops, x, coefs, gain) for x in xs]
+        return [unit(ops, x, coefs, gain) for x in xs]
     return act, stages, B
 
 
@@ -71,7 +72,7 @@ def _onehot_check(a, lg, oh):
 def _mirror(a, sd, act, x, y, ref):
     from perseus.impl.ops import NumpyOps
     from .model import ResNet20
-    m = ResNet20(sd, act, scales=a.scales, argmax=a.tfhe_argmax)
+    m = ResNet20(sd, act, scales=a.scales, argmax=a.tfhe_argmax, conv_m=a.conv_m)
     ops = NumpyOps()
     outs = [m.forward(ops, m.encode(xi)) for xi in x]
     lg = np.stack([m.logits(o) for o in outs])
@@ -84,7 +85,7 @@ def _eager(a, sd, act, x, y, ref):
     from perseus import _pc
     from perseus.impl.ops import FheOps
     from .model import ResNet20
-    m = ResNet20(sd, act, scales=a.scales)
+    m = ResNet20(sd, act, scales=a.scales, conv_m=a.conv_m)
     cfg = _pc.Config.preset(a.preset)
     t0 = time.time()
     keys = _pc.KeySource.generate(m.rotations(), layout=a.key_layout, seed=0)
@@ -116,6 +117,10 @@ def _twin(a, net):
     from perseus.impl.layout import Dims
     from .impl import ResnetImpl
     over = dict(kv.split("=", 1) for kv in a.set)
+    if a.plan:      # the record runs under the plan's runtime switches, as its capture did (--set wins)
+        from perseus.config import _plan_cmd, _runtime_line
+        line = _plan_cmd(a.plan).get("runtime")
+        over = {**(_runtime_line(line) if line else {}), **over}
     over.setdefault("AUTO_BTS_LEVEL", str(a.twin_limit))     # the twin's ceiling, stamped in the capture's Config too
     env.export_env(None, chain="n32", CKKS_COMPLEX="1", **over)
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
@@ -133,7 +138,9 @@ def _twin(a, net):
 
 def _fake(a, sd, act, x, y, ref):
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
+    net = ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax,
+                   conv_m=a.conv_m)
+    model = _twin(a, net)
     lgs, ohs = [], []
     for i, xi in enumerate(x[:1] if a.capture else x):
         t0 = time.time()
@@ -155,8 +162,10 @@ def _planned(a, sd, act, x, y, ref):
     from perseus.examples.bert.planned import plan_config
     from .impl import ResnetPlanned
     from .model import ResNet20
-    model = _twin(a, ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax))
-    cfg = plan_config(a.plan)
+    net = ResNet20(sd, act, scales=a.scales, refresh=not a.one_stage, one_stage=a.one_stage, argmax=a.tfhe_argmax,
+                   conv_m=a.conv_m)
+    model = _twin(a, net)
+    cfg = plan_config(a.plan, graphs=a.graphs)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"resnet_{os.getpid()}")
     run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=a.pt_rows, pool=a.pool,
@@ -193,11 +202,11 @@ def _planned(a, sd, act, x, y, ref):
 
 def main(argv=None, results=None):
     ap = argparse.ArgumentParser()
-    mode = ap.add_mutually_exclusive_group(required=True)
+    mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--mirror", action="store_true", help="plaintext mirror (NumpyOps)")
     mode.add_argument("--eager", action="store_true", help="GPU, eager (needs --debug-refresh)")
     mode.add_argument("--fake", action="store_true", help="the CPU twin (perseus.impl.fakecap)")
-    mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir")
+    mode.add_argument("--plan", default=None, help="GPU, planned: the bootstrap_placements dir (default: the default plan)")
     ap.add_argument("--capture", default=None, help="--fake: write the stage graphs here")
     ap.add_argument("--one-stage", action="store_true", help="twin / plan: the network as one stage")
     ap.add_argument("--twin-limit", type=int, default=50, help="the twin's reactive refresh ceiling")
@@ -207,6 +216,7 @@ def main(argv=None, results=None):
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--pt-rows", type=int, default=28)
     ap.add_argument("--compile-only", action="store_true")
+    ap.add_argument("--graphs", action="store_true", help="--plan: replay as CUDA graphs (the first image captures)")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--configs", default=None)
@@ -218,21 +228,31 @@ def main(argv=None, results=None):
     ap.add_argument("--debug-refresh", action="store_true",
                     help="eager: refresh by decrypt + re-encrypt (the eager session has no bootstrap; NOT encrypted end to end)")
     ap.add_argument("--key-layout", choices=("dense", "packed"), default="packed")
-    ap.add_argument("--pool", type=int, default=256)
+    ap.add_argument("--pool", type=int, default=None, help="ciphertext slots on the device (default: 256 eager, 32 planned)")
     ap.add_argument("--pt-slots", type=int, default=8)
     a = ap.parse_args(argv)
+    if not (a.mirror or a.eager or a.fake or a.plan):
+        from perseus.examples.defaults import default_plan
+        a.plan, a.one_stage = default_plan("resnet"), True
+    if a.pool is None:
+        a.pool = 256 if a.eager else 32
     from perseus._paths import resolve
     from . import weights as R
     from .model import relu_exact
     sd = R.state_dict()
     x, y = R.cifar10(a.n, a.start)
-    a.scales = None
+    a.scales, a.conv_m = None, None
     if a.exact_relu:
         act, ref_relu = relu_exact, None
     else:
         from perseus.calibrate.approximations.relu import relu_apply
         import torch
-        section = json.load(open(resolve(a.configs or DEFAULT_CONFIGS)))["relu"]
+        if a.configs is None and a.plan:
+            from perseus.config import plan_configs
+            a.configs = plan_configs(a.plan)
+        doc = json.load(open(resolve(a.configs or DEFAULT_CONFIGS)))
+        section = doc["relu"]
+        a.conv_m = doc.get("conv", {}).get("baby_steps")
         act, stages, B = relu_act(section)
         a.scales = B
         ref_relu = lambda t, site: torch.from_numpy(relu_apply(t.numpy(), B[site], stages))
