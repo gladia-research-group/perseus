@@ -83,12 +83,11 @@ const MAX_COEFF_BITS: i32 = 126;
 
 pub struct Encoder {
     n: usize,
-    /// cyclotomic order M = 2N
-    m: usize,
-    /// 5^i mod M, i < N/2 (PrecomputedValues::m_rotGroup)
-    rot_group: Vec<usize>,
-    /// exp(2 pi i j / M), j <= M (PrecomputedValues::m_ksiPows)
-    ksi: Vec<Complex>,
+    /// `FFTSpecial`'s twiddles by stage: the stage of half-length h at [h - 1, 2h - 1), entry j the power
+    /// (5^j mod 8h) M / 8h of exp(2 pi i / M) (PrecomputedValues' m_ksiPows at m_rotGroup; M = 2N)
+    tw: Vec<Complex>,
+    /// `FFTSpecialInv`'s: the powers (8h - 5^j mod 8h) M / 8h
+    tw_inv: Vec<Complex>,
     q: Vec<u64>,
     /// primes in the bottom composite level (decode basis)
     d: usize,
@@ -112,7 +111,16 @@ impl Encoder {
             })
             .collect();
         ksi.push(ksi[0]);
-        Encoder { n, m, rot_group, ksi, q: chain.q.clone(), d: chain.level_unit }
+        let (mut tw, mut tw_inv) = (Vec::with_capacity(nh), Vec::with_capacity(nh));
+        let mut lenh = 1;
+        while lenh < nh {
+            let lenq = 8 * lenh;
+            let gap = m / lenq;
+            tw.extend(rot_group[..lenh].iter().map(|&r| ksi[(r % lenq) * gap]));
+            tw_inv.extend(rot_group[..lenh].iter().map(|&r| ksi[(lenq - r % lenq) * gap]));
+            lenh *= 2;
+        }
+        Encoder { n, tw, tw_inv, q: chain.q.clone(), d: chain.level_unit }
     }
 
     pub fn ring_dim(&self) -> usize {
@@ -130,18 +138,17 @@ impl Encoder {
     pub fn fft_special_inv(&self, vals: &mut [Complex]) {
         let size = vals.len();
         let mut len = size;
-        while len >= 1 {
+        while len >= 2 {
             let lenh = len >> 1;
-            let lenq = len << 2;
-            let gap = self.m / lenq;
-            for i in (0..size).step_by(len) {
-                for j in 0..lenh {
-                    let idx = (lenq - (self.rot_group[j] % lenq)) * gap;
-                    let u = vals[i + j] + vals[i + j + lenh];
-                    let mut v = vals[i + j] - vals[i + j + lenh];
-                    v *= self.ksi[idx];
-                    vals[i + j] = u;
-                    vals[i + j + lenh] = v;
+            let tw = &self.tw_inv[lenh - 1..2 * lenh - 1];
+            for block in vals.chunks_exact_mut(len) {
+                let (lo, hi) = block.split_at_mut(lenh);
+                for ((a, b), &w) in lo.iter_mut().zip(hi).zip(tw) {
+                    let u = *a + *b;
+                    let mut v = *a - *b;
+                    v *= w;
+                    *a = u;
+                    *b = v;
                 }
             }
             len >>= 1;
@@ -159,15 +166,14 @@ impl Encoder {
         let mut len = 2;
         while len <= size {
             let lenh = len >> 1;
-            let lenq = len << 2;
-            let gap = self.m / lenq;
-            for i in (0..size).step_by(len) {
-                for j in 0..lenh {
-                    let idx = (self.rot_group[j] % lenq) * gap;
-                    let u = vals[i + j];
-                    let v = vals[i + j + lenh] * self.ksi[idx];
-                    vals[i + j] = u + v;
-                    vals[i + j + lenh] = u - v;
+            let tw = &self.tw[lenh - 1..2 * lenh - 1];
+            for block in vals.chunks_exact_mut(len) {
+                let (lo, hi) = block.split_at_mut(lenh);
+                for ((a, b), &w) in lo.iter_mut().zip(hi).zip(tw) {
+                    let u = *a;
+                    let v = *b * w;
+                    *a = u + v;
+                    *b = u - v;
                 }
             }
             len <<= 1;
@@ -279,9 +285,9 @@ impl Encoder {
             return Err(Error::Encode(format!("rows have {} coefficients, ring dimension is {}", c.len(), self.n)));
         }
         let gap = self.n / (2 * slots);
-        let mut v: Vec<Complex> = (0..slots)
-            .map(|i| Complex::new(c[gap * i] as f64 / scale, c[gap * i + self.n / 2] as f64 / scale))
-            .collect();
+        // through i64 where the coefficient fits (the same double, without the 128-bit conversion)
+        let f = |x: i128| i64::try_from(x).map_or(x as f64, |v| v as f64) / scale;
+        let mut v: Vec<Complex> = (0..slots).map(|i| Complex::new(f(c[gap * i]), f(c[gap * i + self.n / 2]))).collect();
         self.fft_special(&mut v);
         if payload == Payload::Real {
             v.iter_mut().for_each(|x| x.im = 0.0);
