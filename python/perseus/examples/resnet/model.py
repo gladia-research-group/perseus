@@ -1,6 +1,7 @@
 """ResNet-20 from the conv primitive (impl/conv.py): stem, 9 residual blocks, pooled 1x1 head, one stage each. The
-activation is a hook `act(ops, cts, site, gain) -> gain * ReLU(cts)` (the exact max on the mirror, the composite-sign
-ReLU encrypted, the gain folded into its last series).
+activation is a hook `act(ops, cts, site, gain, geom=) -> gain * ReLU(cts)` (the exact max on the mirror, the
+composite-sign ReLU or the TFHE sign encrypted, the gain folded into its last series / its LUT; `geom` the activation's
+layout).
 
 With `scales` ({site: B}) every ReLU input arrives divided by its own B (the producing conv carries the 1 / B) and
 every activation is carried divided by a known scale (the consuming conv carries it back, the head the last one). An
@@ -16,14 +17,17 @@ from perseus.impl.conv import Geom, ConvSpec, conv2d, channel_sum, head_geoms
 from . import weights as R
 
 
-def relu_exact(ops, xs, site, gain=1.0):
+def relu_exact(ops, xs, site, gain=1.0, geom=None):
     return [gain * np.maximum(x.real, 0.0) for x in xs]
 
 
 class ResNet20:
-    def __init__(self, sd, act=relu_exact, slots=1 << 15, scales=None, refresh=False, one_stage=False):
+    def __init__(self, sd, act=relu_exact, slots=1 << 15, scales=None, refresh=False, one_stage=False, argmax=False,
+                 argmax_scale=1 / 16):
         """`refresh`: a deliberate bootstrap of every block / head stage's inputs on entry (the planner reads a stage's
-        exit before a trailing refresh, so the refresh opens the next stage instead)."""
+        exit before a trailing refresh, so the refresh opens the next stage instead). `argmax`: a last stage that adds
+        the encrypted one-hot of the logits' argmax (`argmax_stage`; the differences read at `argmax_scale`)."""
+        self.argmax, self.argmax_scale = argmax, float(argmax_scale)
         stem, blks, (fw, fb) = R.blocks(sd)
         self.act, self.refresh, self.one_stage = act, refresh, one_stage
         B = (lambda site: 1.0) if scales is None else (lambda site: float(scales[site]))
@@ -58,7 +62,50 @@ class ResNet20:
         return self.g_in.pack(img)
 
     def logits(self, cts):
-        return self.head.go.unpack(cts)[:, 0, 0]
+        return self.head.go.unpack(cts[:self.head.go.n_ct])[:, 0, 0]
+
+    def onehot(self, cts):
+        """The argmax stage's one-hot (its last ciphertext; class c at block slot 0 of block c)."""
+        from perseus.impl.conv import S
+        v = np.real(np.asarray(cts[-1]))
+        return np.array([v[c * S] for c in range(self.head.go.C)])
+
+    def argmax_stage(self, ops, xs):
+        """The logits and the one-hot of their argmax, by two TFHE LUTs (impl/tfhe.py): a sampling-style decision
+        inside the model. Logit c sits at slot c S (impl/conv.py head geometry: cpc channel blocks, one pixel each).
+        D[c S + k] = (l_c - l_{(c + k) mod cpc}) argmax_scale for the k with (c + k) mod cpc a class (hoisted rotations
+        of the logits, each times a mask carrying the scale); s = step(D) (one switch on those 90 slots); the wins of c
+        = sum_k s[c S + k] (hoisted rotations, masked to the class slots, / cpc); one-hot = [wins = C - 1] (a second
+        switch on the C class slots). The step is a sign LUT (inputs on (-2, 2): |l_c - l_d| < 2 / argmax_scale).
+        Ties are undefined; differences within the switch's noise band (~1 % of 1 / argmax_scale) may flip."""
+        from perseus.impl import tfhe
+        from perseus.impl.conv import S
+        g = self.head.go
+        C, cpc, n = g.C, g.cpc, g.slots
+        L = xs[0]
+        pairs = [(c, k) for c in range(C) for k in range(1, cpc) if (c + k) % cpc < C]
+        ks = sorted({k for _c, k in pairs})
+        mask = {k: np.zeros(n) for k in ks}
+        for c, k in pairs:
+            mask[k][c * S + k] = self.argmax_scale
+        # slot c S + k: rot(L, -k) holds l_c, rot(L, k S - k) holds l_{c + k}
+        rots = ops.rotate_many(L, [-k for k in ks] + [k * S - k for k in ks])
+        terms = [ops.mult_pt(rots[i], mask[k], kind="mask") for i, k in enumerate(ks)]
+        terms += [ops.mult_pt(rots[len(ks) + i], -mask[k], kind="mask") for i, k in enumerate(ks)]
+        D = terms[0]
+        for t in terms[1:]:
+            D = ops.add(D, t)
+        win = tfhe.register_slots("argmax.pairs", [c * S + k for c, k in pairs])
+        st = tfhe.tfhe_lut(ops, D, tfhe.register_sign("sign01", 0.0, 1.0), win)
+        cls = np.zeros(n)
+        cls[[c * S for c in range(C)]] = 1.0 / cpc
+        rs = ops.rotate_many(st, ks)
+        wins = ops.mult_pt(rs[0], cls, kind="mask")
+        for r in rs[1:]:
+            wins = ops.add(wins, ops.mult_pt(r, cls, kind="mask"))
+        top = tfhe.register_lut("argmax.top", lambda m, t=(C - 1.5) / cpc: (np.asarray(m) >= t).astype(np.float64))
+        oh = tfhe.tfhe_lut(ops, wins, top, tfhe.register_slots("argmax.classes", [c * S for c in range(C)]))
+        return [L, oh]
 
     def specs(self):
         out = [self.stem]
@@ -78,15 +125,15 @@ class ResNet20:
 
     # ── stages ──
     def stem_stage(self, ops, xs):
-        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"])
+        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"], geom=self.stem.go)
 
     def block_stage(self, ops, xs, b):
         name, s1, s2, sh = self.blocks[b]
         xs = self._in(ops, xs)
-        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1")
+        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1", geom=s1.go)
         y = conv2d(ops, h, s2)
         r = conv2d(ops, xs, sh) if sh is not None else xs
-        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"])
+        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"], geom=s2.go)
 
     def head_stage(self, ops, xs):
         return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
@@ -97,6 +144,8 @@ class ResNet20:
         out = [("stem", self.stem_stage)]
         out += [(name, lambda ops, xs, b=b: self.block_stage(ops, xs, b)) for b, (name, *_r) in enumerate(self.blocks)]
         out += [("head", self.head_stage)]
+        if self.argmax:
+            out += [("argmax", self.argmax_stage)]
         if not self.one_stage:
             return out
 

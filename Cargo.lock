@@ -160,6 +160,7 @@ dependencies = [
  "pc-cuda",
  "pc-kernels",
  "pc-shadow",
+ "pc-tfhe",
  "rayon",
  "thiserror",
 ]
@@ -201,6 +202,7 @@ dependencies = [
  "pc-kernels",
  "pc-program",
  "pc-shadow",
+ "pc-tfhe",
  "pyo3",
  "serde_json",
 ]
@@ -216,6 +218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pc-tfhe"
+version = "0.1.0"
+dependencies = [
+ "pc-core",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
 name = "pc-tools"
 version = "0.1.0"
 dependencies = [
@@ -226,6 +237,7 @@ dependencies = [
  "pc-kernels",
  "pc-program",
  "pc-shadow",
+ "pc-tfhe",
  "rayon",
  "serde_json",
 ]

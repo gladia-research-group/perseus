@@ -239,6 +239,8 @@ class CapFhe(FakeFhe):
             return
         n = {"op_type": op, "inputs": list(ins), "input_levels": [int(x) for x in in_levels], "output": out,
              "step": self.path(), "output_level": int(out_ct.level if out_ct is not None else out_level)}
+        if args:
+            n["args"] = args
         if out_ct is not None:
             n["output_noise_level"] = int(out_ct.noise_deg)
             tg = out_ct.tag
@@ -259,8 +261,6 @@ class CapFhe(FakeFhe):
             n["tag"] = tag_json(tg)
             m = out_ct.meta
             n["shadow"] = {"level": int(m.level), "deg": int(m.deg), "nf": float(m.nf)}
-        if args:
-            n["args"] = args
         self.nodes.append(n)
         ps = getattr(self, "_plan_sites", None)
         if ps is not None and out_ct is not None and (out in ps[0] or out in ps[1]) and op not in (
@@ -274,6 +274,9 @@ class CapFhe(FakeFhe):
             from .magtape import node_stats_batch
             for (n, _), st in zip(self._pend, node_stats_batch(np.stack([v for _, v in self._pend]))):
                 n.update(st)
+                ext = n.get("args", {}).get("external")
+                if isinstance(ext, dict) and "range" in ext:     # a TFHE finish: its table's range (impl/tfhe.py)
+                    n["output_max_abs"] = max(float(n.get("output_max_abs", 0.0)), float(ext["range"]))
             self._pend = []
 
     @staticmethod

@@ -2,6 +2,7 @@
 // instantiation after defining PC_W (word type), PC_MM (strategy template) and PC_TABLE (exported function name).
 // The kernels live in an anonymous namespace so the TUs' identical W-only templates never collide at link time.
 #include <cmath>
+#include <cooperative_groups.h>
 #include "../args.cuh"
 
 namespace {
@@ -20,6 +21,7 @@ namespace {
 #include "../bts.cuh"
 #include "../spru.cuh"
 #include "../pcmm.cuh"
+#include "../tfhe.cuh"
 #include "../ccmm.cuh"
 #include "../coeffrows.cuh"
 
@@ -77,6 +79,7 @@ extern "C" const KernelTable* PC_TABLE() {
         &pc::em::tensor_y_l<W, MM>,
         &pc::em::wsum_multi_l<W>,
         &pc::bconv::launch_wide<W, MM>,
+        &pc::tfhe::launch,
     };
     return &T;
 }

@@ -1,0 +1,7 @@
+graph=graphs/gpt2_tfhe_argmax_ship_hyb512
+tool=python -m perseus.examples.gpt2.tfhe_head --fake --mode argmax --logits <logits.npy> --n 1 --capture graphs/gpt2_tfhe_argmax_ship_hyb512 --twin-limit 44 (--set the runtime line); make_plan.sh
+recipe=the gpt2_decode recipe (bootstrap_placements/gpt2_decode/PLAN_CMD.txt) on the head stage
+runtime=FIDESLIB_BTS_SHIFT=1 FIDESLIB_BTS_RAISE_DROP=512:1 FIDESLIB_SPRU=64 FIDESLIB_BTS_RAISE_DROPS=1,3,5 FIDESLIB_BTS_REAL=1 FIDESLIB_BTS_SPARSE_B=1 FIDESLIB_ROT_KEY_BAND=32 CUTMAX_PAIR=1 IMPL_DEAD_OPS=1 FIDESLIB_BTS_STC_FIRST=2 FIDESLIB_BTS_STC_FIRST_ROUTES=dense FIDESLIB_BTS_STC_FIRST_CF=13 AUTO_BTS_LEVEL=44 BTS_MAX_INPUT_LEVEL=48
+twin=--twin-limit 44
+sign=hybrid:6000:0.5
+fine=512
