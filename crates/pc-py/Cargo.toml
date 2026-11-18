@@ -21,3 +21,4 @@ pc-kernels = { path = "../pc-kernels" }
 pc-client = { path = "../pc-client" }
 pc-tfhe = { path = "../pc-tfhe" }
 serde_json = { workspace = true }
+rayon = { workspace = true }

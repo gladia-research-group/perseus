@@ -146,6 +146,46 @@ def test_fused_sums(fhe, rng):
     assert rel(dec(fhe, acc), xs[0] + xs[1] * xs[3] + xs[2] * xs[4]) < 1e-5   # acc at degree 2 after the adds
 
 
+@pytest.mark.parametrize("level", [10, 40])
+def test_mult_sum(fhe, rng, level):
+    """sum_j a_j * b_j relinearized once: 1, 2 (one launch), 3 (odd tail) and 40 pairs (d2 accumulated across launches)."""
+    for n in (1, 2, 3, 40):
+        xs, ys = [cvec(rng) for _ in range(n)], [cvec(rng) for _ in range(n)]
+        a, b = [enc(fhe, x, level) for x in xs], [enc(fhe, y, level) for y in ys]
+        want = sum(x * y for x, y in zip(xs, ys))
+        p = fhe.mult_sum(a, b)
+        assert p.deg == 2
+        assert rel(dec(fhe, p), want) < TOL, n
+        del a, b, p
+    with pytest.raises(Exception):
+        fhe.mult_sum([enc(fhe, xs[0], level)], [enc(fhe, ys[0], level + 2)])
+
+
+@pytest.mark.parametrize("level", [0, 50, 52])
+def test_mult_monomial(fhe, rng, level):
+    """a X^k: slot j times exp(i pi 5^j k / n) (n the ring degree), level and degree kept, exact up to the noise."""
+    n = 2 * N
+    roots = np.array([pow(5, j, 2 * n) for j in range(N)])
+    x = cvec(rng)
+    a = enc(fhe, x, level)
+    for k in (0, 1, 7, n - 1, n, n + 3, 2 * n - 1):
+        p = fhe.mult_monomial(a, k)
+        assert (p.level, p.deg) == (a.level, 1)
+        assert rel(dec(fhe, p), x * np.exp(1j * np.pi * (roots * k % (2 * n)) / n)) < TOL, k
+
+
+def test_settle(fhe, rng):
+    """A product at the bottom level read unrescaled: the operands at 2^-28 each keep it below q0 / 2."""
+    x, y = cvec(rng, 0.25), cvec(rng, 0.25)
+    a, b = enc(fhe, x * 2.0**-28, 52), enc(fhe, y * 2.0**-28, 52)
+    with fhe.suppress_auto_bts():
+        p = fhe.settle(fhe.mult_sum([a], [b]))
+    assert (p.level, p.deg) == (52, 1)
+    assert rel(np.asarray(dec(fhe, p)) * 2.0**56, x * y) < 1e-2
+    with pytest.raises(ValueError):
+        fhe.settle(a)
+
+
 def test_plaintext_caches(fhe, rng):
     x, w = cvec(rng), rng.standard_normal(N)
     a, b = enc(fhe, x, 8), enc(fhe, x, 20)

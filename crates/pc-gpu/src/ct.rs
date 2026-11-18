@@ -37,9 +37,9 @@ pub unsafe fn run_view<'a, W: pc_cuda::Pod>(lay: crate::Layout, cs: &[&Ct<'a, W>
     let words = lay.ct_words();
     let base = first.buf.buf.dptr() as *mut W;
     let at = |c: usize| base.wrapping_add(c * words) as *const W;
-    if cs.len() < 2 || cs.iter().enumerate().any(|(c, x)| x.k() != 1 || x.buf.lay != lay || x.buf.buf.len() < words || x.buf.buf.dptr() != at(c)) {
+    if cs.len() < 2 || cs.iter().enumerate().any(|(c, x)| x.k() != 1 || x.buf.seeds || x.buf.packed || x.buf.lay != lay || x.buf.buf.len() < words || x.buf.buf.dptr() != at(c)) {
         return None;
     }
     let buf = pc_cuda::DBuf::from_raw(base, cs.len() * words);
-    Some(Ct::new(first.meta, CtBuf { buf, k: cs.len(), lay }))
+    Some(Ct::new(first.meta, CtBuf { buf, k: cs.len(), lay, seeds: false, packed: false }))
 }

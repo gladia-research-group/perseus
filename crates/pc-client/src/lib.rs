@@ -9,7 +9,7 @@ pub mod secret;
 pub mod spec;
 pub mod wire;
 
-pub use client::{Client, KeyGenStats};
+pub use client::{Client, KeyGenStats, PreEnc};
 pub use error::{Error, Result};
 pub use secret::ClientSecret;
 pub use spec::{KeyReq, KeyShape, KeySpec, Role, SpruReq};

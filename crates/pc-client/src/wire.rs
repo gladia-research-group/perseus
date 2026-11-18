@@ -263,9 +263,127 @@ pub struct CtHeader {
     /// Q rows per part (ids `0..rows`; rows = top limb + 1).
     pub rows: usize,
     pub meta: WireMeta,
+    /// Compressed frame: each coefficient (coefficient form, the CRT of the `rows` residues) as round(x 2^bits / Q),
+    /// `bits` <= 64 per coefficient per part (`pack_coeffs`); None = the eval-form residues of every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u32>,
+    /// Seeded frame (a fresh encryption): per ciphertext, c0's eval rows then the `rows` 8-word seeds that c1's rows
+    /// are drawn from (`Prng::from_seed(seed, 0).uniform_below(q_r)`, as `Client::encrypt` draws them).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seeded: bool,
+    /// Seeded with the random-access expander instead (`pc_core::keys::cts_expand_row(seed, q_r)`): the server may keep
+    /// the seeds and draw c1 where it reads it (`import_ct(..., regen=True)`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regen: bool,
+    /// Compressed frame: c1's bits when they differ from c0's (`bits`); the words are bit-packed (`pack_bits`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits1: Option<u32>,
+    /// Encrypted under the client's sparse secret (`SecretKey::s_sparse`: the server switched it before export).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sparse: bool,
 }
 
-/// A batch of `k` ciphertexts, eval form, `data` = `[c][part][row][N]`.
+/// Compress coefficient-form residues (`rows[r][i]` mod `q[r]`) to one `bits`-bit word (<= 64) per coefficient:
+/// round(x 2^bits / Q) mod 2^bits, x the CRT of the residues in [0, Q). Q must stay below 2^(128 - bits).
+pub fn pack_coeffs(q: &[u64], rows: &[&[u64]], bits: u32) -> Result<Vec<u64>> {
+    let big: u128 = q.iter().map(|&p| p as u128).product();
+    if bits == 0 || bits > 64 || q.iter().map(|&p| 64 - p.leading_zeros()).sum::<u32>() + bits > 127 {
+        return Err(Error::Wire(format!("pack_coeffs: {bits} bits over a {}-prime modulus", q.len())));
+    }
+    let n = rows[0].len();
+    if q.len() == 2 && big < 1u128 << 63 {
+        // two primes, Q < 2^63: Garner in 64 bits (x = v0 + q0 ((v1 - v0) q0^-1 mod q1)) and, up to 32 bits, the rounding
+        // through an f64 product (x < 2^63: within one unit of the exact rounding, as lossy as the rounding itself);
+        // wider words round exactly
+        use rayon::prelude::*;
+        let (q0, q1) = (q[0], q[1]);
+        let inv = inv_mod(q0 % q1, q1) as u128;
+        let scale = (1u128 << bits) as f64 / big as f64;
+        let mask = u64::MAX >> (64 - bits);
+        let mut out = vec![0u64; n];
+        out.par_chunks_mut(4096).enumerate().for_each(|(ci, o)| {
+            for (k, y) in o.iter_mut().enumerate() {
+                let i = ci * 4096 + k;
+                let (v0, v1) = (rows[0][i] % q0, rows[1][i] % q1);
+                let d = (v1 + q1 - v0 % q1) % q1;
+                let x = v0 + q0 * ((d as u128 * inv % q1 as u128) as u64);
+                *y = if bits <= 32 { ((x as f64) * scale).round() as u64 & mask } else { ((((x as u128) << bits) + big / 2) / big) as u64 & mask };
+            }
+        });
+        return Ok(out);
+    }
+    // Garner: x = sum_r v_r * (Q / q_r) * ((Q / q_r)^-1 mod q_r), reduced mod Q
+    let parts: Vec<(u128, u64)> = q
+        .iter()
+        .map(|&p| {
+            let m = big / p as u128;
+            (m, inv_mod((m % p as u128) as u64, p))
+        })
+        .collect();
+    let mask = u64::MAX as u128 >> (64 - bits);
+    Ok((0..n)
+        .map(|i| {
+            let mut x = 0u128;
+            for (r, (&p, &(m, inv))) in q.iter().zip(&parts).enumerate() {
+                let v = ((rows[r][i] % p) as u128 * inv as u128 % p as u128) * m % big;
+                x = (x + v) % big;
+            }
+            ((((x << bits) + big / 2) / big) & mask) as u64
+        })
+        .collect())
+}
+
+/// `pack_coeffs`' inverse up to the rounding: the residues mod each `q[r]` of round(y Q / 2^bits).
+pub fn unpack_coeffs(q: &[u64], words: &[u64], bits: u32) -> Vec<Vec<u64>> {
+    let big: u128 = q.iter().map(|&p| p as u128).product();
+    let xs: Vec<u128> = words.iter().map(|&y| ((y as u128 * big) + (1u128 << (bits - 1))) >> bits).collect();
+    q.iter().map(|&p| xs.iter().map(|&x| (x % big % p as u128) as u64).collect()).collect()
+}
+
+/// Words of `n` values of `bits` bits, bit-packed (one word per value at 32 bits).
+pub fn packed_words(n: usize, bits: u32) -> usize {
+    (n * bits as usize).div_ceil(32)
+}
+
+/// `bits`-bit values (<= 64), LSB first, into `packed_words(len, bits)` words.
+pub fn pack_bits(v: &[u64], bits: u32) -> Vec<u32> {
+    let mut out = vec![0u32; packed_words(v.len(), bits)];
+    for (i, &x) in v.iter().enumerate() {
+        let (bit, x) = (i * bits as usize, (x & (u64::MAX >> (64 - bits))) as u128);
+        let (w, o) = (bit / 32, bit % 32);
+        let x = x << o;
+        for (k, word) in out[w..].iter_mut().take((o + bits as usize).div_ceil(32)).enumerate() {
+            *word |= (x >> (32 * k)) as u32;
+        }
+    }
+    out
+}
+
+/// `pack_bits`' inverse: `n` values.
+pub fn unpack_bits(w: &[u32], n: usize, bits: u32) -> Vec<u64> {
+    (0..n)
+        .map(|i| {
+            let bit = i * bits as usize;
+            let (k, o) = (bit / 32, bit % 32);
+            let x = w[k..].iter().take((o + bits as usize).div_ceil(32)).enumerate().fold(0u128, |a, (j, &y)| a | (y as u128) << (32 * j));
+            (x >> o) as u64 & (u64::MAX >> (64 - bits))
+        })
+        .collect()
+}
+
+fn inv_mod(a: u64, p: u64) -> u64 {
+    let (mut r, mut b, mut e) = (1u128, a as u128 % p as u128, p - 2);
+    while e > 0 {
+        if e & 1 == 1 {
+            r = r * b % p as u128;
+        }
+        b = b * b % p as u128;
+        e >>= 1;
+    }
+    r as u64
+}
+
+/// A batch of `k` ciphertexts, eval form, `data` = `[c][part][row][N]` (or compressed: `CtHeader::bits`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CtWire {
     pub header: CtHeader,
@@ -274,7 +392,14 @@ pub struct CtWire {
 
 impl CtWire {
     pub fn words(h: &CtHeader) -> usize {
-        h.k * 2 * h.rows * h.n
+        if let Some(b0) = h.bits {
+            let b1 = h.bits1.unwrap_or(b0);
+            h.k * (packed_words(h.n, b0) + packed_words(h.n, b1))
+        } else if h.seeded {
+            h.k * h.rows * (h.n + 8)
+        } else {
+            h.k * 2 * h.rows * h.n
+        }
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(4 * self.data.len() + 512);
@@ -311,6 +436,36 @@ impl CtWire {
         }
         Ok(CtWire { header, data })
     }
+    /// A seeded frame as a full one: c1's rows drawn from their seeds (`primes`: the chain's Q primes, row r = q_r).
+    pub fn expand_seeded(&self, primes: &[u64]) -> Result<CtWire> {
+        use rayon::prelude::*;
+        let h = &self.header;
+        if !h.seeded {
+            return Ok(self.clone());
+        }
+        let (n, rows) = (h.n, h.rows);
+        if primes.len() < rows {
+            return Err(Error::Wire(format!("seeded frame of {rows} rows, {} primes", primes.len())));
+        }
+        let mut data = vec![0u32; h.k * 2 * rows * n];
+        for c in 0..h.k {
+            let src = &self.data[c * rows * (n + 8)..(c + 1) * rows * (n + 8)];
+            let (c0, seeds) = src.split_at(rows * n);
+            let dst = &mut data[c * 2 * rows * n..(c + 1) * 2 * rows * n];
+            let (d0, d1) = dst.split_at_mut(rows * n);
+            d0.copy_from_slice(c0);
+            d1.par_chunks_mut(n).enumerate().for_each(|(r, row)| {
+                let key: [u32; 8] = seeds[r * 8..r * 8 + 8].try_into().expect("8 words");
+                if h.regen {
+                    pc_core::keys::cts_expand_row(&key, primes[r] as u32, row);
+                } else {
+                    let mut g = pc_core::keys::Prng::from_seed(key, 0);
+                    row.iter_mut().for_each(|x| *x = g.uniform_below(primes[r]) as u32);
+                }
+            });
+        }
+        Ok(CtWire { header: CtHeader { seeded: false, regen: false, ..h.clone() }, data })
+    }
     /// Row `row` of part `part` of ciphertext `c`.
     pub fn row(&self, c: usize, part: usize, row: usize) -> &[u32] {
         let (n, rows) = (self.header.n, self.header.rows);
@@ -338,8 +493,37 @@ mod tests {
     }
 
     #[test]
+    fn pack_coeffs_two_primes_wide() {
+        // the two-prime path against the exact rounding of the CRT value, above 32 bits
+        let q = [268369921u64, 268361729];
+        let big = q[0] as u128 * q[1] as u128;
+        let n = 4096;
+        let x: Vec<u128> = (0..n as u128).map(|i| (i * 0x9e37_79b9_7f4a_7c15 + i * i) % big).collect();
+        let rows: Vec<Vec<u64>> = q.iter().map(|&p| x.iter().map(|&v| (v % p as u128) as u64).collect()).collect();
+        let refs: Vec<&[u64]> = rows.iter().map(|r| r.as_slice()).collect();
+        for bits in [33u32, 41, 48, 56, 64] {
+            let got = pack_coeffs(&q, &refs, bits).unwrap();
+            let mask = u64::MAX as u128 >> (64 - bits);
+            for (g, &v) in got.iter().zip(&x) {
+                assert_eq!(*g as u128, (((v << bits) + big / 2) / big) & mask, "bits {bits}");
+            }
+        }
+    }
+
+    #[test]
+    fn pack_bits_roundtrip() {
+        let n = 1000;
+        for bits in [1u32, 20, 26, 32, 33, 46, 57, 64] {
+            let vals: Vec<u64> = (0..n as u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> (64 - bits))).collect();
+            let p = pack_bits(&vals, bits);
+            assert_eq!(p.len(), packed_words(n, bits), "bits {bits}");
+            assert_eq!(unpack_bits(&p, n, bits), vals, "bits {bits}");
+        }
+    }
+
+    #[test]
     fn ct_frame_roundtrip_and_corruption() {
-        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null } };
+        let h = CtHeader { params_hash: "x".into(), n: 16, k: 2, rows: 3, meta: WireMeta { level: 4, deg: 1, nf: 2f64.powi(54), slots: 8, tag: serde_json::Value::Null }, bits: None, seeded: false, regen: false, bits1: None, sparse: false };
         let w = CtWire { data: (0..CtWire::words(&h) as u32).collect(), header: h };
         let mut b = w.to_bytes().unwrap();
         assert_eq!(CtWire::from_bytes(&b).unwrap(), w);

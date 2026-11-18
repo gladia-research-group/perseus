@@ -154,6 +154,10 @@ impl MemPlan {
 
 struct Class<'a, W: DevWord> {
     k: usize,
+    /// Q rows per slot: 0 = the full layout; > 0 = a low class (`CtPool::add_low`).
+    rows: usize,
+    /// A low class of seeded slots (`CtBuf::new_seeded`).
+    seeded: bool,
     slots: Vec<UnsafeCell<Ct<'a, W>>>,
     free: RefCell<Vec<usize>>,
 }
@@ -176,14 +180,58 @@ impl<'a, W: DevWord> CtPool<'a, W> {
             let slots = (0..c.count)
                 .map(|_| Ok(UnsafeCell::new(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "ct_pool", plan.lay, c.k)?))))
                 .collect::<Result<Vec<_>>>()?;
-            classes.push(Class { k: c.k, slots, free: RefCell::new((0..c.count).rev().collect()) });
+            classes.push(Class { k: c.k, rows: 0, seeded: false, slots, free: RefCell::new((0..c.count).rev().collect()) });
         }
         Ok(CtPool { classes })
     }
 
+    /// The layout of a low slot: Q rows `0..rows` and no special rows.
+    pub fn low_layout(lay: &Layout, rows: usize) -> Layout {
+        Layout { n: lay.n, nq: rows, kp: 0 }
+    }
+
+    /// Bytes of `count` low slots of `rows` Q rows (the `MemPlan` section "ct_low"; "ct_low_seeded" when `seeded`,
+    /// c0 packed when `packed`).
+    pub fn low_bytes(lay: &Layout, count: usize, rows: usize, seeded: bool, packed: bool) -> usize {
+        let low = Self::low_layout(lay, rows);
+        let words = if seeded { CtBuf::<Compute, W>::words_seeded(&low, packed) } else { CtBuf::<Compute, W>::words(&low, 1) };
+        // each slot is its own arena allocation, aligned to ARENA_ALIGN
+        count * (words * std::mem::size_of::<W>()).div_ceil(pc_cuda::ARENA_ALIGN) * pc_cuda::ARENA_ALIGN
+    }
+
+    /// Carve `count` low slots (one ciphertext each, Q rows `0..rows`, no special rows) from the "ct_low" section
+    /// (setup only). A low slot holds a ciphertext whose top limb is below `rows`; `acquire` never hands one out, only
+    /// `acquire_low` does, and the caller keeps every op that would write rows past `rows - 1` away from it.
+    /// `seeded`: seeded slots (c0 and the c1 seeds, `CtBuf::new_seeded`; c0 packed when `packed`) from the
+    /// "ct_low_seeded" section instead.
+    pub fn add_low(&mut self, arena: &'a Arena, lay: &Layout, count: usize, rows: usize, seeded: bool, packed: bool) -> Result<()> {
+        if rows == 0 || rows > lay.nq {
+            return Err(Error::Mem { knob: "ct_low rows", value: rows, msg: format!("must be in 1..={}", lay.nq) });
+        }
+        let low = Self::low_layout(lay, rows);
+        let buf = || if seeded { CtBuf::new_seeded(arena, "ct_low_seeded", low, packed) } else { CtBuf::new(arena, "ct_low", low, 1) };
+        let slots = (0..count).map(|_| Ok(UnsafeCell::new(Ct::new(CtMeta::new(0, 1), buf()?)))).collect::<Result<Vec<_>>>()?;
+        self.classes.push(Class { k: 1, rows, seeded, slots, free: RefCell::new((0..count).rev().collect()) });
+        Ok(())
+    }
+
+    /// A free low slot (seeded or not) for one ciphertext of top limb `top`, stamped with `meta` (the smallest such low
+    /// class that holds it).
+    pub fn acquire_low(&self, meta: CtMeta, top: usize, seeded: bool) -> Result<PoolCt<'_, 'a, W>> {
+        let class = (0..self.classes.len())
+            .filter(|&i| self.classes[i].rows > top && self.classes[i].seeded == seeded && !self.classes[i].free.borrow().is_empty())
+            .min_by_key(|&i| self.classes[i].rows)
+            .ok_or_else(|| Error::Mem { knob: if seeded { "ct_low_seeded" } else { "ct_low" }, value: top, msg: "no free low slot holds this top limb".into() })?;
+        let c = &self.classes[class];
+        let idx = c.free.borrow_mut().pop().expect("free slot");
+        // SAFETY: idx was just taken off the free list: no other handle refers to this slot
+        unsafe { (*c.slots[idx].get()).meta = meta };
+        Ok(PoolCt { slot: Rc::new(Slot { pool: self, class, idx }) })
+    }
+
     /// A free slot of the class with exactly `k` ciphertexts, stamped with `meta`. Contents are stale (not zeroed).
     pub fn acquire(&self, k: usize, meta: CtMeta) -> Result<PoolCt<'_, 'a, W>> {
-        let class = self.classes.iter().position(|c| c.k == k).ok_or_else(|| Error::Mem {
+        let class = self.classes.iter().position(|c| c.k == k && c.rows == 0).ok_or_else(|| Error::Mem {
             knob: "MemCfg::pool",
             value: k,
             msg: format!("no pool class of {k} ciphertexts (classes: {:?})", self.classes.iter().map(|c| c.k).collect::<Vec<_>>()),
@@ -202,7 +250,7 @@ impl<'a, W: DevWord> CtPool<'a, W> {
 
     /// Free slots of class `k` (None if there is no such class).
     pub fn free(&self, k: usize) -> Option<usize> {
-        self.classes.iter().find(|c| c.k == k).map(|c| c.free.borrow().len())
+        self.classes.iter().find(|c| c.k == k && c.rows == 0).map(|c| c.free.borrow().len())
     }
 }
 
@@ -239,6 +287,10 @@ impl<'p, 'a, W: DevWord> PoolCt<'p, 'a, W> {
         // SAFETY: this is the only handle to the slot and the slot is off the free list, so no other reference to
         // the cell exists; the &mut borrows self exclusively for its lifetime
         Some(unsafe { &mut *self.cell().get() })
+    }
+    /// Whether the slot is a low slot (`CtPool::add_low`).
+    pub fn is_low(&self) -> bool {
+        self.slot.pool.classes[self.slot.class].rows != 0
     }
     /// Handles sharing this slot.
     pub fn refs(&self) -> usize {

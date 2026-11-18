@@ -146,7 +146,7 @@ impl<'a, W: DevWord> DevEncoder<'a, W> {
             (EncoderKind::DeviceFft, Payload2::Slots { values, slots, payload }) => self.device_fft(ctx, s, ring, values, slots, payload, &at, out)?,
             (EncoderKind::HostFft, Payload2::Slots { .. }) | (EncoderKind::CoeffRows, Payload2::Coeffs(_)) => {
                 let rows = self.host_rows(what, &at)?;
-                self.upload_rows(s, &rows, at.top, out)?;
+                return self.encode_rows(ctx, s, &rows, &at, out);
             }
             (k, _) => return Err(shape("encode", format!("{k:?} does not take this payload"))),
         }
@@ -156,37 +156,48 @@ impl<'a, W: DevWord> DevEncoder<'a, W> {
         Ok(())
     }
 
+    /// `encode` of host-encoded rows (`host_rows`): uploaded, then transformed to `at.form`.
+    pub fn encode_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, rows: &[Vec<u64>], at: &EncodeAt, out: &mut DBuf<'_, Compute, W>) -> Result<()> {
+        self.encode_rows_many(ctx, s, &mut [(rows, *at, out)])
+    }
+
+    /// `encode_rows` of several plaintexts: their live rows staged side by side in the pinned buffer (one wait for its
+    /// previous uploads per buffer's worth, not per plaintext: a wait sits behind whatever the stream has queued),
+    /// each uploaded and transformed in order.
+    pub fn encode_rows_many<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, items: &mut [(&[Vec<u64>], EncodeAt, &mut DBuf<'_, Compute, W>)]) -> Result<()> {
+        let (n, cap) = (self.lay.n, self.pin_w.len());
+        let mut i = 0;
+        while i < items.len() {
+            if self.pin_w_used {
+                self.pin_w_ev.sync()?;
+            }
+            let mut off = 0;
+            while i < items.len() && off + (items[i].1.top + 1) * n <= cap {
+                let (rows, at, out) = &mut items[i];
+                self.check(at, out)?;
+                let words = (at.top + 1) * n;
+                for (l, r) in rows.iter().enumerate().take(at.top + 1) {
+                    for (o, &x) in self.pin_w.as_mut_slice()[off + l * n..off + (l + 1) * n].iter_mut().zip(r) {
+                        *o = W::from_u64(x);
+                    }
+                }
+                // SAFETY: the pinned buffer is not rewritten before pin_w_ev (recorded after these copies) completes
+                unsafe { out.upload_pinned_range_async(s, 0, &self.pin_w, off, words)? };
+                if at.form == PtForm::Eval {
+                    ntt::transform_rows(ctx, s, Dir::Forward, out, &self.lists[at.top])?;
+                }
+                off += words;
+                i += 1;
+            }
+            self.pin_w_ev.record(s)?;
+            self.pin_w_used = true;
+        }
+        Ok(())
+    }
+
     /// Host rows (coefficient form, words already reduced) of `what` at `at` (the staging worker's encoder).
     pub fn host_rows(&self, what: Payload2<'_>, at: &EncodeAt) -> Result<Vec<Vec<u64>>> {
         host_rows(&self.host, &self.primes, what, at)
-    }
-
-    fn upload_rows(&mut self, s: &Stream<Compute>, rows: &[Vec<u64>], top: usize, out: &mut DBuf<'_, Compute, W>) -> Result<()> {
-        let n = self.lay.n;
-        if self.pin_w_used {
-            self.pin_w_ev.sync()?;
-        }
-        {
-            let h = self.pin_w.as_mut_slice();
-            for (l, r) in rows.iter().enumerate().take(top + 1) {
-                for (o, &x) in h[l * n..(l + 1) * n].iter_mut().zip(r) {
-                    *o = W::from_u64(x);
-                }
-            }
-        }
-        // SAFETY: the pinned buffer is not rewritten before pin_w_ev (recorded after this copy) completes; the copy
-        // covers the whole buffer, rows above `top` land in `out` only when it is large enough
-        if out.len() >= self.pin_w.len() {
-            unsafe { out.upload_pinned_async(s, 0, &self.pin_w)? };
-        } else {
-            // a buffer holding exactly rows 0..=top: synchronous copy of the live part
-            let words = (top + 1) * n;
-            let v: Vec<W> = self.pin_w.as_slice()[..words].to_vec();
-            out.upload_at(s, 0, &v)?;
-        }
-        self.pin_w_ev.record(s)?;
-        self.pin_w_used = true;
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
