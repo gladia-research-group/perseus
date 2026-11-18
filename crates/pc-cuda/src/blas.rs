@@ -20,7 +20,10 @@ pub struct Lt {
 
 impl Lt {
     #[cfg(feature = "cublas")]
-    pub fn new(_dev: &Device) -> Result<Lt> {
+    pub fn new(dev: &Device) -> Result<Lt> {
+        if dev.is_host() {
+            return Ok(Lt { inner: pc_cublas::Lt::host() });
+        }
         let v = pc_cublas::version();
         if v / 10000 != LT_MAJOR {
             return Err(Error::Blas(format!("cuBLASLt {} loaded; the int8 exactness gate validated major {LT_MAJOR}", pc_cublas::version_string())));

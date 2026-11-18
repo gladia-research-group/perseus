@@ -13,4 +13,5 @@ cublas = ["dep:pc-cublas"]
 # DevPrimeConst is a device-uploadable type (`Pod`); pc-core is CUDA-free, so this edge adds no CUDA to it
 pc-core = { path = "../pc-core" }
 thiserror = { workspace = true }
+pc-hostrt = { path = "../pc-hostrt" }
 pc-cublas = { path = "../pc-cublas", optional = true }
