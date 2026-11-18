@@ -19,6 +19,13 @@ from perseus.impl.conv import Geom, ConvSpec, conv2d, channel_sum, head_geoms
 from . import weights as R
 
 
+def _step(ops, label):
+    """A step label on the CPU twin (the planner's FORBID_STEPS / PLAN_REFRESH_ENV_CAP_STEPS read it); a no-op on the
+    other sessions."""
+    inf = getattr(ops, "inf", None)
+    return inf.step(label) if hasattr(inf, "step") else contextlib.nullcontext()
+
+
 def relu_exact(ops, xs, site, gain=1.0, geom=None):
     return [gain * np.maximum(x.real, 0.0) for x in xs]
 
@@ -127,20 +134,25 @@ class ResNet20:
 
     # ── stages ──
     def stem_stage(self, ops, xs):
-        return self.act(ops, conv2d(ops, xs, self.stem), "stem", self.gain["stem"], geom=self.stem.go)
+        y = conv2d(ops, xs, self.stem)
+        with _step(ops, "relu"):
+            return self.act(ops, y, "stem", self.gain["stem"], geom=self.stem.go)
 
     def block_stage(self, ops, xs, b):
         name, s1, s2, sh = self.blocks[b]
         xs = self._in(ops, xs)
-        h = self.act(ops, conv2d(ops, xs, s1), name + ".a1", geom=s1.go)
+        y = conv2d(ops, xs, s1)
+        with _step(ops, "relu"):
+            h = self.act(ops, y, name + ".a1", geom=s1.go)
         y = conv2d(ops, h, s2)
         r = conv2d(ops, xs, sh) if sh is not None else xs
-        return self.act(ops, [ops.add(a, c) for a, c in zip(y, r)], name + ".a2", self.gain[name + ".a2"], geom=s2.go)
+        y = [ops.add(a, c) for a, c in zip(y, r)]
+        with _step(ops, "relu"):
+            return self.act(ops, y, name + ".a2", self.gain[name + ".a2"], geom=s2.go)
 
     def head_stage(self, ops, xs):
-        # its own step label on the twin: a plan can give the head (no refresh after it) its own envelope
-        inf = getattr(ops, "inf", None)
-        with inf.step("head") if hasattr(inf, "step") else contextlib.nullcontext():
+        # its own step: a plan can give the head (no refresh after it) its own envelope
+        with _step(ops, "head"):
             return conv2d(ops, channel_sum(ops, self._in(ops, xs)), self.head)
 
     def stages(self):
