@@ -66,8 +66,12 @@ impl KeyShape {
     /// Is this a shape the chain can have (full, banded or bottom with the matching digit count)?
     pub fn check(&self, chain: &Chain) -> Result<()> {
         let bottom = Self::bottom(chain)?;
+        let band = Self::banded(chain, self.q_top)?;
         let want = if self.q_top == bottom.q_top && self.kp == bottom.kp {
             bottom
+        } else if *self == band {
+            // a band at a `LowP` top is over its tier's special primes (`Chain::band_specials`)
+            band
         } else if self.kp <= chain.p_sparse && self.kp < chain.p.len() {
             Self::stc_ps_kp(chain, self.q_top, self.kp)?
         } else {
@@ -199,7 +203,8 @@ impl KeySpec {
                 _ => k.shape.check(chain)?,
             }
             // a rotation over P' (`stc_ps`) is another key than the same rotation over P
-            let ps = k.shape.kp < chain.p.len() && k.shape.q_top >= chain.level_unit;
+            // (a `LowP` band, fewer special primes by the chain's design, is not)
+            let ps = k.shape.kp < chain.p.len() && k.shape.q_top >= chain.level_unit && k.shape != KeyShape::banded(chain, k.shape.q_top)?;
             let id = format!("{}{}", serde_json::to_string(&k.role)?, if ps { " over P'" } else { "" });
             if !seen.insert(id.clone()) {
                 return Err(Error::Spec(format!("key {id} requested twice")));
@@ -209,7 +214,7 @@ impl KeySpec {
                 return Err(Error::Spec(format!("{id}: a key to a sparse secret must have the bottom shape {:?}, not {:?}", KeyShape::bottom(chain)?, k.shape)));
             }
             // P' (below the bottom: `stc_ps`) only for rotation keys
-            if k.shape.kp < chain.p.len() && k.shape.q_top >= chain.level_unit && !matches!(k.role, Role::Rot { .. }) {
+            if ps && !matches!(k.role, Role::Rot { .. }) {
                 return Err(Error::Spec(format!("{id}: only rotation keys may use the P' shape above the bottom")));
             }
             if let Role::Rot { step, galois } | Role::SparseRot { step, galois } = k.role {
