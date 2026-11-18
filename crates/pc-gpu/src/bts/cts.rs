@@ -248,6 +248,7 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
                 tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(),
                 exact,
                 prescaled: true,
+                fixed: false,
             });
         }
     }
@@ -266,7 +267,7 @@ pub(crate) fn md_plan<'a, S: Lane, W: DevWord>(arena: &'a Arena, s: &Stream<S>, 
 }
 
 pub(crate) fn md_plan_bytes<W: DevWord>(primes: &[u64], ncts: usize, nparts: usize, nsrc: usize, ntgt: usize, exact: bool) -> Result<usize> {
-    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact, prescaled: false };
+    let spec = JobSpec { src_off: 0, dst_off: 0, src: (0..nsrc).map(|t| (t as u32, t as u32)).collect(), tgt: (0..ntgt).map(|t| (t as u32, t as u32)).collect(), exact, prescaled: false, fixed: false };
     let specs = vec![spec; ncts * nparts];
     let rl = |n: usize| Arena::bytes_for::<u32>(n) + Arena::bytes_for::<i32>(n);
     let sc = Arena::bytes_for::<u8>(2 * ncts * nparts * nsrc * std::mem::size_of::<W>());

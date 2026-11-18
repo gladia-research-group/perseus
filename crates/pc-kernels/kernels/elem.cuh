@@ -60,6 +60,26 @@ __global__ void ew_copy(EwArgs A) {
     store4<W>(at<W>(A.out, c, part, row) + i, x.v[0], x.v[1], x.v[2], x.v[3]);
 }
 
+template <class W>
+__global__ void ew_many(EwManyArgs A) {
+    const int j = blockIdx.z;
+    const W p = (W)A.pr[blockIdx.y].p;
+    const size_t i = (size_t)blockIdx.y * N + (blockIdx.x * BX + threadIdx.x) * 4;
+    const V4<W> x = load4<W>((const W*)A.a[j] + i);
+    W r[4] = {x.v[0], x.v[1], x.v[2], x.v[3]};
+    if (A.b[j]) {
+        const V4<W> y = load4<W>((const W*)A.b[j] + i);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) r[w] = add<W>(r[w], y.v[w], p);
+    }
+    if (A.c[j]) {
+        const V4<W> y = load4<W>((const W*)A.c[j] + i);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) r[w] = add<W>(r[w], y.v[w], p);
+    }
+    store4<W>((W*)A.out[j] + i, r[0], r[1], r[2], r[3]);
+}
+
 template <class W, class MM, int KMAX>
 __global__ void pt_dot(PtDotArgs A) {
     using Wd = WideOf<W>;
@@ -117,6 +137,12 @@ int sub_mul_l(const EwArgs* a, cudaStream_t s) {
 template <class W>
 int copy_l(const EwArgs* a, cudaStream_t s) {
     ew_copy<W><<<ew_grid(a), BX, 0, s>>>(*a);
+    return (int)cudaGetLastError();
+}
+template <class W>
+int many_l(const EwManyArgs* a, cudaStream_t s) {
+    if (a->n < 1 || a->n > PC_EWM_MAX) return -1;
+    ew_many<W><<<dim3(N / (4 * BX), a->nrows, a->n), BX, 0, s>>>(*a);
     return (int)cudaGetLastError();
 }
 template <class W, class MM>

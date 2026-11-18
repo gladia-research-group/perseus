@@ -77,7 +77,7 @@ fn grid() -> Res<()> {
     let own: Vec<i64> = (1..=63).map(|e| -e).collect();
     let sum7: Vec<i64> = (1..=7).map(|j| 512 * j).collect();
     let steps: Vec<i64> = own.iter().chain(&sum7).copied().collect();
-    let spec = KeySetSpec { relin: true, conj: false, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: false };
+    let spec = KeySetSpec { relin: true, conj: false, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: false, lean: None };
     let packed = KskLayout::packed_for::<W>(&chain)?;
     let shapes: Vec<_> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
     let n_cts = 2 * 4 * 63 + 16;

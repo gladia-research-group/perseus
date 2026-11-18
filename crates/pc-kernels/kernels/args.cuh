@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 27u
+#define PC_KERNELS_ABI 28u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -153,6 +153,31 @@ struct EwArgs {
     int32_t K, nparts, sub, zero_p;
 };
 static_assert(sizeof(EwArgs) == 128, "EwArgs layout");
+
+// ew_many: out[i] = a[i] (+ b[i]) (+ c[i]) for n polynomials given by pointer (Q rows 0..nrows, row r at + r*N words);
+// a null b / c is skipped; out may alias its own sources. Grid = (N/1024, nrows, n).
+constexpr int PC_EWM_MAX = 48;
+struct EwManyArgs {
+    void* out[PC_EWM_MAX];
+    const void* a[PC_EWM_MAX];
+    const void* b[PC_EWM_MAX];
+    const void* c[PC_EWM_MAX];
+    const PrimeConst* pr;
+    int32_t n, nrows;
+};
+static_assert(sizeof(EwManyArgs) == 4 * PC_EWM_MAX * 8 + 16, "EwManyArgs layout");
+
+// submul_many (ABI 28): out[i] = (a[i] - b[i]) * t[row] for n polynomials given by pointer (rows as ew_many; t one
+// table, row r at + r*N words, a general ModMul product as mul_table). Grid = (N/1024, nrows, n).
+struct SubMulManyArgs {
+    void* out[PC_EWM_MAX];
+    const void* a[PC_EWM_MAX];
+    const void* b[PC_EWM_MAX];
+    const void* t;
+    const PrimeConst* pr;
+    int32_t n, nrows;
+};
+static_assert(sizeof(SubMulManyArgs) == 3 * PC_EWM_MAX * 8 + 24, "SubMulManyArgs layout");
 
 // BSGS plaintext dot of an LT stage in the extended basis, K <= 8 ciphertexts sharing the plaintext reads:
 //   res[c][j][part] = sum_{i < bstep} rot[c][i][part] * pt[bstep*j + i]   (j < gstep; diagonals >= npts skipped)
@@ -353,15 +378,26 @@ static_assert(sizeof(TensorMultiArgs) == (2 * PC_TMULTI_OUT + 2 * PC_TMULTI_OUT 
 #define PC_PACK_ROW_WORDS ((PC_N * PC_PACK_BITS + 31) / 32)
 #define PC_TSEED_OUT 16
 #define PC_TSEED_PAIRS 128
+#define PC_TSEED_Q 4
+#define PC_TSEED_QOUT 64
 struct TensorSeededArgs {
-    PolyRef out[PC_TSEED_OUT], d2[PC_TSEED_OUT];
+    // ABI 28: up to PC_TSEED_QOUT outputs (nq sets x nout <= PC_TSEED_OUT first-operand groups)
+    PolyRef out[PC_TSEED_QOUT], d2[PC_TSEED_QOUT];
     PolyRef b[PC_TSEED_PAIRS];
     const void* a[PC_TSEED_OUT][PC_TSEED_PAIRS];
     const PrimeConst* pr;
     uint64_t seed_off;
     int32_t nout, npairs, acc, n, packed, pad;
+    // ABI 28: nq second-operand sets over the same first operands: set 0 is b, set q > 0 at bq[q - 1][j]
+    // (b[j]'s strides); output q nout + o = sum_j a[o][j] * set q's j-th; nq nout <= PC_TSEED_QOUT
+    const void* bq[PC_TSEED_Q - 1][PC_TSEED_PAIRS];
+    // ABI 28: scheduling only. cout > 0: the first-operand groups in chunks of cout (a block: one chunk's outputs of
+    // one tile), swords > 0: the ring in slices of swords words; blocks ordered tile < chunk < slice < row, so every
+    // chunk of a slice reads the second operands' slice while it is still cached
+    int32_t nq, cout, swords, qpad;
 };
-static_assert(sizeof(TensorSeededArgs) == (2 * PC_TSEED_OUT + PC_TSEED_PAIRS) * 24 + PC_TSEED_OUT * PC_TSEED_PAIRS * 8 + 16 + 24,
+static_assert(sizeof(TensorSeededArgs) == (2 * PC_TSEED_QOUT + PC_TSEED_PAIRS) * 24 + PC_TSEED_OUT * PC_TSEED_PAIRS * 8 + 16 + 24
+                  + (PC_TSEED_Q - 1) * PC_TSEED_PAIRS * 8 + 16,
               "TensorSeededArgs layout");
 
 // md_epilogue: for parts 0, 1: dst = f (dst + (x - t) binv) [+ k on part 0]
@@ -986,8 +1022,10 @@ struct KernelTable {
     int (*tensor_sum)(const TensorSumArgs*, cudaStream_t);
     int (*tensor_multi)(const TensorMultiArgs*, cudaStream_t);
     int (*tensor_seeded)(const TensorSeededArgs*, cudaStream_t);
+    int (*ew_many)(const EwManyArgs*, cudaStream_t);
+    int (*submul_many)(const SubMulManyArgs*, cudaStream_t);
 };
-static_assert(sizeof(KernelTable) == 16 + 48 * 8, "KernelTable layout");
+static_assert(sizeof(KernelTable) == 16 + 50 * 8, "KernelTable layout");
 
 // ------------------------------------------------------------------------------------------------ ring tables
 // One table per (W, MM, log_n), exported as `extern "C" const RingTable* pc_ring_<w>_<log_n>()`: the transforms

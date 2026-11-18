@@ -132,7 +132,7 @@ pub fn run(o: &Opts) -> Res<bool> {
     let plan = ClassicPlan::new(&chain, &cfg)?;
     let steps = plan.rot_steps();
     let layout = KskLayout::packed_for::<W>(&chain)?;
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
 
     let dev = Device::open()?;
     let mcfg = MemCfg { k_max: 8, pool: vec![PoolClass { k: 1, count: 6 }], events: 16, scratch_cts: 2 };

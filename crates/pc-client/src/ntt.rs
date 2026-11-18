@@ -116,7 +116,7 @@ pub struct Ring {
     pub ps_mod_q: Vec<u32>,
     /// (first k special primes) mod q_i for k = 1..=|P| (the StC-first input keys' gadget, `KeyShape::stc_ps`).
     pub prefix_mod_q: Vec<Vec<u32>>,
-    /// Special primes in P (a key over fewer uses P').
+    /// Special primes in P (a key over fewer uses a prefix: P' or a `LowP` tier's).
     pub kp: usize,
 }
 

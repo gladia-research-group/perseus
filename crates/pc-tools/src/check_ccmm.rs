@@ -715,7 +715,7 @@ fn bench(args: &[String]) -> Res<bool> {
     geoms.extend(plan.input.iter().map(|h| h.geom));
     geoms.extend(plan.sources.iter().flatten().map(|s| s.geom));
     let steps = rot_steps(&geoms, n);
-    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true };
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
     let dev = Device::open()?;
     let cfg = MemCfg { k_max: kmax, pool: vec![], events: 64, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
