@@ -118,6 +118,8 @@ pub struct Ring {
     pub prefix_mod_q: Vec<Vec<u32>>,
     /// Special primes in P (a key over fewer uses a prefix: P' or a `LowP` tier's).
     pub kp: usize,
+    /// Special primes in P' (`Chain::p_sparse`).
+    pub kps: usize,
 }
 
 impl Ring {
@@ -128,7 +130,7 @@ impl Ring {
         let prod = |ps: &[u64]| chain.q.iter().map(|&q| ps.iter().fold(1u64, |a, &pj| mulmod(a, pj % q, q)) as u32).collect();
         let (p_mod_q, ps_mod_q) = (prod(&chain.p), prod(&chain.p[..chain.p_sparse]));
         let prefix_mod_q = (1..=chain.p.len()).map(|k| prod(&chain.p[..k])).collect();
-        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, prefix_mod_q, kp: chain.p.len() })
+        Ok(Ring { n: chain.n, nq: chain.q.len(), primes, digits: chain.digits.clone(), ntt, p_mod_q, ps_mod_q, prefix_mod_q, kp: chain.p.len(), kps: chain.p_sparse })
     }
 
     /// The gadget factor (the product of the first `kp` special primes mod q: P, P' or a shorter prefix) of a key over
