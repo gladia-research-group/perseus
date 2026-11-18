@@ -140,7 +140,7 @@
     "sc_blk2_ln2_93": 1
   },
   "correction_factor": {
-    "sc_blk2_2": 16,
+    "sc_blk2_2": 19,
     "sc_blk2_ln2_3": 9,
     "sc_blk2_softmax_35": 4,
     "sc_blk2_softmax_81": 8,
@@ -3480,7 +3480,7 @@
         "8": 3,
         "9": 1,
         "10": 2,
-        "16": 1
+        "19": 1
       },
       "out_level_histogram": {
         "28": 2,

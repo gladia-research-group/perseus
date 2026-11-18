@@ -119,7 +119,7 @@
     "sc_blk1_ln2_9": 1
   },
   "correction_factor": {
-    "sc_blk1_2": 15,
+    "sc_blk1_2": 17,
     "sc_blk1_ln1_87": 9,
     "sc_blk1_softmax_41": 8,
     "sc_blk1_softmaxv_4": 5,
@@ -2559,7 +2559,7 @@
         "8": 3,
         "9": 1,
         "10": 2,
-        "15": 1
+        "17": 1
       },
       "out_level_histogram": {
         "28": 1,

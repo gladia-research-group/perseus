@@ -57,7 +57,8 @@ def _core64():
     return types.SimpleNamespace(**ns)
 
 
-@pytest.mark.skipif(not (os.path.exists(WEIGHTS) and os.path.isdir(IO_DIR)), reason="GPT-2 weights / oracle io missing")
+@pytest.mark.skipif(not (os.path.exists(WEIGHTS) and os.path.exists(os.path.join(IO_DIR, "all_blocks_L00_T1.json"))),
+                    reason="GPT-2 weights / oracle io (all_blocks_L00_T1.json) missing")
 def test_eager_gpt2_block0_u64(monkeypatch):
     from perseus.examples.gpt2 import env, oracle_io, weights
     from perseus.examples.gpt2.model import Gpt2Model
@@ -92,7 +93,12 @@ def test_eager_gpt2_block0_u64(monkeypatch):
     cfg["chain.chain"] = "n64"
     cfg["chain.composite_degree"] = 1
     cfg["bts.auto_bts_level"] = LIMIT
-    sess = _pc.w64.Session(cfg, keys, pool=320, pt_slots=320, debug_refresh=True).complete_setup()
+    try:
+        sess = _pc.w64.Session(cfg, keys, pool=320, pt_slots=320, debug_refresh=True).complete_setup()
+    except RuntimeError as e:
+        if "is not built" in str(e):        # a build without the u64 kernels (maturin ... -F pc-gpu/w64)
+            pytest.skip(str(e))
+        raise
     fhe = sess.fhe
     t_setup = time.time() - t0
     core = _core64()

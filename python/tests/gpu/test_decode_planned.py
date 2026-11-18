@@ -25,7 +25,6 @@ PLAN = "bootstrap_placements/gpt2_decode"
 def test_decode_planned_4_tokens(tmp_path, monkeypatch):
     from perseus.examples.gpt2 import run_decode
     monkeypatch.setenv("PERSEUS_SLOTVEC_CACHE", "0")
-    monkeypatch.setenv("FAKECAP_LANDINGS", _pc.Config.preset("n32_gpt2_decode")["quirks.fakecap_landings"])
     got = {}
 
     def on_token(res):
@@ -41,4 +40,6 @@ def test_decode_planned_4_tokens(tmp_path, monkeypatch):
         assert r["kl"] < 0.01, (r["pos"], r["kl"])
         assert r["cutmax"] == r["top1"], (r["pos"], r["cutmax"], r["top1"])
     assert len({r["free_gb"] for r in res}) == 1, [r["free_gb"] for r in res]
-    assert all(set(r["served"]) == {"r"} for r in res[1:]), [r["served"] for r in res]
+    # the plan binds at every cache length (SM_PERIODIC=2): the classed run replays eagerly, its plaintexts
+    # retargeted per token
+    assert all(set(r["served"]) == {"e"} for r in res), [r["served"] for r in res]
