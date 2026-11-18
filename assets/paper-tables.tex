@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama gpt2 vit bert sana core
+% pages: overview llama gpt2 vit bert resnet sana core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -23,10 +23,10 @@
 % SANA-Sprint text to image (sana-t2i branch check, 2026-11-13, GPU 4 alone: forwards 2 and 3, 269.06 and 269.13 s, after
 % a 333 s first forward; lowest free 17.01 GiB)
 \newcommand{\sanaimg}{269}\newcommand{\sanamem}{78.0}
-% ResNet-20 on CIFAR-10, the one-stage StC-first plan resnet20_stcf2 (main 69d1262a, 2026-11-18, GPU 3 alone: 2 runs
-% of 64 test images, medians 0.887 and 0.887 s, 64/64 argmax agreement with the float64 model; peak used 70.7 GiB by
-% nvidia-smi, free 24.27 GiB after setup)
-\newcommand{\resnetimg}{0.887}\newcommand{\resnetmem}{70.7}
+% ResNet-20 on CIFAR-10, the default plan resnet20_folded (scripts/repro/resnet20.sh, 2026-11-18, GPU 3 alone: 2 runs of
+% 64 test images, CUDA graphs, medians 0.320 and 0.322 s, 64/64 argmax agreement with the float64 model; peak used 35.5
+% GiB by nvidia-smi, free 59.58 GB after setup; top-1 on the first 1,000 test images 925, the float64 model's 925)
+\newcommand{\resnetimg}{0.321}\newcommand{\resnetmem}{35.5}\newcommand{\resnettop}{92.5}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
 % optional position cache (PC_PT_CACHE=0), Llama's the GPU's peak used memory over the run (its runner reports no free
@@ -142,6 +142,22 @@ Cerium (Jayashankar et al., 2025) & BERT-base & 128 & 43.6\nt{\S} & RTX PRO 6000
 \end{tabularx}
 \tcap{Encrypted BERT inference of one sentence (SST-2 classification for Perseus). $^\S$Replicated from the released code on
 our GPU. \legend}
+\end{tbl}
+
+\begin{tbl}
+\begin{tabularx}{\linewidth}{L{1.4}rrL{0.6}c}
+\toprule
+\textbf{ResNet-20} & top-1 & s / image & hardware & open source \\
+\midrule
+Orion (Ebel et al., 2025) & -- & 618.2 & CPU, 1 thread & \yes \\
+Cheddar (Kim et al., 2024) & 91.95\% & 0.72 & RTX 5090 & \semi \\
+Cerium (Jayashankar et al., 2025) & 91.4\% & 0.456\nt{\S} & B200 & \yes \\
+\oursrow\textbf{Perseus (ours)} & \resnettop\% & \textbf{\resnetimg} & RTX PRO 6000 & \yes \\
+\bottomrule
+\end{tabularx}
+\tcap{Encrypted ResNet-20 inference of one $32\times32$ CIFAR-10 image; top-1 on the CIFAR-10 test set (Perseus: the
+first 1,000 images, the same as its float64 model). Cheddar's library is released, its ResNet-20 is not. $^\S$From the
+paper (0.620 s on H100). \legend}
 \end{tbl}
 
 \begin{tbl}
