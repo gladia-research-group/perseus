@@ -32,8 +32,9 @@ def pack_token_rows(rows, slots: int, hid: int, dim: int) -> np.ndarray:
 
 
 class Remote:
-    """The client's end of a served session. `ask`: handler of the server's requests during a run
-    (`ask(header, frames) -> (header, frames)`), e.g. decrypting calibration probes."""
+    """The client's end of a served session. It answers nothing but the session protocol: a request to decrypt
+    (or fit, or check) server-chosen ciphertexts would make the client a decryption oracle, so any other message
+    ends the session."""
 
     def __init__(self, addr: str, client: Client, work_dir: str, log=print):
         from perseus import serve
@@ -55,9 +56,8 @@ class Remote:
         self.spec, self.manifest = h["spec"], h
         return h
 
-    def provide_keys(self, threads: int = 8, ask=None) -> dict:
-        """Generate the requested keys into a bundle file, send it, wait for the server's ready (answering its
-        setup-time asks, e.g. a calibration, with `ask`)."""
+    def provide_keys(self, threads: int = 8) -> dict:
+        """Generate the requested keys into a bundle file, send it, wait for the server's ready."""
         path = os.path.join(self.work_dir, "keys.pckb")
         t0 = time.time()
         st = dict(self.client.keygen(self.spec, path, threads=threads))
@@ -68,28 +68,22 @@ class Remote:
         t1 = time.time()
         self.conn.send_file("bundle", path)
         st["send_s"] = time.time() - t1
-        st["ready"] = self._wait("ready", ask)[0]
+        st["ready"] = self._wait("ready")[0]
         self.stats["keygen"] = st
         os.remove(path)
         return st
 
-    def run(self, frames=(), ask=None, **meta):
-        """One request; returns (header, frames) of the result (answering the server's asks on the way)."""
+    def run(self, frames=(), **meta):
+        """One request; returns (header, frames) of the result."""
         self.conn.send("run", blobs=list(frames), **meta)
-        return self._wait("result", ask)
+        return self._wait("result")
 
-    def _wait(self, want, ask):
-        while True:
-            kind, h, blobs = self.conn.recv()
-            if kind == want:
-                return h, blobs
-            if kind == "ask":
-                if ask is None:
-                    raise RuntimeError(f"server asked {h.get('what')!r} and this client has no handler")
-                rh, rb = ask(h, blobs)
-                self.conn.send("answer", blobs=list(rb), **rh)
-                continue
-            raise RuntimeError(f"unexpected '{kind}' message while waiting for '{want}'")
+    def _wait(self, want):
+        kind, h, blobs = self.conn.recv()
+        if kind != want:
+            raise RuntimeError(f"unexpected '{kind}' message while waiting for '{want}'"
+                               + (f" (server request {h.get('what')!r} refused)" if kind == "ask" else ""))
+        return h, blobs
 
     def close(self):
         try:

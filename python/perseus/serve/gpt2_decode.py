@@ -94,7 +94,7 @@ class Gpt2Handler:
               f"{len(json.loads(spec)['keys'])} switching keys", flush=True)
         return {"spec": spec, "input": {"level": int(p0.inputs[0][1]), "deg": 1}, "n_layers": self.n}
 
-    def load(self, path, ask):
+    def load(self, path):
         r = self.run_
         r.bundle = path
         r.setup(self.rows, argmax=self.argmax)
@@ -103,7 +103,7 @@ class Gpt2Handler:
         s, k = r.sess.setup_seconds()
         return {"session_s": round(s, 2), "import_s": round(k, 2), "keys": r.sess.n_keys(), "has_secret": r.sess.has_secret}
 
-    def run(self, h, frames, ask):
+    def run(self, h, frames):
         _pc, r = self._pc, self.run_
         t = int(h["t"])
         t0 = time.time()

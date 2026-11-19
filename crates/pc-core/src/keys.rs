@@ -529,7 +529,12 @@ impl SecretKey {
     }
     /// `sample` with a sparse secret of Hamming weight `h` (the default 32 keeps the dense -> sparse export key at
     /// q0 x P below 128 bits' margin only; a larger h raises it, see `ClientSecret.generate(sparse_h=...)`).
+    /// Weights below `SPARSE_H` are refused: the server's dense -> sparse key encrypts s under the sparse secret, which
+    /// it can then search (h = 0 hands it s outright: b = e + P s).
     pub fn sample_h(prng: &mut Prng, n: usize, h: usize) -> Result<Self> {
+        if h < Self::SPARSE_H {
+            return Err(Error::Keys(format!("sparse secret: Hamming weight h={h} is below {} (the dense -> sparse key would expose the dense secret)", Self::SPARSE_H)));
+        }
         Ok(SecretKey { s: sample_ternary(prng, n), s_sparse: sample_sparse_ternary(prng, n, h)? })
     }
 }
@@ -613,6 +618,16 @@ mod tests {
             let b = chacha_block(&key, c as u32, (c >> 32) as u32, 11, DRBG_TAG, 20);
             assert!((0..16).all(|w| x[w][j] == b[w]), "block {j}");
         }
+    }
+
+    #[test]
+    fn light_sparse_secrets_refused() {
+        let mut g = Prng::from_seed([3; 8], 0);
+        for h in [0usize, 1, 8, SecretKey::SPARSE_H - 1] {
+            assert!(SecretKey::sample_h(&mut g, 1 << 10, h).is_err(), "h {h}");
+        }
+        let sk = SecretKey::sample_h(&mut g, 1 << 10, SecretKey::SPARSE_H).unwrap();
+        assert_eq!(sk.s_sparse.iter().filter(|&&x| x != 0).count(), SecretKey::SPARSE_H);
     }
 
     /// `cargo test --release -p pc-core fill_below_cost -- --ignored --nocapture`.

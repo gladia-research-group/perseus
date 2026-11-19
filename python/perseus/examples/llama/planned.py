@@ -268,13 +268,15 @@ class LlamaPlannedPrefill(PlannedPrefill):
         from perseus import _pc
         return _pc.Session(self.cfg, self.keys, **kw)
 
-    def calibrate_ccmm(self):
-        """ccmm.py `prepare` + `_calibrate` on the session's CCMM service: nf_ref / nf_split from a fresh token at the
-        bootstrap output level, then c_unit from known probe matrices (shift 0, factors 2^-3), fitted like the old one."""
+    def ccmm_fit(self, sess):
+        """ccmm.py `prepare` + `_calibrate` on `sess`'s CCMM service (`sess` must hold its secret): nf_ref / nf_split
+        from a fresh token at the bootstrap output level, then c_unit from known probe matrices (shift 0, factors
+        2^-3), fitted like the old one. c_unit is a property of the chain and the CCMM pipeline, not of the key
+        (over 10 secrets it moves by ~1e-8 relative, as much as between two probes under one secret), so a served
+        session takes it from a throwaway key of the server's own (serve.llama_prefill)."""
         from perseus.impl import ccmm as CC
         from perseus.impl import sinc as sc
-        t0 = time.time()
-        fhe, sess = self.fhe, self.sess
+        fhe = sess.fhe
         L = int(self.in_metas[0][0][0])
         S = len(self.in_vals[0])
         tok = fhe.encrypt(np.zeros(S, dtype=np.complex128), L, 1)
@@ -293,19 +295,26 @@ class LlamaPlannedPrefill(PlannedPrefill):
         want = np.einsum("ijl,jkl->ikl", A, B)[:, :, :16]
         c_unit = float(np.real(np.vdot(want, got) / np.vdot(want, want))) / (f * f)
         err = np.abs(got - c_unit * f * f * want).max() / (np.abs(want).max() * c_unit * f * f)
-        del xa, xb
-        sess.ccmm_set(c_unit, *self.ccmm_kappa)
-        land = (int(ys[0].level), int(ys[0].deg))
+        return {"c_unit": c_unit, "nf_ref": nf_ref, "nf_split": nf_split, "probe_rel_err": float(err),
+                "land": (int(ys[0].level), int(ys[0].deg))}
+
+    def calibrate_ccmm(self):
+        """`ccmm_fit` on the session (which still holds the secret), then `ccmm_set` and the landing check."""
+        from perseus.impl import ccmm as CC
+        t0 = time.time()
+        cal = self.ccmm_fit(self.sess)
+        self.sess.ccmm_set(cal["c_unit"], *self.ccmm_kappa)
+        land, err, nf_ref, nf_split = cal["land"], cal["probe_rel_err"], cal["nf_ref"], cal["nf_split"]
         fake_land = CC.fake_landing(getattr(getattr(self.model, "inf", None), "fhe", None))
-        self.ccmm_cal = {"c_unit": c_unit, "nf_ref": nf_ref, "nf_split": nf_split, "probe_rel_err": float(err),
-                         "land": land, "s": time.time() - t0}
-        self.log(f"[ccmm] calibrated: c_unit {c_unit:.6g} (probe rel. err {err:.2e}, "
+        self.ccmm_cal = dict(cal, s=time.time() - t0)
+        self.log(f"[ccmm] calibrated: c_unit {cal['c_unit']:.6g} (probe rel. err {err:.2e}, "
                  f"{np.log2(1 / max(err, 1e-300)):.1f} bits), nf_ref 2^{np.log2(nf_ref):.3f}, nf_split "
                  f"2^{np.log2(nf_split):.3f}, landing {land} (the twin's {fake_land}), "
                  f"{time.time() - t0:.1f} s")
         if land[0] != fake_land:
             raise RuntimeError(f"CCMM lands at level {land[0]} on the device, the CPU twin recorded {fake_land} "
                                f"(ccmm.fake_landing)")
+        L = int(self.in_metas[0][0][0])
         for kappa in self.ccmm_sweep:
             for case in ("qk", "pv"):
                 bits = self.ccmm_case(case, kappa, L)
