@@ -2,12 +2,12 @@
 
     hello (client: plan contract, chain, run shape) -> manifest (server: `Session.key_manifest` + the input layout)
     bundle (client: the key bundle, once) -> ready (server: `Session.from_bundle`, programs bound)
-    run (client: input frames) [-> ask / answer ...] -> result (server: output frames)   (repeated)
+    run (client: input frames) -> result (server: output frames)   (repeated)
     bye
 
-A `Handler` supplies the model: `manifest(hello) -> dict` (with "spec"), `load(bundle_path, ask) -> dict`,
-`run(header, frames, ask) -> (dict, frames)`; `ask(what, frames, **header) -> (header, frames)` sends a request
-back to the client (e.g. decrypting calibration probes) and waits for its answer.
+A `Handler` supplies the model: `manifest(hello) -> dict` (with "spec"), `load(bundle_path) -> dict`,
+`run(header, frames) -> (dict, frames)`. There is no request back to the client: a value the client derived from
+decrypting ciphertexts the server chose would be a decryption oracle (the server calibrates on its own keys).
 """
 from __future__ import annotations
 
@@ -33,13 +33,8 @@ def serve_one(addr: str, handler, work_dir: str, log=print) -> dict:
         conn.recv_file(path, "bundle")
         recv_s = time.time() - t0
 
-        def ask(what, frames=(), **h):
-            conn.send("ask", what=what, blobs=list(frames), **h)
-            _k, ah, ab = conn.recv("answer")
-            return ah, ab
-
         t1 = time.time()
-        ready = handler.load(path, ask)
+        ready = handler.load(path)
         os.remove(path)
         ready.update(bundle_recv_s=round(recv_s, 2), load_s=round(time.time() - t1, 2))
         log(f"[serve] ready {ready}")
@@ -51,7 +46,7 @@ def serve_one(addr: str, handler, work_dir: str, log=print) -> dict:
                 break
             if kind != "run":
                 raise RuntimeError(f"unexpected '{kind}' message")
-            rh, rb = handler.run(h, blobs, ask)
+            rh, rb = handler.run(h, blobs)
             conn.send("result", blobs=list(rb), **rh)
         return {"sent": conn.sent, "received": conn.received}
     except Exception as e:

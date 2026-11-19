@@ -1,18 +1,19 @@
-"""Llama planned prefill served to a separate client process: the server never holds the secret.
+"""Llama planned prefill served to a separate client process: the server never holds the client's secret.
 
     python -m perseus.serve.llama_prefill server --addr SOCK -- --tokens 127 --plan bootstrap_placements/llama31_8b_prefill128 --force
     python -m perseus.serve.llama_prefill client --addr SOCK [--out res.json] -- <the same run_prefill arguments>
 
 Both processes build `examples.llama.run_prefill`'s CPU twin from the same arguments. The server records and
 compiles with placeholder tokens (BOS everywhere: the prefill's op stream depends on the prompt length only), asks
-for its keys (PCMM + CCMM included), calibrates the CCMM with public probe matrices (the client fits `c_unit` from
-their decryption and returns only that scalar) and runs forwards on the client's encrypted block-0 inputs,
-returning the last block's hidden ciphertexts. The client packs its prompt (`LlamaPlannedPrefill.input_values`'s
+for its keys (PCMM + CCMM included), calibrates the CCMM on its own (`c_unit` under a throwaway secret of its own:
+nothing the client decrypts ever goes back to the server) and runs forwards on the client's encrypted block-0
+inputs, returning the last block's hidden ciphertexts. The client packs its prompt (`LlamaPlannedPrefill.input_values`'s
 packing), decrypts the hidden rows and applies the final norm + LM head itself, gated like run_prefill.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -41,16 +42,6 @@ def _pack(model, toks):
     return [np.array(c.vec) for blk in Xs for c in blk], ch
 
 
-def _probes():
-    from perseus.impl import sinc as sc
-    rng = np.random.default_rng(1)
-    A = np.zeros((sc.D, sc.D, sc.BATCH), complex)
-    B = np.zeros((sc.D, sc.D, sc.BATCH))
-    A[:, :, :16] = 0.05 * (rng.standard_normal((sc.D, sc.D, 16)) + 1j * rng.standard_normal((sc.D, sc.D, 16)))
-    B[:, :, :16] = 0.05 * rng.standard_normal((sc.D, sc.D, 16))
-    return A, B
-
-
 # ── server ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def _server(addr, a, model, toks, gt, ref, results=None):
@@ -67,33 +58,50 @@ def _server(addr, a, model, toks, gt, ref, results=None):
     work = _work_dir()
 
     class Served(LlamaPlannedPrefill):
-        bundle, ask = None, None
+        bundle, ccmm_ref = None, None
 
         def open_session(self, kw):
             return _pc.Session.from_bundle(self.cfg, self.keys, self.bundle, **kw)
 
-        def calibrate_ccmm(self):
-            """`LlamaPlannedPrefill.calibrate_ccmm` with the probe outputs decrypted by the client (which returns
-            only the fitted c_unit; the probes are public matrices)."""
+        def setup(self, toks):
+            if not hasattr(self, "progs"):
+                self.prepare(toks)
+            if self.ccmm:
+                self.ccmm_ref = self.throwaway_fit()
+            return super().setup(toks)
+
+        def throwaway_fit(self):
+            """`ccmm_fit` on a session of the same config and programs under a fresh secret of the server's own
+            (no PCMM keys), closed before the client's session opens. c_unit does not depend on the key (see
+            `ccmm_fit`), so the client is never asked to decrypt anything (a decryption oracle: the server
+            picks the ciphertexts)."""
             t0 = time.time()
-            fhe, sess = self.fhe, self.sess
-            L = int(self.in_metas[0][0][0])
-            S = len(self.in_vals[0])
-            tok = fhe.encrypt(np.zeros(S, dtype=np.complex128), L, 1)
+            own = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
+            sess = _pc.Session(self.cfg, own, **dict(self.session_kwargs(), pcmm=None))
+            sess.complete_setup()
+            cal = self.ccmm_fit(sess)
+            del sess, own
+            gc.collect()
+            self.log(f"[ccmm] throwaway-key fit: c_unit {cal['c_unit']!r} (probe rel. err {cal['probe_rel_err']:.2e}), "
+                     f"landing {cal['land']}, {time.time() - t0:.1f} s")
+            return cal
+
+        def calibrate_ccmm(self):
+            """`LlamaPlannedPrefill.calibrate_ccmm` without a secret: nf_ref / nf_split from a token on the client's
+            session (scales only, no decryption), c_unit and the landing from `throwaway_fit`."""
+            t0 = time.time()
+            ref, sess = self.ccmm_ref, self.sess
+            tok = self.fhe.encrypt(np.zeros(len(self.in_vals[0]), dtype=np.complex128), int(self.in_metas[0][0][0]), 1)
             nf_ref, nf_split = sess.ccmm_prepare(tok)
             del tok
-            A, B = _probes()
-            xa = [fhe.encrypt(v, L, 1) for v in CC.from_mats(A)]
-            xb = [fhe.encrypt(v.astype(np.complex128), L, 1) for v in CC.from_mats(B)]
-            f = 2.0 ** -3
-            ys = sess.ccmm_probe(xa, xb, False, f, f, 0, False)
-            ah, _ = self.ask("ccmm_calibrate", [_pc.export_ct(sess, y) for y in ys], f=f)
-            c_unit, err = float(ah["c_unit"]), float(ah["err"])
-            sess.ccmm_set(c_unit, *self.ccmm_kappa)
-            land = (int(ys[0].level), int(ys[0].deg))
+            if not np.allclose([nf_ref, nf_split], [ref["nf_ref"], ref["nf_split"]], rtol=1e-12, atol=0):
+                raise RuntimeError(f"CCMM scales nf_ref / nf_split {nf_ref} / {nf_split}, the throwaway session's "
+                                   f"{ref['nf_ref']} / {ref['nf_split']}")
+            sess.ccmm_set(ref["c_unit"], *self.ccmm_kappa)
+            land = ref["land"]
             fake_land = CC.fake_landing(getattr(getattr(self.model, "inf", None), "fhe", None))
-            self.ccmm_cal = {"c_unit": c_unit, "nf_ref": nf_ref, "nf_split": nf_split, "probe_rel_err": err, "land": land, "s": time.time() - t0}
-            self.log(f"[ccmm] calibrated by the client: c_unit {c_unit:.6g} (probe rel. err {err:.2e}), landing {land}, {time.time() - t0:.1f} s")
+            self.ccmm_cal = dict(ref, s=time.time() - t0)
+            self.log(f"[ccmm] calibrated on the server: c_unit {ref['c_unit']:.6g}, landing {land}")
             if land[0] != fake_land:
                 raise RuntimeError(f"CCMM lands at level {land[0]} on the device, the CPU twin recorded {fake_land}")
 
@@ -120,14 +128,14 @@ def _server(addr, a, model, toks, gt, ref, results=None):
                 raise ValueError(f"client plan contract {hello['contract']}, server {json.loads(spec)['contract']}")
             return {"spec": spec, "inputs": [list(m) for m in run.in_metas[0]], "warmup": bool(cfg["model.prefill.warmup"])}
 
-        def load(self, path, ask):
-            run.bundle, run.ask = path, ask
+        def load(self, path):
+            run.bundle = path
             run.setup(ptoks)
             assert not run.sess.has_secret and not run.fhe.has_secret_key
             s, k = run.sess.setup_seconds()
             return {"session_s": round(s, 2), "import_s": round(k, 2), "keys": run.sess.n_keys(), "has_secret": run.sess.has_secret}
 
-        def run(self, h, frames, ask):
+        def run(self, h, frames):
             t0 = time.time()
             x0 = [_pc.import_ct(run.sess, f) for f in frames]
             t1 = time.time()
@@ -152,7 +160,6 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     from perseus.examples.llama import hf
     from perseus.examples.llama import run_prefill as RP
     from perseus.examples.llama.prefill import plain_logits, report
-    from perseus.impl import ccmm as CC
     from perseus.impl.blocked import decrypt_blocked
     from perseus.impl.prefill import Chunks
     cfg = RP._plan_config(a.plan)
@@ -161,25 +168,8 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     cl = Client(ClientSecret.generate(), chain=cfg["chain.preset"] or "n32", complex=True)
     remote = Remote(addr, cl, os.path.join(_work_dir(), "client"))
 
-    asked = []
-
-    def ask(h, frames):
-        if h.get("what") != "ccmm_calibrate" or asked:
-            raise RuntimeError(f"unknown or repeated server request {h.get('what')!r}")
-        asked.append(h["what"])
-        A, B = _probes()
-        f = float(h["f"])
-        got = CC.to_mats([cl.decrypt(x)[0] for x in frames])[:, :, :16]
-        want = np.einsum("ijl,jkl->ikl", A, B)[:, :, :16]
-        c_unit = float(np.real(np.vdot(want, got) / np.vdot(want, want))) / (f * f)
-        err = float(np.abs(got - c_unit * f * f * want).max() / (np.abs(want).max() * c_unit * f * f))
-        if not err < 1e-2:
-            raise RuntimeError(f"ccmm_calibrate: the outputs do not fit the probe matrices (rel. err {err:.2e}); refusing")
-        print(f"[client] ccmm calibration: c_unit {c_unit:.6g}, probe rel. err {err:.2e}", flush=True)
-        return {"c_unit": c_unit, "err": err}, []
-
     man = remote.handshake(contract_hash(cfg), tokens=len(toks))
-    kg = remote.provide_keys(ask=ask)
+    kg = remote.provide_keys()
     metas = man["inputs"]
 
     def frames_of(tk):

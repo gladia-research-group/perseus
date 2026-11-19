@@ -3,8 +3,8 @@
 A message is `u64 length | u32 header length | header (JSON: {"kind", ...}) | blobs`, the header listing the blob
 sizes (`"blobs": [n0, n1, ...]`); blobs are ciphertext wire frames (`_pc.export_ct` / `Client.encrypt`) or raw
 bytes. A key bundle travels once as one message whose single blob is streamed from / to a file. The session
-protocol (hello -> manifest -> bundle -> ready -> run* -> bye, and the server's `ask` requests back to the client)
-is in docs/WIRE.md.
+protocol (hello -> manifest -> bundle -> ready -> run* -> bye; the server never sends requests back to the
+client) is in docs/WIRE.md.
 """
 from __future__ import annotations
 
