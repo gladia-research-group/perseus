@@ -971,3 +971,441 @@ fn bytemuck_i32(v: &[i32]) -> &[u32] {
     // SAFETY: i32 and u32 share size and alignment
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u32, v.len()) }
 }
+
+/// `pc-check tfhe-noise [--lwe n,log2] [--nu 1|2] [--samples 262144] [--count 16384] [--norm 5] [--seed S] [--out file]`:
+/// the phase error at the TFHE bootstrap's input as TFHE-rs defines it for its 2_2 parameter sets (atomic pattern
+/// BR -> DP -> KS -> MS): a bootstrap output (device PBS, identity LUT on 16 boxes of the padded half), times the 2-norm
+/// `--norm` (TFHE-rs's max_noise_level), key switched s_br -> s_lwe (device KS), mod switched p0 -> 2 nu n_br (the
+/// device's mean-compensated switch, on the host). Every stage is decrypted on the host.
+///
+/// Prints the measured sigma of the bootstrap output, of the key switch's output and of the bootstrap input (95%
+/// interval), each next to the analytical model's (`NoiseModel`), and p_fail = P(|e| >= 1/64) (2_2: two message bits,
+/// two carry bits and the padding bit) three ways: the Gaussian tail at the measured sigma, at the model's sigma, and a
+/// Chernoff bound from the model terms' exact log-MGFs (no Gaussian assumption; terms independent).
+///
+/// --lwe n,log2: the LWE key (Params::with_lwe; default Params' 840, 2^-18 p0). --nu 2: the extended blind rotation
+/// (mod switch to 4 n_br). --samples: total, rounded up to whole batches of --count. --out: the raw records, per
+/// sample 5 little-endian f64 [message, e_br, e_ks, e_in, e_in_plain], errors as fractions of the torus (e_in_plain: a
+/// plain, uncompensated mod switch, for comparison).
+/// Gates: the device KS == pc-tfhe LweKsk::apply on 4 samples; the measured input sigma within 3% of the model's.
+pub fn cmd_noise(args: &[String]) -> ExitCode {
+    match run_noise(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-noise: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_noise(args: &[String]) -> Res<bool> {
+    use pc_core::keys::{sample_ternary, DiscreteGaussian};
+    use pc_core::pcmm_keys::digit_planes;
+    use pc_kernels::args::{tfhe_op, TfheArgs};
+    use pc_tfhe::chain::ChainKey;
+    use pc_tfhe::gadget::{fixed_ratio, ms_body_mean, scale_round, Gadget};
+    use pc_tfhe::lwe::Lwe;
+    use pc_tfhe::pbs::{BootstrapKey, Rns};
+    use rayon::prelude::*;
+    use std::io::Write;
+    const PLANES: usize = 4;
+    const THR: f64 = 1.0 / 64.0;
+    let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(16384);
+    let samples: usize = arg(args, "--samples").map(|s| s.parse()).transpose()?.unwrap_or(1 << 18);
+    let batches = samples.div_ceil(count).max(1);
+    let nu: usize = arg(args, "--nu").map(|s| s.parse()).transpose()?.unwrap_or(1);
+    if nu != 1 && nu != 2 {
+        return Err("--nu 1 or 2".into());
+    }
+    let norm: u64 = arg(args, "--norm").map(|s| s.parse()).transpose()?.unwrap_or(5);
+    let seed: u32 = arg(args, "--seed").map(|s| s.parse()).transpose()?.unwrap_or(0x61);
+    let out_path = arg(args, "--out");
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let p0 = chain.q[0];
+    let mut p = Params::new(chain.n)?;
+    p.nu = nu;
+    if let Some(v) = arg(args, "--lwe") {
+        let (n_lwe, l) = v.split_once(',').ok_or("--lwe n,log2")?;
+        p = p.with_lwe(n_lwe.parse()?, l.parse()?)?;
+        if let Some(w) = p.lwe_warning() {
+            eprintln!("[tfhe] warning: --lwe {v}: {w}");
+        }
+    }
+    let (n, q, nl) = (p.n_br, p.q_br, p.n_lwe);
+    let mut prng = test_prng(seed);
+    let s_lwe: Vec<i64> = (0..nl).map(|_| (prng.next_u32() & 1) as i64).collect();
+    let s_br: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
+    let dg = DiscreteGaussian::new(p.bsk_sigma)?;
+    let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
+    let t0 = Instant::now();
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), Rns::new(p.br_primes.0, p.br_primes.1, n)?, p.pbs_group, &dg, &mut prng);
+    let ck = ChainKey::generate(&s_br, &s_lwe, p0, &p, &mut prng)?;
+    println!(
+        "[pc-check] tfhe-noise: keys {:.1} s (n_lwe {nl}, sigma 2^{:.2} p0, p0 {p0}, n_br {n}, Q {q}, pbs {:?} group {}, ks {:?}, nu {nu}, norm {norm}; {} samples)",
+        t0.elapsed().as_secs_f64(),
+        p.lwe_sigma_rel.log2(),
+        p.pbs,
+        p.pbs_group,
+        p.ks,
+        batches * count
+    );
+    // identity LUT on 16 boxes of the padded half: tv[j] = floor(16 j / (nu n)) Q / 32
+    let tvl = nu * n;
+    let tv: Vec<u64> = (0..tvl).map(|j| ((16 * j / tvl) as f64 * q as f64 / 32.0).round() as u64).collect();
+    let img = pc_gpu::tfhe::pbs_image(&bsk);
+    let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
+    // the chain key as K-contiguous int8 planes (as run_ks)
+    let (n_in, lv) = (n, p.ks.1);
+    let k = n_in * lv;
+    let cols = nl + 1;
+    let mut w = vec![0i64; cols * k];
+    for i in 0..n_in {
+        for t in 0..lv {
+            let key = &ck.ksk.keys[i][t];
+            for o in 0..cols {
+                let v = if o < nl { key.a[o] } else { key.b };
+                w[o * k + i * lv + t] = centered(v, p0);
+            }
+        }
+    }
+    let planes = digit_planes(&w, PLANES)?;
+    drop(w);
+    let dev = Device::open()?;
+    let lin_words = count * (nl + 1);
+    let ks_words = count * (n_in + 1);
+    let ws_bytes = 64 << 20;
+    let words = img.bsk.len() + 2 * img.tw.len() + tvr.len() + count * nu * 4 * n + 2 * lin_words + count * (n + 1) + ks_words + count * cols + PLANES * cols * count;
+    let arena = pc_cuda::Arena::new(&dev, 4 * words + planes.len() + count * k + ws_bytes + (128 << 20))?;
+    let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
+    let lt = pc_cuda::blas::Lt::new(&dev)?;
+    let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
+        let mut b = arena.alloc::<pc_cuda::Compute, u32>(what, v.len())?;
+        b.upload(&s, v)?;
+        Ok(b)
+    };
+    let d_bsk = up("tfhe.bsk", &img.bsk)?;
+    let d_tw = up("tfhe.tw", &img.tw)?;
+    let d_tws = up("tfhe.tw", &img.tws)?;
+    let d_tv = up("tfhe.tv", &tvr)?;
+    let mut d_in = arena.alloc::<pc_cuda::Compute, u32>("tfhe.in", lin_words)?;
+    let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.acc", count * nu * 4 * n)?;
+    let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", lin_words)?;
+    let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * (n + 1))?;
+    let mut d_planes: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u8>> = Vec::new();
+    for u in 0..PLANES {
+        let mut b = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ksk", cols * k)?;
+        let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
+        b.upload(&s, &bytes)?;
+        d_planes.push(b);
+    }
+    drop(planes);
+    let mut d_ksin = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ksin", ks_words)?;
+    let mut d_dig = arena.alloc::<pc_cuda::Compute, u8>("tfhe.dig", count * k)?;
+    let mut d_g = arena.alloc::<pc_cuda::Compute, i32>("tfhe.g", PLANES * cols * count)?;
+    let mut d_ksout = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ksout", count * cols)?;
+    let mut d_ws = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ws", ws_bytes)?;
+    let gemm = pc_gpu::matmul::gemm::I8Gemm::new(&lt.inner, count as u64, cols as u64, k as u64, 8, ws_bytes)?;
+    let inst = pc_kernels::table::Instance::U32Barrett64;
+    let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
+    let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
+    let base = TfheArgs { n: n as i32, count: count as i32, i1: nl as i32, q, ..Default::default() };
+    let mut cx = [0u64; 8];
+    cx[5] = nu as u64;
+    cx[6] = img.c[6];
+    cx[7] = img.c[7];
+    let mut ic = img.c;
+    ic[5] = nu as u64;
+    let gks = Gadget::new(p0, p.ks, false);
+    let two_n = (2 * nu * n) as u64;
+    let mm = fixed_ratio(two_n, p0);
+    let mut file = match &out_path {
+        Some(f) => Some(std::io::BufWriter::new(std::fs::File::create(f)?)),
+        None => None,
+    };
+    let cen = |x: f64, m: f64| -> f64 { (x + m / 2.0).rem_euclid(m) - m / 2.0 };
+    // per column (e_br, e_ks, e_in, e_in_plain): sum, sum of squares, max |e|; failures |e_in| >= 1/64
+    let mut sums = [[0f64; 3]; 4];
+    let mut fails = 0usize;
+    let mut tot = 0usize;
+    let (mut t_dev, mut t_host) = (0f64, 0f64);
+    for bi in 0..batches {
+        let th = Instant::now();
+        let msgs: Vec<u64> = (0..count).map(|_| (prng.next_u32() & 15) as u64).collect();
+        let lwes: Vec<Lwe> = msgs
+            .iter()
+            .map(|&m| Lwe::encrypt(((m as f64 + 0.5) / 32.0 * p0 as f64).round() as u64 % p0, &s_lwe, p0, &dg_lwe, &mut prng))
+            .collect();
+        let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
+        t_host += th.elapsed().as_secs_f64();
+        let td = Instant::now();
+        d_in.upload(&s, &lin)?;
+        go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(two_n, p0), c: [p0, 0, 0, 0, 1, nu as u64, 0, 0], ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: ic, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_acc.vptr(), m: fixed_ratio(p0, q), c: [0, p0, 0, 0, 0, nu as u64, cx[6], cx[7]], ..base })?;
+        let outs = d_out.download(&s)?;
+        t_dev += td.elapsed().as_secs_f64();
+        // x norm (TFHE-rs's max_noise_level scalar): the KS input [count][n + 1] mod p0
+        let th = Instant::now();
+        let ksin: Vec<u32> = outs.iter().map(|&v| ((v as u64 * norm) % p0) as u32).collect();
+        t_host += th.elapsed().as_secs_f64();
+        let td = Instant::now();
+        d_ksin.upload(&s, &ksin)?;
+        go(&TfheArgs { op: tfhe_op::KS_DIGITS, count: count as i32, i1: n_in as i32, x: d_dig.vptr_mut(), y: d_ksin.vptr(), q: p0, m: gks.m, c: [p.ks.0 as u64, lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+        let gp = d_g.dptr_mut();
+        for u in 0..PLANES {
+            // SAFETY: the operands are live arena buffers of the plan's lengths, owned by `s`
+            unsafe { gemm.run(&s, d_dig.dptr() as *const i8, d_planes[u].dptr() as *const i8, gp.add(u * cols * count), false, &mut d_ws)? };
+        }
+        go(&TfheArgs { op: tfhe_op::KS_RECOMBINE, count: count as i32, i1: n_in as i32, i2: nl as i32, x: d_ksout.vptr_mut(), y: d_g.vptr(), z: d_ksin.vptr(), q: p0, c: [0, 0, PLANES as u64, 0, 0, 0, 0, 0], ..Default::default() })?;
+        let ks = d_ksout.download(&s)?;
+        t_dev += td.elapsed().as_secs_f64();
+        let th = Instant::now();
+        if bi == 0 {
+            // the device KS == the host chain key switch on the first 4 samples
+            for i in 0..4 {
+                let x = Lwe { a: ksin[i * (n + 1)..i * (n + 1) + n].iter().map(|&v| v as u64).collect(), b: ksin[i * (n + 1) + n] as u64 };
+                let want = ck.ksk.apply(&x);
+                let row = &ks[i * cols..(i + 1) * cols];
+                if want.a.iter().zip(row).any(|(a, b)| *a != *b as u64) || want.b != row[nl] as u64 {
+                    println!("[pc-check] tfhe-noise: FAIL device KS != pc-tfhe LweKsk::apply (sample {i})");
+                    return Ok(false);
+                }
+            }
+        }
+        let p0f = p0 as f64;
+        let tnf = two_n as f64;
+        let recs: Vec<[f64; 5]> = (0..count)
+            .into_par_iter()
+            .map(|i| {
+                let m = msgs[i];
+                // the bootstrap output under s_br
+                let o = &outs[i * (n + 1)..(i + 1) * (n + 1)];
+                let mut ph: i128 = o[n] as i128;
+                for (a, s) in o[..n].iter().zip(&s_br) {
+                    ph += *a as i128 * *s as i128;
+                }
+                let e_br = cen(ph.rem_euclid(p0 as i128) as f64 - m as f64 / 32.0 * p0f, p0f) / p0f;
+                // x norm, key switched: under s_lwe
+                let t5 = ((norm * m) % 32) as f64 / 32.0;
+                let r = &ks[i * cols..(i + 1) * cols];
+                let mut ph: i128 = r[nl] as i128;
+                for (a, s) in r[..nl].iter().zip(&s_lwe) {
+                    ph += *a as i128 * *s as i128;
+                }
+                let e_ks = cen(ph.rem_euclid(p0 as i128) as f64 - t5 * p0f, p0f) / p0f;
+                // mod switched to 2 nu n_br: the next bootstrap's input
+                let a: Vec<u64> = r[..nl].iter().map(|&v| v as u64).collect();
+                let ms = |mean: bool| -> f64 {
+                    let b = if mean { ms_body_mean(&a, r[nl] as u64, mm, two_n) } else { scale_round(r[nl] as u64, mm) % two_n };
+                    let mut ph = b as i128;
+                    for (x, s) in a.iter().zip(&s_lwe) {
+                        ph += (scale_round(*x, mm) % two_n) as i128 * *s as i128;
+                    }
+                    cen(ph.rem_euclid(two_n as i128) as f64 - t5 * tnf, tnf) / tnf
+                };
+                [m as f64, e_br, e_ks, ms(true), ms(false)]
+            })
+            .collect();
+        for rcd in &recs {
+            for c in 0..4 {
+                let e = rcd[c + 1];
+                sums[c][0] += e;
+                sums[c][1] += e * e;
+                sums[c][2] = sums[c][2].max(e.abs());
+            }
+            fails += (rcd[3].abs() >= THR) as usize;
+        }
+        tot += count;
+        if let Some(f) = file.as_mut() {
+            for rcd in &recs {
+                for v in rcd {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+        }
+        t_host += th.elapsed().as_secs_f64();
+        if bi % 8 == 7 && bi + 1 < batches {
+            println!("[pc-check] tfhe-noise: {tot} samples, sigma in {:.4e} (dev {t_dev:.1} s, host {t_host:.1} s)", (sums[2][1] / tot as f64).sqrt());
+        }
+    }
+    if let Some(mut f) = file {
+        f.flush()?;
+    }
+    let model = NoiseModel::new(&p, p0, nu, norm as f64);
+    let nf = tot as f64;
+    // sigma about zero (the mod switch's mean is compensated; the means are printed) and its 95% interval
+    let sd = |c: usize| (sums[c][1] / nf).sqrt();
+    let ci = |c: usize| (sd(c) * (1.0 - 1.96 / (2.0 * nf).sqrt()), sd(c) * (1.0 + 1.96 / (2.0 * nf).sqrt()));
+    let names = ["bootstrap output".to_string(), format!("x {norm}, key switched"), format!("bootstrap input (MS to {two_n})"), "  same, plain MS (comparison)".to_string()];
+    let want = [model.var_br_out().sqrt(), model.var_ks().sqrt(), model.var_in().sqrt(), f64::NAN];
+    println!("[pc-check] tfhe-noise: {tot} samples, device {t_dev:.1} s, host {t_host:.1} s; errors as fractions of the torus");
+    for c in 0..4 {
+        let (lo, hi) = ci(c);
+        let m = if want[c].is_nan() { String::new() } else { format!(", model {:.4e} ({:+.2}%)", want[c], (sd(c) / want[c] - 1.0) * 1e2) };
+        println!("[pc-check] tfhe-noise:   {:34} sigma {:.4e} [{lo:.4e}, {hi:.4e}]{m}; mean {:+.2e}, max |e| {:.2} sigma", names[c], sd(c), sums[c][0] / nf, sums[c][2] / sd(c));
+    }
+    let (lo, hi) = ci(2);
+    let lp = |sig: f64| log2_gauss_tail(THR / sig);
+    let (bound, lam) = model.chernoff_log2(THR);
+    println!(
+        "[pc-check] tfhe-noise: log2 p_fail = log2 P(|e_in| >= 1/64): measured {:.2} [{:.2}, {:.2}], model {:.2}, Chernoff bound <= {bound:.2} (lambda {lam:.0}); observed {fails} of {tot}",
+        lp(sd(2)),
+        lp(hi),
+        lp(lo),
+        lp(want[2])
+    );
+    let dev = (sd(2) / want[2] - 1.0).abs();
+    let ok = dev < 0.03;
+    println!("[pc-check] tfhe-noise: {} measured input sigma within 3% of the model ({:.2}%)", if ok { "PASS" } else { "FAIL" }, dev * 1e2);
+    Ok(ok)
+}
+
+/// log2 P(|X| >= z) for X ~ N(0, 1): log2 erfc(z / sqrt 2) (the continued fraction past x = 2, no underflow).
+fn log2_gauss_tail(z: f64) -> f64 {
+    let x = z / std::f64::consts::SQRT_2;
+    let ln = if x < 2.0 {
+        (1.0 - libm_erf(x)).ln()
+    } else {
+        // erfc x = exp(-x^2) / sqrt(pi) / (x + (1/2) / (x + 1 / (x + (3/2) / (x + ...))))
+        let mut t = x;
+        for k in (1..=200).rev() {
+            t = x + k as f64 / 2.0 / t;
+        }
+        -x * x - (std::f64::consts::PI.sqrt() * t).ln()
+    };
+    ln / std::f64::consts::LN_2
+}
+
+/// log(sinh(x) / x): the log-MGF of U(-1, 1) at x.
+fn ln_sinhc(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1e-4 {
+        x * x / 6.0
+    } else {
+        x + (-(-2.0 * x).exp()).ln_1p() - (2.0 * x).ln()
+    }
+}
+
+/// The analytical noise of `pc-check tfhe-noise`'s pattern (variances as fractions of the torus, terms independent):
+///   bootstrap output: per multi-bit group, 2^G - 1 GGSWs times (X^e - 1) (two key errors), 2 components x levels x
+///   n_br digits uniform in [-B/2, B/2) x sigma_bsk^2 / Q^2; the gadget's rounding (eps_0 + eps_1 s_br, uniform
+///   1 / B^levels) on the (1 - 2^-G) of the groups with a non-zero key; the extraction's switch Q -> p0;
+///   x norm^2; the key switch: rounding to 2^-(b l) on h = 2 n_br / 3 nonzero s_br coefficients, the key's errors
+///   sum_i D_i sigma_lwe^2 with D_i = sum_t d_t^2 the digit energy of a uniform input (exact over Z_p0);
+///   the mean-compensated mod switch to 2 nu n_br: n_lwe / 48 + 1 / 12 in units of 1 / (2 nu n_br)^2.
+struct NoiseModel {
+    n_lwe: f64,
+    sigma_lwe: f64,
+    two_n: f64,
+    norm: f64,
+    n_br: f64,
+    hw: f64,
+    q_br: f64,
+    p0: f64,
+    bsk_sigma: f64,
+    base: f64,
+    levels: f64,
+    group: usize,
+    ks_bits: f64,
+    /// (D, P(D)) of the key switch's digit energy per input coefficient
+    digit_energy: Vec<(f64, f64)>,
+}
+
+impl NoiseModel {
+    fn new(p: &Params, p0: u64, nu: usize, norm: f64) -> NoiseModel {
+        use rayon::prelude::*;
+        let g = pc_tfhe::gadget::Gadget::new(p0, p.ks, false);
+        let lv = p.ks.1;
+        let hist = (0..p0)
+            .into_par_iter()
+            .fold(
+                || vec![0u64; 64 * lv + 1],
+                |mut h, x| {
+                    let mut d = [0i64; 64];
+                    g.decompose(x, &mut d[..lv]);
+                    let e: i64 = d[..lv].iter().map(|v| v * v).sum();
+                    h[(e as usize).min(64 * lv)] += 1;
+                    h
+                },
+            )
+            .reduce(|| vec![0u64; 64 * lv + 1], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect());
+        let digit_energy = hist.iter().enumerate().filter(|(_, &c)| c > 0).map(|(e, &c)| (e as f64, c as f64 / p0 as f64)).collect();
+        NoiseModel {
+            n_lwe: p.n_lwe as f64,
+            sigma_lwe: p.lwe_sigma_rel,
+            two_n: (2 * nu * p.n_br) as f64,
+            norm,
+            n_br: p.n_br as f64,
+            hw: (p.n_br as f64 * 2.0 / 3.0).round(),
+            q_br: p.q_br as f64,
+            p0: p0 as f64,
+            bsk_sigma: p.bsk_sigma,
+            base: (p.pbs.0 as f64).exp2(),
+            levels: p.pbs.1 as f64,
+            group: p.pbs_group,
+            ks_bits: (p.ks.0 as usize * p.ks.1) as f64,
+            digit_energy,
+        }
+    }
+
+    fn groups(&self) -> f64 {
+        (self.n_lwe as usize / self.group) as f64
+    }
+
+    fn var_br_out(&self) -> f64 {
+        let g2 = (1u64 << self.group) as f64;
+        let ed2 = self.base * self.base / 12.0 + 1.0 / 6.0;
+        let key = self.groups() * (g2 - 1.0) * 4.0 * self.levels * self.n_br * ed2 * self.bsk_sigma.powi(2) / self.q_br.powi(2);
+        let rnd = self.groups() * 2.0 * (1.0 - 1.0 / g2) * (1.0 + self.hw) / 12.0 / self.base.powf(2.0 * self.levels);
+        key + rnd + (1.0 + self.hw) / 12.0 / self.p0.powi(2)
+    }
+
+    fn var_ks(&self) -> f64 {
+        let ed = self.digit_energy.iter().map(|(d, p)| d * p).sum::<f64>();
+        self.norm.powi(2) * self.var_br_out() + self.hw / 12.0 / (2.0 * self.ks_bits).exp2() + self.n_br * ed * self.sigma_lwe.powi(2)
+    }
+
+    fn var_in(&self) -> f64 {
+        self.var_ks() + (self.n_lwe / 48.0 + 1.0 / 12.0) / self.two_n.powi(2)
+    }
+
+    /// The log-MGF of the input error at `l`, term by term (uniform roundings: ln_sinhc; Gaussian key errors given
+    /// their digits: exp(l^2 sigma^2 sum d^2 / 2), averaged over the digits).
+    fn log_mgf(&self, l: f64) -> f64 {
+        let mut k = self.n_lwe * ln_sinhc(l / 4.0 / self.two_n) + ln_sinhc(l / 2.0 / self.two_n);
+        k += self.hw * ln_sinhc(l / 2.0 / self.ks_bits.exp2());
+        k += (1.0 + self.hw) * ln_sinhc(l * self.norm / 2.0 / self.p0);
+        let s2 = self.sigma_lwe.powi(2);
+        let mx = self.digit_energy.iter().map(|(d, _)| *d).fold(0.0, f64::max);
+        let e: f64 = self.digit_energy.iter().map(|(d, p)| p * (l * l * s2 * (d - mx) / 2.0).exp()).sum();
+        k += self.n_br * (e.ln() + l * l * s2 * mx / 2.0);
+        // the bootstrapping key: per digit (uniform in [-B/2, B/2)) a Gaussian of variance norm^2 (2^G - 1) 2 sigma^2 d^2 / Q^2
+        let c = l * l * self.norm.powi(2) * ((1u64 << self.group) as f64 - 1.0) * 2.0 * self.bsk_sigma.powi(2) / self.q_br.powi(2) / 2.0;
+        let steps = 20000;
+        let ed = (0..=steps).map(|i| (c * (self.base * (i as f64 / steps as f64 - 0.5)).powi(2)).exp_m1()).sum::<f64>() / (steps + 1) as f64;
+        k += self.groups() * 2.0 * self.levels * self.n_br * ed.ln_1p();
+        // its gadget rounding, counted on every group (conservative)
+        k += self.groups() * 2.0 * (1.0 + self.hw) * ln_sinhc(l * self.norm / 2.0 / self.base.powf(self.levels));
+        k
+    }
+
+    /// log2 of the Chernoff bound P(|e| >= thr) <= 2 min_l exp(K(l) - l thr) and the minimizing l (golden section on
+    /// ln l; K is convex).
+    fn chernoff_log2(&self, thr: f64) -> (f64, f64) {
+        let f = |u: f64| self.log_mgf(u.exp()) - u.exp() * thr;
+        let (mut a, mut b) = (1e2f64.ln(), 1e6f64.ln());
+        let r = (5f64.sqrt() - 1.0) / 2.0;
+        for _ in 0..200 {
+            let (c, d) = (b - r * (b - a), a + r * (b - a));
+            if f(c) < f(d) {
+                b = d;
+            } else {
+                a = c;
+            }
+        }
+        let u = (a + b) / 2.0;
+        ((f(u) + std::f64::consts::LN_2) / std::f64::consts::LN_2, u.exp())
+    }
+}
