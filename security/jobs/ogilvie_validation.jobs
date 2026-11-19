@@ -1,0 +1,43 @@
+# results/ogilvie_validation.jsonl: Ogilvie Table 6 sets, 256-bit hit (ours) and IEEE-double hit (FLOATHIT=1), the c17 no-MitM zeta sweep
+# ./run_jobs.sh jobs/ogilvie_validation.jobs out/ogilvie_validation.jsonl 8
+estimate.py ec27 13 55.0 t31 rot_nomitm 3.2 n
+estimate.py ec27 13 55.0 t31 plain_nomitm 3.2 n
+estimate.py ec27 13 55.0 t31 plain_mitm 3.2 n
+estimate.py ec27 13 55.0 t31 rot_h1 3.2 n
+estimate.py ec27 13 55.0 t31 rot_h2 3.2 n
+estimate.py c30 16 118.0 t30 rot_nomitm 3.2 n
+estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+estimate.py c17 16 104.0 t32 rot_h2 3.2 n
+estimate.py c30 16 118.0 t30 rot_h1 3.2 n
+estimate.py c30 16 118.0 t30 rot_h2 3.2 n
+estimate.py c17 16 104.0 t32 rot_h1 3.2 n
+FLOATHIT=1 estimate.py c17_fh 16 104.0 t32 rot_nomitm 3.2 n
+FLOATHIT=1 estimate.py c30_fh 16 118.0 t30 rot_nomitm 3.2 n
+FLOATHIT=1 estimate.py c17_fh 16 104.0 t32 rot_h2 3.2 n
+FLOATHIT=1 estimate.py ec27_fh 13 55.0 t31 rot_nomitm 3.2 n
+FLOATHIT=1 estimate.py c30_fh 16 118.0 t30 rot_h2 3.2 n
+ZETA=16000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=8000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=24000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=32000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=40000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=44000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=48000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=52000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=54000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=56000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=58000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=59000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=60000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=61000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=62000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=61500 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=62300 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=62500 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=63000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=62724 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=63600 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=63300 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=64000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=64500 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
+ZETA=65000 estimate.py c17 16 104.0 t32 rot_nomitm 3.2 n
