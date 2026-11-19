@@ -648,7 +648,6 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
                 tgt: tg.iter().map(|&t| (t as u32, t as u32)).collect(),
                 exact: low_exact,
                 prescaled: true,
-                fixed: false,
             });
         }
     }
@@ -668,7 +667,6 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
                 tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
                 exact,
                 prescaled: true,
-                fixed: false,
             });
         }
     }

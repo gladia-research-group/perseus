@@ -20,13 +20,11 @@ pub struct JobSpec {
     pub dst_off: u32,
     pub src: Vec<(u32, u32)>,
     pub tgt: Vec<(u32, u32)>,
-    /// HPS-corrected (exact) conversion.
+    /// HPS-corrected (exact) conversion: the FMA double estimate's rounding (u32 words: from an integer estimate where
+    /// that gives the same u, `bconv.cuh`).
     pub exact: bool,
     /// The source rows hold `x_i pre_i` already (`pre_scales`: folded into the INTT's last pass).
     pub prescaled: bool,
-    /// The integer-estimate exact conversion of the low-P stack: refused (main's exact path, `exact_round`, serves the
-    /// `LowP` tiers); kept so job tables built elsewhere state it.
-    pub fixed: bool,
 }
 
 /// `pre_i = (B / b_i)^-1 mod b_i` of the sources `bp` (`B` their product).
@@ -43,8 +41,8 @@ pub struct BconvPlan<'a> {
     pub max_tgt: usize,
     /// Most sources of a job (> MAX_SRC: the wide kernel).
     pub max_src: usize,
-    /// `BconvArgs::kind`: 13, 14 or 15 when every job is exact with that many sources (u32 words: a kernel of that
-    /// body alone), else 0.
+    /// `BconvArgs::kind`: 1 to 4 (the low-P key switches' conversions), 13, 14 or 15 when every job is exact with that
+    /// many sources (u32 words: a kernel of that body alone), else 0.
     kind: i32,
     /// Largest limb read in src / written in dst + 1 (bounds checks at launch).
     pub src_limbs: usize,
@@ -99,9 +97,6 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
                 push(&mut pool, (0..ns).filter(|&k| k != i).fold(1u64, |v, k| mulmod(v, bp[k] % t, t)));
             }
         }
-        if j.fixed {
-            return Err(shape("bconv job", "integer-estimate (fixed) conversions are not built: exact jobs take the double estimate"));
-        }
         if j.exact {
             // rb_i = 1/b_i as f64, 8/sizeof(W) little-endian words each, the first 8-byte aligned in the pool
             while (pool.len() * wb) % 8 != 0 {
@@ -119,10 +114,22 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
                 let bm = bp.iter().fold(1u64, |m, &b| mulmod(m, b % t, t));
                 push(&mut pool, bm);
             }
+            // c_i = floor(2^59 / b_i) as u64 (the integer estimate, u32 words), the first 8-byte aligned
+            while (pool.len() * wb) % 8 != 0 {
+                pool.push(W::ZERO);
+            }
+            for &b in &bp {
+                let c = (1u64 << 59) / b;
+                for w in 0..8 / wb {
+                    push(&mut pool, if wb == 8 { c } else { (c >> (8 * wb * w)) & ((1u64 << (8 * wb)) - 1) });
+                }
+            }
         }
         max_tgt = max_tgt.max(j.tgt.len());
                 // u32 words, every target below 2^30: the sums reduced as hi 2^32 + lo in 32-bit products (`BconvJob::split`)
-        let split = wb == 4 && j.tgt.iter().all(|&(_, tp)| primes[tp as usize] < 1 << 30);
+        // (exact: the sum takes u (t - B mod t) more, u <= ns)
+        let (ms, mt) = (bp.iter().max().copied().unwrap_or(0) as u128, j.tgt.iter().map(|&(_, tp)| primes[tp as usize]).max().unwrap_or(0) as u128);
+        let split = wb == 4 && mt < 1 << 30 && (!j.exact || ns as u128 * (ms.saturating_sub(1) * mt.saturating_sub(1) + mt) < 1 << 64);
         jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, j.prescaled as u32, split as u32]);
     }
     Ok((pool, jobs, max_tgt))
@@ -149,7 +156,7 @@ impl<'a> BconvPlan<'a> {
             max_tgt,
             max_src: specs.iter().map(|j| j.src.len()).max().unwrap_or(0),
             kind: match specs.first() {
-                Some(f) if std::mem::size_of::<W>() == 4 && (13..=15).contains(&f.src.len()) && specs.iter().all(|j| j.exact && j.src.len() == f.src.len()) => f.src.len() as i32,
+                Some(f) if std::mem::size_of::<W>() == 4 && (f.src.len() <= 4 || (13..=15).contains(&f.src.len())) && specs.iter().all(|j| j.exact && j.src.len() == f.src.len()) => f.src.len() as i32,
                 _ => 0,
             },
             src_limbs,

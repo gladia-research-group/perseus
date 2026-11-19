@@ -1,7 +1,8 @@
 // Batched fast base conversion, generic over (W, MM); layout and formula in args.cuh BconvArgs.
-// The exact (HPS-corrected) jobs keep FIDESlib's FMA double estimate in source order; a launch whose jobs are all exact
-// with 13, 14 or 15 sources (BconvArgs::kind, u32 words) runs a kernel of that body alone, its rounding u taken from
-// an exact fixed-point sum where that sum is clear of the rounding boundary, else from the estimate (the same u).
+// The exact (HPS-corrected) jobs keep FIDESlib's FMA double estimate in source order; on u32 words its rounding u is
+// taken from an integer estimate where that estimate is clear of the rounding boundary, else from the double one (the
+// same u either way, `int_round`). A launch whose jobs are all exact with 1 to 4 or 13 to 15 sources (BconvArgs::kind,
+// u32 words) runs a kernel of that body alone.
 #pragma once
 #include "arith.cuh"
 
@@ -15,32 +16,26 @@ constexpr int TG = 32;   // targets per block (blockIdx.y)
 __shared__ __align__(32) unsigned char sh_m[16 * TG * 8];
 __shared__ uint32_t stp[TG], str[TG];
 __shared__ uint4 sk[TG];
-// the exact-kind kernels (u32 words): each source's double 1/p_i as the exact integer m 2^(e + 28) (its value in units
-// of 2^-80; e in [-28, -25] for p_i in (2^24, 2^28], so < 2^56), ~0 outside that range (the block then runs the
-// estimate)
-__shared__ unsigned long long sh_rbm[16];
+// the exact jobs (u32 words): c_i = floor(2^59 / b_i) of each source (the job's pool)
+__shared__ unsigned long long sh_rc[16];
 
-// u = floor(v + 0.5), v = the source-order FMA estimate sum_i y_i rb_i in doubles, without the doubles where that is
-// safe (u32 words): T = 2^80 sum_i y_i rb_i is exact in 128-bit integers (rb_i's exact binary values, `sh_rbm`), and
-// the estimate's error is below 17 2^-50 (each FMA rounds once, v < 16; the + 0.5 once more), so floor(T 2^-80 + 0.5)
-// is the estimate's u whenever T 2^-80 + 0.5 is 2^-45 or more from an integer and below 16; otherwise (a chance of
-// about 2^-44 per coefficient) the estimate itself runs
+// u = floor(v + 0.5), v = the source-order FMA estimate sum_i y_i rb_i in doubles, from 64-bit integers where that is
+// safe (u32 words, y_i < b_i): F = 2^58 + sum_i y_i c_i <= 2^59 (sum_i y_i / b_i + 1/2) < F + E, E = 1 + sum_i y_i,
+// and v + 0.5 (rounded) is within 17 2^-50 < 2^-45 of that real number (each FMA rounds once, v < 16; rb_i once; the
+// + 0.5 once more), so floor(F 2^-59) is the estimate's u whenever F mod 2^59 is at least 2^19 and below
+// 2^59 - E - 2^19; otherwise (a chance of about ns 2^-31 per coefficient) the estimate itself runs
 template <class W, int NY>
-__device__ __forceinline__ uint64_t exact_round(const W (&y)[NY], int ns, const double* __restrict__ rb) {
-    unsigned __int128 T = (unsigned __int128)1 << 79;
-    bool amb = false;
+__device__ __forceinline__ uint64_t int_round(const W (&y)[NY], int ns, const double* __restrict__ rb) {
+    uint64_t f = 1ull << 58, e = 1;
 #pragma unroll
     for (int i = 0; i < NY; ++i) {
         if (i < ns) {
-            const unsigned long long m = sh_rbm[i];
-            amb |= m == ~0ull;
-            const unsigned long long yi = (unsigned long long)y[i];
-            T += (unsigned __int128)(yi * (m & 0xFFFFFFFFull)) + ((unsigned __int128)(yi * (m >> 32)) << 32);
+            f += (uint64_t)y[i] * sh_rc[i];
+            e += (uint64_t)y[i];
         }
     }
-    const uint64_t uu = (uint64_t)(T >> 80);
-    const uint64_t f = (uint64_t)(T >> 35) & ((1ull << 45) - 1);
-    if (!(amb || f == 0 || f == (1ull << 45) - 1 || uu >= 16)) return uu;
+    const uint64_t r = f & ((1ull << 59) - 1);
+    if (r >= (1ull << 19) && r + e + (1ull << 19) < (1ull << 59)) return f >> 59;
     double v = 0.0;
 #pragma unroll
     for (int i = 0; i < NY; ++i)
@@ -49,8 +44,8 @@ __device__ __forceinline__ uint64_t exact_round(const W (&y)[NY], int ns, const 
 }
 
 // NS > 0: every job of the launch path has exactly NS sources (a compile-time count: no predicated source steps)
-// EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time); XR (EXM 1, u32 words): u by `exact_round`
-template <class W, class MM, int NS, int EXM, bool XR = false>
+// EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time)
+template <class W, class MM, int NS, int EXM>
 __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restrict__ src, W* __restrict__ dst,
                                            const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     W* const sm = (W*)sh_m;
@@ -69,8 +64,11 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
     const W* trow = P + 3 * ns;
     const W* tprime = trow + J.ntgt;
     const W* M = tprime + J.ntgt;
+    // exact jobs on u32 words: u by `int_round`
+    const bool ir = sizeof(W) == 4 && (EXM == 1 || (EXM == 2 && J.exact));
     // J.split (u32 words, every target below 2^30): the sums are reduced as hi 2^32 + lo with 32-bit Shoup products
     // (R = 2^32 mod p, Rs = floor(R 2^32 / p), m = floor(2^32 / p)) from shared memory: the same canonical residue
+    // (not the dispatch kernels' exact jobs: measured slower there)
     const bool fast = sizeof(W) == 4 && J.split && (EXM != 2 || !J.exact);
     for (int x = threadIdx.x; x < ns * TG; x += BX) {
         const int i = x / TG, k = x % TG;
@@ -87,15 +85,13 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
             sk[threadIdx.x] = make_uint4(p, R, (uint32_t)(((uint64_t)R << 32) / p), m);
         }
     }
-    if constexpr (XR) {
-        static_assert(EXM == 1 && sizeof(W) == 4, "exact_round: exact jobs on u32 words");
-        if (threadIdx.x < ns) {
-            const W* rbw = M + ns * J.ntgt;
-            while ((uintptr_t)rbw & 7) ++rbw;
-            const unsigned long long b = (unsigned long long)__double_as_longlong(((const double*)rbw)[threadIdx.x]);
-            const int e = (int)((b >> 52) & 0x7ff) - 1023;
-            sh_rbm[threadIdx.x] = (b >> 63) == 0 && e >= -28 && e <= -25 ? ((b & ((1ull << 52) - 1)) | (1ull << 52)) << (e + 28) : ~0ull;
-        }
+    if (ir && threadIdx.x < ns) {
+        // c_i after bmod (args.cuh), 8-byte aligned
+        const W* rcw = M + ns * J.ntgt;
+        while ((uintptr_t)rcw & 7) ++rcw;
+        rcw += (8 / sizeof(W)) * ns + J.ntgt;
+        while ((uintptr_t)rcw & 7) ++rcw;
+        sh_rc[threadIdx.x] = ((const unsigned long long*)rcw)[threadIdx.x];
     }
     __syncthreads();
     // the predecessor's rows (the INTT's) are read from here on; the job tables above are setup constants
@@ -119,8 +115,8 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
         const W* rbw = M + ns * J.ntgt;
         while ((uintptr_t)rbw & 7) ++rbw;  // 8-byte aligned doubles
         const double* rb = (const double*)rbw;
-        if constexpr (XR) {
-            u = exact_round<W, NY>(y, ns, rb);
+        if (ir) {
+            u = int_round<W, NY>(y, ns, rb);
         } else {
 #pragma unroll
             for (int i = 0; i < NY; ++i)
@@ -160,8 +156,8 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
                             r = min(r, r - 2 * p);
                             return min(r, r - p);
                         };
-                        uint32_t r = red(acc[q4]);
-                        if (EXM != 0 && ex) r = sub<uint32_t>(r, red(u * (uint64_t)bmod[t0 + k + q4]), p);
+                        // exact: + u (p - B mod p) in the lazy sum (J.split bounds it, bconv.rs)
+                        const uint32_t r = red(EXM != 0 && ex ? acc[q4] + u * (uint64_t)(p - (uint32_t)bmod[t0 + k + q4]) : acc[q4]);
                         dst[(size_t)(J.dst_off + str[k + q4]) * N + idx] = (W)r;
                         continue;
                     }
@@ -191,10 +187,10 @@ __device__ __forceinline__ void bconv_dispatch(const W* __restrict__ src, W* __r
     else bconv_body<W, MM, 0, 2>(J, src, dst, pool, pr);
 }
 
-// Two occupancies of one body: the compiler's registers (46: 10 blocks per SM, the shorter per-thread chains) for a
-// launch that fits in one wave there, 40 registers (12 blocks per SM) for a larger one, which then runs in fewer waves.
+// Two occupancies of one body: up to 48 registers (10 blocks per SM, the shorter per-thread chains) for a launch that
+// fits in one wave there, 40 registers (12 blocks per SM) for a larger one, which then runs in fewer waves.
 template <class W, class MM>
-__global__ void __launch_bounds__(BX) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
+__global__ void __launch_bounds__(BX, 10) bconv_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                    const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     bconv_dispatch<W, MM>(src, dst, jobs, pool, pr);
 }
@@ -204,20 +200,21 @@ __global__ void __launch_bounds__(BX, 12) bconv_kernel12(const W* __restrict__ s
     bconv_dispatch<W, MM>(src, dst, jobs, pool, pr);
 }
 
-// A launch of exact jobs of NS sources only (BconvArgs::kind = NS; u32 words): that body alone, its rounding by
-// `exact_round` (an alternating user region's ModDown from P: 13; a fused relinearization-rescale's from P and its one
-// or two dropped tops: 14, 15), at the two occupancies of the dispatch kernels
+// A launch of exact jobs of NS sources only (BconvArgs::kind = NS; u32 words): that body alone (a low-P key switch's
+// ModUp of its live digit or ModDown from P': 1 to 4; an alternating user region's ModDown from P: 13; a fused
+// relinearization-rescale's from P and its one or two dropped tops: 14, 15), at the two occupancies of the dispatch
+// kernels
 template <class W, class MM, int NS>
 __global__ void __launch_bounds__(BX) bconv_exact_kernel(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                          const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     pdl_trigger();
-    bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
+    bconv_body<W, MM, NS, 1>(jobs[blockIdx.z], src, dst, pool, pr);
 }
 template <class W, class MM, int NS>
 __global__ void __launch_bounds__(BX, 12) bconv_exact_kernel12(const W* __restrict__ src, W* __restrict__ dst, const BconvJob* __restrict__ jobs,
                                                                const W* __restrict__ pool, const PrimeConst* __restrict__ pr) {
     pdl_trigger();
-    bconv_body<W, MM, NS, 1, true>(jobs[blockIdx.z], src, dst, pool, pr);
+    bconv_body<W, MM, NS, 1>(jobs[blockIdx.z], src, dst, pool, pr);
 }
 
 // Wide jobs (ABI 20): up to MW sources (u32 words: 48; u64: 16): each thread's first 16 y_i in registers, the rest
@@ -401,6 +398,22 @@ int launch(const BconvArgs* a, cudaStream_t s) {
             case 15:
                 if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 15>, sp, dp, a->jobs, pp, a->pr);
                 else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 15>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 1:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 1>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 1>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 2:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 2>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 2>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 3:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 3>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 3>, sp, dp, a->jobs, pp, a->pr);
+                return (int)cudaGetLastError();
+            case 4:
+                if (big) cudaLaunchKernelEx(&cfg, bconv_exact_kernel12<W, MM, 4>, sp, dp, a->jobs, pp, a->pr);
+                else cudaLaunchKernelEx(&cfg, bconv_exact_kernel<W, MM, 4>, sp, dp, a->jobs, pp, a->pr);
                 return (int)cudaGetLastError();
             default:
                 break;

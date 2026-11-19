@@ -340,6 +340,17 @@ fn t_bconv(st: &mut Setup) -> Vec<TestResult> {
                 }
             }
             pool.extend(&bmod);
+            // ABI 30: floor(2^59 / s_i) as u64, the first 8-byte aligned
+            while (pool.len() * wb) % 8 != 0 {
+                pool.push(0);
+            }
+            for c in j.sp.iter().map(|&s| st.p(s)).map(|b| (1u64 << 59) / b) {
+                match wb {
+                    8 => pool.push(c),
+                    4 => pool.extend([c & 0xFFFF_FFFF, c >> 32]),
+                    _ => pool.extend((0..4).map(|q| (c >> (16 * q)) & 0xFFFF)),
+                }
+            }
         }
         jobs.push(BconvJob {
             src_off: j.src_off as u32,
@@ -449,6 +460,13 @@ fn t_bconv_wide(st: &mut Setup) -> Vec<TestResult> {
                 pool.extend([bits & 0xFFFF_FFFF, bits >> 32]);
             }
             pool.extend(&bmod);
+            // ABI 30: floor(2^59 / s_i) as u64, the first 8-byte aligned
+            while pool.len() % 2 != 0 {
+                pool.push(0);
+            }
+            for c in sp.iter().map(|&q| st.p(q)).map(|b| (1u64 << 59) / b) {
+                pool.extend([c & 0xFFFF_FFFF, c >> 32]);
+            }
         } else {
             for i in 0..ns {
                 for idx in 0..N {
@@ -533,6 +551,13 @@ fn t_bconv_lean(st: &mut Setup) -> Vec<TestResult> {
                 pool.extend([x.to_bits() & 0xFFFF_FFFF, x.to_bits() >> 32]);
             }
             pool.extend(&bmod);
+            // ABI 30: floor(2^59 / s_i) as u64, the first 8-byte aligned
+            while pool.len() % 2 != 0 {
+                pool.push(0);
+            }
+            for c in (0..ns).map(|i| st.p(i % 8)).map(|b| (1u64 << 59) / b) {
+                pool.extend([c & 0xFFFF_FFFF, c >> 32]);
+            }
         }
         let y: Vec<u64> = (0..ns * N).map(|e| mulmod(src_h[e], pre[e / N], st.p((e / N) % 8))).collect();
         for idx in 0..N {
