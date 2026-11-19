@@ -58,7 +58,10 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
   against 584–894 for DaCapo, Orion and Fhelipe.
 - **CKKS -> TFHE -> CKKS lookup tables.** `perseus.impl.tfhe.tfhe_lut` evaluates a sign or any lookup table on
   chosen slots by programmable bootstrapping (crates `pc-tfhe`, `pc-gpu` `tfhe`), as one planned refresh: exact
-  decisions where a polynomial needs high degree (ReLU's sign, argmax, thresholds).
+  decisions where a polynomial needs high degree (ReLU's sign, argmax, thresholds). A bootstrap takes 1.77 ms
+  (40k/s batched) at TFHE-rs's 2-bit failure target (p_fail 2^-139), 3.8× TFHE-rs on the same GPU.
+- **Security.** Every key estimated against the standard lattice attacks and the 2026 ring attacks
+  (ePrint 2026/279, 2026/366): all at or above 128 bits; scripts and raw results in [`security/`](security/).
 
 ## Results
 
