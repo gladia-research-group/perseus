@@ -950,6 +950,9 @@ fn switch_params(args: &[String], n: usize) -> Res<Params> {
     if let Some(v) = arg(args, "--lwe") {
         let (n_lwe, l) = v.split_once(',').ok_or("--lwe n,log2")?;
         p = p.with_lwe(n_lwe.parse()?, l.parse()?)?;
+        if let Some(w) = p.lwe_warning() {
+            eprintln!("[tfhe] warning: --lwe {v}: {w}");
+        }
     }
     Ok(p)
 }

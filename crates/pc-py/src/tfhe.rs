@@ -84,6 +84,9 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
         let g = v.split_once(',').and_then(|(n, l)| Some((n.trim().parse::<usize>().ok()?, l.trim().parse::<f64>().ok()?)));
         let (n_lwe, l) = g.ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LWE={v}: dimension, log2 sigma")))?;
         p = p.with_lwe(n_lwe, l).map_err(|x| PyValueError::new_err(x.to_string()))?;
+        if let Some(w) = p.lwe_warning() {
+            eprintln!("[tfhe] warning: PC_TFHE_LWE={v}: {w}");
+        }
     }
     // PC_TFHE_NATIVE=bufs,rows: native programs (Params::chain; `bufs` LWE buffers of `rows` each)
     p.chain = native_cap().is_some();
