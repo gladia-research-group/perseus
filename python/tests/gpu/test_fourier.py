@@ -88,3 +88,26 @@ def test_encrypted(env, name):
         assert _rel(inv.unpack(fhe.decrypt_slots_complex(z)), x) < TOL
     from perseus.impl import fourier as F
     F.release(ops)
+
+
+def test_coefficient_encoding_transform():
+    """A client coefficient encryption decrypts to the canonical embedding of its coefficients, and one plaintext
+    product is a length-N negacyclic convolution of them (one level, no rotation)."""
+    from perseus.impl import fourier as F
+    cfg = _pc.Config.preset("n32_gpt2_decode")
+    sec = _pc.ClientSecret.generate(seed=5)
+    cl = _pc.Client(sec, complex=True, seed=6)
+    N = 2 * cl.slots
+    sess = _pc.Session(cfg, _pc.KeySource.generate([1], seed=3, secret=sec.to_bytes()), pool=16,
+                       pt_slots=4).complete_setup()
+    try:
+        rng = np.random.default_rng(1)
+        x, h = rng.standard_normal(N), rng.standard_normal(N) / np.sqrt(N)
+        ct = _pc.import_ct(sess, cl.encrypt_coeffs(list(x), 0))
+        z = F.canonical_embedding(x)
+        assert _rel(sess.fhe.decrypt_slots_complex(ct), z) < 1e-12
+        p = sess.fhe.mult_pt(ct, F.negacyclic_filter(h))
+        got = np.asarray(cl.decrypt_coeffs(_pc.export_ct(sess, p))[0])
+        assert _rel(got, F.negacyclic_conv(x, h)) < 1e-10
+    finally:
+        sess.close()

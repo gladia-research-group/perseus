@@ -23,7 +23,9 @@ once (C z = C x + i C y), so every real transform here packs two real vectors pe
 
 Entry points: `dft`, `idft`, `rfft_pair` / `irfft_pair`, `rfft_half` / `irfft_half`, `dct2`, `dct3`, `dft_2d`,
 `dct2_2d`, `dct3_2d`; each returns a `Transform` (its `steps` with their diagonals, `rot_steps()` the keys,
-`apply(ops, ct)` on any ops surface, `reference(x)` the float64 map, `pack` / `unpack` the slot layout)."""
+`apply(ops, ct)` on any ops surface, `reference(x)` the float64 map, `pack` / `unpack` the slot layout).
+`canonical_embedding` / `negacyclic_filter`: the transform CKKS encoding already is (coefficient-encoded data: its
+slots are an odd-frequency DFT, one plaintext product a length-N negacyclic convolution)."""
 from __future__ import annotations
 
 import dataclasses
@@ -793,3 +795,34 @@ def release(ops):
                     del c[k]
                 else:
                     c.discard(k)
+
+
+# the encoding's own transform: coefficient-encoded data
+
+def canonical_embedding(coeffs) -> np.ndarray:
+    """The slots of a plaintext whose coefficients are `coeffs` (real, length N = 2 slots): slot_j = m(zeta^(5^j)),
+    zeta = exp(i pi / N), an odd-frequency real-input DFT of length 2N in the 5^j order. A client coefficient encryption
+    (`Client.encrypt_coeffs`) decrypts to these slots (measured 4.6e-15 relative at N = 2^16), so the client gets this
+    transform for free in either direction."""
+    m = np.asarray(coeffs, dtype=np.float64)
+    N = m.shape[-1]
+    Y = np.fft.ifft(m * np.exp(1j * np.pi * np.arange(N) / N), axis=-1) * N     # Y_l = m(zeta^(2l + 1))
+    e = np.ones(N // 2, dtype=np.int64)
+    for j in range(1, N // 2):
+        e[j] = e[j - 1] * 5 % (2 * N)
+    return Y[..., (e - 1) // 2]
+
+
+def negacyclic_filter(h) -> np.ndarray:
+    """The slot vector P with ct(x) * P = the length-N negacyclic convolution x * h of coefficient-encoded x (one
+    plaintext product, one level, no rotation: the product of the two polynomials). `ops.mult_pt(ct, P)`; read the
+    result as coefficients (`Client.decrypt_coeffs`, or a bootstrap's CoeffsToSlots)."""
+    return canonical_embedding(h)
+
+
+def negacyclic_conv(x, h) -> np.ndarray:
+    """The float64 reference: (x * h)(X) mod X^N + 1."""
+    x, h = np.asarray(x, dtype=np.float64), np.asarray(h, dtype=np.float64)
+    N = x.shape[-1]
+    tw = np.exp(1j * np.pi * np.arange(N) / N)
+    return np.real(np.fft.ifft(np.fft.fft(x * tw) * np.fft.fft(h * tw)) / tw)

@@ -184,3 +184,15 @@ def test_rlinear_compose():
     f, g = rnd(), rnd()
     z = _cplx(rng, (3, n))
     _close(f.then(g).apply(z), g.apply(f.apply(z)))
+
+
+def test_negacyclic_reference():
+    """negacyclic_conv against the schoolbook product mod X^N + 1, and the embedding turning it into a slot product."""
+    rng = np.random.default_rng(2)
+    N = 64
+    x, h = rng.standard_normal(N), rng.standard_normal(N)
+    full = np.convolve(x, h)
+    want = full[:N].copy()
+    want[:N - 1] -= full[N:]
+    _close(F.negacyclic_conv(x, h), want)
+    _close(F.canonical_embedding(x) * F.negacyclic_filter(h), F.canonical_embedding(want))
