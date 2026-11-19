@@ -29,6 +29,9 @@ class Dims:
     H_real: int       # numHeadsReal
     E: int            # expDim (padded MLP width)
     E_real: int       # expanded (real MLP width)
+    # the real head width when it is not dim / H_real (Gemma-2: 256 of a 2304 hidden over 8 heads); out of the repr,
+    # which keys the Llama slot cache
+    head_real: int = dataclasses.field(default=0, repr=False)
 
     @property
     def t(self): return self.N // self.hid
@@ -37,7 +40,7 @@ class Dims:
     @property
     def d_head(self): return self.hid // self.H
     @property
-    def d_head_real(self): return self.dim // self.H_real
+    def d_head_real(self): return self.head_real or self.dim // self.H_real
     @property
     def tp_E(self): return self.N // self.E
 

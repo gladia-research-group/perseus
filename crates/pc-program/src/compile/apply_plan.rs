@@ -292,6 +292,20 @@ pub fn lower(
                     None
                 }
                 RKind::LevelReduce { target } => {
+                    if *target > lw.meta(ins[0]).level && lw.meta(ins[0]).deg == 2 {
+                        // the device's drop moves the level only, so a pending rescale paid after it would divide by
+                        // the prime of the level it was dropped to: the rescale is paid first (measured on Gemma-2's
+                        // LM head drop: the logits 9 % off); later rescale_after anchors on it find degree 1 and pass
+                        lw.acct.rescales += 1;
+                        let r = lw.emit(Kind::Rescale, vec![ins[0]], &[format!("{out}~rsd")], origin.clone())?;
+                        if *target > lw.meta(r[0]).level {
+                            lw.emit(Kind::DropTo(*target), r, &[out.clone()], origin.clone())?;
+                        } else {
+                            lw.cur.insert(out.clone(), r[0]);
+                        }
+                        lw.exit_hook(&out)?;
+                        return Ok(());
+                    }
                     if *target > lw.meta(ins[0]).level {
                         leaf(Kind::DropTo(*target))
                     } else {

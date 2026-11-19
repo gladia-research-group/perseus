@@ -1306,6 +1306,10 @@ class StreamedPlannedRun:
         for st, names in by_step.items():
             if self.tap_steps and st not in self.tap_steps:
                 continue
+            first = int(os.environ.get("PC_TAP_FIRST", "0") or 0)    # diagnostic: the step's first n outputs instead
+            if first:
+                out += names[:first]
+                continue
             k = len(names) if self.tap_steps else min(self.tap_per_step, len(names))
             out += [names[i] for i in sorted({int(round(x)) for x in np.linspace(0, len(names) - 1, k)})]
         return out

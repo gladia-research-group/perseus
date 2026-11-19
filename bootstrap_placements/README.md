@@ -6,8 +6,8 @@ recipe that regenerates it: the recorded forward pass it was computed from (`gra
 `graphs/`, same name as the plan), the planner settings (`recipe=`), the runtime switches the plan
 was cut for (`runtime=`, applied by `--plan`) and the approximation configs (`configs=`).
 `python/tests/test_paper_plans.py` replans every directory below from those lines and checks that the
-result is identical to the committed files. The Llama recordings are not in the repository (`graphs/LLAMA.txt` lists
-them and how to record them).
+result is identical to the committed files. The Llama and Gemma-2 recordings are not in the repository (`graphs/LLAMA.txt`
+and `graphs/GEMMA2.txt` list them and how to record them).
 
 ## Result plans
 
@@ -25,6 +25,8 @@ default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one s
 | `llama31_8b_decode` | Llama-3.1-8B, decode up to a 512-token context in one plan (below) |
 | `llama31_8b_decode_ctx512_w16`, `_w128` ... `_w512` | Llama-3.1-8B, decode up to a 512-token context: a plan for the first 16 positions, then one per 128-position window (below) |
 | `llama31_8b_prefill128` | Llama-3.1-8B, 128-token prefill: one planner run (python/perseus/examples/llama/make_plan.sh, `prefill` stage) on the fake recording made under its runtime= line |
+| `gemma2_2b_decode_ctx512_w16`, `_w128` ... `_w512` | Gemma-2-2B, decode up to a 512-token context: Llama's window plans recut for Gemma-2 (python/perseus/examples/llama/window_plans.py, `graphs/GEMMA2.txt`) |
+| `gemma2_2b_prefill128` | Gemma-2-2B, 128-token prefill: as `llama31_8b_prefill128`, then the raise-drop pass (its rd= line) |
 
 ## Placement study (`python/`)
 

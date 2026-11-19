@@ -1,0 +1,15 @@
+# The Gemma-2-2B recordings the Gemma-2 plans are computed from: not in the repository (several GB), recorded on the
+# numpy twin (CPU only; the weights from HuggingFace, google/gemma-2-2b). Only re-planning reads them
+# (scripts/make_plans.sh, python/tests/test_paper_plans.py); the plans they made are in bootstrap_placements/ (same
+# names). One command derives the plans' PLAN_CMD.txt from Llama's windows (route 256 -> Gemma's 128 head-slot route,
+# Gemma's configs), records, merges and plans, the steps graphs/LLAMA.txt lists for Llama:
+#   python -m perseus.examples.llama.window_plans --model gemma2_2b --set LLAMA_LMHEAD_BOTTOM=1 --set LLAMA_MLP_SPLIT=2 \
+#       --set SM_HEAD_PACK=1 [--stage derive|capture|merge|plan] [--jobs 3]
+#   window positions: w16 1, 8, 15; w128 16, 64, 127; w256 128, 192, 255; w384 256, 320, 383; w512 384, 448, 511
+#   (OpenWebText window 0, 512 Gemma tokens; ~35 GB and ~8 min per capture).
+gemma2_2b_decode_ctx512_w16    168 MB  the Gemma-2 decode window plan's recording, positions 1-15
+gemma2_2b_decode_ctx512_w128   168 MB  the same, positions 16-127
+gemma2_2b_decode_ctx512_w256   168 MB  the same, positions 128-255
+gemma2_2b_decode_ctx512_w384   168 MB  the same, positions 256-383
+gemma2_2b_decode_ctx512_w512   168 MB  the same, positions 384-511
+gemma2_2b_prefill128           135 MB  the 128-token Gemma prefill plan's recording (fake capture under its runtime= line)

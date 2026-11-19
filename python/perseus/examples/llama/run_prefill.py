@@ -41,7 +41,7 @@ def _plan_config(plan):
 def _planned(a, model, toks, gt, ref, results=None):
     """PLANNED on the new runtime: record + compile + session, then `--repeat` timed forwards (each: block 0's inputs
     encrypted, every block issued, the device drained); gated on the last one."""
-    from perseus import _pc, config as pcfg
+    from perseus import _pc
     from perseus._paths import resolve
     from .planned import LlamaPlannedPrefill
     from .prefill import plain_logits, report
@@ -173,6 +173,8 @@ def main(argv=None, results=None):
     ap.add_argument("--taps", action="store_true", help="compare block 0's sub-steps with the float64 model")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
+    ap.add_argument("--fake-kl", action="store_true",
+                    help="with --fake: the logits' KL against the fp32 model computed on the CPU (the approximations' error)")
     ap.add_argument("--key-layout", choices=("dense", "packed"), default="packed",
                     help="planned: rotation keys resident (dense) or 28-bit b + seed regenerated per use (packed)")
     ap.add_argument("--pt-rows", type=int, default=28, help="planned: rows per plaintext slot (0 = every prime)")
@@ -199,7 +201,10 @@ def main(argv=None, results=None):
         os.environ["PERSEUS_DEVICE"] = "cpu"
     from perseus.examples.defaults import default_plan
     if a.plan is None and not (a.fake or a.capture):
-        a.plan = default_plan("llama_prefill", a.tokens)
+        from . import hf
+        from .arch import model_entry
+        entry = model_entry(hf.NAME)
+        a.plan = default_plan(entry.prefill if entry else "llama_prefill", a.tokens)
     planned = not a.fake
     if planned and (not a.plan or a.capture):
         # the new runtime has no eager device path: a forward is a planned run (its stream recorded on the CPU twin)
@@ -228,7 +233,7 @@ def main(argv=None, results=None):
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
     if a.fake:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    gt = None if a.fake else hf.oracle_logits(toks, cache)
+    gt = None if a.fake and not a.fake_kl else hf.oracle_logits(toks, cache, device="cpu" if a.fake else "cuda")
     # the prefill keeps the host wait on device-encoded plaintexts that FIDESlib f12c06e restored for this path;
     # the decode runs without it (FIDESLIB_ENCODE_NOSYNC default 1). --set FIDESLIB_ENCODE_NOSYNC=1 overrides.
     over = {"FIDESLIB_ENCODE_NOSYNC": "0", **env.plan_runtime(a.plan, "n32"), "LLAMA_PACKING": "cachemir_complex",
@@ -251,6 +256,8 @@ def main(argv=None, results=None):
         os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", "1")
     cfgs = load_configs(a.configs)
     dims = W.llama_dims(store.config)
+    for k, v in env.dims_env(dims).items():        # the model's routes, as the decode's (the plan's line and --set win)
+        over.setdefault(k, v)
     from perseus.impl.prefill import prefill_rot_steps
     from perseus.impl.pcmm import rot_steps as pcmm_rot_steps
     from perseus.impl.layout import ladder_radix_bits, ladder_radix_steps
@@ -258,6 +265,9 @@ def main(argv=None, results=None):
     if ccmm_on:
         from perseus.impl.sinc import rot_steps as sinc_rot_steps
         rot |= sinc_rot_steps() | {16, -16}
+        if dims.d_head == 256:          # the half-head view (sinc.half_perm): its sums, merges and compressed softmax
+            from perseus.impl.sinc import half_rot_steps
+            rot |= half_rot_steps()
     if os.environ.get("PF_LAYOUT", "") == "blocked":
         from perseus.impl.blocked import Blocks, blocked_rot_steps
         rot |= blocked_rot_steps(Blocks(dims, int(os.environ.get("PF_NCH", "512"))), ladder_radix_bits())

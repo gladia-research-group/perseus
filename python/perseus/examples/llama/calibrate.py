@@ -1,11 +1,15 @@
-"""Calibrate the approximation configs of the Llama port on teacher-forced text windows.
+"""Calibrate the approximation configs of the decoder port (arch.Arch: Llama, Gemma-2) on teacher-forced text windows.
 
     CUDA_VISIBLE_DEVICES=3 .venv/bin/python -m perseus.examples.llama.calibrate \
         --out configs/model/approximation/llama31_8b_n32/configs.json
+    CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m perseus.examples.llama.calibrate --model gemma2_2b --T 512 \
+        --sm-kc-max 512 --out configs/model/approximation/gemma2_2b_n32/configs.json
 
 Per site, from every position but 0 (the BOS prefix runs in plaintext): `norm` (RMSNorm inverse sqrt: centering
-scale, band widened by --norm-safety, shallowest Chebyshev seed + Newton count meeting --norm-err), `silu` (THOR
-composite, xmax = --silu-safety * max|gate|), `softmax` (the THOR softmax fit on the decode queries' score rows).
+scale, band widened by --norm-safety, shallowest Chebyshev seed + Newton count meeting --norm-err; the Arch's norm
+sites), the MLP activation (section `silu` or `gelu`: its THOR composite, xmax = --act-safety * max|gate|), `softcap`
+(an Arch with an attention soft-cap: cap tanh(s / cap) as an odd Chebyshev series on +-(--cap-safety * max|s|), the
+lowest degree meeting --cap-err), `softmax` (the THOR softmax fit on the decode queries' score rows, soft-capped).
 """
 from __future__ import annotations
 
@@ -13,7 +17,6 @@ import argparse
 import json
 import math
 import os
-import types
 
 import numpy as np
 
@@ -54,6 +57,37 @@ def fit_silu(gmax, safety, d1, d2):
     p2 = np.where(np.arange(len(p2)) % 2 == 1, p2, 0.0)
     return {"method": "thor_composite", "xmax": S, "thor_p1": p1.tolist(), "thor_p2": p2.tolist(),
             "fit_err_max": e_max, "fit_err_med": e_med, "data_max": float(gmax)}
+
+
+def fit_gelu(gmax, safety, d1, d2):
+    """The tanh GELU's THOR composite (perseus/calibrate/approximations/gelu.py, GPT-2's) at xmax = safety * gmax."""
+    from perseus.calibrate.approximations.gelu import _fit_thor_composite
+    S = float(safety * gmax)
+    p1, p2, e_max, e_med = _fit_thor_composite(S, d1, d2)
+    p1 = np.where(np.arange(len(p1)) % 2 == 1, p1, 0.0)
+    p2 = np.where(np.arange(len(p2)) % 2 == 1, p2, 0.0)
+    return {"method": "thor_composite", "xmax": S, "thor_p1": list(map(float, p1)), "thor_p2": list(map(float, p2)),
+            "fit_err_max": float(e_max), "fit_err_med": float(e_med), "data_max": float(gmax)}
+
+
+ACT_FITS = {"silu": fit_silu, "gelu_tanh": fit_gelu}
+
+
+def fit_softcap(cap, smax, safety, err, max_deg=63):
+    """cap tanh(s / cap) on [-m, m], m = safety * smax: the lowest odd Chebyshev degree whose max error on a dense grid is
+    at most `err` (absolute, in score units), even coefficients zeroed (the function is odd)."""
+    from numpy.polynomial import chebyshev as C
+    m = float(safety * smax)
+    f = lambda t: cap * np.tanh(m * t / cap)
+    t = np.linspace(-1.0, 1.0, 20001)
+    for deg in range(3, max_deg + 1, 2):
+        c = C.chebinterpolate(f, deg)
+        c[0::2] = 0.0
+        e = float(np.abs(C.chebval(t, c) - f(t)).max())
+        if e <= err:
+            break
+    return {"cap": float(cap), "lo": -m, "hi": m, "coeffs": [float(v) for v in c], "degree": deg, "fit_err": e,
+            "data_max": float(smax)}
 
 
 def fit_norm(ms, absmax, eps, a):
@@ -148,6 +182,7 @@ def softmax_knobs():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--model", default=None, help="arch.MODELS alias or HF name (default: hf.NAME)")
     ap.add_argument("--tokens", default=None, help="token windows .npy (default: hf.text_windows)")
     ap.add_argument("--nseq", type=int, default=40)
     ap.add_argument("--T", type=int, default=128)
@@ -156,41 +191,50 @@ def main(argv=None):
     ap.add_argument("--inv-y-max", type=float, default=3.0)
     ap.add_argument("--norm-safety", type=float, default=2.0)
     ap.add_argument("--norm-err", type=float, default=1e-5)
-    ap.add_argument("--silu-safety", type=float, default=1.5)
-    ap.add_argument("--silu-d1", type=int, default=31)
-    ap.add_argument("--silu-d2", type=int, default=27)
+    ap.add_argument("--act-safety", "--silu-safety", type=float, default=1.5)
+    ap.add_argument("--act-d1", "--silu-d1", type=int, default=31)
+    ap.add_argument("--act-d2", "--silu-d2", type=int, default=27)
+    ap.add_argument("--cap-safety", type=float, default=1.5, help="the soft-cap series' range over max |score|")
+    ap.add_argument("--cap-err", type=float, default=1e-4, help="the soft-cap series' max error (score units)")
     ap.add_argument("--sm-safety", type=float, default=2.0, help="softmax denominator band widening")
     ap.add_argument("--sm-err", type=float, default=1e-5, help="softmax per-division relative error")
     ap.add_argument("--device", default="cuda", help="where the fp32 model runs (cpu when the GPU is busy)")
     ap.add_argument("--rotate", type=int, default=None, metavar="SEED",
                     help="rotate the residual stream by the seeded randomized Hadamard (weights.residual_rotation)")
     ap.add_argument("--sm-kc-max", type=int, default=256, help="longest cache the softmax seeds cover")
+    ap.add_argument("--first", type=int, default=1, help="first position the statistics read (an encoder after a "
+                    "public prefix of P tokens: P; --tokens then ragged windows prefix + prompt)")
     ap.add_argument("--sm-margin", type=float, default=0.3, help="clip range margin (fraction of the span)")
     ap.add_argument("--sm-rows", type=int, default=16384, help="score rows sampled per layer")
     a = ap.parse_args(argv)
+    hf.select(a.model)
 
     import torch
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "16")))
-    toks = np.load(a.tokens) if a.tokens else hf.text_windows(a.nseq, a.T)
-    toks = toks[:a.nseq, :a.T]
+    toks = np.load(a.tokens, allow_pickle=True) if a.tokens else hf.text_windows(a.nseq, a.T)   # ragged: an object array
+    ragged = toks.dtype == object
+    toks = [np.asarray(x, dtype=np.int64) for x in toks[:a.nseq]] if ragged else toks[:a.nseq, :a.T]
+    T_max = max(len(x) for x in toks) if ragged else int(toks.shape[1])
     model = hf.load_model(device=a.device)
     cfg = model.config
+    ar = hf.arch()
     L = cfg.num_hidden_layers
     rot = None
     if a.rotate is not None:
         from .weights import residual_rotation
         rot = residual_rotation(cfg.hidden_size, a.rotate)
-    st = hf.collect_sites(model, toks, rows_per_layer=a.sm_rows, rot=rot)          # per site: arrays over (seq, pos >= 1)
+    st = hf.collect_sites(model, toks, rows_per_layer=a.sm_rows, rot=rot, first=a.first)   # per site: (seq, pos >= first)
 
-    out = {"model": {"name": hf.NAME, "n_layers": L, "n_embd": cfg.hidden_size,
-                     "n_head": cfg.num_attention_heads, "n_kv_head": cfg.num_key_value_heads,
+    act = ar.act_step                       # the activation's configs.json section (silu, gelu)
+    out = {"model": {"name": hf.NAME, "family": ar.family, "n_layers": L, "n_embd": cfg.hidden_size,
+                     "n_head": cfg.num_attention_heads, "n_kv_head": cfg.num_key_value_heads, "head_dim": ar.head_dim,
                      "n_inner": cfg.intermediate_size, "vocab": cfg.vocab_size,
                      # the rotary frequencies as HF computes them (llama3 scaling included)
                      "rope_inv_freq": model.model.rotary_emb.inv_freq.double().cpu().tolist(),
-                     "rms_norm_eps": cfg.rms_norm_eps,
-                     "residual_rotation": a.rotate},
-           "norm": {}, "silu": {}, "softmax": {},
-           "meta": {"calib_windows": int(toks.shape[0]), "T": int(toks.shape[1]), "args": vars(a)}}
+                     "rms_norm_eps": cfg.rms_norm_eps, "attn_softcap": ar.attn_softcap,
+                     "final_softcap": ar.final_softcap, "residual_rotation": a.rotate},
+           "norm": {}, act: {}, **({"softcap": {}} if ar.attn_softcap else {}), "softmax": {},
+           "meta": {"calib_windows": len(toks), "T": T_max, "args": vars(a)}}
     eps = float(cfg.rms_norm_eps)
     for name in hf.norm_sites(L):
         out["norm"][name] = fit_norm(st[name + ".ms"], st[name + ".absmax"], eps, a)
@@ -198,13 +242,17 @@ def main(argv=None):
         print(f"[norm] {name:12s} c={n['center_scale']:.3g} band [{n['cheb_lo']:.3g},{n['cheb_hi']:.3g}] "
               f"ios={n['inv_out_scale']:.3g} depth={n['depth']} err={n['fit_err']:.1e}", flush=True)
     for b in range(L):
-        s = fit_silu(float(st[f"layers.{b}.gate.absmax"].max()), a.silu_safety, a.silu_d1, a.silu_d2)
+        s = ACT_FITS[ar.act](float(st[f"layers.{b}.gate.absmax"].max()), a.act_safety, a.act_d1, a.act_d2)
         # the Chebyshev basis the kernel evaluates: the power basis' coefficients reach ~1e8 on wide
         # ranges (layer 31, xmax ~50) and CKKS noise through them destroys the output
         from perseus.calibrate.thor_to_cheb import convert_site
         convert_site(s, f"layers.{b}.mlp.act")
-        out["silu"][f"layers.{b}.mlp.act"] = s
-        print(f"[silu] {b:2d} xmax={s['xmax']:.3g} err max={s['fit_err_max']:.2e} med={s['fit_err_med']:.2e}", flush=True)
+        out[act][f"layers.{b}.mlp.act"] = s
+        print(f"[{act}] {b:2d} xmax={s['xmax']:.3g} err max={s['fit_err_max']:.2e} med={s['fit_err_med']:.2e}", flush=True)
+    for b in range(L if ar.attn_softcap else 0):
+        c = fit_softcap(ar.attn_softcap, float(st[f"layers.{b}.logit.absmax"].max()), a.cap_safety, a.cap_err)
+        out["softcap"][f"layers.{b}.attn"] = c
+        print(f"[softcap] {b:2d} range +-{c['hi']:.3g} degree {c['degree']} err {c['fit_err']:.1e}", flush=True)
     knobs = softmax_knobs()
     knobs.range_margin = a.sm_margin
     # every query of the window: gpt2.yaml's decode_window (160) would fit the clip range on queries < 160 only,
@@ -212,7 +260,7 @@ def main(argv=None):
     knobs.decode_window = None
     for b in range(L):
         rows, row_q = st[f"layers.{b}.scores"]
-        sm = fit_softmax_llama(rows, row_q, int(toks.shape[1]), knobs, a.sm_safety, a.sm_err, kc_max=a.sm_kc_max)
+        sm = fit_softmax_llama(rows, row_q, T_max, knobs, a.sm_safety, a.sm_err, kc_max=a.sm_kc_max)
         out["softmax"][f"layers.{b}.attn"] = sm
         print(f"[softmax] {b:2d} clip [{sm['clip_lo']:.3g},{sm['clip_hi']:.3g}] d1={sm['delta1']} d2={sm['delta2']} "
               f"gs={sm['gs_iters_scaled']} refine={sm['per_step_refine_iters']}", flush=True)

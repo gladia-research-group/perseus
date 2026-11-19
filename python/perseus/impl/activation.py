@@ -100,6 +100,13 @@ def gelu(rt, x, cfg: GeluCfg, lanes: int | None = None, mask=None):
         return rt.mult_mask(g, (mask[0], cfg.xmax), lambda: mask[1](0.5 * cfg.xmax))
     if _GELU_TFHE and cfg.method == "chebyshev" and ops.gelu_fold:
         return gelu_tfhe(rt, x, cfg, lanes)
+    if mask is not None and ops.gelu_fold and cfg.method == "chebyshev" and cfg.mask_fold:
+        # the mask_fold series below with this mask's lanes in place of the expanded layout's (a split MLP's slice)
+        return eval_chebyshev_masked(
+            ops, x, [cfg.xmax * float(c) for c in cfg.cheb_coeffs], cfg.cheb_a, cfg.cheb_b, cfg.cheb_eps,
+            lambda ct, s: rt.mult_mask(ct, (mask[0], "cheb.m", s), lambda: mask[1](s)),
+            (lambda ct, s: rt.add_mask(ct, (mask[0], "cheb.m+", s), lambda: mask[1](s)))
+            if cfg.mask_fold == 2 else None, leaf_terms="budget")
     if mask is not None and ops.gelu_fold and cfg.method == "chebyshev":
         m = np.asarray(mask[1](1.0))
         if _ACT_FOLD and np.all(m == m.flat[0]):          # constant mask: xmax and the mask ride the coefficients

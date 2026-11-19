@@ -55,11 +55,11 @@ class LlamaPlannedPrefill(PlannedPrefill):
         io, kv_io = {}, {}
         self.uniq = {}
 
-        def block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None):
+        def block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None, **kw):
             flat = [x for blk in Xs for x in blk]
             metas = [(int(c.level), int(c.noise_deg)) for c in flat]
             vals = [np.array(c.vec) for c in flat] if layer == 0 else None
-            Y = orig(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last)
+            Y = orig(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last, **kw)
             # graph names as this block's capture wrote them (the next block renames what it reads)
             io[layer] = ([c.name for c in flat], [c.name for blk in Y for c in blk], metas, vals, ch, [len(b) for b in Y])
             return Y
@@ -86,10 +86,10 @@ class LlamaPlannedPrefill(PlannedPrefill):
                 self.snaps[nm] = np.array(ct.vec)
             return nm
 
-        def block_t(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None):
+        def block_t(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=None, layer=0, paged=None, last=None, **kw):
             tapping[0] = layer == self.tap_block
-            try:
-                return block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last)
+            try:      # kw: the Arch's post norms / soft-cap (Gemma-2)
+                return block(rt, Xs, P, cfgs, ch, rope, prefixes, B, kv=kv, layer=layer, paged=paged, last=last, **kw)
             finally:
                 tapping[0] = False
 
@@ -121,6 +121,8 @@ class LlamaPlannedPrefill(PlannedPrefill):
             r.out_names = outs
             self.in_names[i] = names_in
             self.in_metas[i] = metas
+            if os.environ.get("PF_PRINT_METAS", "0") not in ("", "0"):     # diagnostic: the stage entries the twin saw
+                print(f"[planned] block {i} entry (level, deg): {sorted(set(metas))}", flush=True)
             if i == 0:
                 self.in_vals = vals
         self.n_hidden = len(io[0][1])
@@ -159,6 +161,9 @@ class LlamaPlannedPrefill(PlannedPrefill):
         return out
 
     def prepare(self, toks):
+        # a block that ends in a post norm (arch.Arch.post_norms) exits where its plan puts it, not where the unplanned
+        # twin's levels land: the later blocks enter at the compiled exits
+        self.entry_compiled = bool(getattr(self.model.arch, "post_norms", None))
         super().prepare(toks)
         # registers ping-pong between two sets (block b writes set b % 2, reads set (b - 1) % 2): 32 blocks of 8
         # outputs would hold 8 GB of full-layout ciphertexts; a block's outputs are read before b + 2 overwrites them
@@ -202,13 +207,13 @@ class LlamaPlannedPrefill(PlannedPrefill):
         out = {}
         for b in range(self.n_layers):
             for lin in self.model.pcmm_weights(b).values():
-                out[lin.name] = lin
+                if hasattr(lin, "name"):        # the PCMM linears (Gemma-2's entry also holds its post-norm gammas)
+                    out[lin.name] = lin
         return out
 
     def setup(self, toks):
         """`prepare` (CPU) + the planned Session: routes, keys (+ PCMM / CCMM keys), slab, registers, the services;
         every block bound, its plaintexts staged by value; the CCMM calibrated; then the secret is dropped."""
-        from perseus import _pc
         if not hasattr(self, "progs"):
             self.prepare(toks)
         t0 = time.time()
@@ -290,7 +295,7 @@ class LlamaPlannedPrefill(PlannedPrefill):
         xa = [fhe.encrypt(v, L, 1) for v in CC.from_mats(A)]
         xb = [fhe.encrypt(v.astype(np.complex128), L, 1) for v in CC.from_mats(B)]
         f = 2.0 ** -3
-        ys = sess.ccmm_probe(xa, xb, False, f, f, 0, False)
+        ys = sess.ccmm_probe(xa, xb, False, f, f, 0, 1)
         got = CC.to_mats([np.asarray(fhe.decrypt_slots_complex(y)) for y in ys])[:, :, :16]
         want = np.einsum("ijl,jkl->ikl", A, B)[:, :, :16]
         c_unit = float(np.real(np.vdot(want, got) / np.vdot(want, want))) / (f * f)
@@ -317,13 +322,13 @@ class LlamaPlannedPrefill(PlannedPrefill):
         L = int(self.in_metas[0][0][0])
         for kappa in self.ccmm_sweep:
             for case in ("qk", "pv"):
-                bits = self.ccmm_case(case, kappa, L)
+                bits = self.ccmm_case(case, kappa, L, max(2, CC.MERGE_N))
                 self.log(f"[ccmm] sweep {case} kappa 2^{np.log2(kappa):.1f}: {bits:.2f} bits")
 
-    def ccmm_case(self, case, kappa, L):
+    def ccmm_case(self, case, kappa, L, n=2):
         """Precision (bits, max |want| / max err) of one merged CCMM shaped like Llama's: "qk" (Q complex, K real,
         b transposed, amax 4, bmax 24, out_scale 1/sqrt(512), shift 5) or "pv" (P >= 0, V real, amax 1.5, bmax 8,
-        shift 3); operands duplicated on batch l + 16 (PF_CCMM_MERGE)."""
+        shift 3); operands on batch l < 32 / n duplicated on l + 32 k / n (PF_CCMM_MERGE: n = 2 pairs, 4 quadruples)."""
         from perseus.impl import ccmm as CC
         from perseus.impl import sinc as sc
         fhe, sess = self.fhe, self.sess
@@ -331,35 +336,37 @@ class LlamaPlannedPrefill(PlannedPrefill):
         D, BT = sc.D, sc.BATCH
         A = np.zeros((D, D, BT), complex)
         Bm = np.zeros((D, D, BT))
+        h = BT // n
         if case == "qk":
-            A[:, :, :16] = rng.standard_normal((D, D, 16)) + 1j * rng.standard_normal((D, D, 16))
-            A[:, :, :16] *= 4.0 / np.abs(A[:, :, :16]).max()
-            Bm[:, :, :16] = rng.standard_normal((D, D, 16))
-            Bm[:, :, :16] *= 24.0 / np.abs(Bm[:, :, :16]).max()
+            A[:, :, :h] = rng.standard_normal((D, D, h)) + 1j * rng.standard_normal((D, D, h))
+            A[:, :, :h] *= 4.0 / np.abs(A[:, :, :h]).max()
+            Bm[:, :, :h] = rng.standard_normal((D, D, h))
+            Bm[:, :, :h] *= 24.0 / np.abs(Bm[:, :, :h]).max()
             bt, amax, bmax, osc, shift = True, 4.0, 24.0, 1 / np.sqrt(512), 5
         else:
-            A[:, :, :16] = rng.random((D, D, 16)) ** 4
-            A[:, :, :16] *= 1.5 / A[:, :, :16].max()
-            Bm[:, :, :16] = rng.standard_normal((D, D, 16))
-            Bm[:, :, :16] *= 8.0 / np.abs(Bm[:, :, :16]).max()
+            A[:, :, :h] = rng.random((D, D, h)) ** 4
+            A[:, :, :h] *= 1.5 / A[:, :, :h].max()
+            Bm[:, :, :h] = rng.standard_normal((D, D, h))
+            Bm[:, :, :h] *= 8.0 / np.abs(Bm[:, :, :h]).max()
             bt, amax, bmax, osc, shift = False, 1.5, 8.0, 1.0, 3
-        A[:, :, 16:], Bm[:, :, 16:] = A[:, :, :16], Bm[:, :, :16]
+        for k in range(1, n):
+            A[:, :, k * h:(k + 1) * h], Bm[:, :, k * h:(k + 1) * h] = A[:, :, :h], Bm[:, :, :h]
         c_unit = sess.ccmm_stats()["c_unit"]
-        p = osc * 2.0 ** -shift / c_unit * 0.5
+        p = osc * 2.0 ** -shift / c_unit / n
         fa, fb = np.sqrt(p * bmax / amax), np.sqrt(p * amax / bmax)
         xa = [fhe.encrypt(v, L, 1) for v in CC.from_mats(A)]
         xb = [fhe.encrypt(v.astype(np.complex128), L, 1) for v in CC.from_mats(Bm)]
-        ys = sess.ccmm_probe(xa, xb, bt, fa, fb, shift, True, kappa)
+        ys = sess.ccmm_probe(xa, xb, bt, fa, fb, shift, n, kappa)
         got = np.array([np.asarray(fhe.decrypt_slots_complex(y)) for y in ys])
         P = osc * CC.exact(CC.from_mats(A), CC.from_mats(Bm), bt)
-        want = np.array([CC.merged(P[2 * i], P[2 * i + 1], CC.w_theory()) for i in range(sc.NCT // 2)])
+        want = CC._group(P, CC.w_theory(), n)
         ls = (np.arange(sc.SLOTS) - sc.OFFSET) % 32
-        sel = ls < 16
+        sel = ls < h
         g, w = got[:, sel], want[:, sel]
         err = np.abs(g - w).max()
         sc_ = np.real(np.vdot(w, g) / np.vdot(w, w))
         efit = np.abs(g / sc_ - w).max()
-        self.log(f"[ccmm] {case} kappa 2^{np.log2(kappa):.1f}: output scale {sc_:.4g}, fitted {np.log2(np.abs(w).max() / max(efit, 1e-300)):.2f} bits")
+        self.log(f"[ccmm] {case} x{n} kappa 2^{np.log2(kappa):.1f}: output scale {sc_:.4g}, fitted {np.log2(np.abs(w).max() / max(efit, 1e-300)):.2f} bits")
         return float(np.log2(np.abs(w).max() / max(err, 1e-300)))
 
     def hidden(self, b=None):
@@ -371,5 +378,5 @@ class LlamaPlannedPrefill(PlannedPrefill):
         shim = types.SimpleNamespace(ops=types.SimpleNamespace(decrypt_slots_complex=lambda v: v),
                                      dims=self.model.rt.dims)
         Bk = self.model.blocks
-        return decrypt_blocked(shim, [vals[g * Bk.K:(g + 1) * Bk.K] for g in range(len(vals) // Bk.K)], self.ch, Bk,
+        return decrypt_blocked(shim, [vals[g * Bk.Kh:(g + 1) * Bk.Kh] for g in range(len(vals) // Bk.Kh)], self.ch, Bk,
                                self.model.rt.dims.dim)

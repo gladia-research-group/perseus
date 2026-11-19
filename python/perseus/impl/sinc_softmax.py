@@ -13,6 +13,8 @@ from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse
 from .prefill import _KcExtrapolated, split
 
 LO = (sc.slot_coords()[2] < 16).astype(float)
+# the half-head view's unpack mask: the first half's batch slots (kv' with e = 0) alone, P copied onto e = 1 after
+LO_HALF = ((sc.slot_coords()[2] < 8) & (((sc.slot_coords()[2] // sc.HALF_STEP) % 2) == 0)).astype(float)
 # PF_SM_R_REFRESH=1 (with unpacked): one refresh of the last reciprocal R instead of P's 16 CCMM-entry refreshes
 R_REFRESH = os.environ.get("PF_SM_R_REFRESH", "0") not in ("", "0")
 R_SCALE = float(os.environ.get("PF_SM_R_SCALE", "1"))   # refresh R / R_SCALE (|R| <= 32.5), R_SCALE rides the Z masks
@@ -24,6 +26,7 @@ PAIR = os.environ.get("PF_SM_PAIR", "0") not in ("", "0")
 # PF_SM_PAIR_ROUNDS=1: pair only those rounds (the ones the plan refreshes); unset = every round >= 1
 PAIR_ROUNDS = {int(v) for v in os.environ.get("PF_SM_PAIR_ROUNDS", "").split(",") if v}
 R_ITER_P = int(os.environ.get("PF_SM_R_ITER_P", "8"))
+_DBG_X = os.environ.get("PF_SM_DBG_X", "0") not in ("", "0")
 
 
 def pack(rt, S):
@@ -36,15 +39,43 @@ def pack(rt, S):
     return out
 
 
-def unpack(rt, Y, site="sm.unpack"):
-    """packed real -> complex (Re / Im = chunk 0 / 1)."""
+def unpack(rt, Y, site="sm.unpack", lo=None):
+    """packed real -> complex (Re / Im = chunk 0 / 1); `lo`: the batch slots kept (default LO)."""
     ops = rt.ops
+    lo = LO if lo is None else lo
+    key = (site,) if lo is LO else (site, "half")
     out = []
     for y in Y:
-        re = rt.mult_mask(y, (site,), lambda: LO)
-        im = rt.mult_mask(ops.rotate(y, 16), (site,), lambda: LO)
+        re = rt.mult_mask(y, key, lambda: lo)
+        im = rt.mult_mask(ops.rotate(y, 16), key, lambda: lo)
         out.append(ops.add(re, ops.mult_i(im)))
     return out
+
+
+def compress_half(rt, Spk):
+    """The half view's 16 packed real score ciphertexts (zero off sinc's V) -> 4: ciphertext 4 p + r onto p at batch
+    offset HALF_DELTAS[r] (rotations only)."""
+    ops = rt.ops
+    out = []
+    for p in range(len(Spk) // 4):
+        acc = None
+        for r, dl in enumerate(sc.HALF_DELTAS):
+            x = Spk[4 * p + r]
+            x = x if dl == 0 else ops.rotate(x, -dl)
+            acc = x if acc is None else ops.add(acc, x)
+        out.append(acc)
+    return out
+
+
+def _half_den(rt, D, site="sm.hden"):
+    """The compressed layout's denominator: the four regions' sums (offsets 2, 8) on region 0, selected (a level),
+    broadcast back to every region."""
+    ops = rt.ops
+    D = ops.add(D, ops.rotate(D, 2))
+    D = ops.add(D, ops.rotate(D, 8))
+    D = rt.mult_mask(D, (site,), lambda: (sc.half_regions()[0] == 0).astype(float))
+    D = ops.add(D, ops.rotate(D, -2))
+    return ops.add(D, ops.rotate(D, -8))
 
 
 def recip_slots(rt, D, av, bv, iters, key, cheb=None):
@@ -75,13 +106,20 @@ def score_affine(cfg):
     return 2.0 / (b - a), (a + b) / (b - a)
 
 
-def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
+def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False, lo=None, half=False):
     """Spk: 16 packed real score ciphertexts in true units, the BOS key on key token sc.BOS_TOK.
     Returns the packed probabilities, or (`unpacked`) unpack's output with its masks on the Z side of the last
     product: (Z LO) R + i (rot(Z, 16) LO) rot(R, 16), one level shallower when R is the deeper factor."""
     sink_only(cfg, "sinc_softmax.softmax")   # a key-0 config: the caller's K rows came off the BOS key (attention_ccmm)
     ops = rt.ops
-    tq, tk = sc.packed_meta(T)
+    if half:                # the half view: the 16 score ciphertexts compressed to 4 (sinc.half_meta)
+        if not unpacked:
+            raise ValueError("sinc_softmax.softmax: the compressed half view needs unpacked (PF_SM_UNPACK_FOLD=1)")
+        Spk = compress_half(rt, Spk)
+        tq, tk = sc.half_meta(T)
+    else:
+        tq, tk = sc.packed_meta(T)
+    hk = ("half",) if half else ()
     qv = tq >= 0
     kc = np.where(qv, tq + 2, 1)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
@@ -97,6 +135,10 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
             s = rt.add_mask(s, site + ("score", cfg.clip_lo, mean, T),
                             lambda: np.where(valid, -mean, cfg.clip_lo - mean))
             a, b = cfg.cheb_a / sf, cfg.cheb_b / sf
+        if _DBG_X and hasattr(s, "vec"):     # PF_SM_DBG_X=1 (fake): the series' input on valid / invalid slots
+            xv = np.real(s.vec) if prescaled else (2 * np.real(s.vec) - (a + b)) / (b - a)
+            print(f"[sm_dbg_x] {site}: valid |x| max {np.abs(xv[valid]).max():.3g}, invalid |x| max "
+                  f"{np.abs(xv[~valid]).max() if (~valid).any() else 0:.3g}", flush=True)
         if cfg.exp_mask_fold:
             # the active mask's 2^log2delta1-th root rides the series, as the packed prefill's (prefill._sm_cheb):
             # (p M^(1/2^s))^(2^s) = p^(2^s) M, a level less after the exp
@@ -114,7 +156,7 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
             z = ops.square(z)
         z = im_cleanse(ops, z)
         return rt.mult_mask(z, site + ("active", T), lambda: np.where(valid, 0.5 / kc, 0.0))
-    Z = [exp_part(s, qv & ((tk[o] == sc.BOS_TOK) | (tk[o] <= tq)), ("sm", o)) for o, s in enumerate(Spk)]
+    Z = [exp_part(s, qv & ((tk[o] == sc.BOS_TOK) | (tk[o] <= tq)), ("sm", o) + hk) for o, s in enumerate(Spk)]
     cheb = getattr(ops, "sm_cheb_gs", False)
     ks = sorted(set(kc.tolist()))
     rnd = {k: (smcheb.rounds(cfg, k) if cheb else _recip_rounds(_KcExtrapolated(cfg), k, ops.sm_gs_first)) for k in ks}
@@ -133,6 +175,8 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
         for z in Z[1:]:
             D = ops.add(D, z)
         D = ops.rotate_and_sum(D, 1 << 12, sc.SLOTS)
+        if half:
+            D = _half_den(rt, D)
         per = [rnd[int(k)][r] for k in kc]
         av = np.array([p[0] * p[3] for p in per])
         bv = np.array([p[1] * p[3] * p[3] for p in per])
@@ -155,10 +199,22 @@ def softmax(rt, Spk, cfg, layer=0, T=127, unpacked=False, prescaled=False):
                     R = ops.add(y, ops.mult(ops.add(e, -0.25), float(2.0 ** -R_ITER_P)))
                 else:
                     ops.bootstrap_real(R)
+            lm = LO if lo is None else lo
+            mk = (("sm.unpack",) if sc_r == 1.0 else ("sm.unpack", sc_r)) + (() if lo is None else ("half",))
+            if half:        # back to 16: region r of ciphertext p onto V (the unpack masks select it, no level)
+                Rs = [R if dl == 0 else ops.rotate(R, dl) for dl in sc.HALF_DELTAS]
+                Rhs = [ops.rotate(R, dl + 16) for dl in sc.HALF_DELTAS]
+                out = []
+                for z in Z:
+                    for r, dl in enumerate(sc.HALF_DELTAS):
+                        zr = z if dl == 0 else ops.rotate(z, dl)
+                        out.append(ops.add(ops.mult(rt.mult_mask(zr, mk, lambda: sc_r * lm), Rs[r]),
+                                           ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(zr, 16), mk,
+                                                                            lambda: sc_r * lm), Rhs[r]))))
+                return out
             Rh = ops.rotate(R, 16)
-            mk = ("sm.unpack",) if sc_r == 1.0 else ("sm.unpack", sc_r)
-            return [ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * LO), R),
-                            ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), mk, lambda: sc_r * LO), Rh)))
+            return [ops.add(ops.mult(rt.mult_mask(z, mk, lambda: sc_r * lm), R),
+                            ops.mult_i(ops.mult(rt.mult_mask(ops.rotate(z, 16), mk, lambda: sc_r * lm), Rh)))
                     for z in Z]
         Y = [ops.mult(z, R) for z in Z]
     return Y

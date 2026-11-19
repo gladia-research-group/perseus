@@ -1,10 +1,11 @@
-"""HF Llama checkpoint -> the folded, head-rearranged, GQA-expanded matrices of the cachemir
-packing and their slot vectors (EncodedLinear), cached on disk as memory-mapped arrays.
+"""A decoder checkpoint (arch.Arch: Llama, Gemma-2) -> the folded, head-rearranged, GQA-expanded matrices of the
+cachemir packing and their slot vectors (EncodedLinear), cached on disk as memory-mapped arrays.
 
-Per block: q/k/v, gate/up and the LM head carry their norm's gamma / inv_out_scale folded into the rows; K and V
-expanded from the 8 KV heads to the 32 query heads (plain MHA core); columns head-interleaved; gate also carries the
-SiLU's 1/xmax. Slot vectors are float32 / complex64 (bf16 weights are exact there); ~40 GB under PERSEUS_LLAMA_CACHE
-(default $HF_HOME/perseus/llama_slots), keyed by checkpoint, configs and builder sources.
+Per block: q/k/v, gate/up and the LM head carry their norm's gamma / inv_out_scale folded into the rows (gamma = the
+Arch's norm_offset + weight); K and V expanded from the KV heads to the query heads (plain MHA core) in the head slots
+of arch.model_dims; columns head-interleaved; gate also carries the activation's 1/xmax. The post norms' gammas (Gemma-2)
+stay vectors: no linear follows them. Slot vectors are float32 / complex64 (bf16 weights are exact there); ~40 GB for
+Llama-3-8B under PERSEUS_LLAMA_CACHE (default $HF_HOME/perseus/llama_slots), keyed by checkpoint, configs and builder.
 """
 from __future__ import annotations
 
@@ -19,6 +20,19 @@ import numpy as np
 
 from perseus.impl.layout import Dims, rearrange_qkv_weights, rearrange_wo_weights
 from perseus.impl.linear import EncodedLinear
+
+from .arch import arch_of, model_dims
+
+# The slot cache's builder key. Bump BUILDER_VERSION whenever what a slot vector holds changes (the matrices, their folds,
+# the encoding): python/tests/test_decoder_arch.py pins the builder's output on tiny checkpoints, so such an edit fails it
+# until the golden hashes and this version move together. Version 1 is the source hash the caches built before the
+# version existed carry (main 0d5c85b2): they stay valid.
+BUILDER_VERSION = 1
+_BUILDER_KEYS = {1: "4131b6a248f56d4c"}
+
+
+def builder_key() -> str:
+    return _BUILDER_KEYS.get(BUILDER_VERSION, f"v{BUILDER_VERSION}")
 
 
 
@@ -48,13 +62,21 @@ class SafetensorsStore:
         with open(os.path.join(self.dir, "config.json")) as f:
             self.config = json.load(f)
 
+    def _key(self, name):
+        """The checkpoint's own name for `name`: a bare decoder (Gemma2Model, a pipeline's text encoder) has no
+        "model." prefix."""
+        if name not in self._where and name.startswith("model.") and name[6:] in self._where:
+            return name[6:]
+        return name
+
     def has(self, name):
-        return name in self._where
+        return self._key(name) in self._where
 
     def tensor(self, name) -> np.ndarray:
         from safetensors import safe_open
-        with safe_open(self._where[name], "pt") as f:
-            return f.get_tensor(name).float().numpy()
+        k = self._key(name)
+        with safe_open(self._where[k], "pt") as f:
+            return f.get_tensor(k).float().numpy()
 
     def fingerprint(self) -> str:
         """The checkpoint's identity: shard names and sizes (the content is hashed by HF)."""
@@ -66,10 +88,8 @@ class SafetensorsStore:
 
 
 def llama_dims(cfg: dict, N: int = 32768) -> Dims:
-    d, E = int(cfg["hidden_size"]), int(cfg["intermediate_size"])
-    H = int(cfg["num_attention_heads"])
-    hid = 1 << (d - 1).bit_length()
-    return Dims(N, hid, d, H, H, 1 << (E - 1).bit_length(), E)
+    """arch.model_dims (the name the runners used before the Arch)."""
+    return model_dims(cfg, N)
 
 
 def expand_kv(W, H: int, H_kv: int, d_head: int):
@@ -109,7 +129,7 @@ def pad(W, r, c):
 
 @dataclasses.dataclass
 class BlockWeights:
-    q: EncodedLinear
+    q: EncodedLinear | None          # None: Q rides K's padding heads in `kv` (q_pad)
     k: EncodedLinear | None
     v: EncodedLinear | None
     out: EncodedLinear
@@ -118,27 +138,124 @@ class BlockWeights:
     down: EncodedLinear
     tag: str = ""
     kv: EncodedLinear | None = None   # cachemir_complex: the fused K + iV linear (k, v unused)
+    post1: np.ndarray | None = None   # Arch.post_norms: the attention output norm's gamma / inv_out_scale, (dim,)
+    post2: np.ndarray | None = None   # the MLP output norm's
+    q_pad: int = 0                    # Q's head slots in `kv`: its heads moved this many slots up (q_pad_heads)
+    kv_entry: str = "kv"              # the slot cache entry of `kv` ("kvq" with Q on it)
+    mlp: tuple = ()                   # LLAMA_MLP_SPLIT: the MLP's parts (MlpPart), gate / up / down = part 0's
+
+
+@dataclasses.dataclass
+class MlpPart:
+    """One power-of-two slice [off, off + width) of the MLP's real width (mlp_parts), its own gate / up / down."""
+    off: int
+    width: int
+    real: int                          # its real columns (the last part's may stop short of width)
+    gate: EncodedLinear
+    up: EncodedLinear
+    down: EncodedLinear
+
+    @property
+    def tag(self):
+        return f"s{self.off}x{self.width}"
+
+
+def mlp_parts(dims: Dims) -> list[tuple[int, int, int]]:
+    """LLAMA_MLP_SPLIT=<n>: the MLP's real width E_real as at most n power-of-two slices (off, width, real), largest
+    first, instead of one padded to E (Gemma-2-2B: 9216 = 8192 + 1024 of 16384, 44 % fewer plaintexts in gate / up /
+    down). [] (one padded MLP) when off, when it fits E already, or when n slices do not cover it."""
+    n = int(os.environ.get("LLAMA_MLP_SPLIT", "0") or 0)
+    Er, E = dims.E_real, dims.E
+    if n < 2 or Er >= E:
+        return []
+    out, off = [], 0
+    while off < Er and len(out) < n:
+        rest = Er - off
+        w = 1 << (rest.bit_length() - 1)                    # the largest power of two within what is left
+        if len(out) == n - 1 and w < rest:
+            w <<= 1                                         # the last slice covers the rest, padded
+        out.append((off, w, min(w, rest)))
+        off += w
+    return out if off >= Er and sum(w for _, w, _ in out) < E else []
+
+
+def interleave_rows(W, d: int):
+    """W's rows in the input order a (rows, d) cachemir linear with d < rows reads the hidden layout in
+    (encode_linear_input: slot m tp holds feature interleave_idx(m, d, rows)): the projection onto an MLP slice
+    narrower than the hidden reads the hidden as it is."""
+    from perseus.impl.layout import interleave_idx
+    out = np.zeros_like(W)
+    out[interleave_idx(np.arange(W.shape[0]), d, W.shape[0])] = W
+    return out
+
+
+def interleave_cols(W, d: int):
+    """W's columns in the output order a (d, cols) cachemir linear with d < cols writes (decode_linear_output), so
+    the down projection of an MLP slice narrower than the hidden lands in the hidden layout."""
+    from perseus.impl.layout import interleave_idx
+    out = np.zeros_like(W)
+    out[:, interleave_idx(np.arange(W.shape[1]), d, W.shape[1])] = W
+    return out
+
+
+def mlp_mask(dims: Dims, width: int, real: int, scale: float) -> np.ndarray:
+    """The slots of an MLP slice's activation input that hold its real features (the gate projection hid -> width
+    lands them as decode_linear_output reads them), at `scale`; 0 elsewhere."""
+    from perseus.impl.layout import cm_params, interleave_idx
+    p = cm_params(dims.N, dims.hid, width)
+    out = np.zeros(dims.N)
+    if p.is_up and p.alpha > 1:
+        m = np.arange(dims.N // p.tp)
+        ok = interleave_idx(m, p.d, width) < real
+        out[m[ok] * p.tp] = scale
+    else:
+        out[np.arange(real) * p.t] = scale
+    return out
+
+
+def q_pad_heads(dims: Dims) -> int:
+    """Q rides K's zero padding heads in the fused K + iV linear (cachemir_complex), as GPT-2's prefill puts V on K's
+    padding heads (PF_QKV_PACK): the head slots Q moves up by when the model's heads fill at most half of them
+    (Gemma-2-2B: 8 of 16), so the QKV step is one complex linear; 0 (Q its own linear) when they fill more (Llama,
+    GPT-2). LLAMA_Q_PAD=0 keeps Q separate."""
+    if os.environ.get("LLAMA_Q_PAD", "1") in ("", "0"):
+        return 0
+    return dims.H_real if 0 < dims.H_real and 2 * dims.H_real <= dims.H else 0
+
+
+def pad_q(Q, dims: Dims, off: int):
+    """Q's real head columns (rearranged: column r = h + H i) moved `off` head slots up, onto K's zero padding heads."""
+    r = np.arange(Q.shape[1])
+    src = r[(r % dims.H) < dims.H_real]
+    out = np.zeros_like(Q)
+    out[:, src + off] = Q[:, src]
+    return out
 
 
 @dataclasses.dataclass
 class BlockMatrices:
     Q: np.ndarray; K: np.ndarray; V: np.ndarray; O: np.ndarray
     Gate: np.ndarray; Up: np.ndarray; Down: np.ndarray
+    post1: np.ndarray | None = None
+    post2: np.ndarray | None = None
 
 
 def block_matrices(store: SafetensorsStore, cfgs, b: int, dims: Dims) -> BlockMatrices:
     c = store.config
+    arch = arch_of(c)
     H, H_kv = int(c["num_attention_heads"]), int(c["num_key_value_heads"])
-    dh = dims.dim // H
+    dh = dims.d_head_real
     ln1, ln2, _sm, act = cfgs.block(b)
     p = f"model.layers.{b}."
     t = lambda n: store.tensor(p + n).astype(np.float64)
-    g1 = t("input_layernorm.weight") * ln1.descale
-    g2 = t("post_attention_layernorm.weight") * ln2.descale
+    g1 = (arch.norm_offset + t("input_layernorm.weight")) * ln1.descale
+    g2 = (arch.norm_offset + t(f"{arch.pre_mlp_norm}.weight")) * ln2.descale
     R = rotation_of(cfgs, dims.dim)                      # the residual stream is x R (or x)
     rin = (lambda W: R.T @ W) if R is not None else (lambda W: W)
     rout = (lambda W: W @ R) if R is not None else (lambda W: W)
     Q = rin(t("self_attn.q_proj.weight").T * g1[:, None])
+    if arch.q_fold != 1.0:          # the Arch's score scale over the runtime's 1/sqrt(head_dim)
+        Q = Q * arch.q_fold
     K = rin(expand_kv(t("self_attn.k_proj.weight").T, H, H_kv, dh) * g1[:, None])
     V = rin(expand_kv(t("self_attn.v_proj.weight").T, H, H_kv, dh) * g1[:, None])
     Q, K, V = (rearrange_qkv_weights(pad(M, dims.hid, dims.hid), dims.H) for M in (Q, K, V))
@@ -146,7 +263,12 @@ def block_matrices(store: SafetensorsStore, cfgs, b: int, dims: Dims) -> BlockMa
     Gate = pad(rin(t("mlp.gate_proj.weight").T * (g2 / act.xmax)[:, None]), dims.hid, dims.E)
     Up = pad(rin(t("mlp.up_proj.weight").T * g2[:, None]), dims.hid, dims.E)
     Down = pad(rout(t("mlp.down_proj.weight").T), dims.E, dims.hid)
-    return BlockMatrices(Q, K, V, O, Gate, Up, Down)
+    post = [None, None]
+    if arch.post_norms:
+        if R is not None:
+            raise ValueError("post norms with a rotated residual: their gamma would need the rotation too")
+        post = [(arch.norm_offset + t(f"{m}.weight")) * n.descale for m, n in zip(arch.post_norms, cfgs.post(b))]
+    return BlockMatrices(Q, K, V, O, Gate, Up, Down, *post)
 
 
 def _sha(paths):
@@ -165,17 +287,6 @@ def _folded_config(cfgs) -> str:
     return repr(key if rot is None else key + (("residual_rotation", rot),))
 
 
-def _builder_sha():
-    """The source of what produces a slot vector (an edit elsewhere keeps the ~40 GB cache)."""
-    import inspect
-
-    from perseus.impl import layout, linear
-    fns = (block_matrices, expand_kv, pad, LlamaWeights._linear, LlamaWeights.block, LlamaWeights.lm_tiles,
-           layout.cm_params, layout.interleave_idx, layout.weight_index, layout.encode_weight_matrix_fast,
-           layout.rearrange_qkv_weights, layout.rearrange_wo_weights, linear.EncodedLinear.encode)
-    return hashlib.sha256("".join(inspect.getsource(f) for f in fns).encode()).hexdigest()[:16]
-
-
 class LlamaWeights:
     """The slot vectors of every block and of the LM head, built once per (checkpoint, configs,
     packing, builder sources) into the disk cache and memory-mapped from there."""
@@ -186,10 +297,11 @@ class LlamaWeights:
         linear also carries its plaintexts as coefficient rows there (EncodedLinear.coeffs, the device-encoded
         inner sums), built once from the slot vectors into the same disk cache."""
         self.store, self.cfgs, self.dims, self.packing = store, cfgs, dims, packing
+        self.arch = arch_of(store.config)
         self.pinned = pinned
         root = cache_dir or os.environ.get("PERSEUS_LLAMA_CACHE") or os.path.join(
             os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "perseus", "llama_slots")
-        key = hashlib.sha256(f"{store.fingerprint()}|{_folded_config(cfgs)}|{_builder_sha()}|{dims}|{packing}"
+        key = hashlib.sha256(f"{store.fingerprint()}|{_folded_config(cfgs)}|{builder_key()}|{dims}|{packing}"
                              .encode()).hexdigest()[:20]
         self.dir = Path(root) / key
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -267,21 +379,45 @@ class LlamaWeights:
         pre = f"b{b}."
         lin = lambda n, f, i, o, op=False: self._linear(pre + n, f, i, o, op)
         cplx = self.packing == "cachemir_complex"
+        post = [None, None]
+        if self.arch.post_norms:
+            post = [np.asarray(v, dtype=np.float64)
+                    for v in self._cached(pre + "post", lambda: np.stack([mats().post1, mats().post2]))]
+        off = q_pad_heads(d) if cplx else 0
         w = BlockWeights(
-            q=lin("q", lambda: mats().Q, hid, hid),
+            q=None if off else lin("q", lambda: mats().Q, hid, hid),
             k=None if cplx else lin("k", lambda: mats().K, hid, hid),
             v=None if cplx else lin("v", lambda: mats().V, hid, hid),
             out=lin("out", lambda: mats().O, hid, hid),
-            gate=lin("gate", lambda: mats().Gate, hid, E, cplx),
-            up=lin("up", lambda: mats().Up, hid, E, cplx),
-            down=lin("down", lambda: mats().Down, E, hid, cplx),
+            gate=None if mlp_parts(d) else lin("gate", lambda: mats().Gate, hid, E, cplx),
+            up=None if mlp_parts(d) else lin("up", lambda: mats().Up, hid, E, cplx),
+            down=None if mlp_parts(d) else lin("down", lambda: mats().Down, E, hid, cplx),
             tag=pre,
-            kv=lin("kv", lambda: mats().K + 1j * mats().V, hid, hid) if cplx else None)
+            kv=(lin("kvq", lambda: mats().K + pad_q(mats().Q, d, off) + 1j * mats().V, hid, hid) if off
+                else lin("kv", lambda: mats().K + 1j * mats().V, hid, hid)) if cplx else None,
+            post1=post[0], post2=post[1], q_pad=off, kv_entry="kvq" if off else "kv")
+        parts = mlp_parts(d)
+        if parts:
+            from perseus.impl.layout import cm_params
+            mp = []
+            for o, wd, real in parts:
+                sl = slice(o, o + wd)
+                narrow = wd < hid
+                g = (lambda M: interleave_rows(M, wd)) if narrow else (lambda M: M)
+                dn = (lambda M: interleave_cols(M, wd)) if narrow else (lambda M: M)
+                pk_up = cplx and cm_params(d.N, hid, wd).r_o % 2 == 0
+                pk_dn = cplx and cm_params(d.N, wd, hid).r_o % 2 == 0
+                tg = f"s{o}x{wd}"
+                mp.append(MlpPart(o, wd, real,
+                                  lin(f"gate.{tg}", lambda sl=sl, g=g: g(mats().Gate[:, sl]), hid, wd, pk_up),
+                                  lin(f"up.{tg}", lambda sl=sl, g=g: g(mats().Up[:, sl]), hid, wd, pk_up),
+                                  lin(f"down.{tg}", lambda sl=sl, dn=dn: dn(mats().Down[sl, :]), wd, hid, pk_dn)))
+            w = dataclasses.replace(w, gate=mp[0].gate, up=mp[0].up, down=mp[0].down, mlp=tuple(mp))
         return w
 
     def lm_tiles(self, paired: bool = True):
         """encode_gpt2_lm_head_tile: ceil(vocab / N) tiles of (hid, N); `paired`: tiles 2m and
-        2m+1 as one complex tile (real and imaginary axis)."""
+        2m+1 as one complex tile (real and imaginary axis). A tied head (Arch.tied) is the embedding matrix."""
         d = self.dims
         N = d.N
         vocab = int(self.store.config["vocab_size"])
@@ -289,8 +425,10 @@ class LlamaWeights:
         m = {}
         def W():
             if not m:
-                g = self.store.tensor("model.norm.weight").astype(np.float64) * self.cfgs.ln_f.descale
-                m["W"] = self.store.tensor("lm_head.weight").T.astype(np.float64) * g[:, None]
+                g = (self.arch.norm_offset + self.store.tensor("model.norm.weight").astype(np.float64)) \
+                    * self.cfgs.ln_f.descale
+                head = "model.embed_tokens.weight" if self.arch.tied else "lm_head.weight"
+                m["W"] = self.store.tensor(head).T.astype(np.float64) * g[:, None]
                 R = rotation_of(self.cfgs, d.dim)
                 if R is not None:
                     m["W"] = R.T @ m["W"]
@@ -307,7 +445,10 @@ class LlamaWeights:
 
     def linear_names(self, n_layers: int):
         """The slot cache entries of every linear the model uses."""
-        per = ("q", "out", "gate", "up", "down") + (("kv",) if self.packing == "cachemir_complex" else ("k", "v"))
+        cplx = self.packing == "cachemir_complex"
+        qkv = (("kvq",) if q_pad_heads(self.dims) else ("q", "kv")) if cplx else ("q", "k", "v")
+        mlp = [f"{f}.s{o}x{w}" for o, w, _ in mlp_parts(self.dims) for f in ("gate", "up", "down")]
+        per = qkv + ("out",) + (tuple(mlp) or ("gate", "up", "down"))
         K = (int(self.store.config["vocab_size"]) + self.dims.N - 1) // self.dims.N
         lm = [f"lm.c{j}" for j in range((K + 1) // 2)] if self.packing == "cachemir_complex" else [f"lm.{k}" for k in range(K)]
         return [f"b{b}.{n}" for b in range(n_layers) for n in per] + lm
@@ -339,6 +480,8 @@ class LlamaWeights:
             self._emb = self.store.tensor("model.embed_tokens.weight")
             self._R = rotation_of(self.cfgs, self.dims.dim)
         e = np.asarray(self._emb[int(token)], dtype=np.float64)
+        if self.arch.embed_scale != 1.0:
+            e = e * self.arch.embed_scale
         return e if self._R is None else e @ self._R
 
 

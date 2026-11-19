@@ -18,6 +18,10 @@ ENV = {**gpt2_env.ENV,
        "FHE_STAGE_ARENA_GB": "1",
        "LLAMA_PACKING": "cachemir_complex",
        "LLAMA_LINEAR_BOTTOM": "0",
+       "LLAMA_LMHEAD_BOTTOM": "0",
+       "LLAMA_MLP_SPLIT": "0",
+       "SM_QKT_SHARE": "0",
+       "SM_HEAD_PACK": "0",
        # plans that stay bound at any context length: step-scoped ciphertext names, and the softmax
        # periodic at every length (SM_PERIODIC=2: Gp x tH-periodic scores, the Gp-dependent ops in `gp`
        # sub-steps, the Gp x tH-slot route built as the cache grows)
@@ -32,6 +36,22 @@ ENV = {**gpt2_env.ENV,
        "SPARSE_LEVEL_BUDGET": "3,3"}
 
 
+def dims_env(dims: Dims) -> dict:
+    """The switches that follow the model's layout: the periodic softmax refreshes on the attention's per-head block,
+    tH = t H slots (Llama-3-8B 8 x 32 = 256: ENV's value; Gemma-2-2B 8 x 16 = 128). The CPU twin's refresh landings
+    (FAKECAP_LANDINGS, the preset's) list GPT-2's and Llama's sparse routes only: a sparse route lands by its level budget
+    (SPARSE_LEVEL_BUDGET), not its slot count, so a tH route missing there lands where the next listed sparse route does."""
+    out = {"SPARSE_BTS_SLOTS": f"{dims.tH},1"}
+    from perseus import _pc
+    spec = _pc.Config.from_legacy_env(dict(os.environ))["quirks.fakecap_landings"] or "0:32,1:14,256:22,512:22"
+    lands = dict(kv.split(":", 1) for kv in spec.split(",") if kv)
+    sparse = sorted((int(s), v) for s, v in lands.items() if int(s) > 1)
+    if str(dims.tH) not in lands and sparse:
+        ref = next((v for s, v in sparse if s >= dims.tH), sparse[-1][1])
+        out["FAKECAP_LANDINGS"] = f"{spec},{dims.tH}:{ref}"
+    return out
+
+
 def rot_steps(dims: Dims) -> list[int]:
     """Every rotation the port issues, as the signed step the runtime keys it by (a key for -1 is
     not one for N - 1): the linears (hid->hid, hid->E, E->hid, the LM-head tile hid->N), the
@@ -39,7 +59,10 @@ def rot_steps(dims: Dims) -> list[int]:
     the replicate-right ladders."""
     N = dims.N
     steps = set()
-    for d_in, d_out in ((dims.hid, dims.hid), (dims.hid, dims.E), (dims.E, dims.hid), (dims.hid, N)):
+    from .weights import mlp_parts
+    shapes = [(dims.hid, dims.hid), (dims.hid, dims.E), (dims.E, dims.hid), (dims.hid, N)]
+    shapes += [s for _o, w, _r in mlp_parts(dims) for s in ((dims.hid, w), (w, dims.hid))]   # LLAMA_MLP_SPLIT
+    for d_in, d_out in shapes:
         steps |= linear_rot_steps(N, d_in, d_out)
     steps |= attention_rot_steps(dims)
     steps.add(N // 2)
@@ -47,6 +70,15 @@ def rot_steps(dims: Dims) -> list[int]:
     steps = {s % N for s in steps if s % N} - pos
     steps |= {-k for k in range(1, dims.t)}
     steps |= _radix_steps(dims)
+    from .weights import q_pad_heads
+    if q_pad_heads(dims):
+        steps.add(q_pad_heads(dims) * dims.t)      # Q off K's padding heads (the K / V push)
+    if any(os.environ.get(k, "0") not in ("", "0") for k in ("SM_QKT_SHARE", "SM_HEAD_PACK")) \
+            and 0 < dims.H_real and 2 * dims.H_real <= dims.H:
+        steps |= {dims.H_real * dims.t, N - dims.H_real * dims.t}   # attention._qkt_share's shift down and back up
+        if os.environ.get("SM_HEAD_PACK", "0") not in ("", "0"):    # the push's lane + half rotations (K, V)
+            sh = dims.H_real * dims.t
+            steps |= {(-r - sh) % N for r in range(dims.t)} | {(1 - r - sh) % N for r in range(dims.t)}
     if os.environ.get("LLAMA_GQA", "0") not in ("", "0") and dims.H % 8 == 0 and dims.H > 8:
         # mha_gqa: the sub-geometry's core/push steps, the queries' g t moves and their push lanes 2 .. G + 1
         from perseus.impl.attention import gqa_dims
