@@ -350,7 +350,7 @@ class Lstsq(Task):
         if self.method == "precond":
             Ri = self._precond()
             pc = la.full_cube(la.p2(self.mm_), self.n, SLOTS)
-            return [(self.As, la.L(pc, (self.mm_, self.n))), (Ri, la.R(pc, (self.n, self.n))),
+            return [(self.As, la.O(pc, (self.mm_, self.n))), (Ri, la.R(pc, (self.n, self.n))),
                     (Ri.T, la.R(self.cube, (self.n, self.n))), (self.bs.reshape(1, -1), la.L(self.cube, (1, self.mm_)))]
         if self.method == "pinv":
             return [(self.As, la.R(self.cube, (self.mm_, self.n))), (self.bs.reshape(1, -1), la.L(self.cube, (1, self.mm_)))]

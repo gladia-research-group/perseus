@@ -31,7 +31,12 @@ class TaskNet:
         self.task = task
 
     def stages(self):
-        return [(self.task.name, lambda ops, xs: self.task.run(ops, xs))]
+        def stage(ops, xs):
+            # a rotation pair first: a stage whose first node is a product of a fresh input fails the planned
+            # program's level check ("v_1 expected L actual L + 2"); a rotated copy enters like any other value
+            xs = [ops.rotate(ops.rotate(x, 1), -1) for x in xs]
+            return self.task.run(ops, xs)
+        return [(self.task.name, stage)]
 
     def encode(self, _x=None):
         return self.task.encode()
@@ -40,7 +45,7 @@ class TaskNet:
         return self.task.outputs(vals)
 
     def rotations(self):
-        return self.task.rotations()
+        return sorted(set(self.task.rotations()) | {1, T.SLOTS - 1})
 
 
 def _parse_set(items):

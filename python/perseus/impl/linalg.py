@@ -650,11 +650,12 @@ def precond_lstsq(ops, a_l, rinv_r, rinvt_r, b_l, m: int, n: int, *, bound_b: fl
     the small QR S A = Q R (O(s n^2)) and encrypts R^{-1} (and R^{-T}) beside A and b. The server forms B = A R^{-1}
     (cond(B) <= (1 + eps) / (1 - eps) ~ 3 for s = 4 n, whatever cond(A)), solves min ||B y - b|| by pinv_lstsq with
     kappa_b (a handful of steps instead of ~2 log2 cond(A)), and returns x = R^{-1} y. The server learns nothing new
-    (R^{-1} is encrypted). Faces: A as L on full_cube(m, n), R^{-1} as R on it, R^{-T} as R on gram_cube(n), b^T as
+    (R^{-1} is encrypted). Faces: A row-major (O on full_cube(m, n)), R^{-1} as R on it, R^{-T} as R on gram_cube(n), b^T as
     L on gram_cube(n). Returns (O(x^T) on gram_cube (1 x n), 1.0)."""
     slots = slots or ops_slots(ops)
     g, pc = gram_cube(n, slots), full_cube(p2(m), n, slots)
-    bm = mm(ops, a_l, rinv_r, pc)                                                   # B = A R^{-1} (flat m x n)
+    a_l = relayout(ops, a_l, O(pc, (m, n)), L(pc, (m, n)))     # A arrives row-major (a product of two fresh inputs
+    bm = mm(ops, a_l, rinv_r, pc)                              # as the first op fails the plan's level check)
     br = relayout(ops, bm, O(pc, (m, n)), R(g, (m, n)))
     y, _ = pinv_lstsq(ops, br, b_l, m, n, bound=bound_b, kappa=kappa_b, slots=slots)   # y^T (O, 1 x n)
     yl = relayout(ops, y, O(g, (1, n)), L(g, (1, n)))
