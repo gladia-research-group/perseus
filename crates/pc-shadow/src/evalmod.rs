@@ -494,18 +494,19 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
         scopy.resize(k, 0.0);
         if degree(&scopy) > 0 {
             let mut w = vec![];
-            let mut ncts = 0;
+            let mut cts = vec![];
             for i in 0..ps.s2.len() - 1 {
                 if ps.s2[i + 1] != 0.0 {
-                    ncts += 1;
                     w.push(ps.s2[i + 1]);
+                    cts.push(t[i]);
                 }
             }
             let tl = lvl_t2(b) - d_;
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
-            // FIDESlib passes T (not the filtered list): the first ncts T's with the filtered weights
-            b.wsum(su, &t[..ncts], &w)?;
+            // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
+            // whose s2 has no zero below its top, as the shipped tables; a wrong one otherwise)
+            b.wsum(su, &cts, &w)?;
             b.add_scalar(su, ps.s2[0] / 2.0)?;
         } else {
             b.copy(su, t[k - 1]);
@@ -794,38 +795,42 @@ fn inner_ps(
         scopy.resize(k, 0.0);
         if degree(&scopy) > 0 {
             let mut w = vec![];
-            let mut ncts = 0;
+            let mut cts = vec![];
             for i in 0..s2.len() - 1 {
                 if s2[i + 1] != 0.0 {
-                    ncts += 1;
                     w.push(s2[i + 1]);
+                    cts.push(t[i]);
                 }
             }
             let tl = lvl_t2(b) - d_;
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
-            // FIDESlib passes T (not the filtered list): the first ncts T's with the filtered weights
-            b.wsum(su, &t[..ncts], &w)?;
+            // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
+            // whose s2 has no zero below its top, as the shipped tables; a wrong one otherwise)
+            b.wsum(su, &cts, &w)?;
             b.add_scalar(su, s2[0] / 2.0)?;
         } else {
             b.copy(su, t[k - 1]);
             b.add_scalar(su, s2[0] / 2.0)?;
         }
     }
-    if !flag_c {
-        return Err(rule("evalmod", "addScalar(T2, c) branch not ported"));
-    }
     // lean, the lazy top call: the giant power realized before it joins cu (as `build_chebyshev_m2`)
     if b.lean && lazy && level_offset == 0 && m == max_m && b.metas[t2[m - 1]].nl == 2 {
         b.rescale(t2[m - 1])?;
     }
-    if max_m - m <= 1 {
-        b.adjust_add(t2[m - 1], cu)?;
+    if flag_c {
+        if max_m - m <= 1 {
+            b.adjust_add(t2[m - 1], cu)?;
+        }
+        if b.metas[t2[m - 1]].nl == 1 && b.metas[cu].nl == 2 {
+            b.rescale(cu)?;
+        }
+        b.add(cu, t2[m - 1])?;
+    } else {
+        // the quotient c is a constant (InnerEvalChebyshevPS' EvalAdd(T2[m - 1], c_0 / 2))
+        b.copy(cu, t2[m - 1]);
+        b.add_scalar(cu, divcs.q[0] / 2.0)?;
     }
-    if b.metas[t2[m - 1]].nl == 1 && b.metas[cu].nl == 2 {
-        b.rescale(cu)?;
-    }
-    b.add(cu, t2[m - 1])?;
     if lazy && level_offset == 0 && m == max_m {
         return Ok(Some((qu, su)));
     }
@@ -965,5 +970,274 @@ mod general_ps_tests {
         let (prog, out) = build_evalmod(&st, input, &ps, 5).unwrap();
         assert!(!prog.ops.is_empty());
         println!("K24 EvalMod: {} ops, out {:?}", prog.ops.len(), out);
+    }
+}
+
+/// An exact replay of an EvalMod program on a degree-0 plaintext (every buffer one residue per prime, no
+/// encryption, no noise): the program's modular arithmetic and rescale roundings as the device runs them, for
+/// checking a program's constants and scales against the real-number series it encodes (tests, prototypes).
+pub mod sim {
+    use super::{EmOp, Epi};
+    use pc_core::modmul::{invmod, mulmod};
+    use pc_core::scale::ScaleTables;
+
+    /// Residues of the integer nearest `v` mod q (|v| < 2^126).
+    pub fn encode(v: f64, q: &[u64]) -> Vec<u64> {
+        let x = v.round() as i128;
+        q.iter().map(|&p| x.rem_euclid(p as i128) as u64).collect()
+    }
+
+    /// The centred integer of `r` on primes `ids` (their product < 2^126).
+    fn crt(r: &[u64], q: &[u64], ids: &[usize]) -> i128 {
+        let mut x: u128 = 0;
+        let mut m: u128 = 1;
+        for &i in ids {
+            let p = q[i] as u128;
+            // x + m t == r_i mod p
+            let xm = (x % p) as u64;
+            let d = (r[i] + q[i] - xm) % q[i];
+            let t = mulmod(d, invmod((m % p) as u64, q[i]), q[i]);
+            x += m * t as u128;
+            m *= p;
+        }
+        if x > m / 2 {
+            x as i128 - m as i128
+        } else {
+            x as i128
+        }
+    }
+
+    /// Rescale `x` (rows 0..n) by the primes a rescale from top n - 1 drops: round(x / Q_dropped).
+    pub fn rescale(st: &ScaleTables, x: &mut [u64], n: usize) {
+        let top = n - 1;
+        let g = st.drop.get(top).copied().filter(|&g| g > 0).unwrap_or(st.d);
+        let ids: Vec<usize> = (n - g..n).collect();
+        let xd = crt(x, &st.q, &ids);
+        for i in 0..n - g {
+            let p = st.q[i];
+            let mut qd = 1u64;
+            for &j in &ids {
+                qd = mulmod(qd, st.q[j] % p, p);
+            }
+            let r = (x[i] + p - xd.rem_euclid(p as i128) as u64) % p;
+            x[i] = mulmod(r, invmod(qd, p), p);
+        }
+        for v in x.iter_mut().take(n).skip(n - g) {
+            *v = 0;
+        }
+    }
+
+    fn epi(x: &mut [u64], e: &Epi, consts: &[Vec<u64>], q: &[u64], n: usize) {
+        for i in 0..n {
+            if e.dbl {
+                x[i] = (x[i] + x[i]) % q[i];
+            }
+            if let Some(k) = e.k {
+                x[i] = (x[i] + consts[k][i] % q[i]) % q[i];
+            }
+        }
+    }
+
+    /// Run `ops` over `bufs` (each |Q| residues).
+    pub fn run(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>], bufs: &mut Vec<Vec<u64>>) {
+        let q = &st.q;
+        let nq = q.len();
+        for op in ops {
+            let need = super::sim_ids(op).into_iter().max().unwrap_or(0) + 1;
+            if bufs.len() < need {
+                bufs.resize(need, vec![0; nq]);
+            }
+            match op {
+                EmOp::Copy { dst, src, n } => {
+                    let s = bufs[*src].clone();
+                    bufs[*dst][..*n].copy_from_slice(&s[..*n]);
+                    for v in bufs[*dst][*n..].iter_mut() {
+                        *v = 0;
+                    }
+                }
+                EmOp::Add { dst, a, b, n, sub } => {
+                    for i in 0..*n {
+                        let (x, y) = (bufs[*a][i] % q[i], bufs[*b][i] % q[i]);
+                        bufs[*dst][i] = if *sub { (x + q[i] - y) % q[i] } else { (x + y) % q[i] };
+                    }
+                }
+                EmOp::MulConst { x, n, k } => {
+                    for i in 0..*n {
+                        bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                    }
+                }
+                EmOp::AddConst { x, n, k } => {
+                    for i in 0..*n {
+                        bufs[*x][i] = (bufs[*x][i] % q[i] + consts[*k][i] % q[i]) % q[i];
+                    }
+                }
+                EmOp::Rescale { x, n, k } => {
+                    if let Some(k) = k {
+                        for i in 0..*n {
+                            bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                        }
+                    }
+                    rescale(st, &mut bufs[*x], *n);
+                }
+                EmOp::Mult { dst, a, b, n, epi: e } => {
+                    let v: Vec<u64> = (0..*n).map(|i| mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])).collect();
+                    bufs[*dst][..*n].copy_from_slice(&v);
+                    epi(&mut bufs[*dst], e, consts, q, *n);
+                }
+                EmOp::MultAcc { dst, pairs, n, epi: e } => {
+                    for i in 0..*n {
+                        let mut acc = bufs[*dst][i] % q[i];
+                        for (a, b) in pairs {
+                            acc = (acc + mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])) % q[i];
+                        }
+                        bufs[*dst][i] = acc;
+                    }
+                    epi(&mut bufs[*dst], e, consts, q, *n);
+                }
+                EmOp::WSum { dst, srcs, n, k } => {
+                    let v: Vec<u64> = (0..*n)
+                        .map(|i| {
+                            let mut acc = 0u64;
+                            for (j, s) in srcs.iter().enumerate() {
+                                acc = (acc + mulmod(bufs[*s][i] % q[i], consts[*k][j * nq + i] % q[i], q[i])) % q[i];
+                            }
+                            acc
+                        })
+                        .collect();
+                    bufs[*dst][..*n].copy_from_slice(&v);
+                }
+            }
+        }
+    }
+
+    /// The real value of buffer `x` with metadata (top, nl, nf): rescaled once more when nl = 2 (exact), then the
+    /// centred integer on the bottom primes over the scale.
+    pub fn decode(st: &ScaleTables, x: &[u64], top: i32, nl: i32, nf: f64) -> f64 {
+        let mut v = x.to_vec();
+        let (mut top, mut nf) = (top as usize, nf);
+        if nl == 2 {
+            let g = st.drop.get(top).copied().filter(|&g| g > 0).unwrap_or(st.d);
+            nf /= st.mod_reduce_product(top as i32);
+            rescale(st, &mut v, top + 1);
+            top -= g;
+        }
+        let mut ids = vec![];
+        let mut bits = 0.0;
+        for i in 0..=top {
+            bits += (st.q[i] as f64).log2();
+            if bits > 120.0 {
+                break;
+            }
+            ids.push(i);
+        }
+        crt(&v, &st.q, &ids) as f64 / nf
+    }
+}
+
+/// Buffer ids an op names (for `sim::run`).
+pub fn sim_ids(op: &EmOp) -> Vec<usize> {
+    match op {
+        EmOp::Copy { dst, src, .. } => vec![*dst, *src],
+        EmOp::Add { dst, a, b, .. } | EmOp::Mult { dst, a, b, .. } => vec![*dst, *a, *b],
+        EmOp::MulConst { x, .. } | EmOp::AddConst { x, .. } | EmOp::Rescale { x, .. } => vec![*x],
+        EmOp::MultAcc { dst, pairs, .. } => std::iter::once(*dst).chain(pairs.iter().flat_map(|(a, b)| [*a, *b])).collect(),
+        EmOp::WSum { dst, srcs, .. } => std::iter::once(*dst).chain(srcs.iter().copied()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+
+    fn tables() -> ScaleTables {
+        let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::n32()).expect("n32 chain");
+        ScaleTables::precompute(&chain).expect("tables")
+    }
+
+    /// OpenFHE convention (c0 not halved).
+    fn chebval(x: f64, c: &[f64]) -> f64 {
+        let (mut b1, mut b2) = (0.0, 0.0);
+        for &ck in c.iter().skip(1).rev() {
+            let b0 = 2.0 * x * b1 - b2 + ck;
+            b2 = b1;
+            b1 = b0;
+        }
+        x * b1 - b2 + c[0] / 2.0
+    }
+
+    /// Max |program - series| over inputs in [-1, 1] for a series alone on an input at (top, nl = 1).
+    fn series_err(st: &ScaleTables, top: i32, c: &[f64], stage: &str) -> f64 {
+        let input = FMeta { top, nl: 1, nf: st.sf(top).unwrap() };
+        let mut b = Builder::new(st);
+        b.lean = true;
+        let x = b.input(input);
+        build_chebyshev_general(&mut b, x, c).unwrap();
+        let out = b.metas[x];
+        let ops = match stage {
+            "raw" => b.prog.ops.clone(),
+            _ => b.prog.fused(),
+        };
+        let mut e: f64 = 0.0;
+        for i in 0..=20 {
+            let u = -1.0 + i as f64 / 10.0;
+            let mut bufs = vec![sim::encode(u * input.nf, &st.q)];
+            sim::run(st, &ops, &b.prog.consts, &mut bufs);
+            let got = sim::decode(st, &bufs[x], out.top, out.nl, out.nf);
+            e = e.max((got - chebval(u, c)).abs());
+        }
+        e
+    }
+
+    #[test]
+    fn sim_shipped_series() {
+        let st = tables();
+        let top = st.l as i32 - if st.drop[st.l] == 0 { 1 } else { 0 };
+        let c = pc_core::bts_setup::evalmod_coeffs().to_vec();
+        for nl in [1, 2] {
+            let input = FMeta { top, nl, nf: st.sf(top).unwrap().powi(nl) };
+            let mut b = Builder::new(&st);
+            b.lean = true;
+            let x = b.input(input);
+            build_chebyshev_general(&mut b, x, &c).unwrap();
+            let out = b.metas[x];
+            for u in [0.0, 0.3, -0.7] {
+                let mut bufs = vec![sim::encode(u * input.nf, &st.q)];
+                sim::run(&st, &b.prog.ops, &b.prog.consts, &mut bufs);
+                let got = sim::decode(&st, &bufs[x], out.top, out.nl, out.nf);
+                assert!((got - chebval(u, &c)).abs() < 1e-12, "shipped nl {nl} u {u}: {got} vs {}", chebval(u, &c));
+            }
+        }
+    }
+
+    /// A series whose PS remainder has zero coefficients below its top (here: odd series plus a constant) reads the
+    /// T's of its non-zero weights (FIDESlib's first-|w| T's gave 1.94 off on this one); and SparseB's K = 24 table.
+    #[test]
+    fn sim_sparse_series() {
+        let st = tables();
+        let top = st.l as i32 - if st.drop[st.l] == 0 { 1 } else { 0 };
+        let mut c: Vec<f64> = (0..=15).map(|i| if i % 2 == 1 { 0.4 / (i as f64) } else { 0.0 }).collect();
+        c[0] = 0.5;
+        c[14] = 1e-3;
+        assert!(series_err(&st, top, &c, "raw") < 1e-12);
+        assert!(series_err(&st, top, &pc_core::bts_setup::SPARSE_B_CHEB_K24, "raw") < 1e-12);
+        // an even series of degree 342 (GELU-like): a recursion level whose c quotient is a constant
+        let c: Vec<f64> = (0..=342).map(|i| if i % 2 == 0 { 0.5 * 0.99f64.powi(i as i32) } else { 1e-3 * 0.98f64.powi(i as i32) }).collect();
+        assert!(series_err(&st, top, &c, "raw") < 1e-11);
+    }
+
+    #[test]
+    fn sim_series_constants() {
+        let st = tables();
+        let top = st.l as i32 - if st.drop[st.l] == 0 { 1 } else { 0 };
+        for deg in [14usize, 20, 64, 120, 284] {
+            for c0 in [0.0, 0.1, 2.0, 16.0] {
+                let mut c: Vec<f64> = (0..=deg).map(|i| 0.3 * 0.9f64.powi(i as i32) * (1.0 + i as f64).sin()).collect();
+                c[0] = c0;
+                for stage in ["raw", "fused"] {
+                    let e = series_err(&st, top, &c, stage);
+                    assert!(e < 1e-12, "deg {deg} c0 {c0} {stage}: max err {e:.3e}");
+                }
+            }
+        }
     }
 }
