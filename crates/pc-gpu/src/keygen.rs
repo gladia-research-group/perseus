@@ -1,6 +1,7 @@
 //! Device key generation: every switching key of a `KeySet` from the device secret, one `ksk_gen` launch
 //! per key (all digits and slots; `a` from the frozen KSKA expander, `b` written straight into the key's layout,
-//! packed or dense). Host side: the KSKA seed and the error polynomials (Gaussian, sigma 3.19) come from the caller's
+//! packed or dense). Host side: the KSKA seed and the error polynomials (Gaussian, sigma 3.19; the dense -> sparse keys
+//! sigma 2^shift, `err_shift`) come from the caller's
 //! `pc_core::keys::Prng` (ChaCha20 DRBG over OS entropy); errors are lifted to residues with rayon, uploaded into the
 //! executor's KS workspace and NTT'd there (the workspace is free at setup, when keys are generated).
 //!
@@ -13,13 +14,22 @@ use crate::keys::{DevKsk, DevSecret, KeyRole, KeySet, KskShape, KskStore, LevelR
 use crate::ntt::{self, Dir, RowList};
 use crate::poly::{CtBuf, Layout};
 use pc_core::galois;
-use pc_core::keys::{DiscreteGaussian, KskSeed, Prng};
+use pc_core::keys::{DiscreteGaussian, KskSeed, Prng, WideErr};
 use pc_core::params::Chain;
 use pc_cuda::{launch_result, Arena, Compute, ConstBuf, Stream};
 use pc_kernels::{AutomorphArgs, KskGenArgs};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+
+/// Error shift of a key (`pc_core::keys::wide_err_shift`): the one-digit dense -> sparse keys (`EncDenseToSparse`,
+/// also the SPRU block key's role on the device) take the wide error their P' leaves room for, every other key 0.
+pub fn err_shift(chain: &Chain, role: KeyRole, sh: &KskShape) -> u32 {
+    match role {
+        KeyRole::EncDenseToSparse if sh.ndig == 1 => pc_core::keys::wide_err_shift_of(chain, sh.q_top, sh.kp),
+        _ => 0,
+    }
+}
 
 /// Setup-time tables of the generator for a fixed set of key shapes.
 pub struct KeyGen<'a, W: DevWord> {
@@ -186,18 +196,19 @@ impl<'a, W: DevWord> KeyGen<'a, W> {
         let primes = ctx.chain.primes();
         let row_ids = sh.row_ids();
         let rows = sh.rows();
-        let errs: Vec<Vec<i64>> = (0..sh.ndig)
+        let shift = err_shift(&ctx.chain, key.role, &sh);
+        let errs: Vec<WideErr> = (0..sh.ndig)
             .into_par_iter()
             .map(|d| {
                 let mut p = Prng::from_seed(sub, d as u32);
-                self.gauss.sample_vec(&mut p, n)
+                WideErr::sample(&self.gauss, &mut p, n, shift)
             })
             .collect();
         let mut host = vec![W::default(); nr * n];
         host.par_chunks_mut(n).enumerate().for_each(|(r, o)| {
-            let p = primes[row_ids[r % rows]] as i64;
-            for (x, &v) in o.iter_mut().zip(&errs[r / rows]) {
-                *x = W::from_u64(v.rem_euclid(p) as u64);
+            let p = primes[row_ids[r % rows]];
+            for (x, v) in o.iter_mut().zip(errs[r / rows].residues(p)) {
+                *x = W::from_u64(v);
             }
         });
         let t_host = t0.elapsed().as_secs_f64();

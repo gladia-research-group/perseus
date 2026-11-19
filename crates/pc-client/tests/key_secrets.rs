@@ -1,12 +1,13 @@
 //! The secret behind every new switching-key role, checked from the keys themselves: for each digit d and stored prime
 //! t of a generated key, e = b + a s_new - [t in digit d] G_t s_old (mod t) must be the key's small error (discrete
-//! Gaussian, sigma 3.19), with s_new, s_old and the gadget G computed here from the secret's coefficients, independently
-//! of the keygen's helpers. So the key's samples are RLWE samples under s_new, clean (no s_old term) mod every prime
-//! outside digit d, at the modulus of the primes the key stores.
+//! Gaussian, sigma 3.19; under a sparse s_new sigma 2^t, `pc_core::keys::wide_err_shift`: there e is checked over the
+//! CRT of the key's primes, |e| / 2^t), with s_new, s_old and the gadget G computed here from the secret's coefficients,
+//! independently of the keygen's helpers. So the key's samples are RLWE samples under s_new, clean (no s_old term) mod
+//! every prime outside digit d, at the modulus of the primes the key stores.
 use pc_client::ntt::Ring;
 use pc_client::spec::{chain_of, params_hash, KeyReq, KeyShape, KeySpec, Role, LEVEL_RELIN_CAP};
 use pc_client::{wire, Client, ClientSecret, Entry};
-use pc_core::keys::{kska_expand_row, KskSeed, Prng};
+use pc_core::keys::{kska_expand_row, wide_err_max, wide_err_shift_of, KskSeed, Prng};
 use pc_core::modmul::mulmod;
 
 /// a(X) -> a(X^k) mod X^N + 1 on signed coefficients.
@@ -112,7 +113,9 @@ fn new_roles_are_samples_under_the_declared_secret() {
             assert!(lq <= 1734.5, "{:?}: dense samples at log modulus {lq:.1}", key.role);
         }
         let rows = ids.len();
+        let shift = if claim.sparse_new { wide_err_shift_of(&chain, sh.q_top, sh.kp) } else { 0 };
         for d in 0..sh.ndig {
+            let mut erows: Vec<Vec<u64>> = Vec::new();
             for (ri, &t) in ids.iter().enumerate() {
                 let p = primes[t];
                 let mut b = vec![0u32; n];
@@ -135,7 +138,16 @@ fn new_roles_are_samples_under_the_declared_secret() {
                     .collect();
                 ring.ntt[t].inv(&mut e);
                 let mx = e.iter().map(|&x| if x as u64 > p / 2 { p - x as u64 } else { x as u64 }).max().unwrap();
-                assert!(mx > 0 && mx <= 45, "{:?} digit {d} prime id {t}: max |e| {mx}", key.role);
+                if shift > 0 {
+                    assert!(mx > 1 << 24, "{:?} digit {d} prime id {t}: error shift {shift} but max |e mod p| {mx}", key.role);
+                    erows.push(e.iter().map(|&x| x as u64).collect());
+                } else {
+                    assert!(mx > 0 && mx <= 45, "{:?} digit {d} prime id {t}: max |e| {mx}", key.role);
+                }
+            }
+            if shift > 0 {
+                let mx = wide_err_max(&ids.iter().map(|&t| primes[t]).collect::<Vec<_>>(), &erows, shift);
+                assert!(mx > 1.0 && mx <= 45.0, "{:?} digit {d}: max |e| / 2^{shift} = {mx}", key.role);
             }
         }
         checked += 1;

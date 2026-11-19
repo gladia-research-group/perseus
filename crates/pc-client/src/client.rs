@@ -9,7 +9,7 @@ use crate::wire::{self, BundleHeader, BundleWriter, CtHeader, CtWire, Entry, Wir
 use pc_core::ccmm_keys::CcmmKeys;
 use pc_core::encode::{Complex, Encoder, Payload};
 use pc_core::galois;
-use pc_core::keys::{kska_expand_row, DiscreteGaussian, KskSeed, Prng};
+use pc_core::keys::{kska_expand_row, wide_err_max, DiscreteGaussian, KskSeed, Prng, WideErr};
 use pc_core::modmul::{invmod, mulmod, powmod};
 use pc_core::params::Chain;
 use pc_core::pcmm_keys::PcmmKeys;
@@ -169,22 +169,32 @@ impl Client {
     /// Packed `b` of one switching key (relation in `spec` module doc).
     #[allow(clippy::too_many_arguments)]
     fn ksk_packed(&self, shape: &KeyShape, s_new: &[Option<Vec<u32>>], s_old: &[Vec<u32>], sq: bool, seed: &KskSeed, err_key: [u32; 8], bits: u32, row_words: usize) -> Vec<u32> {
-        self.ksk_packed_with(shape, s_new, s_old, sq, seed, err_key, bits, row_words, None)
+        self.ksk_packed_with(shape, s_new, s_old, sq, seed, err_key, bits, row_words, None, 0)
     }
 
-    /// `ksk_packed` with the digit map and the gadget (P mod q_t by prime id) given (level relinearization keys).
+    /// Error shift of a key under a sparse secret (`Role::EncDenseToSparse`, `Role::SpruAtob`: one digit at the bottom
+    /// over P'), 0 for every other role (`pc_core::keys::wide_err_shift`).
+    pub fn err_shift(&self, key: &KeyReq) -> u32 {
+        match key.role {
+            Role::EncDenseToSparse | Role::SpruAtob if key.shape.ndig == 1 => pc_core::keys::wide_err_shift_of(&self.chain, key.shape.q_top, key.shape.kp),
+            _ => 0,
+        }
+    }
+
+    /// `ksk_packed` with the digit map and the gadget (P mod q_t by prime id) given (level relinearization keys) and
+    /// the error shift (`err_shift`).
     #[allow(clippy::too_many_arguments)]
-    fn ksk_packed_with(&self, shape: &KeyShape, s_new: &[Option<Vec<u32>>], s_old: &[Vec<u32>], sq: bool, seed: &KskSeed, err_key: [u32; 8], bits: u32, row_words: usize, ov: Option<(&[i32], &[u32])>) -> Vec<u32> {
+    fn ksk_packed_with(&self, shape: &KeyShape, s_new: &[Option<Vec<u32>>], s_old: &[Vec<u32>], sq: bool, seed: &KskSeed, err_key: [u32; 8], bits: u32, row_words: usize, ov: Option<(&[i32], &[u32])>, shift: u32) -> Vec<u32> {
         let n = self.chain.n;
         let ids = shape.row_ids();
         let rows = ids.len();
         let nq = self.ring.nq;
-        let errs: Vec<Vec<i64>> = (0..shape.ndig).into_par_iter().map(|d| self.gauss.sample_vec(&mut Prng::from_seed(err_key, d as u32), n)).collect();
+        let errs: Vec<WideErr> = (0..shape.ndig).into_par_iter().map(|d| WideErr::sample(&self.gauss, &mut Prng::from_seed(err_key, d as u32), n, shift)).collect();
         let mut out = vec![0u32; shape.ndig * rows * row_words];
         out.par_chunks_mut(row_words).enumerate().for_each(|(r, o)| {
             let (d, id) = (r / rows, ids[r % rows]);
             let p = self.ring.primes[id];
-            let mut b: Vec<u32> = errs[d].iter().map(|&x| x.rem_euclid(p as i64) as u32).collect();
+            let mut b: Vec<u32> = errs[d].residues(p).into_iter().map(|x| x as u32).collect();
             self.ring.ntt[id].fwd(&mut b);
             let mut a = vec![0u32; n];
             kska_expand_row(seed, d as u32, p as u32, &mut a);
@@ -355,7 +365,7 @@ impl Client {
                 Role::Relin => self.ksk_packed(&k.shape, &s_all, &self.s_eval, true, seed, *ek, bits, row_words),
                 Role::RelinLevel { top } => {
                     let (dof, g) = self.level_tables(top)?;
-                    self.ksk_packed_with(&k.shape, &s_all, &self.s_eval, true, seed, *ek, bits, row_words, Some((&dof, &g)))
+                    self.ksk_packed_with(&k.shape, &s_all, &self.s_eval, true, seed, *ek, bits, row_words, Some((&dof, &g)), 0)
                 }
                 Role::Rot { .. } | Role::Conj | Role::Auto { .. } => {
                     let g = k.role.galois(n).ok_or_else(|| Error::Spec(format!("{:?} without a Galois element", k.role)))?;
@@ -367,7 +377,7 @@ impl Client {
                 Role::EncDenseToSparse => {
                     let sp = s_sparse.as_ref().ok_or_else(|| Error::Spec("sparse secret rows".into()))?;
                     let s_new: Vec<Option<Vec<u32>>> = sp.iter().cloned().map(Some).collect();
-                    self.ksk_packed(&k.shape, &s_new, &self.s_eval, false, seed, *ek, bits, row_words)
+                    self.ksk_packed_with(&k.shape, &s_new, &self.s_eval, false, seed, *ek, bits, row_words, None, self.err_shift(k))
                 }
                 Role::EncSparseToDense => {
                     let sp = s_sparse.as_ref().ok_or_else(|| Error::Spec("sparse secret rows".into()))?;
@@ -381,7 +391,7 @@ impl Client {
                 Role::SpruAtob => {
                     let block = self.spru_block.as_ref().ok_or_else(|| Error::Spec("SpruAtob key without a spru request".into()))?;
                     let s_new = self.rows_of(block, &ids);
-                    self.ksk_packed(&k.shape, &s_new, &self.s_eval, false, seed, *ek, bits, row_words)
+                    self.ksk_packed_with(&k.shape, &s_new, &self.s_eval, false, seed, *ek, bits, row_words, None, self.err_shift(k))
                 }
             };
             w.put(&packed)?;
@@ -894,7 +904,8 @@ impl Client {
 
     // ── checks ────────────────────────────────────────────────────────────────────────────────────────────────
 
-    /// Max |e| of the switch relation of one bundle key (`b` packed as in the bundle, `a` regenerated from the seed).
+    /// Max |e| of the switch relation of one bundle key (`b` packed as in the bundle, `a` regenerated from the seed);
+    /// of a wide-error key (`err_shift` > 0) max |e| / 2^shift.
     pub fn ksk_relation_max_err(&self, key: &KeyReq, seed: &KskSeed, packed: &[u32], bits: u32, row_words: usize) -> Result<i64> {
         self.ksk_relation_max_err_from(key, seed, packed, bits, row_words, None)
     }
@@ -928,7 +939,8 @@ impl Client {
             Role::RelinLevel { top } => Some(self.level_tables(top)?),
             _ => None,
         };
-        let mx = (0..key.shape.ndig * rows)
+        let shift = self.err_shift(key);
+        let erows: Vec<Vec<u32>> = (0..key.shape.ndig * rows)
             .into_par_iter()
             .map(|r| {
                 let (d, id) = (r / rows, ids[r % rows]);
@@ -954,10 +966,25 @@ impl Client {
                     })
                     .collect();
                 self.ring.ntt[id].inv(&mut e);
-                e.iter().map(|&x| if x as u64 > p / 2 { p - x as u64 } else { x as u64 } as i64).max().unwrap_or(0)
+                e
             })
-            .max()
-            .unwrap_or(0);
+            .collect();
+        // a wide-error key (one digit): |e| / 2^shift from the CRT of its rows
+        let mx = if shift > 0 {
+            let pr: Vec<u64> = ids.iter().map(|&id| self.ring.primes[id]).collect();
+            let rs: Vec<Vec<u64>> = erows.iter().map(|r| r.iter().map(|&x| x as u64).collect()).collect();
+            wide_err_max(&pr, &rs, shift).ceil() as i64
+        } else {
+            erows
+                .par_iter()
+                .enumerate()
+                .map(|(r, e)| {
+                    let p = self.ring.primes[ids[r % rows]];
+                    e.iter().map(|&x| if x as u64 > p / 2 { p - x as u64 } else { x as u64 } as i64).max().unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        };
         Ok(mx)
     }
 }

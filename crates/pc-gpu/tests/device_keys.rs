@@ -189,10 +189,16 @@ fn keygen_relation_and_layouts() {
             let (db, da) = b.download_dense(&rt.ex.compute, &rt.chain).unwrap();
             let mism = pb.iter().zip(&db).filter(|(x, y)| x != y).count() + pa.iter().zip(&da).filter(|(x, y)| x != y).count();
             let (sn, so, sq) = role_secrets(a.role, n, &s, &sp);
-            let (e, rows) = hc.relation_max_err(&a.shape, &pb, &pa, &sn, &so, sq);
-            println!("[m5a] key {:?} shape q_top {} ndig {}: {rows} rows, max |e| {e}, packed vs dense mismatches {mism}", a.role, a.shape.q_top, a.shape.ndig);
+            let shift = pc_gpu::keygen::err_shift(&rt.chain, a.role, &a.shape);
+            let (e, rows) = hc.relation_max_err_shift(&a.shape, &pb, &pa, &sn, &so, sq, shift);
+            println!("[m5a] key {:?} shape q_top {} ndig {}: {rows} rows, max |e| {e} (error shift {shift}), packed vs dense mismatches {mism}", a.role, a.shape.q_top, a.shape.ndig);
             assert_eq!(mism, 0);
             assert!(e <= 64, "{:?}: max |e| {e}", a.role);
+            if shift > 0 {
+                // the wide error fills every residue (max |e mod p| ~ p / 2)
+                let (raw, _) = hc.relation_max_err(&a.shape, &pb, &pa, &sn, &so, sq);
+                assert!(raw > 1 << 24, "{:?}: error shift {shift} but max |e mod p| {raw}", a.role);
+            }
             worst = worst.max(e);
         }
         println!("[m5a] keygen relation: {} keys, max |e| {worst}", kp.len());

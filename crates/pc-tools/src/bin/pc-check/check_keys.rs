@@ -348,7 +348,8 @@ fn run(dir: &str) -> Res<Tally> {
         let sh = key.shape;
         let (db, da) = device_dense(&ctx, &ex.compute, key, &id_tabs[&sh], &mut wb, &mut wa)?;
         let (sn, so, sq) = role_secrets(key.role, n, &s_eval, &sp_eval)?;
-        let (e, _) = hc.relation_max_err(&sh, &db.iter().map(|&x| x as u64).collect::<Vec<_>>(), &da.iter().map(|&x| x as u64).collect::<Vec<_>>(), &sn, &so, sq);
+        let shift = pc_gpu::keygen::err_shift(&chain, key.role, &sh);
+        let (e, _) = hc.relation_max_err_shift(&sh, &db.iter().map(|&x| x as u64).collect::<Vec<_>>(), &da.iter().map(|&x| x as u64).collect::<Vec<_>>(), &sn, &so, sq, shift);
         grel_max = grel_max.max(e);
         grel_bad += (e > 64) as usize;
     }

@@ -325,6 +325,132 @@ impl DiscreteGaussian {
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+// Wide errors of the sparse-secret (encapsulation) keys
+// ------------------------------------------------------------------------------------------------------------------
+
+/// Bits kept between the wide-error term of a switch and 1 (`wide_err_shift`).
+pub const WIDE_ERR_MARGIN: f64 = 6.0;
+
+/// Error shift `t` of a one-digit switching key whose inputs are at most its Q part (`q_bits`: the bottom shape's q0)
+/// and whose special part P' has `p_bits`. Its error is `e = g 2^t + u - 2^(t-1)` (`WideErr`: g ~ D_sigma, u uniform
+/// on t bits), width ~ sigma 2^t. The switch adds c e / P' (|c| < ~q0, N terms) to its ModDown rounding: ~2^(logN/2 +
+/// q_bits + t - p_bits), held at ~2^-5 by `WIDE_ERR_MARGIN`. The key is an RLWE sample of its new secret at modulus
+/// q0 P' with error sigma 2^t: the lattice attacks see q0 P' / 2^t, so a bottom-shape key of a P' far above q0 (n32:
+/// 252 vs 56 bits) is as hard as one over ~2^t fewer bits (the sparse secret's binding attacks are hybrid ones on
+/// exactly that ratio). 0 (sigma itself) when P' leaves no room. Old keys (shift 0) still switch: the server never
+/// sees the error.
+pub fn wide_err_shift(logn: u32, q_bits: f64, p_bits: f64) -> u32 {
+    let t = p_bits - q_bits - logn as f64 / 2.0 - WIDE_ERR_MARGIN;
+    if t >= 1.0 {
+        t.floor() as u32
+    } else {
+        0
+    }
+}
+
+/// `wide_err_shift` of a one-digit key over the Q rows `0..=q_top` and the first `kp` special primes of `chain`.
+pub fn wide_err_shift_of(chain: &crate::params::Chain, q_top: usize, kp: usize) -> u32 {
+    let lg = |x: &[u64]| x.iter().map(|&v| (v as f64).log2()).sum::<f64>();
+    wide_err_shift(chain.spec.logn, lg(&chain.q[..=q_top.min(chain.q.len() - 1)]), lg(&chain.p[..kp.min(chain.p.len())]))
+}
+
+/// One error polynomial `e = g 2^shift + u - 2^(shift-1)`: g from the Gaussian, then u (shift bits per coefficient,
+/// little-endian 32-bit words) from the same stream. Shift 0 draws exactly `DiscreteGaussian::sample_vec`.
+pub struct WideErr {
+    shift: u32,
+    words: usize,
+    g: Vec<i64>,
+    u: Vec<u32>,
+}
+
+impl WideErr {
+    pub fn sample(gauss: &DiscreteGaussian, prng: &mut Prng, n: usize, shift: u32) -> Self {
+        let g = gauss.sample_vec(prng, n);
+        let words = shift.div_ceil(32) as usize;
+        let top = shift - 32 * (words as u32).saturating_sub(1);
+        let mask = if top == 32 { u32::MAX } else { (1u32 << top) - 1 };
+        let mut u = vec![0u32; n * words];
+        for c in u.chunks_mut(words.max(1)).take(if words == 0 { 0 } else { n }) {
+            for w in c.iter_mut() {
+                *w = prng.next_u32();
+            }
+            c[words - 1] &= mask;
+        }
+        WideErr { shift, words, g, u }
+    }
+    pub fn shift(&self) -> u32 {
+        self.shift
+    }
+    /// e mod p per coefficient (p < 2^63).
+    pub fn residues(&self, p: u64) -> Vec<u64> {
+        let pi = p as i64;
+        if self.shift == 0 {
+            return self.g.iter().map(|&x| x.rem_euclid(pi) as u64).collect();
+        }
+        let m = |a: u64, b: u64| ((a as u128 * b as u128) % p as u128) as u64;
+        let pow = |e: u32| (0..e).fold(1u64 % p, |acc, _| (acc * 2) % p);
+        let (two_t, half) = (pow(self.shift), pow(self.shift - 1));
+        let w32 = (1u64 << 32) % p;
+        self.g
+            .iter()
+            .zip(self.u.chunks(self.words))
+            .map(|(&g, u)| {
+                let um = u.iter().rev().fold(0u64, |acc, &w| (m(acc, w32) + w as u64 % p) % p);
+                (m(g.rem_euclid(pi) as u64, two_t) + um + (p - half)) % p
+            })
+            .collect()
+    }
+}
+
+/// Max over coefficients of |e| / 2^shift, e given by its residue rows `rows[k][i]` mod `primes[k]` (|e| below half
+/// their product; Garner's mixed radix, the sign from the top digit): the switch relation of a wide-error key.
+pub fn wide_err_max(primes: &[u64], rows: &[Vec<u64>], shift: u32) -> f64 {
+    let k = primes.len();
+    let m = |a: u64, b: u64, p: u64| ((a as u128 * b as u128) % p as u128) as u64;
+    let inv = |a: u64, p: u64| {
+        let (mut r, mut b, mut e) = (1u64, a % p, p - 2);
+        while e > 0 {
+            if e & 1 == 1 {
+                r = m(r, b, p);
+            }
+            b = m(b, b, p);
+            e >>= 1;
+        }
+        r
+    };
+    // inv[i][j] = p_j^-1 mod p_i (j < i)
+    let invs: Vec<Vec<u64>> = (0..k).map(|i| (0..i).map(|j| inv(primes[j], primes[i])).collect()).collect();
+    let digits = |r: &dyn Fn(usize) -> u64| -> Vec<u64> {
+        let mut v = vec![0u64; k];
+        for i in 0..k {
+            let p = primes[i];
+            let mut t = r(i) % p;
+            for j in 0..i {
+                t = m((t + p - v[j] % p) % p, invs[i][j], p);
+            }
+            v[i] = t;
+        }
+        v
+    };
+    let n = rows.first().map_or(0, |r| r.len());
+    let scale = (-(shift as f64)).exp2();
+    let mut mx = 0f64;
+    for c in 0..n {
+        let mut v = digits(&|i| rows[i][c]);
+        if v[k - 1] > primes[k - 1] / 2 {
+            v = digits(&|i| (primes[i] - rows[i][c] % primes[i]) % primes[i]);
+        }
+        let (mut acc, mut w) = (0f64, scale);
+        for i in 0..k {
+            acc += v[i] as f64 * w;
+            w *= primes[i] as f64;
+        }
+        mx = mx.max(acc);
+    }
+    mx
+}
+
+// ------------------------------------------------------------------------------------------------------------------
 // KSKA / KSKB seed expansion (FROZEN spec)
 // ------------------------------------------------------------------------------------------------------------------
 
@@ -592,6 +718,39 @@ pub struct BootstrapKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_err_residues_and_crt() {
+        let chain = crate::params::Chain::generate(&crate::params::ChainSpec::n32()).unwrap();
+        // the n32 bottom shape: q0 (2 primes) x all 9 special primes
+        let t = wide_err_shift_of(&chain, 1, chain.p.len());
+        assert_eq!(t, 181);
+        assert_eq!(wide_err_shift_of(&chain, 1, 3), 13);
+        let g = DiscreteGaussian::new(DiscreteGaussian::SIGMA).unwrap();
+        let n = 4096;
+        // shift 0 draws the Gaussian stream unchanged
+        let a = WideErr::sample(&g, &mut Prng::from_seed([7; 8], 1), n, 0).residues(chain.q[0]);
+        let b: Vec<u64> = g.sample_vec(&mut Prng::from_seed([7; 8], 1), n).iter().map(|&x| x.rem_euclid(chain.q[0] as i64) as u64).collect();
+        assert_eq!(a, b);
+        let w = WideErr::sample(&g, &mut Prng::from_seed([7; 8], 2), n, t);
+        let primes: Vec<u64> = chain.q[..2].iter().chain(&chain.p).copied().collect();
+        let rows: Vec<Vec<u64>> = primes.iter().map(|&p| w.residues(p)).collect();
+        // |e| / 2^t = |g + (u - 2^(t-1)) / 2^t| <= max |g| + 1/2
+        let gmax = w.g.iter().map(|x| x.abs()).max().unwrap() as f64;
+        let mx = wide_err_max(&primes, &rows, t);
+        assert!(mx <= gmax + 0.5 && mx >= gmax - 0.5, "{mx} vs {gmax}");
+        // one coefficient exactly: e_0 from its parts (as f64, relative 2^-50)
+        let e0 = w.g[0] as f64 * (t as f64).exp2() + w.u[..w.words].iter().rev().fold(0f64, |acc, &x| acc * 4294967296.0 + x as f64) - ((t - 1) as f64).exp2();
+        let r0: Vec<Vec<u64>> = rows.iter().map(|r| vec![r[0]]).collect();
+        let m0 = wide_err_max(&primes, &r0, t);
+        assert!((m0 - (e0 / (t as f64).exp2()).abs()).abs() < 1e-9, "{m0} vs {}", e0 / (t as f64).exp2());
+        // the width: sd(e) / 2^t ~ sqrt(sigma^2 + 1/12)
+        let sd = (w.g.iter().zip(w.u.chunks(w.words)).map(|(&g, u)| {
+            let f = g as f64 + u.iter().enumerate().map(|(k, &x)| x as f64 * ((32 * k) as f64 - t as f64).exp2()).sum::<f64>() - 0.5;
+            f * f
+        }).sum::<f64>() / n as f64).sqrt();
+        assert!((sd - (3.19f64 * 3.19 + 1.0 / 12.0).sqrt()).abs() < 0.15, "sd {sd}");
+    }
 
     #[test]
     fn fill_below_matches_uniform_below() {

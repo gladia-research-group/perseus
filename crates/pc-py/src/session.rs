@@ -2279,7 +2279,7 @@ impl PySession {
                     KeyRole::EncDenseToSparse => (sp.clone(), &s, false),
                     KeyRole::EncSparseToDense => (s.clone(), &sp, false),
                 };
-                let (e, _) = hc.relation_max_err(&k.shape, &b, &a, &s_new, s_old, sq);
+                let (e, _) = hc.relation_max_err_shift(&k.shape, &b, &a, &s_new, s_old, sq, pc_gpu::keygen::err_shift(chain, k.role, &k.shape));
                 mx = mx.max(e);
                 cnt += 1;
             }

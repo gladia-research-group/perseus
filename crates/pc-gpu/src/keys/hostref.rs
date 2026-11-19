@@ -110,9 +110,16 @@ impl HostChain {
     /// `s_new` / `s_old` are eval rows by prime id (`sq`: s_old squared) and `b`, `a` are `[digit][slot][N]`.
     /// Returns (max |e|, rows checked).
     pub fn relation_max_err(&self, sh: &KskShape, b: &[u64], a: &[u64], s_new: &[Vec<u64>], s_old: &[Vec<u64>], sq: bool) -> (i64, usize) {
+        self.relation_max_err_shift(sh, b, a, s_new, s_old, sq, 0)
+    }
+
+    /// `relation_max_err` of a key with error shift `shift` (`keygen::err_shift`): > 0 gives max |e| / 2^shift over
+    /// the CRT of the (one digit's) rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relation_max_err_shift(&self, sh: &KskShape, b: &[u64], a: &[u64], s_new: &[Vec<u64>], s_old: &[Vec<u64>], sq: bool, shift: u32) -> (i64, usize) {
         let (n, rows) = (self.n, sh.rows());
         let ids = sh.row_ids();
-        let mx = (0..sh.ndig * rows)
+        let erows: Vec<Vec<u64>> = (0..sh.ndig * rows)
             .into_par_iter()
             .map(|r| {
                 let (d, id) = (r / rows, ids[r % rows]);
@@ -130,10 +137,23 @@ impl HostChain {
                     })
                     .collect();
                 self.ntt[id].inv(&mut e);
-                e.iter().map(|&x| if x > p / 2 { p - x } else { x } as i64).max().unwrap_or(0)
+                e
             })
-            .max()
-            .unwrap_or(0);
+            .collect();
+        let mx = if shift > 0 {
+            let pr: Vec<u64> = ids.iter().map(|&id| self.primes[id]).collect();
+            pc_core::keys::wide_err_max(&pr, &erows, shift).ceil() as i64
+        } else {
+            erows
+                .par_iter()
+                .enumerate()
+                .map(|(r, e)| {
+                    let p = self.primes[ids[r % rows]];
+                    e.iter().map(|&x| if x > p / 2 { p - x } else { x } as i64).max().unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        };
         (mx, sh.ndig * rows)
     }
 
