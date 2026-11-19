@@ -5,10 +5,12 @@
 //! Security follows TFHE-rs's rule (its ci/lattice_estimator.sage): lattice-estimator, MATZOV cost model, the minimum
 //! of primal uSVP and dual hybrid >= 128 bits (132 to pass without a warning), every noise sigma >= 4. Each key's
 //! sigma is set by its LWE instance (lattice-estimator run 2026-10-26, bits):
-//! - binary LWE key (LWE key switch), n = 795 (a multiple of the PBS group), sigma 2^-17 p0: 133.2 bits. The switch's
-//!   input noise is the mod switch to 2 n_br (mean-compensated, `gadget::ms_body_mean`) plus the LWE key switch's
-//!   2048 x levels digit x key-noise terms (binary digits: E d^2 = 1/2);
-//!   precise set `Params::with_lwe(990, -21)` (n a multiple of 3 and 5);
+//! - binary LWE key (LWE key switch), n = 840 (a multiple of the PBS groups), sigma 2^-18 p0: 133.5 bits (estimator run
+//!   2026-11-19, dual hybrid). The switch's input noise is the mod switch to 2 n_br (mean-compensated,
+//!   `gadget::ms_body_mean`) plus the LWE key switch's 2048 x levels digit x key-noise terms (NAF digits, sum E d^2 =
+//!   5.44 over the 16 levels). By TFHE-rs's definition (a bootstrap output times 2-norm 5, key switch, mod switch;
+//!   failure at 1/64 of the torus for 2-bit messages + carry) p_fail is 2^-139.3 measured (model 2^-140.0); the former
+//!   default 795 / 2^-17 (133.2 bits) gave 2^-106, 990 / 2^-21 (137.9 bits) gives 2^-136.1;
 //! - ring switch gadget (4, 6): its key-noise term grows with sqrt(N) of the CKKS ring;
 //! - ring switch key / extracted LWE: ternary s' of dimension 2048 (ring N, s'(X^S)) mod p0 ~ 2^28, sigma 4: 254.6;
 //! - GLWE / bootstrapping key: degree 2048, k = 1, q_br = q_a q_b ~ 2^52 (two 26-bit NTT primes, the device's u32
@@ -55,7 +57,7 @@ pub struct Params {
     /// The extended blind rotation's nu (`pbs::BootstrapKey::blind_rotate_ext`; 1 or 2): the mod switch to 2 nu n_br,
     /// nu times less of its noise; the keys are the same.
     pub nu: usize,
-    /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 795) for small batches: n_lwe /
+    /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 840) for small batches: n_lwe /
     /// lat_group sequential blind-rotation steps.
     pub lat_group: usize,
     /// The native chains' key switch s_br -> s_lwe (`chain::ChainKey`): bootstrap outputs feed bootstraps directly.
@@ -78,6 +80,23 @@ impl Params {
         Ok(self)
     }
 
+    /// A warning when the LWE key may be weaker than the default's ~132 bits: every set estimated so far sits at
+    /// n / -log2(sigma_rel) >= 45.75 for >= 132.4 bits (795/-17 133.2, 825/-17.75 132.8, 840/-18 133.5,
+    /// 855/-18.5 133.1, 870/-19 132.5, 990/-21 137.9). None: at or above that line.
+    pub fn lwe_warning(&self) -> Option<String> {
+        let l = -self.lwe_sigma_rel.log2();
+        if l > 0.0 && self.n_lwe as f64 / l >= 45.75 {
+            return None;
+        }
+        Some(format!(
+            "TFHE LWE key n {} sigma 2^{:.2} p0 is below the estimated sets (n / -log2 sigma {:.1} < 45.75, < ~132 bits): \
+             run the lattice estimator before using it",
+            self.n_lwe,
+            -l,
+            self.n_lwe as f64 / l
+        ))
+    }
+
     /// The default set for a CKKS ring of degree `n_ckks` (2^16 in production; tests use 4096 with S = 2).
     pub fn new(n_ckks: usize) -> Result<Params> {
         let n_br = 2048;
@@ -88,8 +107,8 @@ impl Params {
             qb -= m;
         }
         Ok(Params {
-            n_lwe: 795,
-            lwe_sigma_rel: (-17f64).exp2(),
+            n_lwe: 840,
+            lwe_sigma_rel: (-18f64).exp2(),
             n_br,
             br_primes: (qa, qb),
             q_br: qa * qb,
@@ -108,5 +127,22 @@ impl Params {
             lat_group: 0,
             chain: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lwe_warning_line() {
+        let p = Params::new(1 << 16).unwrap();
+        assert!(p.lwe_warning().is_none());
+        for (n, l) in [(795, -17.0), (990, -21.0), (870, -19.0)] {
+            assert!(p.clone().with_lwe(n, l).unwrap().lwe_warning().is_none(), "{n} {l}");
+        }
+        for (n, l) in [(630, -17.0), (840, -20.0), (795, -18.0)] {
+            assert!(p.clone().with_lwe(n, l).unwrap().lwe_warning().is_some(), "{n} {l}");
+        }
     }
 }
