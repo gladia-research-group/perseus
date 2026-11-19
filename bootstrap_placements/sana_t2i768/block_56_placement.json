@@ -1512,10 +1512,10 @@
       "table_measured": true,
       "num_sites": 2,
       "predicted_rel_err": {
-        "median": 8.884491813537306e-05,
-        "p90": 8.884491813537306e-05,
-        "p99": 8.884491813537306e-05,
-        "max": 8.884491813537306e-05
+        "median": 8.884171789106896e-05,
+        "p90": 8.884171789106896e-05,
+        "p99": 8.884171789106896e-05,
+        "max": 8.884171789106896e-05
       },
       "num_sites_missing_target": 0,
       "cf_histogram": {
@@ -1532,15 +1532,15 @@
       "worst_sites": [
         {
           "var": "v_465",
-          "rel_err": 8.884491813537306e-05,
-          "max_abs": 0.7014641388869566,
+          "rel_err": 8.884171789106896e-05,
+          "max_abs": 0.7014888741071924,
           "pack_period": 128,
           "step": "head"
         },
         {
           "var": "v_310",
-          "rel_err": 8.520775771233036e-05,
-          "max_abs": 0.7080222036064495,
+          "rel_err": 8.52071429146778e-05,
+          "max_abs": 0.7080269353452465,
           "pack_period": 512,
           "step": "head"
         }
@@ -1649,11 +1649,12 @@
       "kv_lanes": true,
       "ladder_radix_bits": 3,
       "ln_cheb": true,
+      "sm_cheb_gs": true,
       "sm_den_recip": true,
       "sm_fold": true,
       "sm_gs_first": true,
       "sm_hrs_pack": true,
-      "sm_periodic": 1
+      "sm_periodic": 2
     },
     "exec": {
       "gpt2_cache": true

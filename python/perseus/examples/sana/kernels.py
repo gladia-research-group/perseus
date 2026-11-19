@@ -873,7 +873,7 @@ def cross_attention(rt, Q, Kb, Vb, wq, nl, site, out_scale=1.0):
     Msc = xa_scale(nl, site)
     kfold = 1.0 / (np.sqrt(DX) * Msc) if XA_KEY_FOLD else 1.0
     # PF_SM_FOLD=1: the exp's domain slope rides this mask too (softmax_pair's exp then only shifts: a free add)
-    from .gemma_fhe import sm_fold
+    from .text import sm_fold
     efold = sm_fold()
     if efold:
         e = nl.cfg["exp"][site + ".sm.exp"]

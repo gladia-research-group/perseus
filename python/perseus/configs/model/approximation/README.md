@@ -17,6 +17,8 @@ reaches, plus a record of how it was produced under `meta`. The runtime reads th
 | `gpt2_base_n32_ctx512s_nokl` | GPT-2 | 32-bit | `gpt2_base_n32_ctx512s` without the softmax's `key_lanes` / `pair_heads` (they act only while one head group fits the key window, under 16 keys): the config of `gpt2_decode`, one plan for 0..31 cached keys |
 | `gpt2_base_n32_cm`, `gpt2_base_n32_ctx1024` | GPT-2 | 32-bit | the default decode up to 32 cached keys, and past 512 |
 | `llama31_8b_n32_ctx512_silus`, `llama31_8b_n32_cheb1e-5_kc256s` | Llama-3-8B | 32-bit | the default 512-token decode and 128-token prefill, softmax centred on key 0. The prefill's softmax takes its mask into the exp series (`exp_mask_fold`); its SiLU sites run one series each from `single_cheb_coeffs`, refitted with the norm seeds as for GPT-2. The decode's SiLU, exp and RMSNorm seed series are refitted the same way, with its masks folded into the exp and SiLU series (`exp_mask_fold`, `mask_fold`), the attention's lanes over the first 16 keys (`key_lanes`) and gs_num as GPT-2's (`gs_num`, `gs_num_refresh`, `gs_num_first`) |
+| `gemma2_2b_n32`, `gemma2_2b_n32_ctx512`, `gemma2_2b_n32_kc128` | Gemma-2-2B | 32-bit | the base fit (`examples/llama/calibrate.py`), the default 512-token decode and 128-token prefill (`examples/llama/tune.py`); the soft-caps as Chebyshev series |
+| `gemma2_2b_it_t2i` | Gemma-2-2B-IT (SANA-Sprint's text encoder) | 32-bit | the encoder's 26 layers on the prompt positions after the 207-token public instruction prefix (`calibrate.py --first 207`), each GELU site one series (`single_cheb_coeffs`) |
 | `gpt2_base` | GPT-2 | 64-bit | the same fit, GELU as a plain polynomial |
 | `gpt2_heat`, `gpt2_heat_n32` | GPT-2 fine-tuned for encryption with HEAT | both | |
 | `gpt2_squeeze` | GPT-2 | 64-bit | fewer iterations per function |
@@ -24,7 +26,7 @@ reaches, plus a record of how it was produced under `meta`. The runtime reads th
 | `vit_heat`, `vit_squeeze` | ViT-B/16 | 64-bit | as for GPT-2 |
 | `bert_base`, `bert_base_n32` | BERT-base | both | fitted on SST-2; `bert_base_n32_t128` is the default plan's (`zladder`, `exp_mask_fold` and the refitted series as ViT) |
 | `bert_heat`, `bert_squeeze` | BERT-base | 64-bit | as for GPT-2 |
-| `sana_sprint_t2i` | SANA-Sprint 0.6B + Gemma-2-2B (text-to-image) | 32-bit | fitted by `examples/sana/fit.py` (its arguments under `meta`) on 64 prompts' ranges from `examples/sana/stats.py`, not `perseus-calibrate`: the ReLUs as one-sided composite signs with a polished last stage, the SiLUs as single odd series on unit inputs, the cross-attention scores centred; `pcmm_calib.json` beside it holds the PCMM linears' output bands (`examples/sana/run.py --text --fake --pcmm-calib`) |
+| `sana_sprint_t2i` | SANA-Sprint 0.6B (text-to-image; its text encoder's layers in `gemma2_2b_it_t2i`) | 32-bit | fitted by `examples/sana/fit.py` (its arguments under `meta`) on 64 prompts' ranges from `examples/sana/stats.py`, not `perseus-calibrate`: the ReLUs as one-sided composite signs with a polished last stage, the SiLUs as single odd series on unit inputs, the cross-attention scores centred; `pcmm_calib.json` beside it holds the PCMM linears' output bands (`examples/sana/run.py --text --fake --pcmm-calib`) |
 | `paper/` | GPT-2, ViT | 64-bit | the exact configs behind the published numbers, kept so those results stay reproducible |
 
 `recount_report.json`, where present, records how a config's iteration counts were derived.

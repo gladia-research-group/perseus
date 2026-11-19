@@ -4,9 +4,10 @@ RUNTIME is ViT's runtime line (bootstrap_placements/vit_b16_224: the dense image
 with Llama prefill's runtime levers (bootstrap_placements/llama31_8b_prefill128: sync-free / cache, refresh pairing,
 the key bundle's S2D merge / StC P' / level keys, SparseB K 16 + its w14 EvalMod table, the compiler's mult-sum and
 sparse level budget, the warm-up), restricted to the levers whose consumer is on this pipeline's path: the bootstrap
-and key-switch runtime, the program compiler, impl.poly, impl.pcmm, impl.blocked. The GPT-2 / Llama model switches
-(SM_*, PF_SM_*, PF_ATTN*, PF_GLU_*, PF_SILU_SINGLE, ...) have no consumer here; their ideas are ported into the SANA /
-Gemma kernels themselves. RECIPE is ViT's planner recipe (Llama prefill's whole recipe on SANA: +30% refreshes per
+and key-switch runtime, the program compiler, impl.poly, impl.pcmm, impl.blocked; and Gemma-2 prefill's model levers
+(bootstrap_placements/gemma2_2b_prefill128) for the text encoder, the general Gemma-2 prefill (examples/llama/encoder:
+SM_*, PF_ATTN*, PF_GLU_*, PF_SILU_SINGLE, ...), which SANA's own kernels do not read (their ideas are ported into
+them). RECIPE is ViT's planner recipe (Llama prefill's whole recipe on SANA: +30% refreshes per
 block and a destructive refresh in block 24's cross-attention, 11-10). A plan carries both (PLAN_CMD.txt `runtime=`
 / `recipe=`, written by make_plan.sh), and a run under `--plan` takes the plan's runtime.
 """
@@ -40,7 +41,9 @@ RUNTIME = {
     "PF_PCMM_WBITS": "24",
     # the output projections' finishes one raise drop down (ViT's out:2,down:2 on SANA's names); qx:2 measured -1%
     # on GPU 4 (block 0, 10-31: qkv:2 -1% at +18% error, ff_in:2 and all-of-them +1%)
-    "PF_PCMM_RAISE": "out1:2,out2:2,ff_out:2,qx:6,ff_in:1,b.tv:5,g.s_pub:4,g.pv_pub:5",   # ff_in:1: act1 + dw still end at 46 (planner audit)
+    # g.*: the text encoder's (Gemma-2 prefill's drops; s_pub / pv_pub: the public prefix's PCMMs)
+    "PF_PCMM_RAISE": "out1:2,out2:2,ff_out:2,qx:6,ff_in:1,b.tv:5,g.qkv:4,g.gate_up:0,g.out:5,g.down:5,g.s_pub:4,"
+                     "g.pv_pub:5",   # ff_in:1: act1 + dw still end at 46 (planner audit)
     # Llama prefill's raise drops on Gemma and SANA (11-11): each the most the bound plan's deliberate-drop probe
     # (PLAN_RAISE_DELIB=1, Gemma layers 1-24, SANA blocks of both steps: the same per layer) let a finish take on top
     # of the above, model-scoped (g. Gemma's g<k>.*, b. SANA's b<k>.* and s2.b<k>.*; impl/pcmm._raise_of)
@@ -50,8 +53,8 @@ RUNTIME = {
     # the PCMM weights pooled per stage: the session holds the most one stage finishes (a Gemma layer's ~0.5 GB, not
     # the 16.7 GB of every stage's; pc-py pcmm.rs), uploaded before each stage (planned.SanaPlannedPrefill)
     "PC_PCMM_WEIGHTS_PER_PROGRAM": "1",
-    "PF_PCMM_RAISE_HI": "g.gate_up:5",
-    "PF_PCMM_RAISE_OUT": "g.qkv:0:1,g.qkv:1:1,g.qkv:4:5,b.qkv:0:1,b.qkv:1:1,b.qkv:2:1,b.qkv:6:2,b.qkv:7:2,b.qkv:8:3",
+    "PF_PCMM_RAISE_HI": "g.gate_up:1",
+    "PF_PCMM_RAISE_OUT": "b.qkv:0:1,b.qkv:1:1,b.qkv:2:1,b.qkv:6:2,b.qkv:7:2,b.qkv:8:3",
     # Llama prefill's model levers ported to the Gemma / SANA kernels (11-11; A/B in the session notes): the gate's
     # GELU domain folded into its weights, the softcap / exp domain maps folded into the score producers and the
     # softcap's coefficients (exact), the joint refreshes deliberate, the SiLU series by Llama's absolute error rule
@@ -64,6 +67,14 @@ RUNTIME = {
     # the cross-attention keys' 1 / (sqrt(DX) M) on the scores' window mask instead of the key rows:
     # the keys were refreshed at max |x| ~0.002 (rel. err ~2.5%); -16 refreshes per SANA block, exact
     "PF_XA_KEY_FOLD": "1",
+    # the text encoder: Gemma-2 prefill's model levers (the softmax's Chebyshev-Goldschmidt reciprocal, folds and
+    # periodic range, the attention's BSGS packing, the GLU's joint forms, the single SiLU series: the configs' baked
+    # coefficients, so SANA's PF_SILU_SINGLE_ERR above stays its own; the joint refresh deliberate by the prefill's own
+    # PF_PREFILL_JOINT_FORCE, SANA's PF_JOINT_FORCE off; the down projection's pre-division in its weights)
+    "SM_CHEB_GS": "1", "SM_DEN_RECIP": "1", "SM_FOLD": "1", "SM_GS_FIRST": "1", "SM_HRS_PACK": "1", "SM_PERIODIC": "2",
+    "GELU_FOLD": "1", "PF_ACT_FOLD": "1", "PF_GELU_JOINT": "1", "PF_PREFILL_JOINT_FORCE": "1", "PF_GLU_LEAN": "1",
+    "PF_GLU_XU": "1", "PF_SILU_SINGLE": "1", "PF_SM_EXP_EPS": "2e-6", "PF_ATTN_BSGS": "1", "PF_ATTN_PACK": "3",
+    "PF_ATTN_WROT": "27", "PF_SM_HPACK": "1", "PF_PCMM_INFOLD": "down",
 }
 
 # runtime keys the drivers' process environment carries (impl.pcmm / impl.poly's, the session's env knobs); the

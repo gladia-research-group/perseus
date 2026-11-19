@@ -1,6 +1,6 @@
 """Per-site statistics over prompts: the input ranges every approximation is fitted on (fit.py). The SANA transformer's
-sites (ref.py's) on the ref_float dumps (their Gemma rows and every step's input), or with --gemma Gemma-2's
-(gemma.py's) on the dumps' prompt rows.
+sites (ref.py's) on the ref_float dumps (their Gemma rows and every step's input), or with --gemma the caption stage's
+Gemma site (g.norm) on the dumps' prompt rows.
 
     .venv/bin/python -m perseus.examples.sana.stats --dumps ref --out stats_ref.npz
     .venv/bin/python -m perseus.examples.sana.stats --gemma --dumps ref --out stats_gemma.npz
@@ -71,26 +71,20 @@ def run_dumps(W, dumps, st, on_block=None):
 
 
 def run_gemma(dumps, st):
-    """Gemma-2's sites on the dumps' prompt rows (the public instruction prefix, the same for every prompt, once).
-    Returns the residual stream's per-channel max |x| (the embedding rows and every layer's output: fit's text
-    residual scale)."""
-    import math
+    """The caption stage's Gemma site on the dumps' prompt rows: g.norm, the final RMSNorm's mean square (+ eps) of the
+    prompt positions, from SANA's text encoder (HuggingFace's Gemma-2-2B, float64, the whole instruction + prompt)."""
     import torch
-    from . import gemma as GM
-    W = GM.GemmaWeights()
-    kvs = None
-    m = np.zeros(GM.D)
+    from transformers import AutoModel
+    m = AutoModel.from_pretrained(hf.snapshot(), subfolder="text_encoder", dtype=torch.float64).eval()
+    rows = {}
+    m.norm.register_forward_pre_hook(lambda mod, args: rows.__setitem__("x", args[0]))
     for f in dumps:
         z = np.load(f)
         n_pub, n_tok = int(z["n_pub"]), int(z["n_tok"])
-        ids = z["ids"][:n_pub + n_tok]
-        kvs = kvs or GM.public_prefix(W, ids[:n_pub])
-        x0 = (W["embed_tokens.weight"][torch.as_tensor(ids[n_pub:])] * math.sqrt(GM.D)).abs().max(0).values.numpy()
-        np.maximum(m, x0, out=m)
-        GM.prompt_states(W, ids, n_pub, kvs, ap=st,
-                         on_layer=lambda b, x: np.maximum(m, x.abs().max(0).values.numpy(), out=m))
+        m(input_ids=torch.as_tensor(z["ids"][:n_pub + n_tok])[None])
+        x = rows["x"][0, n_pub:]
+        st.see("g.norm", (x * x).mean(-1, keepdim=True) + R.Approx.ln_eps)
         print(f"[stats] gemma {os.path.basename(f)}", flush=True)
-    return m
 
 
 def main():
@@ -106,9 +100,9 @@ def main():
     st = Stats()
     dumps = sorted(glob.glob(hf.scratch(a.dumps, "p*.npz")))
     if a.gemma:
-        resid = run_gemma(dumps, st)
+        run_gemma(dumps, st)
         summ = st.summary()
-        np.savez(hf.scratch(a.out), summary=np.array(summ, dtype=object), resid=resid)
+        np.savez(hf.scratch(a.out), summary=np.array(summ, dtype=object))
         for s, v in summ.items():
             print(f"{s:20s} [{v['lo']:10.4g}, {v['hi']:10.4g}] q.001 {v['q'][1]:9.3g} q.999 {v['q'][5]:9.3g}")
         return
