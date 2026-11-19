@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import inspect
 import os
+import shutil
 import socket
+import tempfile
 import threading
 
 import pytest
@@ -23,7 +25,9 @@ def test_server_loop_has_no_request_channel():
 
 @pytest.mark.parametrize("phase", ["ready", "result"])
 def test_client_refuses_a_server_request(tmp_path, phase):
-    addr = str(tmp_path / "s.sock")
+    # the socket in a short directory: tmp_path under a long TMPDIR passes AF_UNIX's 108-byte limit
+    sdir = tempfile.mkdtemp(prefix="sock_", dir="/tmp")
+    addr = os.path.join(sdir, "s.sock")
     srv = serve.listen(addr)
     got = {}
 
@@ -53,4 +57,5 @@ def test_client_refuses_a_server_request(tmp_path, phase):
     rem.conn.close()
     th.join()
     srv.close()
+    shutil.rmtree(sdir, ignore_errors=True)
     assert got["bytes"] == 0
