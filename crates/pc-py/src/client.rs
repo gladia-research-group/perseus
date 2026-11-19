@@ -991,9 +991,7 @@ fn ct_frame(frame: &[u8]) -> PyResult<(CtHeader, &[u8], u64)> {
     }
     let d0 = 16 + hl as usize;
     let header: CtHeader = serde_json::from_slice(&frame[16..d0]).map_err(|e| bad(format!("header: {e}")))?;
-    if header.n == 0 || header.k == 0 || header.rows == 0 || header.n > 1 << 17 || header.k > 64 || header.rows > 128 {
-        return Err(bad(format!("ciphertext header out of range: {header:?}")));
-    }
+    header.check().map_err(|e| bad(e.to_string()))?;
     let d1 = d0 + 4 * CtWire::words(&header);
     if frame.len() != d1 + 8 {
         return Err(bad(format!("{} bytes for a frame of {} words", frame.len(), CtWire::words(&header))));

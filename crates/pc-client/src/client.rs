@@ -1207,6 +1207,52 @@ mod tests {
         }
     }
 
+    /// Frames whose header no writer produces (a seeded frame claiming compression without `drop`, compressed words of
+    /// 0 or more than 64 bits, `bits1` / `sub1` without `bits`, `regen` without `seeded`) are refused on read, not
+    /// left to panic the server's `expand_seeded` or the client's decode.
+    #[test]
+    fn malformed_frames_refused() {
+        let c = client(3);
+        let mut g = Prng::from_seed([4; 8], 0);
+        let meta = c.fresh_meta(50, 1).unwrap();
+        let v = vec![Complex::new(0.5, 0.0); 8];
+        let seeded = c.encrypt_as(&[v.clone()], &meta, Payload::Complex, &mut g, true, false).unwrap();
+        let plain = c.encrypt(&[v], &meta, Payload::Complex, &mut g).unwrap();
+        let reframe = |w: &CtWire, f: &dyn Fn(&mut CtHeader)| -> Vec<u8> {
+            let mut header = w.header.clone();
+            f(&mut header);
+            let data: Vec<u32> = (0..CtWire::words(&header) as u32).map(|i| i.wrapping_mul(2654435761) % 95027201).collect();
+            let mut b = Vec::new();
+            b.extend_from_slice(crate::wire::CT_MAGIC);
+            b.extend_from_slice(&crate::wire::VERSION.to_le_bytes());
+            let h = serde_json::to_vec(&header).unwrap();
+            b.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            b.extend_from_slice(&h);
+            data.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+            b.extend_from_slice(&crate::wire::sum64(&data).to_le_bytes());
+            b
+        };
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("seeded + bits, no drop", reframe(&seeded, &|h| h.bits = Some(16))),
+            ("bits 0", reframe(&plain, &|h| h.bits = Some(0))),
+            ("bits 65", reframe(&plain, &|h| h.bits = Some(65))),
+            ("bits1 0", reframe(&plain, &|h| (h.bits, h.bits1) = (Some(16), Some(0)))),
+            ("bits1 without bits", reframe(&plain, &|h| h.bits1 = Some(16))),
+            ("sub1 without bits", reframe(&plain, &|h| h.sub1 = Some(8))),
+            ("regen without seeded", reframe(&plain, &|h| h.regen = true)),
+            ("n not a power of two", reframe(&plain, &|h| h.n = 3 << 14)),
+        ];
+        let wrong: Vec<String> = bad
+            .iter()
+            .filter_map(|(what, b)| match std::panic::catch_unwind(|| CtWire::from_bytes(b).and_then(|w| w.expand_seeded(&c.chain.q)).and_then(|w| c.decrypt(&w, Payload::Complex))) {
+                Ok(Err(_)) => None,
+                Ok(Ok(_)) => Some(format!("{what}: accepted")),
+                Err(_) => Some(format!("{what}: panicked")),
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
     /// Short-c0 frames from either form of the precomputed part: the plain frame's values up to the dropped bits'
     /// rounding, at the short size.
     #[test]

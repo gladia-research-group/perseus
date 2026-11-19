@@ -615,6 +615,31 @@ pub struct CtWire {
     pub data: Vec<u32>,
 }
 
+impl CtHeader {
+    /// The header of a frame some writer produces: sizes in range and the flags in a combination `CtWire::words` and
+    /// the readers (`expand_seeded`, the decoders) agree on (a peer's frame is checked before any of them runs).
+    pub fn check(&self) -> Result<()> {
+        let h = self;
+        if h.n == 0 || h.k == 0 || h.rows == 0 || h.n > 1 << 17 || !h.n.is_power_of_two() || h.k > 64 || h.rows > 128 {
+            return Err(Error::Wire(format!("ciphertext header out of range: {h:?}")));
+        }
+        if h.sub1.is_some_and(|k| k < 2 || !k.is_power_of_two() || h.n % k as usize != 0) || h.sub1.is_some() && h.bits.is_none() {
+            return Err(Error::Wire(format!("packed frame header out of range: {h:?}")));
+        }
+        if h.drop.is_some() {
+            if !(h.seeded && !h.regen && h.bits.is_some_and(|b| (1..=126).contains(&b)) && h.bits1.is_none() && h.rows <= 4) {
+                return Err(Error::Wire(format!("short-c0 frame header out of range: {h:?}")));
+            }
+        } else if (h.bits.is_some() && h.seeded) || [h.bits, h.bits1].iter().flatten().any(|b| !(1..=64).contains(b)) || (h.bits1.is_some() && h.bits.is_none()) {
+            return Err(Error::Wire(format!("compressed frame header out of range: {h:?}")));
+        }
+        if h.regen && !h.seeded {
+            return Err(Error::Wire(format!("regen frame without seeds: {h:?}")));
+        }
+        Ok(())
+    }
+}
+
 impl CtWire {
     pub fn words(h: &CtHeader) -> usize {
         if h.drop.is_some() {
@@ -652,15 +677,7 @@ impl CtWire {
     }
     pub fn read<R: Read>(r: &mut R) -> Result<Self> {
         let header: CtHeader = serde_json::from_slice(&read_header(r, CT_MAGIC)?)?;
-        if header.n == 0 || header.k == 0 || header.rows == 0 || header.n > 1 << 17 || header.k > 64 || header.rows > 128 {
-            return Err(Error::Wire(format!("ciphertext header out of range: {header:?}")));
-        }
-        if header.sub1.is_some_and(|k| k < 2 || !k.is_power_of_two() || header.n % k as usize != 0) {
-            return Err(Error::Wire(format!("packed frame header out of range: {header:?}")));
-        }
-        if header.drop.is_some() && !(header.seeded && !header.regen && header.bits.is_some_and(|b| (1..=126).contains(&b)) && header.rows <= 4) {
-            return Err(Error::Wire(format!("short-c0 frame header out of range: {header:?}")));
-        }
+        header.check()?;
         let data = read_words(r, Self::words(&header))?;
         let mut c = [0u8; 8];
         r.read_exact(&mut c)?;
