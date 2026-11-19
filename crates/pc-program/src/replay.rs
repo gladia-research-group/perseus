@@ -491,6 +491,25 @@ fn step_prof() -> bool {
     *ON.get_or_init(|| std::env::var("PC_STEP_PROFILE").is_ok_and(|v| v != "0" && !v.is_empty()))
 }
 
+/// PC_STEP_PROFILE_MAP=<json {block label: {var name: graph step}}>: the profile's classes are the graph steps the
+/// steps' output vars were recorded in (`<step>`), booked by step instead of by op class.
+fn prof_map() -> Option<&'static std::collections::HashMap<String, std::collections::HashMap<String, String>>> {
+    static MAP: std::sync::OnceLock<Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let p = std::env::var("PC_STEP_PROFILE_MAP").ok().filter(|v| !v.is_empty())?;
+        let txt = std::fs::read_to_string(&p).map_err(|e| eprintln!("[stepprof] {p}: {e}")).ok()?;
+        serde_json::from_str(&txt).map_err(|e| eprintln!("[stepprof] {p}: {e}")).ok()
+    })
+    .as_ref()
+}
+
+/// The graph step of var `name` of block `label` (PC_STEP_PROFILE_MAP; `~pre` / `~raw` states as their var).
+fn prof_step(label: &str, name: &str) -> Option<String> {
+    let m = prof_map()?.get(label)?;
+    let base = name.split('~').next().unwrap_or(name);
+    Some(m.get(base).cloned().unwrap_or_else(|| "?".into()))
+}
+
 /// (class, count) of a step (a unit of `n` steps of one op) for PC_STEP_PROFILE.
 fn prof_class(op: &StepOp, n: usize, outs: impl Fn(u32) -> (usize, String)) -> (String, usize) {
     match op {
@@ -576,6 +595,10 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             // two drains booked to the class issued in between ([stepprof] line per eager run)
             let n = unit.map_or(1, |(_, e)| e - i);
             let (cls, cnt) = prof_class(&b.steps[i].op, n, |f| b.finishes.get(f as usize).map_or((0, String::new()), |fs| (fs.outs.len(), fs.desc.to_string())));
+            let cls = match b.names.get(b.steps[i].var as usize).and_then(|nm| prof_step(&b.label, nm)) {
+                Some(st) => st,
+                None => cls,
+            };
             let mut g = PROF.lock().unwrap();
             if g.0.as_ref().map(|x| x.0.as_str()) != Some(cls.as_str()) {
                 rt.ex.compute.sync()?;

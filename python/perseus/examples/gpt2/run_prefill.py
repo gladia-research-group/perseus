@@ -19,6 +19,22 @@ import numpy as np
 from .run_decode import gpu_busy
 
 
+def _step_profile_map(work, labels):
+    """PC_STEP_PROFILE_MAP=<json> (with PC_STEP_PROFILE=1): write the recorded blocks' {label: {var: step}} there; the
+    replay's profile then books time by graph step (diagnostic)."""
+    out = os.environ.get("PC_STEP_PROFILE_MAP", "")
+    if not out:
+        return
+    import json
+    m = {}
+    for lab in labels:
+        g = os.path.join(work, lab, "graph.json")
+        if os.path.exists(g):
+            m[lab] = {n["output"]: (n.get("step") or "?").split(".", 1)[-1] for n in json.load(open(g))["nodes"]}
+    with open(out, "w") as f:
+        json.dump(m, f)
+
+
 def _planned(a, model, store, rows, gt, ref, results=None):
     """PLANNED on the new runtime (impl.prefill.PlannedPrefill): record + compile + session, then `--repeat` timed
     forwards (each: block 0's inputs encrypted, every block issued, the device drained); gated on the last one."""
@@ -44,6 +60,7 @@ def _planned(a, model, store, rows, gt, ref, results=None):
                   flush=True)
         return 0
     run.setup(rows)
+    _step_profile_map(work, run.labels)
     progs = [run.progs[lab] for lab in run.labels]
     n_bts = sum(p.n_bootstraps for p in progs)
     n_fin = [sum(p.n_finishes[i] for p in progs) for i in (0, 1)]
