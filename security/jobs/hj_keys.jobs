@@ -1,0 +1,16 @@
+# results/hj_keys.jsonl: Hou-Jiang's estimator (egv, ehg) on the sparse keys, full zeta search (SEARCH=fine, 4 workers each)
+# ./run_jobs.sh jobs/hj_keys.jobs out/hj_keys.jsonl 2
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_n32 16 307.636 t32 ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_n32 16 307.636 t32 egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_ek3 16 139.906 t32 ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_ek3 16 139.906 t32 egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py spru_n32 16 307.636 spru ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py spru_n32 16 307.636 spru egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py spru_ek3 16 139.906 spru ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py spru_ek3 16 139.906 spru egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py b64_n32 16 307.636 b64 ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py b64_n32 16 307.636 b64 egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py b64_ek3 16 139.906 b64 ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py b64_ek3 16 139.906 b64 egv 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_n64 16 300.0 t32 ehg 3.19 n
+FINEP=4 SEARCH=fine TRACE={out}.trace.jsonl hj_estimate.py h32_n64 16 300.0 t32 egv 3.19 n

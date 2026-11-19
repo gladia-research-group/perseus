@@ -1,0 +1,12 @@
+[package]
+name = "security-moduli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pc-core = { path = "../../crates/pc-core" }
+pc-tfhe = { path = "../../crates/pc-tfhe" }
+
+# not a member of the repository's workspace
+[workspace]
