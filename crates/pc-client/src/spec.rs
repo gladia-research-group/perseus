@@ -6,6 +6,9 @@
 //! Roles: relin s_old = s^2, s_new = s; rotation by r (Galois g = 5^r mod 2N) and every other automorphism key
 //! s_old = s, s_new = sigma_{g^-1}(s) (the evaluator switches, then applies sigma_g); dense->sparse s_old = s,
 //! s_new = s_sparse; sparse->dense the reverse; the SPRU block key switch s_old = s, s_new = s_block.
+//! e is Gaussian (sigma 3.19) but for the two keys under a sparse secret (dense->sparse, SPRU block: one digit at the
+//! bottom over P'), whose error is sigma 2^t wide (`pc_core::keys::wide_err_shift`, `Client::err_shift`): the server
+//! never sees e, so their shape and every bundle with narrow ones stay valid.
 use crate::error::{Error, Result};
 use pc_core::galois;
 use pc_core::params::Chain;

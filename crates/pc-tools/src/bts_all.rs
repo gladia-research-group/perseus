@@ -223,6 +223,12 @@ fn bench_spec() -> Res<ChainSpec> {
         spec.dnum = d;
         spec.security = pc_core::params::Security::NotSet;
     }
+    // PC_BENCH_LEAN_DNUM: a lean chain's own digit count (its P re-sized by p_margin; the HE-standard check kept)
+    if let Some(d) = env("PC_BENCH_LEAN_DNUM") {
+        if let Some(l) = spec.lean.as_mut() {
+            l.dnum = d;
+        }
+    }
     Ok(spec)
 }
 
