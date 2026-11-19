@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define PC_KERNELS_ABI 29u
+#define PC_KERNELS_ABI 30u
 #define PC_RING_ABI 7u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
@@ -113,20 +113,22 @@ static_assert(sizeof(NttArgs) == 176, "NttArgs layout");
 //   exact jobs: v = sum_i y_i * rb_i (double FMA, source order), u = floor(v + 0.5), out_t -= u * (B mod t).
 // The pool is an array of W words. Pool layout at pool_off (all counts in W words):
 //   src_row[nsrc], src_prime[nsrc], pre[nsrc], tgt_row[ntgt], tgt_prime[ntgt], M[nsrc][ntgt],
-//   (exact) rb[nsrc] as double (8/sizeof(W) words each, first one 8-byte aligned in the pool), bmod[ntgt].
-// Bound: nsrc * (max p - 1)^2 < 2^(2*BITS) (lazy accumulation in the double word).
+//   (exact) rb[nsrc] as double (8/sizeof(W) words each, first one 8-byte aligned in the pool), bmod[ntgt],
+//   (exact, ABI 30) c[nsrc] = floor(2^59 / s_i) as uint64_t (the first 8-byte aligned): u from integers (bconv.cuh).
+// Bound: nsrc * (max p - 1)^2 < 2^(2*BITS) (lazy accumulation in the double word); split exact jobs of the kind kernels
+// add u (t - B mod t), u <= nsrc, to the sum.
 struct BconvJob {
     uint32_t src_off, dst_off;  // limb offsets (units of N) into src / dst
     uint32_t nsrc, ntgt;
     uint32_t pool_off;          // W words
     uint32_t exact;
     uint32_t prescaled;  // ABI 17: 1 = the source rows hold y_i = x_i pre_i already (folded into the INTT)
-    uint32_t split;      // ABI 17: 1 = u32 words, every target < 2^30: the sums reduced as hi 2^32 + lo (plain jobs)
+    uint32_t split;      // ABI 17: 1 = u32 words, every target < 2^30: the sums reduced as hi 2^32 + lo (ABI 30: exact in kind kernels)
 };
 static_assert(sizeof(BconvJob) == 32, "BconvJob layout");
 
-// kind (ABI 21): 0 any jobs; 13, 14 or 15 (u32 words): every job exact with that many sources (a kernel of that body
-// alone, launch() in bconv.cuh); the wide kernel ignores it
+// kind (ABI 21): 0 any jobs; 13, 14 or 15 (ABI 30: also 1 to 4) (u32 words): every job exact with that many sources (a
+// kernel of that body alone, launch() in bconv.cuh); the wide kernel ignores it
 struct BconvArgs {
     const void* src;
     void* dst;
