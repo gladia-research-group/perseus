@@ -803,7 +803,7 @@ def _disk_cached(f):
 
     @functools.wraps(f)
     def g(eps, delta, relu=False):
-        key = f"{float(eps)!r}|{float(delta)!r}|{int(bool(relu))}"
+        key = f"{float(eps)!r}|{float(delta)!r}|{int(bool(relu))}|m{LADDER_MARGIN!r}"
         path = _cache_path()
         try:
             with open(path) as fh:
@@ -830,6 +830,17 @@ def _disk_cached(f):
             pass
         return lad
     return g
+
+
+# A stage past the first is fitted on its input's image widened by this fraction, so its Chebyshev domain is not
+# the image itself: in unit form every intermediate's maximum sat exactly at 1, the edge of the domain, and a refresh
+# between stages (relative error ~1e-3 on unit-size data, plan/btserr.py) evaluated a degree 15..63 stage outside
+# [-1, 1], where T_k grows like (t + sqrt(t^2 - 1))^k: each later stage compounded it to ~1e19 (CKKS bitonic n >= 1024,
+# threshold n 4096, measured 2026-11-20). With the margin an input up to (1 + margin) x the image still maps to
+# +-1 within delta. 1/64 keeps every ladder stable under 3e-3 of noise between stages (the dense route's worst
+# unit-size refresh error is ~2.8e-3 at CF 7) and leaves the ladders' shapes as they were, but sign at 1e-4 (+1 level);
+# 1/16 also holds 1e-2 but costs the ReLU at 1e-3 16 more products.
+LADDER_MARGIN = 1.0 / 64
 
 
 @_memo
@@ -875,15 +886,17 @@ def sign_ladder(eps: float, delta: float, relu: bool = False) -> SignLadder:
         stages, degs, lo, hi = [], [], eps, 1.0
         for m in range(12):
             dm = d1 if m == 0 else d
+            # past the first stage the domain reaches LADDER_MARGIN beyond the previous image (see LADDER_MARGIN)
+            H = hi if m == 0 else hi * (1.0 + LADDER_MARGIN)
             if m:       # a different last stage on the prefix
                 for dl in (15, 27, 31, 63):
                     if dl != d and lo > 0.0:
-                        coef, _l, _t = _stage(dl, lo, hi)
-                        offer(unit(stages + [(coef, hi)]), degs + [dl])
-            coef, lo2, top = _stage(dm, lo, hi)
+                        coef, _l, _t = _stage(dl, lo, H)
+                        offer(unit(stages + [(coef, H)]), degs + [dl])
+            coef, lo2, top = _stage(dm, lo, H)
             if not (0.0 < lo2 <= top and np.isfinite(top)):
                 break               # a degenerate stage (the gap's image collapsed): this shape cannot reach it
-            stages.append((coef, hi))
+            stages.append((coef, H))
             degs.append(dm)
             lo, hi = lo2, top
             coefs = unit(stages)

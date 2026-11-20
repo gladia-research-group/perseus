@@ -61,6 +61,13 @@ def _nslots(ops, x):
 
 DELTA = 2.0 ** -10      # the CKKS comparisons' default distance from 0 / 1 outside the gap (a swap / an indicator
                         # carries it times the compared difference: sorted values within bound DELTA per step)
+IN_MARGIN = 1.0 / 16    # the CKKS comparisons scale |d| <= bound into [-1 / (1 + IN_MARGIN), ..]: values a network
+                        # keeps rewriting drift by its refreshes' error, and a difference past the bound evaluated the
+                        # ladder's first stage outside [-1, 1] (CKKS bitonic n 256: 1e19 on the device; the later
+                        # stages' own margin is impl.math.LADDER_MARGIN)
+NET_MARGIN = 1.0 / 4    # a sorting network's: its values carry every earlier step's refresh error (bitonic n 1024:
+                        # differences up to 2.18 for a bound of 2 on the device, 1e19 at IN_MARGIN; 1/4 costs n 1024's
+                        # comparisons one level, 18 for 17)
 
 
 def ladder_for(bound: float, res: float, delta: float | None = None):
@@ -70,12 +77,14 @@ def ladder_for(bound: float, res: float, delta: float | None = None):
     return M.sign_ladder(eps, min(0.25, float(delta) if delta is not None else min(eps, DELTA)))
 
 
-def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None, tag="c", n=None, levels=1):
+def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None, tag="c", n=None, levels=1,
+         margin=IN_MARGIN):
     """[scale_h d_h >= 0] (1 / 0) on the slots `heads`, 0 elsewhere. `scale`: a number or one per head (a sign
     folds the comparison's direction in); |scale d| <= bound. CKKS: within `delta` of 0 / 1 where |scale d| >= res;
     an exact 0 input gives 1/2. TFHE: exact outside the switch's noise band; `levels` > 1: tfhe_select.msign's
     finer scales in the same switch (2 levels - 1 more PBS per value, the band / 16 per extra level; needs
-    2 levels - 1 slot groups beside the heads)."""
+    2 levels - 1 slot groups beside the heads). `margin` (CKKS): how far past `bound` |scale d| may drift and still
+    land inside the ladder's first stage."""
     n = _nslots(ops, d) if n is None else int(n)
     heads = np.asarray(heads, dtype=np.int64)
     sc = np.broadcast_to(np.asarray(scale, dtype=np.float64), heads.shape)
@@ -92,6 +101,7 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
         return _clean(ops, S, n, heads)
     if method != "ckks":
         raise ValueError(f"method {method!r}: 'tfhe' or 'ckks'")
+    bound = float(bound) * (1.0 + margin)
     lad = ladder_for(bound, res, delta)
     t = ops.mult_pt(d, _put(n, heads, sc / bound), kind="mask")
     from .relu import odd_series
@@ -216,6 +226,7 @@ def rank(ops, x, lay: Batch, bound: float, *, method="ckks", res=1e-2, delta=Non
         r = ops.rotate_and_sum(s, 2 * n * B, P)              # sum over the rows
         offs = 0.0
     else:
+        bound = float(bound) * (1.0 + IN_MARGIN)
         lad = ladder_for(bound, res, delta)
         live = np.tile(_put(P, sl[j < n], 1.0 / bound), N // P)
         t = ops.mult_pt(d, live, kind="mask")                # padding columns: an exact 0 (sgn 0)
@@ -373,7 +384,7 @@ def bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, delta=
         sig = np.where(asc, -1.0, 1.0)            # swap = [-sigma d >= 0]: ascending swaps when d < 0
         d = ops.sub(ops.rotate(x, j * B), x)
         sw = step(ops, d, heads, sig, method=method, bound=bound, res=res, delta=delta, tag=f"b{k}.{j}", n=N,
-                  levels=levels)
+                  levels=levels, margin=NET_MARGIN)
         dl = ops.mult(d, sw)
         x = ops.sub(ops.add(x, dl), ops.rotate(dl, -j * B))
         if payload is not None:
@@ -426,8 +437,7 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
                                                                                           kind="mask"), t)
         c = step(ops, dt, s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag=f"thr{p}", n=N,
                  levels=levels)
-        # count(y >= t + w), every slot of the vector (CKKS: over n + 1 before the sum: a count near n refreshed by
-        # the plan came back as garbage at n = 4096)
+        # count(y >= t + w), every slot of the vector (CKKS: over n + 1 before the sum, so the comparison's bound is 1)
         cnt = total(ops, c if count_method == "tfhe" else ops.mult(c, 1.0 / (n + 1.0)), lay)
         e = ops.add_pt(cnt, _mask(N, s0, 0.5 - k) if count_method == "tfhe" else _mask(N, s, (0.5 - k) / (n + 1.0)),
                        kind="mask")
@@ -436,7 +446,9 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
             bit = msign(ops, e, N, s0, 2.0 * n, 3, f"thr.c{p}", res=0.25)
             inc = ops.rotate_and_sum(ops.mult_pt(bit, _mask(N, s0, w), kind="mask"), -B, N)
         else:
-            # the count over n + 1 (a value of size n refreshed inside the comparison's ladder comes back as garbage)
+            # resolution 1 / 2 (n + 1): a refresh between the sum and the ladder's first stage would cost ~1e-3 of
+            # the bound (plan/btserr.py), past that resolution from n ~ 500 (n 4096: masks exact on the device, two
+            # seeds; the ladders' margins keep a wrong decision bounded)
             bit = step(ops, e, s, 1.0, method="ckks", bound=1.0, res=0.5 / (n + 1.0), tag=f"thr.c{p}", n=N)
             inc = ops.mult(bit, w)
         t = inc if t is None else ops.add(t, inc)

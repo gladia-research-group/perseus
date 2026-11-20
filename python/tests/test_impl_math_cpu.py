@@ -109,6 +109,23 @@ def test_sign_ladder(eps):
     assert np.all(np.abs(y) <= 1.0 + eps)
 
 
+@pytest.mark.parametrize("eps", [1.2e-4, 4.9e-4, 2e-3])
+def test_sign_ladder_survives_refresh_noise(eps):
+    """Noise of 3e-3 (the dense route's worst unit-size refresh error) between stages keeps every output within the
+    ladder's delta: each stage past the first is fitted LADDER_MARGIN beyond its input's image (without the margin a
+    1e-3 perturbation took these ladders to 1e11..1e32, the device's 1e19)."""
+    from numpy.polynomial import chebyshev as C
+    lad = M.sign_ladder(eps, min(eps, 2.0 ** -10))
+    rng = np.random.default_rng(0)
+    x = np.concatenate([np.linspace(-1, 1, 20001), np.geomspace(eps, 1, 2000)])
+    y = x
+    for i, c in enumerate(lad.coefs):
+        if i:
+            y = y + 3e-3 * rng.standard_normal(y.shape)
+        y = C.chebval(y, c)
+    assert np.abs(y).max() <= 1.0 + 2 * lad.delta + 1e-9
+
+
 @pytest.mark.parametrize("method", ["ckks", "tfhe"])
 def test_sign_family_mirror(method):
     ops = NumpyOps()
