@@ -99,8 +99,10 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
         name = f"sort.{len(heads)}.{hashlib.blake2b(heads.tobytes(), digest_size=6).hexdigest()}"
         S = tfhe.tfhe_lut(ops, D, sign01(), tfhe.register_slots(name, heads))
         return _clean(ops, S, n, heads)
+    if method == "fbs":
+        return _step_fbs(ops, d, n, heads, sc, float(bound), float(res))
     if method != "ckks":
-        raise ValueError(f"method {method!r}: 'tfhe' or 'ckks'")
+        raise ValueError(f"method {method!r}: 'tfhe', 'ckks' or 'fbs'")
     bound = float(bound) * (1.0 + margin)
     lad = ladder_for(bound, res, delta)
     t = ops.mult_pt(d, _put(n, heads, sc / bound), kind="mask")
@@ -108,6 +110,48 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
     for i, c in enumerate(lad.coefs):
         t = odd_series(ops, t, [0.5 * v for v in c] if i == len(lad.coefs) - 1 else list(c))
     return ops.add_pt(t, _mask(n, heads, 0.5), kind="mask")
+
+
+# FBS sign (impl/fbs.py register_sign): x = 1.9 scale d / bound on |x| < 2, the 0 / 1 step exact to ~2e-5 outside
+# |x| < gap (degree 63: gap 0.2, 127: 0.1, ... 1023: 0.0125, `FBS_SIGN`); the sine keeps the sign up to |x| < 4, so inputs may drift to
+# twice `bound`. The resolution `res` (d units) maps to the gap 1.9 res / bound; one ciphertext costs one functional
+# bootstrap whatever the number of heads (TFHE: one PBS per head), on the shallow EvalMod table (k32d3).
+FBS_SIGN = ((63, 0.2), (127, 0.1), (255, 0.05), (511, 0.025), (1023, 0.0125))
+FBS_X = 1.9
+
+
+def fbs_sign_name(bound, res):
+    """The registered FBS sign for a resolution `res` at `bound` (the lowest degree whose gap fits), or ValueError."""
+    from . import fbs as F
+    g = FBS_X * float(res) / float(bound)
+    for deg, gap in FBS_SIGN:
+        if gap <= g:
+            name = f"sort.fbs.sign.{deg}"
+            if name not in F.FUNCS:
+                F.register_sign(name, 0.0, 1.0, deg=deg, gap=gap, table="k32d3")
+            return name
+    raise ValueError(f"fbs step: resolution {res} at bound {bound} is gap {g:.3g} < {FBS_SIGN[-1][1]} (use tfhe)")
+
+
+def _step_fbs(ops, d, n, heads, sc, bound, res):
+    from . import fbs as F
+    name = fbs_sign_name(bound, res)
+    x = ops.mult_pt(d, _put(n, heads, sc * FBS_X / bound), kind="mask")
+    s = F.fbs(ops, x, name)
+    return ops.mult_pt(s, _mask(n, heads, 1.0), kind="mask")
+
+
+def step_method(n_heads, bound, res):
+    """The measured rule for `step`'s backend (logs/fbs26_RUNLOG.md): 'fbs' for a wide round (>= FBS_MIN_HEADS heads in
+    one ciphertext) whose resolution the FBS sign reaches, else 'tfhe'."""
+    try:
+        fbs_sign_name(bound, res)
+    except ValueError:
+        return "tfhe"
+    return "fbs" if int(n_heads) >= FBS_MIN_HEADS else "tfhe"
+
+
+FBS_MIN_HEADS = 256
 
 
 def _put(n, idx, vals):
