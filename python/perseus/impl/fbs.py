@@ -65,9 +65,15 @@ class Fn:
     """A registered function: `f` the numpy twin of x -> output, the series `post` (output units, c0 not halved) on
     t = amp sin(2 pi x / 2^cf); `kind` table | sign | smooth with its decision data in `meta`."""
 
-    def __init__(self, f, cf, amp, post, complex, kind, **meta):
+    def __init__(self, f, cf, amp, post, complex, kind, table="k32", **meta):
         self.f, self.cf, self.amp, self.post, self.complex, self.kind = f, int(cf), float(amp), post, bool(complex), kind
+        self.table = str(table)            # the EvalMod table (TABLES)
         self.meta = meta
+
+    @property
+    def center(self):
+        """The bootstrap reads x - center (`meta["center"]`); `f` takes the centred input."""
+        return float(self.meta.get("center", 0.0))
 
 
 def _preset():
@@ -117,7 +123,7 @@ def _cheb_fit_step(deg, gap_t, lo, hi):
     return c
 
 
-def register_sign(name, lo=0.0, hi=1.0, deg=127, gap=0.1, sigma_in=None, check=True):
+def register_sign(name, lo=0.0, hi=1.0, deg=127, gap=0.1, sigma_in=None, check=True, table="k32"):
     """The step (`lo` for x < 0, `hi` for x >= 0) on |x| < 2, exact to ~2e-5 outside |x| < `gap` (in between it moves
     from lo to hi); beyond |x| = 2 it follows sin(pi x / 4) (period 8: inputs must stay in (-2, 2))."""
     gap_t = float(np.sin(np.pi * gap / 4.0))
@@ -128,14 +134,33 @@ def register_sign(name, lo=0.0, hi=1.0, deg=127, gap=0.1, sigma_in=None, check=T
 
     def f(x, c=c):
         return C.chebval(np.sin(np.pi * np.asarray(x, dtype=np.float64) / 4.0), c)
-    fn = Fn(f, SIGN_CF, 1.0, [float(v) for v in post], False, "sign", lo=float(lo), hi=float(hi), gap=float(gap))
+    fn = Fn(f, SIGN_CF, 1.0, [float(v) for v in post], False, "sign", table=table, lo=float(lo), hi=float(hi),
+            gap=float(gap))
     return _register(name, fn, sigma_in, check)
 
 
-def register_table(name, values, complex=False, sigma_in=None, check=True):
+def _flat_series(v, t):
+    """Hermite interpolant (degree 2t - 1, Chebyshev coefficients, numpy convention) of the table on the nodes
+    s_j = sin(pi j / t), |j| <= t/2, with zero slope at the interior nodes (the end nodes are flat in x already: ds/dx
+    = 0 there): an input error e moves the output by O(e^2) instead of O(e), so chained lookups clean their noise
+    (Alexandru-Kim-Polyakov's flattened interpolation, ePrint 2024/1623)."""
+    from numpy.polynomial import chebyshev as C
+    h = t // 2
+    s = np.sin(np.pi * np.arange(-h, h + 1) / t)
+    deg = 2 * t - 1
+    eye = np.eye(deg + 1)
+    d = np.stack([C.chebval(s[1:-1], C.chebder(eye[k])) for k in range(deg + 1)], 1)
+    a = np.vstack([C.chebvander(s, deg), d])
+    return np.linalg.solve(a, np.concatenate([np.asarray(v, dtype=np.float64), np.zeros(t - 1)]))
+
+
+def register_table(name, values, complex=False, sigma_in=None, check=True, table="k32", flat=False):
     """A lookup table: input j (an integer, |j| <= t/2, t = len(values) - 1 a power of two >= 4) -> values[j + t/2].
     Phase j q0 / 2t (cf = log2 2t), A = 1: EvalMod reads s = sin(pi j / t), the Chebyshev extrema of degree t, and the
-    series is the table's degree-t interpolant on them (DCT-I). Inputs off the integers move along the interpolant."""
+    series is the table's degree-t interpolant on them (DCT-I). Inputs off the integers move along the interpolant.
+    `flat`: the degree-(2t - 1) interpolant with zero slope at the nodes instead (`_flat_series`; one more level): the
+    input's noise reaches the output squared, which chained lookups need (a plain table's slope at a node is up to ~6
+    per input unit, and a chain multiplies it)."""
     v = np.asarray(values, dtype=np.float64)
     t = len(v) - 1
     if t < 4 or t & (t - 1):
@@ -148,13 +173,50 @@ def register_table(name, values, complex=False, sigma_in=None, check=True):
     post[t] *= 0.5
     cf = int(math.log2(2 * t))
     from numpy.polynomial import chebyshev as C
+    if flat:
+        post = _flat_series(v[t - k][::-1], t)
+        post[0] *= 2.0
     c = post.copy()
     c[0] /= 2.0
 
     def f(x, c=c, t=t):
         return C.chebval(np.sin(np.pi * np.asarray(x, dtype=np.float64) / t), c)
-    fn = Fn(f, cf, 1.0, [float(x) for x in post], complex, "table", values=v, h=h)
+    fn = Fn(f, cf, 1.0, [float(x) for x in post], complex, "table", table=table, values=v, h=h, flat=bool(flat))
     return _register(name, fn, sigma_in, check)
+
+
+TABLES = {"k32": 32, "k32d3": 32, "k28d1": 28}   # FBS EvalMod tables -> their ModRaise K
+# (pc_core::bts_setup::fbs_evalmod_table): k32d3 (degree-59 cosine, 3 double angles) lands two composite levels
+# shallower than k32, k28d1 (K 28, degree 119, 1 double angle; overflow 2^-137.8 per bootstrap) three: chained lookups
+INPUT_CAP = _N32_CAP          # the deepest level an FBS input may sit at
+
+
+def register_lut(name, fn, lo, hi, table="k32", complex=False, sigma_in=None, check=True, flat=True):
+    """A table on the integers lo..hi: `fn(j)` (vectorized numpy) -> output. The bootstrap reads j - center, center =
+    lo + t/2, t the smallest power of two >= max(4, hi - lo); entries past hi repeat fn(hi). The numpy twin takes the
+    centred input j - center (`Fn.center`, as every centred function's)."""
+    t = 4
+    while t < hi - lo:
+        t *= 2
+    center = lo + t // 2
+    j = np.arange(lo, lo + t + 1)
+    vals = np.asarray(fn(np.minimum(j, hi)), dtype=np.float64)
+    register_table(name, vals, complex=complex, sigma_in=sigma_in, check=False, table=table, flat=flat)
+    f0 = FUNCS[name]
+    f0.meta["center"] = float(center)
+    f0.meta["lo"], f0.meta["hi"] = int(lo), int(hi)
+    if check:
+        r = p_fail(name, sigma_in=sigma_in)
+        if not r["ok"]:
+            warnings.warn(f"fbs {name!r}: p_fail per ciphertext 2^{r['log2_ct']:.1f} is not below 2^{P_FAIL_MAX:.0f}",
+                          RuntimeWarning, stacklevel=2)
+    return name
+
+
+def chain_slack(name):
+    """Levels between the FBS output and the next FBS's input cap (INPUT_CAP - landing): >= 0 chains with no plain
+    refresh; the levels are what integer arithmetic between two lookups may spend."""
+    return INPUT_CAP - landing(name)[0]
 
 
 def sign_error(name, gap):
@@ -234,12 +296,12 @@ def noise(name, sigma_in=None, h=H_SPARSE, preset=None):
     fn = FUNCS[name]
     s = SIGMA_IN if sigma_in is None else float(sigma_in)
     preset = preset or _preset()
-    key = (name, s, int(h), preset)
+    key = (name, s, int(h), preset, fn.table, len(fn.post))
     if key not in _NOISE:
         from perseus import _pc
         xs = _grid(fn)
         r = dict(_pc.fbs_noise(preset, fn.cf, fn.amp, [c / 2.0 ** fn.cf for c in fn.post], [float(x) for x in xs], s,
-                               int(h), **_trig_kw(fn)))
+                               int(h), table=fn.table, **_trig_kw(fn)))
         r.pop("by_i", None)
         r["xs"] = xs
         for k_ in ("lo", "hi", "sigma"):
@@ -279,7 +341,7 @@ def p_fail(name, margin=None, sigma_in=None, h=H_SPARSE, slots=None, preset=None
     lp = 1.0 + _log2_q(m / phase_x)
     room = spacing / 2.0 - dev
     lout = (1.0 + _log2_q(room / out_sigma)) if room > 0 else 0.0
-    lov = log2_overflow(h)
+    lov = log2_overflow(h, TABLES.get(fn.table, K))
     gauss = _log2_add(lp, lout)
     n = int(slots) if slots is not None else (2 ** LOG_N if fn.complex else 2 ** (LOG_N - 1))
     ct = min(0.0, _log2_add(gauss + math.log2(n), lov + LOG_N))
@@ -299,7 +361,7 @@ def error_bound(name, log2_tail=-128.0, sigma_in=None, h=H_SPARSE, preset=None):
     sg = float(r["sigma"].max())
     z = _z_of_log2_tail(log2_tail)
     return {"bound": dev + z * sg, "approx": dev, "sigma": sg, "z": z, "log2_tail": log2_tail,
-            "log2_overflow": log2_overflow(h) + LOG_N}
+            "log2_overflow": log2_overflow(h, TABLES.get(fn.table, K)) + LOG_N}
 
 
 # ── capture ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -308,10 +370,11 @@ def landing(name):
     """(level, deg) of the FBS output on the session's chain (CHAIN_PRESET, default n32); refused off n32 / n32a4."""
     fn = FUNCS[name]
     preset = _preset()
-    key = (preset, name)
+    key = (preset, name, fn.table, len(fn.post))
     if key not in _LAND:
         from perseus import _pc
-        _LAND[key] = tuple(_pc.fbs_landing(preset, fn.amp, [c / 2.0 ** fn.cf for c in fn.post], **_trig_kw(fn)))
+        _LAND[key] = tuple(_pc.fbs_landing(preset, fn.amp, [c / 2.0 ** fn.cf for c in fn.post], table=fn.table,
+                                           **_trig_kw(fn)))
     return _LAND[key]
 
 
@@ -336,6 +399,8 @@ def desc(name):
         d["trig"] = {"post_s": kw["post_s"], "off": kw["off"], "deg": kw["tdeg"], "da": kw["tda"]}
     if kw.get("paired"):
         d["paired"] = True
+    if fn.table != "k32":
+        d["table"] = fn.table
     return d
 
 
