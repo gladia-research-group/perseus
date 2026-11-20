@@ -105,6 +105,31 @@ pub const EVALMOD_K: f64 = 16.0;
 /// Double-angle iterations after the shipped series.
 pub const EVALMOD_DA_ITS: u32 = 5;
 
+/// The functional bootstrap's EvalMod series (K = 32: ModRaise overflow ~2^-291 per bootstrap at h = 32, vs 2^-23.4 at
+/// K = 16): degree-14 Chebyshev refit of (2 pi)^(-1/64) cos(2 pi (32 y - 1/4) / 64) (fit 2.5e-10), followed by
+/// `EVALMOD_K32_DA_ITS` double angles. Same evaluator convention as `EVALMOD_CHEB`.
+pub const EVALMOD_K32_CHEB: [f64; 15] = [
+    -5.91081048541635345e-01,
+    1.35741624791429309e-02,
+    -9.43100000530422977e-01,
+    -1.59036318459664580e-02,
+    2.94187343827178427e-01,
+    2.48677004038857456e-03,
+    -2.82598733766928067e-02,
+    -1.63125202693298853e-04,
+    1.35242431621899941e-03,
+    5.96179046332883096e-06,
+    -3.90404688950024618e-05,
+    -1.39507974576423330e-07,
+    7.56018054080902762e-07,
+    2.27345861483012922e-09,
+    -1.06271443680309545e-08,
+];
+/// EvalMod K of `EVALMOD_K32_CHEB`.
+pub const EVALMOD_K32: f64 = 32.0;
+/// Double-angle iterations after `EVALMOD_K32_CHEB`.
+pub const EVALMOD_K32_DA_ITS: u32 = 6;
+
 /// The frozen EvalMod coefficient table (see `EVALMOD_CHEB`).
 pub fn evalmod_coeffs() -> &'static [f64] {
     &EVALMOD_CHEB

@@ -644,7 +644,12 @@ impl StcFirstPlan {
             b += StcHighPlan::<W>::bytes(&lay, &primes, h, &geoms, self.dense.setup.level_budget[1] as usize, self.dense.chain.level_unit, self.dense.chain.lone_top(), k_max)?;
         }
         r.add("bts.stc_first", b);
-        Ok((r, ws))
+        // the StC stages' giants (the dense plan counts them on its StC-last stages, which a functional bootstrap
+        // does not lay out)
+        let g = Layout::from_chain(&self.dense.chain);
+        let f = cts_stc_factors(g.n, (g.n / 2) as u32, self.dense.setup.level_budget, self.dense.setup.dim1, 1.0, super::stc::scale_dec(&ScaleTables::precompute(&self.dense.chain)?))?;
+        let g_stc = f.fides_layout().stc.iter().map(|fs| LtGeom::from_fides(fs).g).max().unwrap_or(1);
+        Ok((r, BtsWorkShape { g_max: ws.g_max.max(g_stc), ..ws }))
     }
 
     /// Device tables (after `MemPlan::allocate`, before `Arena::freeze`). `keys` must hold every CtS and StC
@@ -1564,5 +1569,142 @@ mod tests {
         assert!(StcFirstPlan::new(&chain, &setup, &StcFirstSetup::n32_shipped()).unwrap().input_own.is_empty());
         let n32 = Chain::generate(&ChainSpec::n32()).unwrap();
         assert!(StcFirstPlan::new(&n32, &setup, &sf).unwrap().input_own.is_empty());
+    }
+}
+
+// ── functional bootstrapping on the route ───────────────────────────────────────────────────────────────────────
+
+/// The chains a functional bootstrap is validated on: composite degree 2, 32-bit words, no alternating single-prime
+/// user region (`ChainSpec::sp`) and no reduced special-prime tiers (`ChainSpec::low_p`): n32 and n32a4. On an
+/// alternating region the series would step single-prime levels the EvalMod builder does not lay out; the device
+/// output there was measured wrong, so it is refused rather than run.
+pub fn fbs_chain_check(chain: &Chain) -> Result<()> {
+    let s = &chain.spec;
+    let why = if s.composite_degree != 2 || s.word != pc_core::word::WordId::U32 {
+        Some("not a composite-degree-2 32-bit chain")
+    } else if s.sp.is_some() {
+        Some("an alternating single-prime user region (sp)")
+    } else if s.low_p.is_some() {
+        Some("reduced special-prime tiers (low_p)")
+    } else {
+        None
+    };
+    match why {
+        Some(w) => Err(shape("fbs", format!("functional bootstrapping is validated on n32 / n32a4 only; this chain has {w}"))),
+        None => Ok(()),
+    }
+}
+
+/// A functional bootstrap (FBS) of the StC-first route: the variant's StC-first input and CtS stages, then ModRaise at
+/// the FBS table's K and an EvalMod whose sine (amplitude `amp`) feeds the Chebyshev series `post` on [-1, 1]
+/// (Alexandru-Kim-Polyakov, ePrint 2024/1623; `pc_shadow::evalmod::PsPlan::fbs`). The output lands as the variant's
+/// EvalMod output, deeper by the series (`FbsHost::out`).
+#[derive(Clone, Debug)]
+pub struct FbsSpec {
+    /// EvalMod table (evaluator convention), its K and double angles (`pc_core::bts_setup::EVALMOD_K32_CHEB`, 32, 6).
+    pub table: Vec<f64>,
+    pub k: f64,
+    pub da_its: u32,
+    pub amp: f64,
+    pub post: Vec<f64>,
+    /// Raise variant the FBS runs on.
+    pub drop: u32,
+    /// Build the complex (two-chain) / real-payload EvalMod.
+    pub complex: bool,
+    pub real: bool,
+}
+
+/// An FBS's host side (no device memory).
+#[derive(Clone, Debug)]
+pub struct FbsHost {
+    pub spec: FbsSpec,
+    pub variant: usize,
+    pub raise_top: usize,
+    pub exact: f64,
+    pub em_in: FMeta,
+    pub out: FMeta,
+    pub ps: pc_shadow::evalmod::PsPlan,
+    pub em_slots: usize,
+}
+
+/// An FBS's device tables.
+pub struct FbsPrecomp<'a, W: DevWord> {
+    pub host: FbsHost,
+    pub raise: RaisePlan<'a, W>,
+    pub em: Option<EvalModPlan<'a, W>>,
+    pub em_real: Option<EvalModPlan<'a, W>>,
+}
+
+impl StcFirstPlan {
+    /// The host side of an FBS on this plan's variant `spec.drop`.
+    pub fn fbs_host(&self, spec: &FbsSpec) -> Result<FbsHost> {
+        fbs_chain_check(&self.dense.chain)?;
+        let variant = self.dense.variants.iter().position(|v| v.drop == spec.drop).ok_or_else(|| shape("fbs", format!("raise drop {} has no variant", spec.drop)))?;
+        let v = &self.dense.variants[variant];
+        let ps = pc_shadow::evalmod::PsPlan::fbs(&spec.table, spec.da_its, spec.amp, &spec.post)?;
+        let st = ScaleTables::precompute(&self.dense.chain)?;
+        let (_, out, em_slots) = EvalModPlan::<u32>::program(&st, v.em_in, &ps, spec.da_its)?;
+        // the post-raise constant scales by 1 / K: the shipped table's K folded out, the FBS table's in
+        let exact = v.exact * self.dense.setup.boot_k / spec.k;
+        Ok(FbsHost { spec: spec.clone(), variant, raise_top: v.raise_top, exact, em_in: v.em_in, out, ps, em_slots })
+    }
+
+    /// Device bytes of an FBS's tables and the EvalMod work it needs (`BtsWorkShape`, merged with the route's).
+    pub fn fbs_mem<W: DevWord>(&self, h: &FbsHost) -> Result<(usize, BtsWorkShape)> {
+        let lay = Layout::from_chain(&self.dense.chain);
+        let st = ScaleTables::precompute(&self.dense.chain)?;
+        let k_max = self.dense.setup.k_max;
+        let em = EvalModPlan::<W>::table_bytes(&st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)?;
+        let b = RaisePlan::<W>::table_bytes() + em * (h.spec.complex as usize + h.spec.real as usize);
+        let mode = if h.spec.complex { EmMode::Complex } else { EmMode::Real };
+        let (n, kk) = super::evalmod::em_work(h.em_slots, k_max, mode);
+        Ok((b, BtsWorkShape { k_max, g_max: 2, em_slots: n, em_kk: kk, spare: 0 }))
+    }
+}
+
+impl<'a, W: DevWord, M: DevStrategy<W>> StcFirstRoute<'a, W, M> {
+    /// The device tables of an FBS (after `MemPlan::allocate`, before `Arena::freeze`; `fbs_mem` reserved them).
+    pub fn build_fbs(&self, arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, keys: &dyn BtsKeyRing, stage_ptrs: Option<(*const std::ffi::c_void, *const std::ffi::c_void)>, h: &FbsHost) -> Result<FbsPrecomp<'a, W>> {
+        let setup = &self.setup;
+        let em_k = |mode| {
+            let mut em = EvalModPlan::new(arena, s, ctx, mode, h.em_in, &h.ps, h.spec.da_its, keys.conj()?, keys.relin()?, stage_ptrs, setup.k_max, setup.em_relin)?;
+            em.fuse_rescale = setup.em_fuse_rescale;
+            em.attach_level_keys(arena, s, ctx, keys, stage_ptrs)?;
+            Ok::<_, Error>(em)
+        };
+        Ok(FbsPrecomp {
+            host: h.clone(),
+            raise: RaisePlan::new(arena, s, ctx, h.raise_top, h.exact, setup.cts0_t)?,
+            em: if h.spec.complex { Some(em_k(EmMode::Complex)?) } else { None },
+            em_real: if h.spec.real { Some(em_k(EmMode::Real)?) } else { None },
+        })
+    }
+
+    /// An FBS from the split (`BtsCall::stc_first_input` done on `st`, the call's route at the FBS's raise drop):
+    /// ModRaise at the FBS's K, the variant's CtS stages, the FBS EvalMod (`st.real`: the real chain), the StC-first
+    /// output (x 2^CF). The ciphertexts land at `fbs.host.out`.
+    pub fn run_fbs(&self, cx: &mut BtsCx<'_, 'a, W, M>, st: &BtsState, cts: &mut [Ct<'a, W>], fbs: &FbsPrecomp<'a, W>) -> Result<()> {
+        if !st.stc_first || st.variant != fbs.host.variant {
+            return Err(shape("fbs", format!("call on variant {} (StC-first {}), the FBS was built for variant {}", st.variant, st.stc_first, fbs.host.variant)));
+        }
+        let prescaled = st.prescaled || st.stc_folded;
+        let encaps = self.encaps.as_ref().ok_or_else(|| no_stage("stc_first", "fbs mod_raise (built without encapsulation keys)"))?;
+        let stop = if self.setup.merge_s2d { raise::RaiseStop::Scaled } else { raise::RaiseStop::Done };
+        raise::raise_to(cx, &fbs.raise, Some(encaps), self.setup.ks_source, cts, if prescaled { None } else { Some(st.correction) }, stop)?;
+        for stage in &self.variants[st.variant].cts {
+            run_lt(cx, stage, cts, self.setup.ks_source)?;
+        }
+        let em = if st.real { fbs.em_real.as_ref() } else { fbs.em.as_ref() }.ok_or_else(|| shape("fbs", format!("EvalMod (real {}) not built", st.real)))?;
+        let ctx = cx.ctx;
+        for x in cts.iter_mut() {
+            let f = FMeta { top: pc_shadow::meta::top_limb(ctx.shape, x.meta.level)? as i32, nl: x.meta.deg as i32, nf: x.meta.nf };
+            if f.top != em.in_meta.top || f.nl != em.in_meta.nl || f.nf.to_bits() != em.in_meta.nf.to_bits() {
+                return Err(shape("fbs eval_mod", format!("input {f:?}, the program was built for {:?}", em.in_meta)));
+            }
+            let k = x.k();
+            em.run(cx, &mut x.buf, k)?;
+            Self::set_meta(cx, x, em.out_meta)?;
+        }
+        Staged::stc_first_output(self, cx, st, cts)
     }
 }

@@ -1881,6 +1881,96 @@ pub fn layout_rows(lay: &Layout) -> usize {
 mod tests {
     use super::*;
 
+    /// OpenFHE convention (c0 not halved).
+    fn chebval(x: f64, c: &[f64]) -> f64 {
+        let (mut b1, mut b2) = (0.0, 0.0);
+        for &ck in c.iter().skip(1).rev() {
+            let b0 = 2.0 * x * b1 - b2 + ck;
+            b2 = b1;
+            b1 = b0;
+        }
+        x * b1 - b2 + c[0] / 2.0
+    }
+
+    /// A functional bootstrap's EvalMod program (sine at amplitude A, then a series with a large constant) replayed
+    /// exactly on a plaintext at every executor stage (recorded, fused, rewritten + scheduled, buffer-assigned)
+    /// against the real-number composition it encodes.
+    #[test]
+    fn fbs_program_stages_exact() {
+        use pc_shadow::evalmod::sim;
+        let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::n32()).expect("n32");
+        let st = pc_core::scale::ScaleTables::precompute(&chain).expect("tables");
+        let base = crate::bts::BtsSetup::n32_shipped();
+        let mut b2 = base.clone();
+        b2.raise_drops = vec![0, 1];
+        let ems: Vec<FMeta> = crate::bts::dense::DensePlan::new(&chain, &b2).expect("dense plan").variants.iter().map(|v| v.em_in).collect();
+        let da = base.evalmod_da_its;
+        // a GELU-like smooth series of degree 342 on the FBS warp (x sigmoid(1.702 x), X = 118, cf 9)
+        let gl: Vec<f64> = {
+            let (x_max, g) = (118.05f64, 512.0f64);
+            let a = (2.0 * std::f64::consts::PI * x_max / g).sin();
+            let n = 343usize;
+            let f = |s: f64| {
+                let x = g * (s * a).asin() / (2.0 * std::f64::consts::PI);
+                x / (1.0 + (-1.702 * x).exp()) / 128.0
+            };
+            (0..n).map(|k| (0..n).map(|j| { let th = std::f64::consts::PI * (j as f64 + 0.5) / n as f64; f(th.cos()) * (k as f64 * th).cos() }).sum::<f64>() * 2.0 / n as f64).collect()
+        };
+        let mut ps_gl = PsPlan::fbs(&base.evalmod_coeffs, da, 1.0075, &gl).expect("gelu-like plan");
+        ps_gl.post = gl.clone();
+        for (name, ps_x, em_in) in [("gelu-like 342", ps_gl, ems[1])] {
+            let (prog, out) = build_evalmod_opts(&st, em_in, &ps_x, da as i32, true).expect("program");
+            let (rw, rc) = rewrite(prog.fused(), &prog.consts, &st.q);
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let a = (1.0075 * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
+            let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
+            let mut emax: f64 = 0.0;
+            for i in 0..=8 {
+                let u = -0.12 + 0.03 * i as f64;
+                let mut y = chebval(u, &bc);
+                for j in 1..=da as i32 {
+                    y = 2.0 * y * y - 1.0075f64.powf(2f64.powi(j - da as i32));
+                }
+                let want = chebval(y, &gl);
+                let mut bufs = vec![sim::encode(u * em_in.nf, &st.q)];
+                sim::run(&st, &asg, &rc, &mut bufs);
+                emax = emax.max((sim::decode(&st, &bufs[0], out.top, out.nl, out.nf) - want).abs());
+            }
+            println!("fbs {name} assigned: max err {emax:.3e} (out {out:?})");
+            assert!(emax < 1e-9, "{name}: {emax:.3e}");
+        }
+        for (deg, c0, amp, em_in) in [(16usize, 0.0, 1.0, ems[0]), (16, 1.0, 1.0, ems[0]), (16, 8.0 / 128.0, 1.07, ems[0]), (16, 8.0 / 128.0, 1.07, ems[1]), (64, 0.5, 1.0, ems[1]), (64, 2.0, 1.07, ems[0]), (284, 0.25, 1.0076, ems[1])] {
+            let cf = 2f64.powi(-7);
+            let mut post: Vec<f64> = (0..=deg).map(|i| cf * 0.3 * 0.97f64.powi(i as i32) * (1.0 + i as f64).sin()).collect();
+            post[0] = c0;
+            let ps = PsPlan::fbs(&base.evalmod_coeffs, da, amp, &post).expect("fbs plan");
+            let (prog, out) = build_evalmod_opts(&st, em_in, &ps, da as i32, true).expect("program");
+            let fused = prog.fused();
+            let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
+            let sch = schedule_relin_rescales(rw, st.d);
+            let (asg, _) = assign_buffers(sch.clone());
+            let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
+            let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
+            for (name, ops, consts, outbuf) in [("raw", &prog.ops, &prog.consts, 0usize), ("fused", &fused, &prog.consts, 0), ("scheduled", &sch, &rc, 0), ("assigned", &asg, &rc, 0)] {
+                let mut emax: f64 = 0.0;
+                for i in 0..=8 {
+                    let u = -0.12 + 0.03 * i as f64;
+                    let mut y = chebval(u, &bc);
+                    for j in 1..=da as i32 {
+                        y = 2.0 * y * y - amp.powf(2f64.powi(j - da as i32));
+                    }
+                    let want = chebval(y, &post);
+                    let mut bufs = vec![sim::encode(u * em_in.nf, &st.q)];
+                    sim::run(&st, ops, consts, &mut bufs);
+                    let got = sim::decode(&st, &bufs[outbuf], out.top, out.nl, out.nf);
+                    emax = emax.max((got - want).abs());
+                }
+                println!("fbs deg {deg} c0 {c0} amp {amp} {name}: max err {emax:.3e} (out {out:?})");
+                assert!(emax < 1e-9, "fbs deg {deg} c0 {c0} {name}: {emax:.3e}");
+            }
+        }
+    }
+
     /// Liveness assignment on the shipped programs: fewer buffers, and every op's operands stay distinct where they
     /// were distinct before (no new aliasing inside an op).
     #[test]

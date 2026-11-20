@@ -88,7 +88,7 @@ impl DensePlan {
         let shp = sh.cfg.chain;
         let d = chain.level_unit;
         let n = chain.n;
-        let ps = PsPlan::from_coeffs(&setup.evalmod_coeffs)?;
+        let ps = if setup.evalmod_post.is_empty() { PsPlan::from_coeffs(&setup.evalmod_coeffs)? } else { PsPlan::fbs(&setup.evalmod_coeffs, setup.evalmod_da_its, setup.evalmod_amp, &setup.evalmod_post)? };
         let mut qd = chain.q[0] as f64;
         for j in 1..d {
             qd *= chain.q[j] as f64;
@@ -139,11 +139,14 @@ impl DensePlan {
             let em_in = to_f(shp, &m)?;
             let (_, em_out, em_slots) = EvalModPlan::<u32>::program(&st, em_in, &ps, setup.evalmod_da_its)?;
             let mo = from_f(shp, em_out)?;
-            let slev = stc_stage_levels(&st, mo.level, mo.deg, lay.stc.len() as u32)?;
+            // a functional bootstrap runs on the StC-first route only: its deep EvalMod leaves no room for the
+            // shipped StC stages behind it, which are not laid out
+            let fbs = !setup.evalmod_post.is_empty();
+            let slev = if fbs { vec![] } else { stc_stage_levels(&st, mo.level, mo.deg, lay.stc.len() as u32)? };
             let mut m = if mo.deg == 2 { sh.rescale(&mo)?.out } else { mo };
             let mut stc = Vec::new();
             let nst = lay.stc.len();
-            for (e, fs) in lay.stc.iter().enumerate() {
+            for (e, fs) in lay.stc.iter().enumerate().take(if fbs { 0 } else { nst }) {
                 let lv = slev[e];
                 let top = pc_shadow::meta::top_limb(shp, m.level)?;
                 if lv.top > top {
@@ -159,13 +162,13 @@ impl DensePlan {
                 }
             }
             let stc_real0 = match &real0 {
-                Some(v) => {
+                Some(v) if !stc.is_empty() => {
                     let s0 = &stc[0];
                     let (geom, coeffs) = fold_periodic_giants(n, LtGeom::from_fides(&lay.stc[0]), diag_coeffs(chain, v, if nst == 1 { s0.nf * fdrop } else { s0.nf })?);
                     debug_assert_eq!(geom, s0.geom);
                     Some(LtHost { geom, top: s0.top, end: s0.end, nf: s0.nf, width: stage_width(n, &coeffs), coeffs })
                 }
-                None => None,
+                _ => None,
             };
             variants.push(VariantHost { drop, raise_top, exact, cts, stc, stc_real0, raised, em_in, em_out, em_slots, out: to_f(shp, &m)? });
         }

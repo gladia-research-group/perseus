@@ -118,6 +118,10 @@ pub struct BtsSetup {
     pub evalmod_coeffs: Vec<f64>,
     pub evalmod_da_its: u32,
     pub boot_k: f64,
+    /// Functional bootstrapping (`PsPlan::fbs`): a Chebyshev series applied to EvalMod's sine at amplitude
+    /// `evalmod_amp`; empty = the plain bootstrap.
+    pub evalmod_post: Vec<f64>,
+    pub evalmod_amp: f64,
     /// Build the real-payload variants (FIDESLIB_BTS_REAL: StC stage 0 for `Route::real`).
     pub real: bool,
     /// Ciphertexts per launch the work buffers are sized for (`cfg.bts.k_max`, <= `MemCfg::k_max`).
@@ -164,6 +168,8 @@ impl BtsSetup {
             evalmod_coeffs: pc_core::bts_setup::evalmod_coeffs().to_vec(),
             evalmod_da_its: pc_core::bts_setup::EVALMOD_DA_ITS,
             boot_k: pc_core::bts_setup::EVALMOD_K,
+            evalmod_post: vec![],
+            evalmod_amp: 1.0,
             real: true,
             k_max: 8,
             ks_source: KskSource::Regen,

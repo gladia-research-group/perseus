@@ -55,13 +55,35 @@ pub struct PsPlan {
     /// The series itself (needed by the general m > 2 / recursive shape; empty for dumped single-level plans).
     #[serde(default)]
     pub coeffs: Vec<f64>,
+    /// Functional bootstrapping: the amplitude A of EvalMod's sine (the series and double angles rescaled, so
+    /// EvalMod returns A sin(2 pi x)); 0 = the shipped 1 / (2 pi).
+    #[serde(default)]
+    pub amp: f64,
+    /// Functional bootstrapping: a Chebyshev series on [-1, 1] applied to the EvalMod output (empty: none).
+    #[serde(default)]
+    pub post: Vec<f64>,
 }
 
 impl PsPlan {
     /// The plan for a Chebyshev coefficient table, computed by OpenFHE's long divisions (`pc_core::cheb`).
     pub fn from_coeffs(coefficients: &[f64]) -> pc_core::error::Result<Self> {
         let p = pc_core::cheb::PsPlan::new(coefficients)?;
-        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec() })
+        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec(), amp: 0.0, post: vec![] })
+    }
+
+    /// Functional bootstrapping (Alexandru-Kim-Polyakov, ePrint 2024/1623; here a real Chebyshev series on the
+    /// sine instead of their power series on the complex exponential): `base` (a shipped EvalMod table, amplitude
+    /// (2 pi)^(-2^-da_its)) rescaled to amplitude `amp`, the double angles at that amplitude, then `post` on
+    /// A sin(2 pi x). A table on |j| <= t/2 at phase j q0 / 2t and A = 1 reads s = sin(pi j / t): the nodes of a
+    /// degree-t Chebyshev interpolation; a smooth f on |x| <= X at phase x q0 / G with A = 1 / sin(2 pi X / G) reads
+    /// t in [-1, 1] (f(G asin(t / A) / 2 pi), interpolated on [-1, 1]).
+    pub fn fbs(base: &[f64], da_its: u32, amp: f64, post: &[f64]) -> pc_core::error::Result<Self> {
+        let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da_its) as f64);
+        let c: Vec<f64> = base.iter().map(|x| x * a).collect();
+        let mut p = Self::from_coeffs(&c)?;
+        p.amp = amp;
+        p.post = post.to_vec();
+        Ok(p)
     }
 
     /// The EvalMod plan of the shipped bootstrap (degree 14, K=16 table).
@@ -69,6 +91,9 @@ impl PsPlan {
         Self::from_coeffs(pc_core::bts_setup::evalmod_coeffs()).expect("frozen EvalMod table has a PS plan")
     }
 }
+
+/// Sources per `WSum` op (the device kernel's bound).
+pub const WSUM_MAX: usize = 8;
 
 /// Metadata replay + op recording (one chain).
 pub struct Builder<'s> {
@@ -273,8 +298,23 @@ impl<'s> Builder<'s> {
         }
         self.square(dst)
     }
-    /// Ciphertext::evalLinearWSumMutable
+    /// Ciphertext::evalLinearWSumMutable; more than `WSUM_MAX` sources (the kernel bound; the long series of a
+    /// functional bootstrap) as sums of chunks added up.
     pub fn wsum(&mut self, dst: usize, srcs: &[usize], w: &[f64]) -> Result<()> {
+        if srcs.len() <= WSUM_MAX {
+            return self.wsum_one(dst, srcs, w);
+        }
+        self.wsum_one(dst, &srcs[..WSUM_MAX], &w[..WSUM_MAX])?;
+        let lv = self.metas[dst].top;
+        for (cs, cw) in srcs[WSUM_MAX..].chunks(WSUM_MAX).zip(w[WSUM_MAX..].chunks(WSUM_MAX)) {
+            let t = self.fresh();
+            self.metas[t] = FMeta { top: lv, nl: 1, nf: 1.0 };
+            self.wsum_one(t, cs, cw)?;
+            self.add(dst, t)?;
+        }
+        Ok(())
+    }
+    fn wsum_one(&mut self, dst: usize, srcs: &[usize], w: &[f64]) -> Result<()> {
         if self.metas[dst].top == -1 {
             self.metas[dst].top = self.metas[srcs[0]].top;
             self.metas[dst].nl = 1;
@@ -841,10 +881,15 @@ fn inner_ps(
 
 /// applyDoubleAngleIterations
 pub fn build_double_angle(b: &mut Builder, x: usize, its: i32) -> Result<()> {
+    build_double_angle_amp(b, x, its, 0.0)
+}
+
+/// applyDoubleAngleIterations at output amplitude `amp` (0: the shipped 1 / (2 pi)).
+pub fn build_double_angle_amp(b: &mut Builder, x: usize, its: i32, amp: f64) -> Result<()> {
     let r = its;
     for j in 1..=r {
         b.square(x)?;
-        let scalar = -1.0 / (2.0 * std::f64::consts::PI).powf(2f64.powf((j - r) as f64));
+        let scalar = if amp > 0.0 { -amp.powf(2f64.powf((j - r) as f64)) } else { -1.0 / (2.0 * std::f64::consts::PI).powf(2f64.powf((j - r) as f64)) };
         b.add(x, x)?;
         b.add_scalar(x, scalar)?;
     }
@@ -862,7 +907,10 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     b.lean = lean;
     let x = b.input(input);
     build_chebyshev(&mut b, x, ps)?;
-    build_double_angle(&mut b, x, double_angle_its)?;
+    build_double_angle_amp(&mut b, x, double_angle_its, ps.amp)?;
+    if !ps.post.is_empty() {
+        build_chebyshev_general(&mut b, x, &ps.post)?;
+    }
     let out = b.metas[x];
     Ok((b.prog, out))
 }
@@ -958,6 +1006,16 @@ mod general_ps_tests {
         assert_eq!((c.metas[xc].top, c.metas[xc].nl, c.metas[xc].nf.to_bits()), (a.metas[xa].top, a.metas[xa].nl, a.metas[xa].nf.to_bits()));
         let rescales = |p: &EmProgram| p.ops.iter().filter(|o| matches!(o, EmOp::Rescale { .. })).count();
         assert!(rescales(&c.prog) < rescales(&a.prog));
+    }
+
+    /// The shipped tables never reach `wsum`'s chunked path (> WSUM_MAX sources, a functional bootstrap's long series):
+    /// every weighted sum reads T's of the baby-step basis, at most k of them, and k <= WSUM_MAX for each.
+    #[test]
+    fn shipped_tables_below_the_wsum_split() {
+        for c in [&pc_core::bts_setup::EVALMOD_CHEB[..], &pc_core::bts_setup::SPARSE_B_CHEB_K24[..], &pc_core::bts_setup::SPARSE_B_K16_W14[..]] {
+            let k = PsPlan::from_coeffs(c).unwrap().k;
+            assert!(k <= WSUM_MAX, "degree {}: k {k}", c.len() - 1);
+        }
     }
 
     /// SparseB's K = 24 degree-20 series (m = 3, recursive PS) builds; depth as FIDESlib's.
