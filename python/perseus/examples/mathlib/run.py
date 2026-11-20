@@ -38,10 +38,6 @@ class TaskNet:
 
     def stages(self):
         def stage(ops, xs):
-            # planner limitation (main c7316a70): a stage whose fresh input is first read by a product fails the
-            # compiled level check (the planner seeds the input one unit richer than it is; fixed on the
-            # impl-linalg-fourier branch). An exact zero added first makes the first consumer an addition.
-            xs = [ops.add_pt(x, np.zeros(T.SLOTS), kind="mask") for x in xs]
             return self.task.run(ops, xs)
         return [(self.task.name, stage)]
 
@@ -99,6 +95,8 @@ def _twin(a, net):
         line = _plan_cmd(a.plan).get("runtime")
         over = {**(_runtime_line(line) if line else {}), **over}
     over.setdefault("AUTO_BTS_LEVEL", str(a.twin_limit))
+    # the twin lands the code's own refreshes where the compiled runtime's routes do
+    over.setdefault("FAKECAP_LANDINGS", "runtime")
     env.export_env(None, chain="n32", CKKS_COMPLEX="1", **over)
     fakecap.session_env(env.ENV, {"CKKS_COMPLEX": "1", **over})
     _, inf = fakecap.make_session(Dims.gpt2(), set(net.rotations()), limit=a.twin_limit, bts_out=a.twin_bts_out)

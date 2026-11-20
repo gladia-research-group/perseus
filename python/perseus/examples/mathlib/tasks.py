@@ -8,34 +8,13 @@ import math as _m
 
 import numpy as np
 
+from perseus.impl import keyset
 from perseus.impl import math as M
 from perseus.impl import sort as T
 from perseus.impl import stats as S
 from perseus.impl.ops import NumpyOps
 
 SLOTS = 1 << 15
-
-
-class RotRec(NumpyOps):
-    """The mirror recording every rotation step (the session's key list)."""
-
-    def __init__(self):
-        self.steps = set()
-
-    def rotate(self, a, k):
-        self.steps.add(int(k))
-        return super().rotate(a, k)
-
-    def rotate_many(self, a, steps):
-        self.steps.update(int(k) for k in steps)
-        return super().rotate_many(a, steps)
-
-    def rotate_and_sum(self, a, start, stop):
-        g = abs(int(start))
-        while g < stop:
-            self.steps.add(g if start > 0 else -g)
-            g *= 2
-        return super().rotate_and_sum(a, start, stop)
 
 
 class Task:
@@ -46,9 +25,8 @@ class Task:
     tfhe = False
 
     def rotations(self):
-        rec = RotRec()
-        self.run(rec, self.encode())
-        return sorted({s % SLOTS for s in rec.steps if s % SLOTS})
+        """The rotation keys the stage needs (keyset.stage_rotations: the code run on the recording mirror)."""
+        return keyset.stage_rotations(self.run, self.encode(), SLOTS)
 
     def mirror(self):
         return self.outputs([np.asarray(v) for v in self.run(NumpyOps(), self.encode())])
