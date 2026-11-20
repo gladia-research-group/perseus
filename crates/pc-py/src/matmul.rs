@@ -290,11 +290,19 @@ pub(crate) struct FinishSvc<'r> {
     pub pcmm: Option<&'r mut PcmmRt>,
     pub ccmm: Option<&'r mut CcmmRt>,
     pub tfhe: Option<&'r mut crate::tfhe::TfheRt>,
+    pub fbs: Option<&'r mut crate::fbs::FbsRt>,
     pub route: &'r StcFirstRoute<'static, W, M>,
 }
 
 impl<'r> FinishExec<'static, W, M> for FinishSvc<'r> {
     fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
+        if f.desc.contains("\"fbs\"") && crate::fbs::Desc::parse(&f.desc).is_some() {
+            let rt = self.fbs.as_deref_mut().ok_or_else(|| ferr(f, "this session has no FBS service (no program named an fbs finish at setup)"))?;
+            return crate::fbs::FbsExec { rt, route: self.route }.finish(cx, f, slots).map_err(|e| match e {
+                pc_program::Error::Replay { .. } => e,
+                e => ferr(f, e.to_string()),
+            });
+        }
         if crate::tfhe::Desc::parse(&f.desc).is_some() {
             let rt = self.tfhe.as_deref_mut().ok_or_else(|| ferr(f, "this session has no TFHE service (Session(tfhe=...))"))?;
             return crate::tfhe::TfheExec { rt, route: self.route }.finish(cx, f, slots).map_err(|e| match e {

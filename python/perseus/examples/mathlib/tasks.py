@@ -436,7 +436,65 @@ class AdHoc(Task):
         return {"max_err": e, "rms_err": r}
 
 
-TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc}
+@dataclasses.dataclass
+class Lut(Task):
+    """A CKKS functional bootstrap (impl/fbs.py) on every slot: `kind` table (inputs the integers |j| <= t/2, `table`
+    sign / step / rand: a fixed pseudo-random table on a 1/8 grid in [-1, 1]) or sign (the 0/1 step on |x| < 2, inputs
+    outside the gap). Planned runs only (the FBS is a refresh the plan places)."""
+    kind: str = "table"
+    table: str = "sign"
+    t: int = 16
+    gap: float = 0.1
+    seed: int = 0
+    name = "lut"
+
+    def __post_init__(self):
+        from perseus.impl import fbs
+        rng = np.random.default_rng(self.seed)
+        self.t, self.gap = int(self.t), float(self.gap)
+        h = self.t // 2
+        if self.kind == "table":
+            j = np.arange(-h, h + 1)
+            if self.table == "sign":
+                self.values = np.sign(j).astype(float)
+            elif self.table == "step":
+                self.values = (j >= 0).astype(float)
+            else:
+                self.values = np.random.default_rng(1234).integers(0, 17, len(j)) / 8.0 - 1.0
+            self.fn = fbs.register_table(f"lut.{self.table}.{self.t}", self.values)
+            self.x = rng.integers(-h, h + 1, SLOTS).astype(float)
+            self.x[:2] = (-h, h)
+            self.spacing = float(np.diff(np.unique(self.values)).min())
+        else:
+            self.fn = fbs.register_sign(f"lut.sign01.g{self.gap:g}", 0.0, 1.0, gap=float(self.gap))
+            a = rng.uniform(self.gap, 1.99, SLOTS)
+            self.x = np.where(rng.integers(0, 2, SLOTS) == 1, a, -a)
+            self.spacing = 1.0
+
+    def encode(self):
+        return [self.x]
+
+    def ref(self, x):
+        if self.kind == "table":
+            return self.values[np.round(x).astype(int) + self.t // 2]
+        return (x >= 0).astype(float)
+
+    def run(self, ops, xs):
+        from perseus.impl import fbs
+        # a copy: the FBS's level hints rename its operand in place, and the stage's input keeps its own name
+        return [fbs.fbs(ops, ops.copy(xs[0]), self.fn)]
+
+    def outputs(self, vals):
+        return {"y": np.real(vals[0])}
+
+    def metrics(self, out):
+        from perseus.impl import fbs
+        e, r = _err(out["y"], self.ref(self.x))
+        wrong = int(np.sum(np.abs(out["y"] - self.ref(self.x)) >= self.spacing / 2.0))
+        return {"max_err": e, "rms_err": r, "wrong": wrong, "log2_pfail_ct": fbs.p_fail(self.fn)["log2_ct"]}
+
+
+TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut}
 
 
 def make(name, **kw):
