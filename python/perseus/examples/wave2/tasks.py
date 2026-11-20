@@ -685,6 +685,7 @@ class Train(Task):
     nesterov: bool = True
     zb: float = 8.0
     err: float = 1e-3
+    fbs: bool = False             # the link as a functional bootstrap of the margin (impl.learn Trainer.fbs)
     seed: int = 0
 
     name = "train"
@@ -694,7 +695,8 @@ class Train(Task):
         self.Xtr, self.ytr, self.Xte, self.yte = _split(self.data, self.N, self.seed)
         self.d = self.Xtr.shape[1]
         self.lay = LN.Design(self.N, self.d, 1, SLOTS)
-        self.tr = LN.Trainer(self.loss, self.lr, self.lam, self.epochs, self.nesterov, self.zb, err=self.err)
+        self.tr = LN.Trainer(self.loss, self.lr, self.lam, self.epochs, self.nesterov, self.zb, err=self.err,
+                             fbs=self.fbs)
 
     def encode(self):
         return [self.lay.encode_points(self.Xtr), self.lay.encode_labels(self.ytr)]
