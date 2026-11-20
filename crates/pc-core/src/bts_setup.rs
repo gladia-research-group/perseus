@@ -1039,3 +1039,106 @@ pub fn sparse_b_diagonals(ring_n: u32, slots: u32, geom: &SparseBGeom, gc: f64, 
     }
     (p_out, q_out)
 }
+
+/// A linear map on slot vectors as offset diagonals: out\[k\] = sum_o diag_o\[k\] x\[(k + o) mod len\] (`FftStage`'s form
+/// with arbitrary offsets).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiagMap {
+    pub len: usize,
+    /// (offset, diagonal), offsets distinct and reduced to [0, len).
+    pub diags: Vec<(i64, Vec<C64>)>,
+}
+
+impl DiagMap {
+    /// The map sum_p m_p (.) Rotate(x, r_p) (`terms` (r_p, m_p): a masked rotation each).
+    pub fn from_terms(len: usize, terms: &[(i64, Vec<C64>)]) -> DiagMap {
+        let mut out = DiagMap { len, diags: Vec::new() };
+        for (r, m) in terms {
+            out.add(*r, m.clone());
+        }
+        out
+    }
+    fn add(&mut self, off: i64, d: Vec<C64>) {
+        let o = off.rem_euclid(self.len as i64);
+        match self.diags.iter_mut().find(|(x, _)| *x == o) {
+            Some((_, v)) => v.iter_mut().zip(&d).for_each(|(a, b)| *a += *b),
+            None => self.diags.push((o, d)),
+        }
+    }
+    /// The map of an `FftStage`.
+    pub fn of_stage(s: &FftStage) -> DiagMap {
+        let c = s.center();
+        let mut out = DiagMap { len: s.len(), diags: Vec::new() };
+        for (d, dv) in s.diags.iter().enumerate() {
+            out.add((d as i64 - c) * s.stride as i64, dv.clone());
+        }
+        out
+    }
+    pub fn apply(&self, x: &[C64]) -> Vec<C64> {
+        let len = x.len() as i64;
+        (0..x.len())
+            .map(|k| {
+                let mut acc = C64::ZERO;
+                for (o, dv) in &self.diags {
+                    acc += dv[k] * x[(k as i64 + o).rem_euclid(len) as usize];
+                }
+                acc
+            })
+            .collect()
+    }
+    /// self o w (w first): out\[k\] = sum_o sum_p a_o\[k\] m_p\[k + o\] x\[k + o + r_p\]: diagonals at the offset sums,
+    /// merged where they coincide.
+    pub fn after(&self, w: &DiagMap) -> DiagMap {
+        let mut out = DiagMap { len: self.len, diags: Vec::new() };
+        for (o, a) in &self.diags {
+            for (r, m) in &w.diags {
+                let d: Vec<C64> = (0..self.len).map(|k| a[k] * m[(k as i64 + o).rem_euclid(self.len as i64) as usize]).collect();
+                out.add(o + r, d);
+            }
+        }
+        out
+    }
+}
+
+/// Functional slots-to-coefficients (Xiao et al., ePrint 2026/1255, Section 4): a fixed linear map W applied to the
+/// slots right before a refresh folds into the first StC stage, StC(W x) = (S_1 ... S_{m-1}) (S_0 W) x, so the
+/// refresh's input stages compute W at no extra level (S_0 W is one plaintext-diagonal stage, like S_0). Returns the
+/// fused first stage; its diagonal count (rotations, plaintexts) against S_0's is the price.
+pub fn functional_stc_first(stc0: &FftStage, w: &DiagMap) -> DiagMap {
+    DiagMap::of_stage(stc0).after(w)
+}
+
+#[cfg(test)]
+mod functional_stc_tests {
+    use super::*;
+
+    /// StC(W x) through the fused first stage equals StC applied to W x, for operand packing a + 4 Rotate(b-slots)
+    /// style maps: a masked rotation plus the identity; the diagonal count grows by the rotation's offsets.
+    #[test]
+    fn fused_first_stage_exact() {
+        let n = 1usize << 10;
+        let f = cts_stc_factors(n, (n / 2) as u32, [3, 3], [0, 0], 1.0, 1.0).unwrap();
+        let len = f.stc[0].len();
+        let mask: Vec<C64> = (0..len).map(|k| C64::new(if k % 16 >= 1 { 4.0 } else { 0.0 }, 0.0)).collect();
+        let w = DiagMap::from_terms(len, &[(0, vec![C64::new(1.0, 0.0); len]), (-1, mask)]);
+        let fused = functional_stc_first(&f.stc[0], &w);
+        let mut seed = 7u64;
+        let x: Vec<C64> = (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                C64::new((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5, 0.0)
+            })
+            .collect();
+        let mut a = f.stc[0].apply(&w.apply(&x));
+        let mut b = fused.apply(&x);
+        for s in &f.stc[1..] {
+            a = s.apply(&a);
+            b = s.apply(&b);
+        }
+        let e = a.iter().zip(&b).map(|(p, q)| (*p - *q).abs()).fold(0f64, f64::max);
+        let s0 = DiagMap::of_stage(&f.stc[0]).diags.len();
+        println!("functional StC: first stage {} diagonals (stride {}), fused {}; max err {e:.2e}", s0, f.stc[0].stride, fused.diags.len());
+        assert!(e < 1e-12, "{e:e}");
+        assert!(fused.diags.len() <= 2 * s0);
+    }
+}
