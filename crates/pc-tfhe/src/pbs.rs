@@ -227,19 +227,50 @@ impl BootstrapKey {
     /// `blind_rotate_ext` for `k` interleaved LUTs (many-LUT, Carpov, Izabachene, Mollimard 2019): the input switched
     /// to 2 nu n / k and scaled by k, so coefficient j of acc reads LUT j (tv: `interleave`).
     pub fn blind_rotate_mlut(&self, tv: &[u64], ct: &Lwe, q_in: u64, nu: usize, kl: usize) -> Vec<[Rlwe; 2]> {
+        assert_eq!(tv.len(), nu * self.rns.n(), "the extended test vector has nu n entries");
+        self.rotate_from(self.rns.residues(tv), None, ct, q_in, nu, kl)
+    }
+
+    /// The blind rotation of a caller-supplied accumulator (an encrypted test polynomial under s_br mod Q, e.g. a
+    /// packed table, `pack::PackingKey::pack`) instead of the plaintext one: `acc` its nu components (component i the
+    /// coefficients nu j + i of R_(nu n); residues per prime, coefficient form), rotated by X^-phi(ct) like
+    /// `blind_rotate_mlut` (many-LUT `kl`). Its noise is carried, not refreshed (`pack::blind_rotate_var` adds).
+    pub fn blind_rotate_acc(&self, acc: &[[Rlwe; 2]], ct: &Lwe, q_in: u64, kl: usize) -> Vec<[Rlwe; 2]> {
+        let (n, nu) = (self.rns.n(), acc.len());
+        let full = |part: usize| -> [Vec<u64>; 2] {
+            [0, 1].map(|p| {
+                let mut v = vec![0u64; nu * n];
+                for (i, c) in acc.iter().enumerate() {
+                    let src = if part == 0 { &c[p].c0 } else { &c[p].c1 };
+                    for j in 0..n {
+                        v[nu * j + i] = src[j];
+                    }
+                }
+                v
+            })
+        };
+        self.rotate_from(full(0), Some(full(1)), ct, q_in, nu, kl)
+    }
+
+    fn rotate_from(&self, c0: [Vec<u64>; 2], c1: Option<[Vec<u64>; 2]>, ct: &Lwe, q_in: u64, nu: usize, kl: usize) -> Vec<[Rlwe; 2]> {
         let n = self.rns.n();
         let big = nu * n;
-        assert_eq!(tv.len(), big, "the extended test vector has nu n entries");
         assert!(kl >= 1 && (2 * big) % kl == 0, "many-LUT: k divides 2 nu n");
         let two_n = 2 * big as u64;
         let m = crate::gadget::fixed_ratio(two_n / kl as u64, q_in);
         let sw = |x: u64| -> usize { kl * (crate::gadget::scale_round(x, m) % (two_n / kl as u64)) as usize };
         let neg = |k: usize| (2 * big - k) % (2 * big);
-        let tvr = self.rns.residues(tv);
         let bt = kl * crate::gadget::ms_body_mean(&ct.a, ct.b, m, two_n / kl as u64) as usize;
-        let tvx = [0, 1].map(|p| monomial_mul(&tvr[p], neg(bt), self.rns.ntt[p].q));
-        let mut acc: Vec<[Rlwe; 2]> =
-            (0..nu).map(|i| [0, 1].map(|p| Rlwe { c0: (0..n).map(|j| tvx[p][nu * j + i]).collect(), c1: vec![0; n] })).collect();
+        let tvx = [0, 1].map(|p| monomial_mul(&c0[p], neg(bt), self.rns.ntt[p].q));
+        let c1x = c1.map(|c| [0, 1].map(|p| monomial_mul(&c[p], neg(bt), self.rns.ntt[p].q)));
+        let mut acc: Vec<[Rlwe; 2]> = (0..nu)
+            .map(|i| {
+                [0, 1].map(|p| Rlwe {
+                    c0: (0..n).map(|j| tvx[p][nu * j + i]).collect(),
+                    c1: c1x.as_ref().map_or_else(|| vec![0; n], |c| (0..n).map(|j| c[p][nu * j + i]).collect()),
+                })
+            })
+            .collect();
         for (a, keys) in ct.a.chunks(self.group).zip(&self.ggsw) {
             let k: Vec<usize> = a.iter().map(|&x| sw(x)).collect();
             if k.iter().all(|&x| x == 0) {
@@ -296,6 +327,22 @@ impl BootstrapKey {
     /// coefficient j, + offsets[j].
     pub fn bootstrap_mlut(&self, tv: &[u64], offsets: &[u64], ct: &Lwe, q_in: u64, nu: usize) -> Vec<Lwe> {
         let acc = self.blind_rotate_mlut(tv, ct, q_in, nu, offsets.len()).swap_remove(0);
+        let q = self.rns.q;
+        offsets
+            .iter()
+            .enumerate()
+            .map(|(j, &off)| {
+                let ex = [0, 1].map(|p| acc[p].sample_extract(j, self.rns.ntt[p].q));
+                let a = (0..self.rns.n()).map(|k| self.rns.crt(ex[0].a[k], ex[1].a[k])).collect();
+                Lwe { a, b: addmod(self.rns.crt(ex[0].b, ex[1].b), off, q) }
+            })
+            .collect()
+    }
+
+    /// `bootstrap_mlut` on a caller-supplied accumulator (`blind_rotate_acc`): the extracted LWEs (dimension n_br,
+    /// mod Q) of coefficients 0 .. offsets.len(), + offsets[j].
+    pub fn bootstrap_acc(&self, acc: &[[Rlwe; 2]], offsets: &[u64], ct: &Lwe, q_in: u64) -> Vec<Lwe> {
+        let acc = self.blind_rotate_acc(acc, ct, q_in, offsets.len()).swap_remove(0);
         let q = self.rns.q;
         offsets
             .iter()

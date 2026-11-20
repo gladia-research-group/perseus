@@ -541,17 +541,52 @@ fn run_pbs(args: &[String]) -> Res<bool> {
             Lwe::encrypt(((m * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64, &s_lwe, p0, &dg_lwe, &mut prng)
         })
         .collect();
+    // --enc-acc: the test vector as an encrypted accumulator (GLWE under s_br, `BootstrapKey::blind_rotate_acc`;
+    // PBS_INIT i0 = 1), one shared by every LWE
+    let enc_acc = args.iter().any(|a| a == "--enc-acc");
+    let acc_comps: Option<Vec<[pc_tfhe::rlwe::Rlwe; 2]>> = enc_acc.then(|| {
+        let tr = bsk.rns.residues(&tv);
+        (0..nu)
+            .map(|c| {
+                let e = dg.sample_vec(&mut prng, n);
+                [0, 1].map(|pp| {
+                    let ntt = &bsk.rns.ntt[pp];
+                    let m: Vec<u64> = (0..n).map(|j| tr[pp][nu * j + c]).collect();
+                    let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(ntt.q)).collect();
+                    pc_tfhe::rlwe::Rlwe::encrypt_with(&m, &s_br, c1, &e, ntt)
+                })
+            })
+            .collect()
+    });
     let th = Instant::now();
     let want: Vec<Lwe> = if no_check {
         vec![]
     } else {
         use rayon::prelude::*;
-        lwes.par_iter().flat_map(|l| bsk.bootstrap_mlut(&tv, &offs, l, p0, nu).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect()
+        match &acc_comps {
+            Some(acc) => lwes.par_iter().flat_map(|l| bsk.bootstrap_acc(acc, &offs, l, p0).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect(),
+            None => lwes.par_iter().flat_map(|l| bsk.bootstrap_mlut(&tv, &offs, l, p0, nu).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect(),
+        }
     };
     let host_s = th.elapsed().as_secs_f64();
 
     let img = pc_gpu::tfhe::pbs_image(&bsk);
-    let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
+    let tvr: Vec<u32> = match &acc_comps {
+        // [part][prime][nu n], the components interleaved
+        Some(acc) => (0..2)
+            .flat_map(|part| {
+                let acc = acc.clone();
+                (0..2).flat_map(move |pp| {
+                    let acc = acc.clone();
+                    (0..nu * n).map(move |x| {
+                        let (j, c) = (x / nu, x % nu);
+                        (if part == 0 { acc[c][pp].c0[j] } else { acc[c][pp].c1[j] }) as u32
+                    })
+                })
+            })
+            .collect(),
+        None => pc_gpu::tfhe::tv_residues(&bsk, &tv),
+    };
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
     // without thread-block clusters (below sm_90) the latency path is one level, nu 1 only
@@ -594,7 +629,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     ic[5] = nu as u64;
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio((2 * nu * n / kl) as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu as u64, 0, 0], ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_INIT, i0: enc_acc as i32, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
         let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: ic, ..base };
         if kb_path && overlap {
             s.record(&e_in)?;
@@ -657,7 +692,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     }
     let mut t = Tally::default();
     if !no_check {
-        t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs x {kl} LUTs, every word"), bad, kl * count * (n + 1));
+        t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs x {kl} LUTs{}, every word", if enc_acc { ", encrypted accumulator" } else { "" }), bad, kl * count * (n + 1));
     }
     println!("[pc-check] tfhe-pbs: {} path", if kb_path { format!("latency (key bundles, windows of {win} groups)") } else { "batch".to_string() });
     println!("[pc-check] tfhe-pbs: device {:.2} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);

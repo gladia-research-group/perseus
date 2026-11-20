@@ -931,7 +931,8 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 // runs over the GLWE ring of degree n (power of two, <= 2048) at the bootstrapping prime q < 2^62 (u64, Shoup products):
 //   PBS_MS       y = u32 LWEs [count][i1 + 1] mod c[0] (a, then b) -> x = u32 [count][i1 + 1] in [0, 2n):
 //                round(v 2n / c[0]) = (v m + 2^63) >> 64 mod 2n  (m = floor(2^64 2n / c[0]))
-//   PBS_INIT     y = test vector u64 [n], z = PBS_MS output -> x = acc u64 [count][2][n]: X^-b~ tv, 0
+//   PBS_INIT     y = test vector u64 [n], z = PBS_MS output -> x = acc u64 [count][2][n]: X^-b~ tv, 0; i0 bit 0: y an
+//                encrypted accumulator [2 part][2 prime][nu n] (both parts rotated), bit 1: one per LWE ([count][..])
 //   PBS_STEP     key i0 of i1: acc += GGSW_i0 [x] (acc X^-a~_i0 - acc); y = bsk u64 [i1][2 c][l][2 part][n] (NTT form),
 //                w = its Shoup companions, z = PBS_MS output, tw = [psi n | ipsi n], tws = their Shoup companions;
 //                gadget: c[0] = base log, c[1] = levels, m = floor(2^(64 + levels base) / q); c[2] = n^-1, c[3] its Shoup

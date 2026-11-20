@@ -18,6 +18,7 @@ mod shadow;
 mod store;
 mod tag;
 mod tfhe;
+mod tfhe_plut;
 mod word64;
 
 pyo3::create_exception!(_pc, LevelError, pyo3::exceptions::PyRuntimeError, "A Shadow rule refused an op (level, degree, route or chain range).");
@@ -48,6 +49,7 @@ fn _pc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     client::register(m)?;
     m.add_function(pyo3::wrap_pyfunction!(fbs::fbs_landing, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(fbs::fbs_noise, m)?)?;
+    m.add_class::<tfhe_plut::TfhePrivateLut>()?;
     word64::register(m)?; // _pc.w64 (u64 words, n64 chain)
     Ok(())
 }

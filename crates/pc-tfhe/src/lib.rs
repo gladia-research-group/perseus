@@ -23,6 +23,7 @@ pub mod chain;
 pub mod gadget;
 pub mod lwe;
 pub mod modq;
+pub mod pack;
 pub mod params;
 pub mod pbs;
 pub mod rlwe;

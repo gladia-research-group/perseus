@@ -336,11 +336,14 @@ __global__ void init_k(TfheArgs A) {
     const uint32_t bt = ((const uint32_t*)A.z)[(size_t)blockIdx.y * (A.i1 + 1) + A.i1];
     const int kp = (int)((2 * big - bt) % (2 * big));
     uint32_t* acc = (uint32_t*)A.x + (size_t)blockIdx.y * nu * 4 * n;
+    // i0 bit 0: y = an encrypted accumulator [2 part][2 prime][nu n] (part 1 rotated as well); bit 1: one per LWE
+    const bool enc = A.i0 & 1;
+    const uint32_t* y = (const uint32_t*)A.y + ((A.i0 & 2) ? (size_t)blockIdx.y * 4 * big : 0);
     for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < big; x += gridDim.x * blockDim.x) {
         const int i = x / n, o = x % n;
         for (int p = 0; p < 2; p++) {
-            acc[(i * 4 + p) * n + o] = mono32((const uint32_t*)A.y + p * big, big, kp, nu * o + i, p ? qb : qa);
-            acc[(i * 4 + 2 + p) * n + o] = 0;
+            acc[(i * 4 + p) * n + o] = mono32(y + p * big, big, kp, nu * o + i, p ? qb : qa);
+            acc[(i * 4 + 2 + p) * n + o] = enc ? mono32(y + (2 + p) * big, big, kp, nu * o + i, p ? qb : qa) : 0;
         }
     }
 }

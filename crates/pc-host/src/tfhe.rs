@@ -559,29 +559,29 @@ fn init(a: &TfheArgs, b: usize) {
     let bt = rd::<u32>(a.z, b * (a.i1 as usize + 1) + a.i1 as usize);
     let kp = ((2 * big as u32).wrapping_sub(bt) % (2 * big as u32)) as i64;
     let acc = rows_mut::<u32>(a.x, b * nu * 4 * n, nu * 4 * n);
+    // i0 bit 0: y holds an encrypted accumulator [2 part][2 prime][nu n] (part 1 rotated too); bit 1: one per LWE
+    let enc = a.i0 & 1 != 0;
+    let base = if a.i0 & 2 != 0 { b * 4 * big } else { 0 };
+    let rot = |src: &[u32], q: u32, oo: i64| -> u32 {
+        let mut s = oo - kp;
+        if s >= 0 {
+            return src[s as usize];
+        }
+        s += big as i64;
+        if s >= 0 {
+            let v = src[s as usize];
+            return if v != 0 { q - v } else { 0 };
+        }
+        src[(s + big as i64) as usize]
+    };
     for x in 0..big {
         let (i, o) = (x / n, x % n);
+        let oo = (nu * o + i) as i64;
         for p in 0..2 {
             let q = if p != 0 { qb } else { qa };
-            let tv = rows::<u32>(a.y, p * big, big);
-            let oo = (nu * o + i) as i64;
-            let mut s = oo - kp;
-            acc[(i * 4 + p) * n + o] = if s >= 0 {
-                tv[s as usize]
-            } else {
-                s += big as i64;
-                if s >= 0 {
-                    let v = tv[s as usize];
-                    if v != 0 {
-                        q - v
-                    } else {
-                        0
-                    }
-                } else {
-                    tv[(s + big as i64) as usize]
-                }
-            };
-            acc[(i * 4 + 2 + p) * n + o] = 0;
+            let off = if enc { base } else { 0 };
+            acc[(i * 4 + p) * n + o] = rot(rows::<u32>(a.y, off + p * big, big), q, oo);
+            acc[(i * 4 + 2 + p) * n + o] = if enc { rot(rows::<u32>(a.y, base + (2 + p) * big, big), q, oo) } else { 0 };
         }
     }
 }
