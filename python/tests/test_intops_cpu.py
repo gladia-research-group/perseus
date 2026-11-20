@@ -53,3 +53,15 @@ def test_chain_slack():
     d = fbs.register_lut("cpu.c16.k32d3", lambda j: j % 4, 0, 15, table="k32d3")
     assert fbs.chain_slack(d) == fbs.chain_slack(k) + 4
     assert fbs.chain_slack(d) >= 0
+
+
+def test_sort_fbs_mirror():
+    """sort.step's FBS backend on the numpy mirror: rank / top-k exact; the rule refuses gaps below degree 255's."""
+    from perseus.examples.mathlib import tasks as T
+    from perseus.impl import sort
+    for kind in ("rank", "topk"):
+        t = T.make("sort", kind=kind, method="fbs", n=16)
+        assert t.metrics(t.mirror())["exact"] == 1.0
+    assert sort.step_method(4096, 2.0, 0.1) == "fbs"
+    assert sort.step_method(16, 2.0, 0.1) == "tfhe"
+    assert sort.step_method(4096, 2.0, 0.01) == "tfhe"
