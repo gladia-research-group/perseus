@@ -1,0 +1,899 @@
+"""Elementwise functions on ciphertexts with explicit domains and error control.
+
+Every function takes its input domain [lo, hi] (public: a calibrated bound) and an error target, picks the cheapest
+method that meets the target over the whole domain, and returns the value. The choice is made on the host, once per
+(function, domain, target) and cached: each candidate method is run on a dense grid of the domain in float64 (the
+same code, on numpy) for its max / RMS error, and on a counting backend (`CountOps`) for its multiplicative depth and
+ciphertext products; the feasible candidate with the fewest levels wins, then the fewest products. `approx(...)`
+returns that choice (`Approx`: method, parameters, depth, error) without evaluating anything; calling it on a ciphertext
+evaluates it (`Approx.__call__(ops, x)`), and the module-level functions do both.
+
+Methods (all built from impl/poly.py's kernels, so they record the standard op stream and plan like any stage):
+
+* ``cheb``: one Chebyshev interpolant of degree d on [lo, hi] (baby-step giant-step, poly.eval_chebyshev), the
+  smallest d meeting the target. Depth ceil(log2(d + 1)) + 1, plus one level for the affine map unless the domain
+  is [-1, 1].
+* ``exp``: ``cheb+sq``: exp(x / 2^k) by a short series, then k squarings (range reduction by squaring: the relative
+  error doubles per squaring, the series' degree falls much faster for wide domains). An `out_scale` rides the series'
+  coefficients (no level), so the result can be held at a chosen size (e.g. exp(x - hi) <= 1 before a refresh).
+* ``log``: ``cheb`` on [lo, hi], or ``atanh``: log x = log c + 2 atanh((x - c) / (x + c)) with c = sqrt(lo hi), the
+  scaling that halves the log-range seen by the series (the division by `reciprocal`).
+* ``rsqrt``: ``cheb``; ``cheb+newton``: a low-degree Chebyshev seed refined by Newton y <- y (3 - x y^2) / 2 (two
+  levels per iteration, poly.inv_sqrt_newton_d2); ``scaled-newton``: the Chebyshev-scaled Newton steps from the seed 1
+  (poly.scaled_newton_steps / inv_sqrt_newton_scaled, the LayerNorm's wide-band inverse square root).
+* ``reciprocal``: ``cheb``; ``cheb+newton`` (y <- y (2 - x y)); ``goldschmidt`` (linear Chebyshev seed,
+  poly.goldschmidt_recip, the softmax's division); ``rsqrt^2``.
+* ``sqrt``: ``cheb`` (also on [0, hi]); ``x*rsqrt``.
+* ``tanh``, ``sigmoid``, ``erf``: ``cheb`` with the function's parity enforced (odd series: half the products).
+* ``pow``: integer exponents by squaring (exact); 1/2, -1/2, -1 routed to sqrt / rsqrt / reciprocal; any other real
+  exponent on a positive domain by ``cheb`` or ``exp(p log x)``.
+* ``sign``, ``abs``, ``relu``, ``max``, ``min``, ``clip``: ``ckks``: a composite of odd minimax polynomials (Lee,
+  Lee, Kim, No, IEEE TDSC 2021: calibrate/approximations/relu.py's fit), the ladder chosen for the resolution `eps`
+  and the target (abs / relu fold the product by x into the last stage: relu.relu_folded); ``tfhe``: the sign from
+  the scheme switch (impl/tfhe.py, tfhe_select.msign: a PBS sign LUT, exact up to the switch's input noise band
+  ~1e-2 of the range; p_fail per PBS < 2^-128 at the default n 840 parameters), then one product. The TFHE path runs
+  in planned sessions only (the switch is a refresh the planner places).
+
+Errors are approximation errors (float64). The encrypted result adds the CKKS noise: ~1e-6 relative on fresh values,
+~1e-5..1e-4 after a bootstrap (n32 chain): a target below that buys nothing.
+"""
+from __future__ import annotations
+
+import dataclasses
+import functools
+import math as _m
+from typing import Callable
+
+import builtins
+
+import numpy as np
+from numpy.polynomial import chebyshev as _C
+
+from . import poly
+from .ops import NumpyOps
+
+_abs = builtins.abs
+
+# ── counting and plaintext backends ─────────────────────────────────────────────────────────────────────────────────
+
+
+class _V:
+    """A value on CountOps: its multiplicative depth."""
+    __slots__ = ("d",)
+
+    def __init__(self, d):
+        self.d = d
+
+
+class CountOps:
+    """The ops protocol on depth counters: levels consumed (`depth`, the deepest value), ciphertext products
+    (`ct_mults`), plaintext / scalar products (`pt_mults`), key switches (`rots`: rotations and conjugations). A scalar
+    product costs a level (the runtime rescales it like a plaintext product); additions, i x and rotations are free.
+    The same switches as a default FheOps (BSGS Chebyshev, dead-op elision)."""
+    complex_payload = True
+    cheb_bsgs = True
+    dead_ops = True
+    realize_shared = False
+    cheb_align = False
+    neg_free = False
+    fused_sm_den = fused_ln_var = folds = False
+    unit = 2
+
+    def __init__(self):
+        self.ct_mults = self.pt_mults = self.rots = self.depth = self.bts = 0
+
+    def _v(self, d):
+        self.depth = max(self.depth, d)
+        return _V(d)
+
+    @staticmethod
+    def _d(x):
+        return x.d if isinstance(x, _V) else 0
+
+    @staticmethod
+    def _sc(b):
+        return isinstance(b, (int, float, np.floating, np.integer, complex))
+
+    def leaf(self, d=0):
+        return _V(d)
+
+    def add(self, a, b): return _V(max(self._d(a), self._d(b)))
+    sub = add
+
+    def mult(self, a, b):
+        if self._sc(b):
+            self.pt_mults += 1
+            return self._v(self._d(a) + 1)
+        self.ct_mults += 1
+        return self._v(max(self._d(a), self._d(b)) + 1)
+
+    def square(self, a):
+        self.ct_mults += 1
+        return self._v(self._d(a) + 1)
+
+    def negate(self, a): return _V(self._d(a))
+    def mult_i(self, a): return _V(self._d(a))
+
+    def conjugate(self, a):
+        self.rots += 1
+        return _V(self._d(a))
+
+    def rotate(self, a, k):
+        self.rots += 1
+        return _V(self._d(a))
+
+    def rotate_many(self, a, steps):
+        return [self.rotate(a, k) for k in steps]
+
+    def rotate_and_sum(self, a, start, stop):
+        g = _abs(int(start))
+        while g < stop:
+            self.rots += 1
+            g *= 2
+        return _V(self._d(a))
+
+    def inplace_add(self, a, b): a.d = max(a.d, self._d(b))
+    def copy(self, a): return _V(self._d(a))
+
+    def scalar_sum(self, ts, cs):
+        self.pt_mults += len(ts)
+        return self._v(max(self._d(t) for t in ts) + 1)
+
+    def mult_pt(self, a, v, key=None, kind="weight", tagged=True):
+        self.pt_mults += 1
+        return self._v(self._d(a) + 1)
+
+    def add_pt(self, a, v, key=None, kind="weight", tagged=True): return _V(self._d(a))
+
+    def mult_const(self, a, re, im):
+        self.pt_mults += 1
+        return self._v(self._d(a) + 1)
+
+    def realize(self, a): return a
+    def bootstrap_hint(self, a, thr, acct=False): return a
+    def tag_reduce(self, a, stride): return a
+
+    def bootstrap(self, a):
+        self.bts += 1
+        a.d = 0
+        return a
+
+    bootstrap_real = bootstrap
+
+
+class _NpOps(NumpyOps):
+    """The plaintext mirror with FheOps' default switches (BSGS Chebyshev, dead ops), so the error measured on the
+    grid is the error of the evaluation order the device runs."""
+    cheb_bsgs = True
+    dead_ops = True
+    complex_payload = True
+
+
+def count(fn, *args, **kw) -> CountOps:
+    """Run `fn(ops, x, *args, **kw)` on a fresh CountOps (x at depth 0); returns the counter."""
+    c = CountOps()
+    fn(c, c.leaf(), *args, **kw)
+    return c
+
+
+# ── the choice ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class Approx:
+    """One method for f on [lo, hi]: its parameters, its depth (levels, `CountOps`), its ciphertext / plaintext products
+    and its float64 error over the domain (max and RMS; relative to |f| when `rel`). Call it on a ciphertext."""
+    fn: str
+    method: str
+    lo: float
+    hi: float
+    depth: int
+    ct_mults: int
+    pt_mults: int
+    err: float
+    rms: float
+    rel: bool
+    params: tuple = ()
+    run: Callable = dataclasses.field(default=None, repr=False, compare=False)
+
+    def __call__(self, ops, x):
+        return self.run(ops, x)
+
+    def numpy(self, x):
+        """The approximation in float64 (what the encrypted evaluation computes, without the CKKS noise)."""
+        y = self.run(_NpOps(), np.asarray(x, dtype=np.float64))
+        return np.real(y)
+
+    def describe(self) -> dict:
+        return {"fn": self.fn, "method": self.method, "lo": self.lo, "hi": self.hi, "depth": self.depth,
+                "ct_mults": self.ct_mults, "pt_mults": self.pt_mults, "err": self.err, "rms": self.rms,
+                "rel": self.rel, "params": dict(self.params)}
+
+
+def grid(lo: float, hi: float, n: int = 4097) -> np.ndarray:
+    """The error grid: uniform plus Chebyshev-clustered points (the interpolants' error peaks at the ends)."""
+    u = np.linspace(lo, hi, n)
+    k = np.arange(n)
+    c = 0.5 * (lo + hi) + 0.5 * (hi - lo) * np.cos(np.pi * k / (n - 1))
+    return np.unique(np.concatenate([u, c]))
+
+
+def _measure(f, run, lo, hi, rel):
+    x = grid(lo, hi)
+    y = np.real(run(_NpOps(), x.copy()))
+    t = f(x)
+    e = np.abs(y - t)
+    if rel:
+        e = e / np.maximum(np.abs(t), 1e-300)
+    return float(e.max()), float(np.sqrt(np.mean(e * e)))
+
+
+def _make(fn, method, f, lo, hi, rel, run, params=()):
+    err, rms = _measure(f, run, lo, hi, rel)
+    c = count(run)
+    return Approx(fn, method, float(lo), float(hi), int(c.depth), int(c.ct_mults), int(c.pt_mults), err, rms,
+                  bool(rel), tuple(params), run)
+
+
+def _pick(cands, err):
+    """The cheapest candidate meeting `err` (depth, then ciphertext products, then error); None if none does."""
+    ok = [a for a in cands if a is not None and a.err <= err]
+    if not ok:
+        return None
+    return min(ok, key=lambda a: (a.depth, a.ct_mults, a.pt_mults, a.err))
+
+
+class TargetError(ValueError):
+    """No method reaches the error target within the degree / iteration limits."""
+
+
+_LAST: dict = {}
+
+
+def _best(name, cands, err):
+    _LAST["cands"] = [c for c in cands if c is not None]
+    a = _pick(cands, err)
+    if a is None:
+        got = min((c.err for c in cands if c is not None), default=float("inf"))
+        raise TargetError(f"{name}: no method reaches {err:.3g} (best {got:.3g}); widen the target or narrow the domain")
+    return a
+
+
+# ── Chebyshev interpolants ──────────────────────────────────────────────────────────────────────────────────────────
+
+MAX_DEGREE = 1023
+_DEGREES = (1, 2, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 383, 511, 767, 1023)
+
+
+def cheb_fit(f, lo: float, hi: float, deg: int, parity: int | None = None) -> np.ndarray:
+    """Chebyshev coefficients (c0 unhalved, poly.eval_chebyshev's convention) of the degree-`deg` interpolant of f at
+    the Chebyshev points of [lo, hi]; `parity` 1 / 0: an odd / even f on a symmetric domain (the other half zeroed)."""
+    c = _C.chebinterpolate(lambda t: f(0.5 * (hi - lo) * t + 0.5 * (hi + lo)), int(deg))
+    if parity is not None:
+        c[(1 - parity)::2] = 0.0
+    return np.asarray(c, dtype=np.float64)
+
+
+def _trim(c, err):
+    """Drop the tail coefficients whose total is below a hundredth of the target (each changes the value by <= |c|)."""
+    c = np.array(c, dtype=np.float64)
+    tail = np.cumsum(np.abs(c[::-1]))[::-1]
+    keep = len(c)
+    while keep > 2 and tail[keep - 1] <= 0.01 * err:
+        keep -= 1
+    c = c[:keep]
+    c[np.abs(c) <= 1e-3 * err / max(len(c), 1)] = 0.0
+    return c
+
+
+def _cheb_run(c, lo, hi):
+    c = [float(v) for v in c]
+
+    def run(ops, x):
+        return poly.eval_chebyshev(ops, x, c, lo, hi, eps=0.0)
+    return run
+
+
+def _cheb_degree(f, lo, hi, err, rel, parity=None, tgt=None, degrees=_DEGREES):
+    """The smallest-degree interpolant of f meeting `err` against `tgt` (default f): a scan of `degrees`, then a
+    bisection below the first one that meets it. Returns (coeffs, err, rms) or None."""
+    tgt = f if tgt is None else tgt
+    x = grid(lo, hi)
+    t = tgt(x)
+    den = np.maximum(np.abs(t), 1e-300) if rel else 1.0
+
+    def e_of(d):
+        c = _trim(cheb_fit(f, lo, hi, d, parity), err if not rel else err * float(np.abs(t).min()))
+        y = _C.chebval((2.0 * x - (lo + hi)) / (hi - lo), c)
+        e = np.abs(y - t) / den
+        return c, float(e.max()), float(np.sqrt(np.mean(e * e)))
+
+    prev = 0
+    for d in degrees:
+        c, e, r = e_of(d)
+        if e <= err:
+            lo_d, hi_d, best = prev, d, (c, e, r)
+            while hi_d - lo_d > 1:
+                mid = (lo_d + hi_d) // 2
+                cm, em, rm = e_of(mid)
+                if em <= err:
+                    hi_d, best = mid, (cm, em, rm)
+                else:
+                    lo_d = mid
+            return best
+        prev = d
+    return None
+
+
+def _cheb_cand(fn, f, lo, hi, err, rel, parity=None, scale=1.0):
+    """`cheb`: scale * f by the cheapest interpolant meeting err (None if degree MAX_DEGREE does not)."""
+    g = (lambda x: scale * f(x)) if scale != 1.0 else f
+    r = _cheb_degree(g, lo, hi, err * (_abs(scale) if not rel else 1.0), rel, parity)
+    if r is None:
+        return None
+    c = r[0]
+    a = _make(fn, "cheb", g, lo, hi, rel, _cheb_run(c, lo, hi), (("degree", len(c) - 1),))
+    if scale != 1.0 and not rel:
+        a = dataclasses.replace(a, err=a.err / _abs(scale), rms=a.rms / _abs(scale))
+    return a
+
+
+def _check(lo, hi, positive=False, nonneg=False):
+    lo, hi = float(lo), float(hi)
+    if not hi > lo:
+        raise ValueError(f"domain [{lo}, {hi}]: need lo < hi")
+    if positive and not lo > 0.0:
+        raise ValueError(f"domain [{lo}, {hi}]: need lo > 0")
+    if nonneg and lo < 0.0:
+        raise ValueError(f"domain [{lo}, {hi}]: need lo >= 0")
+    return lo, hi
+
+
+def _memo(f):
+    return functools.lru_cache(maxsize=512)(f)
+
+
+# ── exp / log ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+@_memo
+def approx_exp(lo: float, hi: float, err: float = 1e-4, rel: bool = True, out_scale: float = 1.0) -> Approx:
+    """out_scale * exp(x) on [lo, hi]: `cheb`, or `cheb+sq` (k squarings of out_scale^(1/2^k) exp(x / 2^k))."""
+    lo, hi = _check(lo, hi)
+    f = lambda x: out_scale * np.exp(x)
+    cands = [_cheb_cand("exp", np.exp, lo, hi, err, rel, scale=out_scale)]
+    for k in range(1, 13):
+        s = 2.0 ** -k
+        g = lambda x, s=s: out_scale ** s * np.exp(s * x)
+        # the series' relative error doubles per squaring; its absolute target follows from the relative one
+        e_k = err * s if rel else err * s / max(float(f(np.array([hi]))[0]), 1e-300)
+        r = _cheb_degree(g, lo, hi, e_k, True)
+        if r is None:
+            continue
+        c, kk = r[0], k
+
+        def run(ops, x, c=[float(v) for v in c], kk=kk):
+            y = poly.eval_chebyshev(ops, x, c, lo, hi, eps=0.0)
+            for _ in range(kk):
+                y = ops.square(y)
+            return y
+        cands.append(_make("exp", "cheb+sq", f, lo, hi, rel, run, (("degree", len(c) - 1), ("squarings", kk))))
+    return _best(f"exp on [{lo}, {hi}]", cands, err)
+
+
+def exp(ops, x, lo, hi, err=1e-4, rel=True, out_scale=1.0):
+    """out_scale * exp(x) for x in [lo, hi] (module doc). The output's size is out_scale exp(hi)."""
+    return approx_exp(float(lo), float(hi), float(err), bool(rel), float(out_scale))(ops, x)
+
+
+@_memo
+def approx_log(lo: float, hi: float, err: float = 1e-4, rel: bool = False) -> Approx:
+    """log x on [lo, hi] (lo > 0): `cheb`, or `atanh` (log c + 2 atanh((x - c) / (x + c)), c = sqrt(lo hi))."""
+    lo, hi = _check(lo, hi, positive=True)
+    cands = [_cheb_cand("log", np.log, lo, hi, err, rel)]
+    c0 = _m.sqrt(lo * hi)
+    if hi / lo > 4.0:
+        lc = _m.log(c0)
+        # the division: 1 / (x + c) on [lo + c, hi + c] to a quarter of the target (t's error enters 2 / (1 - t^2) <=
+        # (hi + c)^2 / (2 hi c) amplified)
+        amp = (hi + c0) ** 2 / (2.0 * hi * c0)
+        tb = (hi - c0) / (hi + c0)
+        try:
+            rc = approx_reciprocal(lo + c0, hi + c0, 0.25 * err / amp / 2.0 / max(1.0, _abs(hi - c0)), rel=False)
+        except TargetError:
+            rc = None
+        r = _cheb_degree(lambda t: 2.0 * np.arctanh(t), -tb, tb, 0.5 * err if not rel else 0.5 * err * 1e-3, False,
+                         parity=1) if rc is not None else None
+        if r is not None:
+            ca = [float(v) for v in r[0]]
+
+            def run(ops, x, rc=rc, ca=ca, tb=tb, lc=lc):
+                inv = rc(ops, ops.add(x, c0))
+                t = ops.mult(ops.add(x, -c0), inv)
+                return ops.add(poly.eval_chebyshev(ops, t, ca, -tb, tb, eps=0.0), lc)
+            cands.append(_make("log", "atanh", np.log, lo, hi, rel, run,
+                               (("reciprocal", rc.method), ("degree", len(ca) - 1))))
+    return _best(f"log on [{lo}, {hi}]", cands, err)
+
+
+def log(ops, x, lo, hi, err=1e-4, rel=False):
+    """log x for x in [lo, hi], lo > 0."""
+    return approx_log(float(lo), float(hi), float(err), bool(rel))(ops, x)
+
+
+# ── inverse square root, reciprocal, square root ────────────────────────────────────────────────────────────────────
+
+
+def _rsqrt_newton_run(c, lo, hi, iters):
+    c = [float(v) for v in c]
+
+    def run(ops, x):
+        y = poly.eval_chebyshev(ops, x, c, lo, hi, eps=0.0)
+        return poly.inv_sqrt_newton_d2(ops, x, y, iters) if iters else y
+    return run
+
+
+def _scaled_newton_run(lo, hi, steps):
+    """poly.inv_sqrt_newton_scaled on x / hi, the 1 / hi riding every step's b (no level) and 1 / sqrt(hi) the last
+    step's constants."""
+    st = [(a, b / hi) for a, b in steps]
+
+    def run(ops, x):
+        return poly.inv_sqrt_newton_scaled(ops, x, st, 1.0 / _m.sqrt(hi))
+    return run
+
+
+@_memo
+def approx_rsqrt(lo: float, hi: float, err: float = 1e-4, rel: bool = True) -> Approx:
+    """1 / sqrt(x) on [lo, hi], lo > 0: `cheb`, `cheb+newton`, `scaled-newton`."""
+    lo, hi = _check(lo, hi, positive=True)
+    f = lambda x: 1.0 / np.sqrt(x)
+    cands = [_cheb_cand("rsqrt", f, lo, hi, err, rel)]
+    er = err if rel else err * _m.sqrt(lo)          # relative target that meets an absolute one
+    for iters in (1, 2, 3, 4):
+        # Newton: e -> 1.5 e^2 (relative); the seed's relative error that reaches er after `iters` steps
+        e0 = er
+        for _ in range(iters):
+            e0 = _m.sqrt(e0 / 1.5)
+        e0 = min(0.5, 0.8 * e0)
+        r = _cheb_degree(f, lo, hi, e0, True, degrees=_DEGREES[:12])
+        if r is None:
+            continue
+        cands.append(_make("rsqrt", "cheb+newton", f, lo, hi, rel, _rsqrt_newton_run(r[0], lo, hi, iters),
+                           (("degree", len(r[0]) - 1), ("newton", iters))))
+    try:
+        steps = poly.scaled_newton_steps(hi / lo, 0.5 * er)
+        cands.append(_make("rsqrt", "scaled-newton", f, lo, hi, rel, _scaled_newton_run(lo, hi, steps),
+                           (("steps", len(steps)),)))
+    except (ValueError, ZeroDivisionError, OverflowError):
+        pass
+    return _best(f"rsqrt on [{lo}, {hi}]", cands, err)
+
+
+def rsqrt(ops, x, lo, hi, err=1e-4, rel=True):
+    """1 / sqrt(x) for x in [lo, hi], lo > 0."""
+    return approx_rsqrt(float(lo), float(hi), float(err), bool(rel))(ops, x)
+
+
+def _recip_newton_run(c, lo, hi, iters):
+    c = [float(v) for v in c]
+
+    def run(ops, x):
+        y = poly.eval_chebyshev(ops, x, c, lo, hi, eps=0.0)
+        nx = ops.mult(x, -1.0)
+        for _ in range(iters):                      # y (2 - x y)
+            y = ops.mult(y, ops.add(ops.mult(nx, y), 2.0))
+        return y
+    return run
+
+
+def _goldschmidt_run(lo, hi, iters):
+    """poly.goldschmidt_recip with the Chebyshev-optimal linear seed of 1 / x on [lo, hi] (calibrate.numerics
+    chebyshev_gs_init): F_init(x) = alpha - beta x."""
+    # chebyshev_gs_init: max |1 - x F_init| = (hi - lo)^2 / (lo^2 + 6 lo hi + hi^2), equioscillating at lo, hi and
+    # the vertex
+    beta = 8.0 / (lo * lo + 6.0 * lo * hi + hi * hi)
+    alpha = beta * (lo + hi)
+
+    def run(ops, x):
+        return poly.goldschmidt_recip(ops, x, alpha, beta, iters)
+    return run
+
+
+@_memo
+def approx_reciprocal(lo: float, hi: float, err: float = 1e-4, rel: bool = True) -> Approx:
+    """1 / x on [lo, hi], lo > 0: `cheb`, `cheb+newton`, `goldschmidt`, `rsqrt^2`."""
+    lo, hi = _check(lo, hi, positive=True)
+    f = lambda x: 1.0 / x
+    cands = [_cheb_cand("reciprocal", f, lo, hi, err, rel)]
+    er = err if rel else err * lo
+    for iters in (1, 2, 3, 4):
+        e0 = er                                     # Newton: e -> e^2
+        for _ in range(iters):
+            e0 = _m.sqrt(e0)
+        e0 = min(0.5, 0.8 * e0)
+        r = _cheb_degree(f, lo, hi, e0, True, degrees=_DEGREES[:12])
+        if r is None:
+            continue
+        cands.append(_make("reciprocal", "cheb+newton", f, lo, hi, rel, _recip_newton_run(r[0], lo, hi, iters),
+                           (("degree", len(r[0]) - 1), ("newton", iters))))
+    e0 = (hi - lo) ** 2 / (lo * lo + 6.0 * lo * hi + hi * hi)   # the linear seed's |1 - x F| peak
+    for iters in range(1, 24):
+        if e0 ** (2 ** (iters - 1)) <= 0.5 * er:
+            cands.append(_make("reciprocal", "goldschmidt", f, lo, hi, rel, _goldschmidt_run(lo, hi, iters),
+                               (("iters", iters),)))
+            break
+    try:
+        rs = approx_rsqrt(lo, hi, 0.45 * er, True)
+        cands.append(_make("reciprocal", "rsqrt^2", f, lo, hi, rel, lambda ops, x, rs=rs: ops.square(rs(ops, x)),
+                           (("rsqrt", rs.method),)))
+    except TargetError:
+        pass
+    return _best(f"reciprocal on [{lo}, {hi}]", cands, err)
+
+
+def reciprocal(ops, x, lo, hi, err=1e-4, rel=True):
+    """1 / x for x in [lo, hi], lo > 0."""
+    return approx_reciprocal(float(lo), float(hi), float(err), bool(rel))(ops, x)
+
+
+@_memo
+def approx_sqrt(lo: float, hi: float, err: float = 1e-4, rel: bool = False) -> Approx:
+    """sqrt x on [lo, hi], lo >= 0: `cheb` (any lo >= 0), `x*rsqrt` (lo > 0)."""
+    lo, hi = _check(lo, hi, nonneg=True)
+    cands = [_cheb_cand("sqrt", np.sqrt, lo, hi, err, rel)]
+    if lo > 0.0:
+        er = err if rel else err / _m.sqrt(hi)
+        try:
+            rs = approx_rsqrt(lo, hi, 0.9 * er, True)
+            cands.append(_make("sqrt", "x*rsqrt", np.sqrt, lo, hi, rel,
+                               lambda ops, x, rs=rs: ops.mult(x, rs(ops, x)), (("rsqrt", rs.method),)))
+        except TargetError:
+            pass
+    return _best(f"sqrt on [{lo}, {hi}]", cands, err)
+
+
+def sqrt(ops, x, lo, hi, err=1e-4, rel=False):
+    """sqrt x for x in [lo, hi], lo >= 0."""
+    return approx_sqrt(float(lo), float(hi), float(err), bool(rel))(ops, x)
+
+
+# ── saturating functions ────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _erf(x):
+    from scipy.special import erf as e
+    return e(x)
+
+
+def _sigmoid(x):
+    return 0.5 * (1.0 + np.tanh(0.5 * np.asarray(x)))
+
+
+_SAT = {"tanh": (np.tanh, 1, 0.0), "erf": (_erf, 1, 0.0), "sigmoid": (_sigmoid, 1, 0.5)}
+
+
+@_memo
+def approx_saturating(name: str, lo: float, hi: float, err: float = 1e-4) -> Approx:
+    """tanh / erf / sigmoid on [lo, hi] by `cheb` (absolute error); on a symmetric domain the odd part's parity is
+    enforced (sigmoid = 1/2 + an odd function: its constant rides the series)."""
+    lo, hi = _check(lo, hi)
+    f, par, c0 = _SAT[name]
+    sym = _abs(lo + hi) <= 1e-12 * max(_abs(lo), _abs(hi))
+    if sym:
+        r = _cheb_degree(lambda x: f(x) - c0, lo, hi, err, False, parity=par)
+        cands = []
+        if r is not None:
+            c = np.array(r[0])
+            c[0] += c0
+            cands.append(_make(name, "cheb", f, lo, hi, False, _cheb_run(c, lo, hi),
+                               (("degree", len(c) - 1), ("parity", "odd"))))
+    else:
+        cands = [_cheb_cand(name, f, lo, hi, err, False)]
+    return _best(f"{name} on [{lo}, {hi}]", cands, err)
+
+
+def tanh(ops, x, lo, hi, err=1e-4):
+    return approx_saturating("tanh", float(lo), float(hi), float(err))(ops, x)
+
+
+def sigmoid(ops, x, lo, hi, err=1e-4):
+    return approx_saturating("sigmoid", float(lo), float(hi), float(err))(ops, x)
+
+
+def erf(ops, x, lo, hi, err=1e-4):
+    return approx_saturating("erf", float(lo), float(hi), float(err))(ops, x)
+
+
+# ── powers ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _pow_int_run(p):
+    """x^p, p >= 1, by binary powering (squares, then the set bits multiplied in, balanced)."""
+    def run(ops, x):
+        sq, terms, b, k = x, [], p, 0
+        while b:
+            if b & 1:
+                terms.append(sq)
+            b >>= 1
+            if b:
+                sq = ops.square(sq)
+        while len(terms) > 1:
+            nxt = [ops.mult(terms[i], terms[i + 1]) for i in range(0, len(terms) - 1, 2)]
+            if len(terms) % 2:
+                nxt.append(terms[-1])
+            terms = nxt
+        return terms[0]
+    return run
+
+
+@_memo
+def approx_pow(p: float, lo: float, hi: float, err: float = 1e-4, rel: bool = True) -> Approx:
+    """x^p: integer p >= 1 on any domain by squarings (exact); p in {1/2, -1/2, -1} as sqrt / rsqrt / reciprocal; any
+    other real p on lo > 0 (lo >= 0 for p > 0) by `cheb` or `exp(p log x)`."""
+    p = float(p)
+    if p == int(p) and p >= 1:
+        lo, hi = _check(lo, hi)
+        f = lambda x: np.asarray(x) ** int(p)
+        return _make("pow", "squarings", f, lo, hi, rel if lo > 0 else False, _pow_int_run(int(p)),
+                     (("p", int(p)),))
+    if p == 0.5:
+        return approx_sqrt(lo, hi, err, rel)
+    if p == -0.5:
+        return approx_rsqrt(lo, hi, err, rel)
+    if p == -1.0:
+        return approx_reciprocal(lo, hi, err, rel)
+    lo, hi = _check(lo, hi, positive=p < 0, nonneg=p > 0)
+    f = lambda x: np.asarray(x) ** p
+    cands = [_cheb_cand("pow", f, lo, hi, err, rel)]
+    if lo > 0.0:
+        try:
+            lg = approx_log(lo, hi, 0.3 * err / _abs(p) if rel else 0.3 * err / _abs(p) / max(hi ** p, lo ** p), False)
+            a, b = sorted((p * _m.log(lo), p * _m.log(hi)))
+            ex = approx_exp(a, b, 0.6 * err if rel else 0.6 * err / max(hi ** p, lo ** p), True)
+
+            def run(ops, x, lg=lg, ex=ex):
+                return ex(ops, ops.mult(lg(ops, x), p))
+            cands.append(_make("pow", "exp(p log x)", f, lo, hi, rel, run, (("log", lg.method), ("exp", ex.method))))
+        except TargetError:
+            pass
+    return _best(f"pow {p} on [{lo}, {hi}]", cands, err)
+
+
+def pow(ops, x, p, lo, hi, err=1e-4, rel=True):  # noqa: A001  (the module's name space, like numpy.power)
+    """x^p for x in [lo, hi] (approx_pow)."""
+    return approx_pow(float(p), float(lo), float(hi), float(err), bool(rel))(ops, x)
+
+
+# ── sign and its relatives: CKKS composites ─────────────────────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class SignLadder:
+    """A composite odd minimax sign on [-1, 1] \\ (-eps, eps): `coefs` per stage on [-1, 1] (stage i's coefficients
+    carry 1 / h_{i+1}, relu.unit_stages), |sgn - p| <= `delta` on [eps, 1]; `half` = the last stage as (1 + s) / 2
+    (relu_folded's form)."""
+    degs: tuple
+    eps: float
+    delta: float
+    depth: int
+    ct_mults: int
+    coefs: tuple
+    half: tuple
+
+
+def _sign_value(coefs, t):
+    y = np.asarray(t, dtype=np.float64)
+    for c in coefs:
+        y = _C.chebval(y, c)
+    return y
+
+
+def _stage(d, lo, hi):
+    """One composite-sign stage: the odd minimax polynomial of degree d on [-hi, hi] for sgn on [lo, hi]
+    (calibrate/approximations/relu.py `_odd_minimax`) and its image (min on [lo, hi], max |p| on [0, hi])."""
+    from perseus.calibrate.approximations.relu import _odd_minimax
+    coef, _ = _odd_minimax(int(d), lo, hi)
+    ys = _C.chebval(np.linspace(lo, hi, 4000) / hi, coef)
+    top = float(np.abs(_C.chebval(np.linspace(0.0, hi, 8000) / hi, coef)).max())
+    return coef, float(ys.min()), top
+
+
+@_memo
+def sign_ladder(eps: float, delta: float) -> SignLadder:
+    """The cheapest composite sign (fewest levels, then products) with |p - sgn| <= delta on [eps, 1]: ladders of one
+    odd degree (7, 15, 31, 63) or a wide first stage (15, 31, 63) then degree 7 / 15 stages, each stage the minimax
+    odd polynomial on the previous stage's image (calibrate/approximations/relu.py, Lee et al. IEEE TDSC 2021), grown
+    one stage at a time until the target holds (at most 12 stages)."""
+    from .relu import odd_series
+    eps, delta = float(eps), float(delta)
+    xs = np.concatenate([np.geomspace(eps, 1.0, 3000), np.linspace(eps, 1.0, 3000)])
+    shapes = [(d, d) for d in (7, 15, 31, 63)] + [(d1, d) for d1 in (15, 31, 63) for d in (7, 15) if d < d1]
+    best = None
+    for d1, d in shapes:
+        stages, lo, hi = [], eps, 1.0
+        for m in range(12):
+            coef, lo2, top = _stage(d1 if m == 0 else d, lo, hi)
+            stages.append((coef, hi))
+            lo, hi = lo2, top
+            # unit form: stage i's coefficients carry 1 / h_{i+1}; the last one maps to +-1
+            coefs = [list(np.asarray(c) / (stages[q + 1][1] if q + 1 < len(stages) else 1.0))
+                     for q, (c, _h) in enumerate(stages)]
+            err = float(np.abs(_sign_value(coefs, xs) - 1.0).max())
+            if err <= delta:
+                break
+            c = CountOps()
+            if best is not None and m + 1 >= 1 and _ladder_cost(coefs) >= (best.depth, best.ct_mults):
+                coefs = None
+                break
+        else:
+            coefs = None
+        if coefs is None or err > delta:
+            continue
+        half = [list(c) for c in coefs[:-1]] + [list(0.5 * np.asarray(coefs[-1]))]
+        half[-1][0] += 0.5
+        dep, cm = _ladder_cost(coefs)
+        cand = SignLadder(tuple(int(d1 if q == 0 else d) for q in range(len(coefs))), eps, err, dep, cm,
+                          tuple(tuple(v) for v in coefs), tuple(tuple(v) for v in half))
+        if best is None or (cand.depth, cand.ct_mults) < (best.depth, best.ct_mults):
+            best = cand
+    if best is None:
+        raise TargetError(f"sign: no ladder reaches delta {delta:.3g} at eps {eps:.3g}")
+    return best
+
+
+def _ladder_cost(coefs):
+    from .relu import odd_series
+    c = CountOps()
+    z = c.leaf()
+    for cc in coefs:
+        z = odd_series(c, z, list(cc))
+    return c.depth, c.ct_mults
+
+
+def sign_ckks(ops, t, lad: SignLadder):
+    """sgn(t) for t in [-1, 1] (|t| >= eps: within delta) by the ladder; an exact 0 maps to 0 (odd stages)."""
+    from .relu import odd_series
+    for c in lad.coefs:
+        t = odd_series(ops, t, list(c))
+    return t
+
+
+def _resolution(bound, err):
+    """(eps, delta) of a sign whose product with x (|x| <= bound) is within err: the gap and the band's error."""
+    r = min(0.25, float(err) / float(bound))
+    return r, r
+
+
+def _scaled(ops, x, s):
+    return x if s == 1.0 else ops.mult(x, s)
+
+
+def relu_ckks(ops, x, bound, err, gain=1.0):
+    """gain * max(x, 0) for |x| <= bound within gain * err: x * (1 + p(x / bound)) / 2 (relu.relu_folded: the product
+    by x rides the last stage)."""
+    from .relu import relu_folded
+    lad = sign_ladder(*_resolution(bound, err))
+    return relu_folded(ops, x if bound == 1.0 else ops.mult(x, 1.0 / bound), [list(c) for c in lad.half],
+                       gain=gain * bound)
+
+
+# ── sign and its relatives: the TFHE switch ─────────────────────────────────────────────────────────────────────────
+
+
+def _heads(ops, x, slots):
+    n = int(getattr(getattr(ops, "inf", None), "slots", 0) or (np.shape(x)[0] if isinstance(x, np.ndarray) else 0))
+    if n == 0:
+        n = int(getattr(x, "vec", np.zeros(1)).shape[0])
+    idx = np.arange(n) if slots is None else np.asarray(slots, dtype=np.int64)
+    return n, idx
+
+
+def step_tfhe(ops, d, bound, slots=None, levels=1, tag="m"):
+    """[d >= 0] (0 / 1) on `slots` (default all), 0 elsewhere, for |d| < bound, by the scheme switch
+    (tfhe_select.msign: a sign LUT, cleaned; `levels` > 1: finer scales in the same switch, needs free slots)."""
+    from .tfhe_select import msign
+    n, idx = _heads(ops, d, slots)
+    return msign(ops, d, n, idx, float(bound), int(levels), f"math.{tag}")
+
+
+# ── the public sign family ──────────────────────────────────────────────────────────────────────────────────────────
+
+
+def sign(ops, x, bound, err=1e-3, method="ckks", slots=None):
+    """sgn(x) for |x| <= bound: within err for |x| >= err * bound (ckks); exact (0 / 1 then 2 s - 1) outside the
+    switch's noise band (tfhe)."""
+    if method == "tfhe":
+        s = step_tfhe(ops, x, bound, slots, tag="sign")
+        return ops.add(ops.add(s, s), -1.0)
+    eps, delta = _resolution(1.0, err)
+    return sign_ckks(ops, _scaled(ops, x, 1.0 / bound), sign_ladder(eps, delta))
+
+
+def relu(ops, x, bound, err=1e-3, method="ckks", slots=None):
+    """max(x, 0) for |x| <= bound, within err (ckks; the error is largest at |x| ~ err), or x [x >= 0] (tfhe: exact
+    outside the switch's noise band, where the error is <= |x|)."""
+    if method == "tfhe":
+        return ops.mult(x, step_tfhe(ops, x, bound, slots, tag="relu"))
+    return relu_ckks(ops, x, float(bound), float(err))
+
+
+def abs(ops, x, bound, err=1e-3, method="ckks", slots=None):  # noqa: A001
+    """|x| for |x| <= bound: 2 relu(x) - x."""
+    if method == "tfhe":
+        s = step_tfhe(ops, x, bound, slots, tag="abs")
+        xs = ops.mult(x, s)
+        return ops.sub(ops.add(xs, xs), x)
+    return ops.sub(relu_ckks(ops, x, float(bound), 0.5 * float(err), gain=2.0), x)
+
+
+def maximum(ops, a, b, bound, err=1e-3, method="ckks", slots=None):
+    """max(a, b) for |a - b| <= bound: b + relu(a - b)."""
+    return ops.add(b, relu(ops, ops.sub(a, b), bound, err, method, slots))
+
+
+def minimum(ops, a, b, bound, err=1e-3, method="ckks", slots=None):
+    """min(a, b) for |a - b| <= bound: a - relu(a - b)."""
+    return ops.sub(a, relu(ops, ops.sub(a, b), bound, err, method, slots))
+
+
+def clip(ops, x, lo, hi, bound, err=1e-3, method="ckks", slots=None):
+    """min(max(x, lo), hi) for |x| <= bound: lo + relu(x - lo) - relu(x - hi) (two signs at the same depth)."""
+    lo, hi = float(lo), float(hi)
+    B = float(bound) + max(_m.fabs(lo), _m.fabs(hi))
+    r1 = relu(ops, ops.add(x, -lo), B, 0.5 * err, method, slots)
+    r2 = relu(ops, ops.add(x, -hi), B, 0.5 * err, method, slots)
+    return ops.add(ops.sub(r1, r2), lo)
+
+
+def approx_relu(bound: float, err: float = 1e-3):
+    """The CKKS relu's ladder and cost for |x| <= bound within err (no evaluation): (SignLadder, depth, products,
+    float64 max error on [-bound, bound])."""
+    lad = sign_ladder(*_resolution(bound, err))
+    x = grid(-bound, bound)
+    y = np.real(relu_ckks(_NpOps(), x.copy(), float(bound), float(err)))
+    c = count(lambda o, v: relu_ckks(o, v, float(bound), float(err)))
+    return lad, c.depth, c.ct_mults, float(np.abs(y - np.maximum(x, 0.0)).max())
+
+
+# ── the catalogue ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+def approx(fn: str, lo: float, hi: float, err: float = 1e-4, **kw) -> Approx:
+    """The chosen method for `fn` on [lo, hi] (exp, log, sqrt, rsqrt, reciprocal, tanh, sigmoid, erf, pow (p=...))."""
+    if fn == "exp":
+        return approx_exp(lo, hi, err, kw.get("rel", True), kw.get("out_scale", 1.0))
+    if fn == "log":
+        return approx_log(lo, hi, err, kw.get("rel", False))
+    if fn == "sqrt":
+        return approx_sqrt(lo, hi, err, kw.get("rel", False))
+    if fn == "rsqrt":
+        return approx_rsqrt(lo, hi, err, kw.get("rel", True))
+    if fn == "reciprocal":
+        return approx_reciprocal(lo, hi, err, kw.get("rel", True))
+    if fn in _SAT:
+        return approx_saturating(fn, lo, hi, err)
+    if fn == "pow":
+        return approx_pow(kw["p"], lo, hi, err, kw.get("rel", True))
+    raise KeyError(fn)
+
+
+def candidates(fn: str, lo: float, hi: float, err: float = 1e-4, **kw) -> list:
+    """Every method tried for `fn` with its cost and error (the table behind `approx`'s choice), feasible or not."""
+    _LAST.clear()
+    try:
+        _approx_uncached(fn, lo, hi, err, **kw)
+    except TargetError:
+        pass
+    return list(_LAST.get("cands", []))
+
+
+def _approx_uncached(fn, lo, hi, err, **kw):
+    f = {"exp": approx_exp, "log": approx_log, "sqrt": approx_sqrt, "rsqrt": approx_rsqrt,
+         "reciprocal": approx_reciprocal}.get(fn)
+    if f is not None:
+        rest = {k: v for k, v in kw.items() if k in ("rel", "out_scale")}
+        return f.__wrapped__(lo, hi, err, **rest)
+    if fn in _SAT:
+        return approx_saturating.__wrapped__(fn, lo, hi, err)
+    return approx_pow.__wrapped__(kw["p"], lo, hi, err, kw.get("rel", True))
