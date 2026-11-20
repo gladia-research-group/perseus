@@ -142,8 +142,9 @@ def test_fourier_stage_compiles(tmp_path):
 
 def test_deliberate_refresh_past_the_default_band_is_priced(tmp_path):
     """A code refresh of a value of size 256 (a softmax sum) is far past the EvalMod band of the runtime's default CF
-    (6: the device returned ~1e17): the planner gives it a CF from its captured magnitude; a unit-size refresh keeps
-    the default (no CF in the plan), as every shipped plan's code refreshes do."""
+    (6: the device returned ~1e17): under PLAN_DELIBERATE_BAND_CF=1 (the impl runners') the planner gives it a CF from
+    its captured magnitude; a unit-size refresh keeps the default (no CF in the plan). Off, as every shipped plan is
+    planned, both keep the default."""
     from perseus._paths import ASSETS, PKG
     g = tmp_path / "graph"
     (g / "block_0").mkdir(parents=True)
@@ -159,11 +160,17 @@ def test_deliberate_refresh_past_the_default_band_is_priced(tmp_path):
         _node("mult", ["v_4", "v_4"], [32, 32], "v_5", 32, 2),
     ]
     (g / "block_0" / "graph.json").write_text(json.dumps({"version": 2, "nodes": nodes}))
-    plan = tmp_path / "plan"
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PLAN_SPARSE_SLOTS="", PYTHON=sys.executable)
-    r = subprocess.run(["bash", str(PKG / "examples" / "gpt2" / "make_plan.sh"), str(g),
-                        os.path.relpath(plan, ASSETS / "bootstrap_placements")], env=env, capture_output=True,
-                       text=True)
-    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
-    cf = json.load(open(plan / "block_0_placement.json"))["correction_factor"]
+
+    def cf_of(band):
+        plan = tmp_path / f"plan{band}"
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PLAN_SPARSE_SLOTS="", PYTHON=sys.executable,
+                   PLAN_DELIBERATE_BAND_CF=band)
+        r = subprocess.run(["bash", str(PKG / "examples" / "gpt2" / "make_plan.sh"), str(g),
+                            os.path.relpath(plan, ASSETS / "bootstrap_placements")], env=env, capture_output=True,
+                           text=True)
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+        return json.load(open(plan / "block_0_placement.json")).get("correction_factor") or {}
+    cf = cf_of("1")
     assert cf.get("v_2", 0) >= 14 and "v_4" not in cf, cf
+    cf = cf_of("0")
+    assert "v_2" not in cf and "v_4" not in cf, cf

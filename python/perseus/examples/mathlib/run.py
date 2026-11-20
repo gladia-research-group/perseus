@@ -222,10 +222,12 @@ def run_auto(a, argv):
     # shipped soft envelope. Each refresh priced to 1e-3 (PLAN_ERR_TARGET): the planner's default 1e-2 is a model's,
     # and on the pipeline it traded a bootstrap for a refresh of a value of size 3 at CF 8 (z 3.2e-3, not 1.7e-3)
     pe = os.environ.get("PLAN_ERR_TARGET", "1e-3")
+    # a code refresh of a value past the default CF's band (a softmax sum, a count) gets a priced CF
+    band = os.environ.get("PLAN_DELIBERATE_BAND_CF", "1")
     for cap in ([os.environ["PLAN_HARD_ENV_CAP"]] if "PLAN_HARD_ENV_CAP" in os.environ else ["1", "0"]):
         r = subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name],
                            env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable, PLAN_HARD_ENV_CAP=cap,
-                                    PLAN_ERR_TARGET=pe))
+                                    PLAN_ERR_TARGET=pe, PLAN_DELIBERATE_BAND_CF=band))
         if r.returncode == 0:
             break
     else:

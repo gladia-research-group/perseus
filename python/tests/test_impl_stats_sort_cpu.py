@@ -246,7 +246,8 @@ def test_pipeline_capture_plan_compile(tmp_path):
     import sys
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=os.path.join(repo, "python"),
-               PLAN_SPARSE_SLOTS="", PLAN_HARD_ENV_CAP="1", PC_WORK_DIR=str(tmp_path))
+               PLAN_SPARSE_SLOTS="", PLAN_HARD_ENV_CAP="1", PLAN_DELIBERATE_BAND_CF="1",
+               PC_WORK_DIR=str(tmp_path))
     graph = tmp_path / "graph"
     plan = os.path.join("bootstrap_placements", "_test_mathlib_pipeline")
     me = [sys.executable, "-m", "perseus.examples.mathlib.run", "--task", "pipeline", "--set", "n=16", "B=4"]

@@ -199,6 +199,8 @@ def main() -> None:
     p.add_argument("--pack-cf", action="store_true", default=None, dest="pack_cf",
                    help="a refresh of a complex pack whose small imaginary part is split off downstream gets the "
                         "lowest CF its band allows")
+    p.add_argument("--deliberate-band-cf", action="store_true", default=None, dest="deliberate_band_cf",
+                   help="a code refresh whose captured magnitude is past the default CF's band gets a priced CF")
     p.add_argument("--prune", action="store_true", default=None,
                    help="remove redundant refreshes from the final plan, any placer")
     p.add_argument("--baseline-depth-cap", type=float, dest="baseline_depth_cap",

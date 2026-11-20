@@ -238,6 +238,9 @@ class PlanConfig:
     #: band allows, where its route's EvalMod sees the coefficients: its noise is absolute, the same on both parts
     #: (PLAN_PACK_CF; emit.split_packs)
     pack_cf: bool = False
+    #: a code refresh (dense, shipped order) whose captured magnitude is past the band of the runtime's default CF gets
+    #: a priced CF (PLAN_DELIBERATE_BAND_CF; out_of_band_deliberates; off: the default CF, as every shipped plan has)
+    deliberate_band_cf: bool = False
     #: placer "ilp": one optimum, the same on every machine and solver build (IlpPlacer.tiebreak, PLAN_ILP_TIEBREAK)
     ilp_tiebreak: bool = False
     #: remove redundant refreshes from the final plan (any placer, after rescue): greedily,
@@ -725,7 +728,9 @@ def out_of_band_deliberates(g: Graph, refresh, cf_default: int, priced: tuple[st
     """The code's own refreshes (dense shipped-order route, not external) whose captured magnitude is past the EvalMod band of the route's
     default CF (`cf_default`, the runtime's when the plan gives a site none): priced like a placed dense site instead
     (emit: `deliberate_priced`). At the default a refresh of a value of size ~n (a softmax sum, a count) is far past
-    the band and the device returns garbage (~1e17); in band, the default stands (shipped plans unchanged)."""
+    the band and the device returns garbage (~1e17); in band, the default stands. Only under
+    PlanConfig.deliberate_band_cf (the impl runners'): the shipped plans' code refreshes run at the default (GPT-2
+    block 13's are past it at PLAN_MAG_SAFETY=2)."""
     out = []
     for n in g.nodes:
         if not (n.is_deliberate_bts and n.output and not n.external and not n.stc_first and not n.route_slots
@@ -996,7 +1001,8 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # a plan CF on a deliberate site, which otherwise runs at its route's default
     refresh.deliberate_priced = priced_deliberates(g, shadow.plan.get("plan.step_landing") or "")
     # and those past the band of the runtime's default CF (6 on n32: pc-gpu BtsSetup; the chain's CF floor above it)
-    oob = out_of_band_deliberates(g, refresh, max(6, int(cfg.cf_min)), refresh.deliberate_priced)
+    oob = (out_of_band_deliberates(g, refresh, max(6, int(cfg.cf_min)), refresh.deliberate_priced)
+           if cfg.deliberate_band_cf else ())
     refresh.deliberate_oob = oob
     if oob:
         refresh.deliberate_priced = refresh.deliberate_priced + oob
