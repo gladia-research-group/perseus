@@ -20,6 +20,7 @@ use pc_shadow::{CtMeta, Route, Shadow};
 pub mod cts;
 pub mod dense;
 pub mod evalmod;
+pub mod fbs_noise; // functional bootstrapping: validated chains, noise model
 pub mod finish;
 pub mod raise;
 pub mod stc;

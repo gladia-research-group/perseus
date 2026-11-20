@@ -1192,6 +1192,170 @@ pub mod sim {
     }
 }
 
+/// Noise of a program, per slot, linearized: the program's value in integer units (`sim`'s integers, as f64), its
+/// derivative with respect to the input (forward values, reverse-mode adjoints through every op), and the variance the
+/// fresh noise sources add at the output: every rescale's rounding (`Fresh::rescale`, added after it) and every
+/// relinearization (`Fresh::relin`, at the product's scale), independent of each other and of the input, each times
+/// its adjoint squared. The input's own error enters as derivative x error (first order: the products of two errors
+/// are dropped, ~2^-40 relative here).
+pub mod noise {
+    use super::{EmOp, Epi};
+    use pc_core::modmul::{invmod, mulmod};
+    use pc_core::scale::ScaleTables;
+
+    /// Variances (integer units squared, per real slot component) a rescale's rounding and a relinearization add.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Fresh {
+        pub rescale: f64,
+        pub relin: f64,
+    }
+
+    /// The centred integer of the residues `r` on primes 0..n (balanced mixed radix), as f64.
+    pub fn centred(r: &[u64], q: &[u64], n: usize) -> f64 {
+        let mut digits: Vec<i64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = q[i];
+            // the value of the digits so far mod p, and M_i = prod_{k < i} q_k mod p
+            let (mut acc, mut m) = (0u64, 1u64);
+            for (k, &t) in digits.iter().enumerate() {
+                acc = (acc + mulmod(t.rem_euclid(p as i64) as u64, m, p)) % p;
+                m = mulmod(m, q[k] % p, p);
+            }
+            let d = mulmod((r[i] % p + p - acc) % p, invmod(m, p), p);
+            digits.push(if d > p / 2 { d as i64 - p as i64 } else { d as i64 });
+        }
+        // the constants are small next to the modulus: the high digits are zero (and their weights overflow f64)
+        let (mut v, mut m) = (0f64, 1f64);
+        for (k, &t) in digits.iter().enumerate() {
+            if t != 0 {
+                v += t as f64 * m;
+            }
+            m *= q[k] as f64;
+        }
+        v
+    }
+
+    fn dropped(st: &ScaleTables, n: usize) -> f64 {
+        let g = st.drop.get(n - 1).copied().filter(|&g| g > 0).unwrap_or(st.d);
+        (n - g..n).map(|i| st.q[i] as f64).product()
+    }
+
+    /// The constants every op reads, decoded once (`run`'s second argument): per op, in its read order.
+    pub fn prepare(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>]) -> Vec<Vec<f64>> {
+        let q = &st.q;
+        let nq = q.len();
+        let epi_c = |e: &Epi, n: usize| e.k.map(|k| centred(&consts[k], q, n)).into_iter().collect::<Vec<_>>();
+        ops.iter()
+            .map(|op| match op {
+                EmOp::MulConst { n, k, .. } | EmOp::AddConst { n, k, .. } => vec![centred(&consts[*k], q, *n)],
+                EmOp::Rescale { n, k, .. } => vec![k.map_or(1.0, |k| centred(&consts[k], q, *n))],
+                EmOp::Mult { n, epi: e, .. } | EmOp::MultAcc { n, epi: e, .. } => epi_c(e, *n),
+                EmOp::WSum { srcs, n, k, .. } => (0..srcs.len()).map(|j| centred(&consts[*k][j * nq..(j + 1) * nq], q, *n)).collect(),
+                EmOp::Copy { .. } | EmOp::Add { .. } => vec![],
+            })
+            .collect()
+    }
+
+    /// The linearized program on input `x` (integer units, buffer 0) read at buffer `out`: (value, d value / d x,
+    /// variance of the fresh noise at `out`), integer units; `pre` = `prepare(st, ops, consts)`.
+    pub fn linearize(st: &ScaleTables, ops: &[EmOp], pre: &[Vec<f64>], x: f64, out: usize, fresh: Fresh) -> (f64, f64, f64) {
+        let nb = ops.iter().flat_map(super::sim_ids).max().unwrap_or(0).max(out) + 1;
+        let mut v = vec![0f64; nb];
+        v[0] = x;
+        // forward: the operand values each product reads
+        let mut tape: Vec<Vec<(f64, f64)>> = Vec::with_capacity(ops.len());
+        let epi = |x: f64, e: &Epi, c: &[f64]| {
+            let x = if e.dbl { 2.0 * x } else { x };
+            if e.k.is_some() {
+                x + c[0]
+            } else {
+                x
+            }
+        };
+        for (op, c) in ops.iter().zip(pre) {
+            let mut t = vec![];
+            match op {
+                EmOp::Copy { dst, src, .. } => v[*dst] = v[*src],
+                EmOp::Add { dst, a, b, sub, .. } => v[*dst] = if *sub { v[*a] - v[*b] } else { v[*a] + v[*b] },
+                EmOp::MulConst { x, .. } => v[*x] *= c[0],
+                EmOp::AddConst { x, .. } => v[*x] += c[0],
+                EmOp::Rescale { x, n, .. } => v[*x] = v[*x] * c[0] / dropped(st, *n),
+                EmOp::Mult { dst, a, b, epi: e, .. } => {
+                    t.push((v[*a], v[*b]));
+                    v[*dst] = epi(v[*a] * v[*b], e, c);
+                }
+                EmOp::MultAcc { dst, pairs, epi: e, .. } => {
+                    let mut acc = v[*dst];
+                    for (a, b) in pairs {
+                        t.push((v[*a], v[*b]));
+                        acc += v[*a] * v[*b];
+                    }
+                    v[*dst] = epi(acc, e, c);
+                }
+                EmOp::WSum { dst, srcs, .. } => v[*dst] = srcs.iter().enumerate().map(|(j, s)| v[*s] * c[j]).sum(),
+            }
+            tape.push(t);
+        }
+        // reverse: adjoints of every buffer, the fresh sources' variance where they enter
+        let mut g = vec![0f64; nb];
+        g[out] = 1.0;
+        let mut var = 0.0;
+        for ((op, c), t) in ops.iter().zip(pre).rev().zip(tape.iter().rev()) {
+            match op {
+                EmOp::Copy { dst, src, .. } => {
+                    let d = std::mem::take(&mut g[*dst]);
+                    g[*src] += d;
+                }
+                EmOp::Add { dst, a, b, sub, .. } => {
+                    let d = std::mem::take(&mut g[*dst]);
+                    g[*a] += d;
+                    g[*b] += if *sub { -d } else { d };
+                }
+                EmOp::MulConst { x, .. } => g[*x] *= c[0],
+                EmOp::AddConst { .. } => {}
+                EmOp::Rescale { x, n, .. } => {
+                    var += g[*x] * g[*x] * fresh.rescale;
+                    g[*x] *= c[0] / dropped(st, *n);
+                }
+                EmOp::Mult { dst, a, b, epi: e, .. } => {
+                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
+                    var += d * d * fresh.relin;
+                    let (va, vb) = t[0];
+                    g[*a] += d * vb;
+                    g[*b] += d * va;
+                }
+                EmOp::MultAcc { dst, pairs, epi: e, .. } => {
+                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
+                    var += d * d * fresh.relin;
+                    g[*dst] += d;
+                    for ((a, b), (va, vb)) in pairs.iter().zip(t) {
+                        g[*a] += d * vb;
+                        g[*b] += d * va;
+                    }
+                }
+                EmOp::WSum { dst, srcs, .. } => {
+                    let d = std::mem::take(&mut g[*dst]);
+                    for (j, s) in srcs.iter().enumerate() {
+                        g[*s] += d * c[j];
+                    }
+                }
+            }
+        }
+        (v[out], g[0], var)
+    }
+
+    /// (value, derivative, fresh variance) of `linearize` read as `sim::decode` reads buffer metadata (top, nl, nf):
+    /// in value units, a degree-2 output rescaled once more (its rounding added).
+    pub fn decode(st: &ScaleTables, l: (f64, f64, f64), top: i32, nl: i32, nf: f64, fresh: Fresh) -> (f64, f64, f64) {
+        if nl == 2 {
+            let qd = dropped(st, top as usize + 1);
+            let nf = nf / st.mod_reduce_product(top);
+            return (l.0 / qd / nf, l.1 / qd / nf, (l.2 / (qd * qd) + fresh.rescale) / (nf * nf));
+        }
+        (l.0 / nf, l.1 / nf, l.2 / (nf * nf))
+    }
+}
+
 /// Buffer ids an op names (for `sim::run`).
 pub fn sim_ids(op: &EmOp) -> Vec<usize> {
     match op {
@@ -1296,6 +1460,42 @@ mod sim_tests {
                     assert!(e < 1e-12, "deg {deg} c0 {c0} {stage}: max err {e:.3e}");
                 }
             }
+        }
+    }
+
+    /// The linearized noise replay reads the program's values as the exact replay does, its derivative is the program's
+    /// (central differences), and its fresh variance is at least the last rescale's rounding.
+    #[test]
+    fn noise_linearize_matches_sim() {
+        let st = tables();
+        let top = st.l as i32 - if st.drop[st.l] == 0 { 1 } else { 0 };
+        let input = FMeta { top, nl: 1, nf: st.sf(top).unwrap() };
+        let mut c: Vec<f64> = (0..=40).map(|i| 0.3 * 0.9f64.powi(i as i32) * (1.0 + i as f64).sin()).collect();
+        c[0] = 0.5;
+        let mut b = Builder::new(&st);
+        b.lean = true;
+        let x = b.input(input);
+        build_chebyshev_general(&mut b, x, &c).unwrap();
+        let out = b.metas[x];
+        let pre = noise::prepare(&st, &b.prog.ops, &b.prog.consts);
+        let fresh = noise::Fresh { rescale: 1e8, relin: 1e8 };
+        for u in [-0.9, -0.3, 0.0, 0.45, 0.8] {
+            let mut bufs = vec![sim::encode(u * input.nf, &st.q)];
+            sim::run(&st, &b.prog.ops, &b.prog.consts, &mut bufs);
+            let want = sim::decode(&st, &bufs[x], out.top, out.nl, out.nf);
+            let l = noise::linearize(&st, &b.prog.ops, &pre, u * input.nf, x, fresh);
+            let (v, d, var) = noise::decode(&st, l, out.top, out.nl, out.nf, fresh);
+            assert!((v - want).abs() < 1e-9, "u {u}: {v} vs {want}");
+            let h = 1e-5;
+            let f = |y: f64| noise::decode(&st, noise::linearize(&st, &b.prog.ops, &pre, y * input.nf, x, fresh), out.top, out.nl, out.nf, fresh).0;
+            let fd = (f(u + h) - f(u - h)) / (2.0 * h) / input.nf;
+            assert!((d - fd).abs() < 1e-6 * fd.abs().max(1e-12) + 1e-20, "u {u}: d {d:.6e} vs {fd:.6e}");
+            assert!(var > 0.0 && var.is_finite());
+        }
+        // the balanced mixed-radix decode of small constants, either sign, over many primes
+        for v in [0i64, 1, -1, 123_456_789, -987_654_321_012] {
+            let r: Vec<u64> = st.q.iter().map(|&p| (v as i128).rem_euclid(p as i128) as u64).collect();
+            assert_eq!(noise::centred(&r, &st.q, st.q.len()), v as f64);
         }
     }
 }
