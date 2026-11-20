@@ -64,12 +64,13 @@ def run_auto(a, argv):
     bp = os.path.join(ASSETS, "bootstrap_placements")
     name = os.path.relpath(plan, bp)
     pe = os.environ.get("PLAN_ERR_TARGET", "1e-3")
+    band = os.environ.get("PLAN_DELIBERATE_BAND_CF", "1")     # code refreshes past the default CF's band: priced
     caps = [os.environ["PLAN_HARD_ENV_CAP"]] if "PLAN_HARD_ENV_CAP" in os.environ else ["1", "0"]
     for recut in (os.environ.get("PLAN_DRIFT_RECUT", "0"), "1"):
         for cap_ in caps:
             r = subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name],
                                env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable, PLAN_HARD_ENV_CAP=cap_,
-                                        PLAN_ERR_TARGET=pe, PLAN_DRIFT_RECUT=recut))
+                                        PLAN_ERR_TARGET=pe, PLAN_DRIFT_RECUT=recut, PLAN_DELIBERATE_BAND_CF=band))
             if r.returncode == 0:
                 break
         else:
