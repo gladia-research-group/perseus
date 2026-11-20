@@ -58,9 +58,11 @@ class Task:
 
 
 def _err(y, t, rel=False):
+    """(max, RMS) error; relative: against |t| floored at 1e-4 max |t| (CKKS noise is absolute: values below the
+    floor, e.g. exp(-30), carry ~1e-9 of noise, not a relative error)."""
     e = np.abs(np.asarray(y) - np.asarray(t))
     if rel:
-        e = e / np.maximum(np.abs(t), 1e-300)
+        e = e / np.maximum(np.abs(t), 1e-4 * float(np.abs(t).max()))
     return float(e.max()), float(np.sqrt(np.mean(e * e)))
 
 

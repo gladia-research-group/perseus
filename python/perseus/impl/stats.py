@@ -13,7 +13,8 @@ rotations per reduction; the levels are the products' (listed per function).
   rotation by s features is cyclic within the sample): d/2 + 1 cyclic diagonals, each one product of the centred
   data with a (hoisted) rotation of itself and one sample ladder; correlation standardises the features first.
 * `logsumexp` / `softmax`: max-shifted (an encrypted maximum from impl.sort, or a calibrated public bound): exp on
-  [lo - hi, 0], the sum, then log / reciprocal on the sum's band ([1, n] after an exact max shift).
+  [lo - hi, margin], the mean, then log / reciprocal on its band ([e^-margin / n, e^margin] after a max shift), with
+  a deliberate refresh before the exp and before the log / reciprocal (`refresh`).
 * `prefix_sum`: Hillis-Steele scan on the padded layout, log2(n) rotations and no level, no mask (the zeros after each
   vector absorb the shifts; the padding holds garbage afterwards).
 """
@@ -281,24 +282,32 @@ def _shift(ops, x, lay, lo, hi, shift, method, err, margin):
     raise ValueError(f"shift {shift!r}: 'bound' or 'max'")
 
 
+def _fresh(ops, x, refresh):
+    """A deliberate refresh (the real-payload route) before a function whose choice assumed a fresh input: the stage
+    reaches it deep, and a refresh the planner places inside a high-degree series multiplies its error (impl.math
+    NOISE_BTS)."""
+    return ops.bootstrap_real(x) if refresh else x
+
+
 def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-            s_lo: float | None = None, margin: float | None = None):
+            s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
     """softmax over each vector, x in [lo, hi]: exp(x - m) / sum. `shift` "max" (exact maximum: the sum's band is
     [1, n]) or "bound" (m = hi: the band is [n e^(lo - hi), n], or `s_lo` if calibrated); `method`: the max's
     comparisons (impl.sort)."""
     u, _m_, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
-    e = M.exp(ops, u, a, b, 0.25 * err, rel=False)
-    s = total(ops, e, lay)
-    return ops.mult(e, M.reciprocal(ops, s, sl, sh, 0.5 * err, rel=True))
+    e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
+    # the mean (<= e^margin), not the sum, is refreshed: a refresh's error grows with the value's size
+    s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), refresh)
+    return ops.mult(ops.mult(e, 1.0 / lay.n), M.reciprocal(ops, s, sl / lay.n, sh / lay.n, 0.5 * err, rel=True))
 
 
 def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-              s_lo: float | None = None, margin: float | None = None):
+              s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
     """log sum_j exp(x_j), x in [lo, hi], broadcast over each vector's slots (softmax's shift and band)."""
     u, m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
-    e = M.exp(ops, u, a, b, 0.25 * err / lay.n, rel=False)
-    s = total(ops, e, lay)
-    L = M.log(ops, s, sl, sh, 0.5 * err)
-    return ops.add(L, m)
+    e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
+    s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), refresh)        # the mean: log s = log mean + log n
+    L = M.log(ops, s, sl / lay.n, sh / lay.n, 0.5 * err)
+    return ops.add(ops.add(L, m), _m.log(lay.n))

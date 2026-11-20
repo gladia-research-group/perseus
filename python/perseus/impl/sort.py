@@ -433,7 +433,9 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
             bit = msign(ops, e, N, s0, 2.0 * n, 3, f"thr.c{p}", res=0.25)
             inc = ops.rotate_and_sum(ops.mult_pt(bit, _mask(N, s0, w), kind="mask"), -B, N)
         else:
-            bit = step(ops, e, s, 1.0, method="ckks", bound=n + 1.0, res=0.5, tag=f"thr.c{p}", n=N)
+            # the count over n + 1 (a value of size n refreshed inside the comparison's ladder comes back as garbage)
+            bit = step(ops, ops.mult(e, 1.0 / (n + 1.0)), s, 1.0, method="ckks", bound=1.0, res=0.5 / (n + 1.0),
+                       tag=f"thr.c{p}", n=N)
             inc = ops.mult(bit, w)
         t = inc if t is None else ops.add(t, inc)
     mask = step(ops, ops.sub(y, t), s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag="thr.m",
