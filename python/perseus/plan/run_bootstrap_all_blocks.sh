@@ -80,4 +80,5 @@ if [[ -n "${PLAN_LATENCY_TABLE:-}"  ]]; then args+=(--latency-table "$PLAN_LATEN
 if [[ "${PLAN_PRUNE:-}" == 1        ]]; then args+=(--prune);                                 fi
 if [[ "${PLAN_FALLBACK_CF:-0}" != 0 ]]; then args+=(--fallback-cf);                           fi
 if [[ "${PLAN_PACK_CF:-0}" != 0     ]]; then args+=(--pack-cf);                               fi
+if [[ "${PLAN_DELIBERATE_BAND_CF:-0}" != 0 ]]; then args+=(--deliberate-band-cf);             fi
 exec "$PYTHON" -m perseus.plan.placer "${args[@]}"

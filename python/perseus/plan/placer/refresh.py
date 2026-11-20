@@ -149,7 +149,17 @@ class RefreshPlanner:
             self._cache[("dense", v)] = got
         return got
 
-    def _build(self, v: str, force_shipped: bool = False, force_dense: bool = False) -> RefreshSpec:
+    def spec_deliberate(self, v: str) -> RefreshSpec:
+        """`spec_dense` with the CF as the only knob (no prescale, no offset): a code's own refresh runs as captured,
+        the plan can give it a correction factor only (planner.out_of_band_deliberates)."""
+        got = self._cache.get(("delib", v))
+        if got is None:
+            got = self._build(v, force_dense=True, cf_only=True)
+            self._cache[("delib", v)] = got
+        return got
+
+    def _build(self, v: str, force_shipped: bool = False, force_dense: bool = False,
+               cf_only: bool = False) -> RefreshSpec:
         p = self.graph.producer_of.get(v)
         if p is None and not is_kv_cache_read(v):
             return RefreshSpec(v, False, True, float("inf"),
@@ -159,6 +169,8 @@ class RefreshPlanner:
         kappa = mag_safety_of(p.step if p is not None else None, pol.mag_safety)
         if kappa != pol.mag_safety:
             pol = dataclasses.replace(pol, mag_safety=kappa)
+        if cf_only:
+            pol = dataclasses.replace(pol, allow_prescale=False, allow_offset=False)
         site = dict(
             slot_mag=p.max_abs if p else None,
             period=p.pack_period if p else None,

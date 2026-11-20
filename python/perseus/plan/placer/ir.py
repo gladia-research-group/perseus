@@ -92,6 +92,8 @@ class Node:
     stc_first: bool = False
     # a deliberate refresh that finishes an external op (a PCMM / CCMM: args.external): its inputs are that op's
     external: bool = False
+    # a deliberate refresh's captured route (args.route.slots; 0 = dense)
+    route_slots: int = 0
 
     @property
     def is_deliberate_bts(self) -> bool:
@@ -180,6 +182,8 @@ class Graph:
                                and not ((n.get("args") or {}).get("route") or {}).get("slots")),
                 external=bool(str(n.get("op_type", "")) == "deliberate_bootstrap"
                               and (n.get("args") or {}).get("external")),
+                route_slots=int(((n.get("args") or {}).get("route") or {}).get("slots") or 0)
+                if str(n.get("op_type", "")) == "deliberate_bootstrap" else 0,
             ))
 
         for d in drafts:

@@ -315,10 +315,11 @@ def assemble(
         out_level_hist[lvl] = out_level_hist.get(lvl, 0) + 1
     # the code's own refreshes of cache-following steps (planner.priced_deliberates): their CF priced as a dense site's,
     # which the compile keeps on the deliberate site (else its route's default CF)
+    oob = set(getattr(refresh, "deliberate_oob", ()))
     for v in getattr(refresh, "deliberate_priced", ()):
         if v in cf_map:
             continue
-        s = refresh.spec_dense(v)
+        s = refresh.spec_deliberate(v) if v in oob else refresh.spec_dense(v)
         cf = _site_cf(v, s.cf)
         if cf is not None:
             cf_map[v] = int(cf)
