@@ -721,6 +721,25 @@ def priced_deliberates(g: Graph, step_landing: str) -> tuple[str, ...]:
                  and _step_landing_floor(step_landing, n.step) is not None)
 
 
+def out_of_band_deliberates(g: Graph, refresh, cf_default: int, priced: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """The code's own refreshes (dense shipped-order route, not external) whose captured magnitude is past the EvalMod band of the route's
+    default CF (`cf_default`, the runtime's when the plan gives a site none): priced like a placed dense site instead
+    (emit: `deliberate_priced`). At the default a refresh of a value of size ~n (a softmax sum, a count) is far past
+    the band and the device returns garbage (~1e17); in band, the default stands (shipped plans unchanged)."""
+    out = []
+    for n in g.nodes:
+        if not (n.is_deliberate_bts and n.output and not n.external and not n.stc_first and not n.route_slots
+                and n.output not in priced):
+            continue
+        p = g.producer_of.get(n.output)
+        mag = (p.max_coeff if p is not None and p.max_coeff else
+               (p.max_abs if p is not None and p.max_abs else 0.0))
+        kappa = refresh.policy.mag_safety
+        if mag and kappa * float(mag) > btserr.band(cf_default)[1]:
+            out.append(n.output)
+    return tuple(out)
+
+
 def cache_route_deliberates(g: Graph, step_landing: str, raw: tuple[float, int]) -> tuple[Graph, int]:
     """A code's own (deliberate) refresh in a cache-following step (plan.step_landing, PLAN_STEP_LANDING: SM_PERIODIC=2,
     a per-key value's period grows with the cache) is planned on the dense StC-first route: its landing `raw` (the
@@ -976,6 +995,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
     # the code's own refreshes of cache-following steps take a priced CF (emit: `deliberate_priced`); the compile keeps
     # a plan CF on a deliberate site, which otherwise runs at its route's default
     refresh.deliberate_priced = priced_deliberates(g, shadow.plan.get("plan.step_landing") or "")
+    # and those past the band of the runtime's default CF (6 on n32: pc-gpu BtsSetup; the chain's CF floor above it)
+    oob = out_of_band_deliberates(g, refresh, max(6, int(cfg.cf_min)), refresh.deliberate_priced)
+    refresh.deliberate_oob = oob
+    if oob:
+        refresh.deliberate_priced = refresh.deliberate_priced + oob
+        if cfg.verbose:
+            log.info(f"[plan] {len(oob)} deliberate refresh(es) past the default CF's band priced: {', '.join(oob[:6])}")
 
     # compile the step substrings into per-var hint_force=False pins, so the pin
     # plumbing (Placer, the rescale_opt trial placers, emit) carries the veto and

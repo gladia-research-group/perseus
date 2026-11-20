@@ -138,3 +138,32 @@ def test_fourier_and_lstsq_in_one_stage(tmp_path):
 def test_fourier_stage_compiles(tmp_path):
     n_bts, plan = _auto(tmp_path, "fourier", ["kind=dft", "n=1024"])
     assert n_bts == 0
+
+
+def test_deliberate_refresh_past_the_default_band_is_priced(tmp_path):
+    """A code refresh of a value of size 256 (a softmax sum) is far past the EvalMod band of the runtime's default CF
+    (6: the device returned ~1e17): the planner gives it a CF from its captured magnitude; a unit-size refresh keeps
+    the default (no CF in the plan), as every shipped plan's code refreshes do."""
+    from perseus._paths import ASSETS, PKG
+    g = tmp_path / "graph"
+    (g / "block_0").mkdir(parents=True)
+    route = {"route": {"slots": 0, "stc_first": False}}
+
+    def big(n, mag):
+        return {**n, "output_max_abs": mag, "output_mean": mag, "output_max_dev": 0.0, "output_max_coeff": mag}
+    nodes = [
+        big(_node("mult", ["anon_1", "const(256)"], [32, -1], "v_1", 32, 2, args={"scalar": 256.0}), 256.0),
+        big(_node("deliberate_bootstrap", ["v_1"], [34], "v_2", 32, 2, args=route), 256.0),
+        _node("mult", ["v_2", "const(0.00390625)"], [32, -1], "v_3", 32, 2, args={"scalar": 1.0 / 256}),
+        _node("deliberate_bootstrap", ["v_3"], [34], "v_4", 32, 2, args=route),
+        _node("mult", ["v_4", "v_4"], [32, 32], "v_5", 32, 2),
+    ]
+    (g / "block_0" / "graph.json").write_text(json.dumps({"version": 2, "nodes": nodes}))
+    plan = tmp_path / "plan"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PLAN_SPARSE_SLOTS="", PYTHON=sys.executable)
+    r = subprocess.run(["bash", str(PKG / "examples" / "gpt2" / "make_plan.sh"), str(g),
+                        os.path.relpath(plan, ASSETS / "bootstrap_placements")], env=env, capture_output=True,
+                       text=True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    cf = json.load(open(plan / "block_0_placement.json"))["correction_factor"]
+    assert cf.get("v_2", 0) >= 14 and "v_4" not in cf, cf
