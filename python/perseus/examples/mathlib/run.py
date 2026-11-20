@@ -220,7 +220,8 @@ def run_auto(a, argv):
     bp = os.path.join(ASSETS, "bootstrap_placements")
     name = os.path.relpath(plan, bp)
     subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name], check=True,
-                   env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable))
+                   env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable,
+                            PLAN_HARD_ENV_CAP=os.environ.get("PLAN_HARD_ENV_CAP", "1")))
     subprocess.run([*me, *rest, "--plan", plan], check=True)
 
 

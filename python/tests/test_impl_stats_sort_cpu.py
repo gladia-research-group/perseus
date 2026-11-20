@@ -151,10 +151,11 @@ def test_bitonic(method, n, B):
     X = _distinct(rng, B, n)
     idx = lay.encode(np.tile(np.arange(n, dtype=float), (B, 1)))
     xs, p = T.bitonic(OPS, lay.encode(X), lay, 2.0, method=method, res=0.5 / n, payload=idx)
-    np.testing.assert_allclose(np.real(xs), lay.encode(np.sort(X, 1)), atol=1e-3)
+    tol = 1e-9 if method == "tfhe" else 0.005           # CKKS: |d| DELTA per step, blended swaps
+    np.testing.assert_allclose(np.real(xs), lay.encode(np.sort(X, 1)), atol=tol)
     np.testing.assert_allclose(lay.decode(p), np.argsort(X, 1), atol=0.02)
     xd, _ = T.bitonic(OPS, lay.encode(X), lay, 2.0, method=method, res=0.5 / n, descending=True)
-    np.testing.assert_allclose(lay.decode(xd), -np.sort(-X, 1), atol=1e-3)
+    np.testing.assert_allclose(lay.decode(xd), -np.sort(-X, 1), atol=tol)
     assert len(T.bitonic_steps(n)) == int(np.log2(n) * (np.log2(n) + 1) / 2)
 
 

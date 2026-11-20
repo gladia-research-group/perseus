@@ -689,54 +689,142 @@ def _sign_value(coefs, t):
     return y
 
 
+def _odd_minimax(d, lo, hi, n_grid=2000):
+    """calibrate/approximations/relu.py `_odd_minimax` (that module imports torch at load): the odd Chebyshev
+    coefficients (domain [-hi, hi]) minimising max |p - 1| on [lo, hi] with p in [-delta, 1 + delta] on [0, lo]."""
+    from scipy.optimize import linprog
+    ks = np.arange(1, d + 1, 2)
+    xa = hi * (lo / hi + (1 - lo / hi) * (1 - np.cos(np.linspace(0, np.pi, n_grid))) / 2)
+    xg = np.linspace(0.0, lo, max(n_grid // 4, 50))
+    Ta = np.cos(np.outer(np.arccos(np.clip(xa / hi, -1, 1)), ks))
+    Tg = np.cos(np.outer(np.arccos(np.clip(xg / hi, -1, 1)), ks))
+    n = len(ks)
+    one, gone = np.ones((len(xa), 1)), np.ones((len(xg), 1))
+    A = np.vstack([np.hstack([Ta, -one]), np.hstack([-Ta, -one]), np.hstack([Tg, -gone]), np.hstack([-Tg, -gone])])
+    b = np.concatenate([np.ones(len(xa)), -np.ones(len(xa)), np.ones(len(xg)), np.zeros(len(xg))])
+    cost = np.zeros(n + 1)
+    cost[-1] = 1.0
+    r = linprog(cost, A_ub=A, b_ub=b, bounds=[(None, None)] * n + [(0, None)], method="highs")
+    if not r.success:
+        raise TargetError(f"sign stage d={d} [{lo}, {hi}]: {r.message}")
+    coef = np.zeros(d + 1)
+    coef[ks] = r.x[:n]
+    return coef
+
+
+@functools.lru_cache(maxsize=4096)
 def _stage(d, lo, hi):
     """One composite-sign stage: the odd minimax polynomial of degree d on [-hi, hi] for sgn on [lo, hi]
     (calibrate/approximations/relu.py `_odd_minimax`) and its image (min on [lo, hi], max |p| on [0, hi])."""
-    from perseus.calibrate.approximations.relu import _odd_minimax
-    coef, _ = _odd_minimax(int(d), lo, hi)
+    coef = _odd_minimax(int(d), lo, hi)
     ys = _C.chebval(np.linspace(lo, hi, 4000) / hi, coef)
     top = float(np.abs(_C.chebval(np.linspace(0.0, hi, 8000) / hi, coef)).max())
     return coef, float(ys.min()), top
 
 
+def _cache_path():
+    import os
+    d = os.environ.get("PERSEUS_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "perseus")
+    return os.path.join(d, "math_sign_ladders.json")
+
+
+def _disk_cached(f):
+    """sign_ladder's results kept on disk (the search fits ~50-300 minimax LPs: seconds per new (eps, delta)); the
+    file is a cache only (PERSEUS_CACHE_DIR, default ~/.cache/perseus), deterministic to recompute."""
+    import json
+    import os
+
+    @functools.wraps(f)
+    def g(eps, delta, relu=False):
+        key = f"{float(eps)!r}|{float(delta)!r}|{int(bool(relu))}"
+        path = _cache_path()
+        try:
+            with open(path) as fh:
+                d = json.load(fh).get(key)
+            if d is not None:
+                return SignLadder(tuple(d["degs"]), d["eps"], d["delta"], d["depth"], d["ct_mults"],
+                                  tuple(tuple(v) for v in d["coefs"]), tuple(tuple(v) for v in d["half"]))
+        except (OSError, ValueError, KeyError):
+            pass
+        lad = f(eps, delta, relu)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path) as fh:
+                    allc = json.load(fh)
+            except (OSError, ValueError):
+                allc = {}
+            allc[key] = dataclasses.asdict(lad)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(allc, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return lad
+    return g
+
+
 @_memo
-def sign_ladder(eps: float, delta: float) -> SignLadder:
-    """The cheapest composite sign (fewest levels, then products) with |p - sgn| <= delta on [eps, 1]: ladders of one
-    odd degree (7, 15, 31, 63) or a wide first stage (15, 31, 63) then degree 7 / 15 stages, each stage the minimax
-    odd polynomial on the previous stage's image (calibrate/approximations/relu.py, Lee et al. IEEE TDSC 2021), grown
-    one stage at a time until the target holds (at most 12 stages)."""
-    from .relu import odd_series
+@_disk_cached
+def sign_ladder(eps: float, delta: float, relu: bool = False) -> SignLadder:
+    """The cheapest composite sign (fewest levels, then products) with |p - sgn| <= delta on [eps, 1]: a first stage of
+    degree d1 (7, 15, 31, 63), middle stages of one degree d (7, 15, 31, 63, <= d1 past the first) and, optionally, a
+    last stage of another degree (15, 27, 31, 63: a wide last stage, as the ResNet-20 ladder 7, 7, 27), each stage
+    the minimax odd polynomial on the previous stage's image (calibrate/approximations/relu.py, Lee et al. IEEE TDSC
+    2021), grown one stage at a time (at most 12) until the target holds or the cost passes the best so far. `relu`:
+    the target is the ReLU's instead, max over t in [0, 1] (the gap included) of t |1 - p(t)| / 2 <= delta."""
     eps, delta = float(eps), float(delta)
-    xs = np.concatenate([np.geomspace(eps, 1.0, 3000), np.linspace(eps, 1.0, 3000)])
+    if relu:
+        xs = np.concatenate([np.geomspace(1e-7, 1.0, 4000), np.linspace(0.0, 1.0, 4000)])
+    else:
+        xs = np.concatenate([np.geomspace(eps, 1.0, 3000), np.linspace(eps, 1.0, 3000)])
+    wt = 0.5 * xs if relu else 1.0
     shapes = [(d, d) for d in (7, 15, 31, 63)] + [(d1, d) for d1 in (15, 31, 63) for d in (7, 15) if d < d1]
     best = None
-    for d1, d in shapes:
-        stages, lo, hi = [], eps, 1.0
-        for m in range(12):
-            coef, lo2, top = _stage(d1 if m == 0 else d, lo, hi)
-            stages.append((coef, hi))
-            lo, hi = lo2, top
-            # unit form: stage i's coefficients carry 1 / h_{i+1}; the last one maps to +-1
-            coefs = [list(np.asarray(c) / (stages[q + 1][1] if q + 1 < len(stages) else 1.0))
-                     for q, (c, _h) in enumerate(stages)]
-            err = float(np.abs(_sign_value(coefs, xs) - 1.0).max())
-            if err <= delta:
-                break
-            c = CountOps()
-            if best is not None and m + 1 >= 1 and _ladder_cost(coefs) >= (best.depth, best.ct_mults):
-                coefs = None
-                break
-        else:
-            coefs = None
-        if coefs is None or err > delta:
-            continue
-        half = [list(c) for c in coefs[:-1]] + [list(0.5 * np.asarray(coefs[-1]))]
-        half[-1][0] += 0.5
+
+    def unit(stages):
+        # unit form: stage i's coefficients carry 1 / h_{i+1}; the last one maps to +-1
+        return [list(np.asarray(c) / (stages[q + 1][1] if q + 1 < len(stages) else 1.0))
+                for q, (c, _h) in enumerate(stages)]
+
+    last = [np.inf]
+
+    def offer(coefs, degs):
+        nonlocal best
+        err = float((wt * np.abs(_sign_value(coefs, xs) - 1.0)).max())
+        last[0] = err
+        if err > delta:
+            return False
         dep, cm = _ladder_cost(coefs)
-        cand = SignLadder(tuple(int(d1 if q == 0 else d) for q in range(len(coefs))), eps, err, dep, cm,
-                          tuple(tuple(v) for v in coefs), tuple(tuple(v) for v in half))
-        if best is None or (cand.depth, cand.ct_mults) < (best.depth, best.ct_mults):
-            best = cand
+        if best is None or (dep, cm) < (best.depth, best.ct_mults):
+            half = [list(c) for c in coefs[:-1]] + [list(0.5 * np.asarray(coefs[-1]))]
+            half[-1][0] += 0.5
+            best = SignLadder(tuple(int(v) for v in degs), eps, err, dep, cm, tuple(tuple(v) for v in coefs),
+                              tuple(tuple(v) for v in half))
+        return True
+
+    for d1, d in shapes:
+        stages, degs, lo, hi = [], [], eps, 1.0
+        for m in range(12):
+            dm = d1 if m == 0 else d
+            if m:       # a different last stage on the prefix
+                for dl in (15, 27, 31, 63):
+                    if dl != d:
+                        coef, _l, _t = _stage(dl, lo, hi)
+                        offer(unit(stages + [(coef, hi)]), degs + [dl])
+            coef, lo2, top = _stage(dm, lo, hi)
+            stages.append((coef, hi))
+            degs.append(dm)
+            lo, hi = lo2, top
+            coefs = unit(stages)
+            prev = last[0]
+            if offer(coefs, degs):
+                break
+            if best is not None and _ladder_cost(coefs) >= (best.depth, best.ct_mults):
+                break
+            if m >= 2 and last[0] > 0.9 * prev:
+                break               # stalled: the gap's own error floor (a wider gap than the target allows)
     if best is None:
         raise TargetError(f"sign: no ladder reaches delta {delta:.3g} at eps {eps:.3g}")
     return best
@@ -769,11 +857,35 @@ def _scaled(ops, x, s):
     return x if s == 1.0 else ops.mult(x, s)
 
 
+@_memo
+def relu_ladder(bound: float, err: float) -> SignLadder:
+    """The cheapest sign ladder whose ReLU x (1 + p(x / bound)) / 2 is within err on [-bound, bound]: the error is
+    |x| |1 - p(|x|)| / 2, small inside the gap too (the composite rises through it), so the ladders are fitted for
+    gaps from err / bound upwards and each one judged by that error directly (sign_ladder relu=True)."""
+    r = float(err) / float(bound)
+    best = None
+    for f in (1.0, 4.0, 16.0):   # inside the gap the error is ~eps / 8 at best: wider gaps cannot pass
+        eps = min(0.25, f * r)
+        try:
+            lad = sign_ladder(eps, r, True)
+        except TargetError:
+            if best is not None:
+                break               # a wider gap only raises the floor
+            continue
+        if best is None or (lad.depth, lad.ct_mults) < (best.depth, best.ct_mults):
+            best = lad
+        if eps >= 0.25:
+            break
+    if best is None:
+        raise TargetError(f"relu: no ladder reaches {err:.3g} on [-{bound}, {bound}]")
+    return best
+
+
 def relu_ckks(ops, x, bound, err, gain=1.0):
     """gain * max(x, 0) for |x| <= bound within gain * err: x * (1 + p(x / bound)) / 2 (relu.relu_folded: the product
     by x rides the last stage)."""
     from .relu import relu_folded
-    lad = sign_ladder(*_resolution(bound, err))
+    lad = relu_ladder(float(bound), float(err))
     return relu_folded(ops, x if bound == 1.0 else ops.mult(x, 1.0 / bound), [list(c) for c in lad.half],
                        gain=gain * bound)
 
@@ -849,7 +961,7 @@ def clip(ops, x, lo, hi, bound, err=1e-3, method="ckks", slots=None):
 def approx_relu(bound: float, err: float = 1e-3):
     """The CKKS relu's ladder and cost for |x| <= bound within err (no evaluation): (SignLadder, depth, products,
     float64 max error on [-bound, bound])."""
-    lad = sign_ladder(*_resolution(bound, err))
+    lad = relu_ladder(float(bound), float(err))
     x = grid(-bound, bound)
     y = np.real(relu_ckks(_NpOps(), x.copy(), float(bound), float(err)))
     c = count(lambda o, v: relu_ckks(o, v, float(bound), float(err)))
