@@ -678,7 +678,7 @@ fn main() -> ExitCode {
         };
     }
     // the StC-first route, stc_high (src/bts_stc_first.rs)
-    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stcf-pair" | "stc-high")) {
+    if matches!(args.first().map(|s| s.as_str()), Some("stcf" | "stcf-prec" | "stcf-pair" | "stc-high" | "fbs")) {
         return bts_stc_first::cmd(bts_stc_first::Mode::Bench, &args);
     }
     match parse(&args).and_then(run) {
