@@ -217,11 +217,15 @@ def run_auto(a, argv):
     subprocess.run([*me, *cap, "--fake", "--capture", graph], check=True, env=cpu)
     bp = os.path.join(ASSETS, "bootstrap_placements")
     name = os.path.relpath(plan, bp)
-    # the hard refresh envelope first; a stage the planner finds infeasible under it (planner limitation: a fresh
-    # input read again deep in the stage) falls back to the shipped soft envelope
+    # the hard refresh envelope first; a stage the planner finds infeasible under it (planner limitation: an op at
+    # the ceiling whose own refresh is past the envelope and whose operands are each within budget) falls back to the
+    # shipped soft envelope. Each refresh priced to 1e-3 (PLAN_ERR_TARGET): the planner's default 1e-2 is a model's,
+    # and on the pipeline it traded a bootstrap for a refresh of a value of size 3 at CF 8 (z 3.2e-3, not 1.7e-3)
+    pe = os.environ.get("PLAN_ERR_TARGET", "1e-3")
     for cap in ([os.environ["PLAN_HARD_ENV_CAP"]] if "PLAN_HARD_ENV_CAP" in os.environ else ["1", "0"]):
         r = subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name],
-                           env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable, PLAN_HARD_ENV_CAP=cap))
+                           env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable, PLAN_HARD_ENV_CAP=cap,
+                                    PLAN_ERR_TARGET=pe))
         if r.returncode == 0:
             break
     else:
