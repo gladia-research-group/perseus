@@ -98,6 +98,21 @@ def test_consolidate_makes_copies_equal():
     np.testing.assert_allclose(c, la.encode(la.decode(c, lo), lo), atol=1e-15)
 
 
+@pytest.mark.parametrize("face,wrap", [("O", False), ("L", False), ("R", False), ("L", True), ("R", True)])
+def test_consolidate_batched_faces(face, wrap):
+    """B = 4 different 8 x 8 problems: every face keeps each problem's own copy (a batched R face replicates along
+    axis 1, which also carries the problem index), and a wrap face's axis-0 repeats end equal too."""
+    n, B = 8, 4
+    cube = la.batched_cube(n, B, S)
+    lay = getattr(la, face)(cube, (n, n), B, **({"wrap": True} if wrap else {}))
+    M = np.random.default_rng(1).standard_normal((B, n, n))
+    v = la.encode(M, lay) + 1e-6 * np.random.default_rng(0).standard_normal(S)
+    c = la.consolidate(NumpyOps(), v, lay, scale=2.0)
+    np.testing.assert_allclose(la.decode(c, lay), 2.0 * M, atol=1e-4)
+    real = np.tile(lay.entries() >= 0, S // cube.P)                             # padding slots keep their noise
+    np.testing.assert_allclose(c[real], la.encode(la.decode(c, lay), lay)[real], atol=1e-15)
+
+
 @pytest.mark.parametrize("method,kw", [("ns", {}), ("cheb", {"kappa": 10.0}), ("ns", {"ridge": 1e-3}),
                                        ("ns", {"m": 1024, "sketch": 128})])
 def test_lstsq_mirror(method, kw):

@@ -449,16 +449,28 @@ def faces(ops, a, src: Lay, cube: Cube, alpha: float = 1.0, beta: float = 0.0, t
     return out
 
 
-def consolidate(ops, x, lay: Lay):
-    """x with every replicated copy of an entry set to ONE copy (the rep-axis index 0): mask (one level) + a
-    replicate ladder (log2 d_rep rotations). A bootstrap's error is independent per slot, so after a refresh the
-    copies of an entry differ by it; faces moved from different copies then carry different errors, and an iteration
-    whose first-order error cancels (Newton-Schulz: Z_L (2 I - A Z_R) at convergence) only cancels it when L(Z) and
-    R(Z) carry the SAME error."""
+def consolidate(ops, x, lay: Lay, scale: float = 1.0):
+    """x with every replicated copy of an entry set to ONE copy: mask (one level) + a replicate ladder (log2 of the
+    copies rotations). A bootstrap's error is independent per slot, so after a refresh the copies of an entry differ
+    by it; faces moved from different copies then carry different errors, and an iteration whose first-order error
+    cancels (Newton-Schulz: Z_L (2 I - A Z_R) at convergence) only cancels it when L(Z) and R(Z) carry the SAME error.
+    The kept copy is index 0 of the rep axis within each problem's block (a batched R face replicates along axis 1,
+    which also carries the problem index) and, for a `wrap` face, the first period of axis 0 (one more ladder over
+    the d0 / extent repeats). `scale` rides the mask."""
     c = lay.cube
-    mask = np.tile((c.coords()[lay.rep] == 0).astype(np.float64), c.slots // c.P)
-    st = c.strides[lay.rep]
-    return ops.rotate_and_sum(ops.mult_pt(x, mask, kind="mask"), -st, st * c.d[lay.rep])
+    co = c.coords()
+    nrep, st = lay.dims[lay.rep], c.strides[lay.rep]
+    keep = co[lay.rep] % nrep == 0
+    ext = None
+    if lay.wrap and 0 in (lay.row, lay.col):
+        ext = lay.shape[0] if lay.row == 0 else lay.shape[1]
+        if ext & (ext - 1) or c.d[0] % ext:
+            raise ValueError(f"consolidate: wrap extent {ext} must be a power of two dividing d0 ({lay})")
+        keep &= co[0] < ext
+    y = ops.rotate_and_sum(ops.mult_pt(x, np.tile(keep * float(scale), c.slots // c.P), kind="mask"), -st, st * nrep)
+    if ext is not None and ext < c.d[0]:
+        y = ops.rotate_and_sum(y, -c.strides[0] * ext, c.strides[0] * c.d[0])
+    return y
 
 
 def refresh(ops, x, on: bool, lay: Lay | None = None, real: bool = True):
