@@ -201,6 +201,8 @@ class Lsq(Task):
                                                 recip_err=self.recip_err))
         else:
             y = S.chebyshev(ops, G, c, lay, lo, hi, bnorm=bn, iters=self.iters or None, eps=self.eps)
+        if pre:          # refreshed by hand before the last product (planned in place, it drifts past the envelope)
+            y = S.refresh(ops, y, lay)
         return [S.precond_back(ops, y, xs[3], lay) if pre else y]
 
     def outputs(self, vals):
