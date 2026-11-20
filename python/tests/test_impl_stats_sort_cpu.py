@@ -261,3 +261,35 @@ def test_pipeline_capture_plan_compile(tmp_path):
     finally:
         import shutil
         shutil.rmtree(os.path.join(repo, plan), ignore_errors=True)
+
+
+@pytest.mark.parametrize("method", ["tfhe", "ckks"])
+def test_rank_bitonic(method):
+    """Ranks for n past the all-pairs limit: the argsort of the argsort (two networks)."""
+    rng = np.random.default_rng(11)
+    n = 32 if method == "ckks" else 256
+    lay = S.Batch(n, 1)
+    X = _distinct(rng, 1, n)
+    r = lay.decode(T.rank_bitonic(OPS, lay.encode(X), lay, 2.0, method=method, res=0.25 / n))
+    np.testing.assert_allclose(r, np.argsort(np.argsort(X, 1), 1), atol=0.1)
+
+
+def test_tfhe_levels_resolve_near_ties():
+    """msign's finer scales (levels=2) decide differences ~16x below the one-level band (the mirror is exact: here
+    the comparisons see the switch's noise model)."""
+    import importlib
+    import os
+    from perseus.impl import tfhe
+    os.environ["PF_TFHE_NOISE"] = "5.3e-3"
+    importlib.reload(tfhe)
+    try:
+        lay = S.Batch(256, 1)
+        X = np.random.default_rng(12).uniform(-1, 1, (1, 256))
+        e = {}
+        for lv in (1, 2):
+            out, _ = T.bitonic(OPS, lay.encode(X), lay, 2.0, method="tfhe", levels=lv)
+            e[lv] = np.abs(lay.decode(out) - np.sort(X, 1)).max()
+        assert e[2] < 2e-3 < e[1]
+    finally:
+        os.environ.pop("PF_TFHE_NOISE", None)
+        importlib.reload(tfhe)
