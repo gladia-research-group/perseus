@@ -685,7 +685,7 @@ class Train(Task):
     nesterov: bool = True
     zb: float = 8.0
     err: float = 1e-3
-    fbs: bool = False             # the link as a functional bootstrap of the margin (impl.learn Trainer.fbs)
+    fbs: bool | None = None       # the link as a functional bootstrap (impl.learn Trainer.fbs; None: its default)
     seed: int = 0
 
     name = "train"
