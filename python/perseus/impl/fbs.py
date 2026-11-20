@@ -10,7 +10,11 @@ Functions (`fbs(ops, x, name)` evaluates one):
 - `register_sign(name, lo, hi, gap)`: the step (lo for x < 0, hi for x >= 0) on |x| < 2, exact to ~2e-5 outside
   |x| < gap (wrapping with period 8);
 - `register(name, f, cf, amp, post, xmax)`: any series `post` on t = amp sin(2 pi x / 2^cf), `f` its numpy twin, valid
-  on |x| <= xmax.
+  on |x| <= xmax;
+- impl/fbs_fit.py `register_smooth(name, f, lo, hi, err | form, deg)`: a smooth f on [lo, hi] (centred: the bootstrap
+  reads x - center), fitted in the sine form (the asin warp, on FIDESlib's or the paired Paterson-Stockmeyer, one
+  level shallower) or the trigonometric form (f folded into EvalMod's own cosine and sine: P(t) + s Q(t); Bian et
+  al., ePrint 2026/367; Xiao et al., ePrint 2026/1255), the shallowest landing meeting the error target.
 Real payload (the real-payload chain: f of the real part, Im ignored) unless complex=True. The capture records one
 external refresh `{op: "fbs", fn, cf, amp, post, real}` landing where the FBS EvalMod lands (`_pc.fbs_landing`); the
 numpy mirror and the fakes compute the series exactly (no noise). The output lands deeper than a plain refresh by
@@ -234,7 +238,7 @@ def noise(name, sigma_in=None, h=H_SPARSE, preset=None):
         from perseus import _pc
         xs = _grid(fn)
         r = dict(_pc.fbs_noise(preset, fn.cf, fn.amp, [c / 2.0 ** fn.cf for c in fn.post], [float(x) for x in xs], s,
-                               int(h)))
+                               int(h), **_trig_kw(fn)))
         r.pop("by_i", None)
         r["xs"] = xs
         for k_ in ("lo", "hi", "sigma"):
@@ -306,18 +310,36 @@ def landing(name):
     key = (preset, name)
     if key not in _LAND:
         from perseus import _pc
-        _LAND[key] = tuple(_pc.fbs_landing(preset, fn.amp, [c / 2.0 ** fn.cf for c in fn.post]))
+        _LAND[key] = tuple(_pc.fbs_landing(preset, fn.amp, [c / 2.0 ** fn.cf for c in fn.post], **_trig_kw(fn)))
     return _LAND[key]
+
+
+def _trig_kw(fn):
+    """The trigonometric form's arguments of `_pc.fbs_landing` / `_pc.fbs_noise` (impl/fbs_fit.py): Q (scaled by 2^-cf
+    as `post`), t's offset, the base pair's degree and double angles; the paired sine form's flag; none for the
+    sine form."""
+    t = fn.meta.get("trig")
+    if t is None:
+        return {"paired": True} if fn.meta.get("paired") else {}
+    return {"post_s": [c / 2.0 ** fn.cf for c in t["post_s"]], "off": float(t["off"]), "tdeg": int(t["deg"]),
+            "tda": int(t["da"])}
 
 
 def desc(name):
     fn = FUNCS[name]
     # the StC-first output multiplies by 2^cf: the series carries 2^-cf
-    return {"op": "fbs", "fn": name, "cf": fn.cf, "amp": fn.amp, "post": [c / 2.0 ** fn.cf for c in fn.post],
-            "real": not fn.complex}
+    d = {"op": "fbs", "fn": name, "cf": fn.cf, "amp": fn.amp, "post": [c / 2.0 ** fn.cf for c in fn.post],
+         "real": not fn.complex}
+    kw = _trig_kw(fn)
+    if "post_s" in kw:
+        d["trig"] = {"post_s": kw["post_s"], "off": kw["off"], "deg": kw["tdeg"], "da": kw["tda"]}
+    if kw.get("paired"):
+        d["paired"] = True
+    return d
 
 
 def _values(name, vec):
+    """The function at the FBS input `vec` (centred: x - center for a centred function)."""
     fn = FUNCS[name]
     v = np.asarray(vec)
     if v.shape[0] <= 1:          # CapCt.novec: the recorder's twin, the op stream only
@@ -333,11 +355,16 @@ def fbs(ops, x, name):
         raise KeyError(f"fbs: {name!r} not registered")
     from .ops import NumpyOps
     if isinstance(ops, NumpyOps):
-        return _values(name, x)
+        return _values(name, np.asarray(x) - float(FUNCS[name].meta.get("center", 0.0)))
     fhe = ops.fhe
     if getattr(ops.core, "bts", None) is not None:
         raise NotImplementedError("fbs runs in planned sessions, not on the eager device path")
     lv, dg = landing(name)             # refused here on a chain FBS is not validated on, before anything is recorded
+    center = float(FUNCS[name].meta.get("center", 0.0))
+    if center != 0.0:                  # the bootstrap reads x - center (impl/fbs_fit.py: the domain's midpoint)
+        if FUNCS[name].complex:
+            raise NotImplementedError(f"fbs {name!r}: a centred function on the complex payload")
+        x = ops.add(x, -center)
     ops.bootstrap_hint(x, _N32_CAP, True)
     fhe.level_hint(x, _N32_CAP)
     names, levels = [fhe.var_name(x)], [ops.level(x)]
