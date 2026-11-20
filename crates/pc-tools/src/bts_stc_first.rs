@@ -697,11 +697,31 @@ struct BArgs {
     members: Vec<(u32, f64)>,
     seeds: usize,
     dirty: u32,
+    /// fbs: table size t (inputs |j| <= t/2), table (sign | step | relu | rand), non-integer sweep
+    fbs_t: u32,
+    lut: String,
+    frac: bool,
+    /// fbs with a smooth series: coefficients file (JSON list, c0 not halved, output units), CF, sine amplitude,
+    /// input range |x| <= range, (input, output) f64 pairs dumped to `dump`
+    post_file: Option<String>,
+    fbs_cf: Option<u32>,
+    amp: f64,
+    range: f64,
+    dump: Option<String>,
+    /// fbs: the EvalMod sine table (file of Chebyshev coefficients, evaluator convention), its K and double angles
+    /// (a table for K >= 28: the ModRaise overflow |I| > K is a wrong output in a functional bootstrap)
+    em_table: Option<String>,
+    em_k: f64,
+    em_da: u32,
+    /// fbs smooth: half the inputs drawn from these samples (raw f32, clipped to the range), half uniform; `pair` > 0:
+    /// one x per slot as Re = x - pair, Im = x + pair (two series on disjoint domains of one sine)
+    samples: Option<String>,
+    pair: f64,
 }
 
 fn bargs(a: &[String]) -> Res<BArgs> {
     let members = vec![(13, 64.0), (10, 8.0), (6, 1.0), (2, 0.25)];
-    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None, members, seeds: 4, dirty: 4 };
+    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None, members, seeds: 4, dirty: 4, fbs_t: 16, lut: "sign".into(), frac: false, post_file: None, fbs_cf: None, amp: 1.0, range: 1.0, dump: None, em_table: None, em_k: 16.0, em_da: 5, samples: None, pair: 0.0 };
     let list = |s: &str| -> Res<Vec<f64>> { s.split(',').map(|x| x.parse::<f64>().map_err(|e| e.into())).collect() };
     let mut i = 1;
     while i < a.len() {
@@ -724,6 +744,23 @@ fn bargs(a: &[String]) -> Res<BArgs> {
                     .collect::<Res<_>>()?
             }
             "--seeds" => r.seeds = v.parse()?,
+            "--t" => r.fbs_t = v.parse()?,
+            "--lut" => r.lut = v.clone(),
+            "--post-file" => r.post_file = Some(v.clone()),
+            "--fbs-cf" => r.fbs_cf = Some(v.parse()?),
+            "--amp" => r.amp = v.parse()?,
+            "--range" => r.range = v.parse()?,
+            "--dump" => r.dump = Some(v.clone()),
+            "--em-table" => r.em_table = Some(v.clone()),
+            "--em-k" => r.em_k = v.parse()?,
+            "--em-da" => r.em_da = v.parse()?,
+            "--samples" => r.samples = Some(v.clone()),
+            "--pair" => r.pair = v.parse()?,
+            "--frac" => {
+                r.frac = true;
+                i += 1;
+                continue;
+            }
             "--dirty" => r.dirty = v.parse()?,
             "--real" => {
                 r.real = true;
@@ -772,6 +809,66 @@ fn rand_gauss(seed: u64, n: usize, sigma: f64) -> Vec<Complex> {
         .collect()
 }
 
+/// Complex slots of every ciphertext of `x` decoded from the bottom `q.len()` rows (exact centred CRT): the bottom pair
+/// alone wraps coefficients beyond q0 / 2 (`Decryptor` built with q.len() rows).
+fn decrypt_wide<W: pc_gpu::DevWord, M: pc_gpu::DevStrategy<W>>(dec: &mut Decryptor<'_, W>, ctx: &Context<'_, W, M>, s: &Stream<Compute>, enc: &pc_core::encode::Encoder, x: &Ct<'_, W>, q: &[u64]) -> Res<Vec<Vec<Complex>>> {
+    let rows = dec.decrypt_rows(ctx, s, x, Which::Dense)?;
+    let big: u128 = q.iter().fold(1u128, |a, &p| a * p as u128);
+    let hats: Vec<(u128, u64)> = q.iter().map(|&p| (big / p as u128, pc_core::modmul::invmod(((big / p as u128) % p as u128) as u64, p))).collect();
+    let slots = if x.meta.slots == 0 { ctx.lay.n / 2 } else { x.meta.slots as usize };
+    let mut out = Vec::new();
+    for r in &rows {
+        let c: Vec<i128> = (0..r[0].len())
+            .map(|j| {
+                let mut v: u128 = 0;
+                for (i, &(hat, hinv)) in hats.iter().enumerate() {
+                    v = (v + pc_core::modmul::mulmod(r[i][j] % q[i], hinv, q[i]) as u128 * hat) % big;
+                }
+                if v > big / 2 { -((big - v) as i128) } else { v as i128 }
+            })
+            .collect();
+        out.push(enc.decode_centered(&c, slots, Payload::Complex, x.meta.nf)?);
+    }
+    Ok(out)
+}
+
+/// The table of `pc-bench fbs` on j in [-t/2, t/2].
+fn fbs_lut(name: &str, t: u32, j: i64) -> f64 {
+    let h = (t / 2) as i64;
+    match name {
+        "sign" => j.signum() as f64,
+        "step" => (j >= 0) as u8 as f64,
+        "relu" => j.max(0) as f64 / h as f64,
+        // a fixed pseudo-random table with values in {-1, ..., 1} on a grid of 1/8 (a "general" LUT)
+        "rand" => {
+            let mut z = ((j + h) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z ^= z >> 29;
+            z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^= z >> 32;
+            (z % 17) as f64 / 8.0 - 1.0
+        }
+        _ => j as f64 / h as f64,
+    }
+}
+
+/// Chebyshev coefficients (OpenFHE convention: c0 not halved) of the degree-t interpolant of `fbs_lut` on the nodes
+/// s_j = sin(pi j / t), j = -t/2..t/2 (the Chebyshev extrema cos(pi k / t), k = t/2 - j), times `gain`.
+fn fbs_post(name: &str, t: u32, gain: f64) -> Vec<f64> {
+    let n = t as usize;
+    let h = (t / 2) as i64;
+    let mut c = vec![0f64; n + 1];
+    for (deg, ck) in c.iter_mut().enumerate() {
+        let mut acc = 0.0;
+        for k in 0..=n {
+            let w = if k == 0 || k == n { 0.5 } else { 1.0 };
+            acc += w * fbs_lut(name, t, h - k as i64) * (std::f64::consts::PI * (deg * k) as f64 / n as f64).cos();
+        }
+        *ck = 2.0 / n as f64 * acc * gain;
+    }
+    c[n] *= 0.5;
+    c
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     v[v.len() / 2]
@@ -814,13 +911,54 @@ pub fn bench(args: &[String]) -> Res<bool> {
     let mut setup = BtsSetup::n32_shipped();
     setup.raise_drops = vec![0, 1];
     setup.k_max = kmax;
+    // fbs: message j at phase j q0 / 2t (CF log2 2t); EvalMod's output reads x 2^CF, folded into the series
+    let fbs_cf = a.fbs_cf.unwrap_or((2 * a.fbs_t).trailing_zeros());
+    let mut post_c0 = 0.0;
+    if a.cmd == "fbs" {
+        if let Some(f) = &a.em_table {
+            setup.evalmod_coeffs = std::fs::read_to_string(f)?.split_whitespace().map(|x| x.parse::<f64>()).collect::<std::result::Result<_, _>>()?;
+            setup.evalmod_da_its = a.em_da;
+            setup.boot_k = a.em_k;
+            println!("[pc-bench] fbs EvalMod table {f}: degree {}, K {}, double angles {}", setup.evalmod_coeffs.len() - 1, a.em_k, a.em_da);
+        }
+        setup.evalmod_amp = a.amp;
+        setup.evalmod_post = match &a.post_file {
+            Some(f) => {
+                // PC_FBS_SPLIT_C0=1: the constant term leaves the series (a plaintext add after the bootstrap,
+                // `post_c0`); by default it stays in (exact: the decrypt reads four rows, see `decrypt_wide`)
+                let mut v: Vec<f64> = serde_json::from_str(&std::fs::read_to_string(f)?)?;
+                if std::env::var("PC_FBS_SPLIT_C0").is_ok_and(|v| v == "1") {
+                    post_c0 = v[0] / 2.0;
+                    v[0] = 0.0;
+                }
+                v.iter().map(|c| c * (fbs_cf as f64).exp2().recip()).collect()
+            }
+            None => fbs_post(&a.lut, a.fbs_t, (fbs_cf as f64).exp2().recip()),
+        };
+        let c = &setup.evalmod_post;
+        println!("[pc-bench] fbs t={} lut={} cf={fbs_cf}: series degree {}, max |c| {:.3}, sum |c| {:.3}", a.fbs_t, a.lut, c.len() - 1, c.iter().fold(0f64, |m, x| m.max(x.abs())) * (fbs_cf as f64).exp2(), c.iter().map(|x| x.abs()).sum::<f64>() * (fbs_cf as f64).exp2());
+    }
+    // PC_FBS_ON_ROUTE=1: the shipped route plus the series as an FBS of it (`StcFirstPlan::fbs_host`, the planned
+    // runtime's path) instead of a route built around the series
+    let on_route = a.cmd == "fbs" && std::env::var("PC_FBS_ON_ROUTE").is_ok_and(|v| v == "1");
+    let fbs_spec = if on_route {
+        let sp = pc_gpu::bts::stc_first::FbsSpec { table: setup.evalmod_coeffs.clone(), k: setup.boot_k, da_its: setup.evalmod_da_its, amp: setup.evalmod_amp, post: setup.evalmod_post.clone(), drop: 0, complex: true, real: true };
+        let base = BtsSetup::n32_shipped();
+        (setup.evalmod_coeffs, setup.boot_k, setup.evalmod_da_its, setup.evalmod_amp, setup.evalmod_post) = (base.evalmod_coeffs, base.boot_k, base.evalmod_da_its, 1.0, vec![]);
+        Some(sp)
+    } else {
+        None
+    };
     setup.real = true;
     // PC_EM_FUSE_RESCALE=1: the EvalMod relinearization-rescale fusion (stcf-prec compares the two forms' errors)
     setup.em_fuse_rescale = std::env::var("PC_EM_FUSE_RESCALE").is_ok_and(|v| v == "1");
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     let high_shapes = vec![StcHighShape { out_level: 50, skip_mask: 1 }, StcHighShape { out_level: 30, skip_mask: 6 }, StcHighShape { out_level: 40, skip_mask: 0 }];
-    sf.high = Some(StcHighSetup { shapes: high_shapes.clone(), slots: 1 });
+    // PC_BENCH_NO_HIGH=1: no stc_high shapes (their levels are n32 / n32a4 ones; off the grid of an sp chain)
+    if !std::env::var("PC_BENCH_NO_HIGH").is_ok_and(|v| v == "1") {
+        sf.high = Some(StcHighSetup { shapes: high_shapes.clone(), slots: 1 });
+    }
     let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
     let mut geoms: Vec<LtGeom> = Vec::new();
     for v in &plan.dense.variants {
@@ -840,13 +978,27 @@ pub fn bench(args: &[String]) -> Res<bool> {
     mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
     mp.reserve("secret", DevSecret::<W>::bytes(&lay));
     mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, false));
-    mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, chain.level_unit, kmax));
+    // two composite levels of rows: the bottom pair alone (q0 ~ 2^56) wraps a coefficient beyond q0 / 2, i.e. a slot
+    // constant beyond ~1.9 at the landing scale (a functional bootstrap's outputs reach it)
+    let dec_rows = 2 * chain.level_unit;
+    mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, dec_rows, kmax));
     mp.reserve("ks.plans", KsPlans::bytes::<W>(&chain, kmax)?);
     mp.reserve("ks.regen_a", pc_gpu::ks::KsWork::<W>::regen_bytes(&lay, chain.dnum()));
     let ocfg = OpsCfg::default();
     Ops::<W>::reserve(&mut mp, &ocfg);
-    let (req, wshape) = plan.mem::<W>()?;
+    let (req, mut wshape) = plan.mem::<W>()?;
     req.reserve(&mut mp);
+    let fbs_host = match &fbs_spec {
+        Some(sp) => {
+            let h = plan.fbs_host(sp)?;
+            let (b, w) = plan.fbs_mem::<W>(&h)?;
+            mp.reserve("bts.fbs", b);
+            wshape = wshape.max(w);
+            println!("[pc-bench] fbs on the shipped route: K {} da {} amp {}, series degree {}, EvalMod {:?} -> {:?}", sp.k, sp.da_its, sp.amp, sp.post.len() - 1, h.em_in, h.out);
+            Some(h)
+        }
+        None => None,
+    };
     let with_dense = a.cmd == "stcf-prec";
     if with_dense {
         let (dreq, _) = plan.dense.mem::<W>()?;
@@ -871,10 +1023,14 @@ pub fn bench(args: &[String]) -> Res<bool> {
     let tk = kg.generate_set(&ctx, &mut ex, &sec, &mut keys, &mut prng)?;
     println!("[pc-bench] keygen {} keys in {:.1} s", tk.keys, tk.total);
     let mut encr = Encryptor::<W>::new(&arena, &ex.compute, lay, false, &mut prng)?;
-    let mut dec = Decryptor::<W>::new(&arena, &ex.compute, lay, chain.level_unit, kmax)?;
+    let mut dec = Decryptor::<W>::new(&arena, &ex.compute, lay, dec_rows, kmax)?;
     dec.load_secret(&ex.compute, &sec)?;
     let tb = Instant::now();
     let route = plan.build(&arena, &dev, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs())?;
+    let fbs_pre = match &fbs_host {
+        Some(h) => Some(route.build_fbs(&arena, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs(), h)?),
+        None => None,
+    };
     let dense_r = if with_dense { Some(plan.dense.build(&arena, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs())?) } else { None };
     ex.compute.sync()?;
     println!("[pc-bench] stcf route tables {:.1} s; arena used {:.1} of {:.1} GB", tb.elapsed().as_secs_f64(), arena.used_bytes() as f64 / 1e9, arena.capacity() as f64 / 1e9);
@@ -885,7 +1041,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
     let enc = Encoder::new(&chain);
     let nq = ctx.shape.n_q;
     let mut fresh = |x: &mut Ct<'_, W>, ex: &mut Executor<'_, W>, vals: &[Vec<Complex>], level: u32| -> Res<()> {
-        let top = (nq - 1 - level) as usize;
+        let top = pc_shadow::meta::top_limb(ctx.shape, level)? as usize;
         let sf_ = ctx.scale.sf(top as i32)?;
         let mut meta = CtMeta::new(level, 1).with_nf(sf_);
         meta.slots = slots as u32;
@@ -959,6 +1115,172 @@ pub fn bench(args: &[String]) -> Res<bool> {
                     let gd = median(gm);
                     println!("[pc-bench] stcf K={k} graph replay: {:.2} ms/call {:.2} ms/ct", gd, gd / k as f64);
                 }
+            }
+        }
+        "fbs" => {
+            let t = a.fbs_t;
+            let h = (t / 2) as i64;
+            // --real: the real-payload route (N/2 real inputs per ciphertext, Im = 0)
+            let real = a.real;
+            let r = Route { cf: Some(fbs_cf), stc_first: true, real, ..Route::dense() };
+            let ev: Vec<Event> = (0..2).map(|_| Event::timing(&dev)).collect::<std::result::Result<_, _>>()?;
+            let mut x_rng = 0x5eed_u64 ^ ((t as u64) << 32);
+            let mut next = move || {
+                x_rng ^= x_rng << 13;
+                x_rng ^= x_rng >> 7;
+                x_rng ^= x_rng << 17;
+                x_rng
+            };
+            // integer inputs, Re and Im both carry a j (2 N/2 table inputs per ciphertext); --frac: j + u, u uniform
+            // in [-1/2, 1/2) (the table's transition between nodes)
+            let (smooth, range, pair) = (a.post_file.is_some(), a.range, a.pair);
+            let samples: Vec<f64> = match &a.samples {
+                Some(f) => std::fs::read(f)?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect(),
+                None => vec![],
+            };
+            let mut draw = |k: usize, frac: bool| -> Vec<Vec<Complex>> {
+                (0..k)
+                    .map(|_| {
+                        (0..slots)
+                            .map(|_| {
+                                let mut v = [0f64; 2];
+                                if smooth && pair > 0.0 {
+                                    let r = next();
+                                    let x = if !samples.is_empty() && r & 1 == 0 {
+                                        samples[(r >> 1) as usize % samples.len()].clamp(-range, range)
+                                    } else {
+                                        ((next() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * range
+                                    };
+                                    return Complex::new(x - pair, x + pair);
+                                }
+                                for z in v.iter_mut() {
+                                    if smooth {
+                                        let r = next();
+                                        *z = if !samples.is_empty() && r & 1 == 0 {
+                                            samples[(r >> 1) as usize % samples.len()].clamp(-range, range)
+                                        } else {
+                                            ((next() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) * range
+                                        };
+                                        continue;
+                                    }
+                                    let j = (next() % (t as u64 + 1)) as i64 - h;
+                                    let u = if frac { (next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5 } else { 0.0 };
+                                    *z = (j as f64 + u).clamp(-(h as f64), h as f64);
+                                }
+                                Complex::new(v[0], if real { 0.0 } else { v[1] })
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let mut landing = (0, 0);
+            let mut dumpf = match &a.dump {
+                Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+                None => None,
+            };
+            for &k in &a.ks {
+                let vals = draw(k, false);
+                let mut ms = Vec::new();
+                for rep in 0..a.reps + 2 {
+                    fresh(&mut x, &mut ex, &vals, a.level)?;
+                    let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                    ev[0].record(&cx.ex.compute)?;
+                    let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, CallOpts::default())?;
+                    match &fbs_pre {
+                    Some(f) => {
+                        call.stc_first_input(&mut cx, std::slice::from_mut(&mut x))?;
+                        route.run_fbs(&mut cx, &call.st, std::slice::from_mut(&mut x), f)?;
+                    }
+                    None => call.run_to(&mut cx, std::slice::from_mut(&mut x), Phase::Done)?,
+                }
+                    ev[1].record(&cx.ex.compute)?;
+                    ev[1].sync()?;
+                    if rep >= 2 {
+                        ms.push(ev[0].elapsed_ms(&ev[1])? as f64);
+                    }
+                }
+                let d = median(ms);
+                landing = (x.meta.level, x.meta.deg);
+                let outs = if real { slots } else { 2 * slots };
+                println!("[pc-bench] fbs t={t} lut={} real={real} K={k}: device {d:.2} ms/call {:.2} ms/ct {:.1} ns/output ({outs} outputs/ct); input level {} -> landing level {} deg {}", a.lut, d / k as f64, d / k as f64 / outs as f64 * 1e6, a.level, x.meta.level, x.meta.deg);
+            }
+            // accuracy: a.reps batches of kmax ciphertexts
+            let (mut n_out, mut wrong, mut sum2, mut emax) = (0usize, 0usize, 0f64, 0f64);
+            let gap = match a.lut.as_str() {
+                "sign" | "step" => 1.0,
+                "rand" => 0.125,
+                _ => 1.0 / h as f64,
+            };
+            let mut hist = vec![0usize; 40];
+            let mut tr: BTreeMap<i64, (f64, f64, usize)> = BTreeMap::new();
+            for _ in 0..a.reps {
+                let vals = draw(kmax, a.frac);
+                fresh(&mut x, &mut ex, &vals, a.level)?;
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, CallOpts::default())?;
+                match &fbs_pre {
+                    Some(f) => {
+                        call.stc_first_input(&mut cx, std::slice::from_mut(&mut x))?;
+                        route.run_fbs(&mut cx, &call.st, std::slice::from_mut(&mut x), f)?;
+                    }
+                    None => call.run_to(&mut cx, std::slice::from_mut(&mut x), Phase::Done)?,
+                }
+                cx.ops.realize(&ctx, cx.ex, &sh, std::slice::from_mut(&mut x))?;
+                let got = decrypt_wide(&mut dec, &ctx, &ex.compute, &enc, &x, &chain.q[..dec_rows])?;
+                for (g, v) in got.iter().zip(&vals) {
+                    for (gz, vz) in g.iter().zip(v) {
+                        for (gv, xv) in [(gz.re, vz.re), (gz.im, vz.im)].into_iter().take(if real { 1 } else { 2 }) {
+                            if let Some(w) = dumpf.as_mut() {
+                                use std::io::Write;
+                                w.write_all(&xv.to_le_bytes())?;
+                                w.write_all(&(gv + post_c0).to_le_bytes())?;
+                            }
+                            if smooth {
+                                continue;
+                            }
+                            if a.frac {
+                                // transition profile: output by input bucket of 1/16 around the jump (|x| < 2)
+                                if xv.abs() < 2.0 {
+                                    let b = (xv * 16.0).floor() as i64;
+                                    let e = tr.entry(b).or_insert((f64::MAX, f64::MIN, 0));
+                                    e.0 = e.0.min(gv);
+                                    e.1 = e.1.max(gv);
+                                    e.2 += 1;
+                                }
+                                continue;
+                            }
+                            let want = fbs_lut(&a.lut, t, xv.round() as i64);
+                            let e = (gv - want).abs();
+                            n_out += 1;
+                            sum2 += e * e;
+                            emax = emax.max(e);
+                            wrong += (e >= gap / 2.0) as usize;
+                            let bk = if e > 0.0 { (-e.log2()).floor().clamp(0.0, 39.0) as usize } else { 39 };
+                            hist[bk] += 1;
+                        }
+                    }
+                }
+            }
+            if smooth {
+                println!("[pc-bench] fbs smooth series: outputs dumped (landing level {} deg {})", landing.0, landing.1);
+            } else if a.frac {
+                for (b, (lo, hi, n)) in &tr {
+                    println!("[pc-bench] fbs frac x in [{:.4}, {:.4}): out min {lo:.4} max {hi:.4} ({n})", *b as f64 / 16.0, (*b + 1) as f64 / 16.0);
+                }
+            } else {
+                let rms = (sum2 / n_out as f64).sqrt();
+                println!(
+                    "[pc-bench] fbs t={t} lut={} accuracy: {n_out} outputs, wrong (err >= gap/2 = {}) {wrong} ({:.3e}), max err {emax:.3e} ({:.2} bits), rms {rms:.3e} ({:.2} bits); landing level {} deg {}",
+                    a.lut,
+                    gap / 2.0,
+                    wrong as f64 / n_out as f64,
+                    -emax.log2(),
+                    -rms.log2(),
+                    landing.0,
+                    landing.1
+                );
+                let hs: Vec<String> = hist.iter().enumerate().filter(|(_, &c)| c > 0).map(|(b, c)| format!("2^-{b}:{c}")).collect();
+                println!("[pc-bench] fbs err histogram (floor(-log2 err)): {}", hs.join(" "));
             }
         }
         "stcf-prec" => {

@@ -243,6 +243,8 @@ pub(crate) struct Planned {
     pub ccmm: Option<crate::matmul::CcmmRt>,
     /// the TFHE service, likewise
     pub tfhe: Option<crate::tfhe::TfheRt>,
+    /// the functional-bootstrap service, likewise
+    pub fbs: Option<crate::fbs::FbsRt>,
     /// per bound block: its runtime Shadow (the plan's landings)
     pub shadows: Vec<Shadow>,
     pub replayer: Replayer,
@@ -640,6 +642,11 @@ fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
                     if let Some(d) = crate::pcmm::Desc::parse(d) {
                         r.dense_drops.insert(d.raise_drop);
                         r.dense_drops.extend(d.raise_drops.iter().flatten().copied());
+                        r.n_dense += 1;
+                    } else if let Some(fd) = crate::fbs::Desc::parse(d) {
+                        // a functional bootstrap: the StC-first route's drop-0 variant, its real chain when real
+                        r.dense_drops.insert(0);
+                        r.real |= fd.real;
                         r.n_dense += 1;
                     } else if crate::tfhe::Desc::parse(d).is_some() {
                         // a TFHE LUT: the switch between the StC-first route's halves, no raise drop
@@ -1297,11 +1304,24 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     }
     // planned: route tables + work, the shared slab, the registers, the programs' key groups
     let mut wshape: Option<BtsWorkShape> = None;
+    let mut fbs_hosts: BTreeMap<String, pc_gpu::bts::stc_first::FbsHost> = BTreeMap::new();
     let mut group_bytes = 0;
     if let Some(ps) = &plan {
         if let Some(sp) = &splan {
-            let (req, w) = sp.mem::<W>().map_err(e)?;
+            let (req, mut w) = sp.mem::<W>().map_err(e)?;
             req.reserve(mp);
+            // the programs' functional bootstraps: a raise table and EvalMod program(s) each, their EvalMod work
+            let fns = crate::fbs::functions(&ps.programs).map_err(PyValueError::new_err)?;
+            let hs = crate::fbs::hosts(sp, &fns).map_err(e)?;
+            for h in hs.values() {
+                let (b, fw) = sp.fbs_mem::<W>(h).map_err(e)?;
+                mp.reserve("bts.fbs", b);
+                w = w.max(fw);
+            }
+            if !hs.is_empty() {
+                eprintln!("[session] fbs: {} function(s): {}", hs.len(), hs.iter().map(|(n, h)| format!("{n} (deg {}, lands top {} nl {})", h.spec.post.len() - 1, h.out.top, h.out.nl)).collect::<Vec<_>>().join(", "));
+            }
+            fbs_hosts = hs;
             wshape = Some(w);
         }
         if let Some(dp) = &dplan {
@@ -1588,6 +1608,17 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 }
                 None => None,
             };
+            let fb = match (&dense, fbs_hosts.is_empty()) {
+                (_, true) => None,
+                (Some(route), false) => {
+                    let mut pre = BTreeMap::new();
+                    for (nm, h) in &fbs_hosts {
+                        pre.insert(nm.clone(), route.build_fbs(a, &ex.compute, &ctx, &keys, stage, h).map_err(e)?);
+                    }
+                    Some(crate::fbs::FbsRt { pre, calls: 0 })
+                }
+                (None, false) => return Err(PyValueError::new_err("fbs finishes without an StC-first route")),
+            };
             // the TFHE switch keys, from the host secret (no client bundle carries them yet)
             let tf = match tfhe {
                 Some(tp) => {
@@ -1627,7 +1658,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 sx.compute.sync().map_err(|x| e(x.into()))?;
                 Some(SideLane { ex: sx, ops: sops, ev, fork, join })
             };
-            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, tfhe: tf, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
+            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, tfhe: tf, fbs: fb, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
         }
     };
     ex.compute.sync().map_err(|x| e(x.into()))?;

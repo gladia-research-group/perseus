@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 mod client;
 mod config;
 mod em;
+mod fbs;
 mod fhe;
 mod matmul;
 mod meta;
@@ -45,6 +46,8 @@ fn _pc(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pcmm::register(m)?;
     store::register(m)?;
     client::register(m)?;
+    m.add_function(pyo3::wrap_pyfunction!(fbs::fbs_landing, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(fbs::fbs_noise, m)?)?;
     word64::register(m)?; // _pc.w64 (u64 words, n64 chain)
     Ok(())
 }

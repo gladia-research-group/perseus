@@ -15,7 +15,8 @@ plan places); the session then serves its LUTs (`--tfhe-chunk` values per switch
 `--auto DIR` chains the three steps of an encrypted run in subprocesses: the twin capture (DIR/graph), the planner
 (make_plan.sh, dense routes unless `--sparse 512,1`; DIR/plan) and the planned run (`--compile-only`: record and
 compile on the CPU, no session). Tasks: `fn` (one impl.math function), `stats`, `sort` and `pipeline` (one stage
-calling all three modules). Prints one JSON line per run (`[mathlib] RESULT {...}`).
+calling all three modules), `lut` (a functional bootstrap: table or sign LUT; planned only). Prints one JSON line
+per run (`[mathlib] RESULT {...}`).
 """
 from __future__ import annotations
 
