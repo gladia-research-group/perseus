@@ -111,3 +111,27 @@ def test_slot_budget():
         tfhe.SLOTS.clear()
         Head(mode).rotations()
         assert sum(len(s) for s, _c in tfhe.SLOTS.values()) <= 1 << 16
+
+
+@pytest.mark.parametrize("plan,mode", [("gpt2_tfhe_topp_native", "topp"), ("gpt2_tfhe_topk_native", "topk"),
+                                       ("gpt2_tfhe_topk_native_draw", "topk")])
+def test_head_plan_compiles(plan, mode, tmp_path):
+    """`tfhe_head --plan --compile-only` (CPU) on the shipped sampler plans: their recipe line names gpt2_decode's in
+    words, and the harness compiles them with that recipe spelled out (else every refresh after the first StC-first
+    one lands off the plan's levels)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    from perseus.examples.gpt2.tfhe_head import _compile_dir
+    root = Path(__file__).resolve().parents[2]
+    np.save(tmp_path / "lg.npy", _logits(1)[None])
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    r = subprocess.run([sys.executable, "-m", "perseus.examples.gpt2.tfhe_head", "--plan", f"bootstrap_placements/{plan}",
+                        "--mode", mode, "--logits", str(tmp_path / "lg.npy"), "--n", "1", "--compile-only",
+                        "--work-dir", str(tmp_path / "wd")], env=env, cwd=root, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert " refreshes" in r.stdout
+    cmd = (tmp_path / "wd" / "plan" / "PLAN_CMD.txt").read_text()
+    assert "PLAN_STC_FIRST_ENTRY=" in cmd and "PLAN_RAISE_DROP_SET=1,3,5" in cmd
+    assert _compile_dir(str(root / "bootstrap_placements/gpt2_gen_topp"), str(tmp_path / "x")).endswith("gpt2_gen_topp")

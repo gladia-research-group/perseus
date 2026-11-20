@@ -350,6 +350,35 @@ def _config(plan, preset):
     return cfg
 
 
+def _compile_dir(plan, work):
+    """The plan dir the compile reads. A head plan's `recipe=` line may name another plan's recipe in words ("the
+    gpt2_decode recipe line (bootstrap_placements/gpt2_decode/PLAN_CMD.txt) with PLAN_RAISE_DROP_SET=1,3,5"), but
+    the compile takes that line as its PlanConfig (K=V tokens only): without the planner's StC-first entry and
+    fallback its runtime shadow lands refreshes elsewhere than the plan did. Such a plan compiles from a copy in the
+    work dir whose recipe line is spelled out (the named recipe, then the line's own K=V tokens), as the generation
+    plans (gpt2_gen_*) carry it; the placements are linked, not changed."""
+    import re
+    from perseus._paths import resolve
+    path = os.path.join(plan, "PLAN_CMD.txt")
+    lines = open(path).read().splitlines() if os.path.exists(path) else []
+    line = next((ln[len("recipe="):] for ln in lines if ln.startswith("recipe=")), "")
+    m = re.search(r"\((\S+/PLAN_CMD\.txt)\)", line)
+    if not m:
+        return plan
+    ref = open(resolve(m.group(1))).read().splitlines()
+    named = next((ln[len("recipe="):] for ln in ref if ln.startswith("recipe=")), "")
+    own = [t.rstrip(";,.") for t in line.split() if re.match(r"^[A-Z][A-Z0-9_]*=\S", t)]
+    out = os.path.join(work, "plan")
+    os.makedirs(out, exist_ok=True)
+    for f in os.listdir(plan):
+        if f != "PLAN_CMD.txt" and not os.path.lexists(os.path.join(out, f)):
+            os.symlink(os.path.abspath(os.path.join(plan, f)), os.path.join(out, f))
+    recipe = "recipe=" + " ".join([named] + own)
+    with open(os.path.join(out, "PLAN_CMD.txt"), "w") as f:
+        f.write("\n".join(recipe if ln.startswith("recipe=") else ln for ln in lines) + "\n")
+    return out
+
+
 def planned(a, L):
     from perseus import _pc
     from perseus.examples.bert.planned import plan_config
@@ -362,7 +391,7 @@ def planned(a, L):
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"tfhe_head_{os.getpid()}")
     cfg = _config(a.plan, "n32_gpt2_decode") if a.mode == "cutmax" else plan_config(a.plan)
     cfg["exec.use_graphs"] = bool(a.graphs)          # the head repeats per token: graph replay pays after the first
-    run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pt_rows=28, pool=a.pool, stc_cache=a.stc_cache,
+    run = ResnetPlanned(model, _compile_dir(a.plan, work), cfg, keys, work_dir=work, pt_rows=28, pool=a.pool, stc_cache=a.stc_cache,
                         log=lambda m: print(m, flush=True))
     from perseus.impl.tfhe_select import ckks_res
     run.tfhe_chunk = 0 if (a.mode == "cutmax" or ckks_res() is not None) else a.tfhe_chunk
