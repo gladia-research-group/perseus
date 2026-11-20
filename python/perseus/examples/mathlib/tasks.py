@@ -261,6 +261,7 @@ class Sort(Task):
     q: float = 0.3
     probes: int = 10
     gap: float = 0.5
+    levels: int = 1               # TFHE comparisons' scales (sort.step)
     seed: int = 0
     name = "sort"
 
@@ -280,16 +281,16 @@ class Sort(Task):
         x, lay, k = xs[0], self.lay, self.kind
         bound, meth, res = 2.0, self.method, self.res
         if k == "max":
-            return [T.vmax(ops, x, lay, bound, method=meth, err=res)]
+            return [T.vmax(ops, x, lay, bound, method=meth, err=res, levels=self.levels)]
         if k == "argmax":
             return [T.argmax(ops, x, lay, bound, method=meth, res=res, err=0.25 * res)]
         if k == "bitonic":
-            return list(T.bitonic(ops, x, lay, bound, method=meth, res=res,
+            return list(T.bitonic(ops, x, lay, bound, method=meth, res=res, levels=self.levels,
                                   payload=ops.add_pt(ops.mult_pt(x, np.zeros(SLOTS), kind="mask"),
                                                      lay.encode(np.tile(np.arange(self.n) / self.n, (self.B, 1))),
                                                      kind="mask")))
         if k == "threshold":
-            t, mask = T.threshold(ops, x, lay, self.k, -1.0, 1.0, probes=self.probes, method=meth)
+            t, mask = T.threshold(ops, x, lay, self.k, -1.0, 1.0, probes=self.probes, method=meth, levels=self.levels)
             return [t, mask]
         r = T.rank(ops, x, lay, bound, method=meth, res=res)
         if k == "rank":

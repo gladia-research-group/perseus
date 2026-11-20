@@ -264,36 +264,41 @@ def correlation(ops, X, lay: Features, lo: float, hi: float, err: float = 1e-4):
 # ── logsumexp / softmax ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def _shift(ops, x, lay, lo, hi, shift, method, err):
-    """(u = x - m, m, the exp's domain [a, 0], the sum's band [s_lo, n]) for shift "bound" (m = hi, public) or "max"
-    (m = the encrypted maximum, impl.sort)."""
+def _shift(ops, x, lay, lo, hi, shift, method, err, margin):
+    """(u = x - m, m, the exp's domain [a, b], the sum's band [s_lo, s_hi]) for shift "bound" (m = hi, public) or "max"
+    (m = the encrypted maximum, impl.sort). `margin`: how far below the true maximum m may land (a TFHE tournament
+    decides values inside the switch's noise band either way: default 3 % of the range; CKKS: err); the exp's domain
+    and the band are widened by it."""
     if shift == "bound":
-        return ops.add(x, -float(hi)), float(hi), (float(lo) - float(hi), 0.0), lay.n * _m.exp(lo - hi)
+        return ops.add(x, -float(hi)), float(hi), (float(lo) - float(hi), 0.0), (lay.n * _m.exp(lo - hi), float(lay.n))
     if shift == "max":
         from . import sort
+        if margin is None:
+            margin = 0.03 * (float(hi) - float(lo)) if method == "tfhe" else float(err)
         m = sort.vmax(ops, x, lay, bound=float(hi) - float(lo), method=method, err=err)
-        return ops.sub(x, m), m, (float(lo) - float(hi), 0.0), 1.0
+        return (ops.sub(x, m), m, (float(lo) - float(hi), float(margin)),
+                (_m.exp(-float(margin)), lay.n * _m.exp(float(margin))))
     raise ValueError(f"shift {shift!r}: 'bound' or 'max'")
 
 
 def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-            s_lo: float | None = None):
+            s_lo: float | None = None, margin: float | None = None):
     """softmax over each vector, x in [lo, hi]: exp(x - m) / sum. `shift` "max" (exact maximum: the sum's band is
     [1, n]) or "bound" (m = hi: the band is [n e^(lo - hi), n], or `s_lo` if calibrated); `method`: the max's
     comparisons (impl.sort)."""
-    u, _m_, (a, b), sl = _shift(ops, x, lay, lo, hi, shift, method, err)
+    u, _m_, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
     e = M.exp(ops, u, a, b, 0.25 * err, rel=False)
     s = total(ops, e, lay)
-    return ops.mult(e, M.reciprocal(ops, s, sl, float(lay.n), 0.5 * err, rel=True))
+    return ops.mult(e, M.reciprocal(ops, s, sl, sh, 0.5 * err, rel=True))
 
 
 def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-              s_lo: float | None = None):
+              s_lo: float | None = None, margin: float | None = None):
     """log sum_j exp(x_j), x in [lo, hi], broadcast over each vector's slots (softmax's shift and band)."""
-    u, m, (a, b), sl = _shift(ops, x, lay, lo, hi, shift, method, err)
+    u, m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
     e = M.exp(ops, u, a, b, 0.25 * err / lay.n, rel=False)
     s = total(ops, e, lay)
-    L = M.log(ops, s, sl, float(lay.n), 0.5 * err)
+    L = M.log(ops, s, sl, sh, 0.5 * err)
     return ops.add(L, m)

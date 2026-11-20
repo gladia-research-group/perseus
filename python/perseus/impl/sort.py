@@ -403,11 +403,13 @@ def rank_bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, d
 # ── threshold search ────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int = 10, method="tfhe", count_method=None):
+def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int = 10, method="tfhe", count_method=None,
+              levels=1):
     """The largest t on the grid lo + (hi - lo) i / 2^probes with count(x >= t) >= k (so the k-th largest value is in
     [t, t + (hi - lo) / 2^probes)), broadcast over each vector's slots, and the top-k mask [x >= t]. Per probe one
     comparison of the n values against t + w, a count ladder, and one comparison of the count with k (on the vector's
-    slot 0 for TFHE, every slot for CKKS)."""
+    slot 0 for TFHE, every slot for CKKS). `levels` (TFHE): the value comparisons' scales (msign; 2: the band / 16 at
+    3x the PBS: a probe resolution below ~1e-2 of the range needs it)."""
     from .stats import total
     n, B = lay.n, lay.B
     N = _nslots(ops, x)
@@ -422,7 +424,8 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
         w /= 2.0
         dt = ops.add_pt(y, _mask(N, s, -w), kind="mask") if t is None else ops.sub(ops.add_pt(y, _mask(N, s, -w),
                                                                                           kind="mask"), t)
-        c = step(ops, dt, s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag=f"thr{p}", n=N)
+        c = step(ops, dt, s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag=f"thr{p}", n=N,
+                 levels=levels)
         cnt = total(ops, c, lay)                          # count(y >= t + w), every slot of the vector
         e = ops.add_pt(cnt, _mask(N, s0 if count_method == "tfhe" else s, 0.5 - k), kind="mask")
         if count_method == "tfhe":
@@ -434,7 +437,7 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
             inc = ops.mult(bit, w)
         t = inc if t is None else ops.add(t, inc)
     mask = step(ops, ops.sub(y, t), s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag="thr.m",
-                n=N)
+                n=N, levels=levels)
     if method == "tfhe":
         mask = _tile(ops, mask, lay, N)
     return ops.add(t, float(lo)), mask
