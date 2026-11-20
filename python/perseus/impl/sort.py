@@ -115,7 +115,8 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
 # FBS sign (impl/fbs.py register_sign): x = 1.9 scale d / bound on |x| < 2, the 0 / 1 step exact to ~2e-5 outside
 # |x| < gap (degree 63: gap 0.2, 127: 0.1, ... 1023: 0.0125, `FBS_SIGN`); the sine keeps the sign up to |x| < 4, so inputs may drift to
 # twice `bound`. The resolution `res` (d units) maps to the gap 1.9 res / bound; one ciphertext costs one functional
-# bootstrap whatever the number of heads (TFHE: one PBS per head), on the shallow EvalMod table (k32d3).
+# bootstrap whatever the number of heads (TFHE: one PBS per head), on the shallowest EvalMod table (k28d1); the step is
+# the odd +-1/2 one plus 1/2 on the heads, so the slots off the heads (x = 0) stay 0 without a mask product.
 FBS_SIGN = ((63, 0.2), (127, 0.1), (255, 0.05), (511, 0.025), (1023, 0.0125))
 FBS_X = 1.9
 
@@ -128,7 +129,7 @@ def fbs_sign_name(bound, res):
         if gap <= g:
             name = f"sort.fbs.sign.{deg}"
             if name not in F.FUNCS:
-                F.register_sign(name, 0.0, 1.0, deg=deg, gap=gap, table="k32d3")
+                F.register_sign(name, -0.5, 0.5, deg=deg, gap=gap, table="k28d1")
             return name
     raise ValueError(f"fbs step: resolution {res} at bound {bound} is gap {g:.3g} < {FBS_SIGN[-1][1]} (use tfhe)")
 
@@ -137,8 +138,8 @@ def _step_fbs(ops, d, n, heads, sc, bound, res):
     from . import fbs as F
     name = fbs_sign_name(bound, res)
     x = ops.mult_pt(d, _put(n, heads, sc * FBS_X / bound), kind="mask")
-    s = F.fbs(ops, x, name)
-    return ops.mult_pt(s, _mask(n, heads, 1.0), kind="mask")
+    s = F.fbs(ops, x, name)      # the odd step +-1/2: 0 off the heads (x = 0 there), no mask product
+    return ops.add_pt(s, _mask(n, heads, 0.5), kind="mask")
 
 
 def step_method(n_heads, bound, res):
