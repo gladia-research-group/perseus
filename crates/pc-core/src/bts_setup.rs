@@ -1141,4 +1141,21 @@ mod functional_stc_tests {
         assert!(e < 1e-12, "{e:e}");
         assert!(fused.diags.len() <= 2 * s0);
     }
+
+    /// Probe (ignored): the shipped n32 StC first stage and its fused diagonal counts for masked shifts by d slots.
+    #[test]
+    #[ignore]
+    fn fused_counts_n32() {
+        let n = 1usize << 16;
+        let f = cts_stc_factors(n, (n / 2) as u32, [4, 3], [0, 0], 1.0, 1.0).unwrap();
+        for (i, s) in f.stc.iter().enumerate() {
+            println!("StC stage {i}: {} diagonals, stride {}, bsgs {}x{}", s.num_diags(), s.stride, s.b, s.g);
+        }
+        let len = f.stc[0].len();
+        for d in [1i64, 2, 4, 8, 16, 64] {
+            let mask: Vec<C64> = (0..len).map(|k| C64::new(if (k as i64) % 64 >= d { 1.0 } else { 0.0 }, 0.0)).collect();
+            let w = DiagMap::from_terms(len, &[(0, vec![C64::new(1.0, 0.0); len]), (-d, mask)]);
+            println!("x + mask Rotate(x, -{d}): fused first stage {} diagonals", functional_stc_first(&f.stc[0], &w).diags.len());
+        }
+    }
 }
