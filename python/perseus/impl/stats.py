@@ -14,8 +14,8 @@ rotations per reduction; the levels are the products' (listed per function).
   data with a (hoisted) rotation of itself and one sample ladder; correlation standardises the features first.
 * `logsumexp` / `softmax`: max-shifted (an encrypted maximum from impl.sort, or a calibrated public bound): exp on
   [lo - hi, margin], the sum, then log / reciprocal on its band ([e^-margin, n e^margin] after a max shift), with
-  deliberate refreshes (`refresh`) before the exp and, after a max shift, of the mean before the log / reciprocal
-  (a deliberate refresh of the sum, up to n in size, came back as garbage on the device).
+  deliberate refreshes (`refresh`, max shift) of the maximum (never of the exp's argument: its absolute error is the
+  exp's relative one) and of the mean before the log / reciprocal (unit size: the bootstrap's error is relative).
 * `prefix_sum`: Hillis-Steele scan on the padded layout, log2(n) rotations and no level, no mask (the zeros after each
   vector absorb the shifts; the padding holds garbage afterwards).
 """
@@ -266,21 +266,38 @@ def correlation(ops, X, lay: Features, lo: float, hi: float, err: float = 1e-4):
 # ── logsumexp / softmax ─────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def _shift(ops, x, lay, lo, hi, shift, method, err, margin):
-    """(u = x - m, m, the exp's domain [a, b], the sum's band [s_lo, s_hi]) for shift "bound" (m = hi, public) or "max"
-    (m = the encrypted maximum, impl.sort). `margin`: how far below the true maximum m may land (a TFHE tournament
-    decides values inside the switch's noise band either way: default 3 % of the range; CKKS: err); the exp's domain
-    and the band are widened by it."""
+def _shift(ops, x, lay, lo, hi, shift, method, err, margin, refresh=False):
+    """(m, the exp's domain [a, b], the sum's band [s_lo, s_hi]) for shift "bound" (m = hi, public) or "max" (m = the
+    encrypted maximum, impl.sort). `margin`: how far below the true maximum m may land (a TFHE tournament decides
+    values inside the switch's noise band either way: default 3 % of the range; CKKS: err); the exp's domain and the
+    band are widened by it. `refresh` (max): m is refreshed, never x - m: the tournament leaves m deep, and a refresh
+    of x - m (|x - m| up to hi - lo) adds an absolute error that the exp turns into the same relative error
+    (logsumexp 3.9e-2 on the device at |x - m| <= 8); m's error is a shift both uses of m share."""
     if shift == "bound":
-        return ops.add(x, -float(hi)), float(hi), (float(lo) - float(hi), 0.0), (lay.n * _m.exp(lo - hi), float(lay.n))
+        return float(hi), (float(lo) - float(hi), 0.0), (lay.n * _m.exp(lo - hi), float(lay.n))
     if shift == "max":
         from . import sort
         if margin is None:
             margin = 0.03 * (float(hi) - float(lo)) if method == "tfhe" else float(err)
-        m = sort.vmax(ops, x, lay, bound=float(hi) - float(lo), method=method, err=err)
-        return (ops.sub(x, m), m, (float(lo) - float(hi), float(margin)),
-                (_m.exp(-float(margin)), lay.n * _m.exp(float(margin))))
+        m = _fresh(ops, sort.vmax(ops, x, lay, bound=float(hi) - float(lo), method=method, err=err), refresh)
+        return m, (float(lo) - float(hi), float(margin)), (_m.exp(-float(margin)), lay.n * _m.exp(float(margin)))
     raise ValueError(f"shift {shift!r}: 'bound' or 'max'")
+
+
+def _exp_shifted(ops, x, m, a, b, err):
+    """exp(x - m) on [a, b]. An encrypted m enters through a product: for a Chebyshev exp the series' own affine map,
+    alpha x - alpha m + beta (no level beyond the series'), else x - 1.0 m (one). A refreshed m lands raw, which the
+    planner seeds a unit deeper than the compile lands it (make_plan.sh's dense clamp of a code refresh): read by a
+    sum with a realized x (a planner refresh) it compiled at the other degree ([plan_deg_error], the pipeline stage);
+    a product leaves its result pending on both sides."""
+    ex = M.approx_exp(float(a), float(b), float(err), False)
+    if not isinstance(m, (int, float)):
+        u = ex.unit()
+        if u is not None:
+            alpha, beta, g = u
+            return g(ops, ops.add(ops.sub(ops.mult(x, alpha), ops.mult(m, alpha)), beta))
+        return ex(ops, ops.sub(x, ops.mult(m, 1.0)))
+    return ex(ops, ops.add(x, -float(m)))
 
 
 def _fresh(ops, x, refresh):
@@ -290,19 +307,32 @@ def _fresh(ops, x, refresh):
     return ops.bootstrap_real(x) if refresh else x
 
 
+def _refreshed_series(ops, s, n, a):
+    """a(s / n) with a deliberate refresh of a unit-size value in between: for a Chebyshev method alpha s / n (the
+    series' variable t = alpha s / n + beta without its constant, which would be most of the refreshed value's size;
+    adding it after costs no level), so the series starts on the refreshed value with one level more than a(mean)
+    (a refresh lands raw, a unit deeper than a fresh input: the degree-72 log needs all 8 of a fresh window, and a
+    refresh the planner placed inside its T recurrence gave 1e-2); else the mean. Never the sum itself: its refresh
+    error is n times larger."""
+    u = a.unit()
+    if u is None:
+        return a(ops, _fresh(ops, ops.mult(s, 1.0 / n), True))
+    alpha, beta, g = u
+    return g(ops, ops.add(_fresh(ops, ops.mult(s, alpha / n), True), beta))
+
+
 def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
             s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
     """softmax over each vector, x in [lo, hi]: exp(x - m) / sum. `shift` "max" (exact maximum: the sum's band is
     [1, n]) or "bound" (m = hi: the band is [n e^(lo - hi), n], or `s_lo` if calibrated); `method`: the max's
     comparisons (impl.sort)."""
-    u, _m_, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
+    m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin, refresh)
     sl = float(s_lo) if s_lo is not None else sl
-    e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
+    e = _exp_shifted(ops, x, m, a, b, 0.25 * err)
     if refresh and shift == "max":
-        # the mean (<= e^margin) is refreshed, not the sum: a deliberate refresh of a value of size n (256) came back
-        # as garbage on the device (no prescale on a code's own refresh)
-        s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), True)
-        return ops.mult(ops.mult(e, 1.0 / lay.n), M.reciprocal(ops, s, sl / lay.n, sh / lay.n, 0.5 * err, rel=True))
+        r = _refreshed_series(ops, total(ops, e, lay), lay.n,
+                              M.approx_reciprocal(sl / lay.n, sh / lay.n, 0.5 * err, True))
+        return ops.mult(ops.mult(e, 1.0 / lay.n), r)
     s = total(ops, e, lay)
     return ops.mult(e, M.reciprocal(ops, s, sl, sh, 0.5 * err, rel=True))
 
@@ -310,11 +340,11 @@ def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: 
 def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
               s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
     """log sum_j exp(x_j), x in [lo, hi], broadcast over each vector's slots (softmax's shift and band)."""
-    u, m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
+    m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin, refresh)
     sl = float(s_lo) if s_lo is not None else sl
-    e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
-    if refresh and shift == "max":
-        s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), True)     # the mean: log s = log mean + log n
-        return ops.add(ops.add(M.log(ops, s, sl / lay.n, sh / lay.n, 0.5 * err), m), _m.log(lay.n))
+    e = _exp_shifted(ops, x, m, a, b, 0.25 * err)
+    if refresh and shift == "max":                                             # log sum = log mean + log n
+        lg = _refreshed_series(ops, total(ops, e, lay), lay.n, M.approx_log(sl / lay.n, sh / lay.n, 0.5 * err))
+        return ops.add(ops.add(lg, m), _m.log(lay.n))
     s = total(ops, e, lay)
     return ops.add(M.log(ops, s, sl, sh, 0.5 * err), m)

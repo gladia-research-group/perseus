@@ -64,11 +64,13 @@ def _auto(tmp_path, task, sets, seeds=("0", "1")):
     ("fn", ["fn=relu", "lo=-1", "hi=1", "err=1e-3", "method=tfhe"], "rms_err", 1e-3),
     ("stats", ["kind=zscore", "n=256", "B=128"], "max_err", 5e-3),
     ("stats", ["kind=softmax", "n=256", "B=128", "method=tfhe"], "max_err", 2e-3),
+    ("stats", ["kind=logsumexp", "n=256", "B=128", "method=tfhe"], "max_err", 3e-3),    # 3.9e-2 when u was refreshed
     ("stats", ["kind=cov", "m=256", "d=16", "B=4"], "max_err", 1e-4),
     ("sort", ["kind=rank", "n=16", "method=ckks"], "exact", None),
     ("sort", ["kind=rank", "n=16", "method=tfhe"], "exact", None),
     ("sort", ["kind=bitonic", "n=64", "method=tfhe"], "exact", None),
     ("sort", ["kind=threshold", "n=256", "k=8", "method=tfhe", "levels=2"], "mask_exact", None),
+    ("sort", ["kind=threshold", "n=4096", "k=8", "method=ckks"], "mask_exact", None),       # 1e19 without ladder margins
     ("pipeline", ["n=16", "B=4", "method=tfhe"], "topk_exact", None),
 ])
 def test_planned(tmp_path, task, sets, key, tol):

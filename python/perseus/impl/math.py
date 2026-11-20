@@ -224,6 +224,17 @@ class Approx:
     def __call__(self, ops, x):
         return self.run(ops, x)
 
+    def unit(self):
+        """A `cheb` method as (alpha, beta, g): g(ops, t) is the series on t = alpha x + beta in [-1, 1], one level
+        less than the call (the affine map is the caller's: e.g. folded into a product before a refresh, so the series
+        starts on a refreshed unit-size value). None for the other methods."""
+        c = getattr(self.run, "cheb", None)
+        if c is None:
+            return None
+        lo, hi = self.lo, self.hi
+        return (2.0 / (hi - lo), -(hi + lo) / (hi - lo),
+                lambda ops, t, c=c: poly.eval_chebyshev(ops, t, list(c), -1.0, 1.0, eps=0.0))
+
     def numpy(self, x):
         """The approximation in float64 (what the encrypted evaluation computes, without the CKKS noise)."""
         y = self.run(_NpOps(), np.asarray(x, dtype=np.float64))
@@ -345,6 +356,7 @@ def _cheb_run(c, lo, hi):
 
     def run(ops, x):
         return poly.eval_chebyshev(ops, x, c, lo, hi, eps=0.0)
+    run.cheb = tuple(c)
     return run
 
 
