@@ -129,10 +129,26 @@ class Fn(Task):
         e, r = _err(y, t)
         rel = self.fn in ("exp", "rsqrt", "reciprocal", "pow")
         er, rr = _err(y, t, True) if rel and np.all(np.abs(t) > 0) else (e, r)
-        return {"max_err": e, "rms_err": r, "max_rel": er, "rms_rel": rr}
+        out = {"max_err": e, "rms_err": r, "max_rel": er, "rms_rel": rr}
+        if self.fn in ("abs", "relu", "sign", "clip"):
+            # the decisions the comparison got wrong (an error past 10x the target), and the largest |x| among them
+            bad = np.abs(y - t) > 10.0 * self.err
+            xs = self.x if self.fn != "sign" else self.x[np.abs(self.x) >= self.err * max(_m.fabs(self.lo),
+                                                                                          _m.fabs(self.hi))]
+            out["wrong_frac"] = float(bad.mean())
+            out["wrong_max_absx"] = float(np.abs(xs[bad]).max()) if bad.any() else 0.0
+        return out
 
     def describe(self):
         d = super().describe()
+        if self.fn in ("abs", "relu", "sign", "clip") and self.method == "ckks":
+            B = max(_m.fabs(self.lo), _m.fabs(self.hi))
+            c = M.count(lambda o, v: self.run(o, [v])[0])
+            lad = (M.sign_ladder(*M._resolution(1.0, self.err)) if self.fn == "sign" else
+                   M.relu_ladder(B if self.fn != "clip" else B + 0.5 * B, 0.5 * self.err if self.fn != "relu"
+                                 else self.err))
+            d.update(method_chosen=f"composite {lad.degs}", depth=c.depth, ct_mults=c.ct_mults,
+                     params={"eps": lad.eps})
         if self.fn not in ("abs", "relu", "sign", "clip"):
             a = self.approx()
             d.update(method_chosen=a.method, depth=a.depth, ct_mults=a.ct_mults, params=dict(a.params),

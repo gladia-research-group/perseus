@@ -296,4 +296,4 @@ def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift
     e = M.exp(ops, u, a, b, 0.25 * err / lay.n, rel=False)
     s = total(ops, e, lay)
     L = M.log(ops, s, sl, float(lay.n), 0.5 * err)
-    return ops.add(L, m) if not isinstance(m, float) else ops.add(L, m)
+    return ops.add(L, m)
