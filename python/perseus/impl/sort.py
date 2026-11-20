@@ -426,16 +426,18 @@ def threshold(ops, x, lay: Batch, k: int, lo: float, hi: float, *, probes: int =
                                                                                           kind="mask"), t)
         c = step(ops, dt, s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag=f"thr{p}", n=N,
                  levels=levels)
-        cnt = total(ops, c, lay)                          # count(y >= t + w), every slot of the vector
-        e = ops.add_pt(cnt, _mask(N, s0 if count_method == "tfhe" else s, 0.5 - k), kind="mask")
+        # count(y >= t + w), every slot of the vector (CKKS: over n + 1 before the sum: a count near n refreshed by
+        # the plan came back as garbage at n = 4096)
+        cnt = total(ops, c if count_method == "tfhe" else ops.mult(c, 1.0 / (n + 1.0)), lay)
+        e = ops.add_pt(cnt, _mask(N, s0, 0.5 - k) if count_method == "tfhe" else _mask(N, s, (0.5 - k) / (n + 1.0)),
+                       kind="mask")
         if count_method == "tfhe":
             from .tfhe_select import msign
             bit = msign(ops, e, N, s0, 2.0 * n, 3, f"thr.c{p}", res=0.25)
             inc = ops.rotate_and_sum(ops.mult_pt(bit, _mask(N, s0, w), kind="mask"), -B, N)
         else:
             # the count over n + 1 (a value of size n refreshed inside the comparison's ladder comes back as garbage)
-            bit = step(ops, ops.mult(e, 1.0 / (n + 1.0)), s, 1.0, method="ckks", bound=1.0, res=0.5 / (n + 1.0),
-                       tag=f"thr.c{p}", n=N)
+            bit = step(ops, e, s, 1.0, method="ckks", bound=1.0, res=0.5 / (n + 1.0), tag=f"thr.c{p}", n=N)
             inc = ops.mult(bit, w)
         t = inc if t is None else ops.add(t, inc)
     mask = step(ops, ops.sub(y, t), s, 1.0, method=method, bound=bound + 1.0, res=bound / 2 ** probes / 4, tag="thr.m",

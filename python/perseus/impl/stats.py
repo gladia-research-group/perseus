@@ -13,8 +13,9 @@ rotations per reduction; the levels are the products' (listed per function).
   rotation by s features is cyclic within the sample): d/2 + 1 cyclic diagonals, each one product of the centred
   data with a (hoisted) rotation of itself and one sample ladder; correlation standardises the features first.
 * `logsumexp` / `softmax`: max-shifted (an encrypted maximum from impl.sort, or a calibrated public bound): exp on
-  [lo - hi, margin], the mean, then log / reciprocal on its band ([e^-margin / n, e^margin] after a max shift), with
-  a deliberate refresh before the exp and before the log / reciprocal (`refresh`).
+  [lo - hi, margin], the sum, then log / reciprocal on its band ([e^-margin, n e^margin] after a max shift), with
+  deliberate refreshes (`refresh`) before the exp and, after a max shift, of the mean before the log / reciprocal
+  (a deliberate refresh of the sum, up to n in size, came back as garbage on the device).
 * `prefix_sum`: Hillis-Steele scan on the padded layout, log2(n) rotations and no level, no mask (the zeros after each
   vector absorb the shifts; the padding holds garbage afterwards).
 """
@@ -297,9 +298,13 @@ def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: 
     u, _m_, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
     e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
-    # the mean (<= e^margin), not the sum, is refreshed: a refresh's error grows with the value's size
-    s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), refresh)
-    return ops.mult(ops.mult(e, 1.0 / lay.n), M.reciprocal(ops, s, sl / lay.n, sh / lay.n, 0.5 * err, rel=True))
+    if refresh and shift == "max":
+        # the mean (<= e^margin) is refreshed, not the sum: a deliberate refresh of a value of size n (256) came back
+        # as garbage on the device (no prescale on a code's own refresh)
+        s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), True)
+        return ops.mult(ops.mult(e, 1.0 / lay.n), M.reciprocal(ops, s, sl / lay.n, sh / lay.n, 0.5 * err, rel=True))
+    s = total(ops, e, lay)
+    return ops.mult(e, M.reciprocal(ops, s, sl, sh, 0.5 * err, rel=True))
 
 
 def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
@@ -308,6 +313,8 @@ def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift
     u, m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin)
     sl = float(s_lo) if s_lo is not None else sl
     e = M.exp(ops, _fresh(ops, u, refresh), a, b, 0.25 * err, rel=False)
-    s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), refresh)        # the mean: log s = log mean + log n
-    L = M.log(ops, s, sl / lay.n, sh / lay.n, 0.5 * err)
-    return ops.add(ops.add(L, m), _m.log(lay.n))
+    if refresh and shift == "max":
+        s = _fresh(ops, ops.mult(total(ops, e, lay), 1.0 / lay.n), True)     # the mean: log s = log mean + log n
+        return ops.add(ops.add(M.log(ops, s, sl / lay.n, sh / lay.n, 0.5 * err), m), _m.log(lay.n))
+    s = total(ops, e, lay)
+    return ops.add(M.log(ops, s, sl, sh, 0.5 * err), m)

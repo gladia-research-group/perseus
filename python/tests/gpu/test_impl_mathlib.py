@@ -68,7 +68,7 @@ def _auto(tmp_path, task, sets, seeds=("0", "1")):
     ("sort", ["kind=rank", "n=16", "method=ckks"], "exact", None),
     ("sort", ["kind=rank", "n=16", "method=tfhe"], "exact", None),
     ("sort", ["kind=bitonic", "n=64", "method=tfhe"], "exact", None),
-    ("sort", ["kind=threshold", "n=256", "k=8", "method=tfhe"], "mask_exact", None),
+    ("sort", ["kind=threshold", "n=256", "k=8", "method=tfhe", "levels=2"], "mask_exact", None),
     ("pipeline", ["n=16", "B=4", "method=tfhe"], "topk_exact", None),
 ])
 def test_planned(tmp_path, task, sets, key, tol):
