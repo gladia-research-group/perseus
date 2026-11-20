@@ -21,6 +21,7 @@ pub mod cts;
 pub mod dense;
 pub mod evalmod;
 pub mod fbs_noise; // functional bootstrapping: validated chains, noise model
+pub mod fbs_trig; // trigonometric functional bootstrapping (f folded into EvalMod's cos / sin)
 pub mod finish;
 pub mod raise;
 pub mod stc;

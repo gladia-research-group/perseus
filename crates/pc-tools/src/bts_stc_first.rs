@@ -717,11 +717,17 @@ struct BArgs {
     /// one x per slot as Re = x - pair, Im = x + pair (two series on disjoint domains of one sine)
     samples: Option<String>,
     pair: f64,
+    /// fbs trigonometric form (PC_FBS_ON_ROUTE=1): Q's coefficients file (as --post-file: P), t's offset, the base
+    /// pair's degree and double angles (`pc_shadow::evalmod::trig_base`)
+    post_s_file: Option<String>,
+    trig_off: f64,
+    trig_deg: usize,
+    trig_da: u32,
 }
 
 fn bargs(a: &[String]) -> Res<BArgs> {
     let members = vec![(13, 64.0), (10, 8.0), (6, 1.0), (2, 0.25)];
-    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None, members, seeds: 4, dirty: 4, fbs_t: 16, lut: "sign".into(), frac: false, post_file: None, fbs_cf: None, amp: 1.0, range: 1.0, dump: None, em_table: None, em_k: 16.0, em_da: 5, samples: None, pair: 0.0 };
+    let mut r = BArgs { cmd: a.first().cloned().ok_or("command")?, ks: vec![1, 2, 4, 8], reps: 10, cfs: vec![13], amps: vec![0.1, 1.0], real: false, level: 44, graph: false, out: None, gauss: None, members, seeds: 4, dirty: 4, fbs_t: 16, lut: "sign".into(), frac: false, post_file: None, fbs_cf: None, amp: 1.0, range: 1.0, dump: None, em_table: None, em_k: 16.0, em_da: 5, samples: None, pair: 0.0, post_s_file: None, trig_off: 0.0, trig_deg: 27, trig_da: 5 };
     let list = |s: &str| -> Res<Vec<f64>> { s.split(',').map(|x| x.parse::<f64>().map_err(|e| e.into())).collect() };
     let mut i = 1;
     while i < a.len() {
@@ -756,6 +762,10 @@ fn bargs(a: &[String]) -> Res<BArgs> {
             "--em-da" => r.em_da = v.parse()?,
             "--samples" => r.samples = Some(v.clone()),
             "--pair" => r.pair = v.parse()?,
+            "--post-s-file" => r.post_s_file = Some(v.clone()),
+            "--trig-off" => r.trig_off = v.parse()?,
+            "--trig-deg" => r.trig_deg = v.parse()?,
+            "--trig-da" => r.trig_da = v.parse()?,
             "--frac" => {
                 r.frac = true;
                 i += 1;
@@ -941,8 +951,19 @@ pub fn bench(args: &[String]) -> Res<bool> {
     // PC_FBS_ON_ROUTE=1: the shipped route plus the series as an FBS of it (`StcFirstPlan::fbs_host`, the planned
     // runtime's path) instead of a route built around the series
     let on_route = a.cmd == "fbs" && std::env::var("PC_FBS_ON_ROUTE").is_ok_and(|v| v == "1");
+    if a.post_s_file.is_some() && !on_route {
+        return Err("fbs --post-s-file (the trigonometric form) runs on the route: set PC_FBS_ON_ROUTE=1".into());
+    }
     let fbs_spec = if on_route {
-        let sp = pc_gpu::bts::stc_first::FbsSpec { table: setup.evalmod_coeffs.clone(), k: setup.boot_k, da_its: setup.evalmod_da_its, amp: setup.evalmod_amp, post: setup.evalmod_post.clone(), drop: 0, complex: true, real: true };
+        let mut sp = pc_gpu::bts::stc_first::FbsSpec { table: setup.evalmod_coeffs.clone(), k: setup.boot_k, da_its: setup.evalmod_da_its, amp: setup.evalmod_amp, post: setup.evalmod_post.clone(), table_s: vec![], off: 0.0, post_s: vec![], paired: std::env::var("PC_FBS_PAIRED").is_ok_and(|v| v == "1"), drop: 0, complex: true, real: true };
+        if let Some(f) = &a.post_s_file {
+            // the trigonometric form: the K32 base pair of degree --trig-deg, --trig-da paired double angles
+            let v: Vec<f64> = serde_json::from_str(&std::fs::read_to_string(f)?)?;
+            let (c, s) = pc_shadow::evalmod::trig_base(32.0, a.trig_da, a.trig_deg);
+            (sp.table, sp.table_s, sp.k, sp.da_its, sp.off) = (c, s, 32.0, a.trig_da, a.trig_off);
+            sp.post_s = v.iter().map(|c| c * (fbs_cf as f64).exp2().recip()).collect();
+            println!("[pc-bench] fbs trig: base pair degree {} da {}, Q degree {}, off {}", a.trig_deg, a.trig_da, sp.post_s.len() - 1, a.trig_off);
+        }
         let base = BtsSetup::n32_shipped();
         (setup.evalmod_coeffs, setup.boot_k, setup.evalmod_da_its, setup.evalmod_amp, setup.evalmod_post) = (base.evalmod_coeffs, base.boot_k, base.evalmod_da_its, 1.0, vec![]);
         Some(sp)
@@ -1119,6 +1140,9 @@ pub fn bench(args: &[String]) -> Res<bool> {
         }
         "fbs" => {
             let t = a.fbs_t;
+            // PC_FBS_OWN_CF=1: the call at the FBS's own CF, as the planned session's FBS service runs it (pc-py
+            // FbsExec: own_cf); default: the route's reference CF with the input pre-scaled
+            let fbs_opts = CallOpts { own_cf: std::env::var("PC_FBS_OWN_CF").is_ok_and(|v| v == "1"), ..CallOpts::default() };
             let h = (t / 2) as i64;
             // --real: the real-payload route (N/2 real inputs per ciphertext, Im = 0)
             let real = a.real;
@@ -1185,7 +1209,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
                     fresh(&mut x, &mut ex, &vals, a.level)?;
                     let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
                     ev[0].record(&cx.ex.compute)?;
-                    let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, CallOpts::default())?;
+                    let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, fbs_opts)?;
                     match &fbs_pre {
                     Some(f) => {
                         call.stc_first_input(&mut cx, std::slice::from_mut(&mut x))?;
@@ -1217,7 +1241,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
                 let vals = draw(kmax, a.frac);
                 fresh(&mut x, &mut ex, &vals, a.level)?;
                 let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
-                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, CallOpts::default())?;
+                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&x), &r, fbs_opts)?;
                 match &fbs_pre {
                     Some(f) => {
                         call.stc_first_input(&mut cx, std::slice::from_mut(&mut x))?;

@@ -62,13 +62,32 @@ pub struct PsPlan {
     /// Functional bootstrapping: a Chebyshev series on [-1, 1] applied to the EvalMod output (empty: none).
     #[serde(default)]
     pub post: Vec<f64>,
+    /// Trigonometric functional bootstrapping (`PsPlan::fbs_trig`): this plan's series is the cosine of the base
+    /// angle, `trig` the sine half and the series on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trig: Option<Box<TrigSeries>>,
+    /// Functional bootstrapping, sine form: the base series and `post` on the paired Paterson-Stockmeyer builder
+    /// (`build_sine_paired`, one level shallower than FIDESlib's at the same degree) instead of FIDESlib's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paired: bool,
+}
+
+/// The sine half of a trigonometric FBS plan (`PsPlan::trig`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrigSeries {
+    /// The base sine series (amplitude A^(2^-r) sin of the base angle).
+    pub sin: PsPlan,
+    /// Q of P(t) + s Q(t) (evaluator convention), s = A sin(2 pi u).
+    pub post_s: Vec<f64>,
+    /// t = A cos(2 pi u) + `off` (added at the last double angle).
+    pub off: f64,
 }
 
 impl PsPlan {
     /// The plan for a Chebyshev coefficient table, computed by OpenFHE's long divisions (`pc_core::cheb`).
     pub fn from_coeffs(coefficients: &[f64]) -> pc_core::error::Result<Self> {
         let p = pc_core::cheb::PsPlan::new(coefficients)?;
-        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec(), amp: 0.0, post: vec![] })
+        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec(), amp: 0.0, post: vec![], trig: None, paired: false })
     }
 
     /// Functional bootstrapping (Alexandru-Kim-Polyakov, ePrint 2024/1623; here a real Chebyshev series on the
@@ -83,6 +102,23 @@ impl PsPlan {
         let mut p = Self::from_coeffs(&c)?;
         p.amp = amp;
         p.post = post.to_vec();
+        Ok(p)
+    }
+
+    /// Trigonometric functional bootstrapping (f folded into EvalMod's own cosine / sine: the Fourier extension of
+    /// Bian et al., ePrint 2026/367, and the trigonometric minimax of Xiao et al., ePrint 2026/1255): the base pair
+    /// `cos_base`, `sin_base` (amplitude 1 cos / sin of the base angle, `trig_base`) rescaled to amplitude `amp`,
+    /// `da_its` paired double angles to c = A cos(2 pi u), s = A sin(2 pi u), then P(t) + s Q(t) on t = c + `off`.
+    /// A degree-n trigonometric polynomial of the phase u is P of degree n and Q of degree n - 1 in cos(2 pi u); on
+    /// a domain |u| <= u_max < 1/2 they are fitted on cos(2 pi u) in [cos(2 pi u_max), 1], mapped to t in [-1, 1].
+    #[allow(clippy::too_many_arguments)]
+    pub fn fbs_trig(cos_base: &[f64], sin_base: &[f64], da_its: u32, amp: f64, off: f64, post: &[f64], post_s: &[f64]) -> pc_core::error::Result<Self> {
+        let a = amp.powf(1.0 / (1u64 << da_its) as f64);
+        let mut p = Self::from_coeffs(&cos_base.iter().map(|x| x * a).collect::<Vec<_>>())?;
+        let sin = Self::from_coeffs(&sin_base.iter().map(|x| x * a).collect::<Vec<_>>())?;
+        p.amp = amp;
+        p.post = post.to_vec();
+        p.trig = Some(Box::new(TrigSeries { sin, post_s: post_s.to_vec(), off }));
         Ok(p)
     }
 
@@ -896,6 +932,355 @@ pub fn build_double_angle_amp(b: &mut Builder, x: usize, its: i32, amp: f64) -> 
     Ok(())
 }
 
+/// A device-time proxy of a program (limb-weighted: a product with its relinearization ~4 rescales, a weighted-sum
+/// source ~1/4, the element-wise ops ~1/5).
+pub fn op_cost(ops: &[EmOp]) -> f64 {
+    ops.iter()
+        .map(|op| match op {
+            EmOp::Mult { n, .. } => 4.0 * *n as f64,
+            EmOp::MultAcc { n, pairs, .. } => (3.0 + pairs.len() as f64) * *n as f64,
+            EmOp::Rescale { n, .. } => *n as f64,
+            EmOp::WSum { n, srcs, .. } => 0.25 * (*n * srcs.len()) as f64,
+            EmOp::Copy { n, .. } | EmOp::Add { n, .. } | EmOp::MulConst { n, .. } | EmOp::AddConst { n, .. } => 0.2 * *n as f64,
+        })
+        .sum()
+}
+
+/// The base pair of a trigonometric FBS (`PsPlan::fbs_trig`): Chebyshev interpolants on [-1, 1] (evaluator convention)
+/// of cos and sin of 2 pi K y / 2^r at degree `deg`; after r paired double angles, y = (u + I) / K reads
+/// (cos 2 pi u, sin 2 pi u) for every ModRaise integer |I| < K.
+pub fn trig_base(k: f64, da_its: u32, deg: usize) -> (Vec<f64>, Vec<f64>) {
+    let w = 2.0 * std::f64::consts::PI * k / (1u64 << da_its) as f64;
+    let n = deg + 1;
+    let interp = |par: usize, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
+        (0..n)
+            .map(|j| {
+                if j % 2 != par {
+                    return 0.0;
+                }
+                let s: f64 = (0..n).map(|i| {
+                    let th = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
+                    f(th.cos()) * (j as f64 * th).cos()
+                }).sum();
+                s * 2.0 / n as f64
+            })
+            .collect()
+    };
+    (interp(0, &|y| (w * y).cos()), interp(1, &|y| (w * y).sin()))
+}
+
+/// f = q T_g + r (true Chebyshev coefficients, value = sum f_i T_i), deg r < g; deg f < 2 g
+/// (T_i = 2 T_(i-g) T_g - T_(2g-i) for g < i < 2 g).
+fn cheb_divide(f: &[f64], g: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut r = f.to_vec();
+    let mut q = vec![0f64; f.len().saturating_sub(g).max(1)];
+    for i in (g..f.len()).rev() {
+        let c = r[i];
+        r[i] = 0.0;
+        if c == 0.0 {
+            continue;
+        }
+        let a = i - g;
+        if a == 0 {
+            q[0] += c;
+        } else {
+            q[a] += 2.0 * c;
+            r[2 * g - i] -= c;
+        }
+    }
+    r.truncate(g);
+    (q, r)
+}
+
+fn top_deg(c: &[f64]) -> Option<usize> {
+    c.iter().rposition(|&x| x != 0.0)
+}
+
+/// The baby / giant powers of a paired Paterson-Stockmeyer evaluation of P(t) + s Q(t).
+struct PairPowers {
+    k: usize,
+    /// T_1..T_k of t (index i - 1)
+    t: Vec<usize>,
+    /// s T_i, i = 0..k-1 (s T_0 = s)
+    st: Vec<usize>,
+    /// T_(k 2^j), j = 0..m-1
+    g: Vec<usize>,
+    /// s T_(k 2^j) (the giant placement of s: `st` empty), and s itself for the leaves
+    sg: Vec<usize>,
+    s: Option<usize>,
+}
+
+enum PairVal {
+    Ct(usize),
+    Const(f64),
+}
+
+/// P(t) + s Q(t) of degree < k 2^m (true coefficients) on the powers `pw`: Q enters only at the leaves (s T_i), so
+/// the product by s costs no level of its own (the leaves sit above the giant powers).
+fn pair_eval(b: &mut Builder, pw: &PairPowers, p: &[f64], q: &[f64], m: usize) -> Result<Option<PairVal>> {
+    let deg = top_deg(p).max(top_deg(q));
+    let Some(deg) = deg else { return Ok(None) };
+    let k = pw.k;
+    if deg < k || m == 0 {
+        if deg >= k {
+            return Err(rule("evalmod trig", format!("leaf of degree {deg} >= k {k}")));
+        }
+        let mut srcs = vec![];
+        let mut w = vec![];
+        for i in 1..k.min(p.len()) {
+            if p[i] != 0.0 {
+                srcs.push(pw.t[i - 1]);
+                w.push(p[i]);
+            }
+        }
+        if !pw.st.is_empty() {
+            for i in 0..k.min(q.len()) {
+                if q[i] != 0.0 {
+                    srcs.push(pw.st[i]);
+                    w.push(q[i]);
+                }
+            }
+        }
+        let c0 = p.first().copied().unwrap_or(0.0);
+        let leaf = if srcs.is_empty() {
+            PairVal::Const(c0)
+        } else {
+            let dst = b.fresh();
+            let top = srcs.iter().map(|&x| b.metas[x].top).min().unwrap_or(-1);
+            b.metas[dst] = FMeta { top, nl: 1, nf: 1.0 };
+            b.wsum(dst, &srcs, &w)?;
+            b.add_scalar(dst, c0)?;
+            PairVal::Ct(dst)
+        };
+        if !pw.st.is_empty() || top_deg(q).is_none() {
+            return Ok(Some(leaf));
+        }
+        // the giant placement: s times the leaf's Q part (one product; the leaf sits a level above its parent's)
+        let s_ = pw.s.ok_or_else(|| rule("evalmod trig", "a Q leaf without s"))?;
+        let lq = pair_eval(b, pw, q, &[], 0)?;
+        let sq = match lq {
+            None => return Ok(Some(leaf)),
+            Some(PairVal::Const(c)) => {
+                let r = b.fresh();
+                b.copy(r, s_);
+                b.mult_scalar(r, c)?;
+                r
+            }
+            Some(PairVal::Ct(h)) => {
+                if b.metas[h].nl == 2 {
+                    b.rescale(h)?;
+                }
+                b.mult(h, s_)?;
+                h
+            }
+        };
+        match leaf {
+            PairVal::Const(c) => b.add_scalar(sq, c)?,
+            PairVal::Ct(l) => b.add(sq, l)?,
+        }
+        return Ok(Some(PairVal::Ct(sq)));
+    }
+    let gd = k << (m - 1);
+    if deg < gd {
+        return pair_eval(b, pw, p, q, m - 1);
+    }
+    let (pq, pr) = cheb_divide(p, gd);
+    let (qq, qr) = cheb_divide(q, gd);
+    let giant = pw.st.is_empty() && top_deg(&qq).is_some();
+    let hi = pair_eval(b, pw, &pq, if giant { &[] } else { &qq }, m - 1)?;
+    // the giant placement: the quotient's Q part times s T_(k 2^(m-1)), a pure series (no s inside)
+    let hq = if giant { pair_eval(b, pw, &qq, &[], m - 1)? } else { None };
+    let lo = pair_eval(b, pw, &pr, &qr, m - 1)?;
+    let times = |b: &mut Builder, v: Option<PairVal>, g: usize| -> Result<Option<usize>> {
+        Ok(match v {
+            None => None,
+            Some(PairVal::Const(c)) => {
+                let r = b.fresh();
+                b.copy(r, g);
+                b.mult_scalar(r, c)?;
+                Some(r)
+            }
+            Some(PairVal::Ct(h)) => {
+                if b.metas[h].nl == 2 {
+                    b.rescale(h)?;
+                }
+                b.mult(h, g)?;
+                Some(h)
+            }
+        })
+    };
+    let r1 = times(b, hi, pw.g[m - 1])?;
+    let r2 = if giant { times(b, hq, pw.sg[m - 1])? } else { None };
+    let res = match (r1, r2) {
+        (Some(a), Some(c)) => {
+            b.add(a, c)?;
+            a
+        }
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return Ok(lo),
+    };
+    match lo {
+        None => {}
+        Some(PairVal::Const(c)) => b.add_scalar(res, c)?,
+        Some(PairVal::Ct(l)) => b.add(res, l)?,
+    }
+    Ok(Some(PairVal::Ct(res)))
+}
+
+fn true_coeffs(c: &[f64]) -> Vec<f64> {
+    let mut v = c.to_vec();
+    if let Some(c0) = v.first_mut() {
+        *c0 /= 2.0;
+    }
+    v
+}
+
+/// The baby steps T_1..T_k of `t`, the giant steps T_(k 2^j) up to the degree `deg` (m of them), and when `s` is
+/// given its products: s T_0..s T_(k-1) (`giant` false: Q at the leaves) or s T_(k 2^j) (`giant`: Q through the
+/// giant powers, s times the bottom leaves only); returns (powers, m).
+fn pair_powers(b: &mut Builder, t: usize, s: Option<usize>, k: usize, deg: usize, giant: bool) -> Result<(PairPowers, usize)> {
+    let mut m = 0;
+    while (k << m) <= deg {
+        m += 1;
+    }
+    let tp = cheb_powers(b, t, k)?;
+    let mut st = Vec::with_capacity(k);
+    if let (Some(s), false) = (s, giant) {
+        for i in 0..k {
+            let v = b.fresh();
+            if i == 0 {
+                b.copy(v, s);
+            } else {
+                b.copy(v, tp[i - 1]);
+                b.mult(v, s)?;
+                if b.metas[v].nl == 2 {
+                    b.rescale(v)?;
+                }
+            }
+            st.push(v);
+        }
+    }
+    let mut g = vec![tp[k - 1]];
+    for j in 1..m {
+        let v = b.fresh();
+        b.square2(v, g[j - 1])?;
+        b.add(v, v)?;
+        b.add_scalar(v, -1.0)?;
+        if b.metas[v].nl == 2 {
+            b.rescale(v)?;
+        }
+        g.push(v);
+    }
+    let mut sg = vec![];
+    if let (Some(s), true) = (s, giant) {
+        for &gj in &g {
+            let v = b.fresh();
+            b.copy(v, gj);
+            b.mult(v, s)?;
+            if b.metas[v].nl == 2 {
+                b.rescale(v)?;
+            }
+            sg.push(v);
+        }
+    }
+    Ok((PairPowers { k, t: tp, st, g, sg, s }, m))
+}
+
+fn pair_result(v: Option<PairVal>) -> Result<usize> {
+    match v {
+        None => Err(rule("evalmod trig", "empty series")),
+        Some(PairVal::Const(_)) => Err(rule("evalmod trig", "a constant series")),
+        Some(PairVal::Ct(r)) => Ok(r),
+    }
+}
+
+/// A trigonometric FBS (`PsPlan::fbs_trig`) on input `x`, the result in `x`: the cos / sin base series on shared
+/// powers of the input (`kb` baby steps), `its` paired double angles (c, s) -> (2 c^2 - a_j, 2 s c) (one more product
+/// per step than the cosine chain, same depth; the last adds `off`), then P(t) + s Q(t) by a paired
+/// Paterson-Stockmeyer with `k` baby steps (Q at the leaves, or through the giant powers: `giant`).
+#[allow(clippy::too_many_arguments)]
+fn build_trig(b: &mut Builder, x: usize, ps: &PsPlan, t: &TrigSeries, its: i32, kb: usize, k: usize, giant: bool) -> Result<()> {
+    if b.metas[x].nl == 2 {
+        b.rescale(x)?;
+    }
+    let cb = true_coeffs(&ps.coeffs);
+    let sb = true_coeffs(&t.sin.coeffs);
+    let dbase = top_deg(&cb).max(top_deg(&sb)).unwrap_or(0);
+    let (pw, m) = pair_powers(b, x, None, kb, dbase, false)?;
+    let c = pair_result(pair_eval(b, &pw, &cb, &[], m)?)?;
+    let mut s = pair_result(pair_eval(b, &pw, &sb, &[], m)?)?;
+    b.copy(x, c);
+    // (c, s) -> (2 c^2 - a_j, 2 s c): the cosine chain's step (the complex square (c - s)(c + s) would halve its
+    // error growth near |c| = a_j but needs c and s at one scale: an alignment level), the last adds `off`
+    for j in 1..=its {
+        for v in [x, s] {
+            if b.metas[v].nl == 2 {
+                b.rescale(v)?;
+            }
+        }
+        let s2 = b.fresh();
+        b.copy(s2, s);
+        b.mult(s2, x)?;
+        b.add(s2, s2)?;
+        s = s2;
+        b.square(x)?;
+        let mut scalar = -ps.amp.powf(2f64.powf((j - its) as f64));
+        if j == its {
+            scalar += t.off;
+        }
+        b.add(x, x)?;
+        b.add_scalar(x, scalar)?;
+    }
+    for v in [x, s] {
+        if b.metas[v].nl == 2 {
+            b.rescale(v)?;
+        }
+    }
+    let p = true_coeffs(&ps.post);
+    let q = true_coeffs(&t.post_s);
+    let deg = top_deg(&p).max(top_deg(&q)).unwrap_or(0);
+    let has_q = top_deg(&q).is_some();
+    let (pw, m) = pair_powers(b, x, if has_q { Some(s) } else { None }, k, deg, giant)?;
+    let r = pair_result(pair_eval(b, &pw, &p, &q, m)?)?;
+    b.copy(x, r);
+    Ok(())
+}
+
+/// The sine form (`PsPlan::fbs`) on the paired Paterson-Stockmeyer builder (`pair_eval`, no Q): the base series on
+/// the input's powers (`kb` baby steps), the double angles, the series `post` (`k` baby steps). The shallowest and
+/// then cheapest (`op_cost`) over the baby-step counts.
+pub fn build_sine_paired(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32) -> Result<(EmProgram, FMeta)> {
+    let mut best: Option<(EmProgram, FMeta)> = None;
+    for (kb, k) in [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].map(move |k| (kb, k))) {
+        let mut b = Builder::new(st);
+        b.lean = true;
+        let x = b.input(input);
+        let run = |b: &mut Builder| -> Result<()> {
+            let cb = true_coeffs(&ps.coeffs);
+            let (pw, m) = pair_powers(b, x, None, kb, top_deg(&cb).unwrap_or(0), false)?;
+            let c = pair_result(pair_eval(b, &pw, &cb, &[], m)?)?;
+            b.copy(x, c);
+            build_double_angle_amp(b, x, double_angle_its, ps.amp)?;
+            if b.metas[x].nl == 2 {
+                b.rescale(x)?;
+            }
+            let p = true_coeffs(&ps.post);
+            let (pw, m) = pair_powers(b, x, None, k, top_deg(&p).unwrap_or(0), false)?;
+            let r = pair_result(pair_eval(b, &pw, &p, &[], m)?)?;
+            b.copy(x, r);
+            Ok(())
+        };
+        if run(&mut b).is_err() {
+            continue;
+        }
+        let out = b.metas[x];
+        if best.as_ref().is_none_or(|(p, o)| out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops))) {
+            best = Some((b.prog, out));
+        }
+    }
+    best.ok_or_else(|| rule("evalmod paired", "no program"))
+}
+
 /// The whole EvalMod chain of one input: the Chebyshev series, then `double_angle_its` double-angle steps.
 pub fn build_evalmod(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32) -> Result<(EmProgram, FMeta)> {
     build_evalmod_opts(st, input, ps, double_angle_its, false)
@@ -906,6 +1291,31 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     let mut b = Builder::new(st);
     b.lean = lean;
     let x = b.input(input);
+    if ps.paired && ps.trig.is_none() && !ps.post.is_empty() {
+        return build_sine_paired(st, input, ps, double_angle_its);
+    }
+    if let Some(t) = &ps.trig {
+        // the baby-step count of the paired series: the shallowest program, then the fewest ops
+        let mut best: Option<(EmProgram, FMeta)> = None;
+        let shapes = [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].iter().flat_map(move |&k| [(kb, k, false), (kb, k, true)]));
+        for (kb, k, giant) in shapes {
+            let mut b = Builder::new(st);
+            b.lean = lean;
+            let x = b.input(input);
+            if build_trig(&mut b, x, ps, t, double_angle_its, kb, k, giant).is_err() {
+                continue;
+            }
+            let out = b.metas[x];
+            let better = match &best {
+                None => true,
+                Some((p, o)) => out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops)),
+            };
+            if better {
+                best = Some((b.prog, out));
+            }
+        }
+        return best.ok_or_else(|| rule("evalmod trig", "no program"));
+    }
     build_chebyshev(&mut b, x, ps)?;
     build_double_angle_amp(&mut b, x, double_angle_its, ps.amp)?;
     if !ps.post.is_empty() {

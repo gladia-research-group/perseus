@@ -1607,11 +1607,32 @@ pub struct FbsSpec {
     pub da_its: u32,
     pub amp: f64,
     pub post: Vec<f64>,
+    /// Trigonometric FBS (`pc_shadow::evalmod::PsPlan::fbs_trig`; `table_s` empty: the sine form): `table` is then
+    /// the cosine of the base angle, `table_s` its sine (`pc_shadow::evalmod::trig_base`), and the output
+    /// P(t) + s Q(t), P = `post`, Q = `post_s`, t = A cos(2 pi u) + `off`, s = A sin(2 pi u).
+    pub table_s: Vec<f64>,
+    pub off: f64,
+    pub post_s: Vec<f64>,
+    /// The sine form on the paired Paterson-Stockmeyer builder (`pc_shadow::evalmod::build_sine_paired`).
+    pub paired: bool,
     /// Raise variant the FBS runs on.
     pub drop: u32,
     /// Build the complex (two-chain) / real-payload EvalMod.
     pub complex: bool,
     pub real: bool,
+}
+
+impl FbsSpec {
+    /// The EvalMod plan of this spec: the sine form, or the trigonometric one when `table_s` is set.
+    pub fn ps_plan(&self) -> Result<pc_shadow::evalmod::PsPlan> {
+        Ok(if self.table_s.is_empty() {
+            let mut p = pc_shadow::evalmod::PsPlan::fbs(&self.table, self.da_its, self.amp, &self.post)?;
+            p.paired = self.paired;
+            p
+        } else {
+            pc_shadow::evalmod::PsPlan::fbs_trig(&self.table, &self.table_s, self.da_its, self.amp, self.off, &self.post, &self.post_s)?
+        })
+    }
 }
 
 /// An FBS's host side (no device memory).
@@ -1641,7 +1662,7 @@ impl StcFirstPlan {
         fbs_chain_check(&self.dense.chain)?;
         let variant = self.dense.variants.iter().position(|v| v.drop == spec.drop).ok_or_else(|| shape("fbs", format!("raise drop {} has no variant", spec.drop)))?;
         let v = &self.dense.variants[variant];
-        let ps = pc_shadow::evalmod::PsPlan::fbs(&spec.table, spec.da_its, spec.amp, &spec.post)?;
+        let ps = spec.ps_plan()?;
         let st = ScaleTables::precompute(&self.dense.chain)?;
         let (_, out, em_slots) = EvalModPlan::<u32>::program(&st, v.em_in, &ps, spec.da_its)?;
         // the post-raise constant scales by 1 / K: the shipped table's K folded out, the FBS table's in
