@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 
+from perseus.impl import fourier as F
+from perseus.impl import keyset
 from perseus.impl import linalg as la
 from perseus.impl.ops import NumpyOps
 
@@ -24,28 +26,6 @@ def test_matrix(rng, m, n, kappa, spd=False, decay="geom"):
         return (U * s) @ U.T
     V, _ = np.linalg.qr(rng.standard_normal((n, k)))
     return (U * s) @ V.T
-
-
-class RotRec(NumpyOps):
-    """The mirror recording every rotation step (the session's key list)."""
-
-    def __init__(self):
-        self.steps = set()
-
-    def rotate(self, a, k):
-        self.steps.add(int(k))
-        return super().rotate(a, k)
-
-    def rotate_many(self, a, steps):
-        self.steps.update(int(k) for k in steps)
-        return super().rotate_many(a, steps)
-
-    def rotate_and_sum(self, a, start, stop):
-        g = abs(int(start))
-        while g < stop:
-            self.steps.add(g if start > 0 else -g)
-            g *= 2
-        return super().rotate_and_sum(a, start, stop)
 
 
 class _D:
@@ -187,9 +167,8 @@ class Task:
         return [la.encode(M, lay) for M, lay in self.inputs()]
 
     def rotations(self):
-        rec = RotRec()
-        self.run(rec, self.encode())
-        return sorted(s % SLOTS for s in rec.steps if s % SLOTS)
+        """The rotation keys the stage needs (keyset.stage_rotations: the code run on the recording mirror)."""
+        return keyset.stage_rotations(self.run, self.encode(), SLOTS)
 
     def mirror(self):
         ops = NumpyOps()
@@ -258,7 +237,7 @@ class Inverse(Task):
 
     def run(self, ops, xs):
         if self.fast:
-            z, self.s = la.inverse_fast(ops, xs[0], self.n, B=self.batch, kappa=self.kb, spd=self.spd,
+            z = la.inverse_fast(ops, xs[0], self.n, B=self.batch, kappa=self.kb, spd=self.spd,
                                         accel=self.accel, wrap=self.wrap, slots=SLOTS, refresh_iterate=self.refresh,
                                         tag_period=self.sparse)
             return [z]
@@ -268,20 +247,20 @@ class Inverse(Task):
             dg = np.diag(self.A)
             Bh = self.A / np.sqrt(np.outer(dg, dg))
             w = np.linalg.eigvalsh(Bh)
-            z, self.s = la.inverse_jacobi(ops, xs[0], self.n, dlo=dg.min() / 1.05, dhi=dg.max() * 1.05,
+            z = la.inverse_jacobi(ops, xs[0], self.n, dlo=dg.min() / 1.05, dhi=dg.max() * 1.05,
                                           bound=1.05 * w.max(), kappa=1.1 * w.max() / w.min(), **kw)
         elif self.precond == "frob":
             f = float(np.sum(self.A ** 2))
-            z, self.s = la.inverse(ops, xs[0], self.n, kappa=self.kb, frob=(f / 4.0, 4.0 * f), **kw)
+            z = la.inverse(ops, xs[0], self.n, kappa=self.kb, frob=(f / 4.0, 4.0 * f), **kw)
         else:
-            z, self.s = la.inverse(ops, xs[0], self.n, bound=self.loose, kappa=self.kb * self.loose, spd=self.spd,
+            z = la.inverse(ops, xs[0], self.n, bound=self.loose, kappa=self.kb * self.loose, spd=self.spd,
                                    **kw)
         return [z]
 
     def outputs(self, vals):
         if self.fast:
-            return {"X": self.s * la.decode(vals[0], self.lay)}
-        return {"X": self.s * la.decode(vals[0], la.O(la.full_cube(self.n, self.n, SLOTS), (self.n, self.n)))}
+            return {"X": la.decode(vals[0], self.lay)}
+        return {"X": la.decode(vals[0], la.O(la.full_cube(self.n, self.n, SLOTS), (self.n, self.n)))}
 
     def metrics(self, out):
         if self.fast:
@@ -350,7 +329,7 @@ class Lstsq(Task):
         if self.method == "precond":
             Ri = self._precond()
             pc = la.full_cube(la.p2(self.mm_), self.n, SLOTS)
-            return [(self.As, la.O(pc, (self.mm_, self.n))), (Ri, la.R(pc, (self.n, self.n))),
+            return [(self.As, la.L(pc, (self.mm_, self.n))), (Ri, la.R(pc, (self.n, self.n))),
                     (Ri.T, la.R(self.cube, (self.n, self.n))), (self.bs.reshape(1, -1), la.L(self.cube, (1, self.mm_)))]
         if self.method == "pinv":
             return [(self.As, la.R(self.cube, (self.mm_, self.n))), (self.bs.reshape(1, -1), la.L(self.cube, (1, self.mm_)))]
@@ -362,21 +341,17 @@ class Lstsq(Task):
             lmax = 1.0
             lmin = 1.0 / kb ** 2 + self.ridge
             it = self.iters or int(math.ceil(math.sqrt(lmax / lmin) * math.log(2.0 / 1e-4) / 2.0))
-            self.s = 1.0
             return [la.chebyshev_solve(ops, xs[0], xs[1], self.mm_, self.n, lmin, lmax, it, slots=SLOTS)]
         if self.method == "pinv":
-            x, self.s = la.pinv_lstsq(ops, xs[0], xs[1], self.mm_, self.n, kappa=kb, slots=SLOTS)
-            return [x]
+            return [la.pinv_lstsq(ops, xs[0], xs[1], self.mm_, self.n, kappa=kb, slots=SLOTS)]
         if self.method == "precond":
-            x, self.s = la.precond_lstsq(ops, *xs, self.mm_, self.n, slots=SLOTS)
-            return [x]
-        x, self.s = la.lstsq(ops, xs[0], xs[1], self.mm_, self.n, kappa=kb, ridge=self.ridge, slots=SLOTS)
-        return [x]
+            return [la.precond_lstsq(ops, *xs, self.mm_, self.n, slots=SLOTS)]
+        return [la.lstsq(ops, xs[0], xs[1], self.mm_, self.n, kappa=kb, ridge=self.ridge, slots=SLOTS)]
 
     def outputs(self, vals):
         if self.method in ("pinv", "precond"):
-            return {"x": self.s * la.decode(vals[0], la.O(self.cube, (1, self.n)))[0]}
-        x = self.s * la.decode(vals[0], la.O(self.cube, (self.n, 1)))[:, 0]
+            return {"x": la.decode(vals[0], la.O(self.cube, (1, self.n)))[0]}
+        x = la.decode(vals[0], la.O(self.cube, (self.n, 1)))[:, 0]
         return {"x": x}
 
     def metrics(self, out):
@@ -623,7 +598,123 @@ class Refresh(Task):
         return {"max_err": float(np.abs(e).max() / self.amp), "rms_err": float(np.sqrt(np.mean(e ** 2)) / self.amp)}
 
 
-TASKS = {"refresh": Refresh, "inverse": Inverse, "lstsq": Lstsq, "qr": QR, "pca": PCA, "rsvd": RSVD}
+def _fourier_transform(kind, n, layout, levels, norm, packing, order, inverse=False):
+    """One of impl.fourier's transforms by name ("dft", "dct2", "dct2_2d" on sqrt(n) x sqrt(n) images, "rfft_half":
+    n real samples in n / 2 complex slots), `levels` 0 = the depth the planner's budget prices (fourier.Budget)."""
+    lv = levels or None
+    if kind == "dft":
+        return F.dft(n, lv, inverse=inverse, norm=norm, order=order, layout=layout)
+    if kind == "dct2":
+        return (F.dct3 if inverse else F.dct2)(n, lv, layout=layout, packing=packing)
+    if kind == "dct2_2d":
+        r = int(round(math.sqrt(n)))
+        return (F.dct3_2d if inverse else F.dct2_2d)(r, lv, layout=layout, separable=True, packing=packing)
+    if kind == "rfft_half":
+        return F.rfft_half(n, lv, inverse=inverse, layout=layout, norm=norm)
+    raise ValueError(kind)
+
+
+@dataclasses.dataclass
+class Fourier(Task):
+    """A batched transform of impl.fourier in one stage (+ its inverse with `roundtrip`): `kind` "dft" (complex),
+    "dct2" (DCT-II; `packing` "real": one real vector per slot vector, "pair": two), "dct2_2d" (separable 2-D DCT of
+    sqrt(n) x sqrt(n) images), "rfft_half" (n real samples, n / 2 complex slots); slots / n vectors per ciphertext,
+    "stride" layout. Errors relative to the RMS of the float64 reference."""
+    kind: str = "dft"
+    n: int = 1024
+    levels: int = 0
+    norm: str = "ortho"
+    packing: str = "real"
+    order: str = "natural"
+    roundtrip: bool = False
+
+    name = "fourier"
+    complex_out = True
+
+    def __post_init__(self):
+        m = self.n // 2 if self.kind == "rfft_half" else self.n
+        self.layout = F.Layout(m, SLOTS, SLOTS // m, "stride")
+        self.T = _fourier_transform(self.kind, self.n, self.layout, self.levels, self.norm, self.packing, self.order)
+        self.Ti = (_fourier_transform(self.kind, self.n, self.layout, self.levels, self.norm, self.packing,
+                                      self.order, inverse=True) if self.roundtrip else None)
+        rng = np.random.default_rng(self.seed)
+        B = self.layout.batch
+        if self.kind == "dft":
+            self.x = rng.standard_normal((B, m)) + 1j * rng.standard_normal((B, m))
+        elif self.kind == "rfft_half":
+            self.x = F.pack_real_half(rng.standard_normal((B, self.n)))
+        elif self.packing == "pair":
+            self.x = F.pack_real_pair(rng.standard_normal((B, m)), rng.standard_normal((B, m)))
+        else:
+            self.x = rng.standard_normal((B, m)) + 0j
+
+    def encode(self):
+        return [self.T.pack(self.x)]
+
+    def run(self, ops, xs):
+        y = self.T.apply(ops, xs[0])
+        return [self.Ti.apply(ops, y) if self.Ti is not None else y]
+
+    def outputs(self, vals):
+        return {"y": (self.Ti or self.T).unpack(np.asarray(vals[0]))}
+
+    def metrics(self, out):
+        ref = self.x if self.Ti is not None else self.T.reference(self.x)
+        e = np.abs(out["y"] - ref)
+        rms = float(np.sqrt(np.mean(np.abs(ref) ** 2)))
+        return {"err_max": float(e.max() / rms), "err_rms": float(np.sqrt(np.mean(e ** 2)) / rms),
+                "levels": self.T.levels + (self.Ti.levels if self.Ti is not None else 0),
+                "rotations": self.T.rotations() + (self.Ti.rotations() if self.Ti is not None else 0)}
+
+    def describe(self):
+        return {k: v for k, v in dataclasses.asdict(self).items()} | {"levels_used": self.T.levels}
+
+
+@dataclasses.dataclass
+class DctLstsq(Task):
+    """Least squares on DCT features, in one stage: the rows of A (m x n signals, R face of gram_cube) go through a
+    DCT-II (impl.fourier, the block layout: each contiguous n-slot row copy), the features solve min ||A C^T y - b||
+    by `pinv_lstsq` (y = C x), and a DCT-III takes y back to the signal domain (x = C^T y; the O face's rows are
+    contiguous n-slot runs as well). The transforms are orthonormal, so the conditioning is A's."""
+    m: int = 128
+    n: int = 16
+    kappa: float = 100.0
+    levels: int = 0
+    noise: float = 1e-3
+    back: bool = True        # the DCT-III back to the signal domain in the stage (else y = C x is decoded)
+
+    name = "dctls"
+
+    def __post_init__(self):
+        rng = np.random.default_rng(self.seed)
+        self.A, self.b = _lsq_problem(rng, self.m, self.n, self.kappa, self.noise)
+        self.cube = la.gram_cube(self.n, SLOTS)
+        lay = F.Layout(self.n, SLOTS, SLOTS // self.n, "block")
+        lv = self.levels or None
+        self.C, self.Ci = F.dct2(self.n, lv, layout=lay), F.dct3(self.n, lv, layout=lay)
+
+    def inputs(self):
+        return [(self.A, la.R(self.cube, (self.m, self.n))), (self.b.reshape(1, -1), la.L(self.cube, (1, self.m)))]
+
+    def run(self, ops, xs):
+        a = self.C.apply(ops, xs[0])                                   # A C^T (R face, rows transformed)
+        y = la.pinv_lstsq(ops, a, xs[1], self.m, self.n, kappa=self.kappa * 1.05, slots=SLOTS)
+        return [self.Ci.apply(ops, y) if self.back else y]              # x^T = y^T C (O face, 1 x n)
+
+    def outputs(self, vals):
+        x = la.decode(np.real(vals[0]), la.O(self.cube, (1, self.n)))[0]
+        return {"x": x if self.back else self.Ci.reference(x[None])[0].real}
+
+    def metrics(self, out):
+        xs = np.linalg.lstsq(self.A, self.b, rcond=None)[0]
+        x = out["x"]
+        res, res_opt = np.linalg.norm(self.A @ x - self.b), np.linalg.norm(self.A @ xs - self.b)
+        return {"rel_err": rel(x, xs), "resid_ratio": float(res / res_opt), "cond": float(np.linalg.cond(self.A)),
+                "levels_dct": self.C.levels}
+
+
+TASKS = {"refresh": Refresh, "inverse": Inverse, "lstsq": Lstsq, "qr": QR, "pca": PCA, "rsvd": RSVD,
+         "fourier": Fourier, "dctls": DctLstsq}
 
 
 def make(name, **kw):

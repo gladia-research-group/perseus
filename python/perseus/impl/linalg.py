@@ -26,6 +26,12 @@ Chebyshev-scaled Newton steps) and a reciprocal (Newton), each on a range the ca
 
 Every function takes `ops` (ops.FheOps on the device session or the fake, ops.NumpyOps for the plaintext mirror) and
 ciphertexts in the layouts named in its docstring; the client side (`encode` / `decode`) is plain numpy.
+
+In a recorded stage. The functions are leaf ops only, so an ImplModel stage records them like any other code and the
+planner places their refreshes. Results are the true values: the iterations hold every iterate at unit size by a public
+per-step scale (the planner refuses to refresh a value far below the bootstrap's envelope) and fold it back in their
+last step. Their own refreshes (`refresh`) run on the real-payload route. The rotation keys a stage needs:
+keyset.stage_rotations; keyset.prefer biases the face moves' BSGS splits toward keys the model already holds.
 """
 from __future__ import annotations
 
@@ -35,6 +41,7 @@ import math
 
 import numpy as np
 
+from . import keyset
 from .poly import scaled_newton_steps
 
 
@@ -182,7 +189,9 @@ def _signed(r, P):
     return np.where(r > P // 2, r - P, r)
 
 
-def _bsgs(diags: dict, slots: int) -> Transform:
+def _bsgs(diags: dict, slots: int, pref: frozenset = frozenset()) -> Transform:
+    """The baby step b (in units of the offsets' gcd) with the fewest rotations; among equal counts, the one needing
+    the fewest keys outside `pref` (keyset.prefer: the keys the model already holds)."""
     rs = sorted(diags)
     nz = [abs(r) for r in rs if r]
     g = functools.reduce(math.gcd, nz, 0) or 1
@@ -193,6 +202,9 @@ def _bsgs(diags: dict, slots: int) -> Transform:
         bab = {x % b for x in q}
         gia = {x - x % b for x in q}
         cost = len(bab - {0}) + len(gia - {0})
+        if pref:
+            new = {k * g % slots for k in (bab | gia) if k} - {k % slots for k in pref}
+            cost += keyset.COST_NEW_KEY * len(new)
         if best is None or cost < best[0]:
             best = (cost, b)
     b = best[1]
@@ -227,10 +239,14 @@ def _want(gather, i, j, src_shape, dst_shape):
     raise ValueError(gather)
 
 
-@functools.lru_cache(maxsize=None)
 def _plan(src: Lay, dst: Lay, gather: tuple, scale: float, sel: tuple | None) -> Transform:
     """The transform taking `src` to `dst` (entries mapped by `gather`, see _want), scaled. `sel`: (row range, col
-    range) of the dst entries kept (the others zero)."""
+    range) of the dst entries kept (the others zero). Its BSGS split prefers the keys of keyset.prefer."""
+    return _plan_keys(src, dst, gather, scale, sel, keyset.preferred())
+
+
+@functools.lru_cache(maxsize=None)
+def _plan_keys(src: Lay, dst: Lay, gather: tuple, scale: float, sel: tuple | None, pref: frozenset) -> Transform:
     S = src.cube.slots
     assert dst.cube.slots == S
     Pm = max(src.cube.P, dst.cube.P)
@@ -269,7 +285,7 @@ def _plan(src: Lay, dst: Lay, gather: tuple, scale: float, sel: tuple | None) ->
         d = np.zeros(Pm)
         d[at] = scale
         diags[int(_signed(r, Pm))] = np.tile(d, S // Pm)
-    return _bsgs(diags, S)
+    return _bsgs(diags, S, pref)
 
 
 def apply(ops, x, t: Transform):
@@ -445,12 +461,15 @@ def consolidate(ops, x, lay: Lay):
     return ops.rotate_and_sum(ops.mult_pt(x, mask, kind="mask"), -st, st * c.d[lay.rep])
 
 
-def refresh(ops, x, on: bool, lay: Lay | None = None):
+def refresh(ops, x, on: bool, lay: Lay | None = None, real: bool = True):
     """A deliberate bootstrap of x (in place) when `on`, then (`lay` given) `consolidate`: a self-correcting
     iteration wants its refreshes on the iterate, whose error the next step squares away, not inside the step (the
-    planner places refreshes by level alone, so some land on intermediates whose error goes straight into the result)."""
+    planner places refreshes by level alone, so some land on intermediates whose error goes straight into the result).
+    `real`: the payload is a real matrix: `bootstrap_real` (the real-payload route when the session runs with
+    bts.real, else the ordinary refresh), whatever its pack tag says (a complex plaintext upstream, e.g. a Fourier
+    transform's twiddles, leaves the tag complex)."""
     if on:
-        ops.bootstrap(x)
+        (ops.bootstrap_real if real and hasattr(ops, "bootstrap_real") else ops.bootstrap)(x)
         if lay is not None:
             x = consolidate(ops, x, lay)
     return x
@@ -473,10 +492,11 @@ def ns_scales(lo: float, hi: float, denom: float, iters: int, spd: bool) -> list
 
 def inverse(ops, a, n: int, *, bound: float = 1.0, kappa: float = 100.0, spd: bool = False, iters: int | None = None,
             method: str = "ns", polish: int = 1, slots: int | None = None, src: Lay | None = None,
-            refresh_iterate: bool = True, frob: tuple | None = None):
+            refresh_iterate: bool = True, frob: tuple | None = None, keep_scale: bool = False):
     """A^{-1} (n x n, n a power of two with n^3 <= slots) from A (default: O on the full cube, i.e. the row-major
-    matrix tiled), Newton-Schulz on PUBLIC bounds ||A||_2 <= `bound`, cond(A) <= `kappa`. Returns (O(Z), s) with
-    A^{-1} = s Z (s = the last step's public scale, see ns_scales: every iterate is held at unit size).
+    matrix tiled), Newton-Schulz on PUBLIC bounds ||A||_2 <= `bound`, cond(A) <= `kappa`. Returns O(A^{-1}): every
+    iterate is held at unit size by a public per-step scale (ns_scales) and the last step folds it back, so the
+    planner sees refreshable magnitudes and the caller sees none of it (`keep_scale`: (O(Z), s) with A^{-1} = s Z).
 
     "ns": X <- X (2 I - A X) (Schulz 1933) from X0 = A^T / bound^2 (Ben-Israel and Cohen 1966: A X0 symmetric positive
     definite, so the residual I - A X_k = (I - A X0)^(2^k) and the step count is log2 of log(eps) / log(1 - 1/kappa^2));
@@ -526,15 +546,18 @@ def inverse(ops, a, n: int, *, bound: float = 1.0, kappa: float = 100.0, spd: bo
                 zl, zr = relayout(ops, zo, lo, ll), relayout(ops, zo, lo, lr, scale=sc[k])
             else:
                 zr = relayout(ops, zo, lo, lr, scale=sc[k])
-            zo = _ns_step(ops, al, zl, zr, cube, sc[k] / sc[k + 1])
-        return zo, sc[iters]
+            last = k == iters - 1 and not keep_scale
+            zo = _ns_step(ops, al, zl, zr, cube, sc[k] if last else sc[k] / sc[k + 1])
+        if keep_scale:
+            return zo, sc[iters]
+        return zo if iters > k0 else ops.mult(zo, sc[iters])     # no step to fold the scale into
     if method != "gs":
         raise ValueError(method)
     # E = I - A X0; X <- X (I + E) with Z_k = X_k / s_k, E <- E^2
     t = mm(ops, al, relayout(ops, zo, lo, lr, scale=sc[k0]), cube)  # A X (O)
     el, er = (add_eye(ops, relayout(ops, t, lo, d, scale=-1.0), d, 1.0) for d in (ll, lr))
     for k in range(k0, iters):
-        r = sc[k] / sc[k + 1]
+        r = sc[k] if (k == total - 1 and not keep_scale) else sc[k] / sc[k + 1]
         zo = mm(ops, zl, add_eye(ops, ops.mult(er, r), lr, r), cube)   # Z (I + E) s_k / s_k+1
         zl = relayout(ops, zo, lo, ll)
         if k + 1 < iters:
@@ -543,8 +566,8 @@ def inverse(ops, a, n: int, *, bound: float = 1.0, kappa: float = 100.0, spd: bo
     for j in range(iters, total):
         zo = refresh(ops, zo, refresh_iterate, lo)
         zl, zr = relayout(ops, zo, lo, ll), relayout(ops, zo, lo, lr, scale=sc[j])
-        zo = _ns_step(ops, al, zl, zr, cube, sc[j] / sc[j + 1])
-    return zo, sc[total]
+        zo = _ns_step(ops, al, zl, zr, cube, sc[j] if (j == total - 1 and not keep_scale) else sc[j] / sc[j + 1])
+    return (zo, sc[total]) if keep_scale else zo
 
 
 def _ns_step(ops, al, zl, zr, cube, ratio: float = 1.0):
@@ -580,8 +603,8 @@ def lstsq(ops, a_r, b_r, m: int, n: int, *, bound: float = 1.0, kappa: float = 1
     Newton-Schulz step applied to the VECTOR: x = (2 I - X G) X c = 2 u - X (G u), u = X c. An error E in X enters x as
     E (I - G X*) c = 0 to first order, so the refresh error of X (relative eps, i.e. cond(G) eps in X c) is squared
     away; X_final c would carry it at cond(G) eps (measured: O(1) relative error at cond(A) = 100). A (m x n) and b
-    (m x 1) come in the R face of gram_cube (m <= slots / n^2; more rows: sum the Grams of row blocks). Returns
-    (O(x), 1.0) (n x 1)."""
+    (m x 1) come in the R face of gram_cube (m <= slots / n^2; more rows: sum the Grams of row blocks). Returns O(x)
+    (n x 1)."""
     slots = slots or ops_slots(ops)
     cube = gram_cube(n, slots)
     lo, ll = O(cube, (n, n)), L(cube, (n, n))
@@ -594,14 +617,14 @@ def lstsq(ops, a_r, b_r, m: int, n: int, *, bound: float = 1.0, kappa: float = 1
     kg = hi / (bound * bound / (kappa * kappa) + ridge)
     it = ns_iters(kg, sq=False)
     z, s = inverse(ops, g, n, bound=hi, kappa=kg, spd=True, slots=slots, method=method, iters=it - 1,
-                   refresh_iterate=refresh_iterate)
+                   refresh_iterate=refresh_iterate, keep_scale=True)
     z = refresh(ops, z, refresh_iterate)
     zl = relayout(ops, z, lo, ll)                                           # X / s (both products read this face)
     gl = relayout(ops, g, lo, ll)
     u = mm(ops, zl, relayout(ops, c, lo1, lr1, scale=s), cube)              # u = X c
     gu = mm(ops, gl, relayout(ops, u, lo1, lr1), cube)                      # G u
     w = mm(ops, zl, relayout(ops, gu, lo1, lr1, scale=s), cube)             # X G u
-    return ops.sub(ops.add(u, u), w), 1.0
+    return ops.sub(ops.add(u, u), w)
 
 
 def pinv_lstsq(ops, a_r, b_l, m: int, n: int, *, bound: float = 1.0, kappa: float = 100.0, slots: int | None = None,
@@ -612,8 +635,8 @@ def pinv_lstsq(ops, a_r, b_l, m: int, n: int, *, bound: float = 1.0, kappa: floa
     m, A^T's face built once) and Y M on full_cube(m, n). The last step is applied to b: x^T = u^T (2 I - A^T Y),
     u^T = b^T Y, so an error E in X enters x as E (b - A x*) (the LS residual) to first order and as E A E b to second:
     the refresh error is amplified by cond(A) (twice in the second-order term), not by cond(A)^2 as through
-    (A^T A)^{-1}. A comes in the R face of gram_cube (m <= slots / n^2), b^T in its L face (1 x m). Returns
-    (O(x^T) on gram_cube (1 x n), 1.0)."""
+    (A^T A)^{-1}. A comes in the R face of gram_cube (m <= slots / n^2), b^T in its L face (1 x m). Returns O(x^T) on
+    gram_cube (1 x n)."""
     slots = slots or ops_slots(ops)
     g, c3 = gram_cube(n, slots), full_cube(p2(m), n, slots)
     assert c3.d[0] >= n
@@ -640,7 +663,7 @@ def pinv_lstsq(ops, a_r, b_l, m: int, n: int, *, bound: float = 1.0, kappa: floa
     ak = alphas[iters - 1]
     mr = add_eye(ops, relayout(ops, t, og, R(g, (n, n)), scale=-ak * ak), R(g, (n, n)), 2.0 * ak)
     ul = relayout(ops, u, O(g, (1, n)), L(g, (1, n)))
-    return mm(ops, ul, mr, g), 1.0
+    return mm(ops, ul, mr, g)
 
 
 def precond_lstsq(ops, a_l, rinv_r, rinvt_r, b_l, m: int, n: int, *, bound_b: float = 2.5, kappa_b: float = 6.0,
@@ -650,16 +673,15 @@ def precond_lstsq(ops, a_l, rinv_r, rinvt_r, b_l, m: int, n: int, *, bound_b: fl
     the small QR S A = Q R (O(s n^2)) and encrypts R^{-1} (and R^{-T}) beside A and b. The server forms B = A R^{-1}
     (cond(B) <= (1 + eps) / (1 - eps) ~ 3 for s = 4 n, whatever cond(A)), solves min ||B y - b|| by pinv_lstsq with
     kappa_b (a handful of steps instead of ~2 log2 cond(A)), and returns x = R^{-1} y. The server learns nothing new
-    (R^{-1} is encrypted). Faces: A row-major (O on full_cube(m, n)), R^{-1} as R on it, R^{-T} as R on gram_cube(n), b^T as
-    L on gram_cube(n). Returns (O(x^T) on gram_cube (1 x n), 1.0)."""
+    (R^{-1} is encrypted). Faces: A as L on full_cube(m, n), R^{-1} as R on it, R^{-T} as R on gram_cube(n), b^T as
+    L on gram_cube(n). Returns O(x^T) on gram_cube (1 x n)."""
     slots = slots or ops_slots(ops)
     g, pc = gram_cube(n, slots), full_cube(p2(m), n, slots)
-    a_l = relayout(ops, a_l, O(pc, (m, n)), L(pc, (m, n)))     # A arrives row-major (a product of two fresh inputs
-    bm = mm(ops, a_l, rinv_r, pc)                              # as the first op fails the plan's level check)
+    bm = mm(ops, a_l, rinv_r, pc)                              # B = A R^{-1}
     br = relayout(ops, bm, O(pc, (m, n)), R(g, (m, n)))
-    y, _ = pinv_lstsq(ops, br, b_l, m, n, bound=bound_b, kappa=kappa_b, slots=slots)   # y^T (O, 1 x n)
+    y = pinv_lstsq(ops, br, b_l, m, n, bound=bound_b, kappa=kappa_b, slots=slots)   # y^T (O, 1 x n)
     yl = relayout(ops, y, O(g, (1, n)), L(g, (1, n)))
-    return mm(ops, yl, rinvt_r, g), 1.0
+    return mm(ops, yl, rinvt_r, g)
 
 
 def chebyshev_solve(ops, a_r, b_r, m: int, n: int, lmin: float, lmax: float, iters: int, slots: int | None = None):
@@ -1024,13 +1046,13 @@ def ns_schedule(lo: float, hi: float, denom: float, spd: bool, accel: bool = Tru
 
 def inverse_fast(ops, a, n: int, *, B: int = 1, bound: float = 1.0, kappa: float = 100.0, spd: bool = False,
                  accel: bool = True, wrap: bool = True, slots: int | None = None, src: Lay | None = None,
-                 refresh_iterate: bool = True, tag_period: bool = False, eps: float = 1e-8):
+                 refresh_iterate: bool = True, tag_period: bool = False, eps: float = 1e-8, keep_scale: bool = False):
     """`inverse` ("ns") with its cost levers: B problems per ciphertext (batched_cube: B = slots / n^3 fills it,
     one refresh per step for all of them), `accel` (ns_schedule: ~40 % fewer steps), `wrap` faces (each product's
     axis-0 sum over n terms, not slots / (B n^2)), and (`tag_period`) the refreshed iterate tagged with its slot
-    period B n^2 (the replicated O face) so the capture routes it sparse (a sparse plan only: a dense plan's runtime
-    has no route landing where the tagged refresh does). A in the batched O face (B x n x n). Returns (O(Z), s):
-    A_b^{-1} = s Z_b."""
+    period B n^2 (the replicated O face) so the capture routes it sparse (the twin must land it where the compiled
+    route does: FAKECAP_LANDINGS=runtime). A in the batched O face (B x n x n). Returns
+    O(A_b^{-1}) (`keep_scale`: (O(Z), s), A_b^{-1} = s Z_b)."""
     slots = slots or ops_slots(ops)
     cube = batched_cube(n, B, slots)
     assert cube.d[0] >= n, "B n^3 <= slots"
@@ -1052,13 +1074,16 @@ def inverse_fast(ops, a, n: int, *, B: int = 1, bound: float = 1.0, kappa: float
         if k > k0 or spd:
             if refresh_iterate and tag_period and hasattr(ops, "tag_reduce"):
                 ops.tag_reduce(zo, cube.strides[0])
-            zo = refresh(ops, zo, refresh_iterate, lo)
+            zo = refresh(ops, zo, refresh_iterate, lo, real=not tag_period)
         zl, zr = relayout(ops, zo, lo, ll), relayout(ops, zo, lo, lr, scale=sc[k])
         t = mm(ops, al, zr, cube, terms)                                    # A X_k
-        r, ak = sc[k] / sc[k + 1], alphas[k]
+        last = k == len(alphas) - 1 and not keep_scale
+        r, ak = (sc[k] if last else sc[k] / sc[k + 1]), alphas[k]
         m = add_eye(ops, relayout(ops, t, lo, lr, scale=-ak * ak * r), lr, 2.0 * ak * r)
         zo = mm(ops, zl, m, cube, terms)
-    return zo, sc[len(alphas)]
+    if keep_scale:
+        return zo, sc[len(alphas)]
+    return zo if len(alphas) > k0 else ops.mult(zo, sc[len(alphas)])
 
 
 def ops_count_schedule(kappa, spd=False, accel=True):
@@ -1072,7 +1097,7 @@ def inverse_jacobi(ops, a, n: int, *, dlo: float, dhi: float, bound: float, kapp
     down columns by face gathers), B = D^{-1/2} A D^{-1/2} (unit diagonal; `bound` >= lambda_max(B), `kappa` >= cond(B)),
     B^{-1} by `inverse` (SPD start), A^{-1} = D^{-1/2} B^{-1} D^{-1/2} (two elementwise products). For a badly scaled
     A = D^{1/2} B D^{1/2} the steps follow cond(B), not cond(A) (van der Sluis 1969: the diagonal scaling is within a
-    factor n of the optimal one). Returns (O(Z), s): A^{-1} = s Z."""
+    factor n of the optimal one). Returns O(A^{-1})."""
     slots = slots or ops_slots(ops)
     cube = full_cube(n, n, slots)
     src = src or O(cube, (n, n))
@@ -1080,8 +1105,8 @@ def inverse_jacobi(ops, a, n: int, *, dlo: float, dhi: float, bound: float, kapp
     ur = inv_sqrt_unit(ops, relayout(ops, a, src, lo, gather=("drow",)), dlo, dhi)    # sqrt(dlo / d_i)
     uc = inv_sqrt_unit(ops, relayout(ops, a, src, lo, gather=("dcol",)), dlo, dhi)    # sqrt(dlo / d_k)
     ah = ops.mult(ops.mult(relayout(ops, a, src, lo), ur), uc)                          # dlo B
-    z, s = inverse(ops, ah, n, bound=dlo * bound, kappa=kappa, spd=True, slots=slots, src=lo, **kw)
-    return ops.mult(ops.mult(z, ur), uc), s
+    z = inverse(ops, ah, n, bound=dlo * bound, kappa=kappa, spd=True, slots=slots, src=lo, **kw)
+    return ops.mult(ops.mult(z, ur), uc)
 
 
 def ops_slots(ops):

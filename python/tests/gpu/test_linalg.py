@@ -66,27 +66,28 @@ def test_inverse_eager(eager):
     assert m["rel_err"] < 1e-7
 
 
-@pytest.mark.parametrize("sets,bts,tol", [
-    (["n=8", "kappa=100"], 17, 1e-4),                                   # inverse(): plain schedule, one matrix
-    (["n=8", "kappa=100", "fast=true", "batch=64"], 11, 1e-3),        # inverse_fast(): 64 matrices per ciphertext
-])
-def test_inverse_planned(tmp_path, sets, bts, tol):
-    """The encrypted run: one refresh per Newton-Schulz step, consolidated (impl/linalg.consolidate)."""
-    py = sys.executable
-    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"), CUDA_VISIBLE_DEVICES="")
-    graph = str(tmp_path / "graph")
-    out = str(tmp_path / "rows.jsonl")
-    sets = ["--task", "inverse", "--set", *sets]
-    subprocess.run([py, "-m", "perseus.examples.linalg.run", *sets, "--fake", "--capture", graph], check=True, env=env,
-                   cwd=REPO)
-    name = os.path.relpath(str(tmp_path / "plan"), os.path.join(REPO, "bootstrap_placements"))
-    subprocess.run(["bash", "python/perseus/examples/gpt2/make_plan.sh", graph, name], check=True, cwd=REPO,
-                   env=dict(env, PLAN_SPARSE_SLOTS="", PYTHON=py))
-    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    env["PC_WORK_DIR"] = str(tmp_path)
-    subprocess.run([py, "-m", "perseus.examples.linalg.run", *sets, "--plan", str(tmp_path / "plan"), "--seeds", "0",
-                    "1", "--reps", "1", "--out", out], check=True, env=env, cwd=REPO)
+def _auto(tmp_path, task, sets, sparse=""):
+    """run.py --auto: twin capture -> plan -> planned run on the device (seeds 0, 1; one rep)."""
     import json
-    rows = [json.loads(line) for line in open(out)]
-    print(f"\n[linalg] planned {sets}: " + " ".join(f"{r['rel_err']:.2e}/{r['wall_s']:.3f}s" for r in rows))
-    assert all(r["rel_err"] < tol and r["bts"] == bts for r in rows), rows
+    out = str(tmp_path / "rows.jsonl")
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"), PC_WORK_DIR=str(tmp_path))
+    subprocess.run([sys.executable, "-m", "perseus.examples.linalg.run", "--task", task, "--set", *sets,
+                    "--auto", str(tmp_path / "run"), "--sparse", sparse, "--seeds", "0", "1", "--reps", "1",
+                    "--out", out], check=True, env=env, cwd=REPO)
+    return [r for r in map(json.loads, open(out)) if r["mode"] == "planned"]
+
+
+@pytest.mark.parametrize("task,sets,sparse,bts,key,tol", [
+    ("inverse", ["n=8", "kappa=100"], "", 17, "rel_err", 1e-4),                          # inverse(): plain schedule
+    ("inverse", ["n=8", "kappa=100", "fast=true", "batch=64"], "", 11, "rel_err", 1e-3),  # 64 matrices per ct
+    ("inverse", ["n=8", "kappa=100", "fast=true", "batch=1", "sparse=true"], "512,1", 11, "rel_err", 1e-3),
+    ("lstsq", ["m=128", "n=16", "kappa=100", "method=precond"], "", 7, "rel_err", 2e-3),   # client sketch
+    ("qr", ["m=128", "n=16", "kappa=100", "method=polarns"], "", 9, "orth", 2e-2),        # starts with a product
+    ("dctls", [], "", 11, "rel_err", 1e-3),                                              # DCT + pinv LS + DCT
+])
+def test_planned(tmp_path, task, sets, sparse, bts, key, tol):
+    """The encrypted run, no workaround in the stage: the planner places / routes every refresh, the stage's first
+    op may be a product of its fresh input, results are the true values (no public scale to apply)."""
+    rows = _auto(tmp_path, task, sets, sparse)
+    print(f"\n[linalg] planned {task} {sets} {sparse}: " + " ".join(f"{r[key]:.2e}/{r['wall_s']:.3f}s" for r in rows))
+    assert rows and all(r[key] < tol and r["bts"] == bts for r in rows), rows

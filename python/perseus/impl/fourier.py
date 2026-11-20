@@ -25,7 +25,13 @@ Entry points: `dft`, `idft`, `rfft_pair` / `irfft_pair`, `rfft_half` / `irfft_ha
 `dct2_2d`, `dct3_2d`; each returns a `Transform` (its `steps` with their diagonals, `rot_steps()` the keys,
 `apply(ops, ct)` on any ops surface, `reference(x)` the float64 map, `pack` / `unpack` the slot layout).
 `canonical_embedding` / `negacyclic_filter`: the transform CKKS encoding already is (coefficient-encoded data: its
-slots are an odd-frequency DFT, one plaintext product a length-N negacyclic convolution)."""
+slots are an odd-frequency DFT, one plaintext product a length-N negacyclic convolution).
+
+In a recorded stage. `apply` issues leaf ops only (hoisted rotations, a conjugation, named plaintext products), so an
+ImplModel stage records it and the planner places the refreshes; the plaintexts are named by transform, grouping and
+step (stable across runs). Without `levels` the grouping is chosen against a `Budget`: what a level costs in refreshes
+(the planner's refresh window, Budget.planner(), by default). `rot_steps()` (or keyset.stage_rotations over the stage)
+is the key set to declare."""
 from __future__ import annotations
 
 import dataclasses
@@ -35,13 +41,47 @@ from functools import lru_cache
 import numpy as np
 import scipy.sparse as sp
 
+from . import keyset
+
 # Relative device costs of one hoisted baby rotation, one plain rotation (giant / conjugation) and one cached
 # plaintext product, measured on the n32 chain at a high level (0.30 / 0.49 / 0.03 ms on an RTX PRO 6000): the
 # planner's tie breaker between groupings, not a timing model.
 COST_HOIST, COST_ROT, COST_MULT = 0.6, 1.0, 0.06
-# The price of one level when `plan` picks the depth itself (levels=None), in rotations: a bootstrap (~12 ms) buys
-# ~5 levels of the n32 chain, ~2.4 ms or ~5 rotations each; 4 keeps the planner on the shallow side of that.
-COST_LEVEL = 4.0
+# One dense refresh in the same units (12.2 ms / 0.49 ms on the n32 chain): what a level is worth, spread over the
+# levels a refresh buys (`Budget`).
+COST_BTS = 25.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Budget:
+    """The level budget a transform is planned against: a refresh (`bts_cost`, in COST_ROT units) buys `window`
+    levels, so each level the transform takes costs bts_cost / window of the refreshes the planner will place;
+    `max_levels` caps the depth (None: no cap). `plan(levels=None)` picks the grouping minimizing rotations + levels x
+    that price: the transform's depth is a function of the budget it is given."""
+    window: int
+    bts_cost: float = COST_BTS
+    max_levels: int | None = None
+
+    @property
+    def level_price(self) -> float:
+        return self.bts_cost / max(self.window, 1)
+
+    @classmethod
+    def planner(cls, max_levels: int | None = None) -> "Budget":
+        """The planner's refresh window: a planted refresh lands at the recipe's bootstrap level (BTS_LEVEL, 36 on the
+        n32 recipe of make_plan.sh) and the next one is due at the refresh envelope (place.refresh_env_cap, 48),
+        PLAN_LEVEL_UNIT (2) levels a product."""
+        import os
+        from perseus.plan.placer.place import refresh_env_cap
+        unit = int(os.environ.get("PLAN_LEVEL_UNIT") or 2)
+        land = int(os.environ.get("BTS_LEVEL") or 36)
+        return cls(window=max(1, int(refresh_env_cap() - land) // unit), max_levels=max_levels)
+
+    @classmethod
+    def of(cls, ops) -> "Budget":
+        """The budget an ops surface stands for: its own `level_budget()` when it has one, else the planner's."""
+        f = getattr(ops, "level_budget", None)
+        return f() if callable(f) else cls.planner()
 
 
 # ── factors ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -264,8 +304,9 @@ def _split(offs, n1):
     return {d: (d - (d % n1), d % n1) for d in offs}
 
 
-def bsgs(offs: set[int], coffs: set[int] = frozenset(), n1: int | None = None) -> Bsgs:
-    """The cheapest power-of-two baby step for these offsets (COST_* weights), or the given n1."""
+def bsgs(offs: set[int], coffs: set[int] = frozenset(), n1: int | None = None, slots: int = 1 << 15) -> Bsgs:
+    """The cheapest power-of-two baby step for these offsets (COST_* weights, plus keyset.COST_NEW_KEY per key outside
+    keyset.prefer's set), or the given n1."""
     allo = set(offs) | set(coffs)
     span = max(1, max(abs(d) for d in allo) if allo else 1)
     cands = [n1] if n1 else [1 << k for k in range(0, int(math.log2(2 * span)) + 2)]
@@ -276,7 +317,8 @@ def bsgs(offs: set[int], coffs: set[int] = frozenset(), n1: int | None = None) -
         cb = sorted({b for _, b in sc.values()})
         giants = sorted({g for g, _ in list(sa.values()) + list(sc.values())})
         cost = (COST_HOIST * (sum(1 for b in babies if b) + sum(1 for b in cb if b))
-                + COST_ROT * (sum(1 for g in giants if g) + (1 if cb else 0)))
+                + COST_ROT * (sum(1 for g in giants if g) + (1 if cb else 0))
+                + keyset.COST_NEW_KEY * keyset.new_keys(set(babies) | set(cb) | set(giants), slots))
         if best is None or cost < best[0]:
             best = (cost, Bsgs(c, babies, cb, giants))
     return best[1]
@@ -295,8 +337,8 @@ class Step:
         return len(self.diags) + len(self.cdiags)
 
 
-def step_cost(offs, coffs) -> tuple[float, Bsgs]:
-    p = bsgs(offs, coffs)
+def step_cost(offs, coffs, slots: int = 1 << 15) -> tuple[float, Bsgs]:
+    p = bsgs(offs, coffs, slots=slots)
     hb = sum(1 for b in p.babies if b) + sum(1 for b in p.cbabies if b)
     gr = sum(1 for g in p.giants if g) + (1 if p.cbabies else 0)
     return COST_HOIST * hb + COST_ROT * gr + COST_MULT * (len(offs) + len(coffs)), p
@@ -354,9 +396,10 @@ def _compose(fs: list[Factor]) -> Factor:
 
 
 def plan(factors: list[Factor], layout: Layout, levels: int | None = None, max_diags: int = 1 << 11,
-         max_nnz: int = 1 << 24, exact: bool = False):
+         max_nnz: int = 1 << 24, exact: bool = False, budget: Budget | None = None):
     """Contiguous groups of `factors` (at most `levels` of them, exactly `levels` with `exact`; None: the cheapest
-    at any depth, each level priced COST_LEVEL) minimizing the summed step cost. Returns [(i, j)] factor ranges."""
+    at any depth up to `budget.max_levels`, each level priced `budget.level_price`, default Budget.planner())
+    minimizing the summed step cost. Returns [(i, j)] factor ranges."""
     L = len(factors)
     if exact and levels > L:
         raise ValueError(f"{levels} levels from {L} factors")
@@ -371,9 +414,13 @@ def plan(factors: list[Factor], layout: Layout, levels: int | None = None, max_d
             coffs = layout.offsets(f.B) if f.B is not None else set()
             if len(offs) + len(coffs) > max_diags:
                 break
-            cost[i, j] = step_cost(offs, coffs)[0]
-    D = levels if levels is not None else L
-    pen = 0.0 if levels is not None else COST_LEVEL
+            cost[i, j] = step_cost(offs, coffs, layout.slots)[0]
+    if levels is None:
+        budget = budget or Budget.planner()
+        D = min(L, budget.max_levels) if budget.max_levels else L
+        pen = budget.level_price
+    else:
+        D, pen = levels, 0.0
     INF = float("inf")
     best = [[INF] * (L + 1) for _ in range(D + 1)]
     arg = [[None] * (L + 1) for _ in range(D + 1)]
@@ -387,7 +434,7 @@ def plan(factors: list[Factor], layout: Layout, levels: int | None = None, max_d
     d = D if exact else min(range(1, D + 1), key=lambda k: (best[k][L], k))
     if best[d][L] == INF:
         if max_diags < max_nnz:
-            return plan(factors, layout, levels, max_diags * 4, max_nnz, exact)
+            return plan(factors, layout, levels, max_diags * 4, max_nnz, exact, budget)
         raise ValueError(f"no grouping in {levels} levels under {max_nnz} nonzeros per step")
     out, j = [], L
     while j > 0:
@@ -459,16 +506,17 @@ class Transform:
 
 
 def build(name: str, factors: list[Factor], layout: Layout, levels: int | None = None, groups=None,
-          max_diags: int = 1 << 11, exact: bool = False) -> Transform:
-    """Plan (or take `groups`) and materialize the steps' diagonals and BSGS splits."""
-    groups = groups if groups is not None else plan(factors, layout, levels, max_diags, exact=exact)
+          max_diags: int = 1 << 11, exact: bool = False, budget: Budget | None = None) -> Transform:
+    """Plan (or take `groups`) and materialize the steps' diagonals and BSGS splits. `levels=None`: the depth the
+    `budget` prices cheapest (default Budget.planner(), the planner's refresh window)."""
+    groups = groups if groups is not None else plan(factors, layout, levels, max_diags, exact=exact, budget=budget)
     steps = []
     tag = f"fourier.{name}{layout.n}{layout.mode[0]}{layout.batch}.g" + "_".join(f"{i}-{j}" for i, j in groups)
     for k, (i, j) in enumerate(groups):
         f = _compose(factors[i:j])
         dg = layout.diagonals(f.A)
         cd = layout.diagonals(f.B) if f.B is not None else {}
-        steps.append(Step(dg, cd, bsgs(set(dg), set(cd)), f"{tag}.s{k}"))
+        steps.append(Step(dg, cd, bsgs(set(dg), set(cd), slots=layout.slots), f"{tag}.s{k}"))
     return Transform(name, layout, factors, list(groups), steps)
 
 
@@ -669,7 +717,10 @@ def dct2_factors(n: int, norm: str = "ortho", packing: str = "real") -> list[Fac
         return mk + fft_factors(n, -1, 1.0) + [dct_post(n, norm)]
     s = _dct_scale(n, norm)
     T = np.exp(-1j * np.pi * np.arange(n) / (2 * n))
-    return mk + fft_factors(n, -1, 1.0) + [dct_re(n, s * T, s * np.conj(T))]
+    # the input's real part (z + conj z) / 2, folded into the (real) reordering: an imaginary residue on a real input
+    # (a refresh's noise on the imaginary axis) would otherwise leak into the real output through the complex steps
+    m0 = mk[0].A * 0.5
+    return [Factor(m0, m0.copy())] + mk[1:] + fft_factors(n, -1, 1.0) + [dct_re(n, s * T, s * np.conj(T))]
 
 
 def dct3_factors(n: int, norm: str = "ortho", packing: str = "real") -> list[Factor]:
@@ -688,7 +739,8 @@ def dct3_factors(n: int, norm: str = "ortho", packing: str = "real") -> list[Fac
     s = _dct_scale(n, "ortho")
     T = np.exp(-1j * np.pi * np.arange(n) / (2 * n))
     mk = [Factor(f.A.T.tocsr()) for f in reversed(makhoul_factors(n))]
-    return (pre + [Factor(sp.diags(s * T).tocsr())] + fft_factors(n, -1, 1.0)
+    # the twiddle on the input's real part, (s T / 2) (y + conj y): see dct2_factors
+    return (pre + [dct_re(n, s * T / 2, s * T / 2)] + fft_factors(n, -1, 1.0)
             + [dct_re(n, np.ones(n), np.ones(n))] + mk)
 
 

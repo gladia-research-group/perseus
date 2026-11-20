@@ -150,6 +150,8 @@ class RefreshNoise(NumpyOps):
         a += self.eps * np.abs(a).max() * self.rng.standard_normal(a.shape)
         return a
 
+    bootstrap_real = bootstrap
+
 
 def test_pinv_beats_normal_equations_under_refresh_noise():
     """Least squares at cond(A) = 100 with a 1e-4 refresh error: through (A^T A)^{-1} the error is amplified by
