@@ -6,6 +6,7 @@
 # from n.
 #   GPU=0 NODE=1 MEMS=1,2 bash scripts/repro/llama_decode.sh
 #   GPU=0 PP=500 bash scripts/repro/llama_decode.sh
+# MODEL=<arch.MODELS alias>: another decoder on the same path (scripts/repro/gemma2_decode.sh).
 source "$(dirname "$0")/common.sh"
 bind $PY -m perseus.examples.llama.run_decode --tokens "${TOKENS:-511}" --window 0 --window-tokens 512 \
-    ${PP:+--plain-prefix "$PP"} --device "$GPU" "$@"
+    ${MODEL:+--model "$MODEL"} ${PP:+--plain-prefix "$PP"} --device "$GPU" "$@"

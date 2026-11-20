@@ -3,7 +3,7 @@
     # 1. the device capture, structure only (fast: no per-node decrypt)
     .venv/bin/python -m perseus.examples.llama.run_decode --tokens 1 --capture graphs/X --structure-only
     # 2. the same position on the numpy fake (CPU), its tape merged into graphs/X/block_<b>/graph.json
-    .venv/bin/python -m perseus.examples.llama.capture_mags graphs/X
+    .venv/bin/python -m perseus.examples.llama.capture_mags graphs/X --window W.npy [--model gemma2_2b]
 
 `--check REF_DIR` compares against a capture taken with magnitudes (the device decrypts) instead
 of writing: the relative difference of every statistic per node, summarized.
@@ -21,20 +21,21 @@ import numpy as np
 
 def run_tape(cfgs, configs_path, toks, pos, n_layers=None, packing="cachemir_complex", overrides=None):
     """{stage b: tape records} of the stages of position `pos` on the fake."""
-    # the switches that shape the op stream must be the device session's (env.ENV wins over a
-    # sourced scripts/local_env.sh exactly as in open_session), or the tape describes another graph
     from . import env as E
-    for k, v in {**E.ENV, **(overrides or {})}.items():
+    from . import hf
+    from . import weights as W
+    store = W.SafetensorsStore(hf.NAME)
+    d = W.llama_dims(store.config)
+    # the switches that shape the op stream must be the device session's (env.ENV and the layout's, as the runner
+    # sets them, win over a sourced scripts/local_env.sh exactly as in open_session), or the tape describes another graph
+    for k, v in {**E.ENV, **E.dims_env(d), **(overrides or {})}.items():
         os.environ[k] = str(v)
     from perseus.impl import fake, magtape
 
-    from . import hf
-    from . import weights as W
     from .model import LlamaModel
-    store = W.SafetensorsStore(hf.NAME)
-    d = W.llama_dims(store.config)
     fhe, inf = fake.make_fake(N=d.N, hid=d.hid, dim=d.dim, H=d.H, H_real=d.H_real, E=d.E, E_real=d.E_real,
-                              complex_payload=True)
+                              complex_payload=True, head_real=d.head_real)
+    fhe._rot |= {int(s) for s in E.rot_steps(d)}      # the runner's keys too (LLAMA_MLP_SPLIT's slice shapes)
     tape = magtape.attach(fhe, inf)
     lw = W.LlamaWeights(store, cfgs, configs_path, d, packing)
     model = LlamaModel(inf, lw, cfgs, core=fake.core, n_layers=n_layers, packing=packing, kv_offload=False)
@@ -74,7 +75,8 @@ def compare(ref_graph, filled_graph):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("graph_dir")
-    ap.add_argument("--configs", default="configs/model/approximation/llama31_8b_n32/configs.json")
+    ap.add_argument("--model", default=None, help="arch.MODELS alias or HF name (run_decode's --model)")
+    ap.add_argument("--configs", default=None, help="default: the model's (arch.MODELS)")
     ap.add_argument("--window", required=True, help=".npy token window (the device capture's)")
     ap.add_argument("--pos", type=int, default=1, help="the captured position (FHE_GRAPH_CAPTURE_TOKEN)")
     ap.add_argument("--layers", type=int, default=None)
@@ -84,7 +86,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     from perseus.impl import magtape
 
+    from . import hf
+    from .arch import model_entry
     from .config import load_configs
+    hf.select(a.model)
+    a.configs = a.configs or model_entry(hf.NAME).configs
     cfgs = load_configs(a.configs)
     toks = np.load(a.window)
     toks = toks if toks.ndim == 1 else toks[0]

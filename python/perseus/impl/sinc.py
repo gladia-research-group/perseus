@@ -262,22 +262,25 @@ def to_sinc_q(rt, Q):
     return stage_b(rt, [stage_a(rt, x) for x in Q], [int(q_ct_bits(q)) for q in range(len(Q))])
 
 
-def to_sinc_kv(rt, X):
+def to_sinc_kv(rt, X, replicas=(0, 1)):
     """Per-chunk real K or V, X[b][c] (2 blocks x 2 chunks) -> the 16 SinC ciphertexts of (rows = keys, cols = dims),
-    each KV head on both replicas u1."""
+    each KV head on the replicas u1 (the half-head view: u1 = 0 alone, its queries have u' < 2)."""
     xs, vs = [], []
     for b, chunks in enumerate(X):
         for c, x in enumerate(chunks):
             a = stage_a(rt, x)
-            for u1 in (0, 1):
+            for u1 in replicas:
                 xs.append(a)
                 vs.append(int(kv_ct_bits(b, c, u1)))
     return stage_b(rt, xs, vs)
 
 
-def dup(rt, xs):
-    """Batch l < 16 copied onto l + 16 (the operands carry nothing on l >= 16): no level."""
+def dup(rt, xs, n=2):
+    """Batch l < 32 / n copied onto l + 32 k / n (the operands carry nothing above): no level. n = 2: onto l + 16;
+    n = 4 (the half-head view's l < 8): onto l + 8, l + 16, l + 24."""
     ops = rt.ops
+    if n == 4:
+        xs = [ops.add(x, ops.rotate(x, -8)) for x in xs]
     return [ops.add(x, ops.rotate(x, -16)) for x in xs]
 
 
@@ -302,16 +305,100 @@ def stage_b_inv_merged(rt, Ms, wl, vs, site="sinc.bim"):
     return outs
 
 
-def from_sinc_q_merged(rt, Ms, wl):
+def from_sinc_q_merged(rt, Ms, wl, n=8):
     """from_sinc_q of the 16 unmerged outputs of the 8 merged CCMM outputs Ms."""
-    vs = [int(q_ct_bits(q)) for q in range(8)]
+    vs = [int(q_ct_bits(q)) for q in range(n)]
     return [stage_a(rt, z, site="sinc.ai") for z in stage_b_inv_merged(rt, Ms, wl, vs)]
 
 
-def from_sinc_q(rt, Y):
-    """Inverse of to_sinc_q (the attention output O, in Q's SinC layout) -> 8 blocked ciphertexts."""
-    vs = [int(q_ct_bits(q)) for q in range(8)]
+def from_sinc_q(rt, Y, n=8):
+    """Inverse of to_sinc_q (the attention output O, in Q's SinC layout) -> n blocked ciphertexts."""
+    vs = [int(q_ct_bits(q)) for q in range(n)]
     return [stage_a(rt, z, site="sinc.ai") for z in stage_b_inv(rt, Y, vs)]
+
+
+# The half-head view (d_head = 2 D: Gemma-2's 256, under the blocked GQA layout, channel j 2 + kv_lo of block
+# 2 g + kv_hi): head dims j = (jl % 64) + 64 e + 128 (jl // 64) of KV head kv = 2 kv_hi + kv_lo seen as Llama-geometry
+# KV heads kv' = 4 kv_hi + 2 e + kv_lo of D dims jl (channel jl 4 + kv' % 4), the GQA member g as u' < 2: Llama's
+# stage A / B maps as they are, Q blocks 0..3 only. RoPE's pairs (j, j + 128) stay (jl, jl + 64), N / 2 apart. A head's
+# scores are its halves' sum (batch kv' and kv' + HALF_STEP); P.V reads P on both halves' batch slots.
+HALF_STEP = 2
+
+
+def half_perm(nch=512):
+    """Half-head view channel of each channel of a GQA block (d_head 2 D, two KV heads per block)."""
+    c = np.arange(nch)
+    j, kvlo = c >> 1, c & 1
+    e = (j >> 6) & 1
+    jl = (j & 63) | ((j >> 7) << 6)
+    return jl * 4 + 2 * e + kvlo
+
+
+def half_perm_slots(t=64, nch=512):
+    """(nch t,) source slot of every half-view slot of a block slot vector (channel c on slots c t + lane)."""
+    inv = np.argsort(half_perm(nch))
+    s = np.arange(nch * t)
+    return inv[s // t] * t + s % t
+
+
+def half_cols(W, nch=512):
+    """W's column blocks (nch channels each) in the half-head view."""
+    inv = np.argsort(half_perm(nch))
+    nb = W.shape[1] // nch
+    return W[:, (np.arange(nb)[:, None] * nch + inv[None, :]).ravel()]
+
+
+def half_rows(W, nch=512):
+    return half_cols(W.T, nch).T
+
+
+# The half view's compressed softmax layout: the packed real scores (Re on batch l < 16, Im on l + 16) of a head's
+# first half sit on V = {0, 1, 4, 5} + {0, 16}; score ciphertext 4 p + r rides ciphertext p at batch offset HALF_DELTAS[r]
+# (the four offsets tile the 32 batch slots), so the softmax runs on 4 ciphertexts instead of 16
+HALF_DELTAS = (0, 2, 8, 10)
+
+
+def half_regions():
+    """Per slot of a compressed ciphertext: its region r (the original ciphertext 4 p + r) and the batch l it came off."""
+    _, _, b = slot_coords()
+    r = np.full(SLOTS, -1)
+    l = np.full(SLOTS, -1)
+    for k, dl in enumerate(HALF_DELTAS):
+        src = b - dl
+        ok = (src >= 0) & np.isin(src, [0, 1, 4, 5, 16, 17, 20, 21])
+        r[ok], l[ok] = k, src[ok]
+    assert (r >= 0).all()
+    return r, l
+
+
+def score_valid_complex(o, T=127):
+    """Causal validity of the complex score ciphertext o (rows = queries, Re / Im = chunk 0 / 1, cols = keys, the BOS key
+    on key token BOS_TOK): (alpha, beta) per slot, the Re and Im parts' 0 / 1."""
+    row, col_lo, _ = slot_coords()
+    lane = brev(row & 63, 6)
+    col = 8 * int(o) + col_lo
+    tk = 64 * (col >> 6) + brev(col & 63, 6)
+    out = []
+    for c in (0, 1):
+        tq = 64 * c + lane
+        out.append(((tq < T) & ((tk == BOS_TOK) | (tk <= tq))).astype(float))
+    return out[0], out[1]
+
+
+def half_rot_steps() -> set[int]:
+    """The half-head view's rotations: halves sum / P copy, the n-way unmerges and duplication, the compressed softmax."""
+    return {2, -2, 8, -8, 10, -10, 16, -16, 18, 24, 26}
+
+
+def half_meta(T=127):
+    """The compressed layout's (tq per slot, tk per (compressed ciphertext p, slot)), as packed_meta's."""
+    row, col_lo, b = slot_coords()
+    r, _ = half_regions()
+    tq = 64 * (b >> 4) + brev(row & 63, 6)
+    tq = np.where(tq < T, tq, -1)
+    col = 8 * (4 * np.arange(NCT // 4)[:, None] + r[None, :]) + col_lo[None, :]
+    tk = 64 * (col >> 6) + brev(col & 63, 6)
+    return tq, tk
 
 
 def rot_steps() -> set[int]:
@@ -358,17 +445,17 @@ def dim_of_col(col):
     return ((col >> 3) & 15) | (((col >> 2) & 1) << 4) | (((col >> 1) & 1) << 5) | ((col & 1) << 6)
 
 
-def kv_rows_pattern(vals, toks):
+def kv_rows_pattern(vals, toks, n_rep=2):
     """kv_row_pattern summed over key rows `toks`."""
-    return sum(kv_row_pattern(vals, t) for t in toks)
+    return sum(kv_row_pattern(vals, t, n_rep) for t in toks)
 
 
-def kv_row_pattern(vals, tok=BOS_TOK):
+def kv_row_pattern(vals, tok=BOS_TOK, n_rep=2):
     """Slot vectors (16 ciphertexts) holding vals[kv][dim] on key row `tok` of a (rows = keys, cols = dims) SinC
-    operand, both replicas."""
+    operand, on the first n_rep replicas (the half-head view: 1, batch l < 8)."""
     out = np.zeros((NCT, SLOTS))
     col = np.arange(D)
-    for l in range(16):
+    for l in range(8 * n_rep):
         ct, sl = sinc_slot(np.full(D, brev(tok % 64, 6) + 64 * (tok // 64)), col, np.full(D, l))
         out[ct, sl] = np.asarray(vals)[l % 8][dim_of_col(col)]
     return out

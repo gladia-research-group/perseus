@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama gpt2 vit bert resnet sana core
+% pages: overview llama gemma gpt2 vit bert resnet sana core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -20,16 +20,19 @@
 % one isolated GPU; decode at a 512-token context, positions 500-511 after a 500-position plaintext prefix)
 \newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.86}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.70}
 \newcommand{\vitimg}{17.7}\newcommand{\bertin}{7.36}
-% SANA-Sprint text to image (sana-t2i branch check, 2026-11-13, GPU 4 alone: forwards 2 and 3, 269.06 and 269.13 s, after
-% a 333 s first forward; lowest free 17.01 GiB)
-\newcommand{\sanaimg}{269}\newcommand{\sanamem}{78.0}
 % ResNet-20 on CIFAR-10, the default plan resnet20_folded (scripts/repro/resnet20.sh, 2026-11-18, GPU 3 alone: 2 runs of
 % 64 test images, CUDA graphs, medians 0.320 and 0.322 s, 64/64 argmax agreement with the float64 model; peak used 35.5
 % GiB by nvidia-smi, free 59.58 GB after setup; top-1 on the first 1,000 test images 925, the float64 model's 925)
 \newcommand{\resnetimg}{0.321}\newcommand{\resnetmem}{35.5}\newcommand{\resnettop}{92.5}
+% Gemma-2-2B on the decoder port (2026-11-19, GPU 4 alone, 2 rounds): prefill 29.70 / 29.71 s (lowest free 14.49 GiB),
+% decode 5.494 / 5.485 s per token at positions 500-511 (plans gemma2_2b_decode_ctx512_w*)
+\newcommand{\gemmapf}{29.7}\newcommand{\gemmadec}{5.49}\newcommand{\gemmapfmem}{80.5}\newcommand{\gemmadecmem}{63.5}
+% SANA-Sprint text to image (2026-11-19, the text encoder on the Gemma-2 decoder port, GPU 4 alone: forwards 2 and 3,
+% 266.59 and 266.58 s, after a 318 s first forward; lowest free 18.30 GiB)
+\newcommand{\sanaimg}{267}\newcommand{\sanamem}{76.7}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
-% optional position cache (PC_PT_CACHE=0), Llama's the GPU's peak used memory over the run (its runner reports no free
+% optional position cache (PC_PT_CACHE=0), Llama's and Gemma's the GPU's peak used memory over the run (their runner reports no free
 % memory)
 \newcommand{\llamapfmem}{85.1}\newcommand{\llamadecmem}{52.4}\newcommand{\gptpfmem}{59.3}\newcommand{\gptdecmem}{63.1}
 \newcommand{\vitmem}{68.1}\newcommand{\bertmem}{57.9}
@@ -55,6 +58,8 @@
 \midrule
 Llama-3-8B & prefill, 128-token prompt & \llamapfmem\ GiB & \textbf{\llamapf\ s} \\
 Llama-3-8B & decode, one token (512-token context) & \llamadecmem\ GiB\nt{\dagger} & \textbf{\llamadec\ s} \\
+Gemma-2-2B & prefill, 128-token prompt & \gemmapfmem\ GiB & \textbf{\gemmapf\ s} \\
+Gemma-2-2B & decode, one token (512-token context) & \gemmadecmem\ GiB\nt{\dagger} & \textbf{\gemmadec\ s} \\
 GPT-2 small & prefill, 128-token prompt & \gptpfmem\ GiB & \textbf{\gptpf\ s} \\
 GPT-2 small & decode, one token (512-token context) & \gptdecmem\ GiB\nt{\dagger} & \textbf{\gptdec\ s} \\
 ViT-B/16 & one $224\times224$ image & \vitmem\ GiB & \textbf{\vitimg\ s} \\
@@ -64,8 +69,8 @@ SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \sanamem\ GiB &
 \bottomrule
 \end{tabularx}
 \tcap{End to end on one NVIDIA RTX PRO 6000 (96 GB), 128-bit security. $^\dagger$Peak memory when decoding 16 tokens, the optional position cache off.
-Llama-3-8B streams its weights from host memory one block at a time, while GPT-2 small keeps its weights on the GPU.
-SANA-Sprint runs two steps with its Gemma-2-2B text encoder, both encrypted.}
+Llama-3-8B and Gemma-2-2B stream their weights from host memory one block at a time, while GPT-2 small keeps its weights
+on the GPU. SANA-Sprint runs two steps with its Gemma-2-2B text encoder, both encrypted.}
 \end{tbl}
 
 % Unlike the paper (two Llama tables, prefill and decode), the README shows one, in the GPT-2 table's layout.
@@ -94,6 +99,20 @@ decode (s / token) & AR-HE (Kanpak and Unat, 2026) & 32 & 1569.0\nt{\dagger} & H
 the context (decode). $^\dagger$Composed from per-block or per-operator timings, not run end to end; $^*$amortized over a
 batch; $^\S$replicated from the released code on our GPU. Perseus runs Llama-3.1-8B (the same architecture) end to end on
 one GPU. \legend}
+\end{tbl}
+
+\begin{tbl}
+\begin{tabularx}{\linewidth}{lXrrlc}
+\toprule
+ & \textbf{Gemma-2-2B} & tokens & latency & GPU & open source \\
+\midrule
+prefill (s) & \oc\textbf{Perseus (ours)} & \oc 128 & \oc\textbf{\gemmapf} & \oc RTX PRO 6000 & \oc\yes \\
+\cdashline{1-6}
+decode (s / token) & \oc\textbf{Perseus (ours)} & \oc 512 & \oc\textbf{\gemmadec} & \oc RTX PRO 6000 & \oc\yes \\
+\bottomrule
+\end{tabularx}
+\tcap{Encrypted Gemma-2-2B: prefill of a prompt and decode of one token; \emph{tokens} is the prompt length (prefill) or
+the context (decode). \legend}
 \end{tbl}
 
 \begin{tbl}

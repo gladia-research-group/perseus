@@ -117,6 +117,13 @@ def _recipe(plan_dir: Path):
     return graph, recipe, tool, route
 
 
+def _plan_line(plan_dir: Path, key: str) -> str | None:
+    for line in (plan_dir / "PLAN_CMD.txt").read_text().splitlines():
+        if line.startswith(key + "="):
+            return line[len(key) + 1:].strip()
+    return None
+
+
 def _rd_switches(plan_dir: Path) -> dict[str, str] | None:
     """The rd= line's switches ({} for the pass alone), None when the plan has no raise-drop re-pass."""
     for line in (plan_dir / "PLAN_CMD.txt").read_text().splitlines():
@@ -202,6 +209,9 @@ def replan(name: str, log: Path) -> tuple[Path, float]:
     env = dict(os.environ, GRAPH_DIR=graph, OUT_NAME=out_name, PYTHON=sys.executable,
                CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="4", PYTHONPATH=pypath)
     env.update(kv.split("=", 1) for kv in recipe)
+    model = _plan_line(plan_dir, "model")
+    if model:       # a decoder plan's model (examples/llama/arch.py MODELS): its layout sizes the sparse routes
+        env["PERSEUS_DECODER"] = model
     pre = []
     if name in KEEP_SITES:          # the kept-sites plan first, into the dir the recipe names
         keep = Path(env["PLAN_KEEP_PLACEMENTS"]).name

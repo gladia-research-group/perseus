@@ -64,7 +64,6 @@ def _planned(a, toks, gt, store, dims, over, cfgs_path, dcfgs_path, log=print):
     from perseus import _pc
     from perseus._paths import resolve
     from perseus.impl import fakecap
-    from perseus.impl.driver import Recorder
     from perseus.impl.handoff import to_decode_cache
     from . import env, prefix as PX, weights as W
     from .config import load_configs
@@ -97,7 +96,7 @@ def _planned(a, toks, gt, store, dims, over, cfgs_path, dcfgs_path, log=print):
     dec.rt.ops.sm_cheb_gs = env.plan_runtime(a.decode_plan, "n32").get("SM_CHEB_GS", "0") not in ("", "0")
     n = pre.n_layers
     bos = lw_p.bos_kv(n)
-    dh = dims.dim // pre.H
+    dh = dims.d_head_real
 
     def bos_vec(f):
         x = np.zeros(dims.N)
@@ -308,7 +307,10 @@ def main(argv=None):
     from perseus.examples.defaults import default_plan
     if a.prefill_plan is None and a.decode_plan is None and not (a.fake or a.old_path):
         # BOS + tokens = the prefill's T
-        a.prefill_plan = default_plan("llama_prefill", a.tokens + 1)
+        from . import hf
+        from .arch import model_entry
+        entry = model_entry(hf.NAME)
+        a.prefill_plan = default_plan(entry.prefill if entry else "llama_prefill", a.tokens + 1)
     if a.prefill_plan and a.decode_plan is None and not a.handoff_only:
         print("no hand-off decode plan ships: pass --decode-plan (a plan cut for the hand-off's cache level), or "
               "--handoff-only", file=sys.stderr)
@@ -414,7 +416,7 @@ def main(argv=None):
         pre.pcmm_weights(b)
     engine(pre.rt).prepare(dims.dim)
     bos = pre.w.bos_kv(pre.n_layers)
-    dh = dims.dim // pre.H
+    dh = dims.d_head_real
 
     def bos_vec(f):
         x = np.zeros(dims.N)
@@ -486,7 +488,6 @@ def main(argv=None):
         hid = None
     ttft = time.time() - t1
     from .prefill import plain_logits
-    from perseus.impl.prefill import Chunks
     if gt is not None and pre.n_layers == int(store.config["num_hidden_layers"]):
         rows, out = report(plain_logits(pre, pre.hidden_rows(Xs, ch) if hid is None else hid), gt[1:a.tokens + 1])
         print(f"[handoff] prefill top1={out.get('top1')}/{a.tokens} medianKL={out.get('medianKL', float('nan')):.4g}",

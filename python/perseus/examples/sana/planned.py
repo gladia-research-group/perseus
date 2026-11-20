@@ -361,7 +361,9 @@ class SanaPlannedPrefill(PlannedPrefill):
         return self
 
     def linears(self):
-        return self.model.lin.linears()
+        """SANA's linears, and the text encoder's when the text side runs encrypted (SanaTextImpl)."""
+        extra = self.model.text_linears() if hasattr(self.model, "text_linears") else {}
+        return {**self.model.lin.linears(), **extra}
 
     def planes(self, nm):
         """Linear `nm`'s digit planes as the bytes `pcmm_upload` takes, made once: pooled weights upload every stage

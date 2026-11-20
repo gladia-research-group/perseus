@@ -31,7 +31,7 @@ def test_encode_roundtrip(T):
     ch = prefill.Chunks(T, B.t)
     rows = np.random.default_rng(T).standard_normal((T, rt.dims.dim))
     Xs = blocked.encode_blocked(rt, rows, ch, B)
-    assert len(Xs) == ch.n_ct and all(len(x) == B.K for x in Xs)
+    assert B.Kh == 3 and len(Xs) == ch.n_ct and all(len(x) == B.Kh for x in Xs)   # 192 of 256: 3 of 4 blocks
     np.testing.assert_allclose(blocked.decrypt_blocked(rt, Xs, ch, B, rt.dims.dim), rows, atol=1e-12)
 
 

@@ -11,10 +11,10 @@ import math
 import numpy as np
 
 from . import smcheb
-from .attention import _recip_rounds, first_iters, sink_only
+from .attention import _recip_rounds, sink_only
 from .layout import lanes_mask, lanes_periodic, stride_mask
 from .layout import cm_params
-from .linear import _baby_sum, linear_multi, prepare_linear_input
+from .linear import _baby_sum, linear_multi
 from .pcmm import session_specs
 from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse, rotsum, rotsum_neg
 import os
@@ -35,6 +35,11 @@ _BSGS = os.environ.get("PF_ATTN_BSGS", "0") not in ("", "0")
 # (2k, 2k + 1), chunk 2k + 1's scores moved onto the group's empty half of chunk 2k's (one chain instead of two; causal:
 # two chunks)
 _SM_HPACK = os.environ.get("PF_SM_HPACK", "0") not in ("", "0")
+# PF_SM_KPACK=1: a causal chunk pair (0, 1) whose scores sit in the first half of every key-offset window (d_head past
+# the pair's offsets: Gemma-2's 256 offset blocks for 128 tokens) runs one softmax: chunk 1's scores (exact zeros off
+# their valid slots) moved half a window up onto chunk 0's empty blocks, the denominator summed per half window (one
+# select mask: a level), chunk 1's probabilities moved back for its P.V
+_SM_KPACK = os.environ.get("PF_SM_KPACK", "0") not in ("", "0")
 # PF_KV_SHARE=1: GQA query sets walk each K / V pair together (one complex K / V combination per pair, not per set)
 _KV_SHARE = os.environ.get("PF_KV_SHARE", "0") not in ("", "0")
 # PF_PRE_PERIODIC=1: a prefix score alone in its score ciphertext stays tH-periodic (sparse refreshes, no block select);
@@ -447,6 +452,46 @@ def prefix_offset(ch: Chunks, c: int) -> int:
     return nq if nq < ch.t else c * ch.t + ch.t
 
 
+@dataclasses.dataclass
+class PublicPrefix:
+    """P public keys / values before the prompt (positions 0 .. P - 1: the prompt's Chunks base is P), whatever P (a
+    model's instruction prefix: SANA's 207). Query set i of chunk c reads their scores as one PCMM on its Q (`s_lin(c,
+    i)`: the scores on key offsets public_offset(ch, c) + p of its first score ciphertext) and their values as one PCMM
+    on its probabilities (`pv_lin(c, i)`); public_prefix_mats builds both. `run(rt, xs, lin)`: the PCMM (pcmm.run)."""
+    P: int
+    s_lin: object
+    pv_lin: object
+    run: object
+
+
+def public_offset(ch: Chunks, c: int) -> int:
+    """Key offset of chunk c's first public key: past its own offsets whatever its lane count (fixed weights)."""
+    return c * ch.t + ch.t
+
+
+def public_prefix_mats(d, ch: Chunks, c: int, Kpub, Vpub, gscale: float, half: float = 0.5):
+    """(W_s, W_pv) of a PublicPrefix's PCMMs for the head-group dims d (one block of N / t channels): Kpub / Vpub
+    (heads, P, dims) per head of the group, post-RoPE keys. W_s takes Q's channel j H + h onto the score layout's
+    channel blk H + h (blk: the score block of key offset public_offset(ch, c) + p), times half gscale (the scores'
+    scale before their cleanse); W_pv takes it back, times 1/2 (P.V's cleanse)."""
+    Kpub, Vpub = np.asarray(Kpub, dtype=np.float64), np.asarray(Vpub, dtype=np.float64)
+    nh, P, dk = Kpub.shape
+    u0 = public_offset(ch, c)
+    if u0 + P > d.d_head:
+        raise NotImplementedError(f"public prefix: {P} keys past offset {u0} overflow the first score ciphertext "
+                                  f"({d.d_head} offsets)")
+    nch, H = d.N // d.t, d.H
+    blk = [(_bsgs_block_of(u0 + p, d.d_head) if _bsgs_on(ch) else u0 + p) for p in range(P)]
+    Ws, Wv = np.zeros((nch, nch)), np.zeros((nch, nch))
+    rows = np.arange(dk) * H
+    for h in range(nh):
+        for p in range(P):
+            col = blk[p] * H + h
+            Ws[rows + h, col] = half * gscale * Kpub[h, p]
+            Wv[col, rows + h] = 0.5 * Vpub[h, p]
+    return Ws, Wv
+
+
 def _bsgs_on(ch: Chunks) -> bool:
     return _BSGS and _ATTN_PAIR and _PACK > 0
 
@@ -480,7 +525,10 @@ def _score_valid(d, ch: Chunks, c: int, m: int, prefix: bool = False):
         return (h < d.H_real) & (lane < nq) & (u < ch.n_chunks * ch.t) & (key < ch.n_keys)
     same = u < ch.t
     reg = (u < c * ch.t + ch.t) & np.where(same, lane >= u, True)
-    if prefix:
+    if isinstance(prefix, tuple) and prefix and prefix[0] == "pub":     # PublicPrefix: P offsets, every lane
+        u0 = public_offset(ch, c)
+        reg = reg | ((u >= u0) & (u < u0 + prefix[1]))
+    elif prefix:
         bos = u == prefix_offset(ch, c)
         reg = (reg & ~bos) | bos
     return (h < d.H_real) & (lane < nq) & reg
@@ -504,14 +552,85 @@ def _hp_valid(d, ch: Chunks, m: int, c0: int = 0):
     return _score_valid(d, ch, c0, m) | np.roll(_score_valid(d, ch, c0 + 1, m), d.tH // 2)
 
 
+def _kp(k: int = 0):
+    """PF_SM_KPACK's chunk name of query chunk pair (2k, 2k + 1)."""
+    return ("kp", k)
+
+
+def _kp_pair(c):
+    """The first chunk of a key-packed chunk name, or None."""
+    return 2 * c[1] if isinstance(c, tuple) and c[0] == "kp" else None
+
+
+def _pair_of(c):
+    """The first chunk of a packed (head or key) chunk name, or None."""
+    c0 = _hp_pair(c)
+    return c0 if c0 is not None else _kp_pair(c)
+
+
+def _kp_win(d, ch: Chunks) -> int:
+    """PF_SM_KPACK's window in score blocks: a BSGS window (W = d_head / 2^PACK), else the whole ciphertext."""
+    return d.d_head >> _PACK if _bsgs_on(ch) else d.d_head
+
+
+def _kp_upper(d, ch: Chunks):
+    """(N,) bool: the second half of every window's blocks (chunk 2k + 1's after the move)."""
+    W = _kp_win(d, ch)
+    return (np.arange(d.N) // d.tH) % W >= W // 2
+
+
+def _kp_shift(d, ch: Chunks) -> int:
+    """PF_SM_KPACK's move of chunk 2k + 1's scores, in slots: half a window up."""
+    return _kp_win(d, ch) // 2 * d.tH
+
+
+def _kp_valid(d, ch: Chunks, m: int, c0: int, prefix: bool):
+    return _score_valid(d, ch, c0, m, prefix) | np.roll(_score_valid(d, ch, c0 + 1, m, prefix), _kp_shift(d, ch))
+
+
+def _kp_fits(d, ch: Chunks, prefix: bool) -> bool:
+    """Chunks 0 and 1 key-pack: one score ciphertext each (every offset, the prefix's too, below d_head) and every
+    valid score of both in the first half of its window."""
+    W = _kp_win(d, ch)
+    if ch.bidir or ch.n_chunks != 2 or d.N // d.tH != d.d_head or W < 2 or W % 2:
+        return False
+    us = [u for c in (0, 1) for u, _, _ in _offsets(ch, c)] + ([prefix_offset(ch, c) for c in (0, 1)] if prefix else [])
+    if max(us) >= d.d_head:
+        return False
+    up = _kp_upper(d, ch)
+    return not any((_score_valid(d, ch, c, 0, prefix) & up).any() for c in (0, 1))
+
+
+def _kp_sum(rt, D, ch: Chunks):
+    """PF_SM_KPACK's denominator: on every block the sum over its own half window across the windows (chunk 2k's on
+    the first halves, 2k + 1's on the second): the windows summed, each half window summed onto its start, the starts
+    selected (a level) and broadcast back over their half."""
+    ops, d = rt.ops, rt.dims
+    W = _kp_win(d, ch)
+    h = W // 2
+    if W * d.tH < d.N:
+        D = rotsum(ops, D, W * d.tH, d.N)
+    D = rotsum(ops, D, d.tH, h * d.tH)
+    D = rt.mult_mask(D, ("pf.kp.sel", W), lambda: ((np.arange(d.N) // d.tH) % h == 0).astype(float))
+    return ops.rotate_and_sum(D, -d.tH, h * d.tH)
+
+
+def _upper_of(d, ch: Chunks, c):
+    """The second-t-lanes selector of a packed chunk name's per-lane vectors (None: the upper heads)."""
+    return _kp_upper(d, ch) if _kp_pair(c) is not None else None
+
+
 def _valid_of(d, ch: Chunks, c, m: int, prefix: bool = False):
     c0 = _hp_pair(c)
-    return _hp_valid(d, ch, m, c0) if c0 is not None else _score_valid(d, ch, c, m, prefix)
+    if c0 is not None:
+        return _hp_valid(d, ch, m, c0)
+    c0 = _kp_pair(c)
+    return _kp_valid(d, ch, m, c0, prefix) if c0 is not None else _score_valid(d, ch, c, m, prefix)
 
 
 def _kcs_of(ch: Chunks, c):
-    """Keys per query lane of chunk c; a head-packed pair: chunk c0's lanes, then chunk c0 + 1's (t each)."""
-    c0 = _hp_pair(c)
+    """Keys per query lane of chunk c; a packed pair: chunk c0's lanes, then chunk c0 + 1's (t each)."""
+    c0 = _pair_of(c)
     if c0 is not None:
         k0 = _kcs(ch, ch.lanes(c0))
         return k0 + [1] * (ch.t - len(k0)) + _kcs(ch, ch.lanes(c0 + 1))
@@ -529,8 +648,9 @@ def _vkey(v):
     return hashlib.blake2b(np.ascontiguousarray(v).tobytes(), digest_size=8).hexdigest()
 
 
-def rope_lanes(rt, x, rope, positions, site):
-    """RoPE of every lane at its own position: x cos + rotate(x, N/2) sin' (one level)."""
+def rope_lanes(rt, x, rope, positions, site, perm=None):
+    """RoPE of every lane at its own position: x cos + rotate(x, N/2) sin' (one level). `perm`: x's slot order as
+    source slots of the dims-major layout (sinc.half_perm_slots: the CCMM's half-head view; partners still N/2 apart)."""
     ops, d = rt.ops, rt.dims
     pos = tuple(int(p) for p in positions)
 
@@ -539,20 +659,22 @@ def rope_lanes(rt, x, rope, positions, site):
             out = np.zeros((d.d_head, d.H, d.t))
             for lane, p in enumerate(pos):
                 out[:, :, lane] = rope.lane_cs(d, p)[k][:, None]
-            return out.reshape(-1)
+            v = out.reshape(-1)
+            return v if perm is None else v[perm]
         return build
-    a = rt.mult_mask(x, (site + ".c", pos), vec(0))
-    b = rt.mult_mask(ops.rotate(x, d.N // 2), (site + ".s", pos), vec(1))
+    hv = () if perm is None else ("hv",)
+    a = rt.mult_mask(x, (site + ".c", pos) + hv, vec(0))
+    b = rt.mult_mask(ops.rotate(x, d.N // 2), (site + ".s", pos) + hv, vec(1))
     return ops.add(a, b)
 
 
-def _lane_vec(d, vals, fill=0.0):
+def _lane_vec(d, vals, fill=0.0, upper=None):
     """A per-query-lane value on every slot (t-periodic); 2t values: the second t on the second half of the heads
-    (PF_SM_HPACK)."""
+    (PF_SM_HPACK) or on the `upper` slots (PF_SM_KPACK: _kp_upper)."""
     if len(vals) <= d.t:
         return lanes_periodic(d.N, d.t, vals, fill)
     lo, hi = lanes_periodic(d.N, d.t, vals[:d.t], fill), lanes_periodic(d.N, d.t, vals[d.t:], fill)
-    return np.where(_upper_heads(d), hi, lo)
+    return np.where(_upper_heads(d) if upper is None else upper, hi, lo)
 
 
 def _upper_heads(d):
@@ -578,25 +700,30 @@ class _KcExtrapolated:
         return r
 
 
-def recip_lanes(rt, D, a_vals, b_vals, iters: int, key, cheb=None):
+def recip_lanes(rt, D, a_vals, b_vals, iters: int, key, cheb=None, upper=None):
     """1 / D by Goldschmidt with per-lane seed a - b D; D and the reciprocal share one complex ciphertext.
-    `cheb` = (per-step kappa lanes, mu lanes): SM_CHEB_GS's scaled steps (poly.goldschmidt_recip)."""
+    `cheb` = (per-step kappa lanes, mu lanes): SM_CHEB_GS's scaled steps (poly.goldschmidt_recip). `upper`: a packed
+    pair's second-t-lanes slots (_lane_vec; PF_SM_KPACK)."""
     ops, d = rt.ops, rt.dims
+    key = key if upper is None else key + ("kp",)
+
+    def lv(v):
+        return _lane_vec(d, v, upper=upper)
     av = np.asarray(a_vals, dtype=np.float64)
     bv = np.asarray(b_vals, dtype=np.float64)
-    hb = rt.mult_mask(D, ("pf.rcp.hb",) + key, lambda: _lane_vec(d, 0.5 * bv))
-    G = rt.add_mask(hb, ("pf.rcp.ha",) + key, lambda: _lane_vec(d, -0.5 * av))
+    hb = rt.mult_mask(D, ("pf.rcp.hb",) + key, lambda: lv(0.5 * bv))
+    G = rt.add_mask(hb, ("pf.rcp.ha",) + key, lambda: lv(-0.5 * av))
     if cheb is not None:
         kap, mu = cheb
-        X = rt.add_mask(ops.mult_i(D), ("pf.rcp.mu",) + key, lambda: _lane_vec(d, mu))
+        X = rt.add_mask(ops.mult_i(D), ("pf.rcp.mu",) + key, lambda: lv(mu))
         P = ops.negate(ops.mult_i(ops.mult(G, X)))
         for j in range(iters - 1):
             F = rt.add_mask(ops.add(P, ops.conjugate(P)), ("pf.rcp.kap", j) + key,
-                            lambda j=j: _lane_vec(d, 2.0 * np.asarray(kap[j])))
+                            lambda j=j: lv(2.0 * np.asarray(kap[j])))
             P = ops.mult(P, F)
         return ops.mult_i(ops.sub(ops.conjugate(P), P))
-    nb = rt.mult_mask(D, ("pf.rcp.nb",) + key, lambda: _lane_vec(d, -0.5 * bv))
-    im = rt.add_mask(nb, ("pf.rcp.pa",) + key, lambda: _lane_vec(d, 0.5 * av))
+    nb = rt.mult_mask(D, ("pf.rcp.nb",) + key, lambda: lv(-0.5 * bv))
+    im = rt.add_mask(nb, ("pf.rcp.pa",) + key, lambda: lv(0.5 * av))
     P = ops.add(ops.mult(D, G), ops.mult_i(im))
     for _ in range(1, iters):
         P = ops.mult(P, ops.add(ops.add(P, ops.conjugate(P)), 2.0))
@@ -608,7 +735,7 @@ def _sm_active(d, cfg, ch: Chunks, c: int, prefix: bool, m: int, valid, f: float
     lane_scale = [f * 0.5 / kc for kc in _kcs_of(ch, c)]
     key = ("pf.sm.active", c, m) + ch.key_tag + (prefix,) + ((f,) if f != 1.0 else ()) + \
         (("per",) if m == periodic else ()) + _layout_tag(ch)
-    return key, (lambda: np.where(valid, _lane_vec(d, lane_scale), 0.0))
+    return key, (lambda: np.where(valid, _lane_vec(d, lane_scale, upper=_upper_of(d, ch, c)), 0.0))
 
 
 def _sm_cheb(rt, S, cfg, ch: Chunks, c: int, prefix: bool, m0: int = 0, periodic=None):
@@ -683,9 +810,13 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
     (prefill_attention's centre_keys)."""
     sink_only(cfg, "prefill_softmax")
     ops, d = rt.ops, rt.dims
-    c0 = _hp_pair(c)
+    c0 = _pair_of(c)
     pos = ch.lanes(c if c0 is None else c0)
     kcs = _kcs_of(ch, c)
+    kp = _kp_pair(c) is not None
+    if kp and (len(S) != 1 or periodic is not None):
+        raise ValueError("PF_SM_KPACK: one score ciphertext per chunk, no periodic prefix one")
+    upper = _kp_upper(d, ch) if kp else None
     if Z is None:     # cheb then tail per score ct: the captured op order
         Z = []
         for m in range(len(S)):
@@ -702,19 +833,21 @@ def prefill_softmax(rt, S, cfg, ch: Chunks, c: int, prefix: bool = False, Z=None
         D = Zr[0] if len(Zr) == 1 else ops.add(Zr[0], Zr[1])
         for z in Zr[2:]:
             ops.inplace_add(D, z)
-        D = rotsum(ops, D, d.tH, d.N)
-        if periodic is not None:
-            D = ops.add(D, Z[periodic])
-        D = ops.tag_reduce(D, d.tH)
+        if kp:
+            D = ops.tag_reduce(_kp_sum(rt, D, ch), _kp_win(d, ch) * d.tH)
+        else:
+            D = rotsum(ops, D, d.tH, d.N)
+            if periodic is not None:
+                D = ops.add(D, Z[periodic])
+            D = ops.tag_reduce(D, d.tH)
         rnd = [pl[k] for pl in per_lane]
         iters = rnd[0][2]
         a_vals = [r[0] * r[3] for r in rnd]
         b_vals = [r[1] * r[3] * r[3] for r in rnd]
         cv = None if not cheb else ([[r[4][0][j] for r in rnd] for j in range(iters - 1)], [r[4][1] for r in rnd])
         R = recip_lanes(rt, D, a_vals, b_vals, iters,
-                        (tuple(round(v, 12) for v in a_vals), tuple(round(v, 15) for v in b_vals)), cv)
+                        (tuple(round(v, 12) for v in a_vals), tuple(round(v, 15) for v in b_vals)), cv, upper)
         if _DBG:
-            dv = np.real(D.vec).reshape(-1, d.t)[:, :len(pos)]; rv = np.real(R.vec).reshape(-1, d.t)[:, :len(pos)]
             hv = (np.arange(d.N) % d.tH) // d.t < d.H_real
             dvv = np.real(D.vec)[hv].reshape(-1)
             if k == 0:
@@ -735,10 +868,11 @@ def centre_keys(rt, K, ch: Chunks):
     return [None if k is None else ops.sub(k, k0) for k in K]
 
 
-def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False):
+def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefix=None, shared=False, score_map=None):
     """Causal attention on dense complex Q/K/V (scale 1/2); returns dense outputs (scale 1) as the decode's P.V.
     `kv` receives the per-chunk real K/V; `prefix`: (k, v) slot vectors of one public key / value before the prompt.
-    `shared`: Qd is a list of query sets on the same K / V (GQA), one output list each."""
+    `shared`: Qd is a list of query sets on the same K / V (GQA), one output list each.    `score_map(rt, s)`: the scores' map before the softmax (Gemma-2's logit soft-cap), on every score ciphertext.
+    """
     ops, d = rt.ops, rt.dims
     nc = ch.n_chunks
 
@@ -1125,11 +1259,13 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
             owns[c] = ([K[c]] + [lane_rotate(rt, K[c], e, "pf.krot") for e in range(1, ch.t)] if ch.bidir
                        else [K[c]] + ops.rotate_many(K[c], [-e for e in range(1, nq)]))
         own = owns.get(c)
-        u_pre = prefix_offset(ch, c)                               # prefix key's offset
-        M = (max([u for u, _, _ in offs] + ([u_pre] if prefix is not None else [])) // d.d_head) + 1
+        pub = isinstance(prefix, PublicPrefix)
+        u_pre = public_offset(ch, c) if pub else prefix_offset(ch, c)      # (the first) prefix key's offset
+        u_last = u_pre + (prefix.P - 1 if pub else 0)
+        M = (max([u for u, _, _ in offs] + ([u_last] if prefix is not None else [])) // d.d_head) + 1
         SL = [[None] * M for _ in QL]
-        pre = prefix is not None
-        per_m = (u_pre // d.d_head) if (pre and _PRE_PERIODIC and u_pre % d.d_head == 0
+        pre = ("pub", prefix.P) if pub else prefix is not None
+        per_m = (u_pre // d.d_head) if (not pub and pre and _PRE_PERIODIC and u_pre % d.d_head == 0
                                         and all(u < u_pre for u, _, _ in offs)) else None
         pair = _ATTN_PAIR
         half = 0.5 if pair else 1.0          # paired: scores at 1/2, one cleanse per score ct
@@ -1163,7 +1299,10 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                     ops.inplace_add(dst[m], v)
 
         with rt.step("qkt"):
-            if pre:
+            if pub:                     # the public keys' scores: one PCMM per query set, on their offsets
+                for i, (Q, S) in enumerate(zip(QL, SL)):
+                    S[0] = prefix.run(rt, [Q[c]], prefix.s_lin(c, qset[id(Q)]))[0]
+            elif pre:
                 for Q, S in zip(QL, SL):
                     m, blk = divmod(u_pre, d.d_head)
                     if bsgs:
@@ -1195,11 +1334,15 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                         place(S, s, [(*divmod(u, d.d_head), coefs[i]) for i, (u, _, _) in enumerate(grp)], "pf.qkt")
             if pair:
                 SL = [[im_cleanse(ops, x) for x in S] for S in SL]
-        return [dict(S=S, offs=offs, nq=nq, u_pre=u_pre, pre=pre, groups=groups, per=per_m) for S in SL]
+        if score_map is not None:          # the logit soft-cap on the real scores (scale 1), before every softmax path
+            with rt.step("score_map"):
+                SL = [[None if x is None else score_map(rt, x) for x in S] for S in SL]
+        return [dict(S=S, offs=offs, nq=nq, u_pre=u_pre, pre=pre, groups=groups, per=per_m, qs=qset[id(Q)])
+                for S, Q in zip(SL, QL)]
 
     def pv_stage(c, sts, PL):
         st = sts[0]
-        offs, nq, u_pre, pre, groups = st["offs"], st["nq"], st["u_pre"], st["pre"], st["groups"]
+        nq, u_pre, pre, groups = st["nq"], st["u_pre"], st["pre"], st["groups"]
         with rt.step("softmax_v"):
             if bsgs:
                 bs = range(1, Bb) if ch.bidir else range(1, min(Bb, nq))
@@ -1209,7 +1352,10 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                             else [V[c]] + ops.rotate_many(V[c], [-e for e in range(1, nq)]))
             vown = vowns.get(c)
             accs = [None] * len(PL)
-            if pre:
+            if isinstance(prefix, PublicPrefix):     # the public values: one PCMM per query set on its probabilities
+                for i, P in enumerate(PL):
+                    accs[i] = prefix.run(rt, [P[0]], prefix.pv_lin(c, sts[i]["qs"]))[0]
+            elif pre:
                 m, blk = divmod(u_pre, d.d_head)
                 if bsgs:
                     blk = _bsgs_block_of(blk, d.d_head)
@@ -1257,6 +1403,8 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
 
     hpack = (_SM_HPACK and not _SM_JOINT and prefix is None and 2 * d.H_real <= d.H
              and (nc % 2 == 0 if ch.bidir else nc == 2))
+    kpack = (_SM_KPACK and not hpack and not _SM_JOINT and score_map is None
+             and not isinstance(prefix, PublicPrefix) and _kp_fits(d, ch, prefix is not None))
 
     def attend(QL):
         outs = [[None] * nc for _ in QL]
@@ -1291,6 +1439,21 @@ def prefill_attention(rt, Qd, Kd, Vd, cfg, ch: Chunks, kv=None, rope=None, prefi
                 for j, c in enumerate((k, k + 1)):
                     for i, o in enumerate(pv_stage(c, sts[j], PL[j])):
                         outs[i][c] = o
+        elif kpack:
+            sh = _kp_shift(d, ch)
+            sts = [qkt_stage(c, QL) for c in (0, 1)]
+            PL = [[], []]
+            for s0, s1 in zip(*sts):
+                if len(s0["S"]) != 1 or len(s1["S"]) != 1 or s0["per"] is not None or s1["per"] is not None:
+                    raise ValueError("PF_SM_KPACK: one score ciphertext per chunk, no periodic prefix one")
+                with rt.step("softmax"):
+                    S = [ops.add(s0["S"][0], ops.rotate(s1["S"][0], d.N - sh))]
+                    P = prefill_softmax(rt, S, cfg, ch, _kp(0), s0["pre"])
+                PL[0].append(P)
+                PL[1].append([ops.rotate(x, sh) for x in P])
+            for j, c in enumerate((0, 1)):
+                for i, o in enumerate(pv_stage(c, sts[j], PL[j])):
+                    outs[i][c] = o
         else:
             for c in range(nc):
                 sts = qkt_stage(c, QL)
@@ -1638,8 +1801,10 @@ def norm_all(rt, Xs, cfg, ch: Chunks, rms: bool = False, max_period: int = 512):
     return res
 
 
-# PF_JOINT_FORCE=1: the joint GELU / softmax refresh is a deliberate bootstrap instead of a hint
-_JOINT_FORCE = os.environ.get("PF_JOINT_FORCE", "0") not in ("", "0")
+# PF_JOINT_FORCE=1: the joint GELU / softmax refresh is a deliberate bootstrap instead of a hint. PF_PREFILL_JOINT_FORCE
+# (when set) is this module's own: a host model whose PF_JOINT_FORCE means its own joint forms (SANA's nl.py: off)
+# runs the general prefill (its text encoder) with it on
+_JOINT_FORCE = os.environ.get("PF_PREFILL_JOINT_FORCE", os.environ.get("PF_JOINT_FORCE", "0")) not in ("", "0")
 
 # PF_SILU_SINGLE=1 (with `us`): sigma(xmax t) - 1/2 as one odd Chebyshev series of degree 63 / 95 / 127, the smallest
 # within PF_SILU_SINGLE_TOL x the composite's error (both as evaluated, trimmed; floor 1e-7) on t in [-1, 1]:
@@ -1657,25 +1822,35 @@ _GLU_LEAN = os.environ.get("PF_GLU_LEAN", "0") not in ("", "0")
 _silu_single_cache = {}
 
 
-def silu_single_coeffs(cfg):
-    """The single-series coefficients of sigma(xmax t) - 1/2 on t in [-1, 1], or None (keep the composite): the
-    config's (single_cheb_coeffs), else derived here over PF_SILU_SINGLE_DEGS."""
+def act_core(act: str):
+    """f(x) - 1/2 of the activation x f(x) the single series fits (odd): SiLU's sigma, GELU-tanh's Phi."""
+    if act == "silu":
+        return lambda x: 1.0 / (1.0 + np.exp(-x)) - 0.5
+    if act == "gelu_tanh":
+        return lambda x: 0.5 * np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3))
+    raise ValueError(f"single-series activation: {act!r} not ported")
+
+
+def silu_single_coeffs(cfg, act: str = "silu"):
+    """The single-series coefficients of f(xmax t) - 1/2 on t in [-1, 1] (f: act_core, SiLU's sigma by default), or
+    None (keep the composite): the config's (single_cheb_coeffs), else derived here over PF_SILU_SINGLE_DEGS."""
     if cfg.single_cheb:
         return [float(v) for v in cfg.single_cheb]
     from numpy.polynomial import chebyshev as C
     from .poly import _cheb_trim
-    key = (float(cfg.xmax), tuple(cfg.thor_p1_cheb), tuple(cfg.thor_p2_cheb))
+    core = act_core(act)
+    key = (act, float(cfg.xmax), tuple(cfg.thor_p1_cheb), tuple(cfg.thor_p2_cheb))
     if key not in _silu_single_cache:
         xm = float(cfg.xmax)
         t = np.linspace(-1.0, 1.0, 40001)
-        f = 1.0 / (1.0 + np.exp(-xm * t)) - 0.5
+        f = core(xm * t)
         a1, b1, a2, b2 = cfg.thor_p1_a, cfg.thor_p1_b, cfg.thor_p2_a, cfg.thor_p2_b
         y1 = C.chebval((2 * t - (a1 + b1)) / (b1 - a1), _cheb_trim(cfg.thor_p1_cheb))
         comp = C.chebval((2 * y1 - (a2 + b2)) / (b2 - a2), _cheb_trim(cfg.thor_p2_cheb))
         tol = _SILU_SINGLE_ERR or max(_SILU_SINGLE_TOL * float((np.abs(comp - f) * np.abs(t) * xm).max()), 1e-7)
         best = None
         for n in _SILU_SINGLE_DEGS:
-            c = C.chebinterpolate(lambda t: 1.0 / (1.0 + np.exp(-xm * t)) - 0.5, n)
+            c = C.chebinterpolate(lambda t: core(xm * t), n)
             c[0::2] = 0.0
             c = np.array(_cheb_trim(c, _SILU_SINGLE_EPS))
             err = float((np.abs(C.chebval(t, c) - f) * np.abs(t) * xm).max())
@@ -1686,10 +1861,9 @@ def silu_single_coeffs(cfg):
     return _silu_single_cache[key]
 
 
-def gelu_joint(rt, A, B, cfg, mask, us=None):
+def gelu_joint(rt, A, B, cfg, mask, us=None, act: str = "silu"):
     """Folded THOR GELU of real halves A, B (x / xmax) with one refresh of p1(A) + i p1(B) between P1 and P2.
     Returns (g(A), g(B)) times the mask; with `us` (forced joint only), (g(A) uA, g(B) uB) without the final cleanse."""
-    from .poly import eval_polynomial_ps
     ops = rt.ops
     if not (cfg.method == "thor_composite" and cfg.thor_p1_cheb and ops.gelu_fold):
         raise ValueError("gelu_joint: the folded THOR composite with Chebyshev P1 / P2 only")
@@ -1704,7 +1878,7 @@ def gelu_joint(rt, A, B, cfg, mask, us=None):
         c1 = [0.5 * al * float(c) for c in cfg.thor_p1_cheb]
         c1[0] -= 0.5 * be
         if us is not None:
-            cs = silu_single_coeffs(cfg) if _SILU_SINGLE else None
+            cs = silu_single_coeffs(cfg, act) if _SILU_SINGLE else None
             lean = _GLU_LEAN and cs is not None
             xu = [ops.mult(x if lean else im_cleanse(ops, x), u) for x, u in zip((A, B), us)]
             if cs is not None:
@@ -1834,8 +2008,10 @@ class PlannedPrefill:
                 raise RuntimeError(f"block {b}: inputs {missing} are not the stage's input ciphertexts {names}")
             self.in_pos[b] = [names.index(n) for n in ins]          # program input i = stage input in_pos[i]
             # the twin knows the entries up to the first extra stage; past it (GPT-2's CutMax after the tail, which the
-            # twin ran unplanned) a stage enters at the previous stage's compiled exit
-            if b <= self.n_layers:
+            # twin ran unplanned) a stage enters at the previous stage's compiled exit. `entry_compiled`: every stage
+            # past the first does (a block whose exit the plan moves: Gemma-2's post norm ends it after the last
+            # refresh landing, where the unplanned twin's levels are not the plan's)
+            if b <= self.n_layers and (b == 0 or not getattr(self, "entry_compiled", False)):
                 metas[lab] = {n: self.in_metas[b][names.index(n)] for n in ins}
             live[lab] = list(r.out_names)
         self.progs = _pc.Program.compile(self.work_dir, self.plan_dir, config=self.cfg, blocks=self.labels,
@@ -2028,7 +2204,7 @@ class PlannedPrefill:
         if os.environ.get("PF_LAYOUT", "") == "blocked":
             from .blocked import decrypt_blocked
             B = self.model.blocks
-            return decrypt_blocked(shim, [vals[g * B.K:(g + 1) * B.K] for g in range(len(vals) // B.K)], self.ch, B,
+            return decrypt_blocked(shim, [vals[g * B.Kh:(g + 1) * B.Kh] for g in range(len(vals) // B.Kh)], self.ch, B,
                                    self.model.rt.dims.dim)
         return decrypt_prompt(shim, vals, self.ch, self.model.rt.dims.dim)
 

@@ -1,5 +1,5 @@
 """The SANA port's polynomial maps on ops, read from a configs.json (fit.py): PolyNL's hooks the kernels call
-(kernels.py, model.py, gemma_fhe.py), and Room / series_units, which size the refresh sites the plan may take.
+(kernels.py, model.py, text.py), and Room / series_units, which size the refresh sites the plan may take.
 
   relu_u / relu_u2   one-sided composite sign on the unit input (a polished last stage optional): ReLU(x) ~ x s(x)
                      with s <= 0 on x <= 0, so f(q).z >= 0 and the attention's division stays in its band
@@ -370,21 +370,6 @@ class PolyNL:
     def exp_need(self, rt, x, site):
         """exp's entry refresh on x (a complex join of two halves: one refresh for both)."""
         return Room(rt).need(x, self.cfg["exp"][site]["cheb"], 2)
-
-    def softcap(self, rt, x, site, folded=False, exp_site=None):
-        """The softcap series; `folded`: x already carries 1 / its half-width (the series on [-1, 1], no map);
-        `exp_site`: the exp's domain map folded into the coefficients (the output is the exp's [-1, 1] variable)."""
-        p = self.cfg["softcap"][site]
-        coef, a, b = list(p["cheb"]), p["a"], p["b"]
-        if folded:
-            assert abs(a + b) < 1e-12 * abs(b), f"{site}: the fold needs a symmetric domain"
-            a, b = -1.0, 1.0
-        if exp_site is not None:
-            e = self.cfg["exp"][exp_site]
-            al, be = 2.0 / (e["b"] - e["a"]), (e["a"] + e["b"]) / (e["b"] - e["a"])
-            coef = [al * c for c in coef]
-            coef[0] -= be
-        return eval_chebyshev(rt.ops, Room(rt).need(x, coef, 2), coef, a, b)
 
     def gelu_tanh(self, rt, x, site, scale=1.0):
         """The tanh GELU of scale x: one Chebyshev series (a narrow range), else clipped to x Phi(clip(x)) (gelu_clip:

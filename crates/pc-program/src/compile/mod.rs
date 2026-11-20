@@ -282,6 +282,14 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
         }
         s <<= 1;
     }
+    // a SparseB route the runtime builds (SPARSE_BTS_SLOTS) the table above does not list (a model's own attention
+    // route, e.g. Gemma-2-2B's 128 head slots) lands where SparseB's {1, 1} precomputation lands: the table's 256 / 512
+    for x in cfg.bts.sparse_bts_slots.iter().flatten().flat_map(|x| x.split(',')).filter(|x| !x.trim().is_empty()) {
+        let s: u32 = x.trim().parse().map_err(|_| cfg_err("bts.sparse_bts_slots", x))?;
+        if s > 1 && s < half && s <= sb_max {
+            bts.landings.entry(s).or_insert(pc_shadow::route::multi_stage_landing([1, 1], unit));
+        }
+    }
     if let Some(bl) = bootstrap_level {
         bts.bootstrap_level = bl;
     }

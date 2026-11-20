@@ -1,4 +1,4 @@
-"""Llama on ``perseus.impl``: streamed weights + configs + per-block K/V caches over one session,
+"""A decoder (arch.Arch: Llama, Gemma-2) on ``perseus.impl``: streamed weights + configs + per-block K/V caches over one session,
 the BOS prefix, the decode step (n_layers blocks -> final RMSNorm -> LM head tiles) and the
 teacher-forced decode driver. Modes and mask staging come from ``perseus.impl.driver.ImplModel``.
 
@@ -11,7 +11,6 @@ Block numbering: 0..n_layers-1 the transformer blocks, n_layers the tail (final 
 from __future__ import annotations
 
 import os
-import time
 
 import numpy as np
 
@@ -76,6 +75,9 @@ def stream_sum_recorder(inf):
     return rec
 
 
+# LLAMA_LMHEAD_BOTTOM=1: the LM head runs at the bottom of the chain (its logits are only decrypted)
+LMHEAD_BOTTOM = os.environ.get("LLAMA_LMHEAD_BOTTOM", "0") not in ("", "0")
+
 class LlamaModel(ImplModel):
     def __init__(self, inf, weights, cfgs, *, core=None, n_layers=None, packing="cachemir_complex",
                  lmhead_cap=44, unit=None, profile=False, kv_offload=None, dims=None):
@@ -89,6 +91,7 @@ class LlamaModel(ImplModel):
             raise ValueError("cachemir_complex needs a complex payload session (CKKS_COMPLEX=1)")
         self.packing = packing
         self.w, self.cfgs = weights, cfgs
+        self.arch = weights.arch
         self.n_layers = int(n_layers if n_layers is not None else cfgs.n_layers)
         self.lmhead_cap = lmhead_cap
         c = weights.store.config
@@ -96,13 +99,17 @@ class LlamaModel(ImplModel):
         self.H, self.H_kv = int(c["num_attention_heads"]), int(c["num_key_value_heads"])
         self.rope = Rope(cfgs.model["rope_inv_freq"])
         Cache = ComplexKVCache if packing == "cachemir_complex" else KVCache
-        # a softmax centred on key 0 (ref_keys): its block's K cache holds every key minus key 0
+        # a softmax centred on key 0 (ref_keys): its block's K cache holds every key minus key 0, unless an attention
+        # soft-cap sits between the scores and the softmax (cap tanh(s / cap) is not shift-invariant): the cache stays
+        # raw and the softmax centres after the cap (attention._centre_mapped)
         self.kv = [ComplexKVCache(self.rt.dims.d_head, centre=self._centred(b)) if Cache is ComplexKVCache
                    else Cache(self.rt.dims.d_head) for b in range(self.n_layers)]
         # LLAMA_GQA=1: K / V caches hold each KV head once (attention.mha_gqa on self.sub)
         self.G = self.H // self.H_kv if os.environ.get("LLAMA_GQA", "0") not in ("", "0") else 1
         self.sub = None
         if self.G > 1:
+            if self.rt.dims.H != self.H:
+                raise ValueError("LLAMA_GQA runs one head per slot block: unset it for padded head slots")
             if packing != "cachemir_complex":
                 raise ValueError("LLAMA_GQA needs the cachemir_complex packing")
             from perseus.impl.attention import gqa_dims
@@ -136,9 +143,12 @@ class LlamaModel(ImplModel):
     def block_weights(self, b):
         if b not in self._bw:
             w = self.w.block(b)
-            for f in ("q", "k", "v", "out", "gate", "up", "down", "kv"):
+            for f in ("q", "k", "v", "out", "kv") + (() if w.mlp else ("gate", "up", "down")):
                 if getattr(w, f) is not None:
-                    self._attach(getattr(w, f), f"b{b}.{f}")
+                    self._attach(getattr(w, f), f"b{b}.{w.kv_entry if f == 'kv' else f}")
+            for prt in w.mlp:           # LLAMA_MLP_SPLIT: each slice's own entries
+                for f in ("gate", "up", "down"):
+                    self._attach(getattr(prt, f), f"b{b}.{f}.{prt.tag}")
             self._bw[b] = w
         return self._bw[b]
 
@@ -159,15 +169,32 @@ class LlamaModel(ImplModel):
     def load_plans(self, plan_dir, validate=True):
         return super().load_plans(plan_dir, range(self.n_layers + 1), validate=validate)
 
+    def key0(self, b):
+        """(name, slot vector) of block b's key 0 (the BOS) as its K cache holds it, for a softmax centred after the
+        attention soft-cap (attention._ref0_score); None for every other block."""
+        if not (self.arch.attn_softcap and self.cfgs.block(b)[2].ref_keys):
+            return None
+        if not hasattr(self, "_key0"):
+            self._key0 = {}
+        if not self._key0:
+            d = self.rt.dims
+            for i, (k, v) in enumerate(self.w.bos_kv(self.n_layers)):
+                kf = P.expanded_heads(k, self.H, self.H_kv, d.d_head_real, d.H)
+                vf = P.expanded_heads(v, self.H, self.H_kv, d.d_head_real, d.H)
+                kv = P.plain_cache(d, kf, vf, self.packing, self.rope)
+                self._key0[i] = (f"b{i}", np.asarray(kv.k_pend[0]))
+        return self._key0[b]
+
     def _centred(self, b):
-        return bool(self.cfgs.block(b)[2].ref_keys)
+        """Block b's K cache holds every key minus key 0 (a centred softmax without a score map)."""
+        return bool(self.cfgs.block(b)[2].ref_keys) and not self.arch.attn_softcap
 
     # ── the BOS prefix ──
     def prefix_caches(self):
         """The plain slot vectors of every block's cache after the BOS push (prefix.py)."""
         if self._prefix is None:
             d = self.rt.dims
-            dh = d.dim // self.H
+            dh = d.d_head_real
             out = []
             Hc = self.H_kv if self.G > 1 else self.H
             dc = self.sub.dims if self.G > 1 else d
@@ -175,14 +202,14 @@ class LlamaModel(ImplModel):
                 # the plain prefix: positions 0 .. n-1 pushed from the exact model's K / V (prefix.plain_cache_n)
                 Ks, Vs = self.plain_prompt
                 for b in range(self.n_layers):
-                    kfs = [P.expanded_heads(k, Hc, self.H_kv, dh) for k in Ks[b]]
-                    vfs = [P.expanded_heads(v, Hc, self.H_kv, dh) for v in Vs[b]]
+                    kfs = [P.expanded_heads(k, Hc, self.H_kv, dh, dc.H) for k in Ks[b]]
+                    vfs = [P.expanded_heads(v, Hc, self.H_kv, dh, dc.H) for v in Vs[b]]
                     out.append(P.plain_cache_n(dc, kfs, vfs, self.packing, self.rope, centre=self._centred(b)))
                 self._prefix = out
                 return out
             for b, (k, v) in enumerate(self.w.bos_kv(self.n_layers)):
-                kf = P.expanded_heads(k, Hc, self.H_kv, dh)
-                vf = P.expanded_heads(v, Hc, self.H_kv, dh)
+                kf = P.expanded_heads(k, Hc, self.H_kv, dh, dc.H)
+                vf = P.expanded_heads(v, Hc, self.H_kv, dh, dc.H)
                 out.append(P.plain_cache(dc, kf, vf, self.packing, self.rope, centre=self._centred(b)))
             self._prefix = out
         return self._prefix
@@ -252,6 +279,9 @@ class LlamaModel(ImplModel):
         return None
 
     def token_stages(self, x, pos, head=True):
+        if self.arch.sliding_window and pos >= self.arch.sliding_window:
+            raise ValueError(f"position {pos}: past the {self.arch.sliding_window}-token window of the local layers "
+                             "(the port attends globally)")
         def block_fn(b):
             def compute(x):
                 if self.taps is not None and b in self.tap_blocks:
@@ -262,7 +292,8 @@ class LlamaModel(ImplModel):
                 with self.rt.step(f"blk{b}"):
                     x = llama_block(self.rt, x, self.block_weights(b), self.kv[b], self.cfgs.block(b),
                                     pos, self.rope, last=b == self.n_layers - 1,
-                                    gqa=(self.sub, self.G) if self.G > 1 else None)
+                                    gqa=(self.sub, self.G) if self.G > 1 else None, post=self.cfgs.post(b),
+                                    softcap=self.cfgs.softcap(b), act_step=self.arch.act_step, k0=self.key0(b))
                 self.exit_stage(b, cap)
                 if self.taps is not None:           # debug: every block's output, decrypted
                     self.taps[(pos, b)] = self.hidden(x)
@@ -276,6 +307,11 @@ class LlamaModel(ImplModel):
                 h = rms_norm(self.rt, x, self.cfgs.ln_f, pos)
                 if self.lmhead_cap is not None:
                     self.rt.ops.bootstrap_hint(h, int(self.lmhead_cap), True)
+                if head and LMHEAD_BOTTOM:
+                    # the logits are only decrypted: the head's products land at the bottom of the chain, on the
+                    # fewest limbs (Gemma-2's 256k-vocab head: 512 streamed sums per token). A pending rescale is paid
+                    # before the drop by the compile (apply_plan's level_reduce)
+                    self.rt.ops.level_drop(h, self.rt.ops.headroom(2))
                 if head:
                     tiles = self.lm_tiles()
                     prep = prepare_linear_input(self.rt, h, tiles[0].d_in, tiles[0].d_out)
@@ -304,7 +340,13 @@ class LlamaModel(ImplModel):
                 out += [decode_linear_output(cv.real, N, d.hid, N), decode_linear_output(cv.imag, N, d.hid, N)]
         else:
             out = [self.rt.ops.decode_linear_output(t, d.hid, N) for t in tiles]
-        return np.concatenate(out)[:self.vocab]
+        return self.post_logits(np.concatenate(out)[:self.vocab])
+
+    def post_logits(self, lg):
+        """What the decrypted LM head output still needs: the Arch's final logit soft-cap (monotone: an encrypted
+        argmax would not need it)."""
+        from .arch import softcap
+        return softcap(lg, self.arch.final_softcap) if self.arch.final_softcap else lg
 
     tap_blocks = ()
 

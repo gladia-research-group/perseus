@@ -176,9 +176,8 @@ def fit_recip_cheb(lo, hi, target=1e-7, max_deg=63, max_nr=4):
 
 
 # Llama prefill's softmax budget (SM_CHEB_GS: the last round to 1e-3; PF_SM_EXP_EPS: a coarser exp), set by main's
-# --sm-last / --text-cgs / --exp-target; the defaults are the fits before the port
-SM_LAST, SM_CGS_TEXT, EXP_TARGET = 1e-5, False, 1e-9
-TEXT_SM_LAST = None                       # --text-sm-last: Gemma's own last-round target (None: SM_LAST)
+# --sm-last / --exp-target; the defaults are the fits before the port
+SM_LAST, EXP_TARGET = 1e-5, 1e-9
 
 
 def _sm_recips(out, site, band0, band, rounds, loose=None, last=1e-5, cgs=False):
@@ -240,10 +239,6 @@ def fit_cheb_fn(f, a, b, target=1e-7, max_deg=127, rel=False, align=False):
     return {"a": float(a), "b": float(b), "cheb": [float(v) for v in coef], "err": err}
 
 
-def gelu_tanh_np(x):
-    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x ** 3)))
-
-
 def fit_gelu_clip(xmax, C=10.0, degs=(15, 15, 15, 27), eps_bits=11):
     """GELU(x) = x Phi(clip(x, -C, C)) with clip(x) = (|x + C| - |x - C|) / 2, |y| = y sgn(y) by the composite sign
     on [-B, B], B = xmax + C: a wide range costs the sign's depth, not a long series. Phi (the tanh GELU's gate) is one
@@ -255,39 +250,17 @@ def fit_gelu_clip(xmax, C=10.0, degs=(15, 15, 15, 27), eps_bits=11):
             "phi": phi}
 
 
-def calibrate_text(summ_g, summ_s, n_layers=26, sm_rounds=4, n_pub=207, kc_extra=48, resid=None, sm_loose=None):
-    """Gemma's prompt-row sites (gemma.py: g<b>.*) and the caption projection's (ref.py: caption.*)."""
-    cfg = {"sm_rounds": sm_rounds, "ln": {}, "softcap": {}, "exp": {}, "recip": {}, "gelu": {}, "gelu_c": {}}
-    for b in range(n_layers):
-        p = f"g{b}"
-        for site in ("ln_in", "ln_post_attn", "ln_ff", "ln_post_ff"):
-            st = summ_g[f"{p}.{site}"]
-            cfg["ln"][f"{p}.{site}"] = fit_ln(st["lo"], st["hi"], 16 * math.sqrt(st["hi"]))
-        lg = summ_g[f"{p}.logit"]
-        m = 1.5 * max(abs(lg["lo"]), abs(lg["hi"]))
-        # x = 2 s -> 2 * 50 tanh(s / 50) on [-2m, 2m]
-        cfg["softcap"][p + ".attn.softcap"] = fit_cheb_fn(lambda x: 100.0 * np.tanh(x / 100.0), -2 * m, 2 * m, 1e-7)
-        sm = summ_g[f"{p}.sm"]
-        span = sm["hi"] - sm["lo"]
-        lo, hi = sm["lo"] - 0.2 * span, sm["hi"] + 0.2 * span
-        c = 0.5 * (lo + hi)
-        cfg["exp"][p + ".attn.sm.exp"] = fit_exp(lo, hi, c, sm_rounds, target=EXP_TARGET)
-        mm = (hi - c) / 2 ** sm_rounds
-        kc_lo, kc_hi = n_pub + 1, n_pub + kc_extra
-        # every row reads the n_pub public keys: the first sum's band is narrow, a Chebyshev seed + Newton
-        lo0, hi0 = kc_lo * math.exp(-mm), kc_hi * math.exp(mm)
-        _sm_recips(cfg["recip"], p + ".attn.sm", (lo0, hi0), (0.5 / kc_hi, 1.05), sm_rounds, sm_loose,
-                   last=SM_LAST if TEXT_SM_LAST is None else TEXT_SM_LAST, cgs=SM_CGS_TEXT)
-        a = summ_g[f"{p}.act"]
-        xm = 1.5 * max(abs(a["lo"]), abs(a["hi"]))
-        cfg["gelu"][p + ".act"] = fit_cheb_fn(gelu_tanh_np, -xm, xm, 1e-6, align=DEG_ALIGN)
+def calibrate_text(summ_g, summ_s):
+    """The caption stage's sites: Gemma's final norm (g.norm, stats.py --gemma) and the caption projection's (ref.py:
+    caption.*). Gemma's layers are the general encoder's (examples/llama/encoder: examples/llama/calibrate.py
+    --first 207, its own configs: impl_text.TEXT_CONFIGS)."""
+    cfg = {"ln": {}}
     st = summ_g["g.norm"]
     cfg["ln"]["g.norm"] = fit_ln(st["lo"], st["hi"], 16 * math.sqrt(st["hi"]))
     a = summ_s["caption.act"]
     cfg["gelu_clip"] = {"caption.act": fit_gelu_clip(1.5 * max(abs(a["lo"]), abs(a["hi"])))}
     st = summ_s["caption.norm"]
     cfg["ln"]["caption.norm"] = fit_ln(st["lo"], st["hi"], summ_s["caption.norm.in"]["absmax"])
-    cfg["resid_scale"] = (resid_scale(resid) if resid is not None else np.ones(2304)).tolist()
     return cfg
 
 
@@ -368,7 +341,8 @@ def main():
     """The shipped configs' recipe by default (hf.CONFIGS: its `meta` records the arguments)."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--stats", default="stats_ref.npz", help="stats.py's SANA sites (under the scratch root)")
-    ap.add_argument("--stats-gemma", default="stats_gemma.npz", help="stats.py --gemma's (absent: no text side)")
+    ap.add_argument("--stats-gemma", default="stats_gemma.npz", help="stats.py --gemma's: the caption stage's final "
+                    "norm (absent: no text side)")
     ap.add_argument("--out", default="configs.json")
     ap.add_argument("--la-delta", type=float, default=1e-3)
     ap.add_argument("--silu-degs", default="15,27", help="THOR p1, p2 degrees (the sites no single series fits; "
@@ -382,17 +356,12 @@ def main():
                     "(their features are summed over the tokens: a wider step is tolerated); '' for relu's")
     ap.add_argument("--sm-last", type=float, default=1e-5, help="the softmax's last reciprocal round's target "
                     "(Llama prefill's SM_CHEB_GS: 1e-3)")
-    ap.add_argument("--text-sm-last", type=float, default=None, help="Gemma's softmax last round's target (default: "
-                    "--sm-last; 1e-3 there cost T rows 1e-5 -> 2.6e-3, 11-11)")
-    ap.add_argument("--text-cgs", action="store_true", help="Gemma's softmax reciprocals: the shallower of seed + "
-                    "Newton and the Chebyshev-scaled Goldschmidt recursion (Llama prefill's SM_CHEB_GS)")
     ap.add_argument("--exp-target", type=float, default=1e-9, help="the softmax exp series' relative error "
                     "(Llama prefill's coarser exp: PF_SM_EXP_EPS)")
     ap.add_argument("--sm-rounds", type=int, default=4, help="softmax squaring rounds (exp on the 2^-r scaled scores)")
     ap.add_argument("--sm-loose", type=float, default=0.3, help="the softmax's intermediate reciprocals to this "
                     "relative error (the next round cancels it), the last to 1e-5")
     ap.add_argument("--kc-max", type=int, default=12, help="SANA cross-attention keys at most (BOS + prompt tokens)")
-    ap.add_argument("--text-kc-extra", type=int, default=12, help="Gemma's prompt keys at most past the public ones")
     ap.add_argument("--xa-center-margin", type=float, default=2.0, help="the centred scores' range over the recorded")
     ap.add_argument("--xa-umax", type=float, default=7.0, help="the largest top of a round's exp domain")
     ap.add_argument("--den-margin", type=float, default=16.0, help="la.den's band from its smallest recorded "
@@ -400,11 +369,11 @@ def main():
     ap.add_argument("--den-zero-margin", type=float, default=256.0, help="la.den: blocks whose zero class reaches the "
                     "1e-4 quantile from the first quantile above it over this margin")
     ap.add_argument("--deg-align", action="store_true", help="inv_sqrt / ln seeds ranked by eval_chebyshev's "
-                    "units (series_units + 4 per Newton) and Gemma's GELU over every degree: the fewest units, then "
-                    "the lowest degree, meeting the same targets")
+                    "units (series_units + 4 per Newton): the fewest units, then the lowest degree, meeting the same "
+                    "targets")
     a = ap.parse_args()
-    global SM_LAST, SM_CGS_TEXT, EXP_TARGET, TEXT_SM_LAST, DEG_ALIGN
-    SM_LAST, SM_CGS_TEXT, EXP_TARGET, TEXT_SM_LAST = a.sm_last, a.text_cgs, a.exp_target, a.text_sm_last
+    global SM_LAST, EXP_TARGET, DEG_ALIGN
+    SM_LAST, EXP_TARGET = a.sm_last, a.exp_target
     DEG_ALIGN = a.deg_align
     st = np.load(hf.scratch(a.stats), allow_pickle=True)
     summ = st["summary"].item()
@@ -424,11 +393,8 @@ def main():
         cfg["relu_k"].pop("sites")                      # the bounds stay relu's
     if os.path.exists(hf.scratch(a.stats_gemma)):
         sg = np.load(hf.scratch(a.stats_gemma), allow_pickle=True)
-        txt = calibrate_text(sg["summary"].item(), summ, sm_rounds=a.sm_rounds, sm_loose=a.sm_loose,
-                             kc_extra=a.text_kc_extra, resid=sg["resid"][None])
-        for key in ("ln", "exp", "recip"):
-            cfg[key].update(txt.pop(key))
-        cfg["resid_scale_text"] = txt.pop("resid_scale")
+        txt = calibrate_text(sg["summary"].item(), summ)
+        cfg["ln"].update(txt.pop("ln"))
         cfg.update(txt)
     cfg["meta"] = {"tool": "python -m perseus.examples.sana.fit", "args": vars(a)}
     with open(hf.scratch(a.out), "w") as f:

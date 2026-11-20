@@ -29,7 +29,9 @@ pub(crate) struct CcmmDesc {
     pub site: String,
     pub n_out: usize,
     pub b_transposed: bool,
-    pub merge: bool,
+    /// Outputs per SinCBoot: 1 (none), 2 (operands duplicated on batch l + 16) or 4 (on l + 8 k): the group's
+    /// outputs merged as o0 + X^1024 o1 + X^2048 o2 + X^3072 o3 (Horner on the X^1024 monomial, no key switch).
+    pub merge: u32,
     pub shift: u32,
     pub amax: f64,
     pub bmax: f64,
@@ -52,7 +54,11 @@ impl CcmmDesc {
             site: v.get("site").and_then(serde_json::Value::as_str).unwrap_or("ccmm").to_string(),
             n_out: v.get("n_out")?.as_u64()? as usize,
             b_transposed: b("b_transposed"),
-            merge: b("merge"),
+            merge: match v.get("merge") {
+                Some(serde_json::Value::Bool(m)) => if *m { 2 } else { 1 },
+                Some(x) => x.as_u64().unwrap_or(1).max(1) as u32,
+                None => 1,
+            },
             shift: v.get("shift").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32,
             amax: f("amax").unwrap_or(1.0),
             bmax: f("bmax").unwrap_or(1.0),
@@ -72,8 +78,8 @@ impl CcmmDesc {
     }
 }
 
-pub(crate) fn factors(c_unit: f64, amax: f64, bmax: f64, shift: u32, out_scale: f64, merge: bool) -> (f64, f64) {
-    let p = out_scale * (-(shift as f64)).exp2() / c_unit * if merge { 0.5 } else { 1.0 };
+pub(crate) fn factors(c_unit: f64, amax: f64, bmax: f64, shift: u32, out_scale: f64, merge: u32) -> (f64, f64) {
+    let p = out_scale * (-(shift as f64)).exp2() / c_unit / f64::from(merge.max(1));
     ((p * bmax / amax).sqrt(), (p * amax / bmax).sqrt())
 }
 
@@ -175,12 +181,16 @@ impl CcmmRt {
     }
 
     /// One CCMM on the service's operands `self.a[..16]`, `self.b[..16]` (already copied in): the outputs end in
-    /// `self.a[..n_out]` (n_out = 16, or 8 merged).
+    /// `self.a[..n_out]` (n_out = 16 / merge).
     /// `kappa`: the operating-point factor of this call (operands x sqrt(kappa) each, SinCBoot stage 0 x 1/kappa);
     /// `drop`: the output refreshes' raise drop.
     #[allow(clippy::too_many_arguments)]
-    pub fn run(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, route: &StcFirstRoute<'static, W, M>, bt: bool, fa: f64, fb: f64, shift: u32, merge: bool, kappa: f64, drop: u32) -> pc_gpu::Result<usize> {
+    pub fn run(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, route: &StcFirstRoute<'static, W, M>, bt: bool, fa: f64, fb: f64, shift: u32, merge: u32, kappa: f64, drop: u32) -> pc_gpu::Result<usize> {
         let (fa, fb) = (fa * kappa.sqrt(), fb * kappa.sqrt());
+        let g = merge.max(1) as usize;
+        if NBIG % g != 0 || !g.is_power_of_two() {
+            return Err(pc_gpu::Error::Shape { what: "ccmm service", msg: format!("merge {g} does not divide {NBIG} outputs") });
+        }
         if !(self.nf_ref > 0.0 && self.nf_split > 0.0) {
             return Err(pc_gpu::Error::Shape { what: "ccmm service", msg: "nf_ref / nf_split unset (Session.ccmm_prepare)".into() });
         }
@@ -212,21 +222,24 @@ impl CcmmRt {
         }
         let (ctx, s) = (cx.ctx, &cx.ex.compute);
         self.ccmm.mul_inplace(ctx, s, &mut self.a[..NBIG], &self.b[..NBIG], bt, None).map_err(|e| ctx_err("ccmm mul (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
-        let n_out = if merge {
-            for i in 0..NBIG / 2 {
-                let (lo, hi) = self.a.split_at_mut(2 * i + 1);
-                pc_gpu::limbs::merge_monomial(cx.ctx, cx.ex, &self.mono, &mut lo[2 * i], &hi[0])?;
+        let n_out = if g > 1 {
+            // group i: a[g i] + X^1024 (a[g i + 1] + X^1024 (...)), innermost first
+            for i in 0..NBIG / g {
+                for k in (0..g - 1).rev() {
+                    let (lo, hi) = self.a.split_at_mut(g * i + k + 1);
+                    pc_gpu::limbs::merge_monomial(cx.ctx, cx.ex, &self.mono, &mut lo[g * i + k], &hi[0])?;
+                }
             }
-            // the merged outputs a[2i] -> a[i] (buffer handles swap, no copy)
-            for i in 1..NBIG / 2 {
-                self.a.swap(i, 2 * i);
+            // the merged outputs a[g i] -> a[i] (buffer handles swap, no copy)
+            for i in 1..NBIG / g {
+                self.a.swap(i, g * i);
             }
-            NBIG / 2
+            NBIG / g
         } else {
             NBIG
         };
-        // output i comes from left operand i (merged: 2 i); runs of equal operand metadata share one SinCBoot call
-        let src = |i: usize| a_meta[if merge { 2 * i } else { i }];
+        // output i comes from left operand i (merged: g i); runs of equal operand metadata share one SinCBoot call
+        let src = |i: usize| a_meta[g * i];
         let mut lo = 0;
         while lo < n_out {
             let m = src(lo);
@@ -292,7 +305,7 @@ impl<'r> FinishExec<'static, W, M> for FinishSvc<'r> {
         if let Some(d) = CcmmDesc::parse(&f.desc) {
             let rt = self.ccmm.as_deref_mut().ok_or_else(|| ferr(f, "this session has no CCMM service (Session(ccmm=True))"))?;
             let c_unit = rt.c_unit.ok_or_else(|| ferr(f, "CCMM not calibrated (Session.ccmm_set)"))?;
-            if f.ins.len() != 2 * NBIG || f.outs.len() != d.n_out || d.n_out != if d.merge { NBIG / 2 } else { NBIG } {
+            if f.ins.len() != 2 * NBIG || f.outs.len() != d.n_out || d.n_out != NBIG / d.merge.max(1) as usize {
                 return Err(ferr(f, format!("{} inputs / {} outputs compiled for n_out {} (merge {})", f.ins.len(), f.outs.len(), d.n_out, d.merge)));
             }
             for (i, &sl) in f.ins.iter().enumerate() {
@@ -322,7 +335,11 @@ mod tests {
     #[test]
     fn desc() {
         let d = CcmmDesc::parse(r#"{"op": "ccmm", "site": "b0.qk", "out": 3, "n_out": 8, "b_transposed": true, "merge": true, "prepared_b": false, "shift": 2, "amax": 4.0, "bmax": 2.0, "out_scale": 0.5}"#).unwrap();
-        assert_eq!((d.n_out, d.b_transposed, d.merge, d.shift), (8, true, true, 2));
+        assert_eq!((d.n_out, d.b_transposed, d.merge, d.shift), (8, true, 2, 2));
+        let d4 = CcmmDesc::parse(r#"{"op": "ccmm", "site": "b0.pv", "out": 0, "n_out": 4, "merge": 4}"#).unwrap();
+        assert_eq!((d4.n_out, d4.merge), (4, 4));
+        let d1 = CcmmDesc::parse(r#"{"op": "ccmm", "site": "b0.pv", "out": 0, "n_out": 16, "merge": false}"#).unwrap();
+        assert_eq!(d1.merge, 1);
         assert!(CcmmDesc::parse(r#"{"op": "pcmm", "linear": "x"}"#).is_none());
         let site = |s: &str| CcmmDesc::parse(&format!(r#"{{"op": "ccmm", "site": "{s}", "n_out": 8}}"#)).unwrap().is_pv();
         assert!(site("pv3") && site("mpv3") && site("mpv11.1.0"));

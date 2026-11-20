@@ -1864,9 +1864,9 @@ impl PySession {
 
     /// CCMM service: one CCMM of fresh ciphertexts (16 + 16, any SinC slot values) with explicit operand factors
     /// (the calibration probe of ccmm.py `_calibrate`; the outputs are new session ciphertexts, 16 or 8 merged).
-    #[pyo3(signature = (a, b, b_transposed, fa, fb, shift=0, merge=false, kappa=1.0))]
+    #[pyo3(signature = (a, b, b_transposed, fa, fb, shift=0, merge=1, kappa=1.0))]
     #[allow(clippy::too_many_arguments)]
-    fn ccmm_probe(&self, py: Python<'_>, a: Vec<PyRef<'_, crate::fhe::PyCt>>, b: Vec<PyRef<'_, crate::fhe::PyCt>>, b_transposed: bool, fa: f64, fb: f64, shift: u32, merge: bool, kappa: f64) -> PyResult<Vec<crate::fhe::PyCt>> {
+    fn ccmm_probe(&self, py: Python<'_>, a: Vec<PyRef<'_, crate::fhe::PyCt>>, b: Vec<PyRef<'_, crate::fhe::PyCt>>, b_transposed: bool, fa: f64, fb: f64, shift: u32, merge: u32, kappa: f64) -> PyResult<Vec<crate::fhe::PyCt>> {
         use pc_core::ccmm_keys::NBIG;
         if a.len() != NBIG || b.len() != NBIG {
             return Err(PyValueError::new_err(format!("ccmm_probe: {} / {} operands, a matrix is {NBIG}", a.len(), b.len())));

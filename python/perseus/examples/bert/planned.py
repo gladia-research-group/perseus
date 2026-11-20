@@ -221,7 +221,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         xa = [fhe.encrypt(v, L, 1) for v in CC.from_mats(A)]
         xb = [fhe.encrypt(v.astype(np.complex128), L, 1) for v in CC.from_mats(B)]
         f = 2.0 ** -3
-        ys = sess.ccmm_probe(xa, xb, False, f, f, 0, False)
+        ys = sess.ccmm_probe(xa, xb, False, f, f, 0, 1)
         got = CC.to_mats([np.asarray(fhe.decrypt_slots_complex(y)) for y in ys])[:, :, :16]
         want = np.einsum("ijl,jkl->ikl", A, B)[:, :, :16]
         c_unit = float(np.real(np.vdot(want, got) / np.vdot(want, want))) / (f * f)
@@ -272,7 +272,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         fa, fb = np.sqrt(p * bmax / amax), np.sqrt(p * amax / bmax)
         xa = [fhe.encrypt(v, L, 1) for v in CC.from_mats(A)]
         xb = [fhe.encrypt(v.astype(np.complex128), L, 1) for v in CC.from_mats(Bm)]
-        ys = sess.ccmm_probe(xa, xb, bt, fa, fb, shift, True, kappa)
+        ys = sess.ccmm_probe(xa, xb, bt, fa, fb, shift, 2, kappa)
         got = np.array([np.asarray(fhe.decrypt_slots_complex(y)) for y in ys])
         P = osc * CC.exact(CC.from_mats(A), CC.from_mats(Bm), bt)
         want = np.array([CC.merged(P[2 * i], P[2 * i + 1], CC.w_theory()) for i in range(sc.NCT // 2)])

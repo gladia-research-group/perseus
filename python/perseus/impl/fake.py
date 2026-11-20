@@ -477,12 +477,12 @@ core = _Core()
 
 
 def make_fake(N=1024, hid=32, dim=24, H=4, H_real=3, E=128, E_real=96, limit=46, bts_out=34,
-              unit=2, strict=False, rot_steps=None, complex_payload=False, sparse_slots=(512, 1)):
+              unit=2, strict=False, rot_steps=None, complex_payload=False, sparse_slots=(512, 1), head_real=0):
     """A small fake session: (fhe, inf). The rotation band covers every step the port
     needs at these dims (linear shapes hid->hid, hid->E, E->hid, hid->N, N->hid, the
     attention/norm ladders)."""
     from .layout import Dims, attention_rot_steps, linear_rot_steps
-    dims = Dims(N, hid, dim, H, H_real, E, E_real)
+    dims = Dims(N, hid, dim, H, H_real, E, E_real, head_real=head_real)
     if rot_steps is None:
         steps = set()
         for d_in, d_out in ((hid, hid), (hid, E), (E, hid), (hid, N), (N, hid)):
@@ -490,6 +490,10 @@ def make_fake(N=1024, hid=32, dim=24, H=4, H_real=3, E=128, E_real=96, limit=46,
         steps |= attention_rot_steps(dims)
         from .layout import ladder_radix_bits, ladder_radix_steps
         steps |= ladder_radix_steps(dims, ladder_radix_bits())
+        if 0 < H_real and 2 * H_real <= H:
+            steps.add(H_real * (N // hid))           # Q off K's padding heads (examples/llama weights.q_pad_heads)
+            sh, t = H_real * (N // hid), N // hid    # SM_HEAD_PACK's push: the lane and half rotations of K and V
+            steps |= {(-r - sh) % N for r in range(t)} | {(1 - r - sh) % N for r in range(t)}
         rot_steps = steps | {(-s) % N for s in steps} | {s - N for s in steps}
     fhe = FakeFhe(rot_steps, limit=limit, bts_out=bts_out, unit=unit, strict=strict, slots=N,
                   complex_payload=complex_payload, sparse_slots=sparse_slots)

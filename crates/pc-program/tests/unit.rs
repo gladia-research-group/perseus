@@ -268,3 +268,25 @@ fn runtime_shadow_on_the_lean_chain() {
     let err = rule(&sh, &Kind::Bootstrap(0), &[CtMeta::new(48, 2)], &[], &sites).unwrap_err();
     assert!(err.starts_with("[bts_input_error]"), "{err}");
 }
+
+/// A SparseB route the runtime builds (SPARSE_BTS_SLOTS) past the fixed landing table, a model's own attention route
+/// (Gemma-2-2B: 128 head slots), lands where the table's SparseB routes land; the table itself is unchanged, and a
+/// route SparseB does not take keeps its classic landing.
+#[test]
+fn runtime_shadow_lands_built_sparse_b_routes() {
+    let mut c = cfg();
+    c.set_env("FIDESLIB_BTS_SPARSE_B", Some("1")).unwrap();
+    c.set_env("FIDESLIB_BTS_SPARSE_B_MAX", Some("1024")).unwrap();
+    let base = pc_program::compile::runtime_shadow(&c, &PlanConfig::default(), Some(34)).unwrap();
+    assert!(!base.cfg.bts.landings.contains_key(&128));
+    c.set_env("SPARSE_BTS_SLOTS", Some("128,1")).unwrap();
+    let sh = pc_program::compile::runtime_shadow(&c, &PlanConfig::default(), Some(34)).unwrap();
+    assert_eq!(sh.cfg.bts.landings[&128], sh.cfg.bts.landings[&256]);
+    let mut table = sh.cfg.bts.landings.clone();
+    table.remove(&128);
+    assert_eq!(table, base.cfg.bts.landings);
+    c.set_env("FIDESLIB_BTS_SPARSE_B_MAX", Some("64")).unwrap();
+    let classic = pc_program::compile::runtime_shadow(&c, &PlanConfig::default(), Some(34)).unwrap();
+    let budget = pc_program::compile::sparse_level_budget(&c).unwrap();
+    assert_eq!(classic.cfg.bts.landings[&128], pc_shadow::route::multi_stage_landing(budget, 2));
+}

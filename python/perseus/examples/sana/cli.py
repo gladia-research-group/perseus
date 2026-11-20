@@ -166,7 +166,6 @@ def to_png(arr, path: Path):
 
 
 def psnr(a, b) -> float:
-    import numpy as np
     return 10 * math.log10(255.0 ** 2 / max(float(((a - b) ** 2).mean()), 1e-12))
 
 
@@ -349,11 +348,10 @@ class Encrypted:
         """The encrypted image's latent (32, g, g) and the server's seconds."""
         import numpy as np
         import torch
-        from . import gemma as GM
         lay = self.check(prompt)
         m, run, T = self.model, self.run, self.term
         ids = torch.as_tensor(lay.ids[lay.n_pub:lay.n_pub + lay.n_tok])
-        rows = (m.Wg["embed_tokens.weight"][ids] * math.sqrt(GM.D)).numpy() / m.r_text
+        rows = m.embed(ids.tolist())
         n1, n2 = noises(seed, self.hf.RES)
         x_in = n1[0].numpy().astype(np.float64) * self.hf.scm_constants()["c_in"]
         own = m.emb_rows

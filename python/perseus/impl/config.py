@@ -107,6 +107,10 @@ class SoftmaxCfg:
     # 3, 4: +2; 6, 9, 10: +4), every refine round 16-20. Its numerator cannot be refreshed inside its recursion, so
     # round 0 runs as without gs_num (no per-key values in its recursion state: refreshable anywhere)
     gs_num_first: int = 0
+    # cap_fold: the exp's series is of exp(sf (cap tanh(s / cap) - c)) on the raw scores (tune.tune_capfold), the
+    # logit soft-cap folded in: clip_lo / clip_hi bound the raw scores and the runtime runs no score map
+    # (block.softcap_map) before this softmax; 0 = the series of exp(sf (s - c)) on the capped scores
+    cap_fold: int = 0
 
     def kc_r(self, i: int, kc: int) -> float:
         """cachemir_attention.cu: the per-step per-kc refine scaling."""
@@ -279,7 +283,8 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
         ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
         key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
         pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)),
-        gs_num_refresh=int(j.get("gs_num_refresh", 0)), gs_num_first=int(j.get("gs_num_first", 0)))
+        gs_num_refresh=int(j.get("gs_num_refresh", 0)), gs_num_first=int(j.get("gs_num_first", 0)),
+        cap_fold=int(j.get("cap_fold", 0)))
 
 
 def parse_gelu(j: dict) -> GeluCfg:

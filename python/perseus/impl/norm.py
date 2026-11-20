@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from .config import NormCfg
 from .layout import active_token_mask, lane_vec, lanes_mask, lanes_periodic, stride_mask
 from .poly import (eval_chebyshev, eval_remez_31, eval_taylor_inv_sqrt, im_cleanse, inv_sqrt_newton,
@@ -206,11 +208,12 @@ def norm(rt, x, cfg: NormCfg, pos: int):
     return ops.mult(centered, inv)
 
 
-def _rms_spru(rt, x2, xs, cfg: NormCfg, c: float):
+def _rms_spru(rt, x2, xs, cfg: NormCfg, c: float, xg=None):
     """rms_norm() with the token's mean square from ONE 1-slot refresh instead of the all-slot ladder (_norm_spru's
     rule for RMSNorm's one statistic): z = (N/d) b xs^2 on the token's slots, stamped one slot; the refresh (SPRU)
     returns its slot mean b m2 in every slot, one conjugation keeps the real part (2 b = s: s m2), and the Chebyshev
-    seed runs on u = s (m2 + eps c^2) - o in [-1, 1], the normalised argument rms_norm's seed takes on S / d."""
+    seed runs on u = s (m2 + eps c^2) - o in [-1, 1], the normalised argument rms_norm's seed takes on S / d.
+    `xg`: the input times its gamma (rms_norm's post-norm gamma), the product the inverse root scales (xs without)."""
     ops, d = rt.ops, rt.dims
     _a, _b, s, o = _spru_consts(cfg, d)
     (_ka, _fa), (kb, fb) = _spru_items(cfg, d, c)
@@ -224,16 +227,18 @@ def _rms_spru(rt, x2, xs, cfg: NormCfg, c: float):
     else:
         inv = init
     ops.bootstrap_hint(inv, ops.headroom(4))
-    return ops.mult(xs, inv)
+    return ops.mult(xs if xg is None else xg, inv)
 
 
-def rms_norm(rt, x, cfg: NormCfg, pos: int):
+def rms_norm(rt, x, cfg: NormCfg, pos: int, gamma=None, tag: str | None = None):
     """RMSNorm without its gamma (the next linear carries gamma / inv_out_scale):
     inv_out_scale * x / sqrt(mean(x^2) + eps) on the lanes. The norm() pipeline minus the mean:
     the centering scale c, the all-slot ladder of (c x)^2, and the Chebyshev seed + Newton
     inverse sqrt of z = c^2 (mean(x^2) + eps) (LN_CHEB's path; the config carries no Remez
     seed). The 1/d of the mean rides the seed's interval and the Newton constant, so the sum
-    S = sum (c x)^2 + d eps c^2 enters both directly (examples/rmsnorm_from_primitives.py)."""
+    S = sum (c x)^2 + d eps c^2 enters both directly (examples/rmsnorm_from_primitives.py). ``gamma`` (per feature,
+    `tag` names its mask): gamma / inv_out_scale applied here, for a norm no linear follows (Gemma-2's post norms), on
+    a second product of the input beside the sum of squares (no level on the norm's path)."""
     ops, d = rt.ops, rt.dims
     N, t, dr = d.N, d.t, d.dim
     if not cfg.cheb_coeffs:
@@ -242,15 +247,21 @@ def rms_norm(rt, x, cfg: NormCfg, pos: int):
     c = math.sqrt(c2)
     x2 = im_cleanse(ops, x)
     xs = rt.mult_mask(x2, ("ln.center", c), lambda: active_token_mask(N, dr, t, 0.5 * c))
+    xg = xs
+    if gamma is not None:
+        if tag is None:
+            raise ValueError("rms_norm: a gamma needs its mask tag")
+        g = np.asarray(gamma, dtype=np.float64)
+        xg = rt.mult_mask(x2, (tag, "gamma", c), lambda: lane_vec(0.5 * c * g, N, t))
     if cfg.spru and ops.ln_cheb:
-        return _rms_spru(rt, x2, xs, cfg, c)
+        return _rms_spru(rt, x2, xs, cfg, c, xg)
     S = ops.tag_reduce(rotsum(ops, ops.square(xs), 1, N), 1)       # broadcast constant
     S = ops.add(S, dr * cfg.epsilon * c2)
     init = eval_chebyshev(ops, S, cfg.cheb_coeffs, dr * cfg.cheb_lo, dr * cfg.cheb_hi)
     inv = inv_sqrt_newton_d2(ops, S, init, cfg.cheb_nr_iters,
                              1.0 / (dr * cfg.inv_out_scale * cfg.inv_out_scale))
     ops.bootstrap_hint(inv, ops.headroom(4))
-    return ops.mult(xs, inv)
+    return ops.mult(xg, inv)
 
 
 def _lane(rt, tag, part, v):

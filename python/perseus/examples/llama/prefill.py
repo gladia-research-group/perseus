@@ -1,6 +1,7 @@
 """Llama prefill on ``perseus.impl.prefill``: the prompt after BOS as complex chunk pairs, BOS K/V a public prefix."""
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -55,20 +56,31 @@ _GELU_JOINT = os.environ.get("PF_GELU_JOINT", "0") not in ("", "0")
 # PF_GLU_XU=1 (with the forced joint): x u before the refresh, the GLU output one level shallower
 _GLU_XU = os.environ.get("PF_GLU_XU", "0") not in ("", "0")
 _GLU_LEAN = os.environ.get("PF_GLU_LEAN", "0") not in ("", "0")
+# PF_PCMM_INFOLD=down,qkv,gate_up: the PCMM pre-division (pc-gpu matmul::pcmm::prediv: a linear whose stamp w_scale 2^shift passes
+# 2^PREDIV_STAMP_LOG2 lowers its inputs' scale by the excess on a level of its own, which the plan keeps free) folded
+# into the producer instead: the linear's weights carry 2^k more (its stamp drops by k to the limit) and its inputs' value
+# 2^-k less, on a plaintext the producer multiplies anyway (down: the GLU's GELU series coefficients), so they reach the
+# PCMM a level deeper, at the precision the pre-division gives them (k bits of their scale); qkv / gate_up: ln_1's /
+# ln_2's inverse square root's region mask (blocked.norm_blocked out_scale). The planner sees the
+# lowered stamps through PLAN_PCMM_STAMPS
+_INFOLD = {x for x in os.environ.get("PF_PCMM_INFOLD", "").split(",") if x}
+PREDIV_SHIFT, PREDIV_STAMP_LOG2 = 1, 20          # pc-gpu matmul::pcmm (plan.placer.planner PCMM_PREDIV_*)
 
 
-def glu_pair(rt, G, U, cfg, dense=False):
-    """2 (silu(g) u) per chunk of G, U = (A + i B) / 2, in the MLP layout or (`dense`) the PCMM's token layout."""
+def glu_pair(rt, G, U, cfg, dense=False, act: str = "silu", out_scale: float = 1.0):
+    """2 (silu(g) u) per chunk of G, U = (A + i B) / 2, in the MLP layout or (`dense`) the PCMM's token layout.
+    `out_scale` (dense): the output times it, on the activation's mask (PF_PCMM_INFOLD's down)."""
     ops, d = rt.ops, rt.dims
     gA, gB = split(ops, G)
     uA, uB = split(ops, U)
     if dense:
-        mask = ("pf.silu.dense", lambda s: np.full(d.N, s))
+        mask = ("pf.silu.dense" if out_scale == 1.0 else ("pf.silu.dense", out_scale),
+                lambda s: np.full(d.N, s * out_scale))
     else:
         from perseus.impl.layout import active_expanded_lanes
         mask = ("pf.silu.lanes", lambda s: active_expanded_lanes(d, s, d.tp_E))
     if _GELU_JOINT and dense and _GLU_XU and _GLU_LEAN:
-        a, b = gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB))      # 2 Re a + 2 i Re b with one conjugate
+        a, b = gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB), act=act)   # 2 Re a + 2 i Re b with one conjugate
         return ops.add(ops.add(a, ops.mult_i(b)), ops.conjugate(ops.sub(a, ops.mult_i(b))))
     if _GELU_JOINT and dense and _GLU_XU:
         hA, hB = (im_cleanse(ops, h) for h in gelu_joint(rt, gA, gB, cfg, mask, us=(uA, uB)))
@@ -118,7 +130,7 @@ def llama_prefill_block(rt, Xs, w, cfgs, ch: Chunks, rope, prefix_kv):
 
 def llama_prefill_block_pcmm(rt, Xs, P, cfgs, ch: Chunks, rope, prefix_kv):
     """llama_prefill_block with every linear a PCMM (P: LlamaPrefill.pcmm_weights), all in the token layout."""
-    ops, d = rt.ops, rt.dims
+    ops = rt.ops
     ln1, ln2, sm, act = cfgs
     tap = getattr(rt, "tap", None) or (lambda name, cts: None)
     skip = Xs
@@ -166,17 +178,32 @@ def _memdbg(rt, tag):
 
 
 def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, kv=None, layer=0, paged=None,
-                                last=None):
+                                last=None, post=None, softcap=None, act_fn: str = "silu"):
     """llama_prefill_block_pcmm on the channel-blocked layout (Xs[g][k]; whole heads per block).
     `paged` = (page, store): attention_paged on the K / V operands of the earlier pages in `store`. `last`: the only
     position the block's output must hold (every position's K / V is still computed): its attention alone
-    (blocked.attention_last), then it fills every lane of the residual stream."""
+    (blocked.attention_last), then it fills every lane of the residual stream. `post`: the (attention, MLP) output
+    norms' configs (arch.Arch.post_norms; their gammas P["post1"] / P["post2"]) before each residual add;
+    `softcap`: the attention logit soft-cap's config (block.softcap_map on the scores at scale 1)."""
     ops, K = rt.ops, B.Kkv
     ln1, ln2, sm, act = cfgs
+    smap = None
+    if softcap is not None and not sm.cap_fold:      # cap_fold: the soft-cap rides the exp's series
+        from .block import softcap_map
+        f = softcap_map(softcap)
+        smap = lambda r, x: f(r, x, 1.0, 0.0, scale=1.0)
+
+    def post_norm(i, X):
+        # the norm's output is 2 inv_out_scale LN (norm_blocked); post = (1 + w) / inv_out_scale: post / 2 lands
+        # (1 + w) LN on the residual's scale
+        with rt.step(("ln_1p", "ln_2p")[i]):
+            return BL.norm_blocked(rt, X, post[i], ch, B, rms=True, max_period=_NORM_PERIOD,
+                                   gamma=0.5 * P[("post1", "post2")[i]], tag=f"b{layer}.post{i + 1}")
     _memdbg(rt, "in")
     skip = Xs
+    infold = P.get("infold", {})
     with rt.step("ln_1"):
-        Y = BL.norm_blocked(rt, Xs, ln1, ch, B, rms=True, max_period=_NORM_PERIOD)
+        Y = BL.norm_blocked(rt, Xs, ln1, ch, B, rms=True, max_period=_NORM_PERIOD, out_scale=infold.get("qkv", 1.0))
     with rt.step("qkv"):
         Q, Kc, V = [], [], []
         for y in Y:
@@ -188,22 +215,28 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
             # the one-query attention whatever the other blocks run (CCMM included); paged, only the prompt's one page
             if paged is not None and (paged[0] != 0 or kv is not None):
                 raise ValueError("PF_LAST_QUERY: paged, a one-page prompt without a K / V hand-off")
-            O = BL.attention_last(rt, Q, Kc, V, sm, ch, B, last, rope=rope, prefixes=prefixes, kv=kv)
+            O = BL.attention_last(rt, Q, Kc, V, sm, ch, B, last, rope=rope, prefixes=prefixes, kv=kv, score_map=smap)
             skip = [BL.token_bcast(rt, skip[0], ch, B, last)]
         elif paged is not None:
+            if smap is not None:
+                raise NotImplementedError("a score map on the paged attention (PF_PAGED)")
             from perseus.impl.ccmm_paged import attention_paged
             O = attention_paged(rt, Q, Kc, V, sm, ch, B, paged[0], paged[1], rope=rope, prefixes=prefixes,
                                 kv=kv if kv is not None else [dict() for _ in range(B.Kkv)], layer=layer, final=len(paged) > 2 and paged[2])
         else:
-            O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
+            O = BL.attention_blocked(rt, Q, Kc, V, sm, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer,
+                                     score_map=smap)
     _memdbg(rt, "attn")
     with rt.step("out_proj"):
         A = [pcmm_run(rt, o, P["out"]) for o in O]
+    if post is not None:
+        A = post_norm(0, A)
     Xs = [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(A, skip)]
     _memdbg(rt, "out_proj")
     skip = Xs
     with rt.step("ln_2"):
-        Y = BL.norm_blocked(rt, Xs, ln2, ch, B, rms=True, max_period=_NORM_PERIOD)
+        Y = BL.norm_blocked(rt, Xs, ln2, ch, B, rms=True, max_period=_NORM_PERIOD,
+                            out_scale=infold.get("gate_up", 1.0))
     _memdbg(rt, "ln_2")
     out = []
     for y in Y:
@@ -211,11 +244,24 @@ def llama_prefill_block_blocked(rt, Xs, P, cfgs, ch: Chunks, rope, prefixes, B, 
             GU = pcmm_run(rt, y, P["gate_up"])
             nb = len(GU) // 2
         with rt.step("glu"):
-            H = [glu_pair(rt, g, u, act, dense=True) for g, u in zip(GU[:nb], GU[nb:])]
+            H = [glu_pair(rt, g, u, act, dense=True, act=act_fn, out_scale=P.get("infold", {}).get("down", 1.0))
+                 for g, u in zip(GU[:nb], GU[nb:])]
         with rt.step("down"):
             out.append(pcmm_run(rt, H, P["down"]))
+    if post is not None:
+        out = post_norm(1, out)
     _memdbg(rt, "mlp")
     return [[ops.add(a, s) for a, s in zip(ra, rs)] for ra, rs in zip(out, skip)]
+
+
+def _infold(lin) -> float:
+    """PF_PCMM_INFOLD on one PcmmLinear: its weights times 2^k (w_scale / 2^k), k its stamp's excess over the
+    pre-division limit; returns the 2^-k its inputs' producer folds in."""
+    if lin.shift <= PREDIV_SHIFT:
+        return 1.0
+    k = max(0, round(math.log2(lin.w_scale * 2.0 ** lin.shift)) - PREDIV_STAMP_LOG2)
+    lin.w_scale /= 2.0 ** k
+    return 2.0 ** -k
 
 
 def _layout_blocked():
@@ -226,6 +272,13 @@ class LlamaPrefill(LlamaModel):
     def __init__(self, inf, weights, cfgs, **kw):
         kw.setdefault("kv_offload", False)
         super().__init__(inf, weights, cfgs, **kw)
+        if self.arch.family != "llama":
+            # the blocked layout's block carries the post norms and the soft-cap (the CCMM path: only folded into the
+            # exp's series, SoftmaxCfg.cap_fold; attention_blocked refuses a score map there); paging does not yet
+            bad = [k for k, ok in (("PF_LAYOUT=blocked", _layout_blocked()),
+                                   ("PF_PAGED off", os.environ.get("PF_PAGED", "0") in ("", "0"))) if not ok]
+            if bad:
+                raise NotImplementedError(f"the {self.arch.family} prefill needs: {', '.join(bad)}")
 
     def prefix_kv(self, b):
         """Block b's BOS key / value as slot vectors on every lane (RoPE at position 0 is the identity)."""
@@ -233,9 +286,9 @@ class LlamaPrefill(LlamaModel):
         if not hasattr(self, "_bos"):
             self._bos = self.w.bos_kv(self.n_layers)
         k, v = self._bos[b]
-        dh = d.dim // self.H
-        kf = PX.expanded_heads(k, self.H, self.H_kv, dh)
-        vf = PX.expanded_heads(v, self.H, self.H_kv, dh)
+        dh = d.d_head_real
+        kf = PX.expanded_heads(k, self.H, self.H_kv, dh, d.H)     # the model's head slots (Gemma-2: 16 of 256)
+        vf = PX.expanded_heads(v, self.H, self.H_kv, dh, d.H)
         if _layout_blocked():
             B = self.blocks
             kg, vg = B.kv_vec(kf), B.kv_vec(vf)
@@ -272,7 +325,9 @@ class LlamaPrefill(LlamaModel):
                 last = self.last_position(ch) if b == self.n_layers - 1 else None
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
-                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b, last=last)
+                                                     self.rope, self.prefix_kv(b), B, kvs, layer=b, last=last,
+                                                     post=self.cfgs.post(b), softcap=self.cfgs.softcap(b),
+                                                     act_fn=self.arch.act)
                 self.exit_stage(b, cap)
                 if on_kv is not None:
                     on_kv(b, [x["K"] for x in kvs], [x["V"] for x in kvs])
@@ -281,7 +336,6 @@ class LlamaPrefill(LlamaModel):
                     on_block(b, Xs, time.time() - t0)
             return Xs, ch, self.token_end(0)
         Xs = encode_prompt(self.rt, rows, ch)
-        ops = self.rt.ops
         for b in range(self.n_layers):
             t0 = time.time()
             w = self.pcmm_weights(b) if _PCMM else self.block_weights(b)
@@ -331,7 +385,9 @@ class LlamaPrefill(LlamaModel):
                 with self.rt.step(f"blk{b}"):
                     Xs = llama_prefill_block_blocked(self.rt, Xs, self.pcmm_weights(b), self.cfgs.block(b), ch,
                                                      self.rope, self.prefix_kv(b), B, kvs, layer=b,
-                                                     paged=(p, stores[b], p == len(pages) - 1), last=last)
+                                                     paged=(p, stores[b], p == len(pages) - 1), last=last,
+                                                     post=self.cfgs.post(b), softcap=self.cfgs.softcap(b),
+                                                     act_fn=self.arch.act)
                 self.rt.rearm_plan = None
                 self.exit_stage(b, cap)
                 if on_kv is not None:
@@ -364,9 +420,27 @@ class LlamaPrefill(LlamaModel):
         t_enc = B.t if blk_l else d.t
         tag = f"blk{t_enc}." if blk_l else ""
 
+        # the hidden / head blocks that hold real channels / heads (Blocks.Kh / Ka): a padded model's linears skip the
+        # rest (Gemma-2: hidden 5 of 8 blocks, heads 4 of 8; their outputs would be exact zeros)
+        trim = blk_l and (B.Kh, B.Ka) != (B.K, B.K)
+
+        # PF_ATTN=ccmm with d_head 2 D (Gemma-2's 256): Q / K / V columns and the out rows in the CCMM's half-head view
+        # (sinc.half_perm: Llama's SinC maps as they are); not the PF_LAST_QUERY block, whose attention_last reads the
+        # native channel order (its RoPE and prefix vectors)
+        hv = (blk_l and os.environ.get("PF_ATTN", "") == "ccmm" and d.d_head == 256
+              and not (_LAST_QUERY and b == self.n_layers - 1))
+        if hv:
+            from perseus.impl import sinc as SC
+        hc = (lambda W: SC.half_cols(W, B.nch)) if hv else (lambda W: W)
+        hr = (lambda W: SC.half_rows(W, B.nch)) if hv else (lambda W: W)
+
         def enc(name, build, scale):
             # cached at scale 1: a power-of-two scale only moves w_scale
             tg = f"blk{t_enc}g{B.G}." if blk_l and B.G > 1 and name in ("qkv", "out") else tag
+            if trim:
+                tg += f"h{B.Kh}a{B.Ka}."
+            if hv and name in ("qkv", "out"):
+                tg += "hv."
             f = self.w.dir / f"pcmm3.w{wb}.{tg}b{b}.{name}.npz"
             if not f.exists():
                 lin = PcmmLinear.encode(build(), t_enc, 1.0, name=name, wbits=wb)
@@ -374,18 +448,28 @@ class LlamaPrefill(LlamaModel):
                 np.savez(tmp, Wd=lin.Wd, ws=lin.w_scale, n=np.array([lin.n_in, lin.n_out]))
                 os.replace(tmp, f)
             z = np.load(f)
-            nm = f"b{b}.{name}"
+            nm = f"{getattr(self, 'lin_prefix', 'b')}{b}.{name}"      # (an encoder inside another model: its own)
             return PcmmLinear(int(z["n"][0]), int(z["n"][1]), pinned_planes(self.core, z["Wd"]), float(z["ws"]) / scale,
                               band_shift(nm), None, nm, t_enc if blk_l else 0)
 
         sc = [float(x) for x in os.environ.get("PF_PCMM_LLAMA_SCALES", "0.25,1,0.25,0.5").split(",")]
         if blk_l:
-            Er = d.E_real
-            cache[b] = {"qkv": enc("qkv", lambda: np.hstack([B.kv_cols(mats().K), B.kv_cols(mats().V),
-                                                             B.group_cols(mats().Q)]), sc[0]),
-                        "out": enc("out", lambda: B.group_rows(mats().O), sc[1]),
-                        "gate_up": enc("gate_up", lambda: np.hstack([mats().Gate[:, :Er], mats().Up[:, :Er]]), sc[2]),
-                        "down": enc("down", lambda: mats().Down[:Er], sc[3])}
+            Er, h, a = d.E_real, B.Kh * B.nch, B.Ka * B.nch
+            # the MLP width on whole blocks (gate / up / down: Gemma-2's 9216 at nch 2048 is 4.5): zero channels
+            Ep = -(-Er // B.nch) * B.nch
+            pc = (lambda W: W) if Ep == Er else (lambda W: np.pad(W, ((0, 0), (0, Ep - W.shape[1]))))
+            pr = (lambda W: W) if Ep == Er else (lambda W: np.pad(W, ((0, Ep - W.shape[0]), (0, 0))))
+            cache[b] = {"qkv": enc("qkv", lambda: np.hstack([hc(B.kv_cols(mats().K)), hc(B.kv_cols(mats().V)),
+                                                             hc(B.group_cols(mats().Q)[:, :a])])[:h], sc[0]),
+                        "out": enc("out", lambda: hr(B.group_rows(mats().O)[:a, :h]), sc[1]),
+                        "gate_up": enc("gate_up", lambda: np.hstack([pc(mats().Gate[:h, :Er]), pc(mats().Up[:h, :Er])]),
+                                       sc[2]),
+                        "down": enc("down", lambda: pr(mats().Down[:Er, :h]), sc[3])}
+            if self.arch.post_norms:
+                cache[b].update(post1=np.asarray(mats().post1, dtype=np.float64),
+                                post2=np.asarray(mats().post2, dtype=np.float64))
+            if _INFOLD:
+                cache[b]["infold"] = {n: _infold(cache[b][n]) for n in _INFOLD & {"down", "qkv", "gate_up"}}
             return cache[b]
         cache[b] = {"qkv": enc("qkv", lambda: np.hstack([mats().K, mats().V, mats().Q]), sc[0]),
                     "out": enc("out", lambda: mats().O, sc[1]),
@@ -407,13 +491,40 @@ def plain_logits(model, hidden):
     if R is not None:
         h = h @ R.T
     eps = float(st.config["rms_norm_eps"])
-    n = h / np.sqrt((h * h).mean(axis=1, keepdims=True) + eps) * st.tensor("model.norm.weight").astype(np.float64)
-    W = st.tensor("lm_head.weight")
-    return np.concatenate([n @ W[i:i + 8192].astype(np.float64).T for i in range(0, W.shape[0], 8192)], axis=1)
+    ar = model.arch
+    n = h / np.sqrt((h * h).mean(axis=1, keepdims=True) + eps) * (ar.norm_offset + st.tensor("model.norm.weight")
+                                                                 .astype(np.float64))
+    W = st.tensor("model.embed_tokens.weight" if ar.tied else "lm_head.weight")
+    lg = np.concatenate([n @ W[i:i + 8192].astype(np.float64).T for i in range(0, W.shape[0], 8192)], axis=1)
+    return model.post_logits(lg)            # the Arch's final logit soft-cap (Gemma-2)
+
+
+def _hf_hidden(model, tokens, n_layers):
+    """Per-block hidden rows of positions 1.. from the HF fp32 model on the CPU (each decoder layer's output)."""
+    import torch
+    from . import hf
+    m = hf.load_model(device="cpu")
+    out = {}
+    def hook(b):
+        def f(_m, _i, o):
+            y = o[0] if isinstance(o, tuple) else o          # a decoder layer returns its hidden (tuple or tensor)
+            out[b] = y[0, 1:].double().numpy()
+        return f
+    hs = [layer.register_forward_hook(hook(b)) for b, layer in enumerate(m.model.layers[:n_layers])]
+    with torch.no_grad():
+        m(torch.tensor([list(tokens)]))
+    for h in hs:
+        h.remove()
+    return [out[b] for b in range(n_layers)]
 
 
 def exact_hidden(model, tokens, n_layers):
-    """Float64 Llama blocks on the prompt (BOS included): per-block hidden rows of positions 1.., rotated basis."""
+    """Float64 Llama blocks on the prompt (BOS included): per-block hidden rows of positions 1.., rotated basis.
+    Another architecture (arch.Arch): the HF fp32 model's (_hf_hidden)."""
+    if model.arch.family != "llama":
+        if rotation_of(model.cfgs, model.rt.dims.dim) is not None:
+            raise ValueError("exact_hidden: a residual rotation off Llama")
+        return _hf_hidden(model, tokens, n_layers)
     st = model.w.store
     c = st.config
     H, H_kv = int(c["num_attention_heads"]), int(c["num_key_value_heads"])

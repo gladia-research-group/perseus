@@ -22,8 +22,8 @@ class Blocks:
     def __post_init__(self):
         if self.d.hid % self.nch or self.nch % self.d.d_head or self.t > self.d.d_head:
             raise ValueError("Blocks: nch must split hid into whole heads, with t <= d_head (score ct coverage)")
-        if self.G > 1 and (self.K % self.G or self.d.H_real != self.d.H):
-            raise ValueError("Blocks: GQA needs whole KV blocks and no padded heads")
+        if self.G > 1 and (self.Ka % self.G or (self.d.H_real != self.d.H and self.d.H_real % (self.G * self.hg))):
+            raise ValueError("Blocks: GQA needs whole KV blocks (padded heads: whole head blocks per query group)")
 
     @property
     def K(self): return self.d.hid // self.nch
@@ -32,7 +32,17 @@ class Blocks:
     @property
     def hg(self): return self.nch // self.d.d_head          # heads per block
     @property
-    def Kkv(self): return self.K // self.G                  # K / V blocks; Q block q reads K / V block q % Kkv
+    def Kh(self):
+        """Hidden blocks with real channels: the residual stream's (Gemma-2's 2304 of a 4096 hidden: 5 of 8)."""
+        return -(-self.d.dim // self.nch)
+
+    @property
+    def Ka(self):
+        """Head blocks with real heads: the attention's (Gemma-2's 8 of 16 head slots: 4 of 8)."""
+        return min(self.K, -(-self.d.H_real // self.hg))
+
+    @property
+    def Kkv(self): return self.Ka // self.G                 # K / V blocks; Q block q reads K / V block q % Kkv
 
     def real(self, k):
         return int(min(max(self.d.dim - k * self.nch, 0), self.nch))
@@ -43,19 +53,27 @@ class Blocks:
         return Dims(self.d.N, self.nch, self.d.d_head_real * hr, self.hg, hr, self.d.N, self.d.N)
 
     def head_perm(self):
-        """Head-grouped index of interleaved feature r = j H + h: block (h % G) Kkv + kv // H', local j H' + kv % H'."""
+        """Head-grouped index of interleaved feature r = j H + h: block (h % G) Kkv + kv // H', local j H' + kv % H'.
+        A padded model's padded heads (h >= H_real) go to the blocks past the real ones (Ka..: trimmed, never read)."""
         r = np.arange(self.d.hid)
         H, hg = self.d.H, self.hg
         j, h = r // H, r % H
         kv, g = h // self.G, h % self.G
-        return (g * self.Kkv + kv // hg) * self.nch + j * hg + (kv % hg)
+        real = (g * self.Kkv + kv // hg) * self.nch + j * hg + (kv % hg)
+        hr = self.d.H_real
+        if self.G == 1 or hr == H:
+            return real
+        p = h - hr
+        pad = (self.Ka + p // hg) * self.nch + j * hg + (p % hg)
+        return np.where(h < hr, real, pad)
 
     def kv_perm(self):
         """(source column, index in the K / V blocks) of each KV head once."""
         r = np.arange(self.d.hid)
         h = r % self.d.H
-        keep = h % self.G == 0
-        return r[keep], self.head_perm()[keep]
+        dst = self.head_perm()
+        keep = (h % self.G == 0) & (dst < self.Kkv * self.nch)     # padded heads past the real head blocks: zero
+        return r[keep], dst[keep]
 
     def kv_cols(self, W):
         src, dst = self.kv_perm()
@@ -128,7 +146,7 @@ def blocked_slots(rows, ch: Chunks, B: Blocks):
     out = []
     for g in range(ch.n_ct):
         blk = []
-        for k in range(B.K):
+        for k in range(B.Kh):
             v = np.zeros(N, dtype=np.complex128)
             for half in (0, 1):
                 if ch.has(2 * g + half):
@@ -173,7 +191,7 @@ def token_of(rt, Xs, ch: Chunks, B: Blocks, p: int):
     c = p // ch.t
     g, half, lane = c // 2, c % 2, p - c * ch.t
     out = None
-    for k in range(B.K):
+    for k in range(B.Kh):
         n = B.real(k)
         if n == 0:
             continue
@@ -204,7 +222,7 @@ def token_of(rt, Xs, ch: Chunks, B: Blocks, p: int):
 def token_of_rot_steps(B: Blocks, lane: int) -> set[int]:
     """The rotation steps token_of takes for a position on `lane`."""
     d = B.d
-    steps = {lane} | {-k * B.nch * d.t for k in range(1, B.K)}
+    steps = {lane} | {-k * B.nch * d.t for k in range(1, B.Kh)}
     steps |= {(B.t - d.t) << j for j in range(max(1, int(B.nch - 1).bit_length()))}
     return {s % d.N for s in steps if s % d.N}
 
@@ -223,8 +241,15 @@ def _region(N, t, R, k, val):
     return np.where((np.arange(N) // t) % R == k, val, 0.0)
 
 
-def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512, row0=None):
+def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512, row0=None,
+                 gamma=None, tag: str | None = None, out_scale: float = 1.0):
     """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks.
+
+    `out_scale`: the output times it, on the inverse square root's region mask (no level; PF_PCMM_INFOLD).
+
+    `gamma` (RMSNorm; per hidden channel, `tag` names its masks): the output times gamma, on a second product of the
+    input beside the statistic's (no level): a norm no linear follows (Gemma-2's post norms, whose output joins the
+    residual).
 
     `row0(g, k)`: the first channel row of block k's real channels for chunk pair g (default 0). A partly filled
     block shared by several chunk pairs (the same ciphertext passed as Xs[g][k] for each of them, pair g's
@@ -248,6 +273,11 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
     # zladder (LayerNorm only): one complex ladder for the mean and the variance instead of two
     zl = not rms and bool(getattr(cfg, "zladder", 0)) and bool(cfg.cheb_coeffs) and ops.ln_cheb
     alpha = 0.5 / dr
+    if gamma is not None and not (rms and tag):
+        raise ValueError("norm_blocked: a gamma needs RMSNorm and its mask tag")
+    gpad = None if gamma is None else np.concatenate([np.asarray(gamma, dtype=np.float64),
+                                                       np.zeros(B.K * B.nch - len(gamma))])
+    xgs = {}                                 # (g, half) -> the gamma'd inputs the output takes
     halves = []                              # (g, half, lane scales, [x_k], statistic)
     for g, blk in enumerate(Xs):
         for half in (0, 1):
@@ -255,14 +285,21 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
                 continue
             pos = ch.lanes(2 * g + half)
             cs = tuple(round(math.sqrt(cfg.c_eff_sq(p)), 12) for p in pos)
-            xs = []
+            xs, xg = [], []
             for k, X in enumerate(blk):
                 if B.real(k) == 0:
                     xs.append(None)
+                    xg.append(None)
                     continue
                 x2 = half_of(X, half)
                 xs.append(rt.mult_mask(x2, ("bl.center", k, cs) + ((r0(g, k),) if r0(g, k) else ()),
                                        lambda g=g, k=k, cs=cs: rows(g, k, [0.5 * c_ for c_ in cs])))
+                if gpad is not None:
+                    gk = np.repeat(gpad[k * B.nch:(k + 1) * B.nch], t)
+                    xg.append(rt.mult_mask(x2, ("bl.center.g", tag, k, cs) + ((r0(g, k),) if r0(g, k) else ()),
+                                           lambda g=g, k=k, cs=cs, gk=gk: rows(g, k, [0.5 * c_ for c_ in cs]) * gk))
+            if gpad is not None:
+                xgs[(g, half)] = xg
             live = [x for x in xs if x is not None]
             if rms:
                 sq = None
@@ -334,10 +371,11 @@ def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_peri
         inv = inv_sqrt_newton_d2(ops, V, init, cfg.cheb_nr_iters, xsc)
         ops.bootstrap_hint(inv, ops.headroom(4))
         for k, (g, half, _cs, xs, _st) in enumerate(grp):
-            ik = rt.mult_mask(inv, ("bl.nreg", R, k, 1.0), lambda R=R, k=k: _region(N, t, R, k, 1.0))
+            ik = rt.mult_mask(inv, ("bl.nreg", R, k, out_scale), lambda R=R, k=k: _region(N, t, R, k, out_scale))
             if R > 1:
                 ik = ops.rotate_and_sum(ik, t, R * t)
-            outs[(g, half)] = [None if x is None else im_cleanse(ops, ops.mult(x, ik)) for x in xs]
+            xo = xgs.get((g, half), xs)
+            outs[(g, half)] = [None if x is None else im_cleanse(ops, ops.mult(x, ik)) for x in xo]
     res = []
     for g, blk in enumerate(Xs):
         row = []
@@ -372,41 +410,44 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
     return rt.add_mask(X2, ("bl.shift", id(shift), k, na, nb, scale), build)
 
 
-def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None, layer=0):
+def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None, layer=0,
+                      score_map=None):
     """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ...
     `kv`: a list receiving each K / V block's per-chunk real K (post-RoPE) / V (GQA only).
-    PF_ATTN=ccmm: the CCMM path (ccmm_attn.py)."""
+    PF_ATTN=ccmm: the CCMM path (ccmm_attn.py). `score_map`: prefill_attention's (the logit soft-cap)."""
     from . import ccmm
     if ccmm.enabled():
+        if score_map is not None:
+            raise NotImplementedError("attention_blocked: a score map on the CCMM path (PF_ATTN=ccmm)")
         from .ccmm_attn import attention_ccmm
         if kv is None:
             kv = [dict() for _ in range(B.Kkv)]
         return attention_ccmm(rt, Q, K, V, cfg, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
     if B.G > 1:
-        outs = [[None] * B.K for _ in Q]
+        outs = [[None] * B.Ka for _ in Q]
         for b in range(B.Kkv):
             qs = [b + g * B.Kkv for g in range(B.G)]
             pre = prefixes[b] if prefixes is not None else None
             o = prefill_attention(sub_rt(rt, B, b), [[q[i] for q in Q] for i in qs], [x[b] for x in K],
                                   [x[b] for x in V], cfg, ch, rope=rope, prefix=pre, shared=True,
-                                  kv=None if kv is None else kv[b])
+                                  kv=None if kv is None else kv[b], score_map=score_map)
             for i, oi in zip(qs, o):
                 for g in range(len(Q)):
                     outs[g][i] = oi[g]
         return outs
     outs = []
-    for k in range(B.K):
+    for k in range(B.Ka):
         if B.group_dims(k).H_real == 0:
             outs.append([None] * len(Q))
             continue
         pre = prefixes[k] if prefixes is not None else None
         outs.append(prefill_attention(sub_rt(rt, B, k), [q[k] for q in Q], [x[k] for x in K], [x[k] for x in V],
-                                      cfg, ch, rope=rope, prefix=pre))
+                                      cfg, ch, rope=rope, prefix=pre, score_map=score_map))
     ops = rt.ops
     res = []
     for g in range(len(Q)):
         row = []
-        for k in range(B.K):
+        for k in range(B.Ka):
             o = outs[k][g]
             row.append(o if o is not None else ops.sub(Q[g][k], Q[g][k]))
         res.append(row)
@@ -448,7 +489,8 @@ def token_bcast(rt, row, ch: Chunks, B: Blocks, p: int):
     return out
 
 
-def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, prefixes=None, kv=None):
+def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, prefixes=None, kv=None,
+                   score_map=None):
     """attention_blocked for query position p alone (the last of a causal prompt, any of a bidirectional one: its keys
     are every unpadded token): O[0][k] holds p's output on every lane of both halves. Per head group k, q_p on every
     lane times the complex K of chunk pair g (keys of chunk 2g real, chunk 2g + 1 imaginary) is summed over the head
@@ -530,17 +572,17 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
             V[gp][b] = rt.add_mask(V[gp][b], ("bl.last.pre.v", B.nch, b, ch.T),
                                    lambda vvec=vvec, ph=ph: np.where(at, (0.5j if ph else 0.5) * vvec, 0.0))
         n_pre = 1
-    ks = [k for k in range(B.K) if B.group_dims(k).H_real]
+    ks = [k for k in range(B.Ka) if B.group_dims(k).H_real]
     gd = B.group_dims(0)
-    tH, R = gd.tH, 2 * G * B.K
+    tH, R = gd.tH, 2 * G * B.Ka
     if (N // tH) % R:
-        raise ValueError(f"attention_last: {2 * G} chunks x {B.K} groups do not tile the {N // tH} score blocks")
+        raise ValueError(f"attention_last: {2 * G} chunks x {B.Ka} groups do not tile the {N // tH} score blocks")
     pair = (lambda g: (("pair", g, G),)) if G > 1 else (lambda g: ())
     cls = (np.arange(N) // tH) % R
     head = (np.arange(N) % tH) // t
-    valid = head < np.array([B.group_dims(r % B.K).H_real for r in range(R)])[cls]
+    valid = head < np.array([B.group_dims(r % B.Ka).H_real for r in range(R)])[cls]
     kc = (ch.n_keys if ch.bidir else p + 1) + n_pre
-    valid &= (cls // B.K) * t + np.arange(N) % t < kc              # the key on each lane: chunk h, lane i
+    valid &= (cls // B.Ka) * t + np.arange(N) % t < kc              # the key on each lane: chunk h, lane i
     gscale = 1.0 / math.sqrt(gd.d_head_real)
     T = None
     for k in ks:
@@ -551,12 +593,14 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
             q = rope_lanes(sub_rt(rt, B, k), q, rope, [ch.base + p] * t, "bl.last.rope.q")
         for g in range(G):
             s = rotsum(ops, ops.mult(q, K[g][kvb(k)]), tH, N)        # (s_2g + i s_2g+1) / 2 on every block
-            c0, c1 = 2 * g * B.K + k, (2 * g + 1) * B.K + k
+            c0, c1 = 2 * g * B.Ka + k, (2 * g + 1) * B.Ka + k
             gs = gscale * kscale
             m = np.where(cls == c0, gs, 0.0) + np.where(cls == c1, -1j * gs, 0.0)
             s = rt.mult_mask(s, ("bl.last.s", B.nch, k, gs) + pair(g), lambda m=m: m)
             T = s if T is None else ops.add(T, s)
     S = im_cleanse(ops, T)                                         # scores of chunk c of group k on class c K + k
+    if score_map is not None:                                      # the logit soft-cap (scale 1), before the masks
+        S = score_map(rt, S)
     mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     skey = ("bl.last.score", B.nch, cfg.clip_lo, mean) + ((("keys", kc),) if ch.bidir else ()) + ((G,) if G > 1 else ())
@@ -583,7 +627,7 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
     for i, r in enumerate(rounds):
         if i:
             Z = ops.square(im_cleanse(ops, Y))
-        D = ops.add(Z, ops.rotate(Z, B.K * tH)) if G == 1 else rotsum(ops, Z, B.K * tH, R * tH)   # every chunk's keys
+        D = ops.add(Z, ops.rotate(Z, B.Ka * tH)) if G == 1 else rotsum(ops, Z, B.Ka * tH, R * tH)   # every chunk's keys
         D = rotsum(ops, D, 1, t)                                   # the key sum on each group's first lane
         a, b, iters = r[0] * r[3], r[1] * r[3] * r[3], r[2]
         cv = None if not cheb else ([[r[4][0][j]] * t for j in range(iters - 1)], [r[4][1]] * t)
@@ -592,13 +636,13 @@ def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, p
                          ("last", round(a, 12), round(b, 15)), cv)
         Y = ops.mult(Z, rotsum(ops, rc, -1, t))
     outs = []
-    for k in range(B.K):
+    for k in range(B.Ka):
         if k not in ks:
             outs.append(ops.sub(Q[0][k], Q[0][k]))
             continue
         acc = None
         for g in range(G):
-            m = np.where(cls == 2 * g * B.K + k, 1.0, 0.0) + np.where(cls == (2 * g + 1) * B.K + k, -1j, 0.0)
+            m = np.where(cls == 2 * g * B.Ka + k, 1.0, 0.0) + np.where(cls == (2 * g + 1) * B.Ka + k, -1j, 0.0)
             pc = rotsum(ops, rt.mult_mask(Y, ("bl.last.pv", B.nch, k) + pair(g), lambda m=m: m), tH, R * tH)
             pv = ops.mult(pc, V[g][kvb(k)])                                # (P_2g - i P_2g+1) (V_2g + i V_2g+1)
             acc = pv if acc is None else ops.add(acc, pv)
@@ -628,4 +672,11 @@ def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
             for par in (0, 1):
                 s = (2 * g + par) * gd.tH + Bb * (g % (B.t // Bb))     # lane step g mod t / Bb (d_head > t)
                 steps |= {s, -s, s - B.t, B.t - s}
+    if prefill._SM_KPACK:       # the half-window move both ways and the denominator's window / half-window ladders
+        W = gd.d_head >> prefill._PACK if prefill._BSGS and prefill._ATTN_PAIR and prefill._PACK else gd.d_head
+        h = W // 2
+        steps |= {h * gd.tH, -h * gd.tH}
+        for a, b in ((W * gd.tH, gd.N), (gd.tH, h * gd.tH), (-gd.tH, h * gd.tH)):
+            for grp in ladder_chunks(a, b, max(1, radix_bits)):
+                steps.update(grp)
     return steps

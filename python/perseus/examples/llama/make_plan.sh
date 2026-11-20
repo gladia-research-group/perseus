@@ -1,8 +1,11 @@
 #!/bin/bash
-# make_plan.sh — plan the bootstraps of a Llama capture (CPU only), with the recipe and runtime levers of the shipped
-# GPT-2 arm (bootstrap_placements/gpt2_decode: SparseB on the sparse route (256 slots: Llama's tH), SPRU on the 1-slot route,
-# the exact post-raise scaling, the real dense route, raise drops 1,3,5):
+# make_plan.sh — plan the bootstraps of a decoder capture (CPU only; Llama, Gemma-2: examples/llama/arch.py), with the
+# recipe and runtime levers of the shipped GPT-2 arm (bootstrap_placements/gpt2_decode: SparseB on the sparse route (the
+# attention's per-head block tH: Llama-3-8B 256, Gemma-2-2B 128), SPRU on the 1-slot route, the exact post-raise scaling,
+# the real dense route, raise drops 1,3,5):
 #   bash python/perseus/examples/llama/make_plan.sh graphs/llama31_8b_decode llama31_8b_decode
+#   PERSEUS_DECODER=gemma2_2b bash python/perseus/examples/llama/make_plan.sh graphs/gemma2_2b_decode gemma2_2b_decode
+# $PERSEUS_DECODER picks the model as in the runners (--model); DECODER_TH skips reading its layout.
 # To reproduce a shipped plan use scripts/make_plans.sh <plan> (or python/tests/test_paper_plans.py <plan>): it exports
 # the plan's PLAN_CMD.txt recipe= line, runs its stages and its rd= pass. Run bare, this script falls back to the
 # built-in recipe below, which no shipped plan uses as is.
@@ -37,26 +40,29 @@ PHASE="${3:-decode}"
 case "$PHASE" in decode | prefill) ;; *) echo "make_plan.sh: stage $PHASE (decode | prefill)" >&2; exit 2 ;; esac
 if [[ -d "$GRAPH_DIR" && ! -d "$REPO/$GRAPH_DIR" ]]; then GRAPH_DIR="$(cd "$GRAPH_DIR" && pwd)"; fi
 cd "$REPO"
+PY="${PYTHON:-$REPO/.venv/bin/python}"
+TH="${DECODER_TH:-$(PYTHONPATH="$PKG/..${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c \
+    'from perseus.examples.llama import hf, weights as W; print(W.llama_dims(hf.config()).tH)')}"
 RECIPE="MAX_LEVEL=50 BTS_LEVEL=34 SRC_LEVEL=36 CACHE_READ_LEVEL=36 PLAN_LEVEL_UNIT=2 PLAN_CF_MAX=20 PLAN_NO_PRESCALE=1 \
-PLAN_ACC_CHAIN=n32l PLAN_MAG_SAFETY=2 PLAN_SPARSE_BTS_OUT=1:16,256:24 PLAN_DELIB_LANDING_REMAP=24:14 \
+PLAN_ACC_CHAIN=n32l PLAN_MAG_SAFETY=2 PLAN_SPARSE_BTS_OUT=1:16,$TH:24 PLAN_DELIB_LANDING_REMAP=24:14 \
 PLAN_HINT_ENV_VETO=1 PLAN_PRUNE=1 PLAN_RAISE_DROP_MAX=0 PLAN_RAISE_ENV_RULE=nominal PLAN_RAISE_DROP_SET=1,3,5 \
 PLAN_REAL_ROUTE=1 PLAN_HINT_VETO_STEPS=tail PLAN_RAISE_ROUTES=0 PLAN_REFRESH_ENV_CAP=50 PLAN_REFRESH_ENV_CAP_STEPS=tail:48 \
 FORBID_STEPS=.qkv,.gp PLAN_STEP_LANDING=softmax:32,softmax_v:32"
 RUNTIME="FIDESLIB_BTS_SHIFT=1 FIDESLIB_SPRU=64 FIDESLIB_BTS_RAISE_DROPS=1,3,5 SM_DEN_RECIP=1 FIDESLIB_BTS_REAL=1 \
 GELU_FOLD=1 LN_CHEB=1 SM_GS_FIRST=1 SM_PERIODIC=2 SM_FOLD=1 FIDESLIB_BTS_SPARSE_B=1 FIDESLIB_ROT_KEY_BAND=32 \
 KV_LANES=1 CHEB_BSGS=1 QKV_LANES=1 BTS_MAX_INPUT_LEVEL=50 IMPL_SCOPED_NAMES=1 \
-SPARSE_BTS_SLOTS=256,1 FIDESLIB_BTS_SPARSE_B_MAX=1024 SPARSE_LEVEL_BUDGET=3,3 \
+SPARSE_BTS_SLOTS=$TH,1 FIDESLIB_BTS_SPARSE_B_MAX=1024 SPARSE_LEVEL_BUDGET=3,3 \
 SM_HRS_PACK=1 CUTMAX_PAIR=1 IMPL_DEAD_OPS=1 LADDER_RADIX_BITS=3 FIDESLIB_DISCARD_SCRATCH=0 ${RUNTIME_EXTRA:-}"
 CONFIGS=""
 if [ "$PHASE" = prefill ]; then
     RECIPE="MAX_LEVEL=48 BTS_LEVEL=34 SRC_LEVEL=36 CACHE_READ_LEVEL=36 PLAN_LEVEL_UNIT=2 PLAN_CF_MAX=20 \
-PLAN_NO_PRESCALE=1 PLAN_ACC_CHAIN=n32l PLAN_MAG_SAFETY=2 PLAN_SPARSE_BTS_OUT=1:16,256:24 PLAN_DELIB_LANDING_REMAP=24:14 \
+PLAN_NO_PRESCALE=1 PLAN_ACC_CHAIN=n32l PLAN_MAG_SAFETY=2 PLAN_SPARSE_BTS_OUT=1:16,$TH:24 PLAN_DELIB_LANDING_REMAP=24:14 \
 PLAN_HINT_ENV_VETO=1 PLAN_PRUNE=1 PLAN_RAISE_DROP_MAX=6 PLAN_RAISE_ENV_RULE=nominal PLAN_RAISE_DROP_SET=1,3,5 \
 PLAN_REAL_ROUTE=1 PLAN_HINT_VETO_STEPS=tail PLAN_RAISE_ROUTES=0 PLAN_REFRESH_ENV_CAP=48 PLAN_REFRESH_ENV_CAP_STEPS=tail:48 \
 FORBID_STEPS=.qkv,.gp PLAN_STEP_LANDING=softmax:32,softmax_v:32 PLAN_DELIB_DEG=captured PLAN_DRIFT_RECUT=1"
     RUNTIME="FIDESLIB_BTS_SHIFT=1 FIDESLIB_SPRU=64 FIDESLIB_BTS_RAISE_DROPS=1,2,4,5,6 SM_DEN_RECIP=1 FIDESLIB_BTS_REAL=1 \
 GELU_FOLD=1 LN_CHEB=1 SM_GS_FIRST=1 SM_PERIODIC=2 SM_FOLD=1 FIDESLIB_BTS_SPARSE_B=1 FIDESLIB_ROT_KEY_BAND=32 KV_LANES=1 \
-CHEB_BSGS=1 QKV_LANES=1 BTS_MAX_INPUT_LEVEL=50 IMPL_SCOPED_NAMES=1 SPARSE_BTS_SLOTS=256,1 FIDESLIB_BTS_SPARSE_B_MAX=1024 \
+CHEB_BSGS=1 QKV_LANES=1 BTS_MAX_INPUT_LEVEL=50 IMPL_SCOPED_NAMES=1 SPARSE_BTS_SLOTS=$TH,1 FIDESLIB_BTS_SPARSE_B_MAX=1024 \
 SPARSE_LEVEL_BUDGET=3,3 SM_HRS_PACK=1 CUTMAX_PAIR=1 IMPL_DEAD_OPS=1 LADDER_RADIX_BITS=3 PF_LINEAR=pcmm PF_ACT_FOLD=1 \
 PF_GELU_JOINT=1 PF_JOINT_FORCE=1 PF_PCMM_WBITS=16 PF_LAYOUT=blocked PF_GQA=1 SM_CHEB_GS=1 PF_ATTN_PACK=3 PF_KV_SHARE=1 \
 PF_ATTN=ccmm PF_GLU_XU=1 PF_SINC_A2=1 PF_SILU_SINGLE=1 PF_SM_UNPACK_FOLD=1 PF_SINC_BI_HOIST=1 \
@@ -70,20 +76,28 @@ PF_WARMUP=1 FIDESLIB_ENCODE_NOSYNC=1 FIDESLIB_CCMM_ASYNC=1 FIDESLIB_PCMM_NOSYNC=
 PF_MASK_HOST_CACHE=1 FIDESLIB_DUMP_FULL=1 FIDESLIB_BTS_RAISE_STC_ONUSE=1 PF_EVICT_ALL_BELOW_GB=3 \
 FIDESLIB_CTS_ALT_BUDGET=5 ${RUNTIME_EXTRA:-}"
     CONFIGS=configs/model/approximation/llama31_8b_n32_cheb1e-5_kc256/configs.json
+    # another decoder's prefill (arch.MODELS): its own recipe, runtime line and config (Gemma-2: GPT-2's generic-attention
+    # prefill recipe, its paths, its fit)
+    RECIPE="${PREFILL_RECIPE:-$RECIPE}"
+    RUNTIME="${PREFILL_RUNTIME:-$RUNTIME}"
+    CONFIGS="${PREFILL_CONFIGS:-$CONFIGS}"
 fi
 # exported values win over the recipe (PLAN_* experiments)
 for kv in $RECIPE; do k=${kv%%=*}; [ -n "${!k+x}" ] || export "$kv"; done
-# the sparse routes follow from Llama's layout (tH = 256), not from the shell: scripts/local_env.sh exports GPT-2's
+# the sparse routes follow from the model's layout (tH), not from the shell: scripts/local_env.sh exports GPT-2's
 # 512,1, which the recipe loop above would keep (LLAMA_PLAN_SPARSE_SLOTS overrides)
-export PLAN_SPARSE_SLOTS="${LLAMA_PLAN_SPARSE_SLOTS:-256,1}"
+export PLAN_SPARSE_SLOTS="${LLAMA_PLAN_SPARSE_SLOTS:-$TH,1}"
 RECIPE="$RECIPE PLAN_SPARSE_SLOTS=$PLAN_SPARSE_SLOTS"
 # KV_ENTRY_LEVEL/DEG: the level the K/V cache reads arrive at (a decode cut for a prefill hand-off's cache);
-# PLAN_KEEP_PLACEMENTS: a plan dir (under bootstrap_placements/) whose refresh sites every block keeps
-for k in KV_ENTRY_LEVEL KV_ENTRY_DEG PLAN_KEEP_PLACEMENTS; do if [ -n "${!k:-}" ]; then RECIPE="$RECIPE $k=${!k}"; fi; done
+# PLAN_KEEP_PLACEMENTS: a plan dir (under bootstrap_placements/) whose refresh sites every block keeps;
+# PLAN_ENVELOPE_STRICT=1: a block enters at the deepest of the previous block's outputs (a blocked prefill hands it
+# several hidden blocks; Gemma-2's post norm leaves them at different levels)
+for k in KV_ENTRY_LEVEL KV_ENTRY_DEG PLAN_KEEP_PLACEMENTS PLAN_ENVELOPE_STRICT; do if [ -n "${!k:-}" ]; then RECIPE="$RECIPE $k=${!k}"; fi; done
 bash "$PKG/examples/gpt2/make_plan.sh" "$GRAPH_DIR" "$OUT_NAME"
 MD5=$(cat "$GRAPH_DIR"/block_*/graph.json | md5sum | cut -d' ' -f1)
 {
     echo "graph=$GRAPH_DIR (md5 $MD5)"
+    [ -z "${PERSEUS_DECODER:-}" ] || echo "model=$PERSEUS_DECODER"
     echo "tool=python/perseus/examples/llama/make_plan.sh$([ "$PHASE" = decode ] || echo " ($PHASE)")"
     echo "recipe=$(for kv in $RECIPE; do k=${kv%%=*}; echo -n "$k=${!k} "; done | sed 's/ $//')"
     echo "runtime=$(echo $RUNTIME)"

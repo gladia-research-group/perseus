@@ -1,4 +1,4 @@
-"""Batch ciphertext-ciphertext matrix products on SinC operands (Cheon-Kang-Lee, ePrint 2025/1957; FIDESlib Ccmm.cu),
+"""Batch ciphertext-ciphertext matrix products on SinC operands (Cheon-Kang-Lee, ePrint 2025/1957; device side crates/pc-gpu/src/matmul/ccmm.rs),
 each output refreshed by SinCBoot. Recorded like the PCMM: one external bootstrap per output."""
 from __future__ import annotations
 
@@ -13,6 +13,11 @@ from .pcmm import FINISH_GRAPH, MM_SYNC, _N32_CAP, KeyRng, _ks_key, _twiddles, f
 
 # PF_CCMM_LANES=n: the output refreshes rotate over n key-switch workspaces (bts.ks_lane), like PF_PCMM_LANES
 _DBG = os.environ.get("PF_CCMM_DBG", "0") not in ("", "0")
+# PF_CCMM_MAGS=1 (fake only): every call's max |a|, |b|, |out| against its amax / bmax / 2^shift (the device bounds)
+_MAGS = os.environ.get("PF_CCMM_MAGS", "0") not in ("", "0")
+# PF_CCMM_CAP_SLACK=1: the operands' entry hint a unit below the cap, so a degree-2 operand (its pending rescale a
+# level the StC-high entry check counts) at the cap is refreshed by the plan, not refused at run time
+_SLACK = os.environ.get("PF_CCMM_CAP_SLACK", "0") not in ("", "0")
 # PF_FUSE_PROBE=dir (diagnostic): the first pv0 call's merged outputs decrypted before the refresh (coefficient form)
 # and after it (SinC slots) -> dir/ccmm_pv_out.npz
 _PROBE = os.environ.get("PF_FUSE_PROBE", "")
@@ -21,7 +26,21 @@ LANES = min(max(int(os.environ.get("PF_CCMM_LANES", "0") or 0), 2), 4) if os.env
 NB, NS, KY, SW = 1 << 16, 1 << 13, 64, 8
 # PF_CCMM_MERGE=1: operands duplicated on batch l + 16 (sinc.dup) make every output even in Y = X^1024, so output pairs
 # merge at the split as e + X^1024 o (no key switch) and share one SinCBoot; unmerge() splits them in the slot domain
+# PF_CCMM_MERGE4=1 (with PF_CCMM_MERGE): operands on l < 8 duplicated on l + 8 k (sinc.dup n = 4: the half-head
+# view's) make every output a polynomial in Y^4, and output quadruples merge as o0 + X^1024 o1 + X^2048 o2 + X^3072 o3:
+# 4 outputs per SinCBoot
 MERGE = os.environ.get("PF_CCMM_MERGE", "0") not in ("", "0")
+MERGE_N = (4 if os.environ.get("PF_CCMM_MERGE4", "0") not in ("", "0") else 2) if MERGE else 1
+
+
+def _mn(merge) -> int:
+    """A merge argument (bool: pairs, int: outputs per SinCBoot) -> outputs per SinCBoot."""
+    return (2 if merge else 1) if isinstance(merge, bool) else max(1, int(merge))
+
+
+def _desc_merge(n):
+    """The descriptor's merge field: the pair form a bool (the plans and caches before n-way), else the count."""
+    return n == 2 if n <= 2 else n
 # PF_CCMM_RAISE="pv:3,qk:0": the output refreshes' raise drop per site prefix (an output that only feeds a few linear
 # levels before the next StC-first input lands lower, with fewer limbs through its CtS / EvalMod)
 _RAISE = [e.split(":") for e in os.environ.get("PF_CCMM_RAISE", "").split(",") if e]
@@ -110,6 +129,16 @@ def w_slots(w):
 def merged(e, o, w):
     """Slot vectors of the merged SinCBoot output (e + w o) / 2."""
     return 0.5 * (np.asarray(e) + w_slots(w) * np.asarray(o))
+
+
+def merged_n(ys, w, n):
+    """Slot vectors of the merged SinCBoot output (1 / n) sum_m w^m y_m."""
+    ws = w_slots(w)
+    return sum(ws ** m * np.asarray(y) for m, y in enumerate(ys)) / n
+
+
+def _group(Y, w, n):
+    return np.array([merged_n(Y[n * i:n * i + n], w, n) for i in range(len(Y) // n)])
 
 
 def to_mats(vecs):
@@ -222,7 +251,7 @@ class Ccmm:
         return ops.level(x) + d.level - entry - ops.unit
 
     def _factors(self, amax, bmax, shift, out_scale, merge):
-        p = out_scale * 2.0 ** -shift / self.c_unit * (0.5 if merge else 1.0)
+        p = out_scale * 2.0 ** -shift / self.c_unit / _mn(merge)
         return math.sqrt(p * bmax / amax), math.sqrt(p * amax / bmax)
 
     def prep_b(self, xb, amax=1.0, bmax=1.0, shift=0, out_scale=1.0, merge=False, keep=False, export=True):
@@ -233,8 +262,8 @@ class Ccmm:
         if self.cap is None:
             self.cap = self._measure_cap(xb[0])
         for x in xb:
-            ops.bootstrap_hint(x, self.cap, True)
-            self.fhe.level_hint(x, self.cap)
+            ops.bootstrap_hint(x, self.cap - (ops.unit if _SLACK else 0), True)
+            self.fhe.level_hint(x, self.cap - (ops.unit if _SLACK else 0))
         prep = PreparedB(list(xb), [self.fhe.var_name(x) for x in xb], [ops.level(x) for x in xb])
         if self.bts is None:
             prep.vecs = [np.array(x.vec) for x in xb]
@@ -279,17 +308,24 @@ class Ccmm:
             self.cap = self._measure_cap(xa[0])
         mine = list(xa) if prep is not None else list(xa) + list(xb)
         for x in mine:
-            ops.bootstrap_hint(x, self.cap, True)
-            self.fhe.level_hint(x, self.cap)
+            ops.bootstrap_hint(x, self.cap - (ops.unit if _SLACK else 0), True)
+            self.fhe.level_hint(x, self.cap - (ops.unit if _SLACK else 0))
         names = [self.fhe.var_name(x) for x in mine] + ([] if prep is None else prep.names)
         levels = [ops.level(x) for x in mine] + ([] if prep is None else prep.levels)
         want = None
         if self.bts is not None and os.environ.get("PF_CCMM_VERIFY") and prep is None:
             want = out_scale * exact([ops.decrypt_slots_complex(x) for x in xa],
                                      [ops.decrypt_slots_complex(x) for x in xb], b_transposed)
-            if merge:
-                want = np.array([merged(want[2 * i], want[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
+            if _mn(merge) > 1:
+                want = _group(want, self.w, _mn(merge))
         if self.bts is None:
+            if _MAGS:
+                va = np.abs([x.vec for x in xa]).max()
+                vb = np.abs([getattr(x, "vec", x) for x in (xb if prep is None else prep.vecs)]).max()
+                vy = np.abs(out_scale * exact([x.vec for x in xa], [getattr(x, "vec", x) for x in
+                                                                    (xb if prep is None else prep.vecs)], b_transposed)).max()
+                print(f"[ccmm_mag] {site} max|a|={va:.4g} max|b|={vb:.4g} max|y|={vy:.4g} (amax {amax:g} bmax {bmax:g} "
+                      f"2^shift {2.0 ** shift:g})", flush=True)
             outs = self._fake(xa, xb if prep is None else prep.vecs, b_transposed, out_scale, merge)
         else:
             fa, fb = self._factors(amax, bmax, shift, out_scale, merge)
@@ -303,7 +339,7 @@ class Ccmm:
         for i, y in enumerate(outs):
             # the finish as the graph records it (args.external): site, output index, operand form, the scales
             desc = {"op": "ccmm", "site": site, "out": i, "n_out": len(outs), "b_transposed": bool(b_transposed),
-                    "merge": bool(merge), "prepared_b": prep is not None, "shift": int(shift), "amax": float(amax),
+                    "merge": _desc_merge(_mn(merge)), "prepared_b": prep is not None, "shift": int(shift), "amax": float(amax),
                     "bmax": float(bmax), "out_scale": float(out_scale), "raise_drop": raise_of(site)}
             if self.bts is None:
                 # the landing (and the raise drop desc carries) is the Shadow's `finish_landing`, unless overridden
@@ -316,8 +352,8 @@ class Ccmm:
 
     def _fake(self, xa, xb, b_transposed, out_scale, merge=False):
         Y = out_scale * exact([x.vec for x in xa], [getattr(x, "vec", x) for x in xb], b_transposed)
-        if merge:
-            Y = np.array([merged(Y[2 * i], Y[2 * i + 1], self.w) for i in range(sc.NCT // 2)])
+        if _mn(merge) > 1:
+            Y = _group(Y, self.w, _mn(merge))
         cls = type(xa[0])
         outs = []
         for m, y in enumerate(Y):
@@ -372,10 +408,12 @@ class Ccmm:
             self._dbg("mul.a0", xa[0])
         t2 = time.perf_counter()
         self.t_mm += t2 - t1
-        if merge:
-            for i in range(sc.NCT // 2):
-                bts.merge_monomial(da[2 * i], da[2 * i + 1], NB // KY)
-            da, states, xa = da[0::2], states[0::2], xa[0::2]
+        g = _mn(merge)
+        if g > 1:
+            for i in range(sc.NCT // g):
+                for k in range(g - 2, -1, -1):          # Horner on X^1024, innermost first
+                    bts.merge_monomial(da[g * i + k], da[g * i + k + 1], NB // KY)
+            da, states, xa = da[0::g], states[0::g], xa[0::g]
         probe = _PROBE and getattr(self, "_site", "") == "pv0" and not getattr(self, "_probed", False)
         if probe:
             bts.sync()
@@ -434,15 +472,76 @@ class PreparedB:
         self.host, self.vecs, self.dev = [], None, []
 
 
-def unmerge(rt, Ms, w, scale=1.0, site="ccmm.um"):
-    """Merged outputs (e + w o) / 2 (duplicated on l + 16) -> scale [e, o, ...] on l < 16 (zero above), one level."""
+def _inv_groups(w, n):
+    """Per SinC slot (batch b < 32 / n, l = b): the (n, n) inverse C of V[k][m] = w_(l + 32 k / n)^m / n, so
+    o_m(l) = sum_k C[m][k] M[l + 32 k / n] for the merged M (1 / n) sum_m w^m o_m."""
+    step = 32 // n
+    w = np.asarray(w)
+    C = np.zeros((step, n, n), dtype=complex)
+    for l in range(step):
+        V = np.array([[w[l + step * k] ** m / n for m in range(n)] for k in range(n)])
+        C[l] = np.linalg.inv(V)
+    return C
+
+
+def unmerge(rt, Ms, w, scale=1.0, site="ccmm.um", n=2):
+    """Merged outputs (duplicated on l + 32 k / n) -> scale [o_0, ..., o_(n-1), ...] on l < 32 / n (zero above), one
+    level. Pairs: (e + w o) / 2 -> e, o as the sum / difference with the l + 16 half."""
     ops = rt.ops
-    lo = scale * (((np.arange(sc.SLOTS) - sc.OFFSET) % 32) < 16)
+    if n == 2:
+        lo = scale * (((np.arange(sc.SLOTS) - sc.OFFSET) % 32) < 16)
+        out = []
+        for m in Ms:
+            r = ops.rotate(m, 16)
+            out.append(rt.mult_mask(ops.add(m, r), (site, "e", scale), lambda: lo))
+            out.append(rt.mult_mask(ops.sub(m, r), (site, "o", scale), lambda: lo / w_slots(w)))
+        return out
+    step = 32 // n
+    b = (np.arange(sc.SLOTS) - sc.OFFSET) % 32
+    C = _inv_groups(w, n)
+    sel = b < step
     out = []
-    for m in Ms:
-        r = ops.rotate(m, 16)
-        out.append(rt.mult_mask(ops.add(m, r), (site, "e", scale), lambda: lo))
-        out.append(rt.mult_mask(ops.sub(m, r), (site, "o", scale), lambda: lo / w_slots(w)))
+    for M in Ms:
+        rs = [M] + ops.rotate_many(M, [step * k for k in range(1, n)])
+        for mo in range(n):
+            masks = [lambda k=k, mo=mo: scale * np.where(sel, C[np.minimum(b, step - 1), mo, k], 0.0) for k in range(n)]
+            out.append(rt.mult_mask_sum(rs, [(site, n, mo, k, scale) for k in range(n)], masks))
+    return out
+
+
+def unmerge_half(rt, Ms, w, scale=1.0, site="ccmm.umh", n=2, T=None):
+    """unmerge then the half view's halves sum (batch l + sinc.HALF_STEP onto l), kept on the first halves' batch slots
+    (e = 0) alone, zero elsewhere: one level, as unmerge. `T`: the scores also zero off their causal keys (Re / Im =
+    the chunks' queries: alpha Re u + i beta Im u = (alpha + beta) / 2 u + (alpha - beta) / 2 conj(u), the conjugates
+    of the rotated inputs beside them; same level), so the exp's series never reads a non-causal product."""
+    ops = rt.ops
+    step = 32 // n
+    hs = sc.HALF_STEP
+    b = (np.arange(sc.SLOTS) - sc.OFFSET) % 32
+    C = _inv_groups(w, n)
+    keep = (b < 8) & (((b // hs) % 2) == 0)          # the half view's data: batch l < 8
+    bi = np.minimum(b, step - 1)
+    bj = np.minimum(b + hs, step - 1)
+    shifts = [step * k for k in range(n)] + [step * k + hs for k in range(n)]
+    out = []
+    for i, M in enumerate(Ms):
+        rs = [M] + ops.rotate_many(M, shifts[1:])
+        if T is not None:
+            cM = ops.conjugate(M)
+            rs += [cM] + ops.rotate_many(cM, shifts[1:])
+        for mo in range(n):
+            coef = ([np.where(keep, C[bi, mo, k], 0.0) for k in range(n)]
+                    + [np.where(keep, C[bj, mo, k], 0.0) for k in range(n)])
+            if T is None:
+                masks = [lambda c=c: scale * c for c in coef]
+                keys = [(site, n, mo, j, scale) for j in range(2 * n)]
+            else:
+                al, be = sc.score_valid_complex(n * i + mo, T)
+                p_, m_ = 0.5 * (al + be), 0.5 * (al - be)
+                masks = ([lambda c=c: scale * p_ * c for c in coef]
+                         + [lambda c=c: scale * m_ * np.conj(c) for c in coef])
+                keys = [(site, n, mo, j, scale, "causal", T, n * i + mo) for j in range(4 * n)]
+            out.append(rt.mult_mask_sum(rs, keys, masks))
     return out
 
 

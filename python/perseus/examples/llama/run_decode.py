@@ -18,7 +18,6 @@ from . import env
 
 DEFAULT_CONFIGS = "configs/model/approximation/llama31_8b_n32/configs.json"
 
-
 def plan_config(plan):
     """The session Config of a planned run: the Llama decode preset, the plan's stamp, its runtime= switches the
     Config has fields for (the rest is listed: old-stack levers without meaning here)."""
@@ -129,7 +128,8 @@ def _planned(a, toks, gt, lw, cfgs, dims, store):
         pos = t + first
         tt = time.time()
         regs, info = run.token(t, rows)
-        lg = logits_of(run.fhe, [run.ct(r) for r in regs], dims, vocab) if run.tail else np.zeros(vocab)
+        lg = twin.post_logits(logits_of(run.fhe, [run.ct(r) for r in regs], dims, vocab)) if run.tail \
+            else np.zeros(vocab)
         r = {"pos": pos, "token_s": time.time() - tt, **info, "top1": int(np.argmax(lg)), "logits": lg}
         st = run.sess.stream_stats()
         r["pcie_gb"] = (st["bytes"] - b0) / 2**30
@@ -163,7 +163,9 @@ def main(argv=None):
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--device", type=int, default=None,
                     help="GPU index (default: the first of CUDA_VISIBLE_DEVICES)")
-    ap.add_argument("--configs", default=None, help="default: the plan's configs= line, else llama31_8b_n32")
+    ap.add_argument("--configs", default=None, help="default: the plan's configs= line, else the model's (arch.MODELS)")
+    ap.add_argument("--model", default=None,
+                    help="arch.MODELS alias (llama31_8b, gemma2_2b) or HF name (default $PERSEUS_DECODER, else Llama-3.1-8B)")
     ap.add_argument("--capture", default=None, help="graph dir: capture block graphs at the first position")
     ap.add_argument("--structure-only", action="store_true",
                     help="capture without the per-node magnitude decrypts; fill them with capture_mags.py")
@@ -180,6 +182,8 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--fake", action="store_true", help="capture on the numpy fake (perseus.impl.fakecap): no GPU")
     ap.add_argument("--cpu", action="store_true", help="the encrypted run on the host device (PERSEUS_DEVICE=cpu): the GPU kernels' results, on the CPU")
+    ap.add_argument("--fake-kl", action="store_true",
+                    help="with --fake: compute the fp32 oracle on the CPU when not cached (KL / top-1 per position)")
     ap.add_argument("--tap-blocks", default="", help="blocks whose sub-steps are tapped too (comma list)")
     ap.add_argument("--taps", default=None, help="decrypt every block output; save {pos_block: vec} to this .npz")
     ap.add_argument("--profile", action="store_true")
@@ -202,6 +206,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cpu:
         os.environ["PERSEUS_DEVICE"] = "cpu"
+    from . import hf
+    from .arch import model_entry
+    hf.select(a.model)
+    entry = model_entry(hf.NAME)
     from perseus._paths import resolve
     from perseus.examples.defaults import default_windows
     a.windows = None
@@ -210,11 +218,14 @@ def main(argv=None):
         a.windows = [(b, resolve(d)) for b, d in parse_plan_windows(a.plan_windows)]
     elif a.plan is None and not (a.fake or a.capture):
         # up to a 512-token context: a plan per 128-position window
-        a.windows = [(b, resolve(d)) for b, d in default_windows("llama_decode")]
+        a.windows = [(b, resolve(d)) for b, d in (default_windows(entry.windows) if entry else None) or []] or None
     if a.windows and a.plan is None:
         a.plan = a.windows[0][1]
     if not a.configs:
-        a.configs = DEFAULT_CONFIGS
+        if entry is None:
+            print(f"{hf.NAME}: no shipped configs (arch.MODELS); pass --configs", file=sys.stderr)
+            return 2
+        a.configs = entry.configs
         from perseus._paths import resolve
         cmd = os.path.join(resolve(a.plan), "PLAN_CMD.txt") if a.plan else ""
         if cmd and os.path.exists(cmd):
@@ -229,7 +240,7 @@ def main(argv=None):
     if busy and not a.force:
         print(f"GPU {a.device} has other processes: {busy}; refusing (use --force)", file=sys.stderr)
         return 2
-    from . import env, hf
+    from . import env
     from . import weights as W
     from .config import load_configs
 
@@ -243,7 +254,10 @@ def main(argv=None):
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
     os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else env.gpt2_env.physical_device(a.device)
-    gt = None if a.fake else hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
+    if not a.fake:
+        gt = hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
+    else:   # the fake's approximation error: against a cached oracle, or one --fake-kl computes on the CPU
+        gt = hf.oracle_logits(toks, cache, device="cpu") if a.fake_kl or os.path.exists(cache) else None
     a.plain_kv = None
     if a.plain_prefix:
         # a fake run from a plain prefix decodes (and captures) its first position alone: the magnitudes of a late
@@ -264,6 +278,8 @@ def main(argv=None):
         os.environ.setdefault("FHE_GRAPH_CAPTURE_TOKEN", str(a.plain_prefix or 1))
     cfgs = load_configs(a.configs)
     dims = W.llama_dims(store.config)
+    for k, v in env.dims_env(dims).items():        # the plan's runtime= line and --set win
+        over.setdefault(k, v)
     t0 = time.time()
     if not a.fake:
         # the new runtime runs planned only: every block a compiled Program, its per-position stream recorded on

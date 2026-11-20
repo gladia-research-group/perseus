@@ -18,6 +18,8 @@ PLANS: dict[str, dict[int | None, str]] = {
     "llama_prefill": {128: "bootstrap_placements/llama31_8b_prefill128"},
     # one stage (run.py --one-stage), the folded ReLU
     "resnet": {None: "bootstrap_placements/resnet20_folded"},
+    # CCMM attention (Gemma's 256 heads as two Llama half-heads, 4-way SinC merge, half pack, causal zeroing)
+    "gemma2_prefill": {128: "bootstrap_placements/gemma2_2b_prefill128"},
 }
 
 # model -> [(bound, plan dir)]: up to a 512-token context, a plan per position window (`--plan-windows`: a window's plan
@@ -26,6 +28,7 @@ PLANS: dict[str, dict[int | None, str]] = {
 WINDOWS: dict[str, list[tuple[int, str]]] = {
     "gpt2_decode": [(b, f"bootstrap_placements/gpt2_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
     "llama_decode": [(b, f"bootstrap_placements/llama31_8b_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
+    "gemma2_decode": [(b, f"bootstrap_placements/gemma2_2b_decode_ctx512_w{b}") for b in (16, 128, 256, 384, 512)],
 }
 
 

@@ -60,3 +60,5 @@ bootstrap_placements/*/programs/
 
 # Llama recordings: not in the repository, recorded by the user (graphs/LLAMA.txt)
 graphs/llama31_8b_*
+# Gemma-2 recordings: likewise (graphs/GEMMA2.txt)
+graphs/gemma2_2b_*

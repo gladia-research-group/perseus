@@ -22,6 +22,57 @@ from .poly import (cheb_mask_scales, cheb_mask_scales_terms, eval_chebyshev, eva
                    goldschmidt_recip, im_cleanse, rotsum, rotsum_neg)
 
 
+# ── head-half pack (SM_HEAD_PACK=1; Gemma-2-2B: 8 heads in 16 head slots) ──
+# K group c of the cache sits on the head slots of half c % 2 (heads h + (c % 2) H_real), packed group c // 2: the K / V
+# cache ciphertexts and the scores hold two groups where they held one, so q.K^T, the score refreshes and P.V run on
+# half the groups. The upper half is a virtual head h + H_real of real head h over the odd groups: the halves share
+# the head sums (one rotation adds them), the key-0 reference (one rotation copies it up) and the output (one rotation
+# folds it down). The query is copied onto the upper half once.
+
+def _hp(rt) -> int:
+    """The upper half's slot shift (H_real t) under SM_HEAD_PACK=1 with the model's heads in at most half the head
+    slots; 0 otherwise."""
+    d = rt.dims
+    if os.environ.get("SM_HEAD_PACK", "0") in ("", "0") or not (0 < d.H_real and 2 * d.H_real <= d.H):
+        return 0
+    return d.H_real * d.t
+
+
+def _hp_counts(d, kc: int):
+    """(keys of the even groups, keys of the odd groups) at kc keys: the halves' key counts (each a prefix of its
+    half's packed groups)."""
+    t = d.t
+    G = -(-kc // t) if kc > 0 else 0
+    return (sum(min(t, kc - g * t) for g in range(0, G, 2)), sum(min(t, kc - g * t) for g in range(1, G, 2)))
+
+
+def _hp_slots(d, kc: int, per):
+    """The packed layout's active slots at kc keys (both halves, the Gp period tiled), as a 0/1 vector."""
+    from .layout import _tile_tH
+    ka, kb = _hp_counts(d, kc)
+    out = np.zeros(d.N)
+    lane = np.arange(d.t)
+    for half, k in ((0, ka), (1, kb)):
+        for pg in range(-(-k // d.t)):
+            n = min(d.t, k - pg * d.t)
+            for h in range(d.H_real):
+                out[pg * d.tH + (h + half * d.H_real) * d.t + lane[:n]] = 1.0
+    return _tile_tH(d, out, per)
+
+
+def _hp_group_item(d, kc: int, pg: int, per: int, scale: float, odd: bool):
+    """complex_qkt's mask of packed group pg (groups 2 pg on the lower half, 2 pg + 1 on the upper) at kc keys: the even
+    / odd group mask of each half on its own head slots, the odd one on the negative imaginary axis."""
+    sh = d.H_real * d.t
+    na, nb = (max(0, min(d.t, kc - (2 * pg + j) * d.t)) for j in (0, 1))
+    key = ("qkt.gmask.hp", na, nb, pg, int(per), odd) + (() if scale == 1.0 else ("x", scale))
+
+    def build():
+        m = qkt_group_mask(d, na, pg, periodic=per) + np.roll(qkt_group_mask(d, nb, pg, periodic=per), sh)
+        return scale * (-1j * m if odd else m)
+    return key, build
+
+
 def sm_periodic(rt, kc: int) -> int:
     """The scores' period in tH blocks, Gp (0: not periodic). SM_PERIODIC=1 while every cached token fits one group
     (kc <= t): q.K^T keeps the score of (h, tok) in every tH block instead of block 0 only, so the THOR softmax and
@@ -31,6 +82,8 @@ def sm_periodic(rt, kc: int) -> int:
     ops, d = rt.ops, rt.dims
     if not getattr(ops, "sm_periodic", False) or getattr(ops, "fused_sm_den", False):
         return 0                                     # FUSED_SM_DEN=1 keeps its block-0 ladder + fold
+    if _hp(rt):
+        kc = _hp_counts(d, kc)[0]                    # the packed groups: the even half's count
     if kc <= d.t:
         return 1
     if getattr(ops, "sm_periodic_general", False):
@@ -144,7 +197,20 @@ def _fold_mask_items(rt, cfg: SoftmaxCfg, kc: int):
     return [_pair_item(rt.dims, i) for i in items] if _pair(rt, cfg, kc) else items
 
 
-def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0), pair: bool = False):
+def _softmax_mask_items(d, cfg: SoftmaxCfg, kc: int, per: int, affine=(1.0, 0.0), pair: bool = False, hp: int = 0):
+    if hp:       # SM_HEAD_PACK: the score / active masks on the packed layout's active slots (0.5 / kc: the head's count)
+        if pair or (cfg.ref_keys and _ref_covers(d, cfg, kc) and not _ref_sink_only(cfg)):
+            raise ValueError("SM_HEAD_PACK: no paired heads, no self / previous-key centring")
+        mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+        al, be = affine
+        act = lambda: _hp_slots(d, kc, per)
+        score = (("sm.score.hp", cfg.clip_lo, mean, kc, int(per), al, be),
+                 lambda: al * np.where(act() > 0, -mean, cfg.clip_lo - mean) - be)
+        if not cfg.exp_mask_fold:
+            return [score, (("sm.active.hp", kc, int(per)), lambda: (0.5 / kc) * act())]
+        p = 2 ** cfg.log2delta1
+        return [score] + [(("sm.activef.hp", kc, int(per), p, sc), lambda sc=sc: sc * (0.5 / kc) ** (1.0 / p) * act())
+                          for sc in _exp_fold_scales(cfg)]
     if pair:
         # the paired layout: every item transformed, but the centred score mask, whose broadcast spill lands where
         # the paired ladder puts it (_ref_score_mask_pair)
@@ -491,6 +557,13 @@ def _vpair_item(d, i_re: int, i_im: int, rr: int, kv_lanes: bool):
     return ("v.cpc", i_re, i_im, rr), lambda: vpair_mask_complex(d, i_re, i_im, rr)
 
 
+class QPad:
+    """mha's Q when it rides K's padding heads in the fused K + iV linear (weights.q_pad_heads): the push takes it out
+    of the refreshed payload, `heads` head slots down."""
+    def __init__(self, heads: int):
+        self.heads = int(heads)
+
+
 def _kv_bts_scope():
     """IMPL_STC_FIRST_KV=0: the K/V push refresh takes the shipped order under FIDESLIB_BTS_STC_FIRST (its payload is
     small in the slots but tiny in the coefficients, where the shipped order is ~4 bits more precise)."""
@@ -511,6 +584,11 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
     ops, d = rt.ops, rt.dims
     kvl = getattr(ops, "kv_lanes", False)
     q_out = None
+    qpad = q if isinstance(q, QPad) else None
+    if qpad is not None:
+        if not kvl:
+            raise ValueError("Q on K's padding heads needs KV_LANES (one refresh for K, V and Q)")
+        q = None
     if kvl:
         # KV_LANES: realify first (both halves fill every token lane), keep K on lane 0 and V on lane 1, and refresh
         # that real payload by the real route; the K mask and the V pair masks below select the two lanes
@@ -529,6 +607,10 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
                 X = ops.add(X, ops.rotate(Qc, -2 - i))
         with _kv_bts_scope():
             ops.bootstrap_real(X)
+        if qpad is not None:
+            # Q rode K's padding heads through the linear and this refresh (lane 0): its heads back down; complex_qkt's
+            # tok0 mask keeps the real heads' lane 0
+            q_out = ops.rotate(X, qpad.heads * d.t)
         if qs is not None:
             # lane 2 (+ i) back to lane 0; complex_qkt's tok0 mask drops the K / V lanes
             q_out = [ops.rotate(X, 2 + i) for i in range(len(qs))]
@@ -547,9 +629,17 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
         K = rope_mask(rt, K2, "kpush.tok0h", lambda: real_head_half_mask(d), rope, pos)
         if kv.centre:
             K = _ref_push(rt, kv, K2, K, half=True)
-    K = ops.rotate(K, -(kv.k_count % d.t))
-    # bucket_k_complex
-    if kv.k_count % d.t == 0:
+    hp = _hp(rt)
+    if hp and kv.centre:
+        raise ValueError("SM_HEAD_PACK: an uncentred K cache only")
+    if hp:
+        # SM_HEAD_PACK: an odd group's K on the upper head slots, in the lane rotation (one op for every group: the
+        # push's names stay the same at every position)
+        K = ops.rotate(K, (-(kv.k_count % d.t) - ((kv.k_count // d.t) % 2) * hp) % d.N)
+    else:
+        K = ops.rotate(K, -(kv.k_count % d.t))
+    # bucket_k_complex (SM_HEAD_PACK: a pending ciphertext holds a packed group, two groups)
+    if kv.k_count % (2 * d.t if hp else d.t) == 0:
         kv.k_pend.append(ops.copy(K))
     else:
         ops.inplace_add(kv.k_pend[-1], K)
@@ -558,20 +648,32 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
     # the names of the V half below
     late_pack = getattr(rt, "scoped_names_requested", False)
     if not late_pack:
-        _pack_k_pair(ops, kv, d)
+        _pack_k_pair(ops, kv, d, hp)
     rr = kv.v_count % d.t
+    c = kv.v_count // d.t
+    half = c % 2 if hp else 0
+    up = half * hp                                     # SM_HEAD_PACK: an odd group's V on the upper head slots
     if kvl:
-        v = ops.rotate(X, 1 - rr) if rr != 1 else ops.copy(X)   # V_raw, lane 1 -> lane rr
+        if hp:
+            v = ops.rotate(X, (1 - rr - up) % d.N)        # one rotation at every position (the push's names)
+        else:
+            v = ops.rotate(X, 1 - rr) if rr != 1 else ops.copy(X)   # V_raw, lane 1 -> lane rr
     else:
-        v = ops.rotate(V, -rr) if rr else ops.copy(V)
+        if hp:
+            v = ops.rotate(V, (-rr - up) % d.N)
+        else:
+            v = ops.rotate(V, -rr) if rr else ops.copy(V)
         v = ops.mult_i(v)                                  # 2 V_raw, no level
     # bucket_v_complex
-    c = kv.v_count // d.t
+    if hp:      # packed group c // 2; an odd group's masks on the upper head slots
+        c //= 2
     keys, builds, lanes = [], [], []
     for p in range(d.d_head_real // 2):
         i_re = ((c - 2 * p) % d.d_head + d.d_head) % d.d_head
         i_im = ((c - 2 * p - 1) % d.d_head + d.d_head) % d.d_head
         key, build = _vpair_item(d, i_re, i_im, rr, kvl)
+        if half:
+            key, build = key + ("hp",), (lambda b=build: np.roll(b(), hp))
         keys.append(key); builds.append(build)
     tmps = rt.mult_masks(v, keys, builds)
     for p, tmp in enumerate(tmps):
@@ -581,28 +683,40 @@ def cache_kv_push_packed_complex(rt, kv: ComplexKVCache, P_in, q=None, rope=None
             ops.inplace_add(kv.v_buckets[p], tmp)
     kv.v_count += 1
     if late_pack:
-        _pack_k_pair(ops, kv, d)
+        _pack_k_pair(ops, kv, d, hp)
     return q_out
 
 
-def _pack_k_pair(ops, kv: ComplexKVCache, d):
+def _pack_k_pair(ops, kv: ComplexKVCache, d, hp: int = 0):
     """Pack the two pending K groups into one complex bucket (even + i odd, the monomial) once
-    both are complete."""
-    if len(kv.k_pend) == 2 and kv.k_count % d.t == 0:
+    both are complete (SM_HEAD_PACK: two packed groups, four groups)."""
+    if len(kv.k_pend) == 2 and kv.k_count % (2 * d.t if hp else d.t) == 0:
         kv.k_buckets.append(ops.add(kv.k_pend[0], ops.mult_i(kv.k_pend[1])))
         kv.k_pend.clear()
 
 
-def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None, merge=None, cfg=None):
+def qkt_query(rt, query, cfg, kc: int, rope=None, pos=None):
+    """complex_qkt's query: RoPE folded into the tok0 head mask, then copied over the key lanes."""
+    d = rt.dims
+    q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
+    if _hp(rt):
+        q = rt.ops.add(q, rt.ops.rotate(q, d.N - _hp(rt)))   # SM_HEAD_PACK: the query on the upper half too
+    lanes = _key_lanes(d, cfg, kc) if sm_periodic(rt, kc) == 1 else d.t   # GQA's merged heads too: same key lanes
+    return rotsum_neg(rt.ops, q, lanes)
+
+
+def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, pos=None, merge=None, cfg=None,
+                ref0: bool = False, prepared: bool = False):
     """complex_qkt (cachemir_complex_attention.cu): one product per K bucket serves two
     token groups; the even group's scores come out of 2 Re, the odd group's out of the
     imaginary axis through the odd mask; pending real groups run the real q.K^T.
-    `cfg` with ref_keys: the scores come out centred on each head's reference key (_ref_broadcast)."""
+    `cfg` with ref_keys: the scores come out centred on each head's reference key (_ref_broadcast).
+    `ref0` (a softmax centred on key 0 after a score map, _centre_mapped): the scores stay raw under the centred
+    config (the K cache is not centred). `prepared`: `query` is qkt_query's already (mha runs it in a step of its own,
+    whose names do not depend on the cache's shape: _ref0_score reads it)."""
     ops, d = rt.ops, rt.dims
-    q = rope_mask(rt, query, "tok0", lambda: real_head_tok0_mask(d), rope, pos)
     kc = kv.k_count
-    lanes = _key_lanes(d, cfg, kc) if sm_periodic(rt, kc) == 1 else d.t   # GQA's merged heads too: same key lanes
-    q = rotsum_neg(ops, q, lanes)
+    q = query if prepared else qkt_query(rt, query, cfg, kc, rope, pos)
     attn = None
     def accum(r):
         nonlocal attn
@@ -613,21 +727,40 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
     per = sm_periodic(rt, kc)
     # merge = (G, g): head g's group c goes to blocks b % (G Gp) == g Gp + c, so G heads share one ciphertext
     per_m, g0 = (merge[0] * per, merge[1] * per) if merge else (per, 0)
-    for gc, bucket in enumerate(kv.k_buckets):
+    centred = cfg is not None and bool(cfg.ref_keys) and not ref0
+    pair = _pair(rt, cfg, kc) and not merge
+    hp = _hp(rt)
+    if hp and (merge or pair or centred):
+        raise ValueError("SM_HEAD_PACK: no merged GQA heads, no paired heads, no K-side centring")
+    sh = _qkt_share(rt) if not (merge or centred or pair or hp) else 0
+    def bucket_scores(gc, result):
         g_even, g_odd = 2 * gc, 2 * gc + 1
-        result = ops.mult(q, bucket)
-        result = rotsum(ops, result, d.tH, d.N)
-        if per:
-            result = ops.tag_reduce(result, d.tH)
         conj = ops.conjugate(result)
         res_e = ops.add(result, conj)
+        if hp:      # packed groups 2 gc (real axis) and 2 gc + 1 (imaginary), each two groups over the head halves
+            accum(rt.mult_mask(res_e, *_hp_group_item(d, kc, g_even, per_m, scale, False)))
+            if 2 * g_odd * d.t < kc:
+                accum(rt.mult_mask(ops.sub(result, conj), *_hp_group_item(d, kc, g_odd, per_m, scale, True)))
+            return
         n_even = min(d.t, kc - g_even * d.t)
         accum(rt.mult_mask(res_e, *_group_mask_item(d, n_even, g0 + g_even, per_m, scale)))
         if g_odd * d.t < kc:
             res_o = ops.sub(result, conj)
             n_odd = min(d.t, kc - g_odd * d.t)
             accum(rt.mult_mask(res_o, *_odd_mask_item(d, n_odd, g0 + g_odd, scale, per_m)))
-    centred = cfg is not None and bool(cfg.ref_keys)
+    for gc in range(len(kv.k_buckets)):
+        if sh and gc % 2:
+            continue
+        result = ops.mult(q, kv.k_buckets[gc])
+        two = sh and gc + 1 < len(kv.k_buckets)
+        if two:      # SM_QKT_SHARE: the next bucket's product on the zero padding heads, one head-dimension sum for both
+            result = ops.add(result, ops.rotate(ops.mult(q, kv.k_buckets[gc + 1]), d.N - sh))
+        result = rotsum(ops, result, d.tH, d.N)
+        if per:
+            result = ops.tag_reduce(result, d.tH)
+        bucket_scores(gc, result)
+        if two:
+            bucket_scores(gc + 1, ops.rotate(result, sh))     # its heads back down; the group masks keep the real ones
     if centred != kv.centre:
         raise ValueError("reference-key centring: the softmax config and the K cache disagree")
     if centred:
@@ -635,27 +768,98 @@ def complex_qkt(rt, kv: ComplexKVCache, query, scale: float = 1.0, rope=None, po
         if not _ref_sink_only(cfg) and (per != 1 or merge or kv.k_buckets):
             raise ValueError("reference-key centring on the self / previous key needs one pending K group of "
                              "tH-periodic scores")
-    pair = _pair(rt, cfg, kc) and not merge
     if pair and (kv.k_buckets or len(kv.k_pend) != 1):
         raise ValueError("pair_heads needs one pending K group")
-    for j, pend in enumerate(kv.k_pend):
+    def pend_scores(j, result):
         g = 2 * len(kv.k_buckets) + j
-        result = ops.mult(q, pend)
-        result = rotsum(ops, result, d.tH, d.N)
-        if per:
-            result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
         n = min(d.t, kc - g * d.t)
         raw = _pack_rots(rt, result) if pair else result
-        item = _group_mask_item(d, n, g0 + g, per_m, scale)
+        item = _hp_group_item(d, kc, g, per_m, scale, False) if hp else _group_mask_item(d, n, g0 + g, per_m, scale)
         result = _pack(rt, raw, item) if pair else rt.mult_mask(result, *item)
         if centred:
             ref = _ref_broadcast(rt, raw, cfg, kc, scale)
             if ref is not None:
                 result = ops.sub(result, ref)
         accum(im_cleanse(ops, result))
+    for j, pend in enumerate(kv.k_pend):
+        if sh and j % 2:
+            continue
+        result = ops.mult(q, pend)
+        two = sh and j + 1 < len(kv.k_pend)
+        if two:      # SM_QKT_SHARE: the two pending groups share the head-dimension sum as the buckets above
+            result = ops.add(result, ops.rotate(ops.mult(q, kv.k_pend[j + 1]), d.N - sh))
+        result = rotsum(ops, result, d.tH, d.N)
+        if per:
+            result = ops.tag_reduce(result, d.tH)             # the ladder's output is tH-periodic
+        pend_scores(j, result)
+        if two:
+            pend_scores(j + 1, ops.rotate(result, sh))
     if pair:
         attn = ops.tag_reduce(attn, d.tH // 2)                  # the paired scores repeat every tH/2 slots
     return attn
+
+
+def _qkt_share(rt) -> int:
+    """SM_QKT_SHARE=1 with the model's heads in at most half the head slots (Gemma-2-2B: 8 of 16): the slot shift
+    (H_real heads up) that puts a second K bucket's q.K^T product on the first's zero padding heads, so the two share
+    one head-dimension rotation sum (8 rotations at tH = 128 of 32768); 0 otherwise."""
+    d = rt.dims
+    if os.environ.get("SM_QKT_SHARE", "0") in ("", "0") or not (0 < d.H_real and 2 * d.H_real <= d.H):
+        return 0
+    return d.H_real * d.t
+
+
+# ── centring on key 0 after a score map (Gemma-2's logit soft-cap) ──
+# A score map f that is not shift-invariant (cap tanh(s / cap)) leaves the K-side centring (s_j - s_0 from K minus key 0)
+# unusable: the softmax needs f(s_j) - f(s_0). The scores stay raw, complex_qkt hands key 0's score s_0 of every head
+# alone (its selector rides group 0's mask), a ladder copies it over the head's t lanes and the Gp blocks of the
+# scores' period, and f runs on that copy with the active mask riding its series (poly.eval_chebyshev_masked): f(s_0)
+# on every active slot, 0 elsewhere, at the level of f(s). Their difference is the centred score; the empty slots
+# keep f(0) = 0 (an odd map, unshifted) as under the K-side centring. Rotations only past the map's own depth.
+
+def _map_in_scale(score_map, alpha: float) -> float:
+    """The scale the q.K^T group masks give the scores: a score map's own input scale (block.softcap_map.in_scale: its
+    series' interval folded in, no affine level), else the SM_FOLD alpha."""
+    f = getattr(score_map, "in_scale", None)
+    return alpha if f is None else f(alpha)
+
+
+def _centre_mask_item(d, kc: int, per: int, s: float, hp: int = 0):
+    if hp:
+        return ("sm.ref0.act.hp", kc, int(per), s), lambda: s * _hp_slots(d, kc, per)
+    return ("sm.ref0.act", kc, int(per), s), lambda: s * (2.0 * kc) * active_mask(d, kc, periodic=per)
+
+
+def _ref0_score(rt, q, k0, kc: int, scale: float, key):
+    """Key 0's scores alone (each head's, on group 0's lane 0, at the group mask's value, as complex_qkt places them):
+    the prepared query (qkt_query) times key 0's K, which is public (the BOS: `k0`, its slot vector as the cache holds
+    it, named `key`), summed over each head's features like a K group's product. Its own step: the q.K^T step's names
+    are the cache's shape, so nothing outside it may read them; these ops are the same at every position."""
+    ops, d = rt.ops, rt.dims
+    per = sm_periodic(rt, kc)
+    x = rt.mult_mask(q, key, lambda: np.asarray(k0))
+    x = ops.tag_reduce(rotsum(ops, x, d.tH, d.N), d.tH)
+    return im_cleanse(ops, rt.mult_mask(x, *_group_mask_item(d, 1, 0, per, scale)))
+
+
+def _centre_mapped(rt, mapped, r0, score_map, affine, kc: int):
+    """f(s) - f(s_0) on the active slots, f(s) on the others (`mapped` = f(s), `r0` = key 0's scores alone
+    (_ref0_score), `score_map` = f under the SM_FOLD `affine`)."""
+    ops, d = rt.ops, rt.dims
+    per = sm_periodic(rt, kc)
+    if not per:
+        raise ValueError("centring after a score map needs tH-periodic scores (SM_PERIODIC)")
+    b = rotsum_neg(ops, r0, d.t)                       # lane 0 over the head's t lanes
+    with _gp_scope(rt, per):                           # block 0 over the Gp blocks of the period (left rotations)
+        b = rotsum(ops, b, d.tH, per * d.tH) if per > 1 else ops.add(b, 0.0)
+    b = _gp_out(rt, b)                                 # every Gp: the same ops outside the sub-step
+    hp = _hp(rt)
+    if hp:
+        b = ops.add(b, ops.rotate(b, d.N - hp))        # SM_HEAD_PACK: key 0's score on the upper half too
+    mask = lambda ct, s: rt.mult_mask(ct, *_centre_mask_item(d, kc, per, s, hp))
+    add_mask = lambda ct, s: rt.add_mask(ct, *_centre_mask_item(d, kc, per, s, hp))
+    ref = score_map(rt, b, *affine, mask=(mask, add_mask))
+    return ops.sub(mapped, ref)
 
 
 def _pair_v(rt, vs):
@@ -726,7 +930,11 @@ def complex_softmax_v(rt, kv: ComplexKVCache, probs, lanes: int = 0, pair: bool 
         res = _gp_out(rt, res)
         res = rotsum(ops, res, 1, d.t)
         res = im_cleanse(ops, res)
+        if _hp(rt):
+            res = ops.add(res, ops.rotate(res, _hp(rt)))   # SM_HEAD_PACK: the upper half's output folded down
         return rt.mult_mask(res, "tok0.h", lambda: real_head_half_mask(d))
+    if _hp(rt):
+        raise ValueError("SM_HEAD_PACK: P.V on the SM_PERIODIC=2 path only")
     if per == 1:
         # tH-periodic scores: every pair's rotated score vector is (1 - i) P, so the pair products collapse into
         # one with the summed buckets; Re((V_re + i V_im)(1 - i) P) puts V P on both lanes of every pair
@@ -874,6 +1082,9 @@ def head_reduce_sum(rt, x, s0_expected: float = 0.0, periodic: bool = False, see
         with _gp_scope(rt, periodic):
             if periodic > 1:
                 x = ops.tag_reduce(rotsum(ops, x, d.tH, int(periodic) * d.tH), d.tH)
+    if periodic and _hp(rt):
+        # SM_HEAD_PACK: the head's two halves added (tH-periodic: both halves then hold the head's sum)
+        x = ops.add(x, ops.rotate(x, _hp(rt)))
     out = rotsum(ops, x, 1, lanes)
     if seed is not None and getattr(ops, "hrs_pack", False) and ops.complex_payload:
         if ops.fused_sm_den:
@@ -932,7 +1143,7 @@ def _thor_exp(rt, scores, cfg: SoftmaxCfg, kc: int, folded: bool = False):
     """The masked exponentials of softmax_thor, before its divisions."""
     ops, d = rt.ops, rt.dims
     affine = sm_fold_affine(rt, cfg) if folded else (1.0, 0.0)   # `folded`: q.K^T already applied alpha (mha)
-    items = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine, _pair(rt, cfg, kc))
+    items = _softmax_mask_items(d, cfg, kc, sm_periodic(rt, kc), affine, _pair(rt, cfg, kc), _hp(rt))
     ct = rt.add_mask(scores, *items[0])
     sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
     if not cfg.cheb_coeffs:
@@ -1132,13 +1343,17 @@ def _kv_push(rt, kv, payload, q=None, rope=None, pos=None):
 
 
 def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
-        pre_linear=None, pre_out=None):
+        pre_linear=None, pre_out=None, score_map=None, k0=None):
     """src/model/mha.cu: qkv -> cache push -> attention core -> out projection.
     ``w`` has .q .k .v .out (EncodedLinear), or .kv (the fused K + iV linear) and .q for
     the cachemir_complex packing, whose ``kv`` is a ComplexKVCache. ``rope``: rotary position
     embedding of q and K at position ``pos`` (folded into their selection masks). ``pre_linear``:
     called on the qkv projection's input after its refresh hint (e.g. a level drop that runs the
-    projection at the bottom of the chain), ``pre_out`` on the out projection's."""
+    projection at the bottom of the chain), ``pre_out`` on the out projection's. ``score_map(rt, scores, alpha,
+    beta, mask=None)``: applied to the scores before the softmax, which come as alpha s under SM_FOLD (Gemma-2's logit
+    soft-cap); it needs real scores, so not with pair_heads. A softmax centred on key 0 under a score map centres
+    after it (_centre_mapped): the K cache stays raw, and `k0` = (name, key 0's K slot vector: public, the BOS) gives
+    key 0's scores (_ref0_score)."""
     if rope is not None and pos is None:
         raise ValueError("mha: RoPE needs the token position")
     rp = dict(rope=rope, pos=pos)
@@ -1157,11 +1372,16 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
         ops.bootstrap_hint(x, ops.headroom(0 if qkvl else 1), True)
         if pre_linear is not None:
             x = pre_linear(x)
-        if cplx:
+        if cplx and w.q is None:          # Q rides K's padding heads (weights.q_pad_heads): one linear
+            if not qkvl:
+                raise ValueError("mha: Q on K's padding heads needs KV_LANES + QKV_LANES")
+            P, q = linear(rt, x, w.kv), QPad(w.q_pad)
+        elif cplx:
             P, q = linear_multi(rt, x, [w.kv, w.q])
         else:
             k, v, q = linear_multi(rt, x, [w.k, w.v, w.q])
-    tap("attn.q", q)
+    if not isinstance(q, QPad):
+        tap("attn.q", q)
     tap("attn.kv", P if cplx else k)
     with rt.step("kv_push"):
         if qkvl:
@@ -1171,12 +1391,35 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
     # the q.K^T issues one product per cache group: its op count is the cache's shape
     shape = (f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if cplx else f"{len(kv.k_groups)}") \
         if getattr(rt, "scoped_names", False) else None
+    post = score_map is not None and bool(getattr(sm_cfg, "ref_keys", ()))      # centred after the map
+    if post and not (cplx and _ref_sink_only(sm_cfg) and k0 is not None):
+        raise ValueError("mha: centring after a score map needs the complex-packed decode, key 0 (sink) only and "
+                         "key 0's K (k0)")
+    if post:
+        with rt.step("qprep"):             # the query outside the shape-named q.K^T step (_ref0_score reads it)
+            q = qkt_query(rt, q, sm_cfg, kv.k_count, rope, pos)
     with rt.step("qkt", shape=shape):
-        a = sm_fold_affine(rt, sm_cfg)[0]
-        scores = complex_qkt(rt, kv, q, a, cfg=sm_cfg, **rp) if cplx else qkt(rt, kv, q, a, **rp)
+        a = _map_in_scale(score_map, sm_fold_affine(rt, sm_cfg)[0])
+        if post:
+            _ref_check(rt.dims, sm_cfg, kv.k_count)
+            scores = complex_qkt(rt, kv, q, a, cfg=sm_cfg, ref0=True, prepared=True, **rp)
+        else:
+            scores = complex_qkt(rt, kv, q, a, cfg=sm_cfg, **rp) if cplx else qkt(rt, kv, q, a, **rp)
         folded = bool(getattr(ops, "sm_fold", False))
+    if post:
+        with rt.step("ref0"):              # key 0's scores, outside the shape-named q.K^T step
+            r0 = _ref0_score(rt, q, k0[1], kv.k_count, a, ("sm.ref0.k0", k0[0]))
     tap("attn.q_pushed", q)
     tap("attn.scores", scores)
+    if score_map is not None:
+        if cplx and _pair(rt, sm_cfg, kv.k_count):
+            raise ValueError("mha: a score map needs unpaired scores (pair_heads = 0)")
+        with rt.step("score_map"):
+            affine = sm_fold_affine(rt, sm_cfg)
+            scores = score_map(rt, scores, *affine)
+            if post:
+                scores = _centre_mapped(rt, scores, r0, score_map, affine, kv.k_count)
+        tap("attn.scores_mapped", scores)
     with rt.step("softmax"):
         probs = softmax_thor(rt, scores, sm_cfg, kv.k_count, folded)
     tap("attn.probs", probs)
@@ -1201,14 +1444,16 @@ def _gqa_psel(d: Dims, G: int, g: int):
 
 def gqa_dims(d: Dims, G: int) -> Dims:
     """Un-expanded K / V geometry for G query groups: hid / G channels, G times the token lanes."""
-    return Dims(d.N, d.hid // G, d.dim // G, d.H // G, d.H_real // G, d.E, d.E_real)
+    return Dims(d.N, d.hid // G, d.dim // G, d.H // G, d.H_real // G, d.E, d.E_real, head_real=d.head_real)
 
 
 def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None,
-            pre_linear=None, pre_out=None):
+            pre_linear=None, pre_out=None, score_map=None):
     """mha on an un-expanded (GQA) K / V cache held by the sub-runtime `sub` (gqa_dims). A softmax centred on key 0
     takes the K side's centring (each query head's scores minus its own key-0 score); the self / previous-key
     references need the expanded cache."""
+    if score_map is not None and getattr(sm_cfg, "ref_keys", ()):
+        raise ValueError("mha_gqa: a softmax centred after a score map runs on mha (expanded K / V)")
     if getattr(sm_cfg, "ref_keys", ()) and not _ref_sink_only(sm_cfg):
         raise ValueError("mha_gqa: reference-key centring on the self / previous key needs the expanded cache")
     if rope is not None and pos is None:
@@ -1227,7 +1472,7 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
             qs = kv_push(sub, kv, P, qs, **rp)
         else:
             kv_push(sub, kv, P, **rp)
-    a = sm_fold_affine(sub, sm_cfg)[0]
+    a = _map_in_scale(score_map, sm_fold_affine(sub, sm_cfg)[0])
     folded = bool(getattr(ops, "sm_fold", False))
     outs = []
     per = sm_periodic(sub, kv.k_count)
@@ -1240,6 +1485,9 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
                 s_g = complex_qkt(sub, kv, qs[g], a, merge=(G, g), cfg=sm_cfg, **rp)
                 scores = s_g if scores is None else ops.add(scores, s_g)
             scores = ops.tag_reduce(scores, G * sub.dims.tH)
+        if score_map is not None:       # mha's score map (the soft-cap), on the merged scores
+            with rt.step("score_map"):
+                scores = score_map(sub, scores, *sm_fold_affine(sub, sm_cfg))
         sub.gq_merge = G
         try:
             with rt.step("softmax"):
@@ -1261,6 +1509,9 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
             shape = f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if getattr(rt, "scoped_names", False) else None
             with rt.step("qkt", shape=shape):
                 scores = complex_qkt(sub, kv, qs[g], a, cfg=sm_cfg, **rp)
+            if score_map is not None:
+                with rt.step("score_map"):
+                    scores = score_map(sub, scores, *sm_fold_affine(sub, sm_cfg))
             with rt.step("softmax"):
                 probs = softmax_thor(sub, scores, sm_cfg, kv.k_count, folded)
             with rt.step("softmax_v"):
@@ -1285,8 +1536,16 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
     per = sm_periodic(rt, kc)
     affine = sm_fold_affine(rt, cfg)
     pair = _pair(rt, cfg, kc)
-    items = (_softmax_mask_items(d, cfg, kc, per, affine, pair) + _fold_mask_items(rt, cfg, kc)
+    hp = _hp(rt)
+    items = (_softmax_mask_items(d, cfg, kc, per, affine, pair, hp) + _fold_mask_items(rt, cfg, kc)
              + _ref_step_items(d, cfg, kc, affine[0], pair))
+    if hp:      # SM_HEAD_PACK: the packed groups' masks (the V masks are built at the push)
+        Gp_ = -(-kc // (2 * d.t))
+        for pg in range(Gp_):
+            items.append(_hp_group_item(d, kc, pg, per, affine[0], False))
+            if pg % 2 and pg < 2 * (kc // (4 * d.t)):
+                items.append(_hp_group_item(d, kc, pg, per, affine[0], True))
+        return items
     Nb = kc // (2 * d.t)
     G = (kc + d.t - 1) // d.t
     for gc in range(Nb):

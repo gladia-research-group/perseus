@@ -38,8 +38,11 @@ def rot_steps(text=False):
     if FD.FOLD:
         s |= FD.rotations()                                           # the hidden fold's sub-blocks
     if text:
-        from . import gemma_fhe as GF
-        s |= {m * t for m in range(-255, 256)} | GF.rot_steps()
+        from perseus.examples.llama.encoder import encoder_rot_steps
+        from . import text as TX
+        from .impl_text import text_store
+        from perseus.examples.llama import weights as LW
+        s |= {m * t for m in range(-255, 256)} | TX.rot_steps() | encoder_rot_steps(LW.llama_dims(text_store().config))
     return {x for x in s if x % L.N}
 
 
@@ -61,11 +64,10 @@ def twin(a, W, nl, z, txt):
     _, inf = fakecap.make_session(L.geometry()[0], rot_steps(a.text), limit=a.twin_limit, bts_out=a.twin_bts_out)
     x_in = z["noise"].astype(np.float64) * hf.scm_constants()["c_in"]
     if a.text:
-        from . import gemma as GM
         from .impl_text import SanaTextImpl
         n_pub, n_tok = int(z["n_pub"]), int(z["n_tok"])
         ids = z["ids"][:n_pub + n_tok]
-        model = SanaTextImpl(inf, W, nl, GM.GemmaWeights(), n_pub=n_pub, prefix_ids=ids[:n_pub], core=fakecap.core,
+        model = SanaTextImpl(inf, W, nl, None, n_pub=n_pub, prefix_ids=ids[:n_pub], core=fakecap.core,
                              n_layers=a.layers, text_layers=a.text_layers)
         model.set_prompt_ids(x_in, ids[n_pub:], txt[0], z.get("z2"))
     else:
@@ -83,7 +85,7 @@ def stage_check(a, model, z, txt):
     """check(i, slot vectors) -> a line: stage i's outputs against the float model (the caption rows after the text
     stages; per step the patch embedding after embed, the residual after a block, the next model input or the latent
     after the head), "" elsewhere."""
-    from . import gemma_fhe as GF
+    from . import text as GF
     W = model.W
     n_tok = int(z["n_tok"])
     labels = [lab for lab, _ in model.stages()]

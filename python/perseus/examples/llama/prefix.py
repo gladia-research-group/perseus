@@ -18,28 +18,48 @@ def _rms(x, g, eps):
     return x / np.sqrt(np.mean(x * x) + eps) * g
 
 
+def _act(arch, g):
+    if arch.act == "silu":
+        return g / (1.0 + np.exp(-g))
+    if arch.act == "gelu_tanh":
+        return 0.5 * g * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (g + 0.044715 * g ** 3)))
+    raise ValueError(f"activation {arch.act!r}")
+
+
 def bos_kv(store, token: int | None = None, n_layers: int | None = None):
     """[(k, v)] per layer (the first `n_layers`) for the BOS token at position 0: (H_kv * d_head,)
-    each, float64."""
+    each, float64. The checkpoint's Arch decides the norms' gamma offset, the post norms, the activation and the
+    embedding scale (one token: the soft-cap of a single score does not change its softmax weight of 1)."""
+    from .arch import arch_of
     c = store.config
+    arch = arch_of(c)
     tok = int(c["bos_token_id"] if token is None else token)
     eps = float(c["rms_norm_eps"])
     H, H_kv = int(c["num_attention_heads"]), int(c["num_key_value_heads"])
-    dh = int(c["hidden_size"]) // H
+    dh = arch.head_dim
+    o = arch.norm_offset
     t = lambda n: store.tensor(n).astype(np.float64)
     x = t("model.embed_tokens.weight")[tok]
+    if arch.embed_scale != 1.0:
+        x = x * arch.embed_scale
     out = []
     for b in range(int(c["num_hidden_layers"]) if n_layers is None else int(n_layers)):
         p = f"model.layers.{b}."
-        n = _rms(x, t(p + "input_layernorm.weight"), eps)
+        n = _rms(x, o + t(p + "input_layernorm.weight"), eps)
         k = t(p + "self_attn.k_proj.weight") @ n
         v = t(p + "self_attn.v_proj.weight") @ n
         out.append((k, v))
         attn = np.repeat(v.reshape(H_kv, dh), H // H_kv, axis=0).ravel()     # softmax over itself = 1
-        x = x + t(p + "self_attn.o_proj.weight") @ attn
-        n = _rms(x, t(p + "post_attention_layernorm.weight"), eps)
+        a = t(p + "self_attn.o_proj.weight") @ attn
+        if arch.post_norms:
+            a = _rms(a, o + t(p + arch.post_norms[0] + ".weight"), eps)
+        x = x + a
+        n = _rms(x, o + t(p + arch.pre_mlp_norm + ".weight"), eps)
         g = t(p + "mlp.gate_proj.weight") @ n
-        x = x + t(p + "mlp.down_proj.weight") @ (g / (1.0 + np.exp(-g)) * (t(p + "mlp.up_proj.weight") @ n))
+        m = t(p + "mlp.down_proj.weight") @ (_act(arch, g) * (t(p + "mlp.up_proj.weight") @ n))
+        if arch.post_norms:
+            m = _rms(m, o + t(p + arch.post_norms[1] + ".weight"), eps)
+        x = x + m
     return out
 
 
@@ -96,7 +116,10 @@ def plain_cache_n(dims, k_feats, v_feats, packing: str, rope=None, centre=False)
     return kv
 
 
-def expanded_heads(vec, H, H_kv, d_head):
-    """(H_kv d_head,) -> head-interleaved (H d_head,) like the K/V linears' outputs."""
+def expanded_heads(vec, H, H_kv, d_head, slots: int | None = None):
+    """(H_kv d_head,) -> head-interleaved (H d_head,) like the K/V linears' outputs; `slots` > H: in that many head
+    slots, the ones past H zero (arch.model_dims)."""
     full = np.repeat(np.asarray(vec).reshape(H_kv, d_head), H // H_kv, axis=0).ravel()
-    return rearrange_qkv_biases(full, H)
+    if slots and slots > H:
+        full = np.concatenate([full, np.zeros((slots - H) * d_head)])
+    return rearrange_qkv_biases(full, slots or H)

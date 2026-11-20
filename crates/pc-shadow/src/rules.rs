@@ -382,9 +382,12 @@ impl Shadow {
         fx.rescale(&mut fa, &mut s)?;
         Ok(Recipe { pre: vec![], out: self.from_f(&fa, a, a.tag)?, consts: None })
     }
-    /// The wrapper's `drop_to_level(t)`: `max(cur, t)`, degree and scale kept.
+    /// The wrapper's `drop_to_level(t)`: `max(cur, t)`, degree and scale kept; a degree-2 value that drops pays its
+    /// pending rescale first (the device's drop moves the level only, so the rescale would otherwise divide by the
+    /// prime of the level it dropped to: the compile emits it, apply_plan's level_reduce).
     pub fn drop_to_level(&self, a: &CtMeta, level: u32) -> Recipe {
-        Recipe { pre: vec![], out: CtMeta { level: a.level.max(level), ..*a }, consts: None }
+        let a = if a.deg == 2 && level > a.level { self.rescale(a).map_or(*a, |r| r.out) } else { *a };
+        Recipe { pre: vec![], out: CtMeta { level: a.level.max(level), ..a }, consts: None }
     }
     /// Pay a pending rescale now (the wrapper's realize / plan `rescale_after` anchor).
     pub fn realize(&self, a: &CtMeta) -> Result<Recipe> {

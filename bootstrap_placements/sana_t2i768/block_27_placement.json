@@ -236,11 +236,12 @@
       "kv_lanes": true,
       "ladder_radix_bits": 3,
       "ln_cheb": true,
+      "sm_cheb_gs": true,
       "sm_den_recip": true,
       "sm_fold": true,
       "sm_gs_first": true,
       "sm_hrs_pack": true,
-      "sm_periodic": 1
+      "sm_periodic": 2
     },
     "exec": {
       "gpt2_cache": true

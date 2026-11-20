@@ -27,6 +27,8 @@ for d in "${dirs[@]}"; do
     tool=$(sed -n 's/^tool=\([^ ]*\).*/\1/p' "$cmd")
     recipe=$(sed -n 's/^recipe=//p' "$cmd")
     route=$(sed -n 's/^route=//p' "$cmd")
+    # a decoder plan's model (python/perseus/examples/llama/arch.py MODELS): its layout sizes the sparse routes
+    model=$(sed -n 's/^model=//p' "$cmd")
     log="logs/plans/${d//\//_}.log"
     # the stages the tool= line lists in parentheses, e.g. "(blocks, argmax, then feedback)" or "(prefill)"
     stages=$(sed -n 's/^tool=[^ ]* *(\(.*\)).*/\1/p' "$cmd" | sed 's/then //g; s/,/ /g')
@@ -35,7 +37,8 @@ for d in "${dirs[@]}"; do
     if [ "$tool" = python/perseus/examples/gpt2/make_plan.sh ] || [ "$tool" = python/perseus/examples/llama/make_plan.sh ]; then
         for s in ${stages:-blocks}; do     # blocks = the tool's default stage, no argument
             # shellcheck disable=SC2086
-            env $recipe bash "$tool" "$graph" "$d" $([ "$s" = blocks ] || echo "$s") >> "$log" 2>&1
+            env ${model:+PERSEUS_DECODER=$model} $recipe bash "$tool" "$graph" "$d" $([ "$s" = blocks ] || echo "$s") \
+                >> "$log" 2>&1
         done
     else
         # shellcheck disable=SC2086
@@ -47,7 +50,7 @@ for d in "${dirs[@]}"; do
     if [ -n "$rd" ]; then
         rd_tool=${rd%% *}; rd_sw=""; [ "$rd" = "$rd_tool" ] || rd_sw=${rd#* }
         # shellcheck disable=SC2086
-        env $rd_sw bash "$rd_tool" "$d" >> "$log" 2>&1
+        env ${model:+PERSEUS_DECODER=$model} $rd_sw bash "$rd_tool" "$d" >> "$log" 2>&1
     fi
     echo "$d: $(tail -n 1 "$log")"
 done
