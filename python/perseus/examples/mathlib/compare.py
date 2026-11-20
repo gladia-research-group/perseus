@@ -20,6 +20,9 @@ from perseus.impl import math as M
 from perseus.impl import poly
 from perseus.impl.math import CountOps, _NpOps
 
+RUNS: dict = {}       # site -> the ad-hoc code (ops, x) -> y (examples/mathlib/tasks.py AdHoc)
+REFS: dict = {}       # site -> its reference function
+
 CFG = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "configs", "model", "approximation")
 
 
@@ -29,7 +32,8 @@ def _cost(fn):
     return c.depth, c.ct_mults
 
 
-def _row(name, dom, adhoc_err, adhoc_cost, ours, rel):
+def _row(name, dom, adhoc_err, adhoc_cost, ours, rel, run=None, ref=None):
+    RUNS[name], REFS[name] = run, ref
     return {"site": name, "domain": [float(dom[0]), float(dom[1])], "rel": rel, "adhoc_err": adhoc_err,
             "adhoc_depth": adhoc_cost[0], "adhoc_ct": adhoc_cost[1], "ours_method": ours.method,
             "ours_params": dict(ours.params), "ours_err": ours.err, "ours_depth": ours.depth, "ours_ct": ours.ct_mults,
@@ -52,7 +56,7 @@ def ln_rows(cfgname="gpt2_base_n32_cm"):
         x = M.grid(lo, hi)
         e = float(np.max(np.abs(np.real(run(_NpOps(), x.copy())) / (k / np.sqrt(x)) - 1.0)))
         ours = M.approx_rsqrt(lo, hi, e, True)
-        out.append(_row(f"LN rsqrt {site}", (lo, hi), e, _cost(run), ours, True))
+        out.append(_row(f"LN rsqrt {site}", (lo, hi), e, _cost(run), ours, True, run, lambda x, k=k: k / np.sqrt(x)))
     return out
 
 
@@ -65,7 +69,7 @@ def softmax_rows(cfgname="gpt2_base_n32_cm"):
         k = 2 ** sq
         lo, hi = k * a, k * b                  # u = 2^sq t: the series reads t = u / 2^sq through its affine
 
-        def run(ops, u, cf=cf, a=a, b=b, sq=sq):
+        def run(ops, u, cf=cf, a=a, b=b, sq=sq, k=k):
             z = poly.eval_chebyshev(ops, u, cf, k * a, k * b)
             for _ in range(sq):
                 z = ops.square(z)
@@ -74,7 +78,7 @@ def softmax_rows(cfgname="gpt2_base_n32_cm"):
         y = np.real(run(_NpOps(), x.copy()))
         e = float(np.max(np.abs(y / np.exp(x) - 1.0)))
         ours = M.approx_exp(lo, hi, e, True)
-        out.append(_row(f"softmax exp {site}", (lo, hi), e, _cost(run), ours, True))
+        out.append(_row(f"softmax exp {site}", (lo, hi), e, _cost(run), ours, True, run, np.exp))
         # the first division: Goldschmidt from the config's seed on its band (chebyshev_gs_init inverted)
         al, be, it = float(s["init_alpha"]), float(s["init_beta"]), int(s["gs_iters_scaled"])
         sm = al / be
@@ -86,7 +90,7 @@ def softmax_rows(cfgname="gpt2_base_n32_cm"):
         x = M.grid(dlo, dhi)
         e = float(np.max(np.abs(np.real(runr(_NpOps(), x.copy())) * x - 1.0)))
         ours = M.approx_reciprocal(float(dlo), float(dhi), max(e, 1e-12), True)
-        out.append(_row(f"softmax recip {site}", (dlo, dhi), e, _cost(runr), ours, True))
+        out.append(_row(f"softmax recip {site}", (dlo, dhi), e, _cost(runr), ours, True, runr, lambda x: 1.0 / x))
     return out
 
 
@@ -120,6 +124,7 @@ def relu_rows():
              "adhoc_depth": _cost(run)[0], "adhoc_ct": _cost(run)[1], "ours_method": f"composite {lad.degs}",
              "ours_params": {"eps": lad.eps}, "ours_err": oe, "ours_depth": dep, "ours_ct": cm}
         r["no_worse"] = (dep, cm) <= (r["adhoc_depth"], r["adhoc_ct"])
+        RUNS[r["site"]], REFS[r["site"]] = run, (lambda x: np.maximum(x, 0.0))
         out.append(r)
     return out
 

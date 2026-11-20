@@ -693,6 +693,8 @@ def _odd_minimax(d, lo, hi, n_grid=2000):
     """calibrate/approximations/relu.py `_odd_minimax` (that module imports torch at load): the odd Chebyshev
     coefficients (domain [-hi, hi]) minimising max |p - 1| on [lo, hi] with p in [-delta, 1 + delta] on [0, lo]."""
     from scipy.optimize import linprog
+    if not (0.0 < lo < hi):
+        raise TargetError(f"sign stage d={d}: interval [{lo}, {hi}]")
     ks = np.arange(1, d + 1, 2)
     xa = hi * (lo / hi + (1 - lo / hi) * (1 - np.cos(np.linspace(0, np.pi, n_grid))) / 2)
     xg = np.linspace(0.0, lo, max(n_grid // 4, 50))
@@ -810,10 +812,12 @@ def sign_ladder(eps: float, delta: float, relu: bool = False) -> SignLadder:
             dm = d1 if m == 0 else d
             if m:       # a different last stage on the prefix
                 for dl in (15, 27, 31, 63):
-                    if dl != d:
+                    if dl != d and lo > 0.0:
                         coef, _l, _t = _stage(dl, lo, hi)
                         offer(unit(stages + [(coef, hi)]), degs + [dl])
             coef, lo2, top = _stage(dm, lo, hi)
+            if not (0.0 < lo2 <= top and np.isfinite(top)):
+                break               # a degenerate stage (the gap's image collapsed): this shape cannot reach it
             stages.append((coef, hi))
             degs.append(dm)
             lo, hi = lo2, top

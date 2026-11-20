@@ -368,8 +368,8 @@ class Pipeline(Task):
         z = S.zscore(ops, x, lay, *self.band, err=self.err)
         t = M.tanh(ops, z, -2.0, 2.0, self.err)
         sm = S.softmax(ops, ops.add(t, t), lay, -2.0, 2.0, self.err, shift="max", method=self.method)
-        gap = float(np.diff(np.sort(self.X, 1), axis=1).min())
-        r = T.rank(ops, x, lay, 2.0 * float(np.abs(self.X).max()), method=self.method, res=0.5 * gap)
+        # neighbours are >= 0.5 / n apart (the construction): a public resolution, the same program for every seed
+        r = T.rank(ops, x, lay, 3.0, method=self.method, res=0.25 / self.n)
         top = T.topk_mask(ops, r, lay, self.k, method=self.method)
         return [z, t, sm, top]
 
@@ -391,7 +391,55 @@ class Pipeline(Task):
         return res
 
 
-TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline}
+@dataclasses.dataclass
+class AdHoc(Task):
+    """An approximation the model code carries (examples/mathlib/compare.py's rows: `kind` ln / smexp / smrecip /
+    relu) against impl.math's choice for the same domain and error (`variant` adhoc / ours), on every slot."""
+    kind: str = "ln"
+    variant: str = "adhoc"
+    seed: int = 0
+    name = "adhoc"
+
+    def __post_init__(self):
+        from . import compare as C
+        rows = {"ln": C.ln_rows, "smexp": C.softmax_rows, "smrecip": C.softmax_rows, "relu": C.relu_rows}[self.kind]()
+        pick = {"ln": "LN rsqrt transformer.h.0.ln_1", "smexp": "softmax exp transformer.h.0.attn",
+                "smrecip": "softmax recip transformer.h.0.attn", "relu": "ReLU composite (7, 7, 27)"}[self.kind]
+        self.row = next(r for r in rows if r["site"].startswith(pick))
+        self.run_adhoc = C.RUNS[self.row["site"]]
+        lo, hi = self.row["domain"]
+        rng = np.random.default_rng(self.seed)
+        self.x = rng.uniform(lo, hi, SLOTS)
+        self.x[:2] = lo, hi
+        self.ref = C.REFS[self.row["site"]]
+
+    def encode(self):
+        return [self.x]
+
+    def run(self, ops, xs):
+        if self.variant == "adhoc":
+            return [self.run_adhoc(ops, xs[0])]
+        lo, hi = self.row["domain"]
+        e = self.row["adhoc_err"]
+        if self.kind == "relu":
+            return [M.relu(ops, xs[0], 1.0, e)]
+        fn = {"ln": "rsqrt", "smexp": "exp", "smrecip": "reciprocal"}[self.kind]
+        a = M.approx(fn, lo, hi, e)
+        if self.kind == "ln":                       # the seed's output scale rides the coefficients' target
+            k = self.ref(np.array([1.0]))[0]
+            return [ops.mult(a(ops, xs[0]), float(k))] if k != 1.0 else [a(ops, xs[0])]
+        return [a(ops, xs[0])]
+
+    def outputs(self, vals):
+        return {"y": np.real(vals[0])}
+
+    def metrics(self, out):
+        t = self.ref(self.x)
+        e, r = _err(out["y"], t, rel=self.row["rel"])
+        return {"max_err": e, "rms_err": r}
+
+
+TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc}
 
 
 def make(name, **kw):

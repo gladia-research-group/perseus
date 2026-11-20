@@ -24,7 +24,8 @@ Algorithms (the comparisons each needs; the best back end differs by size, see t
   three comparisons sharing one evaluation through the layout's tiled copies, a product and a sum), `sort_by_rank`
   (the scatter: two more n^2 comparisons).
 * `bitonic` (any n): Batcher's bitonic network (log2 n (log2 n + 1) / 2 compare-exchange steps, each one comparison of
-  the n/2 pairs at distance j, a product and two rotations), optionally carrying a payload (`argsort`).
+  the n/2 pairs at distance j, a product and two rotations), optionally carrying a payload (`argsort`);
+  `rank_bitonic`: ranks for any n as the argsort of the argsort (two networks).
 * `threshold` (any n): top-k / k-th value by a binary search on the value (the sampler's search, tfhe_select.
   topk_sample, generalised): per probe one comparison of the n values, a count ladder and a comparison of the count;
   the k-th value to (hi - lo) / 2^probes.
@@ -69,13 +70,19 @@ def ladder_for(bound: float, res: float, delta: float | None = None):
     return M.sign_ladder(eps, min(0.25, float(delta) if delta is not None else min(eps, DELTA)))
 
 
-def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None, tag="c", n=None):
+def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None, tag="c", n=None, levels=1):
     """[scale_h d_h >= 0] (1 / 0) on the slots `heads`, 0 elsewhere. `scale`: a number or one per head (a sign
     folds the comparison's direction in); |scale d| <= bound. CKKS: within `delta` of 0 / 1 where |scale d| >= res;
-    an exact 0 input gives 1/2. TFHE: exact outside the switch's noise band."""
+    an exact 0 input gives 1/2. TFHE: exact outside the switch's noise band; `levels` > 1: tfhe_select.msign's
+    finer scales in the same switch (2 levels - 1 more PBS per value, the band / 16 per extra level; needs
+    2 levels - 1 slot groups beside the heads)."""
     n = _nslots(ops, d) if n is None else int(n)
     heads = np.asarray(heads, dtype=np.int64)
     sc = np.broadcast_to(np.asarray(scale, dtype=np.float64), heads.shape)
+    if method == "tfhe" and levels > 1:
+        from .tfhe_select import msign
+        dd = d if np.all(sc == 1.0) else ops.mult_pt(d, _put(n, heads, sc), kind="mask")
+        return msign(ops, dd, n, heads, float(bound), int(levels), f"sort.{tag}")
     if method == "tfhe":
         from . import tfhe
         from .tfhe_select import SPAN, _clean, sign01
@@ -128,7 +135,7 @@ def tile_rotations(lay: Batch) -> list:
 # ── tournament: max / min / argmax ──────────────────────────────────────────────────────────────────────────────────
 
 
-def vmax(ops, x, lay: Batch, bound: float, *, method="tfhe", res=None, err=1e-3):
+def vmax(ops, x, lay: Batch, bound: float, *, method="tfhe", res=None, err=1e-3, levels=1):
     """Each vector's maximum in every one of its slots (|x_i - x_j| <= bound). CKKS: log2 n all-slot rounds of
     max(x, rot(x)) (each within err; the gap res = err); TFHE: head rounds (n - 1 PBS per vector), a mask, a
     broadcast."""
@@ -148,7 +155,8 @@ def vmax(ops, x, lay: Batch, bound: float, *, method="tfhe", res=None, err=1e-3)
     while k < n:
         heads = s[j % (2 * k) == 0]
         d = ops.sub(ops.rotate(x, k * B), x)
-        sel = step(ops, d, heads, 1.0, method=method, bound=bound, tag=f"max{k}", n=N)
+        sel = step(ops, d, heads, 1.0, method=method, bound=bound, tag=f"max{k}", n=N,
+                   levels=levels if len(heads) * (2 * levels - 1) <= N // 2 else 1)
         x = ops.add(x, ops.mult(d, sel))
         k *= 2
     head0 = _mask(N, s[j == 0])
@@ -347,7 +355,7 @@ def bitonic_rotations(lay: Batch) -> list:
 
 
 def bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, delta=None, payload=None, descending=False,
-            refresh=None):
+            refresh=None, levels=1):
     """Batcher's bitonic sort of every vector (ascending; `descending`), returning (sorted, payload sorted along) on
     the first period (TFHE compares the first period's pairs only; CKKS all slots). `payload`: a ciphertext on the
     same layout permuted with the values (e.g. the indices: argsort). |x_i - x_j| <= bound."""
@@ -364,7 +372,8 @@ def bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, delta=
             asc = ~asc
         sig = np.where(asc, -1.0, 1.0)            # swap = [-sigma d >= 0]: ascending swaps when d < 0
         d = ops.sub(ops.rotate(x, j * B), x)
-        sw = step(ops, d, heads, sig, method=method, bound=bound, res=res, delta=delta, tag=f"b{k}.{j}", n=N)
+        sw = step(ops, d, heads, sig, method=method, bound=bound, res=res, delta=delta, tag=f"b{k}.{j}", n=N,
+                  levels=levels)
         dl = ops.mult(d, sw)
         x = ops.sub(ops.add(x, dl), ops.rotate(dl, -j * B))
         if payload is not None:
@@ -376,6 +385,19 @@ def bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, delta=
         x = _tile(ops, x, lay, N)
         payload = _tile(ops, payload, lay, N) if payload is not None else None
     return x, payload
+
+
+def rank_bitonic(ops, x, lay: Batch, bound: float, *, method="tfhe", res=1e-2, delta=None):
+    """rank_j for any n: the argsort of the argsort, two bitonic networks (the first carries the indices j / n along
+    the values, the second sorts those (distinct, 1 / n apart) carrying j / n back: position p of the result holds
+    rank_p / n), then the scale. Twice `bitonic`'s cost."""
+    n = lay.n
+    N = _nslots(ops, x)
+    ramp = lay.encode(np.tile(np.arange(n, dtype=np.float64) / n, (lay.B, 1)))
+    idx = ops.add_pt(ops.mult_pt(x, np.zeros(N), kind="mask"), ramp, kind="mask")
+    _xs, p = bitonic(ops, x, lay, bound, method=method, res=res, delta=delta, payload=idx)
+    _ps, r = bitonic(ops, p, lay, 1.0, method=method, res=0.25 / n, delta=delta, payload=idx)
+    return ops.mult(r, float(n))
 
 
 # ── threshold search ────────────────────────────────────────────────────────────────────────────────────────────────
