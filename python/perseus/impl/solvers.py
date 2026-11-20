@@ -87,17 +87,11 @@ class VecLay:
 
 
 def consolidate(ops, v, lay: VecLay, scale: float = 1.0):
-    """v (R face) with every copy of an entry set to ONE copy: (a0 < n, the first a1 of its block) masked (one level),
-    replicated over the block's a1 (log2 n rotations) and over the a0 tiles (log2 (d0 / n) rotations). A refresh's
-    error is independent per slot; without this the copies differ and products read a mix of them. `scale` rides
-    the mask."""
-    c = lay.cube
-    co = c.coords()
-    m = ((co[0] < lay.n) & (co[1] % lay.n == 0)).astype(np.float64)
-    t = ops.mult_pt(v, np.tile(m * scale, lay.slots // c.P), kind="mask")
-    t = ops.rotate_and_sum(t, -1, lay.n)
-    s = lay.stride * lay.n
-    return ops.rotate_and_sum(t, -s, lay.slots) if s < lay.slots else t
+    """v (R face) with every copy of an entry set to ONE copy (linalg.consolidate on the batched wrap R face: each
+    system's first a1 of its block and the first n of a0 kept, replicated over the block's a1 and the a0 repeats).
+    A refresh's error is independent per slot; without this the copies differ and products read a mix of them.
+    `scale` rides the mask."""
+    return la.consolidate(ops, v, lay.vec, scale)
 
 
 def refresh(ops, v, lay: VecLay):
