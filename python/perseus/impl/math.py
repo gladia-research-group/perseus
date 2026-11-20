@@ -34,8 +34,11 @@ Methods (all built from impl/poly.py's kernels, so they record the standard op s
   ~1e-2 of the range; p_fail per PBS < 2^-128 at the default n 840 parameters), then one product. The TFHE path runs
   in planned sessions only (the switch is a refresh the planner places).
 
-Errors are approximation errors (float64). The encrypted result adds the CKKS noise: ~1e-6 relative on fresh values,
-~1e-5..1e-4 after a bootstrap (n32 chain): a target below that buys nothing.
+The target is held against the encrypted error, not the float64 one: `Approx.err_enc` = the float64 error plus the
+noise model's term (NOISE_BTS x the method's noise gain when the evaluation is deeper than BUDGET levels and the
+planner must refresh inside it; see NOISE_BTS). A deep high-degree series refreshed inside amplifies the refresh's
+error by its Chebyshev recurrence (measured on the device: a degree-318 rsqrt on [1e-3, 10] read 2.8e-2 relative
+for a float64 error of 1e-3), so wide domains at tight targets are refused (TargetError) rather than chosen.
 """
 from __future__ import annotations
 
@@ -179,10 +182,25 @@ def count(fn, *args, **kw) -> CountOps:
 # ── the choice ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 
+#: The encrypted evaluation's noise model (n32 chain, GPU 3, 2026-11-20): without a refresh inside, the device matches
+#: float64 to ~NOISE_FRESH; an evaluation deeper than BUDGET levels gets refreshed inside (a fresh input or a refresh
+#: landing sits at 32 and the planner refreshes by 48: 8 units of the composite chain), and the planner's min cut
+#: refreshes the values most others are built from (a Chebyshev ladder's early T_k, whose error the recurrence then
+#: multiplies): the output error is ~ noise_gain x NOISE_BTS. Measured against it: log degree 311 on [0.01, 100]
+#: 5.2e-2 (gain 6657), sqrt degree 460 on [0, 1] 5.5e-4 (gain 128), rsqrt degree 318 on [1e-3, 10] 0.89 (gain 80829),
+#: i.e. 0.4-1.1 x NOISE_BTS per unit of gain.
+NOISE_BTS = 1e-5
+NOISE_FRESH = 1e-9
+BUDGET = 8
+
+
 @dataclasses.dataclass(frozen=True)
 class Approx:
-    """One method for f on [lo, hi]: its parameters, its depth (levels, `CountOps`), its ciphertext / plaintext products
-    and its float64 error over the domain (max and RMS; relative to |f| when `rel`). Call it on a ciphertext."""
+    """One method for f on [lo, hi]: its parameters, its depth (levels, `CountOps`), its ciphertext / plaintext products,
+    its float64 error over the domain (max and RMS; relative to |f| when `rel`) and its noise gain (the output's
+    absolute change per unit of i.i.d. noise on every product, max over the domain). `err_enc` = err + gain x the
+    noise model (NOISE_BTS past BUDGET levels, else NOISE_FRESH; relative targets: over max |f|): what the choice
+    is held to. Call it on a ciphertext."""
     fn: str
     method: str
     lo: float
@@ -194,7 +212,14 @@ class Approx:
     rms: float
     rel: bool
     params: tuple = ()
+    gain: float = 0.0
+    fmax: float = 1.0
     run: Callable = dataclasses.field(default=None, repr=False, compare=False)
+
+    @property
+    def err_enc(self) -> float:
+        noise = self.gain * (NOISE_BTS if self.depth > BUDGET else NOISE_FRESH)
+        return self.err + (noise / self.fmax if self.rel else noise)
 
     def __call__(self, ops, x):
         return self.run(ops, x)
@@ -207,7 +232,7 @@ class Approx:
     def describe(self) -> dict:
         return {"fn": self.fn, "method": self.method, "lo": self.lo, "hi": self.hi, "depth": self.depth,
                 "ct_mults": self.ct_mults, "pt_mults": self.pt_mults, "err": self.err, "rms": self.rms,
-                "rel": self.rel, "params": dict(self.params)}
+                "rel": self.rel, "params": dict(self.params), "gain": self.gain, "err_enc": self.err_enc}
 
 
 def grid(lo: float, hi: float, n: int = 4097) -> np.ndarray:
@@ -228,16 +253,45 @@ def _measure(f, run, lo, hi, rel):
     return float(e.max()), float(np.sqrt(np.mean(e * e)))
 
 
+class _Noisy(_NpOps):
+    """The mirror with i.i.d. Gaussian noise of std `s` on every product's output (the noise gain's probe)."""
+
+    def __init__(self, s, seed=0):
+        self.s, self.rng = float(s), np.random.default_rng(seed)
+
+    def _n(self, x):
+        # CKKS noise is absolute at the scale of a value near 1 and grows with larger values (a refresh prescales them)
+        return x + self.s * self.rng.standard_normal(np.shape(x))
+
+    def mult(self, a, b):
+        return self._n(super().mult(a, b))
+
+    def square(self, a):
+        return self._n(super().square(a))
+
+
+def noise_gain(run, lo, hi, s=1e-6):
+    """max |run_noisy - run| / s on the domain: how much the products' noise (CKKS rounding, a bootstrap's error on an
+    intermediate) is amplified to the output. Self-correcting iterations (Newton, Goldschmidt) keep it small, a
+    high-degree series with large coefficients makes it large."""
+    x = grid(lo, hi, 1025)
+    y0 = np.real(run(_NpOps(), x.copy()))
+    y1 = np.real(run(_Noisy(s), x.copy()))
+    return float(np.abs(y1 - y0).max() / s)
+
+
 def _make(fn, method, f, lo, hi, rel, run, params=()):
     err, rms = _measure(f, run, lo, hi, rel)
     c = count(run)
+    fmax = float(np.abs(f(grid(lo, hi, 257))).max()) or 1.0
     return Approx(fn, method, float(lo), float(hi), int(c.depth), int(c.ct_mults), int(c.pt_mults), err, rms,
-                  bool(rel), tuple(params), run)
+                  bool(rel), tuple(params), noise_gain(run, lo, hi), fmax, run)
 
 
 def _pick(cands, err):
-    """The cheapest candidate meeting `err` (depth, then ciphertext products, then error); None if none does."""
-    ok = [a for a in cands if a is not None and a.err <= err]
+    """The cheapest candidate meeting `err` with its noise (err_enc; depth, then ciphertext products, then error);
+    None if none does."""
+    ok = [a for a in cands if a is not None and a.err_enc <= err]
     if not ok:
         return None
     return min(ok, key=lambda a: (a.depth, a.ct_mults, a.pt_mults, a.err))
@@ -254,7 +308,7 @@ def _best(name, cands, err):
     _LAST["cands"] = [c for c in cands if c is not None]
     a = _pick(cands, err)
     if a is None:
-        got = min((c.err for c in cands if c is not None), default=float("inf"))
+        got = min((c.err_enc for c in cands if c is not None), default=float("inf"))
         raise TargetError(f"{name}: no method reaches {err:.3g} (best {got:.3g}); widen the target or narrow the domain")
     return a
 
@@ -328,11 +382,18 @@ def _cheb_degree(f, lo, hi, err, rel, parity=None, tgt=None, degrees=_DEGREES):
 def _cheb_cand(fn, f, lo, hi, err, rel, parity=None, scale=1.0):
     """`cheb`: scale * f by the cheapest interpolant meeting err (None if degree MAX_DEGREE does not)."""
     g = (lambda x: scale * f(x)) if scale != 1.0 else f
-    r = _cheb_degree(g, lo, hi, err * (_abs(scale) if not rel else 1.0), rel, parity)
-    if r is None:
+    tgt = err * (_abs(scale) if not rel else 1.0)
+    a = None
+    for frac in (0.8, 0.5, 0.25, 0.1):          # room for the noise term: a tighter fit when the noise needs it
+        r = _cheb_degree(g, lo, hi, frac * tgt, rel, parity)
+        if r is None:
+            break
+        c = r[0]
+        a = _make(fn, "cheb", g, lo, hi, rel, _cheb_run(c, lo, hi), (("degree", len(c) - 1),))
+        if a.err_enc <= tgt:
+            break
+    if a is None:
         return None
-    c = r[0]
-    a = _make(fn, "cheb", g, lo, hi, rel, _cheb_run(c, lo, hi), (("degree", len(c) - 1),))
     if scale != 1.0 and not rel:
         a = dataclasses.replace(a, err=a.err / _abs(scale), rms=a.rms / _abs(scale))
     return a
@@ -367,7 +428,7 @@ def approx_exp(lo: float, hi: float, err: float = 1e-4, rel: bool = True, out_sc
         g = lambda x, s=s: out_scale ** s * np.exp(s * x)
         # the series' relative error doubles per squaring; its absolute target follows from the relative one
         e_k = err * s if rel else err * s / max(float(f(np.array([hi]))[0]), 1e-300)
-        r = _cheb_degree(g, lo, hi, e_k, True)
+        r = _cheb_degree(g, lo, hi, 0.8 * e_k, True)
         if r is None:
             continue
         c, kk = r[0], k
@@ -449,7 +510,7 @@ def approx_rsqrt(lo: float, hi: float, err: float = 1e-4, rel: bool = True) -> A
     lo, hi = _check(lo, hi, positive=True)
     f = lambda x: 1.0 / np.sqrt(x)
     cands = [_cheb_cand("rsqrt", f, lo, hi, err, rel)]
-    er = err if rel else err * _m.sqrt(lo)          # relative target that meets an absolute one
+    er = 0.8 * (err if rel else err * _m.sqrt(lo))  # relative target that meets an absolute one (room for noise)
     for iters in (1, 2, 3, 4):
         # Newton: e -> 1.5 e^2 (relative); the seed's relative error that reaches er after `iters` steps
         e0 = er
@@ -506,7 +567,7 @@ def approx_reciprocal(lo: float, hi: float, err: float = 1e-4, rel: bool = True)
     lo, hi = _check(lo, hi, positive=True)
     f = lambda x: 1.0 / x
     cands = [_cheb_cand("reciprocal", f, lo, hi, err, rel)]
-    er = err if rel else err * lo
+    er = 0.8 * (err if rel else err * lo)
     for iters in (1, 2, 3, 4):
         e0 = er                                     # Newton: e -> e^2
         for _ in range(iters):
@@ -581,13 +642,17 @@ def approx_saturating(name: str, lo: float, hi: float, err: float = 1e-4) -> App
     f, par, c0 = _SAT[name]
     sym = _abs(lo + hi) <= 1e-12 * max(_abs(lo), _abs(hi))
     if sym:
-        r = _cheb_degree(lambda x: f(x) - c0, lo, hi, err, False, parity=par)
         cands = []
-        if r is not None:
+        for frac in (0.8, 0.5, 0.25, 0.1):
+            r = _cheb_degree(lambda x: f(x) - c0, lo, hi, frac * err, False, parity=par)
+            if r is None:
+                break
             c = np.array(r[0])
             c[0] += c0
             cands.append(_make(name, "cheb", f, lo, hi, False, _cheb_run(c, lo, hi),
                                (("degree", len(c) - 1), ("parity", "odd"))))
+            if cands[-1].err_enc <= err:
+                break
     else:
         cands = [_cheb_cand(name, f, lo, hi, err, False)]
     return _best(f"{name} on [{lo}, {hi}]", cands, err)

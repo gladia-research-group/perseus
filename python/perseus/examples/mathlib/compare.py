@@ -32,9 +32,28 @@ def _cost(fn):
     return c.depth, c.ct_mults
 
 
+def _enc(run, dom, err, depth, rel, fmax):
+    """The ad-hoc version's error under impl.math's noise model (the criterion impl.math's choice is held to)."""
+    g = M.noise_gain(run, float(dom[0]), float(dom[1]))
+    noise = g * (M.NOISE_BTS if depth > M.BUDGET else M.NOISE_FRESH)
+    return err + (noise / fmax if rel else noise), g
+
+
+def _ours(fn, dom, run, err, cost, rel, ref, **kw):
+    """impl.math's choice held to the ad-hoc version's own encrypted error (err + its noise term)."""
+    fmax = float(np.abs(ref(M.grid(dom[0], dom[1], 257))).max())
+    e_enc, g = _enc(run, dom, err, cost[0], rel, fmax)
+    return getattr(M, f"approx_{fn}")(float(dom[0]), float(dom[1]), e_enc, rel, **kw), e_enc, g
+
+
 def _row(name, dom, adhoc_err, adhoc_cost, ours, rel, run=None, ref=None):
     RUNS[name], REFS[name] = run, ref
+    if isinstance(ours, tuple):
+        ours, e_enc, g = ours
+    else:
+        e_enc, g = None, None
     return {"site": name, "domain": [float(dom[0]), float(dom[1])], "rel": rel, "adhoc_err": adhoc_err,
+            "adhoc_err_enc": e_enc, "adhoc_gain": g, "ours_err_enc": ours.err_enc, "ours_gain": ours.gain,
             "adhoc_depth": adhoc_cost[0], "adhoc_ct": adhoc_cost[1], "ours_method": ours.method,
             "ours_params": dict(ours.params), "ours_err": ours.err, "ours_depth": ours.depth, "ours_ct": ours.ct_mults,
             "no_worse": (ours.depth, ours.ct_mults) <= tuple(adhoc_cost)}
@@ -55,8 +74,9 @@ def ln_rows(cfgname="gpt2_base_n32_cm"):
             return poly.inv_sqrt_newton_d2(ops, x, y, nr, 1.0 / (k * k)) if nr else y
         x = M.grid(lo, hi)
         e = float(np.max(np.abs(np.real(run(_NpOps(), x.copy())) / (k / np.sqrt(x)) - 1.0)))
-        ours = M.approx_rsqrt(lo, hi, e, True)
-        out.append(_row(f"LN rsqrt {site}", (lo, hi), e, _cost(run), ours, True, run, lambda x, k=k: k / np.sqrt(x)))
+        ref = lambda x, k=k: k / np.sqrt(x)
+        ours = _ours("rsqrt", (lo, hi), run, e, _cost(run), True, ref)
+        out.append(_row(f"LN rsqrt {site}", (lo, hi), e, _cost(run), ours, True, run, ref))
     return out
 
 
@@ -77,7 +97,7 @@ def softmax_rows(cfgname="gpt2_base_n32_cm"):
         x = M.grid(lo, hi)
         y = np.real(run(_NpOps(), x.copy()))
         e = float(np.max(np.abs(y / np.exp(x) - 1.0)))
-        ours = M.approx_exp(lo, hi, e, True)
+        ours = _ours("exp", (lo, hi), run, e, _cost(run), True, np.exp)
         out.append(_row(f"softmax exp {site}", (lo, hi), e, _cost(run), ours, True, run, np.exp))
         # the first division: Goldschmidt from the config's seed on its band (chebyshev_gs_init inverted)
         al, be, it = float(s["init_alpha"]), float(s["init_beta"]), int(s["gs_iters_scaled"])
@@ -89,7 +109,7 @@ def softmax_rows(cfgname="gpt2_base_n32_cm"):
             return poly.goldschmidt_recip(ops, x, al, be, it)
         x = M.grid(dlo, dhi)
         e = float(np.max(np.abs(np.real(runr(_NpOps(), x.copy())) * x - 1.0)))
-        ours = M.approx_reciprocal(float(dlo), float(dhi), max(e, 1e-12), True)
+        ours = _ours("reciprocal", (dlo, dhi), runr, max(e, 1e-12), _cost(runr), True, lambda x: 1.0 / x)
         out.append(_row(f"softmax recip {site}", (dlo, dhi), e, _cost(runr), ours, True, runr, lambda x: 1.0 / x))
     return out
 
@@ -104,7 +124,8 @@ def sampler_exp_rows():
             return _exp_ckks(ops, x, lo, hi)
         x = M.grid(lo, hi)
         e = float(np.max(np.abs(np.real(run(_NpOps(), x.copy())) / np.exp(x) - 1.0)))
-        out.append(_row(f"sampler exp W={W:g}", (lo, hi), e, _cost(run), M.approx_exp(lo, hi, e, True), True))
+        out.append(_row(f"sampler exp W={W:g}", (lo, hi), e, _cost(run), _ours("exp", (lo, hi), run, e, _cost(run), True,
+                                                                              np.exp), True))
     return out
 
 
@@ -167,7 +188,9 @@ def main(argv=None):
     for r in rows:
         print(f"{r['site']:44s} [{r['domain'][0]:.4g}, {r['domain'][1]:.4g}] err {r['adhoc_err']:.2e}: "
               f"ad-hoc depth {r['adhoc_depth']:2d} ct {r['adhoc_ct']:3d} | ours {r['ours_method']:14s} "
-              f"depth {r['ours_depth']:2d} ct {r['ours_ct']:3d} err {r['ours_err']:.2e} {'' if r['no_worse'] else 'WORSE'}")
+              f"depth {r['ours_depth']:2d} ct {r['ours_ct']:3d} err {r['ours_err']:.2e}"
+              + (f" | enc: ad-hoc {r['adhoc_err_enc']:.2e} ours {r['ours_err_enc']:.2e}" if r.get("adhoc_err_enc") else "")
+              + ("" if r["no_worse"] else " WORSE"))
     if a.json:
         with open(a.json, "w") as f:
             for r in rows:

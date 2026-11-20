@@ -10,13 +10,13 @@ from perseus.impl.ops import NumpyOps
 CASES = [
     ("exp", -8.0, 0.0, 1e-4, {}), ("exp", -30.0, 0.0, 1e-3, {}), ("exp", -1.0, 1.0, 1e-6, {}),
     ("exp", -4.0, 4.0, 1e-4, {"out_scale": float(np.exp(-4.0))}),
-    ("log", 1.0, 100.0, 1e-4, {}), ("log", 0.01, 100.0, 1e-3, {}), ("log", 0.5, 2.0, 1e-6, {}),
-    ("rsqrt", 0.01, 1.0, 1e-4, {}), ("rsqrt", 0.0613, 0.9735, 1e-5, {}), ("rsqrt", 1e-3, 10.0, 1e-3, {}),
+    ("log", 1.0, 100.0, 1e-4, {}), ("log", 0.01, 100.0, 5e-2, {}), ("log", 0.5, 2.0, 1e-6, {}),
+    ("rsqrt", 0.01, 1.0, 1e-4, {}), ("rsqrt", 0.0613, 0.9735, 1e-5, {}), ("rsqrt", 1e-3, 10.0, 2e-2, {}),
     ("reciprocal", 0.1, 1.0, 1e-4, {}), ("reciprocal", 1.0, 256.0, 1e-3, {}), ("reciprocal", 0.231, 27.55, 1e-4, {}),
-    ("sqrt", 0.0, 1.0, 1e-3, {}), ("sqrt", 0.1, 10.0, 1e-4, {}),
+    ("sqrt", 0.0, 1.0, 3e-3, {}), ("sqrt", 0.1, 10.0, 1e-4, {}),
     ("tanh", -4.0, 4.0, 1e-4, {}), ("tanh", -1.0, 3.0, 1e-4, {}), ("sigmoid", -8.0, 8.0, 1e-4, {}),
     ("erf", -3.0, 3.0, 1e-5, {}),
-    ("pow", 0.1, 2.0, 1e-4, {"p": 1.5}), ("pow", 0.5, 4.0, 1e-4, {"p": -0.3}), ("pow", -2.0, 2.0, 1e-9, {"p": 5}),
+    ("pow", 0.1, 2.0, 1e-4, {"p": 1.5}), ("pow", 0.5, 4.0, 1e-4, {"p": -0.3}), ("pow", -2.0, 2.0, 1e-6, {"p": 5}),
 ]
 
 REF = {"exp": np.exp, "log": np.log, "rsqrt": lambda x: 1 / np.sqrt(x), "reciprocal": lambda x: 1 / x,
@@ -35,7 +35,7 @@ def _ref(fn, x, kw):
 @pytest.mark.parametrize("fn,lo,hi,err,kw", CASES)
 def test_target_met_on_domain(fn, lo, hi, err, kw):
     a = M.approx(fn, lo, hi, err, **kw)
-    assert a.err <= err and a.depth >= 1 or a.method == "squarings"
+    assert a.err <= a.err_enc <= err and (a.depth >= 1 or a.method == "squarings")
     x = np.random.default_rng(1).uniform(lo, hi, 20000)
     x[:2] = lo, hi
     y = a.numpy(x)
@@ -48,7 +48,7 @@ def test_cheapest_and_candidates():
     """The choice is the feasible candidate with the fewest levels; every candidate's own numbers are honest."""
     cs = M.candidates("reciprocal", 0.231, 27.55, 1e-4)
     assert {c.method for c in cs} >= {"cheb", "cheb+newton", "goldschmidt", "rsqrt^2"}
-    ok = [c for c in cs if c.err <= 1e-4]
+    ok = [c for c in cs if c.err_enc <= 1e-4]
     best = M.approx("reciprocal", 0.231, 27.55, 1e-4)
     assert (best.depth, best.ct_mults) == min((c.depth, c.ct_mults) for c in ok)
     for c in cs:
@@ -79,6 +79,19 @@ def test_domain_refused(fn, lo, hi):
 def test_impossible_target():
     with pytest.raises(M.TargetError):
         M.approx("sqrt", 0.0, 1.0, 1e-9)
+
+
+def test_noise_model():
+    """A deep, high-degree series refreshed inside amplifies the refresh's error (noise_gain x NOISE_BTS, measured on
+    the device: rsqrt degree 318 on [1e-3, 10] read a relative 2.8e-2): such a choice is refused at a tight target;
+    a shallow one (no refresh inside) is held to its float64 error."""
+    with pytest.raises(M.TargetError):
+        M.approx("rsqrt", 1e-3, 10.0, 1e-3)
+    a = M.approx("rsqrt", 1e-3, 10.0, 2e-2)
+    assert a.depth > M.BUDGET and a.err_enc <= 2e-2
+    shallow = M.approx("exp", -8.0, 0.0, 1e-4)
+    assert shallow.depth <= M.BUDGET and shallow.err_enc == pytest.approx(shallow.err, rel=1e-3)
+
 
 
 def test_pow_integer_exact():
