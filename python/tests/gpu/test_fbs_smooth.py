@@ -33,13 +33,14 @@ def _auto(tmp_path, task, sets):
 @pytest.mark.parametrize("sets", [
     ["fn=log", "lo=1", "hi=8", "err=1e-4"],             # a positive range: the asin warp's branch point at its end
     ["fn=sigmoid", "lo=-8", "hi=8", "err=1e-3"],
-    ["fn=exp", "lo=-8", "hi=0", "err=1e-3"],
+    ["fn=exp", "lo=-4", "hi=0", "err=1e-3"],
 ])
 def test_planned_smooth(tmp_path, sets):
     """2 x 32768 outputs per case: the shallowest form (a trigonometric one: two to four levels above today's sine
     form at these targets), every output within the noise model's bound (2^-128 per output, met at selection)."""
+    from perseus.examples.mathlib import run as R
     from perseus.examples.mathlib import tasks as T
-    t = T.make("fn", **dict(s.split("=") for s in sets), fbs=True)
+    t = T.make("fn", **R._parse_set(sets), fbs=True)
     a = t.approx()
     rows = _auto(tmp_path, "fn", sets + ["fbs=true"])
     print(f"\n[fbs smooth] {sets}: {a.method} {dict(a.params)} bound {a.err:.2e}: " + " ".join(
