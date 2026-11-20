@@ -162,7 +162,7 @@ def run_planned(a, task):
     cfg = plan_config(a.plan)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"mathlib_{os.getpid()}")
-    run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pool=a.pool or 32,
+    run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pool=a.pool or 128,
                         log=lambda m: print(m, flush=True))
     run.tfhe_chunk = a.tfhe_chunk if task.tfhe else 0
     t0 = time.time()
@@ -219,9 +219,15 @@ def run_auto(a, argv):
     subprocess.run([*me, *cap, "--fake", "--capture", graph], check=True, env=cpu)
     bp = os.path.join(ASSETS, "bootstrap_placements")
     name = os.path.relpath(plan, bp)
-    subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name], check=True,
-                   env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable,
-                            PLAN_HARD_ENV_CAP=os.environ.get("PLAN_HARD_ENV_CAP", "1")))
+    # the hard refresh envelope first; a stage the planner finds infeasible under it (planner limitation: a fresh
+    # input read again deep in the stage) falls back to the shipped soft envelope
+    for cap in ([os.environ["PLAN_HARD_ENV_CAP"]] if "PLAN_HARD_ENV_CAP" in os.environ else ["1", "0"]):
+        r = subprocess.run(["bash", os.path.join(PKG, "examples", "gpt2", "make_plan.sh"), graph, name],
+                           env=dict(cpu, PLAN_SPARSE_SLOTS=a.sparse, PYTHON=sys.executable, PLAN_HARD_ENV_CAP=cap))
+        if r.returncode == 0:
+            break
+    else:
+        raise SystemExit(f"make_plan.sh failed for {graph}")
     subprocess.run([*me, *rest, "--plan", plan], check=True)
 
 
