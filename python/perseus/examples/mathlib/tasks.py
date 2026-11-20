@@ -505,7 +505,103 @@ class Lut(Task):
         return {"max_err": e, "rms_err": r, "wrong": wrong, "log2_pfail_ct": fbs.p_fail(self.fn)["log2_ct"]}
 
 
-TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut}
+@dataclasses.dataclass
+class IntOp(Task):
+    """Exact integer arithmetic by chained FBS lookups (impl/intops.py) on every slot: `op` add / cmp (a < b) / mux
+    (sel ? a : b) / and / or / xor / addmux (a + b, then sel ? sum : a) on `bits`-bit words in radix 2^`r` digits
+    (one ciphertext per digit), EvalMod `table` (impl/fbs.py TABLES). Every output must round to the exact result."""
+    op: str = "add"
+    bits: int = 16
+    r: int = 2
+    table: str = "k32"
+    layout: str = "cts"           # cts: a digit per ciphertext (ripple); slots: a word's digits in one ciphertext
+    seed: int = 0
+    name = "intop"
+
+    def __post_init__(self):
+        from perseus.impl import intops
+        self.bits, self.r = int(self.bits), int(self.r)
+        rng = np.random.default_rng(self.seed)
+        top = 1 << self.bits
+        self.a = rng.integers(0, top, SLOTS, dtype=np.int64)
+        self.b = rng.integers(0, top, SLOTS, dtype=np.int64)
+        self.b[:64] = self.a[:64]                     # equal words: the compare's "=" path end to end
+        self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
+        if self.layout == "slots":
+            self.io = intops.WordOps(None, self.bits, self.r, self.table, SLOTS)
+            n = self.bits // self.r
+            self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            if self.op in ("and", "or", "xor"):
+                self.io.bitwise(self.op, None, None)
+        else:
+            self.io = intops.IntOps(None, self.r, self.table)      # registers the tables in this process
+            if self.op in ("and", "or", "xor"):
+                self.io.bitwise(self.op, [], [])
+
+    def encode(self):
+        from perseus.impl import intops
+        if self.layout == "slots":
+            v = [self.io.encode(self.a), self.io.encode(self.b)]
+            return v + [np.repeat(self.sel, self.bits // self.r).astype(float)] if self.op in ("mux", "addmux") else v
+        v = intops.digits(self.a, self.bits, self.r) + intops.digits(self.b, self.bits, self.r)
+        return v + [self.sel.astype(float)] if self.op in ("mux", "addmux") else v
+
+    def ref(self):
+        m = (1 << self.bits) - 1
+        a, b, s = self.a, self.b, self.sel
+        return {"add": (a + b) & m, "cmp": (a < b).astype(np.int64), "mux": np.where(s == 1, a, b),
+                "and": a & b, "or": a | b, "xor": a ^ b, "addmux": np.where(s == 1, (a + b) & m, a), "id": a}[self.op]
+
+    def run(self, ops, xs):
+        from perseus.impl import intops
+        if self.layout == "slots":
+            w = intops.WordOps(ops, self.bits, self.r, self.table, SLOTS)
+            a, b = xs[0], xs[1]
+            if self.op == "id":
+                return [ops.add(a, 0.0)]
+            if self.op == "add":
+                return [w.add(a, b)]
+            if self.op == "cmp":
+                return [w.cmp(a, b)]
+            if self.op == "mux":
+                return [w.mux(xs[2], a, b)]
+            if self.op == "addmux":
+                return [w.mux(xs[2], w.add(a, b), a)]
+            return [w.bitwise(self.op, a, b)]
+        io = intops.IntOps(ops, self.r, self.table)
+        n = self.bits // self.r
+        a, b = list(xs[:n]), list(xs[n:2 * n])
+        if self.op == "id":                          # the I/O baseline: inputs in, a out
+            return [ops.add(ai, 0.0) for ai in a]
+        if self.op == "add":
+            return io.add(a, b)
+        if self.op == "cmp":
+            return [io.cmp(a, b)]
+        if self.op == "mux":
+            return io.mux(xs[2 * n], a, b)
+        if self.op == "addmux":
+            return io.mux(xs[2 * n], io.add(a, b), a)
+        return io.bitwise(self.op, a, b)
+
+    def outputs(self, vals):
+        return {"d": [np.real(v) for v in vals]}
+
+    def metrics(self, out):
+        from perseus.impl import intops, fbs
+        d = out["d"]
+        if self.layout == "slots":
+            n = self.bits // self.r
+            got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
+                   else self.io.decode(d[0]))
+        else:
+            got = intops.value(d, self.r) if self.op != "cmp" else np.round(d[0]).astype(np.int64)
+        dev = max(float(np.abs(np.asarray(v) - np.round(v)).max()) for v in d)
+        wrong = int(np.sum(got != self.ref()))
+        lp = max(fbs.p_fail(n)["log2_ct"] for n in self.io.lookups())
+        return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
+
+
+TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut, "intop": IntOp}
 
 
 def make(name, **kw):
