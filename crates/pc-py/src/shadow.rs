@@ -102,7 +102,7 @@ pub fn shadow_config(c: &Config, plan: Option<&PlanConfig>, mode: &str, strict: 
         }
         "fakecap" => {
             let spec = c.quirks.fakecap_landings.as_deref().unwrap_or("0:32,1:14,256:22,512:22");
-            let ls = parse_landings("quirks.fakecap_landings", spec, 2)?;
+            let ls = if spec == "runtime" { runtime_raw_landings(c)? } else { parse_landings("quirks.fakecap_landings", spec, 2)? };
             let dense = ls.iter().find(|(s, _)| *s == 0).map(|x| x.1).ok_or_else(|| cfg_err("quirks.fakecap_landings", "no dense (0:) landing"))?;
             let drop = u32_of("quirks.fakecap_stc_drop", c.quirks.fakecap_stc_drop, 6)?;
             bts.landings = ls.into_iter().collect();
@@ -395,7 +395,33 @@ impl PyShadow {
     }
 }
 
+/// Where every route of the compiled runtime lands from a deep input, raw (degree 2, one unit above the realized level):
+/// the landing table a capture needs so that its own (deliberate) refreshes land where a route of the program compiled
+/// for `c` lands (`quirks.fakecap_landings = "runtime"`). The dense entry is the shipped order's (the fakecap Shadow
+/// derives the StC-first one from it).
+fn runtime_raw_landings(c: &Config) -> PyResult<Vec<(u32, Landing)>> {
+    let e = |x: pc_program::error::Error| cfg_err("quirks.fakecap_landings", x);
+    let sh = pc_program::compile::runtime_shadow(c, &PlanConfig::default(), None).map_err(e)?;
+    let env = pc_program::compile::RouteEnv::from_config(c).map_err(e)?;
+    let unit = sh.unit();
+    let deep = pc_shadow::CtMeta::new(sh.cfg.bts.max_input_level.min(sh.cfg.bts.level_limit).saturating_sub(unit), 2);
+    let mut out = vec![];
+    for &s in sh.cfg.bts.landings.keys() {
+        let r = if s == 0 { Route { stc_first: false, ..env.base(0) } } else { env.base(s) };
+        let rec = sh.bootstrap(&deep, &r).map_err(|x| cfg_err("quirks.fakecap_landings", format!("route s={s}: {x}")))?;
+        out.push((s, Landing { level: rec.out.level.saturating_sub(unit), deg: 2 }));
+    }
+    Ok(out)
+}
+
+/// `runtime_raw_landings` as a FAKECAP_LANDINGS spec ("s:level,...").
+#[pyfunction]
+fn runtime_capture_landings(config: &PyConfig) -> PyResult<String> {
+    Ok(runtime_raw_landings(&config.0)?.iter().map(|(s, l)| format!("{s}:{}", l.level)).collect::<Vec<_>>().join(","))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(runtime_capture_landings, m)?)?;
     m.add_class::<PyShadow>()?;
     m.add_class::<PySimNode>()?;
     Ok(())

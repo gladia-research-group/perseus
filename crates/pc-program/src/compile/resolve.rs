@@ -33,8 +33,9 @@ pub enum RKind {
     /// `drop_to_level(t)`; v1 records no target: the captured output level is used.
     LevelReduce { target: u32 },
     /// The code's own refresh (`bootstrap()`): lands at the captured level; `real` = `bootstrap_real()` (the
-    /// real-payload route when the runtime has it; v2 `args.route.real`).
-    Deliberate { level: u32, deg: u8, real: bool },
+    /// real-payload route when the runtime has it; v2 `args.route.real`); `slots` = the route the capture took
+    /// (`args.route.slots`, None when not recorded).
+    Deliberate { level: u32, deg: u8, real: bool, slots: Option<u32> },
     /// External finish (PCMM/CCMM): `outs` (several sibling nodes merged) land at the captured level; `lands` = every
     /// output's own landing (siblings may differ: per-output raise drops of a PCMM, e.g. gate_up's up half).
     Finish { level: u32, deg: u8, desc: Option<String>, lands: Vec<(u32, u8)>, descs: Vec<Option<String>> },
@@ -341,8 +342,10 @@ pub fn resolve(bg: &BlockGraph, pcmm_calib: &BTreeMap<String, f64>) -> Result<Re
                     delib_group.insert(key, nodes.len());
                     RKind::Finish { level, deg, desc: desc.clone(), lands: vec![(level, deg)], descs: vec![desc] }
                 } else {
-                    let real = args.and_then(|a| a.get("route")).and_then(|r| r.get("real")).and_then(Value::as_bool).unwrap_or(false);
-                    RKind::Deliberate { level, deg, real }
+                    let route = args.and_then(|a| a.get("route"));
+                    let real = route.and_then(|r| r.get("real")).and_then(Value::as_bool).unwrap_or(false);
+                    let slots = route.and_then(|r| r.get("slots")).and_then(Value::as_u64).and_then(|s| u32::try_from(s).ok());
+                    RKind::Deliberate { level, deg, real, slots }
                 }
             }
             "auto_bootstrap" => return Err(gerr(block, n, "auto_bootstrap survived erase_reactive_bootstraps")),

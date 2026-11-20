@@ -84,7 +84,8 @@ impl RouteEnv {
         let logn = u32_of("chain.logn", cfg.chain.logn, 16)?;
         let mut raise_drop_default = BTreeMap::new();
         if let Some(spec) = cfg.bts.raise_drop.as_deref() {
-            for item in spec.split(',').filter(|x| !x.is_empty()) {
+            // "0" (the presets' "no per-route drop") names no route
+            for item in spec.split(',').filter(|x| !x.is_empty() && x.trim() != "0") {
                 let (s, k) = item.split_once(':').ok_or_else(|| cfg_err("bts.raise_drop", format!("{item:?}")))?;
                 let s: u32 = s.parse().map_err(|_| cfg_err("bts.raise_drop", format!("{item:?}")))?;
                 let k: u32 = k.parse().map_err(|_| cfg_err("bts.raise_drop", format!("{item:?}")))?;
@@ -176,7 +177,21 @@ impl RouteEnv {
     }
 
     /// The default route that lands a refresh of `input` at `cap` (raw degree-2 landing, or realized at degree 1).
-    pub fn route_for_landing(&self, sh: &Shadow, input: &CtMeta, cap: Landing) -> Option<Route> {
+    pub fn route_for_landing(&self, sh: &Shadow, input: &CtMeta, cap: Landing, captured: Option<u32>) -> Option<Route> {
+        let lands = |r: &Route| -> bool {
+            let Ok(rec) = sh.bootstrap(input, r) else { return false };
+            let got = if cap.deg == 2 { rec.out.level.checked_sub(sh.unit()).map(|l| (l, 2)) } else { Some((rec.out.level, rec.out.deg)) };
+            got == Some((cap.level, cap.deg))
+        };
+        // the sparse route the capture recorded (`args.route.slots`), when it lands there: the code chose it, and the
+        // session builds every route its programs' sites name, so no `built` guard is needed to tell it apart from
+        // another route landing at the same level
+        if let Some(s) = captured.filter(|&s| s > 0 && s < self.ring_dim / 2 && sh.cfg.bts.landings.contains_key(&s)) {
+            let r = self.base(s);
+            if lands(&r) {
+                return Some(r);
+            }
+        }
         for &s in sh.cfg.bts.landings.keys() {
             let r = self.base(s);
             // a classic sparse route serves a deliberate refresh only when the runtime holds it (the table lists every

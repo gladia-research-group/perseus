@@ -42,6 +42,8 @@ struct Lower<'a> {
     acct: Accounting,
     check: CheckReport,
     deliberate_outs: BTreeSet<String>,
+    /// the route the capture recorded for the deliberate refresh being lowered (`RKind::Deliberate::slots`)
+    captured_slots: Option<u32>,
 }
 
 impl<'a> Lower<'a> {
@@ -90,7 +92,8 @@ impl<'a> Lower<'a> {
         let mut captured = captured;
         if let Some(cap) = captured {
             // a deliberate refresh: the route whose landing the capture recorded (the code's scope chose it)
-            route = match self.env.route_for_landing(self.sh, &in_meta, cap) {
+            let cap_slots = self.captured_slots.take();
+            route = match self.env.route_for_landing(self.sh, &in_meta, cap, cap_slots) {
                 // the plan's CF for the site when it priced one (a code refresh of a cache-following step:
                 // planner.priced_deliberates), else the route's default
                 Some(r) => pc_shadow::route::Route { cf: p.correction_factor.get(site_var).copied().or(r.cf), ..r },
@@ -101,7 +104,15 @@ impl<'a> Lower<'a> {
                     captured = None;
                     pc_shadow::route::Route { stc_first: false, ..self.env.base(0) }
                 }
-                None => return Err(format!("deliberate {name}: no route lands at ({}, {}) from ({}, {})", cap.level, cap.deg, in_meta.level, in_meta.deg)),
+                None => {
+                    // the recorded route's own landing, when it has one: the capture's landing table disagrees with
+                    // the runtime's for that route (the twin's FAKECAP_LANDINGS)
+                    let own = cap_slots
+                        .and_then(|s| self.sh.bootstrap(&in_meta, &self.env.base(s)).ok().map(|r| (s, r.out.level)))
+                        .map(|(s, l)| format!("; its recorded route s={s} lands at ({}, 2) raw", l.saturating_sub(self.sh.unit())))
+                        .unwrap_or_default();
+                    return Err(format!("deliberate {name}: no route lands at ({}, {}) from ({}, {}){own}", cap.level, cap.deg, in_meta.level, in_meta.deg));
+                }
             };
         }
         let realize = match kind {
@@ -233,6 +244,7 @@ pub fn lower(
         acct: Accounting::default(),
         check: CheckReport::default(),
         deliberate_outs: BTreeSet::new(),
+        captured_slots: None,
     };
     let mut inputs = vec![];
     for name in &r.inputs {
@@ -333,9 +345,10 @@ pub fn lower(
                     }
                     None
                 }
-                RKind::Deliberate { level, deg, real } => {
+                RKind::Deliberate { level, deg, real, slots } => {
                     lw.deliberate_outs.insert(out.clone());
                     lw.cur.insert(out.clone(), ins[0]);
+                    lw.captured_slots = *slots;
                     lw.refresh(&out, &out, SiteKind::Deliberate, origin.clone(), Some(Landing { level: *level, deg: *deg }))?;
                     if *real && lw.env.real_enabled {
                         // `bootstrap_real` (v2 args.route.real): the real-payload chain on the same route family

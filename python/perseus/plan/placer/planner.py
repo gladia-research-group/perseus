@@ -867,7 +867,12 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
                     and n.input_levels[i] is not None:
                 input_level_of[v] = float(n.input_levels[i])
             if v not in first_consumer_seed and n.output_level is not None:
-                first_consumer_seed[v] = float(n.output_level) - n.cost
+                # a product captured lazily (its rescale pending: degree 2 at its input's level) has consumed nothing
+                # yet, so its output level IS the input's; subtracting its cost seeded a fresh input one unit richer
+                # than it is, and the compiled program then failed the level check at that first product
+                lazy = (n.op in MULT_FAMILY and n.output_deg == 2 and i < len(n.input_levels)
+                        and n.input_levels[i] is not None and float(n.input_levels[i]) == float(n.output_level))
+                first_consumer_seed[v] = float(n.output_level) - (0 if lazy else n.cost)
 
     # With an `entry_level`, the unnamed graph inputs other than the block input are K/V cache reads: they keep the
     # captured level, at degree 2
