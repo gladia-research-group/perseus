@@ -30,6 +30,7 @@
     ],
     "stc_ps": 6,
     "sb_em_table": "w14",
+    "em_table": "47:2",
     "real": true,
     "shift": true,
     "sparse_auto": 2,
@@ -61,12 +62,12 @@
     "rot_key_band": 32
   },
   "host": {
-    "hf_home": "/data02/users/azirilli/cache/huggingface",
+    "hf_home": "/data02/users/mithrillo/cache/huggingface",
     "malloc_arena_max": 2,
-    "omp_num_threads": 2,
+    "omp_num_threads": 4,
     "perseus_slotvec_cache": false,
-    "python": "/data02/users/azirilli/perseus-wt/r56-venv/bin/python",
-    "pythonpath": "/data02/users/azirilli/perseus-wt/r56-gsl/python"
+    "python": "/data02/users/mithrillo/projects/perseus/.venv/bin/python",
+    "pythonpath": "/data02/users/mithrillo/tmp/claude-1004/agentrb/fbsc/python"
   },
   "model": {
     "cache_read_level_k": 34,
@@ -100,16 +101,15 @@
     "sm_periodic": 2
   },
   "quirks": {
-    "fakecap_sparse_exact": true,
     "fakecap_stc_entry": 50
   },
   "exec": {
-    "all_blocks_io_dir": "/data02/users/azirilli/scratch/.cache/perseus/oracle/gpt2_ctx1024/all_blocks_io",
-    "fhe_graph_dir": "graphs/_gslf3-g_p0",
+    "all_blocks_io_dir": "/data02/users/mithrillo/scratch/.cache/torchfhe/oracle/gpt2/all_blocks_io",
+    "fhe_graph_dir": "/data02/users/mithrillo/tmp/claude-1004/agentrb/fbsc_w/r3/gr/w128_47.s",
     "gpt2_cache": true,
     "gpt2_inference_mode": "sync",
-    "steps_t": 16,
+    "steps_t": 128,
     "mult_sum": true,
-    "weights_path": "/data02/users/azirilli/scratch/.cache/perseus/models/openai-community/gpt2/classic/weights.bin.zip"
+    "weights_path": "/data02/users/mithrillo/projects/perseus/.cache/models/openai-community/gpt2/classic/weights.bin.zip"
   }
 }
