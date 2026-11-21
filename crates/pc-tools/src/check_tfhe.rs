@@ -541,17 +541,52 @@ fn run_pbs(args: &[String]) -> Res<bool> {
             Lwe::encrypt(((m * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64, &s_lwe, p0, &dg_lwe, &mut prng)
         })
         .collect();
+    // --enc-acc: the test vector as an encrypted accumulator (GLWE under s_br, `BootstrapKey::blind_rotate_acc`;
+    // PBS_INIT i0 = 1), one shared by every LWE
+    let enc_acc = args.iter().any(|a| a == "--enc-acc");
+    let acc_comps: Option<Vec<[pc_tfhe::rlwe::Rlwe; 2]>> = enc_acc.then(|| {
+        let tr = bsk.rns.residues(&tv);
+        (0..nu)
+            .map(|c| {
+                let e = dg.sample_vec(&mut prng, n);
+                [0, 1].map(|pp| {
+                    let ntt = &bsk.rns.ntt[pp];
+                    let m: Vec<u64> = (0..n).map(|j| tr[pp][nu * j + c]).collect();
+                    let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(ntt.q)).collect();
+                    pc_tfhe::rlwe::Rlwe::encrypt_with(&m, &s_br, c1, &e, ntt)
+                })
+            })
+            .collect()
+    });
     let th = Instant::now();
     let want: Vec<Lwe> = if no_check {
         vec![]
     } else {
         use rayon::prelude::*;
-        lwes.par_iter().flat_map(|l| bsk.bootstrap_mlut(&tv, &offs, l, p0, nu).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect()
+        match &acc_comps {
+            Some(acc) => lwes.par_iter().flat_map(|l| bsk.bootstrap_acc(acc, &offs, l, p0).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect(),
+            None => lwes.par_iter().flat_map(|l| bsk.bootstrap_mlut(&tv, &offs, l, p0, nu).into_iter().map(|o| o.mod_switch(q, p0)).collect::<Vec<_>>()).collect(),
+        }
     };
     let host_s = th.elapsed().as_secs_f64();
 
     let img = pc_gpu::tfhe::pbs_image(&bsk);
-    let tvr = pc_gpu::tfhe::tv_residues(&bsk, &tv);
+    let tvr: Vec<u32> = match &acc_comps {
+        // [part][prime][nu n], the components interleaved
+        Some(acc) => (0..2)
+            .flat_map(|part| {
+                let acc = acc.clone();
+                (0..2).flat_map(move |pp| {
+                    let acc = acc.clone();
+                    (0..nu * n).map(move |x| {
+                        let (j, c) = (x / nu, x % nu);
+                        (if part == 0 { acc[c][pp].c0[j] } else { acc[c][pp].c1[j] }) as u32
+                    })
+                })
+            })
+            .collect(),
+        None => pc_gpu::tfhe::tv_residues(&bsk, &tv),
+    };
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
     // without thread-block clusters (below sm_90) the latency path is one level, nu 1 only
@@ -594,7 +629,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     ic[5] = nu as u64;
     let mut run = || -> Res<()> {
         go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio((2 * nu * n / kl) as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu as u64, 0, 0], ..base })?;
-        go(&TfheArgs { op: tfhe_op::PBS_INIT, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_INIT, i0: enc_acc as i32, x: d_acc.vptr_mut(), y: d_tv.vptr(), z: d_ms.vptr(), c: cx, ..base })?;
         let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_acc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: ic, ..base };
         if kb_path && overlap {
             s.record(&e_in)?;
@@ -657,7 +692,7 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     }
     let mut t = Tally::default();
     if !no_check {
-        t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs x {kl} LUTs, every word"), bad, kl * count * (n + 1));
+        t.add(&format!("tfhe-pbs: device PBS == pc-tfhe bootstrap + mod_switch, {count} LWEs x {kl} LUTs{}, every word", if enc_acc { ", encrypted accumulator" } else { "" }), bad, kl * count * (n + 1));
     }
     println!("[pc-check] tfhe-pbs: {} path", if kb_path { format!("latency (key bundles, windows of {win} groups)") } else { "batch".to_string() });
     println!("[pc-check] tfhe-pbs: device {:.2} ms for {count} PBS = {:.0} PBS/s (host {:.1} s on {} threads = {:.1} PBS/s)", dev_s * 1e3, count as f64 / dev_s, host_s, rayon::current_num_threads(), count as f64 / host_s);
@@ -1408,4 +1443,485 @@ impl NoiseModel {
         let u = (a + b) / 2.0;
         ((f(u) + std::f64::consts::LN_2) / std::f64::consts::LN_2, u.exp())
     }
+}
+
+/// `pc-check tfhe-pack [--reps 9] [--entries 8] [--count 64]`: the device packing key switch (pc_gpu::tfhe::DevPack:
+/// PACK_DIGITS -> PACK_MAC -> PACK_FIN) vs pc-tfhe `PackingKey::pack`, every word, for k = 1 / 64 / 2048 LWEs and a
+/// weighted case with repeated positions; then an encrypted lookup table on the device: `--entries` t 4-bit entries
+/// (one LWE each, span n / t coefficients) packed, `--count` encrypted indices rotate it (PBS_INIT on the packed
+/// accumulator), extraction mod p0: every word equals pc-tfhe `bootstrap_acc` + mod_switch and every output decodes
+/// to its entry. Timings: packing per k, the rotation, one whole private lookup (pack + one rotation).
+pub fn cmd_pack(args: &[String]) -> ExitCode {
+    match run_pack(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-pack: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_pack(args: &[String]) -> Res<bool> {
+    use pc_core::keys::{sample_ternary, DiscreteGaussian};
+    use pc_kernels::args::{tfhe_op, TfheArgs};
+    use pc_tfhe::gadget::{fixed_ratio, Gadget};
+    use pc_tfhe::lwe::Lwe;
+    use pc_tfhe::pack::{PackingKey, PACK_GADGET};
+    use pc_tfhe::pbs::{BootstrapKey, Rns};
+    use std::ffi::c_void;
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(9).max(1);
+    let t_ent: usize = arg(args, "--entries").map(|s| s.parse()).transpose()?.unwrap_or(8);
+    let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(64);
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let p0 = chain.q[0];
+    let p = Params::new(chain.n)?;
+    let (n, nl, q) = (p.n_br, p.n_lwe, p.q_br);
+    if t_ent == 0 || n % t_ent != 0 {
+        return Err(format!("--entries {t_ent}: a divisor of {n}").into());
+    }
+    let mut prng = test_prng(0x9ac);
+    let s_lwe: Vec<i64> = (0..nl).map(|_| (prng.next_u32() & 1) as i64).collect();
+    let s_br: Vec<i64> = sample_ternary(&mut prng, n).into_iter().map(|x| x as i64).collect();
+    let dg = DiscreteGaussian::new(p.bsk_sigma)?;
+    let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
+    let rns = Rns::new(p.br_primes.0, p.br_primes.1, n)?;
+    let t0 = Instant::now();
+    let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(q, p.pbs, false), rns.clone(), p.pbs_group, &dg, &mut prng);
+    let tk = t0.elapsed().as_secs_f64();
+    let t0 = Instant::now();
+    let pk = PackingKey::generate(&s_lwe, &s_br, PACK_GADGET, rns.clone(), &dg, &mut prng);
+    println!("[pc-check] tfhe-pack: host keys: bootstrapping {tk:.1} s, packing {:.1} s (n_lwe {nl} x {} levels, n {n})", t0.elapsed().as_secs_f64(), PACK_GADGET.1);
+
+    let dev = Device::open()?;
+    let img = pc_gpu::tfhe::pbs_image(&bsk);
+    let kmax = 2048usize.max(n);
+    let groups = nl / p.pbs_group;
+    let win = pc_gpu::tfhe::KB_WINDOW.min(groups);
+    let kb_words = count.min(pc_gpu::tfhe::KB_MAX) * win * 4 * n * 2;
+    let words = img.bsk.len() + 2 * img.tw.len() + kmax * (nl + 1) + 3 * kmax + 4 * n + count * (nl + 1) * 2 + count * 4 * n + count * (n + 1) + kb_words;
+    let arena = pc_cuda::Arena::new(&dev, 4 * words + pc_gpu::tfhe::DevPack::bytes(n, nl, PACK_GADGET.1) + (64 << 20))?;
+    let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
+    let inst = pc_kernels::table::Instance::U32Barrett64;
+    let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
+    let mut dp = pc_gpu::tfhe::DevPack::new(&arena, &s, &pk)?;
+    let mut d_lwe = arena.alloc::<pc_cuda::Compute, u32>("lwe", kmax * (nl + 1))?;
+    let mut d_place = arena.alloc::<pc_cuda::Compute, u32>("place", 2 * kmax)?;
+    let mut d_w = arena.alloc::<pc_cuda::Compute, u32>("w", kmax)?;
+    let mut d_acc = arena.alloc::<pc_cuda::Compute, u32>("acc", 4 * n)?;
+    let mut t = Tally::default();
+    let delta = p0 / 32;
+    let enc = |m: u64, prng: &mut pc_core::keys::Prng| Lwe::encrypt(m % p0, &s_lwe, p0, &dg_lwe, prng);
+    let flat = |c: &[Lwe]| -> Vec<u32> { c.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect() };
+    let cmp = |got: &[u32], want: &[Rlwe; 2]| -> usize {
+        let mut bad = 0;
+        for part in 0..2 {
+            for pr in 0..2 {
+                let w = if part == 0 { &want[pr].c0 } else { &want[pr].c1 };
+                bad += (0..n).filter(|&o| got[(part * 2 + pr) * n + o] as u64 != w[o]).count();
+            }
+        }
+        bad
+    };
+    // 1. the packing: k LWEs at spread positions (weight 1); a weighted case with repeated positions
+    for (k, weighted) in [(1usize, false), (64, false), (2048, false), (512, true)] {
+        let cts: Vec<Lwe> = (0..k).map(|_| enc(prng.uniform_below(16) * delta, &mut prng)).collect();
+        let pos: Vec<usize> = (0..k).map(|j| if weighted { j % 128 * 16 } else { (j * n / k) % n }).collect();
+        let w: Vec<i64> = (0..k).map(|_| if weighted { prng.uniform_below(7) as i64 - 3 } else { 1 }).collect();
+        let th = Instant::now();
+        let want = pk.pack(&cts, p0, &pos, weighted.then_some(&w[..]));
+        let host_s = th.elapsed().as_secs_f64();
+        d_lwe.upload_at(&s, 0, &flat(&cts))?;
+        let pl: Vec<i32> = (0..k).flat_map(|j| [j as i32, pos[j] as i32]).collect();
+        d_place.upload_at(&s, 0, bytemuck_i32(&pl))?;
+        let wi: Vec<i32> = w.iter().map(|&x| x as i32).collect();
+        d_w.upload_at(&s, 0, bytemuck_i32(&wi))?;
+        let wp = if weighted { d_w.vptr() } else { std::ptr::null() };
+        let mut go = || -> Res<f64> {
+            let td = Instant::now();
+            dp.pack(table, &s, d_lwe.vptr(), d_place.vptr(), wp, k, p0, d_acc.vptr_mut())?;
+            s.sync()?;
+            Ok(td.elapsed().as_secs_f64())
+        };
+        go()?;
+        let mut ts: Vec<f64> = (0..reps).map(|_| go()).collect::<Res<_>>()?;
+        ts.sort_by(f64::total_cmp);
+        let got = d_acc.download(&s)?;
+        t.add(&format!("tfhe-pack: device packing == pc-tfhe PackingKey::pack, k {k}{}, every word", if weighted { " (weights, repeated positions)" } else { "" }), cmp(&got, &want), 4 * n);
+        println!("[pc-check] tfhe-pack: k {k}{}: device {:.3} ms (median of {reps}), host {:.1} ms", if weighted { " weighted" } else { "" }, ts[reps / 2] * 1e3, host_s * 1e3);
+    }
+
+    // 2. an encrypted lookup table: entry i (4 bits at p0 / 32) over [i span, (i + 1) span), index i at phase
+    // (i span + span / 2) p0 / (2 n): the rotation brings the entry's middle to coefficient 0
+    let span = n / t_ent;
+    let tab: Vec<u64> = (0..t_ent).map(|_| prng.uniform_below(16)).collect();
+    let ent: Vec<Lwe> = tab.iter().map(|&v| enc(v * delta, &mut prng)).collect();
+    let pl: Vec<i32> = (0..n).flat_map(|o| [(o / span) as i32, o as i32]).collect();
+    let (host_cts, host_pos): (Vec<Lwe>, Vec<usize>) = (0..n).map(|o| (ent[o / span].clone(), o)).unzip();
+    let acc_host = pk.pack(&host_cts, p0, &host_pos, None);
+    d_lwe.upload_at(&s, 0, &flat(&ent))?;
+    d_place.upload_at(&s, 0, bytemuck_i32(&pl))?;
+    let idx: Vec<usize> = (0..count).map(|_| prng.uniform_below(t_ent as u64) as usize).collect();
+    let ilwe: Vec<Lwe> = idx.iter().map(|&i| enc(((i * span + span / 2) as u64 * p0) / (2 * n as u64), &mut prng)).collect();
+    let th = Instant::now();
+    let want: Vec<Lwe> = {
+        use rayon::prelude::*;
+        ilwe.par_iter().map(|l| bsk.bootstrap_acc(&[acc_host.clone()], &[0], l, p0).swap_remove(0).mod_switch(q, p0)).collect()
+    };
+    let host_s = th.elapsed().as_secs_f64();
+    let up = |what: &'static str, v: &[u32]| -> Res<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> {
+        let mut b = arena.alloc::<pc_cuda::Compute, u32>(what, v.len())?;
+        b.upload(&s, v)?;
+        Ok(b)
+    };
+    let d_bsk = up("tfhe.bsk", &img.bsk)?;
+    let d_tw = up("tfhe.tw", &img.tw)?;
+    let d_tws = up("tfhe.tw", &img.tws)?;
+    let d_in = up("tfhe.in", &flat(&ilwe))?;
+    let mut d_ms = arena.alloc::<pc_cuda::Compute, u32>("tfhe.ms", count * (nl + 1))?;
+    let mut d_racc = arena.alloc::<pc_cuda::Compute, u32>("tfhe.racc", count * 4 * n)?;
+    let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * (n + 1))?;
+    let mut d_kb = arena.alloc::<pc_cuda::Compute, u32>("tfhe.kb", kb_words.max(1))?;
+    let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
+    let mut cx = [0u64; 8];
+    cx[5] = 1;
+    cx[6] = img.c[6];
+    cx[7] = img.c[7];
+    let mut ic = img.c;
+    ic[5] = 1;
+    let rotate = |cnt: usize, d_ms: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, d_racc: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, d_out: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, d_kb: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, acc: *const c_void| -> Res<()> {
+        let base = TfheArgs { n: n as i32, count: cnt as i32, i1: nl as i32, q, ..Default::default() };
+        go(&TfheArgs { op: tfhe_op::PBS_MS, x: d_ms.vptr_mut(), y: d_in.vptr(), m: fixed_ratio(2 * n as u64, p0), c: [p0, 0, 0, 0, 1, 1, 0, 0], ..base })?;
+        go(&TfheArgs { op: tfhe_op::PBS_INIT, i0: 1, x: d_racc.vptr_mut(), y: acc, z: d_ms.vptr(), c: cx, ..base })?;
+        let rot = TfheArgs { op: tfhe_op::PBS_ROTATE, i2: p.pbs_group as i32, x: d_racc.vptr_mut(), y: d_bsk.vptr(), z: d_ms.vptr(), tw: d_tw.vptr(), tws: d_tws.vptr(), m: img.m, c: ic, ..base };
+        if cnt <= pc_gpu::tfhe::KB_MAX {
+            for g0 in (0..groups).step_by(win) {
+                let gw = win.min(groups - g0);
+                go(&TfheArgs { op: tfhe_op::PBS_KEYBUNDLE, i0: g0 as i32, i4: gw as i32, x: d_kb.vptr_mut(), ..rot })?;
+                go(&TfheArgs { w: d_kb.vptr(), i0: g0 as i32, i4: gw as i32, ..rot })?;
+            }
+        } else {
+            go(&rot)?;
+        }
+        go(&TfheArgs { op: tfhe_op::PBS_EXTRACT, x: d_out.vptr_mut(), y: d_racc.vptr(), m: fixed_ratio(p0, q), c: [0, p0, 0, 0, 0, 1, cx[6], cx[7]], ..base })?;
+        Ok(())
+    };
+    let med = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    // the whole lookup: pack the t entries (n placements), rotate `cnt` indices
+    type B<'x> = pc_cuda::DBuf<'x, pc_cuda::Compute, u32>;
+    let mut lookup = |cnt: usize, d_ms: &mut B<'_>, d_racc: &mut B<'_>, d_out: &mut B<'_>, d_kb: &mut B<'_>| -> Res<(f64, f64)> {
+        let td = Instant::now();
+        dp.pack(table, &s, d_lwe.vptr(), d_place.vptr(), std::ptr::null(), n, p0, d_acc.vptr_mut())?;
+        s.sync()?;
+        let tp = td.elapsed().as_secs_f64();
+        rotate(cnt, d_ms, d_racc, d_out, d_kb, d_acc.vptr())?;
+        s.sync()?;
+        Ok((tp, td.elapsed().as_secs_f64()))
+    };
+    lookup(count, &mut d_ms, &mut d_racc, &mut d_out, &mut d_kb)?;
+    let full1: Vec<(f64, f64)> = (0..reps).map(|_| lookup(1, &mut d_ms, &mut d_racc, &mut d_out, &mut d_kb)).collect::<Res<_>>()?;
+    let fullc: Vec<(f64, f64)> = (0..reps).map(|_| lookup(count, &mut d_ms, &mut d_racc, &mut d_out, &mut d_kb)).collect::<Res<_>>()?;
+    drop(lookup);
+    let got = d_out.download(&s)?;
+    let got_acc = d_acc.download(&s)?;
+    t.add(&format!("tfhe-pack: device table accumulator ({t_ent} entries x {span} coefficients) == host"), cmp(&got_acc, &acc_host), 4 * n);
+    let (mut bad, mut wrong, mut s2) = (0usize, 0usize, 0.0f64);
+    for (r, w) in want.iter().enumerate() {
+        let row = &got[r * (n + 1)..(r + 1) * (n + 1)];
+        bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[n] as u64) as usize;
+        let lw = Lwe { a: row[..n].iter().map(|&x| x as u64).collect(), b: row[n] as u64 };
+        let ph = centered(lw.phase(&s_br, p0), p0) as f64;
+        let v = (ph / delta as f64).round() as i64;
+        wrong += (v.rem_euclid(32) != tab[idx[r]] as i64) as usize;
+        let e = ph - (tab[idx[r]] * delta) as f64;
+        s2 += e * e;
+    }
+    t.add(&format!("tfhe-pack: device private lookup == pc-tfhe bootstrap_acc + mod_switch, {count} lookups, every word"), bad, count * (n + 1));
+    t.add(&format!("tfhe-pack: device private lookup decodes to the entry, {count} lookups"), wrong, count);
+    let rms = (s2 / count as f64).sqrt();
+    let model = (pk.noise_var(n, 1.0, p0, dg_lwe.sigma()) + pc_tfhe::pack::blind_rotate_var(q, n, nl, p.pbs_group, p.pbs, p.bsk_sigma)).sqrt() * p0 as f64 / q as f64;
+    let p_idx = pc_tfhe::pack::index_log2_fail(nl, span, 1, p.lwe_sigma_rel);
+    println!("[pc-check] tfhe-pack: output noise rms {rms:.3e} (p0 units; model {model:.3e} + the mod switch), spacing {delta}; index p_fail 2^{p_idx:.1} (span {span})");
+    let rot1: Vec<f64> = (0..reps)
+        .map(|_| -> Res<f64> {
+            let td = Instant::now();
+            rotate(1, &mut d_ms, &mut d_racc, &mut d_out, &mut d_kb, d_acc.vptr())?;
+            s.sync()?;
+            Ok(td.elapsed().as_secs_f64())
+        })
+        .collect::<Res<_>>()?;
+    println!(
+        "[pc-check] tfhe-pack: private lookup of {t_ent} entries: pack {:.3} ms; rotation of 1 index {:.3} ms; whole lookup (pack + 1 rotation) {:.3} ms; pack + {count} rotations {:.3} ms (host {:.1} s for the {count} rotations)",
+        med(full1.iter().map(|x| x.0).collect()) * 1e3,
+        med(rot1) * 1e3,
+        med(full1.iter().map(|x| x.1).collect()) * 1e3,
+        med(fullc.iter().map(|x| x.1).collect()) * 1e3,
+        host_s
+    );
+    println!("[pc-check] tfhe-pack: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
+
+/// `pc-check tfhe-bitwise [--words 1,16,256] [--digits 16] [--reps 7] [--nu 2] [--lat-group 5] [--ops add,cmp,mux,xor]`:
+/// native TFHE bitwise ops on radix-4 words, one native LWE (s_br, p0) per digit d at value d / 8, on the device's native
+/// ops (`TfheSwitch::native_lin_c` / `native_pbs`: a key switch s_br -> s_lwe and a PBS per lookup). Every lookup
+/// table has <= 8 bins over the native [-1, 1) (16 for xor):
+/// - add: statuses S_i = sign(s_i - 3) / 4 (kill / propagate / generate, s_i = a_i + b_i), Kogge-Stone prefix rounds
+///   S_i = sign(2 S_i + S_(i - d)) (the last one outputs the carry [S == G] / 8), then (s_i + c_i) mod 4: 1 + log2 n +
+///   1 PBS rounds;
+/// - cmp (a < b): statuses sign(a_i - b_i), a tree of the same combine from the top digit: 1 + log2 n rounds;
+/// - mux (sel ? a : b): one PBS per digit, o = f(2 (a - b) / 8 + 2 sel) = -+(a - b) / 16 (the negacyclic half turn
+///   flips it by sel), output a + b + 2 o = 2 (sel ? a : b) at value d / 4 (consumers fold the 2 into their
+///   coefficients);
+/// - xor: one bivariate PBS per digit on a + 4 b (16 bins: p_fail < 2^-128 needs nu 2).
+/// Every output decrypted against the exact result; latency (device, synced) per word count; p_fail per lookup by
+/// the input noise model (mod switch rounding + key switch).
+pub fn cmd_bitwise(args: &[String]) -> ExitCode {
+    match run_bitwise(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-bitwise: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_bitwise(args: &[String]) -> Res<bool> {
+    use pc_core::keys::DiscreteGaussian;
+    use pc_tfhe::lwe::Lwe;
+    use std::ffi::c_void;
+    let words: Vec<usize> = arg(args, "--words").unwrap_or_else(|| "1,16,256".into()).split(',').map(|x| x.trim().parse()).collect::<std::result::Result<_, _>>()?;
+    let nd: usize = arg(args, "--digits").map(|s| s.parse()).transpose()?.unwrap_or(16);
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(7).max(1);
+    let ops: Vec<String> = arg(args, "--ops").unwrap_or_else(|| "add,cmp,mux,xor".into()).split(',').map(str::to_string).collect();
+    if !nd.is_power_of_two() || nd < 2 {
+        return Err("--digits: a power of two >= 2".into());
+    }
+    let wmax = *words.iter().max().ok_or("--words")?;
+    let rows = wmax * nd;
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let mut params = switch_params(args, n)?;
+    params.chain = true;
+    let (nb, nu) = (params.n_br, params.nu);
+    let row = nb + 1;
+    const NBUF: usize = 8;
+    let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
+    let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
+    let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, rows));
+    mp.reserve("bitwise", 4 * (NBUF * rows * row + 2 * 2 * rows * 8 + 8 * 2 * params.tv_len()) + (1 << 20));
+    let arena = mp.allocate(&dev)?;
+    let ex = Executor::<W>::new(&dev, &arena, &mp)?;
+    let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
+    let s = &ex.compute;
+    let mut prng = test_prng(0xa1);
+    let sk = SecretKey::sample(&mut prng, n)?;
+    let sv: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let tk = Instant::now();
+    let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
+    println!("[pc-check] tfhe-bitwise: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}, ks {:?})", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, params.ks);
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, rows)?;
+    let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..NBUF).map(|_| arena.alloc::<pc_cuda::Compute, u32>("bitwise", rows * row)).collect::<std::result::Result<_, _>>()?;
+    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 2 * 2 * rows * 8)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 8 * 2 * params.tv_len())?;
+    arena.freeze();
+    // the native tables (v at phase v q / 4; inputs on [-1, 1))
+    let r4 = |m: f64| (4.0 * m).round();
+    let tables: Vec<Box<dyn Fn(f64) -> f64>> = vec![
+        Box::new(move |m| match r4(m) {                                                    // 0 sgn: sign(round 4 m) / 4
+            r if r > 0.0 => 0.25,
+            r if r < 0.0 => -0.25,
+            _ => 0.0,
+        }),
+        Box::new(move |m| if r4(m) > 0.0 { 0.125 } else { 0.0 }),                         // 1 carry: [G] / 8
+        Box::new(|m: f64| (((m + 1.0) * 4.0).floor().rem_euclid(4.0)) / 8.0),              // 2 out: (s + c) mod 4 / 8
+        Box::new(move |m| if r4(m) < 0.0 { 0.125 } else { 0.0 }),                         // 3 lt: [a < b] / 8
+        Box::new(move |m| -r4(m) / 16.0),                                                  // 4 mux: -(a - b) / 16
+        Box::new(|m: f64| {                                                                // 5 xor on a + 4 b
+            let k = ((m + 1.0) * 8.0).floor().clamp(0.0, 15.0) as usize;
+            ((k % 4) ^ (k / 4)) as f64 / 8.0
+        }),
+    ];
+    let tvl = params.tv_len();
+    let mut tvw = Vec::new();
+    for f in &tables {
+        let tv = pc_tfhe::chain::native_tv(tvl, params.q_br, |m| f(m));
+        tvw.extend(sw.bsk.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)));
+    }
+    d_tv.upload(s, &tvw)?;
+    let tvp = |k: usize| (d_tv.vptr() as *const u32).wrapping_add(k * 2 * tvl) as *const c_void;
+    let enc_v = |v: f64| ((v * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64;
+    let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
+    let encrypt = |vals: &[f64], prng: &mut pc_core::keys::Prng| -> Vec<u32> {
+        vals.iter().flat_map(|&v| {
+            let l = Lwe::encrypt(enc_v(v), &s_br, p0, &dg, prng);
+            l.a.into_iter().chain(std::iter::once(l.b)).map(|x| x as u32).collect::<Vec<_>>()
+        }).collect()
+    };
+    let decrypt = |w: &[u32], cnt: usize| -> Vec<f64> {
+        (0..cnt).map(|r| {
+            let l = Lwe { a: w[r * row..r * row + nb].iter().map(|&x| x as u64).collect(), b: w[r * row + nb] as u64 };
+            centered(l.phase(&s_br, p0), p0) as f64 * 4.0 / p0 as f64
+        }).collect()
+    };
+    // the input noise model of a lookup (m units, period 4): the mod switch's rounding to 2 nu n_br
+    // ((n_lwe / 2 + 1) / 12) and the key switch s_br -> s_lwe (n_br sum E d^2 sigma^2, NAF digits)
+    let ms_sd = ((params.n_lwe as f64 / 2.0 + 1.0) / 12.0).sqrt() * 4.0 / (2 * nu * nb) as f64;
+    let ks_sd = (nb as f64 * 5.44).sqrt() * params.lwe_sigma_rel * 4.0;
+    let sd = (ms_sd * ms_sd + ks_sd * ks_sd).sqrt();
+    let pf = |half: f64| pc_tfhe::pack::log2_tail(half / sd);
+    println!("[pc-check] tfhe-bitwise: lookup input noise sd {sd:.2e} (mod switch {ms_sd:.2e}, key switch {ks_sd:.2e}); p_fail per lookup: 8-bin tables 2^{:.1}, 16-bin 2^{:.1}", pf(0.125), pf(0.0625));
+    let mut t = Tally::default();
+    let lt_ = &blt.inner;
+    // a native program step: LWE_LIN (dst, a, b, index pairs, rows, ca, cb, c) / PBS (src, rows, table, dst)
+    #[derive(Clone, Copy)]
+    enum St {
+        Lin(*mut c_void, *const c_void, *const c_void, *const c_void, usize, u64, u64, u64),
+        Pbs(*const c_void, usize, usize, *mut c_void),
+    }
+    let mut idx_off = 0usize;
+    let mut upload_pairs = |d: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, pairs: &[(i64, i64)], off: &mut usize| -> Res<*const c_void> {
+        let w: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a as i32 as u32, b as i32 as u32]).collect();
+        d.upload_at(s, *off, &w)?;
+        let p = (d.vptr() as *const u32).wrapping_add(*off) as *const c_void;
+        *off += w.len();
+        Ok(p)
+    };
+    for op in &ops {
+        for &nw in &words {
+            let rr = nw * nd;
+            let mut rng = test_prng(0x5ee0 + nw as u32);
+            let a: Vec<u64> = (0..nw).map(|_| rng.uniform_below(1 << (2 * nd.min(31)))).collect();
+            let b: Vec<u64> = (0..nw).map(|i| if i % 4 == 1 { a[i] } else { rng.uniform_below(1 << (2 * nd.min(31))) }).collect();
+            let sel: Vec<u64> = (0..nw).map(|_| rng.uniform_below(2)).collect();
+            let dig = |x: &[u64]| -> Vec<f64> { x.iter().flat_map(|&v| (0..nd).map(move |i| ((v >> (2 * i)) & 3) as f64 / 8.0)).collect() };
+            bufs[0].upload_at(s, 0, &encrypt(&dig(&a), &mut rng))?;
+            bufs[1].upload_at(s, 0, &encrypt(&dig(&b), &mut rng))?;
+            bufs[2].upload_at(s, 0, &encrypt(&sel.iter().map(|&x| x as f64 / 8.0).collect::<Vec<_>>(), &mut rng))?;
+            idx_off = 0;
+            let all: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, r)).collect();
+            let p_all = upload_pairs(&mut d_idx, &all, &mut idx_off)?;
+            let bp = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr();
+            let bpm = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr() as *mut c_void;
+            let (b0, b1, b2, b3, b4, b5, b6) = (bp(&bufs[0]), bp(&bufs[1]), bp(&bufs[2]), bpm(&bufs[3]), bpm(&bufs[4]), bpm(&bufs[5]), bpm(&bufs[6]));
+            // the program of `op` as a list of launches (prepared index pairs), run `reps` times
+            let (rounds, out_buf, out_rows): (usize, *mut c_void, usize);
+            let mut prog: Vec<St> = Vec::new();
+            match op.as_str() {
+                "add" => {
+                    // X = 2 a + 2 b - 3/4, S = sgn(X)
+                    let c = enc_v(-0.75);
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, 2, c));
+                    prog.push(St::Pbs(b3, rr, 0, b4));
+                    let mut d = 1;
+                    let (mut cur, mut nxt) = (b4, b5);
+                    while d < nd {
+                        let pairs: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, if (r as usize) % nd >= d { r - d as i64 } else { -1 })).collect();
+                        let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                        let last = 2 * d >= nd;
+                        let (src, dst) = (cur, nxt);
+                        prog.push(St::Lin(b6, src, src, pp, rr, 2, 1, 0));
+                        prog.push(St::Pbs(b6, rr, if last { 1 } else { 0 }, dst));
+                        (cur, nxt) = (nxt, cur);
+                        d *= 2;
+                    }
+                    // Z = X + 2 c_(i - 1) - 1/8, out = (s + c) mod 4
+                    let pairs: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, if (r as usize) % nd > 0 { r - 1 } else { -1 })).collect();
+                    let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                    let (cc, c8) = (cur, enc_v(-0.125));
+                    prog.push(St::Lin(b6, b3, cc, pp, rr, 1, 2, c8));
+                    prog.push(St::Pbs(b6, rr, 2, nxt));
+                    (rounds, out_buf, out_rows) = (2 + nd.trailing_zeros() as usize, nxt, rr);
+                }
+                "cmp" => {
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, p0 - 2, 0));
+                    prog.push(St::Pbs(b3, rr, 0, b4));
+                    let (mut cur, mut nxt, mut k) = (b4, b5, nd);
+                    while k > 1 {
+                        let h = k / 2;
+                        let pairs: Vec<(i64, i64)> = (0..nw * h).map(|r| ((r / h * k + 2 * (r % h) + 1) as i64, (r / h * k + 2 * (r % h)) as i64)).collect();
+                        let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                        let (src, dst, cnt, last) = (cur, nxt, nw * h, h == 1);
+                        prog.push(St::Lin(b6, src, src, pp, cnt, 2, 1, 0));
+                        prog.push(St::Pbs(b6, cnt, if last { 3 } else { 0 }, dst));
+                        (cur, nxt) = (nxt, cur);
+                        k = h;
+                    }
+                    (rounds, out_buf, out_rows) = (1 + nd.trailing_zeros() as usize, cur, nw);
+                }
+                "mux" => {
+                    // T = 2 a - 2 b; Y = T + 16 sel (2 sel: the half turn); o = f(Y); out = a + b + 2 o
+                    let ps: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, r / nd as i64)).collect();
+                    let pp = upload_pairs(&mut d_idx, &ps, &mut idx_off)?;
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, p0 - 2, 0));
+                    prog.push(St::Lin(b6, b3, b2, pp, rr, 1, 16, 0));
+                    prog.push(St::Pbs(b6, rr, 4, b4));
+                    prog.push(St::Lin(b5, b0, b1, p_all, rr, 1, 1, 0));
+                    prog.push(St::Lin(b6, b5, b4, p_all, rr, 1, 2, 0));
+                    (rounds, out_buf, out_rows) = (1, b6, rr);
+                }
+                "xor" => {
+                    let c = enc_v(-15.0 / 16.0);
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 1, 4, c));
+                    prog.push(St::Pbs(b3, rr, 5, b4));
+                    (rounds, out_buf, out_rows) = (1, b4, rr);
+                }
+                o => return Err(format!("--ops: {o}?").into()),
+            }
+            let mut go = || -> Res<f64> {
+                let td = Instant::now();
+                for st in &prog {
+                    match *st {
+                        St::Lin(dst, a, b, idx, cnt, ca, cb, c) => ts.native_lin_c(&ctx, s, dst, a, b, idx, cnt, ca, cb, c)?,
+                        St::Pbs(src, cnt, tv, dst) => ts.native_pbs(&ctx, s, lt_, src, cnt, tvp(tv), &[0], &[dst])?,
+                    }
+                }
+                s.sync()?;
+                Ok(td.elapsed().as_secs_f64())
+            };
+            go()?;
+            let mut tm: Vec<f64> = (0..reps).map(|_| go()).collect::<Res<_>>()?;
+            tm.sort_by(f64::total_cmp);
+            let med = tm[reps / 2];
+            // the output buffer's rows (a raw pointer into one of `bufs`)
+            let k = bufs.iter().position(|b| b.vptr() as *mut c_void == out_buf).ok_or("output buffer")?;
+            let got = decrypt(&bufs[k].download_range(s, 0, out_rows * row)?, out_rows);
+            let mask = if 2 * nd >= 64 { u64::MAX } else { (1u64 << (2 * nd)) - 1 };
+            let (want, scale): (Vec<u64>, f64) = match op.as_str() {
+                "add" => (a.iter().zip(&b).map(|(x, y)| (x + y) & mask).collect(), 8.0),
+                "cmp" => (a.iter().zip(&b).map(|(x, y)| (x < y) as u64).collect(), 8.0),
+                "mux" => ((0..nw).map(|i| if sel[i] == 1 { a[i] } else { b[i] }).collect(), 4.0),
+                _ => (a.iter().zip(&b).map(|(x, y)| x ^ y).collect(), 8.0),
+            };
+            let (mut wrong, mut dev_max) = (0usize, 0f64);
+            for w in 0..nw {
+                let v: u64 = if op == "cmp" {
+                    (got[w] * scale).round() as u64
+                } else {
+                    (0..nd).map(|i| (((got[w * nd + i] * scale).round() as i64).rem_euclid(4) as u64) << (2 * i)).sum()
+                };
+                wrong += (v != want[w]) as usize;
+                for i in 0..if op == "cmp" { 1 } else { nd } {
+                    let x = got[if op == "cmp" { w } else { w * nd + i }] * scale;
+                    dev_max = dev_max.max((x - x.round()).abs());
+                }
+            }
+            t.add(&format!("tfhe-bitwise: {op}{} x {nw} words, exact", 2 * nd), wrong, nw);
+            let pbs: usize = match op.as_str() {
+                "add" => rr * (2 + nd.trailing_zeros() as usize),
+                "cmp" => rr + nw * (nd - 1),
+                _ => rr,
+            };
+            println!("[pc-check] tfhe-bitwise: {op}{}: {nw} words: {:.3} ms (median of {reps}), {rounds} PBS rounds, {pbs} PBS; {:.0} words/s, {:.0} PBS/s; max output dev {dev_max:.2e} (digit units)", 2 * nd, med * 1e3, nw as f64 / med, pbs as f64 / med);
+        }
+    }
+    println!("[pc-check] tfhe-bitwise: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
 }

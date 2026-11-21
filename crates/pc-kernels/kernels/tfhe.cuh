@@ -336,11 +336,14 @@ __global__ void init_k(TfheArgs A) {
     const uint32_t bt = ((const uint32_t*)A.z)[(size_t)blockIdx.y * (A.i1 + 1) + A.i1];
     const int kp = (int)((2 * big - bt) % (2 * big));
     uint32_t* acc = (uint32_t*)A.x + (size_t)blockIdx.y * nu * 4 * n;
+    // i0 bit 0: y = an encrypted accumulator [2 part][2 prime][nu n] (part 1 rotated as well); bit 1: one per LWE
+    const bool enc = A.i0 & 1;
+    const uint32_t* y = (const uint32_t*)A.y + ((A.i0 & 2) ? (size_t)blockIdx.y * 4 * big : 0);
     for (int x = blockIdx.x * blockDim.x + threadIdx.x; x < big; x += gridDim.x * blockDim.x) {
         const int i = x / n, o = x % n;
         for (int p = 0; p < 2; p++) {
-            acc[(i * 4 + p) * n + o] = mono32((const uint32_t*)A.y + p * big, big, kp, nu * o + i, p ? qb : qa);
-            acc[(i * 4 + 2 + p) * n + o] = 0;
+            acc[(i * 4 + p) * n + o] = mono32(y + p * big, big, kp, nu * o + i, p ? qb : qa);
+            acc[(i * 4 + 2 + p) * n + o] = enc ? mono32(y + (2 + p) * big, big, kp, nu * o + i, p ? qb : qa) : 0;
         }
     }
 }
@@ -1036,6 +1039,89 @@ __global__ void lwe_lin_k(TfheArgs A) {
     }
 }
 
+// ── the packing key switch LWE -> GLWE (pc-tfhe pack.rs `PackingKey::pack`) ─────────────────────────────────────
+// x mod q_in -> round(x Q / q_in) mod Q (pc-tfhe PackingKey::lift)
+__device__ __forceinline__ uint64_t pack_lift(uint64_t x, uint64_t Q, uint64_t qin) {
+    const unsigned __int128 v = ((unsigned __int128)x * Q + qin / 2) / qin;
+    return (uint64_t)(v % Q);
+}
+// thread per (placement, coefficient i <= i1): the digits of lift(a_i) into D [i1 lv][n] at the placement's position
+// (int32 atomics), the lifted b (times w) into Bacc u64 [2 prime][n] (D's end, 8-byte aligned)
+__global__ void pack_digits_k(TfheArgs A) {
+    const int nl = A.i1, n = A.n, lv = (int)A.c[3], bl = (int)A.c[2];
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)A.count * (nl + 1)) return;
+    const size_t j = idx / (nl + 1);
+    const int i = (int)(idx % (nl + 1));
+    const int2 pl = ((const int2*)A.z)[j];   // (LWE row, position)
+    const int64_t w = A.w ? (int64_t)((const int32_t*)A.w)[j] : 1;
+    const uint64_t x = ((const uint32_t*)A.y)[(size_t)pl.x * (nl + 1) + i];
+    const uint64_t Q = A.c[1], lifted = pack_lift(x, Q, A.c[0]);
+    int32_t* D = (int32_t*)A.x;
+    if (i < nl) {
+        for (int t = 0; t < lv; t++) {
+            const int64_t d = digit(lifted, t, bl, lv, A.m) * w;
+            if (d) atomicAdd(&D[((size_t)i * lv + t) * n + pl.y], (int32_t)d);
+        }
+    } else {
+        unsigned long long* B = (unsigned long long*)(D + (size_t)nl * lv * n);
+        const uint64_t qs[2] = {A.c[6] & 0xffffffffull, A.c[6] >> 32};
+        for (int p = 0; p < 2; p++) {
+            const uint64_t q = qs[p];
+            const int64_t wm = w % (int64_t)q;
+            const uint64_t wq = (uint64_t)(wm < 0 ? wm + (int64_t)q : wm);
+            atomicAdd(&B[(size_t)p * n + pl.y], (unsigned long long)((lifted % q) * wq % q));
+        }
+    }
+}
+// block (row group, prime): per row r of the group D_r mod q, its forward NTT (shared), acc += D_r K_r (both parts,
+// u64 sums, reduced once), then atomically into x = acc u64 [2 prime][2 part][n]; z = key u32 [rows][2 prime][2 part]
+// [n] (NTT form); tw = u64 [prime][psi n | psi Shoup n]; count = rows, i0 = rows per block
+__global__ void __launch_bounds__(1024) pack_mac_k(TfheArgs A) {
+    extern __shared__ uint64_t sh[];
+    const int n = A.n, p = blockIdx.y;
+    const uint64_t q = p ? A.c[6] >> 32 : A.c[6] & 0xffffffffull;
+    const uint64_t* psi = (const uint64_t*)A.tw + (size_t)p * 2 * n;
+    const int r0 = blockIdx.x * A.i0, r1 = min(r0 + A.i0, A.count);
+    uint64_t s0[2] = {0, 0}, s1[2] = {0, 0};
+    for (int r = r0; r < r1; r++) {
+        const int32_t* d = (const int32_t*)A.y + (size_t)r * n;
+        for (int o = threadIdx.x; o < n; o += blockDim.x) {
+            const int64_t v = d[o] % (int64_t)q;
+            sh[o] = (uint64_t)(v < 0 ? v + (int64_t)q : v);
+        }
+        __syncthreads();
+        ntt_fwd(sh, n, psi, psi + n, q);
+        const uint32_t* k = (const uint32_t*)A.z + ((size_t)r * 2 + p) * 2 * n;
+        for (int e = 0, o = threadIdx.x; o < n; o += blockDim.x, e++) {
+            s0[e] += sh[o] * k[o];
+            s1[e] += sh[o] * k[n + o];
+        }
+        __syncthreads();
+    }
+    unsigned long long* acc = (unsigned long long*)A.x + (size_t)p * 2 * n;
+    for (int e = 0, o = threadIdx.x; o < n; o += blockDim.x, e++) {
+        atomicAdd(&acc[o], (unsigned long long)(s0[e] % q));
+        atomicAdd(&acc[n + o], (unsigned long long)(s1[e] % q));
+    }
+}
+// block (part, prime): y = acc u64 [2 prime][2 part][n] mod q, inverse NTT (tw = u64 [prime][ipsi n | Shoup n], c[2 +
+// 2 p] = n^-1 | its Shoup), part 0 + z = Bacc u64 [2 prime][n] -> x = u32 [2 part][2 prime][n] (PBS_INIT's encrypted
+// accumulator)
+__global__ void __launch_bounds__(1024) pack_fin_k(TfheArgs A) {
+    extern __shared__ uint64_t sh[];
+    const int n = A.n, part = blockIdx.x, p = blockIdx.y;
+    const uint64_t q = p ? A.c[6] >> 32 : A.c[6] & 0xffffffffull;
+    const uint64_t* ip = (const uint64_t*)A.tw + (size_t)p * 2 * n;
+    const unsigned long long* acc = (const unsigned long long*)A.y + ((size_t)p * 2 + part) * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) sh[o] = acc[o] % q;
+    __syncthreads();
+    ntt_inv(sh, n, ip, ip + n, A.c[2 + 2 * p], A.c[3 + 2 * p], q);
+    const unsigned long long* B = (const unsigned long long*)A.z + (size_t)p * n;
+    uint32_t* out = (uint32_t*)A.x + ((size_t)part * 2 + p) * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) out[o] = (uint32_t)(part ? sh[o] : addq(sh[o], B[o] % q, q));
+}
+
 __global__ void ks_digits_k(TfheArgs A) {
     const int len = A.i1, lv = (int)A.c[1];
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1554,6 +1640,21 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             break;
         case PC_TFHE_REPACK_C0:
             repack_c0_k<<<(A.n + 255) / 256, 256, 0, s>>>(A);
+            break;
+        case PC_TFHE_PACK_DIGITS: {
+            const size_t tot = (size_t)A.count * (A.i1 + 1);
+            if (A.n > 2048 || (int)A.c[3] < 1 || (int)A.c[2] * (int)A.c[3] > 40) return -1;
+            pack_digits_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
+        case PC_TFHE_PACK_MAC: {
+            if (A.n != 2048 || A.i0 < 1 || A.i0 > 4096) return -1;
+            pack_mac_k<<<dim3((unsigned)((A.count + A.i0 - 1) / A.i0), 2), 1024, A.n * 8, s>>>(A);
+            break;
+        }
+        case PC_TFHE_PACK_FIN:
+            if (A.n != 2048) return -1;
+            pack_fin_k<<<dim3(2, 2), 1024, A.n * 8, s>>>(A);
             break;
         case PC_TFHE_LWE_LIN:
             if (A.count > 65535) return -1;

@@ -207,6 +207,21 @@ class Prog:
         """`lut` None: the rows as they are (a warp pbs's outputs)."""
         self.steps.append({"op": "store", "src": src, "rows": int(rows), "lut": lut, "slots": slots})
 
+    def pack(self, src, rows, place, acc=0, w=None):
+        """The packing key switch (needs PC_TFHE_PACK=slots): encrypted accumulator `acc` from the first `rows` LWEs of
+        buffer `src`, `place` (row, coefficient < 2048) pairs: coefficient c holds sum w * src[row] (native values; w
+        integers, None: 1). `table_place` lays out a table; `plut` reads it."""
+        pl = [int(v) for p in place for v in p]
+        st = {"op": "pack", "src": src, "rows": int(rows), "place": pl, "acc": int(acc)}
+        if w is not None:
+            st["w"] = [int(v) for v in w]
+        self.steps.append(st)
+
+    def plut(self, src, rows, acc, dst):
+        """The private lookup: the first `rows` LWEs of `src` (indices, native values) blindly rotate accumulator
+        `acc`; output j of len(dst) (the coefficient j past the index) into dst[j]. Output rows: `rows`."""
+        self.steps.append({"op": "plut", "src": src, "rows": int(rows), "acc": int(acc), "dst": list(dst)})
+
     def rows_out(self):
         return self.steps[-1]["rows"]
 
@@ -225,9 +240,27 @@ class Prog:
         noise = _NAT_NOISE if noise is None else noise
         rng = _input_rng(np.asarray(m))
         B = [np.zeros(0) for _ in range(self.bufs)]
+        acc = {}
         out = None
         for st in self.steps:
             op = st["op"]
+            if op == "pack":
+                pl = np.asarray(st["place"], dtype=np.int64).reshape(-1, 2)
+                w = np.asarray(st.get("w", np.ones(len(pl))), dtype=np.float64)
+                a = np.zeros(NAT_N)
+                np.add.at(a, pl[:, 1], w * B[st["src"]][pl[:, 0]])
+                acc[st["acc"]] = a
+                continue
+            if op == "plut":
+                x = B[st["src"]][:st["rows"]]
+                k = len(st["dst"])
+                x = x + rng.normal(0.0, noise * k, x.shape) if noise else x
+                phi = (k * np.rint(np.asarray(x, dtype=np.float64) * NAT_N / (2 * k))).astype(np.int64) % (2 * NAT_N)
+                for j, d in enumerate(st["dst"]):
+                    c = (phi + j) % (2 * NAT_N)
+                    y = np.where(c < NAT_N, 1.0, -1.0) * acc[st["acc"]][c % NAT_N]
+                    B[d] = y + rng.normal(0.0, _NAT_OUT, y.shape) if _NAT_OUT else y
+                continue
             if op == "load":
                 fs = self.luts[st["lut"]][0]
                 x = np.asarray(m, dtype=np.float64)
@@ -254,6 +287,27 @@ class Prog:
                 else:
                     out = ys[0] + (_RNG.normal(0.0, _OUT_NOISE, x.shape) if _OUT_NOISE else 0.0)
         return out
+
+
+NAT_N = 2048        # the GLWE degree n_br: an encrypted accumulator's coefficients
+
+
+def table_place(t, n=NAT_N, k=1):
+    """`Prog.pack` placements and weights of a t-entry table on [-1, 1): entry i (row i of the packed buffer) serves
+    the indices m in [-1 + 2 i / t, -1 + 2 (i + 1) / t) (`table_index(i, t)` is its centre). Coefficient c reads
+    m = 2 c / n below n / 2 and 2 (c - n) / n above, where it holds -v (the negacyclic rotation flips it back).
+    k > 1: k tables interleaved (`Prog.plut` with k outputs, one rotation): table j (rows j t .. j t + t - 1) at the
+    coefficients j mod k, on the grid of n / k points (the index's mod-switch noise k times larger)."""
+    c = np.arange(n)
+    u, j, g = c // k, c % k, n // k
+    m = np.where(u < g // 2, 2.0 * u / g, 2.0 * (u - g) / g)
+    i = np.minimum(t - 1, np.floor((m + 1.0) * t / 2.0)).astype(np.int64) + j * t
+    return [(int(a), int(b)) for a, b in zip(i, c)], [1 if x < g // 2 else -1 for x in u]
+
+
+def table_index(i, t):
+    """The native index value that selects entry i of a `table_place` table (its bin's centre)."""
+    return -1.0 + (2.0 * np.asarray(i, dtype=np.float64) + 1.0) / t
 
 
 def register_prog(prog):

@@ -121,6 +121,139 @@ pub fn tv_residues(k: &pc_tfhe::pbs::BootstrapKey, tv: &[u64]) -> Vec<u32> {
 /// The device repack (pc-tfhe `RepackKey`, bit for bit): per RC LWEs REPACK_DIGITS -> REPACK_MAC (the GEMM in
 /// R_{n_br} mod p0 P; split K into int64 sums) -> REPACK_FIN (rescaled by P) -> REPACK_SCATTER (X^j P_j(X^S) into ring N), then REPACK_RING (c0, digits of
 /// c1), NTT, REPACK_RMAC (the ring key), INTT, REPACK_C0: `acc` [part][limb][n] mod p0 p1 under s, coefficient form.
+/// The packing key switch LWE (s_lwe, q_in) -> GLWE (s_br, q_br) on the device (pc-tfhe `pack::PackingKey::pack`,
+/// bit-exact): PACK_DIGITS (lifted digits per placement into D [n_lwe levels][n], the bodies into Bacc), PACK_MAC (the
+/// NTT of every D row times its key row, summed), PACK_FIN (inverse NTT, + Bacc) into PBS_INIT's encrypted accumulator
+/// layout [2 part][2 prime][n]. The work is n_lwe x levels NTTs and products per prime whatever the count; the digits
+/// accumulate across `digits` calls until `finish`.
+pub struct DevPack<'a> {
+    n: usize,
+    nl: usize,
+    lv: usize,
+    bl: u32,
+    m: u64,
+    big_q: u64,
+    qab: u64,
+    ninv: [u64; 4],
+    key: DBuf<'a, Compute, u32>,
+    tw_f: DBuf<'a, Compute, u64>,
+    tw_i: DBuf<'a, Compute, u64>,
+    d: DBuf<'a, Compute, i32>,
+    acc: DBuf<'a, Compute, u64>,
+    /// rows per PACK_MAC block
+    rpb: usize,
+}
+
+fn shoup64(w: u64, q: u64) -> u64 {
+    (((w as u128) << 64) / q as u128) as u64
+}
+
+impl<'a> DevPack<'a> {
+    /// Arena bytes (key + tables + work) for a key of `nl` x `lv` rows at degree `n`.
+    pub fn bytes(n: usize, nl: usize, lv: usize) -> usize {
+        4 * nl * lv * 4 * n + 8 * 8 * n + 4 * (nl * lv * n + 4 * n) + 8 * 4 * n + (1 << 16)
+    }
+
+    pub fn new(arena: &'a Arena, s: &Stream<Compute>, pk: &pc_tfhe::pack::PackingKey) -> Result<Self> {
+        let rns = &pk.rns;
+        let n = rns.n();
+        let (nl, lv) = (pk.keys().len(), pk.gadget.levels);
+        let mut kw = Vec::with_capacity(nl * lv * 4 * n);
+        for row in pk.keys().iter().flatten() {
+            for (c0, c1) in row.iter() {
+                kw.extend(c0.iter().chain(c1).map(|&x| x as u32));
+            }
+        }
+        let mut key = arena.alloc::<Compute, u32>("tfhe.pack", kw.len())?;
+        key.upload(s, &kw)?;
+        let (mut tf, mut ti) = (Vec::with_capacity(4 * n), Vec::with_capacity(4 * n));
+        let mut ninv = [0u64; 4];
+        for p in 0..2 {
+            let (psi, ipsi, ni) = rns.ntt[p].tables();
+            let q = rns.ntt[p].q;
+            tf.extend_from_slice(psi);
+            tf.extend(psi.iter().map(|&w| shoup64(w, q)));
+            ti.extend_from_slice(ipsi);
+            ti.extend(ipsi.iter().map(|&w| shoup64(w, q)));
+            ninv[2 * p] = ni;
+            ninv[2 * p + 1] = shoup64(ni, q);
+        }
+        let mut tw_f = arena.alloc::<Compute, u64>("tfhe.pack", tf.len())?;
+        tw_f.upload(s, &tf)?;
+        let mut tw_i = arena.alloc::<Compute, u64>("tfhe.pack", ti.len())?;
+        tw_i.upload(s, &ti)?;
+        let rows = nl * lv;
+        Ok(DevPack {
+            n,
+            nl,
+            lv,
+            bl: pk.gadget.base_log,
+            m: pk.gadget.m,
+            big_q: rns.q,
+            qab: rns.ntt[0].q | rns.ntt[1].q << 32,
+            ninv,
+            key,
+            tw_f,
+            tw_i,
+            d: arena.alloc("tfhe.pack", rows * n + 4 * n)?,
+            acc: arena.alloc("tfhe.pack", 4 * n)?,
+            // ~2 blocks per SM over the two primes
+            rpb: rows.div_ceil(160).max(1),
+        })
+    }
+
+    /// Start a packing (zero the digits and sums).
+    pub fn begin(&mut self, s: &Stream<Compute>) -> Result<()> {
+        self.d.zero(s)?;
+        Ok(self.acc.zero(s)?)
+    }
+
+    /// Add `count` placements: `place` int32 [count][2] = (row of `lwes`, coefficient < n), `w` int32 [count] weights
+    /// (null: 1); `lwes` u32 [rows][n_lwe + 1] mod `q_in` under s_lwe.
+    pub fn digits(&mut self, table: &KernelTable, s: &Stream<Compute>, lwes: *const c_void, place: *const c_void, w: *const c_void, count: usize, q_in: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let a = TfheArgs {
+            op: tfhe_op::PACK_DIGITS,
+            n: self.n as i32,
+            count: count as i32,
+            i1: self.nl as i32,
+            x: self.d.vptr_mut(),
+            y: lwes,
+            z: place,
+            w,
+            m: self.m,
+            c: [q_in, self.big_q, self.bl as u64, self.lv as u64, 0, 0, self.qab, 0],
+            ..Default::default()
+        };
+        // SAFETY: the pointers address this packing's buffers / the caller's device arrays of the stated lengths
+        launch_result("tfhe", unsafe { (table.tfhe)(&a, s.raw()) })?;
+        Ok(())
+    }
+
+    /// The packed GLWE into `out` u32 [2 part][2 prime][n].
+    pub fn finish(&mut self, table: &KernelTable, s: &Stream<Compute>, out: *mut c_void) -> Result<()> {
+        let rows = self.nl * self.lv;
+        let mac = TfheArgs { op: tfhe_op::PACK_MAC, n: self.n as i32, count: rows as i32, i0: self.rpb as i32, x: self.acc.vptr_mut(), y: self.d.vptr(), z: self.key.vptr(), tw: self.tw_f.vptr(), c: [0, 0, 0, 0, 0, 0, self.qab, 0], ..Default::default() };
+        let bacc = (self.d.vptr() as *const i32).wrapping_add(rows * self.n) as *const c_void;
+        let fin = TfheArgs { op: tfhe_op::PACK_FIN, n: self.n as i32, count: 1, x: out, y: self.acc.vptr(), z: bacc, tw: self.tw_i.vptr(), c: [0, 0, self.ninv[0], self.ninv[1], self.ninv[2], self.ninv[3], self.qab, 0], ..Default::default() };
+        // SAFETY: as `digits`
+        launch_result("tfhe", unsafe { (table.tfhe)(&mac, s.raw()) })?;
+        // SAFETY: as `digits`
+        launch_result("tfhe", unsafe { (table.tfhe)(&fin, s.raw()) })?;
+        Ok(())
+    }
+
+    /// begin + digits + finish.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack(&mut self, table: &KernelTable, s: &Stream<Compute>, lwes: *const c_void, place: *const c_void, w: *const c_void, count: usize, q_in: u64, out: *mut c_void) -> Result<()> {
+        self.begin(s)?;
+        self.digits(table, s, lwes, place, w, count, q_in)?;
+        self.finish(table, s, out)
+    }
+}
+
 pub struct DevRepack<'a> {
     n: usize,
     nb: usize,
@@ -345,6 +478,8 @@ pub struct TfheSwitch<'a> {
     cksk: Vec<DBuf<'a, Compute, u8>>,
     /// native_load: the bootstrap outputs (one buffer per LUT, [b][n_br + 1]) go here instead of the repack
     sinks: Vec<*mut c_void>,
+    /// Params::pack: the packing key switch (encrypted lookup tables: `native_pack`, `native_plut`)
+    pack: Option<DevPack<'a>>,
     bsk: DBuf<'a, Compute, u32>,
     bsk_lat: Option<DBuf<'a, Compute, u32>>,
     btw: DBuf<'a, Compute, u32>,
@@ -388,7 +523,8 @@ impl<'a> TfheSwitch<'a> {
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb * p.nu + 2 * nb * p.nu
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
         let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
-        4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + (1 << 20)
+        let pack = if p.pack { DevPack::bytes(nb, nl, pc_tfhe::pack::PACK_GADGET.1) } else { 0 };
+        4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + pack + (1 << 20)
     }
 
     /// Upload `sw`'s keys (host-generated: pc-tfhe `Switcher::generate`) and carve the work buffers.
@@ -435,6 +571,10 @@ impl<'a> TfheSwitch<'a> {
             ksk,
             cksk,
             sinks: Vec::new(),
+            pack: match &sw.pack {
+                Some(pk) => Some(DevPack::new(arena, s, pk)?),
+                None => None,
+            },
             bsk: up32("tfhe.bsk", &img.bsk)?,
             bsk_lat: match &sw.bsk_lat {
                 Some(k) => Some(up32("tfhe.bsk", &pbs_image(k).bsk)?),
@@ -719,12 +859,45 @@ impl<'a> TfheSwitch<'a> {
     /// the `offsets.len()` interleaved ones into `dsts[j]` [b][n_br + 1].
     #[allow(clippy::too_many_arguments)]
     pub fn native_pbs<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, tv: *const c_void, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
+        self.native_rot(ctx, s, lt_, src, b, tv, 0, offsets, dsts)
+    }
+
+    /// The private lookup: native index LWEs `src` [b][n_br + 1] rotate the encrypted accumulator `acc` ([2 part][2
+    /// prime][n_br], `native_pack`; pc-tfhe `BootstrapKey::bootstrap_acc`), the extraction of coefficient j (+ offsets[j],
+    /// mod switched to p0: native LWEs under s_br, what `native_pbs` reads) into `dsts[j]`. nu 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_plut<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, acc: *const c_void, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
+        if self.p.nu != 1 {
+            return Err(shape("tfhe native", "the private lookup runs at nu 1".to_string()));
+        }
+        self.native_rot(ctx, s, lt_, src, b, acc, 1, offsets, dsts)
+    }
+
+    /// The key switch s_br -> s_lwe of `cb` native LWEs `src` [cb][n_br + 1] (cb <= the switch's capacity) into `lwe`.
+    fn native_ks<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, cb: usize) -> Result<()> {
+        let (nb, nl, p0) = (self.nb, self.nl, self.p0);
+        let (ks_lv, cols) = (self.p.ks.1, nl + 1);
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: nb as i32, x: self.kdig.vptr_mut(), y: src, q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+        self.prepare(lt_, cb)?;
+        let mp = cb.next_multiple_of(16);
+        let gemm = &self.gemms[&mp];
+        let ps = (cols * mp).next_multiple_of(64);
+        let gp_ = self.g.dptr_mut();
+        for u in 0..PLANES {
+            // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
+            unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.cksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
+        }
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: nb as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: src, q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_rot<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, tv: *const c_void, init: i32, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
         let (nb, nl, p0, qb) = (self.nb, self.nl, self.p0, self.p.q_br);
         let kl = offsets.len();
         if self.cksk.is_empty() || b == 0 || kl == 0 || dsts.len() != kl || (2 * nb * self.p.nu) % kl != 0 {
             return Err(shape("tfhe native", format!("{b} LWEs, {kl} LUTs / {} outputs (needs Params::chain)", dsts.len())));
         }
-        let (ks_lv, cols, nu) = (self.p.ks.1, nl + 1, self.p.nu as u64);
+        let nu = self.p.nu as u64;
         let mut cx = [0u64; 8];
         cx[5] = nu;
         cx[6] = self.pbs_c[6];
@@ -734,18 +907,8 @@ impl<'a> TfheSwitch<'a> {
         for c0 in (0..b).step_by(self.max) {
             let cb = self.max.min(b - c0);
             let sc = (src as *const u32).wrapping_add(c0 * (nb + 1)) as *const c_void;
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: nb as i32, x: self.kdig.vptr_mut(), y: sc, q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
-            self.prepare(lt_, cb)?;
-            let mp = cb.next_multiple_of(16);
-            let gemm = &self.gemms[&mp];
-            let ps = (cols * mp).next_multiple_of(64);
-            let gp_ = self.g.dptr_mut();
-            for u in 0..PLANES {
-                // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
-                unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.cksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
-            }
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: nb as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: sc, q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
-            self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
+            self.native_ks(ctx, s, lt_, sc, cb)?;
+            self.rotate_init(ctx, s, cb, tv, init, kl, &cx, pbs_c)?;
             let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
             for (j, (&off, &d)) in offsets.iter().zip(dsts).enumerate() {
                 let x = (d as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
@@ -753,6 +916,26 @@ impl<'a> TfheSwitch<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The packing key switch of native LWEs `src` [rows][n_br + 1] (key switched s_br -> s_lwe, then
+    /// `DevPack::pack` at q_in = p0) into the encrypted accumulator `out` [2 part][2 prime][n_br]: `place` int32
+    /// [count][2] = (row < rows, coefficient < n_br), `w` int32 [count] weights (null: 1). A native value v (phase
+    /// v p0 / 4) lands at phase v q_br / 4: what `native_plut` extracts back to v. rows <= the switch's capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_pack<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, rows: usize, place: *const c_void, w: *const c_void, count: usize, out: *mut c_void) -> Result<()> {
+        if self.pack.is_none() || self.cksk.is_empty() || rows == 0 || rows > self.max || count == 0 {
+            return Err(shape("tfhe native", format!("pack of {rows} LWEs (needs Params::chain and Params::pack; <= {} rows)", self.max)));
+        }
+        self.native_ks(ctx, s, lt_, src, rows)?;
+        let p0 = self.p0;
+        let lwe = self.lwe.vptr();
+        self.pack.as_mut().unwrap().pack(ctx.table, s, lwe, place, w, count, p0, out)
+    }
+
+    /// Whether the switch holds the packing key (`native_pack`).
+    pub fn has_pack(&self) -> bool {
+        self.pack.is_some()
     }
 
     /// Native LWEs `src` [b][n_br + 1] (their phase read as the LUT outputs the finish expects: `pbs::warp`ed) into
@@ -775,12 +958,18 @@ impl<'a> TfheSwitch<'a> {
     /// (batch path, latency path or both) into `acc`.
     #[allow(clippy::too_many_arguments)]
     fn rotate<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, cb: usize, tv: *const c_void, kl: usize, cx: &[u64; 8], pbs_c: [u64; 8]) -> Result<()> {
+        self.rotate_init(ctx, s, cb, tv, 0, kl, cx, pbs_c)
+    }
+
+    /// `rotate` with PBS_INIT's flags `init` (bit 0: `tv` is an encrypted accumulator [2 part][2 prime][n]).
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_init<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, cb: usize, tv: *const c_void, init: i32, kl: usize, cx: &[u64; 8], pbs_c: [u64; 8]) -> Result<()> {
         let (nb, nl, p0, qb, nu) = (self.nb, self.nl, self.p0, self.p.q_br, self.p.nu as u64);
         let cols = nl + 1;
         let cx = *cx;
         let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
         Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_MS, x: self.ms.vptr_mut(), y: self.lwe.vptr(), m: pc_tfhe::gadget::fixed_ratio(2 * nu * nb as u64 / kl as u64, p0), c: [p0, 0, 0, 0, kl as u64, nu, 0, 0], ..pb })?;
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, x: self.acc.vptr_mut(), y: tv, z: self.ms.vptr(), c: cx, ..pb })?;
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_INIT, i0: init, x: self.acc.vptr_mut(), y: tv, z: self.ms.vptr(), c: cx, ..pb })?;
         let rot = TfheArgs {
             op: tfhe_op::PBS_ROTATE,
             i2: self.p.pbs_group as i32,

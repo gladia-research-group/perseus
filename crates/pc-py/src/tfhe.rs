@@ -90,6 +90,8 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
     }
     // PC_TFHE_NATIVE=bufs,rows: native programs (Params::chain; `bufs` LWE buffers of `rows` each)
     p.chain = native_cap().is_some();
+    // PC_TFHE_PACK=slots: encrypted lookup tables in native programs (Params::pack; `slots` packed accumulators)
+    p.pack = p.chain && pack_slots() > 0;
     if let Ok(v) = std::env::var("PC_TFHE_NU") {
         p.nu = match v.trim() {
             "" | "1" => 1,
@@ -107,6 +109,11 @@ pub(crate) fn native_cap() -> Option<(usize, usize)> {
     Some((b.trim().parse().ok()?, r.trim().parse().ok()?))
 }
 
+/// PC_TFHE_PACK=slots: the native programs' encrypted accumulators (0: no packing key).
+pub(crate) fn pack_slots() -> usize {
+    std::env::var("PC_TFHE_PACK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
 /// Index words the native programs' LIN steps may hold in total.
 const MAX_IDX: usize = 1 << 20;
 
@@ -117,6 +124,12 @@ enum Step {
     Lin { dst: usize, a: usize, b: usize, idx: usize, rows: usize, ca: u64, cb: u64, c: u64 },
     Pbs { src: usize, rows: usize, lut: usize, k: usize, dst: Vec<usize> },
     Store { src: usize, rows: usize, lut: Option<usize>, set: String },
+    /// the packing key switch of `rows` LWEs of `src` into accumulator `acc`: `count` placements (row, coefficient)
+    /// at `place` in the index buffer, then `count` weights (`weighted`)
+    Pack { src: usize, rows: usize, place: usize, count: usize, weighted: bool, acc: usize },
+    /// the private lookup: `rows` index LWEs of `src` rotate accumulator `acc`; output j (coefficient j, k of them)
+    /// into dst[j]
+    Plut { src: usize, rows: usize, acc: usize, dst: Vec<usize> },
 }
 
 /// What the session's MemPlan reserves: the switch (`max` values per pass), the tables, one ciphertext.
@@ -132,6 +145,9 @@ impl TfhePlan {
         mp.reserve("tfhe.ct", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1)));
         if let Some((b, r)) = native_cap() {
             mp.reserve("tfhe.native", 4 * ((b + 1) * r * (p.n_br + 1) + MAX_IDX) + 512);
+            if p.pack {
+                mp.reserve("tfhe.accs", 4 * pack_slots() * 4 * p.n_br + 256);
+            }
         }
         Ok(())
     }
@@ -158,6 +174,8 @@ pub(crate) struct TfheRt {
     nat: Option<(pc_cuda::DBuf<'static, pc_cuda::Compute, u32>, usize, usize)>,
     nat_idx: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
     idx_used: usize,
+    /// PC_TFHE_PACK: the encrypted accumulators [slots][2 part][2 prime][n_br]
+    accs: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
     n: usize,
     pub calls: u64,
     pub values: u64,
@@ -192,7 +210,11 @@ impl TfheRt {
             ),
             None => (None, None),
         };
-        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
+        let accs = match params.pack {
+            true => Some(arena.alloc::<pc_cuda::Compute, u32>("tfhe.accs", pack_slots() * 4 * params.n_br).map_err(|x| e(x.into()))?),
+            false => None,
+        };
+        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, accs, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
     }
 
     /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / g (j < g / 2) and 2 (j - g) / g (j >= g / 2)
@@ -435,6 +457,59 @@ impl TfheRt {
                     }
                     Step::Store { src: buf(st, "src")?, rows: r, lut: l, set }
                 }
+                "pack" => {
+                    // place: [[row, coefficient], ...]; w: optional integer weights; acc: the accumulator slot
+                    let r = nrows(st)?;
+                    let place: Vec<i64> = serde_json::from_value(st.get("place").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
+                    let w: Option<Vec<i64>> = match st.get("w") {
+                        Some(x) if !x.is_null() => Some(serde_json::from_value(x.clone()).map_err(|y| bad(y.to_string()))?),
+                        _ => None,
+                    };
+                    let cnt = place.len() / 2;
+                    let nb = self.params.n_br as i64;
+                    if self.accs.is_none() {
+                        return Err(bad("pack: the session has no packing key (PC_TFHE_PACK=slots)".into()));
+                    }
+                    if place.len() % 2 != 0 || cnt == 0 || place.chunks(2).any(|c| c[0] < 0 || c[0] >= r as i64 || c[1] < 0 || c[1] >= nb) {
+                        return Err(bad(format!("pack: placements (row < {r}, coefficient < {nb}) pairs")));
+                    }
+                    if r > self.sw.max() {
+                        return Err(bad(format!("pack: {r} rows (one switch pass holds {})", self.sw.max())));
+                    }
+                    if let Some(w) = &w {
+                        // the digits' int32 sums: |w| 2^7 summed over a coefficient's placements < 2^31
+                        if w.len() != cnt || w.iter().any(|&x| x.abs() > 1 << 16) {
+                            return Err(bad(format!("pack: {} weights for {cnt} placements (|w| <= 2^16)", w.len())));
+                        }
+                    }
+                    let mut words: Vec<u32> = place.iter().map(|&v| v as i32 as u32).collect();
+                    if let Some(w) = &w {
+                        words.extend(w.iter().map(|&v| v as i32 as u32));
+                    }
+                    if self.idx_used + words.len() > MAX_IDX {
+                        return Err(bad(format!("the session holds {MAX_IDX} index words")));
+                    }
+                    let ib = self.nat_idx.as_mut().unwrap();
+                    ib.upload_at(s, self.idx_used, &words).map_err(|x| crate::session::gerr(x.into()))?;
+                    let off = self.idx_used;
+                    self.idx_used += words.len();
+                    let acc = st.get("acc").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    if acc >= pack_slots() {
+                        return Err(bad(format!("pack: accumulator {acc} (the session holds {})", pack_slots())));
+                    }
+                    Step::Pack { src: buf(st, "src")?, rows: r, place: off, count: cnt, weighted: w.is_some(), acc }
+                }
+                "plut" => {
+                    let acc = st.get("acc").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    if self.accs.is_none() || acc >= pack_slots() {
+                        return Err(bad(format!("plut: accumulator {acc} (PC_TFHE_PACK=slots: {})", pack_slots())));
+                    }
+                    let dst: Vec<usize> = st.get("dst").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|y| y.as_u64().map(|z| z as usize)).collect()).unwrap_or_default();
+                    if dst.is_empty() || dst.iter().any(|&b| b >= bufs) || (2 * self.params.n_br) % dst.len() != 0 {
+                        return Err(bad(format!("plut: {} outputs", dst.len())));
+                    }
+                    Step::Plut { src: buf(st, "src")?, rows: nrows(st)?, acc, dst }
+                }
                 o => return Err(bad(format!("step {o:?}"))),
             });
         }
@@ -486,6 +561,17 @@ impl TfheRt {
                     };
                     let pp = (self.pos_buf.vptr() as *const u32).wrapping_add(off) as *const c_void;
                     self.sw.native_store(ctx, st, ltr, out, pp, *r, reps, &mut self.x)?;
+                }
+                Step::Pack { src, rows: r, place, count, weighted, acc } => {
+                    let pl = idx.wrapping_add(*place) as *const c_void;
+                    let w = if *weighted { idx.wrapping_add(*place + 2 * *count) as *const c_void } else { std::ptr::null() };
+                    let out = (self.accs.as_ref().unwrap().vptr() as *mut u32).wrapping_add(acc * 4 * self.params.n_br) as *mut c_void;
+                    self.sw.native_pack(ctx, st, ltr, bp(*src), *r, pl, w, *count, out)?;
+                }
+                Step::Plut { src, rows: r, acc, dst } => {
+                    let a = (self.accs.as_ref().unwrap().vptr() as *const u32).wrapping_add(acc * 4 * self.params.n_br) as *const c_void;
+                    let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
+                    self.sw.native_plut(ctx, st, ltr, bp(*src), *r, a, &vec![0; dst.len()], &dsts)?;
                 }
             }
         }

@@ -505,7 +505,211 @@ class Lut(Task):
         return {"max_err": e, "rms_err": r, "wrong": wrong, "log2_pfail_ct": fbs.p_fail(self.fn)["log2_ct"]}
 
 
-TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut}
+@dataclasses.dataclass
+class IntOp(Task):
+    """Exact integer arithmetic by chained FBS lookups (impl/intops.py) on every slot: `op` add / cmp (a < b) / mux
+    (sel ? a : b) / and / or / xor / addmux (a + b, then sel ? sum : a) on `bits`-bit words in radix 2^`r` digits
+    (one ciphertext per digit), EvalMod `table` (impl/fbs.py TABLES). Every output must round to the exact result."""
+    op: str = "add"
+    bits: int = 16
+    r: int = 2
+    table: str = "k32"
+    layout: str = "cts"           # cts: a digit per ciphertext (ripple); slots: a word's digits in one ciphertext;
+                                  # tfhe: a native TFHE program (impl/tfhe_bitwise.py, radix 4, `words` words)
+    words: int = 16
+    seed: int = 0
+    name = "intop"
+
+    def __post_init__(self):
+        from perseus.impl import intops
+        self.bits, self.r = int(self.bits), int(self.r)
+        rng = np.random.default_rng(self.seed)
+        top = 1 << self.bits
+        self.a = rng.integers(0, top, SLOTS, dtype=np.int64)
+        self.b = rng.integers(0, top, SLOTS, dtype=np.int64)
+        self.b[:64] = self.a[:64]                     # equal words: the compare's "=" path end to end
+        self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
+        if self.layout == "tfhe":
+            import os
+            from perseus.impl import tfhe, tfhe_bitwise
+            self.tfhe = True
+            self.words = int(self.words)
+            nd = self.bits // 2
+            self.a, self.b, self.sel = self.a[:self.words], self.b[:self.words], self.sel[:self.words]
+            self.b[:max(1, self.words // 4)] = self.a[:max(1, self.words // 4)]
+            wp = tfhe_bitwise.WordProg(f"bitwise.{self.op}{self.bits}.w{self.words}", self.words, nd)
+            os.environ.setdefault("PC_TFHE_NATIVE", f"5,{wp.rows_in(True)}")
+            rows_out = self.words if self.op == "cmp" else wp.R
+            tfhe.register_slots(f"bitwise.in.{wp.rows_in(True)}", np.arange(wp.rows_in(True)))
+            tfhe.register_slots(f"bitwise.out.{rows_out}", np.arange(rows_out))
+            out = f"bitwise.out.{rows_out}"
+            if self.op in ("and", "or", "xor"):
+                wp.bitwise(self.op, out)
+            else:
+                {"add": wp.add, "cmp": wp.cmp, "mux": wp.mux, "id": wp.ident}[self.op](out)
+            self.wp, self.prog = wp, tfhe.register_prog(wp.pr)
+            return
+        if self.layout == "slots":
+            self.io = intops.WordOps(None, self.bits, self.r, self.table, SLOTS)
+            n = self.bits // self.r
+            self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            if self.op in ("and", "or", "xor"):
+                self.io.bitwise(self.op, None, None)
+        else:
+            self.io = intops.IntOps(None, self.r, self.table)      # registers the tables in this process
+            if self.op in ("and", "or", "xor"):
+                self.io.bitwise(self.op, [], [])
+
+    def encode(self):
+        from perseus.impl import intops
+        if self.layout == "tfhe":
+            from perseus.impl import tfhe_bitwise
+            nd, x = self.bits // 2, np.zeros(SLOTS)
+            v = np.concatenate([tfhe_bitwise.encode_digits(self.a, nd), tfhe_bitwise.encode_digits(self.b, nd),
+                                (6.0 * self.sel - 3.0) / 4.0])
+            x[:len(v)] = v
+            return [x]
+        if self.layout == "slots":
+            v = [self.io.encode(self.a), self.io.encode(self.b)]
+            return v + [np.repeat(self.sel, self.bits // self.r).astype(float)] if self.op in ("mux", "addmux") else v
+        v = intops.digits(self.a, self.bits, self.r) + intops.digits(self.b, self.bits, self.r)
+        return v + [self.sel.astype(float)] if self.op in ("mux", "addmux") else v
+
+    def ref(self):
+        m = (1 << self.bits) - 1
+        a, b, s = self.a, self.b, self.sel
+        return {"add": (a + b) & m, "cmp": (a < b).astype(np.int64), "mux": np.where(s == 1, a, b),
+                "and": a & b, "or": a | b, "xor": a ^ b, "addmux": np.where(s == 1, (a + b) & m, a), "id": a}[self.op]
+
+    def run(self, ops, xs):
+        from perseus.impl import intops
+        if self.layout == "tfhe":
+            from perseus.impl import tfhe
+            return [tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"bitwise.in.{self.wp.rows_in(True)}")]
+        if self.layout == "slots":
+            w = intops.WordOps(ops, self.bits, self.r, self.table, SLOTS)
+            a, b = xs[0], xs[1]
+            if self.op == "id":
+                return [ops.add(a, 0.0)]
+            if self.op == "add":
+                return [w.add(a, b)]
+            if self.op == "cmp":
+                return [w.cmp(a, b)]
+            if self.op == "mux":
+                return [w.mux(xs[2], a, b)]
+            if self.op == "addmux":
+                return [w.mux(xs[2], w.add(a, b), a)]
+            return [w.bitwise(self.op, a, b)]
+        io = intops.IntOps(ops, self.r, self.table)
+        n = self.bits // self.r
+        a, b = list(xs[:n]), list(xs[n:2 * n])
+        if self.op == "id":                          # the I/O baseline: inputs in, a out
+            return [ops.add(ai, 0.0) for ai in a]
+        if self.op == "add":
+            return io.add(a, b)
+        if self.op == "cmp":
+            return [io.cmp(a, b)]
+        if self.op == "mux":
+            return io.mux(xs[2 * n], a, b)
+        if self.op == "addmux":
+            return io.mux(xs[2 * n], io.add(a, b), a)
+        return io.bitwise(self.op, a, b)
+
+    def outputs(self, vals):
+        return {"d": [np.real(v) for v in vals]}
+
+    def metrics(self, out):
+        from perseus.impl import intops, fbs
+        d = out["d"]
+        if self.layout == "tfhe":
+            nd, y = self.bits // 2, np.real(d[0])
+            if self.op == "cmp":
+                got = np.round(y[:self.words]).astype(np.int64)
+                dev = float(np.abs(y[:self.words] - got).max())
+            else:
+                q = np.clip(np.round(y[:self.words * nd] * 4), 0, 3).astype(np.int64).reshape(self.words, nd)
+                got = (q << (2 * np.arange(nd))).sum(1)
+                dev = float(np.abs(y[:self.words * nd] * 4 - np.round(y[:self.words * nd] * 4)).max())
+            import os
+            nu2 = os.environ.get("PC_TFHE_NU", "1") == "2"      # pc-check tfhe-bitwise's model: 8 / 16 bins at nu 1 / 2
+            lp = (-261.7 if nu2 else -81.9) if self.op in ("and", "or", "xor") else (-1034.1 if nu2 else -317.3)
+            return {"wrong": int(np.sum(got != self.ref())), "max_dev": dev, "log2_pfail_lookup_ct": lp}
+        if self.layout == "slots":
+            n = self.bits // self.r
+            got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
+                   else self.io.decode(d[0]))
+        else:
+            got = intops.value(d, self.r) if self.op != "cmp" else np.round(d[0]).astype(np.int64)
+        dev = max(float(np.abs(np.asarray(v) - np.round(v)).max()) for v in d)
+        wrong = int(np.sum(got != self.ref()))
+        lp = max(fbs.p_fail(n)["log2_ct"] for n in self.io.lookups())
+        return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
+
+
+@dataclasses.dataclass
+class Plut(Task):
+    """An encrypted lookup table (TFHE, impl/tfhe.py Prog.pack / Prog.plut): `t` encrypted entries (multiples of 1/8 in
+    [-1, 1)) and `b` encrypted indices in one ciphertext, the table packed into an accumulator (the packing key switch)
+    and blindly rotated by every index, the entries read back. Planned runs only (a native program in the session's
+    switch; sets PC_TFHE_NATIVE / PC_TFHE_PACK when unset). Every output must round to its entry."""
+    t: int = 16
+    b: int = 256
+    k: int = 1                    # k tables interleaved in one accumulator: k outputs from one rotation
+    seed: int = 0
+    name = "plut"
+    tfhe = True
+
+    def __post_init__(self):
+        import os
+        from perseus.impl import tfhe
+        self.t, self.b, self.k = int(self.t), int(self.b), int(self.k)
+        kt = self.k * self.t
+        if self.k not in (1, 2):
+            raise ValueError("plut: k = 1 or 2 interleaved tables")
+        os.environ.setdefault("PC_TFHE_NATIVE", f"{3 + self.k},{max(kt + self.b, self.k * self.b)}")
+        os.environ.setdefault("PC_TFHE_PACK", "1")
+        rng = np.random.default_rng(self.seed)
+        self.table = rng.integers(-8, 8, (self.k, self.t)) / 8.0
+        self.idx = rng.integers(0, self.t, self.b)
+        self.idx[:self.t] = np.arange(self.t)[:self.b]
+        tfhe.register_slots(f"plut.in.{kt + self.b}", np.arange(kt + self.b))
+        tfhe.register_slots(f"plut.out.{self.k * self.b}", np.arange(self.k * self.b))
+        pr = tfhe.Prog(f"plut.t{self.t}.b{self.b}.k{self.k}", 3 + self.k)
+        pr.lut("id", lambda m: m)
+        pr.lut("out", lambda m: m, warp=True)
+        pr.load("id", 0)
+        place, w = tfhe.table_place(self.t, k=self.k)
+        pr.pack(0, kt, place, acc=0, w=w)
+        pr.lin(1, 0, 0, [(kt + r, -1) for r in range(self.b)])
+        pr.plut(1, self.b, 0, [3 + j for j in range(self.k)] if self.k > 1 else [2])
+        if self.k > 1:       # the k outputs one after the other
+            pr.lin(2, 3, 4, [(r, -1) for r in range(self.b)] + [(-1, r) for r in range(self.b)])
+        pr.store(2, self.k * self.b, "out", f"plut.out.{self.k * self.b}")
+        self.prog = tfhe.register_prog(pr)
+
+    def encode(self):
+        from perseus.impl import tfhe
+        x = np.zeros(SLOTS)
+        x[:self.k * self.t] = self.table.reshape(-1)
+        x[self.k * self.t:self.k * self.t + self.b] = tfhe.table_index(self.idx, self.t)
+        return [x]
+
+    def run(self, ops, xs):
+        from perseus.impl import tfhe
+        y = tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"plut.in.{self.k * self.t + self.b}")
+        return [y]
+
+    def outputs(self, vals):
+        return {"y": np.real(vals[0])[:self.k * self.b]}
+
+    def metrics(self, out):
+        want = np.concatenate([self.table[j][self.idx] for j in range(self.k)])
+        e = np.abs(out["y"] - want)
+        return {"wrong": int(np.sum(np.round(out["y"] * 8) != np.round(want * 8))), "max_err": float(e.max()),
+                "rms_err": float(np.sqrt(np.mean(e * e)))}
+
+
+TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut, "intop": IntOp, "plut": Plut}
 
 
 def make(name, **kw):
