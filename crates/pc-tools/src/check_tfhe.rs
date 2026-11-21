@@ -1665,8 +1665,8 @@ fn run_pack(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `pc-check tfhe-alu [--words 1,16,256] [--digits 16] [--reps 7] [--nu 2] [--lat-group 5] [--ops add,cmp,mux,xor]`:
-/// a native TFHE ALU on radix-4 words, one native LWE (s_br, p0) per digit d at value d / 8, on the device's native
+/// `pc-check tfhe-bitwise [--words 1,16,256] [--digits 16] [--reps 7] [--nu 2] [--lat-group 5] [--ops add,cmp,mux,xor]`:
+/// native TFHE bitwise ops on radix-4 words, one native LWE (s_br, p0) per digit d at value d / 8, on the device's native
 /// ops (`TfheSwitch::native_lin_c` / `native_pbs`: a key switch s_br -> s_lwe and a PBS per lookup). Every lookup
 /// table has <= 8 bins over the native [-1, 1) (16 for xor):
 /// - add: statuses S_i = sign(s_i - 3) / 4 (kill / propagate / generate, s_i = a_i + b_i), Kogge-Stone prefix rounds
@@ -1679,18 +1679,18 @@ fn run_pack(args: &[String]) -> Res<bool> {
 /// - xor: one bivariate PBS per digit on a + 4 b (16 bins: p_fail < 2^-128 needs nu 2).
 /// Every output decrypted against the exact result; latency (device, synced) per word count; p_fail per lookup by
 /// the input noise model (mod switch rounding + key switch).
-pub fn cmd_alu(args: &[String]) -> ExitCode {
-    match run_alu(args) {
+pub fn cmd_bitwise(args: &[String]) -> ExitCode {
+    match run_bitwise(args) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("pc-check tfhe-alu: {e}");
+            eprintln!("pc-check tfhe-bitwise: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_alu(args: &[String]) -> Res<bool> {
+fn run_bitwise(args: &[String]) -> Res<bool> {
     use pc_core::keys::DiscreteGaussian;
     use pc_tfhe::lwe::Lwe;
     use std::ffi::c_void;
@@ -1715,7 +1715,7 @@ fn run_alu(args: &[String]) -> Res<bool> {
     let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
     mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, rows));
-    mp.reserve("alu", 4 * (NBUF * rows * row + 2 * 2 * rows * 8 + 8 * 2 * params.tv_len()) + (1 << 20));
+    mp.reserve("bitwise", 4 * (NBUF * rows * row + 2 * 2 * rows * 8 + 8 * 2 * params.tv_len()) + (1 << 20));
     let arena = mp.allocate(&dev)?;
     let ex = Executor::<W>::new(&dev, &arena, &mp)?;
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
@@ -1726,11 +1726,11 @@ fn run_alu(args: &[String]) -> Res<bool> {
     let (p0, p1) = (chain.q[0], chain.q[1]);
     let tk = Instant::now();
     let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
-    println!("[pc-check] tfhe-alu: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}, ks {:?})", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, params.ks);
+    println!("[pc-check] tfhe-bitwise: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}, ks {:?})", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, params.ks);
     let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, rows)?;
-    let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..NBUF).map(|_| arena.alloc::<pc_cuda::Compute, u32>("alu", rows * row)).collect::<std::result::Result<_, _>>()?;
-    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("alu", 2 * 2 * rows * 8)?;
-    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("alu", 8 * 2 * params.tv_len())?;
+    let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..NBUF).map(|_| arena.alloc::<pc_cuda::Compute, u32>("bitwise", rows * row)).collect::<std::result::Result<_, _>>()?;
+    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 2 * 2 * rows * 8)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 8 * 2 * params.tv_len())?;
     arena.freeze();
     // the native tables (v at phase v q / 4; inputs on [-1, 1))
     let r4 = |m: f64| (4.0 * m).round();
@@ -1777,7 +1777,7 @@ fn run_alu(args: &[String]) -> Res<bool> {
     let ks_sd = (nb as f64 * 5.44).sqrt() * params.lwe_sigma_rel * 4.0;
     let sd = (ms_sd * ms_sd + ks_sd * ks_sd).sqrt();
     let pf = |half: f64| pc_tfhe::pack::log2_tail(half / sd);
-    println!("[pc-check] tfhe-alu: lookup input noise sd {sd:.2e} (mod switch {ms_sd:.2e}, key switch {ks_sd:.2e}); p_fail per lookup: 8-bin tables 2^{:.1}, 16-bin 2^{:.1}", pf(0.125), pf(0.0625));
+    println!("[pc-check] tfhe-bitwise: lookup input noise sd {sd:.2e} (mod switch {ms_sd:.2e}, key switch {ks_sd:.2e}); p_fail per lookup: 8-bin tables 2^{:.1}, 16-bin 2^{:.1}", pf(0.125), pf(0.0625));
     let mut t = Tally::default();
     let lt_ = &blt.inner;
     // a native program step: LWE_LIN (dst, a, b, index pairs, rows, ca, cb, c) / PBS (src, rows, table, dst)
@@ -1913,15 +1913,15 @@ fn run_alu(args: &[String]) -> Res<bool> {
                     dev_max = dev_max.max((x - x.round()).abs());
                 }
             }
-            t.add(&format!("tfhe-alu: {op}{} x {nw} words, exact", 2 * nd), wrong, nw);
+            t.add(&format!("tfhe-bitwise: {op}{} x {nw} words, exact", 2 * nd), wrong, nw);
             let pbs: usize = match op.as_str() {
                 "add" => rr * (2 + nd.trailing_zeros() as usize),
                 "cmp" => rr + nw * (nd - 1),
                 _ => rr,
             };
-            println!("[pc-check] tfhe-alu: {op}{}: {nw} words: {:.3} ms (median of {reps}), {rounds} PBS rounds, {pbs} PBS; {:.0} words/s, {:.0} PBS/s; max output dev {dev_max:.2e} (digit units)", 2 * nd, med * 1e3, nw as f64 / med, pbs as f64 / med);
+            println!("[pc-check] tfhe-bitwise: {op}{}: {nw} words: {:.3} ms (median of {reps}), {rounds} PBS rounds, {pbs} PBS; {:.0} words/s, {:.0} PBS/s; max output dev {dev_max:.2e} (digit units)", 2 * nd, med * 1e3, nw as f64 / med, pbs as f64 / med);
         }
     }
-    println!("[pc-check] tfhe-alu: {} gates, {} failing", t.gates, t.bad);
+    println!("[pc-check] tfhe-bitwise: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }

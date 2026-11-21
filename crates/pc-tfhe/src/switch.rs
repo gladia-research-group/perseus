@@ -305,7 +305,7 @@ impl Switcher {
     }
 
     /// `generate`, also returning the TFHE secrets (s_lwe, s_br) it sampled: for tests that encrypt and decrypt
-    /// native LWEs (pc-check tfhe-alu).
+    /// native LWEs (pc-check tfhe-bitwise).
     pub fn generate_keep(params: Params, s: &[i64], p0: u64, p1: u64, prng: &mut Prng) -> Result<(Switcher, Vec<i64>, Vec<i64>)> {
         let n = s.len();
         let dg = DiscreteGaussian::new(params.key_sigma)?;

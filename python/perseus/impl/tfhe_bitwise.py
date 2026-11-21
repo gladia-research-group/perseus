@@ -1,4 +1,4 @@
-"""A native TFHE ALU on radix-4 words (impl/tfhe.py native programs: one switch in, PBS chains on LWEs, one finish
+"""Native TFHE bitwise ops on radix-4 words (impl/tfhe.py native programs: one switch in, PBS chains on LWEs, one finish
 out). A word of `nd` digits d (base 4, least significant first) is nd native LWEs at value d / 8; every lookup table has
 <= 8 bins on the native [-1, 1) (16 for the bitwise ops), so a lookup's input noise (the mod switch to 2 n_br and the
 key switch: sd ~6e-3 at nu 1) leaves p_fail ~2^-317 per lookup (8 bins; 16 bins need PC_TFHE_NU=2 for < 2^-128).
@@ -10,7 +10,7 @@ key switch: sd ~6e-3 at nu 1) leaves p_fail ~2^-317 per lookup (8 bins; 16 bins 
   a + b + 2 o = 2 (sel ? a : b) / 8: one PBS round;
 - xor / and / or: one PBS per digit on a + 4 b.
 `WordProg` lays words out on a slot set (a's digits, b's, then one sel per word) and appends the steps; pc-check
-tfhe-alu runs the same programs on the device's native ops directly.
+tfhe-bitwise runs the same programs on the device's native ops directly.
 """
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class WordProg:
     def __init__(self, name, words, nd):
         self.w, self.nd = int(words), int(nd)
         if self.nd & (self.nd - 1):
-            raise ValueError("tfhe_alu: digits per word must be a power of two")
+            raise ValueError("tfhe_bitwise: digits per word must be a power of two")
         self.R = self.w * self.nd
         self.pr = tfhe.Prog(name, 5)
         p = self.pr

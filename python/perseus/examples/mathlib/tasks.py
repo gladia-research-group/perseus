@@ -515,7 +515,7 @@ class IntOp(Task):
     r: int = 2
     table: str = "k32"
     layout: str = "cts"           # cts: a digit per ciphertext (ripple); slots: a word's digits in one ciphertext;
-                                  # tfhe: a native TFHE program (impl/tfhe_alu.py, radix 4, `words` words)
+                                  # tfhe: a native TFHE program (impl/tfhe_bitwise.py, radix 4, `words` words)
     words: int = 16
     seed: int = 0
     name = "intop"
@@ -531,18 +531,18 @@ class IntOp(Task):
         self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
         if self.layout == "tfhe":
             import os
-            from perseus.impl import tfhe, tfhe_alu
+            from perseus.impl import tfhe, tfhe_bitwise
             self.tfhe = True
             self.words = int(self.words)
             nd = self.bits // 2
             self.a, self.b, self.sel = self.a[:self.words], self.b[:self.words], self.sel[:self.words]
             self.b[:max(1, self.words // 4)] = self.a[:max(1, self.words // 4)]
-            wp = tfhe_alu.WordProg(f"alu.{self.op}{self.bits}.w{self.words}", self.words, nd)
+            wp = tfhe_bitwise.WordProg(f"bitwise.{self.op}{self.bits}.w{self.words}", self.words, nd)
             os.environ.setdefault("PC_TFHE_NATIVE", f"5,{wp.rows_in(True)}")
             rows_out = self.words if self.op == "cmp" else wp.R
-            tfhe.register_slots(f"alu.in.{wp.rows_in(True)}", np.arange(wp.rows_in(True)))
-            tfhe.register_slots(f"alu.out.{rows_out}", np.arange(rows_out))
-            out = f"alu.out.{rows_out}"
+            tfhe.register_slots(f"bitwise.in.{wp.rows_in(True)}", np.arange(wp.rows_in(True)))
+            tfhe.register_slots(f"bitwise.out.{rows_out}", np.arange(rows_out))
+            out = f"bitwise.out.{rows_out}"
             if self.op in ("and", "or", "xor"):
                 wp.bitwise(self.op, out)
             else:
@@ -563,9 +563,9 @@ class IntOp(Task):
     def encode(self):
         from perseus.impl import intops
         if self.layout == "tfhe":
-            from perseus.impl import tfhe_alu
+            from perseus.impl import tfhe_bitwise
             nd, x = self.bits // 2, np.zeros(SLOTS)
-            v = np.concatenate([tfhe_alu.encode_digits(self.a, nd), tfhe_alu.encode_digits(self.b, nd),
+            v = np.concatenate([tfhe_bitwise.encode_digits(self.a, nd), tfhe_bitwise.encode_digits(self.b, nd),
                                 (6.0 * self.sel - 3.0) / 4.0])
             x[:len(v)] = v
             return [x]
@@ -585,7 +585,7 @@ class IntOp(Task):
         from perseus.impl import intops
         if self.layout == "tfhe":
             from perseus.impl import tfhe
-            return [tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"alu.in.{self.wp.rows_in(True)}")]
+            return [tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"bitwise.in.{self.wp.rows_in(True)}")]
         if self.layout == "slots":
             w = intops.WordOps(ops, self.bits, self.r, self.table, SLOTS)
             a, b = xs[0], xs[1]
@@ -631,7 +631,7 @@ class IntOp(Task):
                 got = (q << (2 * np.arange(nd))).sum(1)
                 dev = float(np.abs(y[:self.words * nd] * 4 - np.round(y[:self.words * nd] * 4)).max())
             import os
-            nu2 = os.environ.get("PC_TFHE_NU", "1") == "2"      # pc-check tfhe-alu's model: 8 / 16 bins at nu 1 / 2
+            nu2 = os.environ.get("PC_TFHE_NU", "1") == "2"      # pc-check tfhe-bitwise's model: 8 / 16 bins at nu 1 / 2
             lp = (-261.7 if nu2 else -81.9) if self.op in ("and", "or", "xor") else (-1034.1 if nu2 else -317.3)
             return {"wrong": int(np.sum(got != self.ref())), "max_dev": dev, "log2_pfail_lookup_ct": lp}
         if self.layout == "slots":
