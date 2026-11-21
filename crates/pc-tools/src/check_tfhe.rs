@@ -2129,7 +2129,9 @@ fn run_prog(args: &[String]) -> Res<bool> {
     let blt = pc_cuda::blas::Lt::new(&dev)?;
     let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
-    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, rows));
+    // the switch's capacity: one pass of at most 32768 LWEs (a longer pbs runs in passes: the kernels' grid y)
+    let cap = rows.min(1 << 15);
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, cap));
     mp.reserve("prog", 4 * (nbuf * rows * row + nidx + ntab * 2 * tvl) + (8 << 20));
     let arena = mp.allocate(&dev)?;
     let ex = Executor::<W>::new(&dev, &arena, &mp)?;
@@ -2142,7 +2144,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
     let tk = Instant::now();
     let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe-prog: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}); {} cases, {nbuf} buffers of {rows} rows", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, cases.len());
-    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, rows)?;
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, cap)?;
     let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..nbuf).map(|_| arena.alloc::<pc_cuda::Compute, u32>("prog", rows * row)).collect::<std::result::Result<_, _>>()?;
     let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("prog", nidx.max(2))?;
     let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("prog", ntab.max(1) * 2 * tvl)?;
