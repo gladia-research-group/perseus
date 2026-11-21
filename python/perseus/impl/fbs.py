@@ -339,11 +339,13 @@ def desc(name):
     return d
 
 
-def _values(name, vec):
-    """The function at the FBS input `vec` (centred: x - center for a centred function)."""
+def _values(name, vec, novec=True):
+    """The function at the FBS input `vec` (centred: x - center for a centred function). `novec`: a vector of one
+    entry is the recorder twin's CapCt.novec (the op stream only: zeros); the plaintext mirror passes False (a public
+    scalar, e.g. a link's value at a known margin)."""
     fn = FUNCS[name]
     v = np.asarray(vec)
-    if v.shape[0] <= 1:          # CapCt.novec: the recorder's twin, the op stream only
+    if novec and v.shape[0] <= 1:
         return np.zeros_like(v, dtype=np.float64)
     if fn.complex:
         return fn.f(np.real(v)) + 1j * fn.f(np.imag(v))
@@ -356,7 +358,7 @@ def fbs(ops, x, name):
         raise KeyError(f"fbs: {name!r} not registered")
     from .ops import NumpyOps
     if isinstance(ops, NumpyOps):
-        return _values(name, np.asarray(x) - float(FUNCS[name].meta.get("center", 0.0)))
+        return _values(name, np.asarray(x) - float(FUNCS[name].meta.get("center", 0.0)), novec=False)
     fhe = ops.fhe
     if getattr(ops.core, "bts", None) is not None:
         raise NotImplementedError("fbs runs in planned sessions, not on the eager device path")

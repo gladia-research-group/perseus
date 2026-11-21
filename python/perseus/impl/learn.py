@@ -83,12 +83,12 @@ class Trainer:
         """sigmoid on the margin band ([-zb, zb] for logistic, the hinge's argument [beta (1 - zb), beta (1 + zb)]).
         `fbs`: as a functional bootstrap of the margin (the cheapest that lands no deeper than the series after a
         refresh, impl.math `fbs_choice`) when one meets the target: the epoch's refresh and its link in one. None
-        (default): the FBS for the logistic loss (n32 planned, breast cancer / wine / iris: -11..12 % per training,
-        the same accuracy, 4 bootstraps instead of 10 besides the links), the series for the hinge (its argument
-        reaches the band's edge, past which a series on EvalMod's sine or cosine diverges: w off by 0.6..1.4)."""
+        (default) or True: the FBS where one qualifies (n32 planned, breast cancer / wine / iris, the same accuracy:
+        the logistic loss -11..12 % per training, 4 bootstraps instead of 10 besides the links; the hinge -31..37 %,
+        14 bootstraps instead of 29..32); False: the series."""
         b = self.zb if self.loss == "logistic" else self.beta * (1.0 + self.zb)
         a = M.approx("sigmoid", -b, b, self.err)
-        if self.fbs or (self.fbs is None and self.loss == "logistic"):
+        if self.fbs is not False:
             f = M.fbs_choice("sigmoid", -b, b, self.err, False, a.depth)
             if f is not None:
                 return f

@@ -45,6 +45,8 @@ def test_numpy_ops_is_the_twin():
     name = fbs.register_table("cpu.step.16", (np.arange(-8, 9) >= 0).astype(float), check=False)
     x = np.arange(-8, 9, dtype=float)
     assert np.abs(fbs.fbs(NumpyOps(), x, name) - (x >= 0)).max() < 1e-12
+    # a one-entry vector is a public scalar on the mirror (the hinge's link at a known margin), not the twin's novec
+    assert abs(fbs.fbs(NumpyOps(), np.array([3.0]), name)[0] - 1.0) < 1e-12
 
 
 @pytest.mark.parametrize("t", [16, 64, 256])
