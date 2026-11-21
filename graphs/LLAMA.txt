@@ -15,6 +15,7 @@
 #       --window w0.npy --window-tokens 512 --capture graphs/_p<P> --configs $CFG $RT
 #   python scripts/utils/merge_window_mags.py graphs/_p1 graphs/llama31_8b_decode_ctx512_w<B> \
 #       --win <the window's captures> --all <the same> --lo --periods <the same>
+#   (the runtime= line carries the dense refreshes' EvalMod table, bts.em_table 47:2: the recordings move with it)
 #   window positions: w16 1, 8, 15; w128 16, 64, 127; w256 128, 192, 255; w384 256, 320, 383; w512 384, 448, 511
 #   (w0.npy: OpenWebText window 0, 512 tokens; the shipped captures past w16 ran the config without the
 #   softmax's key_lanes / pair_heads, which act only while one group fits the key window). Then

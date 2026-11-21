@@ -151,6 +151,8 @@ before it), so one session serves them: 133 refreshes per GPT-2 token (11 of the
 (`bts.em_table` 47:2, as `gpt2_decode`), each on its recording made again with the series (a structure capture at
 position 0, the window's magnitudes by name; w128 ... w512 on `gpt2_base_n32_ctx512s_nokl`, whose structure the
 shipped key-lane config has past 16 keys): 104 refreshes per token instead of 133 (93 + 11 in the argmax at the
-runtime), -2.4 to -3.9 % per token over the windows, KL unchanged. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
+runtime), -2.4 to -3.9 % per token over the windows, KL unchanged. Llama's windows run the same series (their recordings made again under the new runtime= line,
+`graphs/LLAMA.txt`): 214 refreshes per Llama token instead of 279, -8.5 to -10.5 % per token (medians: w16 5.53 -> 5.05 s,
+w128 5.69 -> 5.09 s, w512 6.66 -> 6.10 s); the median KL of w16 / w128 rises about 10x (to 2e-5 / 4e-6), w512's not. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
 precision for +4.4 % per GPT-2 token and +1.3 % per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.
