@@ -301,6 +301,12 @@ pub struct Switcher {
 
 impl Switcher {
     pub fn generate(params: Params, s: &[i64], p0: u64, p1: u64, prng: &mut Prng) -> Result<Switcher> {
+        Ok(Self::generate_keep(params, s, p0, p1, prng)?.0)
+    }
+
+    /// `generate`, also returning the TFHE secrets (s_lwe, s_br) it sampled: for tests that encrypt and decrypt
+    /// native LWEs (pc-check tfhe-alu).
+    pub fn generate_keep(params: Params, s: &[i64], p0: u64, p1: u64, prng: &mut Prng) -> Result<(Switcher, Vec<i64>, Vec<i64>)> {
         let n = s.len();
         let dg = DiscreteGaussian::new(params.key_sigma)?;
         let (dg_bsk, dg_rp) = (DiscreteGaussian::new(params.bsk_sigma)?, DiscreteGaussian::new(params.rp_sigma)?);
@@ -318,7 +324,7 @@ impl Switcher {
         let chain = if params.chain { Some(crate::chain::ChainKey::generate(&s_br, &s_lwe, p0, &params, prng)?) } else { None };
         // the packing key: GLWE(s_br, q_br) at the bootstrapping key's sigma (the same instance)
         let pack = params.pack.then(|| crate::pack::PackingKey::generate(&s_lwe, &s_br, crate::pack::PACK_GADGET, rns, &dg_bsk, prng));
-        Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, repack, chain, pack })
+        Ok((Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, repack, chain, pack }, s_lwe, s_br))
     }
 
     /// The LUT `tv` (+ `offset`, mod q_br) on the coefficients `valid` of a split ciphertext (phase m q0 / 4 there);

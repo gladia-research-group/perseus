@@ -292,14 +292,17 @@ class Prog:
 NAT_N = 2048        # the GLWE degree n_br: an encrypted accumulator's coefficients
 
 
-def table_place(t, n=NAT_N):
+def table_place(t, n=NAT_N, k=1):
     """`Prog.pack` placements and weights of a t-entry table on [-1, 1): entry i (row i of the packed buffer) serves
     the indices m in [-1 + 2 i / t, -1 + 2 (i + 1) / t) (`table_index(i, t)` is its centre). Coefficient c reads
-    m = 2 c / n below n / 2 and 2 (c - n) / n above, where it holds -v (the negacyclic rotation flips it back)."""
+    m = 2 c / n below n / 2 and 2 (c - n) / n above, where it holds -v (the negacyclic rotation flips it back).
+    k > 1: k tables interleaved (`Prog.plut` with k outputs, one rotation): table j (rows j t .. j t + t - 1) at the
+    coefficients j mod k, on the grid of n / k points (the index's mod-switch noise k times larger)."""
     c = np.arange(n)
-    m = np.where(c < n // 2, 2.0 * c / n, 2.0 * (c - n) / n)
-    i = np.minimum(t - 1, np.floor((m + 1.0) * t / 2.0)).astype(np.int64)
-    return [(int(a), int(b)) for a, b in zip(i, c)], [1 if x < n // 2 else -1 for x in c]
+    u, j, g = c // k, c % k, n // k
+    m = np.where(u < g // 2, 2.0 * u / g, 2.0 * (u - g) / g)
+    i = np.minimum(t - 1, np.floor((m + 1.0) * t / 2.0)).astype(np.int64) + j * t
+    return [(int(a), int(b)) for a, b in zip(i, c)], [1 if x < g // 2 else -1 for x in u]
 
 
 def table_index(i, t):

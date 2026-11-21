@@ -25,6 +25,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
     ["op=cmp", "bits=32", "r=2", "table=k32d3"],
     ["op=mux", "bits=16", "r=2", "table=k28d1"],
     ["op=xor", "bits=16", "r=4", "table=k28d1"],
+    ["op=add", "bits=32", "layout=tfhe", "words=16"],     # the native TFHE ALU (impl/tfhe_alu.py)
+    ["op=cmp", "bits=32", "layout=tfhe", "words=16"],
 ])
 def test_planned_intop(tmp_path, sets):
     out = str(tmp_path / "rows.jsonl")

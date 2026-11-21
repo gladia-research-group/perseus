@@ -194,6 +194,7 @@ fn main() -> ExitCode {
         Some("tfhe") => check_tfhe::cmd(&args[1..]),
         Some("tfhe-pbs") => check_tfhe::cmd_pbs(&args[1..]),
         Some("tfhe-pack") => check_tfhe::cmd_pack(&args[1..]),
+        Some("tfhe-alu") => check_tfhe::cmd_alu(&args[1..]),
         Some("tfhe-ks") => check_tfhe::cmd_ks(&args[1..]),
         Some("tfhe-noise") => check_tfhe::cmd_noise(&args[1..]),
         Some("tfhe-bridge") => check_tfhe::cmd_bridge(&args[1..]),

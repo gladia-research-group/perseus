@@ -1664,3 +1664,264 @@ fn run_pack(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-pack: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
+
+/// `pc-check tfhe-alu [--words 1,16,256] [--digits 16] [--reps 7] [--nu 2] [--lat-group 5] [--ops add,cmp,mux,xor]`:
+/// a native TFHE ALU on radix-4 words, one native LWE (s_br, p0) per digit d at value d / 8, on the device's native
+/// ops (`TfheSwitch::native_lin_c` / `native_pbs`: a key switch s_br -> s_lwe and a PBS per lookup). Every lookup
+/// table has <= 8 bins over the native [-1, 1) (16 for xor):
+/// - add: statuses S_i = sign(s_i - 3) / 4 (kill / propagate / generate, s_i = a_i + b_i), Kogge-Stone prefix rounds
+///   S_i = sign(2 S_i + S_(i - d)) (the last one outputs the carry [S == G] / 8), then (s_i + c_i) mod 4: 1 + log2 n +
+///   1 PBS rounds;
+/// - cmp (a < b): statuses sign(a_i - b_i), a tree of the same combine from the top digit: 1 + log2 n rounds;
+/// - mux (sel ? a : b): one PBS per digit, o = f(2 (a - b) / 8 + 2 sel) = -+(a - b) / 16 (the negacyclic half turn
+///   flips it by sel), output a + b + 2 o = 2 (sel ? a : b) at value d / 4 (consumers fold the 2 into their
+///   coefficients);
+/// - xor: one bivariate PBS per digit on a + 4 b (16 bins: p_fail < 2^-128 needs nu 2).
+/// Every output decrypted against the exact result; latency (device, synced) per word count; p_fail per lookup by
+/// the input noise model (mod switch rounding + key switch).
+pub fn cmd_alu(args: &[String]) -> ExitCode {
+    match run_alu(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-alu: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_alu(args: &[String]) -> Res<bool> {
+    use pc_core::keys::DiscreteGaussian;
+    use pc_tfhe::lwe::Lwe;
+    use std::ffi::c_void;
+    let words: Vec<usize> = arg(args, "--words").unwrap_or_else(|| "1,16,256".into()).split(',').map(|x| x.trim().parse()).collect::<std::result::Result<_, _>>()?;
+    let nd: usize = arg(args, "--digits").map(|s| s.parse()).transpose()?.unwrap_or(16);
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(7).max(1);
+    let ops: Vec<String> = arg(args, "--ops").unwrap_or_else(|| "add,cmp,mux,xor".into()).split(',').map(str::to_string).collect();
+    if !nd.is_power_of_two() || nd < 2 {
+        return Err("--digits: a power of two >= 2".into());
+    }
+    let wmax = *words.iter().max().ok_or("--words")?;
+    let rows = wmax * nd;
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let mut params = switch_params(args, n)?;
+    params.chain = true;
+    let (nb, nu) = (params.n_br, params.nu);
+    let row = nb + 1;
+    const NBUF: usize = 8;
+    let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
+    let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
+    let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, rows));
+    mp.reserve("alu", 4 * (NBUF * rows * row + 2 * 2 * rows * 8 + 8 * 2 * params.tv_len()) + (1 << 20));
+    let arena = mp.allocate(&dev)?;
+    let ex = Executor::<W>::new(&dev, &arena, &mp)?;
+    let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
+    let s = &ex.compute;
+    let mut prng = test_prng(0xa1);
+    let sk = SecretKey::sample(&mut prng, n)?;
+    let sv: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let tk = Instant::now();
+    let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
+    println!("[pc-check] tfhe-alu: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}, ks {:?})", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, params.ks);
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, rows)?;
+    let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..NBUF).map(|_| arena.alloc::<pc_cuda::Compute, u32>("alu", rows * row)).collect::<std::result::Result<_, _>>()?;
+    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("alu", 2 * 2 * rows * 8)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("alu", 8 * 2 * params.tv_len())?;
+    arena.freeze();
+    // the native tables (v at phase v q / 4; inputs on [-1, 1))
+    let r4 = |m: f64| (4.0 * m).round();
+    let tables: Vec<Box<dyn Fn(f64) -> f64>> = vec![
+        Box::new(move |m| match r4(m) {                                                    // 0 sgn: sign(round 4 m) / 4
+            r if r > 0.0 => 0.25,
+            r if r < 0.0 => -0.25,
+            _ => 0.0,
+        }),
+        Box::new(move |m| if r4(m) > 0.0 { 0.125 } else { 0.0 }),                         // 1 carry: [G] / 8
+        Box::new(|m: f64| (((m + 1.0) * 4.0).floor().rem_euclid(4.0)) / 8.0),              // 2 out: (s + c) mod 4 / 8
+        Box::new(move |m| if r4(m) < 0.0 { 0.125 } else { 0.0 }),                         // 3 lt: [a < b] / 8
+        Box::new(move |m| -r4(m) / 16.0),                                                  // 4 mux: -(a - b) / 16
+        Box::new(|m: f64| {                                                                // 5 xor on a + 4 b
+            let k = ((m + 1.0) * 8.0).floor().clamp(0.0, 15.0) as usize;
+            ((k % 4) ^ (k / 4)) as f64 / 8.0
+        }),
+    ];
+    let tvl = params.tv_len();
+    let mut tvw = Vec::new();
+    for f in &tables {
+        let tv = pc_tfhe::chain::native_tv(tvl, params.q_br, |m| f(m));
+        tvw.extend(sw.bsk.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)));
+    }
+    d_tv.upload(s, &tvw)?;
+    let tvp = |k: usize| (d_tv.vptr() as *const u32).wrapping_add(k * 2 * tvl) as *const c_void;
+    let enc_v = |v: f64| ((v * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64;
+    let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
+    let encrypt = |vals: &[f64], prng: &mut pc_core::keys::Prng| -> Vec<u32> {
+        vals.iter().flat_map(|&v| {
+            let l = Lwe::encrypt(enc_v(v), &s_br, p0, &dg, prng);
+            l.a.into_iter().chain(std::iter::once(l.b)).map(|x| x as u32).collect::<Vec<_>>()
+        }).collect()
+    };
+    let decrypt = |w: &[u32], cnt: usize| -> Vec<f64> {
+        (0..cnt).map(|r| {
+            let l = Lwe { a: w[r * row..r * row + nb].iter().map(|&x| x as u64).collect(), b: w[r * row + nb] as u64 };
+            centered(l.phase(&s_br, p0), p0) as f64 * 4.0 / p0 as f64
+        }).collect()
+    };
+    // the input noise model of a lookup (m units, period 4): the mod switch's rounding to 2 nu n_br
+    // ((n_lwe / 2 + 1) / 12) and the key switch s_br -> s_lwe (n_br sum E d^2 sigma^2, NAF digits)
+    let ms_sd = ((params.n_lwe as f64 / 2.0 + 1.0) / 12.0).sqrt() * 4.0 / (2 * nu * nb) as f64;
+    let ks_sd = (nb as f64 * 5.44).sqrt() * params.lwe_sigma_rel * 4.0;
+    let sd = (ms_sd * ms_sd + ks_sd * ks_sd).sqrt();
+    let pf = |half: f64| pc_tfhe::pack::log2_tail(half / sd);
+    println!("[pc-check] tfhe-alu: lookup input noise sd {sd:.2e} (mod switch {ms_sd:.2e}, key switch {ks_sd:.2e}); p_fail per lookup: 8-bin tables 2^{:.1}, 16-bin 2^{:.1}", pf(0.125), pf(0.0625));
+    let mut t = Tally::default();
+    let lt_ = &blt.inner;
+    // a native program step: LWE_LIN (dst, a, b, index pairs, rows, ca, cb, c) / PBS (src, rows, table, dst)
+    #[derive(Clone, Copy)]
+    enum St {
+        Lin(*mut c_void, *const c_void, *const c_void, *const c_void, usize, u64, u64, u64),
+        Pbs(*const c_void, usize, usize, *mut c_void),
+    }
+    let mut idx_off = 0usize;
+    let mut upload_pairs = |d: &mut pc_cuda::DBuf<'_, pc_cuda::Compute, u32>, pairs: &[(i64, i64)], off: &mut usize| -> Res<*const c_void> {
+        let w: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a as i32 as u32, b as i32 as u32]).collect();
+        d.upload_at(s, *off, &w)?;
+        let p = (d.vptr() as *const u32).wrapping_add(*off) as *const c_void;
+        *off += w.len();
+        Ok(p)
+    };
+    for op in &ops {
+        for &nw in &words {
+            let rr = nw * nd;
+            let mut rng = test_prng(0x5ee0 + nw as u32);
+            let a: Vec<u64> = (0..nw).map(|_| rng.uniform_below(1 << (2 * nd.min(31)))).collect();
+            let b: Vec<u64> = (0..nw).map(|i| if i % 4 == 1 { a[i] } else { rng.uniform_below(1 << (2 * nd.min(31))) }).collect();
+            let sel: Vec<u64> = (0..nw).map(|_| rng.uniform_below(2)).collect();
+            let dig = |x: &[u64]| -> Vec<f64> { x.iter().flat_map(|&v| (0..nd).map(move |i| ((v >> (2 * i)) & 3) as f64 / 8.0)).collect() };
+            bufs[0].upload_at(s, 0, &encrypt(&dig(&a), &mut rng))?;
+            bufs[1].upload_at(s, 0, &encrypt(&dig(&b), &mut rng))?;
+            bufs[2].upload_at(s, 0, &encrypt(&sel.iter().map(|&x| x as f64 / 8.0).collect::<Vec<_>>(), &mut rng))?;
+            idx_off = 0;
+            let all: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, r)).collect();
+            let p_all = upload_pairs(&mut d_idx, &all, &mut idx_off)?;
+            let bp = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr();
+            let bpm = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr() as *mut c_void;
+            let (b0, b1, b2, b3, b4, b5, b6) = (bp(&bufs[0]), bp(&bufs[1]), bp(&bufs[2]), bpm(&bufs[3]), bpm(&bufs[4]), bpm(&bufs[5]), bpm(&bufs[6]));
+            // the program of `op` as a list of launches (prepared index pairs), run `reps` times
+            let (rounds, out_buf, out_rows): (usize, *mut c_void, usize);
+            let mut prog: Vec<St> = Vec::new();
+            match op.as_str() {
+                "add" => {
+                    // X = 2 a + 2 b - 3/4, S = sgn(X)
+                    let c = enc_v(-0.75);
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, 2, c));
+                    prog.push(St::Pbs(b3, rr, 0, b4));
+                    let mut d = 1;
+                    let (mut cur, mut nxt) = (b4, b5);
+                    while d < nd {
+                        let pairs: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, if (r as usize) % nd >= d { r - d as i64 } else { -1 })).collect();
+                        let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                        let last = 2 * d >= nd;
+                        let (src, dst) = (cur, nxt);
+                        prog.push(St::Lin(b6, src, src, pp, rr, 2, 1, 0));
+                        prog.push(St::Pbs(b6, rr, if last { 1 } else { 0 }, dst));
+                        (cur, nxt) = (nxt, cur);
+                        d *= 2;
+                    }
+                    // Z = X + 2 c_(i - 1) - 1/8, out = (s + c) mod 4
+                    let pairs: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, if (r as usize) % nd > 0 { r - 1 } else { -1 })).collect();
+                    let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                    let (cc, c8) = (cur, enc_v(-0.125));
+                    prog.push(St::Lin(b6, b3, cc, pp, rr, 1, 2, c8));
+                    prog.push(St::Pbs(b6, rr, 2, nxt));
+                    (rounds, out_buf, out_rows) = (2 + nd.trailing_zeros() as usize, nxt, rr);
+                }
+                "cmp" => {
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, p0 - 2, 0));
+                    prog.push(St::Pbs(b3, rr, 0, b4));
+                    let (mut cur, mut nxt, mut k) = (b4, b5, nd);
+                    while k > 1 {
+                        let h = k / 2;
+                        let pairs: Vec<(i64, i64)> = (0..nw * h).map(|r| ((r / h * k + 2 * (r % h) + 1) as i64, (r / h * k + 2 * (r % h)) as i64)).collect();
+                        let pp = upload_pairs(&mut d_idx, &pairs, &mut idx_off)?;
+                        let (src, dst, cnt, last) = (cur, nxt, nw * h, h == 1);
+                        prog.push(St::Lin(b6, src, src, pp, cnt, 2, 1, 0));
+                        prog.push(St::Pbs(b6, cnt, if last { 3 } else { 0 }, dst));
+                        (cur, nxt) = (nxt, cur);
+                        k = h;
+                    }
+                    (rounds, out_buf, out_rows) = (1 + nd.trailing_zeros() as usize, cur, nw);
+                }
+                "mux" => {
+                    // T = 2 a - 2 b; Y = T + 16 sel (2 sel: the half turn); o = f(Y); out = a + b + 2 o
+                    let ps: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, r / nd as i64)).collect();
+                    let pp = upload_pairs(&mut d_idx, &ps, &mut idx_off)?;
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, p0 - 2, 0));
+                    prog.push(St::Lin(b6, b3, b2, pp, rr, 1, 16, 0));
+                    prog.push(St::Pbs(b6, rr, 4, b4));
+                    prog.push(St::Lin(b5, b0, b1, p_all, rr, 1, 1, 0));
+                    prog.push(St::Lin(b6, b5, b4, p_all, rr, 1, 2, 0));
+                    (rounds, out_buf, out_rows) = (1, b6, rr);
+                }
+                "xor" => {
+                    let c = enc_v(-15.0 / 16.0);
+                    prog.push(St::Lin(b3, b0, b1, p_all, rr, 1, 4, c));
+                    prog.push(St::Pbs(b3, rr, 5, b4));
+                    (rounds, out_buf, out_rows) = (1, b4, rr);
+                }
+                o => return Err(format!("--ops: {o}?").into()),
+            }
+            let mut go = || -> Res<f64> {
+                let td = Instant::now();
+                for st in &prog {
+                    match *st {
+                        St::Lin(dst, a, b, idx, cnt, ca, cb, c) => ts.native_lin_c(&ctx, s, dst, a, b, idx, cnt, ca, cb, c)?,
+                        St::Pbs(src, cnt, tv, dst) => ts.native_pbs(&ctx, s, lt_, src, cnt, tvp(tv), &[0], &[dst])?,
+                    }
+                }
+                s.sync()?;
+                Ok(td.elapsed().as_secs_f64())
+            };
+            go()?;
+            let mut tm: Vec<f64> = (0..reps).map(|_| go()).collect::<Res<_>>()?;
+            tm.sort_by(f64::total_cmp);
+            let med = tm[reps / 2];
+            // the output buffer's rows (a raw pointer into one of `bufs`)
+            let k = bufs.iter().position(|b| b.vptr() as *mut c_void == out_buf).ok_or("output buffer")?;
+            let got = decrypt(&bufs[k].download_range(s, 0, out_rows * row)?, out_rows);
+            let mask = if 2 * nd >= 64 { u64::MAX } else { (1u64 << (2 * nd)) - 1 };
+            let (want, scale): (Vec<u64>, f64) = match op.as_str() {
+                "add" => (a.iter().zip(&b).map(|(x, y)| (x + y) & mask).collect(), 8.0),
+                "cmp" => (a.iter().zip(&b).map(|(x, y)| (x < y) as u64).collect(), 8.0),
+                "mux" => ((0..nw).map(|i| if sel[i] == 1 { a[i] } else { b[i] }).collect(), 4.0),
+                _ => (a.iter().zip(&b).map(|(x, y)| x ^ y).collect(), 8.0),
+            };
+            let (mut wrong, mut dev_max) = (0usize, 0f64);
+            for w in 0..nw {
+                let v: u64 = if op == "cmp" {
+                    (got[w] * scale).round() as u64
+                } else {
+                    (0..nd).map(|i| (((got[w * nd + i] * scale).round() as i64).rem_euclid(4) as u64) << (2 * i)).sum()
+                };
+                wrong += (v != want[w]) as usize;
+                for i in 0..if op == "cmp" { 1 } else { nd } {
+                    let x = got[if op == "cmp" { w } else { w * nd + i }] * scale;
+                    dev_max = dev_max.max((x - x.round()).abs());
+                }
+            }
+            t.add(&format!("tfhe-alu: {op}{} x {nw} words, exact", 2 * nd), wrong, nw);
+            let pbs: usize = match op.as_str() {
+                "add" => rr * (2 + nd.trailing_zeros() as usize),
+                "cmp" => rr + nw * (nd - 1),
+                _ => rr,
+            };
+            println!("[pc-check] tfhe-alu: {op}{}: {nw} words: {:.3} ms (median of {reps}), {rounds} PBS rounds, {pbs} PBS; {:.0} words/s, {:.0} PBS/s; max output dev {dev_max:.2e} (digit units)", 2 * nd, med * 1e3, nw as f64 / med, pbs as f64 / med);
+        }
+    }
+    println!("[pc-check] tfhe-alu: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
