@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama gemma gpt2 vit bert resnet sana core
+% pages: overview llama gemma gpt2 vit bert resnet whisper sana core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -30,6 +30,16 @@
 % SANA-Sprint text to image (2026-11-19, the text encoder on the Gemma-2 decoder port, GPU 4 alone: forwards 2 and 3,
 % 266.59 and 266.58 s, after a 318 s first forward; lowest free 18.30 GiB)
 \newcommand{\sanaimg}{267}\newcommand{\sanamem}{76.7}
+% Whisper base.en speech to text (2026-11-21, GPU 4 alone, scripts/repro/whisper_asr.sh, 2 rounds): encoder s/clip the
+% median of the clip walls over one 10-s window (CUDA graphs, the pruned plan with its raise-drop re-pass, 1526 refreshes;
+% 19.16 / 19.16 s), decode s/token the median of the server's token times (forward + argmax drained, the client's
+% decryptions apart; 1.39 / 1.39 s over 64 tokens of 4 clips; contexts up to 64 tokens, cross attention over the 500
+% encoder positions); WER over 64 LibriSpeech test-clean clips <= 8 s spread over the split (Whisper's English
+% normalizer), the float64 greedy's beside it (2026-11-21 gate on these plans: 63/64 transcripts identical, the miss a
+% 0.035-logit near tie); memory per session: the encoder's lowest free 24.96 GiB (graphs), the decoder's 38.1 GiB
+% (PC_PT_CACHE=0 the same, 38.4 GiB on its first clip)
+\newcommand{\whisperenc}{19.2}\newcommand{\whisperdec}{1.39}\newcommand{\whisperencmem}{70.0}\newcommand{\whisperdecmem}{56.9}
+\newcommand{\whisperwer}{4.87}\newcommand{\whisperfloatwer}{4.74}\newcommand{\whisperclips}{64}
 % peak GPU memory, GiB: total (94.97) minus the lowest free of the run (the prefills replay CUDA graphs, captured in
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
 % optional position cache (PC_PT_CACHE=0), Llama's and Gemma's the GPU's peak used memory over the run (their runner reports no free
@@ -65,6 +75,8 @@ GPT-2 small & decode, one token (512-token context) & \gptdecmem\ GiB\nt{\dagger
 ViT-B/16 & one $224\times224$ image & \vitmem\ GiB & \textbf{\vitimg\ s} \\
 BERT-base & 128-token input & \bertmem\ GiB & \textbf{\bertin\ s} \\
 ResNet-20 & one $32\times32$ CIFAR-10 image & \resnetmem\ GiB & \textbf{\resnetimg\ s} \\
+Whisper base.en & encoder, one 10-s audio window & \whisperencmem\ GiB & \textbf{\whisperenc\ s} \\
+Whisper base.en & decode, one token of the transcript & \whisperdecmem\ GiB & \textbf{\whisperdec\ s} \\
 SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \sanamem\ GiB & \textbf{\sanaimg\ s} \\
 \bottomrule
 \end{tabularx}
@@ -177,6 +189,19 @@ Cerium (Jayashankar et al., 2025) & 91.4\% & 0.456\nt{\S} & B200 & \yes \\
 \tcap{Encrypted ResNet-20 inference of one $32\times32$ CIFAR-10 image; top-1 on the CIFAR-10 test set (Perseus: the
 first 1,000 images, the same as its float64 model). Cheddar's library is released, its ResNet-20 is not. $^\S$From the
 paper (0.620 s on H100). \legend}
+\end{tbl}
+
+\begin{tbl}
+\begin{tabularx}{\linewidth}{Xrrrrlc}
+\toprule
+\textbf{Whisper base.en} & audio & WER & encoder (s) & s / token & GPU & open source \\
+\midrule
+\oursrow\textbf{Perseus (ours)} & 10 s & \whisperwer\% & \textbf{\whisperenc} & \textbf{\whisperdec} & RTX PRO 6000 & \yes \\
+\bottomrule
+\end{tabularx}
+\tcap{Encrypted speech to text: the Whisper base.en encoder over one 10-s audio window (clips up to 8 s), then greedy
+decoding with every token's argmax on the server. WER on \whisperclips\ LibriSpeech test-clean clips up to 8 s (Whisper's
+English normalizer); the float64 model's is \whisperfloatwer\%, and 63 of the 64 transcripts are the same as its own. \legend}
 \end{tbl}
 
 \begin{tbl}
