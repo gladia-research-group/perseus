@@ -32,6 +32,10 @@ pub enum EmOp {
     Mult { dst: usize, a: usize, b: usize, n: usize, epi: Epi },
     MultAcc { dst: usize, pairs: Vec<(usize, usize)>, n: usize, epi: Epi },
     WSum { dst: usize, srcs: Vec<usize>, n: usize, k: usize },
+    /// x := i x (`neg`: -i x), the monomial X^(N/2): exact, level, degree and scale kept.
+    MulI { x: usize, n: usize, neg: bool },
+    /// x := x + conj(x), d := x - conj(x) (both of the old x): one key switch with the conjugation key at x's level.
+    ConjSplit { x: usize, d: usize, n: usize },
 }
 
 /// The recorded program: ops, constant rows (residues by prime id, padded to |Q|; a WSum row is one padded row per
@@ -62,13 +66,32 @@ pub struct PsPlan {
     /// Functional bootstrapping: a Chebyshev series on [-1, 1] applied to the EvalMod output (empty: none).
     #[serde(default)]
     pub post: Vec<f64>,
+    /// Trigonometric functional bootstrapping (`PsPlan::fbs_trig`): this plan's series is the cosine of the base
+    /// angle, `trig` the sine half and the series on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trig: Option<Box<TrigSeries>>,
+    /// Functional bootstrapping, sine form: the base series and `post` on the paired Paterson-Stockmeyer builder
+    /// (`build_sine_paired`, one level shallower than FIDESlib's at the same degree) instead of FIDESlib's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paired: bool,
+}
+
+/// The sine half of a trigonometric FBS plan (`PsPlan::trig`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrigSeries {
+    /// The base sine series (amplitude A^(2^-r) sin of the base angle).
+    pub sin: PsPlan,
+    /// Q of P(t) + s Q(t) (evaluator convention), s = A sin(2 pi u).
+    pub post_s: Vec<f64>,
+    /// t = A cos(2 pi u) + `off` (added at the last double angle).
+    pub off: f64,
 }
 
 impl PsPlan {
     /// The plan for a Chebyshev coefficient table, computed by OpenFHE's long divisions (`pc_core::cheb`).
     pub fn from_coeffs(coefficients: &[f64]) -> pc_core::error::Result<Self> {
         let p = pc_core::cheb::PsPlan::new(coefficients)?;
-        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec(), amp: 0.0, post: vec![] })
+        Ok(PsPlan { k: p.k, m: p.m, divqr_q: p.divqr.q.clone(), divcs_q: p.divcs.q.clone(), s2: p.s2.clone(), coeffs: coefficients.to_vec(), amp: 0.0, post: vec![], trig: None, paired: false })
     }
 
     /// Functional bootstrapping (Alexandru-Kim-Polyakov, ePrint 2024/1623; here a real Chebyshev series on the
@@ -83,6 +106,23 @@ impl PsPlan {
         let mut p = Self::from_coeffs(&c)?;
         p.amp = amp;
         p.post = post.to_vec();
+        Ok(p)
+    }
+
+    /// Trigonometric functional bootstrapping (f folded into EvalMod's own cosine / sine: the Fourier extension of
+    /// Bian et al., ePrint 2026/367, and the trigonometric minimax of Xiao et al., ePrint 2026/1255): the base pair
+    /// `cos_base`, `sin_base` (amplitude 1 cos / sin of the base angle, `trig_base`) rescaled to amplitude `amp`,
+    /// `da_its` paired double angles to c = A cos(2 pi u), s = A sin(2 pi u), then P(t) + s Q(t) on t = c + `off`.
+    /// A degree-n trigonometric polynomial of the phase u is P of degree n and Q of degree n - 1 in cos(2 pi u); on
+    /// a domain |u| <= u_max < 1/2 they are fitted on cos(2 pi u) in [cos(2 pi u_max), 1], mapped to t in [-1, 1].
+    #[allow(clippy::too_many_arguments)]
+    pub fn fbs_trig(cos_base: &[f64], sin_base: &[f64], da_its: u32, amp: f64, off: f64, post: &[f64], post_s: &[f64]) -> pc_core::error::Result<Self> {
+        let a = amp.powf(1.0 / (1u64 << da_its) as f64);
+        let mut p = Self::from_coeffs(&cos_base.iter().map(|x| x * a).collect::<Vec<_>>())?;
+        let sin = Self::from_coeffs(&sin_base.iter().map(|x| x * a).collect::<Vec<_>>())?;
+        p.amp = amp;
+        p.post = post.to_vec();
+        p.trig = Some(Box::new(TrigSeries { sin, post_s: post_s.to_vec(), off }));
         Ok(p)
     }
 
@@ -298,6 +338,22 @@ impl<'s> Builder<'s> {
         }
         self.square(dst)
     }
+    /// x := i x (`neg`: -i x).
+    pub fn mul_i(&mut self, x: usize, neg: bool) {
+        let n = self.n(x);
+        self.prog.ops.push(EmOp::MulI { x, n, neg });
+    }
+    /// x := x + conj(x) = 2 Re x; returns d = x - conj(x) = 2 i Im x (same metadata, degree 1).
+    pub fn conj_split(&mut self, x: usize) -> Result<usize> {
+        if self.metas[x].nl == 2 {
+            self.rescale(x)?;
+        }
+        let d = self.fresh();
+        self.metas[d] = self.metas[x];
+        let n = self.n(x);
+        self.prog.ops.push(EmOp::ConjSplit { x, d, n });
+        Ok(d)
+    }
     /// Ciphertext::evalLinearWSumMutable; more than `WSUM_MAX` sources (the kernel bound; the long series of a
     /// functional bootstrap) as sums of chunks added up.
     pub fn wsum(&mut self, dst: usize, srcs: &[usize], w: &[f64]) -> Result<()> {
@@ -464,11 +520,15 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
     b.copy(t2km1, t2[0]);
     // lazy: the single product of the m = 2 loop joins the final sum
     // ---- innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m, &lz)
-    let d_ = b.st.d as i32;
+    // OpenFHE's level arithmetic (one level = d primes) as limb tops: `Fx::up` / `down` step by the levels' own primes
+    // on a chain with an alternating single / pair user region
     let cu = x;
     let dc = degree(&ps.divcs_q);
     let mut flag_c = false;
-    let lvl_t2 = |b: &Builder| b.metas[t2[m - 1]].top + if b.metas[t2[m - 1]].nl == 1 { d_ } else { 0 };
+    let lvl_t2 = |b: &Builder| {
+        let t = b.metas[t2[m - 1]];
+        if t.nl == 1 { b.fx().up(t.top) } else { t.top }
+    };
     if dc >= 1 {
         if dc == 1 {
             b.copy(cu, t[0]);
@@ -541,7 +601,7 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
                     cts.push(t[i]);
                 }
             }
-            let tl = lvl_t2(b) - d_;
+            let tl = b.fx().down(lvl_t2(b));
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
             // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
@@ -758,9 +818,16 @@ fn inner_ps(
     if let Some(l) = s2.last_mut() {
         *l = 1.0;
     }
-    let d_ = b.st.d as i32;
     let cu = out;
-    let lvl_t2 = |b: &Builder| b.metas[t2[m - 1]].top + if b.metas[t2[m - 1]].nl == 1 { d_ } else { 0 } - level_offset * d_;
+    // as `build_chebyshev`'s: OpenFHE's level arithmetic by the levels' own primes (`Fx::up` / `down`)
+    let lvl_t2 = |b: &Builder| {
+        let t = b.metas[t2[m - 1]];
+        let mut top = if t.nl == 1 { b.fx().up(t.top) } else { t.top };
+        for _ in 0..level_offset {
+            top = b.fx().down(top);
+        }
+        top
+    };
     let dc = degree(&divcs.q);
     let mut flag_c = false;
     if dc >= 1 {
@@ -842,7 +909,7 @@ fn inner_ps(
                     cts.push(t[i]);
                 }
             }
-            let tl = lvl_t2(b) - d_;
+            let tl = b.fx().down(lvl_t2(b));
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
             // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
@@ -896,9 +963,494 @@ pub fn build_double_angle_amp(b: &mut Builder, x: usize, its: i32, amp: f64) -> 
     Ok(())
 }
 
+/// A device-time proxy of a program (limb-weighted: a product with its relinearization ~4 rescales, a weighted-sum
+/// source ~1/4, the element-wise ops ~1/5).
+pub fn op_cost(ops: &[EmOp]) -> f64 {
+    ops.iter()
+        .map(|op| match op {
+            EmOp::Mult { n, .. } => 4.0 * *n as f64,
+            EmOp::MultAcc { n, pairs, .. } => (3.0 + pairs.len() as f64) * *n as f64,
+            EmOp::Rescale { n, .. } => *n as f64,
+            EmOp::WSum { n, srcs, .. } => 0.25 * (*n * srcs.len()) as f64,
+            EmOp::Copy { n, .. } | EmOp::Add { n, .. } | EmOp::MulConst { n, .. } | EmOp::AddConst { n, .. } | EmOp::MulI { n, .. } => 0.2 * *n as f64,
+            EmOp::ConjSplit { n, .. } => 3.4 * *n as f64,
+        })
+        .sum()
+}
+
+/// A plain EvalMod table (the shipped tables' function): the Chebyshev interpolant on [-1, 1] (evaluator convention)
+/// of (2 pi)^(-1/2^r) cos(2 pi (K y - 1/4) / 2^r) at degree `deg`; after r double angles it reads sin(2 pi K y) / 2 pi.
+pub fn sine_base(k: f64, da_its: u32, deg: usize) -> Vec<f64> {
+    let s = (1u64 << da_its) as f64;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let n = deg + 1;
+    (0..n)
+        .map(|j| {
+            let acc: f64 = (0..n)
+                .map(|i| {
+                    let th = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
+                    two_pi.powf(-1.0 / s) * (two_pi * (k * th.cos() - 0.25) / s).cos() * (j as f64 * th).cos()
+                })
+                .sum();
+            acc * 2.0 / n as f64
+        })
+        .collect()
+}
+
+/// A plain EvalMod table spec "deg:da" (`sine_base` at degree `deg`, `da` double angles): (deg, da).
+pub fn parse_em_table(spec: &str) -> Option<(usize, u32)> {
+    let (d, r) = spec.trim().split_once(':')?;
+    let (d, r): (usize, u32) = (d.trim().parse().ok()?, r.trim().parse().ok()?);
+    ((4..=128).contains(&d) && (1..=6).contains(&r)).then_some((d, r))
+}
+
+/// Levels a plain EvalMod program on `b` (coefficients, double angles) lands above the one on `a` from the same
+/// `input` (FIDESlib's Paterson-Stockmeyer shape, lean; realized: a pending rescale counted as done). The depth of a
+/// table is a property of the series, not of where it starts: the compile shifts the dense routes' measured landings
+/// by it.
+pub fn table_landing_shift(st: &ScaleTables, input: FMeta, a: (&[f64], u32), b: (&[f64], u32)) -> Result<i32> {
+    let top = |(c, r): (&[f64], u32)| -> Result<i32> {
+        let ps = PsPlan::from_coeffs(c).map_err(|e| rule("evalmod table", e.to_string()))?;
+        let (_, out) = build_evalmod_opts(st, input, &ps, r as i32, true)?;
+        Ok(if out.nl == 2 { Fx { d: st.d as i32, st: Some(st) }.down(out.top) } else { out.top })
+    };
+    // in level units (`d` per level: a single-prime level of an alternating user region counts as one level)
+    let (ta, tb) = (top(a)?, top(b)?);
+    let fx = Fx { d: st.d as i32, st: Some(st) };
+    let (lo, hi, sign) = if tb >= ta { (ta, tb, 1) } else { (tb, ta, -1) };
+    let (mut t, mut k) = (lo, 0);
+    while t < hi {
+        t = fx.up(t);
+        k += 1;
+    }
+    if t != hi {
+        return Err(rule("evalmod table shift", format!("landings {ta} / {tb} off the level grid")));
+    }
+    Ok(sign * k * st.d as i32)
+}
+
+/// The base pair of a trigonometric FBS (`PsPlan::fbs_trig`): Chebyshev interpolants on [-1, 1] (evaluator convention)
+/// of cos and sin of 2 pi K y / 2^r at degree `deg`; after r paired double angles, y = (u + I) / K reads
+/// (cos 2 pi u, sin 2 pi u) for every ModRaise integer |I| < K.
+pub fn trig_base(k: f64, da_its: u32, deg: usize) -> (Vec<f64>, Vec<f64>) {
+    let w = 2.0 * std::f64::consts::PI * k / (1u64 << da_its) as f64;
+    let n = deg + 1;
+    let interp = |par: usize, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
+        (0..n)
+            .map(|j| {
+                if j % 2 != par {
+                    return 0.0;
+                }
+                let s: f64 = (0..n).map(|i| {
+                    let th = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
+                    f(th.cos()) * (j as f64 * th).cos()
+                }).sum();
+                s * 2.0 / n as f64
+            })
+            .collect()
+    };
+    (interp(0, &|y| (w * y).cos()), interp(1, &|y| (w * y).sin()))
+}
+
+/// f = q T_g + r (true Chebyshev coefficients, value = sum f_i T_i), deg r < g; deg f < 2 g
+/// (T_i = 2 T_(i-g) T_g - T_(2g-i) for g < i < 2 g).
+fn cheb_divide(f: &[f64], g: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut r = f.to_vec();
+    let mut q = vec![0f64; f.len().saturating_sub(g).max(1)];
+    for i in (g..f.len()).rev() {
+        let c = r[i];
+        r[i] = 0.0;
+        if c == 0.0 {
+            continue;
+        }
+        let a = i - g;
+        if a == 0 {
+            q[0] += c;
+        } else {
+            q[a] += 2.0 * c;
+            r[2 * g - i] -= c;
+        }
+    }
+    r.truncate(g);
+    (q, r)
+}
+
+fn top_deg(c: &[f64]) -> Option<usize> {
+    c.iter().rposition(|&x| x != 0.0)
+}
+
+/// The baby / giant powers of a paired Paterson-Stockmeyer evaluation of P(t) + s Q(t).
+struct PairPowers {
+    k: usize,
+    /// T_1..T_k of t (index i - 1)
+    t: Vec<usize>,
+    /// s T_i, i = 0..k-1 (s T_0 = s)
+    st: Vec<usize>,
+    /// T_(k 2^j), j = 0..m-1
+    g: Vec<usize>,
+    /// s T_(k 2^j) (the giant placement of s: `st` empty), and s itself for the leaves
+    sg: Vec<usize>,
+    s: Option<usize>,
+}
+
+enum PairVal {
+    Ct(usize),
+    Const(f64),
+}
+
+/// P(t) + s Q(t) of degree < k 2^m (true coefficients) on the powers `pw`: Q enters only at the leaves (s T_i), so
+/// the product by s costs no level of its own (the leaves sit above the giant powers).
+fn pair_eval(b: &mut Builder, pw: &PairPowers, p: &[f64], q: &[f64], m: usize) -> Result<Option<PairVal>> {
+    let deg = top_deg(p).max(top_deg(q));
+    let Some(deg) = deg else { return Ok(None) };
+    let k = pw.k;
+    if deg < k || m == 0 {
+        if deg >= k {
+            return Err(rule("evalmod trig", format!("leaf of degree {deg} >= k {k}")));
+        }
+        let mut srcs = vec![];
+        let mut w = vec![];
+        for i in 1..k.min(p.len()) {
+            if p[i] != 0.0 {
+                srcs.push(pw.t[i - 1]);
+                w.push(p[i]);
+            }
+        }
+        if !pw.st.is_empty() {
+            for i in 0..k.min(q.len()) {
+                if q[i] != 0.0 {
+                    if pw.st[i] == usize::MAX {
+                        return Err(rule("evalmod trig", format!("Q coefficient {i} has no leaf power (the exponential form's sine half is odd)")));
+                    }
+                    srcs.push(pw.st[i]);
+                    w.push(q[i]);
+                }
+            }
+        }
+        let c0 = p.first().copied().unwrap_or(0.0);
+        let leaf = if srcs.is_empty() {
+            PairVal::Const(c0)
+        } else {
+            let dst = b.fresh();
+            let top = srcs.iter().map(|&x| b.metas[x].top).min().unwrap_or(-1);
+            b.metas[dst] = FMeta { top, nl: 1, nf: 1.0 };
+            b.wsum(dst, &srcs, &w)?;
+            b.add_scalar(dst, c0)?;
+            PairVal::Ct(dst)
+        };
+        if !pw.st.is_empty() || top_deg(q).is_none() {
+            return Ok(Some(leaf));
+        }
+        // the giant placement: s times the leaf's Q part (one product; the leaf sits a level above its parent's)
+        let s_ = pw.s.ok_or_else(|| rule("evalmod trig", "a Q leaf without s"))?;
+        let lq = pair_eval(b, pw, q, &[], 0)?;
+        let sq = match lq {
+            None => return Ok(Some(leaf)),
+            Some(PairVal::Const(c)) => {
+                let r = b.fresh();
+                b.copy(r, s_);
+                b.mult_scalar(r, c)?;
+                r
+            }
+            Some(PairVal::Ct(h)) => {
+                if b.metas[h].nl == 2 {
+                    b.rescale(h)?;
+                }
+                b.mult(h, s_)?;
+                h
+            }
+        };
+        match leaf {
+            PairVal::Const(c) => b.add_scalar(sq, c)?,
+            PairVal::Ct(l) => b.add(sq, l)?,
+        }
+        return Ok(Some(PairVal::Ct(sq)));
+    }
+    let gd = k << (m - 1);
+    if deg < gd {
+        return pair_eval(b, pw, p, q, m - 1);
+    }
+    let (pq, pr) = cheb_divide(p, gd);
+    let (qq, qr) = cheb_divide(q, gd);
+    let giant = pw.st.is_empty() && top_deg(&qq).is_some();
+    let hi = pair_eval(b, pw, &pq, if giant { &[] } else { &qq }, m - 1)?;
+    // the giant placement: the quotient's Q part times s T_(k 2^(m-1)), a pure series (no s inside)
+    let hq = if giant { pair_eval(b, pw, &qq, &[], m - 1)? } else { None };
+    let lo = pair_eval(b, pw, &pr, &qr, m - 1)?;
+    let times = |b: &mut Builder, v: Option<PairVal>, g: usize| -> Result<Option<usize>> {
+        Ok(match v {
+            None => None,
+            Some(PairVal::Const(c)) => {
+                let r = b.fresh();
+                b.copy(r, g);
+                b.mult_scalar(r, c)?;
+                Some(r)
+            }
+            Some(PairVal::Ct(h)) => {
+                if b.metas[h].nl == 2 {
+                    b.rescale(h)?;
+                }
+                b.mult(h, g)?;
+                Some(h)
+            }
+        })
+    };
+    let r1 = times(b, hi, pw.g[m - 1])?;
+    let r2 = if giant { times(b, hq, pw.sg[m - 1])? } else { None };
+    let res = match (r1, r2) {
+        (Some(a), Some(c)) => {
+            b.add(a, c)?;
+            a
+        }
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return Ok(lo),
+    };
+    match lo {
+        None => {}
+        Some(PairVal::Const(c)) => b.add_scalar(res, c)?,
+        Some(PairVal::Ct(l)) => b.add(res, l)?,
+    }
+    Ok(Some(PairVal::Ct(res)))
+}
+
+fn true_coeffs(c: &[f64]) -> Vec<f64> {
+    let mut v = c.to_vec();
+    if let Some(c0) = v.first_mut() {
+        *c0 /= 2.0;
+    }
+    v
+}
+
+/// The baby steps T_1..T_k of `t`, the giant steps T_(k 2^j) up to the degree `deg` (m of them), and when `s` is
+/// given its products: s T_0..s T_(k-1) (`giant` false: Q at the leaves) or s T_(k 2^j) (`giant`: Q through the
+/// giant powers, s times the bottom leaves only); returns (powers, m).
+fn pair_powers(b: &mut Builder, t: usize, s: Option<usize>, k: usize, deg: usize, giant: bool) -> Result<(PairPowers, usize)> {
+    let mut m = 0;
+    while (k << m) <= deg {
+        m += 1;
+    }
+    let tp = cheb_powers(b, t, k)?;
+    let mut st = Vec::with_capacity(k);
+    if let (Some(s), false) = (s, giant) {
+        for i in 0..k {
+            let v = b.fresh();
+            if i == 0 {
+                b.copy(v, s);
+            } else {
+                b.copy(v, tp[i - 1]);
+                b.mult(v, s)?;
+                if b.metas[v].nl == 2 {
+                    b.rescale(v)?;
+                }
+            }
+            st.push(v);
+        }
+    }
+    let mut g = vec![tp[k - 1]];
+    for j in 1..m {
+        let v = b.fresh();
+        b.square2(v, g[j - 1])?;
+        b.add(v, v)?;
+        b.add_scalar(v, -1.0)?;
+        if b.metas[v].nl == 2 {
+            b.rescale(v)?;
+        }
+        g.push(v);
+    }
+    let mut sg = vec![];
+    if let (Some(s), true) = (s, giant) {
+        for &gj in &g {
+            let v = b.fresh();
+            b.copy(v, gj);
+            b.mult(v, s)?;
+            if b.metas[v].nl == 2 {
+                b.rescale(v)?;
+            }
+            sg.push(v);
+        }
+    }
+    Ok((PairPowers { k, t: tp, st, g, sg, s }, m))
+}
+
+fn pair_result(v: Option<PairVal>) -> Result<usize> {
+    match v {
+        None => Err(rule("evalmod trig", "empty series")),
+        Some(PairVal::Const(_)) => Err(rule("evalmod trig", "a constant series")),
+        Some(PairVal::Ct(r)) => Ok(r),
+    }
+}
+
+/// A trigonometric FBS (`PsPlan::fbs_trig`) on input `x`, the result in `x`: the cos / sin base series on shared
+/// powers of the input (`kb` baby steps), `its` paired double angles (c, s) -> (2 c^2 - a_j, 2 s c) (one more product
+/// per step than the cosine chain, same depth; the last adds `off`), then P(t) + s Q(t) by a paired
+/// Paterson-Stockmeyer with `k` baby steps (Q at the leaves, or through the giant powers: `giant`).
+#[allow(clippy::too_many_arguments)]
+fn build_trig(b: &mut Builder, x: usize, ps: &PsPlan, t: &TrigSeries, its: i32, kb: usize, k: usize, giant: bool) -> Result<()> {
+    if b.metas[x].nl == 2 {
+        b.rescale(x)?;
+    }
+    let cb = true_coeffs(&ps.coeffs);
+    let sb = true_coeffs(&t.sin.coeffs);
+    let dbase = top_deg(&cb).max(top_deg(&sb)).unwrap_or(0);
+    let (pw, m) = pair_powers(b, x, None, kb, dbase, false)?;
+    let c = pair_result(pair_eval(b, &pw, &cb, &[], m)?)?;
+    let mut s = pair_result(pair_eval(b, &pw, &sb, &[], m)?)?;
+    b.copy(x, c);
+    // (c, s) -> (2 c^2 - a_j, 2 s c): the cosine chain's step (the complex square (c - s)(c + s) would halve its
+    // error growth near |c| = a_j but needs c and s at one scale: an alignment level), the last adds `off`
+    for j in 1..=its {
+        for v in [x, s] {
+            if b.metas[v].nl == 2 {
+                b.rescale(v)?;
+            }
+        }
+        let s2 = b.fresh();
+        b.copy(s2, s);
+        b.mult(s2, x)?;
+        b.add(s2, s2)?;
+        s = s2;
+        b.square(x)?;
+        let mut scalar = -ps.amp.powf(2f64.powf((j - its) as f64));
+        if j == its {
+            scalar += t.off;
+        }
+        b.add(x, x)?;
+        b.add_scalar(x, scalar)?;
+    }
+    for v in [x, s] {
+        if b.metas[v].nl == 2 {
+            b.rescale(v)?;
+        }
+    }
+    let p = true_coeffs(&ps.post);
+    let q = true_coeffs(&t.post_s);
+    let deg = top_deg(&p).max(top_deg(&q)).unwrap_or(0);
+    let has_q = top_deg(&q).is_some();
+    let (pw, m) = pair_powers(b, x, if has_q { Some(s) } else { None }, k, deg, giant)?;
+    let r = pair_result(pair_eval(b, &pw, &p, &q, m)?)?;
+    b.copy(x, r);
+    Ok(())
+}
+
+/// The baby / giant powers of `t` as `pair_powers` (Q at the leaves), with i T_i (the monomial X^(N/2), exact: no
+/// product, no level) in place of s T_i: P + i Q evaluates as one series (a complex leaf per giant product). The
+/// constant i T_0 has no ciphertext (`usize::MAX`): Q must have no constant term at any leaf (an odd Q).
+fn pair_powers_i(b: &mut Builder, t: usize, k: usize, deg: usize) -> Result<(PairPowers, usize)> {
+    let (mut pw, m) = pair_powers(b, t, None, k, deg, false)?;
+    let mut st = vec![usize::MAX];
+    for i in 1..k {
+        let v = b.fresh();
+        b.copy(v, pw.t[i - 1]);
+        b.mul_i(v, false);
+        st.push(v);
+    }
+    pw.st = st;
+    Ok((pw, m))
+}
+
+/// The exponential form of a trigonometric FBS (`PsPlan::fbs_trig`), on the real slots EvalMod reads: z = a e^(i th)
+/// of the base angle as ONE series on the input's powers (the sine half's leaves times i: the giant products shared),
+/// `its` squarings z <- z^2 (one product per step instead of the pair's two; the error grows 2x per step instead of
+/// the cosine chain's up to 4x), then one conjugation: c = z + conj z = A cos 2 pi u (+ `off`), s = -i (z - conj z)
+/// = A sin 2 pi u, and P(t) + s Q(t) as `build_trig`. The base amplitude makes z^(2^its) = A / 2 e^(2 pi i u).
+#[allow(clippy::too_many_arguments)]
+fn build_trig_exp(b: &mut Builder, x: usize, ps: &PsPlan, t: &TrigSeries, its: i32, kb: usize, k: usize, giant: bool) -> Result<()> {
+    if b.metas[x].nl == 2 {
+        b.rescale(x)?;
+    }
+    let f = 0.5f64.powf(1.0 / (1u64 << its) as f64);
+    let cb: Vec<f64> = true_coeffs(&ps.coeffs).iter().map(|v| v * f).collect();
+    let sb: Vec<f64> = true_coeffs(&t.sin.coeffs).iter().map(|v| v * f).collect();
+    if cb.iter().skip(1).step_by(2).chain(sb.iter().step_by(2)).any(|v| *v != 0.0) {
+        return Err(rule("evalmod trig", "the exponential form needs an even cosine and an odd sine half"));
+    }
+    let dbase = top_deg(&cb).max(top_deg(&sb)).unwrap_or(0);
+    let (pw, m) = pair_powers_i(b, x, kb, dbase)?;
+    let z = pair_result(pair_eval(b, &pw, &cb, &sb, m)?)?;
+    for _ in 0..its {
+        b.square(z)?;
+    }
+    let d = b.conj_split(z)?;
+    b.mul_i(d, true);
+    b.add_scalar(z, t.off)?;
+    let p = true_coeffs(&ps.post);
+    let q = true_coeffs(&t.post_s);
+    let deg = top_deg(&p).max(top_deg(&q)).unwrap_or(0);
+    let has_q = top_deg(&q).is_some();
+    let (pw, m) = pair_powers(b, z, if has_q { Some(d) } else { None }, k, deg, giant)?;
+    let r = pair_result(pair_eval(b, &pw, &p, &q, m)?)?;
+    b.copy(x, r);
+    Ok(())
+}
+
+/// The sine form (`PsPlan::fbs`) on the paired Paterson-Stockmeyer builder (`pair_eval`, no Q): the base series on
+/// the input's powers (`kb` baby steps), the double angles, the series `post` (`k` baby steps). The shallowest and
+/// then cheapest (`op_cost`) over the baby-step counts.
+pub fn build_sine_paired(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32) -> Result<(EmProgram, FMeta)> {
+    let mut best: Option<(EmProgram, FMeta)> = None;
+    for (kb, k) in [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].map(move |k| (kb, k))) {
+        let mut b = Builder::new(st);
+        b.lean = true;
+        let x = b.input(input);
+        let run = |b: &mut Builder| -> Result<()> {
+            let cb = true_coeffs(&ps.coeffs);
+            let (pw, m) = pair_powers(b, x, None, kb, top_deg(&cb).unwrap_or(0), false)?;
+            let c = pair_result(pair_eval(b, &pw, &cb, &[], m)?)?;
+            b.copy(x, c);
+            build_double_angle_amp(b, x, double_angle_its, ps.amp)?;
+            if b.metas[x].nl == 2 {
+                b.rescale(x)?;
+            }
+            if ps.post.is_empty() {
+                return Ok(());
+            }
+            let p = true_coeffs(&ps.post);
+            let (pw, m) = pair_powers(b, x, None, k, top_deg(&p).unwrap_or(0), false)?;
+            let r = pair_result(pair_eval(b, &pw, &p, &[], m)?)?;
+            b.copy(x, r);
+            Ok(())
+        };
+        if run(&mut b).is_err() {
+            continue;
+        }
+        let out = b.metas[x];
+        if best.as_ref().is_none_or(|(p, o)| out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops))) {
+            best = Some((b.prog, out));
+        }
+    }
+    best.ok_or_else(|| rule("evalmod paired", "no program"))
+}
+
 /// The whole EvalMod chain of one input: the Chebyshev series, then `double_angle_its` double-angle steps.
 pub fn build_evalmod(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32) -> Result<(EmProgram, FMeta)> {
     build_evalmod_opts(st, input, ps, double_angle_its, false)
+}
+
+/// A trigonometric FBS program (`PsPlan::fbs_trig`): over the baby-step counts of the base and the series, Q's
+/// placement and the double-angle forms `exps` (false: the paired double angles, `build_trig`; true: the exponential
+/// form, `build_trig_exp`), the shallowest program, then the cheapest (`op_cost`).
+pub fn build_trig_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32, lean: bool, exps: &[bool]) -> Result<(EmProgram, FMeta)> {
+    let t = ps.trig.as_deref().ok_or_else(|| rule("evalmod trig", "not a trigonometric plan"))?;
+    let mut best: Option<(EmProgram, FMeta)> = None;
+    let shapes = [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].iter().flat_map(move |&k| [(kb, k, false), (kb, k, true)]));
+    for ((kb, k, giant), &exp) in shapes.flat_map(|s| exps.iter().map(move |e| (s, e))) {
+        let mut b = Builder::new(st);
+        b.lean = lean;
+        let x = b.input(input);
+        let built = if exp { build_trig_exp(&mut b, x, ps, t, double_angle_its, kb, k, giant) } else { build_trig(&mut b, x, ps, t, double_angle_its, kb, k, giant) };
+        if built.is_err() {
+            continue;
+        }
+        let out = b.metas[x];
+        let better = match &best {
+            None => true,
+            Some((p, o)) => out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops)),
+        };
+        if better {
+            best = Some((b.prog, out));
+        }
+    }
+    best.ok_or_else(|| rule("evalmod trig", "no program"))
 }
 
 /// `build_evalmod` with `Builder::lean`.
@@ -906,6 +1458,24 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     let mut b = Builder::new(st);
     b.lean = lean;
     let x = b.input(input);
+    // a series after the sine on a chain with an alternating user region always takes the paired builder: FIDESlib's
+    // lazy Paterson-Stockmeyer adjusts its operands across the region's single / pair levels with integer scalars that
+    // lose ~2^-25 (exact replay: 4e-8 .. 5e-7 at degrees 16 .. 128), the paired one lands them exactly
+    if ps.trig.is_none() && (ps.paired || (st.singles != 0 && !ps.post.is_empty())) {
+        return build_sine_paired(st, input, ps, double_angle_its);
+    }
+    if ps.trig.is_some() {
+        // the exponential form (`build_trig_exp`: one series, one product per double angle, one conjugation; the
+        // same landing and RMS, 6..15 % faster real, 10..17 % complex) in place of the paired double angles; it reads
+        // an imaginary error of its input as an amplitude / phase error, so its key switches run over the exact
+        // ModDown (pc-gpu `EvalModPlan::md_exact`: the fast one's bias sat on slot 0 of every ciphertext, 1.25e-4 vs
+        // 8.4e-6 on GELU [-24.6, 24.6] complex). PC_FBS_TRIG_EXP=0: the paired double angles.
+        let exps: &[bool] = match std::env::var("PC_FBS_TRIG_EXP").as_deref() {
+            Ok("0") => &[false],
+            _ => &[true],
+        };
+        return build_trig_opts(st, input, ps, double_angle_its, lean, exps);
+    }
     build_chebyshev(&mut b, x, ps)?;
     build_double_angle_amp(&mut b, x, double_angle_its, ps.amp)?;
     if !ps.post.is_empty() {
@@ -1096,73 +1666,127 @@ pub mod sim {
         }
     }
 
-    /// Run `ops` over `bufs` (each |Q| residues).
+    /// Run `ops` over `bufs` (each |Q| residues): real slot values (a program with `MulI` / `ConjSplit` needs
+    /// `run_c`).
     pub fn run(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>], bufs: &mut Vec<Vec<u64>>) {
+        let mut im = vec![];
+        run_c(st, ops, consts, bufs, &mut im);
+    }
+
+    /// `run` on complex slot values: `re` and `im` the residues of the two components (Gaussian integers mod q; a
+    /// missing `im` buffer reads zero).
+    pub fn run_c(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>], re: &mut Vec<Vec<u64>>, im: &mut Vec<Vec<u64>>) {
         let q = &st.q;
         let nq = q.len();
+        let neg = |x: u64, p: u64| if x % p == 0 { 0 } else { p - x % p };
         for op in ops {
-            let need = super::sim_ids(op).into_iter().max().unwrap_or(0) + 1;
-            if bufs.len() < need {
-                bufs.resize(need, vec![0; nq]);
+            let need = (super::sim_ids(op).into_iter().max().unwrap_or(0) + 1).max(re.len());
+            if re.len() < need {
+                re.resize(need, vec![0; nq]);
+            }
+            if im.len() < need {
+                im.resize(need, vec![0; nq]);
             }
             match op {
                 EmOp::Copy { dst, src, n } => {
-                    let s = bufs[*src].clone();
-                    bufs[*dst][..*n].copy_from_slice(&s[..*n]);
-                    for v in bufs[*dst][*n..].iter_mut() {
-                        *v = 0;
+                    for b in [&mut *re, &mut *im] {
+                        let s = b[*src].clone();
+                        b[*dst][..*n].copy_from_slice(&s[..*n]);
+                        for v in b[*dst][*n..].iter_mut() {
+                            *v = 0;
+                        }
                     }
                 }
                 EmOp::Add { dst, a, b, n, sub } => {
-                    for i in 0..*n {
-                        let (x, y) = (bufs[*a][i] % q[i], bufs[*b][i] % q[i]);
-                        bufs[*dst][i] = if *sub { (x + q[i] - y) % q[i] } else { (x + y) % q[i] };
+                    for bf in [&mut *re, &mut *im] {
+                        for i in 0..*n {
+                            let (x, y) = (bf[*a][i] % q[i], bf[*b][i] % q[i]);
+                            bf[*dst][i] = if *sub { (x + q[i] - y) % q[i] } else { (x + y) % q[i] };
+                        }
                     }
                 }
                 EmOp::MulConst { x, n, k } => {
-                    for i in 0..*n {
-                        bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                    for b in [&mut *re, &mut *im] {
+                        for i in 0..*n {
+                            b[*x][i] = mulmod(b[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                        }
                     }
                 }
                 EmOp::AddConst { x, n, k } => {
                     for i in 0..*n {
-                        bufs[*x][i] = (bufs[*x][i] % q[i] + consts[*k][i] % q[i]) % q[i];
+                        re[*x][i] = (re[*x][i] % q[i] + consts[*k][i] % q[i]) % q[i];
                     }
                 }
                 EmOp::Rescale { x, n, k } => {
-                    if let Some(k) = k {
-                        for i in 0..*n {
-                            bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                    for b in [&mut *re, &mut *im] {
+                        if let Some(k) = k {
+                            for i in 0..*n {
+                                b[*x][i] = mulmod(b[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                            }
                         }
+                        rescale(st, &mut b[*x], *n);
                     }
-                    rescale(st, &mut bufs[*x], *n);
                 }
                 EmOp::Mult { dst, a, b, n, epi: e } => {
-                    let v: Vec<u64> = (0..*n).map(|i| mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])).collect();
-                    bufs[*dst][..*n].copy_from_slice(&v);
-                    epi(&mut bufs[*dst], e, consts, q, *n);
+                    let (mut vr, mut vi) = (vec![0u64; *n], vec![0u64; *n]);
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (ar, ai, br, bi) = (re[*a][i] % p, im[*a][i] % p, re[*b][i] % p, im[*b][i] % p);
+                        vr[i] = (mulmod(ar, br, p) + neg(mulmod(ai, bi, p), p)) % p;
+                        vi[i] = (mulmod(ar, bi, p) + mulmod(ai, br, p)) % p;
+                    }
+                    re[*dst][..*n].copy_from_slice(&vr);
+                    im[*dst][..*n].copy_from_slice(&vi);
+                    epi(&mut re[*dst], e, consts, q, *n);
+                    epi(&mut im[*dst], &Epi { k: None, ..*e }, consts, q, *n);
                 }
                 EmOp::MultAcc { dst, pairs, n, epi: e } => {
                     for i in 0..*n {
-                        let mut acc = bufs[*dst][i] % q[i];
+                        let p = q[i];
+                        let (mut accr, mut acci) = (re[*dst][i] % p, im[*dst][i] % p);
                         for (a, b) in pairs {
-                            acc = (acc + mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])) % q[i];
+                            let (ar, ai, br, bi) = (re[*a][i] % p, im[*a][i] % p, re[*b][i] % p, im[*b][i] % p);
+                            accr = (accr + mulmod(ar, br, p) + neg(mulmod(ai, bi, p), p)) % p;
+                            acci = (acci + mulmod(ar, bi, p) + mulmod(ai, br, p)) % p;
                         }
-                        bufs[*dst][i] = acc;
+                        re[*dst][i] = accr;
+                        im[*dst][i] = acci;
                     }
-                    epi(&mut bufs[*dst], e, consts, q, *n);
+                    epi(&mut re[*dst], e, consts, q, *n);
+                    epi(&mut im[*dst], &Epi { k: None, ..*e }, consts, q, *n);
                 }
                 EmOp::WSum { dst, srcs, n, k } => {
-                    let v: Vec<u64> = (0..*n)
-                        .map(|i| {
-                            let mut acc = 0u64;
-                            for (j, s) in srcs.iter().enumerate() {
-                                acc = (acc + mulmod(bufs[*s][i] % q[i], consts[*k][j * nq + i] % q[i], q[i])) % q[i];
-                            }
-                            acc
-                        })
-                        .collect();
-                    bufs[*dst][..*n].copy_from_slice(&v);
+                    for b in [&mut *re, &mut *im] {
+                        let v: Vec<u64> = (0..*n)
+                            .map(|i| {
+                                let mut acc = 0u64;
+                                for (j, s) in srcs.iter().enumerate() {
+                                    acc = (acc + mulmod(b[*s][i] % q[i], consts[*k][j * nq + i] % q[i], q[i])) % q[i];
+                                }
+                                acc
+                            })
+                            .collect();
+                        b[*dst][..*n].copy_from_slice(&v);
+                    }
+                }
+                EmOp::MulI { x, n, neg: ng } => {
+                    // i (a + i b) = -b + i a; -i (a + i b) = b - i a
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (a, b) = (re[*x][i] % p, im[*x][i] % p);
+                        (re[*x][i], im[*x][i]) = if *ng { (b, neg(a, p)) } else { (neg(b, p), a) };
+                    }
+                }
+                EmOp::ConjSplit { x, d, n } => {
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (a, b) = (re[*x][i] % p, im[*x][i] % p);
+                        (re[*x][i], im[*x][i]) = ((a + a) % p, 0);
+                        (re[*d][i], im[*d][i]) = (0, (b + b) % p);
+                    }
+                    for v in re[*d][*n..].iter_mut().chain(im[*d][*n..].iter_mut()) {
+                        *v = 0;
+                    }
                 }
             }
         }
@@ -1251,23 +1875,30 @@ pub mod noise {
                 EmOp::Rescale { n, k, .. } => vec![k.map_or(1.0, |k| centred(&consts[k], q, *n))],
                 EmOp::Mult { n, epi: e, .. } | EmOp::MultAcc { n, epi: e, .. } => epi_c(e, *n),
                 EmOp::WSum { srcs, n, k, .. } => (0..srcs.len()).map(|j| centred(&consts[*k][j * nq..(j + 1) * nq], q, *n)).collect(),
-                EmOp::Copy { .. } | EmOp::Add { .. } => vec![],
+                EmOp::Copy { .. } | EmOp::Add { .. } | EmOp::MulI { .. } | EmOp::ConjSplit { .. } => vec![],
             })
             .collect()
     }
 
     /// The linearized program on input `x` (integer units, buffer 0) read at buffer `out`: (value, d value / d x,
-    /// variance of the fresh noise at `out`), integer units; `pre` = `prepare(st, ops, consts)`.
+    /// variance of the fresh noise at `out`), integer units; `pre` = `prepare(st, ops, consts)`. Slot values are
+    /// complex (a program with `MulI` / `ConjSplit` carries a signal in the imaginary part); the input is real, the
+    /// output its real part, every fresh source independent in each real component (`Fresh` is per component), the
+    /// adjoints the transposed real 2 x 2 Jacobians (a complex product: times the conjugate).
     pub fn linearize(st: &ScaleTables, ops: &[EmOp], pre: &[Vec<f64>], x: f64, out: usize, fresh: Fresh) -> (f64, f64, f64) {
+        type C = (f64, f64);
+        let mul = |a: C, b: C| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
+        let conj_mul = |a: C, b: C| (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0);
+        let n2 = |a: C| a.0 * a.0 + a.1 * a.1;
         let nb = ops.iter().flat_map(super::sim_ids).max().unwrap_or(0).max(out) + 1;
-        let mut v = vec![0f64; nb];
-        v[0] = x;
+        let mut v = vec![(0f64, 0f64); nb];
+        v[0] = (x, 0.0);
         // forward: the operand values each product reads
-        let mut tape: Vec<Vec<(f64, f64)>> = Vec::with_capacity(ops.len());
-        let epi = |x: f64, e: &Epi, c: &[f64]| {
-            let x = if e.dbl { 2.0 * x } else { x };
+        let mut tape: Vec<Vec<(C, C)>> = Vec::with_capacity(ops.len());
+        let epi = |x: C, e: &Epi, c: &[f64]| {
+            let x = if e.dbl { (2.0 * x.0, 2.0 * x.1) } else { x };
             if e.k.is_some() {
-                x + c[0]
+                (x.0 + c[0], x.1)
             } else {
                 x
             }
@@ -1276,72 +1907,109 @@ pub mod noise {
             let mut t = vec![];
             match op {
                 EmOp::Copy { dst, src, .. } => v[*dst] = v[*src],
-                EmOp::Add { dst, a, b, sub, .. } => v[*dst] = if *sub { v[*a] - v[*b] } else { v[*a] + v[*b] },
-                EmOp::MulConst { x, .. } => v[*x] *= c[0],
-                EmOp::AddConst { x, .. } => v[*x] += c[0],
-                EmOp::Rescale { x, n, .. } => v[*x] = v[*x] * c[0] / dropped(st, *n),
+                EmOp::Add { dst, a, b, sub, .. } => {
+                    let (va, vb) = (v[*a], v[*b]);
+                    v[*dst] = if *sub { (va.0 - vb.0, va.1 - vb.1) } else { (va.0 + vb.0, va.1 + vb.1) };
+                }
+                EmOp::MulConst { x, .. } => v[*x] = (v[*x].0 * c[0], v[*x].1 * c[0]),
+                EmOp::AddConst { x, .. } => v[*x].0 += c[0],
+                EmOp::Rescale { x, n, .. } => {
+                    let f = c[0] / dropped(st, *n);
+                    v[*x] = (v[*x].0 * f, v[*x].1 * f);
+                }
                 EmOp::Mult { dst, a, b, epi: e, .. } => {
                     t.push((v[*a], v[*b]));
-                    v[*dst] = epi(v[*a] * v[*b], e, c);
+                    v[*dst] = epi(mul(v[*a], v[*b]), e, c);
                 }
                 EmOp::MultAcc { dst, pairs, epi: e, .. } => {
                     let mut acc = v[*dst];
                     for (a, b) in pairs {
                         t.push((v[*a], v[*b]));
-                        acc += v[*a] * v[*b];
+                        let p = mul(v[*a], v[*b]);
+                        acc = (acc.0 + p.0, acc.1 + p.1);
                     }
                     v[*dst] = epi(acc, e, c);
                 }
-                EmOp::WSum { dst, srcs, .. } => v[*dst] = srcs.iter().enumerate().map(|(j, s)| v[*s] * c[j]).sum(),
+                EmOp::WSum { dst, srcs, .. } => {
+                    v[*dst] = srcs.iter().enumerate().fold((0.0, 0.0), |a, (j, s)| (a.0 + v[*s].0 * c[j], a.1 + v[*s].1 * c[j]))
+                }
+                EmOp::MulI { x, neg, .. } => {
+                    let (a, b) = v[*x];
+                    v[*x] = if *neg { (b, -a) } else { (-b, a) };
+                }
+                EmOp::ConjSplit { x, d, .. } => {
+                    let (a, b) = v[*x];
+                    v[*x] = (2.0 * a, 0.0);
+                    v[*d] = (0.0, 2.0 * b);
+                }
             }
             tape.push(t);
         }
         // reverse: adjoints of every buffer, the fresh sources' variance where they enter
-        let mut g = vec![0f64; nb];
-        g[out] = 1.0;
+        let mut g = vec![(0f64, 0f64); nb];
+        g[out] = (1.0, 0.0);
         let mut var = 0.0;
+        let take = |g: &mut Vec<C>, i: usize| std::mem::replace(&mut g[i], (0.0, 0.0));
         for ((op, c), t) in ops.iter().zip(pre).rev().zip(tape.iter().rev()) {
             match op {
                 EmOp::Copy { dst, src, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
-                    g[*src] += d;
+                    let d = take(&mut g, *dst);
+                    g[*src] = (g[*src].0 + d.0, g[*src].1 + d.1);
                 }
                 EmOp::Add { dst, a, b, sub, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
-                    g[*a] += d;
-                    g[*b] += if *sub { -d } else { d };
+                    let d = take(&mut g, *dst);
+                    g[*a] = (g[*a].0 + d.0, g[*a].1 + d.1);
+                    g[*b] = if *sub { (g[*b].0 - d.0, g[*b].1 - d.1) } else { (g[*b].0 + d.0, g[*b].1 + d.1) };
                 }
-                EmOp::MulConst { x, .. } => g[*x] *= c[0],
+                EmOp::MulConst { x, .. } => g[*x] = (g[*x].0 * c[0], g[*x].1 * c[0]),
                 EmOp::AddConst { .. } => {}
                 EmOp::Rescale { x, n, .. } => {
-                    var += g[*x] * g[*x] * fresh.rescale;
-                    g[*x] *= c[0] / dropped(st, *n);
+                    var += n2(g[*x]) * fresh.rescale;
+                    let f = c[0] / dropped(st, *n);
+                    g[*x] = (g[*x].0 * f, g[*x].1 * f);
                 }
                 EmOp::Mult { dst, a, b, epi: e, .. } => {
-                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
-                    var += d * d * fresh.relin;
+                    let m = if e.dbl { 2.0 } else { 1.0 };
+                    let d = take(&mut g, *dst);
+                    let d = (d.0 * m, d.1 * m);
+                    var += n2(d) * fresh.relin;
                     let (va, vb) = t[0];
-                    g[*a] += d * vb;
-                    g[*b] += d * va;
+                    let (ga, gb) = (conj_mul(vb, d), conj_mul(va, d));
+                    g[*a] = (g[*a].0 + ga.0, g[*a].1 + ga.1);
+                    g[*b] = (g[*b].0 + gb.0, g[*b].1 + gb.1);
                 }
                 EmOp::MultAcc { dst, pairs, epi: e, .. } => {
-                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
-                    var += d * d * fresh.relin;
-                    g[*dst] += d;
+                    let m = if e.dbl { 2.0 } else { 1.0 };
+                    let d = take(&mut g, *dst);
+                    let d = (d.0 * m, d.1 * m);
+                    var += n2(d) * fresh.relin;
+                    g[*dst] = (g[*dst].0 + d.0, g[*dst].1 + d.1);
                     for ((a, b), (va, vb)) in pairs.iter().zip(t) {
-                        g[*a] += d * vb;
-                        g[*b] += d * va;
+                        let (ga, gb) = (conj_mul(*vb, d), conj_mul(*va, d));
+                        g[*a] = (g[*a].0 + ga.0, g[*a].1 + ga.1);
+                        g[*b] = (g[*b].0 + gb.0, g[*b].1 + gb.1);
                     }
                 }
                 EmOp::WSum { dst, srcs, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
+                    let d = take(&mut g, *dst);
                     for (j, s) in srcs.iter().enumerate() {
-                        g[*s] += d * c[j];
+                        g[*s] = (g[*s].0 + d.0 * c[j], g[*s].1 + d.1 * c[j]);
                     }
+                }
+                EmOp::MulI { x, neg, .. } => {
+                    // the transpose of (a, b) -> (-b, a) is (g0, g1) -> (g1, -g0)
+                    let (g0, g1) = g[*x];
+                    g[*x] = if *neg { (-g1, g0) } else { (g1, -g0) };
+                }
+                EmOp::ConjSplit { x, d, .. } => {
+                    let (gx, gd) = (take(&mut g, *x), take(&mut g, *d));
+                    // the key switch's noise e enters x as + e and d as - e
+                    var += n2((gx.0 - gd.0, gx.1 - gd.1)) * fresh.relin;
+                    g[*x] = (2.0 * gx.0, 2.0 * gd.1);
                 }
             }
         }
-        (v[out], g[0], var)
+        (v[out].0, g[0].0, var)
     }
 
     /// (value, derivative, fresh variance) of `linearize` read as `sim::decode` reads buffer metadata (top, nl, nf):
@@ -1364,6 +2032,8 @@ pub fn sim_ids(op: &EmOp) -> Vec<usize> {
         EmOp::MulConst { x, .. } | EmOp::AddConst { x, .. } | EmOp::Rescale { x, .. } => vec![*x],
         EmOp::MultAcc { dst, pairs, .. } => std::iter::once(*dst).chain(pairs.iter().flat_map(|(a, b)| [*a, *b])).collect(),
         EmOp::WSum { dst, srcs, .. } => std::iter::once(*dst).chain(srcs.iter().copied()).collect(),
+        EmOp::MulI { x, .. } => vec![*x],
+        EmOp::ConjSplit { x, d, .. } => vec![*x, *d],
     }
 }
 

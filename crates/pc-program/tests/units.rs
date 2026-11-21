@@ -161,7 +161,7 @@ fn grids_and_chains(plan: &str, graph: &str, schedule: Schedule) {
 #[test]
 fn siblings_only_reorders() {
     siblings("gpt2_prefill128", "gpt2_prefill128");
-    siblings("gpt2_decode", "gpt2_decode");
+    siblings("gpt2_decode", "gpt2_decode_em47");
 }
 
 #[test]

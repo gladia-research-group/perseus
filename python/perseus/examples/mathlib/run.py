@@ -159,6 +159,10 @@ def run_planned(a, task):
     net = TaskNet(task)
     model = _twin(a, net)
     cfg = plan_config(a.plan)
+    # --env switches bind the session as they bound the twin (e.g. CHAIN_PRESET)
+    over = dict(kv.split("=", 1) for kv in a.env)
+    if over:
+        cfg = cfg.with_env(over)
     keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"mathlib_{os.getpid()}")
     run = ResnetPlanned(model, a.plan, cfg, keys, work_dir=work, pool=a.pool or 128,

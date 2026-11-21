@@ -42,8 +42,10 @@ pub struct SparseBCfg {
     /// K of the EvalMod series: 24 (FIDESlib's degree-20 table) or 16 (the dense route's degree-14 table); the overflow
     /// integer after the fold has the dense route's distribution.
     pub evalmod_k: f64,
-    /// An EvalMod series replacing the K = 16 table (same K, double angles and depth; empty = the frozen table).
+    /// An EvalMod series replacing the K = 16 table (same K; empty = the frozen table), followed by `em_da` double
+    /// angles (`SPARSE_B_DA_ITS` shipped; fewer on a longer series land shallower).
     pub em_coeffs: Vec<f64>,
+    pub em_da: u32,
     /// The raise's sparse -> dense switch folded into the fold's first round (`BtsSetup::merge_s2d`): its hoisted
     /// group is the sparse -> dense key and `SparseRot` keys of the round's steps, summed with no add of the input.
     pub merge_s2d: bool,
@@ -51,7 +53,7 @@ pub struct SparseBCfg {
 
 impl SparseBCfg {
     pub fn n32(slots: u32, raise_drop: u32) -> Self {
-        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K, em_coeffs: Vec::new(), merge_s2d: false }
+        SparseBCfg { slots, raise_drop, cts0_t: 12, raise_k: pc_core::bts_setup::EVALMOD_K, acc_bstep: 4, b_step: 0, k_max: 8, ks_source: KskSource::Regen, lt_tails: true, em_fuse_rescale: false, evalmod_k: pc_core::bts_setup::SPARSE_B_K, em_coeffs: Vec::new(), em_da: SPARSE_B_DA_ITS, merge_s2d: false }
     }
 
     /// The EvalMod series' Paterson-Stockmeyer plan for `evalmod_k`.
@@ -204,7 +206,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let geo = Self::lt_geom(&g);
         let parts = Self::bytes_parts(chain, st, &lay, cfg)?;
         let b: usize = parts.iter().map(|p| p.1).sum();
-        let (_, _, nslots) = EvalModPlan::<W>::program(st, tops.1, &cfg.em_series()?, SPARSE_B_DA_ITS)?;
+        let (_, _, nslots) = EvalModPlan::<W>::program(st, tops.1, &cfg.em_series()?, cfg.em_da)?;
         let (em_n, em_kk) = em_work(nslots, cfg.k_max, EmMode::Real);
         Ok((b, BtsWorkShape { k_max: cfg.k_max, g_max: geo.g, em_slots: em_n, em_kk, spare: 1 }))
     }
@@ -258,7 +260,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
 
     /// The EvalMod plan's tables as `EvalModPlan::new` carves them.
     fn em_bytes(st: &ScaleTables, lay: &Layout, input: FMeta, cfg: &SparseBCfg) -> Result<usize> {
-        EvalModPlan::<W>::table_bytes(st, lay, input, &cfg.em_series()?, SPARSE_B_DA_ITS, cfg.k_max)
+        EvalModPlan::<W>::table_bytes(st, lay, input, &cfg.em_series()?, cfg.em_da, cfg.k_max)
     }
 
     fn lt_geom(g: &SparseBGeom) -> LtGeom {
@@ -272,7 +274,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         let raised_nf = st.sf(top as i32)? * (cfg.cts0_t as f64).exp2();
         let pt_nf = st.sf(top as i32)? * (-(cfg.cts0_t as f64)).exp2();
         let em_in = FMeta { top: top as i32, nl: 2, nf: raised_nf * pt_nf };
-        let (_, out, _) = EvalModPlan::<W>::program(st, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS)?;
+        let (_, out, _) = EvalModPlan::<W>::program(st, em_in, &cfg.em_series()?, cfg.em_da)?;
         let stc_top = if out.nl == 2 { out.top as usize - d } else { out.top as usize };
         Ok((top, em_in, stc_top))
     }
@@ -330,7 +332,7 @@ impl<'a, W: DevWord> SparseBPrecomp<'a, W> {
         mark("cts", &mut parts);
         let cts_acc = AccRounds::new(arena, s, n, keys, stage, r_cts)?;
         mark("cts_acc", &mut parts);
-        let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &cfg.em_series()?, SPARSE_B_DA_ITS, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
+        let mut em = EvalModPlan::new(arena, s, ctx, EmMode::Real, em_in, &cfg.em_series()?, cfg.em_da, keys.conj()?, keys.relin()?, stage, cfg.k_max, KskSource::Regen)?;
         em.fuse_rescale = cfg.em_fuse_rescale;
         // level relinearization keys: only when the key ring carries them
         em.attach_level_keys(arena, s, ctx, keys, stage)?;

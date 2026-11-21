@@ -77,13 +77,22 @@ class Trainer:
     zb: float = 8.0
     beta: float = 4.0
     err: float = 1e-3
+    fbs: bool | None = None
 
     def link(self):
-        """sigmoid on the margin band ([-zb, zb] for logistic, the hinge's argument [beta (1 - zb), beta (1 + zb)])."""
-        if self.loss == "logistic":
-            return M.approx("sigmoid", -self.zb, self.zb, self.err)
-        b = self.beta * (1.0 + self.zb)
-        return M.approx("sigmoid", -b, b, self.err)
+        """sigmoid on the margin band ([-zb, zb] for logistic, the hinge's argument [beta (1 - zb), beta (1 + zb)]).
+        `fbs`: as a functional bootstrap of the margin (the cheapest that lands no deeper than the series after a
+        refresh, impl.math `fbs_choice`) when one meets the target: the epoch's refresh and its link in one. None
+        (default) or True: the FBS where one qualifies (n32 planned, breast cancer / wine / iris, the same accuracy:
+        the logistic loss -11..12 % per training, 4 bootstraps instead of 10 besides the links; the hinge -31..37 %,
+        14 bootstraps instead of 29..32); False: the series."""
+        b = self.zb if self.loss == "logistic" else self.beta * (1.0 + self.zb)
+        a = M.approx("sigmoid", -b, b, self.err)
+        if self.fbs is not False:
+            f = M.fbs_choice("sigmoid", -b, b, self.err, False, a.depth)
+            if f is not None:
+                return f
+        return a
 
 
 def train(ops, x, y, lay: Design, tr: Trainer, w0=None, refresh_iterate: bool = False):

@@ -1103,3 +1103,103 @@ def _approx_uncached(fn, lo, hi, err, **kw):
     if fn in _SAT:
         return approx_saturating.__wrapped__(fn, lo, hi, err)
     return approx_pow.__wrapped__(kw["p"], lo, hi, err, kw.get("rel", True))
+
+
+# ── functional bootstrapping: a refresh that evaluates the function ─────────────────────────────────────────────────
+
+#: Where a candidate replaces a refresh followed by a series (n32, real payload, GPU 3, 2026-11-20): the plain
+#: real-payload StC-first refresh lands at level REFRESH_LANDING (realized) for REFRESH_MS per ciphertext (K = 1); an
+#: FBS lands at its own level (impl/fbs.py `landing`) for REFRESH_MS + `fbs_extra_ms`; a series after the refresh costs
+#: about SERIES_MS per ciphertext product (the shipped EvalMod: 4.07 ms for ~11 products at 46..34 limbs, scaled to
+#: the 24..10 limbs below the refresh's landing), its levels below the refresh's landing being the Approx's depth.
+REFRESH_LANDING = 26
+REFRESH_MS = 14.13
+SERIES_MS = 0.25
+#: The FBS's EvalMod cost over a plain refresh (ms, real payload, K = 1; least squares over the 15-function campaign,
+#: residual <= 0.7 ms for the paired sine, <= 3.7 ms for the others at degree 256 / 96): a + b x degree per form
+#: (impl/fbs_fit.py `form_name`).
+FBS_EXTRA_MS = {"sine": (1.96, 0.0114), "sine-paired": (2.35, 0.0197), "trig": (5.74, 0.0712),
+                "trig-low": (8.62, 0.0757)}
+
+#: The FBS fit's margin past the domain (fraction of its width; a positive domain's low end: of itself).
+FBS_PAD = 0.02
+_FBS_POSITIVE = ("log", "sqrt", "rsqrt", "reciprocal")
+_FBS_F = {"exp": np.exp, "log": np.log, "sqrt": np.sqrt, "rsqrt": lambda x: 1.0 / np.sqrt(x),
+          "reciprocal": lambda x: 1.0 / x, "tanh": np.tanh, "sigmoid": lambda x: _sigmoid(x), "erf": lambda x: _erf(x)}
+
+
+def fbs_extra_ms(form: str, deg: int) -> float:
+    a, b = FBS_EXTRA_MS[form]
+    return a + b * deg
+
+
+def _fbs_approx(fn, lo, hi, rel, name, fit, lv, bound, f):
+    from . import fbs, fbs_fit
+    fbs_fit.install(name, f, fit, lv, bound)
+    fmax = float(np.abs(f(grid(lo, hi, 257))).max()) or 1.0
+    depth = max(0, (lv - REFRESH_LANDING + 1) // CountOps.unit)
+    form = fbs_fit.form_name(fit)
+    ms = fbs_extra_ms(form, fit["deg"])
+
+    def run(ops, x, name=name):
+        return fbs.fbs(ops, x, name)
+    return Approx(fn, f"fbs-{form}", lo, hi, depth, 0, 0, bound, float(fit["err"]), bool(rel),
+                  (("form", form), ("degree", fit["deg"]), ("landing", lv), ("extra_ms", ms), ("name", name)), 0.0,
+                  fmax, run)
+
+
+@_memo
+def fbs_candidates(fn: str, lo: float, hi: float, err: float = 1e-4, rel: bool = False, scale: float = 1.0) -> tuple:
+    """f(scale x) on [lo, hi] as functional bootstraps (impl/fbs_fit.py: the sine and the trigonometric forms at the
+    smallest degree meeting `err`, absolute or pointwise relative when `rel`, by the noise model's bound): Approx
+    objects, each registered under its own name. Their `depth` counts the levels below a plain refresh's landing;
+    `err` is the model's bound (fit + 13 sigma: 2^-128 per output), `params` the form, degree, landing, extra ms.
+    The fit covers the domain widened by FBS_PAD of its width on each side (a positive domain's low end by FBS_PAD of
+    itself): past its fitted interval a series on EvalMod's sine / cosine leaves [-1, 1] and its high-degree
+    Chebyshev terms explode (a band overshoot of 0.7 % broke an SVM link of degree 96), where a series on x / X would
+    only drift."""
+    from . import fbs_fit
+    lo, hi = _check(lo, hi)
+    f0 = _FBS_F[fn]
+    f = (lambda x: f0(scale * x)) if scale != 1.0 else f0
+    tag = f"math.{fn}.{lo:.9g}.{hi:.9g}.{err:.3g}.{int(rel)}.{scale:.9g}"
+    w = hi - lo
+    flo = lo * (1.0 - FBS_PAD) if fn in _FBS_POSITIVE else lo - FBS_PAD * w
+    fhi = hi + FBS_PAD * w
+    out = []
+    for i, (fit, lv, b) in enumerate(fbs_fit.feasible(tag, f, flo, fhi, err, rel)):
+        name = f"{tag}.{fbs_fit.form_name(fit)}{fit['deg']}c{fit['cf']}"
+        out.append(_fbs_approx(fn, lo, hi, rel, name, fit, lv, b, f))
+    return tuple(out)
+
+
+def approx_fbs(fn: str, lo: float, hi: float, err: float = 1e-4, rel: bool = False, scale: float = 1.0):
+    """The shallowest-landing functional bootstrap of `fbs_candidates` (then the cheapest), or None."""
+    c = fbs_candidates(fn, float(lo), float(hi), float(err), bool(rel), float(scale))
+    return min(c, key=lambda a: (a.depth, dict(a.params)["extra_ms"])) if c else None
+
+
+def fbs_choice(fn: str, lo: float, hi: float, err: float, rel: bool, plain_depth: int, scale: float = 1.0,
+               series_ms: float | None = None):
+    """The functional bootstrap of f(scale x), x in [lo, hi], that replaces a refresh followed by a series landing
+    `plain_depth` levels below the refresh: the cheapest candidate (`fbs_candidates`: extra ms, then depth) that lands
+    no deeper, meets `err` by its bound and, with `series_ms`, costs no more than the series; None if none does."""
+    ok = [f for f in fbs_candidates(fn, float(lo), float(hi), float(err), bool(rel), float(scale))
+          if f.depth <= plain_depth and f.err <= err
+          and (series_ms is None or dict(f.params)["extra_ms"] <= series_ms)]
+    return min(ok, key=lambda f: (dict(f.params)["extra_ms"], f.depth)) if ok else None
+
+
+def refreshed(fn: str, lo: float, hi: float, err: float = 1e-4, fbs: bool = True, **kw):
+    """The cheaper of a refresh followed by `approx(fn, ...)` and a functional bootstrap of fn (`approx_fbs`), for a
+    value the caller refreshes anyway (a deliberate refresh, a stage entry the plan refreshes): the FBS is chosen only
+    if it lands no deeper than the refreshed series and costs no more (REFRESH_MS + its extra ms against REFRESH_MS +
+    SERIES_MS per product), with its bound within `err`. Returns (Approx, uses_fbs); calling the Approx on the
+    unrefreshed value does the whole step (the refresh is inside: `ops.bootstrap_real`, or the FBS)."""
+    rel = kw.get("rel", fn in ("exp", "rsqrt", "reciprocal"))
+    a = approx(fn, lo, hi, err, **kw)
+    plain = dataclasses.replace(a, run=lambda ops, x, a=a: a(ops, ops.bootstrap_real(x)))
+    if not fbs or fn not in _FBS_F:
+        return plain, False
+    f = fbs_choice(fn, lo, hi, err, rel, a.depth, series_ms=SERIES_MS * a.ct_mults)
+    return (plain, False) if f is None else (f, True)

@@ -139,11 +139,18 @@ def std(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-4, ddof: int =
     return M.sqrt(ops, variance(ops, x, lay, ddof, w), lo, hi, err)
 
 
-def zscore(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-4, ddof: int = 0):
+def zscore(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-4, ddof: int = 0, fbs: bool = False):
     """(x - mean) / std for a variance in [lo, hi] (the LayerNorm core without its affine): the centred value times
-    impl.math.rsqrt of the variance (relative error `err`)."""
+    impl.math.rsqrt of the variance (relative error `err`). `fbs`: the rsqrt as a functional bootstrap of the
+    variance (the cheapest that lands no deeper than the series after a refresh, impl.math `fbs_choice`) when one
+    meets the target: the variance's refresh and the series in one."""
     c = centred(ops, x, lay)
     v = variance(ops, x, lay, ddof)
+    if fbs:
+        a = M.approx_rsqrt(float(lo), float(hi), float(err), True)
+        f = M.fbs_choice("rsqrt", lo, hi, err, True, a.depth)
+        if f is not None:
+            return ops.mult(c, f(ops, v))
     return ops.mult(c, M.rsqrt(ops, v, lo, hi, err))
 
 
@@ -321,30 +328,47 @@ def _refreshed_series(ops, s, n, a):
     return g(ops, ops.add(_fresh(ops, ops.mult(s, alpha / n), True), beta))
 
 
+def _fbs_refreshed(ops, s, n, fn, lo, hi, err, rel, a, force=False):
+    """`_refreshed_series(ops, s, n, a)` or, when a functional bootstrap of fn(s / n) beats the refresh and the series
+    after it (impl.math `fbs_choice`: lands no deeper, costs no more, meets the target; `force`: without the cost
+    test), that FBS on s itself."""
+    plain_depth = a.depth - (1 if a.unit() is not None else 0)
+    f = M.fbs_choice(fn, n * lo, n * hi, err, rel, plain_depth, scale=1.0 / n,
+                     series_ms=None if force else M.SERIES_MS * a.ct_mults)
+    return f(ops, s) if f is not None else _refreshed_series(ops, s, n, a)
+
+
 def softmax(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-            s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
+            s_lo: float | None = None, margin: float | None = None, refresh: bool = True, fbs: bool = False):
     """softmax over each vector, x in [lo, hi]: exp(x - m) / sum. `shift` "max" (exact maximum: the sum's band is
     [1, n]) or "bound" (m = hi: the band is [n e^(lo - hi), n], or `s_lo` if calibrated); `method`: the max's
-    comparisons (impl.sort)."""
+    comparisons (impl.sort); `fbs`: the refreshed reciprocal may be a functional bootstrap (`_fbs_refreshed`;
+    "force": without the cost test)."""
     m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin, refresh)
     sl = float(s_lo) if s_lo is not None else sl
     e = _exp_shifted(ops, x, m, a, b, 0.25 * err)
     if refresh and shift == "max":
-        r = _refreshed_series(ops, total(ops, e, lay), lay.n,
-                              M.approx_reciprocal(sl / lay.n, sh / lay.n, 0.5 * err, True))
+        ap = M.approx_reciprocal(sl / lay.n, sh / lay.n, 0.5 * err, True)
+        s = total(ops, e, lay)
+        r = (_fbs_refreshed(ops, s, lay.n, "reciprocal", sl / lay.n, sh / lay.n, 0.5 * err, True, ap,
+                            fbs == "force") if fbs else _refreshed_series(ops, s, lay.n, ap))
         return ops.mult(ops.mult(e, 1.0 / lay.n), r)
     s = total(ops, e, lay)
     return ops.mult(e, M.reciprocal(ops, s, sl, sh, 0.5 * err, rel=True))
 
 
 def logsumexp(ops, x, lay: Batch, lo: float, hi: float, err: float = 1e-3, shift: str = "max", method: str = "tfhe",
-              s_lo: float | None = None, margin: float | None = None, refresh: bool = True):
-    """log sum_j exp(x_j), x in [lo, hi], broadcast over each vector's slots (softmax's shift and band)."""
+              s_lo: float | None = None, margin: float | None = None, refresh: bool = True, fbs: bool = False):
+    """log sum_j exp(x_j), x in [lo, hi], broadcast over each vector's slots (softmax's shift and band); `fbs`: the
+    refreshed log may be a functional bootstrap (`_fbs_refreshed`; "force": without the cost test)."""
     m, (a, b), (sl, sh) = _shift(ops, x, lay, lo, hi, shift, method, err, margin, refresh)
     sl = float(s_lo) if s_lo is not None else sl
     e = _exp_shifted(ops, x, m, a, b, 0.25 * err)
     if refresh and shift == "max":                                             # log sum = log mean + log n
-        lg = _refreshed_series(ops, total(ops, e, lay), lay.n, M.approx_log(sl / lay.n, sh / lay.n, 0.5 * err))
+        al = M.approx_log(sl / lay.n, sh / lay.n, 0.5 * err)
+        s = total(ops, e, lay)
+        lg = (_fbs_refreshed(ops, s, lay.n, "log", sl / lay.n, sh / lay.n, 0.5 * err, False, al, fbs == "force")
+              if fbs else _refreshed_series(ops, s, lay.n, al))
         return ops.add(ops.add(lg, m), _m.log(lay.n))
     s = total(ops, e, lay)
     return ops.add(M.log(ops, s, sl, sh, 0.5 * err), m)

@@ -1574,23 +1574,21 @@ mod tests {
 
 // ── functional bootstrapping on the route ───────────────────────────────────────────────────────────────────────
 
-/// The chains a functional bootstrap is validated on: composite degree 2, 32-bit words, no alternating single-prime
-/// user region (`ChainSpec::sp`) and no reduced special-prime tiers (`ChainSpec::low_p`): n32 and n32a4. On an
-/// alternating region the series would step single-prime levels the EvalMod builder does not lay out; the device
-/// output there was measured wrong, so it is refused rather than run.
+/// The chains a functional bootstrap is validated on: composite degree 2, 32-bit words and no reduced special-prime
+/// tiers (`ChainSpec::low_p`): n32, n32a4 and the alternating single / pair user region of n32sp / n32sph
+/// (`ChainSpec::sp`: the EvalMod builder steps the region's levels by their own primes, `Fx::up` / `down`, the
+/// executor's rescales drop them, `em_drop`, and a sine-form series there takes the paired builder).
 pub fn fbs_chain_check(chain: &Chain) -> Result<()> {
     let s = &chain.spec;
     let why = if s.composite_degree != 2 || s.word != pc_core::word::WordId::U32 {
         Some("not a composite-degree-2 32-bit chain")
-    } else if s.sp.is_some() {
-        Some("an alternating single-prime user region (sp)")
     } else if s.low_p.is_some() {
         Some("reduced special-prime tiers (low_p)")
     } else {
         None
     };
     match why {
-        Some(w) => Err(shape("fbs", format!("functional bootstrapping is validated on n32 / n32a4 only; this chain has {w}"))),
+        Some(w) => Err(shape("fbs", format!("functional bootstrapping is validated on n32 / n32a4 / n32sph only; this chain has {w}"))),
         None => Ok(()),
     }
 }
@@ -1607,11 +1605,32 @@ pub struct FbsSpec {
     pub da_its: u32,
     pub amp: f64,
     pub post: Vec<f64>,
+    /// Trigonometric FBS (`pc_shadow::evalmod::PsPlan::fbs_trig`; `table_s` empty: the sine form): `table` is then
+    /// the cosine of the base angle, `table_s` its sine (`pc_shadow::evalmod::trig_base`), and the output
+    /// P(t) + s Q(t), P = `post`, Q = `post_s`, t = A cos(2 pi u) + `off`, s = A sin(2 pi u).
+    pub table_s: Vec<f64>,
+    pub off: f64,
+    pub post_s: Vec<f64>,
+    /// The sine form on the paired Paterson-Stockmeyer builder (`pc_shadow::evalmod::build_sine_paired`).
+    pub paired: bool,
     /// Raise variant the FBS runs on.
     pub drop: u32,
     /// Build the complex (two-chain) / real-payload EvalMod.
     pub complex: bool,
     pub real: bool,
+}
+
+impl FbsSpec {
+    /// The EvalMod plan of this spec: the sine form, or the trigonometric one when `table_s` is set.
+    pub fn ps_plan(&self) -> Result<pc_shadow::evalmod::PsPlan> {
+        Ok(if self.table_s.is_empty() {
+            let mut p = pc_shadow::evalmod::PsPlan::fbs(&self.table, self.da_its, self.amp, &self.post)?;
+            p.paired = self.paired;
+            p
+        } else {
+            pc_shadow::evalmod::PsPlan::fbs_trig(&self.table, &self.table_s, self.da_its, self.amp, self.off, &self.post, &self.post_s)?
+        })
+    }
 }
 
 /// An FBS's host side (no device memory).
@@ -1641,7 +1660,7 @@ impl StcFirstPlan {
         fbs_chain_check(&self.dense.chain)?;
         let variant = self.dense.variants.iter().position(|v| v.drop == spec.drop).ok_or_else(|| shape("fbs", format!("raise drop {} has no variant", spec.drop)))?;
         let v = &self.dense.variants[variant];
-        let ps = pc_shadow::evalmod::PsPlan::fbs(&spec.table, spec.da_its, spec.amp, &spec.post)?;
+        let ps = spec.ps_plan()?;
         let st = ScaleTables::precompute(&self.dense.chain)?;
         let (_, out, em_slots) = EvalModPlan::<u32>::program(&st, v.em_in, &ps, spec.da_its)?;
         // the post-raise constant scales by 1 / K: the shipped table's K folded out, the FBS table's in
@@ -1654,7 +1673,7 @@ impl StcFirstPlan {
         let lay = Layout::from_chain(&self.dense.chain);
         let st = ScaleTables::precompute(&self.dense.chain)?;
         let k_max = self.dense.setup.k_max;
-        let em = EvalModPlan::<W>::table_bytes(&st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)?;
+        let em = EvalModPlan::<W>::table_bytes(&st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)? + EvalModPlan::<W>::md_exact_bytes(&self.dense.chain, &st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)?;
         let b = RaisePlan::<W>::table_bytes() + em * (h.spec.complex as usize + h.spec.real as usize);
         let mode = if h.spec.complex { EmMode::Complex } else { EmMode::Real };
         let (n, kk) = super::evalmod::em_work(h.em_slots, k_max, mode);

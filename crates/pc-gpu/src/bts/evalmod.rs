@@ -181,13 +181,17 @@ struct RrConst<'a, W: DevWord> {
     tops: ConstBuf<'a, W>,
 }
 
+/// Primes the rescale from limb top `top` drops: the level unit, but one at a single-prime level of a chain with an
+/// alternating user region (`ScaleTables::drop`).
+pub fn em_drop(st: &pc_core::scale::ScaleTables, top: usize) -> usize {
+    st.drop.get(top).copied().filter(|&g| g > 0).unwrap_or(st.d)
+}
+
 /// The program's `Mult; Rescale` pairs `RelinRescale` serves: (top, the epilogue's constant index) per pair. Its
-/// conversion drops two primes (q_a q_b): chains with a level unit `d` other than 2 get none.
-fn relin_rescale_pairs(ops: &[EmOp], d: usize) -> Vec<(usize, Option<usize>)> {
-    if d != 2 {
-        return Vec::new();
-    }
-    (0..ops.len()).filter_map(|i| fused_rescale_at(ops, i).map(|(n, k, _)| (n - 1, k))).collect()
+/// conversion drops two primes (q_a q_b): only the rescales that drop two (none on a chain of level unit 1, the
+/// two-prime levels of an alternating user region).
+fn relin_rescale_pairs(ops: &[EmOp], st: &pc_core::scale::ScaleTables) -> Vec<(usize, Option<usize>)> {
+    (0..ops.len()).filter_map(|i| fused_rescale_at(ops, i).map(|(n, k, _)| (n - 1, k))).filter(|&(t, _)| em_drop(st, t) == 2).collect()
 }
 
 /// The `Mult; Rescale` (or `Mult; Add dst += / -= y; Rescale`) at op `i` that `RelinRescale` serves: (rows, the
@@ -218,6 +222,8 @@ fn reads_writes(op: &EmOp) -> (Vec<usize>, Vec<usize>) {
         EmOp::Mult { dst, a, b, .. } => (vec![*a, *b], vec![*dst]),
         EmOp::MultAcc { dst, pairs, .. } => (std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(), vec![*dst]),
         EmOp::WSum { dst, srcs, .. } => (srcs.clone(), vec![*dst]),
+        EmOp::MulI { x, .. } => (vec![*x], vec![*x]),
+        EmOp::ConjSplit { x, d, .. } => (vec![*x], vec![*x, *d]),
     }
 }
 
@@ -246,7 +252,7 @@ fn dead_after(ops: &[EmOp], i: usize, x: usize) -> bool {
 /// relinearization-rescale (`RelinRescale`); a `Copy z <- dst; Rescale z` with dst dead after becomes
 /// `Rescale dst; Copy z <- dst`. The same values in the same buffers: without the fusion the program computes
 /// what the unscheduled one does, word for word.
-pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, d: usize) -> Vec<EmOp> {
+pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, st: &pc_core::scale::ScaleTables) -> Vec<EmOp> {
     let mut i = 0;
     // a transform may move other relinearizations ahead of this one: they are visited again (bounded)
     let mut budget = 4 * ops.len();
@@ -331,7 +337,7 @@ pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, d: usize) -> Vec<EmOp> {
             None => sched.push(ops[j].clone()),
             Some(z) => {
                 sched.push(EmOp::Rescale { x: dst, n, k: None });
-                sched.push(EmOp::Copy { dst: z, src: dst, n: n - d });
+                sched.push(EmOp::Copy { dst: z, src: dst, n: n - em_drop(st, n - 1) });
             }
         }
         sched.extend(after.iter().map(|&m| ops[m].clone()));
@@ -378,8 +384,37 @@ pub struct EvalModPlan<'a, W: DevWord> {
     levelks: BTreeMap<usize, LevelKs<'a, W>>,
     wmulti: BTreeMap<usize, Vec<ScalarPair<'a, W>>>,
     rfold_k: BTreeMap<usize, usize>,
+    /// The exponential form's key switches outside `RelinRescale` (the conjugations, the relinearizations at tops
+    /// without a fused rescale) by top: the exact ModDown conversion (`ks::moddown_exact_specs`). The fast one's bias
+    /// sits on slot 0 of every ciphertext, which z = a e^(i th) turns into an amplitude / phase error (measured: GELU
+    /// [-24.6, 24.6] complex 1.25e-4 -> 8.4e-6; +1.1 ms). Every other program: none (unchanged).
+    md_exact: BTreeMap<usize, crate::bconv::BconvPlan<'a>>,
     bytes: usize,
     nq: usize,
+}
+
+/// The tops of a program's key switches that run `ks::moddown_conv` (conjugations: the complex entry and every
+/// `ConjSplit`; relinearizations: every product's top).
+fn md_tops(ops: &[EmOp], mode: EmMode, input: FMeta) -> std::collections::BTreeSet<usize> {
+    let mut t = std::collections::BTreeSet::new();
+    if mode == EmMode::Complex {
+        t.insert(input.top as usize);
+    }
+    for op in ops {
+        match op {
+            EmOp::ConjSplit { n, .. } | EmOp::Mult { n, .. } | EmOp::MultAcc { n, .. } => {
+                t.insert(n - 1);
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
+/// The exponential form of a trigonometric FBS (a `ConjSplit` in the program) runs its key switches over the exact
+/// ModDown; every other program (plain tables, the sine and paired forms) keeps the fast one, unchanged.
+fn exact_md_program(ops: &[EmOp]) -> bool {
+    ops.iter().any(|o| matches!(o, EmOp::ConjSplit { .. }))
 }
 
 /// NTT of X^power on every Q prime (rows = prime id).
@@ -416,6 +451,8 @@ fn slots_of(ops: &[EmOp]) -> usize {
             EmOp::Mult { dst, a, b, .. } => vec![*dst, *a, *b],
             EmOp::MultAcc { dst, pairs, .. } => std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(),
             EmOp::WSum { dst, srcs, .. } => std::iter::once(*dst).chain(srcs.iter().copied()).collect(),
+            EmOp::MulI { x, .. } => vec![*x],
+            EmOp::ConjSplit { x, d, .. } => vec![*x, *d],
         };
         m = ids.into_iter().fold(m, |m, i| m.max(i + 1));
     }
@@ -430,6 +467,8 @@ fn ids_mut(op: &mut EmOp) -> Vec<&mut usize> {
         EmOp::Mult { dst, a, b, .. } => vec![dst, a, b],
         EmOp::MultAcc { dst, pairs, .. } => std::iter::once(dst).chain(pairs.iter_mut().flat_map(|p| [&mut p.0, &mut p.1])).collect(),
         EmOp::WSum { dst, srcs, .. } => std::iter::once(dst).chain(srcs.iter_mut()).collect(),
+        EmOp::MulI { x, .. } => vec![x],
+        EmOp::ConjSplit { x, d, .. } => vec![x, d],
     }
 }
 
@@ -536,6 +575,8 @@ fn rw(op: &EmOp) -> (Vec<usize>, Vec<usize>) {
         EmOp::MulConst { x, .. } | EmOp::AddConst { x, .. } | EmOp::Rescale { x, .. } => (vec![*x], vec![*x]),
         EmOp::MultAcc { dst, pairs, .. } => (std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(), vec![*dst]),
         EmOp::WSum { dst, srcs, .. } => (srcs.clone(), vec![*dst]),
+        EmOp::MulI { x, .. } => (vec![*x], vec![*x]),
+        EmOp::ConjSplit { x, d, .. } => (vec![*x], vec![*x, *d]),
     }
 }
 
@@ -854,7 +895,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     pub fn program(st: &pc_core::scale::ScaleTables, input: FMeta, ps: &PsPlan, da_its: u32) -> Result<(EmProgram, FMeta, usize)> {
         let (mut prog, out) = build_evalmod_opts(st, input, ps, da_its as i32, true)?;
         let (ops, consts) = rewrite(prog.fused(), &prog.consts, &st.q);
-        let ops = schedule_relin_rescales(ops, st.d);
+        let ops = schedule_relin_rescales(ops, st);
         let (_, n) = assign_buffers(ops.clone());
         prog.ops = ops;
         prog.consts = consts;
@@ -863,6 +904,21 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
 
     /// Device bytes `new` carves for this program (constants, rescale plans, monomials, keys; the fused regen-relin
     /// epilogue's tables: a dense seeded relinearization key, which the LT stages require anyway).
+    /// Device bytes of `md_exact` (the exponential form's exact ModDown conversions; 0 for every other program), the
+    /// complex mode's (a bound for the real one).
+    pub fn md_exact_bytes(chain: &pc_core::params::Chain, st: &pc_core::scale::ScaleTables, lay: &Layout, input: FMeta, ps: &PsPlan, da_its: u32, kk_max: usize) -> Result<usize> {
+        let (prog, _, _) = Self::program(st, input, ps, da_its)?;
+        if !exact_md_program(&prog.ops) {
+            return Ok(0);
+        }
+        let primes = chain.primes();
+        let mut b = 0;
+        for top in md_tops(&prog.ops, EmMode::Complex, input) {
+            b += crate::bconv::BconvPlan::bytes::<W>(&primes, &crate::ks::moddown_exact_specs(chain, lay, top, kk_max))?;
+        }
+        Ok(b)
+    }
+
     pub fn table_bytes(st: &pc_core::scale::ScaleTables, lay: &Layout, input: FMeta, ps: &PsPlan, da_its: u32, kk_max: usize) -> Result<usize> {
         let (prog, _, _) = Self::program(st, input, ps, da_its)?;
         let np = lay.rows();
@@ -902,7 +958,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         b += 2 * rows_b(nq * lay.n) + 2 * KeyGroup::bytes(1, true);
         // the fused relinearization-rescale pairs: per top the dot rows, the conversion plan, alpha / beta / the top
         // weights, the row table of rows 0..top-2; per (constant, top) the rescaled constant
-        let pairs = relin_rescale_pairs(&fused, st.d);
+        let pairs = relin_rescale_pairs(&fused, st);
         let primes = st.q.iter().chain(st.p.iter()).copied().collect::<Vec<u64>>();
         let rr_tops: std::collections::BTreeSet<usize> = pairs.iter().map(|p| p.0).collect();
         let rr_k: std::collections::BTreeSet<(usize, usize)> = pairs.iter().filter_map(|&(t, k)| k.map(|k| (k, t))).collect();
@@ -972,7 +1028,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let n = lay.n;
         let relin_group = KeyGroup::new(arena, s, n, &[relin], stage_ptrs)?;
         let in_place = relin_group.regen_tab(0)?;
-        let pairs = relin_rescale_pairs(&ops, ctx.chain.level_unit);
+        let pairs = relin_rescale_pairs(&ops, &ctx.scale);
         let regen_epi = match (relin.staging(), relin.seed_ptr()) {
             (st, Some(seed)) if (st.is_none() && relin.digit_stride() == lay.poly_words()) || in_place.is_some() => {
                 let mut rows = BTreeMap::new();
@@ -1079,10 +1135,27 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             levelks,
             wmulti,
             rfold_k,
+            md_exact: BTreeMap::new(),
             bytes: 0,
             nq,
         };
+        let mut plan = plan;
+        if exact_md_program(&plan.ops) {
+            for top in md_tops(&plan.ops, mode, input) {
+                let specs = crate::ks::moddown_exact_specs(&ctx.chain, &lay, top, kk_max);
+                plan.md_exact.insert(top, crate::bconv::BconvPlan::new::<Compute, W>(arena, s, &primes, &specs)?);
+            }
+        }
         Ok(EvalModPlan { bytes: arena.used_bytes() - used0, ..plan })
+    }
+
+    /// `ks::moddown_conv`, over the exact conversion where the program has one for `top` (`md_exact`).
+    #[allow(clippy::too_many_arguments)]
+    fn moddown_conv<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, plans: &crate::ks::KsPlans<'_>, x: &mut CtBuf<'_, Compute, W>, conv: &mut CtBuf<'_, Compute, W>, k: usize, top: usize) -> Result<()> {
+        match self.md_exact.get(&top) {
+            Some(p) => ks::moddown_conv_with(ctx, s, plans, p, x, conv, k, top),
+            None => ks::moddown_conv(ctx, s, plans, x, conv, k, top),
+        }
     }
 
     fn rescale_plan<M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, top: usize, kk_max: usize) -> Result<RescalePlan<'a, W>> {
@@ -1091,7 +1164,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let primes = ctx.chain.primes();
         let np = primes.len();
         let q = &ctx.chain.q;
-        let d = ctx.chain.level_unit;
+        let d = em_drop(st, top);
         if !(1..=2).contains(&d) || top < d {
             return Err(shape("evalmod rescale", format!("composite degree {d} at top {top} (the one-pass kernel drops 1 or 2)")));
         }
@@ -1147,7 +1220,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// (`keys::LevelRelinSpec`). Setup only; the plan's carved bytes grow by the level tables.
     pub fn attach_level_keys<M: DevStrategy<W>>(&mut self, arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, ring: &dyn super::BtsKeyRing, stage: Option<(*const c_void, *const c_void)>) -> Result<usize> {
         let used0 = arena.used_bytes();
-        let pairs = relin_rescale_pairs(&self.ops, ctx.chain.level_unit);
+        let pairs = relin_rescale_pairs(&self.ops, &ctx.scale);
         let tops: Vec<usize> = self.rr.keys().copied().collect();
         let mut n = 0;
         for top in tops {
@@ -1225,7 +1298,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, k, top_in, DotRows::All, io, staged)?;
             // the ModDown's last step is fused into x +- conj(x) below (md_epilogue_to)
-            ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top_in)?;
+            self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top_in)?;
         }
         let s = &cx.ex.compute;
         let xv = View::of(x, 0);
@@ -1489,7 +1562,69 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                         _ => launch_result("wsum", unsafe { (ctx.table.wsum)(&a, s.raw()) })?,
                     }
                 }
+                EmOp::MulI { x, n, neg } => {
+                    let v = slot(cx, *x);
+                    Self::mul_table(ctx, s, v, v, if *neg { &self.mono_3n2 } else { &self.mono_n2 }, *n, kk)?;
+                }
+                EmOp::ConjSplit { x, d, n } => self.conj_split(cx, base + *x, base + *d, *n, kk)?,
             }
+        }
+        Ok(())
+    }
+
+    /// `ConjSplit`: buffer `d` := x - conj(x), then x := x + conj(x) (rows 0..n, kk cts): one key switch with the
+    /// conjugation key at x's level, as the entry's (its ModDown's last step fused into both sums).
+    fn conj_split<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, x: usize, d: usize, n: usize, kk: usize) -> Result<()> {
+        let ctx = cx.ctx;
+        let lay = ctx.lay;
+        let top = n - 1;
+        let cw = lay.ct_words();
+        let pw = lay.poly_words() as u64;
+        {
+            let ex = &mut *cx.ex;
+            let xb = &cx.work.em[x];
+            ks::modup(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, xb, 0, kk, 1, top)?;
+            let v = View::of(xb, 0);
+            let io = DotIo {
+                c1: v.part::<W>(1).base,
+                c0: v.base,
+                ct_stride: v.ct_stride,
+                out: ex.ks.ext.buf.vptr_mut(),
+                part_stride: pw,
+                out_ct_stride: cw as u64,
+                out_rot_stride: 0,
+                c0_mode: 1,
+            };
+            let staged = self.conj.reads_in_place(self.relin_source) || self.conj.needs_stage() || !self.conj.has_a();
+            if staged {
+                let ndig = cx.ks.ndig(top)?;
+                ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.conj, 0, ndig, true)?;
+            }
+            ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, kk, top, DotRows::All, io, staged)?;
+            self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+        }
+        let s = &cx.ex.compute;
+        let xv = View::of(&cx.work.em[x], 0);
+        let av = View::of(&cx.ex.ks.ext, 0);
+        let cv = View::of(&cx.ex.ks.conv, 0);
+        for (out, sub) in [(View::of(&cx.work.em[d], 0), 1), (xv, 0)] {
+            let m = MdEpiArgs {
+                dst: out.r(),
+                x: av.r(),
+                t: cv.r(),
+                binv: ctx.ks.p_inv_mod_q.v.vptr(),
+                binvs: ctx.ks.p_inv_mod_q.s.vptr(),
+                k: std::ptr::null(),
+                pr: ctx.pr(),
+                dbl: 0,
+                n: n as i32,
+                kk: kk as i32,
+                pad: 0,
+            };
+            let a = MdEpiToArgs { m, a: xv.r(), sub, pad: 0 };
+            // SAFETY: kk-ct views of live buffers; d aliases none of x, ext, conv; the second sum writes x in place
+            // (element-wise: each row reads its own a and writes its own dst)
+            launch_result("md_epilogue_to", unsafe { (ctx.table.md_epilogue_to)(&a, s.raw()) })?;
         }
         Ok(())
     }
@@ -1764,7 +1899,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                 let ndig = cx.ks.ndig(top)?;
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.relin, 0, ndig, false)?;
                 ks::dot_regen(ctx, &ex.compute, cx.ks, &ex.ks, &self.relin, kk, top, DotRows::P, io, None)?;
-                ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+                self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
                 if let Some(re) = &self.regen_epi {
                     // Q rows straight into dst = f(dst + (dot - conv) P^-1) with the program's x2 / + constant
                     let rows = re.rows.get(&top).ok_or_else(|| shape("evalmod relin", format!("no row table for top {top}")))?;
@@ -1842,7 +1977,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                     ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.relin, 0, ndig, true)?;
                 }
                 ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.relin, 0, 1, kk, top, DotRows::All, io, staged)?;
-                ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+                self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
                 let a = MdEpiArgs {
                     dst: dstv.r(),
                     x: ext.r(),
@@ -1921,7 +2056,7 @@ mod tests {
         for (name, ps_x, em_in) in [("gelu-like 342", ps_gl, ems[1])] {
             let (prog, out) = build_evalmod_opts(&st, em_in, &ps_x, da as i32, true).expect("program");
             let (rw, rc) = rewrite(prog.fused(), &prog.consts, &st.q);
-            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
             let a = (1.0075 * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
             let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
             let mut emax: f64 = 0.0;
@@ -1947,7 +2082,7 @@ mod tests {
             let (prog, out) = build_evalmod_opts(&st, em_in, &ps, da as i32, true).expect("program");
             let fused = prog.fused();
             let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
-            let sch = schedule_relin_rescales(rw, st.d);
+            let sch = schedule_relin_rescales(rw, &st);
             let (asg, _) = assign_buffers(sch.clone());
             let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
             let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
@@ -1988,7 +2123,7 @@ mod tests {
         println!("dense EvalMod: {} ops, buffers {before} -> {after}", ops.len());
         assert!(after < before);
         let (rw, _) = rewrite(fused.clone(), &prog.consts, &st.q);
-        let rw = schedule_relin_rescales(rw, st.d);
+        let rw = schedule_relin_rescales(rw, &st);
         let after_rw = assign_buffers(rw.clone()).1;
         println!("dense EvalMod rewritten: {} -> {} ops, buffers {after_rw}", fused.len(), rw.len());
         assert!(after_rw <= after && after_rw == v.em_slots);

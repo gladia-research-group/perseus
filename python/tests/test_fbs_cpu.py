@@ -45,6 +45,8 @@ def test_numpy_ops_is_the_twin():
     name = fbs.register_table("cpu.step.16", (np.arange(-8, 9) >= 0).astype(float), check=False)
     x = np.arange(-8, 9, dtype=float)
     assert np.abs(fbs.fbs(NumpyOps(), x, name) - (x >= 0)).max() < 1e-12
+    # a one-entry vector is a public scalar on the mirror (the hinge's link at a known margin), not the twin's novec
+    assert abs(fbs.fbs(NumpyOps(), np.array([3.0]), name)[0] - 1.0) < 1e-12
 
 
 @pytest.mark.parametrize("t", [16, 64, 256])
@@ -107,11 +109,12 @@ def test_smooth_error_bound():
 
 def test_refusals():
     post = [0.0, 0.5, 0.0, 0.1]
-    for preset in ("n32sph", "n32sp", "n64"):
-        with pytest.raises(ValueError, match="validated on n32 / n32a4"):
+    for preset in ("n64", "n32/lp4b3"):
+        with pytest.raises(ValueError, match="validated on n32 / n32a4 / n32sph"):
             _pc.fbs_landing(preset, 1.0, post)
-        with pytest.raises(ValueError, match="validated on n32 / n32a4"):
+        with pytest.raises(ValueError, match="validated on n32 / n32a4 / n32sph"):
             _pc.fbs_noise(preset, 3, 1.0, post, [0.0])
-    assert _pc.fbs_landing("n32", 1.0, post)[1] == 1
+    for preset in ("n32", "n32a4", "n32sph"):
+        assert _pc.fbs_landing(preset, 1.0, post)[1] == 1
     with pytest.raises(ValueError, match="degree >= 2"):
         fbs.register("cpu.lin", lambda x: x, 3, 1.0, [0.0, 1.0])

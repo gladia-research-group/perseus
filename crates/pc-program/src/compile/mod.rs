@@ -284,7 +284,9 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     let l = |level| Landing { level, deg: 1 };
     // FIDESlib's realized landings at raise drop 0 (the shipped decode's 512 -> 26 is 24 + its FIDESLIB_BTS_RAISE_DROP=512:1)
     // (1024: the SparseB route SM_PERIODIC=2 builds past two score groups, Llama decode; same depth as 512)
-    bts.landings = [(0, l(28)), (1024, l(24)), (512, l(24)), (256, l(24)), (1, l(16))].into_iter().collect();
+    // (bts.em_table / bts.sb_em_table "deg:da": a shallower EvalMod series lands its routes that many levels lower)
+    let (dense_up, sb_up) = (dense_em_shift(cfg)?, sb_em_shift(cfg)?);
+    bts.landings = [(0, l(28 - dense_up)), (1024, l(24 - sb_up)), (512, l(24 - sb_up)), (256, l(24 - sb_up)), (1, l(16))].into_iter().collect();
     // the classic multi-stage sparse routes (pc-gpu `sparse_classic`): every power-of-two s SparseB does not take
     // (s > FIDESLIB_BTS_SPARSE_B_MAX, or SparseB off), on the SPARSE_LEVEL_BUDGET precomputation (default {4, 3})
     let budget = sparse_level_budget(cfg)?;
@@ -338,6 +340,33 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 
+/// Levels the dense routes' EvalMod series `bts.em_table` ("deg:da", pc-shadow `evalmod::sine_base` at K = 16) lands
+/// above the frozen table (0 unset). Measured on the n32 chain's dense EvalMod input (raise drop 0: the top limb 45);
+/// the depth of a series does not depend on where it starts (pc-gpu `bts::dense` tests check every raise variant).
+pub fn dense_em_shift(cfg: &Config) -> Result<u32> {
+    let Some(spec) = cfg.bts.em_table.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(0) };
+    let (d, r) = pc_shadow::evalmod::parse_em_table(spec).ok_or_else(|| cfg_err("bts.em_table", format!("{spec:?}: deg:da (e.g. 47:2)")))?;
+    let k = pc_core::bts_setup::EVALMOD_K;
+    em_shift((pc_core::bts_setup::evalmod_coeffs(), pc_core::bts_setup::EVALMOD_DA_ITS), (&pc_shadow::evalmod::sine_base(k, r, d), r), "bts.em_table")
+}
+
+/// `dense_em_shift` for SparseB's `bts.sb_em_table` "deg:da" at `bts.sparse_b_k` = 16 ('w14' and unset: 0).
+pub fn sb_em_shift(cfg: &Config) -> Result<u32> {
+    let Some(spec) = cfg.bts.sb_em_table.as_deref().map(str::trim).filter(|s| s.contains(':')) else { return Ok(0) };
+    let (d, r) = pc_shadow::evalmod::parse_em_table(spec).ok_or_else(|| cfg_err("bts.sb_em_table", format!("{spec:?}: 'w14' or deg:da")))?;
+    let k = pc_core::bts_setup::EVALMOD_K;
+    em_shift((pc_core::bts_setup::evalmod_coeffs(), pc_core::bts_setup::SPARSE_B_DA_ITS), (&pc_shadow::evalmod::sine_base(k, r, d), r), "bts.sb_em_table")
+}
+
+fn em_shift(a: (&[f64], u32), b: (&[f64], u32), field: &'static str) -> Result<u32> {
+    let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset("n32").map_err(|e| cfg_err(field, e))?).map_err(|e| cfg_err(field, e))?;
+    let st = pc_core::scale::ScaleTables::precompute(&chain).map_err(|e| cfg_err(field, e))?;
+    let top = 45;
+    let input = pc_shadow::fides::FMeta { top, nl: 1, nf: st.sf(top).map_err(|e| cfg_err(field, e))? };
+    let up = pc_shadow::evalmod::table_landing_shift(&st, input, a, b).map_err(|e| cfg_err(field, e))?;
+    u32::try_from(up).map_err(|_| cfg_err(field, format!("the series lands {} levels deeper than the frozen table", -up)))
+}
+
 /// SPARSE_LEVEL_BUDGET {CtS, StC} of the classic sparse routes ("3,3" / "3:3"; unset = the dense {4, 3}).
 pub fn sparse_level_budget(cfg: &Config) -> Result<[u32; 2]> {
     match &cfg.bts.sparse_level_budget {
@@ -356,7 +385,9 @@ pub fn sparse_level_budget(cfg: &Config) -> Result<[u32; 2]> {
 /// block entry (the previous block's exit), KV-cache reads their read level, other inputs their first consumer.
 pub fn seeds(bg: &BlockGraph, rules: &crate::plan::Rules, entry: Option<(u32, u8)>, inputs: &[String]) -> Result<HashMap<String, (u32, u8)>> {
     let g = &bg.graph;
-    let bl = rules.bootstrap_level.ok_or_else(|| cfg_err("rules.bootstrap_level", "missing"))? as f64;
+    // the level past which an unmapped input seeds with a pending rescale: the capture's dense landing (plan.seed_level,
+    // a plan made for a shallower EvalMod table on an older capture), else the plan's bootstrap level
+    let bl = rules.seed_level.or(rules.bootstrap_level).ok_or_else(|| cfg_err("rules.bootstrap_level", "missing"))? as f64;
     let source = rules.source_level.unwrap_or(36) as f64;
     let cache_read = rules.cache_read_level.unwrap_or(36) as f64;
     let ins: BTreeSet<&str> = g.inputs.iter().map(String::as_str).collect();

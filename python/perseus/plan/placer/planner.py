@@ -940,6 +940,13 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
             return input_level_of[v] - cfg.bootstrap_level
         return cfg.source_level - cfg.bootstrap_level
 
+    def seed_level() -> int | None:
+        """PLAN_SEED_LEVEL (plan.seed_level): the level past which an unmapped input seeds with a pending rescale, the
+        capture's own dense landing, for a plan made for a shallower EvalMod table (a lower BTS_LEVEL) on a capture
+        made for the shipped one; unset: the bootstrap level."""
+        v = os.environ.get("PLAN_SEED_LEVEL", "").strip()
+        return int(v) if v else None
+
     def seed_deg(v: str) -> int:
         if mapped_entry(v) is not None:
             return mapped_entry(v)[1]
@@ -953,7 +960,9 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         fc = first_consumer_seed.get(v)
         if exp is not None and fc is not None:
             return 2 if exp > fc else 1
-        return 2 if seed_consumed(v) > 0 else 1
+        # past the capture's dense landing (PLAN_SEED_LEVEL; unset: the bootstrap level) an input carries a pending rescale
+        sl = seed_level()
+        return 2 if seed_consumed(v) + cfg.bootstrap_level > (cfg.bootstrap_level if sl is None else sl) else 1
 
     policy = btserr.SitePolicy(
         cf_min=cfg.cf_min, cf_max=cfg.cf_max,
@@ -1461,6 +1470,7 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         g, sim, refresh, sorted(placer.placed),
         bootstrap_level=cfg.bootstrap_level, max_level=cfg.max_level,
         source_level=cfg.source_level, cache_read_level=cfg.cache_read_level,
+        seed_level=seed_level(),
         seed_consumed=seed_consumed, err_target=cfg.err_target,
         num_deliberate=erase.n_deliberate_kept, num_nodes_raw=num_nodes_raw,
         heuristic_config=getattr(placer, "heuristic_config", "min_cut"),

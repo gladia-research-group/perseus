@@ -59,6 +59,7 @@ class Fn(Task):
     err: float = 1e-4
     p: float = 1.5
     method: str = "ckks"          # sign family: ckks / tfhe
+    fbs: bool = False             # the function as a functional bootstrap (impl.math `approx_fbs`)
     seed: int = 0
     name = "fn"
 
@@ -83,6 +84,11 @@ class Fn(Task):
 
     def approx(self):
         kw = {"p": self.p} if self.fn == "pow" else {}
+        if self.fbs:
+            a = M.approx_fbs(self.fn, self.lo, self.hi, self.err, self.fn in ("exp", "rsqrt", "reciprocal"))
+            if a is None:
+                raise M.TargetError(f"fbs {self.fn} on [{self.lo}, {self.hi}]: no form meets {self.err}")
+            return a
         return M.approx(self.fn, self.lo, self.hi, self.err, **kw)
 
     def run(self, ops, xs):
@@ -96,7 +102,8 @@ class Fn(Task):
             return [M.sign(ops, x, B, self.err, self.method)]
         if self.fn == "clip":
             return [M.clip(ops, x, 0.5 * self.lo, 0.5 * self.hi, B, self.err, self.method)]
-        return [self.approx()(ops, x)]
+        # an FBS renames its operand (its level hints): the stage input stays the harness's
+        return [self.approx()(ops, ops.copy(x) if self.fbs else x)]
 
     def outputs(self, vals):
         return {"y": np.real(vals[0])}
@@ -147,6 +154,7 @@ class Stats(Task):
     err: float = 1e-3
     shift: str = "max"
     method: str = "tfhe"
+    fbs: bool | str = False       # softmax / logsumexp / zscore: the refreshed function may be an FBS ("force")
     seed: int = 0
     name = "stats"
 
@@ -183,11 +191,13 @@ class Stats(Task):
             return [S.variance(ops, x, lay)]
         if k == "zscore":
             lo, hi = self._var_band(self.X, 1)
-            return [S.zscore(ops, x, lay, lo, hi, self.err)]
+            return [S.zscore(ops, x, lay, lo, hi, self.err, fbs=self.fbs)]
         if k == "softmax":
-            return [S.softmax(ops, x, lay, -4.0, 4.0, self.err, shift=self.shift, method=self.method)]
+            return [S.softmax(ops, x, lay, -4.0, 4.0, self.err, shift=self.shift, method=self.method,
+                              fbs=self.fbs)]
         if k == "logsumexp":
-            return [S.logsumexp(ops, x, lay, -4.0, 4.0, self.err, shift=self.shift, method=self.method)]
+            return [S.logsumexp(ops, x, lay, -4.0, 4.0, self.err, shift=self.shift, method=self.method,
+                                fbs=self.fbs)]
         if k == "prefix":
             return [S.prefix_sum(ops, x, lay)]
         if k == "cov":
@@ -345,6 +355,7 @@ class Pipeline(Task):
     k: int = 3
     err: float = 1e-3
     method: str = "tfhe"          # the comparisons (max, ranks)
+    fbs: bool | str = False       # zscore's rsqrt and softmax's reciprocal may be FBS ("force")
     seed: int = 0
     name = "pipeline"
 
@@ -362,9 +373,9 @@ class Pipeline(Task):
 
     def run(self, ops, xs):
         x, lay = xs[0], self.lay
-        z = S.zscore(ops, x, lay, *self.band, err=self.err)
+        z = S.zscore(ops, x, lay, *self.band, err=self.err, fbs=self.fbs)
         t = M.tanh(ops, z, -2.0, 2.0, self.err)
-        sm = S.softmax(ops, ops.add(t, t), lay, -2.0, 2.0, self.err, shift="max", method=self.method)
+        sm = S.softmax(ops, ops.add(t, t), lay, -2.0, 2.0, self.err, shift="max", method=self.method, fbs=self.fbs)
         # neighbours are >= 0.5 / n apart (the construction): a public resolution, the same program for every seed
         r = T.rank(ops, x, lay, 3.0, method=self.method, res=0.25 / self.n)
         top = T.topk_mask(ops, r, lay, self.k, method=self.method)

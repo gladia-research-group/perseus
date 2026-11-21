@@ -101,8 +101,7 @@ pub fn shadow_config(c: &Config, plan: Option<&PlanConfig>, mode: &str, strict: 
             bts.max_input_level = u32::MAX;
         }
         "fakecap" => {
-            let spec = c.quirks.fakecap_landings.as_deref().unwrap_or("0:32,1:14,256:22,512:22");
-            let ls = if spec == "runtime" { runtime_raw_landings(c)? } else { parse_landings("quirks.fakecap_landings", spec, 2)? };
+            let ls = capture_landing_table(c)?;
             let dense = ls.iter().find(|(s, _)| *s == 0).map(|x| x.1).ok_or_else(|| cfg_err("quirks.fakecap_landings", "no dense (0:) landing"))?;
             let drop = u32_of("quirks.fakecap_stc_drop", c.quirks.fakecap_stc_drop, 6)?;
             bts.landings = ls.into_iter().collect();
@@ -414,6 +413,41 @@ fn runtime_raw_landings(c: &Config) -> PyResult<Vec<(u32, Landing)>> {
     Ok(out)
 }
 
+/// A capture landing table (the frozen EvalMod series' landings) moved where the runtime's series land: the dense entry
+/// by bts.em_table's shift, the SparseB entries (256 .. 1024) by bts.sb_em_table's (pc-program `compile::dense_em_shift`).
+fn shift_fakecap_landings(c: &Config, ls: Vec<(u32, Landing)>) -> PyResult<Vec<(u32, Landing)>> {
+    let e = |x: pc_program::error::Error| cfg_err("bts.em_table", x);
+    let (du, su) = (pc_program::compile::dense_em_shift(c).map_err(e)?, pc_program::compile::sb_em_shift(c).map_err(e)?);
+    Ok(ls
+        .into_iter()
+        .map(|(s, l)| {
+            let up = match s {
+                0 => du,
+                256 | 512 | 1024 => su,
+                _ => 0,
+            };
+            (s, Landing { level: l.level.saturating_sub(up), ..l })
+        })
+        .collect())
+}
+
+/// The capture's raw landing table (quirks.fakecap_landings, default "0:32,1:14,256:22,512:22", moved by
+/// `shift_fakecap_landings`; "runtime": `runtime_raw_landings`).
+fn capture_landing_table(c: &Config) -> PyResult<Vec<(u32, Landing)>> {
+    let spec = c.quirks.fakecap_landings.as_deref().unwrap_or("0:32,1:14,256:22,512:22");
+    if spec == "runtime" {
+        runtime_raw_landings(c)
+    } else {
+        shift_fakecap_landings(c, parse_landings("quirks.fakecap_landings", spec, 2)?)
+    }
+}
+
+/// `capture_landing_table` as a FAKECAP_LANDINGS spec ("s:level,..."): the landings the CPU twin's capture records.
+#[pyfunction]
+fn capture_landings(config: &PyConfig) -> PyResult<String> {
+    Ok(capture_landing_table(&config.0)?.iter().map(|(s, l)| format!("{s}:{}", l.level)).collect::<Vec<_>>().join(","))
+}
+
 /// `runtime_raw_landings` as a FAKECAP_LANDINGS spec ("s:level,...").
 #[pyfunction]
 fn runtime_capture_landings(config: &PyConfig) -> PyResult<String> {
@@ -422,6 +456,7 @@ fn runtime_capture_landings(config: &PyConfig) -> PyResult<String> {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_capture_landings, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_landings, m)?)?;
     m.add_class::<PyShadow>()?;
     m.add_class::<PySimNode>()?;
     Ok(())

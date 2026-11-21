@@ -291,14 +291,14 @@ mod tests {
 
     #[test]
     fn chains_refused() {
-        for p in ["n32", "n32a4"] {
+        for p in ["n32", "n32a4", "n32sp", "n32sph"] {
             let c = Chain::generate(&ChainSpec::preset(p).unwrap()).unwrap();
             assert!(fbs_chain_check(&c).is_ok(), "{p}");
         }
-        for p in ["n32sp", "n32sph", "n64", "n32/lp4b3"] {
+        for p in ["n64", "n32/lp4b3"] {
             let c = Chain::generate(&ChainSpec::preset(p).unwrap()).unwrap();
             let e = fbs_chain_check(&c).expect_err(p).to_string();
-            assert!(e.contains("validated on n32 / n32a4"), "{p}: {e}");
+            assert!(e.contains("validated on n32 / n32a4 / n32sph"), "{p}: {e}");
         }
     }
 

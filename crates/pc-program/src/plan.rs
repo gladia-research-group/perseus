@@ -33,6 +33,10 @@ pub struct Rules {
     pub cache_pin_level: Option<i64>,
     #[serde(default)]
     pub sparse_bts_slots: Vec<u32>,
+    /// The level past which a block input the plan does not map seeds with a pending rescale (plan.seed_level; unset:
+    /// `bootstrap_level`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_level: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
