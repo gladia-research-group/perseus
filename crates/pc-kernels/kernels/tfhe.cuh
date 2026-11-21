@@ -990,18 +990,27 @@ __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
             out[(2 * e + 1) * blockDim.x] = make_uint4(r(gb[0]), r(gb[1]), r(gb[2]), r(gb[3]));
             continue;
         }
-        uint64_t g00 = 0, g01 = 0, g10 = 0, g11 = 0;   // KM <= 15 terms < q q
+        // sums of up to 31 terms < 31 q q < q 2^32 (redc's bound at q < 2^26), folded into r between chunks (G >= 6)
+        uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
 #pragma unroll
-        for (int m = 0; m < KM; m++) {
-            if (!em[m]) continue;
-            const uint4 w = __ldg(bsk + (m * RT_E + e) * blockDim.x);
-            const uint64_t f = pm1[p * n2 + pswz((ej * em[m]) & (n2 - 1))];
-            g00 += w.x * f;
-            g01 += w.y * f;
-            g10 += w.z * f;
-            g11 += w.w * f;
+        for (int m0 = 0; m0 < KM; m0 += 31) {
+            uint64_t g00 = 0, g01 = 0, g10 = 0, g11 = 0;
+#pragma unroll
+            for (int m = m0; m < (m0 + 31 < KM ? m0 + 31 : KM); m++) {
+                if (!em[m]) continue;
+                const uint4 w = __ldg(bsk + (m * RT_E + e) * blockDim.x);
+                const uint64_t f = pm1[p * n2 + pswz((ej * em[m]) & (n2 - 1))];
+                g00 += w.x * f;
+                g01 += w.y * f;
+                g10 += w.z * f;
+                g11 += w.w * f;
+            }
+            r0 = add32(r0, fold32(redc(g00, q, mi), q), q);
+            r1 = add32(r1, fold32(redc(g01, q, mi), q), q);
+            r2 = add32(r2, fold32(redc(g10, q, mi), q), q);
+            r3 = add32(r3, fold32(redc(g11, q, mi), q), q);
         }
-        out[e * blockDim.x] = make_uint4(fold32(redc(g00, q, mi), q), fold32(redc(g01, q, mi), q), fold32(redc(g10, q, mi), q), fold32(redc(g11, q, mi), q));
+        out[e * blockDim.x] = make_uint4(r0, r1, r2, r3);
     }
 }
 
@@ -1525,7 +1534,7 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             const int grp = A.i2 ? A.i2 : 2;
             const bool cl = tfhe_clusters();
             // groups of 5 (31 keys per bundle): the one-level four-block latency path only
-            if (grp < 2 || grp > 5 || A.i1 % grp || (grp == 5 && (!A.w || lv != 1 || A.c[5] > 1 || A.count > CL4_MAX || A.i3 == 1 || A.i3 == 2 || !cl))) return -1;
+            if (grp < 2 || grp > 7 || A.i1 % grp || (grp >= 5 && (!A.w || lv != 1 || A.c[5] > 1 || A.count > CL4_MAX || A.i3 == 1 || A.i3 == 2 || !cl))) return -1;
             static int sms = 0;
             static bool attr_r = false;
             if (!attr_r) {   // the shared-memory opt-ins (64 / 96 KB), once
@@ -1609,12 +1618,16 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                         cudaFuncSetAttribute(rotate_cl4_k<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
                         cudaFuncSetAttribute(rotate_cl4_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
                         cudaFuncSetAttribute(rotate_cl4_k<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl4_k<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
+                        cudaFuncSetAttribute(rotate_cl4_k<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 2048 * (int)sizeof(uint32_t));
                         attr_c4 = true;
                     }
                     if (grp == 2) rotate_cl4_k<2><<<4 * A.count, th, sc, s>>>(A);
                     else if (grp == 3) rotate_cl4_k<3><<<4 * A.count, th, sc, s>>>(A);
                     else if (grp == 4) rotate_cl4_k<4><<<4 * A.count, th, sc, s>>>(A);
-                    else rotate_cl4_k<5><<<4 * A.count, th, sc, s>>>(A);
+                    else if (grp == 5) rotate_cl4_k<5><<<4 * A.count, th, sc, s>>>(A);
+                    else if (grp == 6) rotate_cl4_k<6><<<4 * A.count, th, sc, s>>>(A);
+                    else rotate_cl4_k<7><<<4 * A.count, th, sc, s>>>(A);
                     break;
                 }
                 if (i3 != 1) {   // a cluster of two blocks per LWE
@@ -1656,8 +1669,8 @@ int launch(const TfheArgs* a, cudaStream_t s) {
         }
         case PC_TFHE_PBS_KEYBUNDLE: {
             const int grp = A.i2 ? A.i2 : 2;
-            if (A.n != 2048 || (A.c[1] != 1 && A.c[1] != 2) || grp < 2 || grp > 5 || A.i1 % grp || A.count > 65535) return -1;
-            if (grp == 5 && (A.c[1] != 1 || A.c[5] > 1)) return -1;
+            if (A.n != 2048 || (A.c[1] != 1 && A.c[1] != 2) || grp < 2 || grp > 7 || A.i1 % grp || A.count > 65535) return -1;
+            if (grp >= 5 && (A.c[1] != 1 || A.c[5] > 1)) return -1;
             const int sm = 4 * A.n * (int)sizeof(uint32_t);   // pm1
             const int gw = A.i4 ? A.i4 : A.i1 / grp - A.i0;
             if (A.i0 < 0 || gw < 1 || A.i0 + gw > A.i1 / grp) return -1;
@@ -1679,7 +1692,9 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if (grp == 2) keybundle_k<2><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 3) keybundle_k<3><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 4) keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);
-            else keybundle_k<5><<<grid, STEP_TH, sm, s>>>(A);
+            else if (grp == 5) keybundle_k<5><<<grid, STEP_TH, sm, s>>>(A);
+            else if (grp == 6) keybundle_k<6><<<grid, STEP_TH, sm, s>>>(A);
+            else keybundle_k<7><<<grid, STEP_TH, sm, s>>>(A);
             break;
         }
         case PC_TFHE_PBS_EXTRACT:

@@ -77,7 +77,7 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
     }
     // PC_TFHE_LAT_GROUP=5: the latency key (Params::lat_group)
     if let Ok(v) = std::env::var("PC_TFHE_LAT_GROUP") {
-        p.lat_group = v.trim().parse().ok().filter(|&g| g == 0 || (2..=5).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP={v}: 2..=5 dividing n_lwe {}", p.n_lwe)))?;
+        p.lat_group = v.trim().parse().ok().filter(|&g| g == 0 || (2..=7).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP={v}: 2..=7 dividing n_lwe {}", p.n_lwe)))?;
     }
     // PC_TFHE_LWE=n,log2: another LWE key (Params::with_lwe; 990,-21 the precise set)
     if let Ok(v) = std::env::var("PC_TFHE_LWE") {
