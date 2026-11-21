@@ -218,6 +218,8 @@ fn reads_writes(op: &EmOp) -> (Vec<usize>, Vec<usize>) {
         EmOp::Mult { dst, a, b, .. } => (vec![*a, *b], vec![*dst]),
         EmOp::MultAcc { dst, pairs, .. } => (std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(), vec![*dst]),
         EmOp::WSum { dst, srcs, .. } => (srcs.clone(), vec![*dst]),
+        EmOp::MulI { x, .. } => (vec![*x], vec![*x]),
+        EmOp::ConjSplit { x, d, .. } => (vec![*x], vec![*x, *d]),
     }
 }
 
@@ -416,6 +418,8 @@ fn slots_of(ops: &[EmOp]) -> usize {
             EmOp::Mult { dst, a, b, .. } => vec![*dst, *a, *b],
             EmOp::MultAcc { dst, pairs, .. } => std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(),
             EmOp::WSum { dst, srcs, .. } => std::iter::once(*dst).chain(srcs.iter().copied()).collect(),
+            EmOp::MulI { x, .. } => vec![*x],
+            EmOp::ConjSplit { x, d, .. } => vec![*x, *d],
         };
         m = ids.into_iter().fold(m, |m, i| m.max(i + 1));
     }
@@ -430,6 +434,8 @@ fn ids_mut(op: &mut EmOp) -> Vec<&mut usize> {
         EmOp::Mult { dst, a, b, .. } => vec![dst, a, b],
         EmOp::MultAcc { dst, pairs, .. } => std::iter::once(dst).chain(pairs.iter_mut().flat_map(|p| [&mut p.0, &mut p.1])).collect(),
         EmOp::WSum { dst, srcs, .. } => std::iter::once(dst).chain(srcs.iter_mut()).collect(),
+        EmOp::MulI { x, .. } => vec![x],
+        EmOp::ConjSplit { x, d, .. } => vec![x, d],
     }
 }
 
@@ -536,6 +542,8 @@ fn rw(op: &EmOp) -> (Vec<usize>, Vec<usize>) {
         EmOp::MulConst { x, .. } | EmOp::AddConst { x, .. } | EmOp::Rescale { x, .. } => (vec![*x], vec![*x]),
         EmOp::MultAcc { dst, pairs, .. } => (std::iter::once(*dst).chain(pairs.iter().flat_map(|p| [p.0, p.1])).collect(), vec![*dst]),
         EmOp::WSum { dst, srcs, .. } => (srcs.clone(), vec![*dst]),
+        EmOp::MulI { x, .. } => (vec![*x], vec![*x]),
+        EmOp::ConjSplit { x, d, .. } => (vec![*x], vec![*x, *d]),
     }
 }
 
@@ -1489,7 +1497,69 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                         _ => launch_result("wsum", unsafe { (ctx.table.wsum)(&a, s.raw()) })?,
                     }
                 }
+                EmOp::MulI { x, n, neg } => {
+                    let v = slot(cx, *x);
+                    Self::mul_table(ctx, s, v, v, if *neg { &self.mono_3n2 } else { &self.mono_n2 }, *n, kk)?;
+                }
+                EmOp::ConjSplit { x, d, n } => self.conj_split(cx, base + *x, base + *d, *n, kk)?,
             }
+        }
+        Ok(())
+    }
+
+    /// `ConjSplit`: buffer `d` := x - conj(x), then x := x + conj(x) (rows 0..n, kk cts): one key switch with the
+    /// conjugation key at x's level, as the entry's (its ModDown's last step fused into both sums).
+    fn conj_split<M: DevStrategy<W>>(&self, cx: &mut BtsCx<'_, '_, W, M>, x: usize, d: usize, n: usize, kk: usize) -> Result<()> {
+        let ctx = cx.ctx;
+        let lay = ctx.lay;
+        let top = n - 1;
+        let cw = lay.ct_words();
+        let pw = lay.poly_words() as u64;
+        {
+            let ex = &mut *cx.ex;
+            let xb = &cx.work.em[x];
+            ks::modup(ctx, &ex.compute, cx.ks, &mut ex.ks, &mut ex.bconv_work, xb, 0, kk, 1, top)?;
+            let v = View::of(xb, 0);
+            let io = DotIo {
+                c1: v.part::<W>(1).base,
+                c0: v.base,
+                ct_stride: v.ct_stride,
+                out: ex.ks.ext.buf.vptr_mut(),
+                part_stride: pw,
+                out_ct_stride: cw as u64,
+                out_rot_stride: 0,
+                c0_mode: 1,
+            };
+            let staged = self.conj.reads_in_place(self.relin_source) || self.conj.needs_stage() || !self.conj.has_a();
+            if staged {
+                let ndig = cx.ks.ndig(top)?;
+                ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.conj, 0, ndig, true)?;
+            }
+            ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, kk, top, DotRows::All, io, staged)?;
+            ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+        }
+        let s = &cx.ex.compute;
+        let xv = View::of(&cx.work.em[x], 0);
+        let av = View::of(&cx.ex.ks.ext, 0);
+        let cv = View::of(&cx.ex.ks.conv, 0);
+        for (out, sub) in [(View::of(&cx.work.em[d], 0), 1), (xv, 0)] {
+            let m = MdEpiArgs {
+                dst: out.r(),
+                x: av.r(),
+                t: cv.r(),
+                binv: ctx.ks.p_inv_mod_q.v.vptr(),
+                binvs: ctx.ks.p_inv_mod_q.s.vptr(),
+                k: std::ptr::null(),
+                pr: ctx.pr(),
+                dbl: 0,
+                n: n as i32,
+                kk: kk as i32,
+                pad: 0,
+            };
+            let a = MdEpiToArgs { m, a: xv.r(), sub, pad: 0 };
+            // SAFETY: kk-ct views of live buffers; d aliases none of x, ext, conv; the second sum writes x in place
+            // (element-wise: each row reads its own a and writes its own dst)
+            launch_result("md_epilogue_to", unsafe { (ctx.table.md_epilogue_to)(&a, s.raw()) })?;
         }
         Ok(())
     }

@@ -32,6 +32,10 @@ pub enum EmOp {
     Mult { dst: usize, a: usize, b: usize, n: usize, epi: Epi },
     MultAcc { dst: usize, pairs: Vec<(usize, usize)>, n: usize, epi: Epi },
     WSum { dst: usize, srcs: Vec<usize>, n: usize, k: usize },
+    /// x := i x (`neg`: -i x), the monomial X^(N/2): exact, level, degree and scale kept.
+    MulI { x: usize, n: usize, neg: bool },
+    /// x := x + conj(x), d := x - conj(x) (both of the old x): one key switch with the conjugation key at x's level.
+    ConjSplit { x: usize, d: usize, n: usize },
 }
 
 /// The recorded program: ops, constant rows (residues by prime id, padded to |Q|; a WSum row is one padded row per
@@ -333,6 +337,22 @@ impl<'s> Builder<'s> {
             self.copy(dst, src);
         }
         self.square(dst)
+    }
+    /// x := i x (`neg`: -i x).
+    pub fn mul_i(&mut self, x: usize, neg: bool) {
+        let n = self.n(x);
+        self.prog.ops.push(EmOp::MulI { x, n, neg });
+    }
+    /// x := x + conj(x) = 2 Re x; returns d = x - conj(x) = 2 i Im x (same metadata, degree 1).
+    pub fn conj_split(&mut self, x: usize) -> Result<usize> {
+        if self.metas[x].nl == 2 {
+            self.rescale(x)?;
+        }
+        let d = self.fresh();
+        self.metas[d] = self.metas[x];
+        let n = self.n(x);
+        self.prog.ops.push(EmOp::ConjSplit { x, d, n });
+        Ok(d)
     }
     /// Ciphertext::evalLinearWSumMutable; more than `WSUM_MAX` sources (the kernel bound; the long series of a
     /// functional bootstrap) as sums of chunks added up.
@@ -941,7 +961,8 @@ pub fn op_cost(ops: &[EmOp]) -> f64 {
             EmOp::MultAcc { n, pairs, .. } => (3.0 + pairs.len() as f64) * *n as f64,
             EmOp::Rescale { n, .. } => *n as f64,
             EmOp::WSum { n, srcs, .. } => 0.25 * (*n * srcs.len()) as f64,
-            EmOp::Copy { n, .. } | EmOp::Add { n, .. } | EmOp::MulConst { n, .. } | EmOp::AddConst { n, .. } => 0.2 * *n as f64,
+            EmOp::Copy { n, .. } | EmOp::Add { n, .. } | EmOp::MulConst { n, .. } | EmOp::AddConst { n, .. } | EmOp::MulI { n, .. } => 0.2 * *n as f64,
+            EmOp::ConjSplit { n, .. } => 3.4 * *n as f64,
         })
         .sum()
 }
@@ -1055,6 +1076,9 @@ fn pair_eval(b: &mut Builder, pw: &PairPowers, p: &[f64], q: &[f64], m: usize) -
         if !pw.st.is_empty() {
             for i in 0..k.min(q.len()) {
                 if q[i] != 0.0 {
+                    if pw.st[i] == usize::MAX {
+                        return Err(rule("evalmod trig", format!("Q coefficient {i} has no leaf power (the exponential form's sine half is odd)")));
+                    }
                     srcs.push(pw.st[i]);
                     w.push(q[i]);
                 }
@@ -1265,6 +1289,57 @@ fn build_trig(b: &mut Builder, x: usize, ps: &PsPlan, t: &TrigSeries, its: i32, 
     Ok(())
 }
 
+/// The baby / giant powers of `t` as `pair_powers` (Q at the leaves), with i T_i (the monomial X^(N/2), exact: no
+/// product, no level) in place of s T_i: P + i Q evaluates as one series (a complex leaf per giant product). The
+/// constant i T_0 has no ciphertext (`usize::MAX`): Q must have no constant term at any leaf (an odd Q).
+fn pair_powers_i(b: &mut Builder, t: usize, k: usize, deg: usize) -> Result<(PairPowers, usize)> {
+    let (mut pw, m) = pair_powers(b, t, None, k, deg, false)?;
+    let mut st = vec![usize::MAX];
+    for i in 1..k {
+        let v = b.fresh();
+        b.copy(v, pw.t[i - 1]);
+        b.mul_i(v, false);
+        st.push(v);
+    }
+    pw.st = st;
+    Ok((pw, m))
+}
+
+/// The exponential form of a trigonometric FBS (`PsPlan::fbs_trig`), on the real slots EvalMod reads: z = a e^(i th)
+/// of the base angle as ONE series on the input's powers (the sine half's leaves times i: the giant products shared),
+/// `its` squarings z <- z^2 (one product per step instead of the pair's two; the error grows 2x per step instead of
+/// the cosine chain's up to 4x), then one conjugation: c = z + conj z = A cos 2 pi u (+ `off`), s = -i (z - conj z)
+/// = A sin 2 pi u, and P(t) + s Q(t) as `build_trig`. The base amplitude makes z^(2^its) = A / 2 e^(2 pi i u).
+#[allow(clippy::too_many_arguments)]
+fn build_trig_exp(b: &mut Builder, x: usize, ps: &PsPlan, t: &TrigSeries, its: i32, kb: usize, k: usize, giant: bool) -> Result<()> {
+    if b.metas[x].nl == 2 {
+        b.rescale(x)?;
+    }
+    let f = 0.5f64.powf(1.0 / (1u64 << its) as f64);
+    let cb: Vec<f64> = true_coeffs(&ps.coeffs).iter().map(|v| v * f).collect();
+    let sb: Vec<f64> = true_coeffs(&t.sin.coeffs).iter().map(|v| v * f).collect();
+    if cb.iter().skip(1).step_by(2).chain(sb.iter().step_by(2)).any(|v| *v != 0.0) {
+        return Err(rule("evalmod trig", "the exponential form needs an even cosine and an odd sine half"));
+    }
+    let dbase = top_deg(&cb).max(top_deg(&sb)).unwrap_or(0);
+    let (pw, m) = pair_powers_i(b, x, kb, dbase)?;
+    let z = pair_result(pair_eval(b, &pw, &cb, &sb, m)?)?;
+    for _ in 0..its {
+        b.square(z)?;
+    }
+    let d = b.conj_split(z)?;
+    b.mul_i(d, true);
+    b.add_scalar(z, t.off)?;
+    let p = true_coeffs(&ps.post);
+    let q = true_coeffs(&t.post_s);
+    let deg = top_deg(&p).max(top_deg(&q)).unwrap_or(0);
+    let has_q = top_deg(&q).is_some();
+    let (pw, m) = pair_powers(b, z, if has_q { Some(d) } else { None }, k, deg, giant)?;
+    let r = pair_result(pair_eval(b, &pw, &p, &q, m)?)?;
+    b.copy(x, r);
+    Ok(())
+}
+
 /// The sine form (`PsPlan::fbs`) on the paired Paterson-Stockmeyer builder (`pair_eval`, no Q): the base series on
 /// the input's powers (`kb` baby steps), the double angles, the series `post` (`k` baby steps). The shallowest and
 /// then cheapest (`op_cost`) over the baby-step counts.
@@ -1308,6 +1383,33 @@ pub fn build_evalmod(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_i
     build_evalmod_opts(st, input, ps, double_angle_its, false)
 }
 
+/// A trigonometric FBS program (`PsPlan::fbs_trig`): over the baby-step counts of the base and the series, Q's
+/// placement and the double-angle forms `exps` (false: the paired double angles, `build_trig`; true: the exponential
+/// form, `build_trig_exp`), the shallowest program, then the cheapest (`op_cost`).
+pub fn build_trig_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32, lean: bool, exps: &[bool]) -> Result<(EmProgram, FMeta)> {
+    let t = ps.trig.as_deref().ok_or_else(|| rule("evalmod trig", "not a trigonometric plan"))?;
+    let mut best: Option<(EmProgram, FMeta)> = None;
+    let shapes = [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].iter().flat_map(move |&k| [(kb, k, false), (kb, k, true)]));
+    for ((kb, k, giant), &exp) in shapes.flat_map(|s| exps.iter().map(move |e| (s, e))) {
+        let mut b = Builder::new(st);
+        b.lean = lean;
+        let x = b.input(input);
+        let built = if exp { build_trig_exp(&mut b, x, ps, t, double_angle_its, kb, k, giant) } else { build_trig(&mut b, x, ps, t, double_angle_its, kb, k, giant) };
+        if built.is_err() {
+            continue;
+        }
+        let out = b.metas[x];
+        let better = match &best {
+            None => true,
+            Some((p, o)) => out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops)),
+        };
+        if better {
+            best = Some((b.prog, out));
+        }
+    }
+    best.ok_or_else(|| rule("evalmod trig", "no program"))
+}
+
 /// `build_evalmod` with `Builder::lean`.
 pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_angle_its: i32, lean: bool) -> Result<(EmProgram, FMeta)> {
     let mut b = Builder::new(st);
@@ -1316,27 +1418,16 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     if ps.paired && ps.trig.is_none() {
         return build_sine_paired(st, input, ps, double_angle_its);
     }
-    if let Some(t) = &ps.trig {
-        // the baby-step count of the paired series: the shallowest program, then the fewest ops
-        let mut best: Option<(EmProgram, FMeta)> = None;
-        let shapes = [4usize, 8, 16].iter().flat_map(|&kb| [2usize, 4, 8, 16].iter().flat_map(move |&k| [(kb, k, false), (kb, k, true)]));
-        for (kb, k, giant) in shapes {
-            let mut b = Builder::new(st);
-            b.lean = lean;
-            let x = b.input(input);
-            if build_trig(&mut b, x, ps, t, double_angle_its, kb, k, giant).is_err() {
-                continue;
-            }
-            let out = b.metas[x];
-            let better = match &best {
-                None => true,
-                Some((p, o)) => out.top > o.top || (out.top == o.top && op_cost(&b.prog.ops) < op_cost(&p.ops)),
-            };
-            if better {
-                best = Some((b.prog, out));
-            }
-        }
-        return best.ok_or_else(|| rule("evalmod trig", "no program"));
+    if ps.trig.is_some() {
+        // PC_FBS_TRIG_EXP=1 (experiments): the exponential form (`build_trig_exp`, ~10 % faster real, ~15 % complex,
+        // same landing and RMS) in place of the paired double angles. Off by default: it turns the imaginary part
+        // of its input and of its own rescales into an amplitude error, which the variance model does not carry
+        // (measured: the slot nearest the root 1 of every ciphertext, up to 20x the paired form's error)
+        let exps: &[bool] = match std::env::var("PC_FBS_TRIG_EXP").as_deref() {
+            Ok("1") => &[true],
+            _ => &[false],
+        };
+        return build_trig_opts(st, input, ps, double_angle_its, lean, exps);
     }
     build_chebyshev(&mut b, x, ps)?;
     build_double_angle_amp(&mut b, x, double_angle_its, ps.amp)?;
@@ -1528,73 +1619,127 @@ pub mod sim {
         }
     }
 
-    /// Run `ops` over `bufs` (each |Q| residues).
+    /// Run `ops` over `bufs` (each |Q| residues): real slot values (a program with `MulI` / `ConjSplit` needs
+    /// `run_c`).
     pub fn run(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>], bufs: &mut Vec<Vec<u64>>) {
+        let mut im = vec![];
+        run_c(st, ops, consts, bufs, &mut im);
+    }
+
+    /// `run` on complex slot values: `re` and `im` the residues of the two components (Gaussian integers mod q; a
+    /// missing `im` buffer reads zero).
+    pub fn run_c(st: &ScaleTables, ops: &[EmOp], consts: &[Vec<u64>], re: &mut Vec<Vec<u64>>, im: &mut Vec<Vec<u64>>) {
         let q = &st.q;
         let nq = q.len();
+        let neg = |x: u64, p: u64| if x % p == 0 { 0 } else { p - x % p };
         for op in ops {
-            let need = super::sim_ids(op).into_iter().max().unwrap_or(0) + 1;
-            if bufs.len() < need {
-                bufs.resize(need, vec![0; nq]);
+            let need = (super::sim_ids(op).into_iter().max().unwrap_or(0) + 1).max(re.len());
+            if re.len() < need {
+                re.resize(need, vec![0; nq]);
+            }
+            if im.len() < need {
+                im.resize(need, vec![0; nq]);
             }
             match op {
                 EmOp::Copy { dst, src, n } => {
-                    let s = bufs[*src].clone();
-                    bufs[*dst][..*n].copy_from_slice(&s[..*n]);
-                    for v in bufs[*dst][*n..].iter_mut() {
-                        *v = 0;
+                    for b in [&mut *re, &mut *im] {
+                        let s = b[*src].clone();
+                        b[*dst][..*n].copy_from_slice(&s[..*n]);
+                        for v in b[*dst][*n..].iter_mut() {
+                            *v = 0;
+                        }
                     }
                 }
                 EmOp::Add { dst, a, b, n, sub } => {
-                    for i in 0..*n {
-                        let (x, y) = (bufs[*a][i] % q[i], bufs[*b][i] % q[i]);
-                        bufs[*dst][i] = if *sub { (x + q[i] - y) % q[i] } else { (x + y) % q[i] };
+                    for bf in [&mut *re, &mut *im] {
+                        for i in 0..*n {
+                            let (x, y) = (bf[*a][i] % q[i], bf[*b][i] % q[i]);
+                            bf[*dst][i] = if *sub { (x + q[i] - y) % q[i] } else { (x + y) % q[i] };
+                        }
                     }
                 }
                 EmOp::MulConst { x, n, k } => {
-                    for i in 0..*n {
-                        bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                    for b in [&mut *re, &mut *im] {
+                        for i in 0..*n {
+                            b[*x][i] = mulmod(b[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                        }
                     }
                 }
                 EmOp::AddConst { x, n, k } => {
                     for i in 0..*n {
-                        bufs[*x][i] = (bufs[*x][i] % q[i] + consts[*k][i] % q[i]) % q[i];
+                        re[*x][i] = (re[*x][i] % q[i] + consts[*k][i] % q[i]) % q[i];
                     }
                 }
                 EmOp::Rescale { x, n, k } => {
-                    if let Some(k) = k {
-                        for i in 0..*n {
-                            bufs[*x][i] = mulmod(bufs[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                    for b in [&mut *re, &mut *im] {
+                        if let Some(k) = k {
+                            for i in 0..*n {
+                                b[*x][i] = mulmod(b[*x][i] % q[i], consts[*k][i] % q[i], q[i]);
+                            }
                         }
+                        rescale(st, &mut b[*x], *n);
                     }
-                    rescale(st, &mut bufs[*x], *n);
                 }
                 EmOp::Mult { dst, a, b, n, epi: e } => {
-                    let v: Vec<u64> = (0..*n).map(|i| mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])).collect();
-                    bufs[*dst][..*n].copy_from_slice(&v);
-                    epi(&mut bufs[*dst], e, consts, q, *n);
+                    let (mut vr, mut vi) = (vec![0u64; *n], vec![0u64; *n]);
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (ar, ai, br, bi) = (re[*a][i] % p, im[*a][i] % p, re[*b][i] % p, im[*b][i] % p);
+                        vr[i] = (mulmod(ar, br, p) + neg(mulmod(ai, bi, p), p)) % p;
+                        vi[i] = (mulmod(ar, bi, p) + mulmod(ai, br, p)) % p;
+                    }
+                    re[*dst][..*n].copy_from_slice(&vr);
+                    im[*dst][..*n].copy_from_slice(&vi);
+                    epi(&mut re[*dst], e, consts, q, *n);
+                    epi(&mut im[*dst], &Epi { k: None, ..*e }, consts, q, *n);
                 }
                 EmOp::MultAcc { dst, pairs, n, epi: e } => {
                     for i in 0..*n {
-                        let mut acc = bufs[*dst][i] % q[i];
+                        let p = q[i];
+                        let (mut accr, mut acci) = (re[*dst][i] % p, im[*dst][i] % p);
                         for (a, b) in pairs {
-                            acc = (acc + mulmod(bufs[*a][i] % q[i], bufs[*b][i] % q[i], q[i])) % q[i];
+                            let (ar, ai, br, bi) = (re[*a][i] % p, im[*a][i] % p, re[*b][i] % p, im[*b][i] % p);
+                            accr = (accr + mulmod(ar, br, p) + neg(mulmod(ai, bi, p), p)) % p;
+                            acci = (acci + mulmod(ar, bi, p) + mulmod(ai, br, p)) % p;
                         }
-                        bufs[*dst][i] = acc;
+                        re[*dst][i] = accr;
+                        im[*dst][i] = acci;
                     }
-                    epi(&mut bufs[*dst], e, consts, q, *n);
+                    epi(&mut re[*dst], e, consts, q, *n);
+                    epi(&mut im[*dst], &Epi { k: None, ..*e }, consts, q, *n);
                 }
                 EmOp::WSum { dst, srcs, n, k } => {
-                    let v: Vec<u64> = (0..*n)
-                        .map(|i| {
-                            let mut acc = 0u64;
-                            for (j, s) in srcs.iter().enumerate() {
-                                acc = (acc + mulmod(bufs[*s][i] % q[i], consts[*k][j * nq + i] % q[i], q[i])) % q[i];
-                            }
-                            acc
-                        })
-                        .collect();
-                    bufs[*dst][..*n].copy_from_slice(&v);
+                    for b in [&mut *re, &mut *im] {
+                        let v: Vec<u64> = (0..*n)
+                            .map(|i| {
+                                let mut acc = 0u64;
+                                for (j, s) in srcs.iter().enumerate() {
+                                    acc = (acc + mulmod(b[*s][i] % q[i], consts[*k][j * nq + i] % q[i], q[i])) % q[i];
+                                }
+                                acc
+                            })
+                            .collect();
+                        b[*dst][..*n].copy_from_slice(&v);
+                    }
+                }
+                EmOp::MulI { x, n, neg: ng } => {
+                    // i (a + i b) = -b + i a; -i (a + i b) = b - i a
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (a, b) = (re[*x][i] % p, im[*x][i] % p);
+                        (re[*x][i], im[*x][i]) = if *ng { (b, neg(a, p)) } else { (neg(b, p), a) };
+                    }
+                }
+                EmOp::ConjSplit { x, d, n } => {
+                    for i in 0..*n {
+                        let p = q[i];
+                        let (a, b) = (re[*x][i] % p, im[*x][i] % p);
+                        (re[*x][i], im[*x][i]) = ((a + a) % p, 0);
+                        (re[*d][i], im[*d][i]) = (0, (b + b) % p);
+                    }
+                    for v in re[*d][*n..].iter_mut().chain(im[*d][*n..].iter_mut()) {
+                        *v = 0;
+                    }
                 }
             }
         }
@@ -1683,23 +1828,30 @@ pub mod noise {
                 EmOp::Rescale { n, k, .. } => vec![k.map_or(1.0, |k| centred(&consts[k], q, *n))],
                 EmOp::Mult { n, epi: e, .. } | EmOp::MultAcc { n, epi: e, .. } => epi_c(e, *n),
                 EmOp::WSum { srcs, n, k, .. } => (0..srcs.len()).map(|j| centred(&consts[*k][j * nq..(j + 1) * nq], q, *n)).collect(),
-                EmOp::Copy { .. } | EmOp::Add { .. } => vec![],
+                EmOp::Copy { .. } | EmOp::Add { .. } | EmOp::MulI { .. } | EmOp::ConjSplit { .. } => vec![],
             })
             .collect()
     }
 
     /// The linearized program on input `x` (integer units, buffer 0) read at buffer `out`: (value, d value / d x,
-    /// variance of the fresh noise at `out`), integer units; `pre` = `prepare(st, ops, consts)`.
+    /// variance of the fresh noise at `out`), integer units; `pre` = `prepare(st, ops, consts)`. Slot values are
+    /// complex (a program with `MulI` / `ConjSplit` carries a signal in the imaginary part); the input is real, the
+    /// output its real part, every fresh source independent in each real component (`Fresh` is per component), the
+    /// adjoints the transposed real 2 x 2 Jacobians (a complex product: times the conjugate).
     pub fn linearize(st: &ScaleTables, ops: &[EmOp], pre: &[Vec<f64>], x: f64, out: usize, fresh: Fresh) -> (f64, f64, f64) {
+        type C = (f64, f64);
+        let mul = |a: C, b: C| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
+        let conj_mul = |a: C, b: C| (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0);
+        let n2 = |a: C| a.0 * a.0 + a.1 * a.1;
         let nb = ops.iter().flat_map(super::sim_ids).max().unwrap_or(0).max(out) + 1;
-        let mut v = vec![0f64; nb];
-        v[0] = x;
+        let mut v = vec![(0f64, 0f64); nb];
+        v[0] = (x, 0.0);
         // forward: the operand values each product reads
-        let mut tape: Vec<Vec<(f64, f64)>> = Vec::with_capacity(ops.len());
-        let epi = |x: f64, e: &Epi, c: &[f64]| {
-            let x = if e.dbl { 2.0 * x } else { x };
+        let mut tape: Vec<Vec<(C, C)>> = Vec::with_capacity(ops.len());
+        let epi = |x: C, e: &Epi, c: &[f64]| {
+            let x = if e.dbl { (2.0 * x.0, 2.0 * x.1) } else { x };
             if e.k.is_some() {
-                x + c[0]
+                (x.0 + c[0], x.1)
             } else {
                 x
             }
@@ -1708,72 +1860,109 @@ pub mod noise {
             let mut t = vec![];
             match op {
                 EmOp::Copy { dst, src, .. } => v[*dst] = v[*src],
-                EmOp::Add { dst, a, b, sub, .. } => v[*dst] = if *sub { v[*a] - v[*b] } else { v[*a] + v[*b] },
-                EmOp::MulConst { x, .. } => v[*x] *= c[0],
-                EmOp::AddConst { x, .. } => v[*x] += c[0],
-                EmOp::Rescale { x, n, .. } => v[*x] = v[*x] * c[0] / dropped(st, *n),
+                EmOp::Add { dst, a, b, sub, .. } => {
+                    let (va, vb) = (v[*a], v[*b]);
+                    v[*dst] = if *sub { (va.0 - vb.0, va.1 - vb.1) } else { (va.0 + vb.0, va.1 + vb.1) };
+                }
+                EmOp::MulConst { x, .. } => v[*x] = (v[*x].0 * c[0], v[*x].1 * c[0]),
+                EmOp::AddConst { x, .. } => v[*x].0 += c[0],
+                EmOp::Rescale { x, n, .. } => {
+                    let f = c[0] / dropped(st, *n);
+                    v[*x] = (v[*x].0 * f, v[*x].1 * f);
+                }
                 EmOp::Mult { dst, a, b, epi: e, .. } => {
                     t.push((v[*a], v[*b]));
-                    v[*dst] = epi(v[*a] * v[*b], e, c);
+                    v[*dst] = epi(mul(v[*a], v[*b]), e, c);
                 }
                 EmOp::MultAcc { dst, pairs, epi: e, .. } => {
                     let mut acc = v[*dst];
                     for (a, b) in pairs {
                         t.push((v[*a], v[*b]));
-                        acc += v[*a] * v[*b];
+                        let p = mul(v[*a], v[*b]);
+                        acc = (acc.0 + p.0, acc.1 + p.1);
                     }
                     v[*dst] = epi(acc, e, c);
                 }
-                EmOp::WSum { dst, srcs, .. } => v[*dst] = srcs.iter().enumerate().map(|(j, s)| v[*s] * c[j]).sum(),
+                EmOp::WSum { dst, srcs, .. } => {
+                    v[*dst] = srcs.iter().enumerate().fold((0.0, 0.0), |a, (j, s)| (a.0 + v[*s].0 * c[j], a.1 + v[*s].1 * c[j]))
+                }
+                EmOp::MulI { x, neg, .. } => {
+                    let (a, b) = v[*x];
+                    v[*x] = if *neg { (b, -a) } else { (-b, a) };
+                }
+                EmOp::ConjSplit { x, d, .. } => {
+                    let (a, b) = v[*x];
+                    v[*x] = (2.0 * a, 0.0);
+                    v[*d] = (0.0, 2.0 * b);
+                }
             }
             tape.push(t);
         }
         // reverse: adjoints of every buffer, the fresh sources' variance where they enter
-        let mut g = vec![0f64; nb];
-        g[out] = 1.0;
+        let mut g = vec![(0f64, 0f64); nb];
+        g[out] = (1.0, 0.0);
         let mut var = 0.0;
+        let take = |g: &mut Vec<C>, i: usize| std::mem::replace(&mut g[i], (0.0, 0.0));
         for ((op, c), t) in ops.iter().zip(pre).rev().zip(tape.iter().rev()) {
             match op {
                 EmOp::Copy { dst, src, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
-                    g[*src] += d;
+                    let d = take(&mut g, *dst);
+                    g[*src] = (g[*src].0 + d.0, g[*src].1 + d.1);
                 }
                 EmOp::Add { dst, a, b, sub, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
-                    g[*a] += d;
-                    g[*b] += if *sub { -d } else { d };
+                    let d = take(&mut g, *dst);
+                    g[*a] = (g[*a].0 + d.0, g[*a].1 + d.1);
+                    g[*b] = if *sub { (g[*b].0 - d.0, g[*b].1 - d.1) } else { (g[*b].0 + d.0, g[*b].1 + d.1) };
                 }
-                EmOp::MulConst { x, .. } => g[*x] *= c[0],
+                EmOp::MulConst { x, .. } => g[*x] = (g[*x].0 * c[0], g[*x].1 * c[0]),
                 EmOp::AddConst { .. } => {}
                 EmOp::Rescale { x, n, .. } => {
-                    var += g[*x] * g[*x] * fresh.rescale;
-                    g[*x] *= c[0] / dropped(st, *n);
+                    var += n2(g[*x]) * fresh.rescale;
+                    let f = c[0] / dropped(st, *n);
+                    g[*x] = (g[*x].0 * f, g[*x].1 * f);
                 }
                 EmOp::Mult { dst, a, b, epi: e, .. } => {
-                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
-                    var += d * d * fresh.relin;
+                    let m = if e.dbl { 2.0 } else { 1.0 };
+                    let d = take(&mut g, *dst);
+                    let d = (d.0 * m, d.1 * m);
+                    var += n2(d) * fresh.relin;
                     let (va, vb) = t[0];
-                    g[*a] += d * vb;
-                    g[*b] += d * va;
+                    let (ga, gb) = (conj_mul(vb, d), conj_mul(va, d));
+                    g[*a] = (g[*a].0 + ga.0, g[*a].1 + ga.1);
+                    g[*b] = (g[*b].0 + gb.0, g[*b].1 + gb.1);
                 }
                 EmOp::MultAcc { dst, pairs, epi: e, .. } => {
-                    let d = std::mem::take(&mut g[*dst]) * if e.dbl { 2.0 } else { 1.0 };
-                    var += d * d * fresh.relin;
-                    g[*dst] += d;
+                    let m = if e.dbl { 2.0 } else { 1.0 };
+                    let d = take(&mut g, *dst);
+                    let d = (d.0 * m, d.1 * m);
+                    var += n2(d) * fresh.relin;
+                    g[*dst] = (g[*dst].0 + d.0, g[*dst].1 + d.1);
                     for ((a, b), (va, vb)) in pairs.iter().zip(t) {
-                        g[*a] += d * vb;
-                        g[*b] += d * va;
+                        let (ga, gb) = (conj_mul(*vb, d), conj_mul(*va, d));
+                        g[*a] = (g[*a].0 + ga.0, g[*a].1 + ga.1);
+                        g[*b] = (g[*b].0 + gb.0, g[*b].1 + gb.1);
                     }
                 }
                 EmOp::WSum { dst, srcs, .. } => {
-                    let d = std::mem::take(&mut g[*dst]);
+                    let d = take(&mut g, *dst);
                     for (j, s) in srcs.iter().enumerate() {
-                        g[*s] += d * c[j];
+                        g[*s] = (g[*s].0 + d.0 * c[j], g[*s].1 + d.1 * c[j]);
                     }
+                }
+                EmOp::MulI { x, neg, .. } => {
+                    // the transpose of (a, b) -> (-b, a) is (g0, g1) -> (g1, -g0)
+                    let (g0, g1) = g[*x];
+                    g[*x] = if *neg { (-g1, g0) } else { (g1, -g0) };
+                }
+                EmOp::ConjSplit { x, d, .. } => {
+                    let (gx, gd) = (take(&mut g, *x), take(&mut g, *d));
+                    // the key switch's noise e enters x as + e and d as - e
+                    var += n2((gx.0 - gd.0, gx.1 - gd.1)) * fresh.relin;
+                    g[*x] = (2.0 * gx.0, 2.0 * gd.1);
                 }
             }
         }
-        (v[out], g[0], var)
+        (v[out].0, g[0].0, var)
     }
 
     /// (value, derivative, fresh variance) of `linearize` read as `sim::decode` reads buffer metadata (top, nl, nf):
@@ -1796,6 +1985,8 @@ pub fn sim_ids(op: &EmOp) -> Vec<usize> {
         EmOp::MulConst { x, .. } | EmOp::AddConst { x, .. } | EmOp::Rescale { x, .. } => vec![*x],
         EmOp::MultAcc { dst, pairs, .. } => std::iter::once(*dst).chain(pairs.iter().flat_map(|(a, b)| [*a, *b])).collect(),
         EmOp::WSum { dst, srcs, .. } => std::iter::once(*dst).chain(srcs.iter().copied()).collect(),
+        EmOp::MulI { x, .. } => vec![*x],
+        EmOp::ConjSplit { x, d, .. } => vec![*x, *d],
     }
 }
 

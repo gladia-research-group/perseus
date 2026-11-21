@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests {
     use crate::bts::evalmod::{assign_buffers, rewrite, schedule_relin_rescales, EvalModPlan};
-    use pc_shadow::evalmod::{build_evalmod_opts, sim, trig_base, PsPlan};
+    use pc_shadow::evalmod::{build_evalmod_opts, build_trig_opts, sim, trig_base, PsPlan};
     use pc_shadow::fides::FMeta;
 
     fn em_ins() -> (pc_core::scale::ScaleTables, Vec<FMeta>) {
@@ -62,6 +62,49 @@ mod tests {
                 println!("trig base {bdeg}/r{da} n {n} {name}: max err {emax:.3e} ({:?} -> {out:?})", ems[em]);
                 assert!(emax < 1e-8, "trig base {bdeg} n {n} {name}: {emax:.3e}");
             }
+        }
+    }
+
+    /// The exponential form (`build_trig_opts` with exps = [true]: z = a e^(i th) as one series, squarings, one
+    /// conjugation) on the complex exact replay equals P(t) + s Q(t) at every ModRaise integer through every executor
+    /// stage, and lands where the paired double angles land.
+    #[test]
+    fn trig_exp_program_exact() {
+        let (st, ems) = em_ins();
+        for (bdeg, da, n, amp, off, em) in [(59usize, 3u32, 12usize, 2.0, -1.0, 0usize), (27, 5, 16, 8.93, -7.93, 0), (27, 5, 15, 2.0, -1.0, 1), (22, 6, 8, 1.0, 0.0, 0)] {
+            let (cb, sb) = trig_base(32.0, da, bdeg);
+            let g = 2f64.powi(-5);
+            let p: Vec<f64> = (0..=n).map(|k| g * 0.8 * 0.7f64.powi(k as i32) * (1.3 + k as f64).cos()).collect();
+            let q: Vec<f64> = (0..n).map(|k| g * 0.6 * 0.7f64.powi(k as i32) * (0.4 + k as f64).sin()).collect();
+            let ps = PsPlan::fbs_trig(&cb, &sb, da, amp, off, &p, &q).expect("trig plan");
+            let (prog, out) = build_trig_opts(&st, ems[em], &ps, da as i32, true, &[true]).expect("exp program");
+            let (_, out_pair) = build_trig_opts(&st, ems[em], &ps, da as i32, true, &[false]).expect("paired program");
+            let cost = |o: &[pc_shadow::evalmod::EmOp]| pc_shadow::evalmod::op_cost(o);
+            let fused = prog.fused();
+            let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
+                let mut emax: f64 = 0.0;
+                let cmin = ((-1.0 - off) / amp).max(-1.0);
+                let umax = cmin.acos() / (2.0 * std::f64::consts::PI);
+                for i in [-31i32, -7, 0, 9, 31] {
+                    for j in 0..=10 {
+                        let u = umax * (-1.0 + 0.2 * j as f64);
+                        let th = 2.0 * std::f64::consts::PI * u;
+                        let want = chebval(amp * th.cos() + off, &p) + amp * th.sin() * chebval(amp * th.cos() + off, &q);
+                        let y = (u + i as f64) / 32.0;
+                        let mut re = vec![sim::encode(y * ems[em].nf, &st.q)];
+                        let mut im = vec![];
+                        sim::run_c(&st, ops, consts, &mut re, &mut im);
+                        let got = sim::decode(&st, &re[0], out.top, out.nl, out.nf);
+                        let got_im = sim::decode(&st, &im[0], out.top, out.nl, out.nf);
+                        emax = emax.max((got - want).abs()).max(got_im.abs());
+                    }
+                }
+                println!("trig exp base {bdeg}/r{da} n {n} {name}: max err {emax:.3e} (out {out:?}, paired {out_pair:?}; cost {:.0} vs paired)", cost(&prog.ops));
+                assert!(emax < 1e-8, "trig exp base {bdeg} n {n} {name}: {emax:.3e}");
+            }
+            assert!(out.top >= out_pair.top, "exp lands deeper: {out:?} vs {out_pair:?}");
         }
     }
 
@@ -172,6 +215,8 @@ mod probe {
                     EmOp::Mult { n, .. } => ("mult", *n),
                     EmOp::MultAcc { n, pairs, .. } => ("multacc", *n * pairs.len()),
                     EmOp::WSum { n, srcs, .. } => ("wsum", *n * srcs.len()),
+                    EmOp::MulI { n, .. } => ("muli", *n),
+                    EmOp::ConjSplit { n, .. } => ("conj", *n),
                 };
                 let e = m.entry(k).or_default();
                 e.0 += 1;
