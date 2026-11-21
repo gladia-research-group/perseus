@@ -217,10 +217,25 @@ class Prog:
             st["w"] = [int(v) for v in w]
         self.steps.append(st)
 
-    def plut(self, src, rows, acc, dst):
+    def plut(self, src, rows, acc, dst, each=False):
         """The private lookup: the first `rows` LWEs of `src` (indices, native values) blindly rotate accumulator
-        `acc`; output j of len(dst) (the coefficient j past the index) into dst[j]. Output rows: `rows`."""
-        self.steps.append({"op": "plut", "src": src, "rows": int(rows), "acc": int(acc), "dst": list(dst)})
+        `acc`; output j of len(dst) (the coefficient j past the index) into dst[j]. Output rows: `rows`. each: row r
+        rotates accumulator acc + r (a selection tree's level, one output)."""
+        st = {"op": "plut", "src": src, "rows": int(rows), "acc": int(acc), "dst": list(dst)}
+        if each:
+            if len(dst) != 1:
+                raise ValueError("plut(each=True): one output")
+            st["each"] = True
+        self.steps.append(st)
+
+    def pack_rows(self, src, rows, t, acc=0, rowmap=None):
+        """The packing by rows (pc-gpu `DevPack::pack_rows`): accumulator acc + a holds the t-entry table
+        (`table_place(t)`, t in 2, 4, 8) of the rows rowmap[a t .. a t + t) of buffer `src` (default: the first `rows`
+        rows, rows / t accumulators). Bit-exact with `pack` on `table_place(t)`, without its per-key-row NTTs."""
+        rm = list(range(int(rows))) if rowmap is None else [int(v) for v in rowmap]
+        if t not in (2, 4, 8) or not rm or len(rm) % t or min(rm) < 0 or max(rm) >= rows:
+            raise ValueError("pack_rows: t in 2, 4, 8 and rows' indices below `rows`, t per accumulator")
+        self.steps.append({"op": "packr", "src": src, "rows": int(rows), "t": int(t), "map": rm, "acc": int(acc)})
 
     def rows_out(self):
         return self.steps[-1]["rows"]
@@ -251,11 +266,24 @@ class Prog:
                 np.add.at(a, pl[:, 1], w * B[st["src"]][pl[:, 0]])
                 acc[st["acc"]] = a
                 continue
+            if op == "packr":
+                t, rm = st["t"], np.asarray(st["map"], dtype=np.int64)
+                pl = np.asarray(table_place(t)[0], dtype=np.int64)
+                w = np.asarray(table_place(t)[1], dtype=np.float64)
+                for a in range(len(rm) // t):
+                    acc[st["acc"] + a] = w * B[st["src"]][rm[a * t + pl[:, 0]]]
+                continue
             if op == "plut":
                 x = B[st["src"]][:st["rows"]]
                 k = len(st["dst"])
                 x = x + rng.normal(0.0, noise * k, x.shape) if noise else x
                 phi = (k * np.rint(np.asarray(x, dtype=np.float64) * NAT_N / (2 * k))).astype(np.int64) % (2 * NAT_N)
+                if st.get("each"):
+                    c = phi % (2 * NAT_N)
+                    tab = np.stack([acc[st["acc"] + r] for r in range(len(x))])
+                    y = np.where(c < NAT_N, 1.0, -1.0) * tab[np.arange(len(x)), c % NAT_N]
+                    B[st["dst"][0]] = y + rng.normal(0.0, _NAT_OUT, y.shape) if _NAT_OUT else y
+                    continue
                 for j, d in enumerate(st["dst"]):
                     c = (phi + j) % (2 * NAT_N)
                     y = np.where(c < NAT_N, 1.0, -1.0) * acc[st["acc"]][c % NAT_N]
@@ -303,6 +331,50 @@ def table_place(t, n=NAT_N, k=1):
     m = np.where(u < g // 2, 2.0 * u / g, 2.0 * (u - g) / g)
     i = np.minimum(t - 1, np.floor((m + 1.0) * t / 2.0)).astype(np.int64) + j * t
     return [(int(a), int(b)) for a, b in zip(i, c)], [1 if x < g // 2 else -1 for x in u]
+
+
+def tree_digits(t):
+    """The selection tree's index digits for a table of t entries (a power of two >= 2): bases of 8 (the last one
+    smaller), least significant first."""
+    t = int(t)
+    if t < 2 or t & (t - 1):
+        raise ValueError("tree: t a power of two >= 2")
+    out = []
+    while t > 1:
+        out.append(min(8, t))
+        t //= out[-1]
+    return out
+
+
+def tree_index(i, t):
+    """Native values of the digits that select entry i of a t-entry tree table: [len(tree_digits(t))] per index."""
+    i = np.asarray(i, dtype=np.int64).reshape(-1)
+    out = []
+    for b in tree_digits(t):
+        out.append(table_index(i % b, b))
+        i = i // b
+    return np.stack(out, axis=1)
+
+
+def tree_steps(p, tab, t, idx, b, rep, out, tmp, acc=0):
+    """Append a selection tree to Prog `p`: `b` lookups into the t-entry table of buffer `tab` (rows 0..t-1, native
+    values), lookup j's digits (`tree_index`) at rows j L + l of buffer `idx` (from its row 0). Level l packs its
+    groups of B_l (`pack_rows`: level 0 the table's groups once per lookup, above the previous level's outputs) into
+    accumulators acc.., copies digit l per group into buffer `rep` (lin) and rotates every group by it (plut each);
+    the outputs ping-pong between `out` and `tmp`. Returns the buffer holding the b results (rows 0..b-1)."""
+    bs = tree_digits(t)
+    L, n_in, cur = len(bs), int(t), None
+    for lv, bb in enumerate(bs):
+        g = n_in // bb
+        if lv == 0:
+            p.pack_rows(tab, t, bb, acc, [gg * bb + e for _ in range(b) for gg in range(g) for e in range(bb)])
+        else:
+            p.pack_rows(cur, b * n_in, bb, acc)
+        p.lin(rep, idx, idx, [(j * L + lv, -1) for j in range(b) for _ in range(g)])
+        dst = out if cur != out else tmp
+        p.plut(rep, b * g, acc, [dst], each=True)
+        cur, n_in = dst, g
+    return cur
 
 
 def table_index(i, t):

@@ -73,6 +73,7 @@ def _auto(tmp_path, task, sets, seeds=("0", "1")):
     ("sort", ["kind=threshold", "n=4096", "k=8", "method=ckks"], "mask_exact", None),       # 1e19 without ladder margins
     ("pipeline", ["n=16", "B=4", "method=tfhe"], "topk_exact", None),
     ("plut", ["t=16", "b=256"], "wrong", 0.5),      # encrypted table: device packing + blind rotation, 0 wrong
+    ("plut", ["t=256", "b=16", "tree=1"], "wrong", 0.5),    # selection tree: packing by rows, rotations per group
 ])
 def test_planned(tmp_path, task, sets, key, tol):
     rows = _auto(tmp_path, task, sets)
