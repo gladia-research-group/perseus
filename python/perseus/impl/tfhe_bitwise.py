@@ -230,8 +230,9 @@ class WordProg:
         self._dig((Y, Y), [(r, R + r) for r in range(R)], ca=2, cb=4, out_slots=out_slots)
 
     def ident(self, out_slots):
-        """The I/O baseline: load a, store it."""
-        self.pr.store(0, self.R, "dig_w", out_slots)
+        """The I/O baseline: load a, store it (read at d / 4: the 8-bin margin)."""
+        self.pr.lin(1, 0, 0, [(r, -1) for r in range(self.R)], ca=2, cb=0)
+        self.pr.store(1, self.R, "dig4_w", out_slots)
 
     # ── the other integer / bitwise ops (module doc) ─────────────────────────────────────────────────────────────
 
