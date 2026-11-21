@@ -1715,7 +1715,7 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
     let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
     let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
     mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, rows));
-    mp.reserve("bitwise", 4 * (NBUF * rows * row + 2 * 2 * rows * 8 + 8 * 2 * params.tv_len()) + (1 << 20));
+    mp.reserve("bitwise", 4 * (NBUF * rows * row + 2 * 2 * rows * 16 + 16 * 2 * params.tv_len()) + (1 << 20));
     let arena = mp.allocate(&dev)?;
     let ex = Executor::<W>::new(&dev, &arena, &mp)?;
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
@@ -1729,11 +1729,12 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
     println!("[pc-check] tfhe-bitwise: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}, ks {:?})", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, params.ks);
     let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, rows)?;
     let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..NBUF).map(|_| arena.alloc::<pc_cuda::Compute, u32>("bitwise", rows * row)).collect::<std::result::Result<_, _>>()?;
-    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 2 * 2 * rows * 8)?;
-    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 8 * 2 * params.tv_len())?;
+    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 2 * 2 * rows * 16)?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("bitwise", 16 * 2 * params.tv_len())?;
     arena.freeze();
     // the native tables (v at phase v q / 4; inputs on [-1, 1))
     let r4 = |m: f64| (4.0 * m).round();
+    let sg = |r: f64| if r > 0.0 { 1.0 } else if r < 0.0 { -1.0 } else { 0.0 };
     let tables: Vec<Box<dyn Fn(f64) -> f64>> = vec![
         Box::new(move |m| match r4(m) {                                                    // 0 sgn: sign(round 4 m) / 4
             r if r > 0.0 => 0.25,
@@ -1748,6 +1749,15 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
             let k = ((m + 1.0) * 8.0).floor().clamp(0.0, 15.0) as usize;
             ((k % 4) ^ (k / 4)) as f64 / 8.0
         }),
+        // the whole-torus tables of the fan-in 3 / 4 prefix: inputs reach (-2, 2) and the negacyclic half carries the
+        // sign, so the only boundaries are the zero band and the wrap (outputs symmetric; lin adds the offsets)
+        Box::new(move |m| if r4(m) > 0.0 { 0.0625 } else { -0.0625 }),                   // 6 carry: c / 8 - 1/16
+        Box::new(move |m| if r4(m) < 0.0 { 0.0625 } else { -0.0625 }),                   // 7 lt: [a < b] / 8 - 1/16
+        Box::new(move |m| sg((8.0 * m).round()) / 8.0),                                  // 8 status on unit 1/8 -> 1/8
+        Box::new(move |m| sg((8.0 * m).round()) / 4.0),                                  // 9 status on unit 1/8 -> 1/4
+        Box::new(move |m| if (8.0 * m).round() > 0.0 { 0.0625 } else { -0.0625 }),     // 10 carry on unit 1/8
+        Box::new(move |m| if (8.0 * m).round() < 0.0 { 0.0625 } else { -0.0625 }),     // 11 lt on unit 1/8
+        Box::new(move |m| sg(r4(m)) / 8.0),                                              // 12 status on unit 1/4 -> 1/8
     ];
     let tvl = params.tv_len();
     let mut tvw = Vec::new();
@@ -1810,10 +1820,15 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
             let p_all = upload_pairs(&mut d_idx, &all, &mut idx_off)?;
             let bp = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr();
             let bpm = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr() as *mut c_void;
-            let (b0, b1, b2, b3, b4, b5, b6) = (bp(&bufs[0]), bp(&bufs[1]), bp(&bufs[2]), bpm(&bufs[3]), bpm(&bufs[4]), bpm(&bufs[5]), bpm(&bufs[6]));
+            let (b0, b1, b2, b3, b4, b5, b6, b7) = (bp(&bufs[0]), bp(&bufs[1]), bp(&bufs[2]), bpm(&bufs[3]), bpm(&bufs[4]), bpm(&bufs[5]), bpm(&bufs[6]), bpm(&bufs[7]));
             // the program of `op` as a list of launches (prepared index pairs), run `reps` times
             let (rounds, out_buf, out_rows): (usize, *mut c_void, usize);
             let mut prog: Vec<St> = Vec::new();
+            // the new prefix programs: PBS count, the final lookups' outputs (+-1/16: their noise), and per round the
+            // lookup's half bin and its input's weighted noise (sum of squares; negative: weights on PBS outputs)
+            let (mut npbs, mut final_buf, mut final_rows) = (0usize, std::ptr::null::<c_void>(), 0usize);
+            let mut specs: Vec<(f64, f64)> = Vec::new();
+            let sig_in = params.lwe_sigma_rel * 4.0;
             match op.as_str() {
                 "add" => {
                     // X = 2 a + 2 b - 3/4, S = sgn(X)
@@ -1867,6 +1882,125 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
                     prog.push(St::Lin(b6, b5, b4, p_all, rr, 1, 2, 0));
                     (rounds, out_buf, out_rows) = (1, b6, rr);
                 }
+                "add3" | "addp" | "cmp3" | "cmpp" => {
+                    // fan-in f prefix rounds on the whole torus: x = sum_k 2^(f - 1 - k) S_k (S in {0, +-u}), the
+                    // status of the first non-propagating input is sign(x) (f 3 at u 1/4 / f 4 at u 1/8: x in
+                    // (-2, 2), margin u / 2). add3 / cmp3: digit statuses (u 1/4), fan-in 3 (nu 1); addp / cmpp:
+                    // statuses of digit pairs (u 1/8: 4 s_j + s_(j - 1)), fan-in 4 (margin 1/16: nu 2). add: the
+                    // output digits are linear in the carries, a_i + b_i + c_(i - 1) - 4 c_i (no output round).
+                    let (pair, is_add) = (op.ends_with('p'), op.starts_with("add"));
+                    let fmax = if pair { 4 } else { 3 };
+                    let ki = |k: i64| -> u64 { k.rem_euclid(p0 as i64) as u64 };
+                    let tab = |uin: usize, uout: usize| -> usize {
+                        match (uin, uout) {
+                            (4, 4) => 0,
+                            (4, 8) => 12,
+                            (8, 8) => 8,
+                            (8, 4) => 9,
+                            (4, _) => if is_add { 6 } else { 7 },
+                            _ => if is_add { 10 } else { 11 },
+                        }
+                    };
+                    let (s0, k0) = if pair { (2, nd / 2) } else { (1, nd) };
+                    let mut fans = Vec::new();
+                    if is_add {
+                        let mut sp = s0;
+                        while sp < nd {
+                            let f = fmax.min(nd.div_ceil(sp));
+                            fans.push(f);
+                            sp *= f;
+                        }
+                    } else {
+                        let mut k = k0;
+                        while k > 1 {
+                            let f = fmax.min(k);
+                            fans.push(f);
+                            k = k.div_ceil(f);
+                        }
+                    }
+                    let unit = |f: usize| if f == 4 { 8 } else { 4 };
+                    let u1 = if pair { 8 } else { 4 };
+                    let id_pairs = |c: usize| -> Vec<(i64, i64)> { (0..c as i64).map(|r| (r, r)).collect() };
+                    let rows1 = if pair && !is_add { rr / 2 } else { rr };
+                    if pair {
+                        // x = (4 s_j + s_(j - 1) - 15) / 8 (add, every j; s_(-1) = 0: no carry in) / (4 d_j + d_(j - 1)) / 8
+                        // (cmp, odd j)
+                        let (hi, lo): (Vec<i64>, Vec<i64>) = if is_add {
+                            ((0..rr as i64).collect(), (0..rr as i64).map(|r| if r as usize % nd > 0 { r - 1 } else { -1 }).collect())
+                        } else {
+                            ((0..rows1 as i64).map(|q| 2 * q + 1).collect(), (0..rows1 as i64).map(|q| 2 * q).collect())
+                        };
+                        let ph: Vec<(i64, i64)> = hi.iter().map(|&j| (j, j)).collect();
+                        let pl: Vec<(i64, i64)> = lo.iter().map(|&j| (j, j)).collect();
+                        let pph = upload_pairs(&mut d_idx, &ph, &mut idx_off)?;
+                        let ppl = upload_pairs(&mut d_idx, &pl, &mut idx_off)?;
+                        let pid = upload_pairs(&mut d_idx, &id_pairs(rows1), &mut idx_off)?;
+                        let sb = if is_add { 1 } else { -1 };
+                        prog.push(St::Lin(b6, b0, b1, pph, rows1, 4, ki(4 * sb), 0));
+                        prog.push(St::Lin(b7, b0, b1, ppl, rows1, 1, ki(sb), 0));
+                        prog.push(St::Lin(b3, b6 as *const c_void, b7 as *const c_void, pid, rows1, 1, 1, if is_add { enc_v(-15.0 / 8.0) } else { 0 }));
+                        specs.push((1.0 / 16.0, 34.0 * sig_in * sig_in));
+                    } else {
+                        let (cb_, c) = if is_add { (2, enc_v(-0.75)) } else { (p0 - 2, 0) };
+                        prog.push(St::Lin(b3, b0, b1, p_all, rr, 2, cb_, c));
+                        specs.push((0.125, 8.0 * sig_in * sig_in));
+                    }
+                    let first_out = fans.first().map_or(0, |&f| unit(f));
+                    prog.push(St::Pbs(b3, rows1, tab(u1, first_out), b4));
+                    npbs += rows1;
+                    let (mut cur, mut nxt) = (b4, b5);
+                    let (mut uin, mut span, mut k) = (first_out, s0, k0);
+                    for (ri, &f) in fans.iter().enumerate() {
+                        let uo = fans.get(ri + 1).map_or(0, |&g| unit(g));
+                        let w: Vec<u64> = (0..f).map(|x| 1u64 << (f - 1 - x)).collect();
+                        // per output row the f source rows, the most significant first (-1: none, a P)
+                        let (cnt, src): (usize, Vec<Vec<i64>>) = if is_add {
+                            (rr, (0..rr as i64).map(|r| (0..f).map(|x| if r as usize % nd >= x * span { r - (x * span) as i64 } else { -1 }).collect()).collect())
+                        } else {
+                            let h = k.div_ceil(f);
+                            (nw * h, (0..nw * h).map(|q| {
+                                let (wd, g) = (q / h, q % h);
+                                (0..f).map(|x| { let e = g * f + f - 1 - x; if e < k { (wd * k + e) as i64 } else { -1 } }).collect()
+                            }).collect())
+                        };
+                        let p01: Vec<(i64, i64)> = src.iter().map(|v| (v[0], if f > 1 { v[1] } else { -1 })).collect();
+                        let pp = upload_pairs(&mut d_idx, &p01, &mut idx_off)?;
+                        let cu = cur as *const c_void;
+                        if f <= 2 {
+                            prog.push(St::Lin(b3, cu, cu, pp, cnt, w[0], if f > 1 { w[1] } else { 0 }, 0));
+                        } else {
+                            prog.push(St::Lin(b6, cu, cu, pp, cnt, w[0], w[1], 0));
+                            let p23: Vec<(i64, i64)> = src.iter().map(|v| (v[2], if f > 3 { v[3] } else { -1 })).collect();
+                            let pp2 = upload_pairs(&mut d_idx, &p23, &mut idx_off)?;
+                            prog.push(St::Lin(b7, cu, cu, pp2, cnt, w[2], if f > 3 { w[3] } else { 0 }, 0));
+                            let pid = upload_pairs(&mut d_idx, &id_pairs(cnt), &mut idx_off)?;
+                            prog.push(St::Lin(b3, b6 as *const c_void, b7 as *const c_void, pid, cnt, 1, 1, 0));
+                        }
+                        prog.push(St::Pbs(b3, cnt, tab(uin, uo), nxt));
+                        npbs += cnt;
+                        specs.push((if uin == 8 { 1.0 / 16.0 } else { 0.125 }, w.iter().map(|&x| (x * x) as f64).sum::<f64>() * -1.0));
+                        (cur, nxt) = (nxt, cur);
+                        uin = uo;
+                        span *= f;
+                        k = k.div_ceil(f);
+                    }
+                    final_buf = cur as *const c_void;
+                    if is_add {
+                        // c = g + 1/16 in {0, 1/8}; out = a + b + c_(i - 1) - 4 c_i
+                        let pprev: Vec<(i64, i64)> = (0..rr as i64).map(|r| (r, if r as usize % nd > 0 { r - 1 } else { -1 })).collect();
+                        let pv = upload_pairs(&mut d_idx, &pprev, &mut idx_off)?;
+                        prog.push(St::Lin(b6, cur as *const c_void, cur as *const c_void, p_all, rr, 1, 0, enc_v(0.0625)));
+                        prog.push(St::Lin(b7, b0, b1, p_all, rr, 1, 1, 0));
+                        prog.push(St::Lin(b3, b7 as *const c_void, b6 as *const c_void, pv, rr, 1, 1, 0));
+                        prog.push(St::Lin(nxt, b3 as *const c_void, b6 as *const c_void, p_all, rr, 1, ki(-4), 0));
+                        (rounds, out_buf, out_rows) = (1 + fans.len(), nxt, rr);
+                    } else {
+                        let pid = upload_pairs(&mut d_idx, &id_pairs(nw), &mut idx_off)?;
+                        prog.push(St::Lin(nxt, cur as *const c_void, cur as *const c_void, pid, nw, 1, 0, enc_v(0.0625)));
+                        (rounds, out_buf, out_rows) = (1 + fans.len(), nxt, nw);
+                    }
+                    final_rows = if is_add { rr } else { nw };
+                }
                 "xor" => {
                     let c = enc_v(-15.0 / 16.0);
                     prog.push(St::Lin(b3, b0, b1, p_all, rr, 1, 4, c));
@@ -1894,7 +2028,8 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
             let k = bufs.iter().position(|b| b.vptr() as *mut c_void == out_buf).ok_or("output buffer")?;
             let got = decrypt(&bufs[k].download_range(s, 0, out_rows * row)?, out_rows);
             let mask = if 2 * nd >= 64 { u64::MAX } else { (1u64 << (2 * nd)) - 1 };
-            let (want, scale): (Vec<u64>, f64) = match op.as_str() {
+            let base = if op.starts_with("add") { "add" } else if op.starts_with("cmp") { "cmp" } else { op.as_str() };
+            let (want, scale): (Vec<u64>, f64) = match base {
                 "add" => (a.iter().zip(&b).map(|(x, y)| (x + y) & mask).collect(), 8.0),
                 "cmp" => (a.iter().zip(&b).map(|(x, y)| (x < y) as u64).collect(), 8.0),
                 "mux" => ((0..nw).map(|i| if sel[i] == 1 { a[i] } else { b[i] }).collect(), 4.0),
@@ -1902,26 +2037,39 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
             };
             let (mut wrong, mut dev_max) = (0usize, 0f64);
             for w in 0..nw {
-                let v: u64 = if op == "cmp" {
+                let v: u64 = if base == "cmp" {
                     (got[w] * scale).round() as u64
                 } else {
                     (0..nd).map(|i| (((got[w * nd + i] * scale).round() as i64).rem_euclid(4) as u64) << (2 * i)).sum()
                 };
                 wrong += (v != want[w]) as usize;
-                for i in 0..if op == "cmp" { 1 } else { nd } {
-                    let x = got[if op == "cmp" { w } else { w * nd + i }] * scale;
+                for i in 0..if base == "cmp" { 1 } else { nd } {
+                    let x = got[if base == "cmp" { w } else { w * nd + i }] * scale;
                     dev_max = dev_max.max((x - x.round()).abs());
                 }
             }
             t.add(&format!("tfhe-bitwise: {op}{} x {nw} words, exact", 2 * nd), wrong, nw);
             let pbs: usize = match op.as_str() {
+                _ if npbs > 0 => npbs,
                 "add" => rr * (2 + nd.trailing_zeros() as usize),
                 "cmp" => rr + nw * (nd - 1),
                 _ => rr,
             };
+            if !final_buf.is_null() {
+                // the PBS output noise (the final lookups' +-1/16), then p_fail per lookup of every round's input
+                let k = bufs.iter().position(|b| b.vptr() == final_buf).ok_or("final buffer")?;
+                let g = decrypt(&bufs[k].download_range(s, 0, final_rows * row)?, final_rows);
+                let sp = (g.iter().map(|&x| { let e = x.abs() - 0.0625; e * e }).sum::<f64>() / g.len() as f64).sqrt();
+                let worst = specs.iter().map(|&(half, w)| {
+                    let v = if w < 0.0 { -w * sp * sp } else { w };
+                    pc_tfhe::pack::log2_tail(half / (sd * sd + v).sqrt())
+                }).fold(f64::NEG_INFINITY, f64::max);
+                println!("[pc-check] tfhe-bitwise: {op}{}: PBS output noise rms {sp:.2e}; worst p_fail per lookup 2^{worst:.1} (rounds' half bins {:?})", 2 * nd, specs.iter().map(|x| x.0).collect::<Vec<_>>());
+            }
             println!("[pc-check] tfhe-bitwise: {op}{}: {nw} words: {:.3} ms (median of {reps}), {rounds} PBS rounds, {pbs} PBS; {:.0} words/s, {:.0} PBS/s; max output dev {dev_max:.2e} (digit units)", 2 * nd, med * 1e3, nw as f64 / med, pbs as f64 / med);
         }
     }
     println!("[pc-check] tfhe-bitwise: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
+
