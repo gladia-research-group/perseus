@@ -60,8 +60,16 @@ pub extern "C" fn bconv<W: Hw>(a: *const BconvArgs, s: CudaStream) -> i32 {
                         }
                     }
                 }
-                for (uc, &d) in u.iter_mut().zip(vd.iter()) {
-                    *uc = (d + 0.5).floor() as u64;
+                if j.exact == 2 {
+                    // centred job (bconv.cuh centre_u): the lift's mean, by coefficient index
+                    for (c, uc) in u.iter_mut().enumerate() {
+                        let idx = (c0 + c) as u32;
+                        *uc = (ns as u64 >> 1) + ((ns as u64 & 1) & (idx.wrapping_mul(0x9E37_79B1) >> 31) as u64);
+                    }
+                } else {
+                    for (uc, &d) in u.iter_mut().zip(vd.iter()) {
+                        *uc = (d + 0.5).floor() as u64;
+                    }
                 }
                 bmod_off = (rbw * std::mem::size_of::<W>() + ns * 8) / std::mem::size_of::<W>();
             }

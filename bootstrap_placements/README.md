@@ -146,6 +146,10 @@ the magnitudes of its window's positions only. A model's five plans share one ru
 at the StC-first entry, the strict envelope, no refresh on the softmax's per-key numerators or its reciprocal
 rounds' squares, nor on the attention output from its P.V product on: the probabilities refresh on the sparse route
 before it), so one session serves them: 133 refreshes per GPT-2 token (11 of them in the encrypted argmax),
-279 per Llama token. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
+279 per Llama token. GPT-2's windows run the dense refreshes on the degree-47 EvalMod series with 2 double angles
+(`bts.em_table` 47:2, as `gpt2_decode`), each on its recording made again with the series (a structure capture at
+position 0, the window's magnitudes by name; w128 ... w512 on `gpt2_base_n32_ctx512s_nokl`, whose structure the
+shipped key-lane config has past 16 keys): 104 refreshes per token instead of 133 (93 + 11 in the argmax at the
+runtime), -2.4 to -3.9 % per token over the windows, KL unchanged. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
 precision for +4.4 % per GPT-2 token and +1.3 % per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.

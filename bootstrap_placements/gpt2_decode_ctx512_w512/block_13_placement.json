@@ -8,7 +8,7 @@
     "num_nodes_optimized": 393
   },
   "rules": {
-    "bootstrap_level": 28,
+    "bootstrap_level": 24,
     "max_level": 54,
     "source_level": 36,
     "cache_read_level": 36,
@@ -118,11 +118,11 @@
     "sc_cutmax_51": 7
   },
   "raise_drop": {
-    "sc_cutmax_132": 3,
+    "sc_cutmax_132": 5,
     "sc_cutmax_190": 9,
-    "sc_cutmax_270": 3,
+    "sc_cutmax_270": 5,
     "sc_cutmax_328": 9,
-    "sc_cutmax_51": 3
+    "sc_cutmax_51": 5
   },
   "summary": {
     "num_placements": 5,
@@ -993,7 +993,7 @@
         "50": 2
       },
       "raise_drop_hist": {
-        "3": 3,
+        "5": 3,
         "9": 2
       },
       "raise_drop_skipped": {},

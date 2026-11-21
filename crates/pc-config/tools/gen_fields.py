@@ -84,9 +84,10 @@ EXTRA = [
     ("bts", "sb_em_table", "Str", "SparseB's EvalMod series at K = 16 (with bts.sparse_b_k = 16): 'w14' = the degree-14 "
      "table refitted by least squares weighted with the overflow integer's distribution (pc-core `SPARSE_B_K16_W14`: the "
      "frozen table's degree, products and depth); unset = the frozen K = 16 table.", "PC_BTS_SB_EM_TABLE"),
-    ("bts", "em_table", "Str", "The dense routes' EvalMod series at K = 16: 'deg:da' = the Chebyshev interpolant of "
-     "degree deg followed by da double angles (pc-shadow `evalmod::sine_base`; fewer double angles on a longer series land "
-     "shallower: 47:2 two composite levels, 23:4 one); unset = the frozen degree-14 table with 5 double angles. The "
+    ("bts", "em_table", "Str", "The dense routes' EvalMod series: 'deg:da[:K]' = the Chebyshev interpolant of "
+     "degree deg followed by da double angles at EvalMod K (default 16; pc-shadow `evalmod::sine_base`; fewer double "
+     "angles on a longer series land shallower: 47:2 two composite levels, 23:4 one; a larger K makes the ModRaise "
+     "overflow rarer: 47:3:24 lands one composite level shallower than the frozen table); unset = the frozen degree-14 table with 5 double angles. The "
      "compile's dense landings follow it (pc-shadow `evalmod::table_landing_shift`).", "PC_BTS_EM_TABLE"),
     ("exec", "use_graphs", "Flag", "Replay a bound block program's static segments as captured CUDA graphs after its "
      "first run (pc-program `ReplayCfg::use_graphs`; default on, off = eager every run)."),

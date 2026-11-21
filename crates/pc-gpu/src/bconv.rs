@@ -25,6 +25,10 @@ pub struct JobSpec {
     pub exact: bool,
     /// The source rows hold `x_i pre_i` already (`pre_scales`: folded into the INTT's last pass).
     pub prescaled: bool,
+    /// Mean-centred fast conversion (with `exact`, at most `MAX_SRC` sources): the exact job's correction `u B` with
+    /// u the fast lift's mean `ns / 2` instead of its estimate (odd ns: (ns - 1) / 2 or (ns + 1) / 2 by a hash of the
+    /// coefficient), so no bias is left behind, only the lift's zero-mean spread; the fast job's cost.
+    pub centre: bool,
 }
 
 /// `pre_i = (B / b_i)^-1 mod b_i` of the sources `bp` (`B` their product).
@@ -64,6 +68,9 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
             return Err(shape("bconv job", format!("{} sources (1..={max})", j.src.len())));
         }
         let ns = j.src.len();
+        if j.centre && (!j.exact || ns > MAX_SRC) {
+            return Err(shape("bconv job", format!("a centred conversion is an exact job of at most {MAX_SRC} sources ({ns})")));
+        }
         if ns > MAX_SRC {
             // lazy double-word sums: nsrc (max source - 1) (max target - 1) < 2^(2 bits)
             let ms = j.src.iter().map(|&(_, p)| primes[p as usize]).max().unwrap_or(0) as u128;
@@ -130,7 +137,7 @@ pub fn build_tables<W: DevWord>(primes: &[u64], specs: &[JobSpec]) -> Result<(Ve
         // (exact: the sum takes u (t - B mod t) more, u <= ns)
         let (ms, mt) = (bp.iter().max().copied().unwrap_or(0) as u128, j.tgt.iter().map(|&(_, tp)| primes[tp as usize]).max().unwrap_or(0) as u128);
         let split = wb == 4 && mt < 1 << 30 && (!j.exact || ns as u128 * (ms.saturating_sub(1) * mt.saturating_sub(1) + mt) < 1 << 64);
-        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, j.exact as u32, j.prescaled as u32, split as u32]);
+        jobs.push([j.src_off, j.dst_off, ns as u32, j.tgt.len() as u32, off as u32, if j.centre { 2 } else { j.exact as u32 }, j.prescaled as u32, split as u32]);
     }
     Ok((pool, jobs, max_tgt))
 }

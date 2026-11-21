@@ -1828,12 +1828,12 @@ pub fn bench(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// PC_EM_TABLE=deg:da (experiments): the plain EvalMod table at the setup's K, `deg` and `da` double angles
+/// PC_EM_TABLE=deg:da[:K] (experiments): the plain EvalMod table at K (default 16), `deg` and `da` double angles
 /// (`pc_shadow::evalmod::sine_base`) in place of the shipped one.
 pub fn em_table_env(setup: &mut BtsSetup) -> Res<()> {
     if let Some(v) = std::env::var("PC_EM_TABLE").ok().filter(|v| !v.is_empty()) {
-        let (d, r) = v.split_once(':').ok_or("PC_EM_TABLE=deg:da")?;
-        let (d, r): (usize, u32) = (d.parse()?, r.parse()?);
+        let (d, r, k) = pc_shadow::evalmod::parse_em_table_k(&v).ok_or("PC_EM_TABLE=deg:da[:K]")?;
+        setup.boot_k = k;
         setup.evalmod_coeffs = pc_shadow::evalmod::sine_base(setup.boot_k, r, d);
         setup.evalmod_da_its = r;
         println!("[pc-bench] EvalMod table K {} degree {d}, {r} double angles (PC_EM_TABLE)", setup.boot_k);

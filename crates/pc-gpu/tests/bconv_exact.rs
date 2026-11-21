@@ -30,6 +30,11 @@ fn sp_user_top(chain: &Chain) -> Option<usize> {
     None
 }
 
+/// A centred job's u (`bconv.cuh` centre_u): the fast lift's mean ns / 2, odd ns by a hash of the coefficient index.
+fn centre_u(ns: usize, idx: usize) -> u64 {
+    (ns as u64 >> 1) + ((ns as u64 & 1) & ((idx as u32).wrapping_mul(0x9E37_79B1) >> 31) as u64)
+}
+
 /// A set of jobs over one source buffer and one target buffer (`ks.rs` level layout, K ciphertexts).
 struct Case {
     name: String,
@@ -60,6 +65,7 @@ fn cases_at(chain: &Chain, preset: &str, top: usize) -> Vec<Case> {
                     tgt: tg.iter().map(|&t| (t as u32, t as u32)).collect(),
                     exact: true,
                     prescaled: true,
+                    centre: false,
                 });
             }
         }
@@ -77,6 +83,7 @@ fn cases_at(chain: &Chain, preset: &str, top: usize) -> Vec<Case> {
                     tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
                     exact: true,
                     prescaled: true,
+                    centre: false,
                 });
             }
         }
@@ -142,7 +149,7 @@ fn reference(case: &Case, primes: &[u64], n: usize, src: &[W], dst: &[W]) -> (Ve
                     .map(|idx| {
                         let y: Vec<u64> = j.src.iter().map(|&(r, _)| src[(j.src_off + r) as usize * n + idx] as u64).collect();
                         let v = (0..ns).fold(0.0f64, |v, i| (y[i] as f64).mul_add(1.0 / bp[i] as f64, v));
-                        let u = (v + 0.5).floor() as u64;
+                        let u = if j.centre { centre_u(ns, idx) } else { (v + 0.5).floor() as u64 };
                         let acc = (0..ns).map(|i| y[i] as u128 * m[i][k] as u128).sum::<u128>() % t as u128;
                         submod(acc as u64, mulmod(u % t, bm[k], t), t)
                     })
@@ -229,5 +236,79 @@ fn exact_conversions_match_the_double_estimate() -> Res<()> {
         }
     }
     assert_eq!(bad_total, 0, "exact conversions differ from the double estimate");
+    Ok(())
+}
+
+/// The mean-centred fast ModDown conversion (`JobSpec::centre`) from P at every limb top of n32 / n32sph, 8
+/// ciphertexts: word for word the host formula with u = centre_u, and on uniform rows the exact estimate's u minus the
+/// centred u averages to ~0 (|mean| < 0.02: no bias left; the fast conversion's is ~ns / 2).
+#[test]
+#[ignore = "GPU: tools/gpu.sh <log> <bconv_exact test binary> --ignored --test-threads=1"]
+fn centred_moddown_matches_and_is_unbiased() -> Res<()> {
+    let dev = Device::open()?;
+    let mut bad_total = 0;
+    for preset in ["n32", "n32sph"] {
+        let chain = Chain::generate(&ChainSpec::preset(preset)?)?;
+        let (n, primes) = (chain.n, chain.primes());
+        let rows = chain.q.len() + chain.p.len();
+        let cases: Vec<Case> = [chain.q.len() - 1, chain.q.len() / 2, 8]
+            .iter()
+            .map(|&top| {
+                let mut specials = chain.special_ids();
+                specials.truncate(chain.specials_at(top));
+                let specs = (0..K)
+                    .flat_map(|c| (0..2).map(move |part| ((2 * c + part) * rows) as u32))
+                    .map(|base| JobSpec {
+                        src_off: base,
+                        dst_off: base,
+                        src: specials.iter().map(|&t| (t as u32, t as u32)).collect(),
+                        tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
+                        exact: true,
+                        prescaled: true,
+                        centre: true,
+                    })
+                    .collect();
+                Case { name: format!("{preset} top {top} centred ModDown {} -> {}", specials.len(), top + 1), specs, src_words: 2 * K * rows * n, dst_words: 2 * K * rows * n }
+            })
+            .collect();
+        let mut plan = MemPlan::build::<W, Barrett64>(&chain, MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 4, scratch_cts: 1 })?;
+        let (ms, md) = cases.iter().fold((0, 0), |(a, b), c| (a.max(c.src_words), b.max(c.dst_words)));
+        plan.reserve("t.src", ms * 4 + 4096);
+        plan.reserve("t.dst", md * 4 + 4096);
+        let tables: usize = cases.iter().map(|c| BconvPlan::bytes::<W>(&primes, &c.specs)).sum::<pc_gpu::Result<usize>>()?;
+        plan.reserve("t.plans", tables + 64 * 1024);
+        let arena = plan.allocate(&dev)?;
+        let ex = Executor::<W>::new(&dev, &arena, &plan)?;
+        let ctx = Context::<W, Barrett64>::new(&arena, &ex.copy, chain.clone(), &plan)?;
+        let mut src = arena.alloc::<Compute, W>("t.src", ms)?;
+        let mut dst = arena.alloc::<Compute, W>("t.dst", md)?;
+        let s = &ex.compute;
+        for (ci, case) in cases.iter().enumerate() {
+            let bplan = BconvPlan::new::<_, W>(&arena, s, &primes, &case.specs)?;
+            let x = fill(case, &primes, n, 0xC3 + ci as u64, true);
+            let d0 = vec![0 as W; case.dst_words];
+            src.upload_at(s, 0, &x)?;
+            dst.upload_at(s, 0, &d0)?;
+            bplan.run(&ctx, s, &src, &mut dst)?;
+            let got = dst.download_range(s, 0, case.dst_words)?;
+            let (want, _) = reference(case, &primes, n, &x, &d0);
+            let bad = got.par_iter().zip(want.par_iter()).filter(|(a, b)| a != b).count();
+            // the bias left: mean of (exact u - centred u) over the first job's coefficients
+            let j = &case.specs[0];
+            let bp: Vec<u64> = j.src.iter().map(|&(_, p)| primes[p as usize]).collect();
+            let ns = bp.len();
+            let mean = (0..n)
+                .map(|idx| {
+                    let v = j.src.iter().enumerate().fold(0.0f64, |v, (i, &(r, _))| (x[(j.src_off + r) as usize * n + idx] as f64).mul_add(1.0 / bp[i] as f64, v));
+                    (v + 0.5).floor() - centre_u(ns, idx) as f64
+                })
+                .sum::<f64>()
+                / n as f64;
+            println!("[bconv_centre] {:<40}: {bad} mismatches / {} words; mean(u_exact - u_centre) {mean:+.4} (fast: {:+.2})", case.name, want.len(), mean + ns as f64 / 2.0);
+            assert!(mean.abs() < 0.02, "{}: centred conversion biased ({mean})", case.name);
+            bad_total += bad;
+        }
+    }
+    assert_eq!(bad_total, 0, "centred conversions differ from the host formula");
     Ok(())
 }

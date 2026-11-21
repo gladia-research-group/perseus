@@ -508,14 +508,16 @@ fn knob(cfg: Option<i64>, default: i64, name: &str) -> PyResult<i64> {
     Ok(v)
 }
 
-/// bts.em_table "deg:da" (runtime switch PC_BTS_EM_TABLE; unset: the frozen table): the dense routes' EvalMod series at
-/// K = 16 as the Chebyshev interpolant of degree `deg` followed by `da` double angles (`pc_shadow::evalmod::sine_base`);
+/// bts.em_table "deg:da[:K]" (runtime switch PC_BTS_EM_TABLE; unset: the frozen table): the dense routes' EvalMod series
+/// at K (default 16; the dense CtS scales by 1 / K) as the Chebyshev interpolant of degree `deg` followed by `da` double
+/// angles (`pc_shadow::evalmod::sine_base`);
 /// fewer double angles on a longer series land shallower (47:2 two composite levels, 23:4 one): the compile's dense
 /// landings follow (`pc_program::compile::dense_em_shift`), the plan's must be made for the same table.
 fn dense_em_table(cfg: &pc_config::Config, setup: &mut BtsSetup) -> PyResult<()> {
     let Some(v) = cfg.bts.em_table.as_deref().map(str::trim).filter(|v| !v.is_empty()) else { return Ok(()) };
-    let (d, r) = pc_shadow::evalmod::parse_em_table(v).ok_or_else(|| crate::ConfigError::new_err(format!("bts.em_table = {v:?}: deg:da (e.g. 47:2)")))?;
-    setup.evalmod_coeffs = pc_shadow::evalmod::sine_base(setup.boot_k, r, d);
+    let (d, r, k) = pc_shadow::evalmod::parse_em_table_k(v).ok_or_else(|| crate::ConfigError::new_err(format!("bts.em_table = {v:?}: deg:da[:K] (e.g. 47:2, 47:3:24)")))?;
+    setup.boot_k = k;
+    setup.evalmod_coeffs = pc_shadow::evalmod::sine_base(k, r, d);
     setup.evalmod_da_its = r;
     Ok(())
 }

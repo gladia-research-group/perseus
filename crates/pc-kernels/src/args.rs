@@ -101,6 +101,7 @@ pub struct BconvJob {
     pub nsrc: u32,
     pub ntgt: u32,
     pub pool_off: u32,
+    /// 0 plain, 1 exact (HPS estimate), 2 exact tables with u the fast lift's mean (`JobSpec::centre`).
     pub exact: u32,
     /// ABI 17: 1 = the source rows hold `x_i pre_i` already (folded into the INTT's last pass).
     pub prescaled: u32,

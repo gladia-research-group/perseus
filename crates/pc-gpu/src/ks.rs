@@ -648,6 +648,7 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
                 tgt: tg.iter().map(|&t| (t as u32, t as u32)).collect(),
                 exact: low_exact,
                 prescaled: true,
+                centre: false,
             });
         }
     }
@@ -667,6 +668,7 @@ fn level_specs_with(chain: &Chain, lay: &Layout, top: usize, k_max: usize, digs:
                 tgt: (0..=top).map(|t| (t as u32, t as u32)).collect(),
                 exact,
                 prescaled: true,
+                centre: false,
             });
         }
     }
@@ -1459,10 +1461,12 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
 /// The ModDown conversion of level `top` (jobs `[c < k_max][part]`, as the level plan's) over the exact conversion:
 /// its [x]_P lift centred. The fast conversion leaves u P, u in [0, |P|), behind: after the division a bias of every
 /// coefficient, which the canonical embedding gathers on the slots nearest the root 1 (slot 0 and its conjugate).
-pub(crate) fn moddown_exact_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> Vec<JobSpec> {
+/// `centre`: the mean-centred fast conversion instead (`JobSpec::centre`: no bias, the fast job's cost).
+pub(crate) fn moddown_exact_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize, centre: bool) -> Vec<JobSpec> {
     let mut v = level_specs(chain, lay, top, k_max, None).moddown;
     for j in &mut v {
         j.exact = true;
+        j.centre = centre;
     }
     v
 }
