@@ -94,6 +94,9 @@ section! {
         #[doc = "SparseB's EvalMod series at K = 16 (with bts.sparse_b_k = 16): 'w14' = the degree-14 table refitted by least squares weighted with the overflow integer's distribution (pc-core `SPARSE_B_K16_W14`: the frozen table's degree, products and depth); unset = the frozen K = 16 table."]
         #[doc = "Runtime switch `PC_BTS_SB_EM_TABLE`: binds the key bundle's SparseB series, not the plan."]
         sb_em_table: Str = "PC_BTS_SB_EM_TABLE", "(unset)";
+        #[doc = "The dense routes' EvalMod series at K = 16: 'deg:da' = the Chebyshev interpolant of degree deg followed by da double angles (pc-shadow `evalmod::sine_base`; fewer double angles on a longer series land shallower: 47:2 two composite levels, 23:4 one); unset = the frozen degree-14 table with 5 double angles. The compile's dense landings follow it (pc-shadow `evalmod::table_landing_shift`)."]
+        #[doc = "Runtime switch `PC_BTS_EM_TABLE`: binds the key bundle's dense series and the plan's dense landings (BTS_LEVEL, PLAN_STC_FIRST_FALLBACK)."]
+        em_table: Str = "PC_BTS_EM_TABLE", "(unset)";
         #[doc = "`FIDESLIB_BTS_REAL`. Default '0'. Read at impl/ops.py::FheOps.bootstrap_real."]
         #[doc = "Shipped plans: runtime= 15."]
         real: Flag = "FIDESLIB_BTS_REAL", "'0'";
@@ -1149,6 +1152,9 @@ section! {
         #[doc = "`RUNTIME_EXTRA`. Default . Read at examples/llama/make_plan.sh::(shell)."]
         #[doc = "Shipped plans: none."]
         runtime_extra: Str = "RUNTIME_EXTRA", "";
+        #[doc = "`PLAN_SEED_LEVEL`: the level above which a block input the plan does not map seeds with a pending rescale (degree 2), the capture's own dense landing; unset = the plan's bootstrap level. A plan made for a shallower EvalMod table on a capture made for the shipped one sets it to the capture's landing."]
+        #[doc = "Shipped plans: none."]
+        seed_level: Int = "PLAN_SEED_LEVEL", "(unset)";
         #[doc = "`PLAN_SHARED_REALIZE`. Default (unset) / 1. Read at examples/gpt2/make_plan.sh::(shell); plan/run_bootstrap_all_blocks.sh::(shell)."]
         #[doc = "Shipped plans: recipe= 6."]
         shared_realize: Str = "PLAN_SHARED_REALIZE", "(unset) / 1";

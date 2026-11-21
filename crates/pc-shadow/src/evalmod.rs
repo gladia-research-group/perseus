@@ -986,6 +986,38 @@ pub fn sine_base(k: f64, da_its: u32, deg: usize) -> Vec<f64> {
         .collect()
 }
 
+/// A plain EvalMod table spec "deg:da" (`sine_base` at degree `deg`, `da` double angles): (deg, da).
+pub fn parse_em_table(spec: &str) -> Option<(usize, u32)> {
+    let (d, r) = spec.trim().split_once(':')?;
+    let (d, r): (usize, u32) = (d.trim().parse().ok()?, r.trim().parse().ok()?);
+    ((4..=128).contains(&d) && (1..=6).contains(&r)).then_some((d, r))
+}
+
+/// Levels a plain EvalMod program on `b` (coefficients, double angles) lands above the one on `a` from the same
+/// `input` (FIDESlib's Paterson-Stockmeyer shape, lean; realized: a pending rescale counted as done). The depth of a
+/// table is a property of the series, not of where it starts: the compile shifts the dense routes' measured landings
+/// by it.
+pub fn table_landing_shift(st: &ScaleTables, input: FMeta, a: (&[f64], u32), b: (&[f64], u32)) -> Result<i32> {
+    let top = |(c, r): (&[f64], u32)| -> Result<i32> {
+        let ps = PsPlan::from_coeffs(c).map_err(|e| rule("evalmod table", e.to_string()))?;
+        let (_, out) = build_evalmod_opts(st, input, &ps, r as i32, true)?;
+        Ok(if out.nl == 2 { Fx { d: st.d as i32, st: Some(st) }.down(out.top) } else { out.top })
+    };
+    // in level units (`d` per level: a single-prime level of an alternating user region counts as one level)
+    let (ta, tb) = (top(a)?, top(b)?);
+    let fx = Fx { d: st.d as i32, st: Some(st) };
+    let (lo, hi, sign) = if tb >= ta { (ta, tb, 1) } else { (tb, ta, -1) };
+    let (mut t, mut k) = (lo, 0);
+    while t < hi {
+        t = fx.up(t);
+        k += 1;
+    }
+    if t != hi {
+        return Err(rule("evalmod table shift", format!("landings {ta} / {tb} off the level grid")));
+    }
+    Ok(sign * k * st.d as i32)
+}
+
 /// The base pair of a trigonometric FBS (`PsPlan::fbs_trig`): Chebyshev interpolants on [-1, 1] (evaluator convention)
 /// of cos and sin of 2 pi K y / 2^r at degree `deg`; after r paired double angles, y = (u + I) / K reads
 /// (cos 2 pi u, sin 2 pi u) for every ModRaise integer |I| < K.

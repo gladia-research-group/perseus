@@ -314,3 +314,49 @@ mod plain_probe {
         }
     }
 }
+
+#[cfg(test)]
+mod plain_shift {
+    use crate::bts::dense::DensePlan;
+    use crate::bts::BtsSetup;
+    use pc_shadow::evalmod::{sine_base, table_landing_shift};
+
+    /// The landing shift of a plain table is the same on every raise variant of the dense plan, on n32, n32sph, n32a4, as
+    /// at the reference input the compile measures it on (pc-program `compile::dense_em_shift`: n32, top 45); n32a4 alike.
+    #[test]
+    fn plain_table_shift_per_variant() {
+        let shipped = (pc_core::bts_setup::evalmod_coeffs().to_vec(), pc_core::bts_setup::EVALMOD_DA_ITS);
+        for preset in ["n32", "n32sph", "n32a4"] {
+            let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset(preset).unwrap()).unwrap();
+            let st = pc_core::scale::ScaleTables::precompute(&chain).unwrap();
+            let mut setup = BtsSetup::n32_shipped();
+            setup.raise_drops = vec![0, 1, 2, 3, 4, 5];
+            let dp = DensePlan::new(&chain, &setup).unwrap();
+            for (d, r, want) in [(23usize, 4u32, 2i32), (31, 3, 2), (47, 2, 4)] {
+                let t = sine_base(setup.boot_k, r, d);
+                let r45 = {
+                    let c = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset("n32").unwrap()).unwrap();
+                    let s = pc_core::scale::ScaleTables::precompute(&c).unwrap();
+                    let input = pc_shadow::fides::FMeta { top: 45, nl: 1, nf: s.sf(45).unwrap() };
+                    table_landing_shift(&s, input, (&shipped.0, shipped.1), (&t, r)).unwrap()
+                };
+                assert_eq!(r45, want, "{d}:{r} at the reference input");
+                let mut s2 = setup.clone();
+                s2.evalmod_coeffs = t.clone();
+                s2.evalmod_da_its = r;
+                let dp2 = DensePlan::new(&chain, &s2).unwrap();
+                for (v, v2) in dp.variants.iter().zip(&dp2.variants) {
+                    let fx = pc_shadow::fides::Fx { d: st.d as i32, st: Some(&st) };
+                    let real = |m: pc_shadow::fides::FMeta| if m.nl == 2 { fx.down(m.top) } else { m.top };
+                    let (mut t0, mut k) = (real(v.em_out), 0);
+                    while t0 < real(v2.em_out) {
+                        t0 = fx.up(t0);
+                        k += st.d as i32;
+                    }
+                    assert_eq!(k, want, "{preset} {d}:{r} drop {}", v.drop);
+                    assert_eq!(table_landing_shift(&st, v.em_in, (&shipped.0, shipped.1), (&t, r)).unwrap(), want, "{preset} {d}:{r} drop {}", v.drop);
+                }
+            }
+        }
+    }
+}

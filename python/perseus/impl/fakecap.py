@@ -178,10 +178,10 @@ class CapFhe(FakeFhe):
         self.ct_counter = self.pt_counter = self.anon_counter = 0
         self.graph_scope, self.graph_scope_counter, self.graph_scope_strict = "", 0, False
         self.steps = []
-        spec = cfg["quirks.fakecap_landings"] or "0:32,1:14,256:22,512:22"
-        # "runtime": the compiled runtime's own route table (each route's raw landing), so the code's own refreshes
-        # land where the program compiled for this config lands them, whatever route they take
-        self.landing = parse_landings(_pc.runtime_capture_landings(cfg) if spec == "runtime" else spec)
+        # quirks.fakecap_landings (default "0:32,1:14,256:22,512:22"), moved where the runtime's EvalMod series land
+        # (bts.em_table / bts.sb_em_table); "runtime": the compiled runtime's own route table (each route's raw
+        # landing), so the code's own refreshes land where the program compiled for this config lands them
+        self.landing = parse_landings(_pc.capture_landings(cfg))
         self.sparse_mode = cfg["bts.sparse_auto"] or 0
         self.sparse_precomp_slots = sorted({int(x) for x in (cfg["bts.sparse_bts_slots"] or []) if x})
         self.pcmm_landing = None           # (level, deg) override of a finish's drop-0 landing (None: the Shadow's)

@@ -508,28 +508,22 @@ fn knob(cfg: Option<i64>, default: i64, name: &str) -> PyResult<i64> {
     Ok(v)
 }
 
-/// PC_BTS_EM_TABLE=deg:da (default unset: the frozen table): the dense routes' EvalMod series at K = 16 as the
-/// Chebyshev interpolant of degree `deg` followed by `da` double angles (`pc_shadow::evalmod::sine_base`); fewer double
-/// angles on a longer series land shallower (47:2 two composite levels, 23:4 one), so the plan's dense landings
-/// (BTS_LEVEL, PLAN_STC_FIRST_FALLBACK) must be made for the same table.
-fn dense_em_table(setup: &mut BtsSetup) -> PyResult<()> {
-    let Some(v) = std::env::var("PC_BTS_EM_TABLE").ok().filter(|v| !v.trim().is_empty()) else { return Ok(()) };
-    let bad = || crate::ConfigError::new_err(format!("PC_BTS_EM_TABLE = {v:?}: deg:da (e.g. 47:2)"));
-    let (d, r) = v.trim().split_once(':').ok_or_else(bad)?;
-    let (d, r): (usize, u32) = (d.parse().map_err(|_| bad())?, r.parse().map_err(|_| bad())?);
-    if !(4..=128).contains(&d) || !(1..=6).contains(&r) {
-        return Err(bad());
-    }
+/// bts.em_table "deg:da" (runtime switch PC_BTS_EM_TABLE; unset: the frozen table): the dense routes' EvalMod series at
+/// K = 16 as the Chebyshev interpolant of degree `deg` followed by `da` double angles (`pc_shadow::evalmod::sine_base`);
+/// fewer double angles on a longer series land shallower (47:2 two composite levels, 23:4 one): the compile's dense
+/// landings follow (`pc_program::compile::dense_em_shift`), the plan's must be made for the same table.
+fn dense_em_table(cfg: &pc_config::Config, setup: &mut BtsSetup) -> PyResult<()> {
+    let Some(v) = cfg.bts.em_table.as_deref().map(str::trim).filter(|v| !v.is_empty()) else { return Ok(()) };
+    let (d, r) = pc_shadow::evalmod::parse_em_table(v).ok_or_else(|| crate::ConfigError::new_err(format!("bts.em_table = {v:?}: deg:da (e.g. 47:2)")))?;
     setup.evalmod_coeffs = pc_shadow::evalmod::sine_base(setup.boot_k, r, d);
     setup.evalmod_da_its = r;
-    eprintln!("[session] dense EvalMod: K {} degree {d}, {r} double angles (PC_BTS_EM_TABLE)", setup.boot_k);
     Ok(())
 }
 
 /// bts.sb_em_table: SparseB's K = 16 EvalMod series ("w14": pc-core `SPARSE_B_K16_W14`, the frozen table's degree and
 /// products); unset or empty = the frozen table (an empty `SparseBCfg::em_coeffs`).
-/// "deg:da" (experiments): `pc_shadow::evalmod::sine_base` at K = 16 with `da` double angles (fewer land shallower:
-/// the plan's SparseB landings must be made for the same table).
+/// "deg:da": `pc_shadow::evalmod::sine_base` at K = 16 with `da` double angles (fewer land shallower: the compile's
+/// SparseB landings follow, `pc_program::compile::sb_em_shift`).
 fn sb_em_table(v: &Option<String>, k: f64) -> PyResult<(Vec<f64>, u32)> {
     let da = pc_core::bts_setup::SPARSE_B_DA_ITS;
     let bad = |s: &str| crate::ConfigError::new_err(format!("bts.sb_em_table = {s:?}: 'w14' or deg:da, with bts.sparse_b_k = 16 (here {k})"));
@@ -537,11 +531,7 @@ fn sb_em_table(v: &Option<String>, k: f64) -> PyResult<(Vec<f64>, u32)> {
         None | Some("") => Ok((Vec::new(), da)),
         Some("w14") if k == pc_core::bts_setup::EVALMOD_K => Ok((pc_core::bts_setup::SPARSE_B_K16_W14.to_vec(), da)),
         Some(s) if k == pc_core::bts_setup::EVALMOD_K && s.contains(':') => {
-            let (d, r) = s.split_once(':').ok_or_else(|| bad(s))?;
-            let (d, r): (usize, u32) = (d.parse().map_err(|_| bad(s))?, r.parse().map_err(|_| bad(s))?);
-            if !(4..=128).contains(&d) || !(1..=6).contains(&r) {
-                return Err(bad(s));
-            }
+            let (d, r) = pc_shadow::evalmod::parse_em_table(s).ok_or_else(|| bad(s))?;
             Ok((pc_shadow::evalmod::sine_base(k, r, d), r))
         }
         Some(s) => Err(bad(s)),
@@ -818,7 +808,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.cts_alt_budget = cts_alt;
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             (setup.merge_s2d, setup.stc_ps) = (merge_s2d, stc_ps);
-            dense_em_table(&mut setup)?;
+            dense_em_table(cfg, &mut setup)?;
             let mut sfs = StcFirstSetup::n32_shipped();
             // FIDESLIB_BTS_STC_FIRST_CF: the route's default CF (a site's own Route::cf wins); 13 shipped
             if let Some(cf) = cfg.bts.stc_first_cf {
@@ -892,7 +882,7 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.cts_alt_budget = cts_alt;
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
             setup.k_max = 1;
-            dense_em_table(&mut setup)?;
+            dense_em_table(cfg, &mut setup)?;
             let dp = pc_gpu::bts::dense::DensePlan::new(chain, &setup).map_err(e)?;
             let geoms: Vec<_> = dp.variants.iter().flat_map(|v| v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter())).map(|h| h.geom).collect();
             full.extend(lt_steps(&geoms, n));
