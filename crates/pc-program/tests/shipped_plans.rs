@@ -123,7 +123,7 @@ fn gate(plan: &str, graph: &str) -> Option<Vec<(String, Program)>> {
 
 #[test]
 fn gpt2_decode() {
-    let Some(progs) = gate("gpt2_decode", "gpt2_decode") else { return };
+    let Some(progs) = gate("gpt2_decode", "gpt2_decode_em47") else { return };
     let p = &progs.iter().find(|(l, _)| l == "block_0").unwrap().1;
     println!("[m7a] gpt2 decode block_0 batch_report: {}", serde_json::to_string(&p.batch_report).unwrap());
 }
@@ -164,7 +164,7 @@ fn llama_prefill() {
 fn schedules() {
     use pc_program::compile::batch::Schedule;
     for (plan, graph) in [
-        ("gpt2_decode", "gpt2_decode"),
+        ("gpt2_decode", "gpt2_decode_em47"),
         ("gpt2_prefill128", "gpt2_prefill128"),
         ("llama31_8b_decode", "llama31_8b_decode"),
     ] {
