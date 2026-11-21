@@ -601,7 +601,64 @@ class IntOp(Task):
         return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
 
 
-TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut, "intop": IntOp}
+@dataclasses.dataclass
+class Plut(Task):
+    """An encrypted lookup table (TFHE, impl/tfhe.py Prog.pack / Prog.plut): `t` encrypted entries (multiples of 1/8 in
+    [-1, 1)) and `b` encrypted indices in one ciphertext, the table packed into an accumulator (the packing key switch)
+    and blindly rotated by every index, the entries read back. Planned runs only (a native program in the session's
+    switch; sets PC_TFHE_NATIVE / PC_TFHE_PACK when unset). Every output must round to its entry."""
+    t: int = 16
+    b: int = 256
+    seed: int = 0
+    name = "plut"
+    tfhe = True
+
+    def __post_init__(self):
+        import os
+        from perseus.impl import tfhe
+        self.t, self.b = int(self.t), int(self.b)
+        os.environ.setdefault("PC_TFHE_NATIVE", f"4,{self.t + self.b}")
+        os.environ.setdefault("PC_TFHE_PACK", "1")
+        rng = np.random.default_rng(self.seed)
+        self.table = rng.integers(-8, 8, self.t) / 8.0
+        self.idx = rng.integers(0, self.t, self.b)
+        self.idx[:self.t] = np.arange(self.t)[:self.b]
+        tfhe.register_slots("plut.in", np.arange(self.t + self.b))
+        tfhe.register_slots("plut.out", np.arange(self.b))
+        pr = tfhe.Prog(f"plut.t{self.t}.b{self.b}", 3)
+        pr.lut("id", lambda m: m)
+        pr.lut("out", lambda m: m, warp=True)
+        pr.load("id", 0)
+        place, w = tfhe.table_place(self.t)
+        pr.pack(0, self.t, place, acc=0, w=w)
+        pr.lin(1, 0, 0, [(self.t + r, -1) for r in range(self.b)])
+        pr.plut(1, self.b, 0, [2])
+        pr.store(2, self.b, "out", "plut.out")
+        self.prog = tfhe.register_prog(pr)
+
+    def encode(self):
+        from perseus.impl import tfhe
+        x = np.zeros(SLOTS)
+        x[:self.t] = self.table
+        x[self.t:self.t + self.b] = tfhe.table_index(self.idx, self.t)
+        return [x]
+
+    def run(self, ops, xs):
+        from perseus.impl import tfhe
+        y = tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, "plut.in")
+        return [y]
+
+    def outputs(self, vals):
+        return {"y": np.real(vals[0])[:self.b]}
+
+    def metrics(self, out):
+        want = self.table[self.idx]
+        e = np.abs(out["y"] - want)
+        return {"wrong": int(np.sum(np.round(out["y"] * 8) != np.round(want * 8))), "max_err": float(e.max()),
+                "rms_err": float(np.sqrt(np.mean(e * e)))}
+
+
+TASKS = {"fn": Fn, "stats": Stats, "sort": Sort, "pipeline": Pipeline, "adhoc": AdHoc, "lut": Lut, "intop": IntOp, "plut": Plut}
 
 
 def make(name, **kw):

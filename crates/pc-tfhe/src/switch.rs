@@ -295,6 +295,8 @@ pub struct Switcher {
     pub repack: RepackKey,
     /// Params::chain: the native chains' key switch
     pub chain: Option<crate::chain::ChainKey>,
+    /// Params::pack: the packing key (encrypted lookup tables)
+    pub pack: Option<crate::pack::PackingKey>,
 }
 
 impl Switcher {
@@ -311,10 +313,12 @@ impl Switcher {
         let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, prng);
         let rns = crate::pbs::Rns::new(params.br_primes.0, params.br_primes.1, params.n_br)?;
         let bsk = BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns.clone(), params.pbs_group, &dg_bsk, prng);
-        let bsk_lat = (params.lat_group > 0).then(|| BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, params.lat_group, &dg_bsk, prng));
+        let bsk_lat = (params.lat_group > 0).then(|| BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns.clone(), params.lat_group, &dg_bsk, prng));
         let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg_rp, &dg, prng)?;
         let chain = if params.chain { Some(crate::chain::ChainKey::generate(&s_br, &s_lwe, p0, &params, prng)?) } else { None };
-        Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, repack, chain })
+        // the packing key: GLWE(s_br, q_br) at the bootstrapping key's sigma (the same instance)
+        let pack = params.pack.then(|| crate::pack::PackingKey::generate(&s_lwe, &s_br, crate::pack::PACK_GADGET, rns, &dg_bsk, prng));
+        Ok(Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, repack, chain, pack })
     }
 
     /// The LUT `tv` (+ `offset`, mod q_br) on the coefficients `valid` of a split ciphertext (phase m q0 / 4 there);

@@ -224,6 +224,11 @@ fn check(a: &TfheArgs) -> i32 {
     }
     match a.op {
         PBS_MS | KS_DIGITS | KS_RECOMBINE | RESCALE_P1 | RS_DIGITS | MAC | REPACK_DIGITS | REPACK_COMB | REPACK_FIN | REPACK_SCATTER | REPACK_RING | REPACK_RMAC | REPACK_C0 => 0,
+        PACK_DIGITS if a.n > 2048 || a.c[3] < 1 || a.c[2] * a.c[3] > 40 => -1,
+        PACK_DIGITS => 0,
+        PACK_MAC if a.n != 2048 || !(1..=4096).contains(&a.i0) => -1,
+        PACK_FIN if a.n != 2048 => -1,
+        PACK_MAC | PACK_FIN => 0,
         PBS_INIT | PBS_EXTRACT | RS_EXTRACT | LWE_LIN if a.count > 65535 => -1,
         PBS_INIT | PBS_EXTRACT | RS_EXTRACT | LWE_LIN => 0,
         PBS_ROTATE => match rot_path(a) {
@@ -293,7 +298,7 @@ pub extern "C" fn tfhe(a: *const TfheArgs, s: CudaStream) -> i32 {
     launch(a, s, check, run)
 }
 
-const OPS: [&str; 21] = ["tfhe.pbs_ms", "tfhe.pbs_init", "tfhe.pbs_step", "tfhe.pbs_extract", "tfhe.ks_digits", "tfhe.ks_recombine", "tfhe.rescale_p1", "tfhe.rs_digits", "tfhe.mac", "tfhe.rs_extract", "tfhe.repack_digits", "tfhe.repack_mac", "tfhe.repack_scatter", "tfhe.pbs_rotate", "tfhe.repack_ring", "tfhe.repack_rmac", "tfhe.repack_c0", "tfhe.repack_fin", "tfhe.pbs_keybundle", "tfhe.repack_comb", "tfhe.lwe_lin"];
+const OPS: [&str; 24] = ["tfhe.pbs_ms", "tfhe.pbs_init", "tfhe.pbs_step", "tfhe.pbs_extract", "tfhe.ks_digits", "tfhe.ks_recombine", "tfhe.rescale_p1", "tfhe.rs_digits", "tfhe.mac", "tfhe.rs_extract", "tfhe.repack_digits", "tfhe.repack_mac", "tfhe.repack_scatter", "tfhe.pbs_rotate", "tfhe.repack_ring", "tfhe.repack_rmac", "tfhe.repack_c0", "tfhe.repack_fin", "tfhe.pbs_keybundle", "tfhe.repack_comb", "tfhe.lwe_lin", "tfhe.pack_digits", "tfhe.pack_mac", "tfhe.pack_fin"];
 
 fn run(a: &TfheArgs) {
     use tfhe_op::*;
@@ -509,6 +514,9 @@ fn run(a: &TfheArgs) {
                 *o = (if k == len - 1 { addq(s, a.c[2], q) } else { s }) as u32;
             }
         }),
+        PACK_DIGITS => pack_digits(a),
+        PACK_MAC => pack_mac(a),
+        PACK_FIN => pack_fin(a),
         _ => {}
     }
     crate::mm::op_prof(OPS.get(a.op as usize).copied().unwrap_or("?"), t0);
@@ -1052,4 +1060,112 @@ mod digits_tests {
             }
         }
     }
+}
+
+/// round(x Q / q_in) mod Q (pack_lift).
+fn pack_lift(x: u64, big_q: u64, q_in: u64) -> u64 {
+    ((x as u128 * big_q as u128 + q_in as u128 / 2) / q_in as u128 % big_q as u128) as u64
+}
+
+/// The packing's digits and lifted bodies (pack_digits_k), placement by placement.
+fn pack_digits(a: &TfheArgs) {
+    let (nl, n, lv, bl) = (a.i1 as usize, a.n as usize, a.c[3] as usize, a.c[2] as u32);
+    let d = rows_mut::<i32>(a.x, 0, nl * lv * n);
+    let bacc = rows_mut::<u64>((a.x as *mut i32).wrapping_add(nl * lv * n) as *mut std::ffi::c_void, 0, 2 * n);
+    let qs = [a.c[6] & 0xffff_ffff, a.c[6] >> 32];
+    let mut dg = vec![0i64; lv];
+    for j in 0..a.count as usize {
+        let (row, pos) = (rd::<i32>(a.z, 2 * j) as usize, rd::<i32>(a.z, 2 * j + 1) as usize);
+        let w = if a.w.is_null() { 1 } else { rd::<i32>(a.w, j) as i64 };
+        let lwe = rows::<u32>(a.y, row * (nl + 1), nl + 1);
+        for (i, &x) in lwe[..nl].iter().enumerate() {
+            digits_of(pack_lift(x as u64, a.c[1], a.c[0]), bl, lv, a.m, &mut dg);
+            for t in 0..lv {
+                let k = (i * lv + t) * n + pos;
+                d[k] = d[k].wrapping_add((dg[t] * w) as i32);
+            }
+        }
+        let lifted = pack_lift(lwe[nl] as u64, a.c[1], a.c[0]);
+        for (p, &q) in qs.iter().enumerate() {
+            let wq = w.rem_euclid(q as i64) as u64;
+            bacc[p * n + pos] = bacc[p * n + pos].wrapping_add(lifted % q * wq % q);
+        }
+    }
+}
+
+fn ntt_fwd64(x: &mut [u64], psi: &[u64], q: u64) {
+    let n = x.len();
+    let (mut m, mut t) = (1, n / 2);
+    while m < n {
+        for i in 0..m {
+            let w = psi[m + i];
+            for j in 2 * i * t..2 * i * t + t {
+                let (u, v) = (x[j], (x[j + t] as u128 * w as u128 % q as u128) as u64);
+                x[j] = addq(u, v, q);
+                x[j + t] = subq(u, v, q);
+            }
+        }
+        m *= 2;
+        t /= 2;
+    }
+}
+
+fn ntt_inv64(x: &mut [u64], ipsi: &[u64], ninv: u64, q: u64) {
+    let n = x.len();
+    let (mut m, mut t) = (n / 2, 1);
+    while m >= 1 {
+        for i in 0..m {
+            let w = ipsi[m + i];
+            for j in 2 * i * t..2 * i * t + t {
+                let (u, v) = (x[j], x[j + t]);
+                x[j] = addq(u, v, q);
+                x[j + t] = (subq(u, v, q) as u128 * w as u128 % q as u128) as u64;
+            }
+        }
+        m /= 2;
+        t *= 2;
+    }
+    for v in x.iter_mut() {
+        *v = (*v as u128 * ninv as u128 % q as u128) as u64;
+    }
+}
+
+/// acc [prime][part] += sum_r NTT(D_r mod q) K_r (pack_mac_k).
+fn pack_mac(a: &TfheArgs) {
+    let n = a.n as usize;
+    par_for(2, a, |a, p| {
+        let q = if p == 1 { a.c[6] >> 32 } else { a.c[6] & 0xffff_ffff };
+        let psi = rows::<u64>(a.tw, p * 2 * n, n);
+        let acc = rows_mut::<u64>(a.x, p * 2 * n, 2 * n);
+        let mut s = vec![0u64; n];
+        for r in 0..a.count as usize {
+            let d = rows::<i32>(a.y, r * n, n);
+            for (o, &v) in s.iter_mut().zip(d) {
+                *o = (v as i64).rem_euclid(q as i64) as u64;
+            }
+            ntt_fwd64(&mut s, psi, q);
+            let k = rows::<u32>(a.z, (r * 2 + p) * 2 * n, 2 * n);
+            for o in 0..n {
+                acc[o] = (acc[o] + s[o] * k[o] as u64 % q) % q;
+                acc[n + o] = (acc[n + o] + s[o] * k[n + o] as u64 % q) % q;
+            }
+        }
+    });
+}
+
+/// INTT of the sums, + Bacc on part 0, into [part][prime][n] (pack_fin_k).
+fn pack_fin(a: &TfheArgs) {
+    let n = a.n as usize;
+    par_for(4, a, |a, b| {
+        let (part, p) = (b / 2, b % 2);
+        let q = if p == 1 { a.c[6] >> 32 } else { a.c[6] & 0xffff_ffff };
+        let ip = rows::<u64>(a.tw, p * 2 * n, n);
+        let mut s: Vec<u64> = rows::<u64>(a.y, (p * 2 + part) * n, n).iter().map(|&v| v % q).collect();
+        ntt_inv64(&mut s, ip, a.c[2 + 2 * p], q);
+        let bacc = rows::<u64>(a.z, p * n, n);
+        let out = rows_mut::<u32>(a.x, (part * 2 + p) * n, n);
+        for o in 0..n {
+            out[o] = (if part == 0 { addq(s[o], bacc[o] % q, q) } else { s[o] }) as u32;
+        }
+    });
 }

@@ -57,3 +57,28 @@ def test_private_lut(keys):
     print(f"\n[tfhe] private LUT: 32 lookups, wrong {wrong}; std acc {sa:.2e} rotation {sb:.2e}; "
           f"log2 p_fail index {li:.1f} output {lo:.1f}")
     assert wrong == 0
+
+
+def test_table_place_mirror():
+    """A native program's encrypted table (Prog.pack on table_place, Prog.plut): the mirror reads entry i at
+    table_index(i, t), on both halves of the accumulator (the upper one holds -v), with k = 2 outputs reading the
+    next coefficient."""
+    from perseus.impl import tfhe
+    for t in (4, 8, 16):
+        tab = np.random.default_rng(t).integers(-8, 8, t) / 8.0
+        pr = tfhe.Prog(f"plut.test{t}", 4)
+        pr.lut("id", lambda m: m)
+        pr.lut("out", lambda m: m, warp=True)
+        pr.load("id", 0)
+        place, w = tfhe.table_place(t)
+        assert len(place) == tfhe.NAT_N and all(0 <= r < t for r, _ in place)
+        pr.pack(0, t, place, acc=0, w=w)
+        idx = np.arange(t)
+        pr.lin(1, 0, 0, [(t + r, -1) for r in range(t)])
+        pr.plut(1, t, 0, [2])
+        pr.store(2, t, "out", "s")
+        x = np.concatenate([tab, tfhe.table_index(idx, t)])
+        y = pr.run(x, noise=0.0)
+        assert np.array_equal(np.round(y * 8), np.round(tab * 8)), (t, y, tab)
+        st = [s for s in __import__("json").loads(pr.json())["steps"] if s["op"] == "pack"][0]
+        assert len(st["place"]) == 2 * tfhe.NAT_N and len(st["w"]) == tfhe.NAT_N

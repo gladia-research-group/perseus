@@ -1,7 +1,8 @@
 //! Encrypted lookup tables on the TFHE host reference (pc-tfhe `pack`): the public functional packing key switch
 //! LWE (s_lwe, q_in) -> GLWE (s_br, Q) and the blind rotation of an encrypted accumulator, as a self-contained key set
-//! (`TfhePrivateLut`): LWEs and GLWEs cross as plain integer lists. Host only (the device path is gated by
-//! `pc-check tfhe-pbs --enc-acc`).
+//! (`TfhePrivateLut`): LWEs and GLWEs cross as plain integer lists. Host reference; the device path (pc-gpu
+//! `tfhe::DevPack`, `TfheSwitch::native_pack` / `native_plut`) runs in planned sessions as the native program steps
+//! `pack` / `plut` (pc-py tfhe.rs, impl/tfhe.py `Prog.pack` / `Prog.plut`), gated bit-exact by `pc-check tfhe-pack`.
 use pc_core::keys::{sample_ternary, DiscreteGaussian, Prng};
 use pc_tfhe::gadget::Gadget;
 use pc_tfhe::lwe::Lwe;

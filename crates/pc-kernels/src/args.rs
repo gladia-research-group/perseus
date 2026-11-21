@@ -1028,6 +1028,9 @@ pub mod tfhe_op {
     pub const PBS_KEYBUNDLE: i32 = 18;
     pub const REPACK_COMB: i32 = 19;
     pub const LWE_LIN: i32 = 20;
+    pub const PACK_DIGITS: i32 = 21;
+    pub const PACK_MAC: i32 = 22;
+    pub const PACK_FIN: i32 = 23;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

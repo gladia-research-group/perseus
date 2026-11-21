@@ -62,6 +62,9 @@ pub struct Params {
     pub lat_group: usize,
     /// The native chains' key switch s_br -> s_lwe (`chain::ChainKey`): bootstrap outputs feed bootstraps directly.
     pub chain: bool,
+    /// The packing key s_lwe -> GLWE(s_br, q_br) (`pack::PackingKey`, gadget `pack::PACK_GADGET`): encrypted lookup
+    /// tables (an accumulator packed from LWEs, blindly rotated).
+    pub pack: bool,
 }
 
 impl Params {
@@ -126,6 +129,7 @@ impl Params {
             nu: 1,
             lat_group: 0,
             chain: false,
+            pack: false,
         })
     }
 }

@@ -63,6 +63,11 @@ impl PackingKey {
         PackingKey { gadget, rns, sigma: dg.sigma(), keys }
     }
 
+    /// [i][t][prime] -> (c0, c1), NTT form: the device image's source.
+    pub fn keys(&self) -> &[Vec<[(Vec<u64>, Vec<u64>); 2]>] {
+        &self.keys
+    }
+
     /// x mod q_in -> round(x Q / q_in) mod Q.
     pub fn lift(&self, x: u64, q_in: u64) -> u64 {
         let q = self.rns.q as u128;

@@ -950,6 +950,17 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //   LWE_LIN      x = u32 LWEs [count][i1 + 1] mod q: c[0] y[w[2 k]] + c[1] z[w[2 k + 1]] (w = int32 index pairs, -1:
 //                the term is 0; y, z [..][i1 + 1]; c[0], c[1] < q), + c[2] on b: the native chains' differences, sums and
 //                constants
+//   PACK_DIGITS  the packing key switch (pc-tfhe pack.rs), n = the GLWE degree (2048): y = u32 LWEs [rows][i1 + 1]
+//                mod c[0] (q_in) under the binary key, z = int32 placements [count][2] (row, position < n), w = int32
+//                weights [count] (null: 1) -> x = int32 D [i1 levels][n] += w d_t(lift(a_i)) at the position (atomic;
+//                the caller zeroes), then u64 Bacc [2 prime][n] (from x + i1 levels n words) += w lift(b) mod q_p;
+//                lift(v) = round(v Q / q_in), Q = c[1]; gadget base 2^c[2], c[3] levels, m (approximate over Q);
+//                c[6] = q_a | q_b << 32; sum |w| 2^(base - 1) < 2^31 per word
+//   PACK_MAC     y = D, z = the packing key u32 [count][2 prime][2 part][n] (NTT form), tw = u64 [2 prime][psi n |
+//                Shoup n] -> x = u64 [2 prime][2 part][n] += sum_r NTT(D_r) K_r mod q_p (atomic; the caller zeroes);
+//                i0 = rows per block (<= 4096)
+//   PACK_FIN     y = PACK_MAC's sums, z = Bacc, tw = u64 [2 prime][ipsi n | Shoup n], c[2 + 2 p] = n^-1 mod q_p, its
+//                Shoup -> x = u32 [2 part][2 prime][n]: INTT, + Bacc on part 0 (PBS_INIT's encrypted accumulator)
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
 //                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
 // The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
@@ -987,6 +998,9 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_PBS_KEYBUNDLE 18
 #define PC_TFHE_REPACK_COMB 19
 #define PC_TFHE_LWE_LIN 20
+#define PC_TFHE_PACK_DIGITS 21
+#define PC_TFHE_PACK_MAC 22
+#define PC_TFHE_PACK_FIN 23
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;
