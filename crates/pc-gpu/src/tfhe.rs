@@ -36,8 +36,13 @@ pub const KB_MAX_EXT: usize = 46;
 pub const LAT_MAX: usize = 24;
 /// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE.
 pub const KB_WINDOW: usize = 32;
-/// LWEs per repack GEMM pass (the digits and packed buffers are sized for it).
-const RC: usize = 256;
+/// LWEs per repack GEMM pass (the digits and packed buffers are sized for it) for a switch of `max` values per pass:
+/// 1024 from 1024 values (one int8 GEMM of 1024 rows per key plane: -16 % repack time at 16384 values against 256),
+/// 256 below; PC_TFHE_REPACK_RC overrides (a multiple of 256 up to 4096).
+fn repack_rc(max: usize) -> usize {
+    let env = std::env::var("PC_TFHE_REPACK_RC").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&r| r % 256 == 0 && (256..=4096).contains(&r));
+    env.unwrap_or(if max >= 1024 { 1024 } else { 256 })
+}
 /// The repack columns' int8 planes (centred residues < 2^27) and the repack GEMMs' workspace.
 const KPL: usize = 4;
 const WSR: usize = 32 << 20;
@@ -118,7 +123,7 @@ pub fn tv_residues(k: &pc_tfhe::pbs::BootstrapKey, tv: &[u64]) -> Vec<u32> {
     k.rns.residues(tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)).collect()
 }
 
-/// The device repack (pc-tfhe `RepackKey`, bit for bit): per RC LWEs REPACK_DIGITS -> REPACK_MAC (the GEMM in
+/// The device repack (pc-tfhe `RepackKey`, bit for bit): per `repack_rc` LWEs REPACK_DIGITS -> REPACK_MAC (the GEMM in
 /// R_{n_br} mod p0 P; split K into int64 sums) -> REPACK_FIN (rescaled by P) -> REPACK_SCATTER (X^j P_j(X^S) into ring N), then REPACK_RING (c0, digits of
 /// c1), NTT, REPACK_RMAC (the ring key), INTT, REPACK_C0: `acc` [part][limb][n] mod p0 p1 under s, coefficient form.
 /// The packing key switch LWE (s_lwe, q_in) -> GLWE (s_br, q_br) on the device (pc-tfhe `pack::PackingKey::pack`,
@@ -326,7 +331,7 @@ pub struct DevRepack<'a> {
     /// the columns as four balanced int8 planes [plane][4 n_br cols][n_br levels] (K-contiguous: the GEMM's B)
     kpl: DBuf<'a, Compute, u8>,
     ring: DBuf<'a, Compute, u32>,
-    /// the digits' two planes [2][RC][n_br levels], one int8 GEMM output [4 n_br][RC] and its workspace
+    /// the digits' two planes [2][rc][n_br levels], one int8 GEMM output [4 n_br][rc] and its workspace
     dpl: DBuf<'a, Compute, u8>,
     gout: DBuf<'a, Compute, i32>,
     ws: DBuf<'a, Compute, u8>,
@@ -337,15 +342,19 @@ pub struct DevRepack<'a> {
     c0: DBuf<'a, Compute, u32>,
     rdig: DBuf<'a, Compute, u32>,
     pub acc: DBuf<'a, Compute, u32>,
+    /// LWEs per GEMM pass (`repack_rc`)
+    rc: usize,
 }
 
 impl<'a> DevRepack<'a> {
-    pub fn bytes(n: usize, nb: usize, lv: usize) -> usize {
-        KPL * 4 * nb * nb * lv + 2 * RC * nb * lv + 4 * (lv * 4 * n + 4 * nb * RC + RC * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * (RC * 4 * nb + 2 * n) + WSR + 11 * 256
+    pub fn bytes(n: usize, nb: usize, lv: usize, max: usize) -> usize {
+        let rc = repack_rc(max);
+        KPL * 4 * nb * nb * lv + 2 * rc * nb * lv + 4 * (lv * 4 * n + 4 * nb * rc + rc * 2 * nb + n + 2 * lv * n + 4 * n) + 8 * (rc * 4 * nb + 2 * n) + WSR + 11 * 256
     }
 
-    pub fn new(arena: &'a Arena, s: &Stream<Compute>, sw: &Switcher) -> Result<Self> {
+    pub fn new(arena: &'a Arena, s: &Stream<Compute>, sw: &Switcher, max: usize) -> Result<Self> {
         let (n, nb, lv) = (sw.n, sw.params.n_br, sw.params.rp.1);
+        let rc = repack_rc(max);
         let up = |what: &'static str, v: &[u32]| -> Result<DBuf<'a, Compute, u32>> {
             let mut b = arena.alloc::<Compute, u32>(what, v.len())?;
             b.upload(s, v)?;
@@ -384,12 +393,13 @@ impl<'a> DevRepack<'a> {
             aux: sw.repack.aux,
             kpl,
             ring: up("tfhe.rring", &ring)?,
-            dpl: arena.alloc("tfhe.work", 2 * RC * nb * lv)?,
-            gout: arena.alloc("tfhe.work", 4 * nb * RC)?,
+            dpl: arena.alloc("tfhe.work", 2 * rc * nb * lv)?,
+            gout: arena.alloc("tfhe.work", 4 * nb * rc)?,
             ws: arena.alloc("tfhe.ws", WSR)?,
             gemms: HashMap::new(),
-            pk: arena.alloc("tfhe.work", RC * 2 * nb)?,
-            sums: arena.alloc("tfhe.work", RC * 4 * nb)?,
+            pk: arena.alloc("tfhe.work", rc * 2 * nb)?,
+            sums: arena.alloc("tfhe.work", rc * 4 * nb)?,
+            rc,
             z: arena.alloc("tfhe.work", 2 * n)?,
             c0: arena.alloc("tfhe.work", n)?,
             rdig: arena.alloc("tfhe.work", 2 * lv * n)?,
@@ -412,7 +422,8 @@ impl<'a> DevRepack<'a> {
     /// Prepare the int8 GEMM plans for passes of `b` values (setup: the replay builds none).
     pub fn prepare(&mut self, lt_: &'a lt::Lt, b: usize) -> Result<()> {
         let (nb, lv) = (self.nb, self.rp.1);
-        for m in [b.min(RC), b % RC] {
+        let rc = self.rc;
+        for m in [b.min(rc), b % rc] {
             let mp = m.next_multiple_of(16);
             if m > 0 && !self.gemms.contains_key(&mp) {
                 self.gemms.insert(mp, I8Gemm::new(lt_, mp as u64, (4 * nb) as u64, (nb * lv) as u64, 8, WSR)?);
@@ -435,8 +446,9 @@ impl<'a> DevRepack<'a> {
             Ok(())
         };
         let rb = self.args();
-        for r0 in (0..b).step_by(RC) {
-            let rc = RC.min(b - r0);
+        let rcp = self.rc;
+        for r0 in (0..b).step_by(rcp) {
+            let rc = rcp.min(b - r0);
             let o = (outs as *const u32).wrapping_add(r0 * (nb + 1)) as *const c_void;
             let ix = (idx as *const u32).wrapping_add(r0) as *const c_void;
             let sums = self.sums.vptr_mut();
@@ -539,6 +551,8 @@ pub struct TfheSwitch<'a> {
     cksk: Vec<DBuf<'a, Compute, u8>>,
     /// native_load: the bootstrap outputs (one buffer per LUT, [b][n_br + 1]) go here instead of the repack
     sinks: Vec<*mut c_void>,
+    /// `native_extract`: the key-switched LWEs (s_lwe) into here instead of a bootstrap (null: off)
+    extract_dst: *mut c_void,
     /// Params::pack: the packing key switch (encrypted lookup tables: `native_pack`, `native_plut`)
     pack: Option<DevPack<'a>>,
     bsk: DBuf<'a, Compute, u32>,
@@ -585,7 +599,7 @@ impl<'a> TfheSwitch<'a> {
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
         let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
         let pack = if p.pack { DevPack::bytes_rows(nb, nl, pc_tfhe::pack::PACK_GADGET.1, PACK_RMAX) } else { 0 };
-        4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + pack + (1 << 20)
+        4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1, max) + pack + (1 << 20)
     }
 
     /// Upload `sw`'s keys (host-generated: pc-tfhe `Switcher::generate`) and carve the work buffers.
@@ -632,6 +646,7 @@ impl<'a> TfheSwitch<'a> {
             ksk,
             cksk,
             sinks: Vec::new(),
+            extract_dst: std::ptr::null_mut(),
             pack: match &sw.pack {
                 Some(pk) => Some(DevPack::with_rows(arena, s, pk, PACK_RMAX)?),
                 None => None,
@@ -643,7 +658,7 @@ impl<'a> TfheSwitch<'a> {
             },
             btw: up32("tfhe.btw", &img.tw)?,
             btw_s: up32("tfhe.btw", &img.tws)?,
-            repack: DevRepack::new(arena, s, sw)?,
+            repack: DevRepack::new(arena, s, sw, max)?,
             stage: arena.alloc("tfhe.work", 8 * n)?,
             low: arena.alloc("tfhe.work", 2 * 2 * n)?,
             dig: arena.alloc("tfhe.work", p.rs.1 * n)?,
@@ -835,6 +850,12 @@ impl<'a> TfheSwitch<'a> {
             }
             Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
             lap(s, &mut t, &mut tm.key_switch)?;
+            if !self.extract_dst.is_null() {
+                let d = (self.extract_dst as *mut u32).wrapping_add(c0 * cols) as *mut c_void;
+                // SAFETY: `native_extract`'s caller passes b rows of n_lwe + 1 words on this device
+                unsafe { self.lwe.copy_to_raw(s, 0, d, cb * cols)? };
+                continue;
+            }
 
             // bootstrap
             let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
@@ -868,7 +889,7 @@ impl<'a> TfheSwitch<'a> {
             }
             lap(s, &mut t, &mut tm.repack)?;
         }
-        if self.sinks.is_empty() {
+        if self.sinks.is_empty() && self.extract_dst.is_null() {
             self.finish_into(ctx, s, &pa, x)?;
         }
         lap(s, &mut t, &mut tm.repack)?;
@@ -890,6 +911,16 @@ impl<'a> TfheSwitch<'a> {
         self.sinks = dsts.to_vec();
         let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, tv, offsets, timed);
         self.sinks.clear();
+        r
+    }
+
+    /// The split's coefficients `pos` [b] of `x` to LWEs under s_lwe mod p0 (ring switch, extraction, key switch: a
+    /// bootstrap's input, what `native_pbs` reaches after its own key switch) into `dst` [b][n_lwe + 1]; no bootstrap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_extract<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, dst: *mut c_void, timed: bool) -> Result<Timings> {
+        self.extract_dst = dst;
+        let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, std::ptr::null(), &[0], timed);
+        self.extract_dst = std::ptr::null_mut();
         r
     }
 

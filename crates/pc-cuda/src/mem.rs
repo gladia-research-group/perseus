@@ -337,6 +337,14 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         // SAFETY: ranges checked; distinct buffers (&mut self vs &src)
         unsafe { copy(s, self.ptr as *mut c_void, src.ptr as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D") }
     }
+    /// Device-to-device copy of `n` elements from `off` to the device address `dst`.
+    ///
+    /// # Safety
+    /// `dst` must address `n` writable elements on this buffer's device, not overlapping it.
+    pub unsafe fn copy_to_raw(&self, s: &Stream<S>, off: usize, dst: *mut c_void, n: usize) -> Result<()> {
+        bounds("copy_to_raw", off.saturating_add(n), self.len)?;
+        copy(s, dst, self.ptr.add(off) as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D")
+    }
     /// Device-to-device copy of `n` elements from `src` at `src_off` to this buffer at `off`.
     pub fn copy_from_at(&mut self, s: &Stream<S>, off: usize, src: &DBuf<'_, S, T>, src_off: usize, n: usize) -> Result<()> {
         bounds("copy_from_at (dst)", off.saturating_add(n), self.len)?;

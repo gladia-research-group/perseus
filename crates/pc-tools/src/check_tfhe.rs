@@ -875,7 +875,7 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
     let pa = PcmmArgs { n: n as i32, p: [p0 as u32, p1 as u32, p0 as u32, 0], mu: [mu(p0), mu(p1), mu(p0), 0], c: [ni0 as u32, ni1 as u32, ni0 as u32, 0, 0, 0, 0, 0], ..Default::default() };
     let dev = Device::open()?;
-    let bytes = 4 * (6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + n_valid * (nb + 1) + n_valid) + pc_gpu::tfhe::DevRepack::bytes(n, nb, rp_lv) + (64 << 20);
+    let bytes = 4 * (6 * n + 2 * 3 * n + rs_lv * n + rs_lv * 2 * n + 2 * n + n_valid * 2 * (n_sub + 1) + n_valid * (nb + 1) + n_valid) + pc_gpu::tfhe::DevRepack::bytes(n, nb, rp_lv, n_valid) + (64 << 20);
     let arena = pc_cuda::Arena::new(&dev, bytes)?;
     let st = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let inst = pc_kernels::table::Instance::U32Barrett64;
@@ -936,7 +936,7 @@ fn run_bridge(args: &[String]) -> Res<bool> {
     let outv: Vec<u32> = outs.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let d_outs = up("tfhe.outs", &outv)?;
     let blt = pc_cuda::blas::Lt::new(&dev)?;
-    let mut drep = pc_gpu::tfhe::DevRepack::new(&arena, &st, &sw)?;
+    let mut drep = pc_gpu::tfhe::DevRepack::new(&arena, &st, &sw, n_valid)?;
     let tg = Instant::now();
     drep.run(table, &st, &blt.inner, d_outs.vptr(), d_idx.vptr(), n_valid, &pa, d_twf.vptr(), d_twi.vptr())?;
     st.sync()?;
@@ -2370,3 +2370,262 @@ fn run_tree(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
+/// `pc-check tfhe-hybrid [--t 16,64,256] [--lookups 64,1024,16384,32768] [--reps 5]`: a batch of L table lookups on
+/// native LWEs through CKKS FBS, end to end on the device, against the native PBS on the same L: the indices j in
+/// [-t/2, t/2) as native LWEs (value 2 j / t), `native_store` (repack into the StC-first split: the phase lands at
+/// the FBS table's input phase j q0 / 2t), the FBS finish (ModRaise, CtS, the EvalMod sine + the table's series:
+/// `StcFirstRoute::run_fbs`, real payload), the StC-first input half of its output, `native_extract` (ring switch,
+/// extraction, key switch) back to LWEs under s_lwe (a bootstrap's input, as the native lookup's own key switch
+/// leaves them), decrypted against the table. The native lookup: `native_pbs` (key switch + PBS) of the same L LWEs.
+/// Every hybrid output must decode to its entry.
+pub fn cmd_hybrid(args: &[String]) -> ExitCode {
+    match run_hybrid(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-hybrid: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A fixed pseudo-random table on j in [-t/2, t/2): values on a grid of 1/16 in [-1/2, 1/2].
+fn hyb_lut(t: u32, j: i64) -> f64 {
+    let h = (t / 2) as i64;
+    let mut z = ((j + h) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^= z >> 29;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 32;
+    (z % 17) as f64 / 16.0 - 0.5
+}
+
+fn run_hybrid(args: &[String]) -> Res<bool> {
+    use pc_core::keys::DiscreteGaussian;
+    use pc_tfhe::lwe::Lwe;
+    use std::ffi::c_void;
+    let list = |k: &str, d: &str| -> Res<Vec<usize>> { Ok(arg(args, k).unwrap_or_else(|| d.into()).split(',').map(|x| x.trim().parse()).collect::<std::result::Result<_, _>>()?) };
+    let ts_ = list("--t", "16,64,256")?;
+    let looks = list("--lookups", "64,1024,16384,32768")?;
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(5).max(1);
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let slots = n / 2;
+    let lmax = *looks.iter().max().ok_or("--lookups")?;
+    if lmax > slots {
+        return Err(format!("--lookups: at most {slots} (one real-payload ciphertext)").into());
+    }
+    let tmax = *ts_.iter().max().ok_or("--t")?;
+    let cf: u32 = 2;
+    let mut setup = BtsSetup::n32_shipped();
+    setup.raise_drops = vec![0];
+    setup.k_max = 1;
+    setup.real = true;
+    let mut sf = StcFirstSetup::n32_shipped();
+    sf.cache_slots = 2;
+    let plan = StcFirstPlan::new(&chain, &setup, &sf)?;
+    let mut geoms = Vec::new();
+    for v in &plan.dense.variants {
+        geoms.extend(v.cts.iter().chain(&v.stc).map(|h| h.geom));
+    }
+    geoms.extend(plan.input.iter().map(|h| h.geom));
+    geoms.extend(plan.sources.iter().flatten().map(|s| s.geom));
+    let steps: BTreeSet<i64> = crate::bts_stc_first::rot_steps(&geoms, n);
+    let spec = KeySetSpec { relin: true, conj: true, rots: steps.iter().map(|&s| RotSpec { step: s, q_top: None }).collect(), encaps: true, lean: None };
+    // one FBS per table size: the shipped EvalMod (sine) and the degree-t series of the table (message j at phase
+    // j q0 / 2t, CF log2 2t: the series' coefficients x 2^-CF)
+    let base = BtsSetup::n32_shipped();
+    let specs: Vec<pc_gpu::bts::stc_first::FbsSpec> = ts_
+        .iter()
+        .map(|&t| {
+            let fcf = (2 * t as u32).trailing_zeros();
+            let post = fbs_series(t as u32, (fcf as f64).exp2().recip());
+            pc_gpu::bts::stc_first::FbsSpec { table: base.evalmod_coeffs.clone(), k: base.boot_k, da_its: base.evalmod_da_its, amp: 1.0, post, table_s: vec![], off: 0.0, post_s: vec![], paired: false, drop: 0, complex: false, real: true }
+        })
+        .collect();
+    let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
+    let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
+    let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
+    let lay = mp.lay;
+    let shapes: Vec<_> = spec.keys(&chain)?.into_iter().map(|(_, s)| s).collect();
+    mp.reserve("keys", spec.bytes::<W>(&chain, KskLayout::Dense)?);
+    mp.reserve("keygen", KeyGen::<W>::bytes(&lay, &shapes));
+    mp.reserve("secret", DevSecret::<W>::bytes(&lay));
+    mp.reserve("encrypt", Encryptor::<W>::bytes(&lay, false));
+    mp.reserve("decrypt", Decryptor::<W>::bytes(&lay, chain.level_unit, 1));
+    mp.reserve("ks.plans", KsPlans::bytes::<W>(&chain, 1)?);
+    mp.reserve("ks.regen_a", pc_gpu::ks::KsWork::<W>::regen_bytes(&lay, chain.dnum()));
+    let ocfg = OpsCfg::default();
+    Ops::<W>::reserve(&mut mp, &ocfg);
+    let (req, mut wshape) = plan.mem::<W>()?;
+    req.reserve(&mut mp);
+    let hosts: Vec<_> = specs.iter().map(|sp| plan.fbs_host(sp)).collect::<std::result::Result<_, _>>()?;
+    for h in &hosts {
+        let (b, w) = plan.fbs_mem::<W>(h)?;
+        mp.reserve("bts.fbs", b);
+        wshape = wshape.max(w);
+    }
+    mp.reserve("bts.work", BtsWork::<W>::bytes(&lay, wshape));
+    mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&lay, 1)));
+    let mut params = switch_params(args, n)?;
+    params.chain = true;
+    let nb = params.n_br;
+    let row = nb + 1;
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, lmax));
+    mp.reserve("check.hyb", 4 * (3 * lmax * row + lmax + 4 * params.tv_len()) + (1 << 20));
+    let arena = mp.allocate(&dev)?;
+    let mut ex = Executor::<W>::new(&dev, &arena, &mp)?;
+    ex.ks.carve_regen(&arena, &lay)?;
+    let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
+    let kplans = KsPlans::new(&arena, &ex.compute, &ctx, 1)?;
+    let mut ops = Ops::new(&arena, &dev, &ex.compute, &ctx, ocfg)?;
+    let mut work = BtsWork::<W>::new(&arena, lay, wshape)?;
+    let mut keys = KeySet::<W>::carve(&arena, &chain, &spec, KskLayout::Dense)?;
+    let mut prng = test_prng(0x4b1);
+    let sk = SecretKey::sample(&mut prng, n)?;
+    let mut sec = DevSecret::<W>::carve(&arena, lay)?;
+    sec.load(&ctx, &ex.compute, &sk)?;
+    let mut kg = KeyGen::<W>::new(&arena, &ex.compute, &chain, &shapes)?;
+    kg.generate_set(&ctx, &mut ex, &sec, &mut keys, &mut prng)?;
+    let mut encr = Encryptor::<W>::new(&arena, &ex.compute, lay, false, &mut prng)?;
+    let route = plan.build(&arena, &dev, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs())?;
+    let fbs: Vec<_> = hosts.iter().map(|h| route.build_fbs(&arena, &ex.compute, &ctx, &keys, ex.ks.stage_ptrs(), h)).collect::<std::result::Result<_, _>>()?;
+    let mut y = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
+    let mut z = Ct::new(CtMeta::new(0, 1), CtBuf::<pc_cuda::Compute, W>::new(&arena, "check.cts", lay, 1)?);
+    let sv: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let (sw, s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
+    let nl = params.n_lwe;
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, &ex.compute, &sw, lmax)?;
+    let al = |w: usize| arena.alloc::<pc_cuda::Compute, u32>("check.hyb", w);
+    let mut d_in = al(lmax * row)?;
+    let d_out = al(lmax * row)?;
+    let d_nat = al(lmax * row)?;
+    let mut d_pos = al(lmax)?;
+    let mut d_tv = al(4 * params.tv_len())?;
+    arena.freeze();
+    let sh = Shadow::new(ShadowConfig { chain: ctx.shape, bts: BtsConfig::n32_shipped(), quirks: Quirks::none() }, Some(Arc::new(ctx.scale.clone())));
+    let enc = Encoder::new(&chain);
+    let nq = ctx.shape.n_q;
+    let tl = sw.params.tv_len();
+    // tables: 0 the load's identity (slot value m -> native m), 1 a native LUT for the PBS timing
+    let tvs: Vec<u32> = [pc_tfhe::chain::native_tv(tl, sw.params.q_br, |m| m), pc_tfhe::chain::native_tv(tl, sw.params.q_br, |m| (4.0 * m).round() / 8.0)]
+        .iter()
+        .flat_map(|t| pc_gpu::tfhe::tv_residues(&sw.bsk, t))
+        .collect();
+    d_tv.upload(&ex.compute, &tvs)?;
+    let tvp = |k: usize| (d_tv.vptr() as *const u32).wrapping_add(k * 2 * tl) as *const c_void;
+    let enc_v = |v: f64| ((v * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64;
+    let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
+    // the hybrid's outputs: LWEs under s_lwe (n_lwe + 1 words), the slot value m at phase m p0 / 4
+    let decrypt = |w: &[u32], cnt: usize| -> Vec<f64> {
+        (0..cnt).map(|r| {
+            let l = Lwe { a: w[r * (nl + 1)..r * (nl + 1) + nl].iter().map(|&x| x as u64).collect(), b: w[r * (nl + 1) + nl] as u64 };
+            centered(l.phase(&s_lwe, p0), p0) as f64 * 4.0 / p0 as f64
+        }).collect()
+    };
+    let bits = (slots as u32).trailing_zeros();
+    let coef_of = |i: usize| ((i + slots - 1) % slots).reverse_bits() >> (usize::BITS - bits);
+    let pos: Vec<u32> = (0..lmax).map(|i| coef_of(i * (slots / lmax)) as u32).collect();
+    d_pos.upload(&ex.compute, &pos)?;
+    // a split to start from (its content is replaced by the store): a fresh ciphertext through the input half
+    let level = 44u32;
+    let top = (nq - 1 - level) as usize;
+    let sf_ = ctx.scale.sf(top as i32)?;
+    let mut meta = CtMeta::new(level, 1).with_nf(sf_);
+    meta.slots = slots as u32;
+    let zeros = vec![Complex::new(0.0, 0.0); slots];
+    let msg = enc.encode_slots(&zeros, slots, top, Payload::Complex, sf_)?;
+    let mut t = Tally::default();
+    let r_in = Route { cf: Some(cf), stc_first: true, real: false, ..Route::dense() };
+    for (ti, &tt) in ts_.iter().enumerate() {
+        let fcf = (2 * tt as u32).trailing_zeros();
+        let r_fbs = Route { cf: Some(fcf), stc_first: true, real: true, ..Route::dense() };
+        for &ll in &looks {
+            let h = (tt / 2) as i64;
+            let mut rng = test_prng(0x77 + (tt * 131 + ll) as u32);
+            let js: Vec<i64> = (0..ll).map(|_| rng.uniform_below(tt as u64) as i64 - h).collect();
+            // the indices as native LWEs: value 2 j / t (phase j p0 / 2t) lands at the split's phase j q0 / 2t
+            let w: Vec<u32> = js.iter().flat_map(|&j| {
+                let l = Lwe::encrypt(enc_v(2.0 * j as f64 / tt as f64), &s_br, p0, &dg, &mut rng);
+                l.a.into_iter().chain(std::iter::once(l.b)).map(|x| x as u32).collect::<Vec<_>>()
+            }).collect();
+            d_in.upload_at(&ex.compute, 0, &w)?;
+            let (mut tot, mut st_store, mut st_fbs, mut st_in, mut st_load, mut tnat) = (Vec::new(), 0f64, 0f64, 0f64, 0f64, Vec::new());
+            for rep in 0..reps + 1 {
+                encr.encrypt_sk(&ctx, &ex.compute, &sec, &[msg.clone()], meta, &mut y, &mut prng)?;
+                let mut cx = BtsCx { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work };
+                let mut call = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r_fbs, CallOpts { prescaled: false, own_cf: true })?;
+                call.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("input below the StC-first entry")?;
+                cx.ex.compute.sync()?;
+                let mut mark = Vec::new();
+                let t0 = Instant::now();
+                ts.native_store(&ctx, &cx.ex.compute, &blt.inner, d_in.vptr(), d_pos.vptr(), ll, 1, &mut y)?;
+                cx.ex.compute.sync()?;
+                mark.push(t0.elapsed().as_secs_f64());
+                route.run_fbs(&mut cx, &call.st, std::slice::from_mut(&mut y), &fbs[ti])?;
+                cx.ex.compute.sync()?;
+                mark.push(t0.elapsed().as_secs_f64());
+                let mut back = BtsCall::begin(StagedRef::StcFirst(&route), &cx, std::slice::from_ref(&y), &r_in, CallOpts { prescaled: false, own_cf: true })?;
+                back.stc_first_input(&mut cx, std::slice::from_mut(&mut y))?.ok_or("FBS output below the StC-first entry")?;
+                cx.ex.compute.sync()?;
+                mark.push(t0.elapsed().as_secs_f64());
+                ts.native_extract(&ctx, &cx.ex.compute, &blt.inner, &mut y, d_pos.vptr(), ll, d_out.vptr() as *mut c_void, false)?;
+                cx.ex.compute.sync()?;
+                mark.push(t0.elapsed().as_secs_f64());
+                // the native lookup of the same L LWEs
+                let t1 = Instant::now();
+                ts.native_pbs(&ctx, &cx.ex.compute, &blt.inner, d_in.vptr(), ll, tvp(1), &[0], &[d_nat.vptr() as *mut c_void])?;
+                cx.ex.compute.sync()?;
+                let tn = t1.elapsed().as_secs_f64();
+                if rep > 0 {
+                    tot.push(mark[3]);
+                    tnat.push(tn);
+                    st_store += mark[0] / reps as f64;
+                    st_fbs += (mark[1] - mark[0]) / reps as f64;
+                    st_in += (mark[2] - mark[1]) / reps as f64;
+                    st_load += (mark[3] - mark[2]) / reps as f64;
+                }
+                let _ = &mut z;
+            }
+            let got = decrypt(&d_out.download_range(&ex.compute, 0, ll * (nl + 1))?, ll);
+            let (mut wrong, mut dev) = (0usize, 0f64);
+            for (k, &j) in js.iter().enumerate() {
+                let want = hyb_lut(tt as u32, j);
+                let e = got[k] - want;
+                dev = dev.max(e.abs());
+                wrong += (e.abs() >= 1.0 / 32.0) as usize;
+            }
+            t.add(&format!("tfhe-hybrid: t {tt}, {ll} lookups, every output its entry (|err| < 1/32)"), wrong, ll);
+            tot.sort_by(f64::total_cmp);
+            tnat.sort_by(f64::total_cmp);
+            let (th, tn) = (tot[tot.len() / 2], tnat[tnat.len() / 2]);
+            println!(
+                "[pc-check] tfhe-hybrid: t {tt}, {ll} lookups: hybrid {:.2} ms (store {:.2}, FBS {:.2}, input half {:.2}, to LWE + key switch {:.2}) vs native key switch + PBS {:.2} ms: {:.2}x; {:.0} vs {:.0} lookups/s; max output err {dev:.2e} (entries 1/16 apart)",
+                th * 1e3, st_store * 1e3, st_fbs * 1e3, st_in * 1e3, st_load * 1e3, tn * 1e3, tn / th, ll as f64 / th, ll as f64 / tn
+            );
+        }
+        let _ = tmax;
+    }
+    println!("[pc-check] tfhe-hybrid: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
+
+/// Chebyshev coefficients (c0 not halved) of the degree-t interpolant of `hyb_lut` on s_j = sin(pi j / t), times `gain`
+/// (`pc-bench fbs`'s `fbs_post`).
+fn fbs_series(t: u32, gain: f64) -> Vec<f64> {
+    let n = t as usize;
+    let h = (t / 2) as i64;
+    let mut c = vec![0f64; n + 1];
+    for (deg, ck) in c.iter_mut().enumerate() {
+        let mut acc = 0.0;
+        for k in 0..=n {
+            let w = if k == 0 || k == n { 0.5 } else { 1.0 };
+            let j = h - k as i64;
+            acc += w * hyb_lut(t, j.min(h - 1)) * (std::f64::consts::PI * (deg * k) as f64 / n as f64).cos();
+        }
+        *ck = 2.0 / n as f64 * acc * gain;
+    }
+    c[n] *= 0.5;
+    c
+}
