@@ -931,10 +931,21 @@ impl<'a> TfheSwitch<'a> {
         self.native_lin_c(ctx, s, dst, src_a, src_b, idx, b, ca, cb, 0)
     }
 
-    /// `native_lin` + the constant `c` (< p0) on every output's b (a native value v is round(v p0 / 4)).
+    /// `native_lin` + the constant `c` (< p0) on every output's b (a native value v is round(v p0 / 4)). Launches of
+    /// at most 65535 rows (the kernel's grid y): a longer lin runs in chunks (outputs and index pairs advanced).
     #[allow(clippy::too_many_arguments)]
     pub fn native_lin_c<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, dst: *mut c_void, src_a: *const c_void, src_b: *const c_void, idx: *const c_void, b: usize, ca: u64, cb: u64, c: u64) -> Result<()> {
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::LWE_LIN, count: b as i32, i1: self.nb as i32, x: dst, y: src_a, z: src_b, w: idx, q: self.p0, c: [ca, cb, c, 0, 0, 0, 0, 0], ..Default::default() })
+        const MAX_ROWS: usize = 65535;
+        let row = self.nb + 1;
+        let mut r0 = 0;
+        while r0 < b {
+            let cnt = (b - r0).min(MAX_ROWS);
+            let x = (dst as *mut u32).wrapping_add(r0 * row) as *mut c_void;
+            let w = (idx as *const i32).wrapping_add(2 * r0) as *const c_void;
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::LWE_LIN, count: cnt as i32, i1: self.nb as i32, x, y: src_a, z: src_b, w, q: self.p0, c: [ca, cb, c, 0, 0, 0, 0, 0], ..Default::default() })?;
+            r0 += cnt;
+        }
+        Ok(())
     }
 
     /// p0 (the native LWEs' modulus).

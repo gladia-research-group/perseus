@@ -2078,6 +2078,229 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
+/// `pc-check tfhe-prog --cases FILE [--reps 7] [--lat-group 5] [--nu 1]`: native TFHE programs (perseus impl/tfhe.py
+/// `Prog` JSON, as `python -m perseus.impl.tfhe_bitwise --cases FILE` writes them with their test words) on the device's
+/// native ops: the loaded values (what the program's load leaves: native LWEs (s_br, p0) at value v) encrypted, every
+/// lin (`TfheSwitch::native_lin_c`) and pbs (`native_pbs`: key switch s_br -> s_lwe and the PBS) run as the session
+/// runs them, the store's table as one more pbs (a warp table's values read as native ones), the stored rows decrypted
+/// against the case's exact rows. Latency (device, synced, median of `--reps`): the program up to the store (the op;
+/// in a session the store's lookup rides the finish) and with it; the store outputs' noise (rms off the exact value).
+pub fn cmd_prog(args: &[String]) -> ExitCode {
+    match run_prog(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-prog: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_prog(args: &[String]) -> Res<bool> {
+    use pc_core::keys::DiscreteGaussian;
+    use pc_tfhe::lwe::Lwe;
+    use serde_json::Value;
+    use std::ffi::c_void;
+    let path = arg(args, "--cases").ok_or("--cases FILE")?;
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(7).max(1);
+    let cases: Vec<Value> = std::fs::read_to_string(&path)?.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<std::result::Result<_, _>>()?;
+    if cases.is_empty() {
+        return Err("no cases".into());
+    }
+    let u = |v: &Value, k: &str| -> Res<usize> { Ok(v.get(k).and_then(Value::as_u64).ok_or_else(|| format!("case without {k}"))? as usize) };
+    let mut rows = 0usize;
+    let (mut nbuf, mut nidx, mut ntab) = (0usize, 0usize, 0usize);
+    for c in &cases {
+        rows = rows.max(u(c, "rows")?);
+        nbuf = nbuf.max(u(c, "bufs")? + 1);
+        let pr = &c["prog"];
+        let steps = pr["steps"].as_array().ok_or("prog without steps")?;
+        nidx = nidx.max(steps.iter().filter_map(|st| st.get("idx").and_then(Value::as_array)).map(|a| a.len()).sum());
+        ntab = ntab.max(pr["luts"].as_object().map_or(0, |o| o.values().map(|l| l["tables"].as_array().map_or(0, |t| t.len())).sum()));
+    }
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let mut params = switch_params(args, n)?;
+    params.chain = true;
+    let (nb, nu) = (params.n_br, params.nu);
+    let row = nb + 1;
+    let tvl = params.tv_len();
+    let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
+    let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
+    let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
+    // the switch's capacity: one pass of at most 32768 LWEs (a longer pbs runs in passes: the kernels' grid y)
+    let cap = rows.min(1 << 15);
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, cap));
+    mp.reserve("prog", 4 * (nbuf * rows * row + nidx + ntab * 2 * tvl) + (8 << 20));
+    let arena = mp.allocate(&dev)?;
+    let ex = Executor::<W>::new(&dev, &arena, &mp)?;
+    let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
+    let s = &ex.compute;
+    let mut prng = test_prng(0xb7);
+    let sk = SecretKey::sample(&mut prng, n)?;
+    let sv: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let tk = Instant::now();
+    let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
+    println!("[pc-check] tfhe-prog: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}); {} cases, {nbuf} buffers of {rows} rows", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, cases.len());
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, cap)?;
+    let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..nbuf).map(|_| arena.alloc::<pc_cuda::Compute, u32>("prog", rows * row)).collect::<std::result::Result<_, _>>()?;
+    let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("prog", nidx.max(2))?;
+    let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("prog", ntab.max(1) * 2 * tvl)?;
+    arena.freeze();
+    let modp = |x: i64| x.rem_euclid(p0 as i64) as u64;
+    let enc_v = |v: f64| modp((v * p0 as f64 / 4.0).round() as i64);
+    let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
+    let decrypt = |w: &[u32], cnt: usize| -> Vec<f64> {
+        (0..cnt).map(|r| {
+            let l = Lwe { a: w[r * row..r * row + nb].iter().map(|&x| x as u64).collect(), b: w[r * row + nb] as u64 };
+            centered(l.phase(&s_br, p0), p0) as f64 * 4.0 / p0 as f64
+        }).collect()
+    };
+    #[derive(Clone, Copy)]
+    enum St {
+        Lin(usize, usize, usize, usize, usize, u64, u64, u64),
+        Pbs(usize, usize, usize, usize),
+    }
+    let mut t = Tally::default();
+    let lt_ = &blt.inner;
+    for c in &cases {
+        let name = c["name"].as_str().unwrap_or("?").to_string();
+        let pr = &c["prog"];
+        // the tables: native values on the grid of tvl points (v at phase v q / 4, the upper half negated)
+        let q = params.q_br;
+        let mut tab_ix: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut tvw: Vec<u32> = Vec::new();
+        for (ln, l) in pr["luts"].as_object().ok_or("luts")? {
+            let tables = l["tables"].as_array().ok_or("tables")?;
+            if tables.len() != 1 {
+                return Err(format!("{name}: lut {ln}: {} interleaved tables (one is supported here)", tables.len()).into());
+            }
+            let vals: Vec<f64> = tables[0].as_array().ok_or("table")?.iter().map(|x| x.as_f64().unwrap_or(f64::NAN)).collect();
+            if vals.len() != tvl || vals.iter().any(|x| !x.is_finite() || x.abs() > 2.0) {
+                return Err(format!("{name}: lut {ln}: {} points (want {tvl}), |v| <= 2", vals.len()).into());
+            }
+            let tv: Vec<u64> = vals.iter().enumerate().map(|(j, &x)| {
+                let y = (q as f64 * x / 4.0).round() as i64;
+                (if j < tvl / 2 { y } else { -y }).rem_euclid(q as i64) as u64
+            }).collect();
+            tab_ix.insert(ln.clone(), tvw.len() / (2 * tvl));
+            tvw.extend(sw.bsk.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)));
+        }
+        d_tv.upload(s, &tvw)?;
+        let tvp = |k: usize| (d_tv.vptr() as *const u32).wrapping_add(k * 2 * tvl) as *const c_void;
+        let steps = pr["steps"].as_array().ok_or("steps")?;
+        let mut prog: Vec<St> = Vec::new();
+        let (mut load_dst, mut store) = (None, None);
+        let mut idx_off = 0usize;
+        let (mut npbs, mut launches) = (0usize, 0usize);
+        for st in steps {
+            let b = |k: &str| -> Res<usize> { u(st, k) };
+            match st["op"].as_str().unwrap_or("") {
+                "load" => load_dst = Some(st["dst"].as_u64().ok_or("load: one buffer")? as usize),
+                "lin" => {
+                    let idx: Vec<i64> = st["idx"].as_array().ok_or("idx")?.iter().map(|x| x.as_i64().unwrap_or(-2)).collect();
+                    let r = idx.len() / 2;
+                    if idx.iter().any(|&i| i < -1 || i >= rows as i64) {
+                        return Err(format!("{name}: lin index outside the buffers").into());
+                    }
+                    let w: Vec<u32> = idx.iter().map(|&i| i as i32 as u32).collect();
+                    d_idx.upload_at(s, idx_off, &w)?;
+                    let cf = st["c"].as_f64().unwrap_or(0.0);
+                    prog.push(St::Lin(b("dst")?, b("a")?, b("b")?, idx_off, r, modp(st["ca"].as_i64().unwrap_or(0)), modp(st["cb"].as_i64().unwrap_or(0)), enc_v(cf)));
+                    idx_off += w.len();
+                }
+                "pbs" => {
+                    let dst = st["dst"].as_array().ok_or("pbs dst")?;
+                    if dst.len() != 1 {
+                        return Err(format!("{name}: pbs with {} outputs", dst.len()).into());
+                    }
+                    let lut = st["lut"].as_str().ok_or("lut")?;
+                    let r = b("rows")?;
+                    prog.push(St::Pbs(b("src")?, r, tab_ix[lut], dst[0].as_u64().ok_or("dst")? as usize));
+                    npbs += r;
+                    launches += 1;
+                }
+                "store" => store = Some((b("src")?, b("rows")?, st["lut"].as_str().map(|l| tab_ix[l]))),
+                o => return Err(format!("{name}: step {o}").into()),
+            }
+        }
+        let (Some(ld), Some((ssrc, srows, slut))) = (load_dst, store) else { return Err(format!("{name}: a program loads and stores").into()) };
+        let m_in: Vec<f64> = c["m_in"].as_array().ok_or("m_in")?.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
+        let mut rng = test_prng(0x9e0);
+        let enc: Vec<u32> = m_in.iter().flat_map(|&v| {
+            let l = Lwe::encrypt(enc_v(v), &s_br, p0, &dg, &mut rng);
+            l.a.into_iter().chain(std::iter::once(l.b)).map(|x| x as u32).collect::<Vec<_>>()
+        }).collect();
+        let scratch = nbuf - 1;
+        let bp = |b: &pc_cuda::DBuf<'_, pc_cuda::Compute, u32>| b.vptr() as *mut c_void;
+        let ptrs: Vec<*mut c_void> = bufs.iter().map(bp).collect();
+        let idxp = |off: usize| (d_idx.vptr() as *const u32).wrapping_add(off) as *const c_void;
+        let mut go = |bufs: &mut Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>>| -> Res<(f64, f64)> {
+            bufs[ld].upload_at(s, 0, &enc)?;
+            s.sync()?;
+            let td = Instant::now();
+            for st in &prog {
+                match *st {
+                    St::Lin(d, a, b2, off, r, ca, cb, cc) => ts.native_lin_c(&ctx, s, ptrs[d], ptrs[a], ptrs[b2], idxp(off), r, ca, cb, cc)?,
+                    St::Pbs(src, r, k, d) => ts.native_pbs(&ctx, s, lt_, ptrs[src], r, tvp(k), &[0], &[ptrs[d]])?,
+                }
+            }
+            s.sync()?;
+            let body = td.elapsed().as_secs_f64();
+            if let Some(k) = slut {
+                ts.native_pbs(&ctx, s, lt_, ptrs[ssrc], srows, tvp(k), &[0], &[ptrs[scratch]])?;
+            }
+            s.sync()?;
+            Ok((body, td.elapsed().as_secs_f64()))
+        };
+        go(&mut bufs)?;
+        let mut tm: Vec<(f64, f64)> = (0..reps).map(|_| go(&mut bufs)).collect::<Res<_>>()?;
+        let med = |v: &mut Vec<f64>| -> f64 { v.sort_by(f64::total_cmp); v[v.len() / 2] };
+        let body = med(&mut tm.iter().map(|x| x.0).collect());
+        let total = med(&mut tm.iter().map(|x| x.1).collect());
+        tm.clear();
+        let ob = if slut.is_some() { scratch } else { ssrc };
+        let got = decrypt(&bufs[ob].download_range(s, 0, srows * row)?, srows);
+        let want: Vec<i64> = c["want"].as_array().ok_or("want")?.iter().map(|x| x.as_i64().unwrap_or(-1)).collect();
+        let scale = c["scale"].as_f64().unwrap_or(1.0);
+        let words = u(c, "words")?;
+        let ndig = u(c, "ndig")?;
+        let nfl = u(c, "nflag")?;
+        let (mut wrong_w, mut wrong_r, mut ss) = (vec![false; words], 0usize, 0f64);
+        for (r, &w) in want.iter().enumerate() {
+            let x = got[r] * scale;
+            let mut v = x.round() as i64;
+            if r < words * ndig {
+                v = v.rem_euclid(4);
+            }
+            ss += (x - x.round()) * (x - x.round()) / (scale * scale);
+            if v != w {
+                wrong_r += 1;
+                let word = if r < words * ndig { r / ndig.max(1) } else { (r - words * ndig) % words.max(1) };
+                wrong_w[word.min(words - 1)] = true;
+            }
+        }
+        let _ = nfl;
+        let wrong = wrong_w.iter().filter(|&&x| x).count();
+        t.add(&format!("tfhe-prog: {name}, exact (rows wrong {wrong_r})"), wrong, words);
+        let an = &c["analysis"];
+        println!(
+            "[pc-check] tfhe-prog: {name}: op {:.3} ms, with the store {:.3} ms (median of {reps}); {} rounds, {launches} launches, {npbs} PBS; {:.0} words/s; store output noise rms {:.2e}; p_fail (model) 2^{:.1} / lookup, 2^{:.1} / op",
+            body * 1e3,
+            total * 1e3,
+            an["rounds"].as_u64().unwrap_or(0),
+            words as f64 / body.max(1e-9),
+            (ss / want.len().max(1) as f64).sqrt(),
+            an["log2_pfail_lookup"].as_f64().unwrap_or(f64::NAN),
+            an["log2_pfail_op"].as_f64().unwrap_or(f64::NAN)
+        );
+    }
+    println!("[pc-check] tfhe-prog: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
+
 /// `pc-check tfhe-tree [--entries 16,64,256,1024,4096] [--lookups 1,16] [--reps 5] [--lat-group 5]`: encrypted
 /// lookup tables of t > 8 entries as a selection tree of private lookups (`TfheSwitch::native_pack` /
 /// `native_plut_each`): the index as base-8 digits (native LWEs at table_index(d, B)), the table's entries (native

@@ -1,6 +1,8 @@
 """Chained-lookup integer arithmetic (impl/intops.py) on the device: 16 / 32-bit add, compare, mux and xor in radix-4
 digits as planned FBS chains on n32 (examples/mathlib `intop` task: capture -> dense plan -> planned Program), no
-plain refresh between lookups, every output rounding to the exact result, p_fail per lookup < 2^-128.
+plain refresh between lookups, every output rounding to the exact result, p_fail per lookup < 2^-128; a subset of the
+other integer ops (sub with flags, signed compare, shifts by public / encrypted amounts, multiply) on both CKKS layouts
+and as native TFHE programs.
 
     tools/gpu.sh out/intops.log .venv/bin/python -m pytest -m gpu python/tests/gpu/test_intops.py -q -s
 """
@@ -27,6 +29,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
     ["op=xor", "bits=16", "r=4", "table=k28d1"],
     ["op=add", "bits=32", "layout=tfhe", "words=16"],     # the native TFHE bitwise ops (impl/tfhe_bitwise.py)
     ["op=cmp", "bits=32", "layout=tfhe", "words=16"],
+    # the other integer / bitwise ops: a word's digits in one ciphertext (WordOps), a digit per ciphertext (IntOps),
+    # native TFHE programs; edge words (0, -1, MIN, MAX), equal words, a + b = -1, shift amounts 0 .. 2 w
+    ["op=subf", "bits=16", "r=2", "table=k28d1", "layout=slots"],
+    ["op=slt", "bits=32", "r=2", "table=k28d1", "layout=slots"],
+    ["op=sarv", "bits=16", "r=2", "table=k28d1", "layout=slots"],
+    ["op=mul", "bits=16", "r=2", "table=k28d1", "layout=slots"],
+    ["op=sar5", "bits=16", "r=2", "table=k28d1", "layout=cts"],
+    ["op=subf", "bits=32", "layout=tfhe", "words=16"],
+    ["op=shlv", "bits=16", "layout=tfhe", "words=16"],
+    ["op=mul", "bits=8", "layout=tfhe", "words=16"],
 ])
 def test_planned_intop(tmp_path, sets):
     out = str(tmp_path / "rows.jsonl")
