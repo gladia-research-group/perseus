@@ -1465,13 +1465,14 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
         return build_sine_paired(st, input, ps, double_angle_its);
     }
     if ps.trig.is_some() {
-        // PC_FBS_TRIG_EXP=1 (experiments): the exponential form (`build_trig_exp`, ~10 % faster real, ~15 % complex,
-        // same landing and RMS) in place of the paired double angles. Off by default: it turns the imaginary part
-        // of its input and of its own rescales into an amplitude error, which the variance model does not carry
-        // (measured: the slot nearest the root 1 of every ciphertext, up to 20x the paired form's error)
+        // the exponential form (`build_trig_exp`: one series, one product per double angle, one conjugation; the
+        // same landing and RMS, 6..15 % faster real, 10..17 % complex) in place of the paired double angles; it reads
+        // an imaginary error of its input as an amplitude / phase error, so its key switches run over the exact
+        // ModDown (pc-gpu `EvalModPlan::md_exact`: the fast one's bias sat on slot 0 of every ciphertext, 1.25e-4 vs
+        // 8.4e-6 on GELU [-24.6, 24.6] complex). PC_FBS_TRIG_EXP=0: the paired double angles.
         let exps: &[bool] = match std::env::var("PC_FBS_TRIG_EXP").as_deref() {
-            Ok("1") => &[true],
-            _ => &[false],
+            Ok("0") => &[false],
+            _ => &[true],
         };
         return build_trig_opts(st, input, ps, double_angle_its, lean, exps);
     }

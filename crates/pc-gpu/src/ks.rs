@@ -1456,6 +1456,42 @@ pub fn moddown_conv<W: DevWord, M: DevStrategy<W>>(
     Ok(())
 }
 
+/// The ModDown conversion of level `top` (jobs `[c < k_max][part]`, as the level plan's) over the exact conversion:
+/// its [x]_P lift centred. The fast conversion leaves u P, u in [0, |P|), behind: after the division a bias of every
+/// coefficient, which the canonical embedding gathers on the slots nearest the root 1 (slot 0 and its conjugate).
+pub(crate) fn moddown_exact_specs(chain: &Chain, lay: &Layout, top: usize, k_max: usize) -> Vec<JobSpec> {
+    let mut v = level_specs(chain, lay, top, k_max, None).moddown;
+    for j in &mut v {
+        j.exact = true;
+    }
+    v
+}
+
+/// `moddown_conv` with `plan` (`moddown_exact_specs` of the same level and k_max) for the level's own conversion.
+#[allow(clippy::too_many_arguments)]
+pub fn moddown_conv_with<W: DevWord, M: DevStrategy<W>>(
+    ctx: &Context<'_, W, M>,
+    s: &Stream<Compute>,
+    plans: &KsPlans<'_>,
+    plan: &BconvPlan<'_>,
+    x: &mut CtBuf<'_, Compute, W>,
+    conv: &mut CtBuf<'_, Compute, W>,
+    k: usize,
+    top: usize,
+) -> Result<()> {
+    plans.check_k(k)?;
+    check_cts(x, 0, k, "ks moddown")?;
+    check_cts(conv, 0, k, "ks moddown")?;
+    let lv = plans.level(top)?;
+    if lv.kp != ctx.lay.kp {
+        return Err(shape("ks moddown", format!("an exact conversion over all {} special primes at a level over {}", ctx.lay.kp, lv.kp)));
+    }
+    md_intt(ctx, s, plans, lv, x, k, None)?;
+    plan.run_prefix(ctx, s, &x.buf, 0, &mut conv.buf, 0, 2 * k)?;
+    ntt::transform_k(ctx, s, Dir::Forward, conv, Span::Q { top }, Parts::Both, k)?;
+    Ok(())
+}
+
 /// `moddown_conv`, then `s` waits for `join` (a forked Q-row dot the caller's epilogue reads).
 #[allow(clippy::too_many_arguments)]
 pub fn moddown_conv_j<W: DevWord, M: DevStrategy<W>>(

@@ -384,8 +384,37 @@ pub struct EvalModPlan<'a, W: DevWord> {
     levelks: BTreeMap<usize, LevelKs<'a, W>>,
     wmulti: BTreeMap<usize, Vec<ScalarPair<'a, W>>>,
     rfold_k: BTreeMap<usize, usize>,
+    /// The exponential form's key switches outside `RelinRescale` (the conjugations, the relinearizations at tops
+    /// without a fused rescale) by top: the exact ModDown conversion (`ks::moddown_exact_specs`). The fast one's bias
+    /// sits on slot 0 of every ciphertext, which z = a e^(i th) turns into an amplitude / phase error (measured: GELU
+    /// [-24.6, 24.6] complex 1.25e-4 -> 8.4e-6; +1.1 ms). Every other program: none (unchanged).
+    md_exact: BTreeMap<usize, crate::bconv::BconvPlan<'a>>,
     bytes: usize,
     nq: usize,
+}
+
+/// The tops of a program's key switches that run `ks::moddown_conv` (conjugations: the complex entry and every
+/// `ConjSplit`; relinearizations: every product's top).
+fn md_tops(ops: &[EmOp], mode: EmMode, input: FMeta) -> std::collections::BTreeSet<usize> {
+    let mut t = std::collections::BTreeSet::new();
+    if mode == EmMode::Complex {
+        t.insert(input.top as usize);
+    }
+    for op in ops {
+        match op {
+            EmOp::ConjSplit { n, .. } | EmOp::Mult { n, .. } | EmOp::MultAcc { n, .. } => {
+                t.insert(n - 1);
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
+/// The exponential form of a trigonometric FBS (a `ConjSplit` in the program) runs its key switches over the exact
+/// ModDown; every other program (plain tables, the sine and paired forms) keeps the fast one, unchanged.
+fn exact_md_program(ops: &[EmOp]) -> bool {
+    ops.iter().any(|o| matches!(o, EmOp::ConjSplit { .. }))
 }
 
 /// NTT of X^power on every Q prime (rows = prime id).
@@ -875,6 +904,21 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
 
     /// Device bytes `new` carves for this program (constants, rescale plans, monomials, keys; the fused regen-relin
     /// epilogue's tables: a dense seeded relinearization key, which the LT stages require anyway).
+    /// Device bytes of `md_exact` (the exponential form's exact ModDown conversions; 0 for every other program), the
+    /// complex mode's (a bound for the real one).
+    pub fn md_exact_bytes(chain: &pc_core::params::Chain, st: &pc_core::scale::ScaleTables, lay: &Layout, input: FMeta, ps: &PsPlan, da_its: u32, kk_max: usize) -> Result<usize> {
+        let (prog, _, _) = Self::program(st, input, ps, da_its)?;
+        if !exact_md_program(&prog.ops) {
+            return Ok(0);
+        }
+        let primes = chain.primes();
+        let mut b = 0;
+        for top in md_tops(&prog.ops, EmMode::Complex, input) {
+            b += crate::bconv::BconvPlan::bytes::<W>(&primes, &crate::ks::moddown_exact_specs(chain, lay, top, kk_max))?;
+        }
+        Ok(b)
+    }
+
     pub fn table_bytes(st: &pc_core::scale::ScaleTables, lay: &Layout, input: FMeta, ps: &PsPlan, da_its: u32, kk_max: usize) -> Result<usize> {
         let (prog, _, _) = Self::program(st, input, ps, da_its)?;
         let np = lay.rows();
@@ -1091,10 +1135,27 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             levelks,
             wmulti,
             rfold_k,
+            md_exact: BTreeMap::new(),
             bytes: 0,
             nq,
         };
+        let mut plan = plan;
+        if exact_md_program(&plan.ops) {
+            for top in md_tops(&plan.ops, mode, input) {
+                let specs = crate::ks::moddown_exact_specs(&ctx.chain, &lay, top, kk_max);
+                plan.md_exact.insert(top, crate::bconv::BconvPlan::new::<Compute, W>(arena, s, &primes, &specs)?);
+            }
+        }
         Ok(EvalModPlan { bytes: arena.used_bytes() - used0, ..plan })
+    }
+
+    /// `ks::moddown_conv`, over the exact conversion where the program has one for `top` (`md_exact`).
+    #[allow(clippy::too_many_arguments)]
+    fn moddown_conv<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, plans: &crate::ks::KsPlans<'_>, x: &mut CtBuf<'_, Compute, W>, conv: &mut CtBuf<'_, Compute, W>, k: usize, top: usize) -> Result<()> {
+        match self.md_exact.get(&top) {
+            Some(p) => ks::moddown_conv_with(ctx, s, plans, p, x, conv, k, top),
+            None => ks::moddown_conv(ctx, s, plans, x, conv, k, top),
+        }
     }
 
     fn rescale_plan<M: DevStrategy<W>>(arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, top: usize, kk_max: usize) -> Result<RescalePlan<'a, W>> {
@@ -1237,7 +1298,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, k, top_in, DotRows::All, io, staged)?;
             // the ModDown's last step is fused into x +- conj(x) below (md_epilogue_to)
-            ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top_in)?;
+            self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, k, top_in)?;
         }
         let s = &cx.ex.compute;
         let xv = View::of(x, 0);
@@ -1540,7 +1601,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.conj, 0, ndig, true)?;
             }
             ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.conj, 0, 1, kk, top, DotRows::All, io, staged)?;
-            ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+            self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
         }
         let s = &cx.ex.compute;
         let xv = View::of(&cx.work.em[x], 0);
@@ -1838,7 +1899,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                 let ndig = cx.ks.ndig(top)?;
                 ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.relin, 0, ndig, false)?;
                 ks::dot_regen(ctx, &ex.compute, cx.ks, &ex.ks, &self.relin, kk, top, DotRows::P, io, None)?;
-                ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+                self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
                 if let Some(re) = &self.regen_epi {
                     // Q rows straight into dst = f(dst + (dot - conv) P^-1) with the program's x2 / + constant
                     let rows = re.rows.get(&top).ok_or_else(|| shape("evalmod relin", format!("no row table for top {top}")))?;
@@ -1916,7 +1977,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
                     ks::stage_key(ctx, &ex.compute, cx.ks, &mut ex.ks, &self.relin, 0, ndig, true)?;
                 }
                 ks::dot(ctx, &ex.compute, cx.ks, &ex.ks, &self.relin, 0, 1, kk, top, DotRows::All, io, staged)?;
-                ks::moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
+                self.moddown_conv(ctx, &ex.compute, cx.ks, &mut ex.ks.ext, &mut ex.ks.conv, kk, top)?;
                 let a = MdEpiArgs {
                     dst: dstv.r(),
                     x: ext.r(),

@@ -1673,7 +1673,7 @@ impl StcFirstPlan {
         let lay = Layout::from_chain(&self.dense.chain);
         let st = ScaleTables::precompute(&self.dense.chain)?;
         let k_max = self.dense.setup.k_max;
-        let em = EvalModPlan::<W>::table_bytes(&st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)?;
+        let em = EvalModPlan::<W>::table_bytes(&st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)? + EvalModPlan::<W>::md_exact_bytes(&self.dense.chain, &st, &lay, h.em_in, &h.ps, h.spec.da_its, k_max)?;
         let b = RaisePlan::<W>::table_bytes() + em * (h.spec.complex as usize + h.spec.real as usize);
         let mode = if h.spec.complex { EmMode::Complex } else { EmMode::Real };
         let (n, kk) = super::evalmod::em_work(h.em_slots, k_max, mode);
