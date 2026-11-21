@@ -655,6 +655,7 @@ class Plut(Task):
     t: int = 16
     b: int = 256
     k: int = 1                    # k tables interleaved in one accumulator: k outputs from one rotation
+    tree: int = 0                 # 1: a selection tree (impl/tfhe.py tree_steps): any t (a power of two), digits base 8
     seed: int = 0
     name = "plut"
     tfhe = True
@@ -662,7 +663,9 @@ class Plut(Task):
     def __post_init__(self):
         import os
         from perseus.impl import tfhe
-        self.t, self.b, self.k = int(self.t), int(self.b), int(self.k)
+        self.t, self.b, self.k, self.tree = int(self.t), int(self.b), int(self.k), int(self.tree)
+        if self.tree:
+            return self._tree_init()
         kt = self.k * self.t
         if self.k not in (1, 2):
             raise ValueError("plut: k = 1 or 2 interleaved tables")
@@ -687,16 +690,46 @@ class Plut(Task):
         pr.store(2, self.k * self.b, "out", f"plut.out.{self.k * self.b}")
         self.prog = tfhe.register_prog(pr)
 
+    def _tree_init(self):
+        import os
+        from perseus.impl import tfhe
+        L = len(tfhe.tree_digits(self.t))
+        n_in = self.t + self.b * L
+        rows = max(n_in, self.b * max(1, self.t // 8))
+        os.environ.setdefault("PC_TFHE_NATIVE", f"4,{rows}")
+        os.environ.setdefault("PC_TFHE_PACK", str(self.b * max(1, self.t // 8)))
+        rng = np.random.default_rng(self.seed)
+        self.table = rng.integers(-8, 8, (1, self.t)) / 8.0
+        self.idx = rng.integers(0, self.t, self.b)
+        self.idx[:min(self.t, self.b)] = np.arange(min(self.t, self.b))
+        self.n_in = n_in
+        tfhe.register_slots(f"plut.in.{n_in}", np.arange(n_in))
+        tfhe.register_slots(f"plut.out.{self.b}", np.arange(self.b))
+        pr = tfhe.Prog(f"plut.tree.t{self.t}.b{self.b}", 4)
+        pr.lut("id", lambda m: m)
+        pr.lut("out", lambda m: m, warp=True)
+        pr.load("id", 0)
+        pr.lin(1, 0, 0, [(self.t + r, -1) for r in range(self.b * L)])      # the digits from row 0 of buffer 1
+        # buffers: 0 the table (rows 0..t-1), 1 the digits, 2 the copied digits, 3 / 0 the levels' outputs (the table
+        # is read only at level 0)
+        res = tfhe.tree_steps(pr, 0, self.t, 1, self.b, 2, 3, 0)
+        pr.store(res, self.b, "out", f"plut.out.{self.b}")
+        self.prog = tfhe.register_prog(pr)
+
     def encode(self):
         from perseus.impl import tfhe
         x = np.zeros(SLOTS)
+        if self.tree:
+            x[:self.t] = self.table.reshape(-1)
+            x[self.t:self.n_in] = tfhe.tree_index(self.idx, self.t).reshape(-1)
+            return [x]
         x[:self.k * self.t] = self.table.reshape(-1)
         x[self.k * self.t:self.k * self.t + self.b] = tfhe.table_index(self.idx, self.t)
         return [x]
 
     def run(self, ops, xs):
         from perseus.impl import tfhe
-        y = tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"plut.in.{self.k * self.t + self.b}")
+        y = tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"plut.in.{self.n_in}" if self.tree else f"plut.in.{self.k * self.t + self.b}")
         return [y]
 
     def outputs(self, vals):

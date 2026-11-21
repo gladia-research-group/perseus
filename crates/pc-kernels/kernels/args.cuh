@@ -961,6 +961,19 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                i0 = rows per block (<= 4096)
 //   PACK_FIN     y = PACK_MAC's sums, z = Bacc, tw = u64 [2 prime][ipsi n | Shoup n], c[2 + 2 p] = n^-1 mod q_p, its
 //                Shoup -> x = u32 [2 part][2 prime][n]: INTT, + Bacc on part 0 (PBS_INIT's encrypted accumulator)
+//   The packing by rows (a placement whose rows are few: D_r = sum_e d_(e, r) P_e(X), P_e = sum of the row's
+//   placements w X^pos, so sum_r NTT(D_r) K_r = sum_e NTT(P_e) (sum_r d_(e, r) K_r): no NTT per key row):
+//   PACK_RBASIS  y = int32 P [count][n] (the rows' placement polynomials), tw = u64 [2 prime][psi n | Shoup n], c[6]
+//                -> x = u64 [count][2 prime][n] = NTT(P_e mod q_p)
+//   PACK_RDIG    y = u32 LWEs [..][i1 + 1] mod c[0] under the binary key, z = int32 [count] (the LWE of row m) ->
+//                x = int32 [count][i1 levels] the gadget digits of lift(a_i) (as PACK_DIGITS), w = u64 [count]
+//                lift(b) (mod Q = c[1])
+//   PACK_RMAC    y = PACK_RDIG's digits, z = the packing key [i1 levels][2 prime][2 part][n] (i1 levels = c[4]) -> x =
+//                u64 V [count][2 prime][2 part][n] += sum_r d_(m, r) K_r mod q_p (atomic; the caller zeroes); i0 =
+//                key rows per block (<= 512)
+//   PACK_RFIN    y = V, z = NTT(P) [i0][2 prime][n], w = PACK_RDIG's bodies, tws = int32 P [i0][n]; count = the
+//                accumulators (row m = a i0 + e) -> x = u32 [count][2 part][2 prime][n]: INTT(sum_e NTT(P_e) V_(a, e)),
+//                + sum_e lift(b_(a, e)) P_e on part 0; c[2..6) n^-1 and Shoups, c[6]
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
 //                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
 // The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
@@ -1001,6 +1014,10 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_PACK_DIGITS 21
 #define PC_TFHE_PACK_MAC 22
 #define PC_TFHE_PACK_FIN 23
+#define PC_TFHE_PACK_RBASIS 24
+#define PC_TFHE_PACK_RDIG 25
+#define PC_TFHE_PACK_RMAC 26
+#define PC_TFHE_PACK_RFIN 27
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

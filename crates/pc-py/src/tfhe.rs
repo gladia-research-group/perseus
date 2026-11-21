@@ -77,7 +77,7 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
     }
     // PC_TFHE_LAT_GROUP=5: the latency key (Params::lat_group)
     if let Ok(v) = std::env::var("PC_TFHE_LAT_GROUP") {
-        p.lat_group = v.trim().parse().ok().filter(|&g| g == 0 || (2..=5).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP={v}: 2..=5 dividing n_lwe {}", p.n_lwe)))?;
+        p.lat_group = v.trim().parse().ok().filter(|&g| g == 0 || (2..=7).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP={v}: 2..=7 dividing n_lwe {}", p.n_lwe)))?;
     }
     // PC_TFHE_LWE=n,log2: another LWE key (Params::with_lwe; 990,-21 the precise set)
     if let Ok(v) = std::env::var("PC_TFHE_LWE") {
@@ -98,6 +98,11 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
             "2" => 2,
             _ => return Err(PyValueError::new_err(format!("PC_TFHE_NU={v}: 1 or 2"))),
         };
+    }
+    // native programs default to the latency key (their lookups run in small rounds: the latency path), where the
+    // latency path takes it (nu 1, one gadget level); PC_TFHE_LAT_GROUP=0 turns it off
+    if p.chain && std::env::var("PC_TFHE_LAT_GROUP").is_err() && p.nu == 1 && p.pbs.1 == 1 && p.n_lwe % 5 == 0 {
+        p.lat_group = 5;
     }
     Ok(p)
 }
@@ -128,8 +133,11 @@ enum Step {
     /// at `place` in the index buffer, then `count` weights (`weighted`)
     Pack { src: usize, rows: usize, place: usize, count: usize, weighted: bool, acc: usize },
     /// the private lookup: `rows` index LWEs of `src` rotate accumulator `acc`; output j (coefficient j, k of them)
-    /// into dst[j]
-    Plut { src: usize, rows: usize, acc: usize, dst: Vec<usize> },
+    /// into dst[j]; `each`: row r rotates accumulator acc + r (one output)
+    Plut { src: usize, rows: usize, acc: usize, dst: Vec<usize>, each: bool },
+    /// the packing by rows (a t-entry table per accumulator, t = 2, 4, 8): per chunk (first accumulator, count, first
+    /// row, rows, offset of its row map rebased to the first row in the index buffer) <= one switch pass of rows
+    PackRows { src: usize, t: usize, acc: usize, chunks: Vec<(usize, usize, usize, usize, usize)> },
 }
 
 /// What the session's MemPlan reserves: the switch (`max` values per pass), the tables, one ciphertext.
@@ -147,6 +155,7 @@ impl TfhePlan {
             mp.reserve("tfhe.native", 4 * ((b + 1) * r * (p.n_br + 1) + MAX_IDX) + 512);
             if p.pack {
                 mp.reserve("tfhe.accs", 4 * pack_slots() * 4 * p.n_br + 256);
+                mp.reserve("tfhe.prows", 4 * 3 * 8 * p.n_br + 8 * 3 * 8 * 2 * p.n_br + 512);
             }
         }
         Ok(())
@@ -176,6 +185,9 @@ pub(crate) struct TfheRt {
     idx_used: usize,
     /// PC_TFHE_PACK: the encrypted accumulators [slots][2 part][2 prime][n_br]
     accs: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
+    /// the packing by rows' table placements P_e (impl/tfhe.py table_place(t), t = 2, 4, 8 at (log2 t - 1) 8 rows:
+    /// int32 [8][n_br]) and their NTTs (u64 [8][2 prime][n_br])
+    prows: Option<(pc_cuda::DBuf<'static, pc_cuda::Compute, u32>, pc_cuda::DBuf<'static, pc_cuda::Compute, u64>)>,
     n: usize,
     pub calls: u64,
     pub values: u64,
@@ -214,7 +226,29 @@ impl TfheRt {
             true => Some(arena.alloc::<pc_cuda::Compute, u32>("tfhe.accs", pack_slots() * 4 * params.n_br).map_err(|x| e(x.into()))?),
             false => None,
         };
-        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, accs, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
+        let prows = match params.pack {
+            true => {
+                let nb = params.n_br;
+                let mut pr = arena.alloc::<pc_cuda::Compute, u32>("tfhe.prows", 3 * 8 * nb).map_err(|x| e(x.into()))?;
+                let ph = arena.alloc::<pc_cuda::Compute, u64>("tfhe.prows", 3 * 8 * 2 * nb).map_err(|x| e(x.into()))?;
+                for lb in 1..=3usize {
+                    let t = 1usize << lb;
+                    let mut w = vec![0u32; t * nb];
+                    for c in 0..nb {
+                        let m = if c < nb / 2 { 2.0 * c as f64 / nb as f64 } else { 2.0 * (c as f64 - nb as f64) / nb as f64 };
+                        let i = (((m + 1.0) * t as f64 / 2.0).floor() as usize).min(t - 1);
+                        w[i * nb + c] = if c < nb / 2 { 1 } else { (-1i32) as u32 };
+                    }
+                    pr.upload_at(st, (lb - 1) * 8 * nb, &w).map_err(|x| e(x.into()))?;
+                    let pp = (pr.vptr() as *const u32).wrapping_add((lb - 1) * 8 * nb) as *const std::ffi::c_void;
+                    let hp = (ph.vptr() as *mut u64).wrapping_add((lb - 1) * 8 * 2 * nb) as *mut std::ffi::c_void;
+                    sw.native_pack_basis(ctx, st, pp, t, hp).map_err(e)?;
+                }
+                Some((pr, ph))
+            }
+            false => None,
+        };
+        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, accs, prows, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
     }
 
     /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / g (j < g / 2) and 2 (j - g) / g (j >= g / 2)
@@ -501,14 +535,60 @@ impl TfheRt {
                 }
                 "plut" => {
                     let acc = st.get("acc").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                    if self.accs.is_none() || acc >= pack_slots() {
-                        return Err(bad(format!("plut: accumulator {acc} (PC_TFHE_PACK=slots: {})", pack_slots())));
+                    let each = st.get("each").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let r = nrows(st)?;
+                    if self.accs.is_none() || acc + if each { r } else { 1 } > pack_slots() {
+                        return Err(bad(format!("plut: accumulator {acc}{} (PC_TFHE_PACK=slots: {})", if each { format!(" + {r}") } else { String::new() }, pack_slots())));
                     }
                     let dst: Vec<usize> = st.get("dst").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|y| y.as_u64().map(|z| z as usize)).collect()).unwrap_or_default();
-                    if dst.is_empty() || dst.iter().any(|&b| b >= bufs) || (2 * self.params.n_br) % dst.len() != 0 {
+                    if dst.is_empty() || dst.iter().any(|&b| b >= bufs) || (2 * self.params.n_br) % dst.len() != 0 || (each && dst.len() != 1) {
                         return Err(bad(format!("plut: {} outputs", dst.len())));
                     }
-                    Step::Plut { src: buf(st, "src")?, rows: nrows(st)?, acc, dst }
+                    Step::Plut { src: buf(st, "src")?, rows: r, acc, dst, each }
+                }
+                "packr" => {
+                    let r = nrows(st)?;
+                    let t = st.get("t").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    let acc = st.get("acc").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    let map: Vec<i64> = serde_json::from_value(st.get("map").cloned().unwrap_or_default()).map_err(|y| bad(y.to_string()))?;
+                    if self.prows.is_none() {
+                        return Err(bad("packr: the session has no packing key (PC_TFHE_PACK=slots)".into()));
+                    }
+                    if !matches!(t, 2 | 4 | 8) || map.is_empty() || map.len() % t != 0 || map.iter().any(|&v| v < 0 || v >= r as i64) {
+                        return Err(bad(format!("packr: t {t} (2, 4, 8), a row map of t rows < {r} per accumulator")));
+                    }
+                    let count = map.len() / t;
+                    if acc + count > pack_slots() {
+                        return Err(bad(format!("packr: accumulators {acc} + {count} (the session holds {})", pack_slots())));
+                    }
+                    // chunks of accumulators whose rows span at most one switch pass (the key switch's capacity)
+                    let cap = self.sw.max();
+                    let mut chunks = Vec::new();
+                    let mut a0 = 0usize;
+                    while a0 < count {
+                        let (mut lo, mut hi, mut a1) = (i64::MAX, i64::MIN, a0);
+                        while a1 < count {
+                            let g = &map[a1 * t..(a1 + 1) * t];
+                            let (l2, h2) = (lo.min(*g.iter().min().unwrap()), hi.max(*g.iter().max().unwrap()));
+                            if (h2 - l2 + 1) as usize > cap {
+                                break;
+                            }
+                            (lo, hi, a1) = (l2, h2, a1 + 1);
+                        }
+                        if a1 == a0 {
+                            return Err(bad(format!("packr: one accumulator's rows span more than one switch pass ({cap})")));
+                        }
+                        let words: Vec<u32> = map[a0 * t..a1 * t].iter().map(|&v| (v - lo) as u32).collect();
+                        if self.idx_used + words.len() > MAX_IDX {
+                            return Err(bad(format!("the session holds {MAX_IDX} index words")));
+                        }
+                        let ib = self.nat_idx.as_mut().unwrap();
+                        ib.upload_at(s, self.idx_used, &words).map_err(|x| crate::session::gerr(x.into()))?;
+                        chunks.push((a0, a1 - a0, lo as usize, (hi - lo + 1) as usize, self.idx_used));
+                        self.idx_used += words.len();
+                        a0 = a1;
+                    }
+                    Step::PackRows { src: buf(st, "src")?, t, acc, chunks }
                 }
                 o => return Err(bad(format!("step {o:?}"))),
             });
@@ -568,10 +648,26 @@ impl TfheRt {
                     let out = (self.accs.as_ref().unwrap().vptr() as *mut u32).wrapping_add(acc * 4 * self.params.n_br) as *mut c_void;
                     self.sw.native_pack(ctx, st, ltr, bp(*src), *r, pl, w, *count, out)?;
                 }
-                Step::Plut { src, rows: r, acc, dst } => {
+                Step::Plut { src, rows: r, acc, dst, each } => {
                     let a = (self.accs.as_ref().unwrap().vptr() as *const u32).wrapping_add(acc * 4 * self.params.n_br) as *const c_void;
                     let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
-                    self.sw.native_plut(ctx, st, ltr, bp(*src), *r, a, &vec![0; dst.len()], &dsts)?;
+                    if *each {
+                        self.sw.native_plut_each(ctx, st, ltr, bp(*src), *r, a, &[0], &dsts)?;
+                    } else {
+                        self.sw.native_plut(ctx, st, ltr, bp(*src), *r, a, &vec![0; dst.len()], &dsts)?;
+                    }
+                }
+                Step::PackRows { src, t, acc, chunks } => {
+                    let nb = self.params.n_br;
+                    let (pr, ph) = self.prows.as_ref().unwrap();
+                    let lb = t.trailing_zeros() as usize;
+                    let pp = (pr.vptr() as *const u32).wrapping_add((lb - 1) * 8 * nb) as *const c_void;
+                    let hp = (ph.vptr() as *const u64).wrapping_add((lb - 1) * 8 * 2 * nb) as *const c_void;
+                    for &(a0, count, lo, n, off) in chunks {
+                        let out = (self.accs.as_ref().unwrap().vptr() as *mut u32).wrapping_add((acc + a0) * 4 * nb) as *mut c_void;
+                        let sp = (bp(*src) as *const u32).wrapping_add(lo * row) as *const c_void;
+                        self.sw.native_pack_rows(ctx, st, ltr, sp, n, idx.wrapping_add(off) as *const c_void, count, *t, pp, hp, out)?;
+                    }
                 }
             }
         }
