@@ -531,22 +531,17 @@ class IntOp(Task):
         self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
         if self.layout == "tfhe":
             import os
-            from perseus.impl import tfhe, tfhe_bitwise
+            from perseus.impl import tfhe, tfhe_bitwise as T
             self.tfhe = True
             self.words = int(self.words)
             nd = self.bits // 2
-            self.a, self.b, self.sel = self.a[:self.words], self.b[:self.words], self.sel[:self.words]
-            self.b[:max(1, self.words // 4)] = self.a[:max(1, self.words // 4)]
-            wp = tfhe_bitwise.WordProg(f"bitwise.{self.op}{self.bits}.w{self.words}", self.words, nd)
-            os.environ.setdefault("PC_TFHE_NATIVE", f"5,{wp.rows_in(True)}")
-            rows_out = self.words if self.op == "cmp" else wp.R
-            tfhe.register_slots(f"bitwise.in.{wp.rows_in(True)}", np.arange(wp.rows_in(True)))
-            tfhe.register_slots(f"bitwise.out.{rows_out}", np.arange(rows_out))
-            out = f"bitwise.out.{rows_out}"
-            if self.op in ("and", "or", "xor"):
-                wp.bitwise(self.op, out)
-            else:
-                {"add": wp.add, "cmp": wp.cmp, "mux": wp.mux, "id": wp.ident}[self.op](out)
+            self.a, self.b, self.sel = T.inputs(self.words, self.bits, self.seed, self.op)
+            name = f"bitwise.{self.op}{self.bits}.w{self.words}"
+            wp = T.build(self.op, name, self.words, nd)
+            rin = wp.rows_in(True)
+            os.environ.setdefault("PC_TFHE_NATIVE", f"{max(5, wp.pr.bufs)},{T.rows_needed(wp.pr, rin)}")
+            tfhe.register_slots(f"bitwise.in.{rin}", np.arange(rin))
+            tfhe.register_slots(name + ".out", np.arange(wp.out_rows))
             self.wp, self.prog = wp, tfhe.register_prog(wp.pr)
             return
         if self.layout == "slots":
@@ -565,8 +560,7 @@ class IntOp(Task):
         if self.layout == "tfhe":
             from perseus.impl import tfhe_bitwise
             nd, x = self.bits // 2, np.zeros(SLOTS)
-            v = np.concatenate([tfhe_bitwise.encode_digits(self.a, nd), tfhe_bitwise.encode_digits(self.b, nd),
-                                (6.0 * self.sel - 3.0) / 4.0])
+            v = tfhe_bitwise.slot_values(self.a, self.b, self.sel, nd)
             x[:len(v)] = v
             return [x]
         if self.layout == "slots":
@@ -622,18 +616,25 @@ class IntOp(Task):
         from perseus.impl import intops, fbs
         d = out["d"]
         if self.layout == "tfhe":
+            from perseus.impl import tfhe_bitwise as T
             nd, y = self.bits // 2, np.real(d[0])
-            if self.op == "cmp":
-                got = np.round(y[:self.words]).astype(np.int64)
-                dev = float(np.abs(y[:self.words] - got).max())
+            want, ndig, nfl, w = T.want_rows(self.op, self.a, self.b, self.sel, nd)
+            sc = T.out_layout(self.op, nd)[2]
+            n = len(want)
+            got = T.decode_rows(self.op, y[:n], nd, self.words)
+            bad = got != want
+            # a word is wrong when any of its rows is (digits [word][digit], then the flag rows [flag][word])
+            wbad = np.zeros(self.words, dtype=bool)
+            if ndig:
+                wbad |= bad[:self.words * ndig].reshape(self.words, ndig).any(1)
+                for f in range(nfl):
+                    wbad |= bad[self.words * ndig + f * self.words:self.words * ndig + (f + 1) * self.words]
             else:
-                q = np.clip(np.round(y[:self.words * nd] * 4), 0, 3).astype(np.int64).reshape(self.words, nd)
-                got = (q << (2 * np.arange(nd))).sum(1)
-                dev = float(np.abs(y[:self.words * nd] * 4 - np.round(y[:self.words * nd] * 4)).max())
-            import os
-            nu2 = os.environ.get("PC_TFHE_NU", "1") == "2"      # pc-check tfhe-bitwise's model: 8 / 16 bins at nu 1 / 2
-            lp = (-261.7 if nu2 else -81.9) if self.op in ("and", "or", "xor") else (-1034.1 if nu2 else -317.3)
-            return {"wrong": int(np.sum(got != self.ref())), "max_dev": dev, "log2_pfail_lookup_ct": lp}
+                wbad |= bad[:self.words]
+            dev = float(np.abs(y[:n] * sc - np.round(y[:n] * sc)).max())
+            an = T.analyze(self.wp.pr, T.load_values(T.slot_values(self.a, self.b, self.sel, nd)))
+            return {"wrong": int(wbad.sum()), "max_dev": dev, "log2_pfail_lookup_ct": an["log2_pfail_lookup"],
+                    "log2_pfail_op": an["log2_pfail_op"], "rounds": an["rounds"], "pbs": an["pbs"]}
         if self.layout == "slots":
             n = self.bits // self.r
             got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
