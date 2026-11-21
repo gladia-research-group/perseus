@@ -1240,6 +1240,11 @@ class StreamedPlannedRun:
         self.classes, self.class_of = [], {}
         keyidx, by_hash = {}, {}
         seen, self.n_pts, self.pt_new = None, 0, 0
+        # fixed states (a cache filled before the first token and only read: an encoder-decoder's cross-attention) are
+        # no units: every token passes the given ciphertexts in (`give_kv`); set before the recording (a class closed
+        # while recording, `_close_class`, reads them)
+        fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
+        self.fixed = {b: set(fixed_keys(b)) for b in range(self.n)}
         for t in range(len(rows)):
             if t in self.records:
                 continue
@@ -1273,9 +1278,8 @@ class StreamedPlannedRun:
             if c.get("closed"):
                 self._reload_ref(keyidx[key], c)
             c["diffs"][t] = {}
-            fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
             for b in ref:
-                sc, kk, z = diff_block(ref[b], rec[b], set(fixed_keys(b)) if b < self.n else ())
+                sc, kk, z = diff_block(ref[b], rec[b], self.fixed.get(b, ()))
                 if z:
                     raise RuntimeError(f"token {t} block {b}: an empty-cache push in a streamed run (the caches start "
                                        f"from the prefix)")
@@ -1290,10 +1294,6 @@ class StreamedPlannedRun:
                      f"{fresh} new plaintexts")
         self.record_s = time.time() - t0
         n = self.n
-        # fixed states (a cache filled before the first token and only read: an encoder-decoder's cross-attention) are
-        # no units: every token passes the given ciphertexts in (`give_kv`)
-        fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
-        self.fixed = {b: set(fixed_keys(b)) for b in range(n)}
         # K/V units: block b's cache keys (suffixes) over every recorded token, one unit each
         suffixes = set()
         for rec in self.records.values():
