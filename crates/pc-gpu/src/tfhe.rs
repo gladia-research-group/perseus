@@ -142,7 +142,17 @@ pub struct DevPack<'a> {
     acc: DBuf<'a, Compute, u64>,
     /// rows per PACK_MAC block
     rpb: usize,
+    /// the packing by rows (PACK_RDIG / RMAC / RFIN): up to `rmax` rows per pass, their digits, sums, bodies
+    rmax: usize,
+    rdig: Option<DBuf<'a, Compute, i32>>,
+    rv: Option<DBuf<'a, Compute, u64>>,
+    rb: Option<DBuf<'a, Compute, u64>>,
 }
+
+/// Rows per pass of the switch's packing by rows (`TfheSwitch::native_pack_rows`).
+const PACK_RMAX: usize = 256;
+/// Key rows per PACK_RMAC block.
+const RMAC_ROWS: usize = 160;
 
 fn shoup64(w: u64, q: u64) -> u64 {
     (((w as u128) << 64) / q as u128) as u64
@@ -154,7 +164,17 @@ impl<'a> DevPack<'a> {
         4 * nl * lv * 4 * n + 8 * 8 * n + 4 * (nl * lv * n + 4 * n) + 8 * 4 * n + (1 << 16)
     }
 
+    /// `bytes` with the packing by rows for `rmax` rows per pass.
+    pub fn bytes_rows(n: usize, nl: usize, lv: usize, rmax: usize) -> usize {
+        Self::bytes(n, nl, lv) + if rmax > 0 { 4 * rmax * nl * lv + 8 * rmax * 4 * n + 8 * rmax + (3 << 8) } else { 0 }
+    }
+
     pub fn new(arena: &'a Arena, s: &Stream<Compute>, pk: &pc_tfhe::pack::PackingKey) -> Result<Self> {
+        Self::with_rows(arena, s, pk, 0)
+    }
+
+    /// `new` with the packing by rows (`pack_rows`) for up to `rmax` rows per pass.
+    pub fn with_rows(arena: &'a Arena, s: &Stream<Compute>, pk: &pc_tfhe::pack::PackingKey, rmax: usize) -> Result<Self> {
         let rns = &pk.rns;
         let n = rns.n();
         let (nl, lv) = (pk.keys().len(), pk.gadget.levels);
@@ -199,7 +219,48 @@ impl<'a> DevPack<'a> {
             acc: arena.alloc("tfhe.pack", 4 * n)?,
             // ~2 blocks per SM over the two primes
             rpb: rows.div_ceil(160).max(1),
+            rmax,
+            rdig: if rmax > 0 { Some(arena.alloc("tfhe.pack", rmax * rows)?) } else { None },
+            rv: if rmax > 0 { Some(arena.alloc("tfhe.pack", rmax * 4 * n)?) } else { None },
+            rb: if rmax > 0 { Some(arena.alloc("tfhe.pack", rmax)?) } else { None },
         })
+    }
+
+    /// The NTT of `e` placement polynomials `p` int32 [e][n] into `phat` u64 [e][2 prime][n] (`pack_rows`' basis).
+    pub fn basis(&self, table: &KernelTable, s: &Stream<Compute>, p: *const c_void, e: usize, phat: *mut c_void) -> Result<()> {
+        let a = TfheArgs { op: tfhe_op::PACK_RBASIS, n: self.n as i32, count: e as i32, x: phat, y: p, tw: self.tw_f.vptr(), c: [0, 0, 0, 0, 0, 0, self.qab, 0], ..Default::default() };
+        // SAFETY: the caller's device arrays of the stated lengths, this packing's tables
+        launch_result("tfhe", unsafe { (table.tfhe)(&a, s.raw()) })?;
+        Ok(())
+    }
+
+    /// The packing by rows: `count` accumulators, accumulator a = sum_e LWE(rowmap[a e_n + e]) P_e(X) (P = `p` int32
+    /// [e_n][n], `phat` its `basis`) into `out` u32 [count][2 part][2 prime][n]; `lwes` u32 [..][n_lwe + 1] mod
+    /// `q_in` under s_lwe, `rowmap` int32 [count e_n]. Bit-exact with `pack` on the placements of P (the key rows'
+    /// NTTs replaced by e_n NTT products: few rows, any number of accumulators per pass of `rmax` rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_rows(&mut self, table: &KernelTable, s: &Stream<Compute>, lwes: *const c_void, rowmap: *const c_void, count: usize, e_n: usize, p: *const c_void, phat: *const c_void, q_in: u64, out: *mut c_void) -> Result<()> {
+        if self.rmax < e_n || e_n == 0 {
+            return Err(shape("tfhe pack", format!("pack_rows: {e_n} rows per accumulator, room for {}", self.rmax)));
+        }
+        let (n, rows) = (self.n, self.nl * self.lv);
+        let per = self.rmax / e_n;
+        let (rdig, rv, rb) = (self.rdig.as_mut().unwrap(), self.rv.as_mut().unwrap(), self.rb.as_mut().unwrap());
+        for a0 in (0..count).step_by(per) {
+            let ac = per.min(count - a0);
+            let m = ac * e_n;
+            let rm = (rowmap as *const i32).wrapping_add(a0 * e_n) as *const c_void;
+            let dig = TfheArgs { op: tfhe_op::PACK_RDIG, n: n as i32, count: m as i32, i1: self.nl as i32, x: rdig.vptr_mut(), y: lwes, z: rm, w: rb.vptr(), m: self.m, c: [q_in, self.big_q, self.bl as u64, self.lv as u64, 0, 0, self.qab, 0], ..Default::default() };
+            rv.zero_range(s, 0, m * 4 * n)?;
+            let mac = TfheArgs { op: tfhe_op::PACK_RMAC, n: n as i32, count: m as i32, i0: RMAC_ROWS as i32, x: rv.vptr_mut(), y: rdig.vptr(), z: self.key.vptr(), c: [0, 0, 0, 0, rows as u64, 0, self.qab, 0], ..Default::default() };
+            let o = (out as *mut u32).wrapping_add(a0 * 4 * n) as *mut c_void;
+            let fin = TfheArgs { op: tfhe_op::PACK_RFIN, n: n as i32, count: ac as i32, i0: e_n as i32, x: o, y: rv.vptr(), z: phat, w: rb.vptr(), tw: self.tw_i.vptr(), tws: p, c: [0, 0, self.ninv[0], self.ninv[1], self.ninv[2], self.ninv[3], self.qab, 0], ..Default::default() };
+            for a in [&dig, &mac, &fin] {
+                // SAFETY: this packing's buffers (rmax rows) and the caller's device arrays of the stated lengths
+                launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?;
+            }
+        }
+        Ok(())
     }
 
     /// Start a packing (zero the digits and sums).
@@ -523,7 +584,7 @@ impl<'a> TfheSwitch<'a> {
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb * p.nu + 2 * nb * p.nu
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
         let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
-        let pack = if p.pack { DevPack::bytes(nb, nl, pc_tfhe::pack::PACK_GADGET.1) } else { 0 };
+        let pack = if p.pack { DevPack::bytes_rows(nb, nl, pc_tfhe::pack::PACK_GADGET.1, PACK_RMAX) } else { 0 };
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1) + pack + (1 << 20)
     }
 
@@ -572,7 +633,7 @@ impl<'a> TfheSwitch<'a> {
             cksk,
             sinks: Vec::new(),
             pack: match &sw.pack {
-                Some(pk) => Some(DevPack::new(arena, s, pk)?),
+                Some(pk) => Some(DevPack::with_rows(arena, s, pk, PACK_RMAX)?),
                 None => None,
             },
             bsk: up32("tfhe.bsk", &img.bsk)?,
@@ -873,6 +934,16 @@ impl<'a> TfheSwitch<'a> {
         self.native_rot(ctx, s, lt_, src, b, acc, 1, offsets, dsts)
     }
 
+    /// `native_plut` with one accumulator per index LWE: `accs` [b][2 part][2 prime][n_br] (LWE r rotates accs[r]),
+    /// the step of a selection tree (several tables rotated by one index digit in one batch). nu 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_plut_each<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, accs: *const c_void, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
+        if self.p.nu != 1 {
+            return Err(shape("tfhe native", "the private lookup runs at nu 1".to_string()));
+        }
+        self.native_rot(ctx, s, lt_, src, b, accs, 3, offsets, dsts)
+    }
+
     /// The key switch s_br -> s_lwe of `cb` native LWEs `src` [cb][n_br + 1] (cb <= the switch's capacity) into `lwe`.
     fn native_ks<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, cb: usize) -> Result<()> {
         let (nb, nl, p0) = (self.nb, self.nl, self.p0);
@@ -908,7 +979,9 @@ impl<'a> TfheSwitch<'a> {
             let cb = self.max.min(b - c0);
             let sc = (src as *const u32).wrapping_add(c0 * (nb + 1)) as *const c_void;
             self.native_ks(ctx, s, lt_, sc, cb)?;
-            self.rotate_init(ctx, s, cb, tv, init, kl, &cx, pbs_c)?;
+            // init bit 1: one accumulator per LWE, [b][2 part][2 prime][nu n]
+            let tvc = if init & 2 != 0 { (tv as *const u32).wrapping_add(c0 * 4 * nb * self.p.nu) as *const c_void } else { tv };
+            self.rotate_init(ctx, s, cb, tvc, init, kl, &cx, pbs_c)?;
             let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
             for (j, (&off, &d)) in offsets.iter().zip(dsts).enumerate() {
                 let x = (d as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
@@ -931,6 +1004,29 @@ impl<'a> TfheSwitch<'a> {
         let p0 = self.p0;
         let lwe = self.lwe.vptr();
         self.pack.as_mut().unwrap().pack(ctx.table, s, lwe, place, w, count, p0, out)
+    }
+
+    /// The packing by rows (`DevPack::pack_rows`) of native LWEs `src` [rows][n_br + 1] (key switched s_br -> s_lwe,
+    /// packed at q_in = p0): `count` accumulators of `e_n` rows each (`rowmap` int32 [count e_n] into `src`, P / `phat`
+    /// the rows' placement polynomials and their `native_pack_basis`) into `out` [count][2 part][2 prime][n_br].
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_pack_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, rows: usize, rowmap: *const c_void, count: usize, e_n: usize, p: *const c_void, phat: *const c_void, out: *mut c_void) -> Result<()> {
+        if self.pack.is_none() || self.cksk.is_empty() || rows == 0 || rows > self.max || count == 0 {
+            return Err(shape("tfhe native", format!("pack of {rows} LWEs (needs Params::chain and Params::pack; <= {} rows)", self.max)));
+        }
+        self.native_ks(ctx, s, lt_, src, rows)?;
+        let p0 = self.p0;
+        let lwe = self.lwe.vptr();
+        self.pack.as_mut().unwrap().pack_rows(ctx.table, s, lwe, rowmap, count, e_n, p, phat, p0, out)
+    }
+
+    /// `DevPack::basis` of the switch's packing key: NTT(P) of `e_n` placement polynomials P int32 [e_n][n_br] into
+    /// `phat` u64 [e_n][2 prime][n_br].
+    pub fn native_pack_basis<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, p: *const c_void, e_n: usize, phat: *mut c_void) -> Result<()> {
+        match &self.pack {
+            Some(pk) => pk.basis(ctx.table, s, p, e_n, phat),
+            None => Err(shape("tfhe native", "no packing key (Params::pack)".to_string())),
+        }
     }
 
     /// Whether the switch holds the packing key (`native_pack`).

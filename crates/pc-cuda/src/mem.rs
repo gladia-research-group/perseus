@@ -303,6 +303,19 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         copy(s, dst.as_mut_ptr() as *mut c_void, self.ptr.add(off) as *const c_void, dst.len() * std::mem::size_of::<T>(), MEMCPY_D2H, "cudaMemcpyAsync D2H (pinned)")
     }
 
+    /// Zero `n` elements from `off` (ordered on the lane).
+    pub fn zero_range(&mut self, s: &Stream<S>, off: usize, n: usize) -> Result<()> {
+        bounds("zero_range", off.saturating_add(n), self.len)?;
+        let (p, b) = (unsafe { self.ptr.add(off) } as *mut u8, n * std::mem::size_of::<T>());
+        if s.is_host() {
+            let pu = p as usize;
+            // SAFETY: range checked, valid while the arena lives
+            unsafe { pc_hostrt::submit(s.raw(), move || std::ptr::write_bytes(pu as *mut u8, 0, b)) };
+            return Ok(());
+        }
+        // SAFETY: range checked
+        check(unsafe { ffi::cudaMemsetAsync(p as *mut c_void, 0, b, s.raw()) }, "cudaMemsetAsync")
+    }
     /// Zero the whole buffer (ordered on the lane).
     pub fn zero(&mut self, s: &Stream<S>) -> Result<()> {
         if s.is_host() {
@@ -323,6 +336,13 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         bounds("copy_from (src)", n, src.len)?;
         // SAFETY: ranges checked; distinct buffers (&mut self vs &src)
         unsafe { copy(s, self.ptr as *mut c_void, src.ptr as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D") }
+    }
+    /// Device-to-device copy of `n` elements from `src` at `src_off` to this buffer at `off`.
+    pub fn copy_from_at(&mut self, s: &Stream<S>, off: usize, src: &DBuf<'_, S, T>, src_off: usize, n: usize) -> Result<()> {
+        bounds("copy_from_at (dst)", off.saturating_add(n), self.len)?;
+        bounds("copy_from_at (src)", src_off.saturating_add(n), src.len)?;
+        // SAFETY: ranges checked; distinct buffers (&mut self vs &src)
+        unsafe { copy(s, self.ptr.add(off) as *mut c_void, src.ptr.add(src_off) as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D") }
     }
     /// Device-to-device copy of `n` elements of constant data into this buffer.
     pub fn copy_from_const(&mut self, s: &Stream<S>, src: &ConstBuf<'_, T>, n: usize) -> Result<()> {

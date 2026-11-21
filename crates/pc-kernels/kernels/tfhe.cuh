@@ -17,6 +17,8 @@ __device__ __forceinline__ uint64_t addq(uint64_t a, uint64_t b, uint64_t q) {
     const uint64_t s = a + b;
     return s >= q ? s - q : s;
 }
+// a b mod q for a, b < q < 2^32
+__device__ __forceinline__ uint64_t mulq64(uint64_t a, uint64_t b, uint64_t q) { return a * b % q; }
 __device__ __forceinline__ uint64_t subq(uint64_t a, uint64_t b, uint64_t q) {
     return a >= b ? a - b : a + q - b;
 }
@@ -1122,6 +1124,105 @@ __global__ void __launch_bounds__(1024) pack_fin_k(TfheArgs A) {
     for (int o = threadIdx.x; o < n; o += blockDim.x) out[o] = (uint32_t)(part ? sh[o] : addq(sh[o], B[o] % q, q));
 }
 
+// PACK_RBASIS: block (row e, prime)
+__global__ void __launch_bounds__(1024) pack_rbasis_k(TfheArgs A) {
+    extern __shared__ uint64_t sh[];
+    const int n = A.n, e = blockIdx.x, p = blockIdx.y;
+    const uint64_t q = p ? A.c[6] >> 32 : A.c[6] & 0xffffffffull;
+    const uint64_t* psi = (const uint64_t*)A.tw + (size_t)p * 2 * n;
+    const int32_t* P = (const int32_t*)A.y + (size_t)e * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        const int64_t v = (int64_t)P[o] % (int64_t)q;
+        sh[o] = (uint64_t)(v < 0 ? v + (int64_t)q : v);
+    }
+    __syncthreads();
+    ntt_fwd(sh, n, psi, psi + n, q);
+    uint64_t* out = (uint64_t*)A.x + ((size_t)e * 2 + p) * n;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) out[o] = sh[o];
+}
+// PACK_RDIG: thread per (row m, coefficient i <= i1)
+__global__ void pack_rdig_k(TfheArgs A) {
+    const int nl = A.i1, lv = (int)A.c[3], bl = (int)A.c[2];
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)A.count * (nl + 1)) return;
+    const size_t m = idx / (nl + 1);
+    const int i = (int)(idx % (nl + 1));
+    const int row = ((const int32_t*)A.z)[m];
+    const uint64_t x = ((const uint32_t*)A.y)[(size_t)row * (nl + 1) + i];
+    const uint64_t lifted = pack_lift(x, A.c[1], A.c[0]);
+    if (i < nl) {
+        int32_t* d = (int32_t*)A.x + m * (size_t)nl * lv + (size_t)i * lv;
+        for (int t = 0; t < lv; t++) d[t] = (int32_t)digit(lifted, t, bl, lv, A.m);
+    } else {
+        ((uint64_t*)A.w)[m] = lifted;
+    }
+}
+// PACK_RMAC: block (256 columns of [2 prime][2 part][n], a chunk of i0 key rows, 16 rows m); the chunk's digits in
+// shared memory, i64 sums (|d| <= 2^(base - 1), K < 2^31: 2^(base + 30) per term)
+constexpr int RM_M = 16;
+__global__ void __launch_bounds__(256) pack_rmac_k(TfheArgs A) {
+    extern __shared__ int32_t dsh[];
+    const int n = A.n, R = (int)A.c[4], rc = A.i0;
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r0 = blockIdx.y * rc, r1 = min(r0 + rc, R);
+    const int m0 = blockIdx.z * RM_M, mc = min(RM_M, A.count - m0);
+    for (int x = threadIdx.x; x < RM_M * rc; x += blockDim.x) {
+        const int mm = x / rc, r = r0 + x % rc;
+        dsh[x] = (mm < mc && r < r1) ? ((const int32_t*)A.y)[(size_t)(m0 + mm) * R + r] : 0;
+    }
+    __syncthreads();
+    int64_t acc[RM_M];
+#pragma unroll
+    for (int mm = 0; mm < RM_M; mm++) acc[mm] = 0;
+    const uint32_t* K = (const uint32_t*)A.z + f;
+    for (int r = r0; r < r1; r++) {
+        const int64_t k = (int64_t)__ldg(K + (size_t)r * 4 * n);
+#pragma unroll
+        for (int mm = 0; mm < RM_M; mm++) acc[mm] += (int64_t)dsh[mm * rc + r - r0] * k;
+    }
+    const int p = f / (2 * n);
+    const int64_t q = (int64_t)(p ? A.c[6] >> 32 : A.c[6] & 0xffffffffull);
+    unsigned long long* V = (unsigned long long*)A.x + (size_t)m0 * 4 * n + f;
+    for (int mm = 0; mm < mc; mm++) {
+        int64_t v = acc[mm] % q;
+        if (v < 0) v += q;
+        atomicAdd(V + (size_t)mm * 4 * n, (unsigned long long)v);
+    }
+}
+// PACK_RFIN: block (accumulator a, part, prime)
+__global__ void __launch_bounds__(1024) pack_rfin_k(TfheArgs A) {
+    extern __shared__ uint64_t sh[];
+    const int n = A.n, E = A.i0, a = blockIdx.x, part = blockIdx.y >> 1, p = blockIdx.y & 1;
+    const uint64_t q = p ? A.c[6] >> 32 : A.c[6] & 0xffffffffull;
+    const uint64_t* ip = (const uint64_t*)A.tw + (size_t)p * 2 * n;
+    const uint64_t* V = (const uint64_t*)A.y;
+    const uint64_t* Ph = (const uint64_t*)A.z;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        uint64_t s = 0;
+        for (int e = 0; e < E; e++) {
+            const uint64_t v = V[((size_t)(a * E + e) * 4 + p * 2 + part) * n + o] % q;
+            s = addq(s, mulq64(v, Ph[((size_t)e * 2 + p) * n + o], q), q);
+        }
+        sh[o] = s;
+    }
+    __syncthreads();
+    ntt_inv(sh, n, ip, ip + n, A.c[2 + 2 * p], A.c[3 + 2 * p], q);
+    uint32_t* out = (uint32_t*)A.x + ((size_t)a * 4 + part * 2 + p) * n;
+    const uint64_t* bodies = (const uint64_t*)A.w;
+    const int32_t* P = (const int32_t*)A.tws;
+    for (int o = threadIdx.x; o < n; o += blockDim.x) {
+        uint64_t v = sh[o];
+        if (part == 0)
+            for (int e = 0; e < E; e++) {
+                const int32_t w = P[(size_t)e * n + o];
+                if (!w) continue;
+                const int64_t wm = (int64_t)w % (int64_t)q;
+                v = addq(v, mulq64(bodies[a * E + e] % q, (uint64_t)(wm < 0 ? wm + (int64_t)q : wm), q), q);
+            }
+        out[o] = (uint32_t)v;
+    }
+}
+
 __global__ void ks_digits_k(TfheArgs A) {
     const int len = A.i1, lv = (int)A.c[1];
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1655,6 +1756,27 @@ int launch(const TfheArgs* a, cudaStream_t s) {
         case PC_TFHE_PACK_FIN:
             if (A.n != 2048) return -1;
             pack_fin_k<<<dim3(2, 2), 1024, A.n * 8, s>>>(A);
+            break;
+        case PC_TFHE_PACK_RBASIS:
+            if (A.n != 2048 || A.count < 1 || A.count > 65535) return -1;
+            pack_rbasis_k<<<dim3(A.count, 2), 1024, A.n * 8, s>>>(A);
+            break;
+        case PC_TFHE_PACK_RDIG: {
+            if (A.count < 1) return -1;
+            const size_t tot = (size_t)A.count * (A.i1 + 1);
+            pack_rdig_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
+        case PC_TFHE_PACK_RMAC: {
+            if (A.n != 2048 || A.i0 < 1 || A.i0 > 512 || A.count < 1) return -1;
+            const dim3 grid(4 * A.n / 256, (unsigned)((A.c[4] + A.i0 - 1) / A.i0), (A.count + RM_M - 1) / RM_M);
+            if (grid.z > 65535) return -1;
+            pack_rmac_k<<<grid, 256, RM_M * A.i0 * 4, s>>>(A);
+            break;
+        }
+        case PC_TFHE_PACK_RFIN:
+            if (A.n != 2048 || A.count < 1 || A.count > 65535 || A.i0 < 1) return -1;
+            pack_rfin_k<<<dim3(A.count, 4), 1024, A.n * 8, s>>>(A);
             break;
         case PC_TFHE_LWE_LIN:
             if (A.count > 65535) return -1;

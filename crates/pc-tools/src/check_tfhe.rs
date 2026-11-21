@@ -2073,3 +2073,300 @@ fn run_bitwise(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
+/// `pc-check tfhe-tree [--entries 16,64,256,1024,4096] [--lookups 1,16] [--reps 5] [--lat-group 5]`: encrypted
+/// lookup tables of t > 8 entries as a selection tree of private lookups (`TfheSwitch::native_pack` /
+/// `native_plut_each`): the index as base-8 digits (native LWEs at table_index(d, B)), the table's entries (native
+/// LWEs, 4-bit values) packed 8 per leaf accumulator once (the table's preparation); level l rotates every group
+/// of the level by digit l in one batch (one accumulator per LWE), the outputs packed 8 per accumulator for the
+/// next level: t / 8 + t / 64 + ... rotations and t / 64 + ... packs per lookup, ceil(log8 t) rotation levels.
+/// Every output decrypted against its entry; p_fail per lookup = the levels' index decisions (each at most 8 entries
+/// per 2048 coefficients: pc_tfhe::pack::index_log2_fail) + the output decision.
+pub fn cmd_tree(args: &[String]) -> ExitCode {
+    match run_tree(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("pc-check tfhe-tree: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_tree(args: &[String]) -> Res<bool> {
+    use pc_core::keys::DiscreteGaussian;
+    use pc_tfhe::lwe::Lwe;
+    use std::ffi::c_void;
+    let list = |k: &str, d: &str| -> Res<Vec<usize>> { Ok(arg(args, k).unwrap_or_else(|| d.into()).split(',').map(|x| x.trim().parse()).collect::<std::result::Result<_, _>>()?) };
+    let ents = list("--entries", "16,64,256,1024,4096")?;
+    let looks = list("--lookups", "1,16")?;
+    let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(5).max(1);
+    let bases = |t: usize| -> Res<Vec<usize>> {
+        if t < 2 || !t.is_power_of_two() {
+            return Err(format!("--entries {t}: a power of two >= 2").into());
+        }
+        let (mut v, mut r) = (Vec::new(), t);
+        while r > 1 {
+            v.push(r.min(8));
+            r /= r.min(8);
+        }
+        Ok(v)
+    };
+    let tmax = *ents.iter().max().ok_or("--entries")?;
+    let bmax = *looks.iter().max().ok_or("--lookups")?;
+    let lmax = bases(tmax)?.len();
+    let rows_cap = (bmax * tmax.div_ceil(8)).max(tmax);
+    let chain = Chain::generate(&ChainSpec::n32())?;
+    let n = chain.n;
+    let mut params = switch_params(args, n)?;
+    params.chain = true;
+    params.pack = true;
+    if params.nu != 1 {
+        return Err("tfhe-tree: the private lookup runs at nu 1".into());
+    }
+    let nb = params.n_br;
+    let (row, aw) = (nb + 1, 4 * nb);
+    let max = rows_cap.min(1024);
+    let dev = Device::open()?;
+    let blt = pc_cuda::blas::Lt::new(&dev)?;
+    let cfg = MemCfg { k_max: 1, pool: vec![PoolClass { k: 1, count: 1 }], events: 16, scratch_cts: 2 };
+    let mut mp = MemPlan::build::<W, M>(&chain, cfg)?;
+    mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, max));
+    let words = (tmax + bmax * lmax + 3 * rows_cap) * row + (tmax / 8 + 1 + rows_cap) * aw + 8 * 3 * nb + 2 * rows_cap + 4096;
+    mp.reserve("tree", 4 * words + (1 << 20));
+    let arena = mp.allocate(&dev)?;
+    let ex = Executor::<W>::new(&dev, &arena, &mp)?;
+    let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
+    let s = &ex.compute;
+    let mut prng = test_prng(0x7ee);
+    let sk = SecretKey::sample(&mut prng, n)?;
+    let sv: Vec<i64> = sk.s.iter().map(|&v| v as i64).collect();
+    let (p0, p1) = (chain.q[0], chain.q[1]);
+    let tk = Instant::now();
+    let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
+    println!("[pc-check] tfhe-tree: host keys {:.1} s (n_lwe {}, n_br {nb}, lat_group {}, packing key)", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group);
+    let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, max)?;
+    let al = |w: usize| arena.alloc::<pc_cuda::Compute, u32>("tree", w);
+    let mut d_ent = al(tmax * row)?;
+    let mut d_idx = al(bmax * lmax * row)?;
+    let d_rep = al(rows_cap * row)?;
+    let mut d_out = [al(rows_cap * row)?, al(rows_cap * row)?];
+    let mut d_leaf = al((tmax / 8).max(1) * aw)?;
+    let mut d_accs = al(rows_cap * aw)?;
+    let mut d_pl = al(8 * 3 * nb)?;   // per table size 2..8 (log2 1..3): place [n][2] + w [n]
+    let mut d_pairs = al(4 * rows_cap)?;
+    // --pack key: the packing by placements (PACK_DIGITS / MAC: a key row NTT each); default: by rows (PACK_RDIG / RMAC)
+    let by_rows = arg(args, "--pack").as_deref() != Some("key");
+    let mut d_prow = al(3 * 8 * nb)?;                     // P [b][n] int32 for b = 2, 4, 8 (at (lb - 1) 8 n)
+    let d_phat = arena.alloc::<pc_cuda::Compute, u64>("tree", 3 * 8 * 2 * nb)?;
+    let mut d_rmap = al(rows_cap)?;
+    let mut d_chk = al(aw)?;
+    arena.freeze();
+    let enc_v = |v: f64| ((v * p0 as f64 / 4.0).round() as i64).rem_euclid(p0 as i64) as u64;
+    let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
+    let encrypt = |vals: &[f64], prng: &mut pc_core::keys::Prng| -> Vec<u32> {
+        vals.iter().flat_map(|&v| {
+            let l = Lwe::encrypt(enc_v(v), &s_br, p0, &dg, prng);
+            l.a.into_iter().chain(std::iter::once(l.b)).map(|x| x as u32).collect::<Vec<_>>()
+        }).collect()
+    };
+    let decrypt = |w: &[u32], cnt: usize| -> Vec<f64> {
+        (0..cnt).map(|r| {
+            let l = Lwe { a: w[r * row..r * row + nb].iter().map(|&x| x as u64).collect(), b: w[r * row + nb] as u64 };
+            centered(l.phase(&s_br, p0), p0) as f64 * 4.0 / p0 as f64
+        }).collect()
+    };
+    // impl/tfhe.py table_place(B): coefficient c serves entry floor((m + 1) B / 2) of m = 2 c / n (c < n / 2) or
+    // 2 (c - n) / n, holding -v above n / 2
+    for lb in 1..=3usize {
+        let bsz = 1usize << lb;
+        let mut w: Vec<u32> = Vec::with_capacity(3 * nb);
+        let mut ws: Vec<u32> = Vec::with_capacity(nb);
+        for c in 0..nb {
+            let m = if c < nb / 2 { 2.0 * c as f64 / nb as f64 } else { 2.0 * (c as f64 - nb as f64) / nb as f64 };
+            let i = (((m + 1.0) * bsz as f64 / 2.0).floor() as usize).min(bsz - 1);
+            w.extend([i as u32, c as u32]);
+            ws.push(if c < nb / 2 { 1 } else { (-1i32) as u32 });
+        }
+        w.extend(ws);
+        d_pl.upload_at(s, (lb - 1) * 3 * nb, &w)?;
+    }
+    for lb in 1..=3usize {
+        let bsz = 1usize << lb;
+        let mut pr = vec![0u32; bsz * nb];
+        for c in 0..nb {
+            let m = if c < nb / 2 { 2.0 * c as f64 / nb as f64 } else { 2.0 * (c as f64 - nb as f64) / nb as f64 };
+            let i = (((m + 1.0) * bsz as f64 / 2.0).floor() as usize).min(bsz - 1);
+            pr[i * nb + c] = if c < nb / 2 { 1 } else { (-1i32) as u32 };
+        }
+        d_prow.upload_at(s, (lb - 1) * 8 * nb, &pr)?;
+        let pp = (d_prow.vptr() as *const u32).wrapping_add((lb - 1) * 8 * nb) as *const c_void;
+        let ph = (d_phat.vptr() as *mut u64).wrapping_add((lb - 1) * 8 * 2 * nb) as *mut c_void;
+        ts.native_pack_basis(&ctx, s, pp, bsz, ph)?;
+    }
+    let rowp = |bsz: usize| -> (*const c_void, *const c_void) {
+        let lb = bsz.trailing_zeros() as usize;
+        ((d_prow.vptr() as *const u32).wrapping_add((lb - 1) * 8 * nb) as *const c_void, (d_phat.vptr() as *const u64).wrapping_add((lb - 1) * 8 * 2 * nb) as *const c_void)
+    };
+    let rmap: Vec<u32> = (0..rows_cap as u32).collect();
+    d_rmap.upload_at(s, 0, &rmap)?;
+    let plp = |bsz: usize| -> (*const c_void, *const c_void) {
+        let o = (bsz.trailing_zeros() as usize - 1) * 3 * nb;
+        let b = d_pl.vptr() as *const u32;
+        (b.wrapping_add(o) as *const c_void, b.wrapping_add(o + 2 * nb) as *const c_void)
+    };
+    let tindex = |d: usize, bsz: usize| -1.0 + (2.0 * d as f64 + 1.0) / bsz as f64;
+    let lt_ = &blt.inner;
+    let mut t = Tally::default();
+    let ms_sd_c = ((params.n_lwe as f64 / 2.0 + 1.0) / 12.0).sqrt();   // the mod switch's sd in 2 n_br units
+    for &te in &ents {
+        let bs = bases(te)?;
+        let lv = bs.len();
+        let mut rng = test_prng(0x3e0 + te as u32);
+        // the table: 4-bit values v at native (2 v + 1) / 16 - 1
+        let vals: Vec<u64> = (0..te).map(|_| rng.uniform_below(16)).collect();
+        let enc16 = |v: u64| (2.0 * v as f64 + 1.0) / 16.0 - 1.0;
+        d_ent.upload_at(s, 0, &encrypt(&vals.iter().map(|&v| enc16(v)).collect::<Vec<_>>(), &mut rng))?;
+        // the table's preparation: the leaf accumulators (B_0 entries each)
+        let b0 = bs[0];
+        let g0 = te / b0;
+        let (pl0, w0) = plp(b0);
+        let (pr0, ph0) = rowp(b0);
+        let tp = Instant::now();
+        if by_rows {
+            let per = max / b0;
+            for a0 in (0..g0).step_by(per) {
+                let ac = per.min(g0 - a0);
+                let src = (d_ent.vptr() as *const u32).wrapping_add(a0 * b0 * row) as *const c_void;
+                let out = (d_leaf.vptr() as *mut u32).wrapping_add(a0 * aw) as *mut c_void;
+                ts.native_pack_rows(&ctx, s, lt_, src, ac * b0, d_rmap.vptr(), ac, b0, pr0, ph0, out)?;
+            }
+        } else {
+            for g in 0..g0 {
+                let src = (d_ent.vptr() as *const u32).wrapping_add(g * b0 * row) as *const c_void;
+                let out = (d_leaf.vptr() as *mut u32).wrapping_add(g * aw) as *mut c_void;
+                ts.native_pack(&ctx, s, lt_, src, b0, pl0, w0, nb, out)?;
+            }
+        }
+        s.sync()?;
+        let t_prep = tp.elapsed().as_secs_f64();
+        // the packing by rows == the packing by placements, every word (group 0 of the leaves)
+        ts.native_pack(&ctx, s, lt_, d_ent.vptr(), b0, pl0, w0, nb, d_chk.vptr() as *mut c_void)?;
+        let (x1, x2) = (d_chk.download_range(s, 0, aw)?, d_leaf.download_range(s, 0, aw)?);
+        t.add(&format!("tfhe-tree: {te} entries, leaf accumulator 0 == the packing by placements, every word"), x1.iter().zip(&x2).filter(|(a, b)| a != b).count(), aw);
+        for &nl in &looks {
+            let idx: Vec<usize> = (0..nl).map(|_| rng.uniform_below(te as u64) as usize).collect();
+            // digit l of lookup j at row j lv + l
+            let mut dv = Vec::with_capacity(nl * lv);
+            for &i in &idx {
+                let mut r = i;
+                for &b in &bs {
+                    dv.push(tindex(r % b, b));
+                    r /= b;
+                }
+            }
+            d_idx.upload_at(s, 0, &encrypt(&dv, &mut rng))?;
+            // per level: digit l of lookup j for every group (rows j g + k), at offsets of the pairs buffer
+            let mut poff = Vec::new();
+            let (mut off, mut np) = (0usize, te);
+            for (l, &b) in bs.iter().enumerate() {
+                let g = np / b;
+                let pairs: Vec<u32> = (0..nl * g).flat_map(|r| [((r / g) * lv + l) as u32, u32::MAX]).collect();
+                d_pairs.upload_at(s, off, &pairs)?;
+                poff.push(off);
+                off += pairs.len();
+                np = g;
+            }
+            let mut times = Vec::new();
+            let (mut t_rot, mut t_pack) = (0f64, 0f64);
+            let mut fin = 0usize;
+            for rep in 0..=reps {
+                s.sync()?;
+                let t0 = Instant::now();
+                let (mut tr, mut tpk) = (0f64, 0f64);
+                let mut cur = 0usize;   // d_out[cur]: the previous level's outputs [j][N]
+                let mut nper = te;
+                for (l, &b) in bs.iter().enumerate() {
+                    let g = nper / b;
+                    let cnt = nl * g;
+                    let tl = Instant::now();
+                    // the accumulators: level 0 the leaves (shared), above the previous outputs packed b per group
+                    let accp: *const c_void = if l == 0 {
+                        if nl == 1 {
+                            d_leaf.vptr()
+                        } else {
+                            for j in 0..nl {
+                                d_accs.copy_from_at(s, j * g * aw, &d_leaf, 0, g * aw)?;
+                            }
+                            d_accs.vptr()
+                        }
+                    } else {
+                        if by_rows {
+                            let (pr, ph) = rowp(b);
+                            let per = max / b;
+                            for a0 in (0..cnt).step_by(per) {
+                                let ac = per.min(cnt - a0);
+                                let src = (d_out[cur].vptr() as *const u32).wrapping_add(a0 * b * row) as *const c_void;
+                                let out = (d_accs.vptr() as *mut u32).wrapping_add(a0 * aw) as *mut c_void;
+                                ts.native_pack_rows(&ctx, s, lt_, src, ac * b, d_rmap.vptr(), ac, b, pr, ph, out)?;
+                            }
+                        } else {
+                            let (pl, w) = plp(b);
+                            for r in 0..cnt {
+                                let src = (d_out[cur].vptr() as *const u32).wrapping_add(r * b * row) as *const c_void;
+                                let out = (d_accs.vptr() as *mut u32).wrapping_add(r * aw) as *mut c_void;
+                                ts.native_pack(&ctx, s, lt_, src, b, pl, w, nb, out)?;
+                            }
+                        }
+                        d_accs.vptr()
+                    };
+                    if rep == reps {
+                        s.sync()?;
+                    }
+                    let tl2 = Instant::now();
+                    // digit l of lookup j for every group: rows j g + k
+                    let pp = (d_pairs.vptr() as *const u32).wrapping_add(poff[l]) as *const c_void;
+                    ts.native_lin_c(&ctx, s, d_rep.vptr() as *mut c_void, d_idx.vptr(), d_idx.vptr(), pp, cnt, 1, 0, 0)?;
+                    let nx = 1 - cur;
+                    let dst = d_out[nx].vptr() as *mut c_void;
+                    ts.native_plut_each(&ctx, s, lt_, d_rep.vptr(), cnt, accp, &[0], &[dst])?;
+                    if rep == reps {
+                        s.sync()?;
+                        tpk += (tl2 - tl).as_secs_f64();
+                        tr += tl2.elapsed().as_secs_f64();
+                    }
+                    cur = nx;
+                    nper = g;
+                }
+                s.sync()?;
+                times.push(t0.elapsed().as_secs_f64());
+                if rep == reps {
+                    (t_rot, t_pack) = (tr, tpk);
+                }
+                fin = cur;
+            }
+            let last = times.pop().unwrap_or(0.0);
+            times.remove(0);
+            times.push(last);
+            times.sort_by(f64::total_cmp);
+            let med = times[times.len() / 2];
+            let got = decrypt(&d_out[fin].download_range(s, 0, nl * row)?, nl);
+            let (mut wrong, mut dev) = (0usize, 0f64);
+            for (j, &i) in idx.iter().enumerate() {
+                let x = (got[j] + 1.0) * 8.0 - 0.5;
+                wrong += (x.round() as i64 != vals[i] as i64) as usize;
+                dev = dev.max((x - x.round()).abs());
+            }
+            t.add(&format!("tfhe-tree: {te} entries, {nl} lookups, every output its entry"), wrong, nl);
+            let pf: Vec<f64> = bs.iter().map(|&b| pc_tfhe::pack::log2_tail((nb / b) as f64 / 2.0 / ms_sd_c)).collect();
+            let pf_all = pf.iter().fold(f64::NEG_INFINITY, |a, &x| { let (h, l) = if a > x { (a, x) } else { (x, a) }; h + (1.0 + (l - h).exp2()).log2() });
+            let rot: usize = (0..lv).map(|l| te / bs[..=l].iter().product::<usize>()).sum();
+            println!(
+                "[pc-check] tfhe-tree: {te} entries (digits {bs:?}), {nl} lookups: {:.3} ms (median of {reps}; last run: rotations {:.3}, packs {:.3}); {rot} rotations + {} packs per lookup, {lv} levels; table prep {:.3} ms ({g0} leaf accumulators, packing by {}); {:.0} lookups/s; p_fail per lookup 2^{pf_all:.1} (index, levels {pf:?}); max output dev {dev:.2e} (of 0.5)",
+                med * 1e3, t_rot * 1e3, t_pack * 1e3, rot - te / bs[0], t_prep * 1e3, if by_rows { "rows" } else { "placements" }, nl as f64 / med
+            );
+        }
+    }
+    println!("[pc-check] tfhe-tree: {} gates, {} failing", t.gates, t.bad);
+    Ok(t.bad == 0)
+}
+
