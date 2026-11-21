@@ -1574,23 +1574,21 @@ mod tests {
 
 // ── functional bootstrapping on the route ───────────────────────────────────────────────────────────────────────
 
-/// The chains a functional bootstrap is validated on: composite degree 2, 32-bit words, no alternating single-prime
-/// user region (`ChainSpec::sp`) and no reduced special-prime tiers (`ChainSpec::low_p`): n32 and n32a4. On an
-/// alternating region the series would step single-prime levels the EvalMod builder does not lay out; the device
-/// output there was measured wrong, so it is refused rather than run.
+/// The chains a functional bootstrap is validated on: composite degree 2, 32-bit words and no reduced special-prime
+/// tiers (`ChainSpec::low_p`): n32, n32a4 and the alternating single / pair user region of n32sp / n32sph
+/// (`ChainSpec::sp`: the EvalMod builder steps the region's levels by their own primes, `Fx::up` / `down`, the
+/// executor's rescales drop them, `em_drop`, and a sine-form series there takes the paired builder).
 pub fn fbs_chain_check(chain: &Chain) -> Result<()> {
     let s = &chain.spec;
     let why = if s.composite_degree != 2 || s.word != pc_core::word::WordId::U32 {
         Some("not a composite-degree-2 32-bit chain")
-    } else if s.sp.is_some() {
-        Some("an alternating single-prime user region (sp)")
     } else if s.low_p.is_some() {
         Some("reduced special-prime tiers (low_p)")
     } else {
         None
     };
     match why {
-        Some(w) => Err(shape("fbs", format!("functional bootstrapping is validated on n32 / n32a4 only; this chain has {w}"))),
+        Some(w) => Err(shape("fbs", format!("functional bootstrapping is validated on n32 / n32a4 / n32sph only; this chain has {w}"))),
         None => Ok(()),
     }
 }

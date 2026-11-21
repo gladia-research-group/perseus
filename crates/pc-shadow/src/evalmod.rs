@@ -520,11 +520,15 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
     b.copy(t2km1, t2[0]);
     // lazy: the single product of the m = 2 loop joins the final sum
     // ---- innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m, &lz)
-    let d_ = b.st.d as i32;
+    // OpenFHE's level arithmetic (one level = d primes) as limb tops: `Fx::up` / `down` step by the levels' own primes
+    // on a chain with an alternating single / pair user region
     let cu = x;
     let dc = degree(&ps.divcs_q);
     let mut flag_c = false;
-    let lvl_t2 = |b: &Builder| b.metas[t2[m - 1]].top + if b.metas[t2[m - 1]].nl == 1 { d_ } else { 0 };
+    let lvl_t2 = |b: &Builder| {
+        let t = b.metas[t2[m - 1]];
+        if t.nl == 1 { b.fx().up(t.top) } else { t.top }
+    };
     if dc >= 1 {
         if dc == 1 {
             b.copy(cu, t[0]);
@@ -597,7 +601,7 @@ fn build_chebyshev_m2(b: &mut Builder, x: usize, ps: &PsPlan) -> Result<()> {
                     cts.push(t[i]);
                 }
             }
-            let tl = lvl_t2(b) - d_;
+            let tl = b.fx().down(lvl_t2(b));
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
             // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
@@ -814,9 +818,16 @@ fn inner_ps(
     if let Some(l) = s2.last_mut() {
         *l = 1.0;
     }
-    let d_ = b.st.d as i32;
     let cu = out;
-    let lvl_t2 = |b: &Builder| b.metas[t2[m - 1]].top + if b.metas[t2[m - 1]].nl == 1 { d_ } else { 0 } - level_offset * d_;
+    // as `build_chebyshev`'s: OpenFHE's level arithmetic by the levels' own primes (`Fx::up` / `down`)
+    let lvl_t2 = |b: &Builder| {
+        let t = b.metas[t2[m - 1]];
+        let mut top = if t.nl == 1 { b.fx().up(t.top) } else { t.top };
+        for _ in 0..level_offset {
+            top = b.fx().down(top);
+        }
+        top
+    };
     let dc = degree(&divcs.q);
     let mut flag_c = false;
     if dc >= 1 {
@@ -898,7 +909,7 @@ fn inner_ps(
                     cts.push(t[i]);
                 }
             }
-            let tl = lvl_t2(b) - d_;
+            let tl = b.fx().down(lvl_t2(b));
             b.grow_to_level(su, tl);
             b.drop_to_level(su, tl);
             // the T's of the non-zero weights (FIDESlib passes the first |w| T's: the same program for a series
@@ -1447,7 +1458,10 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     let mut b = Builder::new(st);
     b.lean = lean;
     let x = b.input(input);
-    if ps.paired && ps.trig.is_none() {
+    // a series after the sine on a chain with an alternating user region always takes the paired builder: FIDESlib's
+    // lazy Paterson-Stockmeyer adjusts its operands across the region's single / pair levels with integer scalars that
+    // lose ~2^-25 (exact replay: 4e-8 .. 5e-7 at degrees 16 .. 128), the paired one lands them exactly
+    if ps.trig.is_none() && (ps.paired || (st.singles != 0 && !ps.post.is_empty())) {
         return build_sine_paired(st, input, ps, double_angle_its);
     }
     if ps.trig.is_some() {

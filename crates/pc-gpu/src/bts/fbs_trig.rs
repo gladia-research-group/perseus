@@ -39,10 +39,10 @@ mod tests {
             let p: Vec<f64> = (0..=n).map(|k| g * 0.8 * 0.7f64.powi(k as i32) * (1.3 + k as f64).cos()).collect();
             let q: Vec<f64> = (0..n).map(|k| g * 0.6 * 0.7f64.powi(k as i32) * (0.4 + k as f64).sin()).collect();
             let ps = PsPlan::fbs_trig(&cb, &sb, da, amp, off, &p, &q).expect("trig plan");
-            let (prog, out) = build_evalmod_opts(&st, ems[em], &ps, da as i32, true).expect("program");
+            let (prog, out) = build_trig_opts(&st, ems[em], &ps, da as i32, true, &[false]).expect("program");
             let fused = prog.fused();
             let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
-            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
             for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
                 let mut emax: f64 = 0.0;
                 let cmin = ((-1.0 - off) / amp).max(-1.0);
@@ -82,7 +82,7 @@ mod tests {
             let cost = |o: &[pc_shadow::evalmod::EmOp]| pc_shadow::evalmod::op_cost(o);
             let fused = prog.fused();
             let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
-            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
             for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
                 let mut emax: f64 = 0.0;
                 let cmin = ((-1.0 - off) / amp).max(-1.0);
@@ -127,7 +127,7 @@ mod tests {
             assert_eq!(out.top, fides.top + 2, "degree {d}: paired lands at {}, FIDESlib's at {}", out.top, fides.top);
             let fused = prog.fused();
             let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
-            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
             let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
             let bc: Vec<f64> = k32.iter().map(|x| x * a).collect();
             for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("assigned", &asg, &rc)] {
@@ -358,5 +358,155 @@ mod plain_shift {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod chain_dump {
+    /// Probe (ignored): a chain's prime groups (bottom-up), its singles mask and level -> top limb.
+    #[test]
+    #[ignore]
+    fn chain_groups() {
+        let preset = std::env::var("PC_PROBE_CHAIN").unwrap_or_else(|_| "n32sph".into());
+        let c = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset(&preset).unwrap()).unwrap();
+        println!("{preset}: q {} groups {:?} singles {:#x} unit {}", c.q.len(), c.groups, c.singles(), c.level_unit);
+        let st = pc_core::scale::ScaleTables::precompute(&c).unwrap();
+        for l in 0..60u32 {
+            if let Some(t) = c.top_at(l) {
+                println!("level {l} top {t} bits {:.1} sf {:.3e}", (c.q[t] as f64).log2(), st.sf(t as i32).unwrap_or(0.0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sp_chain {
+    use crate::bts::evalmod::{assign_buffers, rewrite, schedule_relin_rescales};
+    use pc_shadow::evalmod::{build_evalmod_opts, sim, trig_base, PsPlan};
+
+    fn chebval(x: f64, c: &[f64]) -> f64 {
+        let (mut b1, mut b2) = (0.0, 0.0);
+        for &ck in c.iter().skip(1).rev() {
+            let b0 = 2.0 * x * b1 - b2 + ck;
+            b2 = b1;
+            b1 = b0;
+        }
+        x * b1 - b2 + c[0] / 2.0
+    }
+
+    /// FBS programs on a chain with an alternating single / pair user region (n32sph; PC_PROBE_CHAIN for another): the
+    /// exact replay through every executor stage equals the composition, for series deep enough to enter the region
+    /// (the sine form there on the paired builder, whatever the plan asks).
+    #[test]
+    fn sp_fbs_program_exact() {
+        let preset = std::env::var("PC_PROBE_CHAIN").unwrap_or_else(|_| "n32sph".into());
+        let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset(&preset).unwrap()).unwrap();
+        let st = pc_core::scale::ScaleTables::precompute(&chain).unwrap();
+        let mut b2 = crate::bts::BtsSetup::n32_shipped();
+        b2.raise_drops = vec![0];
+        let em = crate::bts::dense::DensePlan::new(&chain, &b2).unwrap().variants[0].em_in;
+        let k32 = pc_core::bts_setup::EVALMOD_K32_CHEB.to_vec();
+        let da = pc_core::bts_setup::EVALMOD_K32_DA_ITS;
+        let mut bad = vec![];
+        for (d, paired) in [(16usize, false), (64, false), (128, false), (64, true), (0, false)] {
+            let g = 2f64.powi(-6);
+            let post: Vec<f64> = (0..=d.max(2)).map(|i| g * 0.3 * 0.97f64.powi(i as i32) * (1.0 + i as f64).sin()).collect();
+            let post = if d == 0 { vec![] } else { post };
+            let amp = 1.0;
+            let mut ps = PsPlan::fbs(&k32, da, amp, &post).unwrap();
+            ps.paired = paired;
+            let (prog, out) = build_evalmod_opts(&st, em, &ps, da as i32, true).unwrap();
+            let fused = prog.fused();
+            let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
+            let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
+            let bc: Vec<f64> = k32.iter().map(|x| x * a).collect();
+            for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
+                let mut emax: f64 = 0.0;
+                for i in [-29i32, 0, 17] {
+                    for j in 0..=8 {
+                        let u = -0.12 + 0.03 * j as f64;
+                        let mut y = chebval((u + i as f64) / 32.0, &bc);
+                        for jj in 1..=da as i32 {
+                            y = 2.0 * y * y - amp.powf(2f64.powi(jj - da as i32));
+                        }
+                        let want = if post.is_empty() { y } else { chebval(y, &post) };
+                        let mut bufs = vec![sim::encode((u + i as f64) / 32.0 * em.nf, &st.q)];
+                        sim::run(&st, ops, consts, &mut bufs);
+                        emax = emax.max((sim::decode(&st, &bufs[0], out.top, out.nl, out.nf) - want).abs());
+                    }
+                }
+                println!("{preset} sine deg {d} paired {paired} {name}: max err {emax:.3e} ({em:?} -> {out:?})");
+                // degree 128 lands past the region's 2^36-scale single levels: its Paterson-Stockmeyer intermediates
+                // round there (5.6e-7 of a 0.15 output, deterministic; n32: 6e-12), which the variance model's rescale
+                // roundings carry
+                if !(emax < if d >= 128 { 1e-6 } else { 1e-9 }) {
+                    bad.push(format!("deg {d} paired {paired} {name}: {emax:.3e}"));
+                }
+            }
+        }
+        let (cb, sb) = trig_base(32.0, 5, 27);
+        for n in [12usize, 32] {
+            let g = 2f64.powi(-5);
+            let p: Vec<f64> = (0..=n).map(|k| g * 0.8 * 0.7f64.powi(k as i32) * (1.3 + k as f64).cos()).collect();
+            let q: Vec<f64> = (0..n).map(|k| g * 0.6 * 0.7f64.powi(k as i32) * (0.4 + k as f64).sin()).collect();
+            let (amp, off) = (2.0, -1.0);
+            let ps = PsPlan::fbs_trig(&cb, &sb, 5, amp, off, &p, &q).unwrap();
+            let (prog, out) = pc_shadow::evalmod::build_trig_opts(&st, em, &ps, 5, true, &[false]).unwrap();
+            let fused = prog.fused();
+            let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
+            for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
+                let mut emax: f64 = 0.0;
+                let umax = ((-1.0 - off) / amp).max(-1.0f64).acos() / (2.0 * std::f64::consts::PI);
+                for i in [-31i32, 0, 9] {
+                    for j in 0..=10 {
+                        let u = umax * (-1.0 + 0.2 * j as f64);
+                        let th = 2.0 * std::f64::consts::PI * u;
+                        let want = chebval(amp * th.cos() + off, &p) + amp * th.sin() * chebval(amp * th.cos() + off, &q);
+                        let mut bufs = vec![sim::encode((u + i as f64) / 32.0 * em.nf, &st.q)];
+                        sim::run(&st, ops, consts, &mut bufs);
+                        emax = emax.max((sim::decode(&st, &bufs[0], out.top, out.nl, out.nf) - want).abs());
+                    }
+                }
+                println!("{preset} trig n {n} {name}: max err {emax:.3e} ({em:?} -> {out:?})");
+                if !(emax < 1e-8) {
+                    bad.push(format!("trig n {n} {name}: {emax:.3e}"));
+                }
+            }
+        }
+        // the exponential form (complex replay: z = a e^(i th), one conjugation)
+        for n in [12usize, 32] {
+            let g = 2f64.powi(-5);
+            let p: Vec<f64> = (0..=n).map(|k| g * 0.8 * 0.7f64.powi(k as i32) * (1.3 + k as f64).cos()).collect();
+            let q: Vec<f64> = (0..n).map(|k| g * 0.6 * 0.7f64.powi(k as i32) * (0.4 + k as f64).sin()).collect();
+            let (amp, off) = (2.0, -1.0);
+            let ps = PsPlan::fbs_trig(&cb, &sb, 5, amp, off, &p, &q).unwrap();
+            let (prog, out) = pc_shadow::evalmod::build_trig_opts(&st, em, &ps, 5, true, &[true]).unwrap();
+            assert!(prog.ops.iter().any(|o| matches!(o, pc_shadow::evalmod::EmOp::ConjSplit { .. })), "not the exponential form");
+            let fused = prog.fused();
+            let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
+            for (name, ops, consts) in [("raw", &prog.ops, &prog.consts), ("fused", &fused, &prog.consts), ("assigned", &asg, &rc)] {
+                let mut emax: f64 = 0.0;
+                let umax = ((-1.0 - off) / amp).max(-1.0f64).acos() / (2.0 * std::f64::consts::PI);
+                for i in [-31i32, 0, 9] {
+                    for j in 0..=10 {
+                        let u = umax * (-1.0 + 0.2 * j as f64);
+                        let th = 2.0 * std::f64::consts::PI * u;
+                        let want = chebval(amp * th.cos() + off, &p) + amp * th.sin() * chebval(amp * th.cos() + off, &q);
+                        let (mut re, mut im) = (vec![sim::encode((u + i as f64) / 32.0 * em.nf, &st.q)], vec![]);
+                        sim::run_c(&st, ops, consts, &mut re, &mut im);
+                        let (gr, gi) = (sim::decode(&st, &re[0], out.top, out.nl, out.nf), sim::decode(&st, &im[0], out.top, out.nl, out.nf));
+                        emax = emax.max((gr - want).abs()).max(gi.abs());
+                    }
+                }
+                println!("{preset} trig exp n {n} {name}: max err {emax:.3e} ({em:?} -> {out:?})");
+                if !(emax < 1e-8) {
+                    bad.push(format!("trig exp n {n} {name}: {emax:.3e}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{bad:?}");
     }
 }

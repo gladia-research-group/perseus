@@ -20,9 +20,10 @@ external refresh `{op: "fbs", fn, cf, amp, post, real}` landing where the FBS Ev
 numpy mirror and the fakes compute the series exactly (no noise). The output lands deeper than a plain refresh by
 the series' depth (n32, realized: degree 16 at level 40, 64 at 44, 256 at 48), which its consumers pay for.
 
-Chains: n32 and n32a4 only (composite degree 2, no alternating single-prime user region, no reduced special-prime
-tiers); anything else is refused (`_pc.fbs_landing` raises): on n32sph the series would step single-prime levels the
-EvalMod builder does not lay out, and the device output there was measured wrong.
+Chains: n32, n32a4 and n32sph / n32sp (composite degree 2, no reduced special-prime tiers); anything else is refused
+(`_pc.fbs_landing` raises). On the alternating single / pair user region of n32sph the EvalMod program steps the
+region's levels by their own primes and a sine-form series takes the paired builder; a series landing past the
+region's 2^36-scale single levels rounds its intermediates there (the variance model carries it).
 
 Failure model (`p_fail`, `error_bound`): the ModRaise overflow |I| > K is exact (Irwin-Hall: the composite raise lifts
 each coefficient as a sum of 2(h + 1) centred uniforms, h the encapsulation secret's weight; 2^-291.1 per bootstrap at

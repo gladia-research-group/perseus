@@ -181,13 +181,17 @@ struct RrConst<'a, W: DevWord> {
     tops: ConstBuf<'a, W>,
 }
 
+/// Primes the rescale from limb top `top` drops: the level unit, but one at a single-prime level of a chain with an
+/// alternating user region (`ScaleTables::drop`).
+pub fn em_drop(st: &pc_core::scale::ScaleTables, top: usize) -> usize {
+    st.drop.get(top).copied().filter(|&g| g > 0).unwrap_or(st.d)
+}
+
 /// The program's `Mult; Rescale` pairs `RelinRescale` serves: (top, the epilogue's constant index) per pair. Its
-/// conversion drops two primes (q_a q_b): chains with a level unit `d` other than 2 get none.
-fn relin_rescale_pairs(ops: &[EmOp], d: usize) -> Vec<(usize, Option<usize>)> {
-    if d != 2 {
-        return Vec::new();
-    }
-    (0..ops.len()).filter_map(|i| fused_rescale_at(ops, i).map(|(n, k, _)| (n - 1, k))).collect()
+/// conversion drops two primes (q_a q_b): only the rescales that drop two (none on a chain of level unit 1, the
+/// two-prime levels of an alternating user region).
+fn relin_rescale_pairs(ops: &[EmOp], st: &pc_core::scale::ScaleTables) -> Vec<(usize, Option<usize>)> {
+    (0..ops.len()).filter_map(|i| fused_rescale_at(ops, i).map(|(n, k, _)| (n - 1, k))).filter(|&(t, _)| em_drop(st, t) == 2).collect()
 }
 
 /// The `Mult; Rescale` (or `Mult; Add dst += / -= y; Rescale`) at op `i` that `RelinRescale` serves: (rows, the
@@ -248,7 +252,7 @@ fn dead_after(ops: &[EmOp], i: usize, x: usize) -> bool {
 /// relinearization-rescale (`RelinRescale`); a `Copy z <- dst; Rescale z` with dst dead after becomes
 /// `Rescale dst; Copy z <- dst`. The same values in the same buffers: without the fusion the program computes
 /// what the unscheduled one does, word for word.
-pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, d: usize) -> Vec<EmOp> {
+pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, st: &pc_core::scale::ScaleTables) -> Vec<EmOp> {
     let mut i = 0;
     // a transform may move other relinearizations ahead of this one: they are visited again (bounded)
     let mut budget = 4 * ops.len();
@@ -333,7 +337,7 @@ pub fn schedule_relin_rescales(mut ops: Vec<EmOp>, d: usize) -> Vec<EmOp> {
             None => sched.push(ops[j].clone()),
             Some(z) => {
                 sched.push(EmOp::Rescale { x: dst, n, k: None });
-                sched.push(EmOp::Copy { dst: z, src: dst, n: n - d });
+                sched.push(EmOp::Copy { dst: z, src: dst, n: n - em_drop(st, n - 1) });
             }
         }
         sched.extend(after.iter().map(|&m| ops[m].clone()));
@@ -862,7 +866,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     pub fn program(st: &pc_core::scale::ScaleTables, input: FMeta, ps: &PsPlan, da_its: u32) -> Result<(EmProgram, FMeta, usize)> {
         let (mut prog, out) = build_evalmod_opts(st, input, ps, da_its as i32, true)?;
         let (ops, consts) = rewrite(prog.fused(), &prog.consts, &st.q);
-        let ops = schedule_relin_rescales(ops, st.d);
+        let ops = schedule_relin_rescales(ops, st);
         let (_, n) = assign_buffers(ops.clone());
         prog.ops = ops;
         prog.consts = consts;
@@ -910,7 +914,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         b += 2 * rows_b(nq * lay.n) + 2 * KeyGroup::bytes(1, true);
         // the fused relinearization-rescale pairs: per top the dot rows, the conversion plan, alpha / beta / the top
         // weights, the row table of rows 0..top-2; per (constant, top) the rescaled constant
-        let pairs = relin_rescale_pairs(&fused, st.d);
+        let pairs = relin_rescale_pairs(&fused, st);
         let primes = st.q.iter().chain(st.p.iter()).copied().collect::<Vec<u64>>();
         let rr_tops: std::collections::BTreeSet<usize> = pairs.iter().map(|p| p.0).collect();
         let rr_k: std::collections::BTreeSet<(usize, usize)> = pairs.iter().filter_map(|&(t, k)| k.map(|k| (k, t))).collect();
@@ -980,7 +984,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let n = lay.n;
         let relin_group = KeyGroup::new(arena, s, n, &[relin], stage_ptrs)?;
         let in_place = relin_group.regen_tab(0)?;
-        let pairs = relin_rescale_pairs(&ops, ctx.chain.level_unit);
+        let pairs = relin_rescale_pairs(&ops, &ctx.scale);
         let regen_epi = match (relin.staging(), relin.seed_ptr()) {
             (st, Some(seed)) if (st.is_none() && relin.digit_stride() == lay.poly_words()) || in_place.is_some() => {
                 let mut rows = BTreeMap::new();
@@ -1099,7 +1103,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let primes = ctx.chain.primes();
         let np = primes.len();
         let q = &ctx.chain.q;
-        let d = ctx.chain.level_unit;
+        let d = em_drop(st, top);
         if !(1..=2).contains(&d) || top < d {
             return Err(shape("evalmod rescale", format!("composite degree {d} at top {top} (the one-pass kernel drops 1 or 2)")));
         }
@@ -1155,7 +1159,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
     /// (`keys::LevelRelinSpec`). Setup only; the plan's carved bytes grow by the level tables.
     pub fn attach_level_keys<M: DevStrategy<W>>(&mut self, arena: &'a Arena, s: &Stream<Compute>, ctx: &Context<'_, W, M>, ring: &dyn super::BtsKeyRing, stage: Option<(*const c_void, *const c_void)>) -> Result<usize> {
         let used0 = arena.used_bytes();
-        let pairs = relin_rescale_pairs(&self.ops, ctx.chain.level_unit);
+        let pairs = relin_rescale_pairs(&self.ops, &ctx.scale);
         let tops: Vec<usize> = self.rr.keys().copied().collect();
         let mut n = 0;
         for top in tops {
@@ -1991,7 +1995,7 @@ mod tests {
         for (name, ps_x, em_in) in [("gelu-like 342", ps_gl, ems[1])] {
             let (prog, out) = build_evalmod_opts(&st, em_in, &ps_x, da as i32, true).expect("program");
             let (rw, rc) = rewrite(prog.fused(), &prog.consts, &st.q);
-            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, st.d));
+            let (asg, _) = assign_buffers(schedule_relin_rescales(rw, &st));
             let a = (1.0075 * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
             let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
             let mut emax: f64 = 0.0;
@@ -2017,7 +2021,7 @@ mod tests {
             let (prog, out) = build_evalmod_opts(&st, em_in, &ps, da as i32, true).expect("program");
             let fused = prog.fused();
             let (rw, rc) = rewrite(fused.clone(), &prog.consts, &st.q);
-            let sch = schedule_relin_rescales(rw, st.d);
+            let sch = schedule_relin_rescales(rw, &st);
             let (asg, _) = assign_buffers(sch.clone());
             let a = (amp * 2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << da) as f64);
             let bc: Vec<f64> = base.evalmod_coeffs.iter().map(|x| x * a).collect();
@@ -2058,7 +2062,7 @@ mod tests {
         println!("dense EvalMod: {} ops, buffers {before} -> {after}", ops.len());
         assert!(after < before);
         let (rw, _) = rewrite(fused.clone(), &prog.consts, &st.q);
-        let rw = schedule_relin_rescales(rw, st.d);
+        let rw = schedule_relin_rescales(rw, &st);
         let after_rw = assign_buffers(rw.clone()).1;
         println!("dense EvalMod rewritten: {} -> {} ops, buffers {after_rw}", fused.len(), rw.len());
         assert!(after_rw <= after && after_rw == v.em_slots);
