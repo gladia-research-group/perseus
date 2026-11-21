@@ -1,0 +1,10 @@
+name: "openai/whisper-base.en"
+batch_size: 4          # calibration micro-batch (30-s clips: each greedy-decoded, then the decoder teacher-forced)
+block_size: null       # unused for audio models
+resolution: null
+
+instance:              # the decoder on each clip's greedy transcript (examples/whisper/hf.py WhisperDecoderTaps)
+  _target_: perseus.examples.whisper.hf.decoder
+  pretrained_model_name_or_path: ${model.name}
+  attn_implementation: "eager"   # required: the softmax tap needs the eager path
+  max_new_tokens: 128

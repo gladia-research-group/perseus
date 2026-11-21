@@ -125,6 +125,18 @@ class VitPrefill(Gpt2Prefill):
             self._emb_off = V.embed_offsets(self.store) * r
         return self._emb
 
+    def extra_linears(self):
+        """The PCMM linears outside the transformer blocks (stage 0's stem; a subclass's head): the planned run's matmul
+        service holds them with the blocks'."""
+        return [self.embed_weights()]
+
+    def embed(self, Xg, ch: Chunks):
+        """Stage 0's stem on the encrypted input rows Xg[g][k] -> block 0's input: the patch embedding as a PCMM plus
+        the per-token offsets (CLS, position embeddings, conv bias). A subclass with another stem overrides it with
+        `extra_linears`."""
+        Xg = [pcmm_run(self.rt, x, self.embed_weights()) for x in Xg]
+        return add_rows(self.rt, Xg, self._emb_off, ch, self.blocks, "vit.emb")
+
     def diag_weights(self, b):
         """Gpt2Prefill.diag_weights with the residual scale on the out / down projections (VIT_MASSIVE)."""
         cache = self.__dict__.setdefault("_pf_diag", {})
@@ -136,16 +148,15 @@ class VitPrefill(Gpt2Prefill):
         r[:d.dim] = V.residual_scale(d.dim)
         m = GW.block_matrices(self.store, self.cfgs, b, d, self.fold[0], self.fold[1])
         ge = self.cfgs.block(b)[3]
-        us = 1.0 / ge.xmax if (self.rt.ops.gelu_fold and ge.method in ("thor_composite", "chebyshev")) else 1.0
         enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                            name=f"b{b}.{name}")
-        Er = d.E_real
+        Up, bup, Dn = GW.mlp_order(m, ge, d.E_real, B.nch, self.gelu_folded)
         qkv_cols, qkv_bias = qkv_encode(B, m)
         cache[b] = {
             "qkv": enc("qkv", qkv_cols, 0.25, 2.0 * qkv_bias),
             "out": enc("out", B.group_rows(m.O) * r, 1.0, m.bo * r),
-            "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
-            "down": enc("down", m.Down[:Er] * r, 0.5, 2.0 * m.bdown * r),
+            "up": enc("up", Up, 0.25, 2.0 * bup),
+            "down": enc("down", Dn * r, 0.5, 2.0 * m.bdown * r),
             "shift1": self.block_weights(b).shift1, "shift2": self.block_weights(b).shift2}
         return cache[b]
 
@@ -173,7 +184,7 @@ class VitPrefill(Gpt2Prefill):
         return super().hidden(Xs, ch)[:ch.n_keys]
 
     def preload_prefill(self):
-        self.embed_weights()
+        self.extra_linears()
         super().preload_prefill()
 
     def prefill_stages(self, ch: Chunks):
@@ -187,8 +198,7 @@ class VitPrefill(Gpt2Prefill):
                     Xg = [Xs[g * B.K:(g + 1) * B.K] for g in range(len(Xs) // B.K)]
                     if b == 0:
                         with self.rt.step("embed"):
-                            Xg = [pcmm_run(self.rt, x, self.embed_weights()) for x in Xg]
-                            Xg = add_rows(self.rt, Xg, self._emb_off, ch, B, "vit.emb")
+                            Xg = self.embed(Xg, ch)
                         if getattr(self, "dbg_embed", None) is not None:
                             self.dbg_embed(V.unscale(BL.decrypt_blocked(self.rt, Xg, ch, B, self.rt.dims.dim)))
                     tap = self.tap if b == getattr(self, "tap_block", 0) and getattr(self, "tap", None) else None

@@ -407,7 +407,7 @@ def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: f
         for lane in range(t):
             out[idx + lane] = scale * sk * ((1.0 if lane < na else 0.0) + (1j if lane < nb else 0.0))
         return out
-    return rt.add_mask(X2, ("bl.shift", id(shift), k, na, nb, scale), build)
+    return rt.add_mask(X2, ("bl.shift", rt.values_key(shift), k, na, nb, scale), build)
 
 
 def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None, layer=0,

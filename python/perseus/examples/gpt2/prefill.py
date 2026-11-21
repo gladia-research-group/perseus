@@ -195,16 +195,19 @@ def _bias_blocks(rt, ys, lin, ch: Chunks, g: int, B):
 
 
 def _gelu_blocks(rt, H, ge):
+    """The GELU on the up-projection's output blocks H[m], block m with its own approximation (ge.block(m): a range
+    split's, else ge)."""
     ops, d = rt.ops, rt.dims
     mask = ("pf.gelu.dense", lambda s: np.full(d.N, s))
     out = []
-    for h in H:
+    for m, h in enumerate(H):
+        cfg = ge.block(m)
         a, b = split(ops, h)
-        if _GELU_JOINT and ge.method == "thor_composite":
-            ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, ge, mask))
+        if _GELU_JOINT and cfg.method == "thor_composite":
+            ga, gb = (im_cleanse(ops, g) for g in gelu_joint(rt, a, b, cfg, mask))
         else:
-            ga = im_cleanse(ops, gelu(rt, a, ge, mask=mask))
-            gb = im_cleanse(ops, gelu(rt, b, ge, mask=mask))
+            ga = im_cleanse(ops, gelu(rt, a, cfg, mask=mask))
+            gb = im_cleanse(ops, gelu(rt, b, cfg, mask=mask))
         out.append(join(ops, ga, gb))
     return out
 
@@ -319,13 +322,16 @@ class Gpt2Prefill(Gpt2Model):
                 enc = lambda name, Wm, sc, bias: PcmmLinear.encode(Wm, B.t, sc, bias, shift=band_shift(f"b{b}.{name}"),
                                                                    name=f"b{b}.{name}")
                 qkv_cols, qkv_bias = qkv_encode(B, m)
+                Up, bup, Dn = W.mlp_order(m, ge, Er, B.nch, self.gelu_folded)
                 cache[b] = {
                     "qkv": enc("qkv", qkv_cols, 0.25, 2.0 * qkv_bias),
                     "out": enc("out", B.group_rows(m.O), 1.0, m.bo),
-                    "up": enc("up", (m.Up * us)[:, :Er], 0.25, 2.0 * (m.bup * us)[:Er]),
-                    "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
+                    "up": enc("up", Up, 0.25, 2.0 * bup),
+                    "down": enc("down", Dn, 0.5, 2.0 * m.bdown),
                     "shift1": self.block_weights(b).shift1, "shift2": self.block_weights(b).shift2}
                 return cache[b]
+            if ge.blocks:
+                raise ValueError(f"block {b}: a range-split GELU needs PF_LAYOUT=blocked (output blocks of nch units)")
             cache[b] = {
                 "qkv": enc("qkv", np.hstack([m.K, m.V, m.Q]), 0.25, 2.0 * np.concatenate([m.bk, m.bv, m.bq])),
                 "out": enc("out", m.O, 1.0, m.bo),
@@ -333,6 +339,10 @@ class Gpt2Prefill(Gpt2Model):
                 "down": enc("down", m.Down[:Er], 0.5, 2.0 * m.bdown),
                 "shift1": self.block_weights(b).shift1, "shift2": self.block_weights(b).shift2}
         return cache[b]
+
+    def gelu_folded(self, ge):
+        """GELU_FOLD carries this approximation's 1 / xmax in the up-projection."""
+        return bool(self.rt.ops.gelu_fold) and ge.method in ("thor_composite", "chebyshev")
 
     def prefill_stages(self, ch: Chunks):
         diag = os.environ.get("PF_LINEAR", "pairs") in ("diag", "pcmm")

@@ -79,6 +79,50 @@ def fit_thor_gelu(samples, cfg):
     }
 
 
+def fit_cheb_gelu(X, rel_err=1e-5, max_deg=4095):
+    """One Chebyshev series of GELU(X t) / X on t in [-1, 1] (method 'chebyshev', GELU_FOLD's input scale 1 / X): the
+    lowest degree 2^k - 1 whose max error is at most rel_err X (the THOR composite cannot reach a wide range)."""
+    from numpy.polynomial import chebyshev as C
+    from scipy.special import erf
+    f = lambda t: 0.5 * t * (1.0 + erf(X * t / math.sqrt(2.0)))
+    t = np.linspace(-1.0, 1.0, 200001)
+    deg = 127
+    while True:
+        c = C.chebinterpolate(f, deg)
+        e = float(np.abs(C.chebval(t, c) - f(t)).max()) * X
+        if e <= rel_err * X or deg >= max_deg:
+            break
+        deg = 2 * deg + 1
+    log.info(f"[cheb-gelu] X={X:8.3f} deg={deg} max|err|={e:.3e}")
+    return {"method": "chebyshev", "xmax": float(X), "cheb_coeffs": [float(v) for v in c], "cheb_a": -1.0,
+            "cheb_b": 1.0, "cheb_eps": 1e-12, "fit_err_max": e}
+
+
+def fit_split_gelu(unit_max, nch, safety=1.5, target=5e-4, rel_err=1e-5,
+                   thor_degs=((31, 27), (63, 31))):
+    """A range-split site (impl.config.GeluCfg perm / blocks) from each hidden unit's max |input|: the units sorted by
+    range into output blocks of nch, block k fitted at S = safety x its widest unit by the first THOR composite of
+    `thor_degs` meeting `target` (absolute), else by one Chebyshev series (fit_cheb_gelu). The site's own fields are
+    its narrowest block's."""
+    unit_max = np.asarray(unit_max, dtype=np.float64)
+    if len(unit_max) % nch:
+        raise ValueError(f"{len(unit_max)} hidden units are not whole blocks of {nch}")
+    perm = np.argsort(unit_max, kind="stable")
+    blocks = []
+    for k in range(len(unit_max) // nch):
+        S = float(safety * unit_max[perm[(k + 1) * nch - 1]])
+        fit = None
+        for d1, d2 in thor_degs:
+            p1, p2, e_max, e_med = _fit_thor_composite(S, d1, d2)
+            if e_max <= target:
+                fit = {"method": "thor_composite", "xmax": S, "thor_p1": p1.tolist(), "thor_p2": p2.tolist(),
+                       "fit_err_max": e_max}
+                log.info(f"[split-gelu] block {k}: S={S:8.3f} THOR d1={d1} d2={d2} max|err|={e_max:.3e}")
+                break
+        blocks.append(fit or fit_cheb_gelu(S, rel_err))
+    return {**blocks[0], "perm": perm.tolist(), "blocks": blocks}
+
+
 def fit_gelu_section(gelu_samples, cfg):
     """The configs.json "softgelu" section: per-layer (or "global") THOR fits."""
     if cfg.per_layer:

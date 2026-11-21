@@ -110,6 +110,48 @@ def compose_image_get_batch(model_name, dataset, device, micro_batch, resolution
     return get_batch
 
 
+def build_audio_pool(model_name, path, n_clips):
+    """The first `n_clips` WAV files of directory `path` (sorted) through the MODEL'S OWN feature extractor: the audio
+    twin of `build_image_pool` (local files: decoding FLAC / MP3 needs packages the runtime does not carry)."""
+    import glob
+    from transformers import AutoFeatureExtractor
+    from perseus.audio import read_wav
+
+    fe = AutoFeatureExtractor.from_pretrained(model_name)
+    files = sorted(glob.glob(os.path.join(os.path.expandvars(path), "*.wav")))[:n_clips]
+    if len(files) < n_clips:
+        raise RuntimeError(f"{path}: {len(files)} WAV files, {n_clips} wanted")
+    log.info(f"[data] {len(files)} clips from {path} ({fe.__class__.__name__})")
+    sr = fe.sampling_rate
+    out = [fe(read_wav(f, sr).astype(np.float32), sampling_rate=sr, return_tensors="np")["input_features"][0]
+           for f in files]
+    return np.stack(out).astype(np.float32)
+
+
+def load_audio_pool(model_name, dataset):
+    import hashlib
+    src = os.path.realpath(os.path.expandvars(dataset.path))      # the clips' directory names the cached pool too
+    path = _pool_path(f"{dataset.name}_{hashlib.sha1(src.encode()).hexdigest()[:8]}", model_name, dataset.pool_clips)
+    if os.path.exists(path):
+        return np.load(path, mmap_mode="r")
+    pool = build_audio_pool(model_name, dataset.path, dataset.pool_clips)
+    np.save(path, pool)
+    log.info(f"[data] cached audio pool -> {path}")
+    return pool
+
+
+def compose_audio_get_batch(model_name, dataset, device, micro_batch):
+    """Batches of the pool's log-mel features (B, n_mels, frames), drawn at random."""
+    pool = load_audio_pool(model_name, dataset)
+
+    def get_batch():
+        ix = torch.randint(len(pool), (micro_batch,))
+        x = torch.from_numpy(np.stack([pool[i] for i in ix.tolist()]))
+        return x.pin_memory().to(device, non_blocking=True) if "cuda" in device else x.to(device)
+
+    return get_batch
+
+
 def compose_get_batch(model_name, dataset, device, block_size, micro_batch):
     pool = load_token_pool(model_name, dataset)
     n = len(pool)

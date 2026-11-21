@@ -122,11 +122,14 @@ PY
     exit 0
 fi
 if [ "$STAGE" = argmax ]; then
-    [ -d "$GRAPH_DIR/block_13" ] || { echo "no $GRAPH_DIR/block_13 (capture with --argmax)"; exit 1; }
-    TAIL="bootstrap_placements/$OUT_NAME/block_12_placement.json"
+    # CutMax is the capture's last stage (n_layers + 1: GPT-2's 13, Whisper's decoder's 7), the tail the one before
+    CM="${ARGMAX_BLOCK:-$(find "$GRAPH_DIR" -maxdepth 1 -name 'block_*' -printf '%f\n' | sed 's/^block_//' | sort -n | tail -1)}"
+    TL=$((CM - 1))
+    [ -d "$GRAPH_DIR/block_$CM" ] || { echo "no $GRAPH_DIR/block_$CM (capture with --argmax)"; exit 1; }
+    TAIL="bootstrap_placements/$OUT_NAME/block_${TL}_placement.json"
     [ -f "$TAIL" ] || { echo "no $TAIL (plan the blocks first)"; exit 1; }
     read -r ENTRY_LEVEL ENTRY_DEG < <("$PYTHON" -c 'import json,sys; s=json.load(open(sys.argv[1]))["summary"]; print(s["exit_level"], s.get("exit_deg") or 1)' "$TAIL")
-    TMP="$(mktemp -d "$GRAPH_DIR/../_argmax_XXXX")"; ln -s "$(cd "$GRAPH_DIR/block_13" && pwd)" "$TMP/block_13"
+    TMP="$(mktemp -d "$GRAPH_DIR/../_argmax_XXXX")"; ln -s "$(cd "$GRAPH_DIR/block_$CM" && pwd)" "$TMP/block_$CM"
     cp "$GRAPH_DIR/capture_env.json" "$TMP/" 2>/dev/null || true
     # PLAN_ARGMAX_MINCUT=1: the argmax on the min-cut placer without raise drops, whatever placer and raise drops the
     # blocks take (no plan prices the one-hot's noise)
@@ -142,9 +145,9 @@ if [ "$STAGE" = argmax ]; then
         PLAN_ACC_CHAIN="${PLAN_ACC_CHAIN-n32}" PLAN_MAG_SAFETY="${PLAN_MAG_SAFETY:-2}" \
         PLAN_SPARSE_SLOTS="${PLAN_SPARSE_SLOTS-512,1}" PLAN_SPARSE_BTS_OUT="${PLAN_SPARSE_BTS_OUT-1:26,512:36}" \
         bash "$PKG/plan/run_bootstrap_all_blocks.sh"
-    cp "bootstrap_placements/${OUT_NAME}_argmax/block_13_placement.json" "bootstrap_placements/$OUT_NAME/"
+    cp "bootstrap_placements/${OUT_NAME}_argmax/block_${CM}_placement.json" "bootstrap_placements/$OUT_NAME/"
     rm -rf "$TMP" "bootstrap_placements/${OUT_NAME}_argmax"
-    stamp "bootstrap_placements/$OUT_NAME/block_13_placement.json"
+    stamp "bootstrap_placements/$OUT_NAME/block_${CM}_placement.json"
     exit 0
 fi
 # block 0's feedback variant is derived from this block 0: a replan invalidates it

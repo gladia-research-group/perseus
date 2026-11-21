@@ -40,6 +40,13 @@ def main(cfg: DictConfig):
             micro_batch=cfg.model.batch_size,
             resolution=cfg.model.resolution,
         )
+    elif cfg.dataset.kind == "audio":
+        get_batch = data.compose_audio_get_batch(
+            model_name=cfg.model.name,
+            dataset=cfg.dataset,
+            device=cfg.device,
+            micro_batch=cfg.model.batch_size,
+        )
     else:
         block_size = cfg.model.block_size or infer_block_size(model)
         if not block_size:

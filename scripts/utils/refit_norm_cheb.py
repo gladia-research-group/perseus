@@ -61,8 +61,8 @@ def depth(deg, nr):
     return 2 + math.ceil(math.log2(deg)) + 2 * nr if deg > 1 else 2 + 2 * nr
 
 
-def fit_site(lo, hi, scale, target, max_deg):
-    """The shallowest (deg, nr) whose seed + Newton meets `target` relative error on [lo, hi]."""
+def fit_site(lo, hi, scale, target, max_deg, max_nr=4):
+    """The shallowest (deg, nr <= max_nr) whose seed + Newton meets `target` relative error on [lo, hi]."""
     ops = NumpyOps()
     t = np.cos(np.pi * (np.arange(400) + 0.5) / 400)
     xs = (t + 1) / 2 * (hi - lo) + lo
@@ -76,7 +76,7 @@ def fit_site(lo, hi, scale, target, max_deg):
         for _ in range(30):     # reweight toward minimax relative error
             r = np.abs(np.polynomial.chebyshev.chebval(t, c) / f - 1)
             c = np.polynomial.chebyshev.chebfit(t, f, deg, w=w * (r / r.max() + 0.05))
-        for nr in range(0, 5):
+        for nr in range(0, max_nr + 1):
             y = inv_sqrt_newton_d2(ops, grid, eval_chebyshev(ops, grid, c, lo, hi), nr,
                                    1.0 / (scale * scale))
             err = float(np.max(np.abs(y / exact - 1)))

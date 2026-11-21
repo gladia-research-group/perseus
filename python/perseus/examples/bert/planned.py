@@ -63,6 +63,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         t0 = time.time()
         m = self.model
         rec = Recorder(m, self.n_layers)
+        rec.values = False                          # Recorder.stage: one slot per ciphertext
         orig = getattr(m, self._stages_attr)
         io = {}
 
@@ -73,7 +74,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
                     flat = _flat(x)
                     metas = [(int(c.level), int(c.noise_deg)) for c in flat]
                     vals = [np.array(c.vec) for c in flat] if i == 0 else None
-                    y = fn(x)
+                    y = rec.stage(fn, x)
                     io[i] = ([c.name for c in flat], [c.name for c in _flat(y)], metas, vals)
                     return y
                 out.append((lab, pre, wrap))
@@ -93,23 +94,26 @@ class EncoderPlannedPrefill(PlannedPrefill):
             if i == 0:
                 self.in_vals = vals
         self.recs = rec.blocks
+        self.n_stages = len(self.recs)             # the blocks, plus the model's extra stages (PlannedPrefill.record)
+        self.labels = [f"block_{b}" for b in range(self.n_stages)]
         self.record_s = time.time() - t0
         return self.recs
 
     def prepare(self, rows):
-        """`record` + the programs compiled block by block: block b > 0 starts from block b - 1's compiled output
-        metadata (the plan refreshes a block's outputs, landing them above the twin's unplanned levels)."""
+        """`record` + the programs compiled, every block at once (`compile_blocks`): block b > 0 enters at block
+        b - 1's compiled output metadata (the plan refreshes a block's outputs, landing them above the twin's unplanned
+        levels), taken first from b - 1's plan (its planned exit), then checked against b - 1's program; a block whose
+        entry moved is compiled again, until the chain holds."""
         import json
-        from perseus import _pc
+        from perseus.impl.prefill import compile_blocks, planned_exit
         if not hasattr(self, "recs"):
             self.record(rows)
         t0 = time.time()
         os.makedirs(self.work_dir, exist_ok=True)
-        self.progs, self.in_pos = {}, {}
-        prev = None
-        for b in range(self.n_layers):
+        self.in_pos = {}
+        for b in range(self.n_stages):
             r, lab = self.recs[b], self.labels[b]
-            d = os.path.join(self.work_dir, f"block_{b}")
+            d = os.path.join(self.work_dir, lab, lab)
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "graph.json"), "w") as f:
                 json.dump({"version": 2, "nodes": r.nodes}, f)
@@ -119,17 +123,27 @@ class EncoderPlannedPrefill(PlannedPrefill):
             if missing:
                 raise RuntimeError(f"block {b}: inputs {missing} are not the stage's input ciphertexts {names}")
             self.in_pos[b] = [names.index(n) for n in ins]
-            if prev is not None:        # stage input i = the previous stage's output i
-                p = self.progs[self.labels[b - 1]]
-                got = {n: (int(lv), int(dg)) for n, lv, dg, _s in p.outputs}
-                self.in_metas[b] = [got[n] for n in self.recs[b - 1].out_names]
-            metas = {lab: {n: self.in_metas[b][names.index(n)] for n in ins}}
-            self.progs.update(_pc.Program.compile(self.work_dir, self.plan_dir, config=self.cfg, blocks=[lab],
-                                                  live_out={lab: list(r.out_names)}, input_metas=metas,
-                                                  schedule=self.schedule))
-            prev = b
+            if b:
+                self.in_metas[b] = [planned_exit(self.plan_dir, self.labels[b - 1])] * len(names)
+
+        def job(b):
+            names = self.in_names[b]
+            return list(self.recs[b].out_names), {n: self.in_metas[b][names.index(n)] for n in self.recs[b].inputs()}
+        self.progs, todo = {}, list(range(self.n_stages))
+        while todo:
+            self.progs.update(compile_blocks(self.work_dir, self.plan_dir, self.cfg, self.schedule,
+                                             {self.labels[b]: job(b) for b in todo}, log=self.log))
+            todo = []
+            for b in range(1, self.n_stages):        # stage input i = the previous stage's output i
+                got = {n: (int(lv), int(dg)) for n, lv, dg, _s in self.progs[self.labels[b - 1]].outputs}
+                real = [got[n] for n in self.recs[b - 1].out_names]
+                if real != self.in_metas[b]:
+                    self.log(f"[planned] {self.labels[b]}: entry {sorted(set(real))} != {sorted(set(self.in_metas[b]))}"
+                             f" assumed; compiled again")
+                    self.in_metas[b] = real
+                    todo.append(b)
         self.reg, n = {}, 0
-        for b in range(self.n_layers):
+        for b in range(self.n_stages):
             p = self.progs[self.labels[b]]
             self.reg[b] = []
             for o in self.recs[b].out_names:
@@ -166,7 +180,7 @@ class EncoderPlannedPrefill(PlannedPrefill):
         specs = session_specs(lins.values(), t)
         self.rot_keys = plan_rot_scope(self.plan_dir, progs)
         from perseus.impl.driver import register_levels
-        reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_layers) for j, r in self.reg[b]])
+        reg_levels = register_levels(self.n_regs, [(progs[b], j, r) for b in range(self.n_stages) for j, r in self.reg[b]])
         self.sess = _pc.Session(self.cfg, self.keys, pool=self.pool, pt_slots=n_pts + 8, programs=progs,
                                 regs=self.n_regs, pt_rows=pt_rows, stc_cache=self.stc_cache,
                                 pcmm=specs or None, pcmm_cf=self.pcmm_cf, check_meta=self.check_meta, ccmm=self.ccmm,

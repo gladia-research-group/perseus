@@ -8,6 +8,7 @@ records each site's use levels; later steps are staged at those levels; unstaged
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 
@@ -64,6 +65,13 @@ class Rt:
     @staticmethod
     def mask_key(key):
         return "mask." + (key if isinstance(key, str) else ".".join(str(k) for k in key))
+
+    @staticmethod
+    def values_key(a):
+        """A mask key's part for a weight vector: its values' digest. The tag names the same plaintext in every run
+        (an id() would rename it per run, and the compiled programs are cached on the graph's names)."""
+        a = np.ascontiguousarray(a)
+        return hashlib.blake2b(f"{a.dtype.str}{a.shape}".encode() + a.tobytes(), digest_size=8).hexdigest()
 
     sub_tags = frozenset()      # SubRt namespaces: a key's site is the one under the tag
 

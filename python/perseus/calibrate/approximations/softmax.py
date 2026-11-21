@@ -61,8 +61,10 @@ def _derive_per_layer_delta(M, cfg):
 
 
 def fit_softmax(rows, row_q, T, cfg):
+    """`row_q`: each row's query position (its keys 0 .. row_q valid), or -1 for a row of a cross-attention (every key
+    valid, no decode window: _SoftmaxCollector)."""
     win = int(cfg.decode_window) if cfg.decode_window else 0
-    if cfg.bidirectional:
+    if cfg.bidirectional or bool((row_q < 0).all()):
         win = 0
         row_q = torch.full_like(row_q, T - 1)
     if 0 < win < T:
@@ -213,13 +215,16 @@ class _SoftmaxCollector:
         self._orig = None
 
     def _record(self, site, x):
+        """A square score matrix's rows with their query positions; a cross-attention's (queries x encoder keys, not
+        square) with -1, every key valid."""
         T = x.shape[-1]
         scores2d = x.detach().reshape(-1, T)
         keep = min(self.rows_per_batch, scores2d.size(0))
         idx = torch.randperm(scores2d.size(0), device=scores2d.device)[:keep]
         e = self._bufs.setdefault(site, {"rows": [], "row_q": [], "T": T})
+        e["T"] = max(e["T"], T)              # a causal site's sequences vary (a decoder's transcripts): rows padded
         e["rows"].append(scores2d[idx].detach())
-        e["row_q"].append((idx % T).detach())
+        e["row_q"].append((idx % T).detach() if x.shape[-2] == T else torch.full_like(idx, -1))
 
     def _patch(self):
         if self._orig is not None:
@@ -229,7 +234,6 @@ class _SoftmaxCollector:
         def tapped(input, *args, **kwargs):
             dim = kwargs.get("dim", args[0] if args else None)
             if (self._stack and input.dim() >= 2
-                    and input.shape[-1] == input.shape[-2]
                     and dim in (-1, input.dim() - 1)):
                 self._record(self._stack[-1], input)
             return self._orig(input, *args, **kwargs)
@@ -245,7 +249,7 @@ class _SoftmaxCollector:
         if isinstance(module, nn.Softmax):
             def hook(module_, args, kwargs):
                 del module_, kwargs
-                if args and torch.is_tensor(args[0]) and args[0].shape[-1] == args[0].shape[-2]:
+                if args and torch.is_tensor(args[0]) and args[0].dim() >= 2:
                     self._record(name, args[0])
             return [module.register_forward_pre_hook(hook, with_kwargs=True)]
 
@@ -269,8 +273,10 @@ class _SoftmaxCollector:
 
     def finalize(self):
         self._unpatch()
+        # a shorter causal row padded to T past its query position (fit_softmax masks every key after row_q)
+        pad = lambda r, T: torch.nn.functional.pad(r.float(), (0, T - r.size(-1)))
         return {
-            n: (torch.cat(e["rows"], dim=0).float().cpu(),
+            n: (torch.cat([pad(r, e["T"]) for r in e["rows"]], dim=0).cpu(),
                 torch.cat(e["row_q"], dim=0).cpu(),
                 e["T"])
             for n, e in self._bufs.items()

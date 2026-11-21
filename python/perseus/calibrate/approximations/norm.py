@@ -263,16 +263,17 @@ class _NormCollector:
             self._var.setdefault(name, []).append(z.flatten().detach().cpu())
             if z.dim() == 2 and z.size(1) > 1:
                 zc = z.detach().cpu()                     # [B, T] all positions
-                p = self._pos.setdefault(name, {
-                    "sum": torch.zeros(zc.size(1)),
-                    "max": torch.zeros(zc.size(1)),
-                    "min": torch.full((zc.size(1),), float("inf")),
-                    "n": 0,
-                })
-                p["sum"] += zc.sum(dim=0)
-                p["max"] = torch.maximum(p["max"], zc.amax(dim=0))
-                p["min"] = torch.minimum(p["min"], zc.amin(dim=0))
-                p["n"] += zc.size(0)
+                T = zc.size(1)
+                p = self._pos.setdefault(name, {"sum": torch.zeros(0), "max": torch.zeros(0),
+                                                "min": torch.zeros(0), "n": torch.zeros(0)})
+                if T > p["sum"].numel():                  # a longer sequence (a decoder's transcripts vary)
+                    grow = T - p["sum"].numel()
+                    for k, fill in (("sum", 0.0), ("max", 0.0), ("min", float("inf")), ("n", 0.0)):
+                        p[k] = torch.cat([p[k], torch.full((grow,), fill)])
+                p["sum"][:T] += zc.sum(dim=0)
+                p["max"][:T] = torch.maximum(p["max"][:T], zc.amax(dim=0))
+                p["min"][:T] = torch.minimum(p["min"][:T], zc.amin(dim=0))
+                p["n"][:T] += zc.size(0)
                 if self._pos_q_lo > 0.0 or self._pos_q_hi < 1.0:
                     p.setdefault("mat", []).append(zc)
             self._cx.setdefault(name, []).append(cx.abs().amax().reshape(1).detach().cpu())
@@ -290,12 +291,14 @@ class _NormCollector:
             pos = None
             if p is not None:
                 hi, lo = p["max"], p["min"]
-                if "mat" in p:
-                    mat = torch.cat(p["mat"], dim=0)          # [N, T]
-                    hi = torch.quantile(mat, self._pos_q_hi, dim=0)
-                    lo = torch.quantile(mat, self._pos_q_lo, dim=0)
+                if "mat" in p:                                # [N, T], the shorter rows padded with NaN
+                    T = p["sum"].numel()
+                    mat = torch.cat([torch.nn.functional.pad(m, (0, T - m.size(1)), value=float("nan"))
+                                     for m in p["mat"]], dim=0)
+                    hi = torch.nanquantile(mat, self._pos_q_hi, dim=0)
+                    lo = torch.nanquantile(mat, self._pos_q_lo, dim=0)
                 pos = {
-                    "per_pos_mean": (p["sum"] / max(p["n"], 1)).tolist(),
+                    "per_pos_mean": (p["sum"] / p["n"].clamp(min=1)).tolist(),
                     "per_pos_max": hi.tolist(),
                     "per_pos_min": lo.tolist(),
                 }

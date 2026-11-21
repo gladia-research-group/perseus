@@ -337,7 +337,7 @@ def shift_lanes(rt, X2, shift, ch: Chunks, c: int, d_real: int, scale: float = 1
         for lane in range(d.t):
             out[idx + lane] = scale * sh * ((1.0 if lane < na else 0.0) + (1j if lane < nb else 0.0))
         return out
-    return rt.add_mask(X2, ("pf.shift", id(shift), na, nb, scale), build)
+    return rt.add_mask(X2, ("pf.shift", rt.values_key(shift), na, nb, scale), build)
 
 
 def norm_pair(rt, X, cfg, ch: Chunks, c: int, norm_fn):
@@ -1925,6 +1925,57 @@ def gelu_joint(rt, A, B, cfg, mask, us=None, act: str = "silu"):
 # (`Program.run`, GIL released, eager: a one-shot forward gains nothing from a CUDA-graph capture), carrying the
 # block outputs in registers.
 
+def planned_exit(plan_dir, label) -> tuple[int, int]:
+    """(level, deg) a block's plan says it exits at (its placement summary)."""
+    import json
+    s = json.load(open(os.path.join(plan_dir, f"{label}_placement.json")))["summary"]
+    return int(s["exit_level"]), int(s.get("exit_deg") or 1)
+
+
+def compile_blocks(work_dir, plan_dir, cfg, schedule, jobs, workers=None, log=print):
+    """`Program.compile` of the blocks of `jobs` = {label: (live_out names, {input name: (level, deg)})} at once, one
+    thread each (the compile drops the GIL): each block's graph at `work_dir/<label>/<label>/graph.json`, its own graph
+    dir (Program.compile builds every block of the plan its graph dir holds, then keeps the ones asked for: one shared
+    dir compiled block by block is quadratic). A Program is bound to the thread that made it (unsendable): the workers
+    save theirs next to the graph, named by everything the compile reads (the graph, the block's plan files, the
+    Config, the entry metas, the live outputs, the compiler build), and the caller's thread loads them; a save with
+    that name is a compile done. {label: Program}."""
+    import hashlib
+    import json
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from perseus import _pc
+    shared = sorted(f for f in os.listdir(plan_dir) if not f.endswith("_placement.json"))
+    so = os.stat(_pc.__file__)
+    salt = json.dumps([cfg.to_json(), schedule, so.st_size, so.st_mtime_ns])
+
+    def one(lab):
+        t0 = time.time()
+        live, metas = jobs[lab]
+        gdir = os.path.join(work_dir, lab)
+        h = hashlib.sha1(salt.encode())
+        for f in [os.path.join(gdir, lab, "graph.json"), os.path.join(plan_dir, f"{lab}_placement.json")] + \
+                 [os.path.join(plan_dir, f) for f in shared]:
+            with open(f, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 24), b""):
+                    h.update(chunk)
+        h.update(json.dumps([live, sorted(metas.items())]).encode())
+        path = os.path.join(gdir, f"program_{h.hexdigest()[:20]}.json")
+        if os.path.exists(path):
+            log(f"[planned] {lab}: compiled program cached ({os.path.basename(path)})")
+            return path
+        progs = _pc.Program.compile(gdir, plan_dir, config=cfg, blocks=[lab], live_out={lab: live},
+                                    input_metas={lab: metas}, schedule=schedule)
+        progs[lab].save(path + ".tmp")
+        del progs                       # dropped on the thread that made it
+        os.replace(path + ".tmp", path)
+        log(f"[planned] {lab} compiled in {time.time() - t0:.0f} s")
+        return path
+    with ThreadPoolExecutor(max_workers=workers or len(jobs)) as ex:
+        paths = dict(zip(jobs, ex.map(one, jobs)))
+    return {lab: _pc.Program.load(p, plan_dir) for lab, p in paths.items()}
+
+
 class PlannedPrefill:
     """PLANNED prefill on the new runtime (see above). `model`: the prefill model on the CPU twin (fakecap session);
     `plan_dir`: the block plans; `config`: the session Config (plan_runtime over the prefill preset)."""
@@ -1949,6 +2000,7 @@ class PlannedPrefill:
         t0 = time.time()
         m = self.model
         rec = Recorder(m, self.n_layers)
+        rec.values = False                          # Recorder.stage: one slot per ciphertext
         orig = m.prefill_stages
         io = {}
 
@@ -1958,7 +2010,7 @@ class PlannedPrefill:
                 def wrap(x, i=i, fn=fn):
                     metas = [(int(c.level), int(c.noise_deg)) for c in x]
                     vals = [np.array(c.vec) for c in x] if i == 0 else None
-                    y = fn(x)
+                    y = rec.stage(fn, x)
                     # graph names as this block's capture wrote them (the next block renames what it reads)
                     io[i] = ([c.name for c in x], [c.name for c in y], metas, vals)
                     return y

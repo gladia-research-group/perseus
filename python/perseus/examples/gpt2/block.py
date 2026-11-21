@@ -1,18 +1,21 @@
 """One GPT-2 block (src/model/gpt2/gpt2_block.cu with src/model/mlp.cu):
 ln_1 (folded: shift only) -> MHA -> residual -> ln_2 (folded) -> up -> GELU -> down ->
-residual."""
+residual; an encoder-decoder's block (Whisper's) with its cross-attention sub-block after the self-attention's."""
 from __future__ import annotations
 
 from perseus.impl.attention import mha
+from perseus.impl.cross_attention import cross_mha
 from perseus.impl.activation import gelu
 from perseus.impl.linear import linear
 from perseus.impl.norm import norm, ln_shift, ln_affine
 
 
-def transformer_block(rt, x, w, kv, cfgs, pos: int, last: bool = False):
+def transformer_block(rt, x, w, kv, cfgs, pos: int, last: bool = False, cross=None):
     """``w``: BlockWeights (q,k,v,out,up,down EncodedLinear; shift1/shift2 or the unfolded
     gamma/beta); ``cfgs``: (ln_1, ln_2, softmax, gelu) configs; ``pos``: token position;
-    ``last``: the model's final block (its exit feeds the tail, not another block)."""
+    ``last``: the model's final block (its exit feeds the tail, not another block). ``cross``: (weights with .q .out
+    .shift, the filled ComplexKVCache, (its LayerNorm config, its softmax config)): the cross-attention sub-block
+    (ln_x folded -> impl.cross_attention.cross_mha -> residual) between the self-attention and the MLP."""
     ops = rt.ops
     ln1, ln2, sm, ge = cfgs
     skip = x
@@ -23,6 +26,13 @@ def transformer_block(rt, x, w, kv, cfgs, pos: int, last: bool = False):
     x = mha(rt, x, w, kv, sm)
     x = ops.add(x, skip)
     skip = x
+    if cross is not None:
+        xw, xkv, (lnx, xsm) = cross
+        with rt.step("xattn"):
+            with rt.step("ln_x"):
+                x = ln_shift(rt, norm(rt, x, lnx, pos), xw.shift, w.tag + "ln_x")
+            x = ops.add(cross_mha(rt, x, xw, xkv, xsm), skip)
+        skip = x
     with rt.step("ln_2"):
         n = norm(rt, x, ln2, pos)
         if w.shift2 is not None:

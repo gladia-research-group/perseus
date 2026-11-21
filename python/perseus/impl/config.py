@@ -156,6 +156,16 @@ class GeluCfg:
     # sigma(xmax t) - 1/2 on t in [-1, 1] the site runs instead of the composite; empty = derived at runtime
     # (prefill.silu_single_coeffs over PF_SILU_SINGLE_DEGS)
     single_cheb: tuple = ()
+    # range split (an MLP whose hidden units span very different ranges, e.g. the units that build massive
+    # activations): `perm` orders the hidden units (the up-projection's columns, the down-projection's rows) so that
+    # output block m (nch units) holds units of similar range, and `blocks[m]` is its own approximation (its xmax folded
+    # into its columns). Empty: this config on every block.
+    perm: tuple = ()
+    blocks: tuple = ()
+
+    def block(self, m: int) -> "GeluCfg":
+        """The approximation of the MLP's output block m."""
+        return self.blocks[m] if self.blocks else self
 
 
 @dataclasses.dataclass
@@ -234,6 +244,11 @@ class Configs:
         return (self.norm[base + ".ln_1"], self.norm[base + ".ln_2"],
                 self.softmax[base + ".attn"], self.gelu[base + ".mlp.act"])
 
+    def cross(self, b: int):
+        """An encoder-decoder block's cross-attention: (its LayerNorm, its softmax)."""
+        base = f"transformer.h.{b}"
+        return self.norm[base + ".ln_x"], self.softmax[base + ".xattn"]
+
     @property
     def ln_f(self):
         return self.norm["transformer.ln_f"]
@@ -288,6 +303,10 @@ def parse_softmax(j: dict) -> SoftmaxCfg:
 
 
 def parse_gelu(j: dict) -> GeluCfg:
+    if "blocks" in j:                     # a range split: the site's own fields describe its narrowest block
+        base = parse_gelu({k: v for k, v in j.items() if k not in ("blocks", "perm")})
+        return dataclasses.replace(base, perm=tuple(int(i) for i in j["perm"]),
+                                   blocks=tuple(parse_gelu(b) for b in j["blocks"]))
     method = j["method"]
     if method == "thor_composite":
         return GeluCfg(method=method, xmax=float(j["xmax"]), thor_p1=_tup(j["thor_p1"]),

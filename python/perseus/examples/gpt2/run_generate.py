@@ -42,6 +42,39 @@ class GenRecorder(Recorder):
         return self.blocks
 
 
+def plan_overlay(plan_dir, overlay):
+    """`plan_dir`'s files symlinked into `overlay` (a generation run adds its feedback stage's placement there)."""
+    plan_dir = os.path.abspath(str(plan_dir))
+    if not os.path.exists(os.path.join(plan_dir, "block_0_feedback_placement.json")):
+        raise RuntimeError(f"{plan_dir}: generation needs block_0_feedback_placement.json "
+                           "(make_plan.sh <graph> <plan> feedback)")
+    os.makedirs(overlay, exist_ok=True)
+    for f in os.listdir(plan_dir):
+        if not os.path.lexists(os.path.join(overlay, f)):
+            os.symlink(os.path.join(plan_dir, f), os.path.join(overlay, f))
+    return overlay
+
+
+def feedback_stub(source_plan, overlay, n, feedback_nodes):
+    """The feedback stage's placement (block n+2) written into `overlay` when the plan has none: no planned refreshes,
+    the code's hint fired (CutMax hands z over deep) and its closing refresh; `feedback_nodes`: the stage's recorded
+    op stream."""
+    fb = os.path.join(str(overlay), f"block_{n + 2}_placement.json")
+    if os.path.lexists(fb):
+        return
+    with open(os.path.join(str(source_plan), f"block_{n + 1}_placement.json")) as fh:
+        cm = json.load(fh)
+    hints = [nd["output"] for nd in feedback_nodes if nd["op_type"] == "hint"]
+    # the hint's input (CutMax's exit) sits past the StC-first entry: the shipped order refreshes it
+    stub = {"version": cm["version"], "rules": cm["rules"], "placements": [], "hint_fire": hints,
+            "hint_decisions_bound": True, "shipped_order": hints, "rescale_after": [], "sparse_slots": {},
+            "correction_factor": {}, "real_route": [], "weight_levels": {}, "mask_levels": {}, "summary": {}}
+    if "config" in cm:
+        stub["config"] = cm["config"]
+    with open(fb, "w") as fh:
+        json.dump(stub, fh)
+
+
 class GenerateRun(PlannedRun):
     """`PlannedRun` with the generation stages: CutMax (n_layers+1), the feedback embed (n_layers+2) and block 0
     compiled for a fed-back token (`block_0_feedback`, entered at the feedback's refresh landing). The plan dir is
@@ -52,16 +85,8 @@ class GenerateRun(PlannedRun):
     def __init__(self, recorder, plan_dir, config, keys, *, work_dir, **kw):
         n = recorder.n_layers
         labels = [f"block_{b}" for b in range(n + 3)]
-        plan_dir = os.path.abspath(str(plan_dir))
-        if not os.path.exists(os.path.join(plan_dir, "block_0_feedback_placement.json")):
-            raise RuntimeError(f"{plan_dir}: generation needs block_0_feedback_placement.json "
-                               "(make_plan.sh <graph> <plan> feedback)")
-        overlay = os.path.join(work_dir, "plan")
-        os.makedirs(overlay, exist_ok=True)
-        for f in os.listdir(plan_dir):
-            if not os.path.lexists(os.path.join(overlay, f)):
-                os.symlink(os.path.join(plan_dir, f), os.path.join(overlay, f))
-        self.source_plan = plan_dir
+        overlay = plan_overlay(plan_dir, os.path.join(work_dir, "plan"))
+        self.source_plan = os.path.abspath(str(plan_dir))
         super().__init__(recorder, overlay, config, labels, keys, work_dir=work_dir,
                          variants={self.FB_VARIANT: 0}, **kw)
 
@@ -69,22 +94,11 @@ class GenerateRun(PlannedRun):
         """`PlannedRun.prepare`, after giving the overlay a feedback-stage placement when the plan has none: no
         planned refreshes, the code's hint fired (CutMax hands z over deep) and its closing refresh."""
         n = self.rec.n_layers
-        fb = os.path.join(str(self.plan_dir), f"block_{n + 2}_placement.json")
-        if not os.path.lexists(fb):
+        if not os.path.lexists(os.path.join(str(self.plan_dir), f"block_{n + 2}_placement.json")):
             self.rec.values = self.debug
             for t in range(min(self.probe, len(rows))):
                 self._record(t, rows, argmax)
-            with open(os.path.join(self.source_plan, f"block_{n + 1}_placement.json")) as fh:
-                cm = json.load(fh)
-            hints = [nd["output"] for nd in self.records[self.ref_token][n + 2].nodes if nd["op_type"] == "hint"]
-            # the hint's input (CutMax's exit) sits past the StC-first entry: the shipped order refreshes it
-            stub = {"version": cm["version"], "rules": cm["rules"], "placements": [], "hint_fire": hints,
-                    "hint_decisions_bound": True, "shipped_order": hints, "rescale_after": [], "sparse_slots": {},
-                    "correction_factor": {}, "real_route": [], "weight_levels": {}, "mask_levels": {}, "summary": {}}
-            if "config" in cm:
-                stub["config"] = cm["config"]
-            with open(fb, "w") as fh:
-                json.dump(stub, fh)
+            feedback_stub(self.source_plan, self.plan_dir, n, self.records[self.ref_token][n + 2].nodes)
         return super().prepare(rows, argmax)
 
     tfhe_chunk = 0                         # > 0: the session serves the TFHE sampler (impl/tfhe.py)

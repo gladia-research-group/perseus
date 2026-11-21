@@ -1388,6 +1388,18 @@ def mha(rt, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | N
             q = kv_push(rt, kv, P, q, **rp)
         else:
             kv_push(rt, kv, P if cplx else (k, v), **rp)
+    return attend(rt, q, kv, w, sm_cfg, rope, pos, pre_out, score_map, k0)
+
+
+def attend(rt, q, kv, w, sm_cfg: SoftmaxCfg, rope: Rope | None = None, pos: int | None = None, pre_out=None,
+           score_map=None, k0=None):
+    """mha's attention core on the query `q` (its linear's output) and the cache `kv`: q.K^T -> (score map) ->
+    softmax -> P.V -> out projection (w.out). mha runs it after the push; a cross-attention (impl.cross_attention) on
+    a cache the encoder filled."""
+    rp = dict(rope=rope, pos=pos)
+    ops = rt.ops
+    tap = getattr(rt, "tap", None) or (lambda name, ct: None)
+    cplx = isinstance(kv, ComplexKVCache)
     # the q.K^T issues one product per cache group: its op count is the cache's shape
     shape = (f"{len(kv.k_buckets)}x{len(kv.k_pend)}" if cplx else f"{len(kv.k_groups)}") \
         if getattr(rt, "scoped_names", False) else None
@@ -1528,10 +1540,11 @@ def mha_gqa(rt, sub, G: int, x, w, kv, sm_cfg: SoftmaxCfg, rope: Rope | None = N
         return linear(rt, x, w.out)
 
 
-def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int):
+def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int | None, buckets: int | None = None):
     """The per-step masks of the cachemir_complex attention at cache count `kc`: the softmax
     masks, the even / odd group masks of the complete K buckets plus the pending groups',
-    and the V pair masks of the push at `pos_in_group`."""
+    and the V pair masks of the push at `pos_in_group` (None: no push, a cache filled once). `buckets`: the cache's
+    K buckets (default: a pushed cache's, kc // 2t; a filled cache pairs every group, impl.cross_attention)."""
     d = rt.dims
     per = sm_periodic(rt, kc)
     affine = sm_fold_affine(rt, cfg)
@@ -1546,7 +1559,7 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
             if pg % 2 and pg < 2 * (kc // (4 * d.t)):
                 items.append(_hp_group_item(d, kc, pg, per, affine[0], True))
         return items
-    Nb = kc // (2 * d.t)
+    Nb = kc // (2 * d.t) if buckets is None else buckets
     G = (kc + d.t - 1) // d.t
     for gc in range(Nb):
         ge, go = 2 * gc, 2 * gc + 1
@@ -1559,6 +1572,8 @@ def complex_attention_step_masks(rt, cfg: SoftmaxCfg, kc: int, pos_in_group: int
         n = min(d.t, kc - g * d.t)
         it = _group_mask_item(d, n, g, per, affine[0])
         items += _pack_items(d, it) if pair else [it]
+    if pos_in_group is None:
+        return items
     rr = pos_in_group
     c = (kc - 1) // d.t                     # the push's v_count // t
     for p in range(d.d_head_real // 2):

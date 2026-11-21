@@ -22,8 +22,8 @@ class VitPlannedPrefill(EncoderPlannedPrefill):
 
     def linears(self):
         out = super().linears()
-        emb = self.model.embed_weights()
-        out[emb.name] = emb
+        for lin in self.model.extra_linears():
+            out[lin.name] = lin
         return out
 
     def hidden(self, b=None):

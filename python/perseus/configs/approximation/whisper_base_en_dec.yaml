@@ -1,0 +1,7 @@
+# Whisper base.en's decoder: GPT-2's decode set (causal self-attention within the decode window, CutMax); the
+# cross-attention's softmax over the 1500 encoder keys is fitted on every key (no window).
+defaults:
+  - gpt2_cutmax
+  - _self_
+
+name: whisper_base_en_dec

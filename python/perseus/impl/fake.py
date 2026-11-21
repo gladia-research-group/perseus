@@ -256,6 +256,10 @@ class FakeFhe:
     def level_hint(self, a, level):
         pass
 
+    def drop_to_level(self, a, level):
+        """Value-preserving modulus reduction to `level` (fakecap's, unrecorded)."""
+        a.meta = self.shadow.drop_to_level(a.meta, int(level)).out
+
     # bookkeeping for ops computed outside the recorded primitives (pcmm)
     def var_name(self, a):
         return "x"

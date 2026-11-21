@@ -232,10 +232,53 @@ def load_trained_backbone(model, checkpoint):
     return path
 
 
+def _whisper_tensors(model):
+    """Whisper's encoder blocks in the GPT-2 grammar (pre-LN, as ViT's; the key projection has no bias, its slot in
+    c_attn's bias is zero), ln_f its final LayerNorm. The front-end and the decoder are read from the checkpoint by
+    examples/whisper (weights.WhisperStore)."""
+    sd = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+    enc = next(p for p in ("model.encoder.", "encoder.") if p + "layer_norm.weight" in sd)
+    out = {}
+    for b in range(model.config.encoder_layers):
+        p, g = f"{enc}layers.{b}.", f"transformer.h.{b}."
+        q_b = sd[p + "self_attn.q_proj.bias"]
+        out[g + "attn.c_attn.weight"] = np.concatenate([sd[p + f"self_attn.{m}_proj.weight"] for m in "qkv"])
+        out[g + "attn.c_attn.bias"] = np.concatenate([q_b, np.zeros_like(q_b), sd[p + "self_attn.v_proj.bias"]])
+        for s in ("weight", "bias"):
+            out[g + "attn.c_proj." + s] = sd[p + "self_attn.out_proj." + s]
+            out[g + "mlp.c_fc." + s] = sd[p + "fc1." + s]
+            out[g + "mlp.c_proj." + s] = sd[p + "fc2." + s]
+            out[g + "ln_1." + s] = sd[p + "self_attn_layer_norm." + s]
+            out[g + "ln_2." + s] = sd[p + "final_layer_norm." + s]
+    for s in ("weight", "bias"):
+        out["transformer.ln_f." + s] = sd[enc + "layer_norm." + s]
+    return out
+
+
+def _whisper_section(site):
+    """Calibration site (examples/whisper/hf.WhisperEncoderTaps / WhisperDecoderTaps) -> runtime section name: the
+    blocks as GPT-2's, the front-end GELUs `frontend.conv{1,2}.act`, a decoder block's cross-attention `ln_x` and
+    `xattn`."""
+    site = re.sub(r"^(?:model\.)?(?:encoder|decoder)\.", "", site)
+    if site in ("act1", "act2"):
+        return f"frontend.conv{site[-1]}.act"
+    if site == "layer_norm":
+        return "transformer.ln_f"
+    m = re.match(r"layers\.(\d+)\.(.+)", site)
+    if not m:
+        return site                     # not a site (the `model` section's dims)
+    suffix = {"self_attn_layer_norm": "ln_1", "final_layer_norm": "ln_2", "self_attn": "attn",
+              "activation_fn": "mlp.act", "encoder_attn_layer_norm": "ln_x", "encoder_attn": "xattn"}.get(m.group(2))
+    if suffix is None:
+        raise ValueError(f"unmapped Whisper site: {site}")
+    return f"transformer.h.{m.group(1)}.{suffix}"
+
+
 ADAPTERS = {
     "gpt2": {"tensors": _gpt2_tensors, "client": _gpt2_client, "section": lambda s: s},
     "vit":  {"tensors": _vit_tensors, "client": _vit_client, "section": _vit_section},
     "bert": {"tensors": _bert_tensors, "client": _bert_client, "section": _bert_section},
+    "whisper": {"tensors": _whisper_tensors, "client": None, "section": _whisper_section},
 }
 
 

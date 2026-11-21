@@ -495,6 +495,17 @@ class Recorder:
         self.restart = True                # token 0 resets the model (start()); False: it continues from its state
                                            # (a decode after a prefill hand-off)
 
+    def stage(self, fn, x):
+        """A prefill stage `fn(x)` on the recorder, one slot kept per ciphertext unless `values` (the compile reads the
+        op stream, the metas and the plaintexts; every ciphertext of a stage stays referenced until it ends: a
+        1500-position Whisper encoder block would hold ~300 GB of slot vectors)."""
+        cap = self._fakecap.CapCt
+        old, cap.novec = cap.novec, not self.values
+        try:
+            return fn(x)
+        finally:
+            cap.novec = old
+
     def token(self, t, row, argmax=False):
         """{block: BlockRec} of token t (position first + t; blocks 0..n_layers-1, the tail, CutMax when `argmax`)."""
         m, self.blocks = self.model, {}
@@ -533,21 +544,31 @@ class Recorder:
         return self.blocks
 
 
-def _canon(pos, names):
-    """Input names as their position among the block's inputs (anon names differ from token to token)."""
-    return [f"in{pos[x]}" if x in pos else ("const" if x.startswith("const(") else "rot" if x.startswith("rot(") else x)
-            for x in names]
+def _canon(pos, names, keys=None):
+    """Input names as their position among the block's inputs (anon names differ from token to token); a cache state
+    as its cache key (`keys`: its position moves with how many states the token reads before it, e.g. a fixed state
+    after the K/V a first token does not read yet)."""
+    keys = keys or {}
+    return [keys[x] if x in keys else f"in{pos[x]}" if x in pos else
+            ("const" if x.startswith("const(") else "rot" if x.startswith("rot(") else x) for x in names]
 
 
-def diff_block(ref, rec):
+def _cache_keys(r, fixed):
+    """{input name: cache key} of a block record's fixed-state inputs (keys in `fixed`)."""
+    return {n: r.kv_pre[id(o)] for n, o in r.objs.items() if r.kv_pre.get(id(o)) in fixed}
+
+
+def diff_block(ref, rec, fixed=()):
     """(scalars {name: v}, rotations {name: k}, zero-cache input positions) that turn the reference program into
-    this token's stream; raises on any other difference (the plan does not bind)."""
+    this token's stream; raises on any other difference (the plan does not bind). `fixed`: the block's fixed-state
+    cache keys (PlannedRun.kv_fixed), compared by key, not position."""
     if len(ref.nodes) != len(rec.nodes):
         raise RuntimeError(f"op stream of {len(rec.nodes)} nodes, the program's has {len(ref.nodes)}")
     scal, rots, zero = {}, {}, set()
     rin, yin = ref.pos(), rec.pos()
+    rk, yk = (_cache_keys(ref, fixed), _cache_keys(rec, fixed)) if fixed else ({}, {})
     for x, y in zip(ref.nodes, rec.nodes):
-        xi, yi = _canon(rin, x["inputs"]), _canon(yin, y["inputs"])
+        xi, yi = _canon(rin, x["inputs"], rk), _canon(yin, y["inputs"], yk)
         same = x["op_type"] == y["op_type"] and xi == yi and x["output"] == y["output"]
         ax, ay = x.get("args", {}), y.get("args", {})
         if same:
@@ -689,6 +710,7 @@ class PlannedRun:
         self.stats = []
         self._pre, self._staged, self._keys, self._alias = {}, None, {}, {}
         self._ahead = None
+        self.kv_first = {}                 # {block: {input index: Ct}}: its fixed states (`give_kv`)
 
     # ── setup ──
     def _record(self, t, rows, argmax):
@@ -730,8 +752,11 @@ class PlannedRun:
             raise RuntimeError(f"the reference token {self.ref_token} needs {self.ref_token + 1} input rows")
         ref = self.records[self.ref_token]
         self.ref = ref
-        # the reference stream as a graph dir; the K/V states (and every stage output) stay live out
-        live, self.kv = {}, {}
+        # the reference stream as a graph dir; the K/V states (and every stage output) stay live out. Fixed states
+        # (model.fixed_cache_keys(b): a cache filled before the first token and only read, an encoder-decoder's
+        # cross-attention) are no outputs: every token passes the given ciphertexts in (`give_kv`)
+        live, self.kv, self.kv_fixed = {}, {}, {}
+        fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
         os.makedirs(self.work_dir, exist_ok=True)
         for b, r in ref.items():
             lab = self.labels[b]
@@ -741,12 +766,27 @@ class PlannedRun:
                 json.dump({"version": 2, "nodes": r.nodes}, f)
             prev = self.records[self.ref_token - 1][b]
             ins = r.inputs()
-            kv = [(i, prev.final[id(r.objs[n])]) for i, n in enumerate(ins) if n in r.objs and id(r.objs[n]) in prev.final]
+            fk = set(fixed_keys(b)) if b < self.rec.n_layers else set()
+            kv, fixed = [], {}
+            for i, n in enumerate(ins):
+                o = r.objs.get(n)
+                if o is None or id(o) not in prev.final:
+                    continue
+                key = r.kv_pre.get(id(o))
+                if key in fk:
+                    fixed[key] = i
+                else:
+                    kv.append((i, prev.final[id(o)]))
             live[lab] = list(r.out_names) + [nm for _, nm in kv]
-            self.kv[b] = kv
+            self.kv[b], self.kv_fixed[b] = kv, fixed
         # the K/V inputs enter as the previous token left them (the recorder's state when read); the stage input
         # enters at the previous block's compiled exit (compile_dir chains them)
-        metas = {self.labels[b]: {r.inputs()[i]: r.metas[r.inputs()[i]] for i, _ in self.kv[b]} for b, r in ref.items()}
+        metas = {self.labels[b]: {r.inputs()[i]: r.metas[r.inputs()[i]]
+                                  for i in [i for i, _ in self.kv[b]] + list(self.kv_fixed[b].values())}
+                 for b, r in ref.items()}
+        # block 0's input as the twin encoded it (a model may enter every token at a refresh landing's degree)
+        ins0 = ref[0].inputs()
+        metas[self.labels[0]][ins0[0]] = ref[0].metas[ins0[0]]
         for lab, b in self.variants.items():
             live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
         self.progs = _pc.Program.compile(self.work_dir, str(self.plan_dir), config=self.cfg,
@@ -756,7 +796,7 @@ class PlannedRun:
         dyn = {b: set() for b in ref}
         for t, rec in self.records.items():
             for b in ref:
-                s, k, _ = diff_block(ref[b], rec[b])
+                s, k, _ = diff_block(ref[b], rec[b], self.kv_fixed.get(b, ()))
                 dyn[b] |= set(s) | set(k)
         # registers: per block its K/V states, then the stage outputs (carry)
         self.reg = {}
@@ -946,7 +986,7 @@ class PlannedRun:
         keys = self._keys
         for b, r in recs.items():
             labs = [self.labels[b]] + [lab for lab, vb in self.variants.items() if vb == b]
-            s, k, z = diff_block(self.ref[b], r)
+            s, k, z = diff_block(self.ref[b], r, self.kv_fixed.get(b, ()))
             for nm, (kind, v0) in self.ref_dyn[b].items():
                 v = s.pop(nm, v0) if kind == "s" else k.pop(nm, v0)
                 calls += [(self.progs[lab], kind, nm, v) for lab in labs]
@@ -982,6 +1022,13 @@ class PlannedRun:
         self._apply(calls, items)
         return zero, len(items)
 
+    def give_kv(self, b, cts):
+        """Block b's fixed states (model.fixed_cache_keys), {cache key: Ct}: passed in at every token."""
+        missing = sorted(set(self.kv_fixed.get(b, {})) - set(cts))
+        if missing:
+            raise KeyError(f"block {b}: fixed states not given: {missing[:4]}")
+        self.kv_first[b] = {self.kv_fixed[b][k]: ct for k, ct in cts.items() if k in self.kv_fixed[b]}
+
     def _run_block(self, b, t, zero, first_in, variant=None):
         key = variant or b
         p = self.progs[variant or self.labels[b]]
@@ -989,6 +1036,11 @@ class PlannedRun:
         ins[0] = first_in
         for i, _j, r in self.reg[key]["kv"]:
             ins[i] = None if (t == 0 or i in zero.get(b, ())) else r
+        if self.kv_fixed.get(b):
+            if b not in self.kv_first:
+                raise RuntimeError(f"block {b} reads fixed states: give them first (give_kv)")
+            for i, ct in self.kv_first[b].items():
+                ins[i] = ct
         outs = [(j, r) for _i, j, r in self.reg[key]["kv"]] + list(self.reg[key]["out"])
         return p.run(ins, outs)
 
@@ -1134,8 +1186,12 @@ class StreamedPlannedRun:
     def __init__(self, recorder, plan_dir, config, labels, keys, *, work_dir, streams, stream_rows, prefix=None,
                  kv_init=None, input_vec=None, routes_for=None, frames=None, stc_cache=8, pool=16, base_routes=(256, 1),
                  size=None, dense_fallback=False, extra_pt_slots=0, argmax=False, pt_slots=None, slim=False, log=print,
-                 schedule="program", plan_windows=None, pt_cache=False):
+                 schedule="program", plan_windows=None, pt_cache=False, variants=None):
         self.rec, self.plan_dir, self.cfg, self.labels, self.keys = recorder, plan_dir, config, labels, keys
+        # generation (labels past CutMax: the feedback stage n+2, `feedback`): `variants` {label: stage}, a stage's
+        # program for a fed-back token (block_0_feedback), compiled per class from the same stream under its own plan
+        self.variants = dict(variants or {})
+        self.kv_first = {}                 # {block: {cache key: Ct}}: its fixed states (model.fixed_cache_keys, give_kv)
         self.pt_cache = pt_cache        # every position's plaintexts staged at setup (`setup`, `_patch`)
         self.plan_windows = [(int(b), str(d)) for b, d in plan_windows] if plan_windows else None
         if self.plan_windows:
@@ -1217,8 +1273,9 @@ class StreamedPlannedRun:
             if c.get("closed"):
                 self._reload_ref(keyidx[key], c)
             c["diffs"][t] = {}
+            fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
             for b in ref:
-                sc, kk, z = diff_block(ref[b], rec[b])
+                sc, kk, z = diff_block(ref[b], rec[b], set(fixed_keys(b)) if b < self.n else ())
                 if z:
                     raise RuntimeError(f"token {t} block {b}: an empty-cache push in a streamed run (the caches start "
                                        f"from the prefix)")
@@ -1233,12 +1290,16 @@ class StreamedPlannedRun:
                      f"{fresh} new plaintexts")
         self.record_s = time.time() - t0
         n = self.n
+        # fixed states (a cache filled before the first token and only read: an encoder-decoder's cross-attention) are
+        # no units: every token passes the given ciphertexts in (`give_kv`)
+        fixed_keys = getattr(self.rec.model, "fixed_cache_keys", lambda b: ())
+        self.fixed = {b: set(fixed_keys(b)) for b in range(n)}
         # K/V units: block b's cache keys (suffixes) over every recorded token, one unit each
         suffixes = set()
         for rec in self.records.values():
             for b in range(n):
-                suffixes |= {self._ukey(b, k) for k in rec[b].kv_post}
-                suffixes |= {self._ukey(b, k) for k in rec[b].kv_pre.values()}
+                suffixes |= {self._ukey(b, k) for k in rec[b].kv_post if k not in self.fixed[b]}
+                suffixes |= {self._ukey(b, k) for k in rec[b].kv_pre.values() if k not in self.fixed[b]}
         self.kv_keys = sorted(suffixes, key=lambda k: (k.split(".")[0], int(k.split(".")[1]) if k.split(".")[-1].isdigit() else 0))
         self.U = len(self.kv_keys)
         self.unit = {k: i for i, k in enumerate(self.kv_keys)}
@@ -1337,12 +1398,15 @@ class StreamedPlannedRun:
         c["ref_info"] = {}
         for b, r in self.records[c["ref"]].items():
             ins = r.inputs()
-            kv_in = [(i, self._ukey(b, r.kv_pre[id(r.objs[x])])) for i, x in enumerate(ins)
-                     if x in r.objs and id(r.objs[x]) in r.kv_pre]
+            fk = self.fixed.get(b, set())
+            pre = {i: r.kv_pre[id(r.objs[x])] for i, x in enumerate(ins) if x in r.objs and id(r.objs[x]) in r.kv_pre}
+            kv_in = [(i, self._ukey(b, key)) for i, key in pre.items() if key not in fk]
+            fixed_in = {key: i for i, key in pre.items() if key in fk}
             steps = {nd["output"]: (("r", int(nd["inputs"][1][4:-1])) if nd["op_type"] == "rotate"
                                     else ("s", nd["args"]["scalar"]))
                      for nd in r.nodes if nd["op_type"] == "rotate" or nd.get("args", {}).get("scalar") is not None}
-            c["ref_info"][b] = (kv_in, {ins[i]: r.metas[ins[i]] for i, _ in kv_in}, steps)
+            mi = [i for i, _ in kv_in] + list(fixed_in.values()) + ([0] if b == 0 else [])
+            c["ref_info"][b] = (kv_in, {ins[i]: r.metas[ins[i]] for i in mi}, steps, fixed_in)
             r.nodes, r.objs, r.metas = None, None, None
         c["closed"] = True
 
@@ -1367,32 +1431,41 @@ class StreamedPlannedRun:
         ref = self.records[c["ref"]]
         closed = c.get("closed", False)
         wd = c["graphs"] if closed else self._write_graphs(k, c)
-        live, metas, io = {}, {}, {}
+        live, metas, io, fixed_in = {}, {}, {}, {}
         for b, r in ref.items():
             lab = self.labels[b]
             ins = r.inputs()
+            fk = self.fixed.get(b, set())
             if closed:
-                kv_in = c["ref_info"][b][0]
+                kv_in, fixed_in[b] = c["ref_info"][b][0], c["ref_info"][b][3]
             else:
-                kv_in = [(i, self._ukey(b, r.kv_pre[id(r.objs[x])])) for i, x in enumerate(ins) if x in r.objs and id(r.objs[x]) in r.kv_pre]
-            live[lab] = list(r.out_names) + list(r.kv_post.values())
+                pre = {i: r.kv_pre[id(r.objs[x])] for i, x in enumerate(ins) if x in r.objs and id(r.objs[x]) in r.kv_pre}
+                kv_in = [(i, self._ukey(b, key)) for i, key in pre.items() if key not in fk]
+                fixed_in[b] = {key: i for i, key in pre.items() if key in fk}
+            live[lab] = list(r.out_names) + [nm for key, nm in r.kv_post.items() if key not in fk]
             if self.tap and c["ref"] == self.tap[0] and b == self.tap[1]:
                 self.taps = self._pick_taps(r.nodes, set(live[lab]))
                 live[lab] += self.taps
-            metas[lab] = c["ref_info"][b][1] if closed else {ins[i]: r.metas[ins[i]] for i, _ in kv_in}
+            metas[lab] = c["ref_info"][b][1] if closed else \
+                {ins[i]: r.metas[ins[i]] for i in [i for i, _ in kv_in] + list(fixed_in[b].values()) + ([0] if b == 0 else [])}
             io[b] = kv_in
-        progs = _pc.Program.compile(wd, str(c["plan"]), config=self.cfg, blocks=[self.labels[b] for b in ref],
+        for lab, b in self.variants.items():
+            live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
+        progs = _pc.Program.compile(wd, str(c["plan"]), config=self.cfg,
+                                    blocks=[self.labels[b] for b in ref] + list(self.variants),
                                     live_out=live, input_metas=metas, routes_built=list(c["routes"]),
                                     dense_fallback=self.dense_fallback, schedule=self.schedule)
         c["progs"] = {}
-        c["kv_in"], c["kv_out"], c["out"] = {}, {}, {}
-        for b, r in ref.items():
-            p = progs[self.labels[b]]
-            p.relabel(f"c{k}.{self.labels[b]}")
-            c["progs"][b] = p
-            c["kv_in"][b] = [(i, b * self.U + self.unit[key]) for i, key in io[b]]
-            c["kv_out"][b] = [(p.output_index(nm), b * self.U + self.unit[self._ukey(b, key)]) for key, nm in r.kv_post.items()]
-            c["out"][b] = [p.output_index(o) for o in r.out_names]
+        c["kv_in"], c["kv_out"], c["out"], c["fixed"] = {}, {}, {}, fixed_in
+        for key_, b, lab in [(b, b, self.labels[b]) for b in ref] + [(lab, b, lab) for lab, b in self.variants.items()]:
+            r = ref[b]
+            p = progs[lab]
+            p.relabel(f"c{k}.{lab}")
+            c["progs"][key_] = p
+            c["kv_in"][key_] = [(i, b * self.U + self.unit[key]) for i, key in io[b]]
+            c["kv_out"][key_] = [(p.output_index(nm), b * self.U + self.unit[self._ukey(b, key)])
+                                 for key, nm in r.kv_post.items() if key not in self.fixed.get(b, set())]
+            c["out"][key_] = [p.output_index(o) for o in r.out_names]
         # dynamic steps: everything another member token changes (diffs taken when the tokens were recorded)
         dyn = {b: set() for b in ref}
         for t in c["members"]:
@@ -1400,6 +1473,8 @@ class StreamedPlannedRun:
                 s, kk = c["diffs"][t][b]
                 dyn[b] |= set(s) | set(kk)
                 self.dyn_rot = sorted(set(self.dyn_rot) | set(kk.values()))
+        for lab, b in self.variants.items():
+            dyn[lab] = dyn[b]
         c["dyn"] = dyn
         c["ref_dyn"] = {}
         for b, r in ref.items():
@@ -1412,6 +1487,8 @@ class StreamedPlannedRun:
                 c["ref_dyn"][b] = {nm: (("r", int(byname[nm]["inputs"][1][4:-1])) if byname[nm]["op_type"] == "rotate"
                                         else ("s", float(byname[nm]["args"]["scalar"]))) for nm in dyn[b]}
             self.dyn_rot = sorted(set(self.dyn_rot) | {v for kind, v in c["ref_dyn"][b].values() if kind == "r"})
+        for lab, b in self.variants.items():
+            c["ref_dyn"][lab] = c["ref_dyn"][b]
         ops = sum(p.n_ops for p in c["progs"].values())
         sums = sum(len(p.coeff_sums) for p in c["progs"].values())
         bts = sum(p.n_bootstraps for p in c["progs"].values())
@@ -1428,7 +1505,7 @@ class StreamedPlannedRun:
         if not hasattr(self, "classes"):
             self.prepare(rows)
         n = self.n
-        progs = [c["progs"][b] for c in self.classes for b in sorted(c["progs"])]
+        progs = [c["progs"][b] for c in self.classes for b in sorted(c["progs"], key=str)]
         # registers: block b's output -> b; the tail's outputs after
         n_tail = max(len(c["out"][n]) for c in self.classes)
         self.reg_out = {b: [b] for b in range(n)}
@@ -1438,6 +1515,12 @@ class StreamedPlannedRun:
             n_z = max(len(c["out"][n + 1]) for c in self.classes)
             self.reg_out[n + 1] = [regs + j for j in range(n_z)]
             regs += n_z
+        if any(n + 2 in c["out"] for c in self.classes):   # the feedback stage (generation)
+            n_f = max(len(c["out"][n + 2]) for c in self.classes)
+            self.reg_out[n + 2] = [regs + j for j in range(n_f)]
+            regs += n_f
+        for lab, b in self.variants.items():
+            self.reg_out[lab] = self.reg_out[b]
         self.tap_regs = [regs + j for j in range(len(self.taps))]
         regs += len(self.taps)
         # K/V rows: the deepest state any program writes or reads
@@ -1493,7 +1576,7 @@ class StreamedPlannedRun:
                     p.mark_dynamic(sorted(c["dyn"][b]))
                 c.setdefault("pt_idx", {})[b] = [(i, nm, lv_) for i, (nm, lv_, _d, f) in enumerate(p.pt_refs) if f != "stream"]
         c0 = self.classes[0]
-        self.sess.stream_order([c0["progs"][b] for b in sorted(c0["progs"]) if c0["progs"][b].coeff_sums])
+        self.sess.stream_order([c0["progs"][b] for b in sorted(c0["progs"], key=str) if c0["progs"][b].coeff_sums])
         self.sess.complete_setup()
         self.fhe = self.sess.fhe
         tw = time.time()
@@ -1510,7 +1593,7 @@ class StreamedPlannedRun:
             vecs = self.prefix(b) if given is None and self.prefix is not None else None
             for x in r.inputs():
                 o = r.objs.get(x)
-                if o is None or id(o) not in r.kv_pre:
+                if o is None or id(o) not in r.kv_pre or r.kv_pre[id(o)] in self.fixed.get(b, ()):
                     continue
                 key = self._ukey(b, r.kv_pre[id(o)])
                 if given is None and vecs is None:
@@ -1570,29 +1653,31 @@ class StreamedPlannedRun:
         """Token t's dynamic arguments and plaintexts on class c's programs (eager: slots by value)."""
         need, items = {}, []
         for b, r in recs.items():
-            p = c["progs"][b]
             # the token's stream was checked against the class's reference when the classes were made (prepare)
-            s, k = (dict(x) for x in c["diffs"][t][b]) if t in c["diffs"] else diff_block(self.records[c["ref"]][b], r)[:2]
-            for nm, (kind, v0) in c["ref_dyn"][b].items():
-                if kind == "s":
-                    p.set_scalar(nm, s.pop(nm, v0))
-                else:
-                    p.set_rotation(nm, k.pop(nm, v0))
-            if s or k:
-                raise RuntimeError(f"token {t} block {b}: steps the class's tokens kept constant change: {sorted(s) + sorted(k)}")
-            pairs = []
-            for i, nm, lv in c["pt_idx"][b]:
-                v = r.pts[nm]
-                key = (id(v), lv)
-                if key not in need:
-                    have = self._resident.get(key)
-                    if have is None:
-                        self._pt_serial += 1
-                        have = (v, f"v{self._pt_serial}")
-                        items.append((have[1], lv, v))
-                    need[key] = have
-                pairs.append((i, need[key][1]))
-            p.retarget_pts(pairs)
+            s0, k0 = (dict(x) for x in c["diffs"][t][b]) if t in c["diffs"] else diff_block(self.records[c["ref"]][b], r)[:2]
+            for pk in [b] + [lab for lab, vb in self.variants.items() if vb == b and lab in c["progs"]]:
+                p, s, k = c["progs"][pk], dict(s0), dict(k0)
+                for nm, (kind, v0) in c["ref_dyn"][pk].items():
+                    if kind == "s":
+                        p.set_scalar(nm, s.pop(nm, v0))
+                    else:
+                        p.set_rotation(nm, k.pop(nm, v0))
+                if s or k:
+                    raise RuntimeError(f"token {t} block {b}: steps the class's tokens kept constant change: "
+                                       f"{sorted(s) + sorted(k)}")
+                pairs = []
+                for i, nm, lv in c["pt_idx"][pk]:
+                    v = r.pts[nm]
+                    key = (id(v), lv)
+                    if key not in need:
+                        have = self._resident.get(key)
+                        if have is None:
+                            self._pt_serial += 1
+                            have = (v, f"v{self._pt_serial}")
+                            items.append((have[1], lv, v))
+                        need[key] = have
+                    pairs.append((i, need[key][1]))
+                p.retarget_pts(pairs)
         gone = [] if self.pt_cache else [(name, lv) for key, (_v, name) in self._resident.items() if key not in need
                                          for lv in (key[1],)]
         if gone:
@@ -1602,9 +1687,38 @@ class StreamedPlannedRun:
         self._resident = {**self._resident, **need} if self.pt_cache else need
         return len(items)
 
-    def token(self, t, rows, argmax=None):
+    def input_ct(self, t, rows, p):
+        """Block 0's input of token t: its row packed on the token lanes at the program's input (level, deg)."""
+        vec = np.asarray(self.input_vec(rows[t]), dtype=np.float64)
+        _nm, lv, dg = p.inputs[0][:3]
+        if dg == 1:
+            return self.fhe.pack_tokens(np.asarray([vec]), lv)
+        d = self.rec.model.rt.dims
+        v = np.zeros(d.N)
+        v[np.arange(min(len(vec), d.hid)) * d.t] = vec[:d.hid]
+        return self.fhe.encrypt(v, lv, dg)
+
+    def give_kv(self, b, cts):
+        """Block b's fixed states (model.fixed_cache_keys), {cache key: Ct}: passed in at every token."""
+        missing = sorted(self.fixed.get(b, set()) - set(cts))
+        if missing:
+            raise KeyError(f"block {b}: fixed states not given: {missing[:4]}")
+        self.kv_first[b] = dict(cts)
+
+    def feedback(self, t):
+        """Issue the feedback stage (n+2) on token t's CutMax output; returns the register position t+1 enters from."""
+        n = self.n
+        c = self.classes[self.class_of[t]]
+        p = c["progs"][n + 2]
+        ins = [None] * len(p.inputs)
+        ins[0] = self.reg_out[n + 1][0]
+        p.run(ins, [(j, reg) for j, reg in zip(c["out"][n + 2], self.reg_out[n + 2])])
+        return self.reg_out[n + 2][0]
+
+    def token(self, t, rows, argmax=None, entry=None, variant=None):
         """Issue token t's forward; returns (the tail's output registers, host times). Asynchronous. `argmax`: as
-        constructed (every record stages CutMax from setup)."""
+        constructed (every record stages CutMax from setup). `entry`: block 0's input register (a fed-back token),
+        run on block 0's program `variant`."""
         tt = time.time()
         if t not in self.records:
             self.records[t] = self.rec.token(t, rows[t], self.argmax_stage)
@@ -1617,19 +1731,21 @@ class StreamedPlannedRun:
         n, U = self.n, self.U
         units = lambda b: [b * U + j for j in range(U)] if 0 <= b < n else []
         for b in range(n + 1 if self.tail else n):
-            p = c["progs"][b]
+            pk = variant if (b == 0 and variant) else b
+            p = c["progs"][pk]
             ins = [None] * len(p.inputs)
             if b == 0:
-                vec = np.asarray(self.input_vec(rows[t]), dtype=np.float64)
-                ins[0] = self.fhe.pack_tokens(np.asarray([vec]), p.inputs[0][1])
+                ins[0] = self.input_ct(t, rows, p) if entry is None else entry
             else:
                 ins[0] = self.reg_out[b - 1][0]
-            outs = [(j, reg) for j, reg in zip(c["out"][b], self.reg_out[b])]
+            for key, i in c["fixed"].get(b, {}).items():
+                ins[i] = self.kv_first[b][key]
+            outs = [(j, reg) for j, reg in zip(c["out"][pk], self.reg_out[b])]
             if self.tap and (t, b) == tuple(self.tap):
                 outs += [(p.output_index(nm), reg) for nm, reg in zip(self.taps, self.tap_regs)]
             if b < n:
                 nxt = units(b + 1) if b + 1 < n else units(0)
-                info.append(p.run(ins, outs, kv_in=c["kv_in"][b], kv_out=c["kv_out"][b], kv_next=nxt,
+                info.append(p.run(ins, outs, kv_in=c["kv_in"][pk], kv_out=c["kv_out"][pk], kv_next=nxt,
                                   kv_done=units(b - 1 if b > 0 else n - 1)))
             else:
                 info.append(p.run(ins, outs))

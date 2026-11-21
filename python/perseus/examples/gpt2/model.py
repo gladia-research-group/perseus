@@ -29,8 +29,8 @@ from . import weights as W
 class Gpt2Model(ImplModel):
     def __init__(self, inf, store, cfgs: Configs, *, core=None, n_layers=None,
                  fold_ln1=True, fold_ln2=True, fold_lnf=False, lmhead_cap=44,
-                 unit=None, profile=False, packing="cachemir", kv_offload=None):
-        super().__init__(inf, core=core, unit=unit, profile=profile, kv_offload=kv_offload)
+                 unit=None, profile=False, packing="cachemir", kv_offload=None, dims=None):
+        super().__init__(inf, core=core, unit=unit, profile=profile, kv_offload=kv_offload, dims=dims)
         # "cachemir": real weights and linears (with the K/V pair bootstrap and the packed
         # CutMax on a complex payload); "cachemir_complex": the fused K + iV linear, the
         # output-packed up-projection, complex K/V buckets and the paired LM-head tile
@@ -89,11 +89,16 @@ class Gpt2Model(ImplModel):
     def lm_centre(self):
         return bool(self.cfgs.cutmax is not None and self.cfgs.cutmax.lm_centre)
 
+    def lm_matrix(self, fold_lnf):
+        """The LM head's (hid, vocab) matrix, ln_f's gain folded in when `fold_lnf` (weights.lm_head_matrix); a model
+        over part of the vocabulary returns its columns."""
+        return W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, fold_lnf)
+
     def lm_tiles(self):
         if self._lm is None:
             centre = self.lm_centre()
             def build():
-                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, self.fold[2])
+                Wlm = self.lm_matrix(self.fold[2])
                 Wlm = centre_lm(Wlm, self.vocab) if centre else Wlm
                 return W.lm_head_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, paired=self.complex_packing)
             self._lm = slotcache.cached(self._slot_key(), "lm", (self.rt.dims, self.vocab, self.W_tile,
@@ -105,7 +110,7 @@ class Gpt2Model(ImplModel):
         if self._fb is None:
             def build():
                 # the token embedding itself: ln_f's fold scales the LM head's tiles only
-                Wlm = W.lm_head_matrix(self.store, self.cfgs.ln_f, self.rt.dims, self.vocab, False)
+                Wlm = self.lm_matrix(False)
                 return W.feedback_tiles(Wlm, self.rt.dims, self.vocab, self.W_tile, packed=self.complex)
             self._fb = slotcache.cached(self._slot_key(), "fb", (self.rt.dims, self.vocab, self.W_tile,
                                                                  self.complex, False), build)
@@ -127,6 +132,10 @@ class Gpt2Model(ImplModel):
                                   validate=validate, variants=("feedback",))
 
     # ── the hooks ──
+    def block_cross(self, b):
+        """Block b's cross-attention (gpt2.block.transformer_block `cross`): None, a decoder-only model."""
+        return None
+
     def routes_for(self, pos):
         """SM_PERIODIC=2: the Gp x tH-slot route of the softmax's (Gp tH)-periodic values."""
         from perseus.impl.attention import sm_periodic
@@ -171,7 +180,8 @@ class Gpt2Model(ImplModel):
                 cap = self.enter_stage(b, pos)
                 with self.rt.step(f"blk{b}"):
                     x = transformer_block(self.rt, x, self.block_weights(b), self.kv[b],
-                                          self.cfgs.block(b), pos, last=(b == self.n_layers - 1))
+                                          self.cfgs.block(b), pos, last=(b == self.n_layers - 1),
+                                          cross=self.block_cross(b))
                 self.exit_stage(b, cap)
                 return x
             return compute
@@ -313,9 +323,10 @@ class Gpt2Model(ImplModel):
                 on_token(rec)
         return results
 
-    def generate(self, prompt_rows, n_tokens, gt_logits=None, on_step=None):
+    def generate(self, prompt_rows, n_tokens, gt_logits=None, on_step=None, stop=None):
         """src/app/pipeline.cu / perseus.nn.gpt2.stream: the prompt through decode
-        steps (LM head on the last), then CutMax argmax + encrypted feedback."""
+        steps (LM head on the last), then CutMax argmax + encrypted feedback. `stop(rec)`: end before the next
+        token's forward when it returns True (a check reading the decrypted argmax: the server's loop runs n_tokens)."""
         if self.plans and 0 in self.plans and 0 not in self.plan_variants.get("feedback", {}):
             raise RuntimeError("planned generation needs block_0_feedback_placement.json in the "
                                "plan dir: make_plan.sh <graph> <plan> feedback")
@@ -343,6 +354,8 @@ class Gpt2Model(ImplModel):
             out.append(rec)
             if on_step:
                 on_step(rec)
+            if stop is not None and stop(rec):
+                break
             if j + 1 < n_tokens:
                 self.token_begin(pos + 1)
                 x = self.feedback(z, pos + 1)

@@ -1,0 +1,6 @@
+# Whisper base.en's encoder: ViT's set (bidirectional softmax, erf GELU, the LayerNorm bands its massive channels need).
+defaults:
+  - vit_base
+  - _self_
+
+name: whisper_base_en

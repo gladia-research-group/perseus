@@ -1,0 +1,9 @@
+name: "openai/whisper-base.en"
+batch_size: 4          # calibration micro-batch (30-s clips)
+block_size: null       # unused for audio models
+resolution: null
+
+instance:              # the encoder, its front-end GELUs as modules (examples/whisper/hf.py)
+  _target_: perseus.examples.whisper.hf.encoder
+  pretrained_model_name_or_path: ${model.name}
+  attn_implementation: "eager"   # required: the softmax tap needs the eager path

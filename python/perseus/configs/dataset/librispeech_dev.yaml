@@ -1,0 +1,6 @@
+# LibriSpeech dev-clean as 16 kHz WAV files in one directory (perseus.audio reads WAV only: convert the FLACs first).
+# The evaluation set is test-clean, never this one.
+name: librispeech_dev
+kind: audio
+path: ${oc.env:PERSEUS_AUDIO_DIR,${oc.env:HOME}/data/librispeech_dev_wav}
+pool_clips: 64

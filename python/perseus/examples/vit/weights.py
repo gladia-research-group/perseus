@@ -122,8 +122,14 @@ def unscale(rows):
     return np.asarray(rows) / residual_scale(np.asarray(rows).shape[1])
 
 
+def _heads(store):
+    """The attention heads of the store's model (ViT-B/16: 12)."""
+    return int(store.config.get("num_attention_heads", 12))
+
+
 def exact_blocks(store, x, n_layers=12):
-    """Bidirectional HF ViT blocks in float64 on the embedded rows: the per-block hidden states."""
+    """Bidirectional pre-LN blocks (HF ViT's) in float64 on the embedded rows: the per-block hidden states. Any
+    store with the GPT-2 block names (heads and LayerNorm eps from its config)."""
     from scipy.special import erf
     from perseus.examples.gpt2 import weights as GW
     x = np.asarray(x, dtype=np.float64)
@@ -134,15 +140,17 @@ def exact_blocks(store, x, n_layers=12):
         return (h - mu) / np.sqrt(((h - mu) ** 2).mean(axis=1, keepdims=True) + eps) * g + b
 
     t = store.tensor
+    H = _heads(store)
+    dh = x.shape[1] // H
     out = []
     for blk in range(n_layers):
         n = GW.block_names(blk)
         h = ln(x, t(n["ln1_w"]), t(n["ln1_b"]))
         q, k, v = np.split(h @ t(n["qkv_w"]).T + t(n["qkv_b"]), 3, axis=1)
         o = np.zeros_like(q)
-        for hh in range(12):
-            sl = slice(hh * 64, (hh + 1) * 64)
-            s = q[:, sl] @ k[:, sl].T / 8.0
+        for hh in range(H):
+            sl = slice(hh * dh, (hh + 1) * dh)
+            s = q[:, sl] @ k[:, sl].T / np.sqrt(dh)
             if os.environ.get("VIT_REF_CAUSAL"):
                 s = s + np.triu(np.full(s.shape, -np.inf), 1)
             p = np.exp(s - s.max(axis=1, keepdims=True))
@@ -179,9 +187,11 @@ def block0_taps(store, x, b=0):
     h = out["ln1"] * t(n["ln1_w"]) + t(n["ln1_b"])
     q, k, v = np.split(h @ t(n["qkv_w"]).T + t(n["qkv_b"]), 3, axis=1)
     o = np.zeros_like(q)
-    for hh in range(12):
-        sl = slice(hh * 64, (hh + 1) * 64)
-        s = q[:, sl] @ k[:, sl].T / 8.0
+    H = _heads(store)
+    dh = q.shape[1] // H
+    for hh in range(H):
+        sl = slice(hh * dh, (hh + 1) * dh)
+        s = q[:, sl] @ k[:, sl].T / np.sqrt(dh)
         if os.environ.get("VIT_REF_CAUSAL"):
             s = s + np.triu(np.full(s.shape, -np.inf), 1)
         p = np.exp(s - s.max(axis=1, keepdims=True))

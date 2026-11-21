@@ -178,6 +178,17 @@ def block_matrices(store, cfgs: Configs, b: int, dims: Dims, fold_ln1=True, fold
     return BlockMatrices(Q, K, V, bq, bk, bv, O, bo, Up, bup, Down, bdown, g1, b1, g2, b2)
 
 
+def mlp_order(m: BlockMatrices, ge, e_real: int, nch: int, folded):
+    """(Up, bup, Down) over the e_real hidden units in the activation's order (ge.perm; identity without a range
+    split), each output block of nch units scaled by its approximation's input scale: 1 / ge.block(k).xmax where
+    `folded(cfg)` (GELU_FOLD carries it in the up-projection), 1 elsewhere."""
+    perm = np.asarray(ge.perm, dtype=np.int64) if ge.perm else np.arange(e_real)
+    if len(perm) != e_real or (ge.blocks and len(ge.blocks) * nch != e_real):
+        raise ValueError(f"range split: {len(perm)} units / {len(ge.blocks)} blocks for {e_real} units of {nch}")
+    s = np.array([1.0 / ge.block(c // nch).xmax if folded(ge.block(c // nch)) else 1.0 for c in range(e_real)])
+    return m.Up[:, :e_real][:, perm] * s, m.bup[:e_real][perm] * s, m.Down[:e_real][perm]
+
+
 def block_weights(store, cfgs: Configs, b: int, dims: Dims, fold_ln1=True, fold_ln2=True,
                   complex_packing=False, up_scale=1.0):
     """The block's EncodedLinears (weight_loader.h, untiled) plus the LN shifts (folded) or

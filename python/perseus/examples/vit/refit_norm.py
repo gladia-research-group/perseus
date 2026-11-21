@@ -71,6 +71,27 @@ def collect(cfgs, batches):
     return {k: np.concatenate(v) for k, v in out.items()}
 
 
+def fit_sites(cfgs, z, zh, safety=2.0, target_err=1e-5, max_deg=31, max_nr=4):
+    """Each norm site's LN_CHEB seed (cheb_coeffs on [cheb_lo, cheb_hi] + its Newton count) fitted in place on its
+    collected inverse-sqrt inputs z[site] (the band widened by `safety` each side), checked on the held-out zh[site].
+    Any model: the caller collects z in the runtime's centred, scaled units (`collect`)."""
+    from perseus.impl.config import parse_norm
+    from perseus.impl.poly import NumpyOps, eval_chebyshev, inv_sqrt_newton_d2
+    fit = _fit_module().fit_site
+    ops = NumpyOps()
+    for site in sorted(cfgs):
+        cfg = parse_norm(cfgs[site])
+        lo, hi = float(z[site].min()) / safety, float(z[site].max()) * safety
+        (d, _), deg, nr, c, err = fit(lo, hi, cfg.inv_out_scale, target_err, max_deg, max_nr)
+        h = zh[site]
+        y = inv_sqrt_newton_d2(ops, h, eval_chebyshev(ops, h, c, lo, hi), nr, 1.0 / cfg.inv_out_scale ** 2)
+        herr = float(np.max(np.abs(y * np.sqrt(h) / cfg.inv_out_scale - 1)))
+        oob = int(((h < lo) | (h > hi)).sum())
+        print(f"{site:24s} data [{z[site].min():.3g}, {z[site].max():.3g}] deg {deg:2d} + NR{nr} depth {d:2d} "
+              f"err {err:.1e} | holdout err {herr:.1e} out-of-band {oob}/{h.size}", flush=True)
+        cfgs[site].update(cheb_coeffs=[float(v) for v in c], cheb_lo=lo, cheb_hi=hi, cheb_nr_iters=nr)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("config")
@@ -84,10 +105,7 @@ def main(argv=None):
     ap.add_argument("--flat", action="store_true",
                     help="drop the per-position centering scales (high-norm artifact tokens land on any position)")
     a = ap.parse_args(argv)
-    from perseus.impl.config import parse_norm
-    from perseus.impl.poly import NumpyOps, eval_chebyshev, inv_sqrt_newton_d2
     from . import weights as V
-    fit = _fit_module().fit_site
     if a.pool:
         pool = np.load(a.pool, mmap_mode="r")
     else:
@@ -102,18 +120,7 @@ def main(argv=None):
             v.pop("center_scale_sq", None)
     z = collect(cfgs, batches)
     zh = collect(cfgs, hold) if hold else z
-    ops = NumpyOps()
-    for site in sorted(cfgs):
-        cfg = parse_norm(cfgs[site])
-        lo, hi = float(z[site].min()) / a.safety, float(z[site].max()) * a.safety
-        (d, _), deg, nr, c, err = fit(lo, hi, cfg.inv_out_scale, a.target_err, a.max_deg)
-        h = zh[site]
-        y = inv_sqrt_newton_d2(ops, h, eval_chebyshev(ops, h, c, lo, hi), nr, 1.0 / cfg.inv_out_scale ** 2)
-        herr = float(np.max(np.abs(y * np.sqrt(h) / cfg.inv_out_scale - 1)))
-        oob = int(((h < lo) | (h > hi)).sum())
-        print(f"{site:24s} data [{z[site].min():.3g}, {z[site].max():.3g}] deg {deg:2d} + NR{nr} depth {d:2d} "
-              f"err {err:.1e} | holdout err {herr:.1e} out-of-band {oob}/{h.size}", flush=True)
-        cfgs[site].update(cheb_coeffs=[float(v) for v in c], cheb_lo=lo, cheb_hi=hi, cheb_nr_iters=nr)
+    fit_sites(cfgs, z, zh, a.safety, a.target_err, a.max_deg)
     with open(a.config, "w") as fh:
         json.dump(j, fh, indent=1)
     print(f"[write] {a.config}")
