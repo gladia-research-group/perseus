@@ -548,28 +548,30 @@ class WordOps:
         """The plaintext vector f(i mod n) over the slots."""
         return np.asarray(f(np.arange(self.slots) % self.n), dtype=np.float64)
 
-    def _move(self, x, d, fill=None):
-        """x moved d digit slots up (d > 0) / down (d < 0) inside each lane (rotation + mask: one level); the vacated
-        slots take `fill`: None (0), a public scalar, or a ciphertext (its values there)."""
-        if d == 0:
-            return x
+    def _move(self, x, d, fill=None, scale=1.0):
+        """`scale` x (x moved d digit slots up (d > 0) / down (d < 0) inside each lane): rotation + mask, one level
+        (the scale rides the mask: an integer factor without a level of its own); the vacated slots take `fill`:
+        None (0), a public scalar, or a ciphertext (its values there)."""
         o, n = self.ops, self.n
+        if d == 0:
+            return x if scale == 1.0 else o.mult(x, float(scale))
         keep = self._lane(lambda i: (i - d >= 0) & (i - d < n))
-        y = o.mult_pt(o.rotate(x, -d), keep, kind="mask")
+        y = o.mult_pt(o.rotate(x, -d), scale * keep, kind="mask")
         if fill is None or (np.isscalar(fill) and float(fill) == 0.0):
             return y
         if np.isscalar(fill):
-            return o.add_pt(y, float(fill) * (1.0 - keep), kind="mask")
-        return o.add(y, o.mult_pt(fill, 1.0 - keep, kind="mask"))
+            return o.add_pt(y, scale * float(fill) * (1.0 - keep), kind="mask")
+        return o.add(y, o.mult_pt(fill, scale * (1.0 - keep), kind="mask"))
 
-    def _cyc(self, x, d):
-        """x rotated d digit slots up inside each lane, cyclically (two rotations, two masks: one level)."""
+    def _cyc(self, x, d, scale=1.0):
+        """`scale` x (x rotated d digit slots up inside each lane, cyclically): two rotations, two masks, one level."""
         o, n = self.ops, self.n
         d %= n
         if d == 0:
-            return x
+            return x if scale == 1.0 else o.mult(x, float(scale))
         hi = self._lane(lambda i: i >= d)
-        return o.add(o.mult_pt(o.rotate(x, -d), hi, kind="mask"), o.mult_pt(o.rotate(x, n - d), 1.0 - hi, kind="mask"))
+        return o.add(o.mult_pt(o.rotate(x, -d), scale * hi, kind="mask"),
+                     o.mult_pt(o.rotate(x, n - d), scale * (1.0 - hi), kind="mask"))
 
     def _spread(self, x, k, lo, hi):
         """x's value at slot k of every lane (x zero at the lane's other slots) copied to slots lo .. hi of the lane:
@@ -588,10 +590,10 @@ class WordOps:
                 b *= 2
         return acc
 
-    def _bcast(self, x, k):
-        """Slot k of every lane to the whole lane (mask: one level, then rotations)."""
+    def _bcast(self, x, k, scale=1.0):
+        """`scale` x slot k of every lane, over the whole lane (mask: one level, the scale in it; then rotations)."""
         o = self.ops
-        y = o.mult_pt(x, self._lane(lambda i: i == k), kind="mask")
+        y = o.mult_pt(x, scale * self._lane(lambda i: i == k), kind="mask")
         return self._spread(y, k, 0, self.n - 1)
 
     def _top_sum(self, y):
@@ -715,10 +717,10 @@ class WordOps:
         y = a
         if t:
             if kind in ("rotl", "rotr"):
-                nb = self._cyc(a, 1 if kind == "rotl" else -1)
+                nb = self._cyc(a, 1 if kind == "rotl" else -1, scale=B)
             else:
-                nb = self._move(a, 1 if kind == "shl" else -1)
-            j = o.add(a, o.mult(nb, float(B)))
+                nb = self._move(a, 1 if kind == "shl" else -1, scale=B)
+            j = o.add(a, nb)
             if kind == "sar":
                 j = o.add_pt(j, float(B * B) * self._lane(lambda i: i == n - 1), kind="mask")
             y = fbs.fbs(o, j, self._bit_tab(kind, t, kind == "sar"))
@@ -744,7 +746,7 @@ class WordOps:
         if kind not in ("shl", "shr", "sar", "rotl", "rotr"):
             raise ValueError(f"WordOps shift_enc: {kind}?")
         L = bits.bit_length() - 1
-        dig = [self._bcast(b, i) for i in range(-(-L // r))]
+        dig = [self._bcast(b, i, scale=B * B) for i in range(-(-L // r))]          # B^2 b_digit
         rot = kind.startswith("rot")
         big = sg = None
         if not rot:
@@ -753,7 +755,7 @@ class WordOps:
             wv = self._lane(lambda i: np.where(i > q0, T, np.where(i == q0, 1, 0)))
             mx = int(T * (B - 1) * (n - 1 - q0) + (B - 1))
             tb = self._tab(f"big{L}", lambda v, T=T: (v >= T).astype(float), 0, mx)
-            big = self._bcast(fbs.fbs(o, self._top_sum(o.mult_pt(b, wv, kind="mask")), tb), n - 1)
+            big = self._bcast(fbs.fbs(o, self._top_sum(o.mult_pt(b, wv, kind="mask")), tb), n - 1, scale=B ** 3)
         if kind == "sar":
             sg = self._spread(self._signfill(a), n - 1, 0, n - 1)
 
@@ -785,22 +787,14 @@ class WordOps:
             sh = 1 << k
             last = k == L - 1
             use_big = big is not None and (kind == "sar" or last)
-            if sh < r:                                 # within a digit: the neighbour moving in
-                if rot:
-                    xs = self._cyc(x, 1 if kind == "rotl" else -1)
-                else:
-                    xs = self._move(x, 1 if kind == "shl" else -1, fill=sg if kind == "sar" else None)
-                t_bits = sh
+            dd, t_bits = (1, sh) if sh < r else (sh // r, 0)     # within a digit: the neighbour moving in
+            if rot:
+                xs = self._cyc(x, dd if kind == "rotl" else -dd, scale=B)
             else:
-                dd = sh // r
-                if rot:
-                    xs = self._cyc(x, dd if kind == "rotl" else -dd)
-                else:
-                    xs = self._move(x, dd if kind == "shl" else -dd, fill=sg if kind == "sar" else None)
-                t_bits = 0
-            j = o.add(x, o.add(o.mult(xs, float(B)), o.mult(dig[k // r], float(B * B))))
+                xs = self._move(x, dd if kind == "shl" else -dd, fill=sg if kind == "sar" else None, scale=B)
+            j = o.add(x, o.add(xs, dig[k // r]))                 # x + B x_s + B^2 b_digit (+ B^3 big)
             if use_big:
-                j = o.add(j, o.mult(big, float(B ** 3)))
+                j = o.add(j, big)
             x = fbs.fbs(o, j, tab(k, t_bits, use_big))
         return x
 
