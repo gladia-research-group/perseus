@@ -15,6 +15,26 @@ cap (`fbs.chain_slack`).
 - `bitwise(op, a, b)`: and / or / xor per digit, a bivariate table on a_i + B b_i.
 - `bivariate(name, fn, a, b, B)`: any table of two digits through the packed index a + B b.
 
+The other integer / bitwise ops, in both layouts (`IntOps`: digit lists; `WordOps`: one ciphertext per word set, the
+digit slots of a lane; `word_op` / `int_op` dispatch by name, `reference` gives the exact results):
+- sub / neg: a + ~b + 1 / ~a + 1 (~d = B - 1 - d is linear; the carry-in rides the adder: the first carry's input
+  (IntOps) or the prefix's fills, a generate below digit 0 (WordOps)). `flags=True`: also the carry / borrow and the
+  signed overflow (one lookup on the top digits a + B b + B^2 r; WordOps: at the lane's top digit slot).
+- compare predicates lt / le / gt / ge / eq / ne, unsigned or signed (the top digit's own compare table; WordOps
+  through a slot offset B^2 at the top slot, one table of 2 B^2), the last combine's table reading the predicate.
+- sext(from_bits); shifts and rotates by a public amount: whole digits by renumbering (IntOps) / a move (rotation +
+  mask, WordOps), the bits within a digit by one bivariate lookup on the digit and its neighbour (sar: the sign from
+  one lookup fills); >= the width: 0 / the sign.
+- shifts and rotates by an encrypted amount (a word): a barrel shifter, one lookup per amount bit on
+  x + B x_s + B^2 b_digit (+ B^3 big); amounts >= the width give 0 (the last stage's `big`, a weighted lane sum of the
+  amount's high digits through one threshold lookup) or the sign (sar: `big` forces every stage). WordOps folds the
+  integer factors into the move / broadcast masks: no level of their own, the stages chain without plain refreshes.
+- mul: the column sums S_i = sum_j a_(i - j) b_j by CKKS products (no lookup; WordOps broadcasts b's digits over the
+  lane), then `_norm`: S's base-B digits (plain tables: S is a fresh product sum, one hop), the per-column sums T
+  (<= B^2 - 1), one split T mod B / T div B, the add. mulc: the same on scalar multiples (no products).
+- min / max (signed or not): the compare, then the mux; abs: the sign muxes -a and a; popcount: the digits' bit
+  counts, their sum (WordOps: rotations to the lane's top slot), its digits.
+
 Exactness: a lookup is wrong when its input noise crosses half the integer spacing or its output noise reaches half
 the output spacing; both are Gaussian in the FBS variance model and far below 2^-128 at the default input noise
 (`fbs.p_fail`); the ModRaise overflow (exact, 2^-291.1 per bootstrap at K = 32, h = 32) dominates. `chain_p_fail`

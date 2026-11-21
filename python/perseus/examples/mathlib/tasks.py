@@ -555,6 +555,8 @@ class IntOp(Task):
                 self.io.bitwise(self.op, None, None)
         else:
             self.io = intops.IntOps(None, self.r, self.table)      # registers the tables in this process
+            if self.op not in ("addmux", "id", "add", "cmp", "mux", "and", "or", "xor"):
+                self.a, self.b, self.sel = intops.inputs(SLOTS, self.bits, self.seed, self.op)
             if self.op in ("and", "or", "xor"):
                 self.io.bitwise(self.op, [], [])
 
@@ -597,6 +599,11 @@ class IntOp(Task):
         a, b = list(xs[:n]), list(xs[n:2 * n])
         if self.op == "id":                          # the I/O baseline: inputs in, a out
             return [ops.add(ai, 0.0) for ai in a]
+        if self.op not in ("add", "cmp", "mux", "addmux", "and", "or", "xor"):
+            self.io = io
+            outs = intops.int_op(io, self.op, a, b)
+            self._nout = [len(v) if isinstance(v, list) else 1 for v in outs]
+            return [x for v in outs for x in (v if isinstance(v, list) else [v])]
         if self.op == "add":
             return io.add(a, b)
         if self.op == "cmp":
@@ -642,6 +649,16 @@ class IntOp(Task):
             n = self.bits // self.r
             got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
                    else self.io.decode(d[0]))
+        elif self.op not in ("add", "cmp", "mux", "addmux", "and", "or", "xor", "id"):
+            n = self.bits // self.r
+            outs, k = [], 0                          # regroup: the word's digits, then the flags
+            for c in getattr(self, "_nout", [n]):
+                outs.append(list(d[k:k + c]) if (c > 1 or (k == 0 and not intops.is_pred(self.op))) else d[k])
+                k += c
+            wrong, dev = intops.int_check(self.io, self.op, outs, self.a, self.b, self.sel, self.bits)
+            sg = self.io.lookup_sigmas()
+            lp = max(fbs.p_fail(nm, sigma_in=s_)["log2_ct"] for nm, s_ in sg.items())
+            return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
         else:
             got = intops.value(d, self.r) if self.op != "cmp" else np.round(d[0]).astype(np.int64)
         dev = max(float(np.abs(np.asarray(v) - np.round(v)).max()) for v in d)
