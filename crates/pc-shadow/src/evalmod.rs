@@ -997,11 +997,23 @@ pub fn sine_base(k: f64, da_its: u32, deg: usize) -> Vec<f64> {
         .collect()
 }
 
-/// A plain EvalMod table spec "deg:da" (`sine_base` at degree `deg`, `da` double angles): (deg, da).
+/// A plain EvalMod table spec "deg:da" (`sine_base` at degree `deg`, `da` double angles, K = 16): (deg, da).
 pub fn parse_em_table(spec: &str) -> Option<(usize, u32)> {
-    let (d, r) = spec.trim().split_once(':')?;
-    let (d, r): (usize, u32) = (d.trim().parse().ok()?, r.trim().parse().ok()?);
-    ((4..=128).contains(&d) && (1..=6).contains(&r)).then_some((d, r))
+    parse_em_table_k(spec).filter(|t| t.2 == 16.0).map(|(d, r, _)| (d, r))
+}
+
+/// "deg:da" or "deg:da:K": the table's degree, double angles and EvalMod K (ModRaise integers |I| < K; default 16,
+/// 8..=64). A larger K bounds a rarer ModRaise overflow (h = 32, the composite raise's 2 (h + 1) uniforms: per
+/// refresh 2^-23.4 at K = 16, 2^-81.9 at K = 24) and costs input range (log2(K / 16) bits of precision).
+pub fn parse_em_table_k(spec: &str) -> Option<(usize, u32, f64)> {
+    let mut it = spec.trim().split(':');
+    let d: usize = it.next()?.trim().parse().ok()?;
+    let r: u32 = it.next()?.trim().parse().ok()?;
+    let k: u32 = match it.next() {
+        Some(k) => k.trim().parse().ok()?,
+        None => 16,
+    };
+    (it.next().is_none() && (4..=128).contains(&d) && (1..=6).contains(&r) && (8..=64).contains(&k)).then_some((d, r, k as f64))
 }
 
 /// Levels a plain EvalMod program on `b` (coefficients, double angles) lands above the one on `a` from the same

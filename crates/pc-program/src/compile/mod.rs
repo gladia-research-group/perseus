@@ -340,13 +340,12 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     Ok(Shadow::new(ShadowConfig { chain, bts, quirks }, None))
 }
 
-/// Levels the dense routes' EvalMod series `bts.em_table` ("deg:da", pc-shadow `evalmod::sine_base` at K = 16) lands
+/// Levels the dense routes' EvalMod series `bts.em_table` ("deg:da[:K]", pc-shadow `evalmod::sine_base`) lands
 /// above the frozen table (0 unset). Measured on the n32 chain's dense EvalMod input (raise drop 0: the top limb 45);
 /// the depth of a series does not depend on where it starts (pc-gpu `bts::dense` tests check every raise variant).
 pub fn dense_em_shift(cfg: &Config) -> Result<u32> {
     let Some(spec) = cfg.bts.em_table.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { return Ok(0) };
-    let (d, r) = pc_shadow::evalmod::parse_em_table(spec).ok_or_else(|| cfg_err("bts.em_table", format!("{spec:?}: deg:da (e.g. 47:2)")))?;
-    let k = pc_core::bts_setup::EVALMOD_K;
+    let (d, r, k) = pc_shadow::evalmod::parse_em_table_k(spec).ok_or_else(|| cfg_err("bts.em_table", format!("{spec:?}: deg:da[:K] (e.g. 47:2, 47:3:24)")))?;
     em_shift((pc_core::bts_setup::evalmod_coeffs(), pc_core::bts_setup::EVALMOD_DA_ITS), (&pc_shadow::evalmod::sine_base(k, r, d), r), "bts.em_table")
 }
 
