@@ -65,3 +65,74 @@ def test_sort_fbs_mirror():
     assert sort.step_method(4096, 2.0, 0.1) == "fbs"
     assert sort.step_method(16, 2.0, 0.1) == "tfhe"
     assert sort.step_method(4096, 2.0, 0.01) == "tfhe"
+
+
+_WORD_OPS = ["add", "sub", "neg", "addf", "subf", "cmp", "lt", "le", "gt", "ge", "eq", "ne", "slt", "sle", "sgt",
+             "sge", "seq", "sne", "sext4", "shl0", "shl1", "shl2", "shl3", "shlB", "shr1", "shr5", "shrB", "sar1",
+             "sar4", "sar7", "sarM", "sarB", "rotl1", "rotl3", "rotr5", "rotrB", "shlv", "shrv", "sarv", "rotlv",
+             "rotrv", "mul", "mulc0", "mulc1", "mulc7", "mulc12345", "mulcM", "min", "max", "smin", "smax", "abs",
+             "popcount", "mux", "xor"]
+
+
+@pytest.mark.parametrize("bits", [8, 16, 32])
+@pytest.mark.parametrize("op", _WORD_OPS)
+def test_word_ops_exact(op, bits):
+    """WordOps (a word's digits in one ciphertext) on the mirror, every lane exact: edge pairs (0, -1, MIN, MAX, 1,
+    -2), equal words, a + b = -1, shift amounts 0, 1, w - 1, w, w + 1, 2^w - 1, 2 w; flags / predicates at the top
+    digit slot. Every table meets 2^-128 per ciphertext at its input noise, 2^20 chained lookups 2^-100."""
+    import warnings
+    o = op.replace("B", str(bits)).replace("M", str(bits - 1))
+    n = bits // 2
+    a, b, sel = intops.inputs(4096, bits, bits, o)
+    w = intops.WordOps(NumpyOps(), bits, 2, "k28d1", 4096 * n)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)          # a registration over 2^-128 warns
+        outs = intops.word_op(w, o, w.encode(a), w.encode(b), np.repeat(sel, n).astype(float))
+    wrong, dev = intops.word_check(w, o, outs, a, b, sel, bits)
+    assert wrong == 0 and dev < 1e-9, (o, wrong, dev)
+    names = w.lookups()
+    sg = w.lookup_sigmas()
+    for nm in names:
+        assert fbs.p_fail(nm, sigma_in=sg[nm])["log2_ct"] < -128.0, nm
+    assert intops.chain_p_fail(names, [2 ** 20] * len(names)) < -100.0
+
+
+def test_word_op_lookups():
+    """Sequential lookups of the main 32-bit ops (the latency's unit on one ciphertext)."""
+    calls = []
+    orig = fbs.fbs
+
+    def counting(ops, x, name):
+        calls.append(name)
+        return orig(ops, x, name)
+    fbs.fbs = counting
+    try:
+        got = {}
+        for o in ("add", "sub", "slt", "shl3", "shl2", "sar6", "shlv", "sarv", "mul", "mulc12345", "popcount"):
+            calls.clear()
+            w = intops.WordOps(NumpyOps(), 32, 2, "k28d1", 1024)
+            a, b, sel = intops.inputs(64, 32, 0, o)
+            intops.word_op(w, o, w.encode(a), w.encode(b), np.repeat(sel, 16).astype(float))
+            got[o] = len(calls)
+    finally:
+        fbs.fbs = orig
+    assert got == {"add": 4, "sub": 4, "slt": 5, "shl3": 1, "shl2": 0, "sar6": 1, "shlv": 6, "sarv": 7, "mul": 10,
+                   "mulc12345": 9, "popcount": 4}, got
+
+
+@pytest.mark.parametrize("bits", [8, 16, 32])
+@pytest.mark.parametrize("op", _WORD_OPS)
+def test_int_ops_exact(op, bits):
+    """IntOps (a digit per ciphertext, ripple carries) on the mirror: the same ops and edge cases as WordOps."""
+    import warnings
+    o = op.replace("B", str(bits)).replace("M", str(bits - 1))
+    a, b, sel = intops.inputs(4096, bits, bits + 1, o)
+    io = intops.IntOps(NumpyOps(), 2, "k28d1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        outs = intops.int_op(io, o, intops.digits(a, bits, 2), intops.digits(b, bits, 2), sel.astype(float))
+    wrong, dev = intops.int_check(io, o, outs, a, b, sel, bits)
+    assert wrong == 0 and dev < 1e-9, (o, wrong, dev)
+    sg = io.lookup_sigmas()
+    for nm in io.lookups():
+        assert fbs.p_fail(nm, sigma_in=sg[nm])["log2_ct"] < -128.0, nm

@@ -956,16 +956,7 @@ def load_values(slot_values):
 # | sext<k> | shl<k> shr<k> sar<k> rotl<k> rotr<k> (public k) | shlv shrv sarv rotlv rotrv (amount = b) | mul mulw
 # mulc<c> | min max smin smax abs popcount | mux xor and or (the round-2 ops) | id
 
-import re as _re
-
-_PREDS = ("lt", "le", "gt", "ge", "eq", "ne")
-
-
-def parse(op):
-    m = _re.fullmatch(r"(sext|shl|shr|sar|rotl|rotr|mulc)(\d+)", op)
-    if m:
-        return m.group(1), int(m.group(2))
-    return op, None
+from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401  (the shared op registry)
 
 
 def build(op, name, words, nd):
@@ -1064,76 +1055,6 @@ def compact(prog):
     return prog
 
 
-def _sgnd(x, bits):
-    x = np.asarray(x, dtype=np.int64)
-    return np.where(x >= 1 << (bits - 1), x - (1 << bits), x)
-
-
-def reference(op, a, b, sel, bits):
-    """The exact outputs of `op` per word: a list of integer arrays (a word value, or flags / predicates)."""
-    a, b, sel = (np.asarray(v, dtype=np.int64) for v in (a, b, sel))
-    msk = (1 << bits) - 1
-    sa, sb = _sgnd(a, bits), _sgnd(b, bits)
-    base, k = parse(op)
-    if base in ("add", "addf"):
-        r = [(a + b) & msk]
-        if base == "addf":
-            r += [((a + b) >> bits) & 1, ((sa + sb < -(1 << (bits - 1))) | (sa + sb >= 1 << (bits - 1))).astype(np.int64)]
-        return r
-    if base in ("sub", "subf"):
-        r = [(a - b) & msk]
-        if base == "subf":
-            r += [(a < b).astype(np.int64), ((sa - sb < -(1 << (bits - 1))) | (sa - sb >= 1 << (bits - 1))).astype(np.int64)]
-        return r
-    if base == "neg":
-        return [(-a) & msk]
-    if base == "cmp":
-        return [(a < b).astype(np.int64)]
-    if base in _PREDS or (base[:1] == "s" and base[1:] in _PREDS):
-        x, y = (sa, sb) if base not in _PREDS else (a, b)
-        f = {"lt": x < y, "le": x <= y, "gt": x > y, "ge": x >= y, "eq": x == y, "ne": x != y}[base.lstrip("s") if base not in _PREDS else base]
-        return [f.astype(np.int64)]
-    if base == "sext":
-        return [_sgnd(a & ((1 << k) - 1), k) & msk]
-    if base in ("shl", "shr", "sar", "rotl", "rotr") or (base.endswith("v") and base[:-1] in ("shl", "shr", "sar", "rotl", "rotr")):
-        kind = base.rstrip("v") if base.endswith("v") else base
-        s_ = np.full_like(a, k) if k is not None else b
-        if kind.startswith("rot"):
-            s_ = s_ % bits
-            sh = s_ if kind == "rotl" else (bits - s_) % bits
-            return [((a << sh) | (a >> ((bits - sh) % bits) * (sh > 0))) & msk if False else
-                    np.where(sh == 0, a, ((a << sh) | (a >> (bits - sh))) & msk)]
-        big = s_ >= bits
-        sc = np.minimum(s_, bits - 1)
-        if kind == "shl":
-            return [np.where(big, 0, (a << sc) & msk)]
-        if kind == "shr":
-            return [np.where(big, 0, a >> sc)]
-        return [np.where(big, np.where(sa < 0, msk, 0), (sa >> sc) & msk)]
-    if base == "mul":
-        return [(a * b) & msk]
-    if base == "mulw":
-        return [(a.astype(object) * b.astype(object)).astype(np.int64) if bits < 32 else
-                np.array([int(x) * int(y) for x, y in zip(a, b)], dtype=np.uint64).astype(np.int64)]
-    if base == "mulc":
-        return [(a * (k & msk)) & msk]
-    if base in ("min", "max", "smin", "smax"):
-        x, y = (sa, sb) if base.startswith("s") else (a, b)
-        lt = x < y
-        return [np.where(lt, a, b) if base.endswith("min") else np.where(lt, b, a)]
-    if base == "abs":
-        return [np.abs(sa) & msk]
-    if base == "popcount":
-        return [np.array([bin(int(v)).count("1") for v in a], dtype=np.int64)]
-    if base == "mux":
-        return [np.where(sel == 1, a, b)]
-    if base in ("xor", "and", "or"):
-        return [{"xor": a ^ b, "and": a & b, "or": a | b}[base]]
-    if base == "id":
-        return [a]
-    raise ValueError(f"tfhe_bitwise: op {op}?")
-
-
 def out_layout(op, nd):
     """(digits per word of the word result (0: none), number of 0 / 1 rows per word after them, value scale): how a
     program's store rows read (digits at d / 4 then flags at 1 / 4, or one predicate per word at 1)."""
@@ -1171,34 +1092,6 @@ def decode_rows(op, vals, nd, words):
     if ndig:
         x[:words * ndig] = np.mod(x[:words * ndig], 4)
     return x
-
-
-def inputs(words, bits, seed=0, op=None):
-    """Random words with the edge cases first: 0, -1, MIN, MAX, MIN - 1, equal pairs, a + b = -1 (the longest carry
-    chain); shift amounts 0, 1, bits - 1, bits, bits + 1, 2^bits - 1 and random below 2 bits."""
-    rng = np.random.default_rng(seed)
-    top = 1 << bits
-    edge = np.array([0, top - 1, top >> 1, (top >> 1) - 1, 1, top - 2], dtype=np.int64)
-    a = rng.integers(0, top, words, dtype=np.int64)
-    b = rng.integers(0, top, words, dtype=np.int64)
-    sel = rng.integers(0, 2, words).astype(np.int64)
-    ne = len(edge)
-    pairs = [(x, y) for x in edge for y in edge]
-    for i, (x, y) in enumerate(pairs[:max(0, words // 2)]):
-        a[i], b[i] = x, y
-    q = min(words, len(pairs)) if words > 1 else 0
-    if q < words:
-        nq = (words - q) // 4
-        b[q:q + nq] = a[q:q + nq]                                  # equal
-        b[q + nq:q + 2 * nq] = (~a[q + nq:q + 2 * nq]) & (top - 1)   # a + b = -1
-    base = parse(op)[0] if op else ""
-    if base.endswith("v"):                                         # shift amounts
-        amts = np.array([0, 1, bits - 1, bits, bits + 1, top - 1, 2 * bits, bits // 2], dtype=np.int64)
-        b = rng.integers(0, 2 * bits, words, dtype=np.int64)
-        b[:min(words, len(amts))] = amts[:min(words, len(amts))]
-        if words > len(amts):
-            b[len(amts):2 * len(amts)] = amts[:max(0, min(len(amts), words - len(amts)))]
-    return a, b, sel
 
 
 def slot_values(a, b, sel, nd):

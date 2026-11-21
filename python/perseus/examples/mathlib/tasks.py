@@ -547,7 +547,10 @@ class IntOp(Task):
         if self.layout == "slots":
             self.io = intops.WordOps(None, self.bits, self.r, self.table, SLOTS)
             n = self.bits // self.r
-            self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            if self.op in ("addmux", "id"):
+                self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            else:                                     # edge pairs, equal words, a + b = -1, shift amounts
+                self.a, self.b, self.sel = intops.inputs(SLOTS // n, self.bits, self.seed, self.op)
             if self.op in ("and", "or", "xor"):
                 self.io.bitwise(self.op, None, None)
         else:
@@ -582,18 +585,13 @@ class IntOp(Task):
             return [tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"bitwise.in.{self.wp.rows_in(True)}")]
         if self.layout == "slots":
             w = intops.WordOps(ops, self.bits, self.r, self.table, SLOTS)
+            self.io = w                               # its tables (p_fail)
             a, b = xs[0], xs[1]
             if self.op == "id":
                 return [ops.add(a, 0.0)]
-            if self.op == "add":
-                return [w.add(a, b)]
-            if self.op == "cmp":
-                return [w.cmp(a, b)]
-            if self.op == "mux":
-                return [w.mux(xs[2], a, b)]
             if self.op == "addmux":
                 return [w.mux(xs[2], w.add(a, b), a)]
-            return [w.bitwise(self.op, a, b)]
+            return intops.word_op(w, self.op, a, b, xs[2] if self.op == "mux" else None)
         io = intops.IntOps(ops, self.r, self.table)
         n = self.bits // self.r
         a, b = list(xs[:n]), list(xs[n:2 * n])
@@ -635,6 +633,11 @@ class IntOp(Task):
             an = T.analyze(self.wp.pr, T.load_values(T.slot_values(self.a, self.b, self.sel, nd)))
             return {"wrong": int(wbad.sum()), "max_dev": dev, "log2_pfail_lookup_ct": an["log2_pfail_lookup"],
                     "log2_pfail_op": an["log2_pfail_op"], "rounds": an["rounds"], "pbs": an["pbs"]}
+        if self.layout == "slots" and self.op not in ("addmux", "id"):
+            wrong, dev = intops.word_check(self.io, self.op, d, self.a, self.b, self.sel, self.bits)
+            sg = self.io.lookup_sigmas()
+            lp = max(fbs.p_fail(n, sigma_in=s)["log2_ct"] for n, s in sg.items())
+            return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
         if self.layout == "slots":
             n = self.bits // self.r
             got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
