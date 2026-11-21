@@ -531,32 +531,32 @@ class IntOp(Task):
         self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
         if self.layout == "tfhe":
             import os
-            from perseus.impl import tfhe, tfhe_bitwise
+            from perseus.impl import tfhe, tfhe_bitwise as T
             self.tfhe = True
             self.words = int(self.words)
             nd = self.bits // 2
-            self.a, self.b, self.sel = self.a[:self.words], self.b[:self.words], self.sel[:self.words]
-            self.b[:max(1, self.words // 4)] = self.a[:max(1, self.words // 4)]
-            wp = tfhe_bitwise.WordProg(f"bitwise.{self.op}{self.bits}.w{self.words}", self.words, nd)
-            os.environ.setdefault("PC_TFHE_NATIVE", f"5,{wp.rows_in(True)}")
-            rows_out = self.words if self.op == "cmp" else wp.R
-            tfhe.register_slots(f"bitwise.in.{wp.rows_in(True)}", np.arange(wp.rows_in(True)))
-            tfhe.register_slots(f"bitwise.out.{rows_out}", np.arange(rows_out))
-            out = f"bitwise.out.{rows_out}"
-            if self.op in ("and", "or", "xor"):
-                wp.bitwise(self.op, out)
-            else:
-                {"add": wp.add, "cmp": wp.cmp, "mux": wp.mux, "id": wp.ident}[self.op](out)
+            self.a, self.b, self.sel = T.inputs(self.words, self.bits, self.seed, self.op)
+            name = f"bitwise.{self.op}{self.bits}.w{self.words}"
+            wp = T.build(self.op, name, self.words, nd)
+            rin = wp.rows_in(True)
+            os.environ.setdefault("PC_TFHE_NATIVE", f"{max(5, wp.pr.bufs)},{T.rows_needed(wp.pr, rin)}")
+            tfhe.register_slots(f"bitwise.in.{rin}", np.arange(rin))
+            tfhe.register_slots(name + ".out", np.arange(wp.out_rows))
             self.wp, self.prog = wp, tfhe.register_prog(wp.pr)
             return
         if self.layout == "slots":
             self.io = intops.WordOps(None, self.bits, self.r, self.table, SLOTS)
             n = self.bits // self.r
-            self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            if self.op in ("addmux", "id"):
+                self.a, self.b, self.sel = self.a[:SLOTS // n], self.b[:SLOTS // n], self.sel[:SLOTS // n]
+            else:                                     # edge pairs, equal words, a + b = -1, shift amounts
+                self.a, self.b, self.sel = intops.inputs(SLOTS // n, self.bits, self.seed, self.op)
             if self.op in ("and", "or", "xor"):
                 self.io.bitwise(self.op, None, None)
         else:
             self.io = intops.IntOps(None, self.r, self.table)      # registers the tables in this process
+            if self.op not in ("addmux", "id", "add", "cmp", "mux", "and", "or", "xor"):
+                self.a, self.b, self.sel = intops.inputs(SLOTS, self.bits, self.seed, self.op)
             if self.op in ("and", "or", "xor"):
                 self.io.bitwise(self.op, [], [])
 
@@ -565,8 +565,7 @@ class IntOp(Task):
         if self.layout == "tfhe":
             from perseus.impl import tfhe_bitwise
             nd, x = self.bits // 2, np.zeros(SLOTS)
-            v = np.concatenate([tfhe_bitwise.encode_digits(self.a, nd), tfhe_bitwise.encode_digits(self.b, nd),
-                                (6.0 * self.sel - 3.0) / 4.0])
+            v = tfhe_bitwise.slot_values(self.a, self.b, self.sel, nd)
             x[:len(v)] = v
             return [x]
         if self.layout == "slots":
@@ -588,23 +587,23 @@ class IntOp(Task):
             return [tfhe.tfhe_prog(ops, ops.copy(xs[0]), self.prog, f"bitwise.in.{self.wp.rows_in(True)}")]
         if self.layout == "slots":
             w = intops.WordOps(ops, self.bits, self.r, self.table, SLOTS)
+            self.io = w                               # its tables (p_fail)
             a, b = xs[0], xs[1]
             if self.op == "id":
                 return [ops.add(a, 0.0)]
-            if self.op == "add":
-                return [w.add(a, b)]
-            if self.op == "cmp":
-                return [w.cmp(a, b)]
-            if self.op == "mux":
-                return [w.mux(xs[2], a, b)]
             if self.op == "addmux":
                 return [w.mux(xs[2], w.add(a, b), a)]
-            return [w.bitwise(self.op, a, b)]
+            return intops.word_op(w, self.op, a, b, xs[2] if self.op == "mux" else None)
         io = intops.IntOps(ops, self.r, self.table)
         n = self.bits // self.r
         a, b = list(xs[:n]), list(xs[n:2 * n])
         if self.op == "id":                          # the I/O baseline: inputs in, a out
             return [ops.add(ai, 0.0) for ai in a]
+        if self.op not in ("add", "cmp", "mux", "addmux", "and", "or", "xor"):
+            self.io = io
+            outs = intops.int_op(io, self.op, a, b)
+            self._nout = [len(v) if isinstance(v, list) else 1 for v in outs]
+            return [x for v in outs for x in (v if isinstance(v, list) else [v])]
         if self.op == "add":
             return io.add(a, b)
         if self.op == "cmp":
@@ -622,22 +621,44 @@ class IntOp(Task):
         from perseus.impl import intops, fbs
         d = out["d"]
         if self.layout == "tfhe":
+            from perseus.impl import tfhe_bitwise as T
             nd, y = self.bits // 2, np.real(d[0])
-            if self.op == "cmp":
-                got = np.round(y[:self.words]).astype(np.int64)
-                dev = float(np.abs(y[:self.words] - got).max())
+            want, ndig, nfl, w = T.want_rows(self.op, self.a, self.b, self.sel, nd)
+            sc = T.out_layout(self.op, nd)[2]
+            n = len(want)
+            got = T.decode_rows(self.op, y[:n], nd, self.words)
+            bad = got != want
+            # a word is wrong when any of its rows is (digits [word][digit], then the flag rows [flag][word])
+            wbad = np.zeros(self.words, dtype=bool)
+            if ndig:
+                wbad |= bad[:self.words * ndig].reshape(self.words, ndig).any(1)
+                for f in range(nfl):
+                    wbad |= bad[self.words * ndig + f * self.words:self.words * ndig + (f + 1) * self.words]
             else:
-                q = np.clip(np.round(y[:self.words * nd] * 4), 0, 3).astype(np.int64).reshape(self.words, nd)
-                got = (q << (2 * np.arange(nd))).sum(1)
-                dev = float(np.abs(y[:self.words * nd] * 4 - np.round(y[:self.words * nd] * 4)).max())
-            import os
-            nu2 = os.environ.get("PC_TFHE_NU", "1") == "2"      # pc-check tfhe-bitwise's model: 8 / 16 bins at nu 1 / 2
-            lp = (-261.7 if nu2 else -81.9) if self.op in ("and", "or", "xor") else (-1034.1 if nu2 else -317.3)
-            return {"wrong": int(np.sum(got != self.ref())), "max_dev": dev, "log2_pfail_lookup_ct": lp}
+                wbad |= bad[:self.words]
+            dev = float(np.abs(y[:n] * sc - np.round(y[:n] * sc)).max())
+            an = T.analyze(self.wp.pr, T.load_values(T.slot_values(self.a, self.b, self.sel, nd)))
+            return {"wrong": int(wbad.sum()), "max_dev": dev, "log2_pfail_lookup_ct": an["log2_pfail_lookup"],
+                    "log2_pfail_op": an["log2_pfail_op"], "rounds": an["rounds"], "pbs": an["pbs"]}
+        if self.layout == "slots" and self.op not in ("addmux", "id"):
+            wrong, dev = intops.word_check(self.io, self.op, d, self.a, self.b, self.sel, self.bits)
+            sg = self.io.lookup_sigmas()
+            lp = max(fbs.p_fail(n, sigma_in=s)["log2_ct"] for n, s in sg.items())
+            return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
         if self.layout == "slots":
             n = self.bits // self.r
             got = (np.round(np.real(d[0])).astype(np.int64).reshape(-1, n)[:, -1] if self.op == "cmp"
                    else self.io.decode(d[0]))
+        elif self.op not in ("add", "cmp", "mux", "addmux", "and", "or", "xor", "id"):
+            n = self.bits // self.r
+            outs, k = [], 0                          # regroup: the word's digits, then the flags
+            for c in getattr(self, "_nout", [n]):
+                outs.append(list(d[k:k + c]) if (c > 1 or (k == 0 and not intops.is_pred(self.op))) else d[k])
+                k += c
+            wrong, dev = intops.int_check(self.io, self.op, outs, self.a, self.b, self.sel, self.bits)
+            sg = self.io.lookup_sigmas()
+            lp = max(fbs.p_fail(nm, sigma_in=s_)["log2_ct"] for nm, s_ in sg.items())
+            return {"wrong": wrong, "max_dev": dev, "log2_pfail_lookup_ct": lp}
         else:
             got = intops.value(d, self.r) if self.op != "cmp" else np.round(d[0]).astype(np.int64)
         dev = max(float(np.abs(np.asarray(v) - np.round(v)).max()) for v in d)
