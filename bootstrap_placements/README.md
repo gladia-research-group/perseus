@@ -17,6 +17,7 @@ default plan (`python/perseus/examples/defaults.py`); `scripts/repro/` has one s
 | directory | model and task |
 |---|---|
 | `gpt2_decode` | GPT-2, decode with the encrypted argmax up to 32 cached keys (the server, generation and the 16-token decode); block 0 also has its generation plan, `block_0_feedback_placement.json` (`run_generate`: prompt teacher-forced, then each token fed back). The windows' runtime= line and recipe, on their config without the softmax's key lanes (`gpt2_base_n32_ctx512s_nokl`: one plan binds 0..31, past the lanes' 16 keys), recorded at position 0 and merged over positions 0, 8, 16 and 31 (`scripts/utils/merge_window_mags.py`; the window holds its first position, as each window's does); its dense refreshes run the degree-47 EvalMod series with 2 double angles (`bts.em_table` 47:2, two composite levels shallower: BTS_LEVEL 24), on that recording made again with the series (`graphs/gpt2_decode_em47`, the magnitudes of `graphs/gpt2_decode`) |
+| `gpt2_gen_topk`, `_topp`, `_draw` | GPT-2 generation with a TFHE sampler as the selection stage (`GPT2_SAMPLER=bootstrap_placements/gpt2_tfhe_<s>_native`, `run_generate`): blocks 0-12 and block 0's generation plan are `gpt2_decode`'s (links), block 13 is the sampler head, planned at `gpt2_decode`'s block-12 exit on its own recording made with the same EvalMod series (PLAN_CMD.txt `block13=`) |
 | `gpt2_decode_ctx512_w16`, `_w128` ... `_w512` | GPT-2, decode with the encrypted argmax past 32 cached keys up to a 512-token context: a plan for the first 16 positions, then one per 128-position window (below) |
 | `gpt2_decode_ctx1024` | GPT-2, decode up to a 1,024-token context, the default past 512 (below) |
 | `gpt2_prefill128` | GPT-2, 128-token prefill to the first token (the last block on the last position, its final LayerNorm, the LM head and the encrypted argmax), planned by `python/perseus/examples/gpt2/make_plan.sh` (`blocks` stage) on the min-cut placer |
@@ -150,6 +151,8 @@ before it), so one session serves them: 133 refreshes per GPT-2 token (11 of the
 (`bts.em_table` 47:2, as `gpt2_decode`), each on its recording made again with the series (a structure capture at
 position 0, the window's magnitudes by name; w128 ... w512 on `gpt2_base_n32_ctx512s_nokl`, whose structure the
 shipped key-lane config has past 16 keys): 104 refreshes per token instead of 133 (93 + 11 in the argmax at the
-runtime), -2.4 to -3.9 % per token over the windows, KL unchanged. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
+runtime), -2.4 to -3.9 % per token over the windows, KL unchanged. Llama's windows run the same series (their recordings made again under the new runtime= line,
+`graphs/LLAMA.txt`): 214 refreshes per Llama token instead of 279, -8.5 to -10.5 % per token (medians: w16 5.53 -> 5.05 s,
+w128 5.69 -> 5.09 s, w512 6.66 -> 6.10 s); the median KL of w16 / w128 rises about 10x (to 2e-5 / 4e-6), w512's not. The P.V rule (`FORBID_STEPS` `.kred`) is main's own, not ported from the speedrun: it buys
 precision for +4.4 % per GPT-2 token and +1.3 % per Llama token. `PP=500` runs either
 repro script from a plaintext prefix: positions 0-499 on the CPU (`--plain-prefix`), 500-511 encrypted.
