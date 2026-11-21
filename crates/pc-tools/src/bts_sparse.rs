@@ -542,6 +542,11 @@ fn run_sb(o: &Opts) -> Res<bool> {
     let rd = o.raise_drop.unwrap_or_else(|| g0.params["boot_routes"][o.route.to_string()]["raise_drop"].as_u64().unwrap_or(1) as u32);
     let mut scfg = SparseBCfg::n32(o.route, rd);
     scfg.k_max = 8;
+    // PC_BENCH_SPARSE_B_K / PC_SB_EM_TABLE (experiments): SparseB's EvalMod K and series (bts_all)
+    if let Some(k) = std::env::var("PC_BENCH_SPARSE_B_K").ok().and_then(|v| v.parse::<f64>().ok()) {
+        scfg.evalmod_k = k;
+    }
+    sb_em_env(&mut scfg);
     if let Some(src) = o.ks_source {
         scfg.ks_source = src;
     }
@@ -910,5 +915,17 @@ fn rnd(seed: u64) -> impl FnMut() -> u64 {
         x ^= x >> 7;
         x ^= x << 17;
         x
+    }
+}
+
+/// PC_SB_EM_TABLE (experiments, SparseB at K = 16): 'w14' (pc-core `SPARSE_B_K16_W14`, the served decode's) or deg:da
+/// (`pc_shadow::evalmod::sine_base` followed by `da` double angles).
+pub fn sb_em_env(c: &mut pc_gpu::bts::sparse_b::SparseBCfg) {
+    let Ok(v) = std::env::var("PC_SB_EM_TABLE") else { return };
+    if v == "w14" {
+        c.em_coeffs = pc_core::bts_setup::SPARSE_B_K16_W14.to_vec();
+    } else if let Some((d, r)) = v.split_once(':').and_then(|(d, r)| Some((d.parse::<usize>().ok()?, r.parse::<u32>().ok()?))) {
+        c.em_coeffs = pc_shadow::evalmod::sine_base(c.evalmod_k, r, d);
+        c.em_da = r;
     }
 }

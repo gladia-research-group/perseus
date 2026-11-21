@@ -953,6 +953,10 @@ def plan_block(graph_file: Path | str, cfg: PlanConfig, *,
         fc = first_consumer_seed.get(v)
         if exp is not None and fc is not None:
             return 2 if exp > fc else 1
+        # PC_SEED_BL (experiments): the compile's seed threshold when the bootstrap level moved but the inputs did not
+        bl_seed = os.environ.get("PC_SEED_BL")
+        if bl_seed:
+            return 2 if seed_consumed(v) + cfg.bootstrap_level > float(bl_seed) else 1
         return 2 if seed_consumed(v) > 0 else 1
 
     policy = btserr.SitePolicy(

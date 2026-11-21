@@ -921,6 +921,7 @@ pub fn bench(args: &[String]) -> Res<bool> {
     let mut setup = BtsSetup::n32_shipped();
     setup.raise_drops = vec![0, 1];
     setup.k_max = kmax;
+    em_table_env(&mut setup)?;
     // fbs: message j at phase j q0 / 2t (CF log2 2t); EvalMod's output reads x 2^CF, folded into the series
     let fbs_cf = a.fbs_cf.unwrap_or((2 * a.fbs_t).trailing_zeros());
     let mut post_c0 = 0.0;
@@ -1825,4 +1826,17 @@ pub fn bench(args: &[String]) -> Res<bool> {
     }
     println!("[pc-bench] {}: {} gates, {} failing", a.cmd, t.gates, t.bad);
     Ok(t.bad == 0)
+}
+
+/// PC_EM_TABLE=deg:da (experiments): the plain EvalMod table at the setup's K, `deg` and `da` double angles
+/// (`pc_shadow::evalmod::sine_base`) in place of the shipped one.
+pub fn em_table_env(setup: &mut BtsSetup) -> Res<()> {
+    if let Some(v) = std::env::var("PC_EM_TABLE").ok().filter(|v| !v.is_empty()) {
+        let (d, r) = v.split_once(':').ok_or("PC_EM_TABLE=deg:da")?;
+        let (d, r): (usize, u32) = (d.parse()?, r.parse()?);
+        setup.evalmod_coeffs = pc_shadow::evalmod::sine_base(setup.boot_k, r, d);
+        setup.evalmod_da_its = r;
+        println!("[pc-bench] EvalMod table K {} degree {d}, {r} double angles (PC_EM_TABLE)", setup.boot_k);
+    }
+    Ok(())
 }

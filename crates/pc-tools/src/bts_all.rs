@@ -307,6 +307,9 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
     setup.em_fuse_rescale = em_fuse;
     setup.merge_s2d = merge;
     setup.stc_ps = stc_ps;
+    if let Err(e) = crate::bts_stc_first::em_table_env(&mut setup) {
+        return Err(e.to_string().into());
+    }
     let mut sf = StcFirstSetup::n32_shipped();
     sf.cache_slots = 4;
     // --pair-members: pairs up to the members' largest CF (above the reference CF: the pair's last stage at CF + 1)
@@ -332,6 +335,7 @@ fn bench_k(o: &Opts, kb: usize, out_rows: &mut Vec<Row>, mem_rows: &mut Vec<(Str
             c.evalmod_k = sparse_k;
             c.em_fuse_rescale = em_fuse;
             c.merge_s2d = merge;
+            crate::bts_sparse::sb_em_env(&mut c);
             c
         })
         .collect();

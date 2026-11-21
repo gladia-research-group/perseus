@@ -946,6 +946,25 @@ pub fn op_cost(ops: &[EmOp]) -> f64 {
         .sum()
 }
 
+/// A plain EvalMod table (the shipped tables' function): the Chebyshev interpolant on [-1, 1] (evaluator convention)
+/// of (2 pi)^(-1/2^r) cos(2 pi (K y - 1/4) / 2^r) at degree `deg`; after r double angles it reads sin(2 pi K y) / 2 pi.
+pub fn sine_base(k: f64, da_its: u32, deg: usize) -> Vec<f64> {
+    let s = (1u64 << da_its) as f64;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let n = deg + 1;
+    (0..n)
+        .map(|j| {
+            let acc: f64 = (0..n)
+                .map(|i| {
+                    let th = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
+                    two_pi.powf(-1.0 / s) * (two_pi * (k * th.cos() - 0.25) / s).cos() * (j as f64 * th).cos()
+                })
+                .sum();
+            acc * 2.0 / n as f64
+        })
+        .collect()
+}
+
 /// The base pair of a trigonometric FBS (`PsPlan::fbs_trig`): Chebyshev interpolants on [-1, 1] (evaluator convention)
 /// of cos and sin of 2 pi K y / 2^r at degree `deg`; after r paired double angles, y = (u + I) / K reads
 /// (cos 2 pi u, sin 2 pi u) for every ModRaise integer |I| < K.
@@ -1264,6 +1283,9 @@ pub fn build_sine_paired(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_ang
             if b.metas[x].nl == 2 {
                 b.rescale(x)?;
             }
+            if ps.post.is_empty() {
+                return Ok(());
+            }
             let p = true_coeffs(&ps.post);
             let (pw, m) = pair_powers(b, x, None, k, top_deg(&p).unwrap_or(0), false)?;
             let r = pair_result(pair_eval(b, &pw, &p, &[], m)?)?;
@@ -1291,7 +1313,7 @@ pub fn build_evalmod_opts(st: &ScaleTables, input: FMeta, ps: &PsPlan, double_an
     let mut b = Builder::new(st);
     b.lean = lean;
     let x = b.input(input);
-    if ps.paired && ps.trig.is_none() && !ps.post.is_empty() {
+    if ps.paired && ps.trig.is_none() {
         return build_sine_paired(st, input, ps, double_angle_its);
     }
     if let Some(t) = &ps.trig {

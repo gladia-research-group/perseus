@@ -201,3 +201,71 @@ mod probe {
         }
     }
 }
+
+#[cfg(test)]
+mod plain_probe {
+    use crate::bts::evalmod::EvalModPlan;
+    use pc_shadow::evalmod::PsPlan;
+
+    fn chebval(x: f64, c: &[f64]) -> f64 {
+        let (mut b1, mut b2) = (0.0, 0.0);
+        for &ck in c.iter().skip(1).rev() {
+            let b0 = 2.0 * x * b1 - b2 + ck;
+            b2 = b1;
+            b1 = b0;
+        }
+        x * b1 - b2 + c[0] / 2.0
+    }
+
+    /// (2 pi)^(-1/2^r) cos(2 pi (K y - 1/4) / 2^r): the shipped table's function at K, r (evaluator convention).
+    fn table(k: f64, r: u32, deg: usize) -> Vec<f64> {
+        let n = deg + 1;
+        let s = (1u64 << r) as f64;
+        let f = |y: f64| (2.0 * std::f64::consts::PI).powf(-1.0 / s) * (2.0 * std::f64::consts::PI * (k * y - 0.25) / s).cos();
+        (0..n).map(|j| (0..n).map(|i| { let th = std::f64::consts::PI * (i as f64 + 0.5) / n as f64; f(th.cos()) * (j as f64 * th).cos() }).sum::<f64>() * 2.0 / n as f64).collect()
+    }
+
+    /// max |table after r double angles - sin(2 pi K y) / 2 pi| over y in [-1, 1]
+    fn err(c: &[f64], k: f64, r: u32) -> f64 {
+        let mut e: f64 = 0.0;
+        for i in 0..=20000 {
+            let y = -1.0 + i as f64 / 10000.0;
+            let mut v = chebval(y, c);
+            for j in 1..=r as i32 {
+                v = 2.0 * v * v - (2.0 * std::f64::consts::PI).powf(-(2f64.powi(j - r as i32)));
+            }
+            e = e.max((v - (2.0 * std::f64::consts::PI * k * y).sin() / (2.0 * std::f64::consts::PI)).abs());
+        }
+        e
+    }
+
+    /// Probe (ignored): plain EvalMod depth (FIDESlib PS vs the paired builder) for the shipped K16 table and tables
+    /// with fewer double angles, on every raise variant of the shipped dense / StC-first plans.
+    #[test]
+    #[ignore]
+    fn plain_evalmod_probe() {
+        let preset = std::env::var("PC_PROBE_CHAIN").unwrap_or_else(|_| "n32".into());
+        let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::preset(&preset).expect("preset")).expect("chain");
+        let st = pc_core::scale::ScaleTables::precompute(&chain).expect("tables");
+        let b2 = crate::bts::BtsSetup::n32_shipped();
+        let ems: Vec<_> = crate::bts::dense::DensePlan::new(&chain, &b2).expect("dense plan").variants.iter().map(|v| v.em_in).collect();
+        let shipped = pc_core::bts_setup::evalmod_coeffs().to_vec();
+        println!("shipped K16 deg {} r 5: fit err {:.2e}", shipped.len() - 1, err(&shipped, 16.0, 5));
+        let mut cases = vec![("shipped".to_string(), shipped, 5u32)];
+        for (d, r) in [(23usize, 4u32), (31, 3), (47, 2), (63, 2)] {
+            let t = table(16.0, r, d);
+            cases.push((format!("K16 d{d} r{r} (err {:.1e})", err(&t, 16.0, r)), t, r));
+        }
+        for (name, t, r) in &cases {
+            let mut line = format!("{name}:");
+            for em in &ems {
+                let mut ps = PsPlan::from_coeffs(t).expect("plan");
+                let (_, fo, _) = EvalModPlan::<u32>::program(&st, *em, &ps, *r).expect("fides");
+                ps.paired = true;
+                let (p2, po, _) = EvalModPlan::<u32>::program(&st, *em, &ps, *r).expect("paired");
+                line += &format!(" [in {} fides {} paired {} cost {:.0}]", em.top, fo.top, po.top, pc_shadow::evalmod::op_cost(&p2.ops));
+            }
+            println!("{line}");
+        }
+    }
+}

@@ -285,6 +285,16 @@ pub fn runtime_shadow(cfg: &Config, plan_cfg: &PlanConfig, bootstrap_level: Opti
     // FIDESlib's realized landings at raise drop 0 (the shipped decode's 512 -> 26 is 24 + its FIDESLIB_BTS_RAISE_DROP=512:1)
     // (1024: the SparseB route SM_PERIODIC=2 builds past two score groups, Llama decode; same depth as 512)
     bts.landings = [(0, l(28)), (1024, l(24)), (512, l(24)), (256, l(24)), (1, l(16))].into_iter().collect();
+    // PC_BTS_DENSE_LANDING / PC_BTS_SB_LANDING (experiments, with the runtime's PC_BTS_EM_TABLE / bts.sb_em_table
+    // deg:da): the dense StC-first route's and the SparseB routes' raise-drop-0 landings of a shallower EvalMod series
+    if let Some(v) = std::env::var("PC_BTS_DENSE_LANDING").ok().and_then(|v| v.parse().ok()) {
+        bts.landings.insert(0, l(v));
+    }
+    if let Some(v) = std::env::var("PC_BTS_SB_LANDING").ok().and_then(|v| v.parse::<u32>().ok()) {
+        for s in [1024, 512, 256] {
+            bts.landings.insert(s, l(v));
+        }
+    }
     // the classic multi-stage sparse routes (pc-gpu `sparse_classic`): every power-of-two s SparseB does not take
     // (s > FIDESLIB_BTS_SPARSE_B_MAX, or SparseB off), on the SPARSE_LEVEL_BUDGET precomputation (default {4, 3})
     let budget = sparse_level_budget(cfg)?;
@@ -356,7 +366,12 @@ pub fn sparse_level_budget(cfg: &Config) -> Result<[u32; 2]> {
 /// block entry (the previous block's exit), KV-cache reads their read level, other inputs their first consumer.
 pub fn seeds(bg: &BlockGraph, rules: &crate::plan::Rules, entry: Option<(u32, u8)>, inputs: &[String]) -> Result<HashMap<String, (u32, u8)>> {
     let g = &bg.graph;
-    let bl = rules.bootstrap_level.ok_or_else(|| cfg_err("rules.bootstrap_level", "missing"))? as f64;
+    let mut bl = rules.bootstrap_level.ok_or_else(|| cfg_err("rules.bootstrap_level", "missing"))? as f64;
+    // PC_SEED_BL (experiments): the level past which an unmapped input seeds with a pending rescale, when the plan's
+    // bootstrap level moved with a shallower EvalMod series but the inputs did not
+    if let Some(v) = std::env::var("PC_SEED_BL").ok().and_then(|v| v.parse::<f64>().ok()) {
+        bl = v;
+    }
     let source = rules.source_level.unwrap_or(36) as f64;
     let cache_read = rules.cache_read_level.unwrap_or(36) as f64;
     let ins: BTreeSet<&str> = g.inputs.iter().map(String::as_str).collect();
