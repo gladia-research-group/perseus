@@ -99,6 +99,11 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
             _ => return Err(PyValueError::new_err(format!("PC_TFHE_NU={v}: 1 or 2"))),
         };
     }
+    // native programs default to the latency key (their lookups run in small rounds: the latency path), where the
+    // latency path takes it (nu 1, one gadget level); PC_TFHE_LAT_GROUP=0 turns it off
+    if p.chain && std::env::var("PC_TFHE_LAT_GROUP").is_err() && p.nu == 1 && p.pbs.1 == 1 && p.n_lwe % 5 == 0 {
+        p.lat_group = 5;
+    }
     Ok(p)
 }
 

@@ -978,6 +978,11 @@ fn switch_params(args: &[String], n: usize) -> Res<Params> {
         p.pbs = g;
     }
     p.lat_group = arg(args, "--lat-group").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    // --ks b,l: the LWE key switch's gadget (base log, levels)
+    if let Some(v) = arg(args, "--ks") {
+        let (b, l) = v.split_once(',').ok_or("--ks b,l")?;
+        p.ks = (b.parse()?, l.parse()?);
+    }
     // --native-max: the tournament max in TFHE (the native chains' key switch)
     p.chain = args.iter().any(|a| a == "--native-max");
     if let Some(v) = arg(args, "--rs-gadget") {
