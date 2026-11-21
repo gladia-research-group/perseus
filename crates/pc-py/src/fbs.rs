@@ -26,6 +26,8 @@ pub(crate) struct Desc {
     pub cf: u32,
     pub amp: f64,
     pub post: Vec<f64>,
+    /// The EvalMod table (`pc_core::bts_setup::fbs_evalmod_table`; default "k32").
+    pub table: String,
     pub real: bool,
     /// The trigonometric form (`FbsSpec::table_s`); None: the sine form.
     pub trig: Option<Trig>,
@@ -70,20 +72,24 @@ impl Desc {
             cf: v.get("cf")?.as_u64()? as u32,
             amp: v.get("amp").and_then(|x| x.as_f64()).unwrap_or(1.0),
             post,
+            table: v.get("table").and_then(|x| x.as_str()).unwrap_or("k32").to_string(),
             real: v.get("real").and_then(|x| x.as_bool()).unwrap_or(false),
             trig,
             paired: v.get("paired").and_then(|x| x.as_bool()).unwrap_or(false),
         })
+        .filter(|d| pc_core::bts_setup::fbs_evalmod_table(&d.table).is_some())
     }
 
     /// The pc-gpu spec (K = 32 table, raise drop 0); `complex` / `real`: the EvalMod modes built.
     pub fn spec(&self, complex: bool, real: bool) -> FbsSpec {
-        let k = pc_core::bts_setup::EVALMOD_K32;
-        let (table, da_its, table_s, off, post_s) = match &self.trig {
-            None => (pc_core::bts_setup::EVALMOD_K32_CHEB.to_vec(), pc_core::bts_setup::EVALMOD_K32_DA_ITS, vec![], 0.0, vec![]),
+        // the sine form on the descriptor's EvalMod table; the trigonometric form on the K32 base pair
+        let (tab, tk, tda) = pc_core::bts_setup::fbs_evalmod_table(&self.table).expect("table checked at parse");
+        let (table, k, da_its, table_s, off, post_s) = match &self.trig {
+            None => (tab, tk, tda, vec![], 0.0, vec![]),
             Some(t) => {
+                let k = pc_core::bts_setup::EVALMOD_K32;
                 let (c, s) = pc_shadow::evalmod::trig_base(k, t.da, t.deg);
-                (c, t.da, s, t.off, t.post_s.clone())
+                (c, k, t.da, s, t.off, t.post_s.clone())
             }
         };
         FbsSpec { table, k, da_its, amp: self.amp, post: self.post.clone(), table_s, off, post_s, paired: self.paired, drop: 0, complex, real }
@@ -100,7 +106,7 @@ pub(crate) fn functions(progs: &[Program]) -> Result<BTreeMap<String, (Desc, boo
                 if let Kind::Finish { desc: Some(d), .. } = &m.kind {
                     if let Some(d) = Desc::parse(d) {
                         let e = out.entry(d.name.clone()).or_insert_with(|| (d.clone(), false, false));
-                        if (e.0.cf, e.0.amp.to_bits(), &e.0.post, &e.0.trig, e.0.paired) != (d.cf, d.amp.to_bits(), &d.post, &d.trig, d.paired) {
+                        if (e.0.cf, e.0.amp.to_bits(), &e.0.post, &e.0.trig, e.0.paired, &e.0.table) != (d.cf, d.amp.to_bits(), &d.post, &d.trig, d.paired, &d.table) {
                             return Err(format!("fbs function {} captured with two different series", d.name));
                         }
                         if d.real {
@@ -192,8 +198,12 @@ fn model(preset: &str, h: usize) -> Result<std::sync::Arc<(pc_core::params::Chai
     Ok(m)
 }
 
-fn ps_of(amp: f64, post: &[f64], trig: Option<Trig>, paired: bool) -> Result<(pc_shadow::evalmod::PsPlan, FbsSpec), String> {
-    let d = Desc { name: String::new(), cf: 0, amp, post: post.to_vec(), real: true, trig, paired };
+fn ps_of(amp: f64, post: &[f64], trig: Option<Trig>, paired: bool, table: Option<&str>) -> Result<(pc_shadow::evalmod::PsPlan, FbsSpec), String> {
+    let table = table.unwrap_or("k32").to_string();
+    if pc_core::bts_setup::fbs_evalmod_table(&table).is_none() {
+        return Err(format!("fbs EvalMod table {table:?}: k32 | k32d3 | k28d1"));
+    }
+    let d = Desc { name: String::new(), cf: 0, amp, post: post.to_vec(), table, real: true, trig, paired };
     let sp = d.spec(false, true);
     Ok((sp.ps_plan().map_err(|e| e.to_string())?, sp))
 }
@@ -207,14 +217,14 @@ fn trig_of(post_s: Option<Vec<f64>>, off: f64, tdeg: usize, tda: u32) -> Option<
 /// EvalMod output on the StC-first route's drop-0 variant (the session's `FbsHost::out`), realized. Refused on a chain
 /// FBS is not validated on (`fbs_chain_check`).
 #[pyo3::pyfunction]
-#[pyo3(signature = (preset, amp, post, post_s=None, off=0.0, tdeg=TRIG_DEG, tda=TRIG_DA, paired=false))]
+#[pyo3(signature = (preset, amp, post, post_s=None, off=0.0, tdeg=TRIG_DEG, tda=TRIG_DA, paired=false, table=None))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fbs_landing(preset: &str, amp: f64, post: Vec<f64>, post_s: Option<Vec<f64>>, off: f64, tdeg: usize, tda: u32, paired: bool) -> pyo3::PyResult<(u32, u8)> {
+pub(crate) fn fbs_landing(preset: &str, amp: f64, post: Vec<f64>, post_s: Option<Vec<f64>>, off: f64, tdeg: usize, tda: u32, paired: bool, table: Option<&str>) -> pyo3::PyResult<(u32, u8)> {
     use pyo3::exceptions::PyValueError;
     let ve = |e: String| PyValueError::new_err(e);
     let m = model(preset, pc_core::keys::SecretKey::SPARSE_H).map_err(ve)?;
     let (chain, nm) = (&m.0, &m.1);
-    let (ps, sp) = ps_of(amp, &post, trig_of(post_s, off, tdeg, tda), paired).map_err(ve)?;
+    let (ps, sp) = ps_of(amp, &post, trig_of(post_s, off, tdeg, tda), paired, table).map_err(ve)?;
     let st = pc_core::scale::ScaleTables::precompute(chain).map_err(|e| ve(e.to_string()))?;
     let (_, out, _) = pc_gpu::bts::evalmod::EvalModPlan::<u32>::program(&st, nm.em_in, &ps, sp.da_its).map_err(|e| ve(e.to_string()))?;
     let shape = pc_shadow::ChainShape::of(chain);
@@ -231,15 +241,15 @@ pub(crate) fn fbs_landing(preset: &str, amp: f64, post: Vec<f64>, post_s: Option
 /// input units, x K in phase units); `k`: the table's K; `by_i`: per input, (value, std) at each I = -K..=K (NaN off
 /// EvalMod's domain).
 #[pyo3::pyfunction]
-#[pyo3(signature = (preset, cf, amp, post, xs, sigma_x=0.0, h=32, post_s=None, off=0.0, tdeg=TRIG_DEG, tda=TRIG_DA, paired=false))]
+#[pyo3(signature = (preset, cf, amp, post, xs, sigma_x=0.0, h=32, post_s=None, off=0.0, tdeg=TRIG_DEG, tda=TRIG_DA, paired=false, table=None))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fbs_noise(py: pyo3::Python<'_>, preset: &str, cf: u32, amp: f64, post: Vec<f64>, xs: Vec<f64>, sigma_x: f64, h: usize, post_s: Option<Vec<f64>>, off: f64, tdeg: usize, tda: u32, paired: bool) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyDict>> {
+pub(crate) fn fbs_noise(py: pyo3::Python<'_>, preset: &str, cf: u32, amp: f64, post: Vec<f64>, xs: Vec<f64>, sigma_x: f64, h: usize, post_s: Option<Vec<f64>>, off: f64, tdeg: usize, tda: u32, paired: bool, table: Option<&str>) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyDict>> {
     use pyo3::exceptions::PyValueError;
     use pyo3::types::PyDictMethods;
     let ve = |e: String| PyValueError::new_err(e);
     let m = py.allow_threads(|| model(preset, h)).map_err(ve)?;
     let nm = &m.1;
-    let (ps, sp) = ps_of(amp, &post, trig_of(post_s, off, tdeg, tda), paired).map_err(ve)?;
+    let (ps, sp) = ps_of(amp, &post, trig_of(post_s, off, tdeg, tda), paired, table).map_err(ve)?;
     let r = py.allow_threads(|| nm.eval_ps(&ps, sp.da_its, sp.k, cf, &xs, sigma_x)).map_err(|e| ve(e.to_string()))?;
     let d = pyo3::types::PyDict::new(py);
     d.set_item("lo", r.points.iter().map(|p| p.lo).collect::<Vec<_>>())?;

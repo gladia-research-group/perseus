@@ -130,6 +130,60 @@ pub const EVALMOD_K32: f64 = 32.0;
 /// Double-angle iterations after `EVALMOD_K32_CHEB`.
 pub const EVALMOD_K32_DA_ITS: u32 = 6;
 
+/// Chebyshev interpolant on [-1, 1] (evaluator convention, c0 not halved) of `f` at degree `deg`, with the parity
+/// `parity` (0 even, 1 odd, 2 none) imposed on the coefficients.
+fn cheb_interp(deg: usize, parity: usize, f: &dyn Fn(f64) -> f64) -> Vec<f64> {
+    let n = deg + 1;
+    (0..n)
+        .map(|k| {
+            if parity < 2 && k % 2 != parity {
+                return 0.0;
+            }
+            let s: f64 = (0..n)
+                .map(|j| {
+                    let th = std::f64::consts::PI * (j as f64 + 0.5) / n as f64;
+                    f(th.cos()) * (k as f64 * th).cos()
+                })
+                .sum();
+            s * 2.0 / n as f64
+        })
+        .collect()
+}
+
+/// Degree and double angles of the low-depth K32 functional-bootstrap table (`evalmod_k32_low`).
+pub const EVALMOD_K32_LOW_DEG: usize = 59;
+pub const EVALMOD_K32_LOW_DA_ITS: u32 = 3;
+
+/// The low-depth functional bootstrap EvalMod series at K = 32: (2 pi)^(-1/8) cos(2 pi (32 y - 1/4) / 8) at Chebyshev
+/// degree 59 (fit ~5e-13 after the double angles), then 3 double angles: the same sine as `EVALMOD_K32_CHEB` + 6 double
+/// angles, two composite levels shallower (the degree-59 series costs two levels more than the degree-14 one, the
+/// three double angles it replaces four).
+pub fn evalmod_k32_low() -> Vec<f64> {
+    let r = (1u64 << EVALMOD_K32_LOW_DA_ITS) as f64;
+    let pi = std::f64::consts::PI;
+    cheb_interp(EVALMOD_K32_LOW_DEG, 2, &|y| (2.0 * pi).powf(-1.0 / r) * (2.0 * pi * (32.0 * y - 0.25) / r).cos())
+}
+
+/// The table-grade functional bootstrap EvalMod series at K = 28 (ModRaise overflow 2^-137.8 per bootstrap at h = 32):
+/// (2 pi)^(-1/2) cos(2 pi (28 y - 1/4) / 2) at Chebyshev degree 119, one double angle; three composite levels
+/// shallower than `EVALMOD_K32_CHEB` + 6 double angles.
+pub fn evalmod_k28_d1() -> Vec<f64> {
+    let pi = std::f64::consts::PI;
+    cheb_interp(119, 2, &|y| (2.0 * pi).powf(-0.5) * (2.0 * pi * (28.0 * y - 0.25) / 2.0).cos())
+}
+
+/// A functional-bootstrap EvalMod table by name: (series, K, double angles). "k32": `EVALMOD_K32_CHEB` (degree 14, 6
+/// double angles); "k32d3": `evalmod_k32_low` (degree 59, 3 double angles: two composite levels shallower, for chained
+/// lookups); "k28d1": `evalmod_k28_d1` (K = 28, degree 119, 1 double angle: three levels shallower). None otherwise.
+pub fn fbs_evalmod_table(name: &str) -> Option<(Vec<f64>, f64, u32)> {
+    match name {
+        "k32" => Some((EVALMOD_K32_CHEB.to_vec(), EVALMOD_K32, EVALMOD_K32_DA_ITS)),
+        "k32d3" => Some((evalmod_k32_low(), EVALMOD_K32, EVALMOD_K32_LOW_DA_ITS)),
+        "k28d1" => Some((evalmod_k28_d1(), 28.0, 1)),
+        _ => None,
+    }
+}
+
 /// The frozen EvalMod coefficient table (see `EVALMOD_CHEB`).
 pub fn evalmod_coeffs() -> &'static [f64] {
     &EVALMOD_CHEB

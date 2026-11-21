@@ -2106,6 +2106,37 @@ mod tests {
         }
     }
 
+    /// Probe (ignored): EvalMod output level of an FBS for K32 tables of other degrees / double-angle counts.
+    #[test]
+    #[ignore]
+    fn fbs_table_depth_probe() {
+        let chain = pc_core::params::Chain::generate(&pc_core::params::ChainSpec::n32()).expect("n32");
+        let st = pc_core::scale::ScaleTables::precompute(&chain).expect("tables");
+        let mut b2 = crate::bts::BtsSetup::n32_shipped();
+        b2.raise_drops = vec![0];
+        let em_in = crate::bts::dense::DensePlan::new(&chain, &b2).expect("dense plan").variants[0].em_in;
+        for (deg, r) in [(14usize, 6u32), (44, 3), (52, 3), (59, 3), (88, 2), (100, 2), (119, 2), (180, 1), (247, 1), (247, 0)] {
+            let n = deg + 1;
+            let ang = 2.0 * std::f64::consts::PI * 32.0 / (1u64 << r) as f64;
+            let f = |y: f64| (2.0 * std::f64::consts::PI).powf(-1.0 / (1u64 << r) as f64) * (ang * y - 2.0 * std::f64::consts::PI / 4.0 / (1u64 << r) as f64).cos();
+            let tab: Vec<f64> = (0..n).map(|k| (0..n).map(|j| { let th = std::f64::consts::PI * (j as f64 + 0.5) / n as f64; f(th.cos()) * (k as f64 * th).cos() }).sum::<f64>() * 2.0 / n as f64).collect();
+            for pd in [8usize, 16, 64] {
+                let post: Vec<f64> = (0..=pd).map(|i| 0.01 / (1.0 + i as f64)).collect();
+                let ps = PsPlan::fbs(&tab, r, 1.0, &post).expect("plan");
+                let (_, out) = build_evalmod_opts(&st, em_in, &ps, r as i32, true).expect("program");
+                // fit error of the table's sine after r double angles at amplitude 1
+                let mut emax: f64 = 0.0;
+                for i in 0..=2000 {
+                    let y = -1.0 + i as f64 / 1000.0;
+                    let mut c = chebval(y, &tab) * (2.0 * std::f64::consts::PI).powf(1.0 / (1u64 << r) as f64);
+                    for _ in 0..r { c = 2.0 * c * c - 1.0; }
+                    emax = emax.max((c - (2.0 * std::f64::consts::PI * 32.0 * y).sin()).abs());
+                }
+                println!("table deg {deg} r {r} post {pd}: in {} -> out top {} nl {} (sine err {emax:.2e})", em_in.top, out.top, out.nl);
+            }
+        }
+    }
+
     /// Liveness assignment on the shipped programs: fewer buffers, and every op's operands stay distinct where they
     /// were distinct before (no new aliasing inside an op).
     #[test]
