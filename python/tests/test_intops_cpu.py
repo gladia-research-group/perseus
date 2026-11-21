@@ -38,7 +38,7 @@ def test_lut_centering():
 
 @pytest.mark.parametrize("table", fbs.TABLES)
 def test_pfail_and_chains(table):
-    """Every ALU table meets 2^-128 per lookup (per ciphertext); 2^20 chained lookups stay below 2^-100."""
+    """Every integer lookup table meets 2^-128 per lookup (per ciphertext); 2^20 chained lookups stay below 2^-100."""
     io = intops.IntOps(NumpyOps(), 2, table)
     io.bitwise("xor", [], [])
     for n in io.lookups():
