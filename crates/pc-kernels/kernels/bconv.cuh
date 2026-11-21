@@ -43,6 +43,14 @@ __device__ __forceinline__ uint64_t int_round(const W (&y)[NY], int ns, const do
     return (uint64_t)floor(v + 0.5);
 }
 
+// A centred job (J.exact == 2, JobSpec::centre): the fast lift x + u B has u = round(sum_i y_i / b_i), whose mean over
+// uniform y_i is ns / 2; taking that mean for u (odd ns: (ns - 1) / 2 or (ns + 1) / 2 by a multiplicative hash of the
+// coefficient index) leaves no bias, only the lift's zero-mean spread. The same u on every target and part of a
+// coefficient (a function of its index alone).
+__host__ __device__ __forceinline__ uint64_t centre_u(int ns, int idx) {
+    return (uint64_t)(ns >> 1) + (uint64_t)((ns & 1) & (((uint32_t)idx * 0x9E3779B1u) >> 31));
+}
+
 // NS > 0: every job of the launch path has exactly NS sources (a compile-time count: no predicated source steps)
 // EXM: 0 plain jobs, 1 exact jobs, 2 either (J.exact at run time)
 template <class W, class MM, int NS, int EXM>
@@ -115,7 +123,9 @@ __device__ __forceinline__ void bconv_body(const BconvJob& J, const W* __restric
         const W* rbw = M + ns * J.ntgt;
         while ((uintptr_t)rbw & 7) ++rbw;  // 8-byte aligned doubles
         const double* rb = (const double*)rbw;
-        if (ir) {
+        if (J.exact == 2) {
+            u = centre_u(ns, idx);
+        } else if (ir) {
             u = int_round<W, NY>(y, ns, rb);
         } else {
 #pragma unroll
@@ -291,7 +301,7 @@ __global__ void __launch_bounds__(BX) bconv_wide_kernel(const W* __restrict__ sr
         ys[(i - 16) * BX + threadIdx.x] = y;
         if (J.exact) v = __fma_rn((double)y, rb[i], v);
     }
-    const uint64_t u = J.exact ? (uint64_t)floor(v + 0.5) : 0;
+    const uint64_t u = J.exact == 2 ? centre_u(ns, idx) : J.exact ? (uint64_t)floor(v + 0.5) : 0;
     __syncthreads();
     for (int k = 0; k < nt; k += 4) {
         Wd a0 = 0, a1 = 0, a2 = 0, a3 = 0;

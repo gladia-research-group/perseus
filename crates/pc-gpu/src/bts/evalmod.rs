@@ -183,6 +183,22 @@ struct RrConst<'a, W: DevWord> {
 
 /// Primes the rescale from limb top `top` drops: the level unit, but one at a single-prime level of a chain with an
 /// alternating user region (`ScaleTables::drop`).
+/// PC_FBS_MD (experiments; the exponential form's ModDown conversions): unset / `centre` = the mean-centred fast
+/// conversion (`JobSpec::centre`: no bias, the exact one's precision measured to 3 digits, no double estimate),
+/// `exact` = the HPS-exact one, `fast` = FIDESlib's fast one (its bias on slot 0).
+fn md_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("PC_FBS_MD").as_deref() {
+        Ok("exact") => 0,
+        Ok("fast") => 2,
+        _ => 1,
+    })
+}
+
+fn md_centre() -> bool {
+    md_mode() == 1
+}
+
 pub fn em_drop(st: &pc_core::scale::ScaleTables, top: usize) -> usize {
     st.drop.get(top).copied().filter(|&g| g > 0).unwrap_or(st.d)
 }
@@ -385,9 +401,10 @@ pub struct EvalModPlan<'a, W: DevWord> {
     wmulti: BTreeMap<usize, Vec<ScalarPair<'a, W>>>,
     rfold_k: BTreeMap<usize, usize>,
     /// The exponential form's key switches outside `RelinRescale` (the conjugations, the relinearizations at tops
-    /// without a fused rescale) by top: the exact ModDown conversion (`ks::moddown_exact_specs`). The fast one's bias
-    /// sits on slot 0 of every ciphertext, which z = a e^(i th) turns into an amplitude / phase error (measured: GELU
-    /// [-24.6, 24.6] complex 1.25e-4 -> 8.4e-6; +1.1 ms). Every other program: none (unchanged).
+    /// without a fused rescale) by top: the ModDown conversion with its bias removed (`ks::moddown_exact_specs`, the
+    /// mean-centred one by default, `md_mode`). The fast one's bias sits on slot 0 of every ciphertext, which
+    /// z = a e^(i th) turns into an amplitude / phase error (measured: GELU [-24.6, 24.6] complex 1.25e-4 -> 8.4e-6).
+    /// Every other program: none (unchanged).
     md_exact: BTreeMap<usize, crate::bconv::BconvPlan<'a>>,
     bytes: usize,
     nq: usize,
@@ -414,7 +431,7 @@ fn md_tops(ops: &[EmOp], mode: EmMode, input: FMeta) -> std::collections::BTreeS
 /// The exponential form of a trigonometric FBS (a `ConjSplit` in the program) runs its key switches over the exact
 /// ModDown; every other program (plain tables, the sine and paired forms) keeps the fast one, unchanged.
 fn exact_md_program(ops: &[EmOp]) -> bool {
-    ops.iter().any(|o| matches!(o, EmOp::ConjSplit { .. }))
+    md_mode() != 2 && ops.iter().any(|o| matches!(o, EmOp::ConjSplit { .. }))
 }
 
 /// NTT of X^power on every Q prime (rows = prime id).
@@ -904,7 +921,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
 
     /// Device bytes `new` carves for this program (constants, rescale plans, monomials, keys; the fused regen-relin
     /// epilogue's tables: a dense seeded relinearization key, which the LT stages require anyway).
-    /// Device bytes of `md_exact` (the exponential form's exact ModDown conversions; 0 for every other program), the
+    /// Device bytes of `md_exact` (the exponential form's unbiased ModDown conversions; 0 for every other program), the
     /// complex mode's (a bound for the real one).
     pub fn md_exact_bytes(chain: &pc_core::params::Chain, st: &pc_core::scale::ScaleTables, lay: &Layout, input: FMeta, ps: &PsPlan, da_its: u32, kk_max: usize) -> Result<usize> {
         let (prog, _, _) = Self::program(st, input, ps, da_its)?;
@@ -914,7 +931,7 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let primes = chain.primes();
         let mut b = 0;
         for top in md_tops(&prog.ops, EmMode::Complex, input) {
-            b += crate::bconv::BconvPlan::bytes::<W>(&primes, &crate::ks::moddown_exact_specs(chain, lay, top, kk_max))?;
+            b += crate::bconv::BconvPlan::bytes::<W>(&primes, &crate::ks::moddown_exact_specs(chain, lay, top, kk_max, md_centre()))?;
         }
         Ok(b)
     }
@@ -1142,14 +1159,14 @@ impl<'a, W: DevWord> EvalModPlan<'a, W> {
         let mut plan = plan;
         if exact_md_program(&plan.ops) {
             for top in md_tops(&plan.ops, mode, input) {
-                let specs = crate::ks::moddown_exact_specs(&ctx.chain, &lay, top, kk_max);
+                let specs = crate::ks::moddown_exact_specs(&ctx.chain, &lay, top, kk_max, md_centre());
                 plan.md_exact.insert(top, crate::bconv::BconvPlan::new::<Compute, W>(arena, s, &primes, &specs)?);
             }
         }
         Ok(EvalModPlan { bytes: arena.used_bytes() - used0, ..plan })
     }
 
-    /// `ks::moddown_conv`, over the exact conversion where the program has one for `top` (`md_exact`).
+    /// `ks::moddown_conv`, over the unbiased conversion where the program has one for `top` (`md_exact`).
     #[allow(clippy::too_many_arguments)]
     fn moddown_conv<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, plans: &crate::ks::KsPlans<'_>, x: &mut CtBuf<'_, Compute, W>, conv: &mut CtBuf<'_, Compute, W>, k: usize, top: usize) -> Result<()> {
         match self.md_exact.get(&top) {
