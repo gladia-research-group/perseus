@@ -567,43 +567,51 @@ pub struct DevKsk<'a> {
 }
 
 impl<'a> DevKsk<'a> {
-    /// `regen`: a seeded key keeps its seed (K a multiple of 64); `planes`: the stored planes (always for a key that
-    /// cannot regenerate).
+    /// The planes when `planes`, or when the key cannot regenerate (`regen` off, a stored key, K not a multiple of 64);
+    /// a regenerating key's seed and bodies come with `seed_body` (allocated after the switch's other keys).
     pub fn new(arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk, p0: u64, regen: bool, planes: bool) -> Result<Self> {
         let k = key.rows();
-        let seeded = match (regen && k % 64 == 0, key.seed()) {
-            (true, Some(seed)) => {
-                let b: Vec<u32> = key.b.iter().map(|&v| v as u32).collect();
-                let mut body = arena.alloc::<Compute, u32>("tfhe.ksk", k)?;
-                body.upload(s, &b)?;
-                Some((*seed, body))
+        let can = regen && k % 64 == 0 && key.seed().is_some();
+        let mut me = DevKsk { seeded: None, planes: None };
+        if planes || !can {
+            me.planes = Some(Self::planes(arena, s, key, p0)?);
+        }
+        Ok(me)
+    }
+
+    fn planes(arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk, p0: u64) -> Result<Vec<DBuf<'a, Compute, u8>>> {
+        let k = key.rows();
+        let cols = key.n_out + 1;
+        let m = key.masks();
+        let mut w = vec![0i64; cols * k];
+        for o in 0..cols {
+            for r in 0..k {
+                let v = if o < key.n_out { m[o * k + r] as u64 } else { key.b[r] };
+                w[o * k + r] = pc_tfhe::modq::centered(v, p0);
             }
-            _ => None,
-        };
-        let planes = if planes || seeded.is_none() {
-            let cols = key.n_out + 1;
-            let m = key.masks();
-            let mut w = vec![0i64; cols * k];
-            for o in 0..cols {
-                for r in 0..k {
-                    let v = if o < key.n_out { m[o * k + r] as u64 } else { key.b[r] };
-                    w[o * k + r] = pc_tfhe::modq::centered(v, p0);
-                }
-            }
-            let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
-            drop(w);
-            let mut out = Vec::with_capacity(PLANES);
-            for u in 0..PLANES {
-                let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
-                let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
-                b.upload(s, &bytes)?;
-                out.push(b);
-            }
-            Some(out)
-        } else {
-            None
-        };
-        Ok(DevKsk { seeded, planes })
+        }
+        let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
+        drop(w);
+        let mut out = Vec::with_capacity(PLANES);
+        for u in 0..PLANES {
+            let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
+            let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
+            b.upload(s, &bytes)?;
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    /// Adds a seeded key's seed and bodies (K a multiple of 64).
+    pub fn seed_body(&mut self, arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk) -> Result<()> {
+        let k = key.rows();
+        if let (true, Some(seed)) = (k % 64 == 0, key.seed()) {
+            let b: Vec<u32> = key.b.iter().map(|&v| v as u32).collect();
+            let mut body = arena.alloc::<Compute, u32>("tfhe.ksk", k)?;
+            body.upload(s, &b)?;
+            self.seeded = Some((*seed, body));
+        }
+        Ok(())
     }
 
     /// Device bytes of the key.
@@ -619,21 +627,43 @@ pub fn ks_regen(p: &pc_tfhe::params::Params) -> bool {
     p.seeded && *V.get_or_init(|| std::env::var("PC_TFHE_KS_REGEN").map(|v| v.trim() != "0").unwrap_or(true))
 }
 
-/// Batches up to this many LWEs take the regeneration (KS_REGEN_MAX; PC_TFHE_KS_REGEN_MAX overrides), larger ones
-/// the stored planes' GEMMs. Per round (pc-check tfhe-prog, 4 chained rounds, median of 3): 1 / 8 / 16 / 40 rows
-/// 1.115 / 1.198 / 1.495 / 1.88 ms against 1.153 / 1.245 / 1.534 / 1.93 on the planes; 46 rows 2.06 vs 2.04, 64
-/// 2.35 vs 2.31, 188 5.17 vs 4.65, 1024 22.4 vs 19.4 (the expansion repeats per 64 rows, and the GEMMs' tensor
-/// throughput is the regeneration's best case).
+/// Batches up to this many LWEs take the regeneration (KS_REGEN_MAX; PC_TFHE_KS_REGEN_MAX overrides: >= the switch's
+/// batch, the device keeps no planes and every batch regenerates), larger ones the stored planes' GEMMs: up to
+/// KS_SMALL_MAX rows the per-warp kernel, above it the key-tiled one. Per round (pc-check tfhe-prog, 4 chained rounds):
+/// 1 / 16 / 48 / 64 / 92 rows 1.12 / 1.48 / 1.78 / 1.98 / 2.48 ms against 1.15 / 1.54 / 2.26 / 2.31 / 2.74 on the
+/// planes; 188 / 376 / 1024 rows 4.84 / 6.66 / 19.61 against 4.65 / 6.54 / 19.41 (the key-tiled kernel's best shapes:
+/// its MMAs read the digits from L2 once per 16 key columns, the GEMMs' tiles reuse them further).
 pub fn ks_regen_max() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("PC_TFHE_KS_REGEN_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(KS_REGEN_MAX))
 }
-pub const KS_REGEN_MAX: usize = 40;
+pub const KS_REGEN_MAX: usize = 94;
 
 /// Whether a switch of `max` values per pass keeps the planes on the device (some batch exceeds `ks_regen_max()`, or
 /// no regeneration).
 pub fn ks_planes(p: &pc_tfhe::params::Params, max: usize) -> bool {
     !ks_regen(p) || max > ks_regen_max()
+}
+
+/// Batches up to this many LWEs regenerate with the per-warp kernel (ks_regen_k), larger ones with the key-tiled one.
+pub const KS_SMALL_MAX: usize = 40;
+
+/// The key-tiled KS_REGEN's shape for `rows` LWEs: (row tiles per warp RT, column tiles CT, k slices); tuned on the
+/// RTX PRO 6000 (pc-check tfhe-ks: 64 / 94 / 188 / 376 / 1024 rows 0.113 / 0.136 / 0.230 / 0.374 / 0.80 ms; the
+/// stored planes 0.086 / 0.117 / 0.16 / 0.255 / 0.61). PC_TFHE_KS_TILED=rt,ct,slices overrides.
+pub fn ks_tiled_shape(rows: usize, _cols: usize, k: usize, _sms: usize) -> (usize, usize, usize) {
+    if let Some(v) = std::env::var("PC_TFHE_KS_TILED").ok() {
+        let f: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if f.len() == 3 {
+            return (f[0], f[1], f[2].clamp(1, k / (512 / f[1])));
+        }
+    }
+    let (rt, ct, sl) = match rows {
+        0..=128 => (1, 2, 32),
+        129..=512 => (1, 2, 16),
+        _ => (4, 2, 8),
+    };
+    (rt, ct, sl.clamp(1, k / (512 / ct)))
 }
 
 /// KS_REGEN's grid for `rows` LWEs (k slices, row tiles per warp): the blocks (64 columns x slices x row groups)
@@ -728,7 +758,8 @@ impl<'a> TfheSwitch<'a> {
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 }
             + if p.lat_group2 > 0 { nl / p.lat_group2 * ((1 << p.lat_group2) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
         let nkeys = if p.chain { 2 } else { 1 };
-        let key_bytes = if ks_regen(p) && k % 64 == 0 { 4 * k } else { 0 } + if ks_planes(p, max) { PLANES * (nl + 1) * k } else { 0 };
+        // the planes, or the bodies (with the planes, the bodies fit the slack below)
+        let key_bytes = if ks_planes(p, max) { PLANES * (nl + 1) * k } else { 4 * k };
         let bytes8 = key_bytes * nkeys + (max + 16) * k + WS;
         let pack = if p.pack { DevPack::bytes_rows(nb, nl, pc_tfhe::pack::PACK_GADGET.1, PACK_RMAX) } else { 0 };
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1, max) + pack + (1 << 20)
@@ -750,7 +781,7 @@ impl<'a> TfheSwitch<'a> {
         let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
         let rkey: Vec<u32> = sw.rs.keys().iter().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
         let (k, cols) = (n_sub * p.ks.1, nl + 1);
-        let ksk = DevKsk::new(arena, s, &sw.ksk, sw.p0, ks_regen(&p), ks_planes(&p, max))?;
+        let mut ksk = DevKsk::new(arena, s, &sw.ksk, sw.p0, ks_regen(&p), ks_planes(&p, max))?;
         // the native chains' key switch s_br -> s_lwe: the same shapes (n_br = N / S inputs)
         let cksk = match &sw.chain {
             Some(c) if nb == n_sub => Some(DevKsk::new(arena, s, &c.ksk, sw.p0, ks_regen(&p), ks_planes(&p, max))?),
@@ -758,6 +789,26 @@ impl<'a> TfheSwitch<'a> {
             None => None,
         };
         let img = pbs_image(&sw.bsk);
+        let mut cksk = cksk;
+        // the seeds' bodies after the switch's other keys
+        if ks_regen(&p) {
+            ksk.seed_body(arena, s, &sw.ksk)?;
+            if let (Some(d), Some(c)) = (cksk.as_mut(), &sw.chain) {
+                d.seed_body(arena, s, &c.ksk)?;
+            }
+        }
+        // the keys' footprint stays congruent to the stored planes' mod 8 MiB: the batch rotation is sensitive to the
+        // placement of the buffers allocated after the switch (pc-check tfhe-prog, 188 LWEs: a 256 KB shift 4.65 ->
+        // 5.2 ms per round, 768 KB 4.91, 2 / 4 MiB 4.64 / 4.66; 95 / 128 LWEs settle at 8 MiB)
+        {
+            let planes = PLANES * (nl + 1) * n_sub * p.ks.1 * if cksk.is_some() { 2 } else { 1 };
+            let have = ksk.bytes() + cksk.as_ref().map_or(0, |c| c.bytes());
+            const M: usize = 8 << 20;
+            let pad = (planes + 64 * M - have % M) % M;
+            if pad > 0 {
+                std::mem::forget(arena.alloc::<Compute, u8>("tfhe.pad", pad)?);
+            }
+        }
         let me = TfheSwitch {
             n,
             nb,
@@ -1108,12 +1159,17 @@ impl<'a> TfheSwitch<'a> {
         let planes: Vec<*const i8> = key.planes.iter().flatten().map(|b| b.dptr() as *const i8).collect();
         if let Some((seed, body)) = regen {
             let k = n_in * ks_lv;
-            let (slices, mt) = ks_regen_shape(cb, cols, k, self.wave / 2);
             let mut c = [mp as u64, ps as u64, seed.tag as u64, k as u64, 0, 0, 0, 0];
             for i in 0..4 {
                 c[4 + i] = seed.seed.0[2 * i] as u64 | (seed.seed.0[2 * i + 1] as u64) << 32;
             }
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_REGEN, count: cb as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: self.g.vptr_mut(), y: self.kdig.vptr(), z: body, q: p0, c, ..Default::default() })?;
+            if cb <= KS_SMALL_MAX {
+                let (slices, mt) = ks_regen_shape(cb, cols, k, self.wave / 2);
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_REGEN, count: cb as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: self.g.vptr_mut(), y: self.kdig.vptr(), z: body, q: p0, c, ..Default::default() })?;
+            } else {
+                let (rt, ct, sl) = ks_tiled_shape(cb, cols, k, self.wave / 2);
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_REGEN, count: cb as i32, i0: sl as i32, i1: ct as i32, i2: nl as i32, i3: rt as i32, i4: 1, x: self.g.vptr_mut(), y: self.kdig.vptr(), z: body, q: p0, c, ..Default::default() })?;
+            }
         } else {
             self.prepare(lt_, cb)?;
             let gemm = &self.gemms[&mp];

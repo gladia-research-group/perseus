@@ -1370,6 +1370,21 @@ __device__ __noinline__ uint32_t ks_escalate(const uint32_t (&key)[8], uint32_t 
     }
     return v % p;
 }
+// ks_escalate inlined (a call makes the callers keep their accumulators on the stack around it)
+__device__ __forceinline__ uint32_t ks_escalate_in(const uint32_t (&key)[8], uint32_t k, uint32_t o, uint32_t p, uint32_t n16,
+                                                   uint32_t tag, uint32_t m_p) {
+    uint32_t v = 0;
+    for (uint32_t t = 1; t < 32u; ++t) {
+        uint32_t blk[16];
+        chacha::chacha12(key, (k >> 4) + t * n16, o, p, tag, blk);
+        v = blk[0];
+#pragma unroll
+        for (int i = 1; i < 16; ++i)
+            if (i == (int)(k & 15)) v = blk[i];
+        if (v < m_p) break;
+    }
+    return v % p;
+}
 // one chunk's 16 mask words k0 .. k0 + 15 of column o (o < nl), the body's (o == nl) or zeros; a rejected word
 // (probability (2^32 mod p) / 2^32 each) is deferred: 0 here, its value added after the loop (an inline escalation
 // would hold the whole warp for a ChaCha block in most iterations)
@@ -1384,7 +1399,7 @@ __device__ __forceinline__ void ks_words(const uint32_t (&w0)[16], uint32_t (&w)
                     pend[np++] = k0 + i;
                     w[i] = 0;
                 } else {
-                    w[i] = ks_escalate(key, k0 + i, (uint32_t)o, p, n16, tag, m_p);
+                    w[i] = ks_escalate_in(key, k0 + i, (uint32_t)o, p, n16, tag, m_p);
                 }
             } else {
                 const uint32_t x = w0[i] - __umulhi(w0[i], rp) * p;
@@ -1531,7 +1546,7 @@ __global__ void __launch_bounds__(256, 2) ks_regen_k(TfheArgs A) {
     while (__any_sync(0xFFFFFFFFu, np > 0)) {
         if (np > 0) {
             const uint32_t k = pend[--np];
-            const long long v = ks_escalate(key, k, (uint32_t)o, p, n16, tag, m_p);
+            const long long v = ks_escalate_in(key, k, (uint32_t)o, p, n16, tag, m_p);
             for (int r = 0; r < 16 * MT && row0 + r < rows; ++r) {
                 const int dv = D[(size_t)(row0 + r) * K + k];
                 if (dv) atomicAdd((unsigned long long*)&corr[warp][r][g], (unsigned long long)(dv * v));
@@ -1563,6 +1578,124 @@ __global__ void __launch_bounds__(256, 2) ks_regen_k(TfheArgs A) {
             for (int u = 0; u < 4; ++u)
                 if (acc[mt][u][e]) atomicAdd(G + u * ps + (size_t)oc * mp + r, acc[mt][u][e]);
         }
+}
+
+// KS_REGEN, key-tiled (i4 = 1): every mask word expanded once per row group of the batch. Block = 8 CT columns x
+// 128 RT LWE rows x one slice of k; per key subtile of KT = 512 / CT rows of k thread t expands column t % (8 CT)'s
+// 16 words 16 (t / (8 CT)) .. + 15 of the subtile (one ChaCha block, rejection escalated in place) into shared
+// memory as B fragments; then warp w multiplies its RT row tiles (rows 16 (w RT + r) ..) by the CT column tiles. The
+// MMA's k order within a 32-row step: physical slots (4 j, 16 + 4 j) of lane quarter j = logical 8 j .. + 3, 8 j + 4
+// .. + 7, so a lane's digits are one 8-byte load per row. G gets the planes' exact sums (KS_REGEN's contract).
+template <int RT, int CT>
+__global__ void __launch_bounds__(256, (RT * CT <= 2 ? 2 : 1)) ks_tiled_k(TfheArgs A) {
+    constexpr int NC = 8 * CT, KT = 512 / CT, STEPS = KT / 32;
+    __shared__ uint2 sb[STEPS][CT][4][32];   // 16 KB
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, j = lane & 3;
+    const int nl = A.i2;
+    const int col0 = blockIdx.x * NC, row0 = blockIdx.y * 128 * RT;
+    const uint32_t K = (uint32_t)A.c[3], p = (uint32_t)A.q, tag = (uint32_t)A.c[2], n16 = K >> 4;
+    const int subs = (int)(K / KT), slices = gridDim.z;
+    const int s0 = (int)((long long)subs * blockIdx.z / slices), s1 = (int)((long long)subs * (blockIdx.z + 1) / slices);
+    uint32_t key[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        key[2 * i] = (uint32_t)A.c[4 + i];
+        key[2 * i + 1] = (uint32_t)(A.c[4 + i] >> 32);
+    }
+    const int8_t* D = (const int8_t*)A.y;
+    const uint32_t* body = (const uint32_t*)A.z;
+    const int rows = A.count;
+    const int gc = t % NC, kq = t / NC, go = col0 + gc;   // this thread's column and 16-word piece
+    int acc[RT][CT][4][4];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int c = 0; c < CT; ++c)
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[r][c][u][e] = 0;
+    const int8_t* drow[RT][2];
+    bool rok[RT][2];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = row0 + 16 * (warp * RT + r) + g + 8 * h;
+            rok[r][h] = row < rows;
+            drow[r][h] = D + (size_t)(rok[r][h] ? row : 0) * K + 8 * j;
+        }
+    const bool any = row0 + 16 * warp * RT < rows;   // warp-uniform: the MMAs need the whole warp
+    for (int sub = s0; sub < s1; ++sub) {
+        const uint32_t kb = (uint32_t)sub * KT;
+        {
+            uint32_t w[16];
+            const uint32_t k0 = kb + 16 * kq;
+            if (go < nl) {
+                chacha::regen_block16(key, k0 >> 4, (uint32_t)go, p, n16, tag, w, 32u);
+            } else if (go == nl) {
+                const uint4* bp = (const uint4*)(body + k0);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 v = bp[i];
+                    w[4 * i] = v.x; w[4 * i + 1] = v.y; w[4 * i + 2] = v.z; w[4 * i + 3] = v.w;
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) w[i] = 0;
+            }
+            __syncthreads();   // the previous subtile's readers are done
+            const int step = kq >> 1, ct = gc >> 3, L0 = (gc & 7) * 4 + 2 * (kq & 1);
+#pragma unroll
+            for (int q4 = 0; q4 < 4; ++q4) {   // words 4 q4 .. + 3: quarter j = L0 + q4 / 2, half q4 & 1
+                const uint32_t t0 = __byte_perm(w[4 * q4], w[4 * q4 + 1], 0x5140), t1 = __byte_perm(w[4 * q4 + 2], w[4 * q4 + 3], 0x5140);
+                const uint32_t t2 = __byte_perm(w[4 * q4], w[4 * q4 + 1], 0x7362), t3 = __byte_perm(w[4 * q4 + 2], w[4 * q4 + 3], 0x7362);
+                const uint32_t pl[4] = {__byte_perm(t0, t1, 0x5410), __byte_perm(t0, t1, 0x7632), __byte_perm(t2, t3, 0x5410), __byte_perm(t2, t3, 0x7632)};
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    uint2* e = &sb[step][ct][u][L0 + (q4 >> 1)];
+                    if (q4 & 1) e->y = pl[u]; else e->x = pl[u];
+                }
+            }
+            __syncthreads();
+        }
+        if (!any) continue;
+#pragma unroll 2
+        for (int st = 0; st < STEPS; ++st) {
+            const uint32_t ko = kb + 32 * st;
+            uint2 a[RT][2];
+#pragma unroll
+            for (int r = 0; r < RT; ++r)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) a[r][h] = rok[r][h] ? *(const uint2*)(drow[r][h] + ko) : make_uint2(0, 0);
+#pragma unroll
+            for (int c = 0; c < CT; ++c)
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint2 bb = sb[st][c][u][lane];
+#pragma unroll
+                    for (int r = 0; r < RT; ++r)
+                        asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                                     : "+r"(acc[r][c][u][0]), "+r"(acc[r][c][u][1]), "+r"(acc[r][c][u][2]), "+r"(acc[r][c][u][3])
+                                     : "r"(a[r][0].x), "r"(a[r][1].x), "r"(a[r][0].y), "r"(a[r][1].y), "r"(bb.x), "r"(bb.y));
+                }
+        }
+    }
+    int32_t* G = (int32_t*)A.x;
+    const size_t mp = A.c[0], ps = A.c[1];
+#pragma unroll
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+        for (int c = 0; c < CT; ++c)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int oc = col0 + 8 * c + 2 * j + (e & 1), h = e >> 1;
+                if (oc > nl || !rok[r][h]) continue;
+                const size_t row = (size_t)(row0 + 16 * (warp * RT + r) + g + 8 * h);
+#pragma unroll
+                for (int u = 0; u < 4; ++u)
+                    if (acc[r][c][u][e]) atomicAdd(G + u * ps + (size_t)oc * mp + row, acc[r][c][u][e]);
+            }
 }
 
 __global__ void ks_recombine_k(TfheArgs A) {
@@ -2056,6 +2189,22 @@ int launch(const TfheArgs* a, cudaStream_t s) {
             if (K == 0 || K % 64 || A.i2 < 1 || A.q < 2 || A.q > 0xFFFFFFFFull || A.c[0] < (uint64_t)A.count ||
                 A.c[1] < (uint64_t)(A.i2 + 1) * A.c[0])
                 return -1;
+            if (A.i4 == 1) {   // key-tiled: i3 = RT (1, 2, 4, 8), i1 = CT (1, 2, 4), i0 = slices of k
+                const int rt = A.i3, ct = A.i1;
+                if ((rt != 1 && rt != 2 && rt != 4 && rt != 8) || (ct != 1 && ct != 2 && ct != 4) || rt * ct > 8) return -1;
+                if (A.i0 < 1 || (uint64_t)A.i0 > K / (512 / ct)) return -1;
+                const dim3 grid((unsigned)((A.i2 + 1 + 8 * ct - 1) / (8 * ct)), (unsigned)((A.count + 128 * rt - 1) / (128 * rt)), (unsigned)A.i0);
+                if (grid.y > 65535 || grid.z > 65535) return -1;
+                const cudaError_t e = cudaMemsetAsync(A.x, 0, 4 * A.c[1] * sizeof(int32_t), s);
+                if (e != cudaSuccess) return (int)e;
+#define PC_KT(R, C) else if (rt == R && ct == C) ks_tiled_k<R, C><<<grid, 256, 0, s>>>(A)
+                if (false) {}
+                PC_KT(1, 1); PC_KT(2, 1); PC_KT(4, 1); PC_KT(8, 1);
+                PC_KT(1, 2); PC_KT(2, 2); PC_KT(4, 2);
+                PC_KT(1, 4); PC_KT(2, 4);
+#undef PC_KT
+                break;
+            }
             const int mt = A.i3 ? A.i3 : A.count <= 16 ? 1 : A.count <= 32 ? 2 : 4;
             if (mt != 1 && mt != 2 && mt != 4) return -1;
             if (A.i0 < 1 || (uint64_t)A.i0 > K / 64) return -1;

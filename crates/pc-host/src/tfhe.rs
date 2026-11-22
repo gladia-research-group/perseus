@@ -228,6 +228,13 @@ fn check(a: &TfheArgs) -> i32 {
             if k == 0 || k % 64 != 0 || a.i2 < 1 || a.q < 2 || a.q > u32::MAX as u64 || a.c[0] < a.count as u64 || a.c[1] < (a.i2 as u64 + 1) * a.c[0] || a.i0 < 1 || a.i0 as u64 > k / 64 {
                 return -1;
             }
+            if a.i4 == 1 {
+                let (rt, ct) = (a.i3, a.i1);
+                if ![1, 2, 4, 8].contains(&rt) || ![1, 2, 4].contains(&ct) || rt * ct > 8 || a.i0 as u64 > k / (512 / ct as u64) {
+                    return -1;
+                }
+                return 0;
+            }
             let mt = if a.i3 != 0 { a.i3 } else if a.count <= 16 { 1 } else if a.count <= 32 { 2 } else { 4 };
             if ![1, 2, 4].contains(&mt) || (a.count as i64 + 16 * mt as i64 - 1) / (16 * mt as i64) > 65535 {
                 return -1;

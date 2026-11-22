@@ -765,7 +765,12 @@ fn run_ks(args: &[String]) -> Res<bool> {
     let lt = pc_cuda::blas::Lt::new(&dev)?;
     let mut forms = vec![("planes", DevKsk::new(&arena, &s, &ksk, p0, false, true)?)];
     if !stored {
-        forms.push(("regen", DevKsk::new(&arena, &s, &ksk, p0, true, false)?));
+        let mut f = DevKsk::new(&arena, &s, &ksk, p0, true, false)?;
+        f.seed_body(&arena, &s, &ksk)?;
+        forms.push(("regen", f));
+        let mut f = DevKsk::new(&arena, &s, &ksk, p0, true, false)?;
+        f.seed_body(&arena, &s, &ksk)?;
+        forms.push(("tiled", f));
     }
     let mut d_in = arena.alloc::<pc_cuda::Compute, u32>("tfhe.in", lin.len())?;
     d_in.upload(&s, &lin)?;
@@ -790,12 +795,17 @@ fn run_ks(args: &[String]) -> Res<bool> {
                     }
                 }
                 DevKsk { seeded: Some((seed, body)), .. } => {
-                    let (slices, mt) = pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms);
                     let mut c = [mp as u64, ps as u64, seed.tag as u64, k as u64, 0, 0, 0, 0];
                     for i in 0..4 {
                         c[4 + i] = seed.seed.0[2 * i] as u64 | (seed.seed.0[2 * i + 1] as u64) << 32;
                     }
-                    go(&TfheArgs { op: tfhe_op::KS_REGEN, count: count as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: d_g.vptr_mut(), y: d_dig.vptr(), z: body.vptr(), q: p0, c, ..Default::default() })?;
+                    if *name == "tiled" {
+                        let (rt, ct, sl) = pc_gpu::tfhe::ks_tiled_shape(count, cols, k, sms);
+                        go(&TfheArgs { op: tfhe_op::KS_REGEN, count: count as i32, i0: sl as i32, i1: ct as i32, i2: nl as i32, i3: rt as i32, i4: 1, x: d_g.vptr_mut(), y: d_dig.vptr(), z: body.vptr(), q: p0, c, ..Default::default() })?;
+                    } else {
+                        let (slices, mt) = pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms);
+                        go(&TfheArgs { op: tfhe_op::KS_REGEN, count: count as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: d_g.vptr_mut(), y: d_dig.vptr(), z: body.vptr(), q: p0, c, ..Default::default() })?;
+                    }
                 }
                 _ => return Err("tfhe-ks: an empty key form".into()),
             }
@@ -821,7 +831,7 @@ fn run_ks(args: &[String]) -> Res<bool> {
             bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[nl] as u64) as usize;
         }
         t.add(&format!("tfhe-ks: device key switch ({name}) == pc-tfhe LweKsk::apply, {count} LWEs, every word"), bad, count * cols);
-        let label = if form.planes.is_some() { gemm.label() } else { format!("{:?}", pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms)) };
+        let label = if form.planes.is_some() { gemm.label() } else if *name == "tiled" { format!("{:?}", pc_gpu::tfhe::ks_tiled_shape(count, cols, k, sms)) } else { format!("{:?}", pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms)) };
         println!("[pc-check] tfhe-ks: {name}: device {:.3} ms for {count} = {:.0} LWE/s ({label}); key {:.2} MB on the device; host {:.1} s", dev_s * 1e3, count as f64 / dev_s, form.bytes() as f64 / 1e6, host_s);
     }
     println!("[pc-check] tfhe-ks: {} gates, {} failing", t.gates, t.bad);
