@@ -700,8 +700,10 @@ fn run_pbs(args: &[String]) -> Res<bool> {
     Ok(t.bad == 0)
 }
 
-/// `pc-check tfhe-ks [--count 4096]`: the device LWE key switch (KS_DIGITS -> four int8 GEMMs against the key's
-/// balanced base-256 planes -> KS_RECOMBINE) vs pc-tfhe `LweKsk::apply`, every output word; LWEs/s.
+/// `pc-check tfhe-ks [--count 4096] [--reps 1] [--stored]`: the device LWE key switch vs pc-tfhe `LweKsk::apply`,
+/// every output word, on both device forms of the key: the stored planes (KS_DIGITS -> four int8 GEMMs against the
+/// key's balanced base-256 planes -> KS_RECOMBINE) and, for a key with seeded masks (the default; --stored: none), the
+/// in-kernel regeneration (KS_DIGITS -> KS_REGEN -> KS_RECOMBINE); LWEs/s and the key's device bytes.
 pub fn cmd_ks(args: &[String]) -> ExitCode {
     match run_ks(args) {
         Ok(true) => ExitCode::SUCCESS,
@@ -715,13 +717,14 @@ pub fn cmd_ks(args: &[String]) -> ExitCode {
 
 fn run_ks(args: &[String]) -> Res<bool> {
     use pc_core::keys::{sample_ternary, DiscreteGaussian};
-    use pc_core::pcmm_keys::digit_planes;
+    use pc_gpu::tfhe::DevKsk;
     use pc_kernels::args::{tfhe_op, TfheArgs};
     use pc_tfhe::gadget::Gadget;
     use pc_tfhe::lwe::{Lwe, LweKsk};
+    const PLANES: usize = 4;
     let count: usize = arg(args, "--count").map(|s| s.parse()).transpose()?.unwrap_or(4096);
     let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(1).max(1);
-    const PLANES: usize = 4;
+    let stored = args.iter().any(|a| a == "--stored");
     let chain = Chain::generate(&ChainSpec::n32())?;
     let p0 = chain.q[0];
     let p = Params::new(chain.n)?;
@@ -733,83 +736,104 @@ fn run_ks(args: &[String]) -> Res<bool> {
     let dg_lwe = DiscreteGaussian::new(p.lwe_sigma_rel * p0 as f64)?;
     let gad = Gadget::new(p0, p.ks, false);
     let t0 = Instant::now();
-    let ksk = LweKsk::generate(&s_sub, &s_lwe, gad.clone(), &dg_lwe, &mut prng);
-    println!("[pc-check] tfhe-ks: host key switching key {:.1} s ({n_in} -> {nl}, gadget {:?})", t0.elapsed().as_secs_f64(), p.ks);
+    let ksk = if stored { LweKsk::generate(&s_sub, &s_lwe, gad.clone(), &dg_lwe, &mut prng) } else { LweKsk::generate_seeded(&s_sub, &s_lwe, gad.clone(), pc_core::keys::tfhe_tag::LWE_KSK, &dg_lwe, &mut prng) };
+    let rej = (1u64 << 32) % p0;
+    println!(
+        "[pc-check] tfhe-ks: host key switching key {:.1} s ({n_in} -> {nl}, gadget {:?}, {}; p0 {p0}, mask rejection 2^{:.1}); stored form {:.2} MB",
+        t0.elapsed().as_secs_f64(),
+        p.ks,
+        if stored { "stored masks" } else { "seeded masks" },
+        (rej as f64 / 4294967296.0).log2(),
+        ksk.stored_bytes() as f64 / 1e6
+    );
     let lwes: Vec<Lwe> = (0..count).map(|_| Lwe { a: (0..n_in).map(|_| prng.uniform_below(p0)).collect(), b: prng.uniform_below(p0) }).collect();
     let th = Instant::now();
     let want: Vec<Lwe> = lwes.iter().map(|l| ksk.apply(l)).collect();
     let host_s = th.elapsed().as_secs_f64();
 
-    // the key as K-contiguous columns: W[o][i levels + t], o < nl the a entries, o = nl the b entry
     let k = n_in * lv;
     let cols = nl + 1;
-    let mut w = vec![0i64; cols * k];
-    for i in 0..n_in {
-        for t in 0..lv {
-            let key = &ksk.keys[i][t];
-            for o in 0..cols {
-                let v = if o < nl { key.a[o] } else { key.b };
-                w[o * k + i * lv + t] = pc_tfhe::modq::centered(v, p0);
-            }
-        }
-    }
-    let planes = digit_planes(&w, PLANES)?;
+    let mp = count.next_multiple_of(16);
+    let ps = (cols * mp).next_multiple_of(64);
     let lin: Vec<u32> = lwes.iter().flat_map(|l| l.a.iter().chain(std::iter::once(&l.b)).map(|&v| v as u32)).collect();
     let dev = Device::open()?;
+    let sms = dev.sm_count()?;
     let ws_bytes = 64 << 20;
-    let bytes = planes.len() + count * k + 4 * (PLANES * cols * count + lin.len() + count * cols) + ws_bytes + (64 << 20);
+    let bytes = PLANES * cols * k + 4 * k + mp * k + 4 * (PLANES * ps + lin.len() + count * cols) + ws_bytes + (64 << 20);
     let arena = pc_cuda::Arena::new(&dev, bytes)?;
     let s = pc_cuda::Stream::<pc_cuda::Compute>::new(&dev)?;
     let lt = pc_cuda::blas::Lt::new(&dev)?;
-    // int8 operands live in byte buffers (the PCMM's weight planes do the same)
-    let mut d_planes: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u8>> = Vec::new();
-    for u in 0..PLANES {
-        let mut b = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ksk", cols * k)?;
-        let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
-        b.upload(&s, &bytes)?;
-        d_planes.push(b);
+    let mut forms = vec![("planes", DevKsk::new(&arena, &s, &ksk, p0, false, true)?)];
+    if !stored {
+        let mut f = DevKsk::new(&arena, &s, &ksk, p0, true, false)?;
+        f.seed_body(&arena, &s, &ksk)?;
+        forms.push(("regen", f));
+        let mut f = DevKsk::new(&arena, &s, &ksk, p0, true, false)?;
+        f.seed_body(&arena, &s, &ksk)?;
+        forms.push(("tiled", f));
     }
     let mut d_in = arena.alloc::<pc_cuda::Compute, u32>("tfhe.in", lin.len())?;
     d_in.upload(&s, &lin)?;
-    let mut d_dig = arena.alloc::<pc_cuda::Compute, u8>("tfhe.dig", count * k)?;
-    let mut d_g = arena.alloc::<pc_cuda::Compute, i32>("tfhe.g", PLANES * cols * count)?;
+    let mut d_dig = arena.alloc::<pc_cuda::Compute, u8>("tfhe.dig", mp * k)?;
+    let mut d_g = arena.alloc::<pc_cuda::Compute, i32>("tfhe.g", PLANES * ps)?;
     let mut d_out = arena.alloc::<pc_cuda::Compute, u32>("tfhe.out", count * cols)?;
     let mut d_ws = arena.alloc::<pc_cuda::Compute, u8>("tfhe.ws", ws_bytes)?;
-    let gemm = pc_gpu::matmul::gemm::I8Gemm::new(&lt.inner, count as u64, cols as u64, k as u64, 8, ws_bytes)?;
+    let gemm = pc_gpu::matmul::gemm::I8Gemm::new(&lt.inner, mp as u64, cols as u64, k as u64, 8, ws_bytes)?;
     let inst = pc_kernels::table::Instance::U32Barrett64;
     let table = if dev.is_host() { pc_host::table(inst)? } else { pc_kernels::table::table(inst)? };
     let go = |a: &TfheArgs| -> Res<()> { Ok(pc_cuda::launch_result("tfhe", unsafe { (table.tfhe)(a, s.raw()) })?) };
-    let mut run = || -> Res<()> {
-        go(&TfheArgs { op: tfhe_op::KS_DIGITS, count: count as i32, i1: n_in as i32, x: d_dig.vptr_mut(), y: d_in.vptr(), q: p0, m: gad.m, c: [p.ks.0 as u64, lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
-        let gp = d_g.dptr_mut();
-        for u in 0..PLANES {
-            // SAFETY: the operands are live arena buffers of the plan's lengths, owned by `s`
-            unsafe { gemm.run(&s, d_dig.dptr() as *const i8, d_planes[u].dptr() as *const i8, gp.add(u * cols * count), false, &mut d_ws)? };
-        }
-        go(&TfheArgs { op: tfhe_op::KS_RECOMBINE, count: count as i32, i1: n_in as i32, i2: nl as i32, x: d_out.vptr_mut(), y: d_g.vptr(), z: d_in.vptr(), q: p0, c: [0, 0, PLANES as u64, 0, 0, 0, 0, 0], ..Default::default() })?;
-        Ok(())
-    };
-    run()?;
-    s.sync()?;
-    let mut ts: Vec<f64> = (0..reps)
-        .map(|_| -> Res<f64> {
-            let td = Instant::now();
-            run()?;
-            s.sync()?;
-            Ok(td.elapsed().as_secs_f64())
-        })
-        .collect::<Res<_>>()?;
-    ts.sort_by(f64::total_cmp);
-    let dev_s = ts[reps / 2];
-    let got = d_out.download(&s)?;
-    let mut bad = 0;
-    for (i, w) in want.iter().enumerate() {
-        let row = &got[i * cols..(i + 1) * cols];
-        bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[nl] as u64) as usize;
-    }
     let mut t = Tally::default();
-    t.add(&format!("tfhe-ks: device key switch == pc-tfhe LweKsk::apply, {count} LWEs, every word"), bad, count * cols);
-    println!("[pc-check] tfhe-ks: device {:.2} ms for {count} = {:.0} LWE/s ({}); host {:.1} s", dev_s * 1e3, count as f64 / dev_s, gemm.label(), host_s);
+    for (name, form) in &forms {
+        let mut run = || -> Res<()> {
+            go(&TfheArgs { op: tfhe_op::KS_DIGITS, count: count as i32, i1: n_in as i32, x: d_dig.vptr_mut(), y: d_in.vptr(), q: p0, m: gad.m, c: [p.ks.0 as u64, lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
+            match form {
+                DevKsk { planes: Some(planes), .. } => {
+                    let gp = d_g.dptr_mut();
+                    for (u, pl) in planes.iter().enumerate() {
+                        // SAFETY: the operands are live arena buffers of the plan's lengths, owned by `s`
+                        unsafe { gemm.run(&s, d_dig.dptr() as *const i8, pl.dptr() as *const i8, gp.add(u * ps), false, &mut d_ws)? };
+                    }
+                }
+                DevKsk { seeded: Some((seed, body)), .. } => {
+                    let mut c = [mp as u64, ps as u64, seed.tag as u64, k as u64, 0, 0, 0, 0];
+                    for i in 0..4 {
+                        c[4 + i] = seed.seed.0[2 * i] as u64 | (seed.seed.0[2 * i + 1] as u64) << 32;
+                    }
+                    if *name == "tiled" {
+                        let (rt, ct, sl) = pc_gpu::tfhe::ks_tiled_shape(count, cols, k, sms);
+                        go(&TfheArgs { op: tfhe_op::KS_REGEN, count: count as i32, i0: sl as i32, i1: ct as i32, i2: nl as i32, i3: rt as i32, i4: 1, x: d_g.vptr_mut(), y: d_dig.vptr(), z: body.vptr(), q: p0, c, ..Default::default() })?;
+                    } else {
+                        let (slices, mt) = pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms);
+                        go(&TfheArgs { op: tfhe_op::KS_REGEN, count: count as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: d_g.vptr_mut(), y: d_dig.vptr(), z: body.vptr(), q: p0, c, ..Default::default() })?;
+                    }
+                }
+                _ => return Err("tfhe-ks: an empty key form".into()),
+            }
+            go(&TfheArgs { op: tfhe_op::KS_RECOMBINE, count: count as i32, i1: n_in as i32, i2: nl as i32, x: d_out.vptr_mut(), y: d_g.vptr(), z: d_in.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
+            Ok(())
+        };
+        run()?;
+        s.sync()?;
+        let mut ts: Vec<f64> = (0..reps)
+            .map(|_| -> Res<f64> {
+                let td = Instant::now();
+                run()?;
+                s.sync()?;
+                Ok(td.elapsed().as_secs_f64())
+            })
+            .collect::<Res<_>>()?;
+        ts.sort_by(f64::total_cmp);
+        let dev_s = ts[reps / 2];
+        let got = d_out.download(&s)?;
+        let mut bad = 0;
+        for (i, w) in want.iter().enumerate() {
+            let row = &got[i * cols..(i + 1) * cols];
+            bad += w.a.iter().zip(row).filter(|(a, b)| **a != **b as u64).count() + (w.b != row[nl] as u64) as usize;
+        }
+        t.add(&format!("tfhe-ks: device key switch ({name}) == pc-tfhe LweKsk::apply, {count} LWEs, every word"), bad, count * cols);
+        let label = if form.planes.is_some() { gemm.label() } else if *name == "tiled" { format!("{:?}", pc_gpu::tfhe::ks_tiled_shape(count, cols, k, sms)) } else { format!("{:?}", pc_gpu::tfhe::ks_regen_shape(count, cols, k, sms)) };
+        println!("[pc-check] tfhe-ks: {name}: device {:.3} ms for {count} = {:.0} LWE/s ({label}); key {:.2} MB on the device; host {:.1} s", dev_s * 1e3, count as f64 / dev_s, form.bytes() as f64 / 1e6, host_s);
+    }
     println!("[pc-check] tfhe-ks: {} gates, {} failing", t.gates, t.bad);
     Ok(t.bad == 0)
 }
@@ -969,10 +993,19 @@ fn libm_erf(x: f64) -> f64 {
     r.copysign(x)
 }
 
+/// One line per key kind: bytes as stored / shipped (host form) and on the device.
+fn key_sizes(tag: &str, sw: &Switcher, ts: &pc_gpu::tfhe::TfheSwitch<'_>) {
+    let dev: std::collections::BTreeMap<String, usize> = ts.key_bytes().into_iter().collect();
+    for (k, b) in sw.stored_sizes() {
+        println!("[pc-check] {tag}: key {k}: stored {:.3} MB, device {:.3} MB", b as f64 / 1e6, dev.get(&k).copied().unwrap_or(0) as f64 / 1e6);
+    }
+}
+
 /// The tfhe check's switch parameters: Params' defaults, --nu, --pbs-gadget, --lat-group G, --rs-gadget b,l (the ring
-/// switch's), --lwe n,log2 (Params::with_lwe)
+/// switch's), --lwe n,log2 (Params::with_lwe), --stored-keys (the keys' masks stored, not seeded)
 fn switch_params(args: &[String], n: usize) -> Res<Params> {
     let mut p = Params::new(n)?;
+    p.seeded = !args.iter().any(|a| a == "--stored-keys");
     p.nu = arg(args, "--nu").map(|s| s.parse()).transpose()?.unwrap_or(1);
     if let Some(g) = pbs_gadget(args)? {
         p.pbs = g;
@@ -1105,13 +1138,11 @@ fn run_noise(args: &[String]) -> Res<bool> {
     let k = n_in * lv;
     let cols = nl + 1;
     let mut w = vec![0i64; cols * k];
-    for i in 0..n_in {
-        for t in 0..lv {
-            let key = &ck.ksk.keys[i][t];
-            for o in 0..cols {
-                let v = if o < nl { key.a[o] } else { key.b };
-                w[o * k + i * lv + t] = centered(v, p0);
-            }
+    let masks = ck.ksk.masks();
+    for o in 0..cols {
+        for r in 0..k {
+            let v = if o < nl { masks[o * k + r] as u64 } else { ck.ksk.b[r] };
+            w[o * k + r] = centered(v, p0);
         }
     }
     let planes = digit_planes(&w, PLANES)?;
@@ -2151,6 +2182,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
     let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe-prog: host keys {:.1} s (n_lwe {}, n_br {nb}, nu {nu}, lat_group {}); {} cases, {nbuf} buffers of {rows} rows", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group, cases.len());
     let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, cap)?;
+    key_sizes("tfhe-prog", &sw, &ts);
     let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..nbuf).map(|_| arena.alloc::<pc_cuda::Compute, u32>("prog", rows * row)).collect::<std::result::Result<_, _>>()?;
     let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("prog", nidx.max(2))?;
     let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("prog", ntab.max(1) * 2 * tvl)?;
@@ -2424,6 +2456,7 @@ fn run_tree(args: &[String]) -> Res<bool> {
     let (sw, _s_lwe, s_br) = Switcher::generate_keep(params.clone(), &sv, p0, p1, &mut prng)?;
     println!("[pc-check] tfhe-tree: host keys {:.1} s (n_lwe {}, n_br {nb}, lat_group {}, packing key)", tk.elapsed().as_secs_f64(), params.n_lwe, params.lat_group);
     let mut ts = pc_gpu::tfhe::TfheSwitch::new(&arena, &dev, s, &sw, max)?;
+    key_sizes("tfhe-tree", &sw, &ts);
     let al = |w: usize| arena.alloc::<pc_cuda::Compute, u32>("tree", w);
     let mut d_ent = al(tmax * row)?;
     let mut d_idx = al(bmax * lmax * row)?;

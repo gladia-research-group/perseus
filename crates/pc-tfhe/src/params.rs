@@ -68,6 +68,9 @@ pub struct Params {
     /// The packing key s_lwe -> GLWE(s_br, q_br) (`pack::PackingKey`, gadget `pack::PACK_GADGET`): encrypted lookup
     /// tables (an accumulator packed from LWEs, blindly rotated).
     pub pack: bool,
+    /// Seeded key masks (`pc_core::keys::mask_expand`, a domain tag per key kind): the keys' uniform a / c1 words
+    /// are regenerated from a 256-bit seed instead of stored. Same distribution, same noise; false: the stored form.
+    pub seeded: bool,
 }
 
 impl Params {
@@ -134,6 +137,7 @@ impl Params {
             lat_group2: 0,
             chain: false,
             pack: false,
+            seeded: true,
         })
     }
 }

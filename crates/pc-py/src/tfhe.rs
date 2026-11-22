@@ -67,6 +67,8 @@ impl Desc {
 /// points, impl/tfhe.py GRID).
 pub(crate) fn params(n: usize) -> PyResult<Params> {
     let mut p = Params::new(n).map_err(|x| PyValueError::new_err(x.to_string()))?;
+    // PC_TFHE_SEEDED=0: the keys' masks stored instead of seeded (Params::seeded)
+    p.seeded = std::env::var("PC_TFHE_SEEDED").map(|v| v.trim() != "0").unwrap_or(true);
     // PC_TFHE_PBS_GADGET=b,l: the bootstrapping key's gadget (two levels run the batch path)
     if let Ok(v) = std::env::var("PC_TFHE_PBS_GADGET") {
         let g = v.split_once(',').and_then(|(b, l)| Some((b.trim().parse::<u32>().ok()?, l.trim().parse::<usize>().ok()?)));

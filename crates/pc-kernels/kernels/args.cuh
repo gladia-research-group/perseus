@@ -976,6 +976,10 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 //                + sum_e lift(b_(a, e)) P_e on part 0; c[2..6) n^-1 and Shoups, c[6]
 //   KS_RECOMBINE y = int32 GEMM planes [c[2]][i2 + 1][count] (plane p, output column o, LWE row), z = the input LWEs
 //                (i1 + 1 words each) -> x = u32 LWEs [count][i2 + 1]: sum_p 256^p G_p (+ the input b on column i2) mod q
+//   KS_REGEN     the planes' sums against a key with seeded masks: y = KS_DIGITS' int8 [count][K = c[3]], z = the
+//                key's bodies u32 [K] (column i2) -> x = int32 G [4][i2 + 1][c[0] >= count] (plane stride c[1]; the
+//                launcher zeroes it) = sum_k D[b][k] byte_u(W(k, o)), W(k, o < i2) = mask_expand(seed c[4..8) (two words
+//                each, low first), tag c[2], lane o, q, k, K) mod q < 2^32; i0 >= 1 slices of k, i3 = row tiles per warp
 // The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
 // floor(2^64 / q); NTTs run on the pcmm launcher's NTT op with pc-tfhe's tables):
 //   RESCALE_P1   y = [2 part][2 limb][n] mod (q, c[1]) -> x = [2 part][n] mod q: (x_0 - centered(x_1)) c[0] (c[0] = p1^-1)
@@ -1018,6 +1022,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 #define PC_TFHE_PACK_RDIG 25
 #define PC_TFHE_PACK_RMAC 26
 #define PC_TFHE_PACK_RFIN 27
+#define PC_TFHE_KS_REGEN 28
 struct TfheArgs {
     int32_t op, n, count, i0, i1, i2, i3, i4;
     void* x;

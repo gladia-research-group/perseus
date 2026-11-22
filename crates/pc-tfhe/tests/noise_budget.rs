@@ -47,12 +47,12 @@ fn one_key_set(seed: u32) {
     let ntt_p = vec![Ntt::new(p0, N).unwrap(), Ntt::new(p1, N).unwrap()];
     let s_sub: Vec<i64> = sample_ternary(&mut prng, N / params.rs_factor).into_iter().map(|x| x as i64).collect();
     let s_lwe: Vec<i64> = (0..params.n_lwe).map(|_| (prng.next_u32() & 1) as i64).collect();
-    let rs = RingSwitchKey::generate(&s, &s_sub, params.rs_factor, Gadget::new(p0, params.rs, false), &ntt_p[0], &dg, &mut prng);
+    let rs = RingSwitchKey::generate(&s, &s_sub, params.rs_factor, Gadget::new(p0, params.rs, false), &ntt_p[0], &dg, params.seeded, &mut prng);
     let ksk = LweKsk::generate(&s_sub, &s_lwe, Gadget::new(p0, params.ks, false), &dg_lwe, &mut prng);
     // the key switching key's own errors e[i][t] = phase - g_t s_i
-    let kerr: Vec<Vec<i64>> = ksk.keys.iter().zip(&s_sub).map(|(ks, &si)| ks.iter().enumerate().map(|(t, k)| {
+    let kerr: Vec<Vec<i64>> = s_sub.iter().enumerate().map(|(i, &si)| (0..ksk.gadget.levels).map(|t| {
         let want = (centered(ksk.gadget.g(t), p0) as i128 * si as i128).rem_euclid(p0 as i128) as u64;
-        centered((k.phase(&s_lwe, p0) + p0 - want) % p0, p0)
+        centered((ksk.key(i, t).phase(&s_lwe, p0) + p0 - want) % p0, p0)
     }).collect()).collect();
     let ke: Vec<f64> = kerr.iter().flatten().map(|&e| e as f64).collect();
     eprintln!("key errors: rms {:.1} (sigma_rel p0 = {:.1}), mean {:.2}", rms(&ke), params.lwe_sigma_rel * p0 as f64, ke.iter().sum::<f64>() / ke.len() as f64);

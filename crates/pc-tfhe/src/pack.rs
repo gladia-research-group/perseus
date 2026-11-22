@@ -14,58 +14,142 @@
 //! (Q / q_in)^2 sigma_in^2 w^2.
 //! Security: the packing key is GLWE at (s_br, Q) with the bootstrapping key's sigma (`Params::bsk_sigma`): the same
 //! instance as the bootstrapping key (security/README.md: 138.6 bits).
-use pc_core::keys::{DiscreteGaussian, Prng};
+use std::sync::OnceLock;
+
+use pc_core::keys::{mask_expand_row64, DiscreteGaussian, MaskSeed, Prng};
+use rayon::prelude::*;
 
 use crate::gadget::Gadget;
 use crate::lwe::Lwe;
-use crate::modq::{addmod, from_signed, mulmod};
+use crate::modq::{addmod, from_signed, mulmod, submod};
 use crate::pbs::Rns;
 use crate::rlwe::Rlwe;
 
-/// The packing key s_lwe -> GLWE(s_br, Q): K[i][t] per prime (c0, c1) in NTT form.
+/// The packing key s_lwe -> GLWE(s_br, Q): K[i][t] per prime (c0, c1) in NTT form; c1 stored or seeded (row
+/// (i, t, prime) = the mask row (seed, (i levels + t) 2 + prime) of length n, `pc_core::keys::mask_expand_row`).
 pub struct PackingKey {
     pub gadget: Gadget,
     pub rns: Rns,
     pub sigma: f64,
-    /// [i][t][prime] -> (c0, c1), NTT form
-    keys: Vec<Vec<[(Vec<u64>, Vec<u64>); 2]>>,
+    /// [i][t][prime] -> c0, NTT form
+    c0: Vec<Vec<[Vec<u64>; 2]>>,
+    /// stored c1 [i][t][prime] (None: seeded)
+    c1: Option<Vec<Vec<[Vec<u64>; 2]>>>,
+    pub seed: Option<MaskSeed>,
+    cache: OnceLock<Vec<Vec<[(Vec<u64>, Vec<u64>); 2]>>>,
 }
 
 /// The default packing gadget over Q: base 2^8, 3 levels (truncation Q / 2^24: below a q_in ~ 2^28 input's own noise).
 pub const PACK_GADGET: (u32, usize) = (8, 3);
 
 impl PackingKey {
+    /// The stored form (c1 uniform per prime from `prng`, coefficient form).
     pub fn generate(s_lwe: &[i64], s_br: &[i64], gadget: (u32, usize), rns: Rns, dg: &DiscreteGaussian, prng: &mut Prng) -> PackingKey {
         let gadget = Gadget::new(rns.q, gadget, false);
         let n = rns.n();
-        let keys = s_lwe
-            .iter()
-            .map(|&si| {
-                (0..gadget.levels)
+        let (mut c0, mut c1) = (Vec::new(), Vec::new());
+        for &si in s_lwe {
+            let (mut r0, mut r1) = (Vec::new(), Vec::new());
+            for t in 0..gadget.levels {
+                let v = mulmod(from_signed(si, rns.q), gadget.g(t), rns.q);
+                let e = dg.sample_vec(prng, n);
+                let [(a0, a1), (b0, b1)] = [0, 1].map(|p| {
+                    let ntt = &rns.ntt[p];
+                    let q = ntt.q;
+                    let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(q)).collect();
+                    let mut m = vec![0u64; n];
+                    m[0] = v % q;
+                    let mut z = Rlwe::encrypt_with(&m, s_br, c1, &e, ntt);
+                    ntt.fwd(&mut z.c0);
+                    ntt.fwd(&mut z.c1);
+                    (z.c0, z.c1)
+                });
+                r0.push([a0, b0]);
+                r1.push([a1, b1]);
+            }
+            c0.push(r0);
+            c1.push(r1);
+        }
+        PackingKey { gadget, rns, sigma: dg.sigma(), c0, c1: Some(c1), seed: None, cache: OnceLock::new() }
+    }
+
+    /// The seeded form (one seed from `prng`, domain tag `tag`): c1 = the mask row in NTT form, c0 = NTT(e) + v -
+    /// c1 NTT(s_br) (v = g_t s_i, a constant: v in every NTT slot). The errors come from `prng` in row order.
+    pub fn generate_seeded(s_lwe: &[i64], s_br: &[i64], gadget: (u32, usize), rns: Rns, tag: u32, dg: &DiscreteGaussian, prng: &mut Prng) -> PackingKey {
+        let gadget = Gadget::new(rns.q, gadget, false);
+        let (n, lv) = (rns.n(), gadget.levels);
+        let seed = MaskSeed { seed: prng.ksk_seed(), tag };
+        let s_ntt = [0, 1].map(|p| {
+            let mut v = crate::rlwe::signed_poly(s_br, rns.ntt[p].q);
+            rns.ntt[p].fwd(&mut v);
+            v
+        });
+        let errs: Vec<Vec<i64>> = (0..s_lwe.len() * lv).map(|_| dg.sample_vec(prng, n)).collect();
+        let c0 = s_lwe
+            .par_iter()
+            .enumerate()
+            .map(|(i, &si)| {
+                (0..lv)
                     .map(|t| {
                         let v = mulmod(from_signed(si, rns.q), gadget.g(t), rns.q);
-                        let e = dg.sample_vec(prng, n);
                         [0, 1].map(|p| {
                             let ntt = &rns.ntt[p];
                             let q = ntt.q;
-                            let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(q)).collect();
                             let mut m = vec![0u64; n];
-                            m[0] = v % q;
-                            let mut z = Rlwe::encrypt_with(&m, s_br, c1, &e, ntt);
-                            ntt.fwd(&mut z.c0);
-                            ntt.fwd(&mut z.c1);
-                            (z.c0, z.c1)
+                            mask_expand_row64(&seed, ((i * lv + t) * 2 + p) as u32, q, &mut m);
+                            let mut x: Vec<u64> = errs[i * lv + t].iter().map(|&v| from_signed(v, q)).collect();
+                            ntt.fwd(&mut x);
+                            for j in 0..n {
+                                x[j] = addmod(submod(x[j], mulmod(m[j], s_ntt[p][j], q), q), v % q, q);
+                            }
+                            x
                         })
                     })
                     .collect()
             })
             .collect();
-        PackingKey { gadget, rns, sigma: dg.sigma(), keys }
+        PackingKey { gadget, rns, sigma: dg.sigma(), c0, c1: None, seed: Some(seed), cache: OnceLock::new() }
     }
 
-    /// [i][t][prime] -> (c0, c1), NTT form: the device image's source.
+    /// Key rows (n_lwe).
+    pub fn n_lwe(&self) -> usize {
+        self.c0.len()
+    }
+
+    /// Row (i, t)'s (c0, c1) at a prime, NTT form (a seeded c1 expanded here).
+    pub fn row(&self, i: usize, t: usize, p: usize) -> (&[u64], std::borrow::Cow<'_, [u64]>) {
+        let c1 = match (&self.c1, &self.seed) {
+            (Some(c1), _) => std::borrow::Cow::Borrowed(&c1[i][t][p][..]),
+            (None, Some(seed)) => {
+                let mut m = vec![0u64; self.rns.n()];
+                mask_expand_row64(seed, ((i * self.gadget.levels + t) * 2 + p) as u32, self.rns.ntt[p].q, &mut m);
+                std::borrow::Cow::Owned(m)
+            }
+            (None, None) => unreachable!("a packing key holds its masks or their seed"),
+        };
+        (&self.c0[i][t][p], c1)
+    }
+
+    /// [i][t][prime] -> (c0, c1), NTT form (materialized once).
     pub fn keys(&self) -> &[Vec<[(Vec<u64>, Vec<u64>); 2]>] {
-        &self.keys
+        self.cache.get_or_init(|| {
+            (0..self.c0.len()).map(|i| (0..self.gadget.levels).map(|t| [0, 1].map(|p| {
+                let (a, b) = self.row(i, t, p);
+                (a.to_vec(), b.into_owned())
+            })).collect()).collect()
+        })
+    }
+
+    /// The stored form of this key (the same rows).
+    pub fn to_stored(&self) -> PackingKey {
+        let c1 = (0..self.c0.len()).map(|i| (0..self.gadget.levels).map(|t| [0, 1].map(|p| self.row(i, t, p).1.into_owned())).collect()).collect();
+        PackingKey { gadget: self.gadget.clone(), rns: self.rns.clone(), sigma: self.sigma, c0: self.c0.clone(), c1: Some(c1), seed: None, cache: OnceLock::new() }
+    }
+
+    /// Bytes of the key as stored / shipped (u32 words; a seeded key's seed and tag).
+    pub fn stored_bytes(&self) -> usize {
+        let w: usize = self.c0.iter().flatten().flatten().map(|r| r.len()).sum();
+        4 * if self.c1.is_some() { 2 * w } else { w } + if self.seed.is_some() { 36 } else { 0 }
     }
 
     /// x mod q_in -> round(x Q / q_in) mod Q.
@@ -81,7 +165,7 @@ impl PackingKey {
         assert_eq!(cts.len(), pos.len(), "pack: one position per LWE");
         assert!(pos.iter().all(|&p| p < n), "pack: positions below n");
         let l = self.gadget.levels;
-        let nl = self.keys.len();
+        let nl = self.c0.len();
         let wv = |j: usize| w.map_or(1, |w| w[j]);
         // digits [j][i][t] of the lifted a's
         let mut d = vec![0i64; l];
@@ -123,7 +207,7 @@ impl PackingKey {
                     let ntt = &self.rns.ntt[p];
                     let q = ntt.q;
                     ntt.fwd(&mut dp[p]);
-                    let (k0, k1) = &self.keys[i][t][p];
+                    let (k0, k1) = &self.keys()[i][t][p];
                     for x in 0..n {
                         acc[p].0[x] = addmod(acc[p].0[x], mulmod(dp[p][x], k0[x], q), q);
                         acc[p].1[x] = addmod(acc[p].1[x], mulmod(dp[p][x], k1[x], q), q);
@@ -148,7 +232,7 @@ impl PackingKey {
     /// The model's variance per output coefficient (Q units) of `k` packed inputs of weight |w| <= `w`, input noise
     /// std `sigma_in` (q_in units).
     pub fn noise_var(&self, k: usize, w: f64, q_in: u64, sigma_in: f64) -> f64 {
-        let nl = self.keys.len() as f64;
+        let nl = self.c0.len() as f64;
         let (b, l) = ((self.gadget.base_log as f64).exp2(), self.gadget.levels as f64);
         let ed2 = b * b / 12.0 + 1.0 / 6.0;
         let q = self.rns.q as f64;

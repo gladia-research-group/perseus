@@ -223,6 +223,24 @@ fn check(a: &TfheArgs) -> i32 {
         return -1;
     }
     match a.op {
+        KS_REGEN => {
+            let k = a.c[3];
+            if k == 0 || k % 64 != 0 || a.i2 < 1 || a.q < 2 || a.q > u32::MAX as u64 || a.c[0] < a.count as u64 || a.c[1] < (a.i2 as u64 + 1) * a.c[0] || a.i0 < 1 || a.i0 as u64 > k / 64 {
+                return -1;
+            }
+            if a.i4 == 1 {
+                let (rt, ct) = (a.i3, a.i1);
+                if ![1, 2, 4, 8].contains(&rt) || ![1, 2, 4].contains(&ct) || rt * ct > 8 || a.i0 as u64 > k / (512 / ct as u64) {
+                    return -1;
+                }
+                return 0;
+            }
+            let mt = if a.i3 != 0 { a.i3 } else if a.count <= 16 { 1 } else if a.count <= 32 { 2 } else { 4 };
+            if ![1, 2, 4].contains(&mt) || (a.count as i64 + 16 * mt as i64 - 1) / (16 * mt as i64) > 65535 {
+                return -1;
+            }
+            0
+        }
         PBS_MS | KS_DIGITS | KS_RECOMBINE | RESCALE_P1 | RS_DIGITS | MAC | REPACK_DIGITS | REPACK_COMB | REPACK_FIN | REPACK_SCATTER | REPACK_RING | REPACK_RMAC | REPACK_C0 => 0,
         PACK_DIGITS if a.n > 2048 || a.c[3] < 1 || a.c[2] * a.c[3] > 40 => -1,
         PACK_DIGITS => 0,
@@ -302,7 +320,7 @@ pub extern "C" fn tfhe(a: *const TfheArgs, s: CudaStream) -> i32 {
     launch(a, s, check, run)
 }
 
-const OPS: [&str; 28] = ["tfhe.pbs_ms", "tfhe.pbs_init", "tfhe.pbs_step", "tfhe.pbs_extract", "tfhe.ks_digits", "tfhe.ks_recombine", "tfhe.rescale_p1", "tfhe.rs_digits", "tfhe.mac", "tfhe.rs_extract", "tfhe.repack_digits", "tfhe.repack_mac", "tfhe.repack_scatter", "tfhe.pbs_rotate", "tfhe.repack_ring", "tfhe.repack_rmac", "tfhe.repack_c0", "tfhe.repack_fin", "tfhe.pbs_keybundle", "tfhe.repack_comb", "tfhe.lwe_lin", "tfhe.pack_digits", "tfhe.pack_mac", "tfhe.pack_fin", "tfhe.pack_rbasis", "tfhe.pack_rdig", "tfhe.pack_rmac", "tfhe.pack_rfin"];
+const OPS: [&str; 29] = ["tfhe.pbs_ms", "tfhe.pbs_init", "tfhe.pbs_step", "tfhe.pbs_extract", "tfhe.ks_digits", "tfhe.ks_recombine", "tfhe.rescale_p1", "tfhe.rs_digits", "tfhe.mac", "tfhe.rs_extract", "tfhe.repack_digits", "tfhe.repack_mac", "tfhe.repack_scatter", "tfhe.pbs_rotate", "tfhe.repack_ring", "tfhe.repack_rmac", "tfhe.repack_c0", "tfhe.repack_fin", "tfhe.pbs_keybundle", "tfhe.repack_comb", "tfhe.lwe_lin", "tfhe.pack_digits", "tfhe.pack_mac", "tfhe.pack_fin", "tfhe.pack_rbasis", "tfhe.pack_rdig", "tfhe.pack_rmac", "tfhe.pack_rfin", "tfhe.ks_regen"];
 
 fn run(a: &TfheArgs) {
     use tfhe_op::*;
@@ -525,9 +543,80 @@ fn run(a: &TfheArgs) {
         PACK_RDIG => pack_rdig(a),
         PACK_RMAC => pack_rmac(a),
         PACK_RFIN => pack_rfin(a),
+        KS_REGEN => ks_regen(a),
         _ => {}
     }
     crate::mm::op_prof(OPS.get(a.op as usize).copied().unwrap_or("?"), t0);
+}
+
+/// A seeded key's mask as byte planes [o][u][K] (u8), cached per (seed, tag, q, K, columns): the host stands for the
+/// device's in-kernel regeneration with one expansion per key.
+fn ks_regen_planes(seed: &pc_core::keys::MaskSeed, q: u32, k: usize, nl: usize) -> std::sync::Arc<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Key = ([u32; 8], u32, u32, usize, usize);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Arc<Vec<u8>>>>> = OnceLock::new();
+    let id = (seed.seed.0, seed.tag, q, k, nl);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&id) {
+        return v.clone();
+    }
+    let mut planes = vec![0u8; nl * 4 * k];
+    struct P(*mut u8);
+    // SAFETY: tasks write disjoint columns of `planes`
+    unsafe impl Sync for P {}
+    unsafe impl Send for P {}
+    let pp = P(planes.as_mut_ptr());
+    let pp = &pp;
+    pc_hostrt::par(|| {
+        use rayon::prelude::*;
+        (0..nl).into_par_iter().for_each(|o| {
+            let mut w = vec![0u32; k];
+            pc_core::keys::mask_expand_row(seed, o as u32, q, &mut w);
+            // SAFETY: column o's 4 k bytes, disjoint per task
+            let col = unsafe { std::slice::from_raw_parts_mut(pp.0.add(o * 4 * k), 4 * k) };
+            for (i, &v) in w.iter().enumerate() {
+                for u in 0..4 {
+                    col[u * k + i] = (v >> (8 * u)) as u8;
+                }
+            }
+        })
+    });
+    let v = Arc::new(planes);
+    let mut c = cache.lock().unwrap();
+    if c.len() >= 4 {
+        c.clear();
+    }
+    c.insert(id, v.clone());
+    v
+}
+
+/// KS_REGEN (ks_regen_k): G_u[o][b] = sum_k D[b][k] byte_u(W(k, o)), the masks expanded from the seed, the bodies z.
+fn ks_regen(a: &TfheArgs) {
+    let (k, nl, nrows, mp, ps) = (a.c[3] as usize, a.i2 as usize, a.count as usize, a.c[0] as usize, a.c[1] as usize);
+    let mut sw = [0u32; 8];
+    for i in 0..4 {
+        sw[2 * i] = a.c[4 + i] as u32;
+        sw[2 * i + 1] = (a.c[4 + i] >> 32) as u32;
+    }
+    let seed = pc_core::keys::MaskSeed { seed: pc_core::keys::KskSeed(sw), tag: a.c[2] as u32 };
+    rows_mut::<i32>(a.x, 0, 4 * ps).fill(0);
+    let planes = ks_regen_planes(&seed, a.q as u32, k, nl);
+    let body: Vec<u8> = {
+        let z = rows::<u32>(a.z, 0, k);
+        (0..4).flat_map(|u| z.iter().map(move |&v| (v >> (8 * u)) as u8)).collect()
+    };
+    par_for(nl + 1, a, |a, o| {
+        let col: &[u8] = if o < nl { &planes[o * 4 * k..(o + 1) * 4 * k] } else { &body };
+        for b in 0..nrows {
+            let d = rows::<i8>(a.y, b * k, k);
+            for u in 0..4 {
+                let pl = &col[u * k..(u + 1) * k];
+                let s: i32 = d.iter().zip(pl).map(|(&x, &y)| x as i32 * y as i32).sum();
+                wr(a.x, u * ps + o * mp + b, s);
+            }
+        }
+    });
 }
 
 /// The mod switch to 2 nu n / k of one LWE, the body mean-compensated (ms_k).

@@ -10,7 +10,9 @@
 //! K_m = GGSW(prod_{x in S} s_x prod_{x not in S} (1 - s_x)) (exactly one is GGSW(1) unless the group's bits are all 0)
 //! and acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc), e_m = sum_{x in S} a_x: one decomposition and one set of NTTs per
 //! group (1 / G of the transforms of the per-bit CMux) for 2^G - 1 key MACs, at twice the key noise per term.
-use pc_core::keys::{DiscreteGaussian, Prng};
+use std::sync::OnceLock;
+
+use pc_core::keys::{mask_expand_row64, DiscreteGaussian, MaskSeed, Prng};
 use rayon::prelude::*;
 
 use crate::gadget::Gadget;
@@ -115,43 +117,129 @@ fn ntt_digits(ct: &[Rlwe; 2], gadget: &Gadget, rns: &Rns) -> Vec<Vec<[Vec<u64>; 
         .collect()
 }
 
+/// The masks (c1) of a GGSW's rows: seeded (row (c, t, prime) = the mask row (seed, lane + (c levels + t) 2 + prime)
+/// of length n mod that prime, `pc_core::keys::mask_expand_row`, in NTT form) or stored [c][t][prime].
+#[derive(Clone, Debug)]
+pub enum RowMask {
+    Seeded { seed: MaskSeed, lane: u32, q: [u64; 2] },
+    Stored(Vec<Vec<[Vec<u64>; 2]>>),
+}
+
 /// GGSW of a small integer mu: rows (Z + mu g_t (1, 0)) and (Z + mu g_t (0, 1)), per prime, stored in NTT form.
 pub struct Ggsw {
-    /// [component c][level t][prime] -> (c0, c1) in NTT form
-    rows: Vec<Vec<[(Vec<u64>, Vec<u64>); 2]>>,
+    /// [component c][level t][prime] -> c0 in NTT form
+    c0: Vec<Vec<[Vec<u64>; 2]>>,
+    pub mask: RowMask,
+    /// the rows (c0, c1), materialized on first use (`rows`)
+    cache: OnceLock<Vec<Vec<[(Vec<u64>, Vec<u64>); 2]>>>,
 }
 
 impl Ggsw {
+    /// The stored form: c1 uniform per prime from `prng` (coefficient form), Z = (e - c1 s, c1), mu g_t added to
+    /// part c at coefficient 0.
     pub fn encrypt(mu: i64, s: &[i64], gadget: &Gadget, rns: &Rns, dg: &DiscreteGaussian, prng: &mut Prng) -> Ggsw {
         let n = rns.n();
-        let rows = (0..2)
+        let mut c0 = Vec::new();
+        let mut c1s = Vec::new();
+        for c in 0..2 {
+            let (mut r0, mut r1) = (Vec::new(), Vec::new());
+            for t in 0..gadget.levels {
+                // an encryption of zero mod Q: c1 uniform per prime, one integer error
+                let e = dg.sample_vec(prng, n);
+                let v = mulmod(from_signed(mu, rns.q), gadget.g(t), rns.q);
+                let [(a0, a1), (b0, b1)] = [0, 1].map(|l| {
+                    let ntt = &rns.ntt[l];
+                    let q = ntt.q;
+                    let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(q)).collect();
+                    let mut z = Rlwe::encrypt_with(&vec![0; n], s, c1, &e, ntt);
+                    let target = if c == 0 { &mut z.c0 } else { &mut z.c1 };
+                    target[0] = addmod(target[0], v % q, q);
+                    ntt.fwd(&mut z.c0);
+                    ntt.fwd(&mut z.c1);
+                    (z.c0, z.c1)
+                });
+                r0.push([a0, b0]);
+                r1.push([a1, b1]);
+            }
+            c0.push(r0);
+            c1s.push(r1);
+        }
+        Ggsw { c0, mask: RowMask::Stored(c1s), cache: OnceLock::new() }
+    }
+
+    /// The seeded form: row (c, t) per prime has c1 = its mask row (uniform in NTT form, `RowMask::Seeded`) and
+    /// c0 = NTT(e) - c1 NTT(s) + mu g_t (c = 0) or + mu g_t NTT(s) (c = 1): phase e + mu g_t (1 or s), the stored
+    /// form's (whose row c = 1 carries mu g_t on c1: c1 + mu g_t is as uniform as c1). `s_ntt` = NTT(s) per prime,
+    /// `e` [c levels + t] the errors.
+    pub fn encrypt_seeded(mu: i64, s_ntt: &[Vec<u64>; 2], gadget: &Gadget, rns: &Rns, e: &[Vec<i64>], seed: MaskSeed, lane: u32) -> Ggsw {
+        let n = rns.n();
+        let lv = gadget.levels;
+        let q2 = [rns.ntt[0].q, rns.ntt[1].q];
+        let c0 = (0..2)
             .map(|c| {
-                (0..gadget.levels)
+                (0..lv)
                     .map(|t| {
-                        // an encryption of zero mod Q: c1 uniform per prime, one integer error
-                        let e = dg.sample_vec(prng, n);
                         let v = mulmod(from_signed(mu, rns.q), gadget.g(t), rns.q);
-                        [0, 1].map(|l| {
-                            let ntt = &rns.ntt[l];
+                        [0, 1].map(|p| {
+                            let ntt = &rns.ntt[p];
                             let q = ntt.q;
-                            let c1: Vec<u64> = (0..n).map(|_| prng.uniform_below(q)).collect();
-                            let mut z = Rlwe::encrypt_with(&vec![0; n], s, c1, &e, ntt);
-                            let target = if c == 0 { &mut z.c0 } else { &mut z.c1 };
-                            target[0] = addmod(target[0], v % q, q);
-                            ntt.fwd(&mut z.c0);
-                            ntt.fwd(&mut z.c1);
-                            (z.c0, z.c1)
+                            let mut m = vec![0u64; n];
+                            mask_expand_row64(&seed, lane + ((c * lv + t) * 2 + p) as u32, q, &mut m);
+                            let mut x: Vec<u64> = e[c * lv + t].iter().map(|&v| from_signed(v, q)).collect();
+                            ntt.fwd(&mut x);
+                            let vq = v % q;
+                            for j in 0..n {
+                                let mut y = submod(x[j], mulmod(m[j], s_ntt[p][j], q), q);
+                                y = addmod(y, if c == 0 { vq } else { mulmod(vq, s_ntt[p][j], q) }, q);
+                                x[j] = y;
+                            }
+                            x
                         })
                     })
                     .collect()
             })
             .collect();
-        Ggsw { rows }
+        Ggsw { c0, mask: RowMask::Seeded { seed, lane, q: q2 }, cache: OnceLock::new() }
     }
 
-    /// [component c][level t][prime] -> (c0, c1), NTT form: the device layout's source.
+    /// Row (c, t)'s c0 at a prime (NTT form).
+    pub fn c0(&self, c: usize, t: usize, p: usize) -> &[u64] {
+        &self.c0[c][t][p]
+    }
+
+    /// Row (c, t)'s c1 at a prime (NTT form): expanded for a seeded GGSW.
+    pub fn c1(&self, c: usize, t: usize, p: usize) -> std::borrow::Cow<'_, [u64]> {
+        match &self.mask {
+            RowMask::Stored(m) => std::borrow::Cow::Borrowed(&m[c][t][p]),
+            RowMask::Seeded { seed, lane, q } => {
+                let lv = self.c0[0].len();
+                let mut m = vec![0u64; self.c0[c][t][p].len()];
+                mask_expand_row64(seed, lane + ((c * lv + t) * 2 + p) as u32, q[p], &mut m);
+                std::borrow::Cow::Owned(m)
+            }
+        }
+    }
+
+    /// [component c][level t][prime] -> (c0, c1), NTT form (materialized once).
     pub fn rows(&self) -> &[Vec<[(Vec<u64>, Vec<u64>); 2]>] {
-        &self.rows
+        self.cache.get_or_init(|| {
+            (0..2).map(|c| (0..self.c0[c].len()).map(|t| [0, 1].map(|p| (self.c0[c][t][p].clone(), self.c1(c, t, p).into_owned()))).collect()).collect()
+        })
+    }
+
+    /// The stored form of this GGSW (the same rows).
+    pub fn to_stored(&self) -> Ggsw {
+        let c1 = (0..2).map(|c| (0..self.c0[c].len()).map(|t| [0, 1].map(|p| self.c1(c, t, p).into_owned())).collect()).collect();
+        Ggsw { c0: self.c0.clone(), mask: RowMask::Stored(c1), cache: OnceLock::new() }
+    }
+
+    /// Words of the GGSW as stored / shipped (the c0 rows, plus the c1 rows when stored).
+    pub fn stored_words(&self) -> usize {
+        let w: usize = self.c0.iter().flatten().flatten().map(|r| r.len()).sum();
+        match self.mask {
+            RowMask::Seeded { .. } => w,
+            RowMask::Stored(_) => 2 * w,
+        }
     }
 
     /// sum_{c, t} digits[c][t] * rows[c][t]: per prime (part 0, part 1), NTT form.
@@ -162,7 +250,7 @@ impl Ggsw {
             for (t, dt) in dc.iter().enumerate() {
                 for (p, dp) in dt.iter().enumerate() {
                     let q = rns.ntt[p].q;
-                    let (r0, r1) = &self.rows[c][t][p];
+                    let (r0, r1) = &self.rows()[c][t][p];
                     for i in 0..n {
                         out[p].0[i] = addmod(out[p].0[i], mulmod(dp[i], r0[i], q), q);
                         out[p].1[i] = addmod(out[p].1[i], mulmod(dp[i], r1[i], q), q);
@@ -209,6 +297,50 @@ impl BootstrapKey {
             })
             .collect();
         BootstrapKey { gadget, rns, group, ggsw }
+    }
+
+    /// The seeded form (`Ggsw::encrypt_seeded`; one seed from `prng`, domain tag `tag`): GGSW i (group-major, then
+    /// m) has its rows at lanes 4 levels i + (c levels + t) 2 + prime. The errors come from `prng` in GGSW order.
+    pub fn generate_seeded(s_lwe: &[i64], s_br: &[i64], gadget: Gadget, rns: Rns, group: usize, tag: u32, dg: &DiscreteGaussian, prng: &mut Prng) -> BootstrapKey {
+        assert!(group >= 1 && s_lwe.len() % group == 0, "the unrolled bootstrapping key groups the LWE key");
+        let n = rns.n();
+        let seed = MaskSeed { seed: prng.ksk_seed(), tag };
+        let s_ntt = [0, 1].map(|p| {
+            let mut v = crate::rlwe::signed_poly(s_br, rns.ntt[p].q);
+            rns.ntt[p].fwd(&mut v);
+            v
+        });
+        let km = (1usize << group) - 1;
+        let rows = 2 * gadget.levels;
+        let mus: Vec<i64> = s_lwe
+            .chunks(group)
+            .flat_map(|g| (1..1usize << group).map(move |m| g.iter().enumerate().map(|(x, &s)| if m >> x & 1 == 1 { s } else { 1 - s }).product::<i64>()))
+            .collect();
+        let mut flat: Vec<Ggsw> = Vec::with_capacity(mus.len());
+        for (c0, chunk) in mus.chunks(256).enumerate() {
+            let errs: Vec<Vec<Vec<i64>>> = chunk.iter().map(|_| (0..rows).map(|_| dg.sample_vec(prng, n)).collect()).collect();
+            let part: Vec<Ggsw> = chunk
+                .par_iter()
+                .zip(errs.par_iter())
+                .enumerate()
+                .map(|(i, (&mu, e))| Ggsw::encrypt_seeded(mu, &s_ntt, &gadget, &rns, e, seed, (2 * rows * (c0 * 256 + i)) as u32))
+                .collect();
+            flat.extend(part);
+        }
+        let mut it = flat.into_iter();
+        let ggsw = (0..s_lwe.len() / group).map(|_| it.by_ref().take(km).collect()).collect();
+        BootstrapKey { gadget, rns, group, ggsw }
+    }
+
+    /// The stored form of this key (the same GGSWs).
+    pub fn to_stored(&self) -> BootstrapKey {
+        BootstrapKey { gadget: self.gadget.clone(), rns: self.rns.clone(), group: self.group, ggsw: self.ggsw.iter().map(|v| v.iter().map(|g| g.to_stored()).collect()).collect() }
+    }
+
+    /// Bytes of the key as stored / shipped (u32 words; a seeded key's seed and tag).
+    pub fn stored_bytes(&self) -> usize {
+        let w: usize = self.ggsw.iter().flatten().map(|g| g.stored_words()).sum();
+        4 * w + if matches!(self.ggsw.first().and_then(|v| v.first()).map(|g| &g.mask), Some(RowMask::Seeded { .. })) { 36 } else { 0 }
     }
 
     /// acc = (X^-b~ tv, 0), then per key group acc <- acc + sum_m (X^-e_m - 1) (K_m [x] acc) (module doc): the phase
