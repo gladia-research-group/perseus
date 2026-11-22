@@ -34,6 +34,15 @@ pub const KB_MAX: usize = 94;
 pub const KB_MAX_EXT: usize = 46;
 /// Chunks up to this many values take the latency key (Params::lat_group) when the switch holds one.
 pub const LAT_MAX: usize = 24;
+
+/// LAT_MAX, overridable by PC_TFHE_LAT_MAX (read once).
+/// Chunks above LAT_MAX and up to this many values take the mid-batch latency key (Params::lat_group2).
+pub const LAT2_MAX: usize = 40;
+
+pub fn lat_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_TFHE_LAT_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(LAT_MAX))
+}
 /// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE.
 pub const KB_WINDOW: usize = 32;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it) for a switch of `max` values per pass:
@@ -557,6 +566,7 @@ pub struct TfheSwitch<'a> {
     pack: Option<DevPack<'a>>,
     bsk: DBuf<'a, Compute, u32>,
     bsk_lat: Option<DBuf<'a, Compute, u32>>,
+    bsk_lat2: Option<DBuf<'a, Compute, u32>>,
     btw: DBuf<'a, Compute, u32>,
     btw_s: DBuf<'a, Compute, u32>,
     repack: DevRepack<'a>,
@@ -596,7 +606,8 @@ impl<'a> TfheSwitch<'a> {
         let words32 = 2 * 3 * n + p.rs.1 * 2 * n + 8 * n + 2 * n + p.rs.1 * n + 2 * n + max + n
             + max * (n_sub + 1) + PLANES * ((nl + 1) * (max + 16) + 64) + 2 * max * (nl + 1) + max * (nb + 1)
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb * p.nu + 2 * nb * p.nu
-            + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
+            + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 }
+            + if p.lat_group2 > 0 { nl / p.lat_group2 * ((1 << p.lat_group2) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
         let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
         let pack = if p.pack { DevPack::bytes_rows(nb, nl, pc_tfhe::pack::PACK_GADGET.1, PACK_RMAX) } else { 0 };
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1, max) + pack + (1 << 20)
@@ -653,6 +664,10 @@ impl<'a> TfheSwitch<'a> {
             },
             bsk: up32("tfhe.bsk", &img.bsk)?,
             bsk_lat: match &sw.bsk_lat {
+                Some(k) => Some(up32("tfhe.bsk", &pbs_image(k).bsk)?),
+                None => None,
+            },
+            bsk_lat2: match &sw.bsk_lat2 {
                 Some(k) => Some(up32("tfhe.bsk", &pbs_image(k).bsk)?),
                 None => None,
             },
@@ -1136,13 +1151,14 @@ impl<'a> TfheSwitch<'a> {
             // per window the key bundles on `side`, the rotation on `s` once they are in, the next window's bundles
             // filling the other half of `kb` meanwhile
             // the latency key for the small chunks (one level, nu 1): fewer, wider groups
-            let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= LAT_MAX && (self.clusters || self.p.lat_group <= 4));
+            let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= lat_cap() && (self.clusters || self.p.lat_group <= 4)).map(|k| (k, self.p.lat_group));
+            let lat = lat.or_else(|| self.bsk_lat2.as_ref().filter(|_| one && cl > lat_cap() && cl <= LAT2_MAX && (self.clusters || self.p.lat_group2 <= 4)).map(|k| (k, self.p.lat_group2)));
             let rot0 = rot;
             let rot = match lat {
-                Some(k) => TfheArgs { i2: self.p.lat_group as i32, y: k.vptr(), ..rot },
+                Some((k, g)) => TfheArgs { i2: g as i32, y: k.vptr(), ..rot },
                 None => rot,
             };
-            let groups = nl / if lat.is_some() { self.p.lat_group } else { self.p.pbs_group };
+            let groups = nl / match lat { Some((_, g)) => g, None => self.p.pbs_group };
             let nsub = cl.div_ceil(sub);
             let ext = self.p.nu * self.p.pbs.1;   // uint4 per bundle word
             let half = self.max.min(KB_MAX) * KB_WINDOW * 4 * nb * ext;

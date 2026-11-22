@@ -104,6 +104,12 @@ pub(crate) fn params(n: usize) -> PyResult<Params> {
     if p.chain && std::env::var("PC_TFHE_LAT_GROUP").is_err() && p.nu == 1 && p.pbs.1 == 1 && p.n_lwe % 5 == 0 {
         p.lat_group = 5;
     }
+    // ... and the mid-batch latency key (groups of 4 for 25 .. 40 LWEs); PC_TFHE_LAT_GROUP2=0 turns it off
+    if let Ok(v) = std::env::var("PC_TFHE_LAT_GROUP2") {
+        p.lat_group2 = v.trim().parse().ok().filter(|&g| g == 0 || (2..=7).contains(&g) && p.n_lwe % g == 0).ok_or_else(|| PyValueError::new_err(format!("PC_TFHE_LAT_GROUP2={v}: 2..=7 dividing n_lwe {}", p.n_lwe)))?;
+    } else if p.chain && p.lat_group == 5 && p.n_lwe % 4 == 0 {
+        p.lat_group2 = 4;
+    }
     Ok(p)
 }
 
@@ -115,6 +121,11 @@ pub(crate) fn native_cap() -> Option<(usize, usize)> {
 }
 
 /// PC_TFHE_PACK=slots: the native programs' encrypted accumulators (0: no packing key).
+/// PC_TFHE_MACC: rows of per-row trivial accumulators for the native programs' `pbsm` steps (a table per row).
+pub(crate) fn macc_rows() -> usize {
+    std::env::var("PC_TFHE_MACC").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
 pub(crate) fn pack_slots() -> usize {
     std::env::var("PC_TFHE_PACK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
 }
@@ -128,6 +139,8 @@ enum Step {
     Load { lut: usize, dst: Vec<usize> },
     Lin { dst: usize, a: usize, b: usize, idx: usize, rows: usize, ca: u64, cb: u64, c: u64 },
     Pbs { src: usize, rows: usize, lut: usize, k: usize, dst: Vec<usize> },
+    /// one launch, a table per row: row r of `src` rotates the trivial accumulator `acc + r` (PC_TFHE_MACC)
+    PbsM { src: usize, rows: usize, acc: usize, dst: usize },
     Store { src: usize, rows: usize, lut: Option<usize>, set: String },
     /// the packing key switch of `rows` LWEs of `src` into accumulator `acc`: `count` placements (row, coefficient)
     /// at `place` in the index buffer, then `count` weights (`weighted`)
@@ -153,6 +166,9 @@ impl TfhePlan {
         mp.reserve("tfhe.ct", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<pc_cuda::Compute, W>::words(&mp.lay, 1)));
         if let Some((b, r)) = native_cap() {
             mp.reserve("tfhe.native", 4 * ((b + 1) * r * (p.n_br + 1) + MAX_IDX) + 512);
+            if macc_rows() > 0 {
+                mp.reserve("tfhe.macc", 4 * macc_rows() * 4 * p.n_br + 256);
+            }
             if p.pack {
                 mp.reserve("tfhe.accs", 4 * pack_slots() * 4 * p.n_br + 256);
                 mp.reserve("tfhe.prows", 4 * 3 * 8 * p.n_br + 8 * 3 * 8 * 2 * p.n_br + 512);
@@ -185,6 +201,9 @@ pub(crate) struct TfheRt {
     idx_used: usize,
     /// PC_TFHE_PACK: the encrypted accumulators [slots][2 part][2 prime][n_br]
     accs: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
+    /// PC_TFHE_MACC: the `pbsm` steps' trivial accumulators [rows][2 part][2 prime][n_br], `macc_used` taken
+    macc: Option<pc_cuda::DBuf<'static, pc_cuda::Compute, u32>>,
+    macc_used: usize,
     /// the packing by rows' table placements P_e (impl/tfhe.py table_place(t), t = 2, 4, 8 at (log2 t - 1) 8 rows:
     /// int32 [8][n_br]) and their NTTs (u64 [8][2 prime][n_br])
     prows: Option<(pc_cuda::DBuf<'static, pc_cuda::Compute, u32>, pc_cuda::DBuf<'static, pc_cuda::Compute, u64>)>,
@@ -226,6 +245,10 @@ impl TfheRt {
             true => Some(arena.alloc::<pc_cuda::Compute, u32>("tfhe.accs", pack_slots() * 4 * params.n_br).map_err(|x| e(x.into()))?),
             false => None,
         };
+        let macc = match (native_cap(), macc_rows()) {
+            (Some(_), m) if m > 0 => Some(arena.alloc::<pc_cuda::Compute, u32>("tfhe.macc", m * 4 * params.n_br).map_err(|x| e(x.into()))?),
+            _ => None,
+        };
         let prows = match params.pack {
             true => {
                 let nb = params.n_br;
@@ -248,7 +271,7 @@ impl TfheRt {
             }
             false => None,
         };
-        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, accs, prows, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
+        Ok(TfheRt { sw, params, rns, luts: BTreeMap::new(), lut_buf, sets: BTreeMap::new(), pos_buf, pos_used: 0, x, x2, stash: None, progs: BTreeMap::new(), nat, nat_idx, idx_used: 0, accs, macc, macc_used: 0, prows, n, calls: 0, values: 0, keygen_s: t0.elapsed().as_secs_f64(), lt })
     }
 
     /// Register LUT `name`: `values[j]` = f(m_j) on the grid m_j = 2 j / g (j < g / 2) and 2 (j - g) / g (j >= g / 2)
@@ -471,6 +494,34 @@ impl TfheRt {
                     }
                     Step::Pbs { src: buf(st, "src")?, rows: nrows(st)?, lut: l, k, dst }
                 }
+                "pbsm" => {
+                    let names: Vec<String> = serde_json::from_value(st.get("luts").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
+                    let r = names.len();
+                    if r == 0 || r > rows || self.params.nu != 1 {
+                        return Err(bad(format!("pbsm: {r} rows (nu 1, buffers hold {rows})")));
+                    }
+                    if self.macc.is_none() || self.macc_used + r > macc_rows() {
+                        return Err(bad(format!("pbsm: {r} accumulators (PC_TFHE_MACC: {} left)", macc_rows() - self.macc_used.min(macc_rows()))));
+                    }
+                    // row r's accumulator: part 0 = its table's residues (the lut buffer's slot), part 1 = 0
+                    let nbr = self.params.n_br;
+                    let mut words = Vec::with_capacity(r * 4 * nbr);
+                    for n in &names {
+                        let (slot, k) = *lut_k.get(n).ok_or_else(|| bad(format!("lut {n} not in the program")))?;
+                        if k != 1 {
+                            return Err(bad(format!("pbsm: lut {n} has {k} tables")));
+                        }
+                        let tv = self.lut_buf.download_range(s, slot * 2 * nb, 2 * nb).map_err(|x| crate::session::gerr(x.into()))?;
+                        words.extend_from_slice(&tv);
+                        words.extend(std::iter::repeat_n(0u32, 2 * nbr));
+                    }
+                    let mb = self.macc.as_mut().unwrap();
+                    mb.upload_at(s, self.macc_used * 4 * nbr, &words).map_err(|x| crate::session::gerr(x.into()))?;
+                    let acc = self.macc_used;
+                    self.macc_used += r;
+                    let dst = buf(st, "dst")?;
+                    Step::PbsM { src: buf(st, "src")?, rows: r, acc, dst }
+                }
                 "store" => {
                     // no lut: the rows are stored as they are (a warp table's outputs)
                     let l = match st.get("lut") {
@@ -629,6 +680,10 @@ impl TfheRt {
                 Step::Pbs { src, rows: r, lut, k, dst } => {
                     let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
                     self.sw.native_pbs(ctx, st, ltr, bp(*src), *r, tvp(*lut), &vec![0; *k], &dsts)?;
+                }
+                Step::PbsM { src, rows: r, acc, dst } => {
+                    let a = (self.macc.as_ref().unwrap().vptr() as *const u32).wrapping_add(acc * 4 * self.params.n_br) as *const c_void;
+                    self.sw.native_plut_each(ctx, st, ltr, bp(*src), *r, a, &[0], &[bp(*dst)])?;
                 }
                 Step::Store { src, rows: r, lut, set } => {
                     let &(off, _, reps) = &self.sets[set];
