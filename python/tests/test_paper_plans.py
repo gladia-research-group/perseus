@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -115,6 +116,17 @@ def _recipe(plan_dir: Path):
         return None
     assert graph, f"{plan_dir}/PLAN_CMD.txt lacks graph="
     return graph, recipe, tool, route
+
+
+def _with_argmax(plan_dir: Path) -> bool:
+    """Whether the plan was made with the argmax stage: as its tool= line's stage list says (`make_plan.sh (blocks,
+    then argmax)`); without a list, when it has a tail for the stage to follow (more than one block: a one-block plan
+    such as resnet20_folded is its blocks stage alone)."""
+    tool = _plan_line(plan_dir, "tool") or ""
+    words = re.match(r"\S+ \(([a-z ,]+)\)$", tool)
+    if words and {w for w in re.split(r"[ ,]+", words[1]) if w} <= {"blocks", "argmax", "feedback", "then"}:
+        return "argmax" in words[1]
+    return len(set(plan_dir.glob("block_*_placement.json")) - set(plan_dir.glob("block_*_feedback_placement.json"))) > 1
 
 
 def _plan_line(plan_dir: Path, key: str) -> str | None:
@@ -227,7 +239,7 @@ def replan(name: str, log: Path) -> tuple[Path, float]:
     else:
         if stages is None:
             stages = ("blocks",)
-            if tool not in LLAMA_TOOLS:
+            if tool not in LLAMA_TOOLS and _with_argmax(plan_dir):
                 stages += ("argmax",)
                 if (plan_dir / "block_0_feedback_placement.json").exists():
                     stages += ("feedback",)

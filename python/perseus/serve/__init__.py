@@ -114,6 +114,18 @@ class Conn:
             pass
 
 
+def export_frame(sess, ct, bound: float | None = None) -> bytes:
+    """`_pc.export_ct` of `ct` (a ciphertext the caller owns, e.g. `_pc.Program.reg_ct`'s copy of a register) dropped
+    first to `Fhe.export_level`: the rows the client does not decode stay on the server, every decoded bit unchanged.
+    `bound` (the values' magnitude bound) lets the drop go down to the rows that still hold such values."""
+    from perseus import _pc
+    fhe = sess.fhe
+    if ct.deg != 1:
+        fhe.realize(ct)
+    fhe.drop_to_level(ct, fhe.export_level(ct, bound))
+    return _pc.export_ct(sess, ct)
+
+
 def private_dir(path: str) -> str:
     """`path` as this user's own directory, mode 0700: a work directory under a shared /tmp must not be one
     another user made, or a link to somewhere else."""

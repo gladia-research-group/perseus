@@ -93,8 +93,45 @@ def test_compressed_export(setup):
     assert np.abs(b - (xv * yv).sum(0)).max() < 1e-3
     q = s.fhe.mult_sum([_pc.import_ct(s, f) for f in xf[:2]], [_pc.import_ct(s, f) for f in yf[:2]])
     assert _pc.export_ct_many(s, [p, q], 32) == [_pc.export_ct(s, p, bits=32), _pc.export_ct(s, q, bits=32)]
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="bottom-level"):
         _pc.export_ct(s, _pc.import_ct(s, xf[0]), bits=32)        # 4 rows: the modulus is too wide for 32 bits
+
+
+def test_compressed_export_guard():
+    """export_ct(bits=32) refuses what it cannot carry: a frame above the bottom (n32sph's 3-row level 52) and a
+    bottom-level frame whose scale leaves the rounding visible (a fresh level-54 encryption: ~0.1 per slot) unless
+    `tol` allows it; a level-24 encryption dropped to the bottom keeps ~1e-4 and stays allowed."""
+    ch = "n32sph"
+    cfg = _pc.Config.preset("n32_gpt2_decode")
+    cfg.set("bts.auto_bts_level", 52)
+    cfg.set("chain.preset", ch)
+    secret = _pc.ClientSecret.generate(seed=5, chain=ch)
+    client = _pc.Client(secret, seed=6, complex=True, chain=ch)
+    ks = _pc.KeySource.generate([1], conj=False, seed=7, secret=secret.to_bytes())
+    s = _pc.Session(cfg, ks, pool=8, pt_slots=2).complete_setup()
+    try:
+        v = np.random.default_rng(0).standard_normal(1 << 15) + 0j
+        assert s.fhe.bottom_level == 54
+        three = _pc.import_ct(s, client.encrypt(v, 52))
+        for f in (lambda: _pc.export_ct(s, three, bits=32), lambda: _pc.export_ct_many(s, [three], 32)):
+            with pytest.raises(ValueError, match="bottom-level"):
+                f()
+        fresh = _pc.import_ct(s, client.encrypt(v, 54))
+        with pytest.raises(ValueError, match="above tol"):
+            _pc.export_ct(s, fresh, bits=32)
+        assert np.abs(client.decrypt(_pc.export_ct(s, fresh, bits=32, tol=1.0))[0] - v).max() < 0.5
+        deep = _pc.import_ct(s, client.encrypt(v, 24))
+        # export_level: the rows the client decodes (4) kept, bit for bit; a bound takes values that fit further down
+        ref = client.decrypt(_pc.export_ct(s, deep))[0]
+        assert s.fhe.export_level(deep) == 51 and s.fhe.export_level(deep, 1e6) == 52
+        z = _pc.import_ct(s, client.encrypt(v, 46))
+        assert s.fhe.export_level(z, 8.0) == 54
+        s.fhe.drop_to_level(deep, s.fhe.export_level(deep))
+        np.testing.assert_array_equal(client.decrypt(_pc.export_ct(s, deep))[0], ref)
+        s.fhe.drop_to_level(deep, 54)
+        assert np.abs(client.decrypt(_pc.export_ct(s, deep, bits=32))[0] - v).max() < 1e-3
+    finally:
+        s.close()
 
 
 def test_seeded_frames(setup):

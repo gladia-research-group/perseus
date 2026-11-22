@@ -568,11 +568,34 @@ fn checked_imports() -> PyResult<()> {
     Ok(())
 }
 
+/// `export_ct(bits=)`'s default `tol`: the largest estimated slot error a compressed frame may add.
+const COMPRESSED_TOL: f64 = 1.0 / 1024.0;
+
+/// Estimated largest slot error a compressed frame (`bits`-bit words over the primes `q`) adds to a ciphertext of scale
+/// `nf` in a ring of degree `n`: each part rounded to Q 2^-bits (uniform, variance (Q 2^-bits)^2 / 12 per
+/// coefficient), c1's rounding multiplied by a dense ternary secret (weight ~2n/3), the n coefficients summed into a
+/// slot, six standard deviations.
+fn compressed_error(q: &[u64], bits: u32, nf: f64, n: usize) -> f64 {
+    let step = q.iter().map(|&p| (p as f64).log2()).sum::<f64>() - bits as f64;
+    let var = step.exp2().powi(2) / 12.0 * (1.0 + 2.0 * n as f64 / 3.0);
+    6.0 * (n as f64 * var).sqrt() / nf
+}
+
+/// A compressed frame needs the chain's bottom (the rows the client decodes); above it the modulus leaves no precision.
+fn check_compressed_rows(what: &str, rows: usize, unit: usize, level: u32, bits: u32) -> PyResult<()> {
+    if rows != unit {
+        return Err(PyValueError::new_err(format!("{what}(bits={bits}): a compressed frame needs a bottom-level ciphertext ({unit} rows), this one is at level {level} ({rows} rows): drop_to_level first")));
+    }
+    Ok(())
+}
+
 /// Wire frame of a session ciphertext (a pending rescale is realized on a copy first: the client decodes degree 1).
-/// Every frame imported before it has passed its checksum (`import_ct`) when it returns.
+/// Every frame imported before it has passed its checksum (`import_ct`) when it returns. `bits`: compressed, one
+/// `bits`-bit word per coefficient, for a bottom-level ciphertext only; refused when the estimated slot error it adds
+/// (`compressed_error`) exceeds `tol` (default 2^-10), as at a low scale.
 #[pyfunction]
-#[pyo3(signature = (session, ct, bits=None))]
-fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bits: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
+#[pyo3(signature = (session, ct, bits=None, tol=None))]
+fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bits: Option<u32>, tol: Option<f64>) -> PyResult<Bound<'py, PyBytes>> {
     checked_imports()?;
     let dev = session.dev.clone();
     if ct.ct_ref().buf.seeds {
@@ -596,6 +619,11 @@ fn export_ct<'py>(py: Python<'py>, session: &PySession, ct: PyRef<'_, PyCt>, bit
     let n = dev.ctx.lay.n;
     if let Some(b) = bits {
         // compressed: coefficient form, round(x 2^b / Q) per coefficient (pc_client::wire::pack_coeffs)
+        check_compressed_rows("export_ct", top + 1, dev.ctx.chain.level_unit, c.meta.level, b)?;
+        let (err, tol) = (compressed_error(&dev.ctx.chain.q[..=top], b, c.meta.nf, n), tol.unwrap_or(COMPRESSED_TOL));
+        if !(err <= tol) {
+            return Err(PyValueError::new_err(format!("export_ct(bits={b}): the compressed frame would add slot errors up to ~{err:.1e} at this scale (log2 nf {:.1}), above tol {tol:.1e}: export it uncompressed", c.meta.nf.log2())));
+        }
         if ct.ct_ref().meta.deg == 2 || c.buf.lay.nq != dev.ctx.lay.nq {
             ct.check_full()?;
         }
@@ -821,6 +849,7 @@ fn export_ct_many<'py>(py: Python<'py>, session: &PySession, cts: Vec<PyRef<'_, 
             None
         };
         let c = tmp.as_ref().map_or(ct.ct_ref(), |t| t.ct_ref());
+        check_compressed_rows("export_ct_many", c.top(dev.ctx.shape).map_err(gerr)? + 1, dev.ctx.chain.level_unit, c.meta.level, bits)?;
         let mut st = dev.st.borrow_mut();
         let State { ex, .. } = &mut *st;
         if defer {

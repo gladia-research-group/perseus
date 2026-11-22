@@ -276,4 +276,13 @@ impl<'a, W: DevWord, M: DevStrategy<W>> Context<'a, W, M> {
     pub fn top_of(&self, level: u32) -> Result<usize> {
         Ok(pc_shadow::meta::top_limb(self.shape, level)? as usize)
     }
+    /// Whether a ciphertext can sit at `level`: on the chain's level grid with at least `level_unit` rows (the
+    /// bottom's; fewer are past it).
+    pub fn is_live_level(&self, level: u32) -> bool {
+        self.top_of(level).is_ok_and(|t| t + 1 >= self.chain.level_unit)
+    }
+    /// The chain's bottom level: the deepest level a ciphertext can sit at (`is_live_level`).
+    pub fn bottom_level(&self) -> u32 {
+        (0..=2 * self.chain.q.len() as u32).rev().find(|&l| self.is_live_level(l)).unwrap_or(0)
+    }
 }

@@ -227,6 +227,14 @@ def test_levels_and_limbs(fhe, rng):
     fhe.drop_to_level(p, 30)
     assert p.level == 30 and rel(dec(fhe, p), x * y) < TOL
     assert fhe.encode_like_level(p) == (30, 1)
+    # past the bottom (54 primes: level 52 holds two, 53 one) refused at the call, the ciphertext untouched
+    assert fhe.bottom_level == 52
+    for bad in (53, 60):
+        with pytest.raises(ValueError, match="past the bottom"):
+            fhe.drop_to_level(p, bad)
+        assert p.level == 30
+    fhe.drop_to_level(p, 52)
+    assert p.level == 52 and rel(dec(fhe, p), x * y) < 1e-4
     lim = fhe.export_limbs(a)
     assert lim["c0"].shape == (54 - 10, 2 * N) and lim["level"] == 43
     b = enc(fhe, np.zeros(N), 10)
