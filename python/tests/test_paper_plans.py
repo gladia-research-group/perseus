@@ -227,7 +227,9 @@ def replan(name: str, log: Path) -> tuple[Path, float]:
     else:
         if stages is None:
             stages = ("blocks",)
-            if tool not in LLAMA_TOOLS:
+            # the argmax stage follows the plan's tail: a one-block plan (resnet20_folded) is its blocks stage alone
+            if tool not in LLAMA_TOOLS and len(set(plan_dir.glob("block_*_placement.json"))
+                                               - set(plan_dir.glob("block_*_feedback_placement.json"))) > 1:
                 stages += ("argmax",)
                 if (plan_dir / "block_0_feedback_placement.json").exists():
                     stages += ("feedback",)
