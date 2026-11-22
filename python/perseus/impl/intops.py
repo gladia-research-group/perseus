@@ -1018,7 +1018,7 @@ _INT_OPS = ("div", "rem", "divrem", "sdiv", "srem", "sdivrem", "divc", "remc", "
             "bsetv", "bclrv", "binvv", "bextv", "shadd", "shadduw", "adduw", "orcb", "rev8", "zext16", "czeqz", "cznez",
             "mulh", "mulhsu", "mulhu", "clmul", "clmulh", "clmulr", "w32add", "w32sub", "w32shl", "w32shr", "w32sar",
             "w32shlv", "w32shrv", "w32sarv", "w32mul", "w32div", "w32rem", "w32sdiv", "w32srem")
-_ALIAS = {"mulb": "mul", "mulwb": "mulw", "popcountb": "popcount"}
+_ALIAS = {"mulb": "mul", "mulwb": "mulw", "popcountb": "popcount", "rotlvb": "rotlv", "rotrvb": "rotrv"}
 
 
 def _reference_int(op, a, b, sel, bits):

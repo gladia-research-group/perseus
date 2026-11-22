@@ -1,47 +1,50 @@
-"""Native TFHE bitwise ops on radix-4 words (impl/tfhe.py native programs: one switch in, PBS chains on LWEs, one finish
-out). A word of `nd` digits d (base 4, least significant first) is nd native LWEs at value d / 8; every lookup table has
-<= 8 bins on the native [-1, 1) (16 for the bitwise ops), so a lookup's input noise (the mod switch to 2 n_br and the
-key switch: sd ~6e-3 at nu 1) leaves p_fail ~2^-317 per lookup (8 bins; 16 bins need PC_TFHE_NU=2 for < 2^-128).
+"""Native TFHE integer / bitwise ops on radix-4 words (impl/tfhe.py native programs: one switch in, PBS chains on LWEs,
+one finish out). A word of `nd` digits d (base 4, least significant first; 8 to 64 bits) is nd native LWEs at value
+d / 8. Noise (`analyze`): a lookup's input sd is the model pc-check tfhe-noise validates on the device (the mean-
+compensated mod switch to 2 nu n_br / k and the key switch: 4.45e-3 at nu 1, k = 1), plus the lins' propagated PBS
+output noise (`PBS_OUT_SD`); every table keeps p_fail per lookup < 2^-128:
+- 8 bins on [-1, 1) (half bin 1/8: 2^-300 and more), or a negacyclic function of the whole torus at that spacing;
+- 16 bins (half bin 1/16: 2^-137 with inputs a + 4 b, sum w^2 17): bivariate digit tables and group sums <= 15;
+- many-LUT k = 2 on 8-bin inputs (the mod switch twice coarser: 2^-160): two functions of one input per rotation.
+Every op computes its result in the program (digits at d / 4, linear ones included; predicates / flags at 1 / 4): the
+store only reformats. The rounds of an op share one launch each (`Prog.pbsm`: a table per row).
 
-- add: statuses S_i = sign(a_i + b_i - 3) / 4 (kill / propagate / generate), Kogge-Stone rounds of fan-in 3,
-  S_i = sign(4 S_i + 2 S_(i - d) + S_(i - 2 d)) for d = 1, 3, 9, ... (the last one outputs the carry), then
-  (a_i + b_i + c_(i - 1)) mod 4 in the store's table: 1 + ceil(log3 nd) PBS rounds + the store (32 bits: 4);
-- cmp (a < b): statuses sign(a_i - b_i), a tree of the same fan-in 3 combine from the top digit, the last combine
-  (fan-in <= 2) in the store's table: 1 + ceil(log3 nd) - 1 rounds + the store (32 bits: 16 -> 6 -> 2 -> store, 3);
-  fan-in 3 inputs span (-2, 2): the tables' negacyclic half carries the sign, so the bins are only cut at the zero
-  band and the wrap (margin 1/8: the 8-bin p_fail); `fan=2` keeps the radix-2 prefix (1 + log2 nd rounds);
-- mux (sel ? a : b): o = f(2 (a - b) / 8 + 2 sel) = -+(a - b) / 16 (the negacyclic half turn flips it by sel), out =
-  a + b + 2 o = 2 (sel ? a : b) / 8: one PBS round;
-- xor / and / or: one PBS per digit on a + 4 b.
-`WordProg` lays words out on a slot set (a's digits, b's, then one sel per word) and appends the steps; pc-check
-tfhe-bitwise runs the same programs on the device's native ops directly.
-
-The other integer / bitwise ops (fan-in 3 prefix; every table <= 8 bins on [-1, 1) or a negacyclic function of the whole
-torus, so every lookup keeps the 8-bin margin 1/8 at nu 1):
-- sub / neg: a - b = ~(~a + b) and -a = ~(a + 11..1) (~d = 3 - d is linear): the adder with complemented operands, the
-  output complemented in the store's table; no carry-in. `flags=True`: the digits come out linear
-  (a_i + b_i + c_(i - 1) - 4 c_i) and every word gains two rows, the carry / borrow (the prefix's top carry, free) and
-  the signed overflow: one lookup on t = a_top + b_top + c_in (t / 4 - 7 / 8) turned by the half turn 2 (sa + sb)
-  (the sign bits as half turns from one lookup on the top digits, beside the statuses): ovf = [2 <= t <= 5] without
-  a turn, never with one (equal signs put t in [0, 3] or [4, 7], unequal ones in [2, 5]).
-- cmp(pred, signed): statuses sign(a_i - b_i), the fan-in 3 tree, the last combine read by the predicate's table
-  (lt / gt / le / ge / eq / ne); signed: the top group's first combine is turned by 2 (sa + sb) (a half turn when the
-  signs differ: the top digit's status, never zero then, flips), no extra round.
-- sext / public shifts and rotates: whole digits are a renumbering (lins); one bit is one round of the two-region bits
-  table (d & 1 on 2 d / 8 + 1 / 16, d >> 1 on -2 d / 8 + 1 / 16: both functions of every digit in one batch), out =
-  2 lo_i + hi_(i - 1) (left) / hi_i + 2 lo_(i + 1) (right; arithmetic: the sign 3 hi_top fills).
-- shifts and rotates by an encrypted amount (a word in b's place): a barrel shifter, one stage per amount bit k
-  (2^k bits: bit 0 from the bits table's lo / hi, then 1, 2, 4, ... digits renumbered); a stage is the AND mux
-  and(sel, x_s) + and(~sel, x) in one batch (the and table on 2 x / 8 + sel - 7 / 8: x in the upper half iff sel = 1,
-  so the output stays at d / 8 and stages chain); amounts >= the width (shifts) by an OR tree over the high amount bits
-  folded into the last stage's selectors (sar: the sign fill as a third group).
-- mul: b's bits (bits table), a << 1 (lo / hi), partial products and(bit_j, a or a << 1) at digit i + j // 2, a
-  carry-save tree over the columns (groups of items summing to <= 7: one carry lookup, the digit s - 4 c linear),
-  then the prefix adder on the last two rows; `wide=True` keeps all 2 nd digits. mulc (a public constant): the same
-  tree on shifted copies (no and lookups). popcount: the digits' bit counts through the same tree.
-- min / max: the compare's selector (1 / 0) and the AND mux; abs: the sign and the AND mux of -a and a.
-`analyze` gives every program's rounds, PBS count and p_fail per lookup from the noise model (`LOOKUP_SD`,
-`PBS_OUT_SD`); `case` emits a program with encrypted test inputs for pc-check tfhe-prog.
+- add / sub / neg: statuses (kill / propagate / generate) of a_i + b_i (sub: ~a + b, neg: a + 11..1, the output
+  complemented), a Kogge-Stone prefix whose first combine has fan-in 4 where it saves a round (statuses at 1/2 and 1/8
+  from one many-LUT lookup, 2 S2 + S2' + 2 S8 + S8' on the whole torus) and fan-in 3 after (4 S + 2 S' + S'', the
+  negacyclic half carries the sign); the digits linear (a_i + b_i + c_(i-1) - 4 c_i): 2 / 3 / 4 / 4 rounds at 8 / 16
+  / 32 / 64 bits. `flags`: + the carry / borrow (free) and the signed overflow (one lookup).
+- compare (lt / le / gt / ge, signed: the top group's first combine turned by the sign bits' half turns): statuses
+  of a_i - b_i, the same combines as a tree from the top digit, the predicate's table last.
+- eq / ne: [a_i != b_i], then one zero test of their sum on the whole torus (17 points at 1/8: only (0, 16) is
+  negacyclic and their outputs differ); groups of 16 digits combined the same way.
+- bitwise and / or / xor / andn / orn / xnor: one 16-bin lookup per digit on a + 4 b.
+- mux: o = f(2 (a - b) / 8 + 2 sel) = -+(a - b) / 16, out = a + b + 2 o.
+- public shifts / rotates / sext: whole digits are a renumbering, one bit one round (a digit's two bits from one
+  many-LUT lookup). Encrypted amount: shifts a barrel shifter of AND-mux stages (amounts >= the width by an OR tree
+  folded into the last stage); rotates one gated lookup per digit and stage, x + (sel ? x_s - x : 0) (16-bin on
+  (x_s - x + 3) / 8 + 7 sel / 8, the digits carried linearly).
+- mul: digit products (a b) mod 4 and div 4 by 16-bin lookups on a_i + 4 b_j (one launch; past one batch-path wave
+  the lowest columns' products ride the next launch), a carry-save tree of group lookups (sums <= 15 -> s mod 4,
+  s div 4; the top column s mod 4 only), the prefix adder. mulh / mulhsu / mulhu: the upper word, the signed terms as
+  s ? ~b_i : 0 items. mulc: canonical signed digits of the constant, the same tree; divc / remc: q = (a m) >> S with
+  the magic m, r = a - q d.
+- div / rem (unsigned; signed: |a|, |b| by conditional negation, signs fixed after): radix-2 restoring division without
+  shifting the remainder, the no-borrow of R - (b << k) over the active digits and a virtual overflow position from
+  b's clz thermometer bits, the selection round folding the next step's statuses (gated lookups); b = 0: q = all ones,
+  r = a.
+- clz / ctz / log2: thermometer bits [n >= j] as zero tests, every output digit linear in them: 2 rounds.
+- popcount: digit-pair counts, groups of 4 (sums <= 16 on the whole torus: mod 4, div 4 mod 4, [= 16]), the tree.
+- min / max: the compare's selector and the AND mux; abs: conditional negation.
+- with a public constant: andi / ori / xori (1 round), addi / lti / slti (pair statuses: a function of (a_i, a_(i-1))
+  once c is known, span 2 in round 1), eqi (pair items). Single bits (bset / bclr / binv / bext, public index: 1
+  round; encrypted index: the per-digit mask m_i = [(idx >> 1) == i] (1 + idx & 1), then a + 4 m tables: 3 rounds),
+  orcb, rev8, zext16, shadd (k = 1, 3: (a << 1)'s digits by one bivariate lookup), shadduw / adduw, czeqz / cznez
+  (the zero test as the AND mux's selector), clmul / clmulh / clmulr (bit products per digit pair, parity groups),
+  the 32-bit ops on 64-bit words sign-extended (w32*).
+`WordProg` lays words out on a slot set (a's digits, b's, then one sel per word) and appends the steps; `analyze`
+gives every program's rounds, PBS count and p_fail per lookup; `case` emits a program with encrypted test inputs for
+pc-check tfhe-prog, which runs it on the device's native ops (pc-check tfhe-bitwise runs its own add / cmp / mux / xor).
 """
 from __future__ import annotations
 
@@ -102,6 +105,8 @@ import os as _os
 MULTI = _os.environ.get("PC_TFHE_MULTI", "1") not in ("0", "")
 FAN4 = _os.environ.get("PC_TFHE_FAN4", "1") not in ("0", "")
 DIV_GFORM = _os.environ.get("PC_TFHE_DIV_GFORM", "1") not in ("0", "")
+SPLIT = _os.environ.get("PC_TFHE_SPLIT", "1") not in ("0", "")
+BATCH_WAVE = 188               # LWEs of one batch-path wave (one per block, one block per SM of the RTX PRO 6000)
 
 
 def _fan4_helps(n):
@@ -125,6 +130,8 @@ class WordProg:
         self.multi = MULTI             # one launch per round (pbsm: a table per row)
         self.fan4 = FAN4               # fan-in 4 first prefix combines where they save a round
         self.div_gform = DIV_GFORM     # division: every other selection round as one gated lookup per digit
+        self.split_products = SPLIT    # mul: products beyond one batch wave in the next round
+        self.bits_k2 = True            # a digit's two bits from one many-LUT lookup
         if self.fan not in (2, 3):
             raise ValueError("tfhe_bitwise: prefix fan-in 2 or 3")
         if self.nd & (self.nd - 1):
@@ -522,6 +529,11 @@ class WordProg:
     def _lh(self, rows, src=0):
         """The two-region bits table on rows `rows` of `src` (digits at d / 8): buffer [lo (d & 1) / 8 | hi (d >> 1)
         / 8], len(rows) each."""
+        if self.bits_k2:              # lo and hi from one many-LUT lookup per digit (half the rows), then [lo | hi]
+            n = len(rows)
+            IN = self._lin(src, src, [(r, -1) for r in rows], ca=2, cb=0, c=-0.375)
+            LO, HI = self._pbsk(IN, n, "bitsk")
+            return self._lin(LO, HI, [(r, -1) for r in range(n)] + [(-1, r) for r in range(n)], ca=1, cb=1)
         IN = self._lin(src, src, [(r, -1) for r in rows] + [(-1, r) for r in rows], ca=2, cb=-2, c=0.0625)
         return self._pbs(IN, 2 * len(rows), "bits")
 
@@ -826,12 +838,13 @@ class WordProg:
         self._store(Z, self.R, "out_w", out_slots)
         self.nd, self.R = save
 
-    def _reduce16(self, ITEMS, cols, ncols, target=6):
+    def _reduce16(self, ITEMS, cols, ncols, target=6, pending=None):
         """Carry-save tree with 16-bin group lookups: `cols[q][c]` = [(row of ITEMS, max)]; a round cuts every
         column whose items plus this round's incoming carries could pass `target` into groups summing to <= 15
         (first fit decreasing): a group <= 7 is one many-LUT lookup (s mod 4, s >= 4: `mdcy7`), a larger one two
         (s mod 4, s div 4 <= 3: `md15` / `dv15`); the top column keeps s mod 4 only. Returns (ITEMS, cols)."""
-        while any(sum(m for _, m in x) > target for col in cols for x in col):
+        pend = list(pending or [])                   # [(word, column, (buffer, row) input, table, max)]
+        while pend or any(sum(m for _, m in x) > target for col in cols for x in col):
             g8, g16, gtop7, gtop15, plan = [], [], [], [], []
             for q, col in enumerate(cols):
                 inc = 0
@@ -871,7 +884,7 @@ class WordProg:
             if self.multi:
                 # one launch: every group's sum at 1/8 (the 16-bin input), each table a row (pbsm)
                 allg = g8 + g16 + gtop7 + gtop15
-                S = self._gsum(ITEMS, [[r for r, _ in g] for g in allg], ca=1, c=-0.9375)
+                S = self._gsum(ITEMS, [[r for r, _ in g] for g in allg], ca=1, c=-0.9375) if allg else None
                 n8, n16, n7 = len(g8), len(g16), len(gtop7)
                 jobs, keys = [], []
                 for kind, lo, n, tabs in (("g8", 0, n8, ("md15", "dv15")), ("g16", n8, n16, ("md15", "dv15")),
@@ -880,6 +893,11 @@ class WordProg:
                         if n:
                             jobs.append((S, list(range(lo, lo + n)), t))
                             keys.append(kind)
+                if pend:                             # the late products ride this launch
+                    PIN = self._rows([x[2] for x in pend])
+                    for t in sorted({x[3] for x in pend}):
+                        jobs.append((PIN, [k for k, x in enumerate(pend) if x[3] == t], t))
+                        keys.append("pend:" + t)
                 if jobs:
                     OUT, offs = self._multi(jobs)
                     for kind, off in zip(keys, offs):
@@ -914,6 +932,14 @@ class WordProg:
                     if kind in ("g8", "g16") and sm >= 4 and c + 1 < ncols:
                         ncol[q][c + 1].append((len(srcs), 1 if kind == "g8" else sm // 4))
                         srcs.append(ref(outs[kind][1], gi))
+            if pend:
+                for t in sorted({x[3] for x in pend}):
+                    o = outs["pend:" + t][0]
+                    for j, k in enumerate([k for k, x in enumerate(pend) if x[3] == t]):
+                        q, c, _, _, mx = pend[k]
+                        ncol[q][c].append((len(srcs), mx))
+                        srcs.append((o[1], o[2] + j))
+                pend = []
             ITEMS, cols = self._gather(srcs), ncol
         return ITEMS, cols
 
@@ -983,12 +1009,26 @@ class WordProg:
             corr += [(q, nd, (-1, self._row(1, q, nd - 1)), "sbit") for q in range(w)]
         if corr:
             CI = self._lin(0, 0, [c[2] for c in corr], ca=1, cb=4, c=-0.9375)
+        # one batch-path wave holds BATCH_WAVE LWEs (one per block): products beyond it (those of the lowest columns,
+        # which fill last) ride the tree's first launch instead
+        late = []
+        tot = len(prs) + nhi + len(corr)
+        if self.multi and nhi and not corr and BATCH_WAVE < tot <= 2 * BATCH_WAVE and self.split_products:
+            allp = [(k, "plo") for k in range(len(prs))] + [(k, "phi") for k in range(nhi)]
+            allp.sort(key=lambda x: prs[x[0]][1] + prs[x[0]][2] + (x[1] == "phi"))
+            late = allp[:tot - BATCH_WAVE]
+        lateset = set(late)
         if self.multi and nhi:
-            jobs = [(IN, list(range(len(prs))), "plo"), (IN, list(range(nhi)), "phi")]
+            jobs = [(IN, [k for k in range(len(prs)) if (k, "plo") not in lateset], "plo"),
+                    (IN, [k for k in range(nhi) if (k, "phi") not in lateset], "phi")]
             if corr:
                 jobs += [(CI, [k for k, c in enumerate(corr) if c[3] == t], t) for t in ("sgnot", "sbit")]
             P, offs = self._multi(jobs)
-            LO, HI = (P, offs[0]), (P, offs[1])
+            pos = {}
+            for (b_, rows_, t_), o_ in zip(jobs[:2], offs[:2]):
+                for jj, k in enumerate(rows_):
+                    pos[(k, t_)] = o_ + jj
+            LO, HI = (P, None), (P, None)
         else:
             LO = (self._pbs(IN, len(prs), "plo"), 0)
             HI = (self._pbs(IN, nhi, "phi"), 0) if nhi else None
@@ -1004,13 +1044,18 @@ class WordProg:
                     cols[q][col].append((len(srcs), 3 if t == "sgnot" else 1))
                     srcs.append((P, o + j))
         for k, (q, i, j) in enumerate(prs):
+            if (k, "plo") in lateset:
+                continue
             cols[q][i + j].append((len(srcs), 3))
-            srcs.append((LO[0], LO[1] + k))
+            srcs.append((LO[0], pos[(k, "plo")] if LO[1] is None else LO[1] + k))
         for k, (q, i, j) in enumerate(prs[:nhi]):
+            if (k, "phi") in lateset:
+                continue
             cols[q][i + j + 1].append((len(srcs), 2))
-            srcs.append((HI[0], HI[1] + k))
+            srcs.append((HI[0], pos[(k, "phi")] if HI[1] is None else HI[1] + k))
+        pend = [(prs[k][0], prs[k][1] + prs[k][2] + (t == "phi"), (IN, k), t, 3 if t == "plo" else 2) for k, t in late]
         ITEMS = self._gather(srcs)
-        ITEMS, cols = self._reduce16(ITEMS, cols, nc)
+        ITEMS, cols = self._reduce16(ITEMS, cols, nc, pending=pend)
         if not high:
             return self._final_lin(ITEMS, cols, nc, out_slots)
         O = self._final_lin(ITEMS, cols, nc, None)
@@ -1257,7 +1302,17 @@ class WordProg:
             d *= f
 
     def _rows(self, srcs):
-        """A buffer of rows: srcs[r] = (buffer, row), None (0) or ("sum", (buffer, row), (buffer, row))."""
+        """A buffer of rows: srcs[r] = (buffer, row), None (0), ("c", value) (a noiseless constant) or ("sum",
+        (buffer, row), (buffer, row))."""
+        if any(x is not None and x[0] == "c" for x in srcs):
+            consts = [x[1] if x is not None and x[0] == "c" else 0.0 for x in srcs]
+            rest = [None if x is not None and x[0] == "c" else x for x in srcs]
+            if all(x is None for x in rest):
+                return self._crow(consts)
+            g = self._rows(rest)
+            K = self._crow(consts)
+            self._lin(g, K, [(r, r) for r in range(len(srcs))], ca=1, cb=1, dst=g)
+            return g
         first = [x[1] if x is not None and x[0] == "sum" else x for x in srcs]
         g = self._gather([x if x is not None else (first[0] if first[0] is not None else (0, -1)) for x in first])
         # rows that are None: zero them; "sum" rows: add the second term
@@ -1269,7 +1324,7 @@ class WordProg:
                       ca=1, cb=1, dst=g)
         return g
 
-    def divrem(self, out_slots, want="div", A=None, B=None, fin=None):
+    def divrem(self, out_slots, want="div", A=None, B=None, fin=None, cdiv=None):
         """Unsigned a / b and a mod b (want div / rem / divrem: q's digits then r's), radix-2 restoring division
         without shifting the remainder: for k = bits - 1 .. 0, [R >= b 2^k] is the no-borrow of ~R + (b << k) on
         the digits m = k // 2 .. top (the lower digits of b << k are 0, so no carry comes from below) plus a virtual
@@ -1283,23 +1338,32 @@ class WordProg:
         # operands: buffers with rows [word][digit] (default: the loaded a, b)
         ar = (lambda q, i: (0, self._row(0, q, i))) if A is None else (lambda q, i: (A, q * nd + i))
         br = (lambda q, i: (0, self._row(1, q, i))) if B is None else (lambda q, i: (B, q * nd + i))
-        Bb0 = br(0, 0)[0]
-        sh_in = self._lin(Bb0, Bb0, [(br(q, j)[1], br(q, j - 1)[1] if j else -1) for q in range(w) for j in range(nd)],
-                          ca=1, cb=4, c=-0.9375)
-        B1 = self._pbs(sh_in, w * nd, "shl1d")                             # (b << 1)_j / 8
-        T = self._thermo("clz", op=1) if B is None else self._thermo("clz", src=B)   # [b < 2^(bits - j)] / 4
+        if cdiv is None:
+            Bb0 = br(0, 0)[0]
+            sh_in = self._lin(Bb0, Bb0, [(br(q, j)[1], br(q, j - 1)[1] if j else -1) for q in range(w) for j in range(nd)],
+                              ca=1, cb=4, c=-0.9375)
+            B1 = self._pbs(sh_in, w * nd, "shl1d")                         # (b << 1)_j / 8
+            T = self._thermo("clz", op=1) if B is None else self._thermo("clz", src=B)   # [b < 2^(bits - j)] / 4
+            kmax = bits - 1
+        else:                                       # a public divisor: b << k's digits are constants, steps with
+            cdiv = int(cdiv)                        # b 2^k >= 2^bits skipped (q_k = 0)
+            kmax = bits - cdiv.bit_length()
 
         def bsrc(q, k, i):                                                  # digit i of b << k (None: 0)
+            if cdiv is not None:
+                v = ((cdiv << k) >> (2 * i)) & 3
+                return ("c", v / 8.0) if v else None
             j = i - k // 2
             if j < 0:
                 return None
             return br(q, j) if k % 2 == 0 else (B1, q * nd + j)
         Rs = [[ar(q, i) for i in range(nd)] for q in range(w)]
         clean_r = True
-        QB = self._lin(0, 0, [(-1, -1)] * (w * bits), ca=0, cb=0)          # the quotient bits (+-1/16), [word][bit]
+        # the quotient bits (+-1/16), [word][bit]; skipped steps' bits -1/16 (0)
+        QB = self._crow([-0.0625 if (r % bits) > kmax else 0.0 for r in range(w * bits)])
         qrow = [[(QB, q * bits + kk) for kk in range(bits)] for q in range(w)]
         S = None
-        for k in range(bits - 1, -1, -1):
+        for k in range(kmax, -1, -1):
             m = k // 2
             nw, W = nd - m, nd - m + 1
             n = w * nw
@@ -1310,9 +1374,9 @@ class WordProg:
                 S0 = self._pbs(X, n, "sgn")
                 S = [(S0, r) for r in range(n)]
             # statuses [word][position]: digits, then the virtual top 1/4 - T_k (k = 0: never big)
-            STV = self._rows([S[q * nw + p] if p < nw else ((T, q * bits + k - 1) if k else None)
+            STV = self._rows([S[q * nw + p] if p < nw else ((T, q * bits + k - 1) if k and cdiv is None else None)
                               for q in range(w) for p in range(W)])
-            if k:
+            if k and cdiv is None:
                 self._lin(STV, STV, [(q * W + p, -1) for q in range(w) for p in range(W)], ca=1, cb=0, dst=STV)
                 neg = self._lin(STV, STV, [(q * W + p if p < nw else -1, q * W + p if p == nw else -1) for q in range(w) for p in range(W)],
                                 ca=1, cb=-1, c=0.0)
@@ -1857,6 +1921,8 @@ class WordProg:
             Rm = self._lin(0, 0, [(r, -1) for r in range(R)], ca=1, cb=0)
         elif d & (d - 1) == 0 and want != "divrem":        # a power of two: a shift / a mask
             return self.shift(out_slots, "shr", d.bit_length() - 1) if want == "div" else self.bitwise_imm(out_slots, "and", d - 1)
+        elif getattr(self, "_divc_form", None) == "long" or (getattr(self, "_divc_form", None) is None and _divc_long_wins(self, d, want)):
+            return self.divrem(out_slots, want, cdiv=d)
         else:
             l = (d - 1).bit_length()
             S = bits + l + ((bits + l) % 2)
@@ -1926,6 +1992,47 @@ class WordProg:
         F = self._pbs(X, w, "sext3")                                          # 3 / 4 when bit 31 is set
         O = self._lin(src, F, [(q * 16 + i, -1) if i < 16 else (-1, q) for q in range(w) for i in range(32)], ca=1, cb=1)
         self._store(O, R, "dig4_w", out_slots)
+
+    def rotate_enc(self, out_slots, kind):
+        """a rotated by the encrypted amount b mod bits (kind rotl / rotr): round 1 the bits of a's digits (lo, hi:
+        one many-LUT lookup) and of b's low digits at 7 / 8 (the gates' selector weight); then one stage per amount bit
+        (1 bit, then 1, 2, 4 .. digits), each ONE gated lookup per digit: x' = x + (sel ? x_s - x : 0) on the 16-bin
+        input (x_s - x + 3) / 8 + 7 sel / 8, the digits carried linearly (their noise grows by one PBS output per
+        stage: 2^-133 at 64 bits)."""
+        nd, w, R, bits = self.nd, self.w, self.R, 2 * self.nd
+        L = bits.bit_length() - 1
+        na = (L + 1) // 2
+        X = self._lin(0, 0, [(r, -1) for r in range(R)], ca=2, cb=0, c=-0.375)
+        LO, HI = self._pbsk(X, R, "bitsk")
+        XA = self._lin(0, 0, [(self._row(1, q, i), -1) for q in range(w) for i in range(na)], ca=2, cb=0, c=-0.375)
+        A7L, A7H = self._pbsk(XA, w * na, "bits7")                         # amount bits at 7 / 8
+        sel7 = lambda q, k: ((A7L if k % 2 == 0 else A7H), q * na + k // 2)
+        left = kind == "rotl"
+        # stage 0 (one bit): x_s digit i = (left) 2 lo_i + hi_(i-1) | (right) hi_i + 2 lo_(i+1) (cyclic)
+        rowsA, rowsB = [], []
+        for q in range(w):
+            for i in range(nd):
+                if left:
+                    rowsA.append((q * nd + i, q * nd + (i - 1) % nd))
+                else:
+                    rowsB.append((q * nd + (i + 1) % nd, q * nd + i))
+        XS = self._lin(LO, HI, rowsA if left else rowsB, ca=2, cb=1)       # x_s at d / 8
+        cur = [(0, self._row(0, q, i)) for q in range(w) for i in range(nd)]     # (buffer, row) of x's digits
+        xs_src = [(XS, r) for r in range(R)]
+        for k in range(L):
+            if k > 0:
+                s = 1 << (k - 1)
+                xs_src = [cur[q * nd + ((i - s) % nd if left else (i + s) % nd)] for q in range(w) for i in range(nd)]
+            Xc = self._rows(cur)
+            Xs = self._rows(xs_src)
+            S7 = self._rows([sel7(q, k) for q in range(w)])
+            G = self._lin(Xs, Xc, [(r, r) for r in range(R)], ca=1, cb=-1, c=0.375 - 0.9375)
+            self._lin(G, S7, [(r, r // nd) for r in range(R)], ca=1, cb=1, dst=G)
+            Gd = self._pbs(G, R, "gdel")                                   # sel ? (x_s - x) / 8 : 0
+            N = self._lin(Xc, Gd, [(r, r) for r in range(R)], ca=1, cb=1)
+            cur = [(N, r) for r in range(R)]
+        O = self._rows(cur)
+        self._store(self._lin(O, O, [(r, -1) for r in range(R)], ca=2, cb=0), R, "dig4_w", out_slots)
 
     def minmax(self, out_slots, kind="min", signed=False):
         """min / max of a, b per word."""
@@ -2058,6 +2165,8 @@ TABLESK = {
             lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3) >= 2) / 8.0], False),
     "ul": ([lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3) > 0) / 8.0,
             lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3).astype(np.int64) & 1) / 8.0], False),
+    "bits7": ([lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3).astype(np.int64) & 1) * 0.875,
+               lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3).astype(np.int64) >> 1) * 0.875], False),
     "bitsk": ([lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3).astype(np.int64) & 1) / 8.0,
                lambda m: (np.clip(_r4(np.asarray(m) + 0.375), 0, 3).astype(np.int64) >> 1) / 8.0], False),
 }
@@ -2277,6 +2386,42 @@ def load_values(slot_values):
 from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401  (the shared op registry)
 
 
+# measured cost of one bootstrap launch by its rows (RTX PRO 6000, latency keys of 5 / 4 key bits; pc-check tfhe-prog,
+# 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
+COST_MS = ((1, 1.15), (4, 1.22), (8, 1.58), (12, 1.69), (16, 1.77), (24, 2.0), (32, 2.06), (40, 2.53), (48, 2.68),
+           (64, 2.89), (94, 4.2), (188, 5.77), (256, 9.6), (384, 11.0), (512, 15.0), (768, 20.8), (1024, 28.6))
+
+
+def est_ms(prog):
+    """The latency model of a program: the launches of every round (pbs / pbsm steps by their PBS depth) at COST_MS."""
+    D, tot = {}, 0.0
+    for st in prog.steps:
+        op = st["op"]
+        if op == "load":
+            for d in (st["dst"] if isinstance(st["dst"], list) else [st["dst"]]):
+                D[d] = 0
+        elif op == "lin":
+            D[st["dst"]] = max(D.get(st["a"], 0), D.get(st["b"], 0), D.get(st["dst"], 0) if st["dst"] in (st["a"], st["b"]) else 0)
+        elif op in ("pbs", "pbsm"):
+            r = st["rows"]
+            tot += next((t for b, t in COST_MS if r <= b), COST_MS[-1][1] * r / COST_MS[-1][0])
+            for d in (st["dst"] if isinstance(st["dst"], list) else [st["dst"]]):
+                D[d] = D.get(st["src"], 0) + 1
+    return tot
+
+
+def _divc_long_wins(wp, d, want):
+    """Whether the public-divisor long division (few quotient bits for large d) beats the magic multiply."""
+    t = {}
+    for form in ("long", "magic"):
+        x = WordProg("t", wp.w, wp.nd)
+        x.multi, x.fan4 = wp.multi, wp.fan4
+        x._divc_form = form
+        x.divc("t.o", d, want)
+        t[form] = est_ms(x.pr)
+    return t["long"] < t["magic"]
+
+
 def build(op, name, words, nd):
     """A WordProg computing `op` on `words` words of nd digits (inputs: a, b, sel as `WordProg.rows_in(True)`)."""
     wp = WordProg(name, words, nd)
@@ -2310,6 +2455,10 @@ def build_into(wp, op, out=None):
         wp.sext(out, k)
     elif base in ("shl", "shr", "sar", "rotl", "rotr"):
         wp.shift(out, base, k)
+    elif base in ("rotlv", "rotrv"):
+        wp.rotate_enc(out, base[:-1])
+    elif base in ("rotlvb", "rotrvb"):               # the AND-mux barrel shifter
+        wp.shift_enc(out, base[:-2])
     elif base.endswith("v") and base[:-1] in ("shl", "shr", "sar", "rotl", "rotr"):
         wp.shift_enc(out, base[:-1])
     elif base in ("mul", "mulw"):

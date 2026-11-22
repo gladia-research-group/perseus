@@ -40,16 +40,16 @@ def test_bitwise_exact(op, bits):
 
 _OPS = ["add", "sub", "neg", "addf", "subf", "cmp", "lt", "le", "gt", "ge", "eq", "ne", "slt", "sle", "sgt", "sge",
         "seq", "sne", "sext4", "shl0", "shl1", "shl2", "shl7", "shlB", "shr1", "shr3", "shrB", "sar1", "sar4", "sarM",
-        "sarB", "rotl1", "rotl5", "rotr3", "rotrB", "shlv", "shrv", "sarv", "rotlv", "rotrv", "mul", "mulw", "mulb",
+        "sarB", "rotl1", "rotl5", "rotr3", "rotrB", "shlv", "shrv", "sarv", "rotlv", "rotrv", "rotlvb", "rotrvb", "mul", "mulw", "mulb",
         "mulc0", "mulc1", "mulc3", "mulc12345", "mulcM", "min", "max", "smin", "smax", "abs", "popcount", "mux", "xor",
         "and", "or", "andn", "orn", "xnor", "clz", "ctz", "log2", "div", "rem", "divrem", "sdiv", "srem", "sdivrem",
-        "divc7", "divc10", "remc7", "divremc12345", "divc0", "remc0", "divc16", "mulh", "mulhsu", "mulhu", "clmul",
+        "divc7", "divc10", "remc7", "divremc12345", "divc0", "remc0", "divc16", "divc2654435769", "remc2654435769", "mulh", "mulhsu", "mulhu", "clmul",
         "clmulh", "clmulr", "addi12345", "addiM", "andi12345", "ori77", "xori99", "lti12345", "slti3", "eqi12345",
         "eqi0", "bset5", "bclr0", "binv3", "bextM", "bsetv", "bclrv", "binvv", "bextv", "shadd1", "shadd2", "shadd3",
         "orcb", "rev8", "zext16", "czeqz", "cznez"]
 # the 64-bit set (the 32-bit-in-64 word forms only there)
 _OPS64 = ["add", "sub", "subf", "cmp", "slt", "eq", "xor", "mux", "min", "smax", "abs", "popcount", "clz", "ctz", "log2",
-          "shlv", "rotlv", "mul", "mulh", "divc7", "remc10", "addi12345", "lti12345", "eqi12345", "bsetv", "bextv",
+          "shlv", "rotlv", "rotrv", "mul", "mulh", "divc7", "remc10", "divc11400714819323198485", "remc11400714819323198485", "addi12345", "lti12345", "eqi12345", "bsetv", "bextv",
           "shadd1", "shadduw2", "adduw", "orcb", "rev8", "czeqz", "clmulr", "w32add", "w32sub", "w32shl5", "w32sar7",
           "w32shrv", "w32mul", "w32div", "w32srem"]
 
