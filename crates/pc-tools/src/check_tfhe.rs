@@ -978,6 +978,7 @@ fn switch_params(args: &[String], n: usize) -> Res<Params> {
         p.pbs = g;
     }
     p.lat_group = arg(args, "--lat-group").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    p.lat_group2 = arg(args, "--lat-group2").map(|s| s.parse()).transpose()?.unwrap_or(0);
     // --ks b,l: the LWE key switch's gadget (base log, levels)
     if let Some(v) = arg(args, "--ks") {
         let (b, l) = v.split_once(',').ok_or("--ks b,l")?;
@@ -2109,7 +2110,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
     }
     let u = |v: &Value, k: &str| -> Res<usize> { Ok(v.get(k).and_then(Value::as_u64).ok_or_else(|| format!("case without {k}"))? as usize) };
     let mut rows = 0usize;
-    let (mut nbuf, mut nidx, mut ntab) = (0usize, 0usize, 0usize);
+    let (mut nbuf, mut nidx, mut ntab, mut nmacc) = (0usize, 0usize, 0usize, 0usize);
     for c in &cases {
         rows = rows.max(u(c, "rows")?);
         nbuf = nbuf.max(u(c, "bufs")? + 1);
@@ -2117,6 +2118,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
         let steps = pr["steps"].as_array().ok_or("prog without steps")?;
         nidx = nidx.max(steps.iter().filter_map(|st| st.get("idx").and_then(Value::as_array)).map(|a| a.len()).sum());
         ntab = ntab.max(pr["luts"].as_object().map_or(0, |o| o.values().map(|l| l["tables"].as_array().map_or(0, |t| t.len())).sum()));
+        nmacc = nmacc.max(steps.iter().filter(|st| st["op"] == "pbsm").map(|st| st["rows"].as_u64().unwrap_or(0) as usize).sum());
     }
     let chain = Chain::generate(&ChainSpec::n32())?;
     let n = chain.n;
@@ -2132,7 +2134,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
     // the switch's capacity: one pass of at most 32768 LWEs (a longer pbs runs in passes: the kernels' grid y)
     let cap = rows.min(1 << 15);
     mp.reserve("tfhe", pc_gpu::tfhe::TfheSwitch::bytes(n, &params, cap));
-    mp.reserve("prog", 4 * (nbuf * rows * row + nidx + ntab * 2 * tvl) + (8 << 20));
+    mp.reserve("prog", 4 * (nbuf * rows * row + nidx + ntab * 2 * tvl + nmacc * 4 * nb) + (8 << 20));
     let arena = mp.allocate(&dev)?;
     let ex = Executor::<W>::new(&dev, &arena, &mp)?;
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
@@ -2148,6 +2150,8 @@ fn run_prog(args: &[String]) -> Res<bool> {
     let mut bufs: Vec<pc_cuda::DBuf<'_, pc_cuda::Compute, u32>> = (0..nbuf).map(|_| arena.alloc::<pc_cuda::Compute, u32>("prog", rows * row)).collect::<std::result::Result<_, _>>()?;
     let mut d_idx = arena.alloc::<pc_cuda::Compute, u32>("prog", nidx.max(2))?;
     let mut d_tv = arena.alloc::<pc_cuda::Compute, u32>("prog", ntab.max(1) * 2 * tvl)?;
+    // pbsm: one trivial accumulator per row [row][2 part][2 prime][n_br] (part 0 the row's table, part 1 zero)
+    let mut d_macc = arena.alloc::<pc_cuda::Compute, u32>("prog", nmacc.max(1) * 4 * nb)?;
     arena.freeze();
     let modp = |x: i64| x.rem_euclid(p0 as i64) as u64;
     let enc_v = |v: f64| modp((v * p0 as f64 / 4.0).round() as i64);
@@ -2161,7 +2165,8 @@ fn run_prog(args: &[String]) -> Res<bool> {
     #[derive(Clone, Copy)]
     enum St {
         Lin(usize, usize, usize, usize, usize, u64, u64, u64),
-        Pbs(usize, usize, usize, usize),
+        Pbs(usize, usize, usize, [usize; 4], usize),
+        PbsM(usize, usize, usize, usize),
     }
     let mut t = Tally::default();
     let lt_ = &blt.inner;
@@ -2171,20 +2176,29 @@ fn run_prog(args: &[String]) -> Res<bool> {
         // the tables: native values on the grid of tvl points (v at phase v q / 4, the upper half negated)
         let q = params.q_br;
         let mut tab_ix: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut tab_k: std::collections::BTreeMap<String, usize> = Default::default();
         let mut tvw: Vec<u32> = Vec::new();
         for (ln, l) in pr["luts"].as_object().ok_or("luts")? {
             let tables = l["tables"].as_array().ok_or("tables")?;
-            if tables.len() != 1 {
-                return Err(format!("{name}: lut {ln}: {} interleaved tables (one is supported here)", tables.len()).into());
+            // k interleaved tables (many-LUT: one rotation, k outputs), each on tvl / k points
+            let kt = tables.len();
+            if kt == 0 || tvl % kt != 0 {
+                return Err(format!("{name}: lut {ln}: {kt} interleaved tables").into());
             }
-            let vals: Vec<f64> = tables[0].as_array().ok_or("table")?.iter().map(|x| x.as_f64().unwrap_or(f64::NAN)).collect();
-            if vals.len() != tvl || vals.iter().any(|x| !x.is_finite() || x.abs() > 2.0) {
-                return Err(format!("{name}: lut {ln}: {} points (want {tvl}), |v| <= 2", vals.len()).into());
+            let sub = tvl / kt;
+            let mut tvs: Vec<Vec<u64>> = Vec::new();
+            for t in tables {
+                let vals: Vec<f64> = t.as_array().ok_or("table")?.iter().map(|x| x.as_f64().unwrap_or(f64::NAN)).collect();
+                if vals.len() != sub || vals.iter().any(|x| !x.is_finite() || x.abs() > 2.0) {
+                    return Err(format!("{name}: lut {ln}: {} points (want {sub}), |v| <= 2", vals.len()).into());
+                }
+                tvs.push(vals.iter().enumerate().map(|(j, &x)| {
+                    let y = (q as f64 * x / 4.0).round() as i64;
+                    (if j < sub / 2 { y } else { -y }).rem_euclid(q as i64) as u64
+                }).collect());
             }
-            let tv: Vec<u64> = vals.iter().enumerate().map(|(j, &x)| {
-                let y = (q as f64 * x / 4.0).round() as i64;
-                (if j < tvl / 2 { y } else { -y }).rem_euclid(q as i64) as u64
-            }).collect();
+            let tv = pc_tfhe::pbs::interleave(&tvs);
+            tab_k.insert(ln.clone(), kt);
             tab_ix.insert(ln.clone(), tvw.len() / (2 * tvl));
             tvw.extend(sw.bsk.rns.residues(&tv).iter().flat_map(|r| r.iter().map(|&x| x as u32)));
         }
@@ -2195,6 +2209,7 @@ fn run_prog(args: &[String]) -> Res<bool> {
         let (mut load_dst, mut store) = (None, None);
         let mut idx_off = 0usize;
         let (mut npbs, mut launches) = (0usize, 0usize);
+        let mut macc: Vec<u32> = Vec::new();
         for st in steps {
             let b = |k: &str| -> Res<usize> { u(st, k) };
             match st["op"].as_str().unwrap_or("") {
@@ -2213,12 +2228,36 @@ fn run_prog(args: &[String]) -> Res<bool> {
                 }
                 "pbs" => {
                     let dst = st["dst"].as_array().ok_or("pbs dst")?;
-                    if dst.len() != 1 {
-                        return Err(format!("{name}: pbs with {} outputs", dst.len()).into());
-                    }
                     let lut = st["lut"].as_str().ok_or("lut")?;
+                    if dst.len() != tab_k[lut] || dst.len() > 4 {
+                        return Err(format!("{name}: pbs with {} outputs on {} tables", dst.len(), tab_k[lut]).into());
+                    }
                     let r = b("rows")?;
-                    prog.push(St::Pbs(b("src")?, r, tab_ix[lut], dst[0].as_u64().ok_or("dst")? as usize));
+                    let mut d4 = [0usize; 4];
+                    for (j, d) in dst.iter().enumerate() {
+                        d4[j] = d.as_u64().ok_or("dst")? as usize;
+                    }
+                    prog.push(St::Pbs(b("src")?, r, tab_ix[lut], d4, dst.len()));
+                    npbs += r;
+                    launches += 1;
+                }
+                "pbsm" => {
+                    if nu != 1 {
+                        return Err(format!("{name}: pbsm runs at nu 1").into());
+                    }
+                    let ls = st["luts"].as_array().ok_or("pbsm luts")?;
+                    let off = macc.len() / (4 * nb);
+                    for l in ls {
+                        let ln = l.as_str().ok_or("pbsm lut")?;
+                        if tab_k[ln] != 1 {
+                            return Err(format!("{name}: pbsm with a {}-table lut", tab_k[ln]).into());
+                        }
+                        let k = tab_ix[ln];
+                        macc.extend_from_slice(&tvw[k * 2 * tvl..(k + 1) * 2 * tvl]);
+                        macc.extend(std::iter::repeat_n(0u32, 2 * nb));
+                    }
+                    let r = ls.len();
+                    prog.push(St::PbsM(b("src")?, r, off, b("dst")?));
                     npbs += r;
                     launches += 1;
                 }
@@ -2227,6 +2266,10 @@ fn run_prog(args: &[String]) -> Res<bool> {
             }
         }
         let (Some(ld), Some((ssrc, srows, slut))) = (load_dst, store) else { return Err(format!("{name}: a program loads and stores").into()) };
+        if !macc.is_empty() {
+            d_macc.upload(s, &macc)?;
+        }
+        let maccp = |off: usize| (d_macc.vptr() as *const u32).wrapping_add(off * 4 * nb) as *const c_void;
         let m_in: Vec<f64> = c["m_in"].as_array().ok_or("m_in")?.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
         let mut rng = test_prng(0x9e0);
         let enc: Vec<u32> = m_in.iter().flat_map(|&v| {
@@ -2244,7 +2287,11 @@ fn run_prog(args: &[String]) -> Res<bool> {
             for st in &prog {
                 match *st {
                     St::Lin(d, a, b2, off, r, ca, cb, cc) => ts.native_lin_c(&ctx, s, ptrs[d], ptrs[a], ptrs[b2], idxp(off), r, ca, cb, cc)?,
-                    St::Pbs(src, r, k, d) => ts.native_pbs(&ctx, s, lt_, ptrs[src], r, tvp(k), &[0], &[ptrs[d]])?,
+                    St::PbsM(src, r, off, d) => ts.native_plut_each(&ctx, s, lt_, ptrs[src], r, maccp(off), &[0], &[ptrs[d]])?,
+                    St::Pbs(src, r, k, d, kl) => {
+                        let dsts: Vec<*mut c_void> = d[..kl].iter().map(|&x| ptrs[x]).collect();
+                        ts.native_pbs(&ctx, s, lt_, ptrs[src], r, tvp(k), &vec![0u64; kl], &dsts)?
+                    }
                 }
             }
             s.sync()?;

@@ -926,7 +926,8 @@ PREDS = ("lt", "le", "gt", "ge", "eq", "ne")
 
 def parse(op):
     """op -> (base, its integer parameter or None)."""
-    m = _re.fullmatch(r"(sext|shl|shr|sar|rotl|rotr|mulc)(\d+)", op)
+    m = _re.fullmatch(r"(sext|shl|shr|sar|rotl|rotr|mulcb|mulc|divc|remc|divremc|addi|andi|ori|xori|lti|slti|eqi|bset|bclr|binv|bext|"
+                      r"shadd|shadduw|w32shl|w32shr|w32sar)(\d+)", op)
     if m:
         return m.group(1), int(m.group(2))
     return op, None
@@ -945,6 +946,11 @@ def _sgnd(x, bits):
 def reference(op, a, b, sel, bits):
     """The exact outputs of `op` per word (two's complement words of `bits` bits): a list of integer arrays, the
     word value (or the predicate) first, then the flags."""
+    op = _ALIAS.get(op, op)
+    if op.startswith("mulcb"):
+        op = "mulc" + op[5:]
+    if bits > 32 or parse(op)[0] in _INT_OPS:
+        return _reference_int(op, a, b, sel, bits)
     a, b, sel = (np.asarray(v, dtype=np.int64) for v in (a, b, sel))
     msk = (1 << bits) - 1
     sa, sb = _sgnd(a, bits), _sgnd(b, bits)
@@ -1006,14 +1012,164 @@ def reference(op, a, b, sel, bits):
     raise ValueError(f"intops: op {op}?")
 
 
+# ops whose reference runs on Python integers (any width; the int64 path covers the rest up to 32 bits)
+_INT_OPS = ("div", "rem", "divrem", "sdiv", "srem", "sdivrem", "divc", "remc", "divremc", "clz", "ctz", "log2",
+            "andn", "orn", "xnor", "addi", "andi", "ori", "xori", "lti", "slti", "eqi", "bset", "bclr", "binv", "bext",
+            "bsetv", "bclrv", "binvv", "bextv", "shadd", "shadduw", "adduw", "orcb", "rev8", "zext16", "czeqz", "cznez",
+            "mulh", "mulhsu", "mulhu", "clmul", "clmulh", "clmulr", "w32add", "w32sub", "w32shl", "w32shr", "w32sar",
+            "w32shlv", "w32shrv", "w32sarv", "w32mul", "w32div", "w32rem", "w32sdiv", "w32srem")
+_ALIAS = {"mulb": "mul", "mulwb": "mulw", "popcountb": "popcount", "rotlvb": "rotlv", "rotrvb": "rotrv"}
+
+
+def _reference_int(op, a, b, sel, bits):
+    """`reference` on Python integers (words of any width; object arrays out). div / rem by 0: q = all ones, r = a
+    (the common convention); signed division truncates toward 0 (MIN / -1 wraps to MIN, remainder 0); log2(0) = all
+    ones (bits - 1 - clz)."""
+    top, msk = 1 << bits, (1 << bits) - 1
+    a, b, sel = ([int(x) for x in np.asarray(v).reshape(-1)] for v in (a, b, sel))
+    sg = lambda x: x - top if x >= top >> 1 else x
+    base, k = parse(op)
+    O = lambda v: np.array(v, dtype=object)
+
+    def udiv(x, y):
+        return (msk, x) if y == 0 else (x // y, x % y)
+
+    def sdiv(x, y):
+        x, y = sg(x), sg(y)
+        if y == 0:
+            return ((1 if x < 0 else msk) & msk, x & msk)     # q = -1 for x >= 0, 1 for x < 0 (the sign-corrected all ones); r = x
+        q = abs(x) // abs(y)
+        q = -q if (x < 0) != (y < 0) else q
+        return (q & msk, (x - q * y) & msk)
+    if base in ("div", "rem", "divrem", "divc", "remc", "divremc"):
+        ys = [k & msk] * len(a) if k is not None else b
+        qr = [udiv(x, y) for x, y in zip(a, ys)]
+        q, r = O([v[0] for v in qr]), O([v[1] for v in qr])
+        return [q] if base in ("div", "divc") else [r] if base in ("rem", "remc") else [q + (r << bits)]
+    if base in ("sdiv", "srem", "sdivrem"):
+        qr = [sdiv(x, y) for x, y in zip(a, b)]
+        q, r = O([v[0] for v in qr]), O([v[1] for v in qr])
+        return [q] if base == "sdiv" else [r] if base == "srem" else [q + (r << bits)]
+    if base.startswith("w32"):                       # the 32-bit op on the low halves, sign extended to the word
+        inner = base[3:] + ("" if k is None else str(k))
+        lo32 = lambda v: [x & 0xFFFFFFFF for x in v]
+        r = _reference_int(inner, np.array(lo32(a), dtype=object), np.array(lo32(b), dtype=object), np.array(sel, dtype=object), 32)[0]
+        return [O([(x - (1 << 32) if x >> 31 & 1 else x) & msk for x in r])]
+    if base in ("addi", "andi", "ori", "xori"):
+        f = {"addi": lambda x: (x + k) & msk, "andi": lambda x: x & k, "ori": lambda x: (x | k) & msk, "xori": lambda x: (x ^ k) & msk}[base]
+        return [O([f(x) for x in a])]
+    if base in ("lti", "eqi"):
+        return [O([int(x < (k & msk) if base == "lti" else x == (k & msk)) for x in a])]
+    if base == "slti":
+        return [O([int(sg(x) < sg(k & msk)) for x in a])]
+    if base in ("bset", "bclr", "binv", "bext", "bsetv", "bclrv", "binvv", "bextv"):
+        idx = [k % bits] * len(a) if k is not None else [y % bits for y in b]
+        op1 = base[:-1] if base in ("bsetv", "bclrv", "binvv", "bextv") else base
+        f = {"bset": lambda x, j: x | 1 << j, "bclr": lambda x, j: x & ~(1 << j) & msk, "binv": lambda x, j: x ^ 1 << j,
+             "bext": lambda x, j: x >> j & 1}[op1]
+        return [O([f(x, j) for x, j in zip(a, idx)])]
+    if base in ("shadd", "shadduw", "adduw"):
+        kk = 0 if base == "adduw" else k
+        src = [x & 0xFFFFFFFF for x in a] if base != "shadd" else a
+        return [O([((x << kk) + y) & msk for x, y in zip(src, b)])]
+    if base == "orcb":
+        return [O([sum((0xFF if (x >> (8 * t)) & 0xFF else 0) << (8 * t) for t in range(bits // 8)) for x in a])]
+    if base == "rev8":
+        return [O([sum(((x >> (8 * t)) & 0xFF) << (8 * (bits // 8 - 1 - t)) for t in range(bits // 8)) for x in a])]
+    if base == "zext16":
+        return [O([x & 0xFFFF for x in a])]
+    if base in ("czeqz", "cznez"):
+        return [O([(0 if y == 0 else x) if base == "czeqz" else (0 if y != 0 else x) for x, y in zip(a, b)])]
+    if base in ("mulh", "mulhsu", "mulhu"):
+        xs = [sg(x) for x in a] if base in ("mulh", "mulhsu") else a
+        ys = [sg(y) for y in b] if base == "mulh" else b
+        return [O([((x * y) >> bits) & msk for x, y in zip(xs, ys)])]
+    if base in ("clmul", "clmulh", "clmulr"):
+        def cl(x, y):
+            r = 0
+            for i in range(bits):
+                if y >> i & 1:
+                    r ^= x << i
+            return r
+        sh = {"clmul": 0, "clmulh": bits, "clmulr": bits - 1}[base]
+        return [O([(cl(x, y) >> sh) & msk for x, y in zip(a, b)])]
+    if base == "clz":
+        return [O([bits - x.bit_length() for x in a])]
+    if base == "ctz":
+        return [O([bits if x == 0 else (x & -x).bit_length() - 1 for x in a])]
+    if base == "log2":
+        return [O([(x.bit_length() - 1) & msk for x in a])]
+    sa, sb = [sg(x) for x in a], [sg(x) for x in b]
+    if base in ("add", "addf", "sub", "subf"):
+        sub = base.startswith("sub")
+        r = [O([((x - y) if sub else (x + y)) & msk for x, y in zip(a, b)])]
+        if base.endswith("f"):
+            cy = [int(x < y) if sub else (x + y) >> bits for x, y in zip(a, b)]
+            ov = [int(not -(top >> 1) <= ((x - y) if sub else (x + y)) < top >> 1) for x, y in zip(sa, sb)]
+            r += [O(cy), O(ov)]
+        return r
+    if base == "neg":
+        return [O([(-x) & msk for x in a])]
+    if base == "cmp" or base in PREDS or (base[:1] == "s" and base[1:] in PREDS):
+        x_, y_ = (sa, sb) if base not in PREDS and base != "cmp" else (a, b)
+        pr = "lt" if base == "cmp" else base if base in PREDS else base[1:]
+        f = {"lt": lambda x, y: x < y, "le": lambda x, y: x <= y, "gt": lambda x, y: x > y, "ge": lambda x, y: x >= y,
+             "eq": lambda x, y: x == y, "ne": lambda x, y: x != y}[pr]
+        return [O([int(f(x, y)) for x, y in zip(x_, y_)])]
+    if base == "sext":
+        return [O([sg_k & msk for sg_k in ((x & ((1 << k) - 1)) - ((1 << k) if x >> (k - 1) & 1 else 0) for x in a)])]
+    if base in ("shl", "shr", "sar", "rotl", "rotr") or (base.endswith("v") and base[:-1] in ("shl", "shr", "sar", "rotl", "rotr")):
+        kind = base[:-1] if base.endswith("v") else base
+        amts = [k] * len(a) if k is not None else b
+        out = []
+        for x, sx, s_ in zip(a, sa, amts):
+            if kind.startswith("rot"):
+                s_ %= bits
+                sh = s_ if kind == "rotl" else (bits - s_) % bits
+                out.append(((x << sh) | (x >> (bits - sh))) & msk if sh else x)
+            elif s_ >= bits:
+                out.append(msk if kind == "sar" and sx < 0 else 0)
+            else:
+                out.append((x << s_) & msk if kind == "shl" else x >> s_ if kind == "shr" else (sx >> s_) & msk)
+        return [O(out)]
+    if base == "mul":
+        return [O([(x * y) & msk for x, y in zip(a, b)])]
+    if base == "mulw":
+        return [O([x * y for x, y in zip(a, b)])]
+    if base == "mulc":
+        return [O([(x * (k & msk)) & msk for x in a])]
+    if base in ("min", "max", "smin", "smax"):
+        xs, ys = (sa, sb) if base.startswith("s") else (a, b)
+        mn = base.endswith("min")
+        return [O([x if (xx < yy) == mn else y for x, y, xx, yy in zip(a, b, xs, ys)])]
+    if base == "abs":
+        return [O([abs(x) & msk for x in sa])]
+    if base == "popcount":
+        return [O([bin(x).count("1") for x in a])]
+    if base == "mux":
+        return [O([x if s_ == 1 else y for x, y, s_ in zip(a, b, sel)])]
+    if base in ("xor", "and", "or", "andn", "orn", "xnor"):
+        f = {"xor": lambda x, y: x ^ y, "and": lambda x, y: x & y, "or": lambda x, y: x | y,
+             "andn": lambda x, y: x & ~y & msk, "orn": lambda x, y: (x | ~y) & msk, "xnor": lambda x, y: ~(x ^ y) & msk}[base]
+        return [O([f(x, y) for x, y in zip(a, b)])]
+    if base == "id":
+        return [O(a)]
+    raise ValueError(f"intops: op {op}?")
+
+
 def inputs(words, bits, seed=0, op=None):
     """Random words with the edge cases first: 0, -1, MIN, MAX, MIN - 1, equal pairs, a + b = -1 (the longest carry
     chain); shift amounts 0, 1, bits - 1, bits, bits + 1, 2^bits - 1 and random below 2 bits."""
     rng = np.random.default_rng(seed)
     top = 1 << bits
-    edge = np.array([0, top - 1, top >> 1, (top >> 1) - 1, 1, top - 2], dtype=np.int64)
-    a = rng.integers(0, top, words, dtype=np.int64)
-    b = rng.integers(0, top, words, dtype=np.int64)
+    if bits > 32:                                                  # Python integers (object arrays)
+        edge = np.array([0, top - 1, top >> 1, (top >> 1) - 1, 1, top - 2], dtype=object)
+        rnd = lambda: np.array([int(x) | int(y) << 32 for x, y in rng.integers(0, 1 << 32, (words, 2), dtype=np.int64)], dtype=object) & (top - 1)
+        a, b = rnd(), rnd()
+    else:
+        edge = np.array([0, top - 1, top >> 1, (top >> 1) - 1, 1, top - 2], dtype=np.int64)
+        a = rng.integers(0, top, words, dtype=np.int64)
+        b = rng.integers(0, top, words, dtype=np.int64)
     sel = rng.integers(0, 2, words).astype(np.int64)
     pairs = [(x, y) for x in edge for y in edge]
     q = min(len(pairs), words // 2)                                # every edge pair once words >= 72
@@ -1025,8 +1181,9 @@ def inputs(words, bits, seed=0, op=None):
         b[q + nq:q + 2 * nq] = (~a[q + nq:q + 2 * nq]) & (top - 1)   # a + b = -1
     base = parse(op)[0] if op else ""
     if base.endswith("v"):                                         # shift amounts
-        amts = np.array([0, 1, bits - 1, bits, bits + 1, top - 1, 2 * bits, bits // 2], dtype=np.int64)
-        b = rng.integers(0, 2 * bits, words, dtype=np.int64)
+        dt = object if bits > 32 else np.int64
+        amts = np.array([0, 1, bits - 1, bits, bits + 1, top - 1, 2 * bits, bits // 2], dtype=dt)
+        b = rng.integers(0, 2 * bits, words, dtype=np.int64).astype(dt)
         b[:min(words, len(amts))] = amts[:min(words, len(amts))]
         if words > len(amts):
             b[len(amts):2 * len(amts)] = amts[:max(0, min(len(amts), words - len(amts)))]

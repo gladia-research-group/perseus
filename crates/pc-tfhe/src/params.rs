@@ -60,6 +60,9 @@ pub struct Params {
     /// A second bootstrapping key grouped by `lat_group` bits (0: none; 5 at n_lwe 840) for small batches: n_lwe /
     /// lat_group sequential blind-rotation steps.
     pub lat_group: usize,
+    /// A third bootstrapping key grouped by `lat_group2` bits (0: none; 4 for the native programs) for the
+    /// mid-size latency batches (pc-gpu tfhe::LAT_MAX .. LAT2_MAX LWEs), where groups of `lat_group` cost more.
+    pub lat_group2: usize,
     /// The native chains' key switch s_br -> s_lwe (`chain::ChainKey`): bootstrap outputs feed bootstraps directly.
     pub chain: bool,
     /// The packing key s_lwe -> GLWE(s_br, q_br) (`pack::PackingKey`, gadget `pack::PACK_GADGET`): encrypted lookup
@@ -75,7 +78,7 @@ impl Params {
 
     /// Another binary LWE key: dimension `n_lwe` (a multiple of the PBS groups) and sigma 2^`sigma_log2` p0.
     pub fn with_lwe(mut self, n_lwe: usize, sigma_log2: f64) -> Result<Params> {
-        if n_lwe % self.pbs_group != 0 || self.lat_group != 0 && n_lwe % self.lat_group != 0 {
+        if n_lwe % self.pbs_group != 0 || self.lat_group != 0 && n_lwe % self.lat_group != 0 || self.lat_group2 != 0 && n_lwe % self.lat_group2 != 0 {
             return Err(crate::Error::Params(format!("n_lwe {n_lwe}: not a multiple of the PBS groups {} / {}", self.pbs_group, self.lat_group)));
         }
         self.n_lwe = n_lwe;
@@ -128,6 +131,7 @@ impl Params {
             out_cf: 3,
             nu: 1,
             lat_group: 0,
+            lat_group2: 0,
             chain: false,
             pack: false,
         })

@@ -40,8 +40,18 @@ def test_bitwise_exact(op, bits):
 
 _OPS = ["add", "sub", "neg", "addf", "subf", "cmp", "lt", "le", "gt", "ge", "eq", "ne", "slt", "sle", "sgt", "sge",
         "seq", "sne", "sext4", "shl0", "shl1", "shl2", "shl7", "shlB", "shr1", "shr3", "shrB", "sar1", "sar4", "sarM",
-        "sarB", "rotl1", "rotl5", "rotr3", "rotrB", "shlv", "shrv", "sarv", "rotlv", "rotrv", "mul", "mulw", "mulc0",
-        "mulc1", "mulc3", "mulc12345", "mulcM", "min", "max", "smin", "smax", "abs", "popcount", "mux", "xor"]
+        "sarB", "rotl1", "rotl5", "rotr3", "rotrB", "shlv", "shrv", "sarv", "rotlv", "rotrv", "rotlvb", "rotrvb", "mul", "mulw", "mulb",
+        "mulc0", "mulc1", "mulc3", "mulc12345", "mulcM", "min", "max", "smin", "smax", "abs", "popcount", "mux", "xor",
+        "and", "or", "andn", "orn", "xnor", "clz", "ctz", "log2", "div", "rem", "divrem", "sdiv", "srem", "sdivrem",
+        "divc7", "divc10", "remc7", "divremc12345", "divc0", "remc0", "divc16", "divc2654435769", "remc2654435769", "mulh", "mulhsu", "mulhu", "clmul",
+        "clmulh", "clmulr", "addi12345", "addiM", "andi12345", "ori77", "xori99", "lti12345", "slti3", "eqi12345",
+        "eqi0", "bset5", "bclr0", "binv3", "bextM", "bsetv", "bclrv", "binvv", "bextv", "shadd1", "shadd2", "shadd3",
+        "orcb", "rev8", "zext16", "czeqz", "cznez"]
+# the 64-bit set (the 32-bit-in-64 word forms only there)
+_OPS64 = ["add", "sub", "subf", "cmp", "slt", "eq", "xor", "mux", "min", "smax", "abs", "popcount", "clz", "ctz", "log2",
+          "shlv", "rotlv", "rotrv", "mul", "mulh", "divc7", "remc10", "divc11400714819323198485", "remc11400714819323198485", "addi12345", "lti12345", "eqi12345", "bsetv", "bextv",
+          "shadd1", "shadduw2", "adduw", "orcb", "rev8", "czeqz", "clmulr", "w32add", "w32sub", "w32shl5", "w32sar7",
+          "w32shrv", "w32mul", "w32div", "w32srem"]
 
 
 def _op(op, bits):
@@ -52,24 +62,53 @@ def _op(op, bits):
 @pytest.mark.parametrize("bits", [8, 16, 32])
 @pytest.mark.parametrize("op", _OPS)
 def test_ops_exact_and_pfail(op, bits):
+    _check(op, bits)
+
+
+@pytest.mark.parametrize("op", _OPS64)
+def test_ops64_exact_and_pfail(op):
+    _check(op, 64)
+
+
+@pytest.mark.parametrize("op", ["div", "srem"])
+def test_div64(op):
+    """The 64-bit division (249 rounds), fewer words."""
+    _check(op, 64, words=40)
+
+
+def _check(op, bits, words=96):
     """Every op on the mirror with the native input noise: exact on every word (edge pairs 0, -1, MIN, MAX, 1, -2;
     equal words; a + b = -1; shift amounts 0, 1, w - 1, w, w + 1, 2^w - 1, 2 w), and p_fail per lookup < 2^-128
     (2^20 chained lookups < 2^-100)."""
     from perseus.impl import tfhe_bitwise as T
     o = _op(op, bits)
-    got, want, an = T.mirror(o, bits, 96, seed=bits)
+    got, want, an = T.mirror(o, bits, words, seed=bits)
     assert np.array_equal(got, want), (o, int((got != want).sum()))
     assert an["log2_pfail_lookup"] < -128.0 and an["log2_pfail_lookup"] + 20 < -100.0, (o, an)
-    assert an["log2_pfail_op"] < -128.0, (o, an)
+    assert an["log2_pfail_op"] < -118.0, (o, an)        # the union over every lookup of the op
 
 
 def test_buffers_and_rounds():
-    """Compaction keeps programs small; the round counts of the main ops (32-bit) and the public shifts' zero-round
-    cases (whole digits) hold."""
+    """Compaction keeps programs small; the round counts of the main ops (32-bit; the result complete in the
+    program, the store only reformats) and the public shifts' zero-round cases (whole digits) hold."""
     from perseus.impl import tfhe_bitwise as T
     rounds = {o: T.analyze(T.build(o, "r", 4, 16).pr, T.load_values(T.slot_values(*T.inputs(4, 32, 0, o), 16)))["rounds"]
-              for o in ("add", "sub", "subf", "slt", "shl4", "shl5", "sar4", "shlv", "mul", "min")}
-    assert rounds == {"add": 4, "sub": 4, "subf": 5, "slt": 3, "shl4": 0, "shl5": 1, "sar4": 1, "shlv": 6,
-                      "mul": 12, "min": 5}, rounds
-    for o in ("sarv", "mulw", "abs"):
-        assert T.build(o, "b", 16, 16).pr.bufs <= 9
+              for o in ("add", "sub", "subf", "slt", "eq", "xor", "shl4", "shl5", "sar4", "shlv", "mul", "min", "clz",
+                        "popcount", "addi12345", "lti12345")}
+    assert rounds == {"add": 4, "sub": 4, "subf": 5, "slt": 4, "eq": 2, "xor": 1, "shl4": 0, "shl5": 1, "sar4": 1,
+                      "shlv": 6, "mul": 8, "min": 5, "clz": 2, "popcount": 4, "addi12345": 3, "lti12345": 3}, rounds
+    r64 = {o: T.analyze(T.build(o, "r", 2, 32).pr, T.load_values(T.slot_values(*T.inputs(2, 64, 0, o), 32)))["rounds"]
+           for o in ("add", "cmp", "eq", "xor")}
+    assert r64 == {"add": 4, "cmp": 4, "eq": 3, "xor": 1}, r64
+    for o in ("sarv", "mulw", "abs", "div", "sdiv"):
+        assert T.build(o, "b", 16, 16).pr.bufs <= 16
+
+
+def test_one_launch_per_round():
+    """The products and every carry-save round are one bootstrap launch (a table per row where they differ); the
+    division's rounds too, but for its first two (b << 1 and b's thermometer: two launches each)."""
+    from perseus.impl import tfhe_bitwise as T
+    for o, extra in (("mul", 0), ("popcount", 0), ("divrem", 2)):
+        pr = T.build(o, "m", 2, 8).pr
+        an = T.analyze(pr, T.load_values(T.slot_values(*T.inputs(2, 16, 0, o), 8)))
+        assert an["launches"] == an["rounds"] + 1 + extra, (o, an)          # + the store

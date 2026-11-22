@@ -203,6 +203,13 @@ class Prog:
     def pbs(self, src, rows, lut, dst):
         self.steps.append({"op": "pbs", "src": src, "rows": int(rows), "lut": lut, "dst": list(dst)})
 
+    def pbsm(self, src, luts, dst):
+        """One bootstrap launch with a table per row (`luts[r]`, one-table luts): row r of `src` through luts[r] into
+        row r of buffer `dst` (the device: one trivial accumulator per row, PC_TFHE_MACC rows per session)."""
+        if any(len(self.luts[l][0]) != 1 for l in set(luts)):
+            raise ValueError("pbsm: one-table luts")
+        self.steps.append({"op": "pbsm", "src": src, "rows": len(luts), "luts": list(luts), "dst": dst})
+
     def store(self, src, rows, lut, slots):
         """`lut` None: the rows as they are (a warp pbs's outputs)."""
         self.steps.append({"op": "store", "src": src, "rows": int(rows), "lut": lut, "slots": slots})
@@ -301,6 +308,14 @@ class Prog:
                 ta = np.where(idx[:, 0] >= 0, a[np.maximum(idx[:, 0], 0)] if a.size else 0.0, 0.0)
                 tb = np.where(idx[:, 1] >= 0, b[np.maximum(idx[:, 1], 0)] if b.size else 0.0, 0.0)
                 B[st["dst"]] = st["ca"] * ta + st["cb"] * tb + st["c"]
+            elif op == "pbsm":
+                x = B[st["src"]][:st["rows"]]
+                x = x + rng.normal(0.0, noise, x.shape) if noise else x
+                y = np.zeros(len(x))
+                for ln in set(st["luts"]):
+                    sel = np.array([l == ln for l in st["luts"]])
+                    y[sel] = _nat(self.luts[ln][0][0], x[sel], GRID)
+                B[st["dst"]] = y + rng.normal(0.0, _NAT_OUT, y.shape) if _NAT_OUT else y
             elif op == "store" and st["lut"] is None:
                 x = B[st["src"]][:st["rows"]]
                 out = x + (_RNG.normal(0.0, _OUT_NOISE, x.shape) if _OUT_NOISE else 0.0)

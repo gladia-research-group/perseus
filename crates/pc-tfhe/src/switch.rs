@@ -292,6 +292,8 @@ pub struct Switcher {
     pub bsk: BootstrapKey,
     /// the latency key (Params::lat_group), same secrets and gadget
     pub bsk_lat: Option<BootstrapKey>,
+    /// the mid-batch latency key (Params::lat_group2)
+    pub bsk_lat2: Option<BootstrapKey>,
     pub repack: RepackKey,
     /// Params::chain: the native chains' key switch
     pub chain: Option<crate::chain::ChainKey>,
@@ -323,8 +325,9 @@ impl Switcher {
         let repack = RepackKey::generate(s, &s_br, Gadget::new(p0, params.rp, true), params.rp_aux, &ntt_p, &dg_rp, &dg, prng)?;
         let chain = if params.chain { Some(crate::chain::ChainKey::generate(&s_br, &s_lwe, p0, &params, prng)?) } else { None };
         // the packing key: GLWE(s_br, q_br) at the bootstrapping key's sigma (the same instance)
-        let pack = params.pack.then(|| crate::pack::PackingKey::generate(&s_lwe, &s_br, crate::pack::PACK_GADGET, rns, &dg_bsk, prng));
-        Ok((Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, repack, chain, pack }, s_lwe, s_br))
+        let pack = params.pack.then(|| crate::pack::PackingKey::generate(&s_lwe, &s_br, crate::pack::PACK_GADGET, rns.clone(), &dg_bsk, prng));
+        let bsk_lat2 = (params.lat_group2 > 0).then(|| BootstrapKey::generate(&s_lwe, &s_br, Gadget::new(params.q_br, params.pbs, false), rns, params.lat_group2, &dg_bsk, prng));
+        Ok((Switcher { params, n, p0, p1, ntt_p, rs, ksk, bsk, bsk_lat, bsk_lat2, repack, chain, pack }, s_lwe, s_br))
     }
 
     /// The LUT `tv` (+ `offset`, mod q_br) on the coefficients `valid` of a split ciphertext (phase m q0 / 4 there);
