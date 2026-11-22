@@ -121,6 +121,13 @@ def test_compressed_export_guard():
             _pc.export_ct(s, fresh, bits=32)
         assert np.abs(client.decrypt(_pc.export_ct(s, fresh, bits=32, tol=1.0))[0] - v).max() < 0.5
         deep = _pc.import_ct(s, client.encrypt(v, 24))
+        # export_level: the rows the client decodes (4) kept, bit for bit; a bound takes values that fit further down
+        ref = client.decrypt(_pc.export_ct(s, deep))[0]
+        assert s.fhe.export_level(deep) == 51 and s.fhe.export_level(deep, 1e6) == 52
+        z = _pc.import_ct(s, client.encrypt(v, 46))
+        assert s.fhe.export_level(z, 8.0) == 54
+        s.fhe.drop_to_level(deep, s.fhe.export_level(deep))
+        np.testing.assert_array_equal(client.decrypt(_pc.export_ct(s, deep))[0], ref)
         s.fhe.drop_to_level(deep, 54)
         assert np.abs(client.decrypt(_pc.export_ct(s, deep, bits=32))[0] - v).max() < 1e-3
     finally:

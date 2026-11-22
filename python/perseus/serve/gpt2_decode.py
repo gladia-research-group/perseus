@@ -6,8 +6,9 @@
     # client (no device): keygen of the server's request, per token encrypt -> run -> decrypt, gate vs the oracle
     python -m perseus.serve.gpt2_decode client --addr /tmp/x.sock --plan ... --tokens 16 --argmax --out res.json
 
-Per token the client sends block 0's input (`pack_tokens` layout at the compiled input level) and gets back the
-LM-head tile and, with --argmax, CutMax's z; it decodes logits / z itself (`examples.gpt2.head`).
+Per token the client sends block 0's input (`pack_tokens` layout at the compiled input level, a seeded frame: c1 as
+its seeds) and gets back the LM-head tile and, with --argmax, CutMax's z, each dropped to the rows the client decodes
+(`serve.export_frame`; z, within Z_BOUND, to the chain's bottom); it decodes logits / z itself (`examples.gpt2.head`).
 """
 from __future__ import annotations
 
@@ -20,9 +21,11 @@ import time
 
 import numpy as np
 
-from . import private_dir
+from . import export_frame, private_dir
 
 PRESET = "n32_gpt2_decode"
+# CutMax's z: a near one-hot (each slot within [0, 1] up to the approximation's error)
+Z_BOUND = 4.0
 
 
 def _config(plan, chain):
@@ -110,11 +113,12 @@ class Gpt2Handler:
         r.inputs[t] = _pc.import_ct(r.sess, frames[0])
         t1 = time.time()
         reg, rec = r.token(t, self.rows, self.argmax)
-        lg = _pc.export_ct(r.sess, r.ct(reg))
+        # r.ct copies the register: the drop leaves the logits register CutMax reads as it is
+        lg = export_frame(r.sess, r.ct(reg))
         t2 = time.time()
         out = [lg]
         if h.get("argmax"):
-            out.append(_pc.export_ct(r.sess, r.ct(r.argmax(t))))
+            out.append(export_frame(r.sess, r.ct(r.argmax(t)), bound=Z_BOUND))
         t3 = time.time()
         return {"t": t, "import_s": t1 - t0, "fwd_s": t2 - t1, "argmax_s": t3 - t2, "server_s": t3 - t1, **rec}, out
 
@@ -156,12 +160,13 @@ def client_main(a):
     res = []
     for t, row in enumerate(rows):
         ts = time.time()
-        x = cl.encrypt(pack_token_rows([row], d.N, d.hid, d.dim), level)
+        x = cl.encrypt(pack_token_rows([row], d.N, d.hid, d.dim), level, seeded=True)
         te = time.time()
         h, outs = remote.run([x], t=t, argmax=a.argmax)
         tr = time.time()
         lg = decode_logits(shim, [outs[0]], vocab, d.N)
-        r = {"pos": t, "top1": int(np.argmax(lg)), "encrypt_s": te - ts, "roundtrip_s": tr - te, **h}
+        r = {"pos": t, "top1": int(np.argmax(lg)), "encrypt_s": te - ts, "roundtrip_s": tr - te,
+             "up_bytes": len(x), "down_bytes": sum(len(o) for o in outs), **h}
         if gt.T and t < len(gt.logits) and len(gt.logits[t]):
             r.update(dist_report(lg, np.asarray(gt.logits[t])))
         if a.argmax:
@@ -181,7 +186,8 @@ def client_main(a):
     summ = {"tokens": len(res), "top1": sum(1 for r in res if r.get("hit")), "median_kl": kls[len(kls) // 2] if kls else None,
             "cutmax": sum(1 for r in res if r.get("cutmax") == r["top1"]), "server_s_tok": med("server_s"),
             "server_fwd_s": med("fwd_s"), "server_argmax_s": med("argmax_s"), "roundtrip_s": med("roundtrip_s"),
-            "encrypt_s": med("encrypt_s"), "decrypt_s": med("decrypt_s"), "keygen": kg, "wall_s": time.time() - t0,
+            "encrypt_s": med("encrypt_s"), "decrypt_s": med("decrypt_s"), "up_bytes": med("up_bytes"),
+            "down_bytes": med("down_bytes"), "keygen": kg, "wall_s": time.time() - t0,
             "gate": ok}
     print(f"[client] SUMMARY {json.dumps({k: v for k, v in summ.items() if k != 'keygen'})}", flush=True)
     if a.out:

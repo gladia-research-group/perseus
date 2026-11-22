@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-from . import private_dir
+from . import export_frame, private_dir
 
 
 def _work_dir():
@@ -143,7 +143,7 @@ def _server(addr, a, model, toks, gt, ref, results=None):
             run.fhe.device_sync()
             wall = time.time() - t1
             del x0
-            out = [] if h.get("warmup") else [_pc.export_ct(run.sess, run.ct(r)) for r in run.hid_reg[run.n_layers - 1]]
+            out = [] if h.get("warmup") else [export_frame(run.sess, run.ct(r)) for r in run.hid_reg[run.n_layers - 1]]
             return {"import_s": t1 - t0, "wall": wall, "export_s": time.time() - t1 - wall,
                     "host_s": sum(i["host_us"] for i in info) / 1e6, "served": "".join(i["served"][0] for i in info)}, out
 
@@ -176,7 +176,7 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
         vals, ch = _pack(model, tk)
         if len(vals) != len(metas):
             raise RuntimeError(f"{len(vals)} packed inputs, the server's block 0 takes {len(metas)}")
-        return [cl.encrypt(v, int(lv), int(dg)) for v, (lv, dg) in zip(vals, metas)], ch
+        return [cl.encrypt(v, int(lv), int(dg), seeded=True) for v, (lv, dg) in zip(vals, metas)], ch
 
     if man.get("warmup"):
         wtoks = [int(t) for t in hf.text_windows(2, 512)[1][:len(toks)]]
@@ -200,6 +200,7 @@ def _client(addr, out_path, a, model, toks, gt, ref, results=None):
     rows_, s = report(plain_logits(model, hid[lo:]), gt[1 + lo:1 + len(hid)])
     remote.close()
     summ = {"T": a.tokens, "server_wall": h["wall"], "server_host_s": h["host_s"], "served": h["served"],
+            "up_bytes": sum(len(f) for f in frames), "down_bytes": sum(len(o) for o in outs),
             "import_s": h["import_s"], "export_s": h["export_s"], "encrypt_s": enc_s, "roundtrip_s": rt_s,
             "decrypt_s": dec_s, **s, "keygen": kg, "client_wall_s": time.time() - t0}
     print("[client] per-position KL " + " ".join(f"{r['kl']:.3g}" for r in rows_), flush=True)

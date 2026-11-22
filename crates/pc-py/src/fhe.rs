@@ -1301,6 +1301,33 @@ impl PyFhe {
         self.dev.ctx.bottom_level()
     }
 
+    /// The deepest level `a` (degree 1) drops to before `export_ct` with its decryption unchanged. The client decodes
+    /// the bottom rows of a frame only (4 of a frame of 4 or more, a lean chain's 3-row level whole, else the bottom
+    /// pair): a drop that keeps those rows changes no decoded bit. `bound`: the values' magnitude bound; the drop then
+    /// goes further, while the rows the client decodes still hold 4 x bound x the scale (the values unwrapped).
+    #[pyo3(signature = (a, bound=None))]
+    fn export_level(&self, a: PyRef<'_, PyCt>, bound: Option<f64>) -> PyResult<u32> {
+        let d = &*self.dev;
+        let m = a.meta();
+        if m.deg != 1 {
+            return Err(PyValueError::new_err("export_level: a degree-1 ciphertext (realize it first)"));
+        }
+        let chain = &d.ctx.chain;
+        let read = |top: usize| if top >= 3 { 4 } else if top == 2 && chain.lone_top().is_some() { 3 } else { chain.level_unit };
+        let rows = d.ctx.top_of(m.level).map_err(gerr)? + 1;
+        let keep = read(rows - 1).min(rows);
+        let cap = |top: usize| chain.q[..read(top).min(top + 1)].iter().map(|&p| (p as f64).log2()).sum::<f64>();
+        let need = bound.map(|b| (4.0 * b * m.nf).log2());
+        Ok((m.level..=d.ctx.bottom_level())
+            .filter(|&l| d.ctx.is_live_level(l))
+            .filter(|&l| {
+                let top = d.ctx.top_of(l).unwrap_or(0);
+                top + 1 >= keep || need.is_some_and(|n| cap(top) >= n)
+            })
+            .max()
+            .unwrap_or(m.level))
+    }
+
     /// In place: stamp a reduction output's slot period (pack tag).
     fn tag_reduce(&self, a: &Bound<'_, PyCt>, stride: i64) -> PyResult<()> {
         let mut am = a.borrow_mut();
