@@ -525,10 +525,11 @@ class IntOp(Task):
         self.bits, self.r = int(self.bits), int(self.r)
         rng = np.random.default_rng(self.seed)
         top = 1 << self.bits
-        self.a = rng.integers(0, top, SLOTS, dtype=np.int64)
-        self.b = rng.integers(0, top, SLOTS, dtype=np.int64)
-        self.b[:64] = self.a[:64]                     # equal words: the compare's "=" path end to end
-        self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
+        if self.layout != "tfhe":
+            self.a = rng.integers(0, top, SLOTS, dtype=np.int64)
+            self.b = rng.integers(0, top, SLOTS, dtype=np.int64)
+            self.b[:64] = self.a[:64]                 # equal words: the compare's "=" path end to end
+            self.sel = rng.integers(0, 2, SLOTS).astype(np.int64)
         if self.layout == "tfhe":
             import os
             from perseus.impl import tfhe, tfhe_bitwise as T
@@ -540,6 +541,9 @@ class IntOp(Task):
             wp = T.build(self.op, name, self.words, nd)
             rin = wp.rows_in(True)
             os.environ.setdefault("PC_TFHE_NATIVE", f"{max(5, wp.pr.bufs)},{T.rows_needed(wp.pr, rin)}")
+            macc = sum(st["rows"] for st in wp.pr.steps if st["op"] == "pbsm")
+            if macc:
+                os.environ.setdefault("PC_TFHE_MACC", str(macc))
             tfhe.register_slots(f"bitwise.in.{rin}", np.arange(rin))
             tfhe.register_slots(name + ".out", np.arange(wp.out_rows))
             self.wp, self.prog = wp, tfhe.register_prog(wp.pr)

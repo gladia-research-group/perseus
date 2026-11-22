@@ -38,7 +38,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.a
     ["op=sar5", "bits=16", "r=2", "table=k28d1", "layout=cts"],
     ["op=subf", "bits=32", "layout=tfhe", "words=16"],
     ["op=shlv", "bits=16", "layout=tfhe", "words=16"],
-    ["op=mul", "bits=8", "layout=tfhe", "words=16"],
+    ["op=mul", "bits=8", "layout=tfhe", "words=16"],          # one launch per round: a table per row (pbsm)
+    ["op=xor", "bits=32", "layout=tfhe", "words=16"],         # one 16-bin round
+    ["op=clz", "bits=32", "layout=tfhe", "words=16"],         # thermometer bits, linear digits
+    ["op=divrem", "bits=8", "layout=tfhe", "words=4"],        # restoring division (b = 0 among the edge words)
+    ["op=add", "bits=64", "layout=tfhe", "words=8"],          # fan-in 4 first combine, the mid-batch latency key
 ])
 def test_planned_intop(tmp_path, sets):
     out = str(tmp_path / "rows.jsonl")
