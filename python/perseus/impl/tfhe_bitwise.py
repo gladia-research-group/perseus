@@ -16,7 +16,7 @@ store only reformats. The rounds of an op share one launch each (`Prog.pbsm`: a 
   + c_(i-1) - 4 c_i): 2 / 3 / 3 / 4 rounds at 8 / 16 / 32 / 64 bits. `flags`: + the carry / borrow (free) and the
   signed overflow (one lookup).
 - compare (lt / le / gt / ge, signed: the top group's first combine turned by the sign bits' half turns): statuses
-  of a_i - b_i, the same combines as a tree from the top digit, the predicate's table last.
+  of a_i - b_i, the same combines (the fewest levels) as a tree from the top digit, the predicate's table last.
 - eq / ne: [a_i != b_i], then one zero test of their sum on the whole torus (17 points at 1/8: only (0, 16) is
   negacyclic and their outputs differ); groups of 16 digits combined the same way.
 - bitwise and / or / xor / andn / orn / xnor: one 16-bin lookup per digit on a + 4 b.
@@ -303,12 +303,13 @@ def _plan_tree(cm, ncols, target, multi, words, pend, beam=10):
     round (per column: groups, a lone item <= 6 passing unchanged)."""
     def strategies(state, first):
         outs = []
-        for cap, bal in ((15, False), (15, True), (13, False), (11, False), (11, True), (9, False)):
+        for cap, bal, lazy in ((15, False, 0), (15, True, 0), (13, False, 0), (11, False, 0), (11, True, 0), (9, False, 0),
+                               (15, False, 9), (15, False, 12), (15, True, 12)):
             P, inc = [], 0
             for c in range(ncols):
                 ms = state[c]
-                if sum(ms) + inc <= target:
-                    P.append([[k] for k in range(len(ms))] if all(m <= 6 for m in ms) else [[k] for k in range(len(ms))])
+                if sum(ms) + inc <= max(target, lazy) and all(m <= 6 for m in ms):
+                    P.append([[k] for k in range(len(ms))])     # passes (lazy: left for a later round)
                     inc = 0
                     continue
                 gs = _ffd(ms, cap, bal)
@@ -696,55 +697,59 @@ class WordProg:
         self._adder("add", out_slots, True)
 
     def _tree(self, pred=None, signed=False, sel=False):
-        """The compare tree (statuses sign(a_i - b_i), fan-in 3 combines from the top digit). Returns the buffer of
-        w rows: the predicate (lt / gt / le / ge / eq / ne) at d / 8 x 8 = 1 when `sel` (unit 1, an AND mux
-        selector), else stores nothing and returns (buffer, table) for the store."""
+        """The compare tree (statuses sign(a_i - b_i), combines from the top digit: fan-in 4 (statuses at 1/2 and
+        1/8, 2 A + A' + 2 B + B'' on the whole torus at spacing 1/8) or 3 (statuses at 1/4), the fewest levels as the
+        adder's prefix (`_prefix_fans`)). Returns the buffer of w rows: the predicate (lt / gt / le / ge / eq / ne)
+        at d / 8 x 8 = 1 when `sel` (unit 1, an AND mux selector), else stores nothing and returns (buffer, table)
+        for the store."""
         p, R, w, nd = self.pr, self.R, self.w, self.nd
         X = self._lin(0, 0, [(r, R + r) for r in range(R)], ca=2, cb=-2)
         # a fan-in 4 first combine on statuses at two scales (1/2 and 1/8); signed words of > 16 digits keep fan-in 3
-        # (their round-1 launch would pass 64 rows with both scales and the sign bits)
-        f4 = self.fan4 and _fan4_helps(nd) and not (signed and nd > 16)
-        S1 = None
+        # there (their round-1 launch would pass 64 rows with both scales and the sign bits)
+        f4 = self.fan4 and not (signed and nd > 16)
+        fans = _prefix_fans(nd, f4, getattr(self, "fan4all", FAN4ALL) and self.multi)
         if signed and self.multi:              # the statuses and the sign bits in one launch
             HI = self._lin(0, 0, [(r, -1) for r in self._top(0) + self._top(1)], ca=2, cb=0)
-            jobs = [(X, list(range(R)), "sgn8x" if f4 else "sgn")] + ([(X, list(range(R)), "sgn1x")] if f4 else []) + \
-                [(HI, list(range(2 * w)), "hs")]
+            jobs = [(X, list(range(R)), "sgn8x" if fans[0] == 4 else "sgn")] + \
+                ([(X, list(range(R)), "sgn1x")] if fans[0] == 4 else []) + [(HI, list(range(2 * w)), "hs")]
             S, offs = self._multi(jobs)
             oh = offs[-1]
-            if f4:
-                S1 = (S, offs[1])
+            st = ("ab", (S, offs[1]), (S, offs[0])) if fans[0] == 4 else ("s", S)
             HS = self._lin(S, S, [(oh + q, oh + w + q) for q in range(w)], ca=1, cb=1)
         else:
-            if f4:
+            if fans[0] == 4:
                 S, S1b = self._pbsk(X, R, "sgn2s")
-                S1 = (S1b, 0)
+                st = ("ab", (S1b, 0), (S, 0))
             else:
-                S = self._pbs(X, R, "sgn")
+                st = ("s", self._pbs(X, R, "sgn"))
             HS = self._signs() if signed else None
-        cur, k, first = S, nd, True
-        U = self._buf()
-        while True:
-            f = 4 if (first and f4) else min(3, k)
+        k = nd
+        for li, f in enumerate(fans):
             h = -(-k // f)
             src = [[(q // h) * k + (q % h) * f + f - 1 - x if (q % h) * f + f - 1 - x < k else -1 for x in range(f)]
                    for q in range(w * h)]
-            if f == 4:                         # 2 S2[top] + S2[.] + 2 S8[.] + S8[.] (whole torus, spacing 1/8; sum w^2 10)
-                p.lin(U, S1[0], S1[0], [(S1[1] + v[0], S1[1] + v[1] if v[1] >= 0 else -1) for v in src], ca=2, cb=1)
-                p.lin(U, U, cur, [(q, v[2]) for q, v in enumerate(src)], ca=1, cb=2)
-                p.lin(U, U, cur, [(q, v[3]) for q, v in enumerate(src)], ca=1, cb=1)
+            U = self._buf()
+            if f == 4:                         # 2 A[top] + A[.] + 2 B[.] + B[.] (whole torus, spacing 1/8; sum w^2 10)
+                (A, oa), (B, ob) = st[1], st[2]
+                p.lin(U, A, A, [(oa + v[0], oa + v[1] if v[1] >= 0 else -1) for v in src], ca=2, cb=1)
+                p.lin(U, U, B, [(q, ob + v[2] if v[2] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=2)
+                p.lin(U, U, B, [(q, ob + v[3] if v[3] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=1)
             else:
+                cur = st[1]
                 p.lin(U, cur, cur, [(v[0], v[1] if f > 1 else -1) for v in src], ca=1 << (f - 1), cb=1 << max(f - 2, 0))
                 if f == 3:
                     p.lin(U, U, cur, [(q, v[2]) for q, v in enumerate(src)], ca=1, cb=1)
-            if first and signed:
+            if li == 0 and signed:
                 p.lin(U, U, HS, [(q, q // h if q % h == h - 1 else -1) for q in range(w * h)], ca=1, cb=1)
-            first = False
             if h == 1:
                 break
-            nxt = self._buf()
-            self._pbs(U, w * h, "sgn" if f < 4 else "sgn4x", nxt)
-            cur, k = nxt, h
-            U = self._buf()
+            if fans[li + 1] == 4:              # both scales for the next fan-in 4 combine (two tables per row)
+                OUT, offs = self._multi([(U, list(range(w * h)), "sgn8_2" if f == 4 else "sgn1x"),
+                                         (U, list(range(w * h)), "sgn8_8" if f == 4 else "sgn8x")])
+                st = ("ab", (OUT, offs[0]), (OUT, offs[1]))
+            else:
+                st = ("s", self._pbs(U, w * h, "sgn" if f < 4 else "sgn4x"))
+            k = h
         if f == 4:                             # the last combine at spacing 1/8: its whole-torus tables
             if sel:
                 V = self._pbs(U, w, pred + "_pm1x")
@@ -2707,7 +2712,7 @@ from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401
 
 # measured cost of one bootstrap launch by its rows (RTX PRO 6000, latency keys of 5 / 4 key bits; pc-check tfhe-prog,
 # 4 chained rounds of B rows, 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
-COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.69), (32, 1.86), (40, 1.88), (48, 2.29),
+COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.69), (32, 1.83), (40, 1.93), (46, 2.04), (48, 2.29),
            (56, 2.31), (64, 2.33), (80, 2.55), (94, 3.19), (128, 4.65), (188, 4.80), (256, 7.09), (376, 7.12),
            (512, 11.7), (752, 14.2), (1024, 21.2))
 

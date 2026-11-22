@@ -95,8 +95,8 @@ def test_buffers_and_rounds():
     rounds = {o: T.analyze(T.build(o, "r", 4, 16).pr, T.load_values(T.slot_values(*T.inputs(4, 32, 0, o), 16)))["rounds"]
               for o in ("add", "sub", "subf", "slt", "eq", "xor", "shl4", "shl5", "sar4", "shlv", "mul", "min", "clz",
                         "popcount", "addi12345", "lti12345")}
-    assert rounds == {"add": 3, "sub": 3, "subf": 4, "slt": 4, "eq": 2, "xor": 1, "shl4": 0, "shl5": 1, "sar4": 1,
-                      "shlv": 6, "mul": 7, "min": 5, "clz": 2, "popcount": 4, "addi12345": 3, "lti12345": 3}, rounds
+    assert rounds == {"add": 3, "sub": 3, "subf": 4, "slt": 3, "eq": 2, "xor": 1, "shl4": 0, "shl5": 1, "sar4": 1,
+                      "shlv": 6, "mul": 7, "min": 4, "clz": 2, "popcount": 4, "addi12345": 3, "lti12345": 3}, rounds
     r64 = {o: T.analyze(T.build(o, "r", 2, 32).pr, T.load_values(T.slot_values(*T.inputs(2, 64, 0, o), 32)))["rounds"]
            for o in ("add", "cmp", "eq", "xor")}
     assert r64 == {"add": 4, "cmp": 4, "eq": 3, "xor": 1}, r64

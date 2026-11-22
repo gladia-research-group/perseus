@@ -32,8 +32,10 @@ const PLANES: usize = 4;
 pub const KB_MAX: usize = 94;
 /// The extended rotation's latency path (four-block clusters only, args.cuh CL4_MAX): up to this many LWEs.
 pub const KB_MAX_EXT: usize = 46;
-/// Chunks up to this many values take the latency key (Params::lat_group) when the switch holds one.
-pub const LAT_MAX: usize = 24;
+/// Chunks up to this many values take the latency key (Params::lat_group) when the switch holds one: up to the
+/// four-block clusters' CL4_MAX now that the key bundles are shared across LWEs (32 LWEs 1.93 -> 1.83 ms, 46 2.17 ->
+/// 2.04 against the groups of 4).
+pub const LAT_MAX: usize = 46;
 
 /// LAT_MAX, overridable by PC_TFHE_LAT_MAX (read once).
 /// Chunks above LAT_MAX and up to this many values take the mid-batch latency key (Params::lat_group2): four-block
