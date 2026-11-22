@@ -787,8 +787,10 @@ class PlannedRun:
         # block 0's input as the twin encoded it (a model may enter every token at a refresh landing's degree)
         ins0 = ref[0].inputs()
         metas[self.labels[0]][ins0[0]] = ref[0].metas[ins0[0]]
+        # a variant enters at its own landing (block_0_feedback: the feedback's refresh), not block 0's encoding
         for lab, b in self.variants.items():
-            live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
+            live[lab] = live[self.labels[b]]
+            metas[lab] = {k: v for k, v in metas[self.labels[b]].items() if k != ref[b].inputs()[0]}
         self.progs = _pc.Program.compile(self.work_dir, str(self.plan_dir), config=self.cfg,
                                          blocks=[self.labels[b] for b in ref] + list(self.variants), live_out=live,
                                          input_metas=metas, schedule=self.schedule)
@@ -1431,7 +1433,7 @@ class StreamedPlannedRun:
         ref = self.records[c["ref"]]
         closed = c.get("closed", False)
         wd = c["graphs"] if closed else self._write_graphs(k, c)
-        live, metas, io, fixed_in = {}, {}, {}, {}
+        live, metas, io, fixed_in, stage_in = {}, {}, {}, {}, {}
         for b, r in ref.items():
             lab = self.labels[b]
             ins = r.inputs()
@@ -1449,8 +1451,11 @@ class StreamedPlannedRun:
             metas[lab] = c["ref_info"][b][1] if closed else \
                 {ins[i]: r.metas[ins[i]] for i in [i for i, _ in kv_in] + list(fixed_in[b].values()) + ([0] if b == 0 else [])}
             io[b] = kv_in
+            stage_in[b] = ins[0]
+        # a variant enters at its own landing (block_0_feedback: the feedback's refresh), not block 0's encoding
         for lab, b in self.variants.items():
-            live[lab], metas[lab] = live[self.labels[b]], metas[self.labels[b]]
+            live[lab] = live[self.labels[b]]
+            metas[lab] = {k: v for k, v in metas[self.labels[b]].items() if k != stage_in[b]}
         progs = _pc.Program.compile(wd, str(c["plan"]), config=self.cfg,
                                     blocks=[self.labels[b] for b in ref] + list(self.variants),
                                     live_out=live, input_metas=metas, routes_built=list(c["routes"]),
