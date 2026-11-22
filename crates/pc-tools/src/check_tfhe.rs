@@ -979,6 +979,10 @@ fn switch_params(args: &[String], n: usize) -> Res<Params> {
     }
     p.lat_group = arg(args, "--lat-group").map(|s| s.parse()).transpose()?.unwrap_or(0);
     p.lat_group2 = arg(args, "--lat-group2").map(|s| s.parse()).transpose()?.unwrap_or(0);
+    // --pbs-group g: the batch bootstrapping key's groups (key bits per blind-rotation step)
+    if let Some(g) = arg(args, "--pbs-group") {
+        p.pbs_group = g.parse()?;
+    }
     // --ks b,l: the LWE key switch's gadget (base log, levels)
     if let Some(v) = arg(args, "--ks") {
         let (b, l) = v.split_once(',').ok_or("--ks b,l")?;

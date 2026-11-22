@@ -10,10 +10,11 @@ Every op computes its result in the program (digits at d / 4, linear ones includ
 store only reformats. The rounds of an op share one launch each (`Prog.pbsm`: a table per row).
 
 - add / sub / neg: statuses (kill / propagate / generate) of a_i + b_i (sub: ~a + b, neg: a + 11..1, the output
-  complemented), a Kogge-Stone prefix whose first combine has fan-in 4 where it saves a round (statuses at 1/2 and 1/8
-  from one many-LUT lookup, 2 S2 + S2' + 2 S8 + S8' on the whole torus) and fan-in 3 after (4 S + 2 S' + S'', the
-  negacyclic half carries the sign); the digits linear (a_i + b_i + c_(i-1) - 4 c_i): 2 / 3 / 4 / 4 rounds at 8 / 16
-  / 32 / 64 bits. `flags`: + the carry / borrow (free) and the signed overflow (one lookup).
+  complemented), a Kogge-Stone prefix of the fewest levels: combines of fan-in 4 (statuses at 1/2 and 1/8, 2 S2 +
+  S2' + 2 S8 + S8' on the whole torus; the first level's from one many-LUT lookup, a later level's as two tables per
+  row of the level before) or 3 (4 S + 2 S' + S'', the negacyclic half carries the sign); the digits linear (a_i + b_i
+  + c_(i-1) - 4 c_i): 2 / 3 / 3 / 4 rounds at 8 / 16 / 32 / 64 bits. `flags`: + the carry / borrow (free) and the
+  signed overflow (one lookup).
 - compare (lt / le / gt / ge, signed: the top group's first combine turned by the sign bits' half turns): statuses
   of a_i - b_i, the same combines as a tree from the top digit, the predicate's table last.
 - eq / ne: [a_i != b_i], then one zero test of their sum on the whole torus (17 points at 1/8: only (0, 16) is
@@ -24,9 +25,10 @@ store only reformats. The rounds of an op share one launch each (`Prog.pbsm`: a 
   many-LUT lookup). Encrypted amount: shifts a barrel shifter of AND-mux stages (amounts >= the width by an OR tree
   folded into the last stage); rotates one gated lookup per digit and stage, x + (sel ? x_s - x : 0) (16-bin on
   (x_s - x + 3) / 8 + 7 sel / 8, the digits carried linearly).
-- mul: digit products (a b) mod 4 and div 4 by 16-bin lookups on a_i + 4 b_j (one launch; past one batch-path wave
-  the lowest columns' products ride the next launch), a carry-save tree of group lookups (sums <= 15 -> s mod 4,
-  s div 4; the top column s mod 4 only), the prefix adder. mulh / mulhsu / mulhu: the upper word, the signed terms as
+- mul: digit products (a b) mod 4 and div 4 by 16-bin lookups on a_i + 4 b_j (one launch, or, past one batch-path
+  wave when the cost model prefers it, the excess riding the next launch), a carry-save tree of group lookups (sums
+  <= 15 -> s mod 4, s div 4; the top column s mod 4 only; the rounds planned by a beam search with a DP closing
+  round), the prefix adder. mulh / mulhsu / mulhu: the upper word, the signed terms as
   s ? ~b_i : 0 items. mulc: canonical signed digits of the constant, the same tree; divc / remc: q = (a m) >> S with
   the magic m, r = a - q d.
 - div / rem (unsigned; signed: |a|, |b| by conditional negation, signs fixed after): radix-2 restoring division without
@@ -105,8 +107,39 @@ import os as _os
 MULTI = _os.environ.get("PC_TFHE_MULTI", "1") not in ("0", "")
 FAN4 = _os.environ.get("PC_TFHE_FAN4", "1") not in ("0", "")
 DIV_GFORM = _os.environ.get("PC_TFHE_DIV_GFORM", "1") not in ("0", "")
-SPLIT = _os.environ.get("PC_TFHE_SPLIT", "1") not in ("0", "")
+SPLIT = _os.environ.get("PC_TFHE_SPLIT", "auto")    # mul's products past one wave in the next round: auto / 1 / 0
 BATCH_WAVE = 188               # LWEs of one batch-path wave (one per block, one block per SM of the RTX PRO 6000)
+
+
+FAN4ALL = _os.environ.get("PC_TFHE_FAN4ALL", "1") not in ("0", "")
+
+
+def _prefix_fans(nd, first4=True, later4=True):
+    """The prefix combines' fan-ins over nd digits: the fewest levels (fan-in 4 first when `first4`, at any level
+    when `later4`), then the fewest later fan-in 4 levels (each costs its previous level a second table)."""
+    if nd <= 1:
+        return []
+    old, span = [], 1                          # the fan-in 3 plan (fan-in 4 first where it saves a level)
+    while span < nd:
+        f = 4 if (not old and first4 and _fan4_helps(nd)) else min(3, -(-nd // span))
+        old.append(f)
+        span *= f
+    if not later4:
+        return old
+    lv, span = 0, 1
+    while span < nd:
+        span *= 4
+        lv += 1
+    if lv >= len(old):
+        return old
+    fans = [4] * lv                            # then fan-in 3 / 2 from the top while the span still covers nd
+    for i in range(lv - 1, 0, -1):
+        for f in (2, 3):
+            t = fans[:i] + [f] + fans[i + 1:]
+            if int(np.prod(t)) >= nd:
+                fans = t
+                break
+    return fans
 
 
 def _fan4_helps(n):
@@ -120,6 +153,229 @@ def _fan4_helps(n):
     return rounds(n, 4) < rounds(n, 3)
 
 
+TREE_DP = _os.environ.get("PC_TFHE_TREE_DP", "1") not in ("0", "")
+
+
+def _partitions(ms):
+    """Every partition of items with maxima `ms` into groups (index lists) summing to <= 15."""
+    n = len(ms)
+    out = []
+
+    def rec(i, groups):
+        if i == n:
+            out.append([list(g) for g in groups])
+            return
+        for g in groups:
+            if sum(ms[k] for k in g) + ms[i] <= 15:
+                g.append(i)
+                rec(i + 1, groups)
+                g.pop()
+        groups.append([i])
+        rec(i + 1, groups)
+        groups.pop()
+    rec(0, [])
+    return out
+
+
+_PART_MEMO = {}
+
+
+def _col_options(ms, top, multi):
+    """One column's options for a carry-save round, (mods, divs, PBS, groups), Pareto-reduced: a group's mod item
+    min(3, S) stays, its div S // 4 goes up a column (none from the top column, whose groups take one lookup); a
+    lone item <= 6 passes unchanged."""
+    key = (tuple(ms), top, multi)
+    if key in _PART_MEMO:
+        return _PART_MEMO[key]
+    opts = []
+    for P in _partitions(ms):
+        mods = divs = pbs = 0
+        ok = True
+        for g in P:
+            sm = sum(ms[k] for k in g)
+            if len(g) == 1 and sm <= 6:
+                mods += sm                       # passes unchanged (a lone item needs no lookup)
+                continue
+            if sm <= 3:
+                ok = False                       # a group that reduces nothing: covered by the all-pass partition
+                break
+            mods += min(3, sm)
+            if top:
+                pbs += 1
+            else:
+                divs += sm // 4
+                pbs += 2 if (multi or sm > 7) else 1
+        if ok:
+            opts.append((mods, divs, pbs, P))
+    best = []
+    for o in sorted(opts, key=lambda t: (t[2], t[0], t[1])):
+        if not any(b[0] <= o[0] and b[1] <= o[1] and b[2] <= o[2] for b in best):
+            best.append(o)
+    _PART_MEMO[key] = best
+    return best
+
+
+def _final_round(col, ncols, target, multi):
+    """Whether one more carry-save round can leave every column of a word (`col[c]` = [(row, max)]) at <= target:
+    the cheapest such partition per column (DP along the columns on the incoming carry bound), or None. Columns of
+    more than 9 items are not tried (they need more than one round)."""
+    if any(len(x) > 9 for x in col):
+        return None
+    INF = 1 << 30
+    states = {0: (0, [])}                        # incoming carry bound -> (pbs, partitions so far)
+    for c, x in enumerate(col):
+        top = c == ncols - 1
+        ms = [m for _, m in x]
+        order = sorted(range(len(ms)), key=lambda k: -ms[k])
+        opts = _col_options([ms[k] for k in order], top, multi)
+        nxt = {}
+        for inc, (cost, parts) in states.items():
+            for mods, divs, pbs, P in opts:
+                if mods + inc > target:
+                    continue
+                d = 0 if top else divs
+                v = cost + pbs
+                if v < nxt.get(d, (INF,))[0]:
+                    nxt[d] = (v, parts + [[[order[k] for k in g] for g in P]])
+        if not nxt:
+            return None
+        states = nxt
+    return min(states.values(), key=lambda t: t[0])[1]
+
+
+def _row_ms(rows):
+    """est_ms's cost of one launch of `rows` PBS."""
+    return next((t for b, t in COST_MS if rows <= b), COST_MS[-1][1] * rows / COST_MS[-1][0])
+
+
+def _ffd(ms, cap, balanced=False):
+    """Groups (index lists) of items with maxima `ms`, each summing to <= cap: first fit decreasing, or (balanced)
+    the fewest groups of FFD filled least-loaded first (smaller carries)."""
+    order = sorted(range(len(ms)), key=lambda k: -ms[k])
+    gs = []
+    for k in order:
+        for g in gs:
+            if sum(ms[i] for i in g) + ms[k] <= cap:
+                g.append(k)
+                break
+        else:
+            gs.append([k])
+    if balanced and len(gs) > 1:
+        n = len(gs)
+        bs = [[] for _ in range(n)]
+        for k in order:
+            b = min((b for b in bs if sum(ms[i] for i in b) + ms[k] <= 15), key=lambda b: sum(ms[i] for i in b), default=None)
+            if b is None:
+                return gs
+            b.append(k)
+        return bs
+    return gs
+
+
+def _tree_step(cm, P, ncols, multi):
+    """One carry-save round on the column maxima `cm` with the partition P (per column: groups; a lone item <= 6
+    passes unchanged when its group says so, as `_emit_groups`): (new column maxima, PBS)."""
+    new = [[] for _ in range(ncols)]
+    pbs = 0
+    for c in range(ncols):
+        top = c == ncols - 1
+        own = []
+        for g in P[c]:
+            sm = sum(cm[c][k] for k in g)
+            if len(g) == 1 and sm <= 6:
+                own.append(sm)
+                continue
+            own.append(min(3, sm))
+            if top:
+                pbs += 1
+            else:
+                pbs += 2 if (multi or sm > 7) else 1
+                if sm >= 4 and c + 1 < ncols:
+                    new[c + 1].append(1 if sm <= 7 else sm // 4)
+        new[c] += own
+    return new, pbs
+
+
+def _plan_tree(cm, ncols, target, multi, words, pend, beam=10):
+    """The carry-save rounds for one word's columns (maxima `cm`, the late items `pend` = [(column, max)] arriving
+    after the first round): a beam search over per-round strategies (first fit decreasing into groups <= 15 / 13 /
+    11 / 9, balanced, with the DP of `_final_round` closing as soon as it can), by est_ms. Returns the partitions per
+    round (per column: groups, a lone item <= 6 passing unchanged)."""
+    def strategies(state, first):
+        outs = []
+        for cap, bal in ((15, False), (15, True), (13, False), (11, False), (11, True), (9, False)):
+            P, inc = [], 0
+            for c in range(ncols):
+                ms = state[c]
+                if sum(ms) + inc <= target:
+                    P.append([[k] for k in range(len(ms))] if all(m <= 6 for m in ms) else [[k] for k in range(len(ms))])
+                    inc = 0
+                    continue
+                gs = _ffd(ms, cap, bal)
+                gs = [g if (len(g) > 1 or ms[g[0]] > 3) else g for g in gs]
+                P.append(gs)
+                inc = sum((1 if sum(ms[k] for k in g) <= 7 else sum(ms[k] for k in g) // 4)
+                          for g in gs if (len(g) > 1 or ms[g[0]] > 3) and sum(ms[k] for k in g) >= 4)
+            outs.append(P)
+        return outs
+
+    def done(state):
+        return all(sum(x) <= target for x in state)
+
+    def greedy_rest(state):
+        tot = 0.0
+        for _ in range(12):
+            if done(state):
+                return tot
+            fin = _final_round([[(None, m) for m in x] for x in state], ncols, target, multi)
+            if fin is not None:
+                return tot + _row_ms(_tree_step(state, fin, ncols, multi)[1] * words)
+            P = strategies(state, False)[0]
+            state, pbs = _tree_step(state, P, ncols, multi)
+            tot += _row_ms(pbs * words)
+        return tot + 100.0
+
+    beams = [(0.0, [list(x) for x in cm], [], list(pend))]
+    best = None
+    for depth in range(12):
+        nxt = []
+        for cost, state, plan, pd in beams:
+            prow = len(pd) * words
+            if not pd:
+                fin = _final_round([[(None, m) for m in x] for x in state], ncols, target, multi)
+                if fin is not None:
+                    new, pbs = _tree_step(state, fin, ncols, multi)
+                    tot = cost + (_row_ms(pbs * words) if pbs else 0.0)
+                    if pbs == 0:
+                        tot = cost
+                    if best is None or tot < best[0]:
+                        best = (tot, plan + ([fin] if pbs else []))
+                    continue
+            seen = set()
+            for P in strategies(state, not plan):
+                new, pbs = _tree_step(state, P, ncols, multi)
+                for c, m in pd:
+                    new[c].append(m)
+                key = tuple(tuple(x) for x in new)
+                if key in seen:
+                    continue
+                seen.add(key)
+                c2 = cost + _row_ms(pbs * words + prow)
+                if done(new):
+                    if best is None or c2 < best[0]:
+                        best = (c2, plan + [P])
+                    continue
+                nxt.append((c2, new, plan + [P], []))
+        if not nxt:
+            break
+        # rank by the cost so far plus a greedy completion (first fit decreasing <= 15, the DP closing): lookahead
+        nxt.sort(key=lambda t: t[0] + greedy_rest(t[1]))
+        beams = nxt[:beam]
+        if best is not None and all(b[0] >= best[0] for b in beams):
+            break
+    return None if best is None else best[1]
+
+
 class WordProg:
     """A native program over `words` words of `nd` radix-4 digits (`bits` = 2 nd): the loaded slot set holds a's
     digits ([word][digit]), then b's, then (mux) one sel per word at (4 sel - 3) / 4, read as a digit 0 / 2. Outputs:
@@ -130,8 +386,9 @@ class WordProg:
         self.multi = MULTI             # one launch per round (pbsm: a table per row)
         self.fan4 = FAN4               # fan-in 4 first prefix combines where they save a round
         self.div_gform = DIV_GFORM     # division: every other selection round as one gated lookup per digit
-        self.split_products = SPLIT    # mul: products beyond one batch wave in the next round
+        self.split_products = SPLIT    # mul: products beyond one batch wave in the next round (auto: by est_ms)
         self.bits_k2 = True            # a digit's two bits from one many-LUT lookup
+        self.tree_dp = TREE_DP         # the carry-save tree's rounds planned (`_plan_tree`)
         if self.fan not in (2, 3):
             raise ValueError("tfhe_bitwise: prefix fan-in 2 or 3")
         if self.nd & (self.nd - 1):
@@ -336,33 +593,49 @@ class WordProg:
         return [self._row(op, w, self.nd - 1) for w in range(self.w)]
 
     def _carries(self, X):
-        """The fan-in 3 prefix on X = (s_i - 3) / 4 (R rows, s_i = x_i + y_i in 0..6): carries out of every digit,
-        c_i in {0, 1/8}. 1 + ceil(log3 nd) rounds."""
+        """The prefix on X = (s_i - 3) / 4 (R rows, s_i = x_i + y_i in 0..6): carries out of every digit, c_i in {0,
+        1/8}. Combines of fan-in 4 (statuses at 1/2 and 1/8, 2 A + A' + 2 B + B'' on the whole torus at spacing 1/8)
+        or 3 (statuses at 1/4); `_prefix_fans` picks the fewest rounds: 1 + ceil(log4 nd) with the later fan-in 4
+        combines (`fan4all`: the level before outputs both scales, two tables per row in one launch)."""
         p, R, nd = self.pr, self.R, self.nd
-        S, T, U = self._buf(), self._buf(), self._buf()
-        f4 = self.fan4 and _fan4_helps(nd)
-        if f4:                                 # statuses at 1/8 and at 1 (many-LUT): a fan-in 4 first combine
-            S1 = self._buf()
+        fans = _prefix_fans(nd, self.fan4, getattr(self, "fan4all", FAN4ALL) and self.multi)
+        prev = lambda d: [(r, r - d if r % nd >= d else -1) for r in range(R)]
+        U = self._buf()
+        # level 0's statuses: (A, B) the 1/2 and 1/8 scales (buffer, row offset) when the next combine has fan-in 4,
+        # else S at 1/4
+        if fans and fans[0] == 4:          # statuses at 1/8 and at 1/2 (many-LUT: the 8-bin input)
+            S, S1 = self._buf(), self._buf()
             p.pbs(X, R, self._tab("sgn2s"), [S, S1])
+            st = ("ab", (S1, 0), (S, 0))
         else:
-            self._pbs(X, R, "sgn", S)
-        cur, nxt, d = S, T, 1
-        while d < nd:
-            f = 4 if (d == 1 and f4) else min(3, -(-nd // d))
-            last = d * f >= nd
+            st = ("s", self._pbs(X, R, "sgn"))
+        d = 1
+        for li, f in enumerate(fans):
+            last = li == len(fans) - 1
+            U = self._buf()
             if f == 4:
-                p.lin(U, S1, S1, [(r, r - 1 if r % nd >= 1 else -1) for r in range(R)], ca=2, cb=1)
-                p.lin(U, U, cur, [(r, r - 2 if r % nd >= 2 else -1) for r in range(R)], ca=1, cb=2)
-                p.lin(U, U, cur, [(r, r - 3 if r % nd >= 3 else -1) for r in range(R)], ca=1, cb=1)
-                self._pbs(U, R, "carry_pm8x" if last else "sgn4x", nxt)
+                (A, oa), (B, ob) = st[1], st[2]
+                p.lin(U, A, A, [(oa + r, oa + q if q >= 0 else -1) for r, q in prev(d)], ca=2, cb=1)
+                p.lin(U, U, B, [(r, ob + q if q >= 0 else -1) for r, q in prev(2 * d)], ca=1, cb=2)
+                p.lin(U, U, B, [(r, ob + q if q >= 0 else -1) for r, q in prev(3 * d)], ca=1, cb=1)
+                sp8 = True                 # U at spacing 1/8
             else:
-                p.lin(U, cur, cur, [(r, r - d if r % nd >= d else -1) for r in range(R)], ca=1 << (f - 1), cb=1 << (f - 2))
+                cur = st[1]
+                p.lin(U, cur, cur, prev(d), ca=1 << (f - 1), cb=1 << (f - 2))
                 if f == 3:
-                    p.lin(U, U, cur, [(r, r - 2 * d if r % nd >= 2 * d else -1) for r in range(R)], ca=1, cb=1)
-                self._pbs(U, R, "carry_pm" if last else "sgn", nxt)
-            cur, nxt, d = nxt, cur, d * f
-        p.lin(nxt, cur, cur, [(r, -1) for r in range(R)], ca=1, cb=0, c=0.0625)
-        return nxt
+                    p.lin(U, U, cur, prev(2 * d), ca=1, cb=1)
+                sp8 = False
+            if last:
+                C = self._pbs(U, R, "carry_pm8x" if sp8 else "carry_pm")
+            elif fans[li + 1] == 4:         # both scales for the next fan-in 4 combine (two tables per row)
+                OUT, offs = self._multi([(U, list(range(R)), "sgn8_2" if sp8 else "sgn1x"),
+                                         (U, list(range(R)), "sgn8_8" if sp8 else "sgn8x")])
+                st = ("ab", (OUT, offs[0]), (OUT, offs[1]))
+            else:
+                st = ("s", self._pbs(U, R, "sgn4x" if sp8 else "sgn"))
+            d *= f
+        self._lin(C, C, [(r, -1) for r in range(R)], ca=1, cb=0, c=0.0625, dst=C)
+        return C
 
     def _signs(self, extra=None):
         """The half turns 2 sa + 2 sb of every word (w rows; the sign bits as one lookup on the top digits, w + w
@@ -844,7 +1117,13 @@ class WordProg:
         (first fit decreasing): a group <= 7 is one many-LUT lookup (s mod 4, s >= 4: `mdcy7`), a larger one two
         (s mod 4, s div 4 <= 3: `md15` / `dv15`); the top column keeps s mod 4 only. Returns (ITEMS, cols)."""
         pend = list(pending or [])                   # [(word, column, (buffer, row) input, table, max)]
-        while pend or any(sum(m for _, m in x) > target for col in cols for x in col):
+        plan_r, ri = None, 0
+        if self.tree_dp:                             # every word's columns alike: one planned partition per round
+            cm0 = [[m for _, m in x] for x in cols[0]]
+            if all([[m for _, m in x] for x in col] == cm0 for col in cols) and all(x[0] < len(cols) for x in pend):
+                pw = [(x[1], x[4]) for t in sorted({x[3] for x in pend}) for x in pend if x[3] == t and x[0] == 0]
+                plan_r = _plan_tree(cm0, ncols, target, self.multi, len(cols), pw)
+        while (ri < len(plan_r)) if plan_r is not None else (pend or any(sum(m for _, m in x) > target for col in cols for x in col)):
             g8, g16, gtop7, gtop15, plan = [], [], [], [], []
             for q, col in enumerate(cols):
                 inc = 0
@@ -852,7 +1131,23 @@ class WordProg:
                     tot = sum(m for _, m in x) + inc
                     top = c == ncols - 1
                     ents = []
-                    if tot <= target:
+                    if plan_r is not None:         # the planned groups (a lone item <= 6 passes unchanged)
+                        for g in plan_r[ri][c]:
+                            gi = [x[k] for k in g]
+                            sm = sum(m for _, m in gi)
+                            if len(gi) == 1 and sm <= 6:
+                                ents.append(("pass", gi[0][0], gi[0][1]))
+                            elif top:
+                                lst = gtop7 if sm <= 7 else gtop15
+                                ents.append(("top7" if sm <= 7 else "top15", len(lst), gi))
+                                lst.append(gi)
+                            elif sm <= 7:
+                                ents.append(("g8", len(g8), gi))
+                                g8.append(gi)
+                            else:
+                                ents.append(("g16", len(g16), gi))
+                                g16.append(gi)
+                    elif tot <= target:
                         ents = [("pass", r, m) for r, m in x]
                     else:
                         gs = []
@@ -941,6 +1236,7 @@ class WordProg:
                         srcs.append((o[1], o[2] + j))
                 pend = []
             ITEMS, cols = self._gather(srcs), ncol
+            ri += 1
         return ITEMS, cols
 
     def _gather(self, srcs):
@@ -986,6 +1282,20 @@ class WordProg:
         self._lin(O, C, [(r, r) for r in range(R)], ca=1, cb=-8, dst=O)
         return O
 
+    def _split_products(self, wide):
+        """Whether mul2 puts the products past one batch wave into the tree's first launch: forced by
+        `split_products` "1" / "0", else (auto) the form `est_ms` finds faster for this word count and width."""
+        sp = self.split_products
+        if sp in (True, False) or str(sp) in ("0", "1"):
+            return sp is True or str(sp) == "1"
+        t = {}
+        for f in ("1", "0"):
+            x = WordProg("t", self.w, self.nd)
+            x.multi, x.fan4, x.tree_dp, x.split_products = self.multi, self.fan4, self.tree_dp, f
+            x.mul2("t.o", wide=wide)
+            t[f] = est_ms(x.pr)
+        return t["1"] < t["0"]
+
     def mul2(self, out_slots, wide=False, high=None):
         """a b (mod 2^bits; wide: all 2 bits bits): digit products (a b) mod 4 / div 4 by one 16-bin lookup each on
         a_i + 4 b_j, a 16-bin carry-save tree (`_reduce16`), the prefix adder with linear output digits. high:
@@ -1009,13 +1319,19 @@ class WordProg:
             corr += [(q, nd, (-1, self._row(1, q, nd - 1)), "sbit") for q in range(w)]
         if corr:
             CI = self._lin(0, 0, [c[2] for c in corr], ca=1, cb=4, c=-0.9375)
-        # one batch-path wave holds BATCH_WAVE LWEs (one per block): products beyond it (those of the lowest columns,
-        # which fill last) ride the tree's first launch instead
+        # one batch-path wave holds BATCH_WAVE LWEs (one per block): the products beyond it may ride the tree's first
+        # launch instead (round robin over the columns, high parts first), when the cost model says that is faster
+        # than a two-LWE-per-block wave of all of them
         late = []
         tot = len(prs) + nhi + len(corr)
-        if self.multi and nhi and not corr and BATCH_WAVE < tot <= 2 * BATCH_WAVE and self.split_products:
+        if self.multi and nhi and not corr and BATCH_WAVE < tot <= 2 * BATCH_WAVE and self._split_products(wide):
             allp = [(k, "plo") for k in range(len(prs))] + [(k, "phi") for k in range(nhi)]
-            allp.sort(key=lambda x: prs[x[0]][1] + prs[x[0]][2] + (x[1] == "phi"))
+            col = lambda x: prs[x[0]][1] + prs[x[0]][2] + (x[1] == "phi")
+            rank, cnt = {}, {}
+            for x in sorted(allp, key=lambda x: (x[1] != "phi", col(x))):
+                cnt[col(x)] = cnt.get(col(x), 0) + 1
+                rank[x] = cnt[col(x)]
+            allp.sort(key=lambda x: (rank[x], x[1] != "phi", col(x)))
             late = allp[:tot - BATCH_WAVE]
         lateset = set(late)
         if self.multi and nhi:
@@ -1025,9 +1341,10 @@ class WordProg:
                 jobs += [(CI, [k for k, c in enumerate(corr) if c[3] == t], t) for t in ("sgnot", "sbit")]
             P, offs = self._multi(jobs)
             pos = {}
-            for (b_, rows_, t_), o_ in zip(jobs[:2], offs[:2]):
-                for jj, k in enumerate(rows_):
-                    pos[(k, t_)] = o_ + jj
+            for (b_, rows_, t_), o_ in zip(jobs, offs):
+                if t_ in ("plo", "phi"):
+                    for jj, k in enumerate(rows_):
+                        pos[(k, t_)] = o_ + jj
             LO, HI = (P, None), (P, None)
         else:
             LO = (self._pbs(IN, len(prs), "plo"), 0)
@@ -2121,6 +2438,8 @@ TABLES.update({
     "sgn1x": (lambda m: np.sign(_r4(m)) / 2.0, False),
     "sgn4x": (lambda m: np.sign(_r8(m)) / 4.0, False),                      # combines read at spacing 1/8
     "carry_pm8x": (lambda m: np.where(_r8(m) > 0, 0.0625, -0.0625), False),
+    "sgn8_2": (lambda m: np.sign(_r8(m)) / 2.0, False),                     # a fan-in 4 combine's status at 1/2
+    "sgn8_8": (lambda m: np.sign(_r8(m)) / 8.0, False),                     # ... and at 1/8
     "sg_u1": (lambda m: (_dc(m) >= 2).astype(float), False),                # the sign bit as a unit-1 selector
     "sg_st": (lambda m: np.where(_dc(m) >= 2, 0.25, -0.25), False),         # ... as a carry-in status (G / K)
     "xsg_u1": (lambda m: (lambda a, b: ((a >= 2) != (b >= 2)).astype(float))(*_ab16(m)), False),
@@ -2387,9 +2706,10 @@ from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401
 
 
 # measured cost of one bootstrap launch by its rows (RTX PRO 6000, latency keys of 5 / 4 key bits; pc-check tfhe-prog,
-# 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
-COST_MS = ((1, 1.15), (4, 1.22), (8, 1.58), (12, 1.69), (16, 1.77), (24, 2.0), (32, 2.06), (40, 2.53), (48, 2.68),
-           (64, 2.89), (94, 4.2), (188, 5.77), (256, 9.6), (384, 11.0), (512, 15.0), (768, 20.8), (1024, 28.6))
+# 4 chained rounds of B rows, 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
+COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.69), (32, 1.86), (40, 1.88), (48, 2.29),
+           (56, 2.31), (64, 2.33), (80, 2.55), (94, 3.19), (128, 4.65), (188, 4.80), (256, 7.09), (376, 7.12),
+           (512, 11.7), (752, 14.2), (1024, 21.2))
 
 
 def est_ms(prog):
