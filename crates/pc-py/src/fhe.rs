@@ -1280,14 +1280,25 @@ impl PyFhe {
         Ok(l)
     }
 
-    /// In place: drop to `level` if above it (value-preserving modulus reduction; no data moves).
+    /// In place: drop to `level` if above it (value-preserving modulus reduction; no data moves). A level past the
+    /// chain's bottom (`bottom_level`) or off its level grid is refused.
     fn drop_to_level(&self, a: &Bound<'_, PyCt>, level: u32) -> PyResult<()> {
         let mut am = a.borrow_mut();
         let d = &*self.dev;
         let c = am.ct_mut()?;
+        let to = d.sh.drop_to_level(&c.meta, level).out.level;
+        if to != c.meta.level && !d.ctx.is_live_level(to) {
+            return Err(PyValueError::new_err(format!("drop_to_level({level}): past the bottom of the chain (level {}) or off its level grid", d.ctx.bottom_level())));
+        }
         let st = d.st.borrow();
         st.ops.drop_to_level(&d.sh, std::slice::from_mut(c), level);
         Ok(())
+    }
+
+    /// The chain's bottom level: the deepest a ciphertext can be dropped to (`drop_to_level`).
+    #[getter]
+    fn bottom_level(&self) -> u32 {
+        self.dev.ctx.bottom_level()
     }
 
     /// In place: stamp a reduction output's slot period (pack tag).
