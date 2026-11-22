@@ -709,6 +709,9 @@ pub struct TfheSwitch<'a> {
     cksk: Option<DevKsk<'a>>,
     /// native_load: the bootstrap outputs (one buffer per LUT, [b][n_br + 1]) go here instead of the repack
     sinks: Vec<*mut c_void>,
+    /// the native loads' / extractions' windows (`native_load_shifted`): the phase times 2^k per pass, k in `shifts`;
+    /// outputs window-major ([shift][b] rows). Empty: one pass, the phase as it is.
+    shifts: Vec<u32>,
     /// `native_extract`: the key-switched LWEs (s_lwe) into here instead of a bootstrap (null: off)
     extract_dst: *mut c_void,
     /// Params::pack: the packing key switch (encrypted lookup tables: `native_pack`, `native_plut`)
@@ -829,6 +832,7 @@ impl<'a> TfheSwitch<'a> {
             ksk,
             cksk,
             sinks: Vec::new(),
+            shifts: Vec::new(),
             extract_dst: std::ptr::null_mut(),
             pack: match &sw.pack {
                 Some(pk) => Some(DevPack::with_rows(arena, s, pk, PACK_RMAX)?),
@@ -968,20 +972,31 @@ impl<'a> TfheSwitch<'a> {
         let stage = self.stage.vptr_mut();
         Self::gp(ctx, s, &PcmmArgs { ct: x.buf.r(), i0: 0, x: stage, ..chain(pcmm_op::GATHER) })?;
         Self::gp(ctx, s, &PcmmArgs { y: stage, x: self.low.vptr_mut(), c: inv_c, ..chain(pcmm_op::IN_RESCALE) })?;
-        // mod p0: rs = [c1, c0] (the staging's part order)
         let tb = TfheArgs { n: n as i32, q: p0, ..Default::default() };
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::RESCALE_P1, count: 1, x: self.rs.vptr_mut(), y: self.low.vptr(), c: [invmod(p1 % p0, p0), p1, 0, 0, 0, 0, 0, mu(p0)], ..tb })?;
-        // ring switch: digits of c1, NTT, MAC against the key -> stage [c0', c1'] (NTT form), INTT, + c0
-        let (rs_lv, rs_bl) = (self.p.rs.1, self.p.rs.0);
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_DIGITS, count: 1, x: self.dig.vptr_mut(), y: self.rs.vptr(), m: self.rs_m, c: [rs_bl as u64, rs_lv as u64, 0, 0, 0, 0, 0, 0], ..tb })?;
-        Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::NTT, count: rs_lv as i32, i0: rs_lv as i32, x: self.dig.vptr_mut(), tw: self.tw_f.vptr(), ..pa })?;
-        let st = self.stage.vptr_mut();
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::MAC, count: rs_lv as i32, i1: 2, x: st, y: self.dig.vptr(), z: self.rkey.vptr(), c: [0, 0, 0, 0, 0, 0, 0, mu(p0)], ..tb })?;
-        Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 2, x: st, tw: self.tw_i.vptr(), ..pa })?;
-        let c0 = (self.rs.vptr() as *const u32).wrapping_add(n) as *const c_void;
-        Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::ADD, count: 1, i0: n as i32, x: st, y: c0, ..pa })?;
-        lap(s, &mut t, &mut tm.to_lwe)?;
-
+        let shifts = if self.shifts.is_empty() { vec![0u32] } else { self.shifts.clone() };
+        if shifts.len() > 1 && self.sinks.is_empty() && self.extract_dst.is_null() {
+            return Err(shape("tfhe switch", "windows of the phase load native LWEs or extract (no repack)".to_string()));
+        }
+        // mod p0: rs = [c1, c0] (the staging's part order); a window: the phase times 2^sh first (exact, mod p0 p1);
+        // then the ring switch: digits of c1, NTT, MAC against the key -> stage [c0', c1'] (NTT form), INTT, + c0
+        let ring_switch = |me: &mut Self, sh: u32| -> Result<()> {
+            let mut rc = [invmod(p1 % p0, p0), p1, 0, 0, 0, 0, 0, mu(p0)];
+            if sh > 0 {
+                let (t0, t1) = pc_tfhe::switch::shift_mult(sh, p0, p1);
+                rc[2] = t0;
+                rc[3] = t1;
+                rc[4] = mu(p1);
+            }
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::RESCALE_P1, count: 1, x: me.rs.vptr_mut(), y: me.low.vptr(), c: rc, ..tb })?;
+            let (rs_lv, rs_bl) = (me.p.rs.1, me.p.rs.0);
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_DIGITS, count: 1, x: me.dig.vptr_mut(), y: me.rs.vptr(), m: me.rs_m, c: [rs_bl as u64, rs_lv as u64, 0, 0, 0, 0, 0, 0], ..tb })?;
+            Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::NTT, count: rs_lv as i32, i0: rs_lv as i32, x: me.dig.vptr_mut(), tw: me.tw_f.vptr(), ..pa })?;
+            let st = me.stage.vptr_mut();
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::MAC, count: rs_lv as i32, i1: 2, x: st, y: me.dig.vptr(), z: me.rkey.vptr(), c: [0, 0, 0, 0, 0, 0, 0, mu(p0)], ..tb })?;
+            Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::INTT, count: 2, i0: 2, x: st, tw: me.tw_i.vptr(), ..pa })?;
+            let c0 = (me.rs.vptr() as *const u32).wrapping_add(n) as *const c_void;
+            Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::ADD, count: 1, i0: n as i32, x: st, y: c0, ..pa })
+        };
         let cols = nl + 1;
         let qb = self.p.q_br;
         let nu = self.p.nu as u64;
@@ -991,54 +1006,85 @@ impl<'a> TfheSwitch<'a> {
         cx[7] = self.pbs_c[7];
         let mut pbs_c = self.pbs_c;
         pbs_c[5] = nu;
-        for c0 in (0..b).step_by(self.max) {
-            let cb = self.max.min(b - c0);
-            let pc = (pos as *const u32).wrapping_add(c0) as *const c_void;
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_EXTRACT, count: cb as i32, i1: n_sub as i32, i2: self.sfac as i32, x: self.ext.vptr_mut(), y: self.stage.vptr(), z: pc, ..tb })?;
+        // windows in one pass (the digit decomposition's loads, b x windows <= the capacity): every window's ring switch
+        // and extraction, then one key switch and one bootstrap launch for all of them
+        let tot = shifts.len() * b;
+        if shifts.len() > 1 && tot <= self.max {
+            for (wi, &sh) in shifts.iter().enumerate() {
+                ring_switch(self, sh)?;
+                let ex = (self.ext.vptr_mut() as *mut u32).wrapping_add(wi * b * (n_sub + 1)) as *mut c_void;
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_EXTRACT, count: b as i32, i1: n_sub as i32, i2: self.sfac as i32, x: ex, y: self.stage.vptr(), z: pos, ..tb })?;
+            }
             lap(s, &mut t, &mut tm.to_lwe)?;
-
-            // LWE key switch
             let ext = self.ext.vptr();
-            self.key_switch(ctx, s, lt_, ext, n_sub, cb, false)?;
+            self.key_switch(ctx, s, lt_, ext, n_sub, tot, false)?;
             lap(s, &mut t, &mut tm.key_switch)?;
             if !self.extract_dst.is_null() {
-                let d = (self.extract_dst as *mut u32).wrapping_add(c0 * cols) as *mut c_void;
-                // SAFETY: `native_extract`'s caller passes b rows of n_lwe + 1 words on this device
-                unsafe { self.lwe.copy_to_raw(s, 0, d, cb * cols)? };
-                continue;
+                // SAFETY: `native_extract_shifted`'s caller passes windows x b rows of n_lwe + 1 words on this device
+                unsafe { self.lwe.copy_to_raw(s, 0, self.extract_dst, tot * cols)? };
+                return Ok(tm);
             }
-
-            // bootstrap
-            let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
-            self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
-            if !self.sinks.is_empty() {
-                for (j, &dst) in self.sinks.iter().enumerate() {
-                    let x = (dst as *mut u32).wrapping_add(c0 * (nb + 1)) as *mut c_void;
-                    Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
-                }
-                lap(s, &mut t, &mut tm.bootstrap)?;
-                continue;
-            }
-            if kl == 1 {
-                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[0], p0, 0, 0, 0, nu, cx[6], cx[7]], ..pb })?;
-                lap(s, &mut t, &mut tm.bootstrap)?;
-                self.repack.accumulate(ctx.table, s, lt_, self.outs.vptr(), pc, cb, c0 == 0, reps, b)?;
-                lap(s, &mut t, &mut tm.repack)?;
-                continue;
+            let pb = TfheArgs { n: nb as i32, count: tot as i32, i1: nl as i32, q: qb, ..Default::default() };
+            self.rotate(ctx, s, tot, tv, kl, &cx, pbs_c)?;
+            for (j, &dst) in self.sinks.iter().enumerate() {
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: dst, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
             }
             lap(s, &mut t, &mut tm.bootstrap)?;
-            // several LUTs (one pass): LUT j from coefficient j, repacked into its own ciphertext; LUT 0 last (into x)
-            for j in (0..kl).rev() {
-                Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
-                self.repack.accumulate(ctx.table, s, lt_, self.outs.vptr(), pc, cb, true, reps, b)?;
-                if j > 0 {
-                    let meta = x.meta;
-                    let out = &mut *extra[j - 1];
-                    self.finish_into(ctx, s, &pa, out)?;
-                    out.meta = meta;
+            return Ok(tm);
+        }
+        for (wi, &sh) in shifts.iter().enumerate() {
+            ring_switch(self, sh)?;
+            lap(s, &mut t, &mut tm.to_lwe)?;
+
+            for c0 in (0..b).step_by(self.max) {
+                let cb = self.max.min(b - c0);
+                let pc = (pos as *const u32).wrapping_add(c0) as *const c_void;
+                Self::go(ctx, s, &TfheArgs { op: tfhe_op::RS_EXTRACT, count: cb as i32, i1: n_sub as i32, i2: self.sfac as i32, x: self.ext.vptr_mut(), y: self.stage.vptr(), z: pc, ..tb })?;
+                lap(s, &mut t, &mut tm.to_lwe)?;
+
+                // LWE key switch
+                let ext = self.ext.vptr();
+                self.key_switch(ctx, s, lt_, ext, n_sub, cb, false)?;
+                lap(s, &mut t, &mut tm.key_switch)?;
+                if !self.extract_dst.is_null() {
+                    let d = (self.extract_dst as *mut u32).wrapping_add((wi * b + c0) * cols) as *mut c_void;
+                    // SAFETY: `native_extract`'s caller passes b rows of n_lwe + 1 words on this device
+                    unsafe { self.lwe.copy_to_raw(s, 0, d, cb * cols)? };
+                    continue;
                 }
+
+                // bootstrap
+                let pb = TfheArgs { n: nb as i32, count: cb as i32, i1: nl as i32, q: qb, ..Default::default() };
+                self.rotate(ctx, s, cb, tv, kl, &cx, pbs_c)?;
+                if !self.sinks.is_empty() {
+                    for (j, &dst) in self.sinks.iter().enumerate() {
+                        let x = (dst as *mut u32).wrapping_add((wi * b + c0) * (nb + 1)) as *mut c_void;
+                        Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x, y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
+                    }
+                    lap(s, &mut t, &mut tm.bootstrap)?;
+                    continue;
+                }
+                if kl == 1 {
+                    Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[0], p0, 0, 0, 0, nu, cx[6], cx[7]], ..pb })?;
+                    lap(s, &mut t, &mut tm.bootstrap)?;
+                    self.repack.accumulate(ctx.table, s, lt_, self.outs.vptr(), pc, cb, c0 == 0, reps, b)?;
+                    lap(s, &mut t, &mut tm.repack)?;
+                    continue;
+                }
+                lap(s, &mut t, &mut tm.bootstrap)?;
+                // several LUTs (one pass): LUT j from coefficient j, repacked into its own ciphertext; LUT 0 last (into x)
+                for j in (0..kl).rev() {
+                    Self::go(ctx, s, &TfheArgs { op: tfhe_op::PBS_EXTRACT, x: self.outs.vptr_mut(), y: self.acc.vptr(), m: pc_tfhe::gadget::fixed_ratio(p0, qb), c: [offsets[j], p0, 0, 0, j as u64, nu, cx[6], cx[7]], ..pb })?;
+                    self.repack.accumulate(ctx.table, s, lt_, self.outs.vptr(), pc, cb, true, reps, b)?;
+                    if j > 0 {
+                        let meta = x.meta;
+                        let out = &mut *extra[j - 1];
+                        self.finish_into(ctx, s, &pa, out)?;
+                        out.meta = meta;
+                    }
+                }
+                lap(s, &mut t, &mut tm.repack)?;
             }
-            lap(s, &mut t, &mut tm.repack)?;
         }
         if self.sinks.is_empty() && self.extract_dst.is_null() {
             self.finish_into(ctx, s, &pa, x)?;
@@ -1062,6 +1108,26 @@ impl<'a> TfheSwitch<'a> {
         self.sinks = dsts.to_vec();
         let r = self.apply_dev_k(ctx, s, lt_, x, &mut [], pos, b, 1, tv, offsets, timed);
         self.sinks.clear();
+        r
+    }
+
+    /// `native_load_k` of windows of the phase: for each k in `shifts` the split's coefficients `pos` times 2^k
+    /// (pc-tfhe `rescale_p1_mult`: exact before the rescale) through the LUTs, into rows [shift][b] of `dsts[j]`
+    /// (b x shifts.len() rows): the digit decomposition's load (pc-tfhe `Switcher::load_shifted`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_load_shifted<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, shifts: &[u32], tv: *const c_void, offsets: &[u64], dsts: &[*mut c_void], timed: bool) -> Result<Timings> {
+        self.shifts = shifts.to_vec();
+        let r = self.native_load_k(ctx, s, lt_, x, pos, b, tv, offsets, dsts, timed);
+        self.shifts.clear();
+        r
+    }
+
+    /// `native_extract` of windows (as `native_load_shifted`): rows [shift][b] of `dst` (pc-tfhe `lwes_shifted`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_extract_shifted<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, x: &mut Ct<'_, W>, pos: *const c_void, b: usize, shifts: &[u32], dst: *mut c_void, timed: bool) -> Result<Timings> {
+        self.shifts = shifts.to_vec();
+        let r = self.native_extract(ctx, s, lt_, x, pos, b, dst, timed);
+        self.shifts.clear();
         r
     }
 

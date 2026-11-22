@@ -1752,8 +1752,13 @@ __global__ void rescale_p1_k(TfheArgs A) {
     const int part = blockIdx.y;
     const uint32_t* y = (const uint32_t*)A.y + (size_t)part * 2 * n;
     const uint64_t q = A.q, p1 = A.c[1];
-    const uint32_t d = smod32(cent(y[n + k], p1), q);
-    ((uint32_t*)A.x)[(size_t)part * n + k] = mulm32((uint32_t)subq(y[k], d, q), (uint32_t)A.c[0], q, A.c[7]);
+    uint32_t x0 = y[k], x1 = y[n + k];
+    if (A.c[2]) {   // the phase times an integer first (c[2] mod q, c[3] mod p1, c[4] = mu(p1)): a window of it
+        x0 = mulm32(x0, (uint32_t)A.c[2], q, A.c[7]);
+        x1 = mulm32(x1, (uint32_t)A.c[3], p1, A.c[4]);
+    }
+    const uint32_t d = smod32(cent(x1, p1), q);
+    ((uint32_t*)A.x)[(size_t)part * n + k] = mulm32((uint32_t)subq(x0, d, q), (uint32_t)A.c[0], q, A.c[7]);
 }
 
 __global__ void rs_digits_k(TfheArgs A) {

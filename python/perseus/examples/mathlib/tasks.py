@@ -58,8 +58,9 @@ class Fn(Task):
     hi: float = 0.0
     err: float = 1e-4
     p: float = 1.5
-    method: str = "ckks"          # sign family: ckks / tfhe
+    method: str = "ckks"          # sign family: ckks / tfhe / digit (impl/tfhe_digits.py) / auto
     fbs: bool = False             # the function as a functional bootstrap (impl.math `approx_fbs`)
+    k: int = 0                    # sign family: the first k slots only (0: all; tfhe / digit switch k values)
     seed: int = 0
     name = "fn"
 
@@ -67,7 +68,10 @@ class Fn(Task):
         rng = np.random.default_rng(self.seed)
         self.x = rng.uniform(self.lo, self.hi, SLOTS)
         self.x[:2] = (self.lo, self.hi)
-        self.tfhe = self.method == "tfhe" and self.fn in ("abs", "relu", "sign", "clip")
+        self.k = int(self.k)
+        if self.method == "auto" and self.fn in ("abs", "relu", "sign", "clip"):
+            self.method = M.sign_method(self.err, self.k or SLOTS)
+        self.tfhe = self.method in ("tfhe", "digit") and self.fn in ("abs", "relu", "sign", "clip")
 
     def encode(self):
         return [self.x]
@@ -99,7 +103,7 @@ class Fn(Task):
         if self.fn == "relu":
             return [M.relu(ops, x, B, self.err, self.method)]
         if self.fn == "sign":
-            return [M.sign(ops, x, B, self.err, self.method)]
+            return [M.sign(ops, x, B, self.err, self.method, slots=np.arange(self.k) if self.k else None)]
         if self.fn == "clip":
             return [M.clip(ops, x, 0.5 * self.lo, 0.5 * self.hi, B, self.err, self.method)]
         # an FBS renames its operand (its level hints): the stage input stays the harness's
@@ -110,8 +114,10 @@ class Fn(Task):
 
     def metrics(self, out):
         y, t = out["y"], self.ref(self.x)
+        if self.k and self.fn == "sign":
+            y, t = y[:self.k], t[:self.k]
         if self.fn == "sign":            # outside the gap only
-            keep = np.abs(self.x) >= self.err * max(_m.fabs(self.lo), _m.fabs(self.hi))
+            keep = np.abs(self.x[:len(y)]) >= self.err * max(_m.fabs(self.lo), _m.fabs(self.hi))
             y, t = y[keep], t[keep]
         e, r = _err(y, t)
         rel = self.fn in ("exp", "rsqrt", "reciprocal", "pow")
@@ -119,9 +125,10 @@ class Fn(Task):
         out = {"max_err": e, "rms_err": r, "max_rel": er, "rms_rel": rr}
         if self.fn in ("abs", "relu", "sign", "clip"):
             # the decisions the comparison got wrong (an error past 10x the target), and the largest |x| among them
-            bad = np.abs(y - t) > 10.0 * self.err
-            xs = self.x if self.fn != "sign" else self.x[np.abs(self.x) >= self.err * max(_m.fabs(self.lo),
-                                                                                          _m.fabs(self.hi))]
+            # a switched decision is exact up to the finish's output noise (~1e-4): wrong when it flips
+            bad = np.abs(y - t) > (10.0 * self.err if self.method == "ckks" else 0.25)
+            xk = self.x[:self.k] if self.k and self.fn == "sign" else self.x
+            xs = xk if self.fn != "sign" else xk[np.abs(xk) >= self.err * max(_m.fabs(self.lo), _m.fabs(self.hi))]
             out["wrong_frac"] = float(bad.mean())
             out["wrong_max_absx"] = float(np.abs(xs[bad]).max()) if bad.any() else 0.0
         return out

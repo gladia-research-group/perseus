@@ -41,6 +41,8 @@ mod check_pcmm;
 mod word_seam;
 #[path = "../check_tfhe.rs"]
 mod check_tfhe;
+#[path = "../check_digit.rs"]
+mod check_digit;
 
 fn cmd_bts(args: &[String]) -> ExitCode {
     let dir = match args.first() {
@@ -200,6 +202,7 @@ fn main() -> ExitCode {
         Some("tfhe-hybrid") => check_tfhe::cmd_hybrid(&args[1..]),
         Some("tfhe-ks") => check_tfhe::cmd_ks(&args[1..]),
         Some("tfhe-noise") => check_tfhe::cmd_noise(&args[1..]),
+        Some("tfhe-digit") => check_digit::cmd(&args[1..]),
         Some("tfhe-bridge") => check_tfhe::cmd_bridge(&args[1..]),
         Some("n64") => cmd_word_seam(&args[1..]),
         _ => usage(),

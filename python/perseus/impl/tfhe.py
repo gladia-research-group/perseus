@@ -191,9 +191,14 @@ class Prog:
         self.luts[name] = (list(fs), bool(warp))
         return name
 
-    def load(self, lut, dst):
-        """`dst`: a buffer, or a list of one per table of `lut`."""
-        self.steps.append({"op": "load", "lut": lut, "dst": dst})
+    def load(self, lut, dst, shifts=None):
+        """`dst`: a buffer, or a list of one per table of `lut`. `shifts`: windows of the phase (the digit
+        decomposition, impl/tfhe_digits.py): for each k the loaded values times 2^k (exact on the CKKS side, before the
+        switch rounds them), read on the whole torus; rows [window][value]."""
+        st = {"op": "load", "lut": lut, "dst": dst}
+        if shifts:
+            st["shifts"] = [int(k) for k in shifts]
+        self.steps.append(st)
 
     def lin(self, dst, a, b, pairs, ca=1, cb=1, c=0.0):
         """dst[r] = ca a[ia] + cb b[ib] + c for (ia, ib) = pairs[r] (-1: no term); ca, cb integers."""
@@ -299,6 +304,8 @@ class Prog:
             if op == "load":
                 fs = self.luts[st["lut"]][0]
                 x = np.asarray(m, dtype=np.float64)
+                if st.get("shifts"):      # windows: m 2^k on the whole torus [-2, 2), each read with its own noise
+                    x = np.concatenate([np.mod(x * 2.0 ** k + 2.0, 4.0) - 2.0 for k in st["shifts"]])
                 x = x + rng.normal(0.0, _NOISE * len(fs), x.shape) if _NOISE else x
                 for d, f in zip(st["dst"] if isinstance(st["dst"], list) else [st["dst"]], fs):
                     B[d] = _nat(f, x, GRID // len(fs))
@@ -400,6 +407,15 @@ def table_index(i, t):
 def register_prog(prog):
     PROGS[prog.name] = prog
     return prog.name
+
+
+def need_native(bufs, rows):
+    """Raise PC_TFHE_NATIVE (the session's native LWE buffers, read when a session starts) to at least `bufs` buffers
+    of `rows` rows: a program registered before its session (a capture, then the planned run) sizes them."""
+    cur = os.environ.get("PC_TFHE_NATIVE", "")
+    b0, r0 = (int(v) for v in cur.split(",")) if cur else (0, 0)
+    if bufs > b0 or rows > r0:
+        os.environ["PC_TFHE_NATIVE"] = f"{max(bufs, b0)},{max(rows, r0)}"
 
 
 def tfhe_prog(ops, x, prog, slots):

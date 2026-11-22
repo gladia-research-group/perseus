@@ -62,6 +62,9 @@ def _auto(tmp_path, task, sets, seeds=("0", "1")):
     ("fn", ["fn=log", "lo=0.01", "hi=100", "err=5e-2"], "max_err", 5e-2),     # refreshed inside: noise-held
     ("fn", ["fn=relu", "lo=-1", "hi=1", "err=1e-3", "method=ckks"], "max_err", 2e-3),
     ("fn", ["fn=relu", "lo=-1", "hi=1", "err=1e-3", "method=tfhe"], "rms_err", 1e-3),
+    # the digit decomposition's sign (impl/tfhe_digits.py) at 2^-16 / 2^-20 of the bound on 16 slots: every decision exact
+    ("fn", ["fn=sign", "lo=-1", "hi=1", "err=1.52587890625e-05", "method=digit", "k=16"], "wrong_frac", 1e-9),
+    ("fn", ["fn=sign", "lo=-1", "hi=1", "err=9.5367431640625e-07", "method=digit", "k=16"], "wrong_frac", 1e-9),
     ("stats", ["kind=zscore", "n=256", "B=128"], "max_err", 5e-3),
     ("stats", ["kind=softmax", "n=256", "B=128", "method=tfhe"], "max_err", 2e-3),
     ("stats", ["kind=logsumexp", "n=256", "B=128", "method=tfhe"], "max_err", 3e-3),    # 3.9e-2 when u was refreshed

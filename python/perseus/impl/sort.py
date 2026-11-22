@@ -83,7 +83,8 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
     folds the comparison's direction in); |scale d| <= bound. CKKS: within `delta` of 0 / 1 where |scale d| >= res;
     an exact 0 input gives 1/2. TFHE: exact outside the switch's noise band; `levels` > 1: tfhe_select.msign's
     finer scales in the same switch (2 levels - 1 more PBS per value, the band / 16 per extra level; needs
-    2 levels - 1 slot groups beside the heads). `margin` (CKKS): how far past `bound` |scale d| may drift and still
+    2 levels - 1 slot groups beside the heads). Digit: the digit decomposition's sign (impl/tfhe_digits.py), exact
+    for |scale d| >= res (2^-20 of the bound and below; 1 at 0). `margin` (CKKS): how far past `bound` |scale d| may drift and still
     land inside the ladder's first stage."""
     n = _nslots(ops, d) if n is None else int(n)
     heads = np.asarray(heads, dtype=np.int64)
@@ -99,10 +100,16 @@ def step(ops, d, heads, scale, *, method="tfhe", bound=1.0, res=1e-2, delta=None
         name = f"sort.{len(heads)}.{hashlib.blake2b(heads.tobytes(), digest_size=6).hexdigest()}"
         S = tfhe.tfhe_lut(ops, D, sign01(), tfhe.register_slots(name, heads))
         return _clean(ops, S, n, heads)
+    if method == "digit":           # the digit decomposition's sign (impl/tfhe_digits.py): exact down to res
+        from . import math as M, tfhe_digits
+        from .tfhe_select import _clean
+        D = ops.mult_pt(d, _put(n, heads, sc * tfhe_digits.SIGN_SPAN / bound), kind="mask")
+        S = M.digit_sign_loaded(ops, D, heads, max(4, int(np.ceil(np.log2(float(bound) / float(res))))), f"sort.{tag}")
+        return _clean(ops, ops.add_pt(ops.mult_pt(S, _put(n, heads, 0.5), kind="mask"), _mask(n, heads, 0.5), kind="mask"), n, heads)
     if method == "fbs":
         return _step_fbs(ops, d, n, heads, sc, float(bound), float(res))
     if method != "ckks":
-        raise ValueError(f"method {method!r}: 'tfhe', 'ckks' or 'fbs'")
+        raise ValueError(f"method {method!r}: 'tfhe', 'ckks', 'fbs' or 'digit'")
     bound = float(bound) * (1.0 + margin)
     lad = ladder_for(bound, res, delta)
     t = ops.mult_pt(d, _put(n, heads, sc / bound), kind="mask")
