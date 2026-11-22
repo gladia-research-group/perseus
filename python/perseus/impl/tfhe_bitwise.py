@@ -604,21 +604,22 @@ class WordProg:
         U = self._buf()
         # level 0's statuses: (A, B) the 1/2 and 1/8 scales (buffer, row offset) when the next combine has fan-in 4,
         # else S at 1/4
+        ident = list(range(R))
         if fans and fans[0] == 4:          # statuses at 1/8 and at 1/2 (many-LUT: the 8-bin input)
             S, S1 = self._buf(), self._buf()
             p.pbs(X, R, self._tab("sgn2s"), [S, S1])
-            st = ("ab", (S1, 0), (S, 0))
+            st = ("ab", (S1, 0, ident), (S, 0, ident))
         else:
             st = ("s", self._pbs(X, R, "sgn"))
         d = 1
         for li, f in enumerate(fans):
             last = li == len(fans) - 1
             U = self._buf()
-            if f == 4:
-                (A, oa), (B, ob) = st[1], st[2]
-                p.lin(U, A, A, [(oa + r, oa + q if q >= 0 else -1) for r, q in prev(d)], ca=2, cb=1)
-                p.lin(U, U, B, [(r, ob + q if q >= 0 else -1) for r, q in prev(2 * d)], ca=1, cb=2)
-                p.lin(U, U, B, [(r, ob + q if q >= 0 else -1) for r, q in prev(3 * d)], ca=1, cb=1)
+            if f == 4:                     # (buffer, offset, row of position r)
+                (A, oa, ma), (B, ob, mb) = st[1], st[2]
+                p.lin(U, A, A, [(oa + ma[r], oa + ma[q] if q >= 0 else -1) for r, q in prev(d)], ca=2, cb=1)
+                p.lin(U, U, B, [(r, ob + mb[q] if q >= 0 else -1) for r, q in prev(2 * d)], ca=1, cb=2)
+                p.lin(U, U, B, [(r, ob + mb[q] if q >= 0 else -1) for r, q in prev(3 * d)], ca=1, cb=1)
                 sp8 = True                 # U at spacing 1/8
             else:
                 cur = st[1]
@@ -628,10 +629,13 @@ class WordProg:
                 sp8 = False
             if last:
                 C = self._pbs(U, R, "carry_pm8x" if sp8 else "carry_pm")
-            elif fans[li + 1] == 4:         # both scales for the next fan-in 4 combine (two tables per row)
-                OUT, offs = self._multi([(U, list(range(R)), "sgn8_2" if sp8 else "sgn1x"),
-                                         (U, list(range(R)), "sgn8_8" if sp8 else "sgn8x")])
-                st = ("ab", (OUT, offs[0]), (OUT, offs[1]))
+            elif fans[li + 1] == 4:         # both scales for the next fan-in 4 combine (two tables per row; the 1/8
+                # scale only where that combine reads it: digits below nd - 2 d')
+                dn = d * f
+                rb = [r for r in range(R) if r % nd < nd - 2 * dn]
+                OUT, offs = self._multi([(U, ident, "sgn8_2" if sp8 else "sgn1x"),
+                                         (U, rb, "sgn8_8" if sp8 else "sgn8x")])
+                st = ("ab", (OUT, offs[0], ident), (OUT, offs[1], {r: k for k, r in enumerate(rb)}))
             else:
                 st = ("s", self._pbs(U, R, "sgn4x" if sp8 else "sgn"))
             d *= f
@@ -714,12 +718,12 @@ class WordProg:
                 ([(X, list(range(R)), "sgn1x")] if fans[0] == 4 else []) + [(HI, list(range(2 * w)), "hs")]
             S, offs = self._multi(jobs)
             oh = offs[-1]
-            st = ("ab", (S, offs[1]), (S, offs[0])) if fans[0] == 4 else ("s", S)
+            st = ("ab", (S, offs[1], list(range(R))), (S, offs[0], list(range(R)))) if fans[0] == 4 else ("s", S)
             HS = self._lin(S, S, [(oh + q, oh + w + q) for q in range(w)], ca=1, cb=1)
         else:
             if fans[0] == 4:
                 S, S1b = self._pbsk(X, R, "sgn2s")
-                st = ("ab", (S1b, 0), (S, 0))
+                st = ("ab", (S1b, 0, list(range(R))), (S, 0, list(range(R))))
             else:
                 st = ("s", self._pbs(X, R, "sgn"))
             HS = self._signs() if signed else None
@@ -730,10 +734,10 @@ class WordProg:
                    for q in range(w * h)]
             U = self._buf()
             if f == 4:                         # 2 A[top] + A[.] + 2 B[.] + B[.] (whole torus, spacing 1/8; sum w^2 10)
-                (A, oa), (B, ob) = st[1], st[2]
-                p.lin(U, A, A, [(oa + v[0], oa + v[1] if v[1] >= 0 else -1) for v in src], ca=2, cb=1)
-                p.lin(U, U, B, [(q, ob + v[2] if v[2] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=2)
-                p.lin(U, U, B, [(q, ob + v[3] if v[3] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=1)
+                (A, oa, ma), (B, ob, mb) = st[1], st[2]
+                p.lin(U, A, A, [(oa + ma[v[0]], oa + ma[v[1]] if v[1] >= 0 else -1) for v in src], ca=2, cb=1)
+                p.lin(U, U, B, [(q, ob + mb[v[2]] if v[2] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=2)
+                p.lin(U, U, B, [(q, ob + mb[v[3]] if v[3] >= 0 else -1) for q, v in enumerate(src)], ca=1, cb=1)
             else:
                 cur = st[1]
                 p.lin(U, cur, cur, [(v[0], v[1] if f > 1 else -1) for v in src], ca=1 << (f - 1), cb=1 << max(f - 2, 0))
@@ -743,10 +747,14 @@ class WordProg:
                 p.lin(U, U, HS, [(q, q // h if q % h == h - 1 else -1) for q in range(w * h)], ca=1, cb=1)
             if h == 1:
                 break
-            if fans[li + 1] == 4:              # both scales for the next fan-in 4 combine (two tables per row)
+            if fans[li + 1] == 4:              # both scales for the next fan-in 4 combine (two tables per row; the 1/8
+                # scale only for the groups it reads at that scale)
+                h2 = -(-h // 4)
+                rb = sorted({(q // h2) * h + (q % h2) * 4 + 3 - x for q in range(w * h2) for x in (2, 3)
+                             if (q % h2) * 4 + 3 - x < h})
                 OUT, offs = self._multi([(U, list(range(w * h)), "sgn8_2" if f == 4 else "sgn1x"),
-                                         (U, list(range(w * h)), "sgn8_8" if f == 4 else "sgn8x")])
-                st = ("ab", (OUT, offs[0]), (OUT, offs[1]))
+                                         (U, rb, "sgn8_8" if f == 4 else "sgn8x")])
+                st = ("ab", (OUT, offs[0], list(range(w * h))), (OUT, offs[1], {r: k for k, r in enumerate(rb)}))
             else:
                 st = ("s", self._pbs(U, w * h, "sgn" if f < 4 else "sgn4x"))
             k = h
@@ -2712,9 +2720,9 @@ from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401
 
 # measured cost of one bootstrap launch by its rows (RTX PRO 6000, latency keys of 5 / 4 key bits; pc-check tfhe-prog,
 # 4 chained rounds of B rows, 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
-COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.69), (32, 1.83), (40, 1.93), (46, 2.04), (48, 2.29),
-           (56, 2.31), (64, 2.33), (80, 2.55), (94, 3.19), (128, 4.65), (188, 4.80), (256, 7.09), (376, 7.12),
-           (512, 11.7), (752, 14.2), (1024, 21.2))
+COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.67), (32, 1.83), (40, 1.93), (46, 2.04),
+           (48, 2.29), (56, 2.31), (64, 2.33), (72, 2.33), (80, 2.54), (88, 2.65), (92, 2.74), (94, 3.17), (128, 4.54),
+           (188, 4.64), (256, 6.54), (376, 6.54), (512, 11.0), (752, 13.1), (1024, 19.4))
 
 
 def est_ms(prog):
