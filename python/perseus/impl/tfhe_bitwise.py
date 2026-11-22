@@ -2719,8 +2719,9 @@ from .intops import PREDS as _PREDS, inputs, parse, reference  # noqa: E402,F401
 
 
 # measured cost of one bootstrap launch by its rows (RTX PRO 6000, latency keys of 5 / 4 key bits; pc-check tfhe-prog,
-# 4 chained rounds of B rows, 2026-11-22): the cost model `est_ms` uses to pick between two exact forms of an op
-COST_MS = ((1, 1.15), (4, 1.17), (8, 1.25), (12, 1.29), (16, 1.54), (24, 1.67), (32, 1.83), (40, 1.93), (46, 2.04),
+# 4 chained rounds of B rows, 2026-11-22; up to 40 rows the key switch regenerates its seeded masks in the kernel):
+# the cost model `est_ms` uses to pick between two exact forms of an op
+COST_MS = ((1, 1.12), (4, 1.13), (8, 1.20), (12, 1.24), (16, 1.50), (24, 1.64), (32, 1.69), (40, 1.89), (46, 2.04),
            (48, 2.29), (56, 2.31), (64, 2.33), (72, 2.33), (80, 2.54), (88, 2.65), (92, 2.74), (94, 3.17), (128, 4.54),
            (188, 4.64), (256, 6.54), (376, 6.54), (512, 11.0), (752, 13.1), (1024, 19.4))
 

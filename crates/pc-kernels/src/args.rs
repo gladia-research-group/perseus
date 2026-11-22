@@ -1036,6 +1036,7 @@ pub mod tfhe_op {
     pub const PACK_RDIG: i32 = 25;
     pub const PACK_RMAC: i32 = 26;
     pub const PACK_RFIN: i32 = 27;
+    pub const KS_REGEN: i32 = 28;
 }
 
 /// One TFHE kernel launch (args.cuh TfheArgs: per-op field meanings there).

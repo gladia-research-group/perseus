@@ -1347,6 +1347,224 @@ __global__ void ks_digits_k(TfheArgs A) {
     for (int t = 0; t < lv; t++) out[t] = (int8_t)digit(x, t, (int)A.c[0], lv, A.m);
 }
 
+// KS_REGEN: the key switch's products against a key whose masks are seeded (the uniform a's regenerated where they
+// are read, as on-chip key-switch-hint generation, CraterLake ISCA 2022): G_u[o][b] += sum_k D[b][k] byte_u(W(k, o))
+// over this block's slice of k, W(k, o) = the mask word of key row k, column o < i2 (pc-core `mask_expand(seed,
+// lane o, q, k, K)`; chacha::regen_block16), W(k, i2) = the stored bodies z[k]. Integer sums: any slicing and order
+// give the same G, and sum_u 256^u G_u is the planes path's (KS_RECOMBINE reads either).
+// Warp = 8 columns (an n8 tile of the int8 MMA m16n8k32, signed digits x unsigned key bytes), lane = column g = lane/4
+// and quarter j = lane & 3 of every 64 rows of k: it expands the 16 words k = 64 c + 16 j .. + 15 of its column (one
+// ChaCha block); the MMA's k order is permuted to match (physical slots 4 j .. + 3 and 16 + 4 j .. + 3 of step s =
+// rows 64 c + 16 j + 8 s + 0..3 and + 4..7, the digits loaded in the same order). MT row tiles of 16 per warp.
+constexpr int KS_PEND = 4;   // deferred rejected words per lane (more: escalated inline)
+// mask word k of column o after a rejected first attempt: attempts t = 1 .. (pc-core mask_expand)
+__device__ __noinline__ uint32_t ks_escalate(const uint32_t (&key)[8], uint32_t k, uint32_t o, uint32_t p, uint32_t n16,
+                                             uint32_t tag, uint32_t m_p) {
+    uint32_t v = 0, blk[16];
+    for (uint32_t t = 1; t < 32u; ++t) {
+        chacha::chacha12(key, (k >> 4) + t * n16, o, p, tag, blk);
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            if (i == (int)(k & 15)) v = blk[i];
+        if (v < m_p) break;
+    }
+    return v % p;
+}
+// one chunk's 16 mask words k0 .. k0 + 15 of column o (o < nl), the body's (o == nl) or zeros; a rejected word
+// (probability (2^32 mod p) / 2^32 each) is deferred: 0 here, its value added after the loop (an inline escalation
+// would hold the whole warp for a ChaCha block in most iterations)
+__device__ __forceinline__ void ks_words(const uint32_t (&w0)[16], uint32_t (&w)[16], uint32_t k0, int o, int nl, uint32_t p,
+                                         uint32_t m_p, uint32_t rp, const uint32_t (&key)[8], uint32_t n16, uint32_t tag,
+                                         const uint32_t* body, uint32_t (&pend)[KS_PEND], int& np) {
+    if (o < nl) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (w0[i] >= m_p) {
+                if (np < KS_PEND) {
+                    pend[np++] = k0 + i;
+                    w[i] = 0;
+                } else {
+                    w[i] = ks_escalate(key, k0 + i, (uint32_t)o, p, n16, tag, m_p);
+                }
+            } else {
+                const uint32_t x = w0[i] - __umulhi(w0[i], rp) * p;
+                w[i] = x >= p ? x - p : x;
+            }
+        }
+    } else if (o == nl) {
+        const uint4* bp = (const uint4*)(body + k0);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint4 v = bp[i];
+            w[4 * i] = v.x; w[4 * i + 1] = v.y; w[4 * i + 2] = v.z; w[4 * i + 3] = v.w;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) w[i] = 0;
+    }
+}
+
+// the MMAs of one chunk: byte planes b[s][h][u] = byte u of words 8 s + 4 h .. + 3 (a 4 x 4 byte transpose, 8
+// permutes); the digits from the block's shared copy `sa` [16 MT rows][64 bytes] of the chunk, 8-byte unit v of row r
+// at unit v ^ (r & 7) (a warp's fragment loads hit every bank pair twice: two wavefronts per 256 bytes): (a0, a2) =
+// row g's unit 2 j + s, (a1, a3) = row g + 8's
+template <int MT>
+__device__ __forceinline__ void ks_mma(const uint32_t (&w)[16], const uint2* sa, int g, int j, int (&acc)[MT][4][4]) {
+    uint32_t b[2][2][4];
+#pragma unroll
+    for (int q4 = 0; q4 < 4; ++q4) {
+        const uint32_t t0 = __byte_perm(w[4 * q4], w[4 * q4 + 1], 0x5140), t1 = __byte_perm(w[4 * q4 + 2], w[4 * q4 + 3], 0x5140);
+        const uint32_t t2 = __byte_perm(w[4 * q4], w[4 * q4 + 1], 0x7362), t3 = __byte_perm(w[4 * q4 + 2], w[4 * q4 + 3], 0x7362);
+        b[q4 >> 1][q4 & 1][0] = __byte_perm(t0, t1, 0x5410);
+        b[q4 >> 1][q4 & 1][1] = __byte_perm(t0, t1, 0x7632);
+        b[q4 >> 1][q4 & 1][2] = __byte_perm(t2, t3, 0x5410);
+        b[q4 >> 1][q4 & 1][3] = __byte_perm(t2, t3, 0x7632);
+    }
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const int r0 = 16 * mt + g, r1 = r0 + 8, v = 2 * j + s;
+            const uint2 lo = sa[r0 * 8 + (v ^ (r0 & 7))], hi = sa[r1 * 8 + (v ^ (r1 & 7))];
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                             : "+r"(acc[mt][u][0]), "+r"(acc[mt][u][1]), "+r"(acc[mt][u][2]), "+r"(acc[mt][u][3])
+                             : "r"(lo.x), "r"(hi.x), "r"(lo.y), "r"(hi.y), "r"(b[s][0][u]), "r"(b[s][1][u]));
+        }
+    }
+}
+
+// the block's digits of chunks c, c + 1 (rows row0 .. + 16 MT, zero past `rows` or c1) into registers: thread t
+// takes 16-byte pieces t, t + 256, .. of [chunk][row][4 pieces]
+template <int MT>
+__device__ __forceinline__ void ks_dload(const int8_t* D, uint32_t K, int row0, int rows, int c, int c1, uint4 (&v)[(MT + 1) / 2]) {
+#pragma unroll
+    for (int i = 0; i < (MT + 1) / 2; ++i) {
+        const int x = threadIdx.x + 256 * i;   // < 2 chunks x 16 MT rows x 4 pieces = 128 MT
+        const int ch = x / (64 * MT), r = (x / 4) % (16 * MT), pc = x & 3;
+        v[i] = make_uint4(0, 0, 0, 0);
+        if (x < 128 * MT && row0 + r < rows && c + ch < c1)
+            v[i] = *(const uint4*)(D + (size_t)(row0 + r) * K + (size_t)(c + ch) * 64 + 16 * pc);
+    }
+}
+template <int MT>
+__device__ __forceinline__ void ks_dstore(uint2* sa, const uint4 (&v)[(MT + 1) / 2]) {
+#pragma unroll
+    for (int i = 0; i < (MT + 1) / 2; ++i) {
+        const int x = threadIdx.x + 256 * i;
+        if (x >= 128 * MT) continue;
+        const int ch = x / (64 * MT), r = (x / 4) % (16 * MT), pc = x & 3;
+        uint2* row = sa + (size_t)ch * 16 * MT * 8 + r * 8;
+        row[(2 * pc) ^ (r & 7)] = make_uint2(v[i].x, v[i].y);
+        row[(2 * pc + 1) ^ (r & 7)] = make_uint2(v[i].z, v[i].w);
+    }
+}
+
+// Block = 8 column tiles (blockIdx.x % groups) x one slice of k (blockIdx.x / groups, i0 slices); blockIdx.y = the
+// row group (16 MT rows), its digits staged in shared memory per two chunks (two independent ChaCha blocks per lane).
+template <int MT>
+__global__ void __launch_bounds__(256, 2) ks_regen_k(TfheArgs A) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, j = lane & 3;
+    const int nl = A.i2, tiles = (nl + 8) / 8, slices = A.i0, groups = (tiles + 7) / 8;
+    const int ct = (blockIdx.x % groups) * 8 + warp, sl = blockIdx.x / groups;
+    const bool live = ct < tiles;   // a warp past the body column only stages digits
+    const int o = ct * 8 + g;
+    const uint32_t K = (uint32_t)A.c[3], p = (uint32_t)A.q, tag = (uint32_t)A.c[2], n16 = K >> 4;
+    uint32_t key[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        key[2 * i] = (uint32_t)A.c[4 + i];
+        key[2 * i + 1] = (uint32_t)(A.c[4 + i] >> 32);
+    }
+    const int chunks = (int)(K >> 6);
+    const int c0 = (int)((long long)chunks * sl / slices), c1 = (int)((long long)chunks * (sl + 1) / slices);
+    const int row0 = blockIdx.y * 16 * MT, rows = A.count;
+    const int8_t* D = (const int8_t*)A.y;
+    const uint32_t* body = (const uint32_t*)A.z;
+    const uint32_t m_p = (0xFFFFFFFFu / p) * p, rp = 0xFFFFFFFFu / p;
+    uint32_t pend[KS_PEND];
+    int np = 0;
+    int acc[MT][4][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[mt][u][e] = 0;
+    bool rok[MT][2];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) rok[mt][h] = row0 + 16 * mt + g + 8 * h < rows;
+    const bool gen = o < nl;
+    __shared__ uint2 sa[2][16 * MT * 8];
+    for (int c = c0; c < c1; c += 2) {
+        uint4 dv[(MT + 1) / 2];
+        ks_dload<MT>(D, K, row0, rows, c, c1, dv);
+        const uint32_t ka = (uint32_t)c * 64 + 16 * j, kb = ka + 64;
+        const bool two = c + 1 < c1;
+        uint32_t xa[16], xb[16], w[16];
+        if (gen) {
+            chacha::chacha12(key, ka >> 4, (uint32_t)o, p, tag, xa);
+            if (two) chacha::chacha12(key, kb >> 4, (uint32_t)o, p, tag, xb);
+        }
+        __syncthreads();   // the previous iteration's readers are done
+        ks_dstore<MT>(&sa[0][0], dv);
+        __syncthreads();
+        if (live) {
+            ks_words(xa, w, ka, o, nl, p, m_p, rp, key, n16, tag, body, pend, np);
+            ks_mma<MT>(w, sa[0], g, j, acc);
+            if (two) {
+                ks_words(xb, w, kb, o, nl, p, m_p, rp, key, n16, tag, body, pend, np);
+                ks_mma<MT>(w, sa[1], g, j, acc);
+            }
+        }
+    }
+    if (!live) return;
+    // the deferred words: d W summed per (row, column) of the warp's tile in shared memory, then split into the
+    // planes (c = c_0 + 256 c_1 + 2^16 c_2 + 2^24 c_3, c_0..2 bytes: the same sum_u 256^u G_u)
+    __shared__ long long corr[8][16 * MT][8];
+    for (int i = lane; i < 16 * MT * 8; i += 32) corr[warp][i >> 3][i & 7] = 0;
+    __syncwarp();
+    while (__any_sync(0xFFFFFFFFu, np > 0)) {
+        if (np > 0) {
+            const uint32_t k = pend[--np];
+            const long long v = ks_escalate(key, k, (uint32_t)o, p, n16, tag, m_p);
+            for (int r = 0; r < 16 * MT && row0 + r < rows; ++r) {
+                const int dv = D[(size_t)(row0 + r) * K + k];
+                if (dv) atomicAdd((unsigned long long*)&corr[warp][r][g], (unsigned long long)(dv * v));
+            }
+        }
+    }
+    __syncwarp();
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const long long cv = corr[warp][16 * mt + g + 8 * (e >> 1)][2 * j + (e & 1)];
+            acc[mt][0][e] += (int)(cv & 255);
+            acc[mt][1][e] += (int)((cv >> 8) & 255);
+            acc[mt][2][e] += (int)((cv >> 16) & 255);
+            acc[mt][3][e] += (int)(cv >> 24);
+        }
+    // the C fragment: (row g, columns 2 j, 2 j + 1), (row g + 8, the same columns)
+    int32_t* G = (int32_t*)A.x;
+    const size_t mp = A.c[0], ps = A.c[1];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int oc = ct * 8 + 2 * j + (e & 1), h = e >> 1;
+            if (oc > nl || !rok[mt][h]) continue;
+            const size_t r = (size_t)(row0 + 16 * mt + g + 8 * h);
+#pragma unroll
+            for (int u = 0; u < 4; ++u)
+                if (acc[mt][u][e]) atomicAdd(G + u * ps + (size_t)oc * mp + r, acc[mt][u][e]);
+        }
+}
+
 __global__ void ks_recombine_k(TfheArgs A) {
     const int cols = A.i2 + 1, planes = (int)A.c[2];
     const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1830,6 +2048,25 @@ int launch(const TfheArgs* a, cudaStream_t s) {
         case PC_TFHE_KS_RECOMBINE: {
             const size_t tot = (size_t)A.count * (A.i2 + 1);
             ks_recombine_k<<<(unsigned)((tot + 255) / 256), 256, 0, s>>>(A);
+            break;
+        }
+        case PC_TFHE_KS_REGEN: {
+            // i0 = slices of k (>= 1), i3 = row tiles of 16 per warp (1, 2 or 4; 0: the fewest covering count, <= 4)
+            const uint64_t K = A.c[3];
+            if (K == 0 || K % 64 || A.i2 < 1 || A.q < 2 || A.q > 0xFFFFFFFFull || A.c[0] < (uint64_t)A.count ||
+                A.c[1] < (uint64_t)(A.i2 + 1) * A.c[0])
+                return -1;
+            const int mt = A.i3 ? A.i3 : A.count <= 16 ? 1 : A.count <= 32 ? 2 : 4;
+            if (mt != 1 && mt != 2 && mt != 4) return -1;
+            if (A.i0 < 1 || (uint64_t)A.i0 > K / 64) return -1;
+            const unsigned groups = (unsigned)((A.i2 + 8) / 8 + 7) / 8;
+            const dim3 grid(groups * (unsigned)A.i0, (unsigned)((A.count + 16 * mt - 1) / (16 * mt)));
+            if (grid.y > 65535) return -1;
+            const cudaError_t e = cudaMemsetAsync(A.x, 0, 4 * A.c[1] * sizeof(int32_t), s);
+            if (e != cudaSuccess) return (int)e;
+            if (mt == 1) ks_regen_k<1><<<grid, 256, 0, s>>>(A);
+            else if (mt == 2) ks_regen_k<2><<<grid, 256, 0, s>>>(A);
+            else ks_regen_k<4><<<grid, 256, 0, s>>>(A);
             break;
         }
         case PC_TFHE_RESCALE_P1:

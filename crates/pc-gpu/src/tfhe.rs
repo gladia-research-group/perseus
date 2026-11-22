@@ -101,21 +101,36 @@ pub fn pbs_image(k: &pc_tfhe::pbs::BootstrapKey) -> PbsImage {
     let mont = |v: u64, q: u64| ((v << 32) % q) as u32;
     let n = rns.n();
     assert!(lv == 1 || lv == 2, "PBS_ROTATE takes one or two levels");
-    for g in k.ggsw.iter().flatten() {
-        for e in 0..4 {
-            for h in 0..lv {
-                for th in 0..n / 2 {
-                    let (pr, j) = ((th + e * n / 2) / n, (th + e * n / 2) % n);
-                    let q = [qa, qb][pr];
-                    for ct in [2 * h, 2 * h + 1] {
-                        let r = &g.rows()[ct / lv][ct % lv][pr];
-                        for x in [r.0[j], r.1[j]] {
-                            bsk.push(mont(pc_tfhe::modq::mulmod(x, ninv[pr], q), q));
+    // per GGSW (in parallel): its rows' c0 and c1 (a seeded key's masks expanded here, not kept)
+    let ggsws: Vec<&pc_tfhe::pbs::Ggsw> = k.ggsw.iter().flatten().collect();
+    let parts: Vec<Vec<u32>> = {
+        use rayon::prelude::*;
+        ggsws
+            .par_iter()
+            .map(|g| {
+                let rows: Vec<[(&[u64], std::borrow::Cow<'_, [u64]>); 2]> = (0..2 * lv).map(|ct| [0, 1].map(|pr| (g.c0(ct / lv, ct % lv, pr), g.c1(ct / lv, ct % lv, pr)))).collect();
+                let mut out = Vec::with_capacity(4 * lv * 4 * n / 2);
+                for e in 0..4 {
+                    for h in 0..lv {
+                        for th in 0..n / 2 {
+                            let (pr, j) = ((th + e * n / 2) / n, (th + e * n / 2) % n);
+                            let q = [qa, qb][pr];
+                            for ct in [2 * h, 2 * h + 1] {
+                                let r = &rows[ct][pr];
+                                for x in [r.0[j], r.1[j]] {
+                                    out.push(mont(pc_tfhe::modq::mulmod(x, ninv[pr], q), q));
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
+                out
+            })
+            .collect()
+    };
+    bsk.reserve(parts.iter().map(|v| v.len()).sum());
+    for v in parts {
+        bsk.extend(v);
     }
     let mut tw = Vec::new();
     let mut tws = Vec::new();
@@ -202,11 +217,14 @@ impl<'a> DevPack<'a> {
     pub fn with_rows(arena: &'a Arena, s: &Stream<Compute>, pk: &pc_tfhe::pack::PackingKey, rmax: usize) -> Result<Self> {
         let rns = &pk.rns;
         let n = rns.n();
-        let (nl, lv) = (pk.keys().len(), pk.gadget.levels);
+        let (nl, lv) = (pk.n_lwe(), pk.gadget.levels);
         let mut kw = Vec::with_capacity(nl * lv * 4 * n);
-        for row in pk.keys().iter().flatten() {
-            for (c0, c1) in row.iter() {
-                kw.extend(c0.iter().chain(c1).map(|&x| x as u32));
+        for i in 0..nl {
+            for t in 0..lv {
+                for p in 0..2 {
+                    let (c0, c1) = pk.row(i, t, p);
+                    kw.extend(c0.iter().chain(c1.iter()).map(|&x| x as u32));
+                }
             }
         }
         let mut key = arena.alloc::<Compute, u32>("tfhe.pack", kw.len())?;
@@ -539,6 +557,96 @@ impl<'a> DevRepack<'a> {
     }
 }
 
+/// The device forms of an LWE key-switching key: for a key with seeded masks its seed and bodies (KS_REGEN
+/// regenerates the masks in the kernel: 4 K bytes instead of 4 K (n_lwe + 1)), and / or the stored four balanced
+/// base-256 int8 planes of the K-contiguous columns W[o][i levels + t] (the GEMMs' B; a seeded key's masks expanded
+/// on the host). The key switch of `rows` LWEs takes the regeneration up to `ks_regen_max()` rows when it has it.
+pub struct DevKsk<'a> {
+    pub seeded: Option<(pc_core::keys::MaskSeed, DBuf<'a, Compute, u32>)>,
+    pub planes: Option<Vec<DBuf<'a, Compute, u8>>>,
+}
+
+impl<'a> DevKsk<'a> {
+    /// `regen`: a seeded key keeps its seed (K a multiple of 64); `planes`: the stored planes (always for a key that
+    /// cannot regenerate).
+    pub fn new(arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk, p0: u64, regen: bool, planes: bool) -> Result<Self> {
+        let k = key.rows();
+        let seeded = match (regen && k % 64 == 0, key.seed()) {
+            (true, Some(seed)) => {
+                let b: Vec<u32> = key.b.iter().map(|&v| v as u32).collect();
+                let mut body = arena.alloc::<Compute, u32>("tfhe.ksk", k)?;
+                body.upload(s, &b)?;
+                Some((*seed, body))
+            }
+            _ => None,
+        };
+        let planes = if planes || seeded.is_none() {
+            let cols = key.n_out + 1;
+            let m = key.masks();
+            let mut w = vec![0i64; cols * k];
+            for o in 0..cols {
+                for r in 0..k {
+                    let v = if o < key.n_out { m[o * k + r] as u64 } else { key.b[r] };
+                    w[o * k + r] = pc_tfhe::modq::centered(v, p0);
+                }
+            }
+            let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
+            drop(w);
+            let mut out = Vec::with_capacity(PLANES);
+            for u in 0..PLANES {
+                let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
+                let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
+                b.upload(s, &bytes)?;
+                out.push(b);
+            }
+            Some(out)
+        } else {
+            None
+        };
+        Ok(DevKsk { seeded, planes })
+    }
+
+    /// Device bytes of the key.
+    pub fn bytes(&self) -> usize {
+        self.planes.iter().flatten().map(|b| b.len()).sum::<usize>() + self.seeded.as_ref().map_or(0, |(_, b)| 4 * b.len())
+    }
+}
+
+/// Keys with seeded masks run the key switch's in-kernel regeneration (KS_REGEN) unless PC_TFHE_KS_REGEN=0 (then the
+/// planes, expanded on the host).
+pub fn ks_regen(p: &pc_tfhe::params::Params) -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    p.seeded && *V.get_or_init(|| std::env::var("PC_TFHE_KS_REGEN").map(|v| v.trim() != "0").unwrap_or(true))
+}
+
+/// Batches up to this many LWEs take the regeneration (KS_REGEN_MAX; PC_TFHE_KS_REGEN_MAX overrides), larger ones
+/// the stored planes' GEMMs. Per round (pc-check tfhe-prog, 4 chained rounds, median of 3): 1 / 8 / 16 / 40 rows
+/// 1.115 / 1.198 / 1.495 / 1.88 ms against 1.153 / 1.245 / 1.534 / 1.93 on the planes; 46 rows 2.06 vs 2.04, 64
+/// 2.35 vs 2.31, 188 5.17 vs 4.65, 1024 22.4 vs 19.4 (the expansion repeats per 64 rows, and the GEMMs' tensor
+/// throughput is the regeneration's best case).
+pub fn ks_regen_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_TFHE_KS_REGEN_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(KS_REGEN_MAX))
+}
+pub const KS_REGEN_MAX: usize = 40;
+
+/// Whether a switch of `max` values per pass keeps the planes on the device (some batch exceeds `ks_regen_max()`, or
+/// no regeneration).
+pub fn ks_planes(p: &pc_tfhe::params::Params, max: usize) -> bool {
+    !ks_regen(p) || max > ks_regen_max()
+}
+
+/// KS_REGEN's grid for `rows` LWEs (k slices, row tiles per warp): the blocks (64 columns x slices x row groups)
+/// fill one wave of two per SM (`sms`); the slices overridable by PC_TFHE_KS_SLICES, the row tiles by
+/// PC_TFHE_KS_MT.
+pub fn ks_regen_shape(rows: usize, cols: usize, k: usize, sms: usize) -> (usize, usize) {
+    let env = |n: &str| std::env::var(n).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let mt = env("PC_TFHE_KS_MT").filter(|m| [1, 2, 4].contains(m)).unwrap_or(if rows <= 16 { 1 } else if rows <= 32 { 2 } else { 4 });
+    let blocks = cols.div_ceil(64) * rows.div_ceil(16 * mt);
+    let slices = env("PC_TFHE_KS_SLICES").unwrap_or(2 * sms / blocks).clamp(1, k / 64);
+    (slices, mt)
+}
+
 /// Device milliseconds per stage of the last `apply` (host walls around synced stages: diagnostic).
 #[derive(Clone, Debug, Default)]
 pub struct Timings {
@@ -566,9 +674,9 @@ pub struct TfheSwitch<'a> {
     tw_i: DBuf<'a, Compute, u32>,
     ninv: [u32; 2],
     rkey: DBuf<'a, Compute, u32>,
-    ksk: Vec<DBuf<'a, Compute, u8>>,
-    /// Params::chain: the native chains' key switch (empty: none)
-    cksk: Vec<DBuf<'a, Compute, u8>>,
+    ksk: DevKsk<'a>,
+    /// Params::chain: the native chains' key switch
+    cksk: Option<DevKsk<'a>>,
     /// native_load: the bootstrap outputs (one buffer per LUT, [b][n_br + 1]) go here instead of the repack
     sinks: Vec<*mut c_void>,
     /// `native_extract`: the key-switched LWEs (s_lwe) into here instead of a bootstrap (null: off)
@@ -619,7 +727,9 @@ impl<'a> TfheSwitch<'a> {
             + (nl / p.pbs_group * ((1 << p.pbs_group) - 1)) * 2 * p.pbs.1 * 4 * nb + 14 * nb + max * 4 * nb * p.nu + 2 * nb * p.nu
             + if p.lat_group > 0 { nl / p.lat_group * ((1 << p.lat_group) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 }
             + if p.lat_group2 > 0 { nl / p.lat_group2 * ((1 << p.lat_group2) - 1) * 2 * p.pbs.1 * 4 * nb } else { 0 };
-        let bytes8 = PLANES * (nl + 1) * k * if p.chain { 2 } else { 1 } + (max + 16) * k + WS;
+        let nkeys = if p.chain { 2 } else { 1 };
+        let key_bytes = if ks_regen(p) && k % 64 == 0 { 4 * k } else { 0 } + if ks_planes(p, max) { PLANES * (nl + 1) * k } else { 0 };
+        let bytes8 = key_bytes * nkeys + (max + 16) * k + WS;
         let pack = if p.pack { DevPack::bytes_rows(nb, nl, pc_tfhe::pack::PACK_GADGET.1, PACK_RMAX) } else { 0 };
         4 * (words32 + max.min(KB_MAX) * KB_WINDOW * 8 * nb * p.nu * p.pbs.1) + bytes8 + DevRepack::bytes(n, nb, p.rp.1, max) + pack + (1 << 20)
     }
@@ -640,12 +750,12 @@ impl<'a> TfheSwitch<'a> {
         let tw_i: Vec<u32> = [t0i, t1i, t0i].iter().flat_map(|t| t.iter().map(|&x| x as u32)).collect();
         let rkey: Vec<u32> = sw.rs.keys().iter().flat_map(|(a, b)| a.iter().chain(b).map(|&x| x as u32)).collect();
         let (k, cols) = (n_sub * p.ks.1, nl + 1);
-        let ksk = Self::ksk_planes(arena, s, &sw.ksk, sw.p0)?;
-        // the native chains' key switch s_br -> s_lwe: the same GEMM shapes (n_br = N / S inputs)
+        let ksk = DevKsk::new(arena, s, &sw.ksk, sw.p0, ks_regen(&p), ks_planes(&p, max))?;
+        // the native chains' key switch s_br -> s_lwe: the same shapes (n_br = N / S inputs)
         let cksk = match &sw.chain {
-            Some(c) if nb == n_sub => Self::ksk_planes(arena, s, &c.ksk, sw.p0)?,
+            Some(c) if nb == n_sub => Some(DevKsk::new(arena, s, &c.ksk, sw.p0, ks_regen(&p), ks_planes(&p, max))?),
             Some(_) => return Err(shape("tfhe switch", format!("native chains need n_br = N / S ({nb} vs {n_sub})"))),
-            None => Vec::new(),
+            None => None,
         };
         let img = pbs_image(&sw.bsk);
         let me = TfheSwitch {
@@ -709,32 +819,6 @@ impl<'a> TfheSwitch<'a> {
             p,
         };
         Ok(me)
-    }
-
-    /// A key-switching key as K-contiguous columns W[o][i levels + t] in four balanced base-256 planes.
-    fn ksk_planes(arena: &'a Arena, s: &Stream<Compute>, key: &pc_tfhe::lwe::LweKsk, p0: u64) -> Result<Vec<DBuf<'a, Compute, u8>>> {
-        let (n_in, lv, nl) = (key.keys.len(), key.gadget.levels, key.n_out);
-        let k = n_in * lv;
-        let cols = nl + 1;
-        let mut w = vec![0i64; cols * k];
-        for i in 0..n_in {
-            for t in 0..lv {
-                let kk = &key.keys[i][t];
-                for o in 0..cols {
-                    w[o * k + i * lv + t] = pc_tfhe::modq::centered(if o < nl { kk.a[o] } else { kk.b }, p0);
-                }
-            }
-        }
-        let planes = pc_core::pcmm_keys::digit_planes(&w, PLANES)?;
-        drop(w);
-        let mut ksk = Vec::with_capacity(PLANES);
-        for u in 0..PLANES {
-            let mut b = arena.alloc::<Compute, u8>("tfhe.ksk", cols * k)?;
-            let bytes: Vec<u8> = planes[u * cols * k..(u + 1) * cols * k].iter().map(|&x| x as u8).collect();
-            b.upload(s, &bytes)?;
-            ksk.push(b);
-        }
-        Ok(ksk)
     }
 
     fn go<M: DevStrategy<W>>(ctx: &Context<'_, W, M>, s: &Stream<Compute>, a: &TfheArgs) -> Result<()> {
@@ -847,7 +931,7 @@ impl<'a> TfheSwitch<'a> {
         Self::gp(ctx, s, &PcmmArgs { op: pcmm_op::ADD, count: 1, i0: n as i32, x: st, y: c0, ..pa })?;
         lap(s, &mut t, &mut tm.to_lwe)?;
 
-        let (ks_lv, cols) = (self.p.ks.1, nl + 1);
+        let cols = nl + 1;
         let qb = self.p.q_br;
         let nu = self.p.nu as u64;
         let mut cx = [0u64; 8];
@@ -863,18 +947,8 @@ impl<'a> TfheSwitch<'a> {
             lap(s, &mut t, &mut tm.to_lwe)?;
 
             // LWE key switch
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: n_sub as i32, x: self.kdig.vptr_mut(), y: self.ext.vptr(), q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
-            self.prepare(lt_, cb)?;
-            let mp = cb.next_multiple_of(16);
-            let gemm = &self.gemms[&mp];
-            // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
-            let ps = (cols * mp).next_multiple_of(64);
-            let gp_ = self.g.dptr_mut();
-            for u in 0..PLANES {
-                // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
-                unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.ksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
-            }
-            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_sub as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: self.ext.vptr(), q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })?;
+            let ext = self.ext.vptr();
+            self.key_switch(ctx, s, lt_, ext, n_sub, cb, false)?;
             lap(s, &mut t, &mut tm.key_switch)?;
             if !self.extract_dst.is_null() {
                 let d = (self.extract_dst as *mut u32).wrapping_add(c0 * cols) as *mut c_void;
@@ -1014,26 +1088,49 @@ impl<'a> TfheSwitch<'a> {
 
     /// The key switch s_br -> s_lwe of `cb` native LWEs `src` [cb][n_br + 1] (cb <= the switch's capacity) into `lwe`.
     fn native_ks<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, cb: usize) -> Result<()> {
-        let (nb, nl, p0) = (self.nb, self.nl, self.p0);
+        self.key_switch(ctx, s, lt_, src, self.nb, cb, true)
+    }
+
+    /// The LWE key switch of `cb` LWEs `src` [cb][n_in + 1] into `lwe` [cb][n_lwe + 1]: KS_DIGITS, then the products
+    /// against the key (four int8 GEMMs on the stored planes, or KS_REGEN on a key with seeded masks), KS_RECOMBINE.
+    /// `chain`: the native chains' key (s_br -> s_lwe), else the switch's (s' -> s_lwe).
+    #[allow(clippy::too_many_arguments)]
+    fn key_switch<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, n_in: usize, cb: usize, chain: bool) -> Result<()> {
+        let (nl, p0) = (self.nl, self.p0);
         let (ks_lv, cols) = (self.p.ks.1, nl + 1);
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: nb as i32, x: self.kdig.vptr_mut(), y: src, q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
-        self.prepare(lt_, cb)?;
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_DIGITS, count: cb as i32, i1: n_in as i32, x: self.kdig.vptr_mut(), y: src, q: p0, m: self.ks_m, c: [self.p.ks.0 as u64, ks_lv as u64, 0, 0, 0, 0, 0, 0], ..Default::default() })?;
         let mp = cb.next_multiple_of(16);
-        let gemm = &self.gemms[&mp];
+        // each GEMM's output plane starts 256-byte aligned (cuBLASLt's plan): the stride padded to 64 words
         let ps = (cols * mp).next_multiple_of(64);
-        let gp_ = self.g.dptr_mut();
-        for u in 0..PLANES {
-            // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
-            unsafe { gemm.run(s, self.kdig.dptr() as *const i8, self.cksk[u].dptr() as *const i8, gp_.add(u * ps), false, &mut self.ws)? };
+        let key = if chain { self.cksk.as_ref() } else { Some(&self.ksk) };
+        let key = key.ok_or_else(|| shape("tfhe native", "no chain key (needs Params::chain)".to_string()))?;
+        let regen = key.seeded.as_ref().filter(|_| cb <= ks_regen_max() || key.planes.is_none()).map(|(seed, body)| (*seed, body.vptr()));
+        let planes: Vec<*const i8> = key.planes.iter().flatten().map(|b| b.dptr() as *const i8).collect();
+        if let Some((seed, body)) = regen {
+            let k = n_in * ks_lv;
+            let (slices, mt) = ks_regen_shape(cb, cols, k, self.wave / 2);
+            let mut c = [mp as u64, ps as u64, seed.tag as u64, k as u64, 0, 0, 0, 0];
+            for i in 0..4 {
+                c[4 + i] = seed.seed.0[2 * i] as u64 | (seed.seed.0[2 * i + 1] as u64) << 32;
+            }
+            Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_REGEN, count: cb as i32, i0: slices as i32, i2: nl as i32, i3: mt as i32, x: self.g.vptr_mut(), y: self.kdig.vptr(), z: body, q: p0, c, ..Default::default() })?;
+        } else {
+            self.prepare(lt_, cb)?;
+            let gemm = &self.gemms[&mp];
+            let gp_ = self.g.dptr_mut();
+            for (u, &pl) in planes.iter().enumerate() {
+                // SAFETY: operands are this switch's buffers of the plan's lengths, on `s`
+                unsafe { gemm.run(s, self.kdig.dptr() as *const i8, pl, gp_.add(u * ps), false, &mut self.ws)? };
+            }
         }
-        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: nb as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: src, q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })
+        Self::go(ctx, s, &TfheArgs { op: tfhe_op::KS_RECOMBINE, count: cb as i32, i1: n_in as i32, i2: nl as i32, x: self.lwe.vptr_mut(), y: self.g.vptr(), z: src, q: p0, c: [0, 0, PLANES as u64, ps as u64, mp as u64, 0, 0, 0], ..Default::default() })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn native_rot<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, b: usize, tv: *const c_void, init: i32, offsets: &[u64], dsts: &[*mut c_void]) -> Result<()> {
         let (nb, nl, p0, qb) = (self.nb, self.nl, self.p0, self.p.q_br);
         let kl = offsets.len();
-        if self.cksk.is_empty() || b == 0 || kl == 0 || dsts.len() != kl || (2 * nb * self.p.nu) % kl != 0 {
+        if self.cksk.is_none() || b == 0 || kl == 0 || dsts.len() != kl || (2 * nb * self.p.nu) % kl != 0 {
             return Err(shape("tfhe native", format!("{b} LWEs, {kl} LUTs / {} outputs (needs Params::chain)", dsts.len())));
         }
         let nu = self.p.nu as u64;
@@ -1065,7 +1162,7 @@ impl<'a> TfheSwitch<'a> {
     /// v p0 / 4) lands at phase v q_br / 4: what `native_plut` extracts back to v. rows <= the switch's capacity.
     #[allow(clippy::too_many_arguments)]
     pub fn native_pack<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, rows: usize, place: *const c_void, w: *const c_void, count: usize, out: *mut c_void) -> Result<()> {
-        if self.pack.is_none() || self.cksk.is_empty() || rows == 0 || rows > self.max || count == 0 {
+        if self.pack.is_none() || self.cksk.is_none() || rows == 0 || rows > self.max || count == 0 {
             return Err(shape("tfhe native", format!("pack of {rows} LWEs (needs Params::chain and Params::pack; <= {} rows)", self.max)));
         }
         self.native_ks(ctx, s, lt_, src, rows)?;
@@ -1079,7 +1176,7 @@ impl<'a> TfheSwitch<'a> {
     /// the rows' placement polynomials and their `native_pack_basis`) into `out` [count][2 part][2 prime][n_br].
     #[allow(clippy::too_many_arguments)]
     pub fn native_pack_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, lt_: &'a lt::Lt, src: *const c_void, rows: usize, rowmap: *const c_void, count: usize, e_n: usize, p: *const c_void, phat: *const c_void, out: *mut c_void) -> Result<()> {
-        if self.pack.is_none() || self.cksk.is_empty() || rows == 0 || rows > self.max || count == 0 {
+        if self.pack.is_none() || self.cksk.is_none() || rows == 0 || rows > self.max || count == 0 {
             return Err(shape("tfhe native", format!("pack of {rows} LWEs (needs Params::chain and Params::pack; <= {} rows)", self.max)));
         }
         self.native_ks(ctx, s, lt_, src, rows)?;
@@ -1095,6 +1192,27 @@ impl<'a> TfheSwitch<'a> {
             Some(pk) => pk.basis(ctx.table, s, p, e_n, phat),
             None => Err(shape("tfhe native", "no packing key (Params::pack)".to_string())),
         }
+    }
+
+    /// The keys' device bytes, per key kind.
+    pub fn key_bytes(&self) -> Vec<(String, usize)> {
+        let mut v = vec![("ring switch".to_string(), 4 * self.rkey.len()), ("LWE key switch".to_string(), self.ksk.bytes())];
+        if let Some(c) = &self.cksk {
+            v.push(("chain key switch".to_string(), c.bytes()));
+        }
+        v.push((format!("bootstrapping (groups of {})", self.p.pbs_group), 4 * self.bsk.len()));
+        if let Some(b) = &self.bsk_lat {
+            v.push((format!("bootstrapping (groups of {})", self.p.lat_group), 4 * b.len()));
+        }
+        if let Some(b) = &self.bsk_lat2 {
+            v.push((format!("bootstrapping (groups of {})", self.p.lat_group2), 4 * b.len()));
+        }
+        v.push(("repack columns".to_string(), self.repack.kpl.len()));
+        v.push(("repack ring".to_string(), 4 * self.repack.ring.len()));
+        if let Some(p) = &self.pack {
+            v.push(("packing".to_string(), 4 * p.key.len()));
+        }
+        v
     }
 
     /// Whether the switch holds the packing key (`native_pack`).

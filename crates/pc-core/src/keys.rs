@@ -630,6 +630,89 @@ pub fn cts_expand_range(seed: &[u32; 8], modulus: u32, n: usize, start: usize, o
 }
 
 // ------------------------------------------------------------------------------------------------------------------
+// TFHE seeded key masks (FROZEN spec)
+// ------------------------------------------------------------------------------------------------------------------
+
+/// Domain words s\[15\] of the TFHE keys' seeded masks, one per key kind (never a CKKS lane's).
+pub mod tfhe_tag {
+    /// "TLKS": the switch's LWE key-switching key (s' -> s_lwe)
+    pub const LWE_KSK: u32 = 0x544c_4b53;
+    /// "TCKS": the native chains' LWE key-switching key (s_br -> s_lwe)
+    pub const CHAIN_KSK: u32 = 0x5443_4b53;
+    /// "TBSK": the bootstrapping keys' GGSW rows
+    pub const BSK: u32 = 0x5442_534b;
+    /// "TPKS": the packing key switch's rows
+    pub const PACK: u32 = 0x5450_4b53;
+    /// "TRSK": the ring-switch key
+    pub const RING_SWITCH: u32 = 0x5452_534b;
+    /// "TRPC": the repack columns
+    pub const REPACK_COLS: u32 = 0x5452_5043;
+    /// "TRPR": the repack ring key
+    pub const REPACK_RING: u32 = 0x5452_5052;
+}
+/// ChaCha12, as the KSKA lane.
+pub const TFHE_MASK_ROUNDS: u32 = 12;
+/// Attempts per value before the fallback `v % p`: an attempt rejects with probability (2^32 mod p) / 2^32 < p / 2^32,
+/// so the fallback has probability < 2^-128 per value at the TFHE keys' moduli (p < 2^28).
+pub const TFHE_MASK_T_MAX: u32 = 32;
+
+/// The seeded mask of one TFHE key (a 256-bit seed drawn from the key generator's CSPRNG, `Prng::ksk_seed`, and the
+/// key kind's domain tag): every uniform `a` / c1 word of the key is `mask_expand(seed, lane, p, index, len)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskSeed {
+    pub seed: KskSeed,
+    pub tag: u32,
+}
+
+/// Value `index` of mask row (seed, tag, `lane`, modulus p < 2^32) of length `len` (a multiple of 16), the CTSA
+/// layout with the key's tag and lane: attempt t reads word (index & 15) of block (index >> 4) + t (len >> 4) with
+/// s\[13\] = lane, s\[14\] = p, s\[15\] = tag; accept v < floor(2^32 / p) p; the value v mod p. Random access: a
+/// kernel draws a mask word where it reads it (device twin chacha.cuh `regen_block16`, t_max TFHE_MASK_T_MAX).
+pub fn mask_expand(seed: &MaskSeed, lane: u32, modulus: u32, index: u32, len: usize) -> u32 {
+    let n16 = (len as u32) >> 4;
+    let (b0, w) = (index >> 4, (index & 15) as usize);
+    let mp = (u32::MAX / modulus) * modulus;
+    let mut v = 0;
+    for t in 0..TFHE_MASK_T_MAX {
+        v = chacha_block(&seed.seed.0, b0.wrapping_add(t.wrapping_mul(n16)), lane, modulus, seed.tag, TFHE_MASK_ROUNDS)[w];
+        if v < mp {
+            break;
+        }
+    }
+    v % modulus
+}
+
+/// A whole mask row (`out.len()` = len, a positive multiple of 16): one base block per 16 values, escalation blocks
+/// only for rejected words. Same values as `mask_expand` index by index.
+pub fn mask_expand_row(seed: &MaskSeed, lane: u32, modulus: u32, out: &mut [u32]) {
+    let len = out.len();
+    assert!(len % 16 == 0 && len > 0, "mask row of {len}: a positive multiple of 16");
+    let n16 = (len as u32) >> 4;
+    let mp = (u32::MAX / modulus) * modulus;
+    for (i, chunk) in out.chunks_exact_mut(16).enumerate() {
+        let b0 = i as u32;
+        let base = chacha_block(&seed.seed.0, b0, lane, modulus, seed.tag, TFHE_MASK_ROUNDS);
+        for (w, o) in chunk.iter_mut().enumerate() {
+            let mut v = base[w];
+            let mut t = 1;
+            while v >= mp && t < TFHE_MASK_T_MAX {
+                v = chacha_block(&seed.seed.0, b0.wrapping_add(t * n16), lane, modulus, seed.tag, TFHE_MASK_ROUNDS)[w];
+                t += 1;
+            }
+            *o = v % modulus;
+        }
+    }
+}
+
+/// `mask_expand_row` into u64 words (modulus < 2^32).
+pub fn mask_expand_row64(seed: &MaskSeed, lane: u32, modulus: u64, out: &mut [u64]) {
+    let p = u32::try_from(modulus).expect("seeded mask: modulus < 2^32");
+    let mut v = vec![0u32; out.len()];
+    mask_expand_row(seed, lane, p, &mut v);
+    out.iter_mut().zip(v).for_each(|(o, x)| *o = x as u64);
+}
+
+// ------------------------------------------------------------------------------------------------------------------
 // Key material
 // ------------------------------------------------------------------------------------------------------------------
 

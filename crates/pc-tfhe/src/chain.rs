@@ -17,7 +17,9 @@ pub struct ChainKey {
 impl ChainKey {
     pub fn generate(s_br: &[i64], s_lwe: &[i64], p0: u64, params: &Params, prng: &mut Prng) -> Result<ChainKey> {
         let dg = DiscreteGaussian::new(params.lwe_sigma_rel * p0 as f64)?;
-        Ok(ChainKey { ksk: LweKsk::generate(s_br, s_lwe, Gadget::new(p0, params.ks, false), &dg, prng), p0, q_br: params.q_br })
+        let g = Gadget::new(p0, params.ks, false);
+        let ksk = if params.seeded { LweKsk::generate_seeded(s_br, s_lwe, g, pc_core::keys::tfhe_tag::CHAIN_KSK, &dg, prng) } else { LweKsk::generate(s_br, s_lwe, g, &dg, prng) };
+        Ok(ChainKey { ksk, p0, q_br: params.q_br })
     }
 
     /// A bootstrap output (or a sum of them) as the next bootstrap's input: LWE(dim n_lwe) mod p0.
