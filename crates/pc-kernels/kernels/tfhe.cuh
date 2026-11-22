@@ -244,20 +244,28 @@ __device__ __forceinline__ void twl(const uint32_t* tw, const uint32_t* tws, int
     }
 }
 // forward (Cooley-Tukey) phase: stages t = tt, tt / 2, .., tt >> (S - 1); a group = j0 + k tl (tl = tt >> (S - 1))
-template <int S, bool TS = false>
+template <int S, bool TS = false, bool H = false>
 __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int ltl = ltt - (S - 1), tl = 1 << ltl;
-    const int lgpp = RLN - S;   // groups per polynomial = RN / G
-    for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
-        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & pm;
-        const uint32_t q = p ? qb : qa;
+    constexpr int lgpp = RLN - S;   // groups per polynomial = RN / G
+    // STEP_TH threads (every caller): a thread's groups all sit on polys of one parity. H: its prime hoisted out of
+    // the loop (two LWEs per block: -4 % at 376 LWEs; one per block: +3 %, the register allocation)
+    static_assert(STEP_TH % (2 << lgpp) == 0, "a thread's polys of one parity");
+    const int ph = (threadIdx.x >> lgpp) & pm;
+    const uint32_t qh = ph ? qb : qa;
+    for (int gg = threadIdx.x; gg < (P << lgpp); gg += H ? STEP_TH : blockDim.x) {
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = H ? ph : k & pm;
+        const uint32_t q = H ? qh : p ? qb : qa, q2 = 2 * q;
         uint32_t* x = a + k * RN;
         const int gi = g >> ltl;                         // the group's 2 tt block
         const int j0 = (gi << (ltt + 1)) + (g & (tl - 1));
+        // j0 and e tl share no bits and swz is linear over GF(2): swz(j0 + e tl) = swz(j0) ^ swz(e tl), the second a
+        // constant once unrolled
+        const int s0 = swz(j0);
         uint32_t v[G];
 #pragma unroll
-        for (int e = 0; e < G; e++) v[e] = x[swz(j0 + e * tl)];
+        for (int e = 0; e < G; e++) v[e] = x[s0 ^ swz(e << ltl)];
 #pragma unroll
         for (int st = 0; st < S; st++) {
             const int h = G >> (st + 1);                 // partner distance in the group
@@ -271,36 +279,48 @@ __device__ __forceinline__ void fwd_phase(uint32_t* a, int P, int ltt, const uin
                 const int r = e >> (S - st);
                 const uint32_t u = v[e], w = shoup32l(v[e + h], wt[r], wts[r], q);
                 v[e] = u + w;
-                v[e + h] = u - w + 2 * q;
+                v[e + h] = u - w + q2;
             }
         }
 #pragma unroll
-        for (int e = 0; e < G; e++) x[swz(j0 + e * tl)] = v[e];
+        for (int e = 0; e < G; e++) x[s0 ^ swz(e << ltl)] = v[e];
     }
     __syncthreads();
 }
-template <bool TS = false>
+template <bool TS = false, bool H = false>
 __device__ void nttr_fwd(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
-    fwd_phase<2, TS>(a, P, 10, tw, tws, qa, qb, pm);   // t = 1024, 512
-    fwd_phase<3, TS>(a, P, 8, tw, tws, qa, qb, pm);    // t = 256 .. 64
-    fwd_phase<3, TS>(a, P, 5, tw, tws, qa, qb, pm);    // t = 32 .. 8
-    fwd_phase<3, TS>(a, P, 2, tw, tws, qa, qb, pm);    // t = 4 .. 1
+    fwd_phase<2, TS, H>(a, P, 10, tw, tws, qa, qb, pm);   // t = 1024, 512
+    fwd_phase<3, TS, H>(a, P, 8, tw, tws, qa, qb, pm);    // t = 256 .. 64
+    fwd_phase<3, TS, H>(a, P, 5, tw, tws, qa, qb, pm);    // t = 32 .. 8
+    fwd_phase<3, TS, H>(a, P, 2, tw, tws, qa, qb, pm);    // t = 4 .. 1
 }
 // inverse (Gentleman-Sande) phase: stages t = tb, 2 tb, .., tb << (S - 1); a group = j0 + k tb, spanning G tb
-template <int S, bool TS = false>
+template <int S, bool TS = false, bool H = false>
 __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm) {
     constexpr int G = 1 << S;
     const int tb = 1 << ltb;
-    const int lgpp = RLN - S;
-    for (int gg = threadIdx.x; gg < (P << lgpp); gg += blockDim.x) {
-        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = k & pm;
-        const uint32_t q = p ? qb : qa;
+    constexpr int lgpp = RLN - S;
+    // STEP_TH threads (every caller): a thread's groups all sit on polys of one parity. H: its prime hoisted out of
+    // the loop (two LWEs per block: -4 % at 376 LWEs; one per block: +3 %, the register allocation)
+    static_assert(STEP_TH % (2 << lgpp) == 0, "a thread's polys of one parity");
+    const int ph = (threadIdx.x >> lgpp) & pm;
+    const uint32_t qh = ph ? qb : qa;
+    for (int gg = threadIdx.x; gg < (P << lgpp); gg += H ? STEP_TH : blockDim.x) {
+        const int k = gg >> lgpp, g = gg & ((1 << lgpp) - 1), p = H ? ph : k & pm;
+        const uint32_t q = H ? qh : p ? qb : qa, q2 = 2 * q;
         uint32_t* x = a + k * RN;
         const int gi = g >> ltb;                         // the group's G tb block
         const int j0 = (gi << (ltb + S)) + (g & (tb - 1));
+        const int s0 = swz(j0);                          // as fwd_phase: swz(j0 + e tb) = swz(j0) ^ swz(e tb)
         uint32_t v[G];
 #pragma unroll
-        for (int e = 0; e < G; e++) v[e] = x[swz(j0 + e * tb)];
+        for (int e = 0; e < G; e++) v[e] = x[s0 ^ swz(e << ltb)];
+        // lazily: element e's bound (in units of q, a compile-time constant once unrolled) doubles on every sum; the
+        // differences take an offset of their subtrahend's bound and leave the lazy product < 2 q; the sums are
+        // brought back below 2 q once, at the end of the phase (bounds < 2^S 2 q < 2^31 at q < 2^26)
+        int bd[G];
+#pragma unroll
+        for (int e = 0; e < G; e++) bd[e] = 2;
 #pragma unroll
         for (int st = 0; st < S; st++) {
             const int h = 1 << st;                       // partner distance
@@ -313,21 +333,28 @@ __device__ __forceinline__ void inv_phase(uint32_t* a, int P, int ltb, const uin
                 if (e & h) continue;
                 const int r = e >> (st + 1);
                 const uint32_t u = v[e], w = v[e + h];
-                v[e] = fold32(u + w, 2 * q);
-                v[e + h] = shoup32l(u - w + 2 * q, wt[r], wts[r], q);
+                v[e] = u + w;
+                v[e + h] = shoup32l(u - w + (uint32_t)bd[e + h] * q, wt[r], wts[r], q);
+                bd[e] += bd[e + h];
+                bd[e + h] = 2;
             }
         }
 #pragma unroll
-        for (int e = 0; e < G; e++) x[swz(j0 + e * tb)] = v[e];
+        for (int e = 0; e < G; e++)
+#pragma unroll
+            for (int b = 1 << (S + 1); b > 2; b >>= 1)   // [0, b q) -> [0, b q / 2)
+                if (bd[e] >= b) v[e] = min(v[e], v[e] - (uint32_t)(b / 2) * q);
+#pragma unroll
+        for (int e = 0; e < G; e++) x[s0 ^ swz(e << ltb)] = v[e];
     }
     __syncthreads();
 }
-template <bool TS = false>
+template <bool TS = false, bool H = false>
 __device__ void nttr_inv(uint32_t* a, int P, const uint32_t* tw, const uint32_t* tws, uint32_t qa, uint32_t qb, int pm = 1) {
-    inv_phase<3, TS>(a, P, 0, tw, tws, qa, qb, pm);    // t = 1 .. 4
-    inv_phase<3, TS>(a, P, 3, tw, tws, qa, qb, pm);    // t = 8 .. 32
-    inv_phase<3, TS>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
-    inv_phase<2, TS>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
+    inv_phase<3, TS, H>(a, P, 0, tw, tws, qa, qb, pm);    // t = 1 .. 4
+    inv_phase<3, TS, H>(a, P, 3, tw, tws, qa, qb, pm);    // t = 8 .. 32
+    inv_phase<3, TS, H>(a, P, 6, tw, tws, qa, qb, pm);    // t = 64 .. 256
+    inv_phase<2, TS, H>(a, P, 9, tw, tws, qa, qb, pm);    // t = 512, 1024
 }
 
 // acc [count][nu][2 part][2 prime][n] (c[5] = nu, 0: 1): part 0 = X^-b~ tv in R_(nu n), component i holding the
@@ -373,7 +400,8 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     constexpr int KM = (1 << G) - 1;   // keys per group
     constexpr int NL = NB / NU;        // LWEs per block
     extern __shared__ uint32_t sm32[];
-    const int n = A.n, L = A.i1, bl = (int)A.c[0];
+    constexpr int n = RN;   // the launcher admits n = 2048 only: static offsets, the prime of a word known per e
+    const int L = A.i1, bl = (int)A.c[0];
     const int nbv = NU == 1 ? min(NB, A.count - (int)blockIdx.x * NB) : NB;   // slots of this block (the last may hold fewer)
     const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32), inv = (uint32_t)A.c[7], invs = (uint32_t)(A.c[7] >> 32);
     const size_t tbs = (size_t)4 * LV * n;
@@ -387,7 +415,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
         for (int jj = 0; jj < 2; jj++)
 #pragma unroll
-            for (int cp = 0; cp < 4; cp++) ar[b][jj][cp] = g[cp * n + threadIdx.x + jj * blockDim.x];
+            for (int cp = 0; cp < 4; cp++) ar[b][jj][cp] = g[cp * n + threadIdx.x + jj * STEP_TH];
     }
     const uint32_t* tw = (const uint32_t*)A.tw;
     const uint32_t* tws = (const uint32_t*)A.tws;
@@ -400,7 +428,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
     // pm1 [prime][2 n] in shared memory after the digits: its gathers (data-dependent, 2^G - 1 per word) sat on the
     // MAC's critical path from L2
     uint32_t* pm1 = sm32 + NB * tbs;
-    for (int x = threadIdx.x; x < 2 * n2; x += blockDim.x) pm1[(x & ~(n2 - 1)) + pswz(x & (n2 - 1))] = __ldg(tw + 4 * n + x);
+    for (int x = threadIdx.x; x < 2 * n2; x += STEP_TH) pm1[(x & ~(n2 - 1)) + pswz(x & (n2 - 1))] = __ldg(tw + 4 * n + x);
     const int64_t B = 1ll << bl;
     for (int pr = g0; pr < g0 + gw; pr++) {
         int em[NB][KM];
@@ -431,9 +459,17 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             uint32_t* tbb = sm32 + b * tbs;
 #pragma unroll
             for (int jj = 0; jj < 2; jj++) {
-                const int j = threadIdx.x + jj * blockDim.x;
+                const int j = threadIdx.x + jj * STEP_TH;
 #pragma unroll
                 for (int c = 0; c < 2; c++) {
+                    if (LV == 1 && bits <= 30) {   // one level: the digit is the centred value, 32-bit arithmetic
+                        const uint32_t u = (uint32_t)scale_round(crt(ar[b][jj][2 * c], ar[b][jj][2 * c + 1], qa, qb, inv, invs), A.m);
+                        const int32_t r = (int32_t)u - (u >= (1u << (bits - 1)) ? (int32_t)(1u << bits) : 0);
+                        uint32_t* d = tbb + (size_t)c * 2 * n;
+                        d[swz(j)] = r < 0 ? qa + (uint32_t)r : (uint32_t)r;
+                        d[n + swz(j)] = r < 0 ? qb + (uint32_t)r : (uint32_t)r;
+                        continue;
+                    }
                     int64_t v = (int64_t)scale_round(crt(ar[b][jj][2 * c], ar[b][jj][2 * c + 1], qa, qb, inv, invs), A.m);
                     if (v >= (1ll << (bits - 1))) v -= 1ll << bits;
 #pragma unroll
@@ -450,11 +486,11 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             }
         }
         __syncthreads();
-        if (RT_SKIP != 2) nttr_fwd(sm32, 4 * LV * NB, tw, tws, qa, qb);
+        if (RT_SKIP != 2) nttr_fwd<false, (NB > 1)>(sm32, 4 * LV * NB, tw, tws, qa, qb);
         const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
 #pragma unroll
         for (int e = 0; e < RT_E; e++) {
-            const int k = threadIdx.x + e * blockDim.x, p = k >= n;
+            const int k = threadIdx.x + e * STEP_TH, p = e >= RT_E / 2;   // k >= n
             const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
             const int ej = (int)ex[k];   // E [prime][n] at k = prime n + j
             uint32_t d[NB][2 * LV];   // [lwe][c][t]
@@ -464,7 +500,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 for (int ct = 0; ct < 2 * LV; ct++) d[b][ct] = sm32[b * tbs + ct * 2 * n + swz(k)];
             if constexpr (KB) {
                 // the key bundle precomputed by PBS_KEYBUNDLE (w: [lwe][window group][e][thread] uint4, NB = LV = 1)
-                const uint4 g = __ldg((const uint4*)A.w + (((size_t)blockIdx.x * gw + pr - g0) * RT_E + e) * blockDim.x + threadIdx.x);
+                const uint4 g = __ldg((const uint4*)A.w + (((size_t)blockIdx.x * gw + pr - g0) * RT_E + e) * STEP_TH + threadIdx.x);
                 const uint64_t s0 = (uint64_t)d[0][0] * g.x + (uint64_t)d[0][1] * g.z;
                 const uint64_t s1 = (uint64_t)d[0][0] * g.y + (uint64_t)d[0][1] * g.w;
                 sm32[swz(k)] = redc(s0, q, mi);   // < 2 q
@@ -472,11 +508,11 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
             } else if constexpr (NU == 2) {
                 const uint32_t r1 = (uint32_t)((1ull << 32) % q), mone = q - r1;   // 1, -1 in Montgomery form
                 uint64_t ga[2][2] = {}, gb[2][2] = {};   // the bundles A, B at this word: [ct][part], KM terms < q q
-                uint4 wn = __ldg(bsk + e * blockDim.x);   // one m ahead (as the generic MAC)
+                uint4 wn = __ldg(bsk + e * STEP_TH);   // one m ahead (as the generic MAC)
     #pragma unroll
                 for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
                     const uint4 w = wn;
-                    if (m + 1 < KM) wn = __ldg(bsk + ((m + 1) * RT_E + e) * blockDim.x);
+                    if (m + 1 < KM) wn = __ldg(bsk + ((m + 1) * RT_E + e) * STEP_TH);
                     const int x = em[0][m];   // the exponent, mod 2 nu n
                     if (!x) continue;
                     const uint32_t pj = pm1[p * n2 + pswz((ej * (x >> 1)) & (n2 - 1))];   // y^j - 1, j = x div 2
@@ -514,18 +550,18 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
                 // the key words one m ahead: a load's L2 latency hides behind the MACs of the one before
                 uint4 wn[LV];
     #pragma unroll
-                for (int h = 0; h < LV; h++) wn[h] = __ldg(bsk + (e * LV + h) * blockDim.x);
+                for (int h = 0; h < LV; h++) wn[h] = __ldg(bsk + (e * LV + h) * STEP_TH);
     #pragma unroll
                 for (int m = 0; m < (RT_SKIP == 1 ? 0 : KM); m++) {
                     uint4 w[LV];
     #pragma unroll
                     for (int h = 0; h < LV; h++) {
                         w[h] = wn[h];
-                        if (m + 1 < KM) wn[h] = __ldg(bsk + (((m + 1) * RT_E + e) * LV + h) * blockDim.x);
+                        if (m + 1 < KM) wn[h] = __ldg(bsk + (((m + 1) * RT_E + e) * LV + h) * STEP_TH);
                     }
     #pragma unroll
                     for (int b = 0; b < NB; b++) {
-                        if (!em[b][m]) continue;
+                        // em = 0: pm1[0] = g^0 - 1 = 0, a zero term (no branch: the per-LWE predicates cost more)
                         const uint64_t f = pm1[p * n2 + pswz((ej * em[b][m]) & (n2 - 1))];
     #pragma unroll
                         for (int h = 0; h < LV; h++) {
@@ -561,7 +597,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
         __syncthreads();
         // o [lwe][part][prime][n]: poly k at prime k & 1 (the stride between LWEs is a whole number of polys)
         if (LV == 1) {
-            if (RT_SKIP != 2) nttr_inv(sm32, 4 * NB, tw, tws, qa, qb);
+            if (RT_SKIP != 2) nttr_inv<false, (NB > 1)>(sm32, 4 * NB, tw, tws, qa, qb);
         } else {
 #pragma unroll
             for (int b = 0; b < NB; b++) nttr_inv(sm32 + b * tbs, 4, tw, tws, qa, qb);
@@ -573,7 +609,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
                 for (int cp = 0; cp < 4; cp++) {
                     const uint32_t q = cp & 1 ? qb : qa;
-                    const int k = cp * n + threadIdx.x + jj * blockDim.x;
+                    const int k = cp * n + threadIdx.x + jj * STEP_TH;
                     ar[b][jj][cp] = add32(ar[b][jj][cp], fold32(sm32[b * tbs + swz(k)], q), q);
                 }
         __syncthreads();
@@ -585,7 +621,7 @@ __global__ void __launch_bounds__(STEP_TH) rotate_k(TfheArgs A) {
 #pragma unroll
         for (int jj = 0; jj < 2; jj++)
 #pragma unroll
-            for (int cp = 0; cp < 4; cp++) g[cp * n + threadIdx.x + jj * blockDim.x] = ar[b][jj][cp];
+            for (int cp = 0; cp < 4; cp++) g[cp * n + threadIdx.x + jj * STEP_TH] = ar[b][jj][cp];
     }
 }
 
@@ -1011,6 +1047,75 @@ __global__ void __launch_bounds__(STEP_TH) keybundle_k(TfheArgs A) {
             r3 = add32(r3, fold32(redc(g11, q, mi), q), q);
         }
         out[e * blockDim.x] = make_uint4(r0, r1, r2, r3);
+    }
+}
+
+// PBS_KEYBUNDLE for NBK LWEs per block (one level, nu 1; grid (window, count / NBK)): every key word of the group
+// read once for the block's LWEs (keybundle_k reads the group's 2^G - 1 GGSWs once per LWE: at 16 LWEs the latency
+// path's bundles were L2-bandwidth bound and held the rotation's clusters off the SMs). Same sums, same output.
+template <int G, int NBK>
+__global__ void __launch_bounds__(STEP_TH) keybundle_nb_k(TfheArgs A) {
+    extern __shared__ uint32_t sm32[];
+    constexpr int KM = (1 << G) - 1;
+    constexpr int n = RN, n2 = 2 * n;
+    const int L = A.i1, pr = A.i0 + blockIdx.x, b0 = blockIdx.y * NBK, nbv = min(NBK, A.count - b0);
+    const uint32_t qa = (uint32_t)A.c[6], qb = (uint32_t)(A.c[6] >> 32);
+    const uint32_t mia = mont_neg_inv(qa), mib = mont_neg_inv(qb);
+    const uint32_t* tw = (const uint32_t*)A.tw;
+    const uint32_t* ex = tw + 8 * n;
+    uint32_t* pm1 = sm32;
+    int* ems = (int*)(sm32 + 2 * n2);   // [NBK][KM] the exponents (0 for the absent LWEs: pm1[0] = 0)
+    for (int x = threadIdx.x; x < 2 * n2; x += STEP_TH) pm1[(x & ~(n2 - 1)) + pswz(x & (n2 - 1))] = __ldg(tw + 4 * n + x);
+    if (threadIdx.x < NBK * KM) {
+        const int j = threadIdx.x / KM, m = threadIdx.x % KM + 1;
+        int v = 0;
+        if (j < nbv) {
+            const uint32_t* at = (const uint32_t*)A.z + (size_t)(b0 + j) * (L + 1);
+            uint32_t e = 0;
+#pragma unroll
+            for (int x = 0; x < G; x++)
+                if (m >> x & 1) e += at[G * pr + x];
+            v = (int)((G * n2 - e) % n2);
+        }
+        ems[threadIdx.x] = v;
+    }
+    __syncthreads();
+    const size_t kstride = (size_t)2 * 2 * 2 * n;   // one GGSW
+    const uint4* bsk = (const uint4*)((const uint32_t*)A.y + (size_t)pr * KM * kstride) + threadIdx.x;
+#pragma unroll 1
+    for (int e = 0; e < RT_E; e++) {
+        const int k = threadIdx.x + e * STEP_TH, p = e >= RT_E / 2;   // k >= n
+        const uint32_t q = p ? qb : qa, mi = p ? mib : mia;
+        const int ej = (int)ex[k];
+        const uint32_t* pmp = pm1 + p * n2;
+        uint32_t r[NBK][4];
+#pragma unroll
+        for (int j = 0; j < NBK; j++) r[j][0] = r[j][1] = r[j][2] = r[j][3] = 0;
+#pragma unroll
+        for (int m0 = 0; m0 < KM; m0 += 31) {   // sums of up to 31 terms < q 2^32 (keybundle_k)
+            uint64_t g[NBK][4];
+#pragma unroll
+            for (int j = 0; j < NBK; j++) g[j][0] = g[j][1] = g[j][2] = g[j][3] = 0;
+#pragma unroll 2
+            for (int m = m0; m < (m0 + 31 < KM ? m0 + 31 : KM); m++) {
+                const uint4 w = __ldg(bsk + (m * RT_E + e) * STEP_TH);
+#pragma unroll
+                for (int j = 0; j < NBK; j++) {
+                    const uint64_t f = pmp[pswz((ej * ems[j * KM + m]) & (n2 - 1))];
+                    g[j][0] += w.x * f;
+                    g[j][1] += w.y * f;
+                    g[j][2] += w.z * f;
+                    g[j][3] += w.w * f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NBK; j++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) r[j][i] = add32(r[j][i], fold32(redc(g[j][i], q, mi), q), q);
+        }
+#pragma unroll
+        for (int j = 0; j < NBK; j++)
+            if (j < nbv) ((uint4*)A.x)[((size_t)(b0 + j) * gridDim.x + blockIdx.x) * RT_E * STEP_TH + e * STEP_TH + threadIdx.x] = make_uint4(r[j][0], r[j][1], r[j][2], r[j][3]);
     }
 }
 
@@ -1689,6 +1794,22 @@ int launch(const TfheArgs* a, cudaStream_t s) {
                 break;
             }
             if (A.c[5] > 1) return -1;
+            // several LWEs: NBK per block, the key words read once for them (PC_TFHE_KB_NB, default 4; 1: keybundle_k)
+            static const int kbnb = [] { const char* e = getenv("PC_TFHE_KB_NB"); return e ? atoi(e) : 4; }();
+            const int nbk = A.count >= 2 ? (kbnb >= 4 && A.count >= 4 ? 4 : kbnb >= 2 ? 2 : 1) : 1;
+            if (nbk > 1) {
+                const int smn = sm + 4 * 4 * 127;   // + the exponents [NBK][KM]
+                const dim3 gn(gw, (A.count + nbk - 1) / nbk);
+#define PC_KB_NB(GG) do { if (nbk == 4) keybundle_nb_k<GG, 4><<<gn, STEP_TH, smn, s>>>(A); else keybundle_nb_k<GG, 2><<<gn, STEP_TH, smn, s>>>(A); } while (0)
+                if (grp == 2) PC_KB_NB(2);
+                else if (grp == 3) PC_KB_NB(3);
+                else if (grp == 4) PC_KB_NB(4);
+                else if (grp == 5) PC_KB_NB(5);
+                else if (grp == 6) PC_KB_NB(6);
+                else PC_KB_NB(7);
+#undef PC_KB_NB
+                break;
+            }
             if (grp == 2) keybundle_k<2><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 3) keybundle_k<3><<<grid, STEP_TH, sm, s>>>(A);
             else if (grp == 4) keybundle_k<4><<<grid, STEP_TH, sm, s>>>(A);

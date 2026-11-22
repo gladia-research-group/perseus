@@ -32,17 +32,28 @@ const PLANES: usize = 4;
 pub const KB_MAX: usize = 94;
 /// The extended rotation's latency path (four-block clusters only, args.cuh CL4_MAX): up to this many LWEs.
 pub const KB_MAX_EXT: usize = 46;
-/// Chunks up to this many values take the latency key (Params::lat_group) when the switch holds one.
-pub const LAT_MAX: usize = 24;
+/// Chunks up to this many values take the latency key (Params::lat_group) when the switch holds one: up to the
+/// four-block clusters' CL4_MAX now that the key bundles are shared across LWEs (32 LWEs 1.93 -> 1.83 ms, 46 2.17 ->
+/// 2.04 against the groups of 4).
+pub const LAT_MAX: usize = 46;
 
 /// LAT_MAX, overridable by PC_TFHE_LAT_MAX (read once).
-/// Chunks above LAT_MAX and up to this many values take the mid-batch latency key (Params::lat_group2).
-pub const LAT2_MAX: usize = 40;
+/// Chunks above LAT_MAX and up to this many values take the mid-batch latency key (Params::lat_group2): four-block
+/// clusters up to CL4_MAX LWEs, two-block ones up to KB_MAX (the key bundles of several LWEs per block,
+/// keybundle_nb_k: 48 LWEs 2.71 -> 2.27 ms, 94 3.50 -> 3.18 against the batch key's groups of 3).
+pub const LAT2_MAX: usize = 94;
 
 pub fn lat_cap() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("PC_TFHE_LAT_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(LAT_MAX))
 }
+
+/// LAT2_MAX, overridable by PC_TFHE_LAT2_MAX (read once).
+pub fn lat2_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_TFHE_LAT2_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(LAT2_MAX))
+}
+
 /// Groups per latency-path window: 32 keeps the bundles at 2 MB per LWE.
 pub const KB_WINDOW: usize = 32;
 /// LWEs per repack GEMM pass (the digits and packed buffers are sized for it) for a switch of `max` values per pass:
@@ -1152,7 +1163,7 @@ impl<'a> TfheSwitch<'a> {
             // filling the other half of `kb` meanwhile
             // the latency key for the small chunks (one level, nu 1): fewer, wider groups
             let lat = self.bsk_lat.as_ref().filter(|_| one && cl <= lat_cap() && (self.clusters || self.p.lat_group <= 4)).map(|k| (k, self.p.lat_group));
-            let lat = lat.or_else(|| self.bsk_lat2.as_ref().filter(|_| one && cl > lat_cap() && cl <= LAT2_MAX && (self.clusters || self.p.lat_group2 <= 4)).map(|k| (k, self.p.lat_group2)));
+            let lat = lat.or_else(|| self.bsk_lat2.as_ref().filter(|_| one && cl > lat_cap() && cl <= lat2_cap() && (self.clusters || self.p.lat_group2 <= 4)).map(|k| (k, self.p.lat_group2)));
             let rot0 = rot;
             let rot = match lat {
                 Some((k, g)) => TfheArgs { i2: g as i32, y: k.vptr(), ..rot },

@@ -95,8 +95,8 @@ def test_buffers_and_rounds():
     rounds = {o: T.analyze(T.build(o, "r", 4, 16).pr, T.load_values(T.slot_values(*T.inputs(4, 32, 0, o), 16)))["rounds"]
               for o in ("add", "sub", "subf", "slt", "eq", "xor", "shl4", "shl5", "sar4", "shlv", "mul", "min", "clz",
                         "popcount", "addi12345", "lti12345")}
-    assert rounds == {"add": 4, "sub": 4, "subf": 5, "slt": 4, "eq": 2, "xor": 1, "shl4": 0, "shl5": 1, "sar4": 1,
-                      "shlv": 6, "mul": 8, "min": 5, "clz": 2, "popcount": 4, "addi12345": 3, "lti12345": 3}, rounds
+    assert rounds == {"add": 3, "sub": 3, "subf": 4, "slt": 3, "eq": 2, "xor": 1, "shl4": 0, "shl5": 1, "sar4": 1,
+                      "shlv": 6, "mul": 7, "min": 4, "clz": 2, "popcount": 4, "addi12345": 3, "lti12345": 3}, rounds
     r64 = {o: T.analyze(T.build(o, "r", 2, 32).pr, T.load_values(T.slot_values(*T.inputs(2, 64, 0, o), 32)))["rounds"]
            for o in ("add", "cmp", "eq", "xor")}
     assert r64 == {"add": 4, "cmp": 4, "eq": 3, "xor": 1}, r64
@@ -112,3 +112,22 @@ def test_one_launch_per_round():
         pr = T.build(o, "m", 2, 8).pr
         an = T.analyze(pr, T.load_values(T.slot_values(*T.inputs(2, 16, 0, o), 8)))
         assert an["launches"] == an["rounds"] + 1 + extra, (o, an)          # + the store
+
+
+def test_prefix_fans():
+    """The prefix's combine fan-ins: the fewest levels (fan-in 4 at later levels where that saves one: 16 and 64
+    digits), the old fan-in 3 plan otherwise; and the adder exact on the mirror with either."""
+    from perseus.impl import tfhe_bitwise as T
+    assert [T._prefix_fans(n) for n in (2, 4, 8, 16, 32, 64)] == [[2], [4], [3, 3], [4, 4], [4, 3, 3], [4, 4, 4]]
+    assert T._prefix_fans(16, True, False) == [3, 3, 2]
+    rng = np.random.default_rng(3)
+    a = rng.integers(0, 1 << 32, 32, dtype=np.int64)
+    b = (~a) & ((1 << 32) - 1)                        # a + b = 2^32 - 1: the longest chain
+    b[:8] = rng.integers(0, 1 << 32, 8)
+    for later in (True, False):
+        wp = T.WordProg("p", 32, 16)
+        wp.fan4all = later
+        wp._adder("add", "o")
+        out = np.asarray(wp.pr.run(np.concatenate([T.encode_digits(a, 16), T.encode_digits(b, 16)])))
+        d = np.rint(out * 4).astype(np.int64).reshape(32, 16)
+        assert np.array_equal((d * (4 ** np.arange(16))).sum(1) & ((1 << 32) - 1), (a + b) & ((1 << 32) - 1))
