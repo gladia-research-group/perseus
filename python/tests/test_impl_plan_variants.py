@@ -45,3 +45,10 @@ def test_generate_refuses_a_plan_without_the_feedback_variant(tmp_path):
     m.__class__ = Gpt2Model
     with pytest.raises(RuntimeError, match="block_0_feedback_placement.json"):
         m.generate([[0.0]], 1)
+
+
+def test_streamed_programs_follow_block_numbers():
+    # the weight stream follows this order: blocks by number (not as text: 10 before 2), variant labels after
+    from perseus.impl.driver import _block_order
+    keys = [12, "block_0_feedback", 2, 10, 0, 1, 13]
+    assert sorted(keys, key=_block_order) == [0, 1, 2, 10, 12, 13, "block_0_feedback"]

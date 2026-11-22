@@ -544,6 +544,11 @@ class Recorder:
         return self.blocks
 
 
+def _block_order(k):
+    """Sort key of a class's program keys: blocks by number (the weight stream follows it), variant labels after."""
+    return (1, 0, k) if isinstance(k, str) else (0, k, "")
+
+
 def _canon(pos, names, keys=None):
     """Input names as their position among the block's inputs (anon names differ from token to token); a cache state
     as its cache key (`keys`: its position moves with how many states the token reads before it, e.g. a fixed state
@@ -1510,7 +1515,7 @@ class StreamedPlannedRun:
         if not hasattr(self, "classes"):
             self.prepare(rows)
         n = self.n
-        progs = [c["progs"][b] for c in self.classes for b in sorted(c["progs"], key=str)]
+        progs = [c["progs"][b] for c in self.classes for b in sorted(c["progs"], key=_block_order)]
         # registers: block b's output -> b; the tail's outputs after
         n_tail = max(len(c["out"][n]) for c in self.classes)
         self.reg_out = {b: [b] for b in range(n)}
@@ -1581,7 +1586,7 @@ class StreamedPlannedRun:
                     p.mark_dynamic(sorted(c["dyn"][b]))
                 c.setdefault("pt_idx", {})[b] = [(i, nm, lv_) for i, (nm, lv_, _d, f) in enumerate(p.pt_refs) if f != "stream"]
         c0 = self.classes[0]
-        self.sess.stream_order([c0["progs"][b] for b in sorted(c0["progs"], key=str) if c0["progs"][b].coeff_sums])
+        self.sess.stream_order([c0["progs"][b] for b in sorted(c0["progs"], key=_block_order) if c0["progs"][b].coeff_sums])
         self.sess.complete_setup()
         self.fhe = self.sess.fhe
         tw = time.time()
