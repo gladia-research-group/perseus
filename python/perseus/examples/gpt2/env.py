@@ -148,11 +148,16 @@ def bootstrap_setup(fhe, runtime, cpp_bootstrap=False):
 
 
 def physical_device(device=None) -> str:
-    """The GPU a run uses: `device` when given, else the first of CUDA_VISIBLE_DEVICES, else 0."""
+    """The GPU a run uses: `device` when given, else the first of CUDA_VISIBLE_DEVICES, else 0.
+
+    A `device` outside a CUDA_VISIBLE_DEVICES the caller set is refused: the caller's mask wins.
+    """
+    visible = [d.strip() for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
     if device is not None:
+        if visible and str(device) not in visible:
+            raise ValueError(f"device {device} is outside CUDA_VISIBLE_DEVICES={','.join(visible)}")
         return str(device)
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
-    return visible or "0"
+    return visible[0] if visible else "0"
 
 
 def export_env(device=None, chain=None, **overrides):
