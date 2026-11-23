@@ -26,6 +26,7 @@
 </p>
 <p align="center">
   <a href="#results">Results</a> ·
+  <a href="#two-gpus">Two GPUs</a> ·
   <a href="#runtime">Runtime</a> ·
   <a href="#reproduce">Reproduce</a> ·
   <a href="#0-install">Install</a> ·
@@ -60,6 +61,7 @@ our 32-bit GPU port of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)).
   chosen slots by programmable bootstrapping (crates `pc-tfhe`, `pc-gpu` `tfhe`), as one planned refresh: exact
   decisions where a polynomial needs high degree (ReLU's sign, argmax, thresholds). A bootstrap takes 1.77 ms
   (40k/s batched) at TFHE-rs's 2-bit failure target (p_fail 2^-139), 3.8× TFHE-rs on the same GPU.
+- **Two GPUs.** A prefill splits across two GPUs on one PCIe bus, 1.75× faster for Llama-3-8B.
 - **Security.** Every key estimated against the standard lattice attacks and the 2026 ring attacks
   (ePrint 2026/279, 2026/366): all at or above 128 bits; scripts and raw results in [`security/`](security/).
 
@@ -96,6 +98,24 @@ ours where the code is released.
 
 Times exclude key generation, encryption and decryption; each model runs its default plan
 (`python/perseus/examples/defaults.py`).
+
+## Two GPUs
+
+With `PC_REMOTE_DEVICE=1` and two visible GPUs (`REMOTE=<index>` for the scripts in `scripts/repro/`), the models
+below split their forward pass across both. The linear layers' weights, the attention heads, the refreshes and the
+element-wise work are shared, and the copies between the GPUs overlap with compute.
+
+<p align="center">
+  <a href="assets/paper-tables-twogpu-light.png#gh-light-mode-only"><img src="assets/paper-tables-twogpu-light.png#gh-light-mode-only" alt="Perseus on one and on two RTX PRO 6000 over PCIe, encrypted end to end. Llama-3-8B prefill of a 128-token prompt 52.6 s on one GPU and 30.1 s on two (1.75×), Gemma-2-2B prefill 29.6 s and 19.2 s (1.54×), GPT-2 small prefill 5.89 s and 4.22 s (1.40×), ViT-B/16 one image 17.4 s and 13.2 s (1.32×), BERT-base 128 tokens 7.22 s and 5.01 s (1.44×). Decode stays on one GPU." width="707"></a>
+  <a href="assets/paper-tables-twogpu-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-twogpu-dark.png#gh-dark-mode-only" alt="Perseus on one and on two RTX PRO 6000 over PCIe, encrypted end to end. Llama-3-8B prefill of a 128-token prompt 52.6 s on one GPU and 30.1 s on two (1.75×), Gemma-2-2B prefill 29.6 s and 19.2 s (1.54×), GPT-2 small prefill 5.89 s and 4.22 s (1.40×), ViT-B/16 one image 17.4 s and 13.2 s (1.32×), BERT-base 128 tokens 7.22 s and 5.01 s (1.44×). Decode stays on one GPU." width="707"></a>
+
+  <a href="assets/paper-tables-scaling-light.png#gh-light-mode-only"><img src="assets/paper-tables-scaling-light.png#gh-light-mode-only" alt="Scaling with the number of GPUs, seconds on 1, 2, 4 and 8 GPUs and the speedup from one GPU to two. Llama-3-8B prefill of 128 tokens, Cerium on A100 555, 351, 155, 111 (1.58×), on H100 370, 206, 92, 62 (1.80×), on B200 241, 147, 71, 43 (1.64×), Sylph on B200 87, 47, 26 (1.85×) and on RTX PRO 6000 116, 63, 36, 20 (1.84×), composed timings, Perseus on RTX PRO 6000 52.6 and 30.1 (1.75×). BERT-base on 128 tokens, Cerium on A100 66.1, 44.3, 24.6, 19.6 (1.49×), on H100 36.1, 23.9, 13.3, 10.6 (1.51×), on B200 28.3, 19.6, 10.8, 8.8 (1.44×), Perseus on RTX PRO 6000 7.22 and 5.01 (1.44×)." width="707"></a>
+  <a href="assets/paper-tables-scaling-dark.png#gh-dark-mode-only"><img src="assets/paper-tables-scaling-dark.png#gh-dark-mode-only" alt="Scaling with the number of GPUs, seconds on 1, 2, 4 and 8 GPUs and the speedup from one GPU to two. Llama-3-8B prefill of 128 tokens, Cerium on A100 555, 351, 155, 111 (1.58×), on H100 370, 206, 92, 62 (1.80×), on B200 241, 147, 71, 43 (1.64×), Sylph on B200 87, 47, 26 (1.85×) and on RTX PRO 6000 116, 63, 36, 20 (1.84×), composed timings, Perseus on RTX PRO 6000 52.6 and 30.1 (1.75×). BERT-base on 128 tokens, Cerium on A100 66.1, 44.3, 24.6, 19.6 (1.49×), on H100 36.1, 23.9, 13.3, 10.6 (1.51×), on B200 28.3, 19.6, 10.8, 8.8 (1.44×), Perseus on RTX PRO 6000 7.22 and 5.01 (1.44×)." width="707"></a>
+</p>
+
+```bash
+GPU=0 REMOTE=1 bash scripts/repro/llama_prefill128.sh   # Llama-3-8B, 128-token prefill on two GPUs
+```
 
 ## Runtime
 
