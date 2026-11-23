@@ -35,6 +35,20 @@ pub fn rescale_p1(ct: &RnsRlwe, p0: u64, p1: u64) -> Rlwe {
     Rlwe { c0: f(&ct.limbs[0].c0, &ct.limbs[1].c0), c1: f(&ct.limbs[0].c1, &ct.limbs[1].c1) }
 }
 
+/// `rescale_p1` of t ct for an integer t (`shift_mult`): the phase m q0 / 4 becomes t m q0 / 4 mod q0, exactly, before
+/// the rescale's rounding. With t = 2^k the switched LWE reads the window of the phase k bits further down at the
+/// switch's own precision: what the digit decomposition's loads read (`Switcher::lwes_shifted`).
+pub fn rescale_p1_mult(ct: &RnsRlwe, p0: u64, p1: u64, t: (u64, u64)) -> Rlwe {
+    let sc = |l: &Rlwe, m: u64, q: u64| Rlwe { c0: l.c0.iter().map(|&x| mulmod(x, m, q)).collect(), c1: l.c1.iter().map(|&x| mulmod(x, m, q)).collect() };
+    rescale_p1(&RnsRlwe { limbs: vec![sc(&ct.limbs[0], t.0, p0), sc(&ct.limbs[1], t.1, p1)] }, p0, p1)
+}
+
+/// 2^k mod (p0, p1): the integer `rescale_p1_mult` takes for a window k bits down.
+pub fn shift_mult(k: u32, p0: u64, p1: u64) -> (u64, u64) {
+    let pw = |q: u64| (0..k).fold(1u64, |a, _| mulmod(a, 2, q));
+    (pw(p0), pw(p1))
+}
+
 /// RLWE_{s''}(g_t s), s'' = s'(X^S), ring N mod p0; c1 stored or seeded (level t = the mask row (seed, t) of length
 /// N in NTT form).
 pub struct RingSwitchKey {
@@ -523,6 +537,31 @@ impl Switcher {
             slots[j] = Some(o.mod_switch(self.params.q_br, p0));
         }
         self.repack.repack(&slots, self.params.n_br, &self.ntt_p)
+    }
+
+    /// The split's coefficients `valid` as bootstrap inputs (LWEs under s_lwe mod p0) of the phase times 2^`shift`
+    /// (`rescale_p1_mult`): the device's `native_extract` with that shift.
+    pub fn lwes_shifted(&self, ct: &RnsRlwe, valid: &[usize], shift: u32) -> Vec<Lwe> {
+        let p0 = self.p0;
+        let low = if shift == 0 { rescale_p1(ct, p0, self.p1) } else { rescale_p1_mult(ct, p0, self.p1, shift_mult(shift, p0, self.p1)) };
+        let sw = self.rs.apply(&low, &self.ntt_p[0]);
+        // a seeded key's masks expand (in parallel) on first use: here, not under the workers below (a worker blocked
+        // on the expansion while another holds it can deadlock the pool)
+        let _ = self.ksk.masks();
+        valid.par_iter().map(|&j| self.ksk.apply(&self.rs.extract(&sw, j, p0))).collect()
+    }
+
+    /// The native load of windows: for each shift k (window-major) the LUT `tv` (+ `offset`) on the phase times 2^k at
+    /// the coefficients `valid`, as native LWEs under s_br mod p0 (the device's `native_load_k` with shifts).
+    pub fn load_shifted(&self, ct: &RnsRlwe, valid: &[usize], shifts: &[u32], tv: &[u64], offset: u64) -> Vec<Lwe> {
+        let p0 = self.p0;
+        shifts
+            .iter()
+            .flat_map(|&k| {
+                let lwes = self.lwes_shifted(ct, valid, k);
+                lwes.par_iter().map(|l| self.bsk.bootstrap_ext(tv, offset, l, p0, self.params.nu).mod_switch(self.params.q_br, p0)).collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// The keys' bytes as stored / shipped (u32 words; seeded masks: the seeds), per key kind.

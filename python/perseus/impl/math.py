@@ -1003,12 +1003,103 @@ def step_tfhe(ops, d, bound, slots=None, levels=1, tag="m"):
     return msign(ops, d, n, idx, float(bound), int(levels), f"math.{tag}")
 
 
+def _digit_bits(err):
+    """The digit sign's resolution for a target err (of the bound): 2^-bits <= err."""
+    return max(4, int(_m.ceil(-_m.log2(float(err)))))
+
+
+def sign_digit(ops, d, bound, bits, slots=None, tag="m"):
+    """sgn(d) (+-1, 1 at 0) on `slots` (default all), 0 elsewhere, for |d| < bound, exact for |d| >= 2^-bits bound: the
+    digit decomposition (impl/tfhe_digits.py `sign_prog`): one switch reading windows of the split's phase (its
+    ~7.5 bits each, 2^3 apart), a compare tree of their statuses; no new key. Planned sessions only (a refresh)."""
+    from . import tfhe_digits
+    n, idx = _heads(ops, d, slots)
+    D = ops.mult_pt(d, _hmask(n, idx, tfhe_digits.SIGN_SPAN / float(bound)), kind="mask")
+    return digit_sign_loaded(ops, D, idx, bits, tag)
+
+
+def digit_sign_loaded(ops, D, idx, bits, tag="m"):
+    """`sign_digit` on D already at the switch's scale (|D| <= tfhe_digits.SIGN_SPAN on the slots `idx`, 0 elsewhere):
+    +-1 on idx, 0 elsewhere."""
+    import hashlib
+    from . import tfhe, tfhe_digits
+    idx = np.asarray(idx, dtype=np.int64)
+    h = hashlib.blake2b(idx.astype(np.int64).tobytes(), digest_size=6).hexdigest()
+    sl = tfhe.register_slots(f"dsign.{len(idx)}.{h}", idx)
+    name = f"{tag}.dsign{int(bits)}.{len(idx)}.{h}"
+    if name not in tfhe.PROGS:
+        p = tfhe_digits.sign_prog(name, len(idx), int(bits), sl, half=True)
+        tfhe.register_prog(p)
+        tfhe.need_native(p.bufs, len(tfhe_digits.sign_windows(int(bits))) * len(idx))
+    s = tfhe.tfhe_prog(ops, D, name, sl)                 # +-1/2 on the slots
+    return ops.add(s, s)
+
+
+def step_digit(ops, d, bound, bits, slots=None, tag="m"):
+    """[d >= 0] (0 / 1) on `slots`, 0 elsewhere, by `sign_digit` (exact for |d| >= 2^-bits bound)."""
+    n, idx = _heads(ops, d, slots)
+    s = sign_digit(ops, d, bound, bits, slots, tag)
+    return ops.add_pt(ops.mult_pt(s, _hmask(n, idx, 0.5), kind="mask"), _hmask(n, idx, 0.5), kind="mask")
+
+
+def _hmask(n, idx, v):
+    out = np.zeros(n)
+    out[np.asarray(idx, dtype=np.int64)] = v
+    return out
+
+
+#: The sign's cost model (`sign_est_ms`, ms on the shipped n32 chain): the composite, a CKKS product below a landing
+#: (SERIES_MS) and a dense refresh per CKKS_REFRESH_LEVELS levels (the StC-first input cap 44 to the landing 26, two
+#: limbs a level): 71.9 ms at 2^-16 (depth 22, 118 products); the digit sign: the switch's round trip without its
+#: bootstrap (the windows' ring switches, the store's table, repack and finish: DIGIT_SWITCH_MS, pc-check tfhe-digit)
+#: plus the windows' load and the native rounds at tfhe_bitwise.COST_MS per launch: 21.3 ms for one value. Measured
+#: (planned mathlib fn=sign on GPU 3, 2026-11-23, the harness's ~12 ms of encryption and I/O on top): 82.2 / 33.2 ms.
+CKKS_REFRESH_LEVELS = 9
+DIGIT_SWITCH_MS = 19.0
+
+
+def sign_est_ms(method, err, values=1):
+    """Latency model of a sign at resolution err of the bound on `values` slots (ckks: SIMD, any count; inf where no
+    composite reaches err)."""
+    if method == "ckks":
+        try:
+            lad = sign_ladder(*_resolution(1.0, err))
+        except TargetError:
+            return _m.inf
+        return lad.ct_mults * SERIES_MS + _m.ceil(lad.depth / CKKS_REFRESH_LEVELS) * REFRESH_MS
+    from . import tfhe_bitwise, tfhe_digits
+    bits = _digit_bits(err)
+    p = tfhe_digits.sign_prog("est", int(values), bits, "est", half=True)
+    rows = len(tfhe_digits.sign_windows(bits)) * int(values)
+    load = next((t for b, t in tfhe_bitwise.COST_MS if rows <= b), tfhe_bitwise.COST_MS[-1][1] * rows / tfhe_bitwise.COST_MS[-1][0])
+    return DIGIT_SWITCH_MS + load + tfhe_bitwise.est_ms(p)
+
+
+def sign_method(err, values=1):
+    """"ckks" or "digit", whichever `sign_est_ms` finds faster (the plain switch, "tfhe", keeps ~7.5 bits: not a
+    candidate below 2^-7 of the bound)."""
+    return min(("ckks", "digit"), key=lambda m: sign_est_ms(m, err, values))
+
+
 # ── the public sign family ──────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _method(method, err, x, slots):
+    if method != "auto":
+        return method
+    n, idx = 0, slots
+    if slots is None:
+        n = int(getattr(getattr(x, "vec", None), "shape", (0,))[0] or 0)
+    return sign_method(err, len(idx) if idx is not None else max(n, 1))
 
 
 def sign(ops, x, bound, err=1e-3, method="ckks", slots=None):
     """sgn(x) for |x| <= bound: within err for |x| >= err * bound (ckks); exact (0 / 1 then 2 s - 1) outside the
-    switch's noise band (tfhe)."""
+    switch's noise band (tfhe); exact for |x| >= err * bound (digit: +-1, 1 at 0); auto: ckks or digit by
+    `sign_est_ms`."""
+    method = _method(method, err, x, slots)
+    if method == "digit":
+        return sign_digit(ops, x, bound, _digit_bits(err), slots, tag="sign")
     if method == "tfhe":
         s = step_tfhe(ops, x, bound, slots, tag="sign")
         return ops.add(ops.add(s, s), -1.0)
@@ -1018,7 +1109,10 @@ def sign(ops, x, bound, err=1e-3, method="ckks", slots=None):
 
 def relu(ops, x, bound, err=1e-3, method="ckks", slots=None):
     """max(x, 0) for |x| <= bound, within err (ckks; the error is largest at |x| ~ err), or x [x >= 0] (tfhe: exact
-    outside the switch's noise band, where the error is <= |x|)."""
+    outside the switch's noise band, where the error is <= |x|; digit: exact for |x| >= err bound)."""
+    method = _method(method, err, x, slots)
+    if method == "digit":
+        return ops.mult(x, step_digit(ops, x, bound, _digit_bits(err), slots, tag="relu"))
     if method == "tfhe":
         return ops.mult(x, step_tfhe(ops, x, bound, slots, tag="relu"))
     return relu_ckks(ops, x, float(bound), float(err))
@@ -1026,8 +1120,9 @@ def relu(ops, x, bound, err=1e-3, method="ckks", slots=None):
 
 def abs(ops, x, bound, err=1e-3, method="ckks", slots=None):  # noqa: A001
     """|x| for |x| <= bound: 2 relu(x) - x."""
-    if method == "tfhe":
-        s = step_tfhe(ops, x, bound, slots, tag="abs")
+    method = _method(method, err, x, slots)
+    if method in ("tfhe", "digit"):
+        s = step_tfhe(ops, x, bound, slots, tag="abs") if method == "tfhe" else step_digit(ops, x, bound, _digit_bits(err), slots, tag="abs")
         xs = ops.mult(x, s)
         return ops.sub(ops.add(xs, xs), x)
     return ops.sub(relu_ckks(ops, x, float(bound), 0.5 * float(err), gain=2.0), x)

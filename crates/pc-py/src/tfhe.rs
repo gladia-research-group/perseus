@@ -138,7 +138,8 @@ const MAX_IDX: usize = 1 << 20;
 /// One native program step (`TfheRt::prog`).
 #[derive(Clone, Debug)]
 enum Step {
-    Load { lut: usize, dst: Vec<usize> },
+    /// `shifts`: windows of the phase (the phase times 2^k per window, rows [window][value]; the digit decomposition)
+    Load { lut: usize, dst: Vec<usize>, shifts: Vec<u32> },
     Lin { dst: usize, a: usize, b: usize, idx: usize, rows: usize, ca: u64, cb: u64, c: u64 },
     Pbs { src: usize, rows: usize, lut: usize, k: usize, dst: Vec<usize> },
     /// one launch, a table per row: row r of `src` rotates the trivial accumulator `acc + r` (PC_TFHE_MACC)
@@ -468,7 +469,11 @@ impl TfheRt {
                     if dst.len() != k || dst.iter().any(|&b| b >= bufs) {
                         return Err(bad(format!("load: {} outputs for {k} tables", dst.len())));
                     }
-                    Step::Load { lut: l, dst }
+                    let shifts: Vec<u32> = serde_json::from_value(st.get("shifts").cloned().unwrap_or(serde_json::Value::Array(vec![]))).map_err(|x| bad(x.to_string()))?;
+                    if shifts.iter().any(|&k| k > 40) {
+                        return Err(bad("load: window shifts above 40 bits".into()));
+                    }
+                    Step::Load { lut: l, dst, shifts }
                 }
                 "lin" => {
                     let idx: Vec<i64> = serde_json::from_value(st.get("idx").cloned().unwrap_or_default()).map_err(|x| bad(x.to_string()))?;
@@ -669,12 +674,16 @@ impl TfheRt {
         let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&self.lt.inner as *const pc_cuda::blas::lt::Lt) };
         for step in &steps {
             match step {
-                Step::Load { lut, dst } => {
-                    if cnt > rows {
-                        return Err(pc_gpu::Error::Shape { what: "tfhe prog".into(), msg: format!("load of {cnt} values (buffers hold {rows})") });
+                Step::Load { lut, dst, shifts } => {
+                    if cnt * shifts.len().max(1) > rows {
+                        return Err(pc_gpu::Error::Shape { what: "tfhe prog".into(), msg: format!("load of {cnt} values x {} windows (buffers hold {rows})", shifts.len().max(1)) });
                     }
                     let dsts: Vec<*mut c_void> = dst.iter().map(|&d| bp(d)).collect();
-                    self.sw.native_load_k(ctx, st, ltr, &mut self.x, pos, cnt, tvp(*lut), &vec![0; dst.len()], &dsts, false)?;
+                    if shifts.is_empty() {
+                        self.sw.native_load_k(ctx, st, ltr, &mut self.x, pos, cnt, tvp(*lut), &vec![0; dst.len()], &dsts, false)?;
+                    } else {
+                        self.sw.native_load_shifted(ctx, st, ltr, &mut self.x, pos, cnt, shifts, tvp(*lut), &vec![0; dst.len()], &dsts, false)?;
+                    }
                 }
                 Step::Lin { dst, a, b, idx: off, rows: r, ca, cb, c } => {
                     self.sw.native_lin_c(ctx, st, bp(*dst), bp(*a), bp(*b), idx.wrapping_add(*off) as *const c_void, *r, *ca, *cb, *c)?;

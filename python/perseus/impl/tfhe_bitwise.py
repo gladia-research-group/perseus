@@ -382,8 +382,13 @@ class WordProg:
     digits ([word][digit]), then b's, then (mux) one sel per word at (4 sel - 3) / 4, read as a digit 0 / 2. Outputs:
     digits at value d / 4 (cmp: one value per word, 1 when a < b)."""
 
-    def __init__(self, name, words, nd, fan=3):
+    def __init__(self, name, words, nd, fan=3, load="digits"):
         self.w, self.nd, self.fan = int(words), int(nd), int(fan)
+        # load "values": a's then b's words as one CKKS value each (m in [-1, 1), the word round(m 2^(2 nd - 1)) in
+        # two's complement), split into digits by the digit decomposition (impl/tfhe_digits.py `word_load`)
+        if load not in ("digits", "values"):
+            raise ValueError("tfhe_bitwise: load digits or values")
+        self.load_kind = load
         self.multi = MULTI             # one launch per round (pbsm: a table per row)
         self.fan4 = FAN4               # fan-in 4 first prefix combines where they save a round
         self.div_gform = DIV_GFORM     # division: every other selection round as one gated lookup per digit
@@ -406,9 +411,17 @@ class WordProg:
         p.lut("lt_id_w", lambda m: np.where(np.asarray(m) > 0.0625, 1.0, 0.0), warp=True)   # lt / 8 -> lt
         p.lut("dig_w", lambda m: np.clip(np.round(8.0 * np.asarray(m)), 0, 3) / 4.0, warp=True)    # d / 8 in
         p.lut("dig4_w", lambda m: np.clip(np.round(4.0 * np.asarray(m)), 0, 3) / 4.0, warp=True)   # d / 4 in
-        p.load("load", 0)
+        if load == "values":
+            from . import tfhe_digits
+            tfhe_digits.word_load(p, 2 * self.w, self.nd, dst=0)
+        else:
+            p.load("load", 0)
 
     def rows_in(self, sel=False):
+        if self.load_kind == "values":
+            if sel:
+                raise ValueError("tfhe_bitwise: a values load holds a and b, no selector")
+            return 2 * self.w
         return 2 * self.R + (self.w if sel else 0)
 
     def add(self, out_slots):
@@ -2654,8 +2667,11 @@ def analyze(prog, m_in, nu=None, sp=PBS_OUT_SD):
         op = st["op"]
         if op == "load":
             fs = prog.luts[st["lut"]][0]
+            mm = np.asarray(m_in, dtype=np.float64)
+            if st.get("shifts"):        # windows of the phase (impl/tfhe_digits.py: its reads' margins are its own)
+                mm = np.concatenate([np.mod(mm * 2.0 ** k + 2.0, 4.0) - 2.0 for k in st["shifts"]])
             for d, f in zip(st["dst"] if isinstance(st["dst"], list) else [st["dst"]], fs):
-                B[d] = tfhe._nat(f, np.asarray(m_in, dtype=np.float64), pts // len(fs))
+                B[d] = tfhe._nat(f, mm, pts // len(fs))
                 V[d] = np.full(len(B[d]), sp * sp)
                 D[d] = 0
         elif op == "lin":

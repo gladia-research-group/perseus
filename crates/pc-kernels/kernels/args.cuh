@@ -983,6 +983,7 @@ static_assert(sizeof(CoeffArgs) == 80 + 16 * PC_COEFF_MAXT, "CoeffArgs layout");
 // The bridge to the CKKS split (ring N = n = 2^16, u32 residues, products by a 64-bit Barrett step, mu = c[7] =
 // floor(2^64 / q); NTTs run on the pcmm launcher's NTT op with pc-tfhe's tables):
 //   RESCALE_P1   y = [2 part][2 limb][n] mod (q, c[1]) -> x = [2 part][n] mod q: (x_0 - centered(x_1)) c[0] (c[0] = p1^-1)
+//                c[2] != 0: x times the integer (c[2] mod q, c[3] mod c[1]; c[4] = mu(c[1])) first
 //   RS_DIGITS    y = c1 [n] -> x = [levels][n]: the approximate digits (base 2^c[0], c[1] levels, m) mod q
 //   MAC          y = [count][n], z = keys [count][i1][n] (NTT form) -> x = [i1][n] = sum_t y_t z_t,o mod q
 //   RS_EXTRACT   y = [2 part][n] (c0, c1 under s'(X^i2), coefficient form), z = int32 positions [count] ->

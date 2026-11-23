@@ -40,12 +40,12 @@ type W = u32;
 type M = Barrett64;
 type Res<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn arg(a: &[String], k: &str) -> Option<String> {
+pub(crate) fn arg(a: &[String], k: &str) -> Option<String> {
     a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned()
 }
 
 /// Drop the top prime of coefficient-form limbs: c -> (c - [c]_top) top^-1 on the others.
-fn rescale_top(limbs: &mut Vec<Vec<u64>>, primes: &mut Vec<u64>) {
+pub(crate) fn rescale_top(limbs: &mut Vec<Vec<u64>>, primes: &mut Vec<u64>) {
     let top = limbs.pop().unwrap();
     let pt = primes.pop().unwrap();
     for (l, &p) in limbs.iter_mut().zip(primes.iter()) {
@@ -1003,7 +1003,7 @@ fn key_sizes(tag: &str, sw: &Switcher, ts: &pc_gpu::tfhe::TfheSwitch<'_>) {
 
 /// The tfhe check's switch parameters: Params' defaults, --nu, --pbs-gadget, --lat-group G, --rs-gadget b,l (the ring
 /// switch's), --lwe n,log2 (Params::with_lwe), --stored-keys (the keys' masks stored, not seeded)
-fn switch_params(args: &[String], n: usize) -> Res<Params> {
+pub(crate) fn switch_params(args: &[String], n: usize) -> Res<Params> {
     let mut p = Params::new(n)?;
     p.seeded = !args.iter().any(|a| a == "--stored-keys");
     p.nu = arg(args, "--nu").map(|s| s.parse()).transpose()?.unwrap_or(1);
@@ -1045,7 +1045,7 @@ fn pbs_gadget(args: &[String]) -> Res<Option<(u32, usize)>> {
 }
 
 /// i32 words as the u32 a device index buffer holds.
-fn bytemuck_i32(v: &[i32]) -> &[u32] {
+pub(crate) fn bytemuck_i32(v: &[i32]) -> &[u32] {
     // SAFETY: i32 and u32 share size and alignment
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u32, v.len()) }
 }
