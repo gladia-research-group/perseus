@@ -1,10 +1,11 @@
 //! Ring-size tables: the NTT and row kernels compiled per (word, log n)
 //! (Barrett64; Cargo feature `ring`, u64 additionally with `w64`). Mirrors of the `args.cuh` ring structs.
-use crate::args::{BconvArgs, EwArgs, Launch, NttArgs, PrimeConst};
+use crate::args::{BconvArgs, EwArgs, Launch, NttArgs};
 use crate::table::TableError;
-use std::ffi::c_void;
 
 pub const RING_ABI: u32 = 8;
+// the ring tables carry args.cuh's PC_RING_ABI: it must equal RING_ABI (checked when a table loads)
+const _: () = assert!(RING_ABI == crate::cuh_define(crate::ARGS_CUH, "PC_RING_ABI"), "RING_ABI != args.cuh PC_RING_ABI");
 /// Ring sizes with a table when the feature is on.
 pub const RING_LOG_N: std::ops::RangeInclusive<u32> = 10..=17;
 

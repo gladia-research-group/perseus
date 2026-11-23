@@ -2,7 +2,8 @@
 //! (exact u128 arithmetic), and the NTT throughput sweep.
 //!
 //! usage (GPU only through tools/gpu.sh): pc-kernels-selftest [--all | \<instance>...] [--no-bench] [--ring | --ring-only]
-//! (`--ring`: also the ring-size tables of every built word, log n 10..17; needs feature `ring`)
+//! (`--ring`: also the ring-size tables of every built word, log n 10..17; needs feature `ring`). Each group of
+//! checks gets an arena sized from its peak use (printed), PC_SELFTEST_ARENA_MIB=<MiB> overrides it.
 #[path = "selftest/dev.rs"]
 mod dev;
 #[path = "selftest/host.rs"]
@@ -14,7 +15,7 @@ mod ring;
 use dev::{Ctx, Dev};
 use host::*;
 use pc_kernels::*;
-use pc_cuda::{Arena, Compute, Device, Event, Stream};
+use pc_cuda::{Compute, Device, Event, Stream};
 use std::ffi::c_void;
 
 struct TestResult {
@@ -2221,7 +2222,9 @@ fn t_encrypt(st: &mut Setup) -> Vec<TestResult> {
 // ================================================================================================ throughput
 fn bench(st: &mut Setup) -> Vec<(usize, f32)> {
     let maxrows = 640;
-    let big = st.ctx.zeros(maxrows * N);
+    // its own arena: the transform buffer is the largest single carve (640 rows of 2^16 u64 words = 320 MiB)
+    let barena = dev::exact_arena(st.ctx.dev, &[(maxrows * N, st.ctx.wb)]);
+    let big = st.ctx.zeros_in(&barena, maxrows * N, st.ctx.wb);
     let mut res = Vec::new();
     for &nr in &[9usize, 54, 63, 108, 324, 640] {
         let list: Vec<(u32, i32)> = (0..nr).map(|i| (i as u32, (i % 8) as i32)).collect();
@@ -2260,7 +2263,8 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
     };
     let wb = inst.word_bytes() as usize;
     let wbits = 8 * wb as u32;
-    let arena = Arena::new(dev, 3usize << 30).expect("arena");
+    // the checks' peak use (MiB): u16 697, u32 1839, u64 3014
+    let arena = dev::arena(dev, [1024, 2304, 3840][wb.trailing_zeros() as usize - 1]);
     let ctx = Ctx { dev, arena: &arena, s: Stream::<Compute>::new(dev).expect("stream"), wb };
     let mut rng = Rng(0x1234_5678_9abc_def1 ^ (wb as u64 * 0x9E37_79B9) ^ inst.mm() as u64);
     let (primes, ntt_ok) = match wb {
@@ -2321,6 +2325,7 @@ fn run_instance(dev: &Device, inst: Instance, do_bench: bool) -> (u64, Vec<Strin
         }
     }
     println!("[selftest] {name}: {nchecks} checks, {total} mismatches");
+    println!("[selftest] {name}: arena used {} of {} MiB", st.ctx.arena.used_bytes() >> 20, st.ctx.arena.capacity() >> 20);
     let mut lines = Vec::new();
     if do_bench && st.ntt.is_some() {
         for (nr, us) in bench(&mut st) {

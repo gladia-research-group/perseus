@@ -7,6 +7,8 @@ use std::ffi::c_void;
 pub type CudaStream = *mut c_void;
 
 pub const ABI: u32 = 30;
+// a layout change bumps both sides: the header's PC_KERNELS_ABI must equal ABI
+const _: () = assert!(ABI == crate::cuh_define(crate::ARGS_CUH, "PC_KERNELS_ABI"), "ABI != args.cuh PC_KERNELS_ABI");
 pub const LOG_N: u32 = 16;
 pub const N: usize = 1 << LOG_N;
 
