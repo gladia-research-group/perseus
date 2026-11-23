@@ -22,6 +22,14 @@ pub fn on() -> bool {
     *V.get_or_init(|| matches!(std::env::var("PC_SCHED2").as_deref().map(str::trim), Ok("1") | Ok("on")))
 }
 
+/// PC_SCHED2_FIN: `barrier` (default until an A/B wins) = a finish is a barrier (both devices joined, nothing
+/// crosses it); `async` = a finish runs as the runtime runs it, its two halves each on its device when that device is
+/// free (this device joining the remote half at its end), and independent ops may cross it.
+fn fin_async() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_SCHED2_FIN").as_deref().map(str::trim), Ok("async")))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
     /// Element-wise, products, rotations: moves, joins its neighbours into atoms.
@@ -97,8 +105,6 @@ struct Atom {
     hi: usize,
     class: Class,
     ms: f64,
-    /// Level of the last op's first output (a copy's size).
-    level: u32,
 }
 
 fn atoms(p: &Program) -> Vec<Atom> {
@@ -123,16 +129,14 @@ fn atoms(p: &Program) -> Vec<Atom> {
             }
             _ => false,
         };
-        let level = op.all_outs().first().map_or(0, |&v| p.vars[v as usize].meta.level);
         if join {
             let a = out.last_mut().expect("an atom is open");
             a.hi = i + 1;
             a.ms += op_ms(p, op);
-            a.level = level;
         } else {
             wset.clear();
             rots.clear();
-            out.push(Atom { lo: i, hi: i + 1, class: cls[i], ms: op_ms(p, op), level });
+            out.push(Atom { lo: i, hi: i + 1, class: cls[i], ms: op_ms(p, op) });
         }
         wset.extend(op.all_outs());
         if let Some(v) = rot_in(op) {
@@ -151,20 +155,159 @@ pub struct Report {
     pub moved: usize,
     pub one_ms: f64,
     pub two_ms: f64,
+    /// Peak live ciphertext bytes (GB) in program order and in the schedule (what the slot allocation's arena follows).
+    pub live0_gb: f64,
+    pub live_gb: f64,
+    /// Over the regions between finishes (barrier mode): their scheduled spans, sum of max(critical path, work / 2),
+    /// sum of work / 2, and the regions whose critical path exceeds half their work (count, their spans).
+    pub spans: f64,
+    pub bound: f64,
+    pub half: f64,
+    pub chain_regions: usize,
+    pub chain_spans: f64,
+    /// Device idle in the schedule (ms, both devices): waiting for a copy, for an input made on the same device, for
+    /// the remote half of a finish or split refresh batch (this device joining it); and the copies' busy ms (both copy
+    /// engines).
+    pub idle: [f64; 3],
+    pub copies_ms: f64,
+    /// The copies' ms by what produced the copied var: block input, light op, heavy atom (refresh, K-batch), finish or
+    /// split refresh batch.
+    pub copies_by: [f64; 4],
+}
+
+/// Work (both devices' ms) and critical path (ms, RAW inside the range, unbounded devices) of atoms `lo..hi`.
+fn bounds(at: &[Atom], preds: &[Vec<usize>], lo: usize, hi: usize) -> (f64, f64) {
+    let mut fin = vec![0.0f64; hi - lo];
+    let mut w = 0.0;
+    for k in lo..hi {
+        let c = if matches!(at[k].class, Class::Both | Class::Barrier) { at[k].ms / 2.0 } else { at[k].ms };
+        w += at[k].ms;
+        let st = preds[k].iter().filter(|&&q| q >= lo && q < hi).map(|&q| fin[q - lo]).fold(0.0, f64::max);
+        fin[k - lo] = st + c;
+    }
+    (w, fin.into_iter().fold(0.0, f64::max))
+}
+
+/// PC_SCHED2_FILL: `1` / `on` = an atom that would leave its device waiting for its inputs first lets the ready atoms
+/// that fit in the wait run there (inputs already on that device, most urgent first); unset / `0` = off (default
+/// until an A/B wins).
+fn fill() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_SCHED2_FILL").as_deref().map(str::trim), Ok("1") | Ok("on")))
+}
+
+/// PC_SCHED2_MEM=<factor>: the schedule keeps the live ciphertext bytes within factor x the program order's peak
+/// (a ready op that would pass it waits while one that fits, or frees the most, goes first); unset = no cap.
+fn mem_factor() -> Option<f64> {
+    static V: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_SCHED2_MEM").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|&f| f >= 1.0))
+}
+
+/// Live ciphertext bytes along a schedule: each var from its producer until its last reader (block inputs from the
+/// start, block outputs to the end).
+#[derive(Clone)]
+struct Live {
+    /// Readers (atoms) still to come, per var.
+    rem: Vec<u32>,
+    live: f64,
+    peak: f64,
+    cap: Option<f64>,
+}
+
+impl Live {
+    /// Bytes atom `k` adds when it runs: its outputs read later or kept, less its inputs it is the last reader of.
+    fn grow(&self, xin: &[VarId], out: &[VarId], keep: &HashSet<VarId>, vb: &dyn Fn(VarId) -> f64) -> f64 {
+        out.iter().map(|&v| vb(v)).sum::<f64>() - xin.iter().filter(|&&v| self.rem[v as usize] == 1 && !keep.contains(&v)).map(|&v| vb(v)).sum::<f64>()
+    }
+    fn take(&mut self, xin: &[VarId], out: &[VarId], keep: &HashSet<VarId>, vb: &dyn Fn(VarId) -> f64) {
+        self.live += out.iter().map(|&v| vb(v)).sum::<f64>();
+        self.peak = self.peak.max(self.live);
+        for &v in xin {
+            let r = &mut self.rem[v as usize];
+            *r = r.saturating_sub(1);
+            if *r == 0 && !keep.contains(&v) {
+                self.live -= vb(v);
+            }
+        }
+    }
+}
+
+/// Ownership (PC_OWN, the replica lane's): a finish's remote outputs stay valid on the remote device too.
+#[cfg(feature = "gpu")]
+fn owned() -> bool {
+    crate::replica::own()
+}
+#[cfg(not(feature = "gpu"))]
+fn owned() -> bool {
+    false
+}
+
+/// Where each var is (bit per device) and from when it is usable there, over the whole block: block inputs on this
+/// device from the start, every output on the device that computed it, a copy adding the other device.
+struct Loc {
+    on: Vec<u8>,
+    av: Vec<[f64; 2]>,
+}
+
+impl Loc {
+    /// When the vars `vs` are usable on device `d`: those missing there copied over on `d`'s copy engine (`ce`, one
+    /// copy at a time, each from when its var is ready on the other device). `commit` records the copies. Returns the
+    /// time and the number of copies.
+    fn arrive(&mut self, vs: &[VarId], d: usize, ce: &mut [f64; 2], cp: &dyn Fn(VarId) -> f64, commit: bool) -> (f64, usize) {
+        let (mut x, mut c, mut nc) = (0.0f64, ce[d], 0usize);
+        for &v in vs {
+            let i = v as usize;
+            if self.on[i] >> d & 1 != 0 {
+                x = x.max(self.av[i][d]);
+            } else {
+                c = c.max(self.av[i][1 - d]) + cp(v);
+                x = x.max(c);
+                nc += 1;
+                if commit {
+                    self.on[i] |= 1 << d;
+                    self.av[i][d] = c;
+                }
+            }
+        }
+        if commit {
+            ce[d] = c;
+        }
+        (x, nc)
+    }
+    /// Outputs of a step on device `d` ending at `f`.
+    fn put(&mut self, vs: &[VarId], d: usize, f: f64) {
+        for &v in vs {
+            self.on[v as usize] = 1 << d;
+            self.av[v as usize] = [f, f];
+        }
+    }
+    /// Outputs of a finish or a split refresh batch (both devices, inputs here): the first half here, the last half
+    /// (the remote part's) on both devices with ownership (PC_OWN), else here.
+    fn put_split(&mut self, vs: &[VarId], f: f64) {
+        let h = vs.len() - vs.len() / 2;
+        for (j, &v) in vs.iter().enumerate() {
+            self.on[v as usize] = if j >= h && owned() { 3 } else { 1 };
+            self.av[v as usize] = [f, f];
+        }
+    }
 }
 
 /// Reorder `p.ops` and set `p.var_dev` (every output var of an op the schedule puts on the remote device: 1).
-/// `copy_ms(level)`: one ciphertext's copy between the devices.
-pub fn schedule(p: &mut Program, copy_ms: &dyn Fn(u32) -> f64) -> Report {
+/// `copy_ms(level)`: one ciphertext's copy between the devices (degree 1; a degree-2 one costs half again).
+/// `var_bytes(level)`: one ciphertext's buffer (the slot allocation's size).
+pub fn schedule(p: &mut Program, copy_ms: &dyn Fn(u32) -> f64, var_bytes: &dyn Fn(u32) -> f64) -> Report {
     let at = atoms(p);
     let na = at.len();
     let mut rep = Report { ops: p.ops.len(), atoms: na, ..Default::default() };
     if na == 0 {
         return rep;
     }
-    // atom dependencies (RAW through vars; streamed-weight sums chained in order)
+    // atom dependencies (RAW through vars; streamed-weight sums chained in order), and each atom's vars read from
+    // outside it and written
     let mut prod: HashMap<VarId, usize> = HashMap::new();
     let mut preds: Vec<Vec<usize>> = vec![vec![]; na];
+    let mut xin: Vec<Vec<VarId>> = vec![vec![]; na];
+    let mut xout: Vec<Vec<VarId>> = vec![vec![]; na];
     let mut last_pin: Option<usize> = None;
     for (k, a) in at.iter().enumerate() {
         let mut d: Vec<usize> = vec![];
@@ -175,9 +318,15 @@ pub fn schedule(p: &mut Program, copy_ms: &dyn Fn(u32) -> f64) -> Report {
                     if let Some(&q) = prod.get(&v) {
                         d.push(q);
                     }
+                    if !xin[k].contains(&v) {
+                        xin[k].push(v);
+                    }
                 }
             }
-            own.extend(op.all_outs());
+            for v in op.all_outs() {
+                own.insert(v);
+                xout[k].push(v);
+            }
         }
         if a.class == Class::Pinned {
             if let Some(q) = last_pin {
@@ -194,40 +343,112 @@ pub fn schedule(p: &mut Program, copy_ms: &dyn Fn(u32) -> f64) -> Report {
             }
         }
     }
+    let vars = &p.vars;
+    let vb = |v: VarId| var_bytes(vars[v as usize].meta.level);
+    // live bytes: the readers of each var, the outputs anything reads later (or the block keeps)
+    let keep: HashSet<VarId> = p.outputs.iter().copied().collect();
+    let mut nread = vec![0u32; vars.len()];
+    for x in &xin {
+        for &v in x {
+            nread[v as usize] += 1;
+        }
+    }
+    let xlive: Vec<Vec<VarId>> = xout.iter().map(|o| o.iter().copied().filter(|v| nread[*v as usize] > 0 || keep.contains(v)).collect()).collect();
+    let live_in: f64 = p.inputs.iter().filter(|v| nread[**v as usize] > 0 || keep.contains(*v)).map(|&v| vb(v)).sum();
+    let mut po = Live { rem: nread.clone(), live: live_in, peak: live_in, cap: None };
+    for k in 0..na {
+        po.take(&xin[k], &xlive[k], &keep, &vb);
+    }
+    let mut live = Live { rem: nread, live: live_in, peak: live_in, cap: mem_factor().map(|f| f * po.peak) };
+    rep.live0_gb = po.peak / 1e9;
+    let cp = |v: VarId| {
+        let m = &vars[v as usize].meta;
+        copy_ms(m.level) * (m.deg.max(1) as f64 + 1.0) / 2.0
+    };
     rep.one_ms = at.iter().map(|a| a.ms).sum();
-    // regions between barriers; each barrier alone, both devices joined
+    // regions between barriers; each barrier alone, both devices joined, its inputs here
+    let mut loc = Loc { on: vec![1; p.vars.len()], av: vec![[0.0; 2]; p.vars.len()] };
+    let mut ce = [0.0f64; 2];
     let mut order: Vec<usize> = Vec::with_capacity(na);
     let mut dev: Vec<u8> = vec![0; na];
     let mut t_all = 0.0f64;
     let mut lo = 0usize;
+    let mut vcls = vec![0u8; p.vars.len()];
+    for (k, a) in at.iter().enumerate() {
+        let c = match a.class {
+            Class::Light | Class::Pinned => 1,
+            Class::Heavy => 2,
+            Class::Both | Class::Barrier => 3,
+        };
+        for &v in &xout[k] {
+            vcls[v as usize] = c;
+        }
+    }
     while lo < na {
-        if at[lo].class == Class::Barrier {
+        if at[lo].class == Class::Barrier && !fin_async() {
+            let (x, _) = loc.arrive(&xin[lo], 0, &mut ce, &cp, true);
+            let f = t_all.max(x) + at[lo].ms / 2.0;
+            loc.put_split(&xout[lo], f);
+            live.take(&xin[lo], &xlive[lo], &keep, &vb);
             order.push(lo);
-            t_all += at[lo].ms / 2.0;
+            t_all = f;
             lo += 1;
             continue;
         }
         let mut hi = lo;
-        while hi < na && at[hi].class != Class::Barrier {
+        while hi < na && (at[hi].class != Class::Barrier || fin_async()) {
             hi += 1;
         }
-        // best of a few copy penalties (ms charged per copy the choice creates)
-        let mut best: Option<(f64, Vec<usize>, Vec<u8>)> = None;
-        for beta in [0.0, 0.5, 2.0] {
-            let (mk, ord, dv) = region(&at, &preds, lo, hi, beta, copy_ms);
-            if best.as_ref().is_none_or(|b| mk < b.0) {
-                best = Some((mk, ord, dv));
+        // best of a few copy penalties (ms charged per copy the choice creates; larger ones, 5 and 10 ms, scored better
+        // in the model but ran slower: ViT 11.76 vs 11.54 s)
+        type Run = (f64, Vec<usize>, Vec<u8>, Loc, [f64; 2], Live, [f64; 8], f64);
+        let run = |betas: &[f64]| -> Run {
+            let mut best: Option<Run> = None;
+            for &beta in betas {
+                let mut l = Loc { on: loc.on.clone(), av: loc.av.clone() };
+                let mut c = ce;
+                let mut m = live.clone();
+                let mut sts = [0.0f64; 8];
+                let g = Graph { at: &at, preds: &preds, xin: &xin, xout: &xout, xlive: &xlive, keep: &keep, vcls: &vcls };
+                let (mk, ord, dv) = region(&g, lo, hi, t_all, beta, &mut l, &mut c, &mut m, &cp, &vb, &mut sts);
+                if best.as_ref().is_none_or(|b| mk < b.0) {
+                    best = Some((mk, ord, dv, l, c, m, sts, beta));
+                }
             }
+            best.expect("one schedule at least")
+        };
+        let res = run(&[0.0, 0.5, 2.0]);
+        let (mk, ord, dv, l, c, m, sts, _) = res;
+        for i in 0..3 {
+            rep.idle[i] += sts[i];
         }
-        let (mk, ord, dv) = best.expect("one schedule at least");
-        t_all += mk;
+        for i in 0..4 {
+            rep.copies_by[i] += sts[4 + i];
+            rep.copies_ms += sts[4 + i];
+        }
+        let (w, cp) = bounds(&at, &preds, lo, hi);
+        rep.spans += mk - t_all;
+        rep.bound += cp.max(w / 2.0);
+        rep.half += w / 2.0;
+        if cp > w / 2.0 {
+            rep.chain_regions += 1;
+            rep.chain_spans += mk - t_all;
+        }
+        t_all = mk;
+        loc = l;
+        ce = c;
+        live = m;
         for (j, &k) in ord.iter().enumerate() {
             order.push(k);
             dev[k] = dv[j];
         }
         lo = hi;
     }
-    rep.two_ms = t_all;
+    // the block's outputs back here
+    let outs = p.outputs.clone();
+    let (x, _) = loc.arrive(&outs, 0, &mut ce, &cp, true);
+    rep.two_ms = t_all.max(x);
+    rep.live_gb = live.peak / 1e9;
     // the new op order and the device hints
     let mut ops: Vec<Option<Op>> = std::mem::take(&mut p.ops).into_iter().map(Some).collect();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
@@ -248,9 +469,25 @@ pub fn schedule(p: &mut Program, copy_ms: &dyn Fn(u32) -> f64) -> Report {
     rep
 }
 
-/// List schedule of atoms `lo..hi` (no barrier inside) on two in-order devices with one copy engine into each:
-/// (makespan from the region's start, atoms in start order, their devices).
-fn region(at: &[Atom], preds: &[Vec<usize>], lo: usize, hi: usize, beta: f64, copy_ms: &dyn Fn(u32) -> f64) -> (f64, Vec<usize>, Vec<u8>) {
+/// List schedule of atoms `lo..hi` (no barrier inside) from `t0` (both devices free) on two in-order devices with one
+/// copy engine into each, every var read where it is not copied over (`loc`, `ce`: updated): (makespan, atoms in
+/// start order, their devices).
+/// The block's atoms and their dataflow.
+struct Graph<'g> {
+    at: &'g [Atom],
+    preds: &'g [Vec<usize>],
+    /// Vars each atom reads from outside it, writes, and writes that something reads later (or the block keeps).
+    xin: &'g [Vec<VarId>],
+    xout: &'g [Vec<VarId>],
+    xlive: &'g [Vec<VarId>],
+    keep: &'g HashSet<VarId>,
+    /// Per var: what produced it (0 block input, 1 light, 2 heavy, 3 finish / split refresh batch).
+    vcls: &'g [u8],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region(g: &Graph<'_>, lo: usize, hi: usize, t0: f64, beta: f64, loc: &mut Loc, ce: &mut [f64; 2], live: &mut Live, cp: &dyn Fn(VarId) -> f64, vb: &dyn Fn(VarId) -> f64, st: &mut [f64; 8]) -> (f64, Vec<usize>, Vec<u8>) {
+    let (at, preds, xin, xout) = (g.at, g.preds, g.xin, g.xout);
     let n = hi - lo;
     let mut succ: Vec<Vec<usize>> = vec![vec![]; n];
     let mut npred = vec![0usize; n];
@@ -262,7 +499,7 @@ fn region(at: &[Atom], preds: &[Vec<usize>], lo: usize, hi: usize, beta: f64, co
             }
         }
     }
-    let cost = |k: usize| if at[lo + k].class == Class::Both { at[lo + k].ms / 2.0 } else { at[lo + k].ms };
+    let cost = |k: usize| if matches!(at[lo + k].class, Class::Both | Class::Barrier) { at[lo + k].ms / 2.0 } else { at[lo + k].ms };
     let mut tail = vec![0.0f64; n];
     for k in (0..n).rev() {
         tail[k] = cost(k) + succ[k].iter().map(|&s| tail[s]).fold(0.0, f64::max);
@@ -282,77 +519,143 @@ fn region(at: &[Atom], preds: &[Vec<usize>], lo: usize, hi: usize, beta: f64, co
         }
     }
     let mut heap: BinaryHeap<R> = (0..n).filter(|&k| npred[k] == 0).map(|k| R(tail[k], k)).collect();
-    let mut t = [0.0f64; 2];
-    let mut ce = [0.0f64; 2];
-    let mut fin = vec![0.0f64; n];
-    // where each atom's outputs are (bit per device) and when they are usable there
-    let mut on = vec![0u8; n];
-    let mut avail = vec![[0.0f64; 2]; n];
+    let mut t = [t0; 2];
     let mut start = vec![0.0f64; n];
     let mut dv = vec![0u8; n];
-    while let Some(R(_, k)) = heap.pop() {
-        let a = &at[lo + k];
-        // arrival of the inputs on d (copies queued on d's engine; commit: record them)
-        let arr = |d: usize, on: &mut [u8], avail: &mut [[f64; 2]], ce: &mut [f64; 2], commit: bool| -> (f64, usize) {
-            let mut x = 0.0f64;
-            let mut c = ce[d];
-            let mut nc = 0;
-            for &q in &preds[lo + k] {
-                if q < lo || q >= hi {
-                    continue;
-                }
-                let q = q - lo;
-                if on[q] >> d & 1 != 0 {
-                    x = x.max(avail[q][d]);
-                } else {
-                    let s0 = fin[q].max(c);
-                    c = s0 + copy_ms(at[lo + q].level);
-                    x = x.max(c);
-                    nc += 1;
-                    if commit {
-                        on[q] |= 1 << d;
-                        avail[q][d] = c;
+    while !heap.is_empty() {
+        // the most urgent ready atom; under a memory cap (PC_SCHED2_MEM) the most urgent that fits, else of all the
+        // ready atoms the one that grows the live bytes least (the most urgent of those)
+        let k = match live.cap {
+            None => heap.pop().expect("not empty").1,
+            Some(cap) => {
+                let mut tried: Vec<(f64, R)> = vec![];
+                let mut pick = None;
+                while let Some(r) = heap.pop() {
+                    let gr = live.grow(&xin[lo + r.1], &g.xlive[lo + r.1], g.keep, vb);
+                    if live.live + gr <= cap {
+                        pick = Some(r.1);
+                        break;
                     }
+                    tried.push((gr, r));
                 }
+                let k = match pick {
+                    Some(k) => k,
+                    None => {
+                        // `tried` is in urgency order: the first of the least growing
+                        let j = (0..tried.len()).min_by(|&a, &b| tried[a].0.total_cmp(&tried[b].0).then(a.cmp(&b))).expect("one tried");
+                        tried.swap_remove(j).1 .1
+                    }
+                };
+                for (_, r) in tried {
+                    heap.push(r);
+                }
+                k
             }
-            if commit {
-                ce[d] = c;
-            }
-            (x, nc)
         };
+        let a = &at[lo + k];
         match a.class {
-            Class::Both => {
-                let (x0, _) = arr(0, &mut on, &mut avail, &mut ce, true);
-                let st = t[0].max(t[1]).max(x0);
+            Class::Both if !fin_async() => {
+                // a split refresh batch: its inputs here, both devices for its span
+                let (x, _) = loc.arrive(&xin[lo + k], 0, ce, cp, true);
+                let st = t[0].max(t[1]).max(x);
                 let f = st + cost(k);
                 t = [f, f];
-                fin[k] = f;
                 start[k] = st;
-                on[k] = 3;
-                avail[k] = [f, f];
+                loc.put_split(&xout[lo + k], f);
+                dv[k] = 0;
+            }
+            Class::Both | Class::Barrier => {
+                // a split refresh batch or a finish (PC_SCHED2_FIN=async): its inputs here, each half on its device
+                // when that device is free (the remote half reads its inputs over the link itself), this device
+                // joining the remote half at the end; issued after both devices' earlier ops
+                for &v in &xin[lo + k] {
+                    if loc.on[v as usize] & 1 == 0 {
+                        st[4 + g.vcls[v as usize] as usize] += cp(v);
+                    }
+                }
+                let (x, _) = loc.arrive(&xin[lo + k], 0, ce, cp, true);
+                let (s0, s1) = (t[0].max(x), t[1].max(x));
+                let (f0, f1) = (s0 + cost(k), s1 + cost(k));
+                let end = f0.max(f1);
+                st[1] += (s0 - t[0]) + (s1 - t[1]);
+                st[2] += end - f0;
+                t = [end, f1];
+                start[k] = s0.max(s1);
+                loc.put_split(&xout[lo + k], end);
                 dv[k] = 0;
             }
             _ => {
-                let mut opts: Vec<(f64, f64, usize)> = vec![];
+                let mut best: Option<(f64, f64, usize)> = None;
                 for d in 0..2 {
                     if d == 1 && a.class == Class::Pinned {
                         continue;
                     }
-                    let (x, nc) = arr(d, &mut on.clone(), &mut avail.clone(), &mut ce.clone(), false);
+                    let mut c = *ce;
+                    let (x, nc) = loc.arrive(&xin[lo + k], d, &mut c, cp, false);
                     let f = t[d].max(x) + cost(k);
-                    opts.push((f + beta * nc as f64, f, d));
+                    let score = f + beta * nc as f64;
+                    if best.is_none_or(|b| score < b.0) {
+                        best = Some((score, f, d));
+                    }
                 }
-                let &(_, f, d) = opts.iter().min_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2))).expect("device 0 always");
-                arr(d, &mut on, &mut avail, &mut ce, true);
+                let (_, f, d) = best.expect("device 0 always");
+                // PC_SCHED2_FILL: the wait before k on d filled with ready atoms whose inputs are on d already
+                let s_k = f - cost(k);
+                while fill() && s_k > t[d] {
+                    let mut seen: Vec<R> = vec![];
+                    let mut found = None;
+                    while let Some(r) = heap.pop() {
+                        let j = r.1;
+                        let cls = at[lo + j].class;
+                        if matches!(cls, Class::Light | Class::Heavy) || (cls == Class::Pinned && d == 0) {
+                            let xs = &xin[lo + j];
+                            if xs.iter().all(|&v| loc.on[v as usize] >> d & 1 != 0) {
+                                let st = xs.iter().map(|&v| loc.av[v as usize][d]).fold(t[d], f64::max);
+                                if st + cost(j) <= s_k && live.cap.is_none_or(|c| live.live + live.grow(xs, &g.xlive[lo + j], g.keep, vb) <= c) {
+                                    found = Some((j, st));
+                                    break;
+                                }
+                            }
+                        }
+                        seen.push(r);
+                        if seen.len() >= 256 {
+                            break;
+                        }
+                    }
+                    for r in seen {
+                        heap.push(r);
+                    }
+                    let Some((j, st)) = found else { break };
+                    let fj = st + cost(j);
+                    start[j] = st;
+                    t[d] = fj;
+                    loc.put(&xout[lo + j], d, fj);
+                    dv[j] = d as u8;
+                    live.take(&xin[lo + j], &g.xlive[lo + j], g.keep, vb);
+                    for &s2 in &succ[j] {
+                        npred[s2] -= 1;
+                        if npred[s2] == 0 {
+                            heap.push(R(tail[s2], s2));
+                        }
+                    }
+                }
+                // idle before k on d: waiting for inputs made on d (dep), then for copies
+                let xl = xin[lo + k].iter().filter(|&&v| loc.on[v as usize] >> d & 1 != 0).map(|&v| loc.av[v as usize][d]).fold(t[d], f64::max);
+                for &v in &xin[lo + k] {
+                    if loc.on[v as usize] >> d & 1 == 0 {
+                        st[4 + g.vcls[v as usize] as usize] += cp(v);
+                    }
+                }
+                loc.arrive(&xin[lo + k], d, ce, cp, true);
                 start[k] = f - cost(k);
+                st[1] += xl.min(start[k]) - t[d];
+                st[0] += (start[k] - xl).max(0.0);
                 t[d] = f;
-                fin[k] = f;
-                on[k] = 1 << d;
-                avail[k] = [0.0, 0.0];
-                avail[k][d] = f;
+                loc.put(&xout[lo + k], d, f);
                 dv[k] = d as u8;
             }
         }
+        live.take(&xin[lo + k], &g.xlive[lo + k], g.keep, vb);
         for &s in &succ[k] {
             npred[s] -= 1;
             if npred[s] == 0 {
@@ -362,6 +665,5 @@ fn region(at: &[Atom], preds: &[Vec<usize>], lo: usize, hi: usize, beta: f64, co
     }
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| start[a].total_cmp(&start[b]).then(a.cmp(&b)));
-    let mk = t[0].max(t[1]);
-    (mk, idx.iter().map(|&k| lo + k).collect(), idx.iter().map(|&k| dv[k]).collect())
+    (t[0].max(t[1]), idx.iter().map(|&k| lo + k).collect(), idx.iter().map(|&k| dv[k]).collect())
 }

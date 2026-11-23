@@ -600,6 +600,7 @@ struct KvIo<'k> {
 /// `Program.run` without the GIL: inputs into the slab, the replay, outputs into registers.
 fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], kvio: &KvIo<'_>) -> PyResult<pc_program::replay::RunInfo> {
     use pc_program::kv::KvStore;
+    let t_prof = host_prof().then(std::time::Instant::now);
     let mut st = dev.st.borrow_mut();
     let State { planned, ex, ops, plans, pts, .. } = &mut *st;
     let pl = planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
@@ -639,12 +640,16 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
             k.prefetch(ex, u).map_err(perr)?;
         }
     }
-    // PC_REPLICA_PT: the replica's copies of this block's plaintexts (the session's rows resolved first)
+    // PC_REPLICA_PT: the replica's copies of this block's plaintexts (the session's rows resolved first); skipped when
+    // the block's cached schedule runs nothing on the replica (decode blocks: a per-token host cost otherwise)
     if let Some(r) = remote.as_mut().filter(|r| r.replica.as_ref().is_some_and(|rp| rp.pts.is_some())) {
         let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
-        b.resolve_pts(pts).map_err(perr)?;
-        r.replica_pts(idx, b, pts, &dev.device, &ex.compute)?;
+        if !replayer.replica_idle(b) {
+            b.resolve_pts(pts).map_err(perr)?;
+            r.replica_pts(idx, b, pts, &dev.device, &ex.compute)?;
+        }
     }
+    let t_pts = t_prof.map(|t| t.elapsed().as_secs_f64());
     let mut routes = pc_program::replay::Routes::new();
     if let Some(d) = dense.as_ref() {
         routes.add(d);
@@ -739,6 +744,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         }),
         _ => None,
     };
+    let t_lane = t_prof.map(|t| t.elapsed().as_secs_f64());
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
     if ins.len() != b.inputs.len() {
@@ -801,7 +807,24 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                     };
                     let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);
                     let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut(), remote: rlane.as_mut().map(|l| l as &mut dyn pc_program::replay::RemoteLane<'static, W, crate::session::M>) };
-                    replayer.run(b, &mut rt)?
+                    // PC_BLOCK_TIMING=1 (diagnostic): this block's device time (timing events on this device's compute stream
+                    // around the replay, which joins every lane back into it), synchronized and printed per run
+                    let tev = if block_timing() {
+                        let e0 = pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?;
+                        let e1 = pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?;
+                        rt.ex.compute.record(&e0).map_err(pc_gpu::Error::from)?;
+                        Some((e0, e1))
+                    } else {
+                        None
+                    };
+                    let info = replayer.run(b, &mut rt)?;
+                    if let Some((e0, e1)) = tev {
+                        rt.ex.compute.record(&e1).map_err(pc_gpu::Error::from)?;
+                        e1.sync().map_err(pc_gpu::Error::from)?;
+                        let ms = e0.elapsed_ms(&e1).map_err(pc_gpu::Error::from)?;
+                        eprintln!("[block-time] {} {:.3} ms ({})", b.label, ms, match info.served { Served::Replayed => "graph", Served::Captured => "captured", Served::Eager => "eager" });
+                    }
+                    info
                 };
                 for &(j, r) in outputs {
                     if lent.iter().any(|l| l.1 == j && l.3 == r) {
@@ -849,7 +872,23 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         }
     }
     let _ = gerr;
+    if let (Some(t), Some(p), Some(l)) = (t_prof, t_pts, t_lane) {
+        // PC_HOST_PROF=1 (diagnostic): this block's host time to the plaintext mirror, to the lanes' set-up, in all (ms)
+        eprintln!("[host-prof] {} pts {:.3} lane {:.3} total {:.3} replay-host {:.3}", bounds[idx].label, p * 1e3, l * 1e3, t.elapsed().as_secs_f64() * 1e3, info.host_us / 1e3);
+    }
     Ok(info)
+}
+
+/// PC_BLOCK_TIMING=1 (diagnostic): per block run, its device time (stderr).
+fn block_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_BLOCK_TIMING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// PC_HOST_PROF=1 (diagnostic): per block, the host time of `run_block`'s parts (stderr).
+fn host_prof() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_HOST_PROF").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The block inputs whose register can stand in for their slot during the run, as (input, output, slot, register):

@@ -290,9 +290,13 @@ fn remote_lanes<W: DevWord>(b: &Bound<'_, W>, rp: &RemotePlan<'_>, sim: &[f64], 
             (StepOp::Bootstrap { .. }, Some(u)) => match &u.kind {
                 UnitKind::Refresh { kind, .. } => joint[i] = u.hi - u.lo >= 2 && (rp.holds)(*kind),
                 UnitKind::Pair { kind, .. } if i == u.lo as usize && (u.lo..u.hi).all(|j| !dyns[j as usize]) && (rp.holds)(*kind) => {
-                    // one complex refresh: a bit more than a single, all of it on the first step
-                    costs[i] *= 1.2;
-                    costs[i + 1] = 0.0;
+                    // one complex refresh: a bit more than a single, all of it on the LAST step (it starts once both
+                    // members' inputs are there; on the first step a pair whose second input comes later looked free
+                    // to run early: ResNet's three staggered pairs moved for a modeled -1.7..-3.3 ms each, measured
+                    // +1.2 ms each)
+                    let last = u.hi as usize - 1;
+                    costs[last] = 1.2 * costs[i];
+                    (i..last).for_each(|j| costs[j] = 0.0);
                     groups.push((u.lo as usize..u.hi as usize).collect());
                 }
                 _ => {}

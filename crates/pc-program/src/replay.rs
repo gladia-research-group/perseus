@@ -345,6 +345,12 @@ fn no_lane() -> pc_gpu::Error {
 /// A refresh run on a remote device's StC-first route (`RemoteLane::stcf_singles`), on its gathered batch.
 pub type StcfFn<'f, 'a, W, M> = dyn FnMut(&mut BtsCx<'_, 'a, W, M>, &StcFirstRoute<'a, W, M>, &mut Ct<'a, W>) -> pc_gpu::Result<()> + 'f;
 
+/// Ciphertexts per batch of a remote StC-first stage: the gather buffer's `GRID_INPUTS`, at most the route's
+/// `BtsSetup::k_max` (what its stages' work buffers hold).
+fn stcf_batch<W: DevWord, M: DevStrategy<W>>(r: &StcFirstRoute<'_, W, M>) -> usize {
+    crate::program::GRID_INPUTS.min(r.setup.k_max).max(1)
+}
+
 /// A PCMM finish's offload (`pc_gpu::matmul::pcmm::GroupOffload`) over the run's remote lane: the linear's last
 /// half of finish groups refreshed on the remote device.
 pub struct FarGroups<'x, 'a, W: DevWord, M: DevStrategy<W>> {
@@ -1300,7 +1306,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
         let res = (|| -> pc_gpu::Result<()> {
             self.ex.compute.wait(self.fork)?;
             let mut at = first;
-            for chunk in xs.chunks_mut(crate::program::GRID_INPUTS) {
+            for chunk in xs.chunks_mut(stcf_batch(r)) {
                 {
                     let s = &self.ex.compute;
                     for (c, x) in chunk.iter().enumerate() {
@@ -1440,7 +1446,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
         let res = (|| -> pc_gpu::Result<()> {
             self.ex.compute.wait(self.fork)?;
             let mut at = 0;
-            for chunk in xs.chunks_mut(crate::program::GRID_INPUTS) {
+            for chunk in xs.chunks_mut(stcf_batch(r)) {
                 {
                     let s = &self.ex.compute;
                     for (c, x) in chunk.iter().enumerate() {
@@ -1556,7 +1562,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
         self.there.make_current()?;
         let res = (|| -> pc_gpu::Result<()> {
             self.ex.compute.wait(self.fork)?;
-            for chunk in xs.chunks_mut(crate::program::GRID_INPUTS) {
+            for chunk in xs.chunks_mut(stcf_batch(r)) {
                 {
                     let s = &self.ex.compute;
                     for (c, x) in chunk.iter().enumerate() {
@@ -1598,7 +1604,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
         self.there.make_current()?;
         let res = (|| -> pc_gpu::Result<()> {
             self.ex.compute.wait(self.fork)?;
-            for chunk in xs.chunks_mut(crate::program::GRID_INPUTS) {
+            for chunk in xs.chunks_mut(stcf_batch(r)) {
                 {
                     let s = &self.ex.compute;
                     for (c, x) in chunk.iter().enumerate() {
@@ -1779,6 +1785,8 @@ pub struct Replayer {
     eager_only: std::collections::HashSet<String>,
     /// Blocks whose PC_GRAPH_EAGER_FINISH steps were made dynamic (before their first capture).
     eager_marked: std::collections::HashSet<String>,
+    /// Per block label: the dynamic-step set of its last run and whether that run put anything on the replica lane.
+    replica_last: std::collections::HashMap<String, (Vec<u32>, bool)>,
 }
 
 /// A capture failed for lack of device memory (cudaErrorMemoryAllocation in the capture or the instantiation).
@@ -3162,13 +3170,20 @@ fn segments<W: DevWord>(b: &Bound<'_, W>) -> Vec<std::result::Result<(usize, usi
 
 impl Replayer {
     pub fn new(cfg: ReplayCfg) -> Self {
-        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default(), eager_only: Default::default(), eager_marked: Default::default() }
+        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default(), eager_only: Default::default(), eager_marked: Default::default(), replica_last: Default::default() }
     }
 
     /// Run `b` once on the inputs the driver wrote into its input slots: eager, or (graphs) the graph captured for
     /// the block's current plaintext rows (those of the last `Bound::resolve_pts`), or, when none matches, eager +
     /// capture (at most `ReplayCfg::graphs_per_block` layouts per block; the oldest is dropped beyond). Asynchronous:
     /// the outputs are ready on `compute` (the caller syncs or records an event).
+    /// Whether `b`'s last run, with the same dynamic steps, put nothing on the replica lane (no step there, no copy onto
+    /// it; or no replica schedule at all), so the replica's plaintext mirror goes unread again. False before its first run.
+    pub fn replica_idle<W: DevWord>(&self, b: &Bound<'_, W>) -> bool {
+        let dynamic: Vec<u32> = b.dynamic.iter().copied().collect();
+        matches!(self.replica_last.get(&b.label), Some((d, false)) if *d == dynamic)
+    }
+
     /// The lane schedule of `b` (None: no side lane in use).
     pub fn schedule<'a, W: DevWord, M: DevStrategy<W>>(&mut self, b: &Bound<'a, W>, rt: &Rt<'_, 'a, W, M>) -> Option<Sched> {
         if !self.side_lane || rt.side.is_none() {
@@ -3236,7 +3251,7 @@ impl Replayer {
             }
             if std::env::var_os("PC_REPLICA_LOG").is_some() {
                 eprintln!(
-                    "[replica] {}: {} of {} steps on the replica, {} copies; static {:.1} ms -> {:.1} ms; placement sim {:.1} -> {:.1} ms{}",
+                    "[replica] {}: {} of {} steps on the replica, {} copies; static {:.1} ms -> {:.1} ms; placement sim {:.1} -> {:.1} ms{}{}",
                     b.label,
                     rs.moved,
                     b.steps.len(),
@@ -3245,7 +3260,8 @@ impl Replayer {
                     rs.two_ms,
                     rs.base_ms,
                     rs.base_ms - rs.saving_ms,
-                    if rs.owner_ms > 0.0 { format!(" (owner-computes {:.1} ms{})", rs.owner_ms, if rs.owner { ", taken" } else { "" }) } else { String::new() }
+                    if rs.owner_ms > 0.0 { format!(" (owner-computes {:.1} ms{})", rs.owner_ms, if rs.owner { ", taken" } else { "" }) } else { String::new() },
+                    if rs.hint_ms > 0.0 { format!(" (hints {:.1} ms, {})", rs.hint_ms, if rs.hint { "taken" } else { "components taken" }) } else { String::new() }
                 );
             }
             let n = b.steps.len();
@@ -3332,6 +3348,8 @@ impl Replayer {
         }
         let sched = self.schedule(b, rt);
         let sched = sched.as_ref();
+        let busy = sched.and_then(|s| s.replica.as_ref()).is_some_and(|rs| rs.moved > 0 || rs.dev.contains(&1) || !rs.xc.is_empty() || rs.copies.iter().any(|c| !c.is_empty()));
+        self.replica_last.insert(b.label.clone(), (b.dynamic.iter().copied().collect(), busy));
         if graphs && sched.is_some_and(|s| s.replica.is_some()) && replica_check() {
             return Err(rerr(&b.label, "PC_REPLICA_CHECK runs each block twice and compares on the host: run it eager (graphs off)"));
         }

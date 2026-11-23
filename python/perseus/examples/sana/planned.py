@@ -511,6 +511,8 @@ class SanaPlannedPrefill(PlannedPrefill):
                 on_block(b, info)
         if times is not None:
             self.stage_times = times
+            print(f"[stages] {len(times)} stages: plaintexts {sum(t[3] for t in times):.1f} s, weights "
+                  f"{sum(t[4] for t in times):.1f} s, issue {sum(t[5] for t in times):.1f} s (host)", flush=True)
         return [reg for _j, reg in self.reg[self.n_stages - 1]]
 
     def input_values(self, x_in=None, txt_rows=None):

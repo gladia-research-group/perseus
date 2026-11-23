@@ -78,6 +78,10 @@ pub struct ReplicaSched {
     /// PC_REPLICA_PLACE: the owner-computes placement's simulated block (ms, 0 = not tried) and whether it was taken
     pub owner_ms: f64,
     pub owner: bool,
+    /// PC_SCHED2: the hinted placement's simulated block (ms, 0 = no hints) and whether it was taken (else the
+    /// components' placement on the same order simulated faster)
+    pub hint_ms: f64,
+    pub hint: bool,
 }
 
 impl ReplicaSched {
@@ -373,26 +377,88 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
             writer[s as usize] = k;
         }
     }
+    // ciphertext ownership (PC_REPLICA_CTOWN=1, default off): the two members of a refresh pair are two
+    // ciphertexts of one activation (a CNN layer packed in two ciphertexts). The second member's output is homed on the
+    // remote device (the plan copies it there, 14 MiB at the landing), so that ciphertext's activation follows it; a
+    // group whose every input is broadcast (read by >= CTOWN_BCAST groups: a convolution's rotation grid) goes with the
+    // pair member it feeds, when it feeds members of one device only (its chains of plaintext products and their
+    // rotation accumulation). Same ops, same order: word-exact.
+    let ctown = ctown();
+    let member1: Vec<Vec<u32>> = gs
+        .iter()
+        .map(|&(lo, _)| match b.unit_of.get(lo).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]) {
+            Some(u) if ctown && matches!(u.kind, UnitKind::Pair { .. }) && u.lo as usize == lo && u.hi - u.lo == 2 => rw(b, &b.steps[lo + 1]).1,
+            _ => vec![],
+        })
+        .collect();
+    // sink[k]: bit d set when group k feeds (before any refresh) a pair member that runs on device d (member c on c);
+    // a single refresh, a finish or the block's end feed device 0
+    let mut sink: Vec<u8> = vec![0; gs.len()];
+    if ctown {
+        let mut cons: Vec<Vec<(usize, u32)>> = vec![vec![]; gs.len()];
+        let mut wr: Vec<usize> = vec![usize::MAX; ns];
+        for (k, (reads, writes)) in grw.iter().enumerate() {
+            for &s in reads {
+                if let Some(p) = Some(wr[s as usize]).filter(|&p| p != usize::MAX) {
+                    cons[p].push((k, s));
+                }
+            }
+            for &s in writes {
+                wr[s as usize] = k;
+            }
+        }
+        for k in (0..gs.len()).rev() {
+            let mut m = 0u8;
+            for &(c, s) in &cons[k] {
+                let lo = gs[c].0;
+                m |= if !member1[c].is_empty() {
+                    // which member of the pair reads slot s
+                    if rw(b, &b.steps[lo + 1]).0.contains(&s) { 2 } else { 1 }
+                } else if matches!(b.steps[lo].op, StepOp::Bootstrap { .. } | StepOp::Finish { .. }) {
+                    1
+                } else {
+                    sink[c]
+                };
+            }
+            sink[k] = if cons[k].is_empty() { 1 } else { m };
+        }
+    }
     let mut home: Vec<u8> = vec![0; ns];
     let mut on = vec![0u8; gs.len()];
     for (k, &(lo, _)) in gs.iter().enumerate() {
         let (reads, writes) = &grw[k];
         let d = if mv[k] && !b.dynamic.contains(&(lo as u32)) && gown[k].is_empty() {
             let mut score = [0.0f64; 2];
+            let mut bcast = !reads.is_empty();
             for (&s, &w) in reads.iter().zip(&ver[k]) {
-                let r = readers.get(&(s, w)).copied().unwrap_or(1).max(1) as f64;
-                score[home[s as usize] as usize] += 1.0 / r;
+                let r = readers.get(&(s, w)).copied().unwrap_or(1).max(1);
+                bcast &= r >= CTOWN_BCAST;
+                score[home[s as usize] as usize] += 1.0 / r as f64;
             }
-            (score[1] > score[0]) as u8
+            if score[1] > score[0] {
+                1
+            } else {
+                (ctown && bcast && sink[k] == 2 && !matches!(b.steps[lo].op, StepOp::Bootstrap { .. })) as u8
+            }
         } else {
             0
         };
         on[k] = d;
         for &s in writes {
-            home[s as usize] = if gown[k].contains(&s) { 1 } else { d };
+            home[s as usize] = if gown[k].contains(&s) || member1[k].contains(&s) { 1 } else { d };
         }
     }
     on
+}
+
+/// PC_REPLICA_CTOWN's broadcast: an input read by at least this many groups counts as shared by both devices.
+const CTOWN_BCAST: u32 = 4;
+
+/// PC_REPLICA_CTOWN=1 (with the replica lane; default off until an A/B wins): ciphertext ownership in owner-computes
+/// (`owner_place`): a refresh pair's second ciphertext and the work that feeds it or reads it on the remote device.
+pub fn ctown() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_CTOWN").as_deref().map(str::trim), Ok("1") | Ok("on")))
 }
 
 /// PC_REPLICA_PLACE: `comp` (the components), `owner` (owner-computes), `best` (owner-computes where it simulates
@@ -497,11 +563,19 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
         let mv: Vec<bool> = gs.iter().map(|&(lo, _)| movable(b, lo, holds, pt_ok)).collect();
         owner_place(b, &gs, &grw, &gown, &mv, ns)
     });
+    let (mut hint_ms, mut hint) = (0.0, false);
     let (mut on, base, mut best) = if hinted {
         let on: Vec<u8> = gs.iter().map(|&(lo, hi)| (movable(b, lo, holds, pt_ok) && (lo..hi).any(|j| b.hint.get(j) == Some(&1))) as u8).collect();
-        let base = simulate(b, &gs, &grw, &gc, &gown, &vec![0; gs.len()], copy_ms, ns);
         let v = simulate(b, &gs, &grw, &gc, &gown, &on, copy_ms, ns);
-        (on, base, v)
+        // per block: the components' placement on the same order instead when it simulates faster
+        let (on_c, base, v_c) = place(b, &gs, &grw, &gc, &gown, holds, pt_ok, copy_ms, ns, false, None);
+        hint_ms = v;
+        hint = v <= v_c + MIN_GAIN_MS;
+        if hint {
+            (on, base, v)
+        } else {
+            (on_c, base, v_c)
+        }
     } else {
         place(b, &gs, &grw, &gc, &gown, holds, pt_ok, copy_ms, ns, force_all, owner_on.as_deref().filter(|_| pm == 3))
     };
@@ -527,7 +601,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
     }
     // a product batch whose members landed on both devices issues one by one; one on a single device stays a batch
     let split_unit: Vec<bool> = b.units.iter().map(|u| matches!(u.kind, UnitKind::Mult { .. }) && splitk() && (u.lo as usize..u.hi as usize).any(|j| place_of[j] != place_of[u.lo as usize])).collect();
-    let mut rs = ReplicaSched { dev: vec![0; n], copies: vec![vec![]; n], wait: vec![vec![]; n], signal: vec![false; n], own: vec![vec![]; n], split_unit: split_unit.clone(), base_ms: base, saving_ms: base - best, owner_ms, owner, ..Default::default() };
+    let mut rs = ReplicaSched { dev: vec![0; n], copies: vec![vec![]; n], wait: vec![vec![]; n], signal: vec![false; n], own: vec![vec![]; n], split_unit: split_unit.clone(), base_ms: base, saving_ms: base - best, owner_ms, owner, hint_ms, hint, ..Default::default() };
     // per slot: devices holding the current version (bit 0 / bit 1), the version's producer per device (the step that
     // wrote it there, or the step whose copy brought it), the time it is usable per device (static model)
     let mut valid: Vec<u8> = vec![1; ns];
