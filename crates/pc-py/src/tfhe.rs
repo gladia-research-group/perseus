@@ -766,7 +766,7 @@ pub(crate) struct TfheExec<'r> {
 }
 
 impl<'r> FinishExec<'static, W, M> for TfheExec<'r> {
-    fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
+    fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>], _remote: Option<&mut dyn pc_program::replay::RemoteLane<'static, W, M>>) -> pc_program::Result<()> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not a TFHE descriptor"))?;
         let rt = &mut *self.rt;
         if let Some((j, _)) = d.part.filter(|p| p.0 > 0) {

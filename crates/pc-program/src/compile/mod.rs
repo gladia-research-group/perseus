@@ -17,6 +17,8 @@ pub mod rotacc;
 pub mod rr;
 pub mod share;
 pub mod stream;
+pub mod tree;
+pub mod two;
 
 use crate::error::{Error, Result};
 use crate::graph::BlockGraph;
@@ -617,12 +619,28 @@ pub fn compile_block(
     if crate::program::lever_on("rotacc") && crate::program::lever_on("rotacc_lazy") {
         rotacc::sink(&mut p);
     }
+    // PC_SUM_TREE: chained sums in two halves (each device's blocks summed apart: a norm statistic's all-reduce)
+    if tree::on() {
+        let n = tree::rewire(&mut p);
+        if std::env::var_os("PC_REPLICA_LOG").is_some() {
+            eprintln!("[sum-tree] {label}: {n} chained sums in two halves");
+        }
+    }
     // PC_MULT_SUM: a chain of added relinearized products relinearized once
     if cfg.exec.mult_sum.unwrap_or(false) {
         msum::fuse(&mut p);
     }
     batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
+    // PC_SCHED2: the ops reordered by a two-device list schedule, each op's device as a hint for the replica lane
+    if two::on() {
+        let n_q = sh.cfg.chain.n_q;
+        let limb = env.ring_dim as f64 * word_bytes as f64;
+        let r = two::schedule(&mut p, &|level| 2.0 * n_q.saturating_sub(level) as f64 * limb / 30e6);
+        if std::env::var_os("PC_REPLICA_LOG").is_some() {
+            eprintln!("[sched2] {label}: {} ops in {} atoms, {} ops on the remote device; static {:.1} ms -> {:.1} ms", r.ops, r.atoms, r.moved, r.one_ms, r.two_ms);
+        }
+    }
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);
     let mut rep = check::verify(&sh, &p);
     let mut errors = lower_errors;

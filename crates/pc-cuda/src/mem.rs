@@ -352,6 +352,26 @@ impl<'a, S: Lane, T: Pod> DBuf<'a, S, T> {
         // SAFETY: ranges checked; distinct buffers (&mut self vs &src)
         unsafe { copy(s, self.ptr.add(off) as *mut c_void, src.ptr.add(src_off) as *const c_void, n * std::mem::size_of::<T>(), MEMCPY_D2D, "cudaMemcpyAsync D2D") }
     }
+    /// Copy `n` elements from `src` (memory of `src_dev`) at element `src_off` into this buffer (memory of
+    /// `dst_dev`) at element `off`, ordered on `s` (a stream of either device). One `cudaMemcpyAsync` with
+    /// `cudaMemcpyDefault` (unified addressing names the devices): direct over the bus when peer access is enabled
+    /// (`Device::enable_peer`), staged by the driver otherwise, and capturable into a graph, unlike
+    /// `cudaMemcpyPeerAsync`.
+    ///
+    /// # Safety
+    /// `src` may belong to another device or lane, so nothing orders this read for the caller: `s` must wait for the
+    /// event that publishes `src` (`Stream::wait` works across devices), nothing may write `src` before an event
+    /// recorded on `s` after the copy, and the two ranges must not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn copy_from_peer<U: Lane>(&mut self, s: &Stream<S>, dst_dev: &Device, off: usize, src: &DBuf<'_, U, T>, src_dev: &Device, src_off: usize, n: usize) -> Result<()> {
+        bounds("copy_from_peer (dst)", off + n, self.len)?;
+        bounds("copy_from_peer (src)", src_off + n, src.len)?;
+        if s.is_host() || dst_dev.is_host() || src_dev.is_host() {
+            return Err(Error::Host("copy_from_peer: GPU devices only"));
+        }
+        let kind = if dst_dev.ordinal() == src_dev.ordinal() { MEMCPY_D2D } else { ffi::MEMCPY_DEFAULT };
+        copy(s, self.ptr.add(off) as *mut c_void, src.ptr.add(src_off) as *const c_void, n * std::mem::size_of::<T>(), kind, "cudaMemcpyAsync (peer)")
+    }
     /// Device-to-device copy of `n` elements of constant data into this buffer.
     pub fn copy_from_const(&mut self, s: &Stream<S>, src: &ConstBuf<'_, T>, n: usize) -> Result<()> {
         bounds("copy_from_const (dst)", n, self.len)?;

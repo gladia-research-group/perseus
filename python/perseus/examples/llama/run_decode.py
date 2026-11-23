@@ -253,7 +253,10 @@ def main(argv=None):
     store = W.SafetensorsStore(hf.NAME)
     cache = os.path.join(os.environ.get("HF_HOME", "."), "perseus", "llama_oracle",
                          f"{store.fingerprint()}_{abs(hash(tuple(int(t) for t in toks))) % 10**12}.npy")
-    os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else env.gpt2_env.physical_device(a.device)
+    dev = env.gpt2_env.physical_device(a.device)
+    if os.environ.get("PC_REMOTE_DEVICE"):   # the remote refresh device (an ordinal after `dev`) stays visible
+        dev = ",".join([dev] + [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip() and d.strip() != dev])
+    os.environ["CUDA_VISIBLE_DEVICES"] = "" if a.fake else dev
     if not a.fake:
         gt = hf.oracle_logits(toks, cache)   # before the session: the fp32 model needs the GPU
     else:   # the fake's approximation error: against a cached oracle, or one --fake-kl computes on the CPU

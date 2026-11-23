@@ -215,6 +215,32 @@ pub struct DevKsk<'a, W: DevWord> {
 }
 
 impl<'a, W: DevWord> DevKsk<'a, W> {
+    /// Copy key `src` (another device's key of the same role, shape and layout; memory of `sd`) into this one
+    /// (memory of `dd`), on `s`. Returns the bytes moved.
+    ///
+    /// # Safety
+    /// As `DBuf::copy_from_peer`: `s` is ordered after the writes of `src`, which nothing writes during the copy.
+    pub unsafe fn copy_from_peer(&mut self, s: &Stream<Compute>, dd: &pc_cuda::Device, src: &DevKsk<'_, W>, sd: &pc_cuda::Device) -> Result<usize> {
+        if self.role != src.role || self.shape != src.shape || self.layout() != src.layout() {
+            return Err(shape("key copy", format!("{:?} {:?} {:?} from {:?} {:?} {:?}", self.role, self.shape, self.layout(), src.role, src.shape, src.layout())));
+        }
+        self.seed = src.seed;
+        self.seed_dev.copy_from_peer(s, dd, 0, &src.seed_dev, sd, 0, 8)?;
+        let mut bytes = 32;
+        match (&mut self.store, &src.store) {
+            (KskStore::Dense { b, a }, KskStore::Dense { b: sb, a: sa }) => {
+                b.copy_from_peer(s, dd, 0, sb, sd, 0, sb.len())?;
+                a.copy_from_peer(s, dd, 0, sa, sd, 0, sa.len())?;
+                bytes += (sb.len() + sa.len()) * std::mem::size_of::<W>();
+            }
+            (KskStore::PackedSeeded { b, .. }, KskStore::PackedSeeded { b: sb, .. }) => {
+                b.copy_from_peer(s, dd, 0, sb, sd, 0, sb.len())?;
+                bytes += sb.len() * 4;
+            }
+            _ => return Err(shape("key copy", "store kinds differ")),
+        }
+        Ok(bytes)
+    }
     /// Carve storage for one key (setup only); contents undefined until keygen / import.
     pub fn carve(arena: &'a Arena, role: KeyRole, shape: KskShape, layout: KskLayout, n: usize) -> Result<Self> {
         let store = match layout {
@@ -509,6 +535,51 @@ impl ExtraKeySpec {
 }
 
 impl<'a, W: DevWord> KeySet<'a, W> {
+    /// Copy every key of `src` (another device's set carved from the same specs; memory of `sd`) into this one
+    /// (memory of `dd`), on `s`: whatever made `src` (device keygen, a client's bundle), this set then holds the same
+    /// words. Returns the bytes moved.
+    ///
+    /// # Safety
+    /// As `DBuf::copy_from_peer`: `s` is ordered after the writes of `src`, which nothing writes during the copy.
+    pub unsafe fn copy_from_peer(&mut self, s: &Stream<Compute>, dd: &pc_cuda::Device, src: &KeySet<'_, W>, sd: &pc_cuda::Device) -> Result<usize> {
+        fn one<W: DevWord>(what: &'static str, d: Option<&mut DevKsk<'_, W>>, x: Option<&DevKsk<'_, W>>, s: &Stream<Compute>, dd: &pc_cuda::Device, sd: &pc_cuda::Device) -> Result<usize> {
+            match (d, x) {
+                (Some(d), Some(x)) => unsafe { d.copy_from_peer(s, dd, x, sd) },
+                (None, None) => Ok(0),
+                _ => Err(shape("key set copy", format!("{what}: carved on one device only"))),
+            }
+        }
+        fn map<W: DevWord>(what: &'static str, d: &mut BTreeMap<i64, DevKsk<'_, W>>, x: &BTreeMap<i64, DevKsk<'_, W>>, s: &Stream<Compute>, dd: &pc_cuda::Device, sd: &pc_cuda::Device) -> Result<usize> {
+            if d.len() != x.len() || d.keys().zip(x.keys()).any(|(a, b)| a != b) {
+                return Err(shape("key set copy", format!("{what}: different steps")));
+            }
+            d.values_mut().zip(x.values()).map(|(d, x)| unsafe { d.copy_from_peer(s, dd, x, sd) }).sum()
+        }
+        if self.layout != src.layout || self.relin_levels.len() != src.relin_levels.len() || self.relin_levels.keys().zip(src.relin_levels.keys()).any(|(a, b)| a != b) {
+            return Err(shape("key set copy", "layout or level keys differ"));
+        }
+        let mut bytes = one("relin", self.relin.as_mut(), src.relin.as_ref(), s, dd, sd)?;
+        bytes += one("conj", self.conj.as_mut(), src.conj.as_ref(), s, dd, sd)?;
+        bytes += one("export", self.export.as_mut(), src.export.as_ref(), s, dd, sd)?;
+        bytes += map("rots", &mut self.rots, &src.rots, s, dd, sd)?;
+        bytes += map("rots_ps", &mut self.rots_ps, &src.rots_ps, s, dd, sd)?;
+        bytes += map("sparse_rots", &mut self.sparse_rots, &src.sparse_rots, s, dd, sd)?;
+        match (self.bts.as_mut(), src.bts.as_ref()) {
+            (Some(d), Some(x)) => {
+                bytes += d.enc_dense_to_sparse.copy_from_peer(s, dd, &x.enc_dense_to_sparse, sd)?;
+                bytes += d.enc_sparse_to_dense.copy_from_peer(s, dd, &x.enc_sparse_to_dense, sd)?;
+            }
+            (None, None) => {}
+            _ => return Err(shape("key set copy", "bootstrap keys carved on one device only")),
+        }
+        for ((_, (ls, d)), (_, (lx, x))) in self.relin_levels.iter_mut().zip(src.relin_levels.iter()) {
+            if ls != lx {
+                return Err(shape("key set copy", "level key specs differ"));
+            }
+            bytes += d.copy_from_peer(s, dd, x, sd)?;
+        }
+        Ok(bytes)
+    }
     /// Carve every key of `spec` (setup only, before `Arena::freeze`); fill with keygen / import.
     pub fn carve(arena: &'a Arena, chain: &Chain, spec: &KeySetSpec, layout: KskLayout) -> Result<Self> {
         if let KskLayout::PackedSeeded { bits } = layout {

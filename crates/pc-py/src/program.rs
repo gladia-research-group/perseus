@@ -393,6 +393,17 @@ impl PyProgram {
         };
         pl.stream_tag.push(tag);
         pl.bounds.push(b);
+        // PC_REPLICA: the same block bound on the remote device's replica lane (the session's route checks)
+        let mut rem = pl.remote.take();
+        let rb = match rem.as_mut() {
+            Some(r) => r.replica_bind(&self.prog, &dr, Some(&pl.streams), &pl.routes()),
+            None => Ok(()),
+        };
+        pl.remote = rem;
+        rb.map_err(|x| {
+            eprintln!("[replica] {}: {x}", self.prog.block);
+            x
+        })?;
         pl.shadows.push(pc_shadow::Shadow::new(sh_cfg, Some(std::sync::Arc::new(dev.ctx.scale.clone()))));
         let i = pl.bounds.len() - 1;
         drop(st);
@@ -592,7 +603,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     let mut st = dev.st.borrow_mut();
     let State { planned, ex, ops, plans, pts, .. } = &mut *st;
     let pl = planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
-    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, tfhe, fbs, side, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
+    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, tfhe, fbs, side, remote, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
     // the block's weight frame: staged while the block before ran (else now), joined into compute
     let spos = match stream_tag.get(idx).copied().flatten() {
         Some(tag) => {
@@ -628,6 +639,12 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
             k.prefetch(ex, u).map_err(perr)?;
         }
     }
+    // PC_REPLICA_PT: the replica's copies of this block's plaintexts (the session's rows resolved first)
+    if let Some(r) = remote.as_mut().filter(|r| r.replica.as_ref().is_some_and(|rp| rp.pts.is_some())) {
+        let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
+        b.resolve_pts(pts).map_err(perr)?;
+        r.replica_pts(idx, b, pts, &dev.device, &ex.compute)?;
+    }
     let mut routes = pc_program::replay::Routes::new();
     if let Some(d) = dense.as_ref() {
         routes.add(d);
@@ -644,15 +661,84 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     if let Some(x) = spru.as_ref() {
         routes.add(x);
     }
+    // the remote refresh device (PC_REMOTE_DEVICE): its routes, and its stage caches locked with ours while capturing
+    let (rroutes, rparts) = match remote.as_mut() {
+        Some(r) => {
+            let crate::remote::RemoteDev { replica: rrep, pcmm: rpc, routes: rset, gather, ring, ring_done, lane_in, cb_ev, cb, lane_fork, lane_join, cb_join, fcb, fcb_ev, work: rwork, ops: rops, plans: rplans, ctx: rctx, ex: rex, fork, join, device, .. } = r;
+            let rfcb = pc_program::replay::remote_cb().then_some((&*fcb, &*fcb_ev));
+            // the replica lane (PC_REPLICA): this block's second binding, the mirrored slab swapped in for the run
+            let rrep = rrep.as_mut().filter(|rp| pc_program::replica::mode() > 0 && rp.bounds.len() > idx).map(|rp| {
+                let crate::remote::ReplicaDev { bounds, slab, ev, join, fork, ops, ex, hand, work, dma, .. } = rp;
+                let dma = dma.as_ref().map(|(st, evs, j)| (st, &evs[..], j));
+                (&mut bounds[idx], slab, &ev[..], &*join, &*fork, ops, ex, &hand[..], work.as_mut(), dma)
+            });
+            let rset: &crate::routes::RouteSet = rset;
+            let lane = pc_program::replay::RemoteAsync {
+                ring: &mut ring[..],
+                done: &ring_done[..],
+                ev_in: &lane_in[..],
+                cb: &*cb,
+                cb_ev: &cb_ev[..],
+                fork: &*lane_fork,
+                join: &*lane_join,
+                cb_join: &*cb_join,
+                next: 0,
+                last: vec![None; ring_done.len()],
+                pending: None,
+            };
+            let rpcmm = rpc.as_mut().map(|p| pc_program::replay::RemotePcmm { engine: &mut p.engine, planes: &p.planes, ins: &mut p.ins[..], outs: &mut p.outs[..] });
+            (Some((rset.routes(), rset)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb)))
+        }
+        None => (None, None),
+    };
     // the CCMM's stc_high caches (keys change per call): no capture may read them (ForbidLock), their callers run
     // eager between the graph segments; their evictions are not watched
     let forbid: Vec<pc_gpu::graph::ForbidLock<'_, '_, W>> =
-        dense.iter().flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c)))).collect();
+        dense
+            .iter()
+            .chain(rroutes.iter().filter_map(|(_, rs)| rs.dense.as_ref()))
+            .flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c))))
+            .collect();
     let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense
         .iter()
         .flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))
         .chain(forbid.iter().map(|f| f as &dyn pc_program::replay::CaptureLock))
+        .chain(rroutes.iter().flat_map(|(_, rs)| rs.dense.iter().flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))))
         .collect();
+    let mut slab_back: Option<SlabBack> = None;
+    let mut rlane = match (rroutes.as_ref(), rparts) {
+        (Some((rr, _)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb))) => Some(pc_program::replay::Remote {
+            here: &dev.device,
+            there: &*device,
+            here_ctx: &dev.ctx,
+            ctx: &*rctx,
+            ex: rex,
+            ks: &*rplans,
+            ops: rops,
+            work: rwork,
+            routes: rr,
+            stcf: rroutes.as_ref().and_then(|(_, rs)| rs.dense.as_ref()),
+            gather,
+            fork: &*fork,
+            join: &*join,
+            lane: Some(lane),
+            pcmm: rpcmm,
+            fcb: rfcb,
+            own: Default::default(),
+            replica: match rrep {
+                Some((b5, slab5, ev, rjoin, rfork, rops5, rex5, rhand, rwork5, rdma5)) => {
+                    b5.swap_slab(slab5).map_err(perr)?;
+                    let (bp, sp): (*mut pc_program::bind::Bound<'static, W>, *mut pc_program::bind::Slab<'static, W>) = (b5, slab5);
+                    slab_back = Some(SlabBack(bp, sp));
+                    // SAFETY: `bp` is this block's replica binding, borrowed by the run only; `slab_back` (declared
+                    // before the lane, dropped after it) swaps the slab back out
+                    Some(pc_program::replay::RemoteReplica { hand: rhand, work: rwork5, ex: rex5, ops: rops5, b: unsafe { &mut *bp }, ev, fork: rfork, join: rjoin, owners: (None, None), dma: rdma5 })
+                }
+                None => None,
+            },
+        }),
+        _ => None,
+    };
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
     if ins.len() != b.inputs.len() {
@@ -714,7 +800,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                         _ => None,
                     };
                     let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);
-                    let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut() };
+                    let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut(), remote: rlane.as_mut().map(|l| l as &mut dyn pc_program::replay::RemoteLane<'static, W, crate::session::M>) };
                     replayer.run(b, &mut rt)?
                 };
                 for &(j, r) in outputs {
@@ -825,4 +911,14 @@ fn json_diff(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProgram>()?;
     Ok(())
+}
+
+/// Swaps the replica lane's slab back out of its binding when the run ends, whatever happened (`Bound::swap_slab`).
+struct SlabBack(*mut pc_program::bind::Bound<'static, W>, *mut pc_program::bind::Slab<'static, W>);
+
+impl Drop for SlabBack {
+    fn drop(&mut self) {
+        // SAFETY: both outlive the run (the session's replica lane); nothing else borrows them once the lane is gone
+        let _ = unsafe { (*self.0).swap_slab(&mut *self.1) };
+    }
 }

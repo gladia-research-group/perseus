@@ -4,6 +4,7 @@
 //!       device ms per call/ciphertext (CUDA events, median of `reps` after 2 warm-ups) | precision on random real
 //!       payloads: bits = -log2(max |out - in| / A) (the bts_accuracy_sweep methodology; `--old` adds the reference row)
 //!   pc-bench ccmm|pcmm|stcf|stcf-prec|stcf-pair|stc-high|replay|modmul ...   (src/check_*.rs, bts_*.rs, replay_g0.rs, word_seam.rs)
+//!   pc-bench bts --devices 0,1 [--k 2,4] [--graph] ...   two GPUs, independent bootstraps against the single-GPU batch (src/bts_mgpu.rs)
 //!
 //! Keys: a fresh secret (dense ternary + sparse h=32), every CtS/StC rotation, conjugation, relinearization and both
 //! encapsulation keys generated on the device (dense layout with resident `a`). Full usage: docs/ARCHITECTURE.md.
@@ -57,6 +58,8 @@ mod bts_stc_first;
 mod bts_all;
 #[path = "../word_seam.rs"]
 mod word_seam;
+#[path = "../bts_mgpu.rs"]
+mod bts_mgpu;
 
 type W = u32;
 type M = Barrett64;
@@ -626,6 +629,10 @@ fn modmul(a: &[String]) -> Res<bool> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // two GPUs: independent bootstraps per device against the single-GPU batch (src/bts_mgpu.rs)
+    if args.first().map(|s| s.as_str()) == Some("bts") && args.iter().any(|a| a == "--devices") {
+        return bts_mgpu::cmd(&args[1..]);
+    }
     // the classic multi-stage sparse route: its own harness
     if args.iter().any(|a| a == "--classic") {
         let mode = match args.first().map(|s| s.as_str()) {

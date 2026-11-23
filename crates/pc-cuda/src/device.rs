@@ -3,7 +3,8 @@
 //! that GPU is visible and the process holds the machine's GPU lock (`PERSEUS_CORE_LOCKED=1`, which `tools/gpu.sh`
 //! exports in guarded mode). Every other entry point of this crate needs the `Device` it returns.
 //! `PERSEUS_DEVICE=cpu` (or `Device::open_host`) opens the host device instead: the same API over host memory, inline
-//! streams and the host kernel tables (pc-hostrt), no GPU touched.
+//! streams and the host kernel tables (pc-hostrt), no GPU touched. `Device::open_ordinal` opens another visible
+//! device next to the first (several devices from one host thread; see `Device`).
 use crate::error::{check, Error, Result};
 use crate::ffi;
 use std::marker::PhantomData;
@@ -28,12 +29,16 @@ pub fn host_requested() -> bool {
     std::env::var(DEVICE_VAR).is_ok_and(|v| matches!(v.trim(), "cpu" | "host"))
 }
 
-/// Proof that device selection passed and the device is current on this thread. Not `Send`: CUDA's
-/// current device is per host thread, and one host thread issues all work.
+/// Proof that device selection passed for one visible device (`ordinal`). Not `Send`: CUDA's current device is
+/// per host thread, and one host thread issues all work. A process with one `Device` (`open`) never changes the
+/// current device. With several (`open_ordinal`), the caller makes a device current (`make_current`) before it
+/// creates that device's streams, events or arena and before it issues work on them: streams, events and the arena
+/// bind to the device current at creation, and a kernel launch into a stream of another device fails with an error.
 pub struct Device {
     runtime: i32,
     driver: i32,
     host: bool,
+    ordinal: i32,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -61,7 +66,16 @@ impl Device {
     /// Check the opt-in guard, select visible device 0 and read the runtime version; the host device when
     /// `PERSEUS_DEVICE=cpu`.
     pub fn open() -> Result<Device> {
+        Self::open_ordinal(0)
+    }
+
+    /// `open` for visible device `ordinal` (made current). The guard admits ordinal 0 only (exactly one visible
+    /// device); the host device has ordinal 0 only.
+    pub fn open_ordinal(ordinal: i32) -> Result<Device> {
         if host_requested() {
+            if ordinal != 0 {
+                return Err(Error::Guard(format!("{DEVICE_VAR}=cpu: the host device has ordinal 0 only, asked {ordinal}")));
+            }
             return Ok(Device::open_host());
         }
         let guard = std::env::var(GUARD_VAR).ok();
@@ -76,25 +90,69 @@ impl Device {
         if n < 1 || (guarded && n != 1) {
             return Err(Error::Guard(format!("{n} devices visible under CUDA_VISIBLE_DEVICES={visible:?}")));
         }
+        if ordinal < 0 || ordinal >= n {
+            return Err(Error::Guard(format!("device ordinal {ordinal}: {n} devices visible under CUDA_VISIBLE_DEVICES={visible:?}")));
+        }
         let (mut runtime, mut driver) = (0i32, 0i32);
         // SAFETY: plain calls / out-pointers to locals
         unsafe {
-            check(ffi::cudaSetDevice(0), "cudaSetDevice")?;
+            check(ffi::cudaSetDevice(ordinal), "cudaSetDevice")?;
             check(ffi::cudaRuntimeGetVersion(&mut runtime), "cudaRuntimeGetVersion")?;
             check(ffi::cudaDriverGetVersion(&mut driver), "cudaDriverGetVersion")?;
         }
         HOST.with(|h| h.set(false));
-        Ok(Device { runtime, driver, host: false, _not_send: PhantomData })
+        Ok(Device { runtime, driver, host: false, ordinal, _not_send: PhantomData })
     }
 
     /// The host device (no GPU, no guard): runtime and driver versions read 0.
     pub fn open_host() -> Device {
         HOST.with(|h| h.set(true));
-        Device { runtime: 0, driver: 0, host: true, _not_send: PhantomData }
+        Device { runtime: 0, driver: 0, host: true, ordinal: 0, _not_send: PhantomData }
     }
 
     pub fn is_host(&self) -> bool {
         self.host
+    }
+
+    /// Visible-device index (0 for `open` and the host device).
+    pub fn ordinal(&self) -> i32 {
+        self.ordinal
+    }
+
+    /// Make this device current on the calling thread (a no-op call for a single-device process; the host device
+    /// has nothing to select).
+    pub fn make_current(&self) -> Result<()> {
+        if self.host {
+            return Ok(());
+        }
+        // SAFETY: plain call; the ordinal was validated by open_ordinal
+        check(unsafe { ffi::cudaSetDevice(self.ordinal) }, "cudaSetDevice")
+    }
+
+    /// Let this device read and write `peer`'s memory directly (copies and kernels over the bus instead of staged
+    /// through the host). Returns false when the pair cannot (then `DBuf::copy_from_peer` still works, staged by the
+    /// driver). Leaves this device current. Enabling twice is not an error.
+    pub fn enable_peer(&self, peer: &Device) -> Result<bool> {
+        if self.host || peer.host {
+            return Ok(false);
+        }
+        let mut can = 0i32;
+        // SAFETY: out-pointer to a local; both ordinals validated
+        check(unsafe { ffi::cudaDeviceCanAccessPeer(&mut can, self.ordinal, peer.ordinal) }, "cudaDeviceCanAccessPeer")?;
+        if can == 0 {
+            return Ok(false);
+        }
+        self.make_current()?;
+        // SAFETY: plain call on the current device
+        let rc = unsafe { ffi::cudaDeviceEnablePeerAccess(peer.ordinal, 0) };
+        if rc == ffi::ERR_PEER_ACCESS_ALREADY_ENABLED {
+            // clear the last-error slot: the kernel launchers return cudaGetLastError
+            // SAFETY: plain call
+            unsafe { ffi::cudaGetLastError() };
+            return Ok(true);
+        }
+        check(rc, "cudaDeviceEnablePeerAccess")?;
+        Ok(true)
     }
 
     /// cudart version (e.g. 13020 for 13.2).
@@ -105,29 +163,29 @@ impl Device {
         self.driver
     }
 
-    /// Streaming multiprocessors of the current device.
+    /// Streaming multiprocessors of this device.
     pub fn sm_count(&self) -> Result<usize> {
         if self.host {
             return Ok(pc_hostrt::threads());
         }
         let mut v = 0i32;
-        // SAFETY: out-pointer to a local; attribute 16 = cudaDevAttrMultiProcessorCount of device 0 (the visible one)
-        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 16, 0) }, "cudaDeviceGetAttribute")?;
+        // SAFETY: out-pointer to a local; attribute 16 = cudaDevAttrMultiProcessorCount of this device
+        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 16, self.ordinal) }, "cudaDeviceGetAttribute")?;
         Ok(v as usize)
     }
 
-    /// Thread-block clusters (compute capability 9.0+) on the current device.
+    /// Thread-block clusters (compute capability 9.0+) on this device.
     pub fn clusters(&self) -> Result<bool> {
         if self.host {
             return Ok(false);
         }
         let mut v = 0i32;
-        // SAFETY: out-pointer to a local; attribute 75 = cudaDevAttrComputeCapabilityMajor of device 0 (the visible one)
-        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 75, 0) }, "cudaDeviceGetAttribute")?;
+        // SAFETY: out-pointer to a local; attribute 75 = cudaDevAttrComputeCapabilityMajor of this device
+        check(unsafe { ffi::cudaDeviceGetAttribute(&mut v, 75, self.ordinal) }, "cudaDeviceGetAttribute")?;
         Ok(v >= 9)
     }
 
-    /// (free, total) device memory in bytes.
+    /// (free, total) memory of the current device in bytes (this device in a single-device process).
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         if self.host {
             return Ok(pc_hostrt::mem_info());
@@ -187,4 +245,16 @@ pub fn mem_info_current() -> Result<(usize, usize)> {
     // SAFETY: out-pointers to locals
     check(unsafe { ffi::cudaMemGetInfo(&mut f, &mut t) }, "cudaMemGetInfo")?;
     Ok((f, t))
+}
+
+/// Ordinal of the calling thread's current device (0 on the host device): the check before issuing on one of
+/// several devices.
+pub fn current_ordinal() -> Result<i32> {
+    if current_is_host() {
+        return Ok(0);
+    }
+    let mut d = 0i32;
+    // SAFETY: out-pointer to a local
+    check(unsafe { ffi::cudaGetDevice(&mut d) }, "cudaGetDevice")?;
+    Ok(d)
 }

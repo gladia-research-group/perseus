@@ -22,10 +22,10 @@ use pc_gpu::ops::{Ops, OpsCfg};
 use pc_gpu::pt_store::{PtStore, PtStoreCfg, PtStorePolicy};
 use pc_gpu::rotate::RotKeys;
 use pc_gpu::bts::sparse::{chain_deg, SparseBRoute, SpruRoute};
-use pc_gpu::bts::sparse_b::{SparseBCfg, SparseBPrecomp};
+use pc_gpu::bts::sparse_b::SparseBCfg;
 use pc_gpu::bts::spru::{Spru, SpruCfg, SpruKey};
 use pc_gpu::bts::stc_first::{StcFirstPlan, StcFirstRoute, StcFirstSetup};
-use pc_gpu::bts::{BtsKeyRing, BtsSetup, BtsWork, BtsWorkShape, RouteKind};
+use pc_gpu::bts::{BtsSetup, BtsWork, BtsWorkShape, RouteKind};
 use pc_gpu::keys::KskShape;
 use pc_gpu::{Context, Ct, CtPool, Executor, MemCfg, MemPlan, PoolClass};
 use pc_program::bind::{Bound as PBound, Slab};
@@ -266,6 +266,8 @@ pub(crate) struct Planned {
     pub stats: PlannedStats,
     /// the side lane the replay schedules a block's off-critical-path steps on
     pub side: Option<SideLane<'static, W>>,
+    /// the remote refresh device (`PC_REMOTE_DEVICE`): the second half of every refresh batch runs there
+    pub remote: Option<crate::remote::RemoteDev>,
     /// streamed weights: the device expander, the weight frames, the pinned rows, the blocks' run order
     pub coeff: Option<pc_gpu::encode_dev::CoeffRowsDevice<'static, W>>,
     pub ring: Option<pc_program::residency::StreamRing<'static, 'static>>,
@@ -449,6 +451,17 @@ impl Drop for Dev {
         // nothing in flight may still read or write the arena when it is freed
         let ex = &self.st.get_mut().ex;
         let _ = (ex.compute.sync(), ex.aux.sync(), ex.side.sync(), ex.copy.sync());
+        if std::env::var("PC_BTS_COUNT").is_ok_and(|v| v.trim() == "1") {
+            use pc_program::replay::{BTS_BATCHES, BTS_BATCH_CTS, BTS_PAIRS, BTS_SINGLE};
+            use std::sync::atomic::Ordering::Relaxed;
+            eprintln!(
+                "[bts-count] eager refreshes: {} single bootstrap steps, {} complex pairs, {} batches of {} ciphertexts",
+                BTS_SINGLE.load(Relaxed),
+                BTS_PAIRS.load(Relaxed),
+                BTS_BATCHES.load(Relaxed),
+                BTS_BATCH_CTS.load(Relaxed)
+            );
+        }
     }
 }
 
@@ -644,6 +657,9 @@ struct RouteNeeds {
     /// dense sites on the shipped order (no StC-first): `DenseRoute`
     plain_drops: BTreeSet<u32>,
     plain_real: bool,
+    /// the largest refresh batch the programs run on `DenseRoute` (at most `GRID_INPUTS`, the most a launch takes;
+    /// 1 = none)
+    plain_k: usize,
     sparse: BTreeMap<u32, BTreeSet<u32>>,
     /// classic sparse routes (`Route::sparse_b` off): slots -> raise drops
     classic: BTreeMap<u32, BTreeSet<u32>>,
@@ -654,8 +670,18 @@ struct RouteNeeds {
     ccmm_levels: BTreeSet<(u32, u8, u32)>,
 }
 
+/// `PC_DENSE_BATCH`: `DenseRoute` takes the programs' refresh batches (see `RouteNeeds::plain_k`). Default: only with
+/// a remote refresh device (`PC_REMOTE_DEVICE`), which splits them; on one device a batch costs more per ciphertext
+/// than one refresh at a time (Llama-8B prefill +0.7 %).
+fn dense_batch() -> bool {
+    match std::env::var("PC_DENSE_BATCH").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        Some(v) => v != "0",
+        None => crate::remote::requested().ok().flatten().is_some(),
+    }
+}
+
 fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
-    let mut r = RouteNeeds { dense_drops: BTreeSet::new(), real: false, n_dense: 0, plain_drops: BTreeSet::new(), plain_real: false, sparse: BTreeMap::new(), classic: BTreeMap::new(), spru_h: None, spru_drops: 0, ccmm_levels: BTreeSet::new() };
+    let mut r = RouteNeeds { dense_drops: BTreeSet::new(), real: false, n_dense: 0, plain_drops: BTreeSet::new(), plain_real: false, plain_k: 1, sparse: BTreeMap::new(), classic: BTreeMap::new(), spru_h: None, spru_drops: 0, ccmm_levels: BTreeSet::new() };
     for p in progs {
         // a PCMM finish refreshes its outputs on the StC-first dense route (its raise drop's variant)
         for op in &p.ops {
@@ -684,6 +710,14 @@ fn route_needs(progs: &[Program], n: usize) -> RouteNeeds {
                             r.ccmm_levels.insert((am.level, am.deg, cd.raise_drop));
                         }
                     }
+                }
+            }
+        }
+        for op in &p.ops {
+            let m = op.members();
+            if let (true, Kind::Bootstrap(s)) = (m.len() > 1, &m[0].kind) {
+                if p.bts_sites.get(*s as usize).is_some_and(|x| RouteKind::of(&x.route, n) == RouteKind::Dense) {
+                    r.plain_k = r.plain_k.max(m.len().min(pc_program::program::GRID_INPUTS));
                 }
             }
         }
@@ -883,7 +917,8 @@ fn key_needs(cfg: &pc_config::Config, ks: &PyKeySource, chain: &Chain, plan: &Op
             setup.real = rn.plain_real;
             setup.cts_alt_budget = cts_alt;
             (setup.lt_tails, setup.em_fuse_rescale) = (lt_tails, em_fuse);
-            setup.k_max = 1;
+            // the programs' refresh batches on this route launch as K-batches with a remote device (`dense_batch`)
+            setup.k_max = if dense_batch() { rn.plain_k } else { 1 };
             dense_em_table(cfg, &mut setup)?;
             let dp = pc_gpu::bts::dense::DensePlan::new(chain, &setup).map_err(e)?;
             let geoms: Vec<_> = dp.variants.iter().flat_map(|v| v.cts.iter().chain(&v.stc).chain(v.stc_real0.iter())).map(|h| h.geom).collect();
@@ -1331,44 +1366,22 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
     let mut fbs_hosts: BTreeMap<String, pc_gpu::bts::stc_first::FbsHost> = BTreeMap::new();
     let mut group_bytes = 0;
     if let Some(ps) = &plan {
+        let rplans = crate::routes::RoutePlans { splan: &splan, dplan: &dplan, sb_cfgs: &sb_cfgs, cplans: &cplans };
+        wshape = crate::routes::reserve(mp, &chain, &lay, &rplans)?;
+        // the programs' functional bootstraps: a raise table and EvalMod program(s) each, their EvalMod work (this device
+        // only: a remote device never runs them)
         if let Some(sp) = &splan {
-            let (req, mut w) = sp.mem::<W>().map_err(e)?;
-            req.reserve(mp);
-            // the programs' functional bootstraps: a raise table and EvalMod program(s) each, their EvalMod work
             let fns = crate::fbs::functions(&ps.programs).map_err(PyValueError::new_err)?;
             let hs = crate::fbs::hosts(sp, &fns).map_err(e)?;
             for h in hs.values() {
                 let (b, fw) = sp.fbs_mem::<W>(h).map_err(e)?;
                 mp.reserve("bts.fbs", b);
-                w = w.max(fw);
+                wshape = Some(wshape.map_or(fw, |x| x.max(fw)));
             }
             if !hs.is_empty() {
                 eprintln!("[session] fbs: {} function(s): {}", hs.len(), hs.iter().map(|(n, h)| format!("{n} (deg {}, lands top {} nl {})", h.spec.post.len() - 1, h.out.top, h.out.nl)).collect::<Vec<_>>().join(", "));
             }
             fbs_hosts = hs;
-            wshape = Some(w);
-        }
-        if let Some(dp) = &dplan {
-            let (req, w) = dp.mem::<W>().map_err(e)?;
-            req.reserve(mp);
-            mp.reserve("bts.route", pc_gpu::bts::raise::EncapsKeys::bytes() + pc_gpu::bts::finish::Pow2::<W>::bytes(lay.rows()) + KeyGroup::bytes(1, true));
-            wshape = Some(wshape.map_or(w, |x| x.max(w)));
-        }
-        let st_tables = pc_core::scale::ScaleTables::precompute(&chain).map_err(|x| e(x.into()))?;
-        mp.reserve("bts.sparse", SparseBPrecomp::<W>::tails_bytes(&chain, &st_tables, &lay, &sb_cfgs).map_err(e)?);
-        for (i, c) in sb_cfgs.iter().enumerate() {
-            let (b, w) = SparseBPrecomp::<W>::bytes(&chain, &st_tables, &lay, c).map_err(e)?;
-            mp.reserve("bts.sparse", b);
-            // one route per slot count: its raise variants share the encapsulation keys and the post-factor table
-            if sb_cfgs[..i].iter().all(|x| x.slots != c.slots) {
-                mp.reserve("bts.route", pc_gpu::bts::raise::EncapsKeys::bytes() + pc_gpu::bts::finish::Pow2::<W>::bytes(lay.rows()));
-            }
-            wshape = Some(wshape.map_or(w, |x| x.max(w)));
-        }
-        for cp in &cplans {
-            let (req, w) = cp.mem::<W>().map_err(e)?;
-            req.reserve(mp);
-            wshape = Some(wshape.map_or(w, |x| x.max(w)));
         }
         if let Some(c) = &spru_cfg {
             mp.reserve("bts.spru", Spru::<W>::bytes(&lay, c, &chain).map_err(e)? + Spru::<W>::bind_bytes(c, n));
@@ -1539,34 +1552,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
         Some(ps) => {
             let shadows: Vec<Shadow> = ps.shadows.iter().map(|c| Shadow::new(c.clone(), Some(tables.clone()))).collect();
             let sh0 = shadows.first().cloned().ok_or_else(|| PyValueError::new_err("Session(programs=[]): no program"))?;
-            let dense = match &splan {
-                Some(sp) => Some(sp.build(a, &device, &ex.compute, &ctx, &keys, stage).map_err(e)?),
-                None => None,
-            };
-            let plain = match &dplan {
-                Some(dp) => Some(dp.build(a, &ex.compute, &ctx, &keys, stage).map_err(e)?),
-                None => None,
-            };
-            let mut sparse: Vec<SparseBRoute<'_, W>> = vec![];
-            let sb_tails = SparseBPrecomp::<W>::tails(a, &ex.compute, &ctx, &keys, &sb_cfgs).map_err(e)?;
-            for c in &sb_cfgs {
-                let s = &ex.compute;
-                let pre = SparseBPrecomp::new(a, s, &ctx, c.clone(), &keys, &sb_tails, stage).map_err(e)?;
-                // the raise variants of one slot count are one route (`SparseBRoute::variant` picks by drop)
-                if let Some(r) = sparse.iter_mut().find(|r| r.slots == c.slots) {
-                    r.variants.push(pre);
-                    continue;
-                }
-                let encaps = pc_gpu::bts::raise::EncapsKeys::new(a, s, n, BtsKeyRing::dense_to_sparse(&keys).map_err(e)?, BtsKeyRing::sparse_to_dense(&keys).map_err(e)?, stage).map_err(e)?;
-                let pow2 = pc_gpu::bts::finish::Pow2::new(a, s, &ctx).map_err(e)?;
-                sparse.push(SparseBRoute { slots: c.slots, ring_n: n, variants: vec![pre], encaps, pow2, cf_default: 6, cf_window: (2, 20), deg: chain_deg(&ctx).map_err(e)?, ks_source: c.ks_source });
-            }
-            let mut classic = vec![];
-            for cp in &cplans {
-                let r = cp.build(a, &ex.compute, &ctx, &keys, stage).map_err(e)?;
-                r.check_mem().map_err(e)?;
-                classic.push(r);
-            }
+            let rplans = crate::routes::RoutePlans { splan: &splan, dplan: &dplan, sb_cfgs: &sb_cfgs, cplans: &cplans };
+            let crate::routes::RouteSet { dense, plain, sparse, classic } = crate::routes::build(a, &device, &ex.compute, &ctx, &keys, stage, &rplans)?;
             let mut spru_secret = None;
             let spru = match &spru_cfg {
                 Some(c) => {
@@ -1598,6 +1585,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
             }
             let _ = &needs;
             // the PCMM keys are made here, from the host secret (the driver drops it after setup)
+            let mut remote_pcmm: Option<crate::pcmm::RemotePcmmSpec> = None;
             let pc = match pcmm {
                 Some(pp) => {
                     if dense.is_none() {
@@ -1611,6 +1599,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                             pp.ts().iter().map(|&t| pc_core::pcmm_keys::PcmmKeys::generate(&sk.s, &chain.q[..4], t, &mut prng)).collect::<Result<Vec<_>, _>>().map_err(|x| e(x.into()))?
                         }
                     };
+                    // PC_JOINT_LINEAR: the remote device's share (its engine is built with the remote device below)
+                    remote_pcmm = pp.remote_spec(&pk);
                     Some(crate::pcmm::PcmmRt::build(pp, a, &device, &ex.compute, &ctx, pk, tp.elapsed().as_secs_f64())?)
                 }
                 None => None,
@@ -1682,7 +1672,16 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 sx.compute.sync().map_err(|x| e(x.into()))?;
                 Some(SideLane { ex: sx, ops: sops, ev, fork, join })
             };
-            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, tfhe: tf, fbs: fb, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
+            // PC_REMOTE_DEVICE: a second device for the refresh batches (its own copy of the keys and the routes)
+            let remote = match crate::remote::requested()? {
+                Some(ord) => {
+                    let rplans = crate::routes::RoutePlans { splan: &splan, dplan: &dplan, sb_cfgs: &sb_cfgs, cplans: &cplans };
+                    let rspec = (pc_program::replica::mode() > 0).then(|| crate::remote::ReplicaSpec { n_slab: slab.slots.len(), held_words: held_words(&ps, &lay, chain.dnum(), k_max), group_bytes, pt_span: pc_program::replica::pt_mirror().then(|| pts.span()) });
+                    Some(crate::remote::RemoteDev::build(ord, &device, &keys, &ex.compute, &chain, k_max, layout, &spec, &extra, &levels, ocfg, &rplans, side.as_ref().map_or(0, |sl| sl.ev.len()), remote_pcmm.take(), rspec)?)
+                }
+                None => None,
+            };
+            Some(Planned { bounds: vec![], pcmm: pc, ccmm: cc, tfhe: tf, fbs: fb, shadows: vec![], replayer, slab, regs, work, dense, plain, sparse, classic, spru, spru_secret, spec: ps, group_bytes, stats: PlannedStats::default(), side, remote, coeff, ring, streams, stream_tag: vec![], tag_layouts: vec![], stream_order: vec![], kv, stream_events })
         }
     };
     ex.compute.sync().map_err(|x| e(x.into()))?;
@@ -1946,7 +1945,7 @@ impl PySession {
                     pc_program::replay::copy_ct(&d.ctx, &ex.compute, dst, c).map_err(cp)?;
                 }
                 let mut cx = pc_gpu::bts::BtsCx { ctx: &d.ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work };
-                rt.run(&mut cx, route, b_transposed, fa, fb, shift, merge, kappa, 0)
+                rt.run(&mut cx, route, b_transposed, fa, fb, shift, merge, kappa, 0, None, None)
             })
             .map_err(gerr)?
         };
@@ -2035,9 +2034,17 @@ impl PySession {
     fn pcmm_upload(&self, py: Python<'_>, name: &str, planes: &[u8], pinned: bool) -> PyResult<()> {
         let mut st = self.dev.st.borrow_mut();
         let State { planned, ex, .. } = &mut *st;
-        let pc = planned.as_mut().and_then(|p| p.pcmm.as_mut()).ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
+        let pl = planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
+        let pc = pl.pcmm.as_mut().ok_or_else(|| PyRuntimeError::new_err("Session has no PCMM service (pcmm=)"))?;
         let dev = if pinned { Some(&self.dev.device) } else { None };
-        nogil(py, || pc.upload(&ex.compute, name, planes, dev))
+        nogil(py, || pc.upload(&ex.compute, name, planes, dev))?;
+        // PC_JOINT_LINEAR: the remote device's planes of a joint linear's far outputs
+        if let Some(fp) = pc.joint_far_planes(name, planes)? {
+            if let Some(rd) = pl.remote.as_mut() {
+                rd.pcmm_upload(name, &fp)?;
+            }
+        }
+        Ok(())
     }
 
     /// Pooled weights (PC_PCMM_WEIGHTS_PER_PROGRAM=1): free the buffers of PCMM linears `names` for the next
@@ -2394,6 +2401,9 @@ impl PySession {
     /// Freeze the arena (a later device allocation panics) and enable the op surface. Returns the session.
     fn complete_setup(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
         slf.dev.arena().freeze();
+        if let Some(r) = slf.dev.st.borrow().planned.as_ref().and_then(|p| p.remote.as_ref()) {
+            r.freeze();
+        }
         slf.dev.frozen.set(true);
         slf
     }

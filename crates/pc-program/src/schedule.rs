@@ -6,29 +6,49 @@
 //! an element-wise group runs as one pass only when its steps share a lane.
 //!
 //! Correctness does not depend on the heuristic: every slot hazard between the lanes (read after write, write after
-//! read, write after write) becomes one event wait on the latest conflicting step of the other lane (stream order
+//! read, write after write) becomes one event wait per other lane on its latest conflicting step (stream order
 //! covers the earlier ones). Hazards are tracked per region (the steps between two dynamic steps): the replay forks
 //! the side lane from compute at a region's first side step and joins it back at the region's end, so a captured
 //! segment's graph holds the fork / join and never waits on an event of another capture.
+//!
+//! With a remote refresh device (`RemotePlan`, PC_REMOTE_ASYNC=1) a third lane (2) takes whole refreshes: single
+//! refresh steps and refresh pairs, chosen greedily where a three-lane simulation says the block finishes earlier (the
+//! remote device is held by every finish and split refresh batch for its whole span, and each remote refresh pays its
+//! copies). A remote step runs in two parts: its inputs copied over and refreshed on the remote device (lane 2, after
+//! what wrote its inputs), then the result copied back into its slot on this device's copy-back stream (lane 3, after
+//! what still reads or writes that slot). Hazards are tracked on the four lanes: a later writer of a remote step's
+//! input waits only for its inputs to be copied (lane 2's event), a reader of its output for the copy back (lane 3's).
+//! The replay forks lanes 2 and 3 at the start of each region that has a remote step and joins them at its end.
 use crate::bind::{Bound, Step, StepOp, UnitKind, NONE};
+use pc_gpu::bts::RouteKind;
 use pc_gpu::DevWord;
 use std::collections::BTreeSet;
 
 /// Lane of every step and the cross-lane waits.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sched {
-    /// 0 = compute, 1 = side.
+    /// 0 = compute, 1 = side, 2 = the remote refresh device (its copy back on lane 3, this device's copy-back stream).
     pub lane: Vec<u8>,
-    /// Step whose completion (event) this step waits for on the other lane, or NONE.
-    pub wait: Vec<u32>,
-    /// Record an event after this step (some later step of the other lane waits for it).
+    /// Per producer lane (0, 1, 2 = a remote step's inputs copied, 3 = a remote step's output copied back), the step
+    /// whose event this step waits for, or NONE. A remote step: what its inputs wait for (before the copy over).
+    pub wait: Vec<[u32; 4]>,
+    /// A remote step: what its copy back waits for (the slot's earlier readers and writer); NONE elsewhere.
+    pub wait_out: Vec<[u32; 4]>,
+    /// Record an event after this step (some later step of another lane waits for it; a remote step: after its copy
+    /// back, which the replay records anyway).
     pub signal: Vec<bool>,
+    /// A remote step whose input copy some later step waits for.
+    pub signal_in: Vec<bool>,
     pub n_side: usize,
+    /// Steps on the remote lane.
+    pub n_remote: usize,
     /// Element-wise groups whose steps sit on two lanes (issued step by step).
     pub n_split: usize,
     /// Static cost estimates (ms): every step, the critical path.
     pub total_ms: f64,
     pub critical_ms: f64,
+    /// The replica lane's plan (`replica`; its steps carry lane 4, the others 0, no side or remote lane).
+    pub replica: Option<crate::replica::ReplicaSched>,
 }
 
 /// Rough device cost of a step (ms, K = 1, n32 decode levels): only the ordering between steps matters.
@@ -77,8 +97,21 @@ fn pinned(st: &Step, side_ok: &dyn Fn(&Step) -> bool) -> bool {
     matches!(st.op, StepOp::Bootstrap { .. } | StepOp::Finish { .. } | StepOp::CoeffSum { .. } | StepOp::MultRescale { .. } | StepOp::MultSum { .. }) || tmp || !side_ok(st)
 }
 
-/// The schedule of `b` (its current dynamic steps) for one compute + one side lane.
-pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool, live: &dyn Fn(u32) -> f64) -> Sched {
+/// The remote refresh device as a lane: the route families it holds and whether finishes use it (the finish split).
+pub struct RemotePlan<'f> {
+    pub holds: &'f dyn Fn(RouteKind) -> bool,
+    pub finishes: bool,
+}
+
+/// Host-device copies of one remote refresh (ms per ciphertext, n32 at 38-40 GB/s): in at the input level, back at
+/// the landing's.
+const REMOTE_IN_MS: f64 = 0.10;
+const REMOTE_OUT_MS: f64 = 0.25;
+/// Greedy passes over the remote candidates.
+const REMOTE_PASSES: usize = 3;
+
+/// The schedule of `b` (its current dynamic steps) for one compute + one side lane (+ the remote refresh device).
+pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool, live: &dyn Fn(u32) -> f64, remote: Option<&RemotePlan<'_>>) -> Sched {
     let n = b.steps.len();
     let dynamic: &BTreeSet<u32> = &b.dynamic;
     let costs: Vec<f64> = b.steps.iter().map(|s| cost(s, &b.step_lists)).collect();
@@ -143,77 +176,224 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, side_ok: &dyn Fn(&Step) -> bool, live:
         relieve(&sim, &preds, &dyns, &spans, &mut lane, RELIEF_TRIES);
     }
     let n_split = unit_lanes(&mut lane, &spans);
-    // hazards per region: last writer and the latest reader per lane of every slot since its last write
-    let mut wait = vec![NONE; n];
+    if let Some(rp) = remote {
+        let sim: Vec<f64> = b.steps.iter().map(|st| sim_cost(st, &b.step_lists, live(st.meta.level))).collect();
+        let dyns: Vec<bool> = (0..n).map(|i| dynamic.contains(&(i as u32))).collect();
+        remote_lanes(b, rp, &sim, &preds, &dyns, &mut lane);
+    }
+    // hazards per region: last writer and the latest reader per reading lane (0, 1, 2) of every slot since its last
+    // write. A step reads on its lane and writes on it, except a remote step: it reads on lane 2 and writes on 3.
+    let rlane = |p: usize| lane[p] as usize;
+    let wlane = |p: usize| if lane[p] == 2 { 3 } else { lane[p] as usize };
+    let mut wait = vec![[NONE; 4]; n];
+    let mut wait_out = vec![[NONE; 4]; n];
     let mut signal = vec![false; n];
+    let mut signal_in = vec![false; n];
     let ns = b.n_slots.max(1) + 1;
     let mut last_w: Vec<Option<usize>> = vec![None; ns];
-    let mut last_r: Vec<[Option<usize>; 2]> = vec![[None, None]; ns];
+    let mut last_r: Vec<[Option<usize>; 3]> = vec![[None; 3]; ns];
+    let latest = |d: &mut [Option<usize>; 4], pl: usize, p: usize| {
+        if d[pl].map_or(true, |x| p > x) {
+            d[pl] = Some(p);
+        }
+    };
     for i in 0..n {
         if dynamic.contains(&(i as u32)) {
-            // a region boundary: the side lane joined compute before it and forks after it
+            // a region boundary: the other lanes joined compute before it and fork after it
             last_w.iter_mut().for_each(|x| *x = None);
-            last_r.iter_mut().for_each(|x| *x = [None, None]);
+            last_r.iter_mut().for_each(|x| *x = [None; 3]);
             continue;
         }
-        let l = lane[i] as usize;
+        let (lr, lw) = (rlane(i), wlane(i));
         let (r, w) = rw(b, &b.steps[i]);
-        let mut dep: Option<usize> = None;
-        let mut need = |p: Option<usize>| {
-            if let Some(p) = p {
-                if lane[p] as usize != l && dep.map_or(true, |d| p > d) {
-                    dep = Some(p);
-                }
-            }
-        };
+        // what the reads wait for (read after write) and what the writes wait for (write after write / read)
+        let mut dr: [Option<usize>; 4] = [None; 4];
+        let mut dw: [Option<usize>; 4] = [None; 4];
         for &s in &r {
-            if let Some(x) = last_w.get(s as usize) {
-                need(*x);
+            if let Some(Some(p)) = last_w.get(s as usize) {
+                if wlane(*p) != lr {
+                    latest(&mut dr, wlane(*p), *p);
+                }
             }
         }
         for &s in &w {
-            if let Some(x) = last_w.get(s as usize) {
-                need(*x);
+            if let Some(Some(p)) = last_w.get(s as usize) {
+                if wlane(*p) != lw {
+                    latest(&mut dw, wlane(*p), *p);
+                }
             }
             if let Some(rr) = last_r.get(s as usize) {
-                need(rr[1 - l]);
+                for (ol, x) in rr.iter().enumerate() {
+                    if let Some(p) = *x {
+                        if ol != lw && p != i {
+                            latest(&mut dw, ol, p);
+                        }
+                    }
+                }
             }
         }
-        if let Some(d) = dep {
-            wait[i] = d as u32;
-            signal[d] = true;
+        let set = |d: &[Option<usize>; 4], out: &mut [u32; 4], signal: &mut Vec<bool>, signal_in: &mut Vec<bool>| {
+            for (pl, x) in d.iter().enumerate() {
+                if let Some(p) = *x {
+                    if out[pl] == NONE || p as u32 > out[pl] {
+                        out[pl] = p as u32;
+                    }
+                    if pl == 2 {
+                        signal_in[p] = true;
+                    } else {
+                        signal[p] = true;
+                    }
+                }
+            }
+        };
+        if lane[i] == 2 {
+            set(&dr, &mut wait[i], &mut signal, &mut signal_in);
+            set(&dw, &mut wait_out[i], &mut signal, &mut signal_in);
+        } else {
+            set(&dr, &mut wait[i], &mut signal, &mut signal_in);
+            set(&dw, &mut wait[i], &mut signal, &mut signal_in);
         }
         for &s in &r {
             if let Some(rr) = last_r.get_mut(s as usize) {
-                rr[l] = Some(i);
+                rr[lr] = Some(i);
             }
         }
         for &s in &w {
             if (s as usize) < ns {
                 last_w[s as usize] = Some(i);
-                last_r[s as usize] = [None, None];
+                last_r[s as usize] = [None; 3];
             }
         }
     }
     let n_side = lane.iter().filter(|&&x| x == 1).count();
+    let n_remote = lane.iter().filter(|&&x| x == 2).count();
     if let Ok(dir) = std::env::var("PC_SCHED_DUMP") {
-        dump(&dir, b, &lane, &wait, &costs, &preds, &forced);
+        dump(&dir, b, &lane, &wait, &wait_out, &costs, &preds, &forced);
     }
-    Sched { lane, wait, signal, n_side, n_split, total_ms: costs.iter().sum(), critical_ms: total_cp }
+    Sched { lane, wait, wait_out, signal, signal_in, n_side, n_remote, n_split, total_ms: costs.iter().sum(), critical_ms: total_cp, replica: None }
 }
 
-/// PC_SCHED_DUMP=<dir>: every planned block's steps (op kind, level, degree, lane, the step it waits for, cost, forced
-/// onto compute, data predecessors, unit) as `<dir>/<label>.jsonl`, for offline analysis of the lane schedule.
+/// Moves whole refreshes onto the remote lane (2): single refresh steps outside units and refresh pairs whose route
+/// family the remote device holds, most slack first, each kept there when `simulate3` says the block finishes earlier
+/// (a few passes, until none moves). Finishes (when the remote device runs their split) and refresh batches it splits
+/// hold the remote lane for their whole span.
+fn remote_lanes<W: DevWord>(b: &Bound<'_, W>, rp: &RemotePlan<'_>, sim: &[f64], preds: &[Vec<usize>], dyns: &[bool], lane: &mut [u8]) {
+    let n = lane.len();
+    let unit = |i: usize| b.unit_of.get(i).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]);
+    let mut costs = sim.to_vec();
+    let mut joint = vec![false; n];
+    let mut groups: Vec<Vec<usize>> = vec![];
+    for (i, st) in b.steps.iter().enumerate() {
+        match (&st.op, unit(i)) {
+            (StepOp::Finish { .. }, _) => joint[i] = rp.finishes,
+            (StepOp::Bootstrap { kind, .. }, None) if !dyns[i] && (rp.holds)(*kind) => groups.push(vec![i]),
+            (StepOp::Bootstrap { .. }, Some(u)) => match &u.kind {
+                UnitKind::Refresh { kind, .. } => joint[i] = u.hi - u.lo >= 2 && (rp.holds)(*kind),
+                UnitKind::Pair { kind, .. } if i == u.lo as usize && (u.lo..u.hi).all(|j| !dyns[j as usize]) && (rp.holds)(*kind) => {
+                    // one complex refresh: a bit more than a single, all of it on the first step
+                    costs[i] *= 1.2;
+                    costs[i + 1] = 0.0;
+                    groups.push((u.lo as usize..u.hi as usize).collect());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    // slack under unbounded lanes: latest minus earliest start (going backwards, `lst[i]` holds the smallest latest
+    // start of i's successors, or the critical path, until i's turn subtracts its own cost)
+    let mut est = vec![0.0f64; n];
+    for i in 0..n {
+        est[i] = preds[i].iter().map(|&p| est[p] + costs[p]).fold(0.0, f64::max);
+    }
+    let cp = (0..n).map(|i| est[i] + costs[i]).fold(0.0, f64::max);
+    let mut lst = vec![cp; n];
+    for i in (0..n).rev() {
+        lst[i] -= costs[i];
+        for &p in &preds[i] {
+            if lst[i] < lst[p] {
+                lst[p] = lst[i];
+            }
+        }
+    }
+    groups.sort_by(|a, b| {
+        let s = |g: &Vec<usize>| g.iter().map(|&i| lst[i] - est[i]).fold(f64::INFINITY, f64::min);
+        s(b).total_cmp(&s(a))
+    });
+    let mut best = simulate3(&costs, preds, dyns, lane, &joint);
+    for _ in 0..REMOTE_PASSES {
+        let mut moved = false;
+        for g in &groups {
+            if lane[g[0]] == 2 {
+                continue;
+            }
+            let old: Vec<u8> = g.iter().map(|&i| lane[i]).collect();
+            g.iter().for_each(|&i| lane[i] = 2);
+            let t = simulate3(&costs, preds, dyns, lane, &joint);
+            if t < best - 1e-6 {
+                best = t;
+                moved = true;
+            } else {
+                g.iter().zip(&old).for_each(|(&i, &l)| lane[i] = l);
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// Three in-order lanes (0 compute, 1 side, 2 remote) issuing the steps in program order: as `simulate`, a remote step
+/// paying its copies, a `joint` step (a finish or a split refresh batch) taking the remote lane with its own for its
+/// whole span. Returns the finish time.
+pub fn simulate3(costs: &[f64], preds: &[Vec<usize>], dynamic: &[bool], lane: &[u8], joint: &[bool]) -> f64 {
+    let mut t = [0.0f64; 3];
+    let mut fin = vec![0.0f64; costs.len()];
+    for i in 0..costs.len() {
+        if dynamic.get(i).copied().unwrap_or(false) {
+            let m = t[0].max(t[1]).max(t[2]);
+            t = [m, m, m];
+        }
+        let l = lane[i] as usize;
+        let mut ready = 0.0f64;
+        for &p in &preds[i] {
+            let r = fin[p] + if lane[p] as usize != l { SYNC_MS } else { 0.0 };
+            if r > ready {
+                ready = r;
+            }
+        }
+        fin[i] = if l == 2 {
+            t[2].max(ready) + REMOTE_IN_MS + costs[i] + REMOTE_OUT_MS
+        } else if joint[i] {
+            let f = t[l].max(t[2]).max(ready) + costs[i];
+            t[2] = f;
+            f
+        } else {
+            t[l].max(ready) + costs[i]
+        };
+        t[l] = fin[i];
+    }
+    t[0].max(t[1]).max(t[2])
+}
+
+/// PC_SCHED_DUMP=<dir>: every planned block's steps (op kind, level, degree, lane, slots read and written, the step it
+/// waits for per lane, cost, forced onto compute, data predecessors, unit) as `<dir>/<label>.jsonl`, for offline
+/// analysis of the lane schedule.
 #[allow(clippy::too_many_arguments)]
-fn dump<W: DevWord>(dir: &str, b: &Bound<'_, W>, lane: &[u8], wait: &[u32], costs: &[f64], preds: &[Vec<usize>], forced: &[bool]) {
+fn dump<W: DevWord>(dir: &str, b: &Bound<'_, W>, lane: &[u8], wait: &[[u32; 4]], wait_out: &[[u32; 4]], costs: &[f64], preds: &[Vec<usize>], forced: &[bool]) {
     let name: String = b.label.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
     let mut out = String::new();
     for (i, st) in b.steps.iter().enumerate() {
         let op = format!("{:?}", st.op);
         let kind: String = op.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
         let unit = b.unit_of.get(i).copied().filter(|&u| u != NONE).map_or(-1, |u| u as i64);
-        let row = serde_json::json!({"i": i, "op": kind, "lvl": st.meta.level, "deg": st.meta.deg, "lane": lane[i],
-            "wait": if wait[i] == NONE { -1 } else { wait[i] as i64 }, "cost": costs[i], "forced": forced[i], "preds": preds[i], "unit": unit,
+        let (r, w) = rw(b, st);
+        let row = serde_json::json!({"i": i, "op": kind, "name": b.names.get(st.var as usize).cloned().unwrap_or_default(), "lvl": st.meta.level, "deg": st.meta.deg, "lane": lane[i], "r": r, "w": w,
+            "wait": wait[i].iter().map(|&w| if w == NONE { -1 } else { w as i64 }).collect::<Vec<_>>(),
+            "wait_out": wait_out[i].iter().map(|&w| if w == NONE { -1 } else { w as i64 }).collect::<Vec<_>>(), "cost": costs[i], "forced": forced[i], "preds": preds[i], "unit": unit,
             "dyn": b.dynamic.contains(&(i as u32))});
         out.push_str(&row.to_string());
         out.push('\n');

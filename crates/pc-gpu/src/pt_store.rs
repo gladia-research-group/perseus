@@ -143,6 +143,8 @@ pub struct PtStore<'a, 'e, W: DevWord> {
     pub enc: DevEncoder<'a, W>,
     /// one scratch plaintext (mult_pt_sum / mult_coeff_sum rows encoded per term)
     tmp: DBuf<'a, Compute, W>,
+    /// the slots' device range (they are carved one after the other): first byte, bytes
+    span: (usize, usize),
 }
 
 fn slot_rows(lay: &Layout, cfg: &PtStoreCfg) -> usize {
@@ -194,6 +196,14 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
             .iter()
             .map(|&rows| Ok(Slot { state: State::Free(arena.alloc("pt_store.slot", rows * lay.n)?), rows, key: None, meta: PtMeta { level: 0, deg: 1, nf: 0.0, tag: Default::default() }, last_use: 0 }))
             .collect::<Result<Vec<_>>>()?;
+        let addr = |sl: &Slot<'a, 'e, W>| match &sl.state {
+            State::Free(b) => b.vptr() as usize,
+            _ => 0,
+        };
+        let span = match (slots.first(), slots.last()) {
+            (Some(f), Some(l)) => (addr(f), addr(l) + l.rows * lay.n * std::mem::size_of::<W>() - addr(f)),
+            _ => (0, 0),
+        };
         let ring = (0..cfg.ring).map(|_| PinnedBuf::new(dev, w)).collect::<std::result::Result<Vec<_>, _>>()?;
         let ring_ev = (0..cfg.ring).map(|_| Event::new(dev)).collect::<std::result::Result<Vec<_>, _>>()?;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -223,7 +233,20 @@ impl<'a, 'e, W: DevWord> PtStore<'a, 'e, W> {
             named: HashMap::new(),
             enc,
             tmp: arena.alloc("pt_store.tmp", lay.nq * lay.n)?,
+            span,
         })
+    }
+
+    /// The slots' device range (first byte address, bytes): every resident plaintext's rows lie inside it (a mirror of
+    /// the store on another device translates addresses by their offset in it).
+    pub fn span(&self) -> (usize, usize) {
+        self.span
+    }
+
+    /// The key whose encoding the slot holding `key` carries (keys of equal values and level share one slot), or None
+    /// when `key` is not in the store.
+    pub fn content_key(&self, key: &PtKey) -> Option<&PtKey> {
+        self.index.get(key).and_then(|&i| self.slots[i].key.as_ref())
     }
 
     pub fn has(&self, key: &PtKey) -> bool {

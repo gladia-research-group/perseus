@@ -842,7 +842,7 @@ fn run(o: &Opts) -> Res<bool> {
     let locks: Vec<&dyn CaptureLock> = dense.last.iter().map(|c| c as &dyn CaptureLock).collect();
     macro_rules! rt {
         () => {
-            Rt { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work, routes: &routes, source: KskSource::Regen, locks: &locks, finish: None, side: None, coeff: None }
+            Rt { ctx: &ctx, ex: &mut ex, sh: &sh, ks: &kplans, ops: &mut ops, work: &mut work, routes: &routes, source: KskSource::Regen, locks: &locks, finish: None, side: None, coeff: None, remote: None }
         };
     }
 

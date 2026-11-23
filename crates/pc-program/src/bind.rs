@@ -317,6 +317,8 @@ pub struct BindEnv<'e, 'a> {
 /// captured graph (replay.rs). One `Bound` per (block, variant).
 pub struct Bound<'a, W: DevWord> {
     pub label: String,
+    /// PC_SCHED2: per step, the device the compiler's two-device schedule chose (1 = the replica lane); all 0 without.
+    pub hint: Vec<u8>,
     /// Own slots (`Bound::new`), or empty for a block bound on a shared `Slab` (swapped in by `with_slab`).
     pub slots: Vec<Ct<'a, W>>,
     /// Scratch for in-place ops without an in-place kernel (copy, then out of place); the slab's while swapped in.
@@ -862,39 +864,58 @@ impl<'a, W: DevWord> Bound<'a, W> {
         // K-batches of products and of refreshes (siblings of one recipe / route; outputs in slots of their own, the
         // refresh route built for K ciphertexts)
         for (oi, op) in p.ops.iter().enumerate() {
-            let m = op.members();
-            let (lo, hi) = (first_step[oi], first_step[oi + 1]);
-            if m.len() < 2 || m.len() > GRID_INPUTS || hi - lo != m.len() || steps[lo..hi].iter().any(|st| st.inplace) {
+            let all = op.members();
+            let (lo0, hi0) = (first_step[oi], first_step[oi + 1]);
+            if all.len() < 2 || hi0 - lo0 != all.len() || steps[lo0..hi0].iter().any(|st| st.inplace) {
                 continue;
             }
-            let ins: Vec<u32> = steps[lo..hi].iter().map(|st| st.a).collect();
-            let bs: Vec<u32> = steps[lo..hi].iter().map(|st| st.b).collect();
-            let outs: Vec<u32> = steps[lo..hi].iter().map(|st| st.out).collect();
-            if outs.iter().enumerate().any(|(c, o)| ins.contains(o) || bs.contains(o) || outs[..c].contains(o)) {
+            // a dense shipped-order refresh batch above `GRID_INPUTS` (the compiler's `bts.k_max` may be larger)
+            // launches as balanced chunks of at most `GRID_INPUTS` (its members are mutually independent), when the
+            // route takes them (`DenseRoute` is built for one ciphertext unless a remote device splits its batches);
+            // any other batch whole or not at all
+            let chunks = if all.len() <= GRID_INPUTS {
+                1
+            } else if matches!(steps[lo0].op, StepOp::Bootstrap { kind: RouteKind::Dense, .. }) {
+                all.len().div_ceil(GRID_INPUTS)
+            } else {
                 continue;
-            }
-            let kind = match (&m[0].kind, &steps[lo].op) {
-                (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs, rs: None },
-                (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![], rs: None },
-                (Kind::MultRescale { square, dbl, .. }, StepOp::MultRescale { .. }) if steps[lo..hi].iter().all(|st| st.op == steps[lo].op) && relin != NONE => UnitKind::Mult { b: if *square { vec![] } else { bs }, rs: Some(*dbl) },
-                (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) if m.len() == PAIR_K && m.iter().all(|x| paired(p, x, p.batch_report.pair)) => {
-                    let StepOp::Bootstrap { route: ry, .. } = steps[lo + 1].op else { continue };
-                    if *kind != RouteKind::StcFirst || routes.get(*kind).is_none() {
-                        continue;
-                    }
-                    UnitKind::Pair { routes: [*route, ry], kind: *kind }
-                }
-                (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) => {
-                    let same = steps[lo..hi].iter().all(|st| matches!(&st.op, StepOp::Bootstrap { route: r, .. } if r == route));
-                    if !same || routes.get(*kind).is_none_or(|r| r.mem().1.k_max < m.len()) {
-                        continue;
-                    }
-                    UnitKind::Refresh { route: *route, kind: *kind }
-                }
-                _ => continue,
             };
-            unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
-            units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind, chain: NONE, off: false });
+            for c in 0..chunks {
+                let (ca, cb) = (c * all.len() / chunks, (c + 1) * all.len() / chunks);
+                let m = &all[ca..cb];
+                let (lo, hi) = (lo0 + ca, lo0 + cb);
+                if m.len() < 2 {
+                    continue;
+                }
+                let ins: Vec<u32> = steps[lo..hi].iter().map(|st| st.a).collect();
+                let bs: Vec<u32> = steps[lo..hi].iter().map(|st| st.b).collect();
+                let outs: Vec<u32> = steps[lo..hi].iter().map(|st| st.out).collect();
+                if outs.iter().enumerate().any(|(c, o)| ins.contains(o) || bs.contains(o) || outs[..c].contains(o)) {
+                    continue;
+                }
+                let kind = match (&m[0].kind, &steps[lo].op) {
+                    (Kind::Mult, StepOp::Mult) if steps[lo..hi].iter().all(|st| st.op == StepOp::Mult) && relin != NONE => UnitKind::Mult { b: bs, rs: None },
+                    (Kind::Square, StepOp::Square) if steps[lo..hi].iter().all(|st| st.op == StepOp::Square) && relin != NONE => UnitKind::Mult { b: vec![], rs: None },
+                    (Kind::MultRescale { square, dbl, .. }, StepOp::MultRescale { .. }) if steps[lo..hi].iter().all(|st| st.op == steps[lo].op) && relin != NONE => UnitKind::Mult { b: if *square { vec![] } else { bs }, rs: Some(*dbl) },
+                    (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) if m.len() == PAIR_K && m.iter().all(|x| paired(p, x, p.batch_report.pair)) => {
+                        let StepOp::Bootstrap { route: ry, .. } = steps[lo + 1].op else { continue };
+                        if *kind != RouteKind::StcFirst || routes.get(*kind).is_none() {
+                            continue;
+                        }
+                        UnitKind::Pair { routes: [*route, ry], kind: *kind }
+                    }
+                    (Kind::Bootstrap(_), StepOp::Bootstrap { route, kind, .. }) => {
+                        let same = steps[lo..hi].iter().all(|st| matches!(&st.op, StepOp::Bootstrap { route: r, .. } if r == route));
+                        if !same || routes.get(*kind).is_none_or(|r| r.mem().1.k_max < m.len()) {
+                            continue;
+                        }
+                        UnitKind::Refresh { route: *route, kind: *kind }
+                    }
+                    _ => continue,
+                };
+                unit_of[lo..hi].iter_mut().for_each(|x| *x = units.len() as u32);
+                units.push(Unit { lo: lo as u32, hi: hi as u32, ins, kind, chain: NONE, off: false });
+            }
         }
         // affine element-wise groups: runs of constant products, negations, constant adds, adds and subs outside the
         // units, cut at every output read outside the run, read twice, by the driver (a block output) or through a
@@ -1062,8 +1083,10 @@ impl<'a, W: DevWord> Bound<'a, W> {
         let plain = plain_slots(&steps, &units, &unit_of, &pre, &finishes, &coeff_sums, &mult_sums, n_slots);
         // a block on its own slots carves no held-chain buffers: those chains issue step by step
         let io = |vs: &[u32]| -> Result<Vec<(String, u32, CtMeta)>> { vs.iter().map(|&v| Ok((p.vars[v as usize].name.clone(), slot_of(v)?, p.vars[v as usize].meta))).collect() };
+        let hint: Vec<u8> = steps.iter().map(|st| p.var_dev.get(st.var as usize).copied().unwrap_or(0)).collect();
         Ok(Bound {
             label: block.to_string(),
+            hint,
             slots,
             tmp,
             gather,
@@ -1191,6 +1214,19 @@ impl<'a, W: DevWord> Bound<'a, W> {
         std::mem::swap(&mut self.gather, &mut slab.gather);
         std::mem::swap(&mut self.held, &mut slab.held);
         r
+    }
+
+    /// Swap `slab`'s slots in (a block bound by `new_shared` holding none) or back out (`with_slab` without the
+    /// closure: the caller swaps back, e.g. the replica lane's binding around a run).
+    pub fn swap_slab(&mut self, slab: &mut Slab<'a, W>) -> Result<()> {
+        if self.slots.is_empty() && (slab.slots.len() < self.n_slots || slab.tmp.is_none() || slab.gather.is_none()) {
+            return Err(berr(&self.label, format!("slab of {} slots, the block needs {}", slab.slots.len(), self.n_slots)));
+        }
+        std::mem::swap(&mut self.slots, &mut slab.slots);
+        std::mem::swap(&mut self.tmp, &mut slab.tmp);
+        std::mem::swap(&mut self.gather, &mut slab.gather);
+        std::mem::swap(&mut self.held, &mut slab.held);
+        Ok(())
     }
 
     /// The steps producing graph name `name` (a var `name` or its `~pre` / `~raw` states).

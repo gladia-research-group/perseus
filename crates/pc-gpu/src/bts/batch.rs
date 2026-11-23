@@ -165,6 +165,86 @@ pub fn put<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc
     ks::ew(ctx, s, ks::Ew::Copy, View::of(&dst.buf, at), View::of(&src.buf, 0), None, ctx.lay.rs_q(top), 1, 2)
 }
 
+/// `put` across devices: single ciphertext `src` (memory of `sd`) into slot `at` of the K-ciphertext buffer `dst`
+/// (memory of `dd`), its live rows of both polynomials, ordered on `s` (a stream of either device).
+///
+/// # Safety
+/// As `DBuf::copy_from_peer`: `s` is ordered after the writes of `src`, which nothing writes during the copy.
+pub unsafe fn put_peer<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, dd: &pc_cuda::Device, at: usize, src: &Ct<'_, W>, sd: &pc_cuda::Device) -> Result<()> {
+    let top = src.top(ctx.shape)?;
+    if src.k() != 1 || at >= dst.buf.buf.len() / ctx.lay.ct_words() || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay || src.buf.seeds || src.buf.packed {
+        return Err(shape("batch put (peer)", format!("ciphertext {at} of a {}-ciphertext buffer", dst.buf.buf.len() / ctx.lay.ct_words())));
+    }
+    for part in 0..2 {
+        let (od, os) = (dst.buf.offset(at, part, 0), src.buf.offset(0, part, 0));
+        dst.buf.buf.copy_from_peer(s, dd, od, &src.buf.buf, sd, os, (top + 1) * ctx.lay.n)?;
+    }
+    Ok(())
+}
+
+/// `put_peer` for a whole batch: every member of `src` (memory of `sd`, its live rows of both polynomials) into
+/// members `0..k` of `dst` (memory of `dd`), with `src`'s member count and metadata, ordered on `s`.
+///
+/// # Safety
+/// As `put_peer`.
+pub unsafe fn put_batch_peer<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, dd: &pc_cuda::Device, src: &Ct<'_, W>, sd: &pc_cuda::Device) -> Result<()> {
+    let top = src.top(ctx.shape)?;
+    let k = src.k();
+    let cap = dst.buf.buf.len() / ctx.lay.ct_words();
+    if k == 0 || k > cap || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay || src.buf.seeds || src.buf.packed || dst.buf.seeds || dst.buf.packed {
+        return Err(shape("batch put (peer)", format!("a {k}-ciphertext batch into a {cap}-ciphertext buffer")));
+    }
+    for c in 0..k {
+        for part in 0..2 {
+            let o = src.buf.offset(c, part, 0);
+            dst.buf.buf.copy_from_peer(s, dd, dst.buf.offset(c, part, 0), &src.buf.buf, sd, o, (top + 1) * ctx.lay.n)?;
+        }
+    }
+    dst.buf.k = k;
+    dst.meta = src.meta;
+    Ok(())
+}
+
+/// `take_peer` for a whole batch: members `0..k` of `src` (memory of `sd`; their live rows at `meta`) into the
+/// `k`-member batch `dst` (memory of `dd`), which lands at `meta`, ordered on `s`.
+///
+/// # Safety
+/// As `take_peer`.
+pub unsafe fn take_batch_peer<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, dd: &pc_cuda::Device, src: &Ct<'_, W>, sd: &pc_cuda::Device, meta: CtMeta) -> Result<()> {
+    let top = pc_shadow::meta::top_limb(ctx.shape, meta.level)? as usize;
+    let k = dst.k();
+    if k == 0 || k != src.k() || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay || dst.buf.seeds || dst.buf.packed {
+        return Err(shape("batch take (peer)", format!("a {}-ciphertext batch into a {k}-ciphertext one", src.k())));
+    }
+    for c in 0..k {
+        for part in 0..2 {
+            let o = src.buf.offset(c, part, 0);
+            dst.buf.buf.copy_from_peer(s, dd, dst.buf.offset(c, part, 0), &src.buf.buf, sd, o, (top + 1) * ctx.lay.n)?;
+        }
+    }
+    dst.meta = meta;
+    Ok(())
+}
+
+/// `take` across devices: ciphertext `at` of the K-ciphertext buffer `src` (memory of `sd`; its live rows at `meta`)
+/// into single ciphertext `dst` (memory of `dd`), which takes `meta`, ordered on `s` (a stream of either device).
+///
+/// # Safety
+/// As `DBuf::copy_from_peer`: `s` is ordered after the writes of `src`, which nothing writes during the copy.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn take_peer<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, dd: &pc_cuda::Device, src: &Ct<'_, W>, sd: &pc_cuda::Device, at: usize, meta: CtMeta) -> Result<()> {
+    let top = pc_shadow::meta::top_limb(ctx.shape, meta.level)? as usize;
+    if dst.k() != 1 || at >= src.k() || src.buf.lay != ctx.lay || dst.buf.lay != ctx.lay || dst.buf.seeds || dst.buf.packed {
+        return Err(shape("batch take (peer)", format!("ciphertext {at} of a {}-ciphertext batch", src.k())));
+    }
+    for part in 0..2 {
+        let (od, os) = (dst.buf.offset(0, part, 0), src.buf.offset(at, part, 0));
+        dst.buf.buf.copy_from_peer(s, dd, od, &src.buf.buf, sd, os, (top + 1) * ctx.lay.n)?;
+    }
+    dst.meta = meta;
+    Ok(())
+}
+
 /// Copy ciphertext `at` of the K-ciphertext buffer `src` (its live rows at `meta`) into single ciphertext `dst`, which
 /// takes `meta` (a scatter), on the compute lane.
 pub fn take<W: DevWord, M: DevStrategy<W>>(ctx: &crate::Context<'_, W, M>, s: &pc_cuda::Stream<Compute>, dst: &mut Ct<'_, W>, src: &Ct<'_, W>, at: usize, meta: CtMeta) -> Result<()> {

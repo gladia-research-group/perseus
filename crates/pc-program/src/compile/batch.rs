@@ -151,6 +151,17 @@ pub enum Schedule {
     Siblings,
 }
 
+/// With a remote refresh device (PC_REMOTE_DEVICE), `pull` also gathers the siblings of dense shipped-order refreshes
+/// (not StC-first): one device runs those one ciphertext at a time, but a remote device splits their batches
+/// (`dense_batch`), so independent chains' refreshes meeting in one batch run half on each device. `PC_PULL_DENSE`:
+/// on by default (faster or equal on every model measured), `0` / `off` = off.
+pub fn pull_dense() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PC_REMOTE_DEVICE").is_ok_and(|v| !v.trim().is_empty()) && !matches!(std::env::var("PC_PULL_DENSE").as_deref().map(str::trim), Ok("0") | Ok("off"))
+    })
+}
+
 /// Ops a sibling may bring forward with it (its unissued ancestors), and how far ahead siblings are looked for.
 const PULL_OPS: usize = 256;
 const PULL_WINDOW: usize = 1024;
@@ -215,7 +226,7 @@ fn pull(p: &mut Program, k_max: usize, cf_free: bool, pair: Option<Pairing>) {
         .map(|o| match &o.kind {
             Kind::RotateSum(_) | Kind::Mult | Kind::Square => key(p, o, None, cf_free, pair),
             Kind::Bootstrap(_) if paired(p, o, pair) => None,
-            Kind::Bootstrap(s) if p.bts_sites[*s as usize].route.slots == 0 && p.bts_sites[*s as usize].route.stc_first => key(p, o, None, cf_free, pair),
+            Kind::Bootstrap(s) if p.bts_sites[*s as usize].route.slots == 0 && (p.bts_sites[*s as usize].route.stc_first || pull_dense()) => key(p, o, None, cf_free, pair),
             _ => None,
         })
         .collect();

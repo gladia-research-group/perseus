@@ -370,6 +370,10 @@ pub struct Program {
     pub batch_report: BatchReport,
     pub accounting: Accounting,
     pub check: CheckReport,
+    /// PC_SCHED2 (`compile::two`): per var, the device the two-device schedule put its op on (1 = the remote
+    /// device's replica lane); empty without the pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub var_dev: Vec<u8>,
 }
 
 /// Ciphertexts a rotation grid reads (pc-gpu `ks::KEY_KMAX`: one inner-product launch serves them all).
