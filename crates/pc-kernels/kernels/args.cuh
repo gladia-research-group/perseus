@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #define PC_KERNELS_ABI 30u
-#define PC_RING_ABI 7u
+#define PC_RING_ABI 8u
 // the ring tables (RingTable) are compiled once per ring size with -DPC_LOGN; everything else is N = 2^16
 #ifndef PC_LOGN
 #define PC_LOGN 16

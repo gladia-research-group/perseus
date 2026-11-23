@@ -5,7 +5,7 @@ use crate::host::{brev, invmod, is_prime, mulmod, powmod, shoup, Rng};
 use crate::{ck, cmp, prime_table, TestResult};
 use pc_kernels::ring::RING_LOG_N;
 use pc_kernels::*;
-use pc_cuda::{Arena, Compute, Device, Event, Stream};
+use pc_cuda::{Compute, Device, Event, Stream};
 
 /// `count` primes p = 1 mod 2n just below 2^bits, largest first.
 fn primes(bits: u32, n: usize, count: usize) -> Vec<u64> {
@@ -120,7 +120,8 @@ pub fn run(dev: &Device, word: RingWord, do_bench: bool) -> (u64, Vec<String>) {
     let wb = word.bytes() as usize;
     let wbits = 8 * wb as u32;
     let pbits = if wb == 4 { 31 } else { 62 };
-    let arena = Arena::new(dev, 3usize << 30).expect("arena");
+    // the checks of every ring size (the bench has its own arenas): peak u32 107, u64 215 MiB
+    let arena = crate::dev::arena(dev, 64 * wb);
     let ctx = Ctx { dev, arena: &arena, s: Stream::<Compute>::new(dev).expect("stream"), wb };
     let mut rng = Rng(0x5eed_0f_a11_5172e ^ wb as u64);
     let (mut grand, mut lines) = (0u64, Vec::new());
@@ -198,14 +199,17 @@ pub fn run(dev: &Device, word: RingWord, do_bench: bool) -> (u64, Vec<String>) {
             println!("[selftest] {name} | {:<44} | {:>9} mismatches of {:>9}", r.name, r.bad, r.total);
         }
         println!("[selftest] {name}: {} checks, {bad} mismatches", res.len());
+        println!("[selftest] {name}: arena used {} of {} MiB", ctx.arena.used_bytes() >> 20, ctx.arena.capacity() >> 20);
         grand += bad;
         if do_bench {
             // the same words per transform batch at every size: 2^16 x 324 (a 108-row chain, 3 ciphertext parts)
             let rows = 324usize << (16 - logn.min(16)) >> logn.saturating_sub(16);
-            let big = ctx.zeros(rows * n);
-            let list: Vec<u32> = (0..rows as u32).collect();
-            let pl: Vec<i32> = (0..rows as i32).map(|i| i % 8).collect();
-            let (bro, brp) = (ctx.up32(&list), ctx.up_i32(&pl));
+            // the batch in its own arena, freed per ring size
+            let barena = crate::dev::exact_arena(dev, &[(rows * n, wb), (rows, 4), (rows, 4)]);
+            let big = ctx.zeros_in(&barena, rows * n, wb);
+            let list: Vec<u64> = (0..rows as u64).collect();
+            let pl: Vec<u64> = (0..rows as u64).map(|i| i % 8).collect();
+            let (bro, brp) = (ctx.up_in(&barena, &list, 4), ctx.up_in(&barena, &pl, 4));
             let a = tb.args(big.p(), &bro, &brp, rows, if logn >= 16 { 128 } else { 0 });
             let (e0, e1) = (Event::timing(dev).expect("event"), Event::timing(dev).expect("event"));
             let reps = 20;

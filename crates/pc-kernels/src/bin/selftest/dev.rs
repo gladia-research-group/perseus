@@ -37,13 +37,30 @@ fn u32_words(len: usize, wb: usize) -> usize {
     (len * wb).div_ceil(4).max(1)
 }
 
+/// The arena of a group of checks, which never frees: `need_mib` MiB (the group's peak plus headroom; the
+/// selftest prints each group's use), or `PC_SELFTEST_ARENA_MIB` when set.
+pub fn arena(dev: &Device, need_mib: usize) -> Arena {
+    let mib = std::env::var("PC_SELFTEST_ARENA_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(need_mib);
+    Arena::new(dev, mib << 20).unwrap_or_else(|e| panic!("selftest arena of {mib} MiB: {e}"))
+}
+
+/// An arena of exactly the buffers `bufs` = (words, word bytes) (alignment included).
+pub fn exact_arena(dev: &Device, bufs: &[(usize, usize)]) -> Arena {
+    let bytes: usize = bufs.iter().map(|&(len, wb)| Arena::bytes_for::<u32>(u32_words(len, wb))).sum();
+    Arena::new(dev, bytes).unwrap_or_else(|e| panic!("selftest arena of {bytes} bytes: {e}"))
+}
+
 impl<'a> Ctx<'a> {
     /// zero-filled buffer of `len` words of the instantiation
     pub fn zeros(&self, len: usize) -> Dev<'a> {
         self.zeros_wb(len, self.wb)
     }
     pub fn zeros_wb(&self, len: usize, wb: usize) -> Dev<'a> {
-        let mut buf = self.arena.alloc::<Compute, u32>("selftest", u32_words(len, wb)).expect("arena");
+        self.zeros_in(self.arena, len, wb)
+    }
+    /// zero-filled buffer carved from another arena (filled on this context's stream)
+    pub fn zeros_in<'b>(&self, arena: &'b Arena, len: usize, wb: usize) -> Dev<'b> {
+        let mut buf = arena.alloc::<Compute, u32>("selftest", u32_words(len, wb)).expect("arena");
         buf.zero(&self.s).expect("zero");
         let ptr = buf.dptr_mut() as *mut c_void;
         Dev { buf, ptr, wb, len }
@@ -52,7 +69,10 @@ impl<'a> Ctx<'a> {
         self.up_wb(data, self.wb)
     }
     pub fn up_wb(&self, data: &[u64], wb: usize) -> Dev<'a> {
-        let mut d = self.zeros_wb(data.len(), wb);
+        self.up_in(self.arena, data, wb)
+    }
+    pub fn up_in<'b>(&self, arena: &'b Arena, data: &[u64], wb: usize) -> Dev<'b> {
+        let mut d = self.zeros_in(arena, data.len(), wb);
         d.write(self, data);
         d
     }

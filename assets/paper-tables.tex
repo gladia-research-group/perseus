@@ -21,7 +21,10 @@
 % GPT-2 decode on the degree-47 EvalMod table (gpt2_decode_ctx512_w*, 2026-11-21, GPU 4 alone, scripts/repro/gpt2_decode_ctx.sh
 % CTX=512 PP=500, 2 rounds: e2e medians 1.554 / 1.554 s, 93 refreshes per token, 12/12 top-1; its 16-token memory run
 % PC_PT_CACHE=0 leaves 31.64 GiB free)
-\newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.86}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.55}
+% Llama-3.1-8B decode on the degree-47 EvalMod windows (llama31_8b_decode_ctx512_w*, 2026-11-23, GPU 3 alone,
+% scripts/repro/llama_decode.sh PP=500, 2 rounds: medians 6.117 / 6.110 s, 12/12 top-1; its 16-token memory run
+% PC_PT_CACHE=0 peaks at 54497 MiB used, both rounds)
+\newcommand{\llamapf}{53.6}\newcommand{\llamadec}{6.11}\newcommand{\gptpf}{6.04}\newcommand{\gptdec}{1.55}
 \newcommand{\vitimg}{17.7}\newcommand{\bertin}{7.36}
 % ResNet-20 on CIFAR-10, the default plan resnet20_folded (scripts/repro/resnet20.sh, 2026-11-18, GPU 3 alone: 2 runs of
 % 64 test images, CUDA graphs, medians 0.320 and 0.322 s, 64/64 argmax agreement with the float64 model; peak used 35.5
@@ -47,7 +50,7 @@
 % the first forward after setup); the decode rows at a short context (the repro scripts' 16 tokens), without the
 % optional position cache (PC_PT_CACHE=0), Llama's and Gemma's the GPU's peak used memory over the run (their runner reports no free
 % memory)
-\newcommand{\llamapfmem}{85.1}\newcommand{\llamadecmem}{52.4}\newcommand{\gptpfmem}{59.3}\newcommand{\gptdecmem}{63.3}
+\newcommand{\llamapfmem}{85.1}\newcommand{\llamadecmem}{53.2}\newcommand{\gptpfmem}{59.3}\newcommand{\gptdecmem}{63.3}
 \newcommand{\vitmem}{68.1}\newcommand{\bertmem}{57.9}
 \newcommand{\oursrow}{\rowcolor{ours}}
 \newcommand{\oc}{\cellcolor{ours}}
