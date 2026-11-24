@@ -30,6 +30,12 @@ pub enum Phase {
     Done,
 }
 
+/// PC_BTS_PHASES=1 (diagnostic): `BtsCall::step` times each phase (device syncs around it) and prints it.
+pub fn bts_phases() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_BTS_PHASES").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Per-call options.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CallOpts {
@@ -240,6 +246,34 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> BtsCall<'r, 'a, W, M> {
 
     /// The next stage in order; returns the phase reached.
     pub fn step(&mut self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>]) -> Result<Phase> {
+        // PC_BTS_PHASES=1 (diagnostic, eager): each phase timed between device syncs, one line per phase
+        if bts_phases() {
+            let name = match self.phase {
+                Phase::Begun if self.st.stc_first => "stcf_input".to_string(),
+                Phase::Begun | Phase::Split => "raise".to_string(),
+                Phase::Raised => "fold".to_string(),
+                Phase::Folded => if self.st.n_cts > 0 { "cts0".to_string() } else { "evalmod".to_string() },
+                Phase::Cts(n) => if n < self.st.n_cts { format!("cts{n}") } else { "evalmod".to_string() },
+                Phase::EvalMod => if self.st.stc_first { "stcf_output".to_string() } else { "stc_enter".to_string() },
+                Phase::Entered => if self.st.n_stc > 0 { "stc0".to_string() } else { "finish".to_string() },
+                Phase::Stc(n) => if n < self.st.n_stc { format!("stc{n}") } else { "finish".to_string() },
+                Phase::Done => "done".to_string(),
+            };
+            let k: usize = cts.iter().map(|x| x.k()).sum();
+            let lvl = cts.first().map_or(0, |x| x.meta.level);
+            cx.ex.join_aux()?;
+            cx.ex.compute.sync()?;
+            let t0 = std::time::Instant::now();
+            let r = self.step_inner(cx, cts);
+            cx.ex.join_aux()?;
+            cx.ex.compute.sync()?;
+            eprintln!("[bts-phase] k {k} slots {} lvl {lvl} {name} {:.3} ms", self.st.slots, t0.elapsed().as_secs_f64() * 1e3);
+            return r;
+        }
+        self.step_inner(cx, cts)
+    }
+
+    fn step_inner(&mut self, cx: &mut BtsCx<'_, 'a, W, M>, cts: &mut [Ct<'a, W>]) -> Result<Phase> {
         match self.phase {
             Phase::Begun if self.st.stc_first => {
                 self.stc_first_input(cx, cts)?;

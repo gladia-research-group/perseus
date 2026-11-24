@@ -145,6 +145,9 @@ pub(crate) struct CcmmRt {
     /// stages, product + merge, output refreshes, shift)
     pub prof: Option<Vec<pc_cuda::Event>>,
     pub last_prof: Option<[f64; 4]>,
+    /// PC_CCMM_PHASES=1 (diagnostic): timing events inside the product (`CcmmTimes`: ring in, CMT, PPMM, CMTs +
+    /// relinearization, ring out), each call's printed
+    pub phases: Option<Vec<pc_cuda::Event>>,
     #[allow(dead_code)]
     lt: Box<pc_cuda::blas::Lt>,
 }
@@ -165,7 +168,8 @@ impl CcmmRt {
         let mono = MonomialTable::<W>::new(arena, s, ctx, NB / KY).map_err(gerr)?;
         let pow2 = Pow2::<W>::new(arena, s, ctx).map_err(gerr)?;
         let prof = if crate::pcmm::finish_profile() { Some((0..5).map(|_| pc_cuda::Event::timing(dev)).collect::<Result<Vec<_>, _>>().map_err(|x| gerr(x.into()))?) } else { None };
-        Ok(CcmmRt { ccmm, a, b, mono, pow2, c_unit: None, nf_ref: 0.0, nf_split: 0.0, kappa: (1.0, 1.0), cf, calls: 0, keygen_s, prof, last_prof: None, lt })
+        let phases = if std::env::var("PC_CCMM_PHASES").is_ok_and(|v| v.trim() == "1") { Some((0..6).map(|_| pc_cuda::Event::timing(dev)).collect::<Result<Vec<_>, _>>().map_err(|x| gerr(x.into()))?) } else { None };
+        Ok(CcmmRt { ccmm, a, b, mono, pow2, c_unit: None, nf_ref: 0.0, nf_split: 0.0, kappa: (1.0, 1.0), cf, calls: 0, keygen_s, prof, last_prof: None, phases, lt })
     }
 
     fn route(&self, drop: u32) -> Route {
@@ -272,7 +276,12 @@ impl CcmmRt {
         }
         self.mark(cx, 1)?;
         let (ctx, s) = (cx.ctx, &cx.ex.compute);
-        self.ccmm.mul_inplace(ctx, s, &mut self.a[..NBIG], &self.b[..NBIG], bt, None).map_err(|e| ctx_err("ccmm mul (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
+        let ph = self.phases.as_ref().map(|v| [&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]]);
+        self.ccmm.mul_inplace(ctx, s, &mut self.a[..NBIG], &self.b[..NBIG], bt, ph).map_err(|e| ctx_err("ccmm mul (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
+        if let Some(ev) = ph {
+            let t = pc_gpu::matmul::ccmm::CcmmTimes::read(ev)?;
+            eprintln!("[ccmm-phases] ring_in {:.3} cmt {:.3} ppmm {:.3} cmt2_relin {:.3} ring_out {:.3} total {:.3} ms", t.ring_in, t.cmt, t.ppmm, t.cmt2_relin, t.ring_out, t.total());
+        }
         let n_out = if g > 1 {
             // group i: a[g i] + X^1024 (a[g i + 1] + X^1024 (...)), innermost first
             for i in 0..NBIG / g {
