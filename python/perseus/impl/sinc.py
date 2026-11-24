@@ -284,6 +284,11 @@ def dup(rt, xs, n=2):
     return [ops.add(x, ops.rotate(x, -16)) for x in xs]
 
 
+# PF_SINC_BI_SPLIT=1: stage_b_inv_merged's masked sums as two half sums (over the first / last half of the merged CCMM
+# outputs) and their sum, so each device can sum its own finish outputs (no level, the same residues)
+BI_SPLIT = __import__("os").environ.get("PF_SINC_BI_SPLIT", "0") not in ("", "0")
+
+
 def stage_b_inv_merged(rt, Ms, wl, vs, site="sinc.bim"):
     """stage_b_inv (hoisted) of the unmerged pairs of the merged CCMM outputs Ms ((e + w o) / 2, wl: w per SinC slot):
     the unmerge's halves ride the stage's masks (no extra level)."""
@@ -298,9 +303,16 @@ def stage_b_inv_merged(rt, Ms, wl, vs, site="sinc.bim"):
     um = [lo, lo / np.asarray(wl)]
     outs = []
     for v in vs:
-        acc = rt.mult_mask_sum(us, [(site, v, o) for o in range(len(us))],
-                               [lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o) * np.roll(um[o % 2], (4 * o - OFFSET) % SLOTS)
-                                for o in range(len(us))])
+        keys = [(site, v, o) for o in range(len(us))]
+        builds = [lambda v=v, o=o: np.roll(_bi_mask(v), 4 * o) * np.roll(um[o % 2], (4 * o - OFFSET) % SLOTS)
+                  for o in range(len(us))]
+        if BI_SPLIT and len(us) % 2 == 0:
+            # the sum over each half of the sources apart (the first / last half of the merged outputs: each device's
+            # own after a split finish), then their sum: the same op count, the same residues (exact mod q)
+            h = len(us) // 2
+            acc = ops.add(rt.mult_mask_sum(us[:h], keys[:h], builds[:h]), rt.mult_mask_sum(us[h:], keys[h:], builds[h:]))
+        else:
+            acc = rt.mult_mask_sum(us, keys, builds)
         outs.append(ops.rotate(acc, 4 * v) if v else acc)
     return outs
 

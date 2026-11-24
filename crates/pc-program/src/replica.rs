@@ -434,7 +434,7 @@ fn place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32>, 
 /// home: where its version was written; an owned output's, the remote device), each input weighted by 1 / its
 /// version's readers (a broadcast value counts little against a block's own); ties stay here. Lane-0 groups (finishes,
 /// split refresh batches, unmovable steps) run here, their owned outputs homed there.
-fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32>, Vec<u32>)], gown: &[Vec<u32>], mv: &[bool], ns: usize) -> Vec<u8> {
+fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32>, Vec<u32>)], gc: &[f64], gown: &[Vec<u32>], mv: &[bool], ns: usize) -> Vec<u8> {
     // readers per slot version (a version = the group that wrote it, or the block's input: usize::MAX)
     let mut writer: Vec<usize> = vec![usize::MAX; ns];
     let mut readers: std::collections::HashMap<(u32, usize), u32> = std::collections::HashMap::new();
@@ -497,8 +497,15 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
     }
     let mut home: Vec<u8> = vec![0; ns];
     let mut on = vec![0u8; gs.len()];
+    // PC_REPLICA_TIE=load: the owner-computes work placed per device since the region's start (a tie goes to the
+    // lighter device)
+    let tie_load = tie_load();
+    let mut load = [0.0f64; 2];
     for (k, &(lo, _)) in gs.iter().enumerate() {
         let (reads, writes) = &grw[k];
+        if b.dynamic.contains(&(lo as u32)) {
+            load = [0.0; 2];
+        }
         let d = if mv[k] && !b.dynamic.contains(&(lo as u32)) && gown[k].is_empty() {
             let mut score = [0.0f64; 2];
             let mut bcast = !reads.is_empty();
@@ -509,18 +516,31 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
             }
             if score[1] > score[0] {
                 1
+            } else if tie_load && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
+                // inputs from both devices in equal parts: the lighter device so far
+                (load[1] < load[0]) as u8
             } else {
                 (ctown && bcast && sink[k] == 2 && !matches!(b.steps[lo].op, StepOp::Bootstrap { .. })) as u8
             }
         } else {
             0
         };
+        if mv[k] {
+            load[d as usize] += gc[k];
+        }
         on[k] = d;
         for &s in writes {
             home[s as usize] = if gown[k].contains(&s) || member1[k].contains(&s) { 1 } else { d };
         }
     }
     on
+}
+
+/// PC_REPLICA_TIE=load (with the owner-computes placement; default off until an A/B wins): a group reading as much
+/// from each device goes to the device with less owner-computes work so far in the region (else it stays here).
+pub fn tie_load() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("load")))
 }
 
 /// PC_REPLICA_CTOWN's broadcast: an input read by at least this many groups counts as shared by both devices.
@@ -633,7 +653,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
     let hinted = !force_all && hinted(b);
     let owner_on = (pm > 0 && pm < 4 && !force_all && !hinted).then(|| {
         let mv: Vec<bool> = gs.iter().map(|&(lo, _)| movable(b, lo, holds, pt_ok)).collect();
-        owner_place(b, &gs, &grw, &gown, &mv, ns)
+        owner_place(b, &gs, &grw, &gc, &gown, &mv, ns)
     });
     let (mut hint_ms, mut hint) = (0.0, false);
     let (mut on, base, mut best) = if hinted {
