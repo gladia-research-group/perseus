@@ -4050,7 +4050,8 @@ impl Replayer {
                             failed = Some(e)
                         }
                         (Err(e), None) => {
-                            oom = is_oom(&e);
+                            // a graph over the launch limit (pc_cuda::stream::graph_node_cap) runs eager too
+                            oom = is_oom(&e) || matches!(e, pc_cuda::Error::GraphTooLarge { .. });
                             failed = Some(e.into())
                         }
                         (Ok((exec, ())), None) => items.push(Item::Graph(exec)),
@@ -4135,7 +4136,7 @@ impl Replayer {
                 self.eager_only.insert(b.label.clone());
                 self.stats.graph_oom += 1;
                 self.stats.eager += 1;
-                eprintln!("[replay] {}: graph capture out of device memory, the block runs eager", b.label);
+                eprintln!("[replay] {}: graph not captured ({e}), the block runs eager", b.label);
                 info.served = Served::Eager;
                 return Ok(info);
             }
@@ -4152,8 +4153,9 @@ impl Replayer {
             let free = pc_cuda::device::mem_info_current().map(|m| m.0 as f64 / 1e9).unwrap_or(-1.0);
             let (cu, ct) = rt.ops.ring.leased_units();
             let (su, stt) = rt.side.as_deref().map_or((0, 0), |s| s.ops.ring.leased_units());
-            eprintln!("[replay] {}: captured {} graphs, {:.0} ms, constants {} + {} side (leased units {cu} / {ct}, side {su} / {stt}), device free {free:.2} GB",
-                b.label, items.iter().filter(|i| matches!(i, Item::Graph(_))).count(), capture_ms, lease.len(), side_lease.len());
+            let nodes: Vec<usize> = items.iter().filter_map(|i| if let Item::Graph(g) = i { Some(g.nodes()) } else { None }).collect();
+            eprintln!("[replay] {}: captured {} graphs ({} nodes, largest {}), {:.0} ms, constants {} + {} side (leased units {cu} / {ct}, side {su} / {stt}), device free {free:.2} GB",
+                b.label, nodes.len(), nodes.iter().sum::<usize>(), nodes.iter().max().copied().unwrap_or(0), capture_ms, lease.len(), side_lease.len());
         }
         self.stats.captures += 1;
         self.stats.capture_ms += capture_ms;

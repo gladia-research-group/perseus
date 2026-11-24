@@ -53,6 +53,7 @@ extern "C" {
     pub fn cudaGraphLaunch(e: cudaGraphExec_t, s: cudaStream_t) -> cudaError_t;
     pub fn cudaGraphExecDestroy(e: cudaGraphExec_t) -> cudaError_t;
     pub fn cudaGraphDestroy(g: cudaGraph_t) -> cudaError_t;
+    pub fn cudaGraphGetNodes(g: cudaGraph_t, nodes: *mut *mut c_void, n: *mut usize) -> cudaError_t;
     pub fn cudaProfilerStart() -> cudaError_t;
     pub fn cudaProfilerStop() -> cudaError_t;
 }
