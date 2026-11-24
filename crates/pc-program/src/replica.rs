@@ -550,7 +550,7 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
             } else if tie_load && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
                 // inputs from both devices in equal parts: the lighter device so far
                 (load[1] < load[0]) as u8
-            } else if tie_alt && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] && halves_sum(k) {
+            } else if tie_alt && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] && (tie_alt_all() || halves_sum(k)) {
                 // the sum of two masked half sums, one from each device (a split stage's outputs): the devices in turn
                 toggle ^= 1;
                 1 - toggle
@@ -584,10 +584,16 @@ pub fn input_split() -> bool {
     *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_INPUT_SPLIT").as_deref().map(str::trim), Ok("1") | Ok("on")))
 }
 
+/// PC_REPLICA_TIE=altall: every such tie alternates (not only a sum of two product-sum chains).
+fn tie_alt_all() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("altall")))
+}
+
 /// PC_REPLICA_TIE=alt: such ties go to the two devices in turn (this device first).
 pub fn tie_alt() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("alt")))
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("alt") | Ok("altall")))
 }
 
 /// PC_REPLICA_CTOWN's broadcast: an input read by at least this many groups counts as shared by both devices.
