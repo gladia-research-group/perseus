@@ -69,6 +69,19 @@ pub(crate) struct PtMirror {
     /// keys left unmirrored (not resolved in the store's slots on the session's device), and why (first example each)
     pub left: std::collections::HashSet<pc_gpu::pt_store::PtKey>,
     pub why: std::collections::BTreeMap<&'static str, (usize, String)>,
+    /// PC_PT_MIRROR_ASYNC: the session stream's event the copies wait for (session device), the copies' event (this
+    /// device; the replica stream waits for it, the session stream after the block), whether one is unwaited there
+    pub ev_in: Option<Event>,
+    pub ev_out: Option<Event>,
+    pub pending: bool,
+}
+
+/// PC_PT_MIRROR_ASYNC=1 (default off): the plaintext mirror's copies ordered by events (after the session stream's
+/// staging; the replica stream after them; the session stream after them once the block is issued) instead of the
+/// host waiting for the session's stream before and for the copies after.
+pub(crate) fn pt_mirror_async() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_PT_MIRROR_ASYNC").is_ok_and(|v| v.trim() == "1"))
 }
 
 pub(crate) struct ReplicaDev {
@@ -162,6 +175,8 @@ impl RemoteDev {
         let Some(rp) = self.replica.as_mut() else { return Ok(()) };
         let Some(m) = rp.pts.as_mut() else { return Ok(()) };
         let Some(rb) = rp.bounds.get_mut(idx) else { return Ok(()) };
+        let rex = &rp.ex;
+        let asy = pt_mirror_async();
         let mut copied = false;
         let wb = std::mem::size_of::<W>();
         let pool_bytes = m.pool.len() * wb;
@@ -210,7 +225,21 @@ impl RemoteDev {
                     continue;
                 };
                 if m.owner.get(&off) != Some(ck) {
-                    if !copied {
+                    if !copied && asy {
+                        // the copies after the session stream's staging (and the previous block, whose replica work
+                        // it joined: the mirror's old content read): an event of it, waited on by this device's stream
+                        here.make_current().map_err(ce)?;
+                        if m.ev_in.is_none() {
+                            m.ev_in = Some(Event::new(here).map_err(ce)?);
+                        }
+                        let ei = m.ev_in.as_ref().ok_or_else(|| e(pc_gpu::Error::Shape { what: "pt mirror", msg: "no event".into() }))?;
+                        ei.record(here_s).map_err(ce)?;
+                        self.device.make_current().map_err(ce)?;
+                        if m.ev_out.is_none() {
+                            m.ev_out = Some(Event::new(&self.device).map_err(ce)?);
+                        }
+                        self.ex.compute.wait(ei).map_err(ce)?;
+                    } else if !copied {
                         // the session's staging of these rows done before the copy reads them (synchronized from its
                         // own device: a stream is synchronized in its device's context)
                         here.make_current().map_err(ce)?;
@@ -229,7 +258,14 @@ impl RemoteDev {
                 bp.rows = m.pool.vptr().wrapping_byte_add(off);
                 bp.meta = mp.meta;
             }
-            if copied {
+            if copied && asy {
+                // the replica's steps after the copies; the session stream waits for them after this block
+                // (`replica_pts_done`: its next staging overwrites the rows read here)
+                let eo = m.ev_out.as_ref().ok_or_else(|| e(pc_gpu::Error::Shape { what: "pt mirror", msg: "no event".into() }))?;
+                eo.record(&self.ex.compute).map_err(ce)?;
+                rex.compute.wait(eo).map_err(ce)?;
+                m.pending = true;
+            } else if copied {
                 self.ex.compute.sync().map_err(ce)?;
             }
             Ok(())
@@ -237,6 +273,18 @@ impl RemoteDev {
         let back = self._back.0.make_current().map_err(|x| e(x.into()));
         r?;
         back
+    }
+
+    /// PC_PT_MIRROR_ASYNC: the session stream `here_s` (current device) after the last block's mirror copies (issued
+    /// after the block: the copies ran long before), so its next staging cannot overwrite rows they read.
+    pub(crate) fn replica_pts_done(&mut self, here_s: &Stream<Compute>) -> PyResult<()> {
+        if let Some(m) = self.replica.as_mut().and_then(|rp| rp.pts.as_mut()).filter(|m| m.pending) {
+            if let Some(eo) = m.ev_out.as_ref() {
+                here_s.wait(eo).map_err(|x| gerr(x.into()))?;
+            }
+            m.pending = false;
+        }
+        Ok(())
     }
 
     pub(crate) fn freeze(&self) {
@@ -475,7 +523,7 @@ impl RemoteDev {
                     None
                 };
                 let pts = match rs.pt_span {
-                    Some((base, bytes)) => Some(PtMirror { pool: a.alloc("replica.pts", bytes.div_ceil(std::mem::size_of::<W>())).map_err(ce)?, base, owner: std::collections::HashMap::new(), copies: 0, left: std::collections::HashSet::new(), why: Default::default() }),
+                    Some((base, bytes)) => Some(PtMirror { pool: a.alloc("replica.pts", bytes.div_ceil(std::mem::size_of::<W>())).map_err(ce)?, base, owner: std::collections::HashMap::new(), copies: 0, left: std::collections::HashSet::new(), why: Default::default(), ev_in: None, ev_out: None, pending: false }),
                     None => None,
                 };
                 rx.compute.sync().map_err(ce)?;
