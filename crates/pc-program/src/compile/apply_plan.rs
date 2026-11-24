@@ -44,6 +44,9 @@ struct Lower<'a> {
     deliberate_outs: BTreeSet<String>,
     /// the route the capture recorded for the deliberate refresh being lowered (`RKind::Deliberate::slots`)
     captured_slots: Option<u32>,
+    /// that refresh is `bootstrap_real`'s; PC_SHRINK_DELIB moved it off the real-payload route
+    captured_real: bool,
+    shrunk_real: bool,
 }
 
 impl<'a> Lower<'a> {
@@ -118,8 +121,12 @@ impl<'a> Lower<'a> {
             // PC_SHRINK_DELIB=1: a code refresh of a real payload (`bootstrap_real`: the softmax's last reciprocal)
             // shrinks as a planned one does, landing where the capture recorded it (a complex one may pack two values
             // of other periods: a refresh pair)
-            if captured.is_some() && route.real && std::env::var("PC_SHRINK_DELIB").is_ok_and(|v| v.trim() == "1") {
-                route = self.shrink_periodic(name, &in_meta, route);
+            if captured.is_some() && self.captured_real && std::env::var("PC_SHRINK_DELIB").is_ok_and(|v| v.trim() == "1") {
+                let r = self.shrink_periodic(name, &in_meta, pc_shadow::Route { real: true, ..route });
+                if r.slots != route.slots {
+                    route = r;
+                    self.shrunk_real = true;
+                }
             }
         }
         let realize = match kind {
@@ -296,6 +303,8 @@ pub fn lower(
         check: CheckReport::default(),
         deliberate_outs: BTreeSet::new(),
         captured_slots: None,
+        captured_real: false,
+        shrunk_real: false,
     };
     let mut inputs = vec![];
     for name in &r.inputs {
@@ -400,8 +409,11 @@ pub fn lower(
                     lw.deliberate_outs.insert(out.clone());
                     lw.cur.insert(out.clone(), ins[0]);
                     lw.captured_slots = *slots;
+                    lw.captured_real = *real && lw.env.real_enabled;
+                    lw.shrunk_real = false;
                     lw.refresh(&out, &out, SiteKind::Deliberate, origin.clone(), Some(Landing { level: *level, deg: *deg }))?;
-                    if *real && lw.env.real_enabled {
+                    lw.captured_real = false;
+                    if *real && lw.env.real_enabled && !lw.shrunk_real {
                         // `bootstrap_real` (v2 args.route.real): the real-payload chain on the same route family
                         // (the perseus wrapper's set_real_payload scope; the landing is the same)
                         if let Some(s) = lw.sites.last_mut() {
