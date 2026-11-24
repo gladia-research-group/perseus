@@ -224,15 +224,22 @@ Gemma-2-2B text encoder and both SANA-Sprint steps, and the client decodes the i
 \end{tbl}
 
 % Two GPUs (PC_REMOTE_DEVICE; GPUs 4+5 alone, PCIe Gen5 on one switch, no NVLink): scripts/repro/* with and without
-% REMOTE=5, Gemma by PERSEUS_DECODER=gemma2_2b llama run_prefill; 1, 2, 2, 1 GPUs per model (both orders), medians of
-% 3 timed forwards; the table takes the mean of the two runs per configuration (2026-11-23, rebased on main 04acedad).
-% Speedups from the unrounded means: Llama 52.58 / 30.12, Gemma 29.585 / 19.24, GPT-2 5.89 / 4.22, ViT 17.40 / 13.18,
-% BERT 7.215 / 5.005.
-\newcommand{\tgllamaone}{52.6}\newcommand{\tgllamatwo}{30.1}\newcommand{\tgllamax}{1.75}
-\newcommand{\tggemmaone}{29.6}\newcommand{\tggemmatwo}{19.2}\newcommand{\tggemmax}{1.54}
-\newcommand{\tggptone}{5.89}\newcommand{\tggpttwo}{4.22}\newcommand{\tggptx}{1.40}
-\newcommand{\tgvitone}{17.4}\newcommand{\tgvittwo}{13.2}\newcommand{\tgvitx}{1.32}
-\newcommand{\tgbertone}{7.22}\newcommand{\tgberttwo}{5.01}\newcommand{\tgbertx}{1.44}
+% REMOTE=5, Gemma by PERSEUS_DECODER=gemma2_2b llama run_prefill, the Whisper encoder by whisper.run_encoder (4 clips,
+% graphs; the median of clips 2-4), SANA by the CLI with two prompts in one process (the warm second image); 1, 2, 2, 1
+% GPUs per model (both orders), medians of 3 timed forwards (ResNet: of the 63 images after the capturing one); the table
+% takes the mean of the two runs per configuration (2026-11-24, on main d1728ff6). Speedups from the unrounded means:
+% Llama 52.28 / 29.035, Gemma 29.525 / 18.13, GPT-2 5.89 / 3.86, ViT 17.395 / 10.88, BERT 7.215 / 4.58, Whisper 19.15 /
+% 13.57, SANA 266 / 185, ResNet 0.3215 / 0.3225. Outputs: GPT-2 --check and Llama / Gemma top-1, BERT agree, ViT 4/4,
+% ResNet 64/64 with the float64 model, SANA's two-GPU images 44-52 dB from the one-GPU image (encryption noise alone
+% gives 41-52 dB between runs).
+\newcommand{\tgllamaone}{52.3}\newcommand{\tgllamatwo}{29.0}\newcommand{\tgllamax}{1.80}
+\newcommand{\tggemmaone}{29.5}\newcommand{\tggemmatwo}{18.1}\newcommand{\tggemmax}{1.63}
+\newcommand{\tggptone}{5.89}\newcommand{\tggpttwo}{3.86}\newcommand{\tggptx}{1.53}
+\newcommand{\tgvitone}{17.4}\newcommand{\tgvittwo}{10.9}\newcommand{\tgvitx}{1.60}
+\newcommand{\tgbertone}{7.22}\newcommand{\tgberttwo}{4.58}\newcommand{\tgbertx}{1.58}
+\newcommand{\tgwhisperone}{19.2}\newcommand{\tgwhispertwo}{13.6}\newcommand{\tgwhisperx}{1.41}
+\newcommand{\tgsanaone}{266}\newcommand{\tgsanatwo}{185}\newcommand{\tgsanax}{1.44}
+\newcommand{\tgresnetone}{0.322}\newcommand{\tgresnettwo}{0.323}\newcommand{\tgresnetx}{1.00}
 \begin{tbl}
 \renewcommand{\arraystretch}{1.3}\setlength{\aboverulesep}{0pt}\setlength{\belowrulesep}{0pt}\setlength{\extrarowheight}{2pt}
 \begin{tabularx}{\linewidth}{lL{1}rPr}
@@ -244,12 +251,17 @@ Gemma-2-2B & prefill, 128-token prompt & \tggemmaone\ s & \textbf{\tggemmatwo\ s
 GPT-2 small & prefill, 128-token prompt & \tggptone\ s & \textbf{\tggpttwo\ s} & \tggptx$\times$ \\
 ViT-B/16 & one $224\times224$ image & \tgvitone\ s & \textbf{\tgvittwo\ s} & \tgvitx$\times$ \\
 BERT-base & 128-token input & \tgbertone\ s & \textbf{\tgberttwo\ s} & \tgbertx$\times$ \\
+Whisper base.en & encoder, one 10-s audio window & \tgwhisperone\ s & \textbf{\tgwhispertwo\ s} & \tgwhisperx$\times$ \\
+SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \tgsanaone\ s & \textbf{\tgsanatwo\ s} & \tgsanax$\times$ \\
+ResNet-20 & one $32\times32$ CIFAR-10 image & \tgresnetone\ s & \tgresnettwo\ s & \tgresnetx$\times$ \\
 \bottomrule
 \end{tabularx}
 \tcap{Encrypted end to end on one and on two NVIDIA RTX PRO 6000 over PCIe Gen5 (no NVLink), 128-bit security, with the
 same plans and outputs; both columns are measured side by side. The second GPU holds half of every linear layer's weights
 and computes half of its outputs, half of the attention heads, half of the refreshes and its share of the element-wise
-work, and the copies between the GPUs run on copy engines next to the compute. Decode stays on one GPU.}
+work, and Llama's and Gemma's attention products are split between the GPUs too. The copies between the GPUs run on
+copy engines next to the compute. ResNet-20 is one chain of dependent refreshes, so it gains nothing from the second
+GPU. Decode stays on one GPU.}
 \end{tbl}
 
 % Two-GPU scaling on the same models and inputs: Cerium arXiv 2512.11269v2 Table 1 (DGX A100 / H100 / B200, SXM), Sylph
