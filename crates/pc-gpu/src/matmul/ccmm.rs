@@ -829,7 +829,12 @@ unsafe fn pull_cols(s: &Stream<Compute>, dst: &mut DBuf<'_, Compute, u32>, dd: &
     for &part in parts {
         for i in 0..NQ {
             let off = ((part * NQ + i) * D + cols.start) * NS;
-            dst.copy_from_peer(s, dd, off, src, sd, off, cols.len() * NS)?;
+            if dd.is_host() {
+                // the host device (both shares on it: the host twin's check)
+                dst.copy_from_at(s, off, src, off, cols.len() * NS)?;
+            } else {
+                dst.copy_from_peer(s, dd, off, src, sd, off, cols.len() * NS)?;
+            }
         }
     }
     Ok(())

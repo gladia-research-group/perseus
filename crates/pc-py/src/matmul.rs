@@ -232,7 +232,27 @@ impl CcmmRt {
         let split = op_split && pc_program::replay::ccmm_split() && g <= NBIG / 2 && far.as_deref().is_some_and(|r| r.ccmm_split_on()) && uni(&self.a) && uni(&self.b);
         let mut op_far = false;
         let mut op_stash: Vec<(usize, CtMeta, [Vec<W>; 2])> = vec![];
-        for (side, (xs, f)) in [(&mut self.a, fa), (&mut self.b, fb)].into_iter().enumerate() {
+        if split {
+            // both sides' remote halves first (the remote device converts them back to back, without waiting for this
+            // device's conversions), then both local halves
+            let h = NBIG / 2;
+            let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
+            for (side, (xs, f)) in [(&mut self.a, fa), (&mut self.b, fb)].into_iter().enumerate() {
+                let m0 = xs[0].meta;
+                if check {
+                    for (j, x) in xs[h..NBIG].iter().enumerate() {
+                        op_stash.push((side * NBIG + h + j, x.meta, download_one(cx, x)?));
+                    }
+                }
+                fr.ccmm_operands_far(&cx.ex.compute, cx.sh, side, &mut xs[h..NBIG], &hi(f), check).map_err(|e| ctx_err("remote operand stc_high (kept)", &[m0], e))?;
+            }
+            op_far = true;
+            for (xs, f) in [(&mut self.a, fa), (&mut self.b, fb)] {
+                let m0 = xs[0].meta;
+                Staged::stc_high(route, cx, &mut xs[..h], &hi(f)).map_err(|e| ctx_err("operand stc_high", &[m0], e))?;
+            }
+        }
+        for (side, (xs, f)) in [(&mut self.a, fa), (&mut self.b, fb)].into_iter().enumerate().filter(|_| !split) {
             let m0 = xs[0].meta;
             if xs[..NBIG].iter().all(|x| x.meta.nf == m0.nf && x.meta.level == m0.level && x.meta.deg == m0.deg) {
                 let h = if op_split { NBIG / 2 } else { NBIG };
@@ -243,11 +263,7 @@ impl CcmmRt {
                         }
                     }
                     let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
-                    if split {
-                        fr.ccmm_operands_far(&cx.ex.compute, cx.sh, side, &mut xs[h..NBIG], &hi(f), check).map_err(|e| ctx_err("remote operand stc_high (kept)", &[m0], e))?;
-                    } else {
-                        fr.stc_high_far(&cx.ex.compute, cx.sh, &mut xs[h..NBIG], &hi(f)).map_err(|e| ctx_err("remote operand stc_high", &[m0], e))?;
-                    }
+                    fr.stc_high_far(&cx.ex.compute, cx.sh, &mut xs[h..NBIG], &hi(f)).map_err(|e| ctx_err("remote operand stc_high", &[m0], e))?;
                     op_far = true;
                 }
                 Staged::stc_high(route, cx, &mut xs[..h], &hi(f)).map_err(|e| ctx_err("operand stc_high", &[m0], e))?;

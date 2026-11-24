@@ -552,8 +552,9 @@ fn check(args: &[String]) -> Res<bool> {
     if args.iter().any(|a| a == "--split") {
         let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(10);
         cc.enable_split(&lt.inner, &dev, s)?;
-        let dev1 = Device::open_ordinal(1)?;
-        let peer = (dev.enable_peer(&dev1)?, dev1.enable_peer(&dev)?);
+        // the host device (PERSEUS_DEVICE=cpu): both shares on it, two engines (the host twin's batch ranges)
+        let dev1 = if dev.is_host() { Device::open_host() } else { Device::open_ordinal(1)? };
+        let peer = if dev.is_host() { (false, false) } else { (dev.enable_peer(&dev1)?, dev1.enable_peer(&dev)?) };
         dev1.make_current()?;
         let mut mp1 = MemPlan::build::<W, M>(&chain, MemCfg { k_max: 1, pool: vec![], events: 8, scratch_cts: 1 })?;
         mp1.reserve("ccmm", Ccmm::<W>::bytes(&ccfg));
@@ -586,7 +587,7 @@ fn check(args: &[String]) -> Res<bool> {
             Ok(())
         };
         // the link: 16.7 MB (a CCMM half column set) one way, then both ways at once (each device pulls)
-        {
+        if !dev.is_host() {
             let n = 4 * D * NS / 2 * 2;
             let (e0, e1) = (Event::timing(&dev)?, Event::timing(&dev)?);
             dev1.make_current()?;
