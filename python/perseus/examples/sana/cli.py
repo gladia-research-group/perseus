@@ -414,6 +414,8 @@ def main(argv=None):
                     "CUDA_VISIBLE_DEVICES, else 0)")
     ap.add_argument("--wait", action="store_true", help="wait for the GPU to be free instead of refusing")
     ap.add_argument("--no-save-programs", action="store_true", help="do not keep compiled programs in the plan")
+    ap.add_argument("--work-dir", default=None, help="the session's work directory (default: $SANA_SCRATCH/cli_work/"
+                    "<plan>, shared by every launch of the plan; give concurrent launches their own)")
     ap.add_argument("--no-record-cache", action="store_true", help="record on the CPU twin even when a saved record "
                     "matches, and do not save one")
     ap.add_argument("--list", action="store_true", help="the plans and their measurements")
@@ -434,6 +436,9 @@ def main(argv=None):
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+    # 4x the driver's launch queues (~1022 -> 4094 pending launches per device): the eager two-GPU issue fills one
+    # device while the other drains (11-24 ABBA: -6.6 % on 2 GPUs, 1 GPU unchanged)
+    os.environ.setdefault("CUDA_SCALE_LAUNCH_QUEUES", "4x")
     os.environ["SANA_RES"] = str(a.res)
     plan = None if a.float_only else pick_plan(a.plan, a.steps, a.res)
     if plan is not None:
@@ -482,8 +487,8 @@ def main(argv=None):
                 T.say(f"  ! this plan is cut for {plan['n_tok']}-token prompts; {prompt!r} has {lay.n_tok} ("
                       + " | ".join(tok.decode([int(t)]) for t in ids) + f"). Rephrase it to {plan['n_tok']} tokens.")
                 return 2
-        work = Path(hf.scratch("cli_work", plan["name"]))
-        cache = None if a.no_record_cache else Path(hf.scratch("cli_record", plan["name"]))
+        work = Path(a.work_dir) if a.work_dir else Path(hf.scratch("cli_work", plan["name"]))
+        cache = None if a.no_record_cache else Path(os.environ.get("SANA_RECORD_DIR") or hf.scratch("cli_record", plan["name"]))
         enc = Encrypted(plan, a.device, work, T, a.wait, not a.no_save_programs, cache)
         T.say("warming up (once per process): ...")
         enc.warm_up()

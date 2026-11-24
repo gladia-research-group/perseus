@@ -571,6 +571,14 @@ pub(crate) fn finish_balance() -> bool {
     })
 }
 
+/// `PC_PER_INPUT_FAR` (with the finish split; on by default, `0` / `off` off): a linear whose inputs sit at several
+/// scales (`linear_per_input`) sends its last finish groups to the remote device too, as the uniform path does
+/// (SANA 2 GPUs: -6.9 % per image, ABBA 11-24).
+pub(crate) fn per_input_far() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pc_program::replay::default_on("PC_PER_INPUT_FAR"))
+}
+
 /// `PC_FINISH_PROFILE=1` (eager runs only: it waits for each finish): per PCMM / CCMM finish, a `[finprof]` line with
 /// the device time of its phases (inputs' StC stages, the product, the output refreshes).
 pub(crate) fn finish_profile() -> bool {
@@ -671,9 +679,14 @@ impl<'r> FinishExec<'static, W, M> for PcmmExec<'r> {
                 },
             }
         } else {
+            // PC_PER_INPUT_FAR=1: the finish groups' offload (the uniform path's far groups) here too
+            let mut far = remote.filter(|r| per_input_far() && remote_finish() && r.has_finish()).map(|lane| pc_program::replay::FarGroups { lane, n_far });
+            let off = far.as_mut().map(|x| x as &mut dyn pc_gpu::matmul::pcmm::GroupOffload<'static, W, M>);
+            let all: Vec<usize> = (0..lin.shape.n_out).collect();
             match &sv.joint {
                 // a joint linear's inputs at several scales: both halves here (this device holds both planes)
-                Some((h, fo, bh, bf)) => pc_gpu::matmul::pcmm::linear_per_input_parts(cx, self.route, pcmm, lin, &[(&bufs[*bh].buf, h.as_slice()), (&bufs[*bf].buf, fo.as_slice())], &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts),
+                Some((h, fo, bh, bf)) => pc_gpu::matmul::pcmm::linear_per_input_off(cx, self.route, pcmm, lin, &[(&bufs[*bh].buf, h.as_slice()), (&bufs[*bf].buf, fo.as_slice())], &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts, off),
+                None if off.is_some() => pc_gpu::matmul::pcmm::linear_per_input_off(cx, self.route, pcmm, lin, &[(w, all.as_slice())], &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts, off),
                 None => linear_per_input(cx, self.route, pcmm, lin, w, &mut ins[..d.n_in], &mut outs[..groups.len()], &groups, &gd, *opts),
             }
         };

@@ -952,6 +952,10 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         r.release(ex, f).map_err(perr)?;
     }
     let ev1: u64 = locks.iter().map(|l| l.evictions()).sum();
+    // PC_PT_MIRROR_ASYNC: the session stream after this block's mirror copies (before its next staging)
+    if let Some(r) = remote.as_mut() {
+        r.replica_pts_done(&ex.compute)?;
+    }
     stats.runs += 1;
     stats.host_us += info.host_us;
     stats.launch_us += info.launch_us;

@@ -1008,6 +1008,14 @@ pub fn linear_per_input<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a
 /// times the inputs into its outputs; the parts cover the outputs once (a joint linear's two halves, both here).
 #[allow(clippy::too_many_arguments)]
 pub fn linear_per_input_parts<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, parts: &[(&DBuf<'_, Compute, u8>, &[usize])], ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts) -> Result<()> {
+    linear_per_input_off(cx, route, pcmm, lin, parts, ins, outs, groups, drops, opts, None)
+}
+
+/// `linear_per_input_parts` with the finish groups' offload (`linear`'s: the last `off.far` groups refreshed on the
+/// other device, issued before this device's groups, joined after them). The inputs' StC-first stages stay here
+/// (each input its own call).
+#[allow(clippy::too_many_arguments)]
+pub fn linear_per_input_off<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, parts: &[(&DBuf<'_, Compute, u8>, &[usize])], ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts, off: Option<&mut dyn GroupOffload<'a, W, M>>) -> Result<()> {
     let sh = lin.shape;
     let mut out_map = vec![(usize::MAX, 0); sh.n_out];
     for (g, ms) in groups.iter().enumerate() {
@@ -1043,12 +1051,62 @@ pub fn linear_per_input_parts<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<
         let map: Vec<(usize, usize)> = po.iter().map(|&m| out_map[m]).collect();
         pcmm.product(cx.ctx, &cx.ex.compute, &sub, planes, ins, outs, &map, nf_out, None)?;
     }
+    let mut off = off.filter(|_| drops.len() >= 2);
+    let Some(o) = off.as_deref_mut() else {
+        for (g, &dr) in drops.iter().enumerate() {
+            let mut fin = inp.finish_call(dr)?;
+            fin.at_split(cx, &outs[g..g + 1])?;
+            fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+            if lin.shift > 0 {
+                pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
+            }
+        }
+        return Ok(());
+    };
+    // the last groups on the offload device, issued first (they start as soon as the product is done)
+    let mut calls = Vec::with_capacity(drops.len());
     for (g, &dr) in drops.iter().enumerate() {
         let mut fin = inp.finish_call(dr)?;
         fin.at_split(cx, &outs[g..g + 1])?;
+        calls.push(fin);
+    }
+    let n_far = o.far(calls.len()).min(calls.len());
+    let n_here = calls.len() - n_far;
+    let check = o.check();
+    let mut stash: Vec<(CtMeta, Vec<[Vec<W>; 2]>)> = Vec::new();
+    for g in n_here..calls.len() {
+        if check {
+            stash.push((outs[g].meta, download_members(cx, &outs[g])?));
+        }
+        o.issue(&cx.ex.compute, cx.sh, &calls[g], &mut outs[g])?;
+    }
+    for (g, fin) in calls[..n_here].iter_mut().enumerate() {
         fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
-        if lin.shift > 0 {
-            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
+    }
+    if n_far > 0 {
+        o.join(&cx.ex.compute)?;
+    }
+    // PC_REMOTE_CHECK: each remote group again here from its saved input, against what came back
+    for (j, (m_in, data)) in stash.into_iter().enumerate() {
+        let g = n_here + j;
+        let far = (outs[g].meta, download_members(cx, &outs[g])?);
+        let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m_in.level)? as usize).collect();
+        for (c, parts) in data.iter().enumerate() {
+            for (part, d) in parts.iter().enumerate() {
+                outs[g].buf.upload_rows(&cx.ex.compute, c, part, &rows, d)?;
+            }
+        }
+        outs[g].meta = m_in;
+        calls[g].run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+        let here = (outs[g].meta, download_members(cx, &outs[g])?);
+        if here != far {
+            return Err(shape("pcmm linear", format!("{}: remote check: per-input finish group {g} of {} refreshed remotely differs from the same group refreshed here", lin.name, calls.len())));
+        }
+        o.checked();
+    }
+    if lin.shift > 0 {
+        for x in outs[..calls.len()].iter_mut() {
+            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, x, lin.shift)?;
         }
     }
     Ok(())

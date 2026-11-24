@@ -82,6 +82,10 @@ pub struct ReplicaSched {
     /// components' placement on the same order simulated faster)
     pub hint_ms: f64,
     pub hint: bool,
+    /// PC_ISSUE_ORDER=sim: the host's issue order, issue groups (a unit whole, else one step: `[lo, hi)`), each device's
+    /// groups in program order, the two merged by the static model's start times within each region (a group after
+    /// every group whose events it waits for); empty = program order.
+    pub order: Vec<(u32, u32)>,
 }
 
 impl ReplicaSched {
@@ -712,6 +716,8 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
     rs.early = vec![vec![]; n];
     let mut t = [0.0f64; 2];
     let mut region_lo = 0usize;
+    // PC_ISSUE_ORDER=sim: the issue groups with their static start times
+    let mut gl: Vec<(usize, usize, f64)> = vec![];
     let mut i = 0usize;
     while i < n {
         if b.dynamic.contains(&(i as u32)) {
@@ -792,6 +798,7 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
         let d = if is_fin { 0 } else { place_of[i] as usize };
         // copies onto d of the slots it reads that are not valid there
         let start = t[d].max(arrive(d, &valid, &ready));
+        gl.push((i, hi, start));
         let mut waits: Vec<u32> = vec![];
         let war = |q: u32, waits: &mut Vec<u32>, signal: &mut Vec<bool>, xat: &[usize]| {
             if q != NONE && pos(q, xat) >= region_lo && (q as usize) != i {
@@ -965,7 +972,126 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
         }
     }
     rs.two_ms = t[0].max(t[1]);
+    if issue_order() && rs.moved > 0 {
+        rs.order = issue_merge(b, &rs, &gl);
+    }
     rs
+}
+
+/// PC_ISSUE_ORDER: `sim` = the host issues a replica block's groups in the static model's start-time order (each
+/// device's own groups in program order, a group only after every group whose events it waits for), so neither
+/// device's launch queue drains while the host issues a long run of the other's; unset / `program` = program order.
+pub fn issue_order() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("PC_ISSUE_ORDER").as_deref().map(str::trim) {
+        Ok("sim") => true,
+        Err(_) | Ok("") | Ok("program") => false,
+        Ok(v) => {
+            eprintln!("[replica] PC_ISSUE_ORDER={v}: not sim / program; program");
+            false
+        }
+    })
+}
+
+/// The issue order of `rs` (`ReplicaSched::order`) from its groups `gl` (`[lo, hi)`, static start ms, program order).
+/// Per region (between dynamic steps, which stay in place): the next group of each device, the earlier start first among
+/// those whose prerequisites (the groups holding the steps and copies its waits, copies and early copies wait for) are
+/// issued. Program order satisfies every prerequisite, so one of the two is always ready; if not (a plan this does not
+/// understand), program order is kept.
+fn issue_merge<W: DevWord>(b: &Bound<'_, W>, rs: &ReplicaSched, gl: &[(usize, usize, f64)]) -> Vec<(u32, u32)> {
+    let n = b.steps.len();
+    let n_id = n as u32;
+    let mut gof = vec![usize::MAX; n];
+    for (k, &(lo, hi, _)) in gl.iter().enumerate() {
+        for g in gof.iter_mut().take(hi).skip(lo) {
+            *g = k;
+        }
+    }
+    let step_of = |q: u32| -> Option<usize> {
+        if q == NONE {
+            None
+        } else if q < n_id {
+            Some(q as usize)
+        } else {
+            rs.xc.get((q - n_id) as usize).map(|x| x.at as usize)
+        }
+    };
+    let mut pre: Vec<Vec<usize>> = vec![vec![]; gl.len()];
+    for (k, &(lo, hi, _)) in gl.iter().enumerate() {
+        for j in lo..hi {
+            let qs = rs.wait[j].iter().copied().chain(rs.copies[j].iter().map(|c| c.1)).chain(rs.early[j].iter().flat_map(|&c| rs.xc.get(c as usize).map_or(&[][..], |x| &x.waits[..]).iter().copied()));
+            for q in qs {
+                if let Some(g) = step_of(q).and_then(|st| gof.get(st).copied()).filter(|&g| g != usize::MAX && g != k) {
+                    if !pre[k].contains(&g) {
+                        pre[k].push(g);
+                    }
+                }
+            }
+        }
+    }
+    let program: Vec<(u32, u32)> = gl.iter().map(|&(lo, hi, _)| (lo as u32, hi as u32)).collect();
+    let mut done = vec![false; gl.len()];
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(gl.len());
+    let mut k = 0usize;
+    while k < gl.len() {
+        if b.dynamic.contains(&(gl[k].0 as u32)) {
+            done[k] = true;
+            out.push(program[k]);
+            k += 1;
+            continue;
+        }
+        let mut e = k;
+        while e < gl.len() && !b.dynamic.contains(&(gl[e].0 as u32)) {
+            e += 1;
+        }
+        let mut lists: [Vec<usize>; 2] = [vec![], vec![]];
+        for g in k..e {
+            lists[(rs.dev[gl[g].0] & 1) as usize].push(g);
+        }
+        let mut head = [0usize; 2];
+        while head[0] < lists[0].len() || head[1] < lists[1].len() {
+            let ready = |d: usize| head[d] < lists[d].len() && pre[lists[d][head[d]]].iter().all(|&p| done[p]);
+            let pick = match (ready(0), ready(1)) {
+                (true, true) => {
+                    let (g0, g1) = (lists[0][head[0]], lists[1][head[1]]);
+                    if gl[g1].2 < gl[g0].2 || (gl[g1].2 == gl[g0].2 && g1 < g0) {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                (true, false) => 0,
+                (false, true) => 1,
+                (false, false) => {
+                    if std::env::var_os("PC_REPLICA_LOG").is_some() {
+                        eprintln!("[replica] {}: issue order: no ready group at groups {:?}, program order kept", b.label, (lists[0].get(head[0]), lists[1].get(head[1])));
+                    }
+                    return vec![];
+                }
+            };
+            let g = lists[pick][head[pick]];
+            head[pick] += 1;
+            done[g] = true;
+            out.push(program[g]);
+        }
+        k = e;
+    }
+    if std::env::var_os("PC_REPLICA_LOG").is_some() {
+        // the longest run of one device's groups, in steps, in program order and in this order
+        let run = |o: &[(u32, u32)]| -> usize {
+            let (mut best, mut cur, mut last) = (0usize, 0usize, 2u8);
+            for &(lo, hi) in o {
+                let d = rs.dev[lo as usize];
+                cur = if d == last { cur + (hi - lo) as usize } else { (hi - lo) as usize };
+                last = d;
+                best = best.max(cur);
+            }
+            best
+        };
+        let moved = out.iter().zip(&program).filter(|(a, b)| a != b).count();
+        eprintln!("[replica] {}: issue order: {} groups, {} not in program order, longest one-device run {} -> {} steps", b.label, out.len(), moved, run(&program), run(&out));
+    }
+    out
 }
 
 /// PC_REPLICA (with a remote device): unset, `1` or `on` = the replica lane (default: faster on every model measured),
