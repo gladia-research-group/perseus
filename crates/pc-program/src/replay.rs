@@ -503,12 +503,13 @@ fn no_split() -> pc_gpu::Error {
     pc_gpu::Error::Mem { knob: "ccmm split", value: 0, msg: "this remote lane holds no CCMM engine (PC_CCMM_SPLIT)".into() }
 }
 
-/// PC_CCMM_SPLIT=1 (with the CCMM finish split and a remote CCMM engine): every CCMM product split across the two
-/// devices (`pc_gpu::matmul::ccmm::mul_split`), the remote operand halves kept there and the remote output half
-/// refreshed where it is. Default off until it measures faster.
+/// PC_CCMM_SPLIT (with the CCMM finish split and a remote CCMM engine; on by default: -0.185 s on Llama, -0.14 s on
+/// Gemma, bit-exact; `0` / `off` off): every CCMM product split across the two devices
+/// (`pc_gpu::matmul::ccmm::mul_split`), the remote operand halves kept there and the remote output half refreshed where
+/// it is.
 pub fn ccmm_split() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("PC_CCMM_SPLIT").is_ok_and(|v| v.trim() == "1"))
+    *V.get_or_init(|| default_on("PC_CCMM_SPLIT"))
 }
 
 /// PC_CCMM_SPLIT_CHECK=1 (diagnostic, graphs off): the CCMM service's word checks of PC_REMOTE_CHECK alone (remote
