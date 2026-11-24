@@ -25,6 +25,14 @@ pub fn alloc(p: &mut Program, n_q: u32, bytes_per_limb: u64) {
     }
 }
 
+/// PC_ALLOC_FIFO=1: a new var takes, among the free slots of the best-fitting size, the one freed longest ago (else
+/// the lowest-numbered): with two devices, a copy into a slot waits for the receiver's last access of its old content,
+/// which a slot freed just before is still close to. Unset / `0` = off (default until an A/B wins).
+fn fifo() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_ALLOC_FIFO").as_deref().map(str::trim), Ok("1") | Ok("on")))
+}
+
 fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
     let bytes_of = |p: &Program, v: VarId| -> u64 { 2 * (n_q.saturating_sub(p.vars[v as usize].meta.level)) as u64 * bytes_per_limb };
     let keep: BTreeSet<VarId> = p.outputs.iter().copied().collect();
@@ -35,17 +43,20 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
         }
     }
     let mut slot_bytes: Vec<u64> = vec![];
-    // free slots by size: (bytes, slot)
-    let mut free: BTreeSet<(u64, u32)> = BTreeSet::new();
+    // free slots by size: (bytes, stamp, slot); the stamp orders slots of one size (PC_ALLOC_FIFO: the op index that
+    // freed it, else 0: by slot number)
+    let mut free: BTreeSet<(u64, u64, u32)> = BTreeSet::new();
+    let mut stamp: Vec<u64> = vec![];
+    let fifo = fifo();
     let mut live: u64 = 0;
     let mut live_peak: u64 = 0;
     let max_bytes = (0..p.vars.len()).map(|v| bytes_of(p, v as VarId)).max().unwrap_or(0);
-    let take = |p: &mut Program, v: VarId, slot_bytes: &mut Vec<u64>, free: &mut BTreeSet<(u64, u32)>, live: &mut u64| {
+    let take = |p: &mut Program, v: VarId, slot_bytes: &mut Vec<u64>, free: &mut BTreeSet<(u64, u64, u32)>, live: &mut u64| {
         let need = bytes_of(p, v);
-        let s = match free.range((need, 0)..).next().copied() {
+        let s = match free.range((need, 0, 0)..).next().copied() {
             Some(e) => {
                 free.remove(&e);
-                e.1
+                e.2
             }
             None => {
                 slot_bytes.push(if uniform { max_bytes } else { need });
@@ -58,11 +69,11 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
     // a batch's outputs in consecutive slots, member order (the lowest run of free slots that fit, else new slots
     // after the free ones that end the list): a later batch over the same values reads them as one K-ciphertext
     // buffer, and this batch writes them as one (the replay's gathers find nothing to copy)
-    let take_run = |p: &mut Program, vs: &[VarId], slot_bytes: &mut Vec<u64>, free: &mut BTreeSet<(u64, u32)>, live: &mut u64| {
+    let take_run = |p: &mut Program, vs: &[VarId], slot_bytes: &mut Vec<u64>, free: &mut BTreeSet<(u64, u64, u32)>, stamp: &[u64], live: &mut u64| {
         let need = vs.iter().map(|&v| bytes_of(p, v)).max().unwrap_or(0);
         let k = vs.len();
-        let fits = |s: usize, free: &BTreeSet<(u64, u32)>| s < slot_bytes.len() && slot_bytes[s] >= need && free.contains(&(slot_bytes[s], s as u32));
-        let mut slots: Vec<u32> = free.iter().map(|e| e.1).collect();
+        let fits = |s: usize, free: &BTreeSet<(u64, u64, u32)>| s < slot_bytes.len() && slot_bytes[s] >= need && free.contains(&(slot_bytes[s], stamp.get(s).copied().unwrap_or(0), s as u32));
+        let mut slots: Vec<u32> = free.iter().map(|e| e.2).collect();
         slots.sort_unstable();
         let start = slots.iter().map(|&s| s as usize).find(|&s| (s..s + k).all(|t| fits(t, free))).unwrap_or_else(|| {
             // new slots, after the free slots that fit at the end of the list
@@ -75,7 +86,7 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
         for (j, &v) in vs.iter().enumerate() {
             let t = start + j;
             if t < slot_bytes.len() {
-                free.remove(&(slot_bytes[t], t as u32));
+                free.remove(&(slot_bytes[t], stamp.get(t).copied().unwrap_or(0), t as u32));
             } else {
                 slot_bytes.push(if uniform { max_bytes } else { need });
             }
@@ -113,7 +124,7 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
         }
         if freed_inplace.is_none() {
             if !single && outs.len() > 1 {
-                take_run(p, &outs, &mut slot_bytes, &mut free, &mut live);
+                take_run(p, &outs, &mut slot_bytes, &mut free, &stamp, &mut live);
             } else {
                 for &o in &outs {
                     take(p, o, &mut slot_bytes, &mut free, &mut live);
@@ -126,7 +137,10 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
                 continue;
             }
             if let Some(s) = p.vars[v as usize].slot {
-                free.insert((slot_bytes[s as usize], s));
+                let st = if fifo { i as u64 + 1 } else { 0 };
+                stamp.resize(slot_bytes.len(), 0);
+                stamp[s as usize] = st;
+                free.insert((slot_bytes[s as usize], st, s));
                 live -= bytes_of(p, v);
             }
         }
@@ -134,7 +148,10 @@ fn assign(p: &mut Program, n_q: u32, bytes_per_limb: u64, uniform: bool) {
         for &o in &outs {
             if !last_use.contains_key(&o) && !keep.contains(&o) {
                 if let Some(s) = p.vars[o as usize].slot {
-                    free.insert((slot_bytes[s as usize], s));
+                    let st = if fifo { i as u64 + 1 } else { 0 };
+                    stamp.resize(slot_bytes.len(), 0);
+                    stamp[s as usize] = st;
+                    free.insert((slot_bytes[s as usize], st, s));
                     live -= bytes_of(p, o);
                 }
             }

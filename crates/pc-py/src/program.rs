@@ -744,6 +744,8 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         }),
         _ => None,
     };
+    // PC_TL: the remote device (its timing events)
+    let rlane_there: Option<*const pc_cuda::Device> = rlane.as_ref().map(|l| l.there as *const pc_cuda::Device);
     let t_lane = t_prof.map(|t| t.elapsed().as_secs_f64());
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
@@ -817,7 +819,85 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                     } else {
                         None
                     };
+                    if seg_timing() && replayer.seg_ev.len() < 64 {
+                        for _ in 0..64 {
+                            replayer.seg_ev.push(pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?);
+                        }
+                    }
+                    // PC_TL=<block label> (diagnostic): timing events after every step of that block where it ran (both
+                    // devices), written to $PC_TL_OUT/<label>.tl after each run
+                    let tl_here = std::env::var("PC_TL").is_ok_and(|v| v == b.label);
+                    if tl_here {
+                        pc_program::replay::TL.with(|t| -> pc_program::Result<()> {
+                            let mut g = t.borrow_mut();
+                            if g.is_none() {
+                                let cap = 4 * b.steps.len() + 256;
+                                // SAFETY: plain allocation call
+                                let buf = unsafe { pc_kernels::pc_stamp_alloc(cap) };
+                                if buf.is_null() {
+                                    return Err(pc_program::Error::Replay { block: b.label.clone(), msg: "PC_TL: cudaHostAlloc failed".into() });
+                                }
+                                *g = Some(pc_program::replay::Tl { label: b.label.clone(), buf, cap, marks: vec![], n: 0, on: false, cur: 0 });
+                            }
+                            // marks accumulate over the runs: a graph segment's stamps carry the indices of its capture
+                            // (written again at every replay), an eager step's those of its latest issue
+                            let tl = g.as_mut().unwrap();
+                            tl.on = true;
+                            Ok(())
+                        })?;
+                    }
                     let info = replayer.run(b, &mut rt)?;
+                    if tl_here {
+                        let there = rt.remote.as_deref().and(rlane_there);
+                        pc_program::replay::TL.with(|t| -> pc_program::Result<()> {
+                            let mut g = t.borrow_mut();
+                            let tl = g.as_mut().unwrap();
+                            tl.on = false;
+                            dev.device.synchronize().map_err(pc_gpu::Error::from)?;
+                            if let Some(th) = there {
+                                // SAFETY: the remote device outlives the session's runs
+                                let th: &pc_cuda::Device = unsafe { &*th };
+                                th.make_current().map_err(pc_gpu::Error::from)?;
+                                th.synchronize().map_err(pc_gpu::Error::from)?;
+                                dev.device.make_current().map_err(pc_gpu::Error::from)?;
+                            }
+                            let mut out = String::new();
+                            let mut last: std::collections::BTreeMap<(u32, u8), Vec<u32>> = std::collections::BTreeMap::new();
+                            for &(i, d, k) in &tl.marks {
+                                // the latest registration per (step, device); a step's several remote parts all
+                                let e = last.entry((i, d)).or_default();
+                                if d != 4 {
+                                    e.clear();
+                                }
+                                e.push(k);
+                            }
+                            for (&(i, d), ks) in &last {
+                              for &k in ks {
+                                // SAFETY: k < cap, written by a completed stamp kernel (both devices synchronized)
+                                let ns = unsafe { std::ptr::read_volatile(tl.buf.add(k as usize)) };
+                                out.push_str(&format!("{i} {d} {ns}\n"));
+                              }
+                            }
+                            let dir = std::env::var("PC_TL_OUT").unwrap_or_else(|_| ".".into());
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.tl", b.label)), out);
+                            Ok(())
+                        })?;
+                    }
+                    if seg_timing() && !replayer.seg_kinds.is_empty() {
+                        // PC_SEG_TIMING=1 (diagnostic): per replayed item (graph segment G / dynamic step D<i>), its span on
+                        // this device's compute stream (every lane joins it at the item's end) and its host issue time
+                        let n = replayer.seg_kinds.len();
+                        replayer.seg_ev[n].sync().map_err(pc_gpu::Error::from)?;
+                        let mut line = String::new();
+                        for k in 0..n {
+                            let ms = replayer.seg_ev[k].elapsed_ms(&replayer.seg_ev[k + 1]).map_err(pc_gpu::Error::from)?;
+                            let kd = replayer.seg_kinds[k];
+                            let nm = if kd == usize::MAX { "G".to_string() } else { format!("D{kd}") };
+                            line.push_str(&format!(" {nm}:{ms:.2}/{:.2}", replayer.seg_host_us[k] / 1e3));
+                        }
+                        eprintln!("[seg] {}{line}", b.label);
+                    }
                     if let Some((e0, e1)) = tev {
                         rt.ex.compute.record(&e1).map_err(pc_gpu::Error::from)?;
                         e1.sync().map_err(pc_gpu::Error::from)?;
@@ -883,6 +963,12 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
 fn block_timing() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("PC_BLOCK_TIMING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// PC_SEG_TIMING=1 (diagnostic): per graph replay, each item's device span and host issue time (stderr).
+fn seg_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_SEG_TIMING").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// PC_HOST_PROF=1 (diagnostic): per block, the host time of `run_block`'s parts (stderr).

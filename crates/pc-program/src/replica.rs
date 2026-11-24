@@ -110,6 +110,29 @@ pub struct XCopy {
     pub at: u32,
 }
 
+/// PC_OWN_LAZY=1 (with ownership; default off until an A/B wins): an owned output (a finish's or a split refresh
+/// batch's remote part) lives on the remote device only: the remote services skip copying it back here, the replica
+/// plan copies it over (after the owning step's event) where this device reads it.
+pub fn own_lazy() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| own() && matches!(std::env::var("PC_OWN_LAZY").as_deref().map(str::trim), Ok("1") | Ok("on")))
+}
+
+/// PC_REPLICA_LOCAL=1 (with the replica lane; default off until an A/B wins): the placement tries, among components of
+/// equal cost, those whose inputs are already on the remote device (owned outputs) first.
+pub fn local_first() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_LOCAL").as_deref().map(str::trim), Ok("1") | Ok("on")))
+}
+
+/// PC_REPLICA_UNIT_SPLIT=1 (with the replica lane; default off until an A/B wins): the placement simulation counts a
+/// split refresh batch's members per device as the remote lane splits it (an odd batch: one more here), so a lone
+/// refresh beside it can move there.
+pub fn unit_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_UNIT_SPLIT").as_deref().map(str::trim), Ok("1") | Ok("on")))
+}
+
 /// PC_REPLICA_DMA (with the replica lane, on by default; `0` / `off` off): copies between the devices on copy
 /// streams, issued as soon as their version exists.
 pub fn dma() -> bool {
@@ -236,8 +259,18 @@ fn simulate<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32
             ready[s][d] = ready[s][d].max(start);
         }
         let end = if both {
-            let f0 = start + ncp as f64 * cp + gc[k] / 2.0;
-            let f1 = t[1].max(x) + gc[k] / 2.0;
+            // PC_REPLICA_UNIT_SPLIT=1: a split refresh batch of K members as the remote lane splits it (ceil(K/2) here,
+            // floor(K/2) there: an odd batch leaves one more refresh here); otherwise (and finishes) half each
+            let (h0, h1) = match b.unit_of.get(lo).filter(|&&u| u != NONE).map(|&u| &b.units[u as usize]) {
+                Some(u) if unit_split() && matches!(u.kind, UnitKind::Refresh { .. }) && u.hi - u.lo >= 2 => {
+                    let n = (u.hi - u.lo) as f64;
+                    let r = ((u.hi - u.lo) / 2) as f64;
+                    ((n - r) / n, r / n)
+                }
+                _ => (0.5, 0.5),
+            };
+            let f0 = start + ncp as f64 * cp + gc[k] * h0;
+            let f1 = t[1].max(x) + gc[k] * h1;
             t = [f0, f1];
             f0.max(f1)
         } else {
@@ -246,7 +279,11 @@ fn simulate<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32
         };
         for &s in writes {
             let su = s as usize;
-            if gown[k].contains(&s) {
+            if gown[k].contains(&s) && own_lazy() {
+                // PC_OWN_LAZY: the owned version lives on the remote device only
+                valid[su] = 2;
+                ready[su][1] = end;
+            } else if gown[k].contains(&s) {
                 valid[su] = 3;
                 ready[su] = [end, end];
             } else {
@@ -315,7 +352,42 @@ fn place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<u32>, 
         }
     }
     let mut cl: Vec<(f64, Vec<usize>)> = comps.into_values().map(|ks| (ks.iter().map(|&k| gc[k]).sum(), ks)).filter(|(c, _)| *c >= MIN_COMP_MS).collect();
-    cl.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if local_first() {
+        // PC_REPLICA_LOCAL=1: among components of the same cost (to 0.1 ms: the per-head / per-chain copies of one
+        // computation), those whose inputs the replica already holds (owned outputs, or nothing read from outside)
+        // first: the greedy then fills the remote device with work that needs no copy before work that does
+        let mut writer: Vec<Option<usize>> = vec![None; ns];
+        let mut ext_copy: Vec<u32> = vec![0; gs.len()];
+        let mut comp_of: Vec<usize> = vec![usize::MAX; gs.len()];
+        for (c, (_, ks)) in cl.iter().enumerate() {
+            for &k in ks {
+                comp_of[k] = c;
+            }
+        }
+        for (k, &(lo, _)) in gs.iter().enumerate() {
+            if b.dynamic.contains(&(lo as u32)) {
+                writer.iter_mut().for_each(|w| *w = None);
+            }
+            for &s in &grw[k].0 {
+                let w = writer[s as usize];
+                let outside = w.is_none_or(|p| comp_of[p] != comp_of[k] || comp_of[k] == usize::MAX);
+                let both = w.is_some_and(|p| gown[p].contains(&s));
+                if outside && !both {
+                    ext_copy[k] += 1;
+                }
+            }
+            for &s in &grw[k].1 {
+                writer[s as usize] = Some(k);
+            }
+        }
+        let key = |c: &(f64, Vec<usize>)| -> (i64, u32) { ((c.0 * 10.0).round() as i64, c.1.iter().map(|&k| ext_copy[k]).sum()) };
+        cl.sort_by(|a, b| {
+            let (ka, kb) = (key(a), key(b));
+            kb.0.cmp(&ka.0).then(ka.1.cmp(&kb.1))
+        });
+    } else {
+        cl.sort_by(|a, b| b.0.total_cmp(&a.0));
+    }
     cl.truncate(MAX_TRIES);
     let mut on = vec![0u8; gs.len()];
     let base = simulate(b, gs, grw, gc, gown, &on, copy_ms, ns);
@@ -837,11 +909,18 @@ pub fn plan<W: DevWord>(b: &Bound<'_, W>, holds: &dyn Fn(RouteKind) -> bool, pt_
         for &s in &writes {
             let su = s as usize;
             if own.contains(&s) {
-                // owned: valid on both devices, the replica's readers after this step's event
+                // owned: valid on both devices, the replica's readers after this step's event (PC_OWN_LAZY: on the
+                // remote device only, this device's readers copy it over after this step's event)
                 own_last[su] = i as u32;
-                valid[su] = 3;
-                prod[su] = [i as u32; 2];
-                ready[su] = [f; 2];
+                if own_lazy() {
+                    valid[su] = 2;
+                    prod[su] = [NONE, i as u32];
+                    ready[su][1] = f;
+                } else {
+                    valid[su] = 3;
+                    prod[su] = [i as u32; 2];
+                    ready[su] = [f; 2];
+                }
                 copied_by[su] = [NONE; 2];
                 acc1[su] = NONE;
                 continue;

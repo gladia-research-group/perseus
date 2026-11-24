@@ -39,6 +39,7 @@ extern "C" {
     pub fn cudaEventCreateWithFlags(e: *mut cudaEvent_t, flags: u32) -> cudaError_t;
     pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(e: cudaEvent_t, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaEventRecordWithFlags(e: cudaEvent_t, s: cudaStream_t, flags: u32) -> cudaError_t;
     pub fn cudaEventSynchronize(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventElapsedTime(ms: *mut f32, a: cudaEvent_t, b: cudaEvent_t) -> cudaError_t;
     pub fn cudaDeviceSynchronize() -> cudaError_t;

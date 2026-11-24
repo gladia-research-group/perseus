@@ -54,6 +54,8 @@ fn main() {
             }
         }
     }
+    // PC_TL's timestamp kernel (diagnostic)
+    tus.push(("stamp".to_string(), "stamp.cu".to_string(), Vec::new()));
     let mut objs = Vec::new();
     for chunk in tus.chunks(jobs) {
         let mut kids = Vec::new();

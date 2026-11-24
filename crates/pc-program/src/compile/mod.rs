@@ -640,8 +640,19 @@ pub fn compile_block(
         let n_q = shape.n_q as f64;
         let limb = env.ring_dim as f64 * word_bytes as f64;
         let limbs = |level: u32| shape.primes_dropped(level).map_or(n_q, |d| (n_q - d as f64).max(1.0));
+        // PC_SCHED2_DUMP=<dir> (diagnostic): the block before the pass and its cost tables (<dir>/<block>.json), for
+        // the offline model (examples/sched2_model.rs)
+        if let Ok(dir) = std::env::var("PC_SCHED2_DUMP") {
+            let top = p.vars.iter().map(|v| v.meta.level).max().unwrap_or(0) + 1;
+            let cm: Vec<f64> = (0..=top).map(|l| 2.0 * limbs(l) * limb / 30e6).collect();
+            let vbt: Vec<f64> = (0..=top).map(|l| 2.0 * (shape.n_q.saturating_sub(l)) as f64 * limb).collect();
+            let j = serde_json::json!({ "copy_ms": cm, "var_bytes": vbt, "program": &p });
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{label}.json")), j.to_string());
+        }
         // a slot's bytes as the allocation sizes it (`alloc`: n_q - level limbs of two polynomials)
-        let r = two::schedule(&mut p, &|level| 2.0 * limbs(level) * limb / 30e6, &|level| 2.0 * (shape.n_q.saturating_sub(level)) as f64 * limb);
+        let (lat, gbs) = two::copy_model();
+        let r = two::schedule(&mut p, &|level| lat + 2.0 * limbs(level) * limb / (gbs * 1e6), &|level| 2.0 * (shape.n_q.saturating_sub(level)) as f64 * limb);
         if std::env::var_os("PC_REPLICA_LOG").is_some() {
             eprintln!("[sched2] {label}: {} ops in {} atoms, {} ops on the remote device; static {:.1} ms -> {:.1} ms; live {:.2} -> {:.2} GB", r.ops, r.atoms, r.moved, r.one_ms, r.two_ms, r.live0_gb, r.live_gb);
             eprintln!("[sched2] {label}: regions: spans {:.1} ms, sum max(cp, w/2) {:.1}, sum w/2 {:.1}; {} chain-bound regions spanning {:.1} ms; idle copy {:.1} dep {:.1} join {:.1} ms, copies {:.1} ms (from inputs {:.1}, light {:.1}, heavy {:.1}, finishes {:.1})", r.spans, r.bound, r.half, r.chain_regions, r.chain_spans, r.idle[0], r.idle[1], r.idle[2], r.copies_ms, r.copies_by[0], r.copies_by[1], r.copies_by[2], r.copies_by[3]);

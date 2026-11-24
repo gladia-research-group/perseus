@@ -279,6 +279,10 @@ pub trait RemoteLane<'a, W: DevWord, M: DevStrategy<W>> {
     fn replica_wait(&mut self, _ev: &Event) -> Result<()> {
         Err(no_replica())
     }
+    /// PC_TL (diagnostic): a timestamp kernel on the replica's stream writing `buf[idx]` (mapped host memory).
+    fn replica_stamp(&mut self, _buf: *mut u64, _idx: i32) -> Result<()> {
+        Ok(())
+    }
     /// PC_REPLICA_DMA: fork both copy streams (this device's, the replica's) from `here` (a region's first early copy:
     /// what they issue next comes after everything issued on `here` so far).
     fn dma_fork(&mut self, _here: &Stream<Compute>) -> Result<()> {
@@ -303,6 +307,10 @@ pub trait RemoteLane<'a, W: DevWord, M: DevStrategy<W>> {
         None
     }
     /// Copy `src` (this device's slot `s`, metadata included) into the replica's slot `s`, on the replica's stream.
+    /// The replica's slot `s` for writing from this device (a peer write on this device's stream).
+    fn replica_slot_ptr(&mut self, _s: u32) -> Option<*mut Ct<'a, W>> {
+        None
+    }
     fn replica_copy_in(&mut self, _s: u32, _src: &Ct<'a, W>) -> Result<()> {
         Err(no_replica())
     }
@@ -484,6 +492,13 @@ pub struct Remote<'r, 'a, W: DevWord, M: DevStrategy<W>> {
     /// ownership (PC_OWN): the current step's expected slots, the next service call's output slots and shift, the
     /// slots left in the replica's slots so far
     pub own: OwnState,
+}
+
+/// PC_OWN_LAZY_PATHS (diagnostic, with PC_OWN_LAZY): which services skip copying owned outputs back, bits: 1 split
+/// refresh batches, 2 joint linears' far groups, 4 CCMM output halves (default 7: all).
+fn lazy_path(bit: u32) -> bool {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_OWN_LAZY_PATHS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(7)) & bit != 0
 }
 
 /// Ownership's per-step state on a remote lane (`RemoteLane::own_begin` .. `own_take`).
@@ -922,6 +937,21 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
         r
     }
 
+    fn replica_stamp(&mut self, buf: *mut u64, idx: i32) -> Result<()> {
+        self.there.make_current()?;
+        let r = (|| -> Result<()> {
+            let rp = self.replica.as_mut().ok_or_else(no_replica)?;
+            // SAFETY: `buf` is mapped portable host memory of at least idx + 1 words (PC_TL's)
+            let e = unsafe { pc_kernels::pc_stamp(buf, idx, rp.ex.compute.raw() as *mut std::ffi::c_void) };
+            if e != 0 {
+                return Err(rerr("PC_TL", format!("stamp launch: CUDA error {e}")));
+            }
+            Ok(())
+        })();
+        self.here.make_current()?;
+        r
+    }
+
     fn replica_copy_in(&mut self, s: u32, src: &Ct<'a, W>) -> Result<()> {
         let ctx = self.ctx;
         self.there.make_current()?;
@@ -942,6 +972,10 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
 
     fn replica_slot(&self, s: u32) -> Option<&Ct<'a, W>> {
         self.replica.as_ref().and_then(|rp| rp.b.slots.get(s as usize))
+    }
+
+    fn replica_slot_ptr(&mut self, s: u32) -> Option<*mut Ct<'a, W>> {
+        self.replica.as_mut().and_then(|rp| rp.b.slots.get_mut(s as usize)).map(|c| c as *mut Ct<'a, W>)
     }
 
     fn replica_issue(&mut self, sh: &Shadow, source: KskSource, i: usize, unit: Option<(u32, usize)>, signal: Option<usize>) -> Result<()> {
@@ -1232,13 +1266,20 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                 }
                 None => &self.ex.compute,
             };
+            // PC_OWN_LAZY: members the ownership above left in the replica's slots are not copied back here
+            let lazy = |c: usize| -> bool { crate::replica::own_lazy() && lazy_path(1) && self.fcb.is_none() && own_next.as_ref().is_some_and(|(v, _)| self.own.done.contains(&v[c])) };
             for (c, o) in outs.iter_mut().enumerate() {
                 // each member's own landing at the batch's level, degree and scale, as the local batch sets it
                 let m = r.landing(sh, &xs[c].meta, route).ok().filter(|m| m.level == out.level && m.deg == out.deg).map_or(out, |m| CtMeta { nf: out.nf, ..m });
+                if lazy(c) {
+                    o.meta = m;
+                    continue;
+                }
                 // SAFETY: the gather buffer was written by the refresh just issued on this stream; `here` reads the
                 // outputs only after `join`
                 unsafe { batch::take_peer(self.here_ctx, s, o, self.here, self.gather, self.there, c, m)? };
             }
+            tl_remote(s);
             s.record(self.join)?;
             Ok(())
         })();
@@ -1280,6 +1321,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
             // SAFETY: the gather buffer was written by the refresh just issued on this stream; `here` reads `x` only
             // after `join`
             unsafe { batch::take_batch_peer(self.here_ctx, s, x, self.here, self.gather, self.there, m)? };
+            tl_remote(s);
             s.record(self.join)?;
             Ok(())
         })();
@@ -1332,6 +1374,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                 }
                 at += chunk.len();
             }
+            tl_remote(&self.ex.compute);
             self.ex.compute.record(self.join)?;
             Ok(())
         })();
@@ -1400,8 +1443,19 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                 }
                 None => &self.ex.compute,
             };
+            // PC_OWN_LAZY: a far group whose every output the ownership below leaves in the replica's slots is not
+            // copied back here (its version lives there only; the replica plan copies it over where this device reads it)
+            let lazy_slots: Option<Vec<u32>> = self.own.next.as_ref().filter(|(v, _)| crate::replica::own_lazy() && lazy_path(2) && self.fcb.is_none() && self.replica.is_some() && v.len() == groups.iter().map(Vec::len).sum::<usize>()).map(|(v, _)| v.clone());
+            let mut at0 = 0usize;
             for (g, o) in outs.iter_mut().enumerate() {
                 let m = p.outs[g].meta;
+                let k = groups[g].len();
+                let skip = lazy_slots.as_ref().is_some_and(|v| v[at0..at0 + k].iter().all(|sl| self.own.want.contains(sl) && !self.own.done.contains(sl)));
+                at0 += k;
+                if skip {
+                    o.meta = m;
+                    continue;
+                }
                 // SAFETY: the outputs were written by the finishes just issued on this stream; `here` reads them only
                 // after `join`
                 unsafe { batch::take_batch_peer(self.here_ctx, s, o, self.here, &p.outs[g], self.there, m)? };
@@ -1421,6 +1475,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                     }
                 }
             }
+            tl_remote(s);
             s.record(self.join)?;
             Ok(())
         })();
@@ -1488,6 +1543,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
             let p = self.pcmm.as_mut().ok_or_else(no_joint)?;
             let planes = p.planes.get(&lin.name).ok_or_else(|| pc_gpu::Error::Mem { knob: "remote pcmm", value: 0, msg: format!("no row planes of {}", lin.name) })?;
             p.engine.product_rows(self.ctx, &self.ex.compute, sub, planes, &p.ins[..sub.n_in])?;
+            tl_remote(&self.ex.compute);
             self.ex.compute.record(self.join)?;
             Ok(p.engine.partial_ptrs())
         })();
@@ -1543,6 +1599,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                 // SAFETY: as joint_far
                 unsafe { batch::take_batch_peer(self.here_ctx, s, o, self.here, &p.outs[g], self.there, m)? };
             }
+            tl_remote(s);
             s.record(self.join)?;
             Ok(())
         })();
@@ -1585,6 +1642,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                     unsafe { batch::take_peer(self.here_ctx, s, o, self.here, self.gather, self.there, c, m)? };
                 }
             }
+            tl_remote(&self.ex.compute);
             self.ex.compute.record(self.join)?;
             Ok(())
         })();
@@ -1625,6 +1683,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                     unsafe { batch::take_peer(self.here_ctx, s, o, self.here, self.gather, self.there, c, m)? };
                 }
             }
+            tl_remote(&self.ex.compute);
             self.ex.compute.record(self.join)?;
             Ok(())
         })();
@@ -1663,7 +1722,13 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                 }
                 None => &self.ex.compute,
             };
+            // PC_OWN_LAZY: outputs the ownership below leaves in the replica's slots are not copied back here
+            let lazy_slots: Option<Vec<u32>> = self.own.next.as_ref().filter(|(v, sh)| crate::replica::own_lazy() && lazy_path(4) && self.fcb.is_none() && self.replica.is_some() && v.len() == xs.len() && (*sh == 0 || self.pcmm.is_some())).map(|(v, _)| v.clone());
             for (c, o) in xs.iter_mut().enumerate() {
+                if lazy_slots.as_ref().is_some_and(|v| self.own.want.contains(&v[c]) && !self.own.done.contains(&v[c])) {
+                    o.meta = m;
+                    continue;
+                }
                 // SAFETY: the gather buffer was written by the refresh just issued on this stream; `here` reads the
                 // outputs only after `join`
                 unsafe { batch::take_peer(self.here_ctx, s, o, self.here, self.gather, self.there, c, m)? };
@@ -1680,6 +1745,7 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
                     }
                 }
             }
+            tl_remote(s);
             s.record(self.join)?;
             Ok(())
         })();
@@ -1787,6 +1853,82 @@ pub struct Replayer {
     eager_marked: std::collections::HashSet<String>,
     /// Per block label: the dynamic-step set of its last run and whether that run put anything on the replica lane.
     replica_last: std::collections::HashMap<String, (Vec<u32>, bool)>,
+    /// PC_SEG_TIMING (diagnostic): timing events of this device (set by the driver before a run), one recorded on
+    /// compute before each item of a graph replay (a segment or a dynamic step) and one after the last; `seg_kinds` /
+    /// `seg_host_us` the items replayed (step index, or usize::MAX for a graph segment) and their host issue times.
+    pub seg_ev: Vec<pc_cuda::stream::Event>,
+    pub seg_kinds: Vec<usize>,
+    pub seg_host_us: Vec<f64>,
+}
+
+/// PC_TL=<block label> (diagnostic): timing events recorded after every step of that block on the device it ran on
+/// (this device's compute stream, or the replica's stream), events of this device in `a`, of the remote one in `b`
+/// (the driver creates them, `program.rs`); `marks` the (step, device, event index) recorded by the last run.
+pub struct Tl {
+    pub label: String,
+    /// mapped portable host memory, `cap` words: every stamp's %globaltimer (ns)
+    pub buf: *mut u64,
+    pub cap: usize,
+    pub marks: Vec<(u32, u8, u32)>,
+    pub n: usize,
+    pub on: bool,
+    /// the step being issued (remote stamps are booked to it)
+    pub cur: u32,
+}
+
+thread_local! {
+    pub static TL: std::cell::RefCell<Option<Tl>> = const { std::cell::RefCell::new(None) };
+}
+
+/// PC_TL: a stamp on a remote-device stream (`s`, current device: the remote one) at the end of its part of the
+/// current step (device code 4).
+fn tl_remote(s: &Stream<Compute>) {
+    if !tl_active() {
+        return;
+    }
+    TL.with(|t| {
+        let mut g = t.borrow_mut();
+        let Some(tl) = g.as_mut().filter(|tl| tl.on && tl.n < tl.cap) else { return };
+        // SAFETY: mapped portable host memory of `cap` words
+        let e = unsafe { pc_kernels::pc_stamp(tl.buf, tl.n as i32, s.raw() as *mut std::ffi::c_void) };
+        if e == 0 {
+            tl.marks.push((tl.cur, 4, tl.n as u32));
+            tl.n += 1;
+        }
+    });
+}
+
+fn tl_active() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_TL").is_ok_and(|v| !v.is_empty()))
+}
+
+/// PC_TL: after step `i` (or the unit it starts) of `label`, on lane `lane` (0 this device, 4 the replica).
+fn tl_mark<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, i: usize, lane: u8, fork: bool) -> Result<()> {
+    TL.with(|t| -> Result<()> {
+        let mut g = t.borrow_mut();
+        let Some(tl) = g.as_mut().filter(|tl| tl.on && tl.n < tl.cap) else { return Ok(()) };
+        match lane {
+            0 => {
+                // SAFETY: mapped portable host memory of `cap` words
+                let e = unsafe { pc_kernels::pc_stamp(tl.buf, tl.n as i32, rt.ex.compute.raw() as *mut std::ffi::c_void) };
+                if e != 0 {
+                    return Err(rerr("PC_TL", format!("stamp launch: CUDA error {e}")));
+                }
+                tl.marks.push((i as u32, if fork { 2 } else { 0 }, tl.n as u32));
+                tl.n += 1;
+            }
+            4 => {
+                if let Some(rm) = rt.remote.as_deref_mut() {
+                    rm.replica_stamp(tl.buf, tl.n as i32)?;
+                    tl.marks.push((i as u32, if fork { 3 } else { 1 }, tl.n as u32));
+                    tl.n += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 /// A capture failed for lack of device memory (cudaErrorMemoryAllocation in the capture or the instantiation).
@@ -2237,6 +2379,11 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                     if s.lane[i..end].contains(&4) {
                         rt.remote.as_deref_mut().ok_or_else(no_replica)?.replica_fork(&rt.ex.compute)?;
                         rrforked = true;
+                        if tl_active() {
+                            // PC_TL: the region's fork on both devices (device codes 2 / 3: before step i)
+                            tl_mark(rt, i, 0, true)?;
+                            tl_mark(rt, i, 4, true)?;
+                        }
                     }
                 }
                 if region_start && !dforked {
@@ -2397,6 +2544,13 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             {
                 let Bound { label, slots, tmp, gather, held, steps, groups, relin, step_lists, units, unit_of, pts, finishes, coeff_sums, mult_sums, stream_base, names, .. } = &mut *b;
                 let tmp = tmp.as_mut().ok_or_else(|| rerr(label, "no scratch slot"))?;
+                if tl_active() {
+                    TL.with(|t| {
+                        if let Some(tl) = t.borrow_mut().as_mut() {
+                            tl.cur = i as u32;
+                        }
+                    });
+                }
                 let r = match unit {
                     _ if lane == 2 => {
                         let s = sched.ok_or_else(|| rerr(label, "remote lane step without a schedule"))?;
@@ -2458,6 +2612,9 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             if let Some((_, e)) = unit {
                 unit_end = e;
             }
+            if tl_active() {
+                tl_mark(rt, i, if lane == 4 { 4 } else { 0 }, false)?;
+            }
         }
         if let (Some(rs), 0) = (rsched, lane) {
             // the plan's event of a unit is keyed by its first step and covers all its steps: recorded once the unit
@@ -2469,12 +2626,34 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 (None, None) if !in_unit => Some(i),
                 _ => None,
             };
+            // PC_OWN_LAZY: the plan has the owned outputs on the remote device only and its readers (there, or this
+            // device's copies of them back) wait for this step's event: those the remote services did not leave there
+            // are written over now, from here on this device's compute stream, before the event
+            let lazy_own = crate::replica::own_lazy();
+            if let Some(k) = key.filter(|&k| lazy_own && rs.own.get(k).is_some_and(|o| !o.is_empty())) {
+                let rm = rt.remote.as_deref_mut().ok_or_else(no_replica)?;
+                let done = rm.own_take();
+                for &sl in &rs.own[k] {
+                    let src: *const Ct<'a, W> = b.slots.get(sl as usize).ok_or_else(|| rerr(&b.label, format!("slot {sl}")))?;
+                    if done.contains(&sl) {
+                        OWN_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        let dst = rm.replica_slot_ptr(sl).ok_or_else(|| rerr(&b.label, format!("replica slot {sl}")))?;
+                        // SAFETY: this device's slot (valid: its service copied it back) into the replica's, whose last
+                        // reader there the step waited for (the plan's write-after-read wait of an owned write)
+                        copy_ct(rt.ctx, &rt.ex.compute, unsafe { &mut *dst }, unsafe { &*src })?;
+                        OWN_COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // SAFETY: as above
+                    rm.replica_set_meta(sl, unsafe { (*src).meta })?;
+                }
+            }
             if let Some(k) = key.filter(|&k| rs.signal[k]) {
                 let side = rt.side.as_deref_mut().ok_or_else(|| rerr(&b.label, "replica plan without the side lane's events"))?;
                 let ev = side.ev.get(k).ok_or_else(|| rerr(&b.label, format!("step {k}: {} side events", side.ev.len())))?;
                 rt.ex.compute.record(ev)?;
             }
-            if let Some(k) = key.filter(|&k| rs.own.get(k).is_some_and(|o| !o.is_empty())) {
+            if let Some(k) = key.filter(|&k| !lazy_own && rs.own.get(k).is_some_and(|o| !o.is_empty())) {
                 // ownership: the owned outputs the remote services did not leave there copied over (after this step's
                 // event), every one's replica metadata this device's
                 let ev: *const Event = rt.side.as_deref().and_then(|sd| sd.ev.get(k)).ok_or_else(|| rerr(&b.label, format!("step {k}: no side event")))?;
@@ -3170,7 +3349,7 @@ fn segments<W: DevWord>(b: &Bound<'_, W>) -> Vec<std::result::Result<(usize, usi
 
 impl Replayer {
     pub fn new(cfg: ReplayCfg) -> Self {
-        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default(), eager_only: Default::default(), eager_marked: Default::default(), replica_last: Default::default() }
+        Replayer { cfg, stats: ReplayStats::default(), side_lane: true, scheds: Default::default(), eager_only: Default::default(), eager_marked: Default::default(), replica_last: Default::default(), seg_ev: vec![], seg_kinds: vec![], seg_host_us: vec![] }
     }
 
     /// Run `b` once on the inputs the driver wrote into its input slots: eager, or (graphs) the graph captured for
@@ -3204,9 +3383,10 @@ impl Replayer {
             let holds = |k: RouteKind| rr.replica_holds(k);
             // one ciphertext across the devices: its level's limbs, both parts, at ~30 GB/s (a kernel reading the peer)
             let n = b.ring_n as f64;
+            let (lat, gbs) = crate::compile::two::copy_model();
             let copy_ms = |level: u32| -> f64 {
                 let limbs = chain.primes_dropped(level).map_or(top, |d| (top - d as f64).max(1.0));
-                2.0 * limbs * n * std::mem::size_of::<W>() as f64 / 30e6
+                lat + 2.0 * limbs * n * std::mem::size_of::<W>() as f64 / (gbs * 1e6)
             };
             let pt_ok = |p: u32| rr.replica_pt(p);
             // ownership (PC_OWN): a finish's owned outputs (its service says which), a split refresh batch's remote
@@ -3497,7 +3677,18 @@ impl Replayer {
             // the dynamic steps need the Bound mutably: take the captured block out while it replays
             let g = b.graphs.remove(gi);
             let mut res = Ok(());
-            for it in &g.items {
+            self.seg_kinds.clear();
+            self.seg_host_us.clear();
+            let seg = self.seg_ev.len() > g.items.len();
+            for (k, it) in g.items.iter().enumerate() {
+                let th = Instant::now();
+                if seg {
+                    self.seg_ev[k].record(&rt.ex.compute)?;
+                    self.seg_kinds.push(match it {
+                        Item::Graph(_) => usize::MAX,
+                        Item::Step(i) => *i,
+                    });
+                }
                 res = match it {
                     Item::Graph(exec) => {
                         let tl = Instant::now();
@@ -3507,9 +3698,15 @@ impl Replayer {
                     }
                     Item::Step(i) => issue_dynamic(rt, b, *i, sched),
                 };
+                if seg {
+                    self.seg_host_us.push(th.elapsed().as_secs_f64() * 1e6);
+                }
                 if res.is_err() {
                     break;
                 }
+            }
+            if seg {
+                self.seg_ev[g.items.len()].record(&rt.ex.compute)?;
             }
             for (i, (_, s, _)) in b.outputs.iter().enumerate() {
                 b.slots[*s as usize].meta = g.out_metas[i];

@@ -9,6 +9,13 @@ pub use args::*;
 pub use ring::{ring_table, RingTable, RingWord};
 pub use table::{table, Instance, TableError};
 
+extern "C" {
+    /// PC_TL (diagnostic): `buf[idx]` = the device's %globaltimer (ns) when the launch on `stream` runs; 0 = launched.
+    pub fn pc_stamp(buf: *mut u64, idx: i32, stream: *mut std::ffi::c_void) -> i32;
+    /// `n` u64 of mapped, portable pinned host memory (null on failure); never freed (a diagnostic's lifetime).
+    pub fn pc_stamp_alloc(n: usize) -> *mut u64;
+}
+
 /// The value of `#define <name> <digits>` in `src` (a C header), evaluated at compile time; 0 when absent.
 pub(crate) const fn cuh_define(src: &str, name: &str) -> u32 {
     let (s, n) = (src.as_bytes(), name.as_bytes());

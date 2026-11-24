@@ -158,6 +158,15 @@ impl Event {
         // SAFETY: both handles are live (borrowed)
         check(unsafe { ffi::cudaEventRecord(self.raw, s.raw()) }, "cudaEventRecord")
     }
+    /// `record` as an external event (cudaEventRecordExternal): inside a stream capture it becomes an event-record node
+    /// of the graph (recorded at each launch: timing inside graphs), outside one a plain record.
+    pub fn record_external<S: Lane>(&self, s: &Stream<S>) -> Result<()> {
+        if self.host || s.host {
+            return self.record(s);
+        }
+        // SAFETY: both handles are live (borrowed); 1 = cudaEventRecordExternal
+        check(unsafe { ffi::cudaEventRecordWithFlags(self.raw, s.raw(), 1) }, "cudaEventRecordWithFlags")
+    }
     /// Block the host until the recorded work completed.
     pub fn sync(&self) -> Result<()> {
         if self.host {
