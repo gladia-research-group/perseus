@@ -500,6 +500,8 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
     // PC_REPLICA_TIE=load: the owner-computes work placed per device since the region's start (a tie goes to the
     // lighter device)
     let tie_load = tie_load();
+    let tie_alt = tie_alt();
+    let mut toggle = 0u8;
     let mut load = [0.0f64; 2];
     for (k, &(lo, _)) in gs.iter().enumerate() {
         let (reads, writes) = &grw[k];
@@ -519,6 +521,10 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
             } else if tie_load && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
                 // inputs from both devices in equal parts: the lighter device so far
                 (load[1] < load[0]) as u8
+            } else if tie_alt && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
+                // inputs from both devices in equal parts: the devices in turn
+                toggle ^= 1;
+                1 - toggle
             } else {
                 (ctown && bcast && sink[k] == 2 && !matches!(b.steps[lo].op, StepOp::Bootstrap { .. })) as u8
             }
@@ -541,6 +547,12 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
 pub fn tie_load() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("load")))
+}
+
+/// PC_REPLICA_TIE=alt: such ties go to the two devices in turn (this device first).
+pub fn tie_alt() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("alt")))
 }
 
 /// PC_REPLICA_CTOWN's broadcast: an input read by at least this many groups counts as shared by both devices.
