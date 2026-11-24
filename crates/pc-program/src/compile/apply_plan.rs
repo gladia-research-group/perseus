@@ -115,8 +115,10 @@ impl<'a> Lower<'a> {
                     return Err(format!("deliberate {name}: no route lands at ({}, {}) from ({}, {}){own}", cap.level, cap.deg, in_meta.level, in_meta.deg));
                 }
             };
-            // PC_SHRINK_DELIB=1: a code refresh shrinks as a planned one does, landing where the capture recorded it
-            if captured.is_some() && std::env::var("PC_SHRINK_DELIB").is_ok_and(|v| v.trim() == "1") {
+            // PC_SHRINK_DELIB=1: a code refresh of a real payload (`bootstrap_real`: the softmax's last reciprocal)
+            // shrinks as a planned one does, landing where the capture recorded it (a complex one may pack two values
+            // of other periods: a refresh pair)
+            if captured.is_some() && route.real && std::env::var("PC_SHRINK_DELIB").is_ok_and(|v| v.trim() == "1") {
                 route = self.shrink_periodic(name, &in_meta, route);
             }
         }
