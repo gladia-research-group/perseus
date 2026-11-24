@@ -414,6 +414,8 @@ def main(argv=None):
                     "CUDA_VISIBLE_DEVICES, else 0)")
     ap.add_argument("--wait", action="store_true", help="wait for the GPU to be free instead of refusing")
     ap.add_argument("--no-save-programs", action="store_true", help="do not keep compiled programs in the plan")
+    ap.add_argument("--work-dir", default=None, help="the session's work directory (default: $SANA_SCRATCH/cli_work/"
+                    "<plan>, shared by every launch of the plan; give concurrent launches their own)")
     ap.add_argument("--no-record-cache", action="store_true", help="record on the CPU twin even when a saved record "
                     "matches, and do not save one")
     ap.add_argument("--list", action="store_true", help="the plans and their measurements")
@@ -482,7 +484,7 @@ def main(argv=None):
                 T.say(f"  ! this plan is cut for {plan['n_tok']}-token prompts; {prompt!r} has {lay.n_tok} ("
                       + " | ".join(tok.decode([int(t)]) for t in ids) + f"). Rephrase it to {plan['n_tok']} tokens.")
                 return 2
-        work = Path(hf.scratch("cli_work", plan["name"]))
+        work = Path(a.work_dir) if a.work_dir else Path(hf.scratch("cli_work", plan["name"]))
         cache = None if a.no_record_cache else Path(hf.scratch("cli_record", plan["name"]))
         enc = Encrypted(plan, a.device, work, T, a.wait, not a.no_save_programs, cache)
         T.say("warming up (once per process): ...")
