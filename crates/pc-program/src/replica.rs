@@ -502,6 +502,12 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
     let tie_load = tie_load();
     let tie_alt = tie_alt();
     let mut toggle = 0u8;
+    // group k: one add of two product-sum chains' outputs (PF_SINC_BI_SPLIT's halves)
+    let chain_of = |g: usize| gs.get(g).and_then(|&(lo, _)| b.unit_of.get(lo).filter(|&&u| u != NONE)).is_some_and(|&u| matches!(b.units[u as usize].kind, UnitKind::MultPtAddChain { .. }));
+    let halves_sum = |k: usize| {
+        let (lo, hi) = gs[k];
+        hi - lo == 1 && matches!(b.steps[lo].op, StepOp::Add) && ver[k].len() == 2 && ver[k].iter().all(|&w| w != usize::MAX && chain_of(w))
+    };
     let mut load = [0.0f64; 2];
     for (k, &(lo, _)) in gs.iter().enumerate() {
         let (reads, writes) = &grw[k];
@@ -521,8 +527,8 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
             } else if tie_load && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
                 // inputs from both devices in equal parts: the lighter device so far
                 (load[1] < load[0]) as u8
-            } else if tie_alt && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] {
-                // inputs from both devices in equal parts: the devices in turn
+            } else if tie_alt && score[0] > 0.0 && score[1] > 0.0 && (score[1] - score[0]).abs() <= 1e-9 * score[0] && halves_sum(k) {
+                // the sum of two masked half sums, one from each device (a split stage's outputs): the devices in turn
                 toggle ^= 1;
                 1 - toggle
             } else {
