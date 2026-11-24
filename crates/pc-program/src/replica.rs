@@ -576,11 +576,27 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
     on
 }
 
-/// PC_REPLICA_TIE=load (with the owner-computes placement; default off until an A/B wins): a group reading as much
-/// from each device goes to the device with less owner-computes work so far in the region (else it stays here).
+/// PC_REPLICA_TIE: where owner-computes places a group that reads as much from each device. `altall` (the default;
+/// 11-24 ABBA with PF_SINC_BI_SPLIT: Llama -0.07 s) = the two devices in turn (this device first); `alt` = in turn only
+/// for a sum of two product-sum chains; `load` = the device with less owner-computes work so far in the region;
+/// `here` = this device.
+fn tie_mode() -> &'static str {
+    static V: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    V.get_or_init(|| match std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim) {
+        Err(_) | Ok("") | Ok("altall") => "altall",
+        Ok("alt") => "alt",
+        Ok("load") => "load",
+        Ok("here") | Ok("0") | Ok("off") => "here",
+        Ok(v) => {
+            eprintln!("[replica] PC_REPLICA_TIE={v}: not altall / alt / load / here; altall");
+            "altall"
+        }
+    })
+}
+
+/// PC_REPLICA_TIE=load.
 pub fn tie_load() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("load")))
+    tie_mode() == "load"
 }
 
 /// PC_REPLICA_INPUT_SPLIT=1: owner-computes homes the second half of the block's inputs on the remote device.
@@ -591,14 +607,12 @@ pub fn input_split() -> bool {
 
 /// PC_REPLICA_TIE=altall: every such tie alternates (not only a sum of two product-sum chains).
 fn tie_alt_all() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("altall")))
+    tie_mode() == "altall"
 }
 
-/// PC_REPLICA_TIE=alt: such ties go to the two devices in turn (this device first).
+/// PC_REPLICA_TIE=alt or altall: such ties go to the two devices in turn (this device first).
 pub fn tie_alt() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("alt") | Ok("altall")))
+    matches!(tie_mode(), "alt" | "altall")
 }
 
 /// PC_REPLICA_CTOWN's broadcast: an input read by at least this many groups counts as shared by both devices.

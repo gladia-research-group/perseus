@@ -139,7 +139,8 @@ def main(argv=None, results=None):
     a = ap.parse_args(argv)
     if a.cpu:
         os.environ["PERSEUS_DEVICE"] = "cpu"
-    from perseus.examples.defaults import default_plan
+    from perseus.examples.defaults import apply_env, default_plan
+    apply_env("vit")
     if a.plan is None and not (a.fake or a.capture):
         a.plan = default_plan("vit")
     planned = not a.fake

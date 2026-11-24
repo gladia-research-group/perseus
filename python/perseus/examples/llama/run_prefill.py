@@ -205,11 +205,12 @@ def main(argv=None, results=None):
     a = ap.parse_args(argv)
     if a.cpu:
         os.environ["PERSEUS_DEVICE"] = "cpu"
-    from perseus.examples.defaults import default_plan
+    from perseus.examples.defaults import apply_env, default_plan
+    from . import hf
+    from .arch import model_entry
+    entry = model_entry(hf.NAME)
+    apply_env(entry.prefill if entry else "llama_prefill")
     if a.plan is None and not (a.fake or a.capture):
-        from . import hf
-        from .arch import model_entry
-        entry = model_entry(hf.NAME)
         a.plan = default_plan(entry.prefill if entry else "llama_prefill", a.tokens)
     planned = not a.fake
     if planned and (not a.plan or a.capture):

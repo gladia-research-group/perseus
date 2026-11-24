@@ -284,9 +284,12 @@ def dup(rt, xs, n=2):
     return [ops.add(x, ops.rotate(x, -16)) for x in xs]
 
 
-# PF_SINC_BI_SPLIT=1: stage_b_inv_merged's masked sums as two half sums (over the first / last half of the merged CCMM
-# outputs) and their sum, so each device can sum its own finish outputs (no level, the same residues)
-BI_SPLIT = __import__("os").environ.get("PF_SINC_BI_SPLIT", "0") not in ("", "0")
+# PF_SINC_BI_SPLIT: stage_b_inv_merged's masked sums as two half sums (over the first / last half of the merged CCMM
+# outputs) and their sum, so each device can sum its own finish outputs (no level, the same residues); on by default
+# on two GPUs (PC_REMOTE_DEVICE; 11-24 ABBA with PC_REPLICA_TIE=altall: Llama -0.07 s), `0` turns it off
+_ENV = __import__("os").environ
+BI_SPLIT = _ENV.get("PF_SINC_BI_SPLIT", "1" if _ENV.get("PC_REMOTE_DEVICE", "").strip() not in ("", "0") else "0") \
+    not in ("", "0")
 
 
 def stage_b_inv_merged(rt, Ms, wl, vs, site="sinc.bim"):
