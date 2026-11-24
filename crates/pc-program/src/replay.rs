@@ -2612,22 +2612,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
     // a fused product is never written: the metadata check and the step hooks see the pair step by step
     // PC_REPLICA_CHECK=units: the hooks see the fused units as units
     let stepwise = check || (hook.is_some() && !std::env::var("PC_REPLICA_CHECK").is_ok_and(|v| v == "units"));
-    // PC_ISSUE_ORDER=sim: the replica plan's issue groups in its order (each device's in program order, merged by the
-    // static start times), when they cover this range; a group's first step starts afresh (no unit of another group
-    // covers it); the region's forks look at the whole region, not from the first step issued
-    let sim: Option<Vec<(usize, usize)>> = rsched
-        .filter(|rs| !rs.order.is_empty())
-        .map(|rs| rs.order.iter().map(|&(a, e)| (a as usize, e as usize)).filter(|&(a, _)| a >= lo && a < hi).collect::<Vec<_>>())
-        .filter(|o| o.iter().all(|&(_, e)| e <= hi) && o.iter().map(|&(a, e)| e - a).sum::<usize>() == hi - lo);
-    let seq: Vec<(usize, bool)> = match &sim {
-        Some(o) => o.iter().flat_map(|&(a, e)| (a..e).map(move |i| (i, i == a))).collect(),
-        None => (lo..hi).map(|i| (i, false)).collect(),
-    };
-    let sim_on = sim.is_some();
-    for &(i, ghead) in &seq {
-        if ghead {
-            unit_end = i;
-        }
+    for i in lo..hi {
         let in_unit = i < unit_end;
         // the replica plan's copies (and the region's fork) before anything reads this step's slots: the unit choice
         // below reads their metadata
@@ -2635,7 +2620,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
             if !b.dynamic.contains(&(i as u32)) {
                 if region_start && !rrforked {
                     let end = b.dynamic.range(i as u32..).next().map_or(hi, |&d| (d as usize).min(hi));
-                    if s.lane[region_from(b, i, lo, sim_on)..end].contains(&4) {
+                    if s.lane[i..end].contains(&4) {
                         rt.remote.as_deref_mut().ok_or_else(no_replica)?.replica_fork(&rt.ex.compute)?;
                         rrforked = true;
                         if tl_active() {
@@ -2647,7 +2632,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 }
                 if region_start && !dforked {
                     let end = b.dynamic.range(i as u32..).next().map_or(hi, |&d| (d as usize).min(hi));
-                    if rs.early.get(region_from(b, i, lo, sim_on)..end).is_some_and(|v| v.iter().any(|c| !c.is_empty())) {
+                    if rs.early.get(i..end).is_some_and(|v| v.iter().any(|c| !c.is_empty())) {
                         rt.remote.as_deref_mut().ok_or_else(no_replica)?.dma_fork(&rt.ex.compute)?;
                         dforked = true;
                     }
@@ -2723,7 +2708,7 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
                 // a region with remote steps: the remote lane starts after everything before the region (its steps
                 // then wait only for the events of what they read and overwrite)
                 let end = b.dynamic.range(i as u32..).next().map_or(hi, |&d| (d as usize).min(hi));
-                if s.lane[region_from(b, i, lo, sim_on)..end].contains(&2) {
+                if s.lane[i..end].contains(&2) {
                     rt.remote.as_deref_mut().ok_or_else(|| rerr(&b.label, "remote lane step without a remote device"))?.lane_fork(&rt.ex.compute)?;
                     rforked = true;
                 }
@@ -3015,16 +3000,6 @@ fn issue_range<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: 
 /// The replica plan's waits and copies before step `i` (in a range starting at `lo`): the other device's events it
 /// waits for (write after read), then its copies, each after its producer's event (events of steps before `lo` are
 /// ordered already: an earlier segment, joined).
-/// The first step of the region holding step `i` (after the last dynamic step before it, at least `lo`) when the
-/// steps issue out of program order (`sim`), else `i` (a region's first step issued is its first).
-fn region_from<W: DevWord>(b: &Bound<'_, W>, i: usize, lo: usize, sim: bool) -> usize {
-    if sim {
-        b.dynamic.range(..i as u32).next_back().map_or(lo, |&d| (d as usize + 1).max(lo))
-    } else {
-        i
-    }
-}
-
 fn replica_copies<'a, W: DevWord, M: DevStrategy<W>>(rt: &mut Rt<'_, 'a, W, M>, b: &mut Bound<'a, W>, rs: &crate::replica::ReplicaSched, i: usize, lo: usize) -> Result<()> {
     let on_rep = rs.on_replica(i);
     let n = b.steps.len() as u32;
