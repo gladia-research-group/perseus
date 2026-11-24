@@ -1,7 +1,7 @@
 % The paper's comparison tables for README.md (paper-org/main.tex, 10-19), one page per table, every table the full
 % line width. Render: bash assets/render.sh paper-tables, which writes paper-tables-<page>-{light,dark}.png in the order
 % of the pages line below. \darkmode switches the palette.
-% pages: overview llama gemma gpt2 vit bert resnet whisper sana core
+% pages: overview llama gemma gpt2 vit bert resnet whisper sana twogpu scaling core
 % border: 14pt left and right, 4pt top and bottom (stacked in the README, the tables sit close together)
 \documentclass[border={14pt 4pt 14pt 4pt},varwidth=17.2cm,multi=tbl]{standalone}
 \usepackage{newtxtext,newtxmath}
@@ -221,6 +221,76 @@ English normalizer); the float64 model's is \whisperfloatwer\%, and 63 of the 64
 \tcap{Encrypted generation of one image from a text prompt. Perseus encrypts the prompt's tokens end to end, through the
 Gemma-2-2B text encoder and both SANA-Sprint steps, and the client decodes the image from the decrypted latent.
 \legend}
+\end{tbl}
+
+% Two GPUs (PC_REMOTE_DEVICE; GPUs 4+5 alone, PCIe Gen5 on one switch, no NVLink): scripts/repro/* with and without
+% REMOTE=5, Gemma by PERSEUS_DECODER=gemma2_2b llama run_prefill, the Whisper encoder by whisper.run_encoder (4 clips,
+% graphs; the median of clips 2-4), SANA by the CLI with two prompts in one process (the warm second image); 1, 2, 2, 1
+% GPUs per model (both orders), medians of 3 timed forwards (ResNet: of the 63 images after the capturing one); the table
+% takes the mean of the two runs per configuration (2026-11-24, on main d1728ff6). Speedups from the unrounded means:
+% Llama 52.28 / 29.035, Gemma 29.525 / 18.13, GPT-2 5.89 / 3.86, ViT 17.395 / 10.88, BERT 7.215 / 4.58, Whisper 19.15 /
+% 13.57, SANA 266 / 185, ResNet 0.3215 / 0.3225. Outputs: GPT-2 --check and Llama / Gemma top-1, BERT agree, ViT 4/4,
+% ResNet 64/64 with the float64 model, SANA's two-GPU images 44-52 dB from the one-GPU image (encryption noise alone
+% gives 41-52 dB between runs).
+\newcommand{\tgllamaone}{52.3}\newcommand{\tgllamatwo}{29.0}\newcommand{\tgllamax}{1.80}
+\newcommand{\tggemmaone}{29.5}\newcommand{\tggemmatwo}{18.1}\newcommand{\tggemmax}{1.63}
+\newcommand{\tggptone}{5.89}\newcommand{\tggpttwo}{3.86}\newcommand{\tggptx}{1.53}
+\newcommand{\tgvitone}{17.4}\newcommand{\tgvittwo}{10.9}\newcommand{\tgvitx}{1.60}
+\newcommand{\tgbertone}{7.22}\newcommand{\tgberttwo}{4.58}\newcommand{\tgbertx}{1.58}
+\newcommand{\tgwhisperone}{19.2}\newcommand{\tgwhispertwo}{13.6}\newcommand{\tgwhisperx}{1.41}
+\newcommand{\tgsanaone}{266}\newcommand{\tgsanatwo}{185}\newcommand{\tgsanax}{1.44}
+\newcommand{\tgresnetone}{0.322}\newcommand{\tgresnettwo}{0.323}\newcommand{\tgresnetx}{1.00}
+\begin{tbl}
+\renewcommand{\arraystretch}{1.3}\setlength{\aboverulesep}{0pt}\setlength{\belowrulesep}{0pt}\setlength{\extrarowheight}{2pt}
+\begin{tabularx}{\linewidth}{lL{1}rPr}
+\toprule
+\textbf{Model} & \textbf{Task} & \textbf{1 GPU} & \textbf{2 GPUs} & \textbf{Speedup} \\
+\midrule
+Llama-3-8B & prefill, 128-token prompt & \tgllamaone\ s & \textbf{\tgllamatwo\ s} & \tgllamax$\times$ \\
+Gemma-2-2B & prefill, 128-token prompt & \tggemmaone\ s & \textbf{\tggemmatwo\ s} & \tggemmax$\times$ \\
+GPT-2 small & prefill, 128-token prompt & \tggptone\ s & \textbf{\tggpttwo\ s} & \tggptx$\times$ \\
+ViT-B/16 & one $224\times224$ image & \tgvitone\ s & \textbf{\tgvittwo\ s} & \tgvitx$\times$ \\
+BERT-base & 128-token input & \tgbertone\ s & \textbf{\tgberttwo\ s} & \tgbertx$\times$ \\
+Whisper base.en & encoder, one 10-s audio window & \tgwhisperone\ s & \textbf{\tgwhispertwo\ s} & \tgwhisperx$\times$ \\
+SANA-Sprint 0.6B & one $768\times768$ image from a text prompt & \tgsanaone\ s & \textbf{\tgsanatwo\ s} & \tgsanax$\times$ \\
+ResNet-20 & one $32\times32$ CIFAR-10 image & \tgresnetone\ s & \tgresnettwo\ s & \tgresnetx$\times$ \\
+\bottomrule
+\end{tabularx}
+\tcap{Encrypted end to end on one and on two NVIDIA RTX PRO 6000 over PCIe Gen5 (no NVLink), 128-bit security, with the
+same plans and outputs; both columns are measured side by side. The second GPU holds half of every linear layer's weights
+and computes half of its outputs, half of the attention heads, half of the refreshes and its share of the element-wise
+work, and Llama's and Gemma's attention products are split between the GPUs too. The copies between the GPUs run on
+copy engines next to the compute. ResNet-20 is one chain of dependent refreshes, so it gains nothing from the second
+GPU. Decode stays on one GPU.}
+\end{tbl}
+
+% Two-GPU scaling on the same models and inputs: Cerium arXiv 2512.11269v2 Table 1 (DGX A100 / H100 / B200, SXM), Sylph
+% arXiv 2601.18511v2 Table 1 (8x RTX PRO 6000 on PCIe Gen5 and 2x Xeon 6530P; 4x B200 on NV18 NVLink); both prompts and
+% BERT inputs are 128 tokens.
+\begin{tbl}
+\begin{tabularx}{\linewidth}{lXlrrrrr}
+\toprule
+ & & & \multicolumn{4}{c}{seconds on $n$ GPUs} & speedup \\
+\cmidrule(lr){4-7}
+ & \textbf{System} & GPU & $n = 1$ & 2 & 4 & 8 & $1\!\to\!2$ \\
+\midrule
+Llama-3-8B & Cerium (Jayashankar et al., 2025) & A100 & 555 & 351 & 155 & 111 & 1.58$\times$ \\
+prefill & Cerium & H100 & 370 & 206 & 92 & 62 & 1.80$\times$ \\
+128 tokens & Cerium & B200 & 241 & 147 & 71 & 43 & 1.64$\times$ \\
+ & Sylph (Park et al., 2026)\nt{\dagger} & B200 & 87 & 47 & 26 & -- & 1.85$\times$ \\
+ & Sylph\nt{\dagger} & RTX PRO 6000 & 116 & 63 & 36 & 20 & 1.84$\times$ \\
+ & \oc\textbf{Perseus (ours)} & \oc RTX PRO 6000 & \oc\tgllamaone & \oc\textbf{\tgllamatwo} & \oc -- & \oc -- & \oc\textbf{\tgllamax$\times$} \\
+\cdashline{1-8}
+BERT-base & Cerium & A100 & 66.1 & 44.3 & 24.6 & 19.6 & 1.49$\times$ \\
+128 tokens & Cerium & H100 & 36.1 & 23.9 & 13.3 & 10.6 & 1.51$\times$ \\
+ & Cerium & B200 & 28.3 & 19.6 & 10.8 & 8.8 & 1.44$\times$ \\
+ & \oc\textbf{Perseus (ours)} & \oc RTX PRO 6000 & \oc\tgbertone & \oc\textbf{\tgberttwo} & \oc -- & \oc -- & \oc\textbf{\tgbertx$\times$} \\
+\bottomrule
+\end{tabularx}
+\tcap{Scaling of encrypted prefill and BERT inference with the number of GPUs, as each paper reports it: Cerium on DGX
+A100, H100 and B200 systems, Sylph on RTX PRO 6000 over PCIe Gen5 and on B200 over NVLink. Perseus runs on two RTX PRO
+6000 over PCIe Gen5, the same GPUs and link as Sylph's server, and is not yet run on four or eight. $^\dagger$Composed
+from per-block or per-operator timings, not run end to end. Perseus runs Llama-3.1-8B (the same architecture).}
 \end{tbl}
 
 % perseus-core primitives (2026-11-02, GPU 4 alone, PC_BENCH_CHAIN=n32a4; pc-bench built with --features pc-kernels/mont,

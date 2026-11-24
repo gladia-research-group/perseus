@@ -62,6 +62,11 @@ pub fn named_shapes() -> Vec<(&'static str, PcmmShape)> {
         ("llama.down", s(8, 4, 1, 3)),
         ("blk64.gate_up", s(64, 8, 56, 3)),
         ("blk64.down", s(64, 28, 8, 3)),
+        // one device's half of the outputs (the two-device split of a linear's output blocks)
+        ("blk64.gate_up_half", s(64, 8, 28, 3)),
+        ("blk64.down_half", s(64, 28, 4, 3)),
+        ("blk64.qkv", s(64, 8, 12, 3)),
+        ("blk64.qkv_half", s(64, 8, 6, 3)),
     ]
 }
 
@@ -354,10 +359,37 @@ fn check(args: &[String]) -> Res<bool> {
     let shapes = pick(&arg(args, "--shapes").unwrap_or_else(|| "gpt2.qkv,gpt2.down,llama.qkv,llama.gate_up,llama.down".into()))?;
     let twin = pick(&arg(args, "--twin").unwrap_or_else(|| "gpt2.qkv,gpt2.down,llama.qkv,llama.down".into()))?;
     let seed: u32 = arg(args, "--seed").map(|s| s.parse()).transpose()?.unwrap_or(9);
+    // --split a,b: the product of a subset of the outputs on gathered planes (`gather_planes`, the two-device split of a
+    // linear's output blocks) == the same outputs of the whole product, every word; the even outputs, then the odd
+    let split = pick(&arg(args, "--split").unwrap_or_default())?;
+    let halves = |sh: &PcmmShape| -> [Vec<usize>; 2] { [(0..sh.n_out).step_by(2).collect(), (1..sh.n_out).step_by(2).collect()] };
+    // --rows a,b: the row split (Sylph's reduction split): two engines each multiply the inputs of one half (first /
+    // last) on `gather_planes_rows`, one adds the other's partial Y and runs the output stage == the whole product
+    let rows = pick(&arg(args, "--rows").unwrap_or_default())?;
+    let in_halves = |sh: &PcmmShape| -> [Vec<usize>; 2] {
+        let h = sh.n_in - sh.n_in / 2;
+        [(0..h).collect(), (h..sh.n_in).collect()]
+    };
     let mut uniq: Vec<PcmmShape> = Vec::new();
-    for (_, s) in shapes.iter().chain(&twin) {
+    for (_, s) in shapes.iter().chain(&twin).chain(&split).chain(&rows) {
         if !uniq.contains(s) {
             uniq.push(*s);
+        }
+    }
+    for (_, s) in &rows {
+        for h in in_halves(s) {
+            let sub = PcmmShape { n_in: h.len(), ..*s };
+            if !h.is_empty() && !uniq.contains(&sub) {
+                uniq.push(sub);
+            }
+        }
+    }
+    for (_, s) in &split {
+        for h in halves(s) {
+            let sub = PcmmShape { n_out: h.len(), ..*s };
+            if !h.is_empty() && !uniq.contains(&sub) {
+                uniq.push(sub);
+            }
         }
     }
     let chain = Chain::generate(&ChainSpec::n32())?;
@@ -372,6 +404,10 @@ fn check(args: &[String]) -> Res<bool> {
     let mut mp = MemPlan::build::<W, M>(&chain, MemCfg { k_max: 1, pool: vec![], events: 8, scratch_cts: 1 })?;
     let pcfg = PcmmCfg { shapes: uniq.clone(), ..PcmmCfg::default() };
     mp.reserve("pcmm", Pcmm::<W>::bytes(&pcfg, lay.rows())?);
+    if !rows.is_empty() {
+        // the second engine of the row split, its weights and its inputs
+        mp.reserve("pcmm", Pcmm::<W>::bytes(&pcfg, lay.rows())?);
+    }
     let wmax = uniq.iter().map(|s| WeightBuf::bytes(s)).collect::<Result<Vec<_>, _>>()?.into_iter().max().unwrap_or(0);
     mp.reserve("check.weights", wmax);
     let xmax = uniq.iter().map(|s| 2 * s.rows_in().unwrap_or(0) * N1).max().unwrap_or(0);
@@ -379,6 +415,10 @@ fn check(args: &[String]) -> Res<bool> {
     mp.reserve("check.xy", pc_cuda::Arena::bytes_for::<u32>(xmax) + pc_cuda::Arena::bytes_for::<u32>(ymax));
     let (nin, nout) = (uniq.iter().map(|s| s.n_in).max().unwrap_or(1), uniq.iter().map(|s| s.n_out).max().unwrap_or(1));
     mp.reserve("check.cts", pc_cuda::Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(&lay, nin)) + pc_cuda::Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(&lay, nout)));
+    if !rows.is_empty() {
+        mp.reserve("check.weights", wmax);
+        mp.reserve("check.cts", 2 * pc_cuda::Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(&lay, nin)));
+    }
     let arena = mp.allocate(&dev)?;
     let ex = Executor::<W>::new(&dev, &arena, &mp)?;
     let ctx = Context::<W, M>::new(&arena, &ex.copy, chain.clone(), &mp)?;
@@ -395,6 +435,15 @@ fn check(args: &[String]) -> Res<bool> {
     let mut yb: DBuf<'_, Compute, u32> = arena.alloc("check.xy", ymax)?;
     let mut cin = Ct::new(CtMeta::new(0, 2), CtBuf::<Compute, W>::new(&arena, "check.cts", lay, nin)?);
     let mut cout = Ct::new(CtMeta::new(0, 2), CtBuf::<Compute, W>::new(&arena, "check.cts", lay, nout)?);
+    let mut rows_parts = if rows.is_empty() {
+        None
+    } else {
+        let pc2 = Pcmm::<W>::new(&arena, &dev, s, &ctx, &lt.inner, PcmmCfg { shapes: uniq.clone(), ..PcmmCfg::default() }, &keys)?;
+        let wb2 = WeightBuf::carve(&arena, uniq.iter().max_by_key(|s| s.planes_len().unwrap_or(0)).ok_or("no shapes")?)?;
+        let ca = Ct::new(CtMeta::new(0, 2), CtBuf::<Compute, W>::new(&arena, "check.cts", lay, nin)?);
+        let cb = Ct::new(CtMeta::new(0, 2), CtBuf::<Compute, W>::new(&arena, "check.cts", lay, nin)?);
+        Some((pc2, wb2, ca, cb))
+    };
     arena.freeze();
     let q = [chain.q[0], chain.q[1]];
     let mut t = Tally::default();
@@ -458,6 +507,103 @@ fn check(args: &[String]) -> Res<bool> {
         t.add(&format!("pcmm product {name} {sh:?} vs host twin (device inputs {:.2} gemm {:.2} outputs {:.2} ms; host {ht:.1} s)", tm.inputs, tm.gemm, tm.outputs), bad, tot);
         let meta_ok = cout.meta.level == cin.meta.level && cout.meta.deg == 2 && cout.meta.nf == 0.5;
         t.add(&format!("pcmm product {name}: output metadata (split level, deg 2, nf_out)"), (!meta_ok) as usize, 1);
+    }
+    // (1c) the split of the output blocks: each half on its gathered planes == those outputs of the whole product
+    for (name, sh) in &split {
+        let planes: Vec<u8> = rand_planes(&mut g, sh.planes_len()?).iter().map(|&x| x as u8).collect();
+        // SAFETY: i8 and u8 have one size and every bit pattern is valid for both
+        wb.upload(s, unsafe { std::slice::from_raw_parts(planes.as_ptr() as *const i8, planes.len()) })?;
+        cin.buf.k = sh.n_in;
+        for c in 0..sh.n_in {
+            for part in 0..2 {
+                let mut pr = Vec::with_capacity(4 * N);
+                for l in 0..4 {
+                    pr.extend(rand_res(&mut g, N, chain.q[l]));
+                }
+                cin.buf.upload_rows(s, c, part, &[0, 1, 2, 3], &pr)?;
+            }
+        }
+        cin.meta = CtMeta::new(ctx.shape.n_q - 1 - 3, 2).with_nf(1.0);
+        cout.buf.k = sh.n_out;
+        let map: Vec<(usize, usize)> = (0..sh.n_out).map(|m| (0, m)).collect();
+        pc.product(&ctx, s, sh, &wb.buf, std::slice::from_ref(&cin), std::slice::from_mut(&mut cout), &map, 0.5, None)?;
+        let whole: Vec<[Vec<W>; 2]> = (0..sh.n_out).map(|m| Ok::<_, pc_gpu::Error>([cout.buf.download_rows(s, m, 0, &[0, 1, 2, 3])?, cout.buf.download_rows(s, m, 1, &[0, 1, 2, 3])?])).collect::<Result<_, _>>()?;
+        for (hi, outs) in halves(sh).iter().enumerate() {
+            if outs.is_empty() {
+                continue;
+            }
+            let (sub_planes, sub) = pc_gpu::matmul::pcmm::gather_planes(&planes, sh, outs)?;
+            // SAFETY: as above
+            wb.upload(s, unsafe { std::slice::from_raw_parts(sub_planes.as_ptr() as *const i8, sub_planes.len()) })?;
+            cout.buf.k = sub.n_out;
+            let smap: Vec<(usize, usize)> = (0..sub.n_out).map(|j| (0, j)).collect();
+            pc.product(&ctx, s, &sub, &wb.buf, std::slice::from_ref(&cin), std::slice::from_mut(&mut cout), &smap, 0.5, None)?;
+            let (mut bad, mut tot) = (0, 0);
+            for (j, &m) in outs.iter().enumerate() {
+                for part in 0..2 {
+                    let got = cout.buf.download_rows(s, j, part, &[0, 1, 2, 3])?;
+                    bad += got.iter().zip(&whole[m][part]).filter(|(a, b)| a != b).count();
+                    tot += got.len();
+                }
+            }
+            t.add(&format!("pcmm split {name} {sh:?}: {} half ({} outputs) on gathered planes == the whole product's", ["even", "odd"][hi], outs.len()), bad, tot);
+        }
+    }
+    // (1d) the row split: each engine's half of the inputs on its rows of the planes, partials summed, outputs == whole
+    for (name, sh) in &rows {
+        let (pc2, wb2, ca, cb) = rows_parts.as_mut().ok_or("row-split engines")?;
+        let planes: Vec<u8> = rand_planes(&mut g, sh.planes_len()?).iter().map(|&x| x as u8).collect();
+        // SAFETY: i8 and u8 have one size and every bit pattern is valid for both
+        wb.upload(s, unsafe { std::slice::from_raw_parts(planes.as_ptr() as *const i8, planes.len()) })?;
+        cin.buf.k = sh.n_in;
+        let mut data: Vec<[Vec<W>; 2]> = Vec::new();
+        for c in 0..sh.n_in {
+            let mut d: [Vec<W>; 2] = [vec![], vec![]];
+            for (part, dp) in d.iter_mut().enumerate() {
+                let mut pr = Vec::with_capacity(4 * N);
+                for l in 0..4 {
+                    pr.extend(rand_res(&mut g, N, chain.q[l]));
+                }
+                cin.buf.upload_rows(s, c, part, &[0, 1, 2, 3], &pr)?;
+                *dp = pr;
+            }
+            data.push(d);
+        }
+        let meta = CtMeta::new(ctx.shape.n_q - 1 - 3, 2).with_nf(1.0);
+        cin.meta = meta.clone();
+        cout.buf.k = sh.n_out;
+        let map: Vec<(usize, usize)> = (0..sh.n_out).map(|m| (0, m)).collect();
+        pc.product(&ctx, s, sh, &wb.buf, std::slice::from_ref(&cin), std::slice::from_mut(&mut cout), &map, 0.5, None)?;
+        let whole: Vec<[Vec<W>; 2]> = (0..sh.n_out).map(|m| Ok::<_, pc_gpu::Error>([cout.buf.download_rows(s, m, 0, &[0, 1, 2, 3])?, cout.buf.download_rows(s, m, 1, &[0, 1, 2, 3])?])).collect::<Result<_, _>>()?;
+        let [ia, ib] = in_halves(sh);
+        for (dst, ins) in [(&mut *ca, &ia), (&mut *cb, &ib)] {
+            dst.buf.k = ins.len();
+            for (j, &c) in ins.iter().enumerate() {
+                for part in 0..2 {
+                    dst.buf.upload_rows(s, j, part, &[0, 1, 2, 3], &data[c][part])?;
+                }
+            }
+            dst.meta = meta.clone();
+        }
+        let (pa, sa) = pc_gpu::matmul::pcmm::gather_planes_rows(&planes, sh, &ia)?;
+        let (pb, sb) = pc_gpu::matmul::pcmm::gather_planes_rows(&planes, sh, &ib)?;
+        // SAFETY: as above
+        wb.upload(s, unsafe { std::slice::from_raw_parts(pa.as_ptr() as *const i8, pa.len()) })?;
+        wb2.upload(s, unsafe { std::slice::from_raw_parts(pb.as_ptr() as *const i8, pb.len()) })?;
+        pc.product_rows(&ctx, s, &sa, &wb.buf, std::slice::from_ref(&*ca))?;
+        pc2.product_rows(&ctx, s, &sb, &wb2.buf, std::slice::from_ref(&*cb))?;
+        let all: Vec<usize> = (0..sh.n_out).collect();
+        pc.add_partial(&ctx, s, &sa, pc2.partial_ptrs(), &all)?;
+        pc.product_outputs(&ctx, s, &sa, &all, std::slice::from_mut(&mut cout), &map, &meta, 0.5)?;
+        let (mut bad, mut tot) = (0, 0);
+        for m in 0..sh.n_out {
+            for part in 0..2 {
+                let got = cout.buf.download_rows(s, m, part, &[0, 1, 2, 3])?;
+                bad += got.iter().zip(&whole[m][part]).filter(|(a, b)| a != b).count();
+                tot += got.len();
+            }
+        }
+        t.add(&format!("pcmm rows {name} {sh:?}: inputs {ia:?} + {ib:?} on two engines, partials summed == the whole product"), bad, tot);
     }
     println!("[pc-check] pcmm: {} gates, {} mismatching", t.gates, t.bad);
     Ok(t.bad == 0)
@@ -863,6 +1009,6 @@ fn linear_timed<'a>(
     rec: Option<&mut BtsLog>,
 ) -> Res<()> {
     let hooks = LinearHooks { after_stc: Some(&e[1]), product: Some([&e[1], &e[2], &e[3], &e[4]]), after_finish: Some(&e[5]) };
-    linear(cx, route, pc, lin, planes, ins, outs, groups, drops, opts, rec.map(|r| r as &mut dyn pc_gpu::bts::staged::BtsRecorder), Some(hooks))?;
+    linear(cx, route, pc, lin, planes, ins, outs, groups, drops, opts, rec.map(|r| r as &mut dyn pc_gpu::bts::staged::BtsRecorder), Some(hooks), None)?;
     Ok(())
 }

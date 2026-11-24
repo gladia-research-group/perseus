@@ -17,6 +17,8 @@ pub mod kv;
 #[cfg(feature = "gpu")]
 pub mod replay;
 #[cfg(feature = "gpu")]
+pub mod replica;
+#[cfg(feature = "gpu")]
 pub mod residency;
 #[cfg(feature = "gpu")]
 pub mod schedule;

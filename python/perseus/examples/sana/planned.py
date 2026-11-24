@@ -30,7 +30,8 @@ def record_workers():
 
 # switches that change how a record runs, not what it records
 _KEY_SKIP = {"PERSEUS_RECORD_WORKERS", "PERSEUS_T2I_THREADS", "PERSEUS_T2I_PLANS", "CUDA_VISIBLE_DEVICES",
-             "OMP_NUM_THREADS"}
+             "OMP_NUM_THREADS", "PC_WORK_DIR", "PC_STAGE_TIMES", "PC_REPLICA_LOG", "PC_REPLICA_DUMP", "PC_REMOTE_DEVICE",
+             "PC_REMOTE_CHECK", "PC_REPLICA_CHECK", "PC_PER_INPUT_FAR", "PC_PT_MIRROR_ASYNC", "PC_ISSUE_ORDER"}
 
 
 def _env_value(v):
@@ -511,6 +512,8 @@ class SanaPlannedPrefill(PlannedPrefill):
                 on_block(b, info)
         if times is not None:
             self.stage_times = times
+            print(f"[stages] {len(times)} stages: plaintexts {sum(t[3] for t in times):.1f} s, weights "
+                  f"{sum(t[4] for t in times):.1f} s, issue {sum(t[5] for t in times):.1f} s (host)", flush=True)
         return [reg for _j, reg in self.reg[self.n_stages - 1]]
 
     def input_values(self, x_in=None, txt_rows=None):

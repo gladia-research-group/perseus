@@ -4,6 +4,8 @@ still needs an explicit `--plan`. The 512-token decodes run a plan per position 
 """
 from __future__ import annotations
 
+import os
+
 # model -> {T or None (any): plan dir, resolved by perseus._paths.resolve}
 PLANS: dict[str, dict[int | None, str]] = {
     # up to 32 cached keys (the server, generation); past them the window plans up to 512 (WINDOWS)
@@ -42,3 +44,33 @@ def default_windows(model: str, tokens: int | None = None) -> list[tuple[int, st
     """The default window plans of `model` for a `tokens`-token context (None past the last window)."""
     windows = WINDOWS.get(model)
     return windows if windows and (tokens is None or tokens <= windows[-1][0]) else None
+
+
+# model -> switches every run of the model takes unless the environment sets them (each won a both-order A/B on it)
+RUN_ENV: dict[str, dict[str, str]] = {
+    # 11-24 (graphs, 2 forwards): the rotation pairs around the SiLU-GLU dropped (-0.19 s on 1 GPU, -0.135 s on 2) and
+    # the softmax reciprocal chain's dense refreshes, 4096-periodic, on the 4096-slot route (-0.10 s / -0.12 s, 1.5 GB
+    # more device memory)
+    "llama_prefill": {"PC_ROT_CANCEL": "1", "PC_SHRINK_SLOTS": "4096", "PC_SHRINK_MATCH": "attn_softmax"},
+    # 11-24 (2 GPUs, graphs): the rotation pairs dropped, -0.05 s and 0.8 GB less device memory
+    "gemma2_prefill": {"PC_ROT_CANCEL": "1"},
+}
+
+_SCHED2 = {"PC_SCHED2": "1", "PC_SCHED2_FIN": "async"}
+_PART = {"PC_SCHED2_PART": "1", "PC_SCHED2_PART_ALL": "1"}
+# model -> switches of a two-GPU run (PC_REMOTE_DEVICE set) unless the environment sets them: the two-device compile
+# schedule where it beats the replica lane alone
+TWO_GPU_ENV: dict[str, dict[str, str]] = {
+    "gpt2_prefill": {**_SCHED2, **_PART},
+    "vit": {**_SCHED2, **_PART},
+    "bert": dict(_SCHED2),
+    "gemma2_prefill": {**_SCHED2, "PC_SCHED2_MEM": "1.1"},
+}
+
+
+def apply_env(model: str) -> None:
+    """Set `model`'s default switches (RUN_ENV, and TWO_GPU_ENV on two GPUs) that the environment leaves unset; call
+    before the runtime starts (the switches are read once)."""
+    two = os.environ.get("PC_REMOTE_DEVICE", "").strip() not in ("", "0")
+    for k, v in {**RUN_ENV.get(model, {}), **(TWO_GPU_ENV.get(model, {}) if two else {})}.items():
+        os.environ.setdefault(k, v)

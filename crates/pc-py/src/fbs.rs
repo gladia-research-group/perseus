@@ -144,7 +144,7 @@ pub(crate) struct FbsExec<'r> {
 }
 
 impl<'r> FinishExec<'static, W, M> for FbsExec<'r> {
-    fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>]) -> pc_program::Result<()> {
+    fn finish(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, f: &FinishStep, slots: &mut [Ct<'static, W>], _remote: Option<&mut dyn pc_program::replay::RemoteLane<'static, W, M>>) -> pc_program::Result<()> {
         let d = Desc::parse(&f.desc).ok_or_else(|| ferr(f, "not an FBS descriptor"))?;
         let pre = self.rt.pre.get(&d.name).ok_or_else(|| ferr(f, format!("function {} not built at setup", d.name)))?;
         if f.ins.len() != 1 || f.outs.len() != 1 {

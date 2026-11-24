@@ -478,23 +478,50 @@ pub fn run_staged<'a, W: DevWord, M: DevStrategy<W>>(
     route: &Route,
     prescaled: bool,
 ) -> Result<BtsState> {
+    // PC_BTS_PHASES=1 (diagnostic, eager): each stage timed between device syncs
+    let prof = staged::bts_phases();
+    let kk: usize = cts.iter().map(|x| x.k()).sum();
+    let mut t = |cx: &mut BtsCx<'_, 'a, W, M>, name: &str, t0: &mut Option<std::time::Instant>, lvl: u32, slots: u32| -> Result<()> {
+        if prof {
+            cx.ex.join_aux()?;
+            cx.ex.compute.sync()?;
+            if let Some(a) = t0.take() {
+                eprintln!("[bts-phase] run k {kk} slots {slots} lvl {lvl} {name} {:.3} ms", a.elapsed().as_secs_f64() * 1e3);
+            }
+            *t0 = Some(std::time::Instant::now());
+        }
+        Ok(())
+    };
+    let lvl0 = cts.first().map_or(0, |x| x.meta.level);
+    let mut t0 = None;
+    t(cx, "", &mut t0, lvl0, 0)?;
     let mut st = s.begin(cx, cts, route, prescaled)?;
+    let sl = st.slots;
     s.stc_first_input(cx, &st, cts)?;
+    t(cx, "stcf_input", &mut t0, lvl0, sl)?;
     s.mod_raise(cx, &mut st, cts)?;
+    t(cx, "raise", &mut t0, lvl0, sl)?;
     s.fold(cx, &st, cts)?;
+    t(cx, "fold", &mut t0, lvl0, sl)?;
     for k in 0..st.n_cts {
         s.cts_stage(cx, &st, cts, k)?;
+        t(cx, &format!("cts{k}"), &mut t0, lvl0, sl)?;
     }
     s.eval_mod(cx, &st, cts)?;
+    t(cx, "evalmod", &mut t0, lvl0, sl)?;
     if st.stc_first {
         s.stc_first_output(cx, &st, cts)?;
+        t(cx, "stcf_output", &mut t0, lvl0, sl)?;
         return Ok(st);
     }
     s.stc_enter(cx, &st, cts)?;
+    t(cx, "stc_enter", &mut t0, lvl0, sl)?;
     for k in 0..st.n_stc {
         s.stc_stage(cx, &st, cts, k)?;
+        t(cx, &format!("stc{k}"), &mut t0, lvl0, sl)?;
     }
     s.finish(cx, &st, cts)?;
+    t(cx, "finish", &mut t0, lvl0, sl)?;
     Ok(st)
 }
 

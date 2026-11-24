@@ -81,7 +81,7 @@ impl<S: Lane> Stream<S> {
             let r = f(self);
             // SAFETY: as above
             let g = unsafe { pc_hostrt::end_capture(self.raw) }.map_err(Error::Host)?;
-            return Ok((GraphExec { raw: std::ptr::null_mut(), host: Some(g) }, r?));
+            return Ok((GraphExec { raw: std::ptr::null_mut(), host: Some(g), nodes: 0 }, r?));
         }
         // SAFETY: valid stream; global capture mode
         check(unsafe { ffi::cudaStreamBeginCapture(self.raw, ffi::CAPTURE_MODE_GLOBAL) }, "cudaStreamBeginCapture")?;
@@ -99,13 +99,37 @@ impl<S: Lane> Stream<S> {
                 return Err(e);
             }
         };
+        let mut nodes = 0usize;
+        // SAFETY: g is a valid captured graph; a null node array only counts
+        let counted = check(unsafe { ffi::cudaGraphGetNodes(g, std::ptr::null_mut(), &mut nodes) }, "cudaGraphGetNodes");
+        if let Some(cap) = counted.is_ok().then(graph_node_cap).flatten().filter(|&c| nodes > c) {
+            // SAFETY: graph returned by EndCapture, destroyed once
+            unsafe { ffi::cudaGraphDestroy(g) };
+            return Err(Error::GraphTooLarge { nodes, cap });
+        }
         let mut e = std::ptr::null_mut();
         // SAFETY: g is a valid captured graph; destroyed right after instantiation (the exec keeps its own copy)
         let inst = check(unsafe { ffi::cudaGraphInstantiate(&mut e, g, 0) }, "cudaGraphInstantiate");
         unsafe { ffi::cudaGraphDestroy(g) };
         inst?;
-        Ok((GraphExec { raw: e, host: None }, r))
+        Ok((GraphExec { raw: e, host: None, nodes }, r))
     }
+}
+
+/// The most nodes a captured graph may have (`capture` refuses a larger one: `Error::GraphTooLarge`). With
+/// `CUDA_SCALE_LAUNCH_QUEUES=4x` the driver (595.58, CUDA 13.2, sm_120) cannot launch a one-device graph of more than
+/// 6060 kernel nodes: the launch or its upload never completes, or `cuGraphLaunch` faults on the host (2x and the
+/// default depth launch 200k; two-device graphs of ~40k nodes launched, 55k ones failed). Default 6000 under a scale
+/// above 2x, else none; `PC_GRAPH_MAX_NODES=<n>` sets it (0: none).
+pub fn graph_node_cap() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("PC_GRAPH_MAX_NODES").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => (n > 0).then_some(n),
+        None => {
+            let scale = std::env::var("CUDA_SCALE_LAUNCH_QUEUES").ok().and_then(|v| v.trim().trim_end_matches(['x', 'X']).parse::<f64>().ok());
+            scale.filter(|&s| s > 2.0).map(|_| 6000)
+        }
+    })
 }
 
 impl<S: Lane> Drop for Stream<S> {
@@ -157,6 +181,15 @@ impl Event {
         }
         // SAFETY: both handles are live (borrowed)
         check(unsafe { ffi::cudaEventRecord(self.raw, s.raw()) }, "cudaEventRecord")
+    }
+    /// `record` as an external event (cudaEventRecordExternal): inside a stream capture it becomes an event-record node
+    /// of the graph (recorded at each launch: timing inside graphs), outside one a plain record.
+    pub fn record_external<S: Lane>(&self, s: &Stream<S>) -> Result<()> {
+        if self.host || s.host {
+            return self.record(s);
+        }
+        // SAFETY: both handles are live (borrowed); 1 = cudaEventRecordExternal
+        check(unsafe { ffi::cudaEventRecordWithFlags(self.raw, s.raw(), 1) }, "cudaEventRecordWithFlags")
     }
     /// Block the host until the recorded work completed.
     pub fn sync(&self) -> Result<()> {
@@ -239,8 +272,13 @@ impl Drop for PoolEvent<'_> {
 pub struct GraphExec {
     raw: ffi::cudaGraphExec_t,
     host: Option<pc_hostrt::HostGraph>,
+    nodes: usize,
 }
 impl GraphExec {
+    /// Nodes of the captured graph (0 on the host device).
+    pub fn nodes(&self) -> usize {
+        self.nodes
+    }
     pub fn launch<S: Lane>(&self, s: &Stream<S>) -> Result<()> {
         if let Some(g) = &self.host {
             // SAFETY: live host stream; the graph's buffers live in the arena that outlives the replay

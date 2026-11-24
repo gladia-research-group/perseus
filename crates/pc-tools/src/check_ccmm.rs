@@ -482,7 +482,7 @@ fn check(args: &[String]) -> Res<bool> {
     let lt = pc_cuda::blas::Lt::new(&dev)?;
     let s = &ex.compute;
     let tp = Instant::now();
-    let mut cc = Ccmm::<W>::new(&arena, &dev, s, &ctx, &lt.inner, ccfg, &keys)?;
+    let mut cc = Ccmm::<W>::new(&arena, &dev, s, &ctx, &lt.inner, ccfg.clone(), &keys)?;
     println!("[pc-check] ccmm setup {:.2} s; PPMM GEMM {} of {} candidates, tuned ms {:?}", tp.elapsed().as_secs_f64(), cc.gemm.label(), cc.gemm.algos(), cc.gemm.tuned_ms);
     // operands as 2 batches of 8 (members of batched ciphertexts), outputs as 16 x k = 1 views of 2 x 8
     let mut cts: Vec<Ct<'_, W>> = (0..8).map(|_| Ok(Ct::new(CtMeta::new(0, 1), CtBuf::<Compute, W>::new(&arena, "check.cts", lay, 8)?))).collect::<Res<_>>()?;
@@ -547,6 +547,152 @@ fn check(args: &[String]) -> Res<bool> {
     load(cb, &mats[1])?;
     cc.mul_inplace(&ctx, s, ca, cb, false, None)?;
     cmp(&mut t, "ccmm_mul in place (outs = a)", &read(ca)?, &want_m);
+    // --split: the product split across two devices (`ccmm::mul_split`, visible devices 0 and 1) vs the twin, and the
+    // device ms of both forms (--reps)
+    if args.iter().any(|a| a == "--split") {
+        let reps: usize = arg(args, "--reps").map(|s| s.parse()).transpose()?.unwrap_or(10);
+        cc.enable_split(&lt.inner, &dev, s)?;
+        // the host device (PERSEUS_DEVICE=cpu): both shares on it, two engines (the host twin's batch ranges)
+        let dev1 = if dev.is_host() { Device::open_host() } else { Device::open_ordinal(1)? };
+        let peer = if dev.is_host() { (false, false) } else { (dev.enable_peer(&dev1)?, dev1.enable_peer(&dev)?) };
+        dev1.make_current()?;
+        let mut mp1 = MemPlan::build::<W, M>(&chain, MemCfg { k_max: 1, pool: vec![], events: 8, scratch_cts: 1 })?;
+        mp1.reserve("ccmm", Ccmm::<W>::bytes(&ccfg));
+        mp1.reserve("check.cts", 3 * ctb);
+        let arena1 = mp1.allocate(&dev1)?;
+        let ex1 = Executor::<W>::new(&dev1, &arena1, &mp1)?;
+        let ctx1 = Context::<W, M>::new(&arena1, &ex1.copy, chain.clone(), &mp1)?;
+        let lt1 = pc_cuda::blas::Lt::new(&dev1)?;
+        let s1 = &ex1.compute;
+        let mut cc1 = Ccmm::<W>::new(&arena1, &dev1, s1, &ctx1, &lt1.inner, ccfg.clone(), &keys)?;
+        cc1.enable_split(&lt1.inner, &dev1, s1)?;
+        let mut c1: Vec<Ct<'_, W>> = (0..3).map(|_| Ok(Ct::new(CtMeta::new(0, 1), CtBuf::<Compute, W>::new(&arena1, "check.cts", lay, 8)?))).collect::<Res<_>>()?;
+        let ev1: Vec<Event> = (0..ccmm::SPLIT_EVENTS).map(|_| Event::new(&dev1)).collect::<Result<_, _>>()?;
+        let ph1: Vec<Event> = (0..6).map(|_| Event::timing(&dev1)).collect::<Result<_, _>>()?;
+        let cp1 = pc_cuda::Stream::<Compute>::new(&dev1)?;
+        dev.make_current()?;
+        let ev0: Vec<Event> = (0..ccmm::SPLIT_EVENTS).map(|_| Event::new(&dev)).collect::<Result<_, _>>()?;
+        let ph0: Vec<Event> = (0..6).map(|_| Event::timing(&dev)).collect::<Result<_, _>>()?;
+        let cp0 = pc_cuda::Stream::<Compute>::new(&dev)?;
+        println!("[pc-check] ccmm split: device 1 peer access {peer:?}; half PPMM GEMM {} (tuned ms {:?})", cc.gemm_half.as_ref().map_or(String::new(), |g| g.label()), cc.gemm_half.as_ref().map(|g| g.tuned_ms.clone()));
+        let load1 = |dev1: &Device, x: &mut Ct<'_, W>, m: &[[Vec<u32>; 2]]| -> Res<()> {
+            dev1.make_current()?;
+            for (idx, [p0, p1]) in m.iter().enumerate() {
+                for (part, rows) in [p0, p1].iter().enumerate() {
+                    x.buf.upload_rows(s1, idx, part, &[0, 1, 2, 3], rows)?;
+                }
+            }
+            x.meta = split.clone();
+            dev.make_current()?;
+            Ok(())
+        };
+        // the link: 16.7 MB (a CCMM half column set) one way, then both ways at once (each device pulls)
+        if !dev.is_host() {
+            let n = 4 * D * NS / 2 * 2;
+            let (e0, e1) = (Event::timing(&dev)?, Event::timing(&dev)?);
+            dev1.make_current()?;
+            let (f0, f1) = (Event::timing(&dev1)?, Event::timing(&dev1)?);
+            dev.make_current()?;
+            for both in [false, true, false, true] {
+                dev.synchronize()?;
+                e0.record(&cp0)?;
+                // SAFETY: scratch buffers of this check, nothing else in flight
+                unsafe { co[0].buf.buf.copy_from_peer(&cp0, &dev, 0, &c1[2].buf.buf, &dev1, 0, n)? };
+                e1.record(&cp0)?;
+                if both {
+                    dev1.make_current()?;
+                    f0.record(&cp1)?;
+                    // SAFETY: as above
+                    unsafe { c1[2].buf.buf.copy_from_peer(&cp1, &dev1, 0, &cb[0].buf.buf, &dev, 0, n)? };
+                    f1.record(&cp1)?;
+                    f1.sync()?;
+                    dev.make_current()?;
+                }
+                e1.sync()?;
+                let ms = e0.elapsed_ms(&e1)? as f64;
+                let other = if both { format!(", the other way {:.3} ms", f0.elapsed_ms(&f1)?) } else { String::new() };
+                println!("[pc-check] link: {:.1} MB {} in {ms:.3} ms ({:.1} GB/s){other}", (n * 4) as f64 / 1e6, if both { "both ways" } else { "one way" }, (n * 4) as f64 / ms / 1e6);
+            }
+        }
+        for (bt, want) in [(false, &want_m), (true, &want_mt)] {
+            load(ca, &mats[0])?;
+            load(cb, &mats[1])?;
+            {
+                let (a1, rest) = c1.split_at_mut(1);
+                let (b1, _) = rest.split_at_mut(1);
+                load1(&dev1, &mut a1[0], &mats[0][8..])?;
+                load1(&dev1, &mut b1[0], &mats[1][8..])?;
+            }
+            let mut tm = (0.0f64, 0.0f64);
+            let mut tph = ([0.0f64; 5], [0.0f64; 5]);
+            for rep in 0..reps.max(1) {
+                let t0 = Instant::now();
+                {
+                    let oh_out = ccmm::split_out_members(&mut co[..1]);
+                    let oh = ccmm::SplitOps { a: &ccmm::split_members(&ctx, "a", &ca[..1], 8)?, b: &ccmm::split_members(&ctx, "b", &cb[..1], 8)?, out: &oh_out };
+                    let (a1, rest) = c1.split_at_mut(1);
+                    let (b1, o1) = rest.split_at_mut(1);
+                    let ot_out = ccmm::split_out_members(&mut o1[..1]);
+                    let ot = ccmm::SplitOps { a: &ccmm::split_members(&ctx1, "a", &a1[..1], 8)?, b: &ccmm::split_members(&ctx1, "b", &b1[..1], 8)?, out: &ot_out };
+                    let mut h = ccmm::SplitSide { eng: &mut cc, ctx: &ctx, dev: &dev, s, cp: &cp0, ev: &ev0, ph: Some(&ph0) };
+                    let mut tt = ccmm::SplitSide { eng: &mut cc1, ctx: &ctx1, dev: &dev1, s: s1, cp: &cp1, ev: &ev1, ph: Some(&ph1) };
+                    ccmm::mul_split(&mut h, &mut tt, &oh, &ot, bt)?;
+                }
+                dev1.make_current()?;
+                dev1.synchronize()?;
+                dev.make_current()?;
+                dev.synchronize()?;
+                let wall = t0.elapsed().as_secs_f64() * 1e3;
+                let d = |e: &[Event]| -> Res<[f64; 6]> {
+                    let mut v = [0.0; 6];
+                    for i in 1..6 {
+                        v[i] = e[i - 1].elapsed_ms(&e[i])? as f64;
+                    }
+                    v[0] = e[0].elapsed_ms(&e[5])? as f64;
+                    Ok(v)
+                };
+                let (p0, p1) = (d(&ph0)?, d(&ph1)?);
+                if rep > 0 || reps <= 1 {
+                    tm.0 += wall;
+                    tm.1 += p0[0].max(p1[0]);
+                    for i in 0..5 {
+                        tph.0[i] += p0[i + 1];
+                        tph.1[i] += p1[i + 1];
+                    }
+                }
+            }
+            let nrep = if reps > 1 { reps - 1 } else { 1 } as f64;
+            // outputs: 0 .. 8 here, 8 .. 16 there
+            let mut got = read(co)?;
+            dev1.make_current()?;
+            for idx in 0..8 {
+                got[8 + idx] = [c1[2].buf.download_rows(s1, idx, 0, &[0, 1, 2, 3])?, c1[2].buf.download_rows(s1, idx, 1, &[0, 1, 2, 3])?];
+            }
+            dev.make_current()?;
+            let r = |v: [f64; 5]| v.map(|x| (x / nrep * 100.0).round() / 100.0);
+            cmp(&mut t, &format!("ccmm_mul split b_transposed={bt} (host wall ms {:.2}, device ms max {:.2}; here {:?} there {:?})", tm.0 / nrep, tm.1 / nrep, r(tph.0), r(tph.1)), &got, want);
+            // the single-device product timed the same way
+            let mut ts = (0.0, 0.0);
+            for rep in 0..reps.max(1) {
+                load(ca, &mats[0])?;
+                load(cb, &mats[1])?;
+                dev.synchronize()?;
+                let t0 = Instant::now();
+                cc.mul(&ctx, s, ca, cb, co, bt, Some(evr))?;
+                dev.synchronize()?;
+                let wall = t0.elapsed().as_secs_f64() * 1e3;
+                if rep > 0 || reps <= 1 {
+                    ts.0 += wall;
+                    ts.1 += CcmmTimes::read(evr)?.total();
+                }
+            }
+            println!("[pc-check] ccmm_mul one device b_transposed={bt}: host wall ms {:.2}, device ms {:.2}", ts.0 / nrep, ts.1 / nrep);
+        }
+        dev1.make_current()?;
+        drop(c1);
+        drop(cc1);
+        dev.make_current()?;
+    }
     // refusals
     let mut bad_meta = ca[0].meta.clone();
     bad_meta.level -= 2;

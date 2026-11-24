@@ -200,6 +200,8 @@ pub struct Ccmm<'a, 'lt, W: DevWord> {
     pub cfg: CcmmCfg,
     pub keys: DevCcmmKeys<'a>,
     pub gemm: I8Gemm<'lt>,
+    /// The PPMM GEMM over one half of the left operand's rows (a two-device product, `enable_split`).
+    pub gemm_half: Option<I8Gemm<'lt>>,
     work: Work<'a, W>,
     rows: RowList<'a>,
 }
@@ -256,12 +258,36 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         let rows_v: Vec<(u32, i32)> = (0..NBIG * 8).map(|r| (r as u32, (r % 4) as i32)).collect();
         let rows = RowList::new(arena, s, &rows_v)?;
         let gemm = I8Gemm::with_spec(lt_, tn_spec_batched(2 * D as u64, 2 * D as u64, D as u64, KY as i32), cfg.max_algos, cfg.gemm_workspace)?;
-        let mut me = Ccmm { cfg, keys: dk, gemm, work, rows };
+        let mut me = Ccmm { cfg, keys: dk, gemm, gemm_half: None, work, rows };
         if me.cfg.autotune {
             me.autotune(dev, s)?;
         }
         s.sync()?;
         Ok(me)
+    }
+
+    /// Plan (and with `cfg.autotune` time) the half-rows PPMM GEMM a two-device product runs (`mul_split`).
+    /// Synchronous on `s`.
+    pub fn enable_split(&mut self, lt_: &'lt lt::Lt, dev: &Device, s: &Stream<Compute>) -> Result<()> {
+        if self.gemm_half.is_some() {
+            return Ok(());
+        }
+        // the full plan's strides (a left half is every u's rows h D .. (h + 1) D of the 2D-row plane)
+        let mut spec = tn_spec_batched(2 * D as u64, 2 * D as u64, D as u64, KY as i32);
+        spec.n = D as u64;
+        let mut g = I8Gemm::with_spec(lt_, spec, self.cfg.max_algos, self.cfg.gemm_workspace)?;
+        if self.cfg.autotune {
+            let ev = (Event::timing(dev)?, Event::timing(dev)?);
+            let w = &mut self.work;
+            w.xd.zero(s)?;
+            w.yd.zero(s)?;
+            let (a, b, c) = (w.yd.dptr() as *const i8, w.xd.dptr() as *const i8, w.g.dptr_mut());
+            // SAFETY: as `autotune`: the half plan reads and writes within one digit plane / one exponent
+            unsafe { g.tune(s, (&ev.0, &ev.1), a, b, c, &mut w.gws, 5)? };
+        }
+        s.sync()?;
+        self.gemm_half = Some(g);
+        Ok(())
     }
 
     /// Time the PPMM GEMM's candidates on the work buffers (contents irrelevant) and keep the fastest.
@@ -338,8 +364,13 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         Self::launch(ctx, s, a)
     }
 
-    /// The 16 ciphertexts of a matrix -> columns `x` (FIDESlib ringIn).
-    fn ring_in<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, ins: &[(PolyRef, usize)], x: *mut u32) -> Result<()> {
+    /// Ciphertexts `c0 .. c0 + ins.len()` of a matrix -> their columns 8 c0 .. of `x` (FIDESlib ringIn; all 16 with
+    /// `c0` = 0).
+    fn ring_in<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, ins: &[(PolyRef, usize)], c0: usize, x: *mut u32) -> Result<()> {
+        let cnt = ins.len();
+        if cnt == 0 || c0 + cnt > NBIG {
+            return Err(shape("ccmm ring in", format!("ciphertexts {c0} .. {} of a {NBIG}-ciphertext matrix", c0 + cnt)));
+        }
         let stage = self.work.stage.dptr_mut() as *mut c_void;
         for (slot, &(ct, m)) in ins.iter().enumerate() {
             let mut a = self.kargs(op::GATHER, NB);
@@ -349,33 +380,43 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
             a.x = stage;
             Self::launch(ctx, s, a)?;
         }
-        ntt::transform_rows(ctx, s, Dir::Inverse, &mut self.work.stage, &self.rows)?;
+        ntt::transform_rows_prefix(ctx, s, Dir::Inverse, &mut self.work.stage, &self.rows, 8 * cnt)?;
         // a = part 1 of each slot: digit j at + j NB, slot q at + 8 q NB
         let src = (self.work.stage.dptr() as *const W).wrapping_add(4 * NB) as *const c_void;
         let fwd = self.keys.fwd.dptr();
-        self.key_switch(ctx, s, NB, NBIG, src, NB, 8 * NB, true, fwd, 0)?;
+        self.key_switch(ctx, s, NB, cnt, src, NB, 8 * NB, true, fwd, 0)?;
         let mut a = self.kargs(op::RING_IN, NB);
         a.y = self.work.stage.vptr();
         a.z = self.work.res.vptr();
         a.x = x as *mut c_void;
+        a.i0 = c0 as i32;
+        a.i1 = cnt as i32;
         Self::launch(ctx, s, a)
     }
 
-    /// Columns `x` -> the 16 output ciphertexts (FIDESlib ringOut).
-    fn ring_out<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, x: *const u32, outs: &[(PolyRef, usize)]) -> Result<()> {
+    /// Columns 8 c0 .. of `x` -> output ciphertexts `c0 .. c0 + outs.len()` (FIDESlib ringOut; all 16 with `c0` = 0).
+    fn ring_out<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, x: *const u32, outs: &[(PolyRef, usize)], c0: usize) -> Result<()> {
+        let cnt = outs.len();
+        if cnt == 0 || c0 + cnt > NBIG {
+            return Err(shape("ccmm ring out", format!("ciphertexts {c0} .. {} of a {NBIG}-ciphertext matrix", c0 + cnt)));
+        }
         let mut a = self.kargs(op::COMPOSE_A, NB);
         a.y = x as *const c_void;
         a.x = self.work.biga.vptr_mut();
+        a.i0 = c0 as i32;
+        a.i1 = cnt as i32;
         Self::launch(ctx, s, a)?;
         let src = self.work.biga.vptr();
         let back = self.keys.back.dptr();
-        self.key_switch(ctx, s, NB, NBIG, src, NBIG * NB, NB, false, back, 0)?;
+        self.key_switch(ctx, s, NB, cnt, src, cnt * NB, NB, false, back, 0)?;
         let mut a = self.kargs(op::RING_OUT, NB);
         a.y = x as *const c_void;
         a.z = self.work.res.vptr();
         a.x = self.work.stage.vptr_mut();
+        a.i0 = c0 as i32;
+        a.i1 = cnt as i32;
         Self::launch(ctx, s, a)?;
-        ntt::transform_rows(ctx, s, Dir::Forward, &mut self.work.stage, &self.rows)?;
+        ntt::transform_rows_prefix(ctx, s, Dir::Forward, &mut self.work.stage, &self.rows, 8 * cnt)?;
         for (slot, &(ct, m)) in outs.iter().enumerate() {
             let mut a = self.kargs(op::SCATTER, NB);
             a.ct = ct;
@@ -434,8 +475,15 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         self.cols_op(ctx, s, op::MONO, r2, x, -1, 0, 0)
     }
 
-    /// The four PPMMs of M (columns `xm`) and M'^T (columns `xmp`) -> Cn [4][2D][2D][KY] (FIDESlib ppmm).
-    fn ppmm<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, xm: *const u32, xmp: *const u32) -> Result<()> {
+    /// The four PPMMs of M (columns `xm`) and M'^T (columns `xmp`) -> Cn [4][2D][2D][KY] (FIDESlib ppmm). `half` =
+    /// Some(h): only the rows r of Cn in h D .. (h + 1) D (the left operand's part h: 0 = b, 1 = a), the rest unset.
+    fn ppmm<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, xm: *const u32, xmp: *const u32, half: Option<usize>) -> Result<()> {
+        let gh = match half {
+            Some(h) if h < 2 => Some((h, self.gemm_half.as_ref().ok_or_else(|| shape("ccmm ppmm", "half rows without the half plan (enable_split)"))?)),
+            Some(h) => return Err(shape("ccmm ppmm", format!("half {h}"))),
+            None => None,
+        };
+        let (boff, coff) = gh.map_or((0, 0), |(h, _)| (h * D * D, h * D * 2 * D));
         let e = self.work.e.dptr_mut();
         for (src, off) in [(xm, 0), (xmp, COLS)] {
             let mut a = self.kargs(op::GATHER_U, 0);
@@ -467,17 +515,39 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
                     let ex = da + db;
                     // SAFETY: A = right digit plane db, B = left digit plane da (PER bytes each, the batched operands),
                     // C = exponent ex's accumulator (GPER int32), inside the work buffers
+                    // (half: B = the left plane's rows h D .., C = the accumulator's rows h D ..)
                     unsafe {
-                        self.gemm.run(s, yd.wrapping_add(db * PER) as *const i8, xd.wrapping_add(da * PER) as *const i8, g.wrapping_add(ex * GPER), seen[ex], &mut self.work.gws)?;
+                        let gm = gh.map_or(&self.gemm, |(_, x)| x);
+                        gm.run(s, yd.wrapping_add(db * PER) as *const i8, xd.wrapping_add(da * PER + boff) as *const i8, g.wrapping_add(ex * GPER + coff), seen[ex], &mut self.work.gws)?;
                     }
                     seen[ex] = true;
                 }
             }
             let mut a = self.kargs(op::RECOMBINE, 0);
             a.i0 = pi as i32;
+            if let Some((h, _)) = gh {
+                a.i1 = (h * D) as i32;
+                a.i2 = D as i32;
+            }
             a.y = g as *const c_void;
             a.x = self.work.cn.vptr_mut();
             Self::launch(ctx, s, a)?;
+        }
+        if let Some((h, _)) = gh {
+            // per prime: its rows h D .. (h + 1) D of Cn, one block of D 2D polys of KY
+            for pi in 0..NQ {
+                let mut a = self.kargs(op::INTT, KY);
+                a.p[0] = self.keys.primes[pi];
+                a.mu[0] = self.keys.mu[pi];
+                a.c[0] = self.keys.ninv[ti][pi];
+                a.count = (D * 2 * D) as i32;
+                a.i0 = (D * 2 * D) as i32;
+                a.i1 = 1;
+                a.x = self.work.cn.dptr_mut().wrapping_add((pi * 2 * D + h * D) * 2 * D * KY) as *mut c_void;
+                a.tw = (self.keys.itw[ti].dptr() as *const u32).wrapping_add(pi * KY) as *const c_void;
+                Self::launch(ctx, s, a)?;
+            }
+            return Ok(());
         }
         let mut a = self.kargs(op::INTT, KY);
         a.count = (NQ * GPER / KY) as i32;
@@ -487,6 +557,43 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         a.tw = self.keys.itw[ti].vptr();
         a.c[..NP].copy_from_slice(&self.keys.ninv[ti]);
         Self::launch(ctx, s, a)
+    }
+
+    /// Rows `off .. off + D` of Cn -> the column set `dst` (FIDESlib ppmm's scatter: 0 = the M b-part rows, D = a).
+    fn scatter_rows<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, off: usize, dst: *mut u32) -> Result<()> {
+        let mut ar = self.kargs(op::SCATTER_ROWS, 0);
+        ar.i0 = off as i32;
+        ar.y = self.work.cn.vptr();
+        ar.x = dst as *mut c_void;
+        Self::launch(ctx, s, ar)
+    }
+
+    /// Relinearize the CMT'd x1 (its a part times s'^2): res = KS of x1's a part under `rlk`.
+    fn relin<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, x1: *const u32) -> Result<()> {
+        let per = D * NS;
+        let rlk = self.keys.rlk.dptr();
+        self.key_switch(ctx, s, NS, D, x1.wrapping_add(NQ * per) as *const c_void, per, NS, false, rlk, 0)
+    }
+
+    /// `relin` of x1's columns c0 .. c0 + n folded into x1 (a split product): x1[0] += res[0], x1[1] = res[1] over those
+    /// columns (res [2][4][n][NS] of the n-poly key switch), so that xm + x1 is the relinearized sum there.
+    fn relin_fold<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, c0: usize, n: usize) -> Result<()> {
+        let per = D * NS;
+        let rlk = self.keys.rlk.dptr();
+        let x1 = self.work.x1.dptr();
+        self.key_switch(ctx, s, NS, n, x1.wrapping_add(NQ * per + c0 * NS) as *const c_void, per, NS, false, rlk, 0)?;
+        for i in 0..NQ {
+            let (xo, ro) = ((i * D + c0) * NS, i * n * NS);
+            // one prime's n NS words: the ADD over 4 "primes" of n NS / 4 words, all p_i
+            let mut a = self.kargs(op::ADD, 0);
+            a.p[..NQ].fill(self.keys.primes[i]);
+            a.x = self.work.x1.dptr_mut().wrapping_add(xo) as *mut c_void;
+            a.y = self.work.res.dptr().wrapping_add(ro) as *const c_void;
+            a.s[0] = (n * NS / NQ) as i64;
+            Self::launch(ctx, s, a)?;
+            self.work.x1.copy_from_at(s, NQ * per + xo, &self.work.res, (NQ + i) * n * NS, n * NS)?;
+        }
+        Ok(())
     }
 
     fn add<M: DevStrategy<W>>(&self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, x: *mut u32, y: *const u32) -> Result<()> {
@@ -506,33 +613,27 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         };
         rec(0)?;
         let (xm, xmp, x1) = (self.work.xm.dptr_mut(), self.work.xmp.dptr_mut(), self.work.x1.dptr_mut());
-        self.ring_in(ctx, s, a, xm)?;
-        self.ring_in(ctx, s, b, xmp)?;
+        self.ring_in(ctx, s, a, 0, xm)?;
+        self.ring_in(ctx, s, b, 0, xmp)?;
         rec(1)?;
         if !b_transposed {
             self.cmt(ctx, s, xmp)?;
         }
         rec(2)?;
-        self.ppmm(ctx, s, xm, xmp)?;
+        self.ppmm(ctx, s, xm, xmp, None)?;
         rec(3)?;
-        for (dst, off) in [(xm, 0), (x1, D)] {
-            let mut ar = self.kargs(op::SCATTER_ROWS, 0);
-            ar.i0 = off as i32;
-            ar.y = self.work.cn.vptr();
-            ar.x = dst as *mut c_void;
-            Self::launch(ctx, s, ar)?;
-        }
+        self.scatter_rows(ctx, s, 0, xm)?;
+        self.scatter_rows(ctx, s, D, x1)?;
         self.cmt(ctx, s, xm)?;
         self.cmt(ctx, s, x1)?;
+        self.relin(ctx, s, x1)?;
         let per = D * NS;
-        let rlk = self.keys.rlk.dptr();
-        self.key_switch(ctx, s, NS, D, x1.wrapping_add(NQ * per) as *const c_void, per, NS, false, rlk, 0)?;
         let res = self.work.res.dptr();
         self.add(ctx, s, xm, res.wrapping_add(NQ * per))?;
         self.add(ctx, s, xm.wrapping_add(NQ * per), x1)?;
         self.add(ctx, s, xm.wrapping_add(NQ * per), res)?;
         rec(4)?;
-        self.ring_out(ctx, s, xm, outs)?;
+        self.ring_out(ctx, s, xm, outs, 0)?;
         rec(5)
     }
 
@@ -545,13 +646,13 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         };
         rec(0)?;
         let xm = self.work.xm.dptr_mut();
-        self.ring_in(ctx, s, ins, xm)?;
+        self.ring_in(ctx, s, ins, 0, xm)?;
         rec(1)?;
         self.cmt(ctx, s, xm)?;
         rec(2)?;
         rec(3)?;
         rec(4)?;
-        self.ring_out(ctx, s, xm, outs)?;
+        self.ring_out(ctx, s, xm, outs, 0)?;
         rec(5)
     }
 
@@ -639,6 +740,284 @@ impl<'a, 'lt, W: DevWord> Ccmm<'a, 'lt, W> {
         let mo = Self::write_members(x);
         self.transpose_members(ctx, s, &mi, &mo, ev)
     }
+}
+
+// ── the product split across two devices (PC_CCMM_SPLIT) ─────────────────────────────────────────────────────────
+//
+// Every output ciphertext depends on every input ciphertext (the PPMM sums over all 128 columns of both operands, the
+// two CMTs mix all columns), so no device can compute output ciphertexts from a share of the inputs. What splits:
+// the ring switch in (per input ciphertext), the PPMM by the left operand's part (rows 0 .. D of Cn = b, D .. 2D = a:
+// the two halves feed the independent CMT(xm) and CMT(x1)), the relinearization (on x1's device) and the ring switch
+// out (per output ciphertext). Here = ciphertexts 0 .. 8 of each operand and of the output, Cn rows 0 .. D, CMT(xm);
+// there = ciphertexts 8 .. 16, rows D .. 2D, CMT(x1) + relinearization. Both run the right operand's CMT. Two
+// exchanges of columns (each device pulls on its copy stream, chunk by chunk as they are made): after the ring switch
+// in (the right operand's other 64 columns, the left part the device's rows need), and before the ring switch out
+// (here: x1 with its relinearization folded in, columns 0 .. 64, made first; there: xm of columns 64 .. 128).
+// Bit-exact: the same integer ops, the additions regrouped mod p.
+
+/// Events one device records in a split product (`SplitSide::ev`, on that device).
+pub const SPLIT_EVENTS: usize = 10;
+const EV_START: usize = 0;
+/// the ring switch in of chunk c of the right (`EV_XR + c`) / left (`EV_XL + c`) operand
+const EV_XR: usize = 1;
+const EV_XL: usize = 3;
+const EV_RXR: usize = 5;
+const EV_RXL: usize = 6;
+const EV_PP: usize = 7;
+const EV_POST: usize = 8;
+const EV_R2: usize = 9;
+/// Ring-switch chunks of a device's 8 ciphertexts per operand (their columns are pulled as each one is done).
+const SPLIT_CHUNKS: usize = 2;
+
+/// One device's share of a split product: its engine (`enable_split`), context, compute stream, its copy stream
+/// (pulls the other device's columns into its engine) and `SPLIT_EVENTS` events of its own.
+pub struct SplitSide<'s, 'a, 'lt, 'c, W: DevWord, M: DevStrategy<W>> {
+    pub eng: &'s mut Ccmm<'a, 'lt, W>,
+    pub ctx: &'s Context<'c, W, M>,
+    pub dev: &'s Device,
+    pub s: &'s Stream<Compute>,
+    pub cp: &'s Stream<Compute>,
+    pub ev: &'s [Event],
+    /// PC_CCMM_PHASES: 6 timing events of this device (start, ring in, CMT, PPMM, CMT(s) + relinearization, ring out)
+    pub ph: Option<&'s [Event]>,
+}
+
+/// One device's operands and outputs of a split product: its 8 ciphertexts of `a`, of `b` and of the output.
+pub struct SplitOps<'m> {
+    pub a: &'m [(PolyRef, usize)],
+    pub b: &'m [(PolyRef, usize)],
+    pub out: &'m [(PolyRef, usize)],
+}
+
+/// The member views of `cts` (`n` ciphertexts in all, each at the CCMM split).
+pub fn split_members<W: DevWord, M: DevStrategy<W>>(ctx: &Context<'_, W, M>, what: &str, cts: &[Ct<'_, W>], n: usize) -> Result<Members> {
+    let mut v = Vec::new();
+    for x in cts {
+        if ctx.lay != x.buf.lay || ctx.top_of(x.meta.level)? != NQ - 1 {
+            return Err(shape("ccmm split", format!("{what}: ciphertext at level {} (top {:?}); the CCMM holds limbs 0..3", x.meta.level, ctx.top_of(x.meta.level).ok())));
+        }
+        let r = x.buf.r();
+        for m in 0..x.k() {
+            v.push((r, m));
+        }
+    }
+    if v.len() != n {
+        return Err(shape("ccmm split", format!("{what}: {} ciphertexts, a share is {n}", v.len())));
+    }
+    Ok(v)
+}
+
+/// The writable member views of `cts` (a share's outputs).
+pub fn split_out_members<W: DevWord>(cts: &mut [Ct<'_, W>]) -> Members {
+    let mut v = Vec::new();
+    for x in cts.iter_mut() {
+        let r = x.buf.w();
+        for m in 0..x.k() {
+            v.push((r, m));
+        }
+    }
+    v
+}
+
+/// Parts `parts` x primes of columns `cols` of the column set `src` (memory of `sd`) into the same words of `dst`
+/// (memory of `dd`), on `s`.
+///
+/// # Safety
+/// As `DBuf::copy_from_peer`: `s` waits for the writes of `src` and nothing writes `src` / reads `dst` before an event
+/// recorded on `s` after the copy.
+unsafe fn pull_cols(s: &Stream<Compute>, dst: &mut DBuf<'_, Compute, u32>, dd: &Device, src: &DBuf<'_, Compute, u32>, sd: &Device, parts: &[usize], cols: std::ops::Range<usize>) -> Result<()> {
+    for &part in parts {
+        for i in 0..NQ {
+            let off = ((part * NQ + i) * D + cols.start) * NS;
+            if dd.is_host() {
+                // the host device (both shares on it: the host twin's check)
+                dst.copy_from_at(s, off, src, off, cols.len() * NS)?;
+            } else {
+                dst.copy_from_peer(s, dd, off, src, sd, off, cols.len() * NS)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rec_ph(ph: Option<&[Event]>, s: &Stream<Compute>, i: usize) -> Result<()> {
+    if let Some(e) = ph {
+        e[i].record(s)?;
+    }
+    Ok(())
+}
+
+/// A split product's last step on one device (current): after both column pulls of the second exchange, xm += x1 (the
+/// relinearization folded in, `relin_fold`) and the ring switch out of its output ciphertexts `c0 ..`.
+fn finish_side<W: DevWord, M: DevStrategy<W>>(x: &mut SplitSide<'_, '_, '_, '_, W, M>, o: &SplitOps<'_>, c0: usize, r2: &[&Event]) -> Result<()> {
+    for e in r2 {
+        x.s.wait(e)?;
+    }
+    let per = D * NS;
+    let e = &mut *x.eng;
+    let (xm, x1) = (e.work.xm.dptr_mut(), e.work.x1.dptr());
+    e.add(x.ctx, x.s, xm, x1.wrapping_add(NQ * per))?;
+    e.add(x.ctx, x.s, xm.wrapping_add(NQ * per), x1)?;
+    e.ring_out(x.ctx, x.s, xm, o.out, c0)?;
+    rec_ph(x.ph, x.s, 5)
+}
+
+/// The product M M' (`b_transposed`: M'^T given) split across two devices `h` (here) and `t` (there), in place or not
+/// as the member lists say: `h` takes ciphertexts 0 .. 8 of `a`, `b` and the output (`oh`), `t` 8 .. 16 (`ot`).
+/// Everything is issued asynchronously; `h`'s device is current on return. The outputs are ready on each device's
+/// compute stream; `t`'s inputs are read after everything issued on `t.s` so far, `h`'s after `h.s`'s.
+pub fn mul_split<W: DevWord, M: DevStrategy<W>>(h: &mut SplitSide<'_, '_, '_, '_, W, M>, t: &mut SplitSide<'_, '_, '_, '_, W, M>, oh: &SplitOps<'_>, ot: &SplitOps<'_>, b_transposed: bool) -> Result<()> {
+    const HB: usize = NBIG / 2;
+    const HC: usize = D / 2;
+    for (o, who) in [(oh, "here"), (ot, "there")] {
+        if o.a.len() != HB || o.b.len() != HB || o.out.len() != HB {
+            return Err(shape("ccmm split", format!("{who}: {} / {} / {} ciphertexts, a share is {HB}", o.a.len(), o.b.len(), o.out.len())));
+        }
+    }
+    if h.ev.len() < SPLIT_EVENTS || t.ev.len() < SPLIT_EVENTS || h.eng.gemm_half.is_none() || t.eng.gemm_half.is_none() {
+        return Err(shape("ccmm split", "both engines need enable_split and SPLIT_EVENTS events"));
+    }
+    let (hd, td) = (h.dev, t.dev);
+    let (hev, tev): (&[Event], &[Event]) = (h.ev, t.ev);
+    // a device's ciphertexts per chunk, and the columns of chunk c of the device whose first ciphertext is c0
+    const CC: usize = HB / SPLIT_CHUNKS;
+    let chunk_cols = |c0: usize, c: usize| (c0 + c * CC) * (D / NBIG)..(c0 + (c + 1) * CC) * (D / NBIG);
+    let res = (|| -> Result<()> {
+        // 1., 2. both: the ring switch in of the device's ciphertexts in chunks (the right operand first: both CMTs
+        // wait for it), an event after each
+        td.make_current()?;
+        {
+            let e = &mut *t.eng;
+            rec_ph(t.ph, t.s, 0)?;
+            t.ev[EV_START].record(t.s)?;
+            let (xm, xmp) = (e.work.xm.dptr_mut(), e.work.xmp.dptr_mut());
+            for (ops, x, ev) in [(ot.b, xmp, EV_XR), (ot.a, xm, EV_XL)] {
+                for c in 0..SPLIT_CHUNKS {
+                    e.ring_in(t.ctx, t.s, &ops[c * CC..(c + 1) * CC], HB + c * CC, x)?;
+                    t.ev[ev + c].record(t.s)?;
+                }
+            }
+            rec_ph(t.ph, t.s, 1)?;
+        }
+        hd.make_current()?;
+        {
+            let e = &mut *h.eng;
+            rec_ph(h.ph, h.s, 0)?;
+            h.ev[EV_START].record(h.s)?;
+            let (xm, xmp) = (e.work.xm.dptr_mut(), e.work.xmp.dptr_mut());
+            for (ops, x, ev) in [(oh.b, xmp, EV_XR), (oh.a, xm, EV_XL)] {
+                for c in 0..SPLIT_CHUNKS {
+                    e.ring_in(h.ctx, h.s, &ops[c * CC..(c + 1) * CC], c * CC, x)?;
+                    h.ev[ev + c].record(h.s)?;
+                }
+            }
+            rec_ph(h.ph, h.s, 1)?;
+        }
+        // 3. here pulls there's right columns (both parts) and its left columns' b part, chunk by chunk (after there's
+        // last pull of here's columns, in the previous product)
+        h.cp.wait(&h.ev[EV_START])?;
+        h.cp.wait(&t.ev[EV_R2])?;
+        for c in 0..SPLIT_CHUNKS {
+            h.cp.wait(&t.ev[EV_XR + c])?;
+            // SAFETY: the copy stream waits for the events after the source's writes and after this device's last reads
+            // of the destination (START); the sources are not written before the waits below (RXR / RXL) there
+            unsafe { pull_cols(h.cp, &mut h.eng.work.xmp, hd, &t.eng.work.xmp, td, &[0, 1], chunk_cols(HB, c))? };
+        }
+        h.ev[EV_RXR].record(h.cp)?;
+        for c in 0..SPLIT_CHUNKS {
+            h.cp.wait(&t.ev[EV_XL + c])?;
+            // SAFETY: as above
+            unsafe { pull_cols(h.cp, &mut h.eng.work.xm, hd, &t.eng.work.xm, td, &[0], chunk_cols(HB, c))? };
+        }
+        h.ev[EV_RXL].record(h.cp)?;
+        // 4. there pulls here's right columns and its left columns' a part
+        td.make_current()?;
+        t.cp.wait(&t.ev[EV_START])?;
+        t.cp.wait(&h.ev[EV_R2])?;
+        for c in 0..SPLIT_CHUNKS {
+            t.cp.wait(&h.ev[EV_XR + c])?;
+            // SAFETY: as above
+            unsafe { pull_cols(t.cp, &mut t.eng.work.xmp, td, &h.eng.work.xmp, hd, &[0, 1], chunk_cols(0, c))? };
+        }
+        t.ev[EV_RXR].record(t.cp)?;
+        for c in 0..SPLIT_CHUNKS {
+            t.cp.wait(&h.ev[EV_XL + c])?;
+            // SAFETY: as above
+            unsafe { pull_cols(t.cp, &mut t.eng.work.xm, td, &h.eng.work.xm, hd, &[1], chunk_cols(0, c))? };
+        }
+        t.ev[EV_RXL].record(t.cp)?;
+        // 5. here: CMT of the right operand (after both pulls of it), PPMM rows 0 .. D, CMT(xm)
+        hd.make_current()?;
+        {
+            let e = &mut *h.eng;
+            let (xm, xmp) = (e.work.xm.dptr_mut(), e.work.xmp.dptr_mut());
+            h.s.wait(&h.ev[EV_RXR])?;
+            h.s.wait(&t.ev[EV_RXR])?;
+            if !b_transposed {
+                e.cmt(h.ctx, h.s, xmp)?;
+            }
+            rec_ph(h.ph, h.s, 2)?;
+            h.s.wait(&h.ev[EV_RXL])?;
+            e.ppmm(h.ctx, h.s, xm, xmp, Some(0))?;
+            h.ev[EV_PP].record(h.s)?;
+            rec_ph(h.ph, h.s, 3)?;
+            // there has pulled xm's a part
+            h.s.wait(&t.ev[EV_RXL])?;
+            e.scatter_rows(h.ctx, h.s, 0, xm)?;
+            e.cmt(h.ctx, h.s, xm)?;
+            h.ev[EV_POST].record(h.s)?;
+            rec_ph(h.ph, h.s, 4)?;
+        }
+        // 6. there: CMT, PPMM rows D .. 2D, CMT(x1), its relinearization folded into x1 (x1 = (x1.b + res[0], res[1])):
+        // here's columns first (the pull of them overlaps the rest)
+        td.make_current()?;
+        {
+            let e = &mut *t.eng;
+            let (xm, xmp, x1) = (e.work.xm.dptr_mut(), e.work.xmp.dptr_mut(), e.work.x1.dptr_mut());
+            t.s.wait(&t.ev[EV_RXR])?;
+            t.s.wait(&h.ev[EV_RXR])?;
+            if !b_transposed {
+                e.cmt(t.ctx, t.s, xmp)?;
+            }
+            rec_ph(t.ph, t.s, 2)?;
+            t.s.wait(&t.ev[EV_RXL])?;
+            e.ppmm(t.ctx, t.s, xm, xmp, Some(1))?;
+            t.ev[EV_PP].record(t.s)?;
+            rec_ph(t.ph, t.s, 3)?;
+            e.scatter_rows(t.ctx, t.s, D, x1)?;
+            e.cmt(t.ctx, t.s, x1)?;
+            e.relin_fold(t.ctx, t.s, 0, HC)?;
+            t.ev[EV_POST].record(t.s)?;
+            e.relin_fold(t.ctx, t.s, HC, HC)?;
+            rec_ph(t.ph, t.s, 4)?;
+        }
+        // 7. here pulls x1 of columns 0 .. 64
+        hd.make_current()?;
+        h.cp.wait(&h.ev[EV_POST])?;
+        h.cp.wait(&t.ev[EV_POST])?;
+        // SAFETY: as above (here's x1 is free after its CMT(xm); there writes its x1 columns 0 .. 64 again only in its
+        // next product, after R2 of here)
+        unsafe { pull_cols(h.cp, &mut h.eng.work.x1, hd, &t.eng.work.x1, td, &[0, 1], 0..HC)? };
+        h.ev[EV_R2].record(h.cp)?;
+        // 8. there pulls xm of columns 64 .. 128 (its xm is free after its PPMM and here's pull of it)
+        td.make_current()?;
+        t.cp.wait(&t.ev[EV_PP])?;
+        t.cp.wait(&h.ev[EV_RXL])?;
+        t.cp.wait(&h.ev[EV_POST])?;
+        // SAFETY: as above (here's adds write xm after R2 of there)
+        unsafe { pull_cols(t.cp, &mut t.eng.work.xm, td, &h.eng.work.xm, hd, &[0, 1], HC..D)? };
+        t.ev[EV_R2].record(t.cp)?;
+        // 9., 10. both: xm += x1, the ring switch out of the device's output ciphertexts, after its own pull (here also
+        // after there's pull of its xm, which its additions overwrite; there's x1 columns here pulls stay untouched)
+        hd.make_current()?;
+        finish_side(h, oh, 0, &[&hev[EV_R2], &tev[EV_R2]])?;
+        td.make_current()?;
+        finish_side(t, ot, HB, &[&tev[EV_R2]])
+    })();
+    let back = hd.make_current();
+    res?;
+    back?;
+    Ok(())
 }
 
 // ── SinCBoot (CKL Sec. 3.2 on the StC-first route) ───────────────────────────────────────────────────────────────

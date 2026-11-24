@@ -289,6 +289,88 @@ pub struct LinearHooks<'e> {
     pub after_finish: Option<&'e Event>,
 }
 
+/// A second device for a linear's finish groups (`linear`'s `off`): the last half of the groups is refreshed there
+/// while this device refreshes the first half.
+pub trait GroupOffload<'a, W: DevWord, M: DevStrategy<W>> {
+    /// Refresh group ciphertext `x` (this device's memory, at the split of `call`) to `Done` on the remote device,
+    /// written back into `x`, ordered after everything issued on `here` so far.
+    fn issue(&mut self, here: &Stream<Compute>, sh: &pc_shadow::Shadow, call: &BtsCall<'_, 'a, W, M>, x: &mut Ct<'a, W>) -> Result<()>;
+    /// Order `here` after every issued group.
+    fn join(&mut self, here: &Stream<Compute>) -> Result<()>;
+    /// Every remote group refreshed here again from its saved input and compared word for word (host waits, eager
+    /// only: `PC_REMOTE_CHECK`).
+    fn check(&self) -> bool {
+        false
+    }
+    /// How many of `total` finish groups (the last ones) go to the other device: by default the last half.
+    fn far(&self, total: usize) -> usize {
+        total / 2
+    }
+    /// How many of the linear's `n` inputs (the last ones) take their StC-first input stage on the other device
+    /// (0: none, the default).
+    fn stc_far(&self, _n: usize) -> usize {
+        0
+    }
+    /// The input stage of `call` (at `Begun`, the linear's input call) for `xs` on the other device, the results back
+    /// in `xs` at the split, ordered after everything issued on `here` so far (`join` orders `here` after it).
+    fn stc_issue(&mut self, _here: &Stream<Compute>, _sh: &pc_shadow::Shadow, _call: &BtsCall<'_, 'a, W, M>, _xs: &mut [Ct<'a, W>]) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no input stages"))
+    }
+    /// Joint linear (`linear_joint`): whether the other device holds its own planes of linear `lin`'s far outputs.
+    fn joint(&self, _lin: &str) -> bool {
+        false
+    }
+    /// Joint: the input stage of `call` for inputs `first..first + xs.len()` (`xs`) on the other device, the results
+    /// kept there for its product and copied back into `xs` (`join` orders `here` after it).
+    fn joint_stc(&mut self, _here: &Stream<Compute>, _sh: &pc_shadow::Shadow, _call: &BtsCall<'_, 'a, W, M>, _first: usize, _xs: &mut [Ct<'a, W>]) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no joint linears"))
+    }
+    /// Joint: this device's inputs `0..xs.len()` at the split copied to the other device (after everything issued on
+    /// `here` so far).
+    fn joint_inputs(&mut self, _here: &Stream<Compute>, _xs: &[Ct<'a, W>]) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no joint linears"))
+    }
+    /// Joint: linear `lin`'s far outputs (sub-shape `sub`, numbered `0..sub.n_out` as the other device's planes) at
+    /// scale `nf_out` on the other device's inputs, each group of `groups` (sub numbering) finished there at raise drop
+    /// `drops[g]` from the input call `call` (at the split), the results copied back into `outs[g]` (`join` orders
+    /// `here` after it; the caller applies 2^shift).
+    #[allow(clippy::too_many_arguments)]
+    fn joint_far(&mut self, _here: &Stream<Compute>, _sh: &pc_shadow::Shadow, _lin: &PcmmLinear, _sub: &PcmmShape, _call: &BtsCall<'_, 'a, W, M>, _nf_out: f64, _groups: &[Vec<usize>], _drops: &[u32], _outs: &mut [Ct<'a, W>]) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no joint linears"))
+    }
+    /// Row split (`linear_rows`, Sylph's reduction split): whether the other device holds its planes of linear `lin`'s
+    /// last inputs (every output).
+    fn rows(&self, _lin: &str) -> bool {
+        false
+    }
+    /// Rows: the input stage of `call` for inputs `first..first + xs.len()` (`xs`) on the other device, kept there for
+    /// its partial product (copied back into `xs` too when `back`: the remote check), ordered after everything issued
+    /// on `here` so far.
+    fn rows_stc(&mut self, _here: &Stream<Compute>, _sh: &pc_shadow::Shadow, _call: &BtsCall<'_, 'a, W, M>, _first: usize, _xs: &mut [Ct<'a, W>], _back: bool) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no row splits"))
+    }
+    /// Rows: the other device's partial product of its staged inputs (sub-shape `sub`: those inputs, every output) on
+    /// its planes of `lin`, the partial's buffers returned (`Pcmm::partial_ptrs`, peer memory); `rows_wait` orders a
+    /// stream of this device after it.
+    fn rows_product(&mut self, _lin: &PcmmLinear, _sub: &PcmmShape) -> Result<(*const u32, *const u32)> {
+        Err(shape("pcmm offload", "this offload runs no row splits"))
+    }
+    /// Rows: order `here` after the other device's partial product.
+    fn rows_wait(&mut self, _here: &Stream<Compute>) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no row splits"))
+    }
+    /// Rows: on the other device, after everything issued on `here` so far, this device's partial (`here_partial`,
+    /// peer memory) added into its own for its outputs `far_outs` (every-output numbering), their output stage at
+    /// `meta` / `nf_out`, each group of `groups` (positions in `far_outs`) finished there at `drops[g]` from `call`, the
+    /// results copied back into `outs[g]` (`join` orders `here` after it).
+    #[allow(clippy::too_many_arguments)]
+    fn rows_far(&mut self, _here: &Stream<Compute>, _sh: &pc_shadow::Shadow, _sub: &PcmmShape, _call: &BtsCall<'_, 'a, W, M>, _here_partial: (*const u32, *const u32), _far_outs: &[usize], _meta: &CtMeta, _nf_out: f64, _groups: &[Vec<usize>], _drops: &[u32], _outs: &mut [Ct<'a, W>]) -> Result<()> {
+        Err(shape("pcmm offload", "this offload runs no row splits"))
+    }
+    /// One remote group checked.
+    fn checked(&mut self) {}
+}
+
 /// The PCMM engine of a session: keys per token-lane count, GEMM plans per shape, one set of work buffers.
 pub struct Pcmm<'a, 'lt, W: DevWord> {
     pub cfg: PcmmCfg,
@@ -575,6 +657,19 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
 
     #[allow(clippy::too_many_arguments)]
     fn run_with<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, k: &DevPcmmKeys<'_>, sh: &PcmmShape, planes: &DBuf<'_, Compute, u8>, ins: &[(PolyRef, usize)], outs: &[(PolyRef, usize)], ev: Option<[&Event; 4]>) -> Result<()> {
+        self.inputs_gemm(ctx, s, k, sh, planes, ins, ev)?;
+        let os: Vec<(usize, PolyRef, usize)> = outs.iter().enumerate().map(|(o, &(ct, m))| (o, ct, m)).collect();
+        self.outputs_stage(ctx, s, k, sh, &os)?;
+        if let Some(e) = ev {
+            e[3].record(s)?;
+        }
+        Ok(())
+    }
+
+    /// The per-input stage and both digit GEMMs of `ins` (the inputs of `sh`): Y = W X mod q_i over every output row
+    /// of `sh`, left in the work buffers (`ap` [2][rows_out][N1], `bp` [2][rows_out][np]).
+    #[allow(clippy::too_many_arguments)]
+    fn inputs_gemm<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, k: &DevPcmmKeys<'_>, sh: &PcmmShape, planes: &DBuf<'_, Compute, u8>, ins: &[(PolyRef, usize)], ev: Option<[&Event; 4]>) -> Result<()> {
         let lay = k.shape;
         let (np, r, nch) = (lay.np(), lay.r(), lay.nch());
         let (ri, ro) = (sh.rows_in()?, sh.rows_out()?);
@@ -583,8 +678,8 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
         }
         let w = &mut self.work;
         let (stage, xr, res, scratch) = (w.stage.dptr_mut() as *mut c_void, w.xr.dptr_mut(), w.res.dptr_mut(), w.scratch.dptr_mut());
-        let (pa, pbm, pap, pbp, pc, ppk, pra, prb) = (w.a.dptr_mut(), w.bm.dptr_mut(), w.ap.dptr_mut(), w.bp.dptr_mut(), w.c.dptr_mut(), w.pk.dptr_mut(), w.ra.dptr_mut(), w.rb.dptr_mut());
-        let (c4, cmu, inv_c, lift, ns) = (self.chain4, self.chain_mu, self.inv_c, self.lift, self.nsplit as i32);
+        let (pa, pbm, pap, pbp) = (w.a.dptr_mut(), w.bm.dptr_mut(), w.ap.dptr_mut(), w.bp.dptr_mut());
+        let (c4, cmu, inv_c, ns) = (self.chain4, self.chain_mu, self.inv_c, self.nsplit as i32);
         let chain = |opc: i32| PcmmArgs { op: opc, n: N as i32, p: c4, mu: cmu, i4: ns, ..PcmmArgs::default() };
         for (c, &(ct, m)) in ins.iter().enumerate() {
             let mut a = chain(op::GATHER);
@@ -626,8 +721,22 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
         if let Some(e) = ev {
             e[2].record(s)?;
         }
+        Ok(())
+    }
+
+    /// The per-output stage of output blocks `outs` = (block index o of `sh`, ciphertext view, member) from the work
+    /// buffers' GEMM rows: pack back, compose, switch back to s, lift, eval form.
+    fn outputs_stage<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, k: &DevPcmmKeys<'_>, sh: &PcmmShape, outs: &[(usize, PolyRef, usize)]) -> Result<()> {
+        let lay = k.shape;
+        let (np, r, nch) = (lay.np(), lay.r(), lay.nch());
+        let ro = sh.rows_out()?;
+        let w = &mut self.work;
+        let (stage, res, scratch) = (w.stage.dptr_mut() as *mut c_void, w.res.dptr_mut(), w.scratch.dptr_mut());
+        let (pap, pbp, pc, ppk, pra, prb) = (w.ap.dptr_mut(), w.bp.dptr_mut(), w.c.dptr_mut(), w.pk.dptr_mut(), w.ra.dptr_mut(), w.rb.dptr_mut());
+        let (c4, cmu, lift, ns) = (self.chain4, self.chain_mu, self.lift, self.nsplit as i32);
+        let chain = |opc: i32| PcmmArgs { op: opc, n: N as i32, p: c4, mu: cmu, i4: ns, ..PcmmArgs::default() };
         let pkb = ppk.wrapping_add(L * S_SWITCH * N1);
-        for (o, &(ct, m)) in outs.iter().enumerate() {
+        for &(o, ct, m) in outs {
             let mut a = Self::kargs(k, op::PACK_C, N1);
             a.count = nch as i32;
             a.i0 = ro as i32;
@@ -674,8 +783,82 @@ impl<'a, 'lt, W: DevWord> Pcmm<'a, 'lt, W> {
             a.y = stage;
             Self::launch(ctx, s, a)?;
         }
-        if let Some(e) = ev {
-            e[3].record(s)?;
+        Ok(())
+    }
+
+    /// Row split (Sylph's reduction split), first half: the per-input stage and the GEMMs of the inputs `ins` (each
+    /// at the split) of the sub-shape `sh` (these inputs, every output of the linear) on `planes` (`gather_planes_rows`
+    /// of these inputs): a partial Y over every output row, left in the work buffers (`partial_ptrs`).
+    pub fn product_rows<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, sh: &PcmmShape, planes: &DBuf<'_, Compute, u8>, ins: &[Ct<'_, W>]) -> Result<()> {
+        for x in ins {
+            Self::check_split(ctx, x)?;
+        }
+        let ir: Vec<(PolyRef, usize)> = Self::members(ins).into_iter().map(|(i, m)| (ins[i].buf.r(), m)).collect();
+        if !self.cfg.shapes.contains(sh) || ir.len() != sh.n_in {
+            return Err(shape("pcmm rows", format!("{} inputs for {sh:?} (configured: {})", ir.len(), self.cfg.shapes.contains(sh))));
+        }
+        if planes.len() < sh.planes_len()? || planes.dptr() as usize % 256 != 0 {
+            return Err(shape("pcmm weights", format!("{} bytes at {:#x}, need {} 256-aligned", planes.len(), planes.dptr() as usize, sh.planes_len()?)));
+        }
+        let ki = self.keys.iter().position(|k| k.t == sh.t).ok_or_else(|| shape("pcmm", format!("no keys for t = {}", sh.t)))?;
+        let k = self.keys.swap_remove(ki);
+        let r = self.inputs_gemm(ctx, s, &k, sh, planes, &ir, None);
+        self.keys.push(k);
+        r
+    }
+
+    /// The work buffers holding the partial Y of `product_rows` (`ap`, `bp`): another device's `add_partial` reads
+    /// them (peer access).
+    pub fn partial_ptrs(&self) -> (*const u32, *const u32) {
+        (self.work.ap.dptr(), self.work.bp.dptr())
+    }
+
+    /// Row split: another engine's partial Y (`other` = its `partial_ptrs`, same sub-shape `sh` rows, peer memory) added
+    /// into this engine's for output blocks `os`, mod q_i (the sum over all inputs: exact).
+    pub fn add_partial<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, sh: &PcmmShape, other: (*const u32, *const u32), os: &[usize]) -> Result<()> {
+        let k = self.keys.iter().find(|k| k.t == sh.t).ok_or_else(|| shape("pcmm", format!("no keys for t = {}", sh.t)))?;
+        let (np, nch, ro) = (k.shape.np(), k.shape.nch(), sh.rows_out()?);
+        let (pap, pbp) = (self.work.ap.dptr_mut(), self.work.bp.dptr_mut());
+        for &o in os {
+            if o >= sh.n_out {
+                return Err(shape("pcmm rows", format!("output {o} of {sh:?}")));
+            }
+            for (mine, theirs, cols) in [(pap, other.0, N1), (pbp, other.1, np)] {
+                for prime in 0..2 {
+                    let off = prime * ro * cols + o * nch * cols;
+                    let mut a = Self::kargs(k, op::ADD, 0);
+                    a.count = 1;
+                    a.i0 = (nch * cols) as i32;
+                    a.p[0] = k.primes[prime];
+                    a.x = mine.wrapping_add(off) as *mut c_void;
+                    a.y = theirs.wrapping_add(off) as *const c_void;
+                    Self::launch(ctx, s, a)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Row split, second half: the per-output stage of output blocks `os` of `sh` from the (summed) work buffers into
+    /// `outs` (output `os[j]` to member `out_map[j]`), each named ciphertext at `meta` with scale `nf_out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn product_outputs<M: DevStrategy<W>>(&mut self, ctx: &Context<'_, W, M>, s: &Stream<Compute>, sh: &PcmmShape, os: &[usize], outs: &mut [Ct<'_, W>], out_map: &[(usize, usize)], meta: &CtMeta, nf_out: f64) -> Result<()> {
+        if os.len() != out_map.len() || os.iter().any(|&o| o >= sh.n_out) {
+            return Err(shape("pcmm rows", format!("outputs {os:?} / map {} for {sh:?}", out_map.len())));
+        }
+        for &(c, m) in out_map {
+            if c >= outs.len() || m >= outs[c].k() || outs[c].buf.lay != ctx.lay {
+                return Err(shape("pcmm", format!("output member ({c}, {m}) outside the {} output ciphertexts", outs.len())));
+            }
+        }
+        let ov: Vec<(usize, PolyRef, usize)> = os.iter().zip(out_map).map(|(&o, &(c, m))| (o, outs[c].buf.w(), m)).collect();
+        let ki = self.keys.iter().position(|k| k.t == sh.t).ok_or_else(|| shape("pcmm", format!("no keys for t = {}", sh.t)))?;
+        let k = self.keys.swap_remove(ki);
+        let r = self.outputs_stage(ctx, s, &k, sh, &ov);
+        self.keys.push(k);
+        r?;
+        for &(c, _) in out_map {
+            outs[c].meta = CtMeta { nf: nf_out, ..meta.clone() };
         }
         Ok(())
     }
@@ -817,12 +1000,33 @@ fn prediv<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route
 /// finishes run from input 0's call, as perseus does.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_per_input<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, planes: &DBuf<'_, Compute, u8>, ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts) -> Result<()> {
+    let all: Vec<usize> = (0..lin.shape.n_out).collect();
+    linear_per_input_parts(cx, route, pcmm, lin, &[(planes, &all)], ins, outs, groups, drops, opts)
+}
+
+/// `linear_per_input` with the product in parts: each part's planes (`gather_planes` of its outputs, in that order)
+/// times the inputs into its outputs; the parts cover the outputs once (a joint linear's two halves, both here).
+#[allow(clippy::too_many_arguments)]
+pub fn linear_per_input_parts<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, parts: &[(&DBuf<'_, Compute, u8>, &[usize])], ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts) -> Result<()> {
+    linear_per_input_off(cx, route, pcmm, lin, parts, ins, outs, groups, drops, opts, None)
+}
+
+/// `linear_per_input_parts` with the finish groups' offload (`linear`'s: the last `off.far` groups refreshed on the
+/// other device, issued before this device's groups, joined after them). The inputs' StC-first stages stay here
+/// (each input its own call).
+#[allow(clippy::too_many_arguments)]
+pub fn linear_per_input_off<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a, W, M>, route: &StcFirstRoute<'a, W, M>, pcmm: &mut Pcmm<'a, '_, W>, lin: &PcmmLinear, parts: &[(&DBuf<'_, Compute, u8>, &[usize])], ins: &mut [Ct<'a, W>], outs: &mut [Ct<'a, W>], groups: &[Vec<usize>], drops: &[u32], opts: LinearOpts, off: Option<&mut dyn GroupOffload<'a, W, M>>) -> Result<()> {
     let sh = lin.shape;
     let mut out_map = vec![(usize::MAX, 0); sh.n_out];
     for (g, ms) in groups.iter().enumerate() {
         for (j, &m) in ms.iter().enumerate() {
             out_map[m] = (g, j);
         }
+    }
+    let mut cover: Vec<usize> = parts.iter().flat_map(|(_, o)| o.iter().copied()).collect();
+    cover.sort();
+    if cover != (0..sh.n_out).collect::<Vec<_>>() || out_map.iter().any(|x| x.0 == usize::MAX) {
+        return Err(shape("pcmm linear", format!("{}: the parts / groups do not cover the {} outputs once", lin.name, sh.n_out)));
     }
     let stamp = lin.w_scale * (lin.shift as f64).exp2();
     let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
@@ -842,13 +1046,67 @@ pub fn linear_per_input<'a, W: DevWord, M: DevStrategy<W>>(cx: &mut BtsCx<'_, 'a
     }
     let inp = first.ok_or_else(|| shape("pcmm linear", "no inputs"))?;
     let nf_out = ins[0].meta.nf / lin.w_scale;
-    pcmm.product(cx.ctx, &cx.ex.compute, &sh, planes, ins, outs, &out_map, nf_out, None)?;
+    for (planes, po) in parts {
+        let sub = PcmmShape { n_out: po.len(), ..sh };
+        let map: Vec<(usize, usize)> = po.iter().map(|&m| out_map[m]).collect();
+        pcmm.product(cx.ctx, &cx.ex.compute, &sub, planes, ins, outs, &map, nf_out, None)?;
+    }
+    let mut off = off.filter(|_| drops.len() >= 2);
+    let Some(o) = off.as_deref_mut() else {
+        for (g, &dr) in drops.iter().enumerate() {
+            let mut fin = inp.finish_call(dr)?;
+            fin.at_split(cx, &outs[g..g + 1])?;
+            fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+            if lin.shift > 0 {
+                pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
+            }
+        }
+        return Ok(());
+    };
+    // the last groups on the offload device, issued first (they start as soon as the product is done)
+    let mut calls = Vec::with_capacity(drops.len());
     for (g, &dr) in drops.iter().enumerate() {
         let mut fin = inp.finish_call(dr)?;
         fin.at_split(cx, &outs[g..g + 1])?;
+        calls.push(fin);
+    }
+    let n_far = o.far(calls.len()).min(calls.len());
+    let n_here = calls.len() - n_far;
+    let check = o.check();
+    let mut stash: Vec<(CtMeta, Vec<[Vec<W>; 2]>)> = Vec::new();
+    for g in n_here..calls.len() {
+        if check {
+            stash.push((outs[g].meta, download_members(cx, &outs[g])?));
+        }
+        o.issue(&cx.ex.compute, cx.sh, &calls[g], &mut outs[g])?;
+    }
+    for (g, fin) in calls[..n_here].iter_mut().enumerate() {
         fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
-        if lin.shift > 0 {
-            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, &mut outs[g], lin.shift)?;
+    }
+    if n_far > 0 {
+        o.join(&cx.ex.compute)?;
+    }
+    // PC_REMOTE_CHECK: each remote group again here from its saved input, against what came back
+    for (j, (m_in, data)) in stash.into_iter().enumerate() {
+        let g = n_here + j;
+        let far = (outs[g].meta, download_members(cx, &outs[g])?);
+        let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m_in.level)? as usize).collect();
+        for (c, parts) in data.iter().enumerate() {
+            for (part, d) in parts.iter().enumerate() {
+                outs[g].buf.upload_rows(&cx.ex.compute, c, part, &rows, d)?;
+            }
+        }
+        outs[g].meta = m_in;
+        calls[g].run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+        let here = (outs[g].meta, download_members(cx, &outs[g])?);
+        if here != far {
+            return Err(shape("pcmm linear", format!("{}: remote check: per-input finish group {g} of {} refreshed remotely differs from the same group refreshed here", lin.name, calls.len())));
+        }
+        o.checked();
+    }
+    if lin.shift > 0 {
+        for x in outs[..calls.len()].iter_mut() {
+            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, x, lin.shift)?;
         }
     }
     Ok(())
@@ -901,12 +1159,198 @@ pub fn finish_groups(drops: &[u32], batch: usize, batch_drops: bool) -> Result<V
     Ok(out)
 }
 
+/// `finish_groups` for a finish split across two devices: each drop class's outputs halved (the first ceil half here,
+/// the rest on the other device), each half chunked into groups of `batch`, every group of this device before every
+/// group of the other. Returns the groups and how many of them (the last ones) go to the other device. Halving every
+/// class balances the two devices by cost whatever the classes' per-output costs (a class's outputs refresh alike).
+pub fn finish_groups_split(drops: &[u32], batch: usize, batch_drops: bool) -> Result<(Vec<Vec<usize>>, usize)> {
+    let whole = finish_groups(drops, batch, batch_drops)?;
+    let b = batch.max(1);
+    // the classes `finish_groups` batches together (one class when the drops are uniform or batching is per drop)
+    let uniform = drops.windows(2).all(|w| w[0] == w[1]);
+    if !(uniform || (b > 1 && batch_drops)) {
+        // one output per group: the last half of the groups
+        let n = whole.len();
+        return Ok((whole, n / 2));
+    }
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    let mut seen: Vec<u32> = Vec::new();
+    for (m, &d) in drops.iter().enumerate() {
+        match seen.iter().position(|&x| x == d) {
+            Some(c) if !uniform => classes[c].push(m),
+            _ if uniform && !classes.is_empty() => classes[0].push(m),
+            _ => {
+                seen.push(d);
+                classes.push(vec![m]);
+            }
+        }
+    }
+    let (mut here, mut far) = (Vec::new(), Vec::new());
+    for ms in &classes {
+        let h = ms.len() - ms.len() / 2;
+        here.extend(ms[..h].chunks(b).map(|c| c.to_vec()));
+        far.extend(ms[h..].chunks(b).map(|c| c.to_vec()));
+    }
+    let n_far = far.len();
+    here.extend(far);
+    Ok((here, n_far))
+}
+
+/// The digit planes `[nw][rows_out][rows_in]` of a linear restricted to the outputs `outs` (in that order): the
+/// planes of the sub-shape (`n_out = outs.len()`) a device computing only those outputs multiplies by (each output
+/// owns `nch` consecutive rows of every plane). Returns the planes and the sub-shape.
+pub fn gather_planes(planes: &[u8], sh: &PcmmShape, outs: &[usize]) -> Result<(Vec<u8>, PcmmShape)> {
+    let (nch, ri, ro) = (sh.nch()?, sh.rows_in()?, sh.rows_out()?);
+    if planes.len() != sh.planes_len()? || outs.is_empty() || outs.iter().any(|&m| m >= sh.n_out) {
+        return Err(shape("pcmm gather", format!("{} plane bytes for {sh:?}, outputs {outs:?}", planes.len())));
+    }
+    let sub = PcmmShape { n_out: outs.len(), ..*sh };
+    let mut v = Vec::with_capacity(sub.planes_len()?);
+    for p in 0..sh.nw {
+        for &m in outs {
+            let r0 = p * ro * ri + m * nch * ri;
+            v.extend_from_slice(&planes[r0..r0 + nch * ri]);
+        }
+    }
+    Ok((v, sub))
+}
+
+/// The digit planes `[nw][rows_out][rows_in]` of a linear restricted to the inputs `ins` (in that order): the planes
+/// of the sub-shape (`n_in = ins.len()`, every output) a device multiplies its inputs by in a row split (each input
+/// owns `nch` consecutive columns of every row). Returns the planes and the sub-shape.
+pub fn gather_planes_rows(planes: &[u8], sh: &PcmmShape, ins: &[usize]) -> Result<(Vec<u8>, PcmmShape)> {
+    let (nch, ri, ro) = (sh.nch()?, sh.rows_in()?, sh.rows_out()?);
+    if planes.len() != sh.planes_len()? || ins.is_empty() || ins.iter().any(|&i| i >= sh.n_in) {
+        return Err(shape("pcmm gather rows", format!("{} plane bytes for {sh:?}, inputs {ins:?}", planes.len())));
+    }
+    let sub = PcmmShape { n_in: ins.len(), ..*sh };
+    let mut v = Vec::with_capacity(sub.planes_len()?);
+    for p in 0..sh.nw {
+        for row in 0..ro {
+            let base = p * ro * ri + row * ri;
+            for &i in ins {
+                v.extend_from_slice(&planes[base + i * nch..base + (i + 1) * nch]);
+            }
+        }
+    }
+    Ok((v, sub))
+}
+
 /// The capture descriptor of output m (pcmm.py `Pcmm.desc`; graph v2 `args.external`).
 pub fn desc_json(lin: &PcmmLinear, m: usize, drop: u32) -> String {
     format!(
         "{{\"op\": \"pcmm\", \"linear\": {:?}, \"out\": {m}, \"n_in\": {}, \"n_out\": {}, \"t\": {}, \"shift\": {}, \"raise_drop\": {drop}}}",
         lin.name, lin.shape.n_in, lin.shape.n_out, lin.shape.t, lin.shift
     )
+}
+
+/// One PCMM linear split across two devices by input blocks (Sylph's reduction split, the 2-D block of a column of
+/// pc = 2): each device stages and multiplies its half of the inputs into a partial product of every output on its
+/// rows of the planes (`gather_planes_rows`), the partials are exchanged and summed mod q for each device's own outputs
+/// (exact: `Pcmm::add_partial`), and each device runs the output stage of its outputs and finishes them. `planes_here`:
+/// this device's rows (sub-shape: the first `n_in - n_in / 2` inputs, every output); `planes_full`: the whole planes
+/// when this device holds them (PC_REMOTE_CHECK recomputes the whole product here). Groups as `linear_joint`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_rows<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
+    cx: &mut BtsCx<'_, 'a, W, M>,
+    route: &'r StcFirstRoute<'a, W, M>,
+    pcmm: &mut Pcmm<'a, 'lt, W>,
+    lin: &PcmmLinear,
+    planes_here: &DBuf<'_, Compute, u8>,
+    planes_full: Option<&DBuf<'_, Compute, u8>>,
+    ins: &mut [Ct<'a, W>],
+    outs: &mut [Ct<'a, W>],
+    groups: &[Vec<usize>],
+    drops: &[u32],
+    n_far: usize,
+    opts: LinearOpts,
+    off: &mut dyn GroupOffload<'a, W, M>,
+) -> Result<()> {
+    let sh = lin.shape;
+    if groups.len() != outs.len() || drops.len() != outs.len() || n_far == 0 || n_far >= groups.len() || ins.len() < 2 {
+        return Err(shape("pcmm rows", format!("{} groups, {} drops for {} outputs, {n_far} far, {} inputs", groups.len(), drops.len(), outs.len(), ins.len())));
+    }
+    let n_here = groups.len() - n_far;
+    let (here_outs, far_outs) = joint_outputs(groups, n_far);
+    let mut all: Vec<usize> = here_outs.iter().chain(&far_outs).copied().collect();
+    all.sort();
+    if all != (0..sh.n_out).collect::<Vec<_>>() {
+        return Err(shape("pcmm rows", format!("{}: the groups do not cover the {} outputs once", lin.name, sh.n_out)));
+    }
+    let pos = |list: &[usize], m: usize| list.iter().position(|&x| x == m).unwrap_or(usize::MAX);
+    let mut map_here = vec![(usize::MAX, 0); here_outs.len()];
+    for (g, ms) in groups[..n_here].iter().enumerate() {
+        if ms.len() != outs[g].k() {
+            return Err(shape("pcmm rows", format!("group {g}: {} outputs, {} members", ms.len(), outs[g].k())));
+        }
+        for (j, &m) in ms.iter().enumerate() {
+            map_here[pos(&here_outs, m)] = (g, j);
+        }
+    }
+    let far_groups: Vec<Vec<usize>> = groups[n_here..].iter().map(|ms| ms.iter().map(|&m| pos(&far_outs, m)).collect()).collect();
+    let n_in = ins.len();
+    let s_far = n_in / 2;
+    let s_here = n_in - s_far;
+    let sub_here = PcmmShape { n_in: s_here, ..sh };
+    let sub_far = PcmmShape { n_in: s_far, ..sh };
+    prediv_inputs(cx, route, pcmm, lin, ins)?;
+    let stamp = lin.w_scale * (lin.shift as f64).exp2();
+    for x in ins.iter_mut() {
+        x.meta.nf *= stamp;
+    }
+    let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
+    let mut inp = BtsCall::begin(StagedRef::StcFirst(route), cx, ins, &r, CallOpts { prescaled: false, own_cf: true })?;
+    let check = off.check();
+    // the other device stages its inputs (kept there) and multiplies them while this one does the same with its own
+    off.rows_stc(&cx.ex.compute, cx.sh, &inp, s_here, &mut ins[s_here..], check)?;
+    let far_partial = off.rows_product(lin, &sub_far)?;
+    if inp.stc_first_input(cx, &mut ins[..s_here])?.is_none() {
+        return Err(shape("pcmm rows", format!("{}: inputs at level {} are below the StC-first entry", lin.name, ins[0].meta.level)));
+    }
+    pcmm.product_rows(cx.ctx, &cx.ex.compute, &sub_here, planes_here, &ins[..s_here])?;
+    let meta = ins[0].meta.clone();
+    let nf_out = meta.nf / lin.w_scale;
+    // the reduce-scatter: each device adds the other's partial rows of its own outputs (disjoint rows of both
+    // partials); this one first (after the other's product), then the other (after everything issued here so far)
+    off.rows_wait(&cx.ex.compute)?;
+    pcmm.add_partial(cx.ctx, &cx.ex.compute, &sub_here, far_partial, &here_outs)?;
+    off.rows_far(&cx.ex.compute, cx.sh, &sub_far, &inp, pcmm.partial_ptrs(), &far_outs, &meta, nf_out, &far_groups, &drops[n_here..], &mut outs[n_here..])?;
+    pcmm.product_outputs(cx.ctx, &cx.ex.compute, &sub_here, &here_outs, &mut outs[..n_here], &map_here, &meta, nf_out)?;
+    for g in 0..n_here {
+        let mut fin = inp.finish_call(drops[g])?;
+        fin.at_split(cx, &outs[g..g + 1])?;
+        fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+    }
+    off.join(&cx.ex.compute)?;
+    if check {
+        // PC_REMOTE_CHECK: the whole product here on the whole planes (the other device's staged inputs came back),
+        // every group finished here, against what the split produced
+        let planes_full = planes_full.ok_or_else(|| shape("pcmm rows", "PC_REMOTE_CHECK needs this device's copy of the whole planes"))?;
+        let got: Vec<(CtMeta, Vec<[Vec<W>; 2]>)> = outs.iter().map(|x| download_members(cx, x).map(|d| (x.meta, d))).collect::<Result<_>>()?;
+        let mut map = vec![(usize::MAX, 0); sh.n_out];
+        for (g, ms) in groups.iter().enumerate() {
+            for (j, &m) in ms.iter().enumerate() {
+                map[m] = (g, j);
+            }
+        }
+        pcmm.product(cx.ctx, &cx.ex.compute, &sh, planes_full, ins, outs, &map, nf_out, None)?;
+        for g in 0..groups.len() {
+            let x = &mut outs[g..g + 1];
+            let mut fin = inp.finish_call(drops[g])?;
+            fin.at_split(cx, x)?;
+            fin.run_to(cx, x, Phase::Done)?;
+            if (x[0].meta, download_members(cx, &x[0])?) != got[g] {
+                return Err(shape("pcmm rows", format!("{}: remote check: group {g} ({} side) of the row split differs from the whole product here", lin.name, if g < n_here { "this" } else { "the other" })));
+            }
+            off.checked();
+        }
+    }
+    for x in outs.iter_mut() {
+        if lin.shift > 0 {
+            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, x, lin.shift)?;
+        }
+    }
+    Ok(())
 }
 
 /// One PCMM linear end to end (perseus `Pcmm._device_cf` + `_finish_all`): stamp `w_scale 2^shift` into the inputs'
@@ -928,6 +1372,7 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
     opts: LinearOpts,
     mut rec: Option<&mut dyn BtsRecorder>,
     hooks: Option<LinearHooks<'_>>,
+    mut off: Option<&mut dyn GroupOffload<'a, W, M>>,
 ) -> Result<()> {
     let hooks = hooks.unwrap_or_default();
     let sh = lin.shape;
@@ -957,8 +1402,47 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
     }
     let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
     let mut inp = BtsCall::begin(StagedRef::StcFirst(route), cx, ins, &r, CallOpts { prescaled: false, own_cf: true })?;
-    if inp.stc_first_input(cx, ins)?.is_none() {
+    // the last inputs' StC-first stage on the offload device (PC_STC_SPLIT), issued first, joined before the product
+    let n_in = ins.len();
+    let s_far = off.as_deref().map_or(0, |o| o.stc_far(n_in).min(n_in.saturating_sub(1)));
+    let s_here = n_in - s_far;
+    let stash_in: Option<Vec<(CtMeta, Vec<[Vec<W>; 2]>)>> = match off.as_deref() {
+        Some(o) if s_far > 0 && o.check() => Some(ins[s_here..].iter().map(|x| download_members(cx, x).map(|d| (x.meta, d))).collect::<Result<_>>()?),
+        _ => None,
+    };
+    if s_far > 0 {
+        if let Some(o) = off.as_deref_mut() {
+            o.stc_issue(&cx.ex.compute, cx.sh, &inp, &mut ins[s_here..])?;
+        }
+    }
+    if inp.stc_first_input(cx, &mut ins[..s_here])?.is_none() {
         return Err(shape("pcmm linear", format!("{}: inputs at level {} are below the StC-first entry (cap {})", lin.name, ins[0].meta.level, route.input_cap(cx.ctx.shape)?)));
+    }
+    if s_far > 0 {
+        if let Some(o) = off.as_deref_mut() {
+            o.join(&cx.ex.compute)?;
+            // PC_REMOTE_CHECK: the remote inputs' stage again here from their saved inputs, word for word
+            if let Some(stash) = stash_in {
+                for (j, (m_in, data)) in stash.into_iter().enumerate() {
+                    let x = &mut ins[s_here + j];
+                    let far = (x.meta, download_members(cx, x)?);
+                    let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m_in.level)? as usize).collect();
+                    for (c, parts) in data.iter().enumerate() {
+                        for (part, d) in parts.iter().enumerate() {
+                            x.buf.upload_rows(&cx.ex.compute, c, part, &rows, d)?;
+                        }
+                    }
+                    x.meta = m_in;
+                    let mut again = BtsCall::resume(StagedRef::StcFirst(route), inp.st.clone(), Phase::Begun, inp.opts);
+                    again.stc_first_input(cx, std::slice::from_mut(x))?;
+                    let here = (x.meta, download_members(cx, x)?);
+                    if here != far {
+                        return Err(shape("pcmm linear", format!("{}: remote check: input {} of {n_in}'s StC-first stage on the other device differs from the same stage here", lin.name, s_here + j)));
+                    }
+                    o.checked();
+                }
+            }
+        }
     }
     if let Some(rc) = rec.as_deref_mut() {
         let ni: Vec<(&str, u32)> = names.iter().map(|(n, l)| (n.as_str(), *l)).collect();
@@ -975,12 +1459,50 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
         fin.at_split(cx, &outs[g..g + 1])?;
         calls.push(fin);
     }
+    // the last half of the groups on the offload device, issued first (it starts as soon as the product is done)
+    let mut off = off.filter(|_| calls.len() >= 2);
+    // (the input stages above used it whatever the group count)
+    let n_far = off.as_deref().map_or(0, |o| o.far(calls.len()).min(calls.len()));
+    let n_here = calls.len() - n_far;
+    let mut stash: Vec<(CtMeta, Vec<[Vec<W>; 2]>)> = Vec::new();
+    if let Some(o) = off.as_deref_mut() {
+        let check = o.check();
+        for g in n_here..calls.len() {
+            if check {
+                stash.push((outs[g].meta, download_members(cx, &outs[g])?));
+            }
+            o.issue(&cx.ex.compute, cx.sh, &calls[g], &mut outs[g])?;
+        }
+    }
     if opts.interleave {
-        let mut sl: Vec<&mut [Ct<'a, W>]> = outs.chunks_mut(1).collect();
-        crate::bts::staged::run_interleaved(cx, &mut calls, &mut sl, Phase::Done)?;
+        let mut sl: Vec<&mut [Ct<'a, W>]> = outs[..n_here].chunks_mut(1).collect();
+        crate::bts::staged::run_interleaved(cx, &mut calls[..n_here], &mut sl, Phase::Done)?;
     } else {
-        for (g, fin) in calls.iter_mut().enumerate() {
+        for (g, fin) in calls[..n_here].iter_mut().enumerate() {
             fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+        }
+    }
+    if let Some(o) = off.as_deref_mut() {
+        if n_far > 0 {
+            o.join(&cx.ex.compute)?;
+        }
+        // PC_REMOTE_CHECK: each remote group again here from its saved input, against what came back
+        for (j, (m_in, data)) in stash.into_iter().enumerate() {
+            let g = n_here + j;
+            let far = (outs[g].meta, download_members(cx, &outs[g])?);
+            let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m_in.level)? as usize).collect();
+            for (c, parts) in data.iter().enumerate() {
+                for (part, d) in parts.iter().enumerate() {
+                    outs[g].buf.upload_rows(&cx.ex.compute, c, part, &rows, d)?;
+                }
+            }
+            outs[g].meta = m_in;
+            calls[g].run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+            let here = (outs[g].meta, download_members(cx, &outs[g])?);
+            if here != far {
+                return Err(shape("pcmm linear", format!("{}: remote check: finish group {g} of {} refreshed remotely differs from the same group refreshed here", lin.name, calls.len())));
+            }
+            o.checked();
         }
     }
     if let Some(e) = hooks.after_finish {
@@ -998,6 +1520,155 @@ pub fn linear<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
         }
     }
     Ok(())
+}
+
+/// The output order of a joint linear's two devices from its finish groups (`finish_groups_split`): this device's
+/// outputs (groups `..n_here`, in order) then the other's; the planes of each side are gathered in that order.
+pub fn joint_outputs(groups: &[Vec<usize>], n_far: usize) -> (Vec<usize>, Vec<usize>) {
+    let n_here = groups.len() - n_far.min(groups.len());
+    (groups[..n_here].concat(), groups[n_here..].concat())
+}
+
+/// One PCMM linear split across two devices by output blocks (the Sylph column split): each device computes the
+/// product of its own outputs on its own planes and finishes them. `groups` / `drops` as `linear` (this device's
+/// groups first, the last `n_far` on the other device: `finish_groups_split`); `planes_here` the planes of this
+/// device's outputs (`gather_planes` in `joint_outputs` order), `planes_far` the same of the other's when this device
+/// holds them (PC_REMOTE_CHECK recomputes the far groups here). The inputs' StC-first stage is split in two halves,
+/// each device keeping all the inputs at the split for its product.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_joint<'r, 'a, 'lt, W: DevWord, M: DevStrategy<W>>(
+    cx: &mut BtsCx<'_, 'a, W, M>,
+    route: &'r StcFirstRoute<'a, W, M>,
+    pcmm: &mut Pcmm<'a, 'lt, W>,
+    lin: &PcmmLinear,
+    planes_here: &DBuf<'_, Compute, u8>,
+    planes_far: Option<&DBuf<'_, Compute, u8>>,
+    ins: &mut [Ct<'a, W>],
+    outs: &mut [Ct<'a, W>],
+    groups: &[Vec<usize>],
+    drops: &[u32],
+    n_far: usize,
+    opts: LinearOpts,
+    off: &mut dyn GroupOffload<'a, W, M>,
+) -> Result<()> {
+    let sh = lin.shape;
+    if groups.len() != outs.len() || drops.len() != outs.len() || n_far == 0 || n_far >= groups.len() {
+        return Err(shape("pcmm joint", format!("{} groups, {} drops for {} outputs, {n_far} far", groups.len(), drops.len(), outs.len())));
+    }
+    let n_here = groups.len() - n_far;
+    let (here_outs, far_outs) = joint_outputs(groups, n_far);
+    let mut all: Vec<usize> = here_outs.iter().chain(&far_outs).copied().collect();
+    all.sort();
+    if all != (0..sh.n_out).collect::<Vec<_>>() {
+        return Err(shape("pcmm joint", format!("{}: the groups do not cover the {} outputs once", lin.name, sh.n_out)));
+    }
+    let pos = |list: &[usize], m: usize| list.iter().position(|&x| x == m).unwrap_or(usize::MAX);
+    let sub_here = PcmmShape { n_out: here_outs.len(), ..sh };
+    let sub_far = PcmmShape { n_out: far_outs.len(), ..sh };
+    let mut map_here = vec![(usize::MAX, 0); sub_here.n_out];
+    for (g, ms) in groups[..n_here].iter().enumerate() {
+        if ms.len() != outs[g].k() {
+            return Err(shape("pcmm joint", format!("group {g}: {} outputs, {} members", ms.len(), outs[g].k())));
+        }
+        for (j, &m) in ms.iter().enumerate() {
+            map_here[pos(&here_outs, m)] = (g, j);
+        }
+    }
+    let far_groups: Vec<Vec<usize>> = groups[n_here..].iter().map(|ms| ms.iter().map(|&m| pos(&far_outs, m)).collect()).collect();
+    prediv_inputs(cx, route, pcmm, lin, ins)?;
+    let stamp = lin.w_scale * (lin.shift as f64).exp2();
+    for x in ins.iter_mut() {
+        x.meta.nf *= stamp;
+    }
+    let r = Route { cf: Some(opts.cf), stc_first: true, real: opts.real, ..Route::dense() };
+    let mut inp = BtsCall::begin(StagedRef::StcFirst(route), cx, ins, &r, CallOpts { prescaled: false, own_cf: true })?;
+    // inputs: the other device stages the last half (kept there, copied back), this one the first, then the first half
+    // goes over: both hold every input at the split
+    let n_in = ins.len();
+    let s_far = n_in / 2;
+    let s_here = n_in - s_far;
+    let check = off.check();
+    let stash_far_in: Option<Vec<(CtMeta, Vec<[Vec<W>; 2]>)>> = if check && s_far > 0 {
+        Some(ins[s_here..].iter().map(|x| download_members(cx, x).map(|d| (x.meta, d))).collect::<Result<_>>()?)
+    } else {
+        None
+    };
+    if s_far > 0 {
+        off.joint_stc(&cx.ex.compute, cx.sh, &inp, s_here, &mut ins[s_here..])?;
+    }
+    if inp.stc_first_input(cx, &mut ins[..s_here])?.is_none() {
+        return Err(shape("pcmm joint", format!("{}: inputs at level {} are below the StC-first entry", lin.name, ins[0].meta.level)));
+    }
+    off.joint_inputs(&cx.ex.compute, &ins[..s_here])?;
+    // the far half's stage written back here before this device's product reads it; with no far half (a one-input
+    // linear) nothing comes back, and `joint_stc`'s join would be a stale record (a capture error under graphs). The
+    // other device's reads of these inputs are covered by the join after the far finishes.
+    if s_far > 0 {
+        off.join(&cx.ex.compute)?;
+    }
+    let nf_out = ins[0].meta.nf / lin.w_scale;
+    // the far outputs on the other device (product, finishes) while this one does its own
+    off.joint_far(&cx.ex.compute, cx.sh, lin, &sub_far, &inp, nf_out, &far_groups, &drops[n_here..], &mut outs[n_here..])?;
+    pcmm.product(cx.ctx, &cx.ex.compute, &sub_here, planes_here, ins, &mut outs[..n_here], &map_here, nf_out, None)?;
+    for g in 0..n_here {
+        let mut fin = inp.finish_call(drops[g])?;
+        fin.at_split(cx, &outs[g..g + 1])?;
+        fin.run_to(cx, &mut outs[g..g + 1], Phase::Done)?;
+    }
+    off.join(&cx.ex.compute)?;
+    if check {
+        // PC_REMOTE_CHECK: the far half of the inputs' stage, the far product and its finishes again here, word for word
+        let planes_far = planes_far.ok_or_else(|| shape("pcmm joint", "PC_REMOTE_CHECK needs this device's copy of the far planes"))?;
+        if let Some(stash) = stash_far_in {
+            for (j, (m_in, data)) in stash.into_iter().enumerate() {
+                let x = &mut ins[s_here + j];
+                let far = (x.meta, download_members(cx, x)?);
+                let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m_in.level)? as usize).collect();
+                for (c, parts) in data.iter().enumerate() {
+                    for (part, d) in parts.iter().enumerate() {
+                        x.buf.upload_rows(&cx.ex.compute, c, part, &rows, d)?;
+                    }
+                }
+                x.meta = m_in;
+                let mut again = BtsCall::resume(StagedRef::StcFirst(route), inp.st.clone(), Phase::Begun, inp.opts);
+                again.stc_first_input(cx, std::slice::from_mut(x))?;
+                if (x.meta, download_members(cx, x)?) != far {
+                    return Err(shape("pcmm joint", format!("{}: remote check: input {}'s stage on the other device differs", lin.name, s_here + j)));
+                }
+                off.checked();
+            }
+        }
+        let far_res: Vec<(CtMeta, Vec<[Vec<W>; 2]>)> = outs[n_here..].iter().map(|x| download_members(cx, x).map(|d| (x.meta, d))).collect::<Result<_>>()?;
+        let mut map_far = vec![(usize::MAX, 0); sub_far.n_out];
+        for (g, ms) in far_groups.iter().enumerate() {
+            for (j, &k) in ms.iter().enumerate() {
+                map_far[k] = (g, j);
+            }
+        }
+        pcmm.product(cx.ctx, &cx.ex.compute, &sub_far, planes_far, ins, &mut outs[n_here..], &map_far, nf_out, None)?;
+        for g in 0..n_far {
+            let x = &mut outs[n_here + g..n_here + g + 1];
+            let mut fin = inp.finish_call(drops[n_here + g])?;
+            fin.at_split(cx, x)?;
+            fin.run_to(cx, x, Phase::Done)?;
+            if (x[0].meta, download_members(cx, &x[0])?) != far_res[g] {
+                return Err(shape("pcmm joint", format!("{}: remote check: far group {g} (product + finish on the other device) differs from the same here", lin.name)));
+            }
+            off.checked();
+        }
+    }
+    for x in outs.iter_mut() {
+        if lin.shift > 0 {
+            pcmm.mult_pow2(cx.ctx, &cx.ex.compute, x, lin.shift)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every member's live rows of both polynomials (host; waits for `cx`'s compute stream).
+fn download_members<W: DevWord, M: DevStrategy<W>>(cx: &BtsCx<'_, '_, W, M>, x: &Ct<'_, W>) -> Result<Vec<[Vec<W>; 2]>> {
+    let rows: Vec<usize> = (0..=x.top(cx.ctx.shape)?).collect();
+    (0..x.k()).map(|c| Ok([x.buf.download_rows(&cx.ex.compute, c, 0, &rows)?, x.buf.download_rows(&cx.ex.compute, c, 1, &rows)?])).collect()
 }
 
 // ── calibration (pcmm_calib.json) ────────────────────────────────────────────────────────────────────────────────
@@ -1051,6 +1722,26 @@ mod tests {
         assert_eq!(finish_groups(&[0, 1, 0, 1], 2, false).unwrap(), vec![vec![0], vec![1], vec![2], vec![3]]);
         assert_eq!(finish_groups(&[0, 1, 0, 1, 0], 2, true).unwrap(), vec![vec![0, 2], vec![4], vec![1, 3]]);
         assert!(finish_groups(&[0; 3], 5, false).is_err());
+    }
+
+    /// The balanced split: each drop class halved (first ceil half here), each half batched, here's groups first.
+    #[test]
+    fn groups_split() {
+        // Llama qkv: 12 uniform outputs, batch 4: 4 + 2 here, 4 + 2 there (was 3 groups, 1 there)
+        assert_eq!(finish_groups_split(&[0; 12], 4, true).unwrap(), (vec![vec![0, 1, 2, 3], vec![4, 5], vec![6, 7, 8, 9], vec![10, 11]], 2));
+        assert_eq!(finish_groups_split(&[0; 8], 4, true).unwrap(), (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 1));
+        // per-drop classes: {0, 1, 2} -> [0, 1] | [2]; {3, 4} -> [3] | [4]; {5} -> [5] | -
+        assert_eq!(finish_groups_split(&[0, 0, 0, 1, 1, 2], 4, true).unwrap(), (vec![vec![0, 1], vec![3], vec![5], vec![2], vec![4]], 2));
+        // one output per group (mixed drops, no per-drop batching): the last half of the groups
+        assert_eq!(finish_groups_split(&[0, 1, 0, 1], 2, false).unwrap(), (vec![vec![0], vec![1], vec![2], vec![3]], 2));
+        // every output is in exactly one group
+        for (d, b, bd) in [(vec![0u32; 7], 3usize, true), (vec![0, 1, 2, 1, 0, 0, 2], 4, true), (vec![3; 1], 4, true)] {
+            let (g, n) = finish_groups_split(&d, b, bd).unwrap();
+            let mut all: Vec<usize> = g.iter().flatten().copied().collect();
+            all.sort();
+            assert_eq!(all, (0..d.len()).collect::<Vec<_>>());
+            assert!(n <= g.len() && g.iter().all(|x| !x.is_empty() && x.len() <= b && x.iter().all(|&m| d[m] == d[x[0]])));
+        }
     }
 
     #[test]

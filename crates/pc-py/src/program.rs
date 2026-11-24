@@ -393,6 +393,17 @@ impl PyProgram {
         };
         pl.stream_tag.push(tag);
         pl.bounds.push(b);
+        // PC_REPLICA: the same block bound on the remote device's replica lane (the session's route checks)
+        let mut rem = pl.remote.take();
+        let rb = match rem.as_mut() {
+            Some(r) => r.replica_bind(&self.prog, &dr, Some(&pl.streams), &pl.routes()),
+            None => Ok(()),
+        };
+        pl.remote = rem;
+        rb.map_err(|x| {
+            eprintln!("[replica] {}: {x}", self.prog.block);
+            x
+        })?;
         pl.shadows.push(pc_shadow::Shadow::new(sh_cfg, Some(std::sync::Arc::new(dev.ctx.scale.clone()))));
         let i = pl.bounds.len() - 1;
         drop(st);
@@ -589,10 +600,11 @@ struct KvIo<'k> {
 /// `Program.run` without the GIL: inputs into the slab, the replay, outputs into registers.
 fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], kvio: &KvIo<'_>) -> PyResult<pc_program::replay::RunInfo> {
     use pc_program::kv::KvStore;
+    let t_prof = host_prof().then(std::time::Instant::now);
     let mut st = dev.st.borrow_mut();
     let State { planned, ex, ops, plans, pts, .. } = &mut *st;
     let pl = planned.as_mut().ok_or_else(|| PyRuntimeError::new_err("not a planned session"))?;
-    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, tfhe, fbs, side, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
+    let crate::session::Planned { bounds, shadows, replayer, slab, regs, work, dense, plain, sparse, classic, spru, stats, pcmm, ccmm, tfhe, fbs, side, remote, coeff, ring, streams, stream_tag, tag_layouts, stream_order, kv, .. } = pl;
     // the block's weight frame: staged while the block before ran (else now), joined into compute
     let spos = match stream_tag.get(idx).copied().flatten() {
         Some(tag) => {
@@ -628,6 +640,16 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
             k.prefetch(ex, u).map_err(perr)?;
         }
     }
+    // PC_REPLICA_PT: the replica's copies of this block's plaintexts (the session's rows resolved first); skipped when
+    // the block's cached schedule runs nothing on the replica (decode blocks: a per-token host cost otherwise)
+    if let Some(r) = remote.as_mut().filter(|r| r.replica.as_ref().is_some_and(|rp| rp.pts.is_some())) {
+        let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
+        if !replayer.replica_idle(b) {
+            b.resolve_pts(pts).map_err(perr)?;
+            r.replica_pts(idx, b, pts, &dev.device, &ex.compute)?;
+        }
+    }
+    let t_pts = t_prof.map(|t| t.elapsed().as_secs_f64());
     let mut routes = pc_program::replay::Routes::new();
     if let Some(d) = dense.as_ref() {
         routes.add(d);
@@ -644,15 +666,100 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     if let Some(x) = spru.as_ref() {
         routes.add(x);
     }
+    // the remote refresh device (PC_REMOTE_DEVICE): its routes, and its stage caches locked with ours while capturing
+    let (rroutes, rparts) = match remote.as_mut() {
+        Some(r) => {
+            let crate::remote::RemoteDev { ccmm: rcc, replica: rrep, pcmm: rpc, routes: rset, gather, ring, ring_done, lane_in, cb_ev, cb, lane_fork, lane_join, cb_join, fcb, fcb_ev, work: rwork, ops: rops, plans: rplans, ctx: rctx, ex: rex, fork, join, device, .. } = r;
+            let rfcb = pc_program::replay::remote_cb().then_some((&*fcb, &*fcb_ev));
+            // the replica lane (PC_REPLICA): this block's second binding, the mirrored slab swapped in for the run
+            let rrep = rrep.as_mut().filter(|rp| pc_program::replica::mode() > 0 && rp.bounds.len() > idx).map(|rp| {
+                let crate::remote::ReplicaDev { bounds, slab, ev, join, fork, ops, ex, hand, work, dma, .. } = rp;
+                let dma = dma.as_ref().map(|(st, evs, j)| (st, &evs[..], j));
+                (&mut bounds[idx], slab, &ev[..], &*join, &*fork, ops, ex, &hand[..], work.as_mut(), dma)
+            });
+            let rset: &crate::routes::RouteSet = rset;
+            let lane = pc_program::replay::RemoteAsync {
+                ring: &mut ring[..],
+                done: &ring_done[..],
+                ev_in: &lane_in[..],
+                cb: &*cb,
+                cb_ev: &cb_ev[..],
+                fork: &*lane_fork,
+                join: &*lane_join,
+                cb_join: &*cb_join,
+                next: 0,
+                last: vec![None; ring_done.len()],
+                pending: None,
+            };
+            let rpcmm = rpc.as_mut().map(|p| pc_program::replay::RemotePcmm { engine: &mut p.engine, planes: &p.planes, ins: &mut p.ins[..], outs: &mut p.outs[..] });
+            let rccmm = rcc.as_mut().filter(|_| pc_program::replay::ccmm_split()).map(|c| pc_program::replay::RemoteCcmm {
+                engine: &mut c.engine,
+                cts: &mut c.cts[..],
+                mono: &c.mono,
+                ev_t: &c.ev_t[..],
+                cp_t: &c.cp_t,
+                ph_t: c.ph_t.as_deref(),
+                ev_h: &c.ev_h[..],
+                cp_h: &*c.cp_h,
+                ph_h: c.ph_h.as_deref(),
+                back: &c.back,
+            });
+            (Some((rset.routes(), rset)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb, rccmm)))
+        }
+        None => (None, None),
+    };
     // the CCMM's stc_high caches (keys change per call): no capture may read them (ForbidLock), their callers run
     // eager between the graph segments; their evictions are not watched
     let forbid: Vec<pc_gpu::graph::ForbidLock<'_, '_, W>> =
-        dense.iter().flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c)))).collect();
+        dense
+            .iter()
+            .chain(rroutes.iter().filter_map(|(_, rs)| rs.dense.as_ref()))
+            .flat_map(|d| d.high.iter().flat_map(|h| h.caches.iter().map(|(_, c)| pc_gpu::graph::ForbidLock(c))))
+            .collect();
     let locks: Vec<&dyn pc_program::replay::CaptureLock> = dense
         .iter()
         .flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))
         .chain(forbid.iter().map(|f| f as &dyn pc_program::replay::CaptureLock))
+        .chain(rroutes.iter().flat_map(|(_, rs)| rs.dense.iter().flat_map(|d| d.last.iter().map(|l| l as &dyn pc_program::replay::CaptureLock))))
         .collect();
+    let mut slab_back: Option<SlabBack> = None;
+    let mut rlane = match (rroutes.as_ref(), rparts) {
+        (Some((rr, _)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb, rccmm))) => Some(pc_program::replay::Remote {
+            here: &dev.device,
+            there: &*device,
+            here_ctx: &dev.ctx,
+            ctx: &*rctx,
+            ex: rex,
+            ks: &*rplans,
+            ops: rops,
+            work: rwork,
+            routes: rr,
+            stcf: rroutes.as_ref().and_then(|(_, rs)| rs.dense.as_ref()),
+            gather,
+            fork: &*fork,
+            join: &*join,
+            lane: Some(lane),
+            pcmm: rpcmm,
+            fcb: rfcb,
+            own: Default::default(),
+            ccmm: rccmm,
+            replica: match rrep {
+                Some((b5, slab5, ev, rjoin, rfork, rops5, rex5, rhand, rwork5, rdma5)) => {
+                    b5.swap_slab(slab5).map_err(perr)?;
+                    let (bp, sp): (*mut pc_program::bind::Bound<'static, W>, *mut pc_program::bind::Slab<'static, W>) = (b5, slab5);
+                    slab_back = Some(SlabBack(bp, sp));
+                    // SAFETY: `bp` is this block's replica binding, borrowed by the run only; `slab_back` (declared
+                    // before the lane, dropped after it) swaps the slab back out
+                    Some(pc_program::replay::RemoteReplica { hand: rhand, work: rwork5, ex: rex5, ops: rops5, b: unsafe { &mut *bp }, ev, fork: rfork, join: rjoin, owners: (None, None), dma: rdma5 })
+                }
+                None => None,
+            },
+        }),
+        _ => None,
+    };
+    // PC_TL: the remote device (its timing events)
+    let rlane_there: Option<*const pc_cuda::Device> = rlane.as_ref().map(|l| l.there as *const pc_cuda::Device);
+    let t_lane = t_prof.map(|t| t.elapsed().as_secs_f64());
     let ev0: u64 = locks.iter().map(|l| l.evictions()).sum();
     let b = bounds.get_mut(idx).ok_or_else(|| PyRuntimeError::new_err(format!("bound block {idx}")))?;
     if ins.len() != b.inputs.len() {
@@ -714,8 +821,103 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                         _ => None,
                     };
                     let finish = fx.as_mut().map(|f| f as &mut dyn pc_program::replay::FinishExec<'static, W, crate::session::M>);
-                    let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut() };
-                    replayer.run(b, &mut rt)?
+                    let mut rt = Rt { ctx, ex: &mut *ex, sh, ks: &*plans, ops: &mut *ops, work: &mut *work, routes: &routes, source: dev.source, locks: &locks, finish, side: side.as_mut(), coeff: coeff.as_mut(), remote: rlane.as_mut().map(|l| l as &mut dyn pc_program::replay::RemoteLane<'static, W, crate::session::M>) };
+                    // PC_BLOCK_TIMING=1 (diagnostic): this block's device time (timing events on this device's compute stream
+                    // around the replay, which joins every lane back into it), synchronized and printed per run
+                    let tev = if block_timing() {
+                        let e0 = pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?;
+                        let e1 = pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?;
+                        rt.ex.compute.record(&e0).map_err(pc_gpu::Error::from)?;
+                        Some((e0, e1))
+                    } else {
+                        None
+                    };
+                    if seg_timing() && replayer.seg_ev.len() < 64 {
+                        for _ in 0..64 {
+                            replayer.seg_ev.push(pc_cuda::stream::Event::timing(&dev.device).map_err(pc_gpu::Error::from)?);
+                        }
+                    }
+                    // PC_TL=<block label> (diagnostic): timing events after every step of that block where it ran (both
+                    // devices), written to $PC_TL_OUT/<label>.tl after each run
+                    let tl_here = std::env::var("PC_TL").is_ok_and(|v| v == b.label);
+                    if tl_here {
+                        pc_program::replay::TL.with(|t| -> pc_program::Result<()> {
+                            let mut g = t.borrow_mut();
+                            if g.is_none() {
+                                let cap = 4 * b.steps.len() + 256;
+                                // SAFETY: plain allocation call
+                                let buf = unsafe { pc_kernels::pc_stamp_alloc(cap) };
+                                if buf.is_null() {
+                                    return Err(pc_program::Error::Replay { block: b.label.clone(), msg: "PC_TL: cudaHostAlloc failed".into() });
+                                }
+                                *g = Some(pc_program::replay::Tl { label: b.label.clone(), buf, cap, marks: vec![], n: 0, on: false, cur: 0 });
+                            }
+                            // marks accumulate over the runs: a graph segment's stamps carry the indices of its capture
+                            // (written again at every replay), an eager step's those of its latest issue
+                            let tl = g.as_mut().unwrap();
+                            tl.on = true;
+                            Ok(())
+                        })?;
+                    }
+                    let info = replayer.run(b, &mut rt)?;
+                    if tl_here {
+                        let there = rt.remote.as_deref().and(rlane_there);
+                        pc_program::replay::TL.with(|t| -> pc_program::Result<()> {
+                            let mut g = t.borrow_mut();
+                            let tl = g.as_mut().unwrap();
+                            tl.on = false;
+                            dev.device.synchronize().map_err(pc_gpu::Error::from)?;
+                            if let Some(th) = there {
+                                // SAFETY: the remote device outlives the session's runs
+                                let th: &pc_cuda::Device = unsafe { &*th };
+                                th.make_current().map_err(pc_gpu::Error::from)?;
+                                th.synchronize().map_err(pc_gpu::Error::from)?;
+                                dev.device.make_current().map_err(pc_gpu::Error::from)?;
+                            }
+                            let mut out = String::new();
+                            let mut last: std::collections::BTreeMap<(u32, u8), Vec<u32>> = std::collections::BTreeMap::new();
+                            for &(i, d, k) in &tl.marks {
+                                // the latest registration per (step, device); a step's several remote parts all
+                                let e = last.entry((i, d)).or_default();
+                                if d != 4 {
+                                    e.clear();
+                                }
+                                e.push(k);
+                            }
+                            for (&(i, d), ks) in &last {
+                              for &k in ks {
+                                // SAFETY: k < cap, written by a completed stamp kernel (both devices synchronized)
+                                let ns = unsafe { std::ptr::read_volatile(tl.buf.add(k as usize)) };
+                                out.push_str(&format!("{i} {d} {ns}\n"));
+                              }
+                            }
+                            let dir = std::env::var("PC_TL_OUT").unwrap_or_else(|_| ".".into());
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.tl", b.label)), out);
+                            Ok(())
+                        })?;
+                    }
+                    if seg_timing() && !replayer.seg_kinds.is_empty() {
+                        // PC_SEG_TIMING=1 (diagnostic): per replayed item (graph segment G / dynamic step D<i>), its span on
+                        // this device's compute stream (every lane joins it at the item's end) and its host issue time
+                        let n = replayer.seg_kinds.len();
+                        replayer.seg_ev[n].sync().map_err(pc_gpu::Error::from)?;
+                        let mut line = String::new();
+                        for k in 0..n {
+                            let ms = replayer.seg_ev[k].elapsed_ms(&replayer.seg_ev[k + 1]).map_err(pc_gpu::Error::from)?;
+                            let kd = replayer.seg_kinds[k];
+                            let nm = if kd == usize::MAX { "G".to_string() } else { format!("D{kd}") };
+                            line.push_str(&format!(" {nm}:{ms:.2}/{:.2}", replayer.seg_host_us[k] / 1e3));
+                        }
+                        eprintln!("[seg] {}{line}", b.label);
+                    }
+                    if let Some((e0, e1)) = tev {
+                        rt.ex.compute.record(&e1).map_err(pc_gpu::Error::from)?;
+                        e1.sync().map_err(pc_gpu::Error::from)?;
+                        let ms = e0.elapsed_ms(&e1).map_err(pc_gpu::Error::from)?;
+                        eprintln!("[block-time] {} {:.3} ms ({})", b.label, ms, match info.served { Served::Replayed => "graph", Served::Captured => "captured", Served::Eager => "eager" });
+                    }
+                    info
                 };
                 for &(j, r) in outputs {
                     if lent.iter().any(|l| l.1 == j && l.3 == r) {
@@ -750,6 +952,10 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         r.release(ex, f).map_err(perr)?;
     }
     let ev1: u64 = locks.iter().map(|l| l.evictions()).sum();
+    // PC_PT_MIRROR_ASYNC: the session stream after this block's mirror copies (before its next staging)
+    if let Some(r) = remote.as_mut() {
+        r.replica_pts_done(&ex.compute)?;
+    }
     stats.runs += 1;
     stats.host_us += info.host_us;
     stats.launch_us += info.launch_us;
@@ -763,7 +969,29 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         }
     }
     let _ = gerr;
+    if let (Some(t), Some(p), Some(l)) = (t_prof, t_pts, t_lane) {
+        // PC_HOST_PROF=1 (diagnostic): this block's host time to the plaintext mirror, to the lanes' set-up, in all (ms)
+        eprintln!("[host-prof] {} pts {:.3} lane {:.3} total {:.3} replay-host {:.3}", bounds[idx].label, p * 1e3, l * 1e3, t.elapsed().as_secs_f64() * 1e3, info.host_us / 1e3);
+    }
     Ok(info)
+}
+
+/// PC_BLOCK_TIMING=1 (diagnostic): per block run, its device time (stderr).
+fn block_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_BLOCK_TIMING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// PC_SEG_TIMING=1 (diagnostic): per graph replay, each item's device span and host issue time (stderr).
+fn seg_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_SEG_TIMING").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// PC_HOST_PROF=1 (diagnostic): per block, the host time of `run_block`'s parts (stderr).
+fn host_prof() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_HOST_PROF").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The block inputs whose register can stand in for their slot during the run, as (input, output, slot, register):
@@ -825,4 +1053,14 @@ fn json_diff(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProgram>()?;
     Ok(())
+}
+
+/// Swaps the replica lane's slab back out of its binding when the run ends, whatever happened (`Bound::swap_slab`).
+struct SlabBack(*mut pc_program::bind::Bound<'static, W>, *mut pc_program::bind::Slab<'static, W>);
+
+impl Drop for SlabBack {
+    fn drop(&mut self) {
+        // SAFETY: both outlive the run (the session's replica lane); nothing else borrows them once the lane is gone
+        let _ = unsafe { (*self.0).swap_slab(&mut *self.1) };
+    }
 }

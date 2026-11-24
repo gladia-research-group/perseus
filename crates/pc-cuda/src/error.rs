@@ -22,6 +22,8 @@ pub enum Error {
     Host(&'static str),
     #[error("cuBLASLt: {0}")]
     Blas(String),
+    #[error("captured graph of {nodes} nodes, over the {cap}-node limit (PC_GRAPH_MAX_NODES; CUDA_SCALE_LAUNCH_QUEUES=4x)")]
+    GraphTooLarge { nodes: usize, cap: usize },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 

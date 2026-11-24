@@ -11,12 +11,19 @@ pub type cudaGraphExec_t = *mut c_void;
 pub const MEMCPY_H2D: i32 = 1;
 pub const MEMCPY_D2H: i32 = 2;
 pub const MEMCPY_D2D: i32 = 3;
+/// cudaMemcpyDefault: the direction from unified addresses (also across devices).
+pub const MEMCPY_DEFAULT: i32 = 4;
 pub const STREAM_NON_BLOCKING: u32 = 1;
 pub const EVENT_DISABLE_TIMING: u32 = 2;
 pub const CAPTURE_MODE_GLOBAL: i32 = 0;
+/// cudaErrorPeerAccessAlreadyEnabled (not sticky, but left in the last-error slot the launchers read).
+pub const ERR_PEER_ACCESS_ALREADY_ENABLED: i32 = 704;
 
 extern "C" {
     pub fn cudaSetDevice(dev: i32) -> cudaError_t;
+    pub fn cudaGetDevice(dev: *mut i32) -> cudaError_t;
+    pub fn cudaDeviceCanAccessPeer(can: *mut i32, dev: i32, peer: i32) -> cudaError_t;
+    pub fn cudaDeviceEnablePeerAccess(peer: i32, flags: u32) -> cudaError_t;
     pub fn cudaGetDeviceCount(n: *mut i32) -> cudaError_t;
     pub fn cudaRuntimeGetVersion(v: *mut i32) -> cudaError_t;
     pub fn cudaDriverGetVersion(v: *mut i32) -> cudaError_t;
@@ -32,6 +39,7 @@ extern "C" {
     pub fn cudaEventCreateWithFlags(e: *mut cudaEvent_t, flags: u32) -> cudaError_t;
     pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(e: cudaEvent_t, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaEventRecordWithFlags(e: cudaEvent_t, s: cudaStream_t, flags: u32) -> cudaError_t;
     pub fn cudaEventSynchronize(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventElapsedTime(ms: *mut f32, a: cudaEvent_t, b: cudaEvent_t) -> cudaError_t;
     pub fn cudaDeviceSynchronize() -> cudaError_t;
@@ -45,6 +53,7 @@ extern "C" {
     pub fn cudaGraphLaunch(e: cudaGraphExec_t, s: cudaStream_t) -> cudaError_t;
     pub fn cudaGraphExecDestroy(e: cudaGraphExec_t) -> cudaError_t;
     pub fn cudaGraphDestroy(g: cudaGraph_t) -> cudaError_t;
+    pub fn cudaGraphGetNodes(g: cudaGraph_t, nodes: *mut *mut c_void, n: *mut usize) -> cudaError_t;
     pub fn cudaProfilerStart() -> cudaError_t;
     pub fn cudaProfilerStop() -> cudaError_t;
 }

@@ -14,9 +14,12 @@ pub mod check;
 pub mod msum;
 pub mod resolve;
 pub mod rotacc;
+pub mod rotcancel;
 pub mod rr;
 pub mod share;
 pub mod stream;
+pub mod tree;
+pub mod two;
 
 use crate::error::{Error, Result};
 use crate::graph::BlockGraph;
@@ -600,6 +603,13 @@ pub fn compile_block(
     let cf_max = cfg.bts.pair_cf_max.map_or(cf_max, |v| v as u32);
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default, window: cfg.bts.pair_window.unwrap_or(0) as u32, loose: cfg.bts.pair_loose.unwrap_or(false) });
+    // PC_ROT_CANCEL: rotations by k whose values reach rotations by -k through slot-wise ops only, dropped
+    if rotcancel::on() {
+        let (r, c) = rotcancel::cancel(&mut p, (env.ring_dim / 2) as i64);
+        if std::env::var_os("PC_ROT_CANCEL_LOG").is_some() {
+            eprintln!("[rot-cancel] {label}: {r} rotations dropped in {c} components");
+        }
+    }
     if crate::program::lever_on("rr") {
         let shape = ChainShape::of(&chain_of(cfg)?);
         rr::fuse(&mut p, &sh, &shape);
@@ -617,12 +627,45 @@ pub fn compile_block(
     if crate::program::lever_on("rotacc") && crate::program::lever_on("rotacc_lazy") {
         rotacc::sink(&mut p);
     }
+    // PC_SUM_TREE: chained sums in two halves (each device's blocks summed apart: a norm statistic's all-reduce)
+    if tree::on() {
+        let n = tree::rewire(&mut p);
+        if std::env::var_os("PC_REPLICA_LOG").is_some() {
+            eprintln!("[sum-tree] {label}: {n} chained sums in two halves");
+        }
+    }
     // PC_MULT_SUM: a chain of added relinearized products relinearized once
     if cfg.exec.mult_sum.unwrap_or(false) {
         msum::fuse(&mut p);
     }
     batch::batch(&mut p, k_max, opts.schedule, opts.batch_cf_free, pair);
     let word_bytes = 4u64;
+    // PC_SCHED2: the ops reordered by a two-device list schedule, each op's device as a hint for the replica lane
+    if two::on() {
+        // one ciphertext across the devices: its level's limbs (the primes left), both parts, at ~30 GB/s (replay's
+        // replica model)
+        let shape = ChainShape::of(&chain_of(cfg)?);
+        let n_q = shape.n_q as f64;
+        let limb = env.ring_dim as f64 * word_bytes as f64;
+        let limbs = |level: u32| shape.primes_dropped(level).map_or(n_q, |d| (n_q - d as f64).max(1.0));
+        // PC_SCHED2_DUMP=<dir> (diagnostic): the block before the pass and its cost tables (<dir>/<block>.json), for
+        // the offline model (examples/sched2_model.rs)
+        if let Ok(dir) = std::env::var("PC_SCHED2_DUMP") {
+            let top = p.vars.iter().map(|v| v.meta.level).max().unwrap_or(0) + 1;
+            let cm: Vec<f64> = (0..=top).map(|l| 2.0 * limbs(l) * limb / 30e6).collect();
+            let vbt: Vec<f64> = (0..=top).map(|l| 2.0 * (shape.n_q.saturating_sub(l)) as f64 * limb).collect();
+            let j = serde_json::json!({ "copy_ms": cm, "var_bytes": vbt, "program": &p });
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{label}.json")), j.to_string());
+        }
+        // a slot's bytes as the allocation sizes it (`alloc`: n_q - level limbs of two polynomials)
+        let (lat, gbs) = two::copy_model();
+        let r = two::schedule(&mut p, &|level| lat + 2.0 * limbs(level) * limb / (gbs * 1e6), &|level| 2.0 * (shape.n_q.saturating_sub(level)) as f64 * limb);
+        if std::env::var_os("PC_REPLICA_LOG").is_some() {
+            eprintln!("[sched2] {label}: {} ops in {} atoms, {} ops on the remote device; static {:.1} ms -> {:.1} ms; live {:.2} -> {:.2} GB", r.ops, r.atoms, r.moved, r.one_ms, r.two_ms, r.live0_gb, r.live_gb);
+            eprintln!("[sched2] {label}: regions: spans {:.1} ms, sum max(cp, w/2) {:.1}, sum w/2 {:.1}; {} chain-bound regions spanning {:.1} ms; idle copy {:.1} dep {:.1} join {:.1} ms, copies {:.1} ms (from inputs {:.1}, light {:.1}, heavy {:.1}, finishes {:.1})", r.spans, r.bound, r.half, r.chain_regions, r.chain_spans, r.idle[0], r.idle[1], r.idle[2], r.copies_ms, r.copies_by[0], r.copies_by[1], r.copies_by[2], r.copies_by[3]);
+        }
+    }
     alloc::alloc(&mut p, sh.cfg.chain.n_q, env.ring_dim as u64 * word_bytes);
     let mut rep = check::verify(&sh, &p);
     let mut errors = lower_errors;

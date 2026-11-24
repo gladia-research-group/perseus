@@ -60,40 +60,48 @@ __global__ void scatter_k(CcmmArgs A) {
     W* dst = (W*)A.ct.base + (size_t)A.i0 * A.ct.ct_stride + (size_t)part * A.ct.part_stride + (size_t)l * NB;
     dst[k] = ((const W*)A.y)[((size_t)A.i1 * 8 + row) * NB + k];
 }
+// The ring-switch ops run on a batch of cnt = i1 (0: NBIG) ciphertexts, ciphertexts i0 .. i0 + cnt of the matrix
+// (columns 8 i0 .. 8 (i0 + cnt)): staging slot / key-switch poly lc <-> ciphertext i0 + lc.
+__device__ __forceinline__ int batch_cnt(const CcmmArgs& A) {
+    return A.i1 > 0 ? A.i1 : NBIG;
+}
 // X[0][i][8c + j][z] = c0 + fwd-switched b, X[1] = fwd-switched a (FIDESlib ringIn's ksApply + splitBig)
 template <class W>
 __global__ void ring_in_k(CcmmArgs A) {
     const int z = blockIdx.x * BX + threadIdx.x;
-    const int col = blockIdx.y, i = blockIdx.z;
+    const int lcol = blockIdx.y, i = blockIdx.z;
     if (z >= NS) return;
-    const int c = col / SW, idx = col % SW + SW * z;
+    const int cnt = batch_cnt(A);
+    const int c = lcol / SW, idx = lcol % SW + SW * z, col = A.i0 * SW + lcol;
     const W* st = (const W*)A.y;
     const uint32_t* res = (const uint32_t*)A.z;
     uint32_t* X = (uint32_t*)A.x;
     const uint32_t b0 = (uint32_t)st[(((size_t)c * 2 + 0) * 4 + i) * NB + idx];
-    X[(((size_t)0 * NQ + i) * D + col) * NS + z] = addm(b0, res[(((size_t)1 * NQ + i) * NBIG + c) * NB + idx], A.p[i]);
-    X[(((size_t)1 * NQ + i) * D + col) * NS + z] = res[(((size_t)0 * NQ + i) * NBIG + c) * NB + idx];
+    X[(((size_t)0 * NQ + i) * D + col) * NS + z] = addm(b0, res[(((size_t)1 * NQ + i) * cnt + c) * NB + idx], A.p[i]);
+    X[(((size_t)1 * NQ + i) * D + col) * NS + z] = res[(((size_t)0 * NQ + i) * cnt + c) * NB + idx];
 }
-// bigA[i][c][j + 8z] = X[1][i][8c + j][z]
+// bigA[i][lc][j + 8z] = X[1][i][8 (i0 + lc) + j][z]
 __global__ void compose_a_k(CcmmArgs A) {
     const int idx = blockIdx.x * BX + threadIdx.x;
-    const int c = blockIdx.y, i = blockIdx.z;
+    const int lc = blockIdx.y, i = blockIdx.z;
     if (idx >= NB) return;
+    const int cnt = batch_cnt(A), c = A.i0 + lc;
     const uint32_t* X = (const uint32_t*)A.y;
-    ((uint32_t*)A.x)[((size_t)i * NBIG + c) * NB + idx] = X[(((size_t)1 * NQ + i) * D + c * SW + idx % SW) * NS + idx / SW];
+    ((uint32_t*)A.x)[((size_t)i * cnt + lc) * NB + idx] = X[(((size_t)1 * NQ + i) * D + c * SW + idx % SW) * NS + idx / SW];
 }
 // staging (coefficient form): part 0 = composed X[0] + back-switched b, part 1 = back-switched a
 template <class W>
 __global__ void ring_out_k(CcmmArgs A) {
     const int idx = blockIdx.x * BX + threadIdx.x;
-    const int c = blockIdx.y, i = blockIdx.z;
+    const int lc = blockIdx.y, i = blockIdx.z;
     if (idx >= NB) return;
+    const int cnt = batch_cnt(A), c = A.i0 + lc;
     const uint32_t* X = (const uint32_t*)A.y;
     const uint32_t* res = (const uint32_t*)A.z;
     W* st = (W*)A.x;
     const uint32_t xb = X[(((size_t)0 * NQ + i) * D + c * SW + idx % SW) * NS + idx / SW];
-    st[(((size_t)c * 2 + 0) * 4 + i) * NB + idx] = (W)addm(xb, res[(((size_t)1 * NQ + i) * NBIG + c) * NB + idx], A.p[i]);
-    st[(((size_t)c * 2 + 1) * 4 + i) * NB + idx] = (W)res[(((size_t)0 * NQ + i) * NBIG + c) * NB + idx];
+    st[(((size_t)lc * 2 + 0) * 4 + i) * NB + idx] = (W)addm(xb, res[(((size_t)1 * NQ + i) * cnt + lc) * NB + idx], A.p[i]);
+    st[(((size_t)lc * 2 + 1) * 4 + i) * NB + idx] = (W)res[(((size_t)0 * NQ + i) * cnt + lc) * NB + idx];
 }
 
 // ── key switching over {q0..q3, P} ──────────────────────────────────────────────────────────────────────────────
@@ -354,19 +362,21 @@ __global__ void digits_k(CcmmArgs A) {
         v = (v - q) / 256;
     }
 }
-// Cn[prime][r][c][u] = sum_e G_e[u][r][c] 256^e mod p
+// Cn[prime][r][c][u] = sum_e G_e[u][r][c] 256^e mod p, rows r = i1 .. i1 + nr (nr = i2, 0: all 2D)
 __global__ void recombine_k(CcmmArgs A) {
     const size_t k = blockIdx.x * (size_t)BX + threadIdx.x;
     const size_t gper = (size_t)KY * 2 * D * 2 * D;
-    if (k >= gper) return;
+    const int nr = A.i2 > 0 ? A.i2 : 2 * D;
+    if (k >= (size_t)KY * nr * 2 * D) return;
     const int prime = A.i0;
     const int64_t p = A.p[prime];
     const int c = (int)(k % (2 * D));
-    const int r = (int)((k / (2 * D)) % (2 * D));
-    const int u = (int)(k / ((size_t)4 * D * D));
+    const int r = A.i1 + (int)((k / (2 * D)) % nr);
+    const int u = (int)(k / ((size_t)2 * D * nr));
+    const size_t g = ((size_t)u * 2 * D + r) * 2 * D + c;
     const int32_t* G = (const int32_t*)A.y;
     int64_t v = 0;
-    for (int e = 6; e >= 0; --e) v = (v * 256 + G[(size_t)e * gper + k]) % p;
+    for (int e = 6; e >= 0; --e) v = (v * 256 + G[(size_t)e * gper + g]) % p;
     if (v < 0) v += p;
     ((uint32_t*)A.x)[(((size_t)prime * 2 * D + r) * 2 * D + c) * KY + u] = (uint32_t)v;
 }
@@ -433,14 +443,15 @@ int launch(const CcmmArgs* a, cudaStream_t s) {
             mod_down_k<<<dim3(blocks(n), A.count, 2), BX, 0, s>>>(A);
             break;
         case CCMM_RING_IN:
-            ring_in_k<W><<<dim3(NS / BX, D, NQ), BX, 0, s>>>(A);
-            break;
         case CCMM_COMPOSE_A:
-            compose_a_k<<<dim3(blocks(NB), NBIG, NQ), BX, 0, s>>>(A);
+        case CCMM_RING_OUT: {
+            const int cnt = A.i1 > 0 ? A.i1 : NBIG;
+            if (A.i0 < 0 || A.i1 < 0 || A.i0 + cnt > NBIG) return -1;
+            if (A.op == CCMM_RING_IN) ring_in_k<W><<<dim3(NS / BX, SW * cnt, NQ), BX, 0, s>>>(A);
+            else if (A.op == CCMM_COMPOSE_A) compose_a_k<<<dim3(blocks(NB), cnt, NQ), BX, 0, s>>>(A);
+            else ring_out_k<W><<<dim3(blocks(NB), cnt, NQ), BX, 0, s>>>(A);
             break;
-        case CCMM_RING_OUT:
-            ring_out_k<W><<<dim3(blocks(NB), NBIG, NQ), BX, 0, s>>>(A);
-            break;
+        }
         case CCMM_MONO:
             mono_k<<<cols, BX, 0, s>>>(A);
             break;
@@ -467,10 +478,12 @@ int launch(const CcmmArgs* a, cudaStream_t s) {
             if (A.i0 < 0 || A.i0 >= NQ) return -1;
             digits_k<<<blocks((size_t)2 * D * D * KY), BX, 0, s>>>(A);
             break;
-        case CCMM_RECOMBINE:
-            if (A.i0 < 0 || A.i0 >= NQ) return -1;
-            recombine_k<<<blocks((size_t)KY * 4 * D * D), BX, 0, s>>>(A);
+        case CCMM_RECOMBINE: {
+            const int nr = A.i2 > 0 ? A.i2 : 2 * D;
+            if (A.i0 < 0 || A.i0 >= NQ || A.i1 < 0 || A.i2 < 0 || A.i1 + nr > 2 * D) return -1;
+            recombine_k<<<blocks((size_t)KY * nr * 2 * D), BX, 0, s>>>(A);
             break;
+        }
         case CCMM_SCATTER_ROWS:
             scatter_rows_k<<<blocks(COLS), BX, 0, s>>>(A);
             break;
