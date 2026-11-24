@@ -110,19 +110,20 @@ pub struct XCopy {
     pub at: u32,
 }
 
-/// PC_OWN_LAZY=1 (with ownership; default off until an A/B wins): an owned output (a finish's or a split refresh
+/// PC_OWN_LAZY (with ownership; on by default: faster on Llama and Gemma, even elsewhere; `0` / `off` off): an owned output (a finish's or a split refresh
 /// batch's remote part) lives on the remote device only: the remote services skip copying it back here, the replica
 /// plan copies it over (after the owning step's event) where this device reads it.
 pub fn own_lazy() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| own() && matches!(std::env::var("PC_OWN_LAZY").as_deref().map(str::trim), Ok("1") | Ok("on")))
+    *V.get_or_init(|| own() && crate::replay::default_on("PC_OWN_LAZY"))
 }
 
-/// PC_REPLICA_LOCAL=1 (with the replica lane; default off until an A/B wins): the placement tries, among components of
+/// PC_REPLICA_LOCAL (with the replica lane; on by default: faster on Llama and Gemma, even elsewhere; `0` / `off` off):
+/// the placement tries, among components of
 /// equal cost, those whose inputs are already on the remote device (owned outputs) first.
 pub fn local_first() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_LOCAL").as_deref().map(str::trim), Ok("1") | Ok("on")))
+    *V.get_or_init(|| crate::replay::default_on("PC_REPLICA_LOCAL"))
 }
 
 /// PC_REPLICA_UNIT_SPLIT=1 (with the replica lane; default off until an A/B wins): the placement simulation counts a
