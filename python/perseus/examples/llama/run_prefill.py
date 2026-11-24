@@ -47,7 +47,10 @@ def _planned(a, model, toks, gt, ref, results=None):
     from .prefill import plain_logits, report
     cfg = _plan_config(a.plan)
     cfg["exec.use_graphs"] = bool(a.graphs)
-    keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout)
+    # PF_KEY_SEED=<int> (diagnostic): keys, encryptions and every sample drawn from one seeded stream (reproducible
+    # words: two runs of one program decrypt the same bits)
+    seed = int(os.environ["PF_KEY_SEED"]) if os.environ.get("PF_KEY_SEED") else None
+    keys = _pc.KeySource.generate([], conj=True, layout=a.key_layout, seed=seed)
     work = a.work_dir or os.path.join(os.environ.get("PC_WORK_DIR", "/tmp"), f"llama_prefill_{os.getpid()}")
     run = LlamaPlannedPrefill(model, resolve(a.plan), cfg, keys, work_dir=work, pt_rows=a.pt_rows,
                               stc_cache=a.stc_cache, check_meta=a.check_meta, log=lambda m: print(m, flush=True),
@@ -128,6 +131,9 @@ def _planned(a, model, toks, gt, ref, results=None):
     n_rep = a.tokens
     if gt is not None and model.n_layers == int(model.w.store.config["num_hidden_layers"]):
         hid = run.hidden()[:a.tokens]
+        if os.environ.get("PF_HID_HASH"):     # diagnostic: the decrypted last hidden state's words
+            import hashlib
+            print(f"[llama-prefill] hidden sha1 {hashlib.sha1(np.ascontiguousarray(hid).tobytes()).hexdigest()}", flush=True)
         # PF_LAST_QUERY: the last position alone is computed past the last block's K / V
         from perseus.impl.prefill import Chunks
         lo = len(hid) - 1 if model.last_position(Chunks(len(hid), model.blocks.t)) is not None else 0

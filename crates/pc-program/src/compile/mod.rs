@@ -14,6 +14,7 @@ pub mod check;
 pub mod msum;
 pub mod resolve;
 pub mod rotacc;
+pub mod rotcancel;
 pub mod rr;
 pub mod share;
 pub mod stream;
@@ -602,6 +603,13 @@ pub fn compile_block(
     let cf_max = cfg.bts.pair_cf_max.map_or(cf_max, |v| v as u32);
     let cf_default = u32_of("bts.stc_first_cf", cfg.bts.stc_first_cf, 13)?;
     let pair = sh.cfg.bts.stc_first_entry.filter(|_| cfg.bts.pair.unwrap_or(false)).map(|entry| Pairing { entry, unit: sh.cfg.chain.unit, cf_max, cf_default, window: cfg.bts.pair_window.unwrap_or(0) as u32, loose: cfg.bts.pair_loose.unwrap_or(false) });
+    // PC_ROT_CANCEL: rotations by k whose values reach rotations by -k through slot-wise ops only, dropped
+    if rotcancel::on() {
+        let (r, c) = rotcancel::cancel(&mut p, (env.ring_dim / 2) as i64);
+        if std::env::var_os("PC_ROT_CANCEL_LOG").is_some() {
+            eprintln!("[rot-cancel] {label}: {r} rotations dropped in {c} components");
+        }
+    }
     if crate::program::lever_on("rr") {
         let shape = ChainShape::of(&chain_of(cfg)?);
         rr::fuse(&mut p, &sh, &shape);
