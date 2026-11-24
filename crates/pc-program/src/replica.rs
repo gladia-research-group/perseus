@@ -496,6 +496,29 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
         }
     }
     let mut home: Vec<u8> = vec![0; ns];
+    // PC_REPLICA_INPUT_SPLIT=1 (default off until an A/B wins): the block's inputs (slots read before any write, in
+    // first-read order) homed half here, half there: a norm on the block's inputs is split like the one on the
+    // residual adds (each device normalizes its half, the statistic summed across), the placement copying the second
+    // half over where it pays
+    if input_split() {
+        let mut seen: Vec<bool> = vec![false; ns];
+        let mut ins: Vec<u32> = vec![];
+        for (reads, writes) in grw {
+            for &s in reads {
+                if !seen[s as usize] {
+                    seen[s as usize] = true;
+                    ins.push(s);
+                }
+            }
+            for &s in writes {
+                seen[s as usize] = true;
+            }
+        }
+        let n = ins.len();
+        for &s in &ins[n - n / 2..] {
+            home[s as usize] = 1;
+        }
+    }
     let mut on = vec![0u8; gs.len()];
     // PC_REPLICA_TIE=load: the owner-computes work placed per device since the region's start (a tie goes to the
     // lighter device)
@@ -553,6 +576,12 @@ fn owner_place<W: DevWord>(b: &Bound<'_, W>, gs: &[(usize, usize)], grw: &[(Vec<
 pub fn tie_load() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_TIE").as_deref().map(str::trim), Ok("load")))
+}
+
+/// PC_REPLICA_INPUT_SPLIT=1: owner-computes homes the second half of the block's inputs on the remote device.
+pub fn input_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("PC_REPLICA_INPUT_SPLIT").as_deref().map(str::trim), Ok("1") | Ok("on")))
 }
 
 /// PC_REPLICA_TIE=alt: such ties go to the two devices in turn (this device first).
