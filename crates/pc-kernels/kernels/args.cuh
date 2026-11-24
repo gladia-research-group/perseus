@@ -836,11 +836,12 @@ static_assert(sizeof(PcmmArgs) == 168, "PcmmArgs layout");
 //                [4][5][count][n] = centered(src c[j] mod p[j]) mod p[pi]   (c[0..4) = (Q / q_j)^-1 mod q_j)
 //   KS_MAC       y = Dg, z = keys [4][5][2][n] (+ q s[0] for poly q; s[0] = 0: one key) -> x = acc [2][5][count][n]
 //   MOD_DOWN     y = acc -> x = res [2][4][count][n]: (acc_i - centered(acc_P)) c[i] mod p[i]   (c = P^-1 mod q_i)
-//   RING_IN      y = staging (W, coefficient form, 16 slots), z = res of the fwd switch [2][4][16][NB] -> x = X:
-//                X[0][i][8c + j][z] = c0[c][i][j + 8z] + res[1][i][c][j + 8z], X[1][i][8c + j][z] = res[0][i][c][j + 8z]
-//   COMPOSE_A    y = X -> x = bigA [4][16][NB]: bigA[i][c][j + 8z] = X[1][i][8c + j][z]
-//   RING_OUT     y = X, z = res of the back switch -> x = staging (W, 16 slots, coefficient form):
-//                part 0 = X[0] composed + res[1], part 1 = res[0]
+//   RING_IN      y = staging (W, coefficient form, cnt slots), z = res of the fwd switch [2][4][cnt][NB] -> x = X:
+//                X[0][i][8c + j][z] = c0[c - i0][i][j + 8z] + res[1][i][c - i0][j + 8z], X[1][i][8c + j][z] =
+//                res[0][i][c - i0][j + 8z], for the matrix's ciphertexts c = i0 .. i0 + cnt (cnt = i1, 0: all 16)
+//   COMPOSE_A    y = X -> x = bigA [4][cnt][NB]: bigA[i][c - i0][j + 8z] = X[1][i][8c + j][z] (c, i0, cnt as RING_IN)
+//   RING_OUT     y = X, z = res of the back switch [2][4][cnt][NB] -> x = staging (W, cnt slots, coefficient form):
+//                part 0 = X[0] composed + res[1], part 1 = res[0] (slot c - i0 <- ciphertext c, as RING_IN)
 //   MONO         y -> x: column col times X^(i0 col) (negacyclic, NS), over [2][4][D][NS]
 //   BITREV       y -> x: column col <- column brev7(col)
 //   TWEAK        y -> x: one radix-2 level of CKL Alg. 2 (h = i0, kk = i1, sgn = i2)
@@ -850,7 +851,8 @@ static_assert(sizeof(PcmmArgs) == 168, "PcmmArgs layout");
 //   GATHER_U     y = X -> x = E [2][4][D col][D i][KY u] = X[..][col][i + D u]
 //   DIGITS       y = E (one matrix), prime i0 -> x = int8 d[4][KY u][2D r][D t] = balanced base-256 digit of
 //                centered E[r / D][i0][t][r % D][u] (K-contiguous: both GEMM operands of the col-TN layout)
-//   RECOMBINE    y = G int32 [7][KY][2D][2D] -> x = Cn [4][2D r][2D c][KY] at prime i0 (Horner in 256)
+//   RECOMBINE    y = G int32 [7][KY][2D][2D] -> x = Cn [4][2D r][2D c][KY] at prime i0 (Horner in 256), rows
+//                r = i1 .. i1 + i2 (i2 = 0: all 2D)
 //   SCATTER_ROWS y = Cn -> x = X: X[part][i][j][ii + D u] = Cn[i][i0 + j][part D + ii][u]
 enum CcmmOp : int32_t {
     CCMM_GATHER = 0,

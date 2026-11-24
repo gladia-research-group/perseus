@@ -46,6 +46,32 @@ pub(crate) struct RemotePcmmDev {
     lt: Box<pc_cuda::blas::Lt>,
 }
 
+/// The remote device's CCMM engine for split products (PC_CCMM_SPLIT, `pc_program::replay::RemoteCcmm`): the engine
+/// (half PPMM plan), 16 one-ciphertext operands / outputs, the merge table, the split events, copy stream and
+/// PC_CCMM_PHASES events of both devices (`_h`: the session's device), and the copy-back event (session's device).
+/// Field order = drop order: the engine's GEMM plans borrow the cuBLASLt handle declared last.
+pub(crate) struct RemoteCcmmDev {
+    pub engine: pc_gpu::matmul::ccmm::Ccmm<'static, 'static, W>,
+    pub cts: Vec<Ct<'static, W>>,
+    pub mono: pc_gpu::limbs::MonomialTable<'static, W>,
+    pub ev_t: Vec<Event>,
+    pub ph_t: Option<Vec<Event>>,
+    pub cp_t: Stream<Compute>,
+    pub ev_h: Vec<Event>,
+    pub ph_h: Option<Vec<Event>>,
+    /// a stream of the session's device: synchronized and destroyed with that device current (`RemoteDev::drop`)
+    pub cp_h: std::mem::ManuallyDrop<Stream<Compute>>,
+    pub back: Event,
+    #[allow(dead_code)]
+    lt: Box<pc_cuda::blas::Lt>,
+}
+
+/// What the remote CCMM engine is built from (PC_CCMM_SPLIT): the session's CCMM keys and engine knobs.
+pub(crate) struct RemoteCcmmSpec {
+    pub keys: pc_core::ccmm_keys::CcmmKeys,
+    pub cfg: pc_gpu::matmul::ccmm::CcmmCfg,
+}
+
 /// What the replica lane (PC_REPLICA, `pc_program::replica`) needs sized: the session's slab (slots, held-chain
 /// words) and its programs' key-group bytes.
 pub(crate) struct ReplicaSpec {
@@ -90,6 +116,8 @@ pub(crate) struct ReplicaDev {
 
 /// The remote refresh device. Field order = drop order: everything carved from `arena` before it, `_back` last.
 pub(crate) struct RemoteDev {
+    /// split CCMM products (None: off)
+    pub ccmm: Option<RemoteCcmmDev>,
     /// the replica lane (None: off)
     pub replica: Option<ReplicaDev>,
     /// joint linears (None: no PCMM engine here)
@@ -266,6 +294,11 @@ impl Drop for RemoteDev {
         let _ = self.cb.sync();
         // SAFETY: dropped once, here, with its device (the session's) current; never used after
         unsafe { std::mem::ManuallyDrop::drop(&mut self.cb) };
+        if let Some(c) = self.ccmm.as_mut() {
+            let _ = c.cp_h.sync();
+            // SAFETY: as `cb`
+            unsafe { std::mem::ManuallyDrop::drop(&mut c.cp_h) };
+        }
         let _ = self.device.make_current();
         let ex = &self.ex;
         let _ = (ex.compute.sync(), ex.aux.sync(), ex.side.sync(), ex.copy.sync(), self.fcb.sync());
@@ -284,10 +317,11 @@ impl Drop for RemoteDev {
             REMOTE_FIN_CHECKED.load(Ordering::Relaxed)
         );
         eprintln!(
-            "[remote] device {}: {} CCMM output halves ({} ciphertexts) refreshed here, {} checked word for word",
+            "[remote] device {}: {} CCMM output halves ({} ciphertexts) refreshed here, {} split CCMM products (PC_CCMM_SPLIT), {} checked word for word",
             self.device.ordinal(),
             REMOTE_CCMM_RUNS.load(Ordering::Relaxed),
             REMOTE_CCMM_CTS.load(Ordering::Relaxed),
+            pc_program::replay::REMOTE_CCMM_SPLITS.load(Ordering::Relaxed),
             REMOTE_CCMM_CHECKED.load(Ordering::Relaxed)
         );
         eprintln!(
@@ -358,6 +392,7 @@ impl RemoteDev {
         n_ev: usize,
         pcmm: Option<crate::pcmm::RemotePcmmSpec>,
         replica: Option<ReplicaSpec>,
+        ccmm: Option<RemoteCcmmSpec>,
     ) -> PyResult<RemoteDev> {
         let e = gerr;
         let ce = |x: pc_cuda::Error| gerr(x.into());
@@ -406,6 +441,11 @@ impl RemoteDev {
                 mp.reserve("replica.bts_work", BtsWork::<W>::bytes(&lay, w));
             }
         }
+        if let Some(cs) = &ccmm {
+            mp.reserve("ccmm", pc_gpu::matmul::ccmm::Ccmm::<W>::bytes(&cs.cfg));
+            mp.reserve("ccmm.cts", pc_core::ccmm_keys::NBIG * Arena::bytes_for::<W>(CtBuf::<Compute, W>::words(&lay, 1)));
+            mp.reserve("ccmm.mono", pc_gpu::limbs::MonomialTable::<W>::bytes(chain.q.len(), lay.n));
+        }
         mp.reserve("slack", 256 << 20);
         let arena = Box::new(mp.allocate(&device).map_err(e)?);
         // SAFETY: the box is owned by the `RemoteDev` built below together with every borrower, and dropped after them
@@ -446,6 +486,25 @@ impl RemoteDev {
                 let outs = (0..sp.max_groups).map(|_| ct(sp.batch)).collect::<PyResult<Vec<_>>>()?;
                 eprintln!("[remote] device {ordinal}: PCMM engine for {} joint linears", planes.len());
                 Some(RemotePcmmDev { engine, planes, ins, outs, lt })
+            }
+            None => None,
+        };
+        // PC_CCMM_SPLIT: the remote CCMM engine (its events and copy stream here; the session device's below)
+        let rccmm = match ccmm {
+            Some(cs) => {
+                let lt = Box::new(pc_cuda::blas::Lt::new(&device).map_err(ce)?);
+                // SAFETY: as the PCMM engine's: the box is owned by the RemoteCcmmDev built below, declared after the
+                // engine whose plans borrow it; its heap address is stable
+                let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&lt.inner as *const pc_cuda::blas::lt::Lt) };
+                let mut engine = pc_gpu::matmul::ccmm::Ccmm::<W>::new(a, &device, &ex.compute, &ctx, ltr, cs.cfg, &cs.keys).map_err(e)?;
+                engine.enable_split(ltr, &device, &ex.compute).map_err(e)?;
+                let cts = (0..pc_core::ccmm_keys::NBIG).map(|_| CtBuf::new(a, "ccmm.cts", lay, 1).map(|b| Ct::new(CtMeta::new(0, 1), b))).collect::<Result<Vec<_>, _>>().map_err(e)?;
+                let mono = pc_gpu::limbs::MonomialTable::<W>::new(a, &ex.compute, &ctx, pc_core::ccmm_keys::NB / pc_core::ccmm_keys::KY).map_err(e)?;
+                let ev_t = (0..pc_gpu::matmul::ccmm::SPLIT_EVENTS).map(|_| Event::new(&device)).collect::<Result<Vec<_>, _>>().map_err(ce)?;
+                let phases = std::env::var("PC_CCMM_PHASES").is_ok_and(|v| v.trim() == "1");
+                let ph_t = if phases { Some((0..6).map(|_| Event::timing(&device)).collect::<Result<Vec<_>, _>>().map_err(ce)?) } else { None };
+                let cp_t = Stream::<Compute>::new(&device).map_err(ce)?;
+                Some((engine, cts, mono, ev_t, ph_t, cp_t, lt))
             }
             None => None,
         };
@@ -493,6 +552,17 @@ impl RemoteDev {
         let cb_join = Event::new(here).map_err(ce)?;
         let cb = Stream::<Compute>::new(here).map_err(ce)?;
         let cb_ev = (0..n_ev).map(|_| Event::new(here)).collect::<Result<Vec<_>, _>>().map_err(ce)?;
+        let ccmm = match rccmm {
+            Some((engine, cts, mono, ev_t, ph_t, cp_t, lt)) => {
+                let ev_h = (0..pc_gpu::matmul::ccmm::SPLIT_EVENTS).map(|_| Event::new(here)).collect::<Result<Vec<_>, _>>().map_err(ce)?;
+                let ph_h = if ph_t.is_some() { Some((0..6).map(|_| Event::timing(here)).collect::<Result<Vec<_>, _>>().map_err(ce)?) } else { None };
+                let cp_h = std::mem::ManuallyDrop::new(Stream::<Compute>::new(here).map_err(ce)?);
+                let back = Event::new(here).map_err(ce)?;
+                eprintln!("[remote] device {ordinal}: CCMM engine for split products (PC_CCMM_SPLIT), half PPMM GEMM {} (tuned ms {:?})", engine.gemm_half.as_ref().map_or(String::new(), |g| g.label()), engine.gemm_half.as_ref().map(|g| g.tuned_ms.clone()));
+                Some(RemoteCcmmDev { engine, cts, mono, ev_t, ph_t, cp_t, ev_h, ph_h, cp_h, back, lt })
+            }
+            None => None,
+        };
         eprintln!(
             "[remote] device {ordinal}: peer access {}/{}, keys {:.1} GB copied in {:.2} s, arena {:.1} of {:.1} GB, setup {:.1} s",
             peer.0,
@@ -515,6 +585,6 @@ impl RemoteDev {
             }
             None => None,
         };
-        Ok(RemoteDev { replica, pcmm: rpcmm, routes, gather, ring, ring_done, lane_in, cb_ev, cb: std::mem::ManuallyDrop::new(cb), lane_fork, lane_join, cb_join, fcb, fcb_ev, work, ops, plans: kplans, keys, ctx, ex, fork, join, device, arena, _back: back })
+        Ok(RemoteDev { ccmm, replica, pcmm: rpcmm, routes, gather, ring, ring_done, lane_in, cb_ev, cb: std::mem::ManuallyDrop::new(cb), lane_fork, lane_join, cb_join, fcb, fcb_ev, work, ops, plans: kplans, keys, ctx, ex, fork, join, device, arena, _back: back })
     }
 }

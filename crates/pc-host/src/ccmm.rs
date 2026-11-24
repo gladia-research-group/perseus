@@ -56,9 +56,21 @@ fn check(a: &CcmmArgs) -> i32 {
         ccmm_op::KS_DIGITS | ccmm_op::KS_MAC | ccmm_op::MOD_DOWN if a.count < 1 || a.count > 65535 => -1,
         ccmm_op::TWEAK if a.i0 < 1 || a.i0 >= D as i32 => -1,
         ccmm_op::DIGITS | ccmm_op::RECOMBINE if a.i0 < 0 || a.i0 >= NQ as i32 => -1,
+        ccmm_op::RECOMBINE if a.i1 < 0 || a.i2 < 0 || a.i1 + rows_of(a) as i32 > 2 * D as i32 => -1,
+        ccmm_op::RING_IN | ccmm_op::COMPOSE_A | ccmm_op::RING_OUT if a.i0 < 0 || a.i1 < 0 || a.i0 as usize + cnt_of(a) > NBIG => -1,
         0..=19 => 0,
         _ => -2,
     }
+}
+
+/// The ring-switch ops' batch: ciphertexts i0 .. i0 + cnt of the matrix (cnt = i1, 0: all NBIG).
+fn cnt_of(a: &CcmmArgs) -> usize {
+    if a.i1 > 0 { a.i1 as usize } else { NBIG }
+}
+
+/// RECOMBINE's rows i1 .. i1 + nr (nr = i2, 0: all 2D).
+fn rows_of(a: &CcmmArgs) -> usize {
+    if a.i2 > 0 { a.i2 as usize } else { 2 * D }
 }
 
 pub extern "C" fn ccmm<W: Hw>(a: *const CcmmArgs, s: CudaStream) -> i32 {
@@ -154,37 +166,42 @@ fn run<W: Hw>(a: &CcmmArgs) {
                 }
             }
         }),
-        ccmm_op::RING_IN => par_for(NQ * D, a, |a, t| {
-            let (i, col) = (t / D, t % D);
-            let (c, j) = (col / SW, col % SW);
+        ccmm_op::RING_IN => par_for(NQ * SW * cnt_of(a), a, |a, t| {
+            let cnt = cnt_of(a);
+            let (i, lcol) = (t / (SW * cnt), t % (SW * cnt));
+            let (c, j, col) = (lcol / SW, lcol % SW, a.i0 as usize * SW + lcol);
             let x0 = rows_mut::<u32>(a.x, (i * D + col) * NS, NS);
             for (z, o) in x0.iter_mut().enumerate() {
                 let idx = j + SW * z;
                 let b0 = rd::<W>(a.y, ((c * 2) * 4 + i) * NB + idx).u64() as u32;
-                *o = addm(b0, rd(a.z, ((NQ + i) * NBIG + c) * NB + idx), a.p[i]);
+                *o = addm(b0, rd(a.z, ((NQ + i) * cnt + c) * NB + idx), a.p[i]);
             }
             let x1 = rows_mut::<u32>(a.x, ((NQ + i) * D + col) * NS, NS);
             for (z, o) in x1.iter_mut().enumerate() {
-                *o = rd(a.z, (i * NBIG + c) * NB + j + SW * z);
+                *o = rd(a.z, (i * cnt + c) * NB + j + SW * z);
             }
         }),
-        ccmm_op::COMPOSE_A => par_for(NQ * NBIG, a, |a, t| {
-            let (i, c) = (t / NBIG, t % NBIG);
-            let x = rows_mut::<u32>(a.x, (i * NBIG + c) * NB, NB);
+        ccmm_op::COMPOSE_A => par_for(NQ * cnt_of(a), a, |a, t| {
+            let cnt = cnt_of(a);
+            let (i, lc) = (t / cnt, t % cnt);
+            let c = a.i0 as usize + lc;
+            let x = rows_mut::<u32>(a.x, (i * cnt + lc) * NB, NB);
             for (idx, o) in x.iter_mut().enumerate() {
                 *o = rd(a.y, ((NQ + i) * D + c * SW + idx % SW) * NS + idx / SW);
             }
         }),
-        ccmm_op::RING_OUT => par_for(NQ * NBIG, a, |a, t| {
-            let (i, c) = (t / NBIG, t % NBIG);
-            let s0 = rows_mut::<W>(a.x, ((c * 2) * 4 + i) * NB, NB);
+        ccmm_op::RING_OUT => par_for(NQ * cnt_of(a), a, |a, t| {
+            let cnt = cnt_of(a);
+            let (i, lc) = (t / cnt, t % cnt);
+            let c = a.i0 as usize + lc;
+            let s0 = rows_mut::<W>(a.x, ((lc * 2) * 4 + i) * NB, NB);
             for (idx, o) in s0.iter_mut().enumerate() {
                 let xb = rd::<u32>(a.y, (i * D + c * SW + idx % SW) * NS + idx / SW);
-                *o = W::from_u64(addm(xb, rd(a.z, ((NQ + i) * NBIG + c) * NB + idx), a.p[i]) as u64);
+                *o = W::from_u64(addm(xb, rd(a.z, ((NQ + i) * cnt + lc) * NB + idx), a.p[i]) as u64);
             }
-            let s1 = rows_mut::<W>(a.x, ((c * 2 + 1) * 4 + i) * NB, NB);
+            let s1 = rows_mut::<W>(a.x, ((lc * 2 + 1) * 4 + i) * NB, NB);
             for (idx, o) in s1.iter_mut().enumerate() {
-                *o = W::from_u64(rd::<u32>(a.z, (i * NBIG + c) * NB + idx) as u64);
+                *o = W::from_u64(rd::<u32>(a.z, (i * cnt + lc) * NB + idx) as u64);
             }
         }),
         ccmm_op::MONO => par_for(2 * NQ * D, a, |a, t| {
@@ -267,8 +284,9 @@ fn run<W: Hw>(a: &CcmmArgs) {
         ccmm_op::RECOMBINE => {
             let gper = KY * 4 * D * D;
             let prime = a.i0 as usize;
-            // per block of 2D (r, c) pairs: the 64 u-planes recombined, then u made innermost
-            par_for(2 * D, a, |a, r| {
+            // per block of 2D (r, c) pairs: the 64 u-planes recombined, then u made innermost (rows i1 .. i1 + nr)
+            par_for(rows_of(a), a, |a, r| {
+                let r = a.i1 as usize + r;
                 let p = a.p[prime];
                 let mut cn = buf::<u32>(KY * 2 * D);
                 for u in 0..KY {

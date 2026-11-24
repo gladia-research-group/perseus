@@ -669,7 +669,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
     // the remote refresh device (PC_REMOTE_DEVICE): its routes, and its stage caches locked with ours while capturing
     let (rroutes, rparts) = match remote.as_mut() {
         Some(r) => {
-            let crate::remote::RemoteDev { replica: rrep, pcmm: rpc, routes: rset, gather, ring, ring_done, lane_in, cb_ev, cb, lane_fork, lane_join, cb_join, fcb, fcb_ev, work: rwork, ops: rops, plans: rplans, ctx: rctx, ex: rex, fork, join, device, .. } = r;
+            let crate::remote::RemoteDev { ccmm: rcc, replica: rrep, pcmm: rpc, routes: rset, gather, ring, ring_done, lane_in, cb_ev, cb, lane_fork, lane_join, cb_join, fcb, fcb_ev, work: rwork, ops: rops, plans: rplans, ctx: rctx, ex: rex, fork, join, device, .. } = r;
             let rfcb = pc_program::replay::remote_cb().then_some((&*fcb, &*fcb_ev));
             // the replica lane (PC_REPLICA): this block's second binding, the mirrored slab swapped in for the run
             let rrep = rrep.as_mut().filter(|rp| pc_program::replica::mode() > 0 && rp.bounds.len() > idx).map(|rp| {
@@ -692,7 +692,19 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
                 pending: None,
             };
             let rpcmm = rpc.as_mut().map(|p| pc_program::replay::RemotePcmm { engine: &mut p.engine, planes: &p.planes, ins: &mut p.ins[..], outs: &mut p.outs[..] });
-            (Some((rset.routes(), rset)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb)))
+            let rccmm = rcc.as_mut().filter(|_| pc_program::replay::ccmm_split()).map(|c| pc_program::replay::RemoteCcmm {
+                engine: &mut c.engine,
+                cts: &mut c.cts[..],
+                mono: &c.mono,
+                ev_t: &c.ev_t[..],
+                cp_t: &c.cp_t,
+                ph_t: c.ph_t.as_deref(),
+                ev_h: &c.ev_h[..],
+                cp_h: &*c.cp_h,
+                ph_h: c.ph_h.as_deref(),
+                back: &c.back,
+            });
+            (Some((rset.routes(), rset)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb, rccmm)))
         }
         None => (None, None),
     };
@@ -712,7 +724,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
         .collect();
     let mut slab_back: Option<SlabBack> = None;
     let mut rlane = match (rroutes.as_ref(), rparts) {
-        (Some((rr, _)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb))) => Some(pc_program::replay::Remote {
+        (Some((rr, _)), Some((gather, rwork, rops, rplans, rctx, rex, fork, join, device, lane, rpcmm, rrep, rfcb, rccmm))) => Some(pc_program::replay::Remote {
             here: &dev.device,
             there: &*device,
             here_ctx: &dev.ctx,
@@ -730,6 +742,7 @@ fn run_block(dev: &Dev, idx: usize, ins: &[In<'_>], outputs: &[(usize, usize)], 
             pcmm: rpcmm,
             fcb: rfcb,
             own: Default::default(),
+            ccmm: rccmm,
             replica: match rrep {
                 Some((b5, slab5, ev, rjoin, rfork, rops5, rex5, rhand, rwork5, rdma5)) => {
                     b5.swap_slab(slab5).map_err(perr)?;

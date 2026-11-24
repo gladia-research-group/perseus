@@ -15,7 +15,9 @@ use pc_core::encode::Complex;
 use pc_cuda::{launch_result, Compute, Event, GraphExec, Stream};
 use pc_gpu::bts::staged::{BtsCall, Phase, StagedRef};
 use pc_gpu::bts::stc_first::{nf_key, StcFirstRoute};
+use pc_gpu::matmul::ccmm::{self as ccmm_eng, Ccmm};
 use pc_gpu::matmul::pcmm::{GroupOffload, Pcmm, PcmmLinear, PcmmShape};
+use pc_gpu::limbs::MonomialTable;
 use pc_gpu::bts::{batch, BtsCx, BtsRoute, BtsWork, RouteKind, Staged, StcHigh};
 use pc_gpu::encode_dev::CoeffRowsDevice;
 use pc_gpu::ks::{KeyGroup, KsPlans, KskSource};
@@ -190,6 +192,43 @@ pub trait RemoteLane<'a, W: DevWord, M: DevStrategy<W>> {
     /// refreshes.
     fn stcf_singles(&mut self, _here: &Stream<Compute>, _sh: &Shadow, _xs: &mut [&mut Ct<'a, W>], _f: &mut StcfFn<'_, 'a, W, M>) -> pc_gpu::Result<()> {
         Err(pc_gpu::Error::Mem { knob: "remote finish", value: 0, msg: "this remote lane runs no finish refreshes".into() })
+    }
+    /// Split CCMM products (PC_CCMM_SPLIT): whether the remote device holds a CCMM engine of its own.
+    fn ccmm_split_on(&self) -> bool {
+        false
+    }
+    /// A split product's operand conversion: `stc_high` (spec `spec`) of `xs` (this device's memory: ciphertexts
+    /// 8 .. 16 of operand `side`, 0 = left, 1 = right) on the remote device, kept there for `ccmm_mul_split`; `back`:
+    /// copied back into `xs` too (the word checks). `xs` take the conversion's metadata either way.
+    fn ccmm_operands_far(&mut self, _here: &Stream<Compute>, _sh: &Shadow, _side: usize, _xs: &mut [Ct<'a, W>], _spec: &StcHigh, _back: bool) -> pc_gpu::Result<()> {
+        Err(no_split())
+    }
+    /// The product split across both devices (`pc_gpu::matmul::ccmm::mul_split`, in place over `a`) with this
+    /// device's engine `eng` on `here` (context `ctx`): this device takes ciphertexts 0 .. 8 of `a` and `b`, the remote
+    /// one its operands of `ccmm_operands_far`. Outputs 0 .. 8 land in `a[..8]`, outputs 8 .. 16 stay on the remote
+    /// device (`a[8..]` take their metadata) until `ccmm_far_back` / `ccmm_far_singles`.
+    fn ccmm_mul_split(&mut self, _here: &Stream<Compute>, _eng: &mut Ccmm<'a, 'static, W>, _ctx: &Context<'a, W, M>, _a: &mut [Ct<'a, W>], _b: &[Ct<'a, W>], _bt: bool) -> pc_gpu::Result<()> {
+        Err(no_split())
+    }
+    /// The remote outputs merged in groups of `g` (o0 + X^1024 o1 + ..: `merge_monomial` with the remote table), the
+    /// groups' results moved to the front (as the service does with its own).
+    fn ccmm_far_merge(&mut self, _g: usize) -> pc_gpu::Result<()> {
+        Err(no_split())
+    }
+    /// Remote outputs `first .. first + xs.len()` (after `ccmm_far_merge`: the groups' results) into `xs` (this
+    /// device's memory) on this device's copy stream, `here` ordered after.
+    fn ccmm_far_back(&mut self, _here: &Stream<Compute>, _first: usize, _xs: &mut [Ct<'a, W>]) -> pc_gpu::Result<()> {
+        Err(no_split())
+    }
+    /// `stcf_singles` of the remote outputs `first .. first + xs.len()` where they are (no copy over); `xs` receive the
+    /// results as `stcf_singles` gives them back.
+    fn ccmm_far_singles(&mut self, _here: &Stream<Compute>, _sh: &Shadow, _first: usize, _xs: &mut [&mut Ct<'a, W>], _f: &mut StcfFn<'_, 'a, W, M>) -> pc_gpu::Result<()> {
+        Err(no_split())
+    }
+    /// PC_CCMM_PHASES: the last split product's phase times per device (ms: ring in, CMT, PPMM, CMT + relinearization,
+    /// ring out, total; host-waits for both devices).
+    fn ccmm_split_phases(&mut self) -> pc_gpu::Result<Option<[[f64; 6]; 2]>> {
+        Ok(None)
     }
     /// The asynchronous lane (`schedule` lanes 2 and 3, PC_REMOTE_ASYNC=1): whole refreshes, each in two parts ordered
     /// by events: `lane_issue` copies the inputs into a ring buffer of the remote device and refreshes them there
@@ -460,6 +499,45 @@ pub fn ccmm_operand_split() -> bool {
     *V.get_or_init(|| default_on("PC_CCMM_OPERAND_SPLIT"))
 }
 
+fn no_split() -> pc_gpu::Error {
+    pc_gpu::Error::Mem { knob: "ccmm split", value: 0, msg: "this remote lane holds no CCMM engine (PC_CCMM_SPLIT)".into() }
+}
+
+/// PC_CCMM_SPLIT=1 (with the CCMM finish split and a remote CCMM engine): every CCMM product split across the two
+/// devices (`pc_gpu::matmul::ccmm::mul_split`), the remote operand halves kept there and the remote output half
+/// refreshed where it is. Default off until it measures faster.
+pub fn ccmm_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_CCMM_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// PC_CCMM_SPLIT_CHECK=1 (diagnostic, graphs off): the CCMM service's word checks of PC_REMOTE_CHECK alone (remote
+/// operand conversions, split products, remote merges and output refreshes against the same work on this device).
+pub fn ccmm_split_check() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PC_CCMM_SPLIT_CHECK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Split CCMM products run (process total).
+pub static REMOTE_CCMM_SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The remote device's CCMM engine for split products (PC_CCMM_SPLIT): the engine (`enable_split`), its ciphertexts
+/// (0 .. 8: the left operand's 8 .. 16, then the outputs 8 .. 16; 8 .. 16: the right operand's 8 .. 16), its merge
+/// table, and per device (`_t` there, `_h` here) the split events, the copy stream and PC_CCMM_PHASES timing events.
+/// `back` (here): the copies back of `ccmm_far_back`.
+pub struct RemoteCcmm<'r, 'a, W: DevWord> {
+    pub engine: &'r mut Ccmm<'a, 'static, W>,
+    pub cts: &'r mut [Ct<'a, W>],
+    pub mono: &'r MonomialTable<'a, W>,
+    pub ev_t: &'r [Event],
+    pub cp_t: &'r Stream<Compute>,
+    pub ph_t: Option<&'r [Event]>,
+    pub ev_h: &'r [Event],
+    pub cp_h: &'r Stream<Compute>,
+    pub ph_h: Option<&'r [Event]>,
+    pub back: &'r Event,
+}
+
 /// The remote lane over one device's executor, op layer, keys and routes (`RemoteLane`): `here` / `there` the two
 /// devices, `gather` the remote batch buffer, `fork` an event of `here` (recorded on its compute, waited on by the
 /// remote one), `join` an event of `there` (the other way).
@@ -492,6 +570,8 @@ pub struct Remote<'r, 'a, W: DevWord, M: DevStrategy<W>> {
     /// ownership (PC_OWN): the current step's expected slots, the next service call's output slots and shift, the
     /// slots left in the replica's slots so far
     pub own: OwnState,
+    /// split CCMM products (None: off)
+    pub ccmm: Option<RemoteCcmm<'r, 'a, W>>,
 }
 
 /// PC_OWN_LAZY_PATHS (diagnostic, with PC_OWN_LAZY): which services skip copying owned outputs back, bits: 1 split
@@ -1695,6 +1775,166 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
     }
 
     fn stcf_singles(&mut self, here: &Stream<Compute>, sh: &Shadow, xs: &mut [&mut Ct<'a, W>], f: &mut StcfFn<'_, 'a, W, M>) -> pc_gpu::Result<()> {
+        self.singles_from(here, sh, None, xs, f)
+    }
+
+    fn ccmm_split_on(&self) -> bool {
+        self.ccmm.is_some() && self.stcf.is_some()
+    }
+
+    fn ccmm_operands_far(&mut self, here: &Stream<Compute>, sh: &Shadow, side: usize, xs: &mut [Ct<'a, W>], spec: &StcHigh, back: bool) -> pc_gpu::Result<()> {
+        let r = self.stcf.ok_or_else(|| pc_gpu::Error::Mem { knob: "remote stc_high", value: 0, msg: "no StC-first route on the remote device".into() })?;
+        let hb = pc_core::ccmm_keys::NBIG / 2;
+        if side > 1 || xs.len() != hb || xs.iter().any(|x| x.k() != 1 || x.meta != xs[0].meta) || self.ccmm.is_none() {
+            return Err(pc_gpu::Error::Mem { knob: "ccmm split", value: xs.len(), msg: format!("{hb} operands of one ciphertext each at one metadata (side {side})") });
+        }
+        here.record(self.fork)?;
+        self.there.make_current()?;
+        let res = (|| -> pc_gpu::Result<()> {
+            self.ex.compute.wait(self.fork)?;
+            let mut done = 0;
+            for chunk in xs.chunks_mut(stcf_batch(r)) {
+                {
+                    let s = &self.ex.compute;
+                    for (c, x) in chunk.iter().enumerate() {
+                        // SAFETY: the remote stream waits for `fork`, recorded on `here` after every write of the operands
+                        unsafe { batch::put_peer(self.ctx, s, self.gather, self.there, c, x, self.here)? };
+                    }
+                    self.gather.buf.k = chunk.len();
+                    self.gather.meta = chunk[0].meta;
+                }
+                let mut cx = BtsCx { ctx: self.ctx, ex: &mut *self.ex, sh, ks: self.ks, ops: &mut *self.ops, work: &mut *self.work };
+                Staged::stc_high(r, &mut cx, std::slice::from_mut(&mut *self.gather), spec)?;
+                self.ex.join_aux()?;
+                let m = self.gather.meta;
+                let s = &self.ex.compute;
+                let rc = self.ccmm.as_mut().ok_or_else(no_split)?;
+                for (c, o) in chunk.iter_mut().enumerate() {
+                    batch::take(self.ctx, s, &mut rc.cts[side * hb + done + c], self.gather, c, m)?;
+                    if back {
+                        // SAFETY: the gather buffer was written by the conversion just issued on this stream; `here`
+                        // reads the operands only after `join`
+                        unsafe { batch::take_peer(self.here_ctx, s, o, self.here, self.gather, self.there, c, m)? };
+                    } else {
+                        o.meta = m;
+                    }
+                }
+                done += chunk.len();
+            }
+            tl_remote(&self.ex.compute);
+            self.ex.compute.record(self.join)?;
+            Ok(())
+        })();
+        let back_cur = self.here.make_current();
+        res?;
+        back_cur?;
+        REMOTE_CCMM_OPERANDS.fetch_add(xs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn ccmm_mul_split(&mut self, here: &Stream<Compute>, eng: &mut Ccmm<'a, 'static, W>, ctx: &Context<'a, W, M>, a: &mut [Ct<'a, W>], b: &[Ct<'a, W>], bt: bool) -> pc_gpu::Result<()> {
+        let nb = pc_core::ccmm_keys::NBIG;
+        let hb = nb / 2;
+        if a.len() != nb || b.len() != nb {
+            return Err(pc_gpu::Error::Mem { knob: "ccmm split", value: a.len(), msg: format!("{} / {} operands, a matrix is {nb}", a.len(), b.len()) });
+        }
+        let meta = pc_gpu::bts::common_meta(a)?;
+        let rc = self.ccmm.as_mut().ok_or_else(no_split)?;
+        let (ta, tb) = rc.cts.split_at_mut(hb);
+        let oh = ccmm_eng::SplitOps { a: &ccmm_eng::split_members(ctx, "a", &a[..hb], hb)?, b: &ccmm_eng::split_members(ctx, "b", &b[..hb], hb)?, out: &ccmm_eng::split_out_members(&mut a[..hb]) };
+        let ot = ccmm_eng::SplitOps { a: &ccmm_eng::split_members(self.ctx, "a", ta, hb)?, b: &ccmm_eng::split_members(self.ctx, "b", &tb[..hb], hb)?, out: &ccmm_eng::split_out_members(ta) };
+        let mut h = ccmm_eng::SplitSide { eng, ctx, dev: self.here, s: here, cp: rc.cp_h, ev: rc.ev_h, ph: rc.ph_h };
+        let mut t = ccmm_eng::SplitSide { eng: &mut *rc.engine, ctx: self.ctx, dev: self.there, s: &self.ex.compute, cp: rc.cp_t, ev: rc.ev_t, ph: rc.ph_t };
+        ccmm_eng::mul_split(&mut h, &mut t, &oh, &ot, bt)?;
+        for x in a.iter_mut().chain(ta.iter_mut()) {
+            x.meta = meta;
+        }
+        REMOTE_CCMM_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn ccmm_far_merge(&mut self, g: usize) -> pc_gpu::Result<()> {
+        let hb = pc_core::ccmm_keys::NBIG / 2;
+        if g < 2 || hb % g != 0 {
+            return Err(pc_gpu::Error::Mem { knob: "ccmm split", value: g, msg: format!("merge {g} of {hb} outputs") });
+        }
+        self.there.make_current()?;
+        let res = (|| -> pc_gpu::Result<()> {
+            let rc = self.ccmm.as_mut().ok_or_else(no_split)?;
+            for i in 0..hb / g {
+                for k in (0..g - 1).rev() {
+                    let (lo, hi) = rc.cts.split_at_mut(g * i + k + 1);
+                    pc_gpu::limbs::merge_monomial(self.ctx, self.ex, rc.mono, &mut lo[g * i + k], &hi[0])?;
+                }
+            }
+            for i in 1..hb / g {
+                rc.cts.swap(i, g * i);
+            }
+            Ok(())
+        })();
+        let back = self.here.make_current();
+        res?;
+        back?;
+        Ok(())
+    }
+
+    fn ccmm_far_back(&mut self, here: &Stream<Compute>, first: usize, xs: &mut [Ct<'a, W>]) -> pc_gpu::Result<()> {
+        let rc = self.ccmm.as_mut().ok_or_else(no_split)?;
+        if first + xs.len() > pc_core::ccmm_keys::NBIG / 2 {
+            return Err(pc_gpu::Error::Mem { knob: "ccmm split", value: first + xs.len(), msg: "remote outputs past the half".into() });
+        }
+        self.there.make_current()?;
+        let r = self.ex.compute.record(self.join);
+        let back = self.here.make_current();
+        r?;
+        back?;
+        // this device's copy stream pulls (after the remote product, merges and everything before them there)
+        let cp = rc.cp_h;
+        cp.wait(self.join)?;
+        for (c, o) in xs.iter_mut().enumerate() {
+            let src = &rc.cts[first + c];
+            // SAFETY: `cp` waits for the remote stream's event after the outputs' writes; nothing writes them before
+            // the remote device's next split product, ordered after this device's (which waits for `back`)
+            unsafe { batch::take_peer(self.here_ctx, cp, o, self.here, src, self.there, 0, src.meta)? };
+        }
+        rc.back.record(cp)?;
+        here.wait(rc.back)?;
+        Ok(())
+    }
+
+    fn ccmm_far_singles(&mut self, here: &Stream<Compute>, sh: &Shadow, first: usize, xs: &mut [&mut Ct<'a, W>], f: &mut StcfFn<'_, 'a, W, M>) -> pc_gpu::Result<()> {
+        if self.ccmm.is_none() || first + xs.len() > pc_core::ccmm_keys::NBIG / 2 {
+            return Err(no_split());
+        }
+        self.singles_from(here, sh, Some(first), xs, f)
+    }
+
+    fn ccmm_split_phases(&mut self) -> pc_gpu::Result<Option<[[f64; 6]; 2]>> {
+        let Some(rc) = self.ccmm.as_ref() else { return Ok(None) };
+        let (Some(ph), Some(pt)) = (rc.ph_h, rc.ph_t) else { return Ok(None) };
+        let d = |e: &[Event]| -> pc_gpu::Result<[f64; 6]> {
+            e[5].sync()?;
+            let mut v = [0.0; 6];
+            for i in 0..5 {
+                v[i] = e[i].elapsed_ms(&e[i + 1])? as f64;
+            }
+            v[5] = e[0].elapsed_ms(&e[5])? as f64;
+            Ok(v)
+        };
+        let here = d(ph)?;
+        self.there.make_current()?;
+        let there = d(pt);
+        let back = self.here.make_current();
+        let there = there?;
+        back?;
+        Ok(Some([here, there]))
+    }
+}
+
+impl<'r, 'a, W: DevWord, M: DevStrategy<W>> Remote<'r, 'a, W, M> {
+    /// `stcf_singles` with the inputs copied over from `xs` (`local` None) or taken from the remote CCMM outputs
+    /// `local ..` where they are.
+    fn singles_from(&mut self, here: &Stream<Compute>, sh: &Shadow, local: Option<usize>, xs: &mut [&mut Ct<'a, W>], f: &mut StcfFn<'_, 'a, W, M>) -> pc_gpu::Result<()> {
         let r = self.stcf.ok_or_else(|| pc_gpu::Error::Mem { knob: "remote finish", value: 0, msg: "no StC-first route on the remote device".into() })?;
         if xs.is_empty() || xs.len() > crate::program::GRID_INPUTS {
             return Err(pc_gpu::Error::Mem { knob: "remote finish", value: xs.len(), msg: format!("{} ciphertexts for a {}-ciphertext batch buffer", xs.len(), crate::program::GRID_INPUTS) });
@@ -1705,8 +1945,11 @@ impl<'r, 'a, W: DevWord, M: DevStrategy<W>> RemoteLane<'a, W, M> for Remote<'r, 
             let s = &self.ex.compute;
             s.wait(self.fork)?;
             for (c, x) in xs.iter().enumerate() {
-                // SAFETY: the remote stream waits for `fork`, recorded on `here` after every write of the inputs
-                unsafe { batch::put_peer(self.ctx, s, self.gather, self.there, c, x, self.here)? };
+                match (local, self.ccmm.as_ref()) {
+                    (Some(first), Some(rc)) => batch::put(self.ctx, s, self.gather, c, &rc.cts[first + c])?,
+                    // SAFETY: the remote stream waits for `fork`, recorded on `here` after every write of the inputs
+                    _ => unsafe { batch::put_peer(self.ctx, s, self.gather, self.there, c, x, self.here)? },
+                }
             }
             self.gather.buf.k = xs.len();
             self.gather.meta = xs[0].meta;

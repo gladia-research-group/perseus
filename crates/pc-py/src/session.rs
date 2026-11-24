@@ -1605,7 +1605,8 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 }
                 None => None,
             };
-            // the CCMM keys too
+            // the CCMM keys too (PC_CCMM_SPLIT: a copy for the remote device's engine)
+            let mut remote_ccmm: Option<crate::remote::RemoteCcmmSpec> = None;
             let cc = match ccmm {
                 Some(cp) => {
                     let d = dense.as_ref().ok_or_else(|| PyValueError::new_err("Session(ccmm=True): no program has a CCMM finish (no StC-first route)"))?;
@@ -1618,6 +1619,9 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                             pc_core::ccmm_keys::CcmmKeys::generate(&sk.s, &chain.q[..4], &mut prng).map_err(|x| e(x.into()))?.0
                         }
                     };
+                    if pc_program::replay::ccmm_split() && crate::remote::requested()?.is_some() {
+                        remote_ccmm = Some(crate::remote::RemoteCcmmSpec { keys: ck.clone(), cfg: cp.cfg.clone() });
+                    }
                     Some(crate::matmul::CcmmRt::build(cp, a, &device, &ex.compute, &ctx, ck, tc.elapsed().as_secs_f64(), cf)?)
                 }
                 None => None,
@@ -1677,7 +1681,7 @@ fn setup(cfg: &pc_config::Config, ks: &PyKeySource, origin: &Origin, sizes: Size
                 Some(ord) => {
                     let rplans = crate::routes::RoutePlans { splan: &splan, dplan: &dplan, sb_cfgs: &sb_cfgs, cplans: &cplans };
                     let rspec = (pc_program::replica::mode() > 0).then(|| crate::remote::ReplicaSpec { n_slab: slab.slots.len(), held_words: held_words(&ps, &lay, chain.dnum(), k_max), group_bytes, pt_span: pc_program::replica::pt_mirror().then(|| pts.span()) });
-                    Some(crate::remote::RemoteDev::build(ord, &device, &keys, &ex.compute, &chain, k_max, layout, &spec, &extra, &levels, ocfg, &rplans, side.as_ref().map_or(0, |sl| sl.ev.len()), remote_pcmm.take(), rspec)?)
+                    Some(crate::remote::RemoteDev::build(ord, &device, &keys, &ex.compute, &chain, k_max, layout, &spec, &extra, &levels, ocfg, &rplans, side.as_ref().map_or(0, |sl| sl.ev.len()), remote_pcmm.take(), rspec, remote_ccmm.take())?)
                 }
                 None => None,
             };

@@ -161,7 +161,11 @@ impl CcmmRt {
         // SAFETY: the box is owned by the returned CcmmRt and declared after `ccmm`, so it is dropped after the plan
         // that borrows it; its heap address is stable
         let ltr: &'static pc_cuda::blas::lt::Lt = unsafe { &*(&lt.inner as *const pc_cuda::blas::lt::Lt) };
-        let ccmm = Ccmm::<W>::new(arena, dev, s, ctx, ltr, plan.cfg, &keys).map_err(gerr)?;
+        let mut ccmm = Ccmm::<W>::new(arena, dev, s, ctx, ltr, plan.cfg, &keys).map_err(gerr)?;
+        // PC_CCMM_SPLIT with a remote device: the half-rows PPMM plan of split products
+        if pc_program::replay::ccmm_split() && crate::remote::requested()?.is_some() {
+            ccmm.enable_split(ltr, dev, s).map_err(gerr)?;
+        }
         let ct = |_| -> PyResult<Ct<'static, W>> { Ok(Ct::new(CtMeta::new(0, 1), CtBuf::new(arena, "ccmm.cts", ctx.lay, 1).map_err(gerr)?)) };
         let a = (0..NBIG).map(ct).collect::<PyResult<Vec<_>>>()?;
         let b = (0..NBIG).map(ct).collect::<PyResult<Vec<_>>>()?;
@@ -200,7 +204,7 @@ impl CcmmRt {
     /// `out_slots` (ownership, PC_OWN): output i's slot, for the remote halves left in the replica's slots too.
     pub fn run(&mut self, cx: &mut BtsCx<'_, 'static, W, M>, route: &StcFirstRoute<'static, W, M>, bt: bool, fa: f64, fb: f64, shift: u32, merge: u32, kappa: f64, drop: u32, far: Option<&mut dyn RemoteLane<'static, W, M>>, out_slots: Option<&[u32]>) -> pc_gpu::Result<usize> {
         let mut far = far.filter(|r| crate::pcmm::remote_finish_ccmm() && r.has_finish());
-        let check = far.is_some() && pc_program::replay::remote_check();
+        let check = far.is_some() && (pc_program::replay::remote_check() || pc_program::replay::ccmm_split_check());
         let (fa, fb) = (fa * kappa.sqrt(), fb * kappa.sqrt());
         let g = merge.max(1) as usize;
         if NBIG % g != 0 || !g.is_power_of_two() {
@@ -222,6 +226,10 @@ impl CcmmRt {
         // PC_CCMM_OPERAND_SPLIT: the last half of each operand side converted on the remote device (one metadata per
         // side only), issued first and joined before the product
         let op_split = far.is_some() && pc_program::replay::ccmm_operand_split();
+        // PC_CCMM_SPLIT: the product split across both devices, the remote operand halves kept there (both sides at one
+        // metadata each, as the operand split takes them)
+        let uni = |xs: &[Ct<'static, W>]| xs[..NBIG].iter().all(|x| x.meta.nf == xs[0].meta.nf && x.meta.level == xs[0].meta.level && x.meta.deg == xs[0].meta.deg);
+        let split = op_split && pc_program::replay::ccmm_split() && g <= NBIG / 2 && far.as_deref().is_some_and(|r| r.ccmm_split_on()) && uni(&self.a) && uni(&self.b);
         let mut op_far = false;
         let mut op_stash: Vec<(usize, CtMeta, [Vec<W>; 2])> = vec![];
         for (side, (xs, f)) in [(&mut self.a, fa), (&mut self.b, fb)].into_iter().enumerate() {
@@ -235,7 +243,11 @@ impl CcmmRt {
                         }
                     }
                     let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
-                    fr.stc_high_far(&cx.ex.compute, cx.sh, &mut xs[h..NBIG], &hi(f)).map_err(|e| ctx_err("remote operand stc_high", &[m0], e))?;
+                    if split {
+                        fr.ccmm_operands_far(&cx.ex.compute, cx.sh, side, &mut xs[h..NBIG], &hi(f), check).map_err(|e| ctx_err("remote operand stc_high (kept)", &[m0], e))?;
+                    } else {
+                        fr.stc_high_far(&cx.ex.compute, cx.sh, &mut xs[h..NBIG], &hi(f)).map_err(|e| ctx_err("remote operand stc_high", &[m0], e))?;
+                    }
                     op_far = true;
                 }
                 Staged::stc_high(route, cx, &mut xs[..h], &hi(f)).map_err(|e| ctx_err("operand stc_high", &[m0], e))?;
@@ -252,7 +264,8 @@ impl CcmmRt {
                 }
             }
         }
-        if op_far {
+        // (split: this device's half of the product needs none of the remote operands)
+        if op_far && (!split || check) {
             let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
             fr.join(&cx.ex.compute)?;
             // PC_REMOTE_CHECK: the remote operands converted again here from their saved inputs, word for word
@@ -277,18 +290,53 @@ impl CcmmRt {
         self.mark(cx, 1)?;
         let (ctx, s) = (cx.ctx, &cx.ex.compute);
         let ph = self.phases.as_ref().map(|v| [&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]]);
-        self.ccmm.mul_inplace(ctx, s, &mut self.a[..NBIG], &self.b[..NBIG], bt, ph).map_err(|e| ctx_err("ccmm mul (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
-        if let Some(ev) = ph {
-            let t = pc_gpu::matmul::ccmm::CcmmTimes::read(ev)?;
-            eprintln!("[ccmm-phases] ring_in {:.3} cmt {:.3} ppmm {:.3} cmt2_relin {:.3} ring_out {:.3} total {:.3} ms", t.ring_in, t.cmt, t.ppmm, t.cmt2_relin, t.ring_out, t.total());
+        let hb = NBIG / 2;
+        if split {
+            let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
+            // PC_REMOTE_CHECK: every operand word saved here (the remote ones came back with their conversion)
+            let stash = if check { Some(self.a[..NBIG].iter().chain(&self.b[..NBIG]).map(|x| Ok((x.meta, download_one(cx, x)?))).collect::<pc_gpu::Result<Vec<_>>>()?) } else { None };
+            fr.ccmm_mul_split(s, &mut self.ccmm, ctx, &mut self.a[..NBIG], &self.b[..NBIG], bt).map_err(|e| ctx_err("ccmm mul split (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
+            if let Some([h, t]) = fr.ccmm_split_phases()? {
+                eprintln!("[ccmm-phases] split bt={} here ring_in {:.3} cmt {:.3} ppmm {:.3} post {:.3} ring_out {:.3} total {:.3} | there ring_in {:.3} cmt {:.3} ppmm {:.3} post {:.3} ring_out {:.3} total {:.3} ms", bt as u8, h[0], h[1], h[2], h[3], h[4], h[5], t[0], t[1], t[2], t[3], t[4], t[5]);
+            }
+            if let Some(st) = stash {
+                // the remote outputs back here, every output word against the same product on this device alone
+                fr.ccmm_far_back(s, 0, &mut self.a[hb..NBIG])?;
+                let got = self.a[..NBIG].iter().map(|x| Ok((x.meta, download_one(cx, x)?))).collect::<pc_gpu::Result<Vec<_>>>()?;
+                for (x, (m, data)) in self.a[..NBIG].iter_mut().chain(self.b[..NBIG].iter_mut()).zip(&st) {
+                    let rows: Vec<usize> = (0..=pc_shadow::meta::top_limb(cx.ctx.shape, m.level)? as usize).collect();
+                    for (part, d) in data.iter().enumerate() {
+                        x.buf.upload_rows(&cx.ex.compute, 0, part, &rows, d)?;
+                    }
+                    x.meta = *m;
+                }
+                self.ccmm.mul_inplace(cx.ctx, &cx.ex.compute, &mut self.a[..NBIG], &self.b[..NBIG], bt, None)?;
+                let want = self.a[..NBIG].iter().map(|x| Ok((x.meta, download_one(cx, x)?))).collect::<pc_gpu::Result<Vec<_>>>()?;
+                if got != want {
+                    let bad: Vec<usize> = (0..NBIG).filter(|&i| got[i] != want[i]).collect();
+                    return Err(pc_gpu::Error::Shape { what: "ccmm service", msg: format!("remote check: split product outputs {bad:?} differ from the product on this device alone") });
+                }
+                pc_program::replay::REMOTE_CCMM_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.ccmm.mul_inplace(ctx, s, &mut self.a[..NBIG], &self.b[..NBIG], bt, ph).map_err(|e| ctx_err("ccmm mul (a)", &self.a[..NBIG].iter().map(|x| x.meta).collect::<Vec<_>>(), e))?;
+            if let Some(ev) = ph {
+                let t = pc_gpu::matmul::ccmm::CcmmTimes::read(ev)?;
+                eprintln!("[ccmm-phases] ring_in {:.3} cmt {:.3} ppmm {:.3} cmt2_relin {:.3} ring_out {:.3} total {:.3} ms", t.ring_in, t.cmt, t.ppmm, t.cmt2_relin, t.ring_out, t.total());
+            }
         }
         let n_out = if g > 1 {
-            // group i: a[g i] + X^1024 (a[g i + 1] + X^1024 (...)), innermost first
-            for i in 0..NBIG / g {
+            // group i: a[g i] + X^1024 (a[g i + 1] + X^1024 (...)), innermost first (split: the remote groups merge
+            // there; the check merges them here too, from the local product)
+            let local = if split && !check { hb / g } else { NBIG / g };
+            for i in 0..local {
                 for k in (0..g - 1).rev() {
                     let (lo, hi) = self.a.split_at_mut(g * i + k + 1);
                     pc_gpu::limbs::merge_monomial(cx.ctx, cx.ex, &self.mono, &mut lo[g * i + k], &hi[0])?;
                 }
+            }
+            if split {
+                far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?.ccmm_far_merge(g)?;
             }
             // the merged outputs a[g i] -> a[i] (buffer handles swap, no copy)
             for i in 1..NBIG / g {
@@ -298,6 +346,34 @@ impl CcmmRt {
         } else {
             NBIG
         };
+        // split: outputs n_out / 2 .. live on the remote device. One run of output refreshes whose remote part lies there
+        // refreshes them where they are (`resident`: the first remote output it takes) after the rest come back here;
+        // otherwise they all come back first
+        let mut resident: Option<usize> = None;
+        if split {
+            let fr = far.as_deref_mut().ok_or_else(|| pc_gpu::Error::Shape { what: "ccmm service", msg: "no remote lane".into() })?;
+            let h2 = n_out / 2;
+            if check {
+                // the remote merges against this device's (the remote outputs into b's buffers, free now)
+                fr.ccmm_far_back(&cx.ex.compute, 0, &mut self.b[..h2])?;
+                for j in 0..h2 {
+                    if download_one(cx, &self.b[j])? != download_one(cx, &self.a[h2 + j])? || self.b[j].meta != self.a[h2 + j].meta {
+                        return Err(pc_gpu::Error::Shape { what: "ccmm service", msg: format!("remote check: remote output {} (merge {g}) differs from this device's", h2 + j) });
+                    }
+                }
+            }
+            let one_run = (0..n_out).all(|i| a_meta[g * i] == a_meta[0]);
+            let n_far = if n_out >= 2 { (n_out / 2).min(GRID_INPUTS) } else { 0 };
+            let mid = n_out - n_far;
+            if one_run && n_far > 0 && mid >= h2 {
+                if mid > h2 {
+                    fr.ccmm_far_back(&cx.ex.compute, 0, &mut self.a[h2..mid])?;
+                }
+                resident = Some(mid - h2);
+            } else {
+                fr.ccmm_far_back(&cx.ex.compute, 0, &mut self.a[h2..n_out])?;
+            }
+        }
         // output i comes from left operand i (merged: g i); runs of equal operand metadata share one SinCBoot call
         self.mark(cx, 2)?;
         let src = |i: usize| a_meta[g * i];
@@ -324,7 +400,10 @@ impl CcmmRt {
                     lane.own_next(sl[mid..hi].to_vec(), shift);
                 }
                 let mut xs: Vec<&mut Ct<'static, W>> = self.a[mid..hi].iter_mut().collect();
-                lane.stcf_singles(&cx.ex.compute, cx.sh, &mut xs, &mut |c1, r1, g| sinc_boot_scaled(c1, r1, &st2, std::slice::from_mut(g), nf_split, factor))?;
+                match resident.filter(|_| lo == 0 && hi == n_out) {
+                    Some(first) => lane.ccmm_far_singles(&cx.ex.compute, cx.sh, first, &mut xs, &mut |c1, r1, g| sinc_boot_scaled(c1, r1, &st2, std::slice::from_mut(g), nf_split, factor))?,
+                    None => lane.stcf_singles(&cx.ex.compute, cx.sh, &mut xs, &mut |c1, r1, g| sinc_boot_scaled(c1, r1, &st2, std::slice::from_mut(g), nf_split, factor))?,
+                }
             }
             sinc_boot_scaled(cx, route, &st, &mut self.a[lo..mid], nf_split, factor)
                 .map_err(|e| ctx_err(&format!("SinCBoot outputs {lo}..{mid} (operand {m:?})"), &outs, e))?;
