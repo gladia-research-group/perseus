@@ -436,6 +436,9 @@ def main(argv=None):
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+    # 4x the driver's launch queues (~1022 -> 4094 pending launches per device): the eager two-GPU issue fills one
+    # device while the other drains (11-24 ABBA: -6.6 % on 2 GPUs, 1 GPU unchanged)
+    os.environ.setdefault("CUDA_SCALE_LAUNCH_QUEUES", "4x")
     os.environ["SANA_RES"] = str(a.res)
     plan = None if a.float_only else pick_plan(a.plan, a.steps, a.res)
     if plan is not None:

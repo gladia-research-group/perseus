@@ -571,11 +571,12 @@ pub(crate) fn finish_balance() -> bool {
     })
 }
 
-/// `PC_PER_INPUT_FAR=1` (with the finish split; default off): a linear whose inputs sit at several scales
-/// (`linear_per_input`) sends its last finish groups to the remote device too, as the uniform path does.
+/// `PC_PER_INPUT_FAR` (with the finish split; on by default, `0` / `off` off): a linear whose inputs sit at several
+/// scales (`linear_per_input`) sends its last finish groups to the remote device too, as the uniform path does
+/// (SANA 2 GPUs: -6.9 % per image, ABBA 11-24).
 pub(crate) fn per_input_far() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PC_PER_INPUT_FAR").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| pc_program::replay::default_on("PC_PER_INPUT_FAR"))
 }
 
 /// `PC_FINISH_PROFILE=1` (eager runs only: it waits for each finish): per PCMM / CCMM finish, a `[finprof]` line with
