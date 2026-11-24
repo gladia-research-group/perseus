@@ -88,6 +88,7 @@ impl<'a> Lower<'a> {
         let mut route = self.env.route_tagged(site_var, self.plan, self.tags.get(name));
         if captured.is_none() {
             route = self.keep_planned_landing(name, site_var, &in_meta, route);
+            route = self.shrink_periodic(name, &in_meta, route);
         }
         let mut captured = captured;
         if let Some(cap) = captured {
@@ -187,6 +188,36 @@ impl<'a> Lower<'a> {
         for d in drops {
             let r = pc_shadow::Route { raise_drop: d, ..route };
             if level(&r).is_some_and(|l| l <= want) {
+                return r;
+            }
+        }
+        route
+    }
+
+    /// PC_SHRINK_SLOTS=s1,s2,.. (default off until an A/B wins): a planned dense refresh (shipped order) of a value the
+    /// Shadow tags periodic at one of these slot counts (the smallest that fits) runs on that sparse route instead, at
+    /// the largest built raise drop that lands it no deeper than the dense route the plan priced (same levels after
+    /// it: the softmax's denominators and reciprocals, rotate-summed onto 2^12 slots). The real-payload route has no
+    /// sparse form: real sites shrink only with PC_SHRINK_REAL=1 (then complex). Same values, another refresh.
+    fn shrink_periodic(&self, name: &str, input: &CtMeta, route: pc_shadow::Route) -> pc_shadow::Route {
+        let sizes = shrink_sizes();
+        if sizes.is_empty() || route.slots != 0 || route.stc_first || route.spru_h > 0 || (route.real && !shrink_real()) {
+            return route;
+        }
+        let Some(t) = self.tags.get(name).filter(|t| t.known()) else { return route };
+        let Some(&s) = sizes.iter().find(|&&s| t.periodic_at(s as i64)) else { return route };
+        let level = |r: &pc_shadow::Route| self.sh.bootstrap(input, r).ok().map(|x| x.out.level);
+        let Some(want) = level(&route) else { return route };
+        let base = pc_shadow::Route { slots: s, real: false, stc_first: false, sparse_b: self.env.base(s).sparse_b, ..route };
+        let mut drops: Vec<u32> = self.sh.cfg.bts.raise_drops.iter().copied().chain([0]).collect();
+        drops.sort_unstable_by(|a, b| b.cmp(a));
+        drops.dedup();
+        for d in drops {
+            let r = pc_shadow::Route { raise_drop: d, ..base };
+            if level(&r).is_some_and(|l| l <= want) {
+                if std::env::var_os("PC_SHRINK_LOG").is_some() {
+                    eprintln!("[shrink] {name}: dense drop {} -> {s} slots drop {d} (lands {:?} vs {want})", route.raise_drop, level(&r));
+                }
                 return r;
             }
         }
@@ -438,4 +469,18 @@ fn merged_desc(first: &Option<String>, descs: &[Option<String>]) -> Option<Strin
     }
     v["raise_drops"] = serde_json::Value::Array(drops);
     Some(v.to_string())
+}
+
+/// PC_SHRINK_SLOTS: the sparse slot counts a periodic dense refresh may shrink to (ascending).
+fn shrink_sizes() -> &'static [u32] {
+    static V: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let mut v: Vec<u32> = std::env::var("PC_SHRINK_SLOTS").unwrap_or_default().split(',').filter_map(|x| x.trim().parse().ok()).filter(|&x: &u32| x > 1).collect();
+        v.sort_unstable();
+        v
+    })
+}
+
+fn shrink_real() -> bool {
+    matches!(std::env::var("PC_SHRINK_REAL").as_deref().map(str::trim), Ok("1") | Ok("on"))
 }
