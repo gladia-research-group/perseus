@@ -485,7 +485,7 @@ def main(argv=None):
                       + " | ".join(tok.decode([int(t)]) for t in ids) + f"). Rephrase it to {plan['n_tok']} tokens.")
                 return 2
         work = Path(a.work_dir) if a.work_dir else Path(hf.scratch("cli_work", plan["name"]))
-        cache = None if a.no_record_cache else Path(hf.scratch("cli_record", plan["name"]))
+        cache = None if a.no_record_cache else Path(os.environ.get("SANA_RECORD_DIR") or hf.scratch("cli_record", plan["name"]))
         enc = Encrypted(plan, a.device, work, T, a.wait, not a.no_save_programs, cache)
         T.say("warming up (once per process): ...")
         enc.warm_up()
