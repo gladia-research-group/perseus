@@ -115,6 +115,10 @@ impl<'a> Lower<'a> {
                     return Err(format!("deliberate {name}: no route lands at ({}, {}) from ({}, {}){own}", cap.level, cap.deg, in_meta.level, in_meta.deg));
                 }
             };
+            // PC_SHRINK_DELIB=1: a code refresh shrinks as a planned one does, landing where the capture recorded it
+            if captured.is_some() && std::env::var("PC_SHRINK_DELIB").is_ok_and(|v| v.trim() == "1") {
+                route = self.shrink_periodic(name, &in_meta, route);
+            }
         }
         let realize = match kind {
             SiteKind::Deliberate => false,
