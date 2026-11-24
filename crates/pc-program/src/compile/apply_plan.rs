@@ -204,8 +204,22 @@ impl<'a> Lower<'a> {
         if sizes.is_empty() || route.slots != 0 || route.stc_first || route.spru_h > 0 || (route.real && !shrink_real()) {
             return route;
         }
-        let Some(t) = self.tags.get(name).filter(|t| t.known()) else { return route };
-        let Some(&s) = sizes.iter().find(|&&s| t.periodic_at(s as i64)) else { return route };
+        let tag = self.tags.get(name);
+        if std::env::var_os("PC_SHRINK_LOG").is_some() {
+            eprintln!("[shrink?] {name}: tag {:?}", tag.map(|t| (t.known(), t.slots, t.period)));
+        }
+        // PC_SHRINK_MATCH=<substring>: sites whose var holds it shrink to the first size unless their tag is known and
+        // not periodic there (a value the twin did not tag: the caller vouches for its period)
+        let matched = std::env::var("PC_SHRINK_MATCH").ok().filter(|m| !m.is_empty()).is_some_and(|m| name.contains(m.as_str()));
+        let s = match tag.filter(|t| t.known()) {
+            Some(t) => match sizes.iter().find(|&&s| t.periodic_at(s as i64)) {
+                Some(&s) => s,
+                None if matched && t.period >= t.slots && t.slots > sizes[0] as i64 => sizes[0],
+                None => return route,
+            },
+            None if matched => sizes[0],
+            None => return route,
+        };
         let level = |r: &pc_shadow::Route| self.sh.bootstrap(input, r).ok().map(|x| x.out.level);
         let Some(want) = level(&route) else { return route };
         let base = pc_shadow::Route { slots: s, real: false, stc_first: false, sparse_b: self.env.base(s).sparse_b, ..route };
