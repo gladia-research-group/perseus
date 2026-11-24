@@ -127,9 +127,14 @@ the softmax refresh inputs grow with the cache, and factors sized at position 0 
 (`gpt2_base_n32_ctx1024`) refit the softmax on every query position up to 1,024 keys, without the per-cache-length
 refine rescale. The runtime records every position on the CPU twin at setup and compiles one program per structure
 class (112 for 1,024 positions: the score period, the K bucket and the routes change with the cache), with the K/V
-states in pinned host memory and every route resident. 1,024 positions (`CTX=1024 scripts/repro/gpt2_decode_ctx.sh`,
-RTX PRO 6000): top-1 994/1024 against the plaintext model, the encrypted argmax 1024/1024, median KL 8.9e-4, 3.25 s
-per token at 120-127 keys, 3.49 at 480-511, 3.63 at 992-1023; setup 34 min (recording 1,024 positions).
+states in pinned host memory and every route resident. Its runtime has the decode's bootstrap switches that move no
+level (the sparse -> dense switch merged into the first rotations, StC-first input stages over 6 special primes,
+level relinearization keys in EvalMod, loose refresh pairs, the SparseB w14 series), not the rest of the decode
+recipe: on this config `SM_CHEB_GS`, and the hybrid chain `n32sph` even without it, lose precision as the cache grows
+(median KL ~0.3 at 1008-1023 keys). 1,024 positions (`CTX=1024 scripts/repro/gpt2_decode_ctx.sh`, RTX PRO 6000, host
+on 12 CPUs): top-1 993/1024 against the plaintext model, the encrypted argmax 1024/1024, median KL 7.8e-4, 2.41 s per
+token at 120-127 keys, 2.55 at 480-511, 2.67 at 992-1023 (without the switches, the same session: 998/1024, 6.9e-4,
+2.43 / 2.57 / 2.70 s); setup 33 min (recording 1,024 positions).
 
 `llama31_8b_decode` decodes up to a 512-token context on `llama31_8b_n32_ctx512` (the softmax fitted on every query
 position up to 512 keys), captured at position 1 the same way (its recording is not in the repository, `graphs/LLAMA.txt`); its
